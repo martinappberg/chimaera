@@ -58,8 +58,17 @@ export interface TablePage {
   truncated: boolean;
 }
 
-/** Server cap for one /fs/file read; also the code view's chunk size. */
+/** The code view's chunk size — what one paged /fs/file read fetches, and the
+ *  daemon's own default `limit`. NOT the server's ceiling (see below). */
 export const FILE_CHUNK = 262144;
+
+/** The daemon's hard ceiling for one /fs/file read (`MAX_FILE_CHUNK` in
+ *  crates/chimaera-server/src/fs.rs), which a `limit` is clamped to.
+ *  A board is read at this ceiling rather than in FILE_CHUNK pages: its parse
+ *  is the pane's whole interaction model (hit-testing, the outline, every
+ *  commit anchor), so a partial read is not a smaller feature set — it is a
+ *  stage where nothing can be selected. */
+export const BOARD_MAX_BYTES = 2 * 1024 * 1024;
 
 async function json<T>(res: Response): Promise<T> {
   if (!res.ok) {

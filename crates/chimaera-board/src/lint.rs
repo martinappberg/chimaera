@@ -6,10 +6,18 @@
 //! Every finding names object, field, measured value and expected value.
 //!
 //! Three profiles live here: the legality lint ([`lint`]: duplicate ids,
-//! inline data caps, off-canvas, unresolved tokens/endpoints, unknown
-//! objects), the target lint ([`lint_target`]: the venue's floors, tiers and
-//! rules), and the style lint ([`lint_style`]: the measured near-miss set).
-//! [`lint_fix`] repairs the mechanically-unambiguous classes in place.
+//! inline data caps, off-canvas and canvas bleed, a pinned theme fighting a
+//! literal ground, unresolved tokens/endpoints, unknown objects), the
+//! target lint ([`lint_target`]: the venue's floors, tiers and rules), and the
+//! style lint ([`lint_style`]: the measured near-miss set, and the overlap
+//! doctrine). [`lint_fix`] repairs the mechanically-unambiguous classes in
+//! place.
+//!
+//! A rule earns its place by *precision*, not coverage: a profile an agent
+//! learns to skim is worse than one that stays quiet. That is why the geometry
+//! checks here report only shapes no compositional idiom produces (a partial
+//! crossing, a word wider than its box) and why a page-wide condition reports
+//! once at page level rather than forty times at object level.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -23,6 +31,7 @@ use crate::theme::{Theme, TypeRole};
 pub fn lint(board: &Board, theme: &Theme) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
     let canvas = &board.canvas;
+    check_pinned_against_ground(board, theme, &mut diags);
 
     for page in &board.pages {
         let index = crate::normalize::index_page(page);
@@ -33,22 +42,32 @@ pub fn lint(board: &Board, theme: &Theme) -> Vec<Diagnostic> {
             page.walk().map(|o| (o.id(), o)).collect();
         for obj in page.walk() {
             // Off-canvas: parked is legal, invisible-by-accident is not worth
-            // the silence.
+            // the silence. A frame that only *crosses* an edge is the worse
+            // case — it renders, so the loss reads as a design choice rather
+            // than as the clipping it is (nothing clips text or shapes to the
+            // canvas; the raster simply ends).
             if let Some(f) = obj.frame() {
-                if f.right() < 0.0
-                    || f.bottom() < 0.0
-                    || f.x > canvas.width()
-                    || f.y > canvas.height()
-                {
+                let (cw, ch) = (canvas.width(), canvas.height());
+                if f.right() < 0.0 || f.bottom() < 0.0 || f.x > cw || f.y > ch {
+                    diags.push(
+                        Diagnostic::new(
+                            Severity::Warning,
+                            format!("off-canvas: at [{}, {}] on a {cw}×{ch} canvas", f.x, f.y),
+                        )
+                        .at(&page.id, obj.id())
+                        .field("at"),
+                    );
+                } else if let Some(over) = canvas_bleed(&f, cw, ch) {
                     diags.push(
                         Diagnostic::new(
                             Severity::Warning,
                             format!(
-                                "off-canvas: at [{}, {}] on a {}×{} canvas",
-                                f.x,
-                                f.y,
-                                canvas.width(),
-                                canvas.height()
+                                "clipped by the canvas edge: {over} (frame [{}, {}] {}×{} on a \
+                                 {cw}×{ch} canvas)",
+                                pt(f.x),
+                                pt(f.y),
+                                pt(f.w),
+                                pt(f.h)
                             ),
                         )
                         .at(&page.id, obj.id())
@@ -447,6 +466,263 @@ pub fn lint(board: &Board, theme: &Theme) -> Vec<Diagnostic> {
     }
 
     diags
+}
+
+/// Which canvas edges a frame overhangs, as a phrase, or `None` when the frame
+/// sits inside. A point of slack on every edge: a rounded extent is a rounding
+/// artefact, not a bleed.
+fn canvas_bleed(f: &Frame, cw: f64, ch: f64) -> Option<String> {
+    let mut over = Vec::new();
+    if f.x < -1.0 {
+        over.push(format!("left edge {} is off the canvas", pt(f.x)));
+    }
+    if f.y < -1.0 {
+        over.push(format!("top edge {} is off the canvas", pt(f.y)));
+    }
+    if f.right() > cw + 1.0 {
+        over.push(format!("right edge {} exceeds {cw}", pt(f.right())));
+    }
+    if f.bottom() > ch + 1.0 {
+        over.push(format!("bottom edge {} exceeds {ch}", pt(f.bottom())));
+    }
+    (!over.is_empty()).then(|| over.join("; "))
+}
+
+/// A board that **pins** a concrete theme variant while nailing its ground to
+/// a literal `#hex` of the opposite appearance — the one half of the
+/// literal-ground trap that resolution deliberately does not fix.
+///
+/// [`crate::theme::resolve_for_board`] lets a literal ground pick the
+/// appearance for the tiers that were already following the mode (`auto`, a
+/// scheme), because a literal ground is painted verbatim while every `@token`
+/// keeps following the theme. A pinned variant is exempt there on purpose —
+/// "ignore the app's mode" is itself an explicit choice — which leaves exactly
+/// this case unsaid: the ink cannot follow the ground, so the board renders
+/// light-mode type on a black canvas (or the reverse) and is unreadable. The
+/// finding names both sides and the measured ratio, and fires only when the
+/// theme's own body ink actually fails the crate's legibility contract (4.5:1,
+/// the same floor [`Theme::contrast_findings`] holds a theme to) against that
+/// ground — an appearance disagreement that still reads is not a defect.
+///
+/// An `@token` ground resolves *through* the theme and fixes nothing, so it is
+/// silent; so is `auto` and a scheme, which the ground already redirects.
+///
+/// What is deliberately **not** checked here: whether the theme in force is
+/// the one the reference named. A workspace `<id>.theme.json` whose inner `id`
+/// differs from its filename resolves — by filename — to exactly the file the
+/// author wrote and renders exactly as intended (copying a bundled theme to a
+/// new name and editing it is the supported way to make one), and a reference
+/// that resolves to *nothing* is a hard error out of [`crate::theme::resolve`]
+/// long before lint runs. There was no unreadable board left in that rule, and
+/// the render cache keys on the resolved theme's whole serialized form, so a
+/// shared inner id cannot cross wires either.
+fn check_pinned_against_ground(board: &Board, theme: &Theme, diags: &mut Vec<Diagnostic>) {
+    if crate::theme::theme_selection(board.theme.as_deref()) != crate::theme::PINNED_SELECTION {
+        return;
+    }
+    // `theme_selection` only answers "pinned" for a reference that is there.
+    let reference = board.theme.as_deref().unwrap_or(&theme.id);
+    let ground_ref = board.canvas.background.as_deref();
+    let (Some(ground_dark), Some(ground)) = (
+        crate::theme::mode_from_ground(ground_ref),
+        ground_ref.and_then(crate::theme::parse_hex),
+    ) else {
+        return;
+    };
+    if ground_dark == theme.dark {
+        return;
+    }
+    let ink = theme.color_or_fg(Some(&theme.body().color));
+    let ratio = ink.contrast(&ground);
+    if ratio >= MIN_INK_CONTRAST {
+        return;
+    }
+    let (theme_side, ground_side) = if theme.dark {
+        ("dark", "light")
+    } else {
+        ("light", "dark")
+    };
+    // The reference is what the author must edit; the resolved id is only
+    // worth naming when a workspace theme file answers to a different one.
+    let resolved = if reference == theme.id {
+        String::new()
+    } else {
+        format!(" ({})", theme.id)
+    };
+    diags.push(
+        Diagnostic::new(
+            Severity::Warning,
+            format!(
+                "theme {reference:?}{resolved} is a {theme_side} theme pinned over a \
+                 {ground_side} literal ground ({}): a pinned theme ignores the ground, so its \
+                 body ink {} lands at {ratio:.1}:1 and is unreadable ({MIN_INK_CONTRAST}:1 is \
+                 the floor). Set `canvas.background` to \"@bg\", or name the scheme (\"{}\") \
+                 instead of the variant so the ink follows the ground",
+                ground.hex(),
+                ink.hex(),
+                crate::theme::SCHEMES
+                    .iter()
+                    .map(|s| s.id)
+                    .collect::<Vec<_>>()
+                    .join("\", \"")
+            ),
+        )
+        .field("theme"),
+    );
+}
+
+/// The legibility floor a body ink must clear against the ground it lands on:
+/// WCAG AA for body text, the same ratio [`Theme::contrast_findings`] holds
+/// every role to.
+const MIN_INK_CONTRAST: f64 = 4.5;
+
+/// Two frames that **cross** — overlapping, with neither nested inside the
+/// other. §3.5 refuses *general* overlap on purpose (a callout over a panel is
+/// the entire point of the annotation layer, and an icon inside its disc, a
+/// label on a filled card and a full-bleed backdrop are all composition), so
+/// this reports only the narrow shape left over: an *asymmetric* partial
+/// crossing between unlike elements, which is what an accident looks like.
+/// The exclusions are the rule —
+///
+/// - **nesting, either way, with a [`GRID_PT`] slack**: the smallest offset the
+///   format can express, so a frame poking one step out is still nested;
+/// - **the annotation composites**: they exist to sit over content;
+/// - **hairlines** (a rule, divider, tick, legend dot — under two grid steps on
+///   an axis): chrome that crosses regions by design;
+/// - **text against text**: a text frame is a *box* and its ink fills only part
+///   of it (align/valign), so two crossing text boxes are not evidence of
+///   crossing ink, and this check measures frames, not ink;
+/// - **anything you can see through** ([`see_through`]) and **same-shape peers**
+///   ([`symmetric_peers`]): the two diagram idioms that *are* built out of
+///   partial crossings;
+/// - **a trivial nick**: under a quarter of the smaller frame.
+///
+/// Group envelopes are skipped — the envelope is its children's union, so the
+/// actionable subject is always a child.
+///
+/// This lives in the **style** profile, not the legality one: even with the
+/// exclusions it is a judgement about composition, and the always-on profile
+/// has to stay a profile an agent can trust enough to clear to zero. A false
+/// positive there is worse than a miss — it teaches agents to break correct
+/// artwork to silence it.
+fn crossing_frames(page: &Page, resolved: &BTreeMap<String, Frame>, diags: &mut Vec<Diagnostic>) {
+    let framed: Vec<(&Object, Frame)> = page
+        .walk()
+        .filter(|o| overlap_subject(o))
+        .filter_map(|o| resolved.get(o.id()).map(|f| (o, *f)))
+        .filter(|(_, f)| f.w.min(f.h) >= 2.0 * GRID_PT)
+        .collect();
+    for i in 0..framed.len() {
+        for j in (i + 1)..framed.len() {
+            let ((a, fa), (b, fb)) = (framed[i], framed[j]);
+            if matches!(a, Object::Text(_)) && matches!(b, Object::Text(_)) {
+                continue;
+            }
+            if see_through(a) || see_through(b) || symmetric_peers(a, b, &fa, &fb) {
+                continue;
+            }
+            let area = intersection_area(&fa, &fb);
+            let smaller = (fa.w * fa.h).min(fb.w * fb.h);
+            if area < GRID_PT * GRID_PT || area < 0.25 * smaller {
+                continue;
+            }
+            if nests(&fa, &fb) || nests(&fb, &fa) {
+                continue;
+            }
+            // The later object owns the finding and names the earlier one —
+            // the same z-order contract the near-miss pair findings follow.
+            diags.push(
+                Diagnostic::new(
+                    Severity::Warning,
+                    format!(
+                        "crosses {:?}: frames overlap over {:.0}% of the smaller one ([{}, {}] \
+                         {}×{} against [{}, {}] {}×{}); move one clear, or nest it fully inside \
+                         the other",
+                        a.id(),
+                        100.0 * area / smaller,
+                        pt(fb.x),
+                        pt(fb.y),
+                        pt(fb.w),
+                        pt(fb.h),
+                        pt(fa.x),
+                        pt(fa.y),
+                        pt(fa.w),
+                        pt(fa.h)
+                    ),
+                )
+                .at(&page.id, b.id())
+                .field("at"),
+            );
+        }
+    }
+}
+
+/// Objects whose frame is their ink, and whose job is not to sit over content.
+fn overlap_subject(obj: &Object) -> bool {
+    match obj {
+        Object::Text(_)
+        | Object::Shape(_)
+        | Object::Image(_)
+        | Object::Icon(_)
+        | Object::Table(_)
+        | Object::Chart(_)
+        | Object::Diagram(_)
+        | Object::Equation(_) => true,
+        // A group envelope is derived; a connector has no frame; the
+        // annotation composites are *made* to overlay content.
+        Object::Group(_)
+        | Object::Connector(_)
+        | Object::PanelLabel(_)
+        | Object::Scalebar(_)
+        | Object::SigBracket(_)
+        | Object::Legend(_)
+        | Object::Colorbar(_)
+        | Object::Callout(_)
+        | Object::Inset(_)
+        | Object::Unknown(_) => false,
+    }
+}
+
+/// A shape you can see *through*: translucent (`fillOpacity` under 1) or not
+/// filled at all. This is the format's own signal that a shape is meant to sit
+/// over content — there is no Venn lobe, no highlight band, and no ring drawn
+/// around a region of a figure without it — and the paint proves it: nothing is
+/// hidden underneath, so the crossing is the composition, not a loss.
+fn see_through(obj: &Object) -> bool {
+    let Object::Shape(s) = obj else { return false };
+    s.fill_opacity.is_some_and(|o| o < 1.0)
+        || s.fill
+            .as_deref()
+            .is_none_or(|f| f.eq_ignore_ascii_case("none"))
+}
+
+/// Two shapes of the same `geo` and near-equal extent — so they overlap each
+/// other by the same fraction. That symmetry is composed, never accidental: it
+/// is the Venn/interlocking-set idiom (and its opaque cousins, overlapping
+/// stages and stacked ripples). An accidental crossing is between *unlike*
+/// elements — a disc through a row of labels — and stays reported.
+fn symmetric_peers(a: &Object, b: &Object, fa: &Frame, fb: &Frame) -> bool {
+    let (Object::Shape(sa), Object::Shape(sb)) = (a, b) else {
+        return false;
+    };
+    // An eighth: enough slack for two hand-placed circles that were never
+    // meant to differ, far short of "one of these is a different element".
+    let peer = |x: f64, y: f64| (x - y).abs() <= 0.125 * x.max(y);
+    sa.geo == sb.geo && peer(fa.w, fb.w) && peer(fa.h, fb.h)
+}
+
+fn intersection_area(a: &Frame, b: &Frame) -> f64 {
+    let w = a.right().min(b.right()) - a.x.max(b.x);
+    let h = a.bottom().min(b.bottom()) - a.y.max(b.y);
+    w.max(0.0) * h.max(0.0)
+}
+
+/// `inner` sits inside `outer`, allowing one grid step of slack on every side.
+fn nests(outer: &Frame, inner: &Frame) -> bool {
+    outer.x <= inner.x + GRID_PT
+        && outer.y <= inner.y + GRID_PT
+        && outer.right() >= inner.right() - GRID_PT
+        && outer.bottom() >= inner.bottom() - GRID_PT
 }
 
 /// Run the target lint: the legality profile plus the preset's floors and
@@ -905,21 +1181,35 @@ fn check_color(
 /// spacing (3+ objects in a row/column with gaps differing by 0 < Δ < 3) ·
 /// off-grid geometry (explicit `at`/`size` not on the 8 pt grid; slot
 /// geometry is on-grid by construction and never checked) · overfull box ·
-/// margin violation. Always warnings: underfull box (<40% of frame height
-/// used) · distinct-value counts per page (>2 resolved families, >1
-/// non-neutral accent among literal colors) · override budget (>4 run-level
-/// size/family/color overrides per page; objects with role `"code"` exempt) ·
-/// title widow · a free `at` where the page's layout still has unclaimed
-/// slots · a flat pile (a busy designed figure of many loose top-level objects
-/// with no `group` — nudge to layer it).
+/// text overhanging its box (a word `wrap` cannot break, measured against the
+/// frame — nothing clips it, so it draws over its neighbours) · margin
+/// violation. Always warnings: underfull box (<40% of frame height used) ·
+/// distinct-value counts per page (>2 resolved families, >1 non-neutral accent
+/// among literal colors) · override budget (>4 run-level size/family/color
+/// overrides per page; objects with role `"code"` exempt) · title widow · a
+/// free `at` where the page's layout still has unclaimed slots · a flat pile
+/// (a busy designed figure of many loose top-level objects with no `group` —
+/// nudge to layer it) · [`crossing_frames`], the one shape of overlap that is
+/// reported at all (a warning even under `strict`: it is composition, and it
+/// carries known idiom exceptions).
 ///
 /// **Refused at any severity, deliberately unimplemented** (§3.5): general
-/// object overlap (callouts over panels are the entire point of the
-/// annotation layer) · panel-extent consistency (a wide time series beside a
-/// square heatmap is correct; plot-area *edges* matter, panel *extents*
-/// don't) · data-ink ratio (empirically contested — Tufte's direction lives
-/// in theme defaults, never in a rule) · whitespace balance · "wrong
-/// hierarchy" (the last two are judgement, and judgement is the loop's 5%).
+/// object overlap — callouts over panels are the entire point of the
+/// annotation layer, so only the *crossing* case, minus the idioms built out
+/// of crossings, is reported ·
+/// panel-extent consistency (a wide time series beside a square heatmap is
+/// correct; plot-area *edges* matter, panel *extents* don't) · crowding, in
+/// the sense of "too tight to read": measured against this deck it fires only
+/// on an icon beside its own label, which is the design · data-ink ratio
+/// (empirically contested — Tufte's direction lives in theme defaults, never
+/// in a rule) · whitespace balance · "wrong hierarchy" (the last two are
+/// judgement, and judgement is the loop's 5%).
+///
+/// One measurement note the numbers depend on: `normalize` snaps every stated
+/// coordinate to the 8 pt grid, and every render path normalizes first, so on
+/// a board that has been through it the sub-3 pt near-miss deltas below are
+/// *unrepresentable* — the near-miss profile bites while a file is being
+/// authored, and goes quiet once the grid owns the geometry.
 pub fn lint_style(
     board: &Board,
     theme: &Theme,
@@ -946,6 +1236,7 @@ pub fn lint_style(
             .filter_map(|o| resolved.get(o.id()).map(|f| (o.id(), *f)))
             .collect();
 
+        crossing_frames(page, &resolved, &mut diags);
         near_miss_alignment(&framed, &page.id, base, &mut diags);
         near_miss_spacing(&framed, &page.id, base, &mut diags);
         off_grid(page, base, &mut diags);
@@ -1222,6 +1513,13 @@ fn off_grid(page: &Page, base: Severity, diags: &mut Vec<Diagnostic>) {
 /// a warning, because floating an accent off the grid can be a deliberate
 /// choice. Group envelopes are skipped: their geometry is their children's
 /// union, so the actionable subject is a child, not the derived box.
+///
+/// When a page ignores its grid *wholesale* — [`GRID_UNUSED_MIN`] objects and
+/// three in four of them off every line — the per-object nudges collapse into
+/// a single page-level one. Telling forty objects to move is not advice, it is
+/// noise, and the real finding is one level up: the declared grid is not the
+/// alignment this page was built on, and every other check reads `canvas.grid`
+/// as if it were.
 fn near_miss_grid(
     page: &Page,
     xs: &[f64],
@@ -1237,6 +1535,8 @@ fn near_miss_grid(
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
     };
+    let mut placed = 0usize;
+    let mut adrift: Vec<Diagnostic> = Vec::new();
     for obj in page.walk() {
         if matches!(obj, Object::Group(_)) {
             continue;
@@ -1273,14 +1573,18 @@ fn near_miss_grid(
                 );
             }
         }
-        if present > 0 && !aligned_or_near {
+        if present == 0 {
+            continue;
+        }
+        placed += 1;
+        if !aligned_or_near {
             let nx = nearest(xs, f.x).unwrap_or(f.x);
             let ny = if ys.is_empty() {
                 f.y
             } else {
                 nearest(ys, f.y).unwrap_or(f.y)
             };
-            diags.push(
+            adrift.push(
                 Diagnostic::new(
                     Severity::Info,
                     format!(
@@ -1298,10 +1602,37 @@ fn near_miss_grid(
             );
         }
     }
+
+    if adrift.len() >= GRID_UNUSED_MIN && adrift.len() * 4 >= placed * 3 {
+        let mut d = Diagnostic::new(
+            Severity::Info,
+            format!(
+                "the layout grid is declared but unused: {} of {placed} placed objects sit on no \
+                 cell of the {}-column grid (columns at {}). Either place on it — every alignment \
+                 check reads `canvas.grid` as this page's intended geometry — or drop `canvas.grid`",
+                adrift.len(),
+                xs.len(),
+                xs.iter()
+                    .take(4)
+                    .map(|v| pt(*v).to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        )
+        .field("at");
+        d.page = Some(page.id.clone());
+        diags.push(d);
+    } else {
+        diags.append(&mut adrift);
+    }
 }
 
-/// Overfull (base severity) and underfull (always a warning) text boxes,
-/// measured against the resolved frame.
+/// The floor the wholesale "grid declared but unused" roll-up fires at: a page
+/// that never adopted its grid, never a handful of deliberate strays.
+const GRID_UNUSED_MIN: usize = 8;
+
+/// Overfull (base severity), overhanging (base severity) and underfull
+/// (always a warning) text boxes, measured against the resolved frame.
 fn text_boxes(
     page: &Page,
     resolved: &BTreeMap<String, Frame>,
@@ -1342,7 +1673,28 @@ fn text_boxes(
             continue;
         }
         let role = theme.role(role_name).unwrap_or_else(|| theme.body());
-        let block = text_block_height(paras, role, fonts, frame.w);
+        let measured = text_block(paras, role, fonts, frame.w);
+        let block = measured.height;
+        // A word wider than the box cannot wrap (hyphenation is
+        // language-specific, so `FontStack::wrap` emits it whole) and nothing
+        // clips it: it draws straight over whatever is beside the box. The
+        // widest line is therefore a hard measurement of overhang, not a
+        // guess.
+        if let Some((widest, line)) = measured.overhang(frame.w) {
+            diags.push(
+                Diagnostic::new(
+                    base,
+                    format!(
+                        "text overhangs its box: {line:?} measures {widest:.0} pt in a {:.0} pt \
+                         frame — it cannot wrap and it is not clipped, so it draws over its \
+                         neighbours; widen `size` or shorten the word",
+                        frame.w
+                    ),
+                )
+                .at(&page.id, id)
+                .field("size"),
+            );
+        }
         if block > frame.h + 0.5 {
             diags.push(
                 Diagnostic::new(
@@ -1402,7 +1754,22 @@ fn table_cell_overfull(
         for (ci, cell) in row.iter().enumerate() {
             let avail_w = (widths[ci] - pad * 2.0).max(1.0);
             let avail_h = row_h - pad * 2.0;
-            let block = text_block_height(std::slice::from_ref(cell), role, fonts, avail_w);
+            let measured = text_block(std::slice::from_ref(cell), role, fonts, avail_w);
+            let block = measured.height;
+            if let Some((widest, line)) = measured.overhang(avail_w) {
+                diags.push(
+                    Diagnostic::new(
+                        base,
+                        format!(
+                            "cell [{ri}][{ci}] overhangs its column: {line:?} measures \
+                             {widest:.0} pt in a {avail_w:.0} pt cell — it cannot wrap and it \
+                             is not clipped, so it draws into the next column"
+                        ),
+                    )
+                    .at(&page.id, &t.id)
+                    .field("columns"),
+                );
+            }
             if block > avail_h + 0.5 {
                 diags.push(
                     Diagnostic::new(
@@ -1420,31 +1787,64 @@ fn table_cell_overfull(
     }
 }
 
-/// The conservative height estimate `--style` shares with the renderer:
-/// plain paragraphs greedy-wrap through the same [`FontStack`] the renderer
-/// shapes with, each line at `size × lineHeight`; a rich paragraph is one
-/// line at its largest run size — exactly `emit_text_block`'s layout today,
-/// with paragraph spacing ignored. Measured height therefore equals what the
-/// renderer draws, and errs low if rich-run wrapping lands later — an
-/// overfull finding is never a false positive.
-fn text_block_height(paras: &[Paragraph], role: &TypeRole, fonts: &FontStack, width: f64) -> f64 {
+/// A measured text block: the height it fills, and its widest laid-out line.
+struct TextBlock {
+    height: f64,
+    /// The widest wrapped line and its measured advance width, over the plain
+    /// paragraphs only: the renderer measures a *rich* paragraph itself and
+    /// emits its own overflow finding, so counting one here would put the same
+    /// fact in front of the agent twice.
+    widest: Option<(String, f64)>,
+}
+
+impl TextBlock {
+    /// The widest line and its width when it overhangs `width`, else `None`.
+    /// The half-point slack matches the renderer's own overfull tolerance.
+    fn overhang(&self, width: f64) -> Option<(f64, &str)> {
+        let (line, w) = self.widest.as_ref()?;
+        (*w > width + 0.5).then_some((*w, line.as_str()))
+    }
+}
+
+/// The conservative measurement `--style` shares with the renderer: plain
+/// paragraphs greedy-wrap through the same [`FontStack`] the renderer shapes
+/// with, each line at `size × lineHeight`; a rich paragraph is one line at its
+/// largest run size — exactly `emit_text_block`'s layout today, with paragraph
+/// spacing ignored. Measured height therefore equals what the renderer draws,
+/// and errs low if rich-run wrapping lands later — an overfull finding is
+/// never a false positive.
+fn text_block(paras: &[Paragraph], role: &TypeRole, fonts: &FontStack, width: f64) -> TextBlock {
     let size = role.size.max(role.min_pt);
-    let mut h = 0.0;
+    let mut out = TextBlock {
+        height: 0.0,
+        widest: None,
+    };
     for p in paras {
         match p {
             Paragraph::Plain(text) => {
                 let lines = fonts.wrap(text, &role.family, size, role.weight, width);
-                h += lines.len() as f64 * size * role.line_height;
+                out.height += lines.len() as f64 * size * role.line_height;
+                for line in lines {
+                    let w = fonts.measure(&line, &role.family, size, role.weight);
+                    if out.widest.as_ref().is_none_or(|(_, prev)| w > *prev) {
+                        out.widest = Some((line, w));
+                    }
+                }
             }
             Paragraph::Rich(rich) => {
                 let max = rich.runs.iter().filter_map(|r| r.size).fold(size, f64::max);
-                h += max * role.line_height;
+                out.height += max * role.line_height;
             }
         }
     }
-    h
+    out
 }
 
+/// The margin an object may not cross: the theme's, widened per edge by the
+/// board's own `canvas.grid.margin` when it declares a larger one. A grid
+/// margin is the author *stating* where content starts, so it binds; taking
+/// the wider of the two means an author-declared inset is enforced without a
+/// permissive grid ever relaxing the theme's.
 fn margin_violations(
     board: &Board,
     page: &Page,
@@ -1453,7 +1853,8 @@ fn margin_violations(
     base: Severity,
     diags: &mut Vec<Diagnostic>,
 ) {
-    let [mt, mr, mb, ml] = theme.spacing.margin;
+    let declared = board.canvas.grid.as_ref().map_or(0.0, |g| g.margin);
+    let [mt, mr, mb, ml] = theme.spacing.margin.map(|m| m.max(declared));
     let (cw, ch) = (board.canvas.width(), board.canvas.height());
     for obj in page.walk() {
         // Slot geometry respects margins by construction (full-bleed ignores
@@ -2022,6 +2423,105 @@ mod tests {
         assert!(w.message.contains("960×540"), "{}", w.message);
     }
 
+    #[test]
+    fn a_frame_crossing_the_canvas_edge_names_the_edge_it_loses() {
+        // Half on: it renders, so the missing half reads as a design choice
+        // rather than as the clipping it is.
+        let diags =
+            linted(r#"{"id":"t","type":"text","at":[880,64],"size":[160,40],"text":["clipped"]}"#);
+        let w = diags
+            .iter()
+            .find(|d| d.message.contains("clipped by the canvas edge"))
+            .expect("a bleed finding");
+        assert_eq!(w.severity, Severity::Warning);
+        assert_eq!(w.object.as_deref(), Some("t"));
+        assert!(w.message.contains("right edge 1040"), "{}", w.message);
+        assert!(w.message.contains("exceeds 960"), "{}", w.message);
+        // Parked keeps the off-canvas wording; inside says nothing at all.
+        let parked =
+            linted(r#"{"id":"t","type":"text","at":[2000,64],"size":[160,40],"text":["p"]}"#);
+        assert!(
+            parked
+                .iter()
+                .all(|d| !d.message.contains("clipped by the canvas edge")),
+            "{parked:?}"
+        );
+        let inside =
+            linted(r#"{"id":"t","type":"text","at":[80,64],"size":[160,40],"text":["ok"]}"#);
+        assert!(
+            inside.iter().all(|d| !d.message.contains("canvas")),
+            "{inside:?}"
+        );
+    }
+
+    // --- the theme against the ground --------------------------------------
+
+    fn lint_themed(reference: &str, background: &str, theme: Theme) -> Vec<Diagnostic> {
+        let mut b = crate::parse(&format!(
+            r#"{{"format":"chimaera.board","formatVersion":1,"theme":"{reference}",
+                "canvas":{{"size":[960,540],"background":"{background}"}},
+                "pages":[{{"id":"p1","objects":[]}}]}}"#
+        ))
+        .unwrap();
+        crate::normalize(&mut b);
+        lint(&b, &theme)
+    }
+
+    /// A pinned variant is the one tier `resolve_for_board` deliberately does
+    /// NOT let the ground redirect, so a literal ground of the opposite
+    /// appearance renders the theme's ink into a wall it cannot be read
+    /// against. Naming both sides and the measured ratio is the whole point.
+    #[test]
+    fn a_pinned_theme_over_the_opposite_literal_ground_is_a_warning() {
+        let diags = lint_themed("talk-light", "#000000", crate::theme::default_for(false));
+        let w = diags
+            .iter()
+            .find(|d| d.field.as_deref() == Some("theme"))
+            .expect("a theme warning");
+        assert_eq!(w.severity, Severity::Warning);
+        assert!(w.message.contains("talk-light"), "{}", w.message);
+        assert!(w.message.contains("#000000"), "{}", w.message);
+        assert!(
+            w.message.contains(":1"),
+            "the measured ratio: {}",
+            w.message
+        );
+        // And the mirror: a dark theme nailed to a white ground.
+        let mirrored = lint_themed("talk-dark", "#ffffff", crate::theme::default_for(true));
+        assert!(
+            mirrored.iter().any(|d| d.field.as_deref() == Some("theme")),
+            "{mirrored:?}"
+        );
+    }
+
+    /// Silent everywhere the ground and the theme are not actually fighting:
+    /// a matching pin, a scheme or `auto` (which the ground redirects at
+    /// resolution), an `@token` ground (which resolves *through* the theme),
+    /// and a workspace theme whose inner id merely differs from the filename
+    /// that found it — that board renders exactly as its author intended.
+    #[test]
+    fn a_ground_the_theme_can_carry_says_nothing() {
+        let mut polished = crate::theme::default_for(false);
+        polished.id = "talk-light".into(); // a copied bundled theme, renamed
+        for (reference, background, theme) in [
+            ("talk-dark", "#000000", crate::theme::default_for(true)),
+            ("talk-light", "#ffffff", crate::theme::default_for(false)),
+            ("talk", "#000000", crate::theme::default_for(true)),
+            ("auto", "#000000", crate::theme::default_for(true)),
+            ("talk-light", "@bg", crate::theme::default_for(false)),
+            ("talk-light", "@surface", crate::theme::default_for(false)),
+            // The renamed copy: a reference that answers to another id, on a
+            // ground it carries fine. The old id-mismatch rule fired here.
+            ("my-deck", "#ffffff", polished),
+        ] {
+            let diags = lint_themed(reference, background, theme);
+            assert!(
+                diags.iter().all(|d| d.field.as_deref() != Some("theme")),
+                "{reference} on {background}: {diags:?}"
+            );
+        }
+    }
+
     // --- equations (the C6 exception) --------------------------------------
 
     #[test]
@@ -2437,6 +2937,115 @@ mod tests {
         )
     }
 
+    // --- crossing frames (the overlap doctrine, --style only) ---------------
+
+    /// A crossing pair is reported on the later object, names the earlier one,
+    /// and states how much of the smaller frame is lost. It is a **style**
+    /// finding — the always-on profile must stay clearable to zero.
+    #[test]
+    fn two_crossing_frames_are_a_warning_naming_both_and_the_overlap() {
+        let objects = r#"{"id":"disc","type":"shape","geo":"ellipse","at":[400,200],"size":[160,160],
+                "fill":"@bg"},
+               {"id":"label","type":"text","at":[320,240],"size":[160,32],"text":["Astrocyte"]}"#;
+        let diags = style_linted(objects, false);
+        let w = diags
+            .iter()
+            .find(|d| d.message.contains("crosses"))
+            .expect("a crossing finding");
+        assert_eq!(w.severity, Severity::Warning);
+        assert_eq!(
+            w.object.as_deref(),
+            Some("label"),
+            "the later object owns it"
+        );
+        assert!(w.message.contains("\"disc\""), "{}", w.message);
+        assert!(w.message.contains("50%"), "{}", w.message);
+        // A warning even under --strict: composition is not a floor.
+        let strict = style_linted(objects, true);
+        assert_eq!(
+            strict
+                .iter()
+                .find(|d| d.message.contains("crosses"))
+                .expect("still reported")
+                .severity,
+            Severity::Warning
+        );
+        // And nothing at all from the legality profile.
+        assert!(
+            linted(objects)
+                .iter()
+                .all(|d| !d.message.contains("crosses")),
+            "the always-on profile stays out of composition"
+        );
+    }
+
+    /// The composition idioms §3.5 refuses to call overlap: an icon inside its
+    /// disc, a label on a filled card, a full-canvas backdrop, a hairline rule
+    /// spanning a region, two text boxes (whose ink fills only part of them),
+    /// an annotation composite, which exists to sit over content — and the two
+    /// idioms *built* out of partial crossings, a Venn (filled-translucent or
+    /// stroke-only) and a highlight band drawn across a card.
+    #[test]
+    fn composition_never_reads_as_a_crossing() {
+        let quiet = |objects: &str| {
+            let diags = style_linted(objects, false);
+            assert!(
+                diags.iter().all(|d| !d.message.contains("crosses")),
+                "{objects}\n{diags:?}"
+            );
+        };
+        let card = r#"{"id":"card","type":"shape","geo":"rect","at":[400,200],"size":[240,160],
+                       "fill":"@surface"}"#;
+        // icon nested in its disc
+        quiet(&format!(
+            r#"{card},{{"id":"ic","type":"icon","name":"flask","at":[440,240],"size":[80,80]}}"#
+        ));
+        // label on the card
+        quiet(&format!(
+            r#"{card},{{"id":"l","type":"text","at":[416,216],"size":[208,48],"text":["Gene A"]}}"#
+        ));
+        // a full-canvas backdrop under it
+        quiet(&format!(
+            r#"{{"id":"bg","type":"shape","geo":"rect","at":[0,0],"size":[960,540],
+                 "fill":"@bg"}},{card}"#
+        ));
+        // a hairline rule crossing it
+        quiet(&format!(
+            r#"{card},{{"id":"rule","type":"shape","geo":"rect","at":[0,264],"size":[960,8],
+                        "fill":"@edge"}}"#
+        ));
+        // two text boxes: ink, not frames, is what would collide
+        quiet(
+            r#"{"id":"a","type":"text","at":[400,200],"size":[240,160],"text":["a"]},
+               {"id":"b","type":"text","at":[320,240],"size":[160,32],"text":["b"]}"#,
+        );
+        // an annotation composite over content is the annotation layer's job
+        quiet(&format!(
+            r#"{card},{{"id":"co","type":"callout","at":[320,240],"size":[160,32],
+                        "text":["see here"]}}"#
+        ));
+        // a Venn: two same-geo peers overlapping symmetrically, translucent…
+        quiet(
+            r#"{"id":"va","type":"shape","geo":"ellipse","at":[240,160],"size":[280,280],
+                "fill":"@cat1","fillOpacity":0.35},
+               {"id":"vb","type":"shape","geo":"ellipse","at":[440,160],"size":[280,280],
+                "fill":"@cat2","fillOpacity":0.35}"#,
+        );
+        // …and stroke-only, which is the same diagram drawn as outlines
+        quiet(
+            r#"{"id":"oa","type":"shape","geo":"ellipse","at":[240,160],"size":[280,280],
+                "stroke":{"color":"@cat1","width":2}},
+               {"id":"ob","type":"shape","geo":"ellipse","at":[440,160],"size":[280,280],
+                "stroke":{"color":"@cat2","width":2}}"#,
+        );
+        // a highlight band drawn across a card: translucent, so it hides
+        // nothing — and it is neither nested in the card nor nesting it
+        quiet(&format!(
+            r#"{card},{{"id":"hl","type":"shape","geo":"rect","at":[360,240],"size":[320,64],
+                        "fill":"@cat6","fillOpacity":0.22}}"#
+        ));
+    }
+
     #[test]
     fn an_overfull_table_cell_is_reported_with_the_cell_named() {
         let diags = style_linted(
@@ -2454,6 +3063,114 @@ mod tests {
         // Short cells never trip an underfull finding.
         assert!(
             !diags.iter().any(|d| d.message.contains("underfull")),
+            "{diags:?}"
+        );
+    }
+
+    /// A word wider than its box cannot wrap and is never clipped: it draws
+    /// straight over whatever is beside it. Measured, not guessed — through
+    /// the same [`FontStack`] the renderer shapes with.
+    #[test]
+    fn a_word_wider_than_its_box_is_reported_as_an_overhang() {
+        let narrow = r#"{"id":"gate","type":"text","role":"caption","at":[80,80],
+            "size":[16,72],"text":["Pass"]}"#;
+        let diags = style_linted(narrow, false);
+        let f = diags
+            .iter()
+            .find(|d| d.message.contains("overhangs its box"))
+            .expect("an overhang finding");
+        assert_eq!(f.severity, Severity::Warning, "warning by default");
+        assert_eq!(f.object.as_deref(), Some("gate"));
+        assert_eq!(f.field.as_deref(), Some("size"));
+        assert!(f.message.contains("\"Pass\""), "{}", f.message);
+        assert!(f.message.contains("16 pt frame"), "{}", f.message);
+        // It escalates with the rest of the measured set under --strict…
+        assert_eq!(
+            style_linted(narrow, true)
+                .iter()
+                .find(|d| d.message.contains("overhangs its box"))
+                .map(|d| d.severity),
+            Some(Severity::Error)
+        );
+        // …and the same word in a box that seats it says nothing.
+        let wide = r#"{"id":"gate","type":"text","role":"caption","at":[80,80],
+            "size":[160,72],"text":["Pass"]}"#;
+        assert!(
+            style_linted(wide, false)
+                .iter()
+                .all(|d| !d.message.contains("overhangs")),
+            "{:?}",
+            style_linted(wide, false)
+        );
+    }
+
+    /// A page that never adopted its declared grid gets ONE page-level nudge,
+    /// not one per object: telling forty objects to move is noise, and the
+    /// actionable fact is that `canvas.grid` describes no geometry here.
+    #[test]
+    fn a_page_that_ignores_its_declared_grid_is_reported_once() {
+        // Ten objects, none on an 80 pt column line.
+        let adrift: String = (0..10)
+            .map(|i| {
+                rect(
+                    &format!("s{i}"),
+                    [8.0, 16.0 + i as f64 * 40.0],
+                    [64.0, 24.0],
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let diags = grid_style_linted(&adrift, false);
+        let rolled: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("declared but unused"))
+            .collect();
+        assert_eq!(rolled.len(), 1, "{diags:?}");
+        assert_eq!(rolled[0].severity, Severity::Info, "a nudge, not a warning");
+        assert_eq!(rolled[0].page.as_deref(), Some("p1"));
+        assert!(
+            rolled[0].message.contains("10 of 10"),
+            "{}",
+            rolled[0].message
+        );
+        assert!(
+            rolled[0].message.contains("12-column"),
+            "{}",
+            rolled[0].message
+        );
+        assert!(
+            diags
+                .iter()
+                .all(|d| !d.message.contains("off the layout grid: at")),
+            "the per-object nudges are replaced, not added to: {diags:?}"
+        );
+
+        // A page that IS on the grid but for two strays keeps the per-object
+        // nudges — a stray is actionable where a whole page is not.
+        let mostly: String = (0..8)
+            .map(|i| rect(&format!("g{i}"), [80.0 * i as f64, 16.0], [64.0, 24.0]))
+            .chain((0..2).map(|i| {
+                rect(
+                    &format!("s{i}"),
+                    [8.0, 96.0 + i as f64 * 40.0],
+                    [64.0, 24.0],
+                )
+            }))
+            .collect::<Vec<_>>()
+            .join(",");
+        let diags = grid_style_linted(&mostly, false);
+        assert!(
+            diags
+                .iter()
+                .all(|d| !d.message.contains("declared but unused")),
+            "{diags:?}"
+        );
+        assert_eq!(
+            diags
+                .iter()
+                .filter(|d| d.message.contains("off the layout grid: at"))
+                .count(),
+            2,
             "{diags:?}"
         );
     }

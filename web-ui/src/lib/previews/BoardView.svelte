@@ -16,6 +16,7 @@
   import { untrack } from "svelte";
   import { activeTheme } from "../settings/store.svelte";
   import {
+    BOARD_MAX_BYTES,
     fsBoardCanvasBackground,
     fsBoardTheme,
     fsBoardEdit,
@@ -23,12 +24,14 @@
     fsBoardJournalAll,
     fsBoardJournalAppend,
     fsBoardRender,
+    fsFile,
     midTruncate,
     navigateDownload,
     type BoardExport,
     type BoardExportFormat,
     type BoardJournalOp,
     type BoardRender,
+    type FileChunk,
   } from "./files";
   import { retain, release, noteWrite, type FileEntry } from "./fileStore.svelte";
   import { boardNudge } from "./boardEvents";
@@ -40,15 +43,18 @@
     composeBoardContext,
     configSig,
     CORNERS,
+    coversPoint,
     diagramNodeIndex,
     diagramNodeLabel,
     editorFontPx,
     editorTextToNodeLabel,
     editorTextToParagraphs,
     fateCensus,
+    findMember,
     GRID_PT,
     gridLines,
     hitChild,
+    hitMember,
     MIN_RESIZE_PT,
     nextPinId,
     pageFrames,
@@ -93,23 +99,117 @@
   let { path, wsRoot = null }: Props = $props();
 
   // --- file entry: revalidation signal -----------------------------------
+  // Only the entry's `mtime` is wanted here — the board's own bytes are read
+  // WHOLE below, not through the code view's 256KB chunk. `retain` still pins
+  // the path for the daemon's disk watcher, which is what moves that token.
+  // `ensureMtime` seeds the token once (deduped with FileView's own probe on
+  // the same entry); the whole read below GATES on it, so the file is read
+  // exactly once — with the real token — instead of once at token=null and
+  // again when it lands (that null→value transition is a genuine key change,
+  // so a synchronous claim can't collapse it — the read must simply wait).
   let entry = $state<FileEntry | null>(null);
   $effect(() => {
     const p = path;
     const e = retain(p);
     entry = e;
-    void e.ensureChunk();
+    void e.ensureMtime();
     return () => release(p);
   });
 
-  const board = $derived.by<BoardInfo | null>(() => {
-    const e = entry;
-    if (e === null || e.path !== path || e.chunk === null) return null;
-    // Boards past the 256KB first chunk lose editing, not viewing — the
-    // render path reads the file server-side regardless.
-    if (e.chunk.bytes.length < e.chunk.size) return null;
-    return parseBoard(e.chunk.bytes);
+  /** The board file's bytes, read whole (to the daemon's own /fs/file ceiling).
+   *  The parse IS this pane's interaction model, so a truncated read leaves a
+   *  stage where nothing can be selected — past the ceiling the degrade is
+   *  stated, never silent (see `boardFault`). */
+  let boardBytes = $state<{ path: string; chunk: FileChunk } | null>(null);
+  let boardReadError = $state<string | null>(null);
+  /** `path\nmtime` of the bytes in hand, so a token that merely re-arrives at
+   *  the value we already read (a revalidation probe of an unchanged file)
+   *  does not re-read it. */
+  let bytesKey = "";
+
+  // Re-read on a path change and on every mtime move: the daemon's ~2s watcher
+  // and the board-epoch nudge — and our own commits, via noteWrite — move
+  // `entry.mtime`, which is how an agent's edit reaches the rail and the
+  // inspector without a reload. Gated on a NON-NULL token so the open costs one
+  // whole-file read: the null→value seeding is not a change to re-read for, and
+  // waiting for the real token means the request and its response share a key.
+  $effect(() => {
+    const p = path;
+    const token = entry?.mtime ?? null;
+    if (token === null) return;
+    const key = `${p}\n${token}`;
+    if (bytesKey === key) return;
+    // Claimed BEFORE the fetch: a re-run while the read is in flight (a token
+    // re-arriving at the same value) must not start a second read of the same
+    // bytes. The response's own X-Mtime then reconfirms this same key.
+    bytesKey = key;
+    let cancelled = false;
+    fsFile(p, 0, BOARD_MAX_BYTES).then(
+      (c) => {
+        if (cancelled) return;
+        boardBytes = { path: p, chunk: c };
+        boardReadError = null;
+        bytesKey = `${p}\n${c.mtime ?? ""}`;
+      },
+      (err: unknown) => {
+        if (cancelled) return;
+        boardReadError = err instanceof Error ? err.message : String(err);
+        // Nothing is in hand, so the claim must not survive: the next token
+        // move (or remount) has to retry rather than sit on the failure.
+        bytesKey = "";
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
   });
+
+  const board = $derived.by<BoardInfo | null>(() => {
+    const b = boardBytes;
+    if (b === null || b.path !== path) return null;
+    // A partial read is a JSON error, not a smaller board — refuse it here so
+    // the fault below can say which of the two happened.
+    if (b.chunk.truncated) return null;
+    return parseBoard(b.chunk.bytes);
+  });
+
+  const mb = (n: number): string => `${(n / (1024 * 1024)).toFixed(1)} MB`;
+
+  /** Why this board is view-only — past the read ceiling, unparseable, or
+   *  unreadable — or null when it parsed whole (or is still being read). The
+   *  stage banner states it in full; the rail (220px) gets the short form in
+   *  place of its empty state, which must only ever mean a genuinely empty
+   *  page. */
+  const boardFault = $derived.by<{ short: string; long: string } | null>(() => {
+    if (board !== null) return null;
+    if (boardReadError !== null)
+      return {
+        short: "could not be read — view-only",
+        long: `this board could not be read — ${boardReadError}. Nothing here is selectable or editable until it can be.`,
+      };
+    const b = boardBytes;
+    if (b === null || b.path !== path) return null;
+    if (b.chunk.truncated)
+      return {
+        short: `${mb(b.chunk.size)} — too large to edit here, view-only`,
+        long:
+          `this board is ${mb(b.chunk.size)} — past the ${mb(BOARD_MAX_BYTES)} the pane reads in ` +
+          `one go, so it is view-only here: no selection, no editing. The stage still shows the ` +
+          `engine's own render, and an agent can still edit the file.`,
+      };
+    return {
+      short: "could not be parsed — view-only",
+      long:
+        "this board's JSON could not be parsed, so it is view-only here: no selection, no " +
+        "editing. The stage still shows the engine's own render, which parses leniently.",
+    };
+  });
+
+  /** What the outline says instead of the empty state while there is nothing
+   *  to list for a reason other than an empty page. */
+  const outlineNote = $derived(
+    board !== null ? null : (boardFault?.short ?? "reading the board…"),
+  );
 
   // --- render state -------------------------------------------------------
   let page = $state(0);
@@ -177,6 +277,7 @@
     // dots must not linger over the new stage meanwhile).
     void path;
     page = 0;
+    boardReadError = null;
     pins = [];
     openPin = null;
     pinDraft = null;
@@ -217,11 +318,16 @@
   let selected = $state<string | null>(null);
   const selectedObj = $derived(pageObjects.find((o) => o.id === selected) ?? null);
 
-  // --- composite children (click-through selection) -----------------------
-  /** The selected composite's drilled-into child (a derived id like
-   *  `flow/too-hot`), or null when the selection is the object itself. The
-   *  click-through idiom: the first press selects the composite, a second
-   *  press inside it selects the child under the pointer. */
+  // --- drilled-into children (click-through selection) --------------------
+  /** The selection's drilled-into child, or null when the selection is the
+   *  object itself. Two nestings share this one idiom — first press selects the
+   *  top-level object, a second press inside it selects what is under the
+   *  pointer:
+   *    - a COMPOSITE's derived child (an id like `flow/too-hot`), whose frame
+   *      is the render's;
+   *    - a GROUP MEMBER (its own id, its own literal frame). The group stays
+   *      the dragged unit — the engine moves groups, not members — so drilling
+   *      in costs no draggability. */
   let selectedChild = $state<string | null>(null);
   /** A committed child pin's optimistic frame — holds the outline at the
    *  dropped spot for the beat between pointer-up and the re-render whose
@@ -234,10 +340,22 @@
   );
   const selectedChildren = $derived(selected !== null ? (pageChildFrames[selected] ?? []) : []);
 
-  /** The selected child's current frame (overlay first, then the render's). */
+  /** The drilled-into GROUP MEMBER, when the drill went into a group rather
+   *  than a composite (they are disjoint kinds). */
+  const selectedMember = $derived.by<ObjInfo | null>(() => {
+    const o = selectedObj;
+    const id = selectedChild;
+    return o !== null && id !== null ? findMember(o, id) : null;
+  });
+
+  /** The selected child's current frame: a group member carries the file's own
+   *  literal geometry; a composite child's comes from the committed overlay
+   *  first, then the render. */
   const selectedChildFrame = $derived.by<Frame | null>(() => {
     const id = selectedChild;
     if (id === null) return null;
+    const m = selectedMember;
+    if (m !== null && m.at !== null && m.size !== null) return { at: m.at, size: m.size };
     const ov = childOverlay;
     if (ov !== null && ov.id === id) return ov.frame;
     const kid = selectedChildren.find((c) => c.id === id);
@@ -614,17 +732,12 @@
   let skipAttribution = false;
 
   function hit(pt: [number, number]): ObjInfo | null {
-    // Topmost wins: z-order is array order, so walk backwards.
+    // Topmost wins: z-order is array order, so walk backwards. Coverage is
+    // `coversPoint`, which resolves a GROUP to its members: a group's box is
+    // the envelope its members union, mostly empty space, so treating it as
+    // solid would shadow every unrelated object that happens to sit inside it.
     for (let i = pageObjects.length - 1; i >= 0; i--) {
-      const o = pageObjects[i];
-      if (o.at === null || o.size === null) continue;
-      if (
-        pt[0] >= o.at[0] &&
-        pt[0] <= o.at[0] + o.size[0] &&
-        pt[1] >= o.at[1] &&
-        pt[1] <= o.at[1] + o.size[1]
-      )
-        return o;
+      if (coversPoint(pageObjects[i], pt)) return pageObjects[i];
     }
     return null;
   }
@@ -633,9 +746,12 @@
   const HANDLE_PX = 8;
   const handleBoxes = $derived.by(() => {
     // A drilled-into child owns the selection: children are not resizable
-    // (their size is layout-derived), and parent handles would read as the
-    // child's.
-    if (selectedChild !== null) return [];
+    // (their size is layout-derived, or the group's own to re-union), and
+    // parent handles would read as the child's. A GROUP is never resizable
+    // either — its box is the envelope normalize() unions from its members, so
+    // the daemon refuses a size on it; offering handles would promise a
+    // gesture that cannot land.
+    if (selectedChild !== null || selectedObj?.kind === "group") return [];
     const box = selectionBox;
     if (box === null) return [];
     return CORNERS.map((corner) => ({
@@ -768,8 +884,18 @@
         }
       }
     }
+    // The same drill, one level down a GROUP: the first press selects the
+    // group — the only unit the engine moves, since a member's `at` is
+    // page-absolute and a group move is a rigid translation of the subtree —
+    // and a press inside the ALREADY selected group selects the member under
+    // the pointer. The drill costs no draggability: the drag armed below is
+    // still the group's, from wherever inside it the press landed.
+    const member =
+      target !== null && target.id === selected && target.children.length > 0
+        ? hitMember(target, pt)
+        : null;
     selected = target?.id ?? null;
-    selectedChild = null;
+    selectedChild = member?.id ?? null;
     childOverlay = null;
     // A plain press collapses the arrange multi-selection to this one object.
     arrangeExtra = [];
@@ -1072,14 +1198,27 @@
     { op: "snap-grid", label: "Snap grid", title: "snap to the layout grid", min: 1, grid: true },
   ];
 
+  /** Can the selection be wrapped in a group / dissolved? The daemon owns the
+   *  refusals; these only keep an impossible gesture from being offered. */
+  const canGroup = $derived(arrangeSel.length >= 2);
+  const canUngroup = $derived(arrangeSel.length === 1 && selectedObj?.kind === "group");
+
   /**
    * The multi-object arrange gesture: POST /board/edit `{arrange:{op, objects}}`
    * on the same serialized commit chain as every edit, adopting the write so
    * the pixels follow (files.ts owns the typed edit wrappers, but its `change`
    * type can't carry `arrange`, so this rides the shared `api` helper). Our own
    * edit — the §6.5 attribution differ skips its re-render.
+   *
+   * A `structural` op (group/ungroup) rewrites the page's object TREE rather
+   * than moving frames: it mints (or dissolves) an id the client did not
+   * choose, so the selection follows the daemon's ANSWER — the response's
+   * `group`/`members` — instead of inventing optimistic structure. The ids
+   * resolve to objects one parse later, which is exactly when their boxes
+   * appear. The page needs no naming: the daemon reads it off the ids and
+   * refuses a selection spread across pages.
    */
-  async function runArrange(op: string): Promise<void> {
+  async function runArrange(op: string, structural = false): Promise<void> {
     if (arrangeBusy) return;
     const ids = arrangeSel.filter((id) => pageObjects.some((o) => o.id === id));
     if (ids.length === 0) return;
@@ -1104,7 +1243,13 @@
           }
           throw new ApiError(res.status, message);
         }
-        const body = (await res.json()) as { mtime?: string | null };
+        const body = (await res.json()) as {
+          mtime?: string | null;
+          /** A structural op's answer: the minted/dissolved group and the
+           *  member ids it now holds (or released). */
+          group?: string;
+          members?: string[];
+        };
         const mtime = body.mtime ?? null;
         skipAttribution = true;
         if (mtime !== null) {
@@ -1115,6 +1260,15 @@
           }
         }
         noteWrite(path, mtime);
+        if (structural) {
+          // Follow the gesture: a new group becomes the selection (it is now
+          // the unit that moves), and a dissolved one hands the selection back
+          // to the members it released.
+          const members = body.members ?? [];
+          selected = op === "group" ? (body.group ?? null) : (members[0] ?? null);
+          arrangeExtra = op === "group" ? [] : members.slice(1);
+          selectedChild = null;
+        }
         showToast(`${op} · ${ids.length}`);
       } catch (err) {
         saveError = err instanceof Error ? err.message : String(err);
@@ -2020,13 +2174,16 @@
   });
 
   /** The drilled-into child's outline in stage pixels, tracking an in-flight
-   *  child drag exactly like the parent box tracks a move. */
+   *  child drag exactly like the parent box tracks a move. A drilled-into group
+   *  member rides its GROUP's drag instead — it moves with the unit. */
   const childBox = $derived.by(() => {
     const f = selectedChildFrame;
     if (f === null) return null;
     const d = drag;
     let at = f.at;
     if (d !== null && d.mode === "child-move" && d.childId === selectedChild) {
+      at = [f.at[0] + d.dx, f.at[1] + d.dy];
+    } else if (d !== null && d.mode === "move" && d.id === selected && selectedMember !== null) {
       at = [f.at[0] + d.dx, f.at[1] + d.dy];
     }
     return {
@@ -2046,6 +2203,12 @@
   tabindex="-1"
 >
   <div class="stage-wrap">
+    {#if !presenting && boardFault !== null}
+      <!-- The honest degrade: a board the pane could not parse whole is
+           view-only, and says so here rather than presenting an empty rail as
+           if the page had no objects. -->
+      <div class="board-fault" role="status">{boardFault.long}</div>
+    {/if}
     <!-- The stage is a pointer surface for select/drag/resize; keyboard access
          to the same objects goes through the outline rail's real buttons. -->
     <div
@@ -2525,6 +2688,23 @@
                 >
               {/each}
             </div>
+            <!-- Structure, not alignment: a group is the unit the stage moves,
+                 so grouping is how a set of objects becomes one draggable
+                 layer. The new group's id arrives with the next parse. -->
+            <div class="arrange-grid">
+              <button
+                class="arr"
+                disabled={arrangeBusy || !canGroup}
+                title="wrap the selection in a new group — the group becomes the unit the stage moves"
+                onclick={() => void runArrange("group", true)}>Group</button
+              >
+              <button
+                class="arr"
+                disabled={arrangeBusy || !canUngroup}
+                title="dissolve the selected group — its members become page objects again"
+                onclick={() => void runArrange("ungroup", true)}>Ungroup</button
+              >
+            </div>
           </div>
         {/if}
       </div>
@@ -2536,6 +2716,7 @@
     <BoardRail
       title={board?.title ?? "board"}
       objects={pageObjects}
+      unavailable={outlineNote}
       {selected}
       childFrames={pageChildFrames}
       {selectedChild}
@@ -2580,6 +2761,17 @@
     min-width: 0;
     display: flex;
     flex-direction: column;
+  }
+  /* The view-only banner: stated once, above the stage, in the warn tone the
+     lint notes already use. */
+  .board-fault {
+    flex-shrink: 0;
+    padding: 6px 12px;
+    border-bottom: 1px solid var(--edge);
+    background: color-mix(in srgb, var(--warn) 12%, transparent);
+    color: var(--warn);
+    font-size: var(--text-xs);
+    line-height: 1.4;
   }
   .stage {
     position: relative;

@@ -18,10 +18,11 @@ mod windows;
 mod wsl;
 
 fn main() {
-    // Triple role. `--askpass <prompt>` is the tiny SSH_ASKPASS helper ssh
-    // runs to prompt for a password / 2FA: it relays to the running app over
-    // a socket and prints the answer, no Tauri init. Checked first — it must
-    // stay lightweight and never spawn a daemon or a window.
+    // Four roles, chosen by argv before any init: askpass, daemon, board CLI,
+    // else the Tauri shell. `--askpass <prompt>` is the tiny SSH_ASKPASS helper
+    // ssh runs to prompt for a password / 2FA: it relays to the running app
+    // over a socket and prints the answer, no Tauri init. Checked first — it
+    // must stay lightweight and never spawn a daemon or a window.
     if std::env::args().any(|a| a == "--askpass") {
         askpass::run_helper();
         return;
@@ -101,7 +102,8 @@ fn board_cli() -> ! {
 
     #[derive(clap::Subcommand)]
     enum BoardCommand {
-        /// Boards: compose, render, and read back .board.json visual surfaces.
+        /// Boards: compose, render, and read back .board visual surfaces (the
+        /// legacy .board.json extension still opens).
         Board {
             #[command(subcommand)]
             cmd: chimaera_board::cli::BoardCmd,

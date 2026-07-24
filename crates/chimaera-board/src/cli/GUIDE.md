@@ -3,9 +3,13 @@
 Boards are plain `*.board` files (JSON content under a branded extension; the
 legacy `*.board.json` still opens); `chimaera board` renders them to pixels.
 This page is self-contained: run the examples as-is, and never explore
-`--help`, the source, or the repo to learn the tool. One law up front:
+`--help`, the source, or the repo to learn the tool. Two laws up front:
 **Board computes scales and layout, never statistics** — no binning, no
-aggregation, no regression; compute quartiles/CIs yourself and pass them.
+aggregation, no regression; compute quartiles/CIs yourself and pass them. And
+**the board file is the deliverable**: it leaves here through `chimaera board
+export` and nothing else — never re-render a board through another
+presentation tool, another skill, or an HTML→pptx converter (see "Hand it
+off").
 
 ## Show a result inline (the main move)
 
@@ -51,11 +55,9 @@ card auto-sizes to the flowchart unless `--size`/`--preset` says otherwise).
 
 ## Choosing the inline format
 
-Don't default to prose or one fixed shape — pick the format that communicates
-best and let `--as <format>` render it inline. `chimaera board show --as
-auto|chart|table|figure|slide|diagram` chooses the card SHAPE; the body
-(`chart`/`table`/`text`/`mermaid`) is what you already pass. Decide by what you
-are showing:
+Don't default to prose or one fixed shape. `chimaera board show --as
+auto|chart|table|figure|slide|diagram` picks the card SHAPE; the body
+(`chart`/`table`/`text`/`mermaid`) is what you already pass:
 
 - **A quick number comparison** → `--as chart` (the compact 720×450 card; also
   the default for a chart body).
@@ -70,11 +72,9 @@ are showing:
 - **Not sure / a one-off** → `--as auto` (the default): today's inference — a
   mermaid card fits its flowchart, everything else gets the compact card.
 
-`--as` picks the shape; `board show` renders the card inline. Size for the
-inline chat column (~600–700 px wide) so it reads cleanly. Precedence: an
-explicit `--size WxH` wins over everything, then a named `--preset`
-(`wide`/`square`/`tall`), then `--as`; with all defaults you get today's
-inference.
+Size for the inline chat column (~600–700 px wide) so it reads cleanly.
+Precedence: an explicit `--size WxH` wins over everything, then a named
+`--preset` (`wide`/`square`/`tall`), then `--as`.
 
 ## Data provenance — favor real files, leave a trace
 
@@ -99,6 +99,22 @@ validates the file, renders its first page to a PNG beside it, and prints the
 shown line for THAT path so the chat card mounts. Use it after hand-writing
 or editing a board; plain `render` does not surface a card.
 
+## Present evidence, not a pitch
+
+A board reports what you found. Unless the user explicitly asked for a
+persuasive or sales deck, check every page against these before you show it:
+
+- **Title the finding, not the claim** — "Median latency fell 42 ms after
+  caching", not "Caching is a game changer". A title that could survive the
+  numbers changing is a slogan; rewrite it.
+- **Say what each number IS**: measured · modelled · simulated · planned. A
+  page that mixes them labels which is which (a per-item label, or the
+  caption), because a reader cannot tell by looking.
+- **The number and its unit beat the adjective** — "3.3× (n = 240)", not
+  "dramatically faster". Cut superlatives and momentum words.
+- **Name the source** on any data page — `data.origin`/`data.source`, or a
+  caption naming the file, cohort, or run — so the reader can check you.
+
 ## Hand-written boards (decks, figures)
 
 `chimaera board new boards/name.board --title "…"`, then edit the JSON:
@@ -112,37 +128,53 @@ heading | subtitle | body | caption | label | code`); colors are theme
 `@tokens` (`@fg @body @muted @accent1 @surface @edge @bg @cat1..7`) or
 `#hex`. Prefer `page.intent.kind` + slots over coordinates — the layout
 engine places slotted objects. Themes: **by default a board matches the
-Chimaera app you're viewing it in — light or dark — automatically** (`auto`,
-what `new`/`show` write; an absent `theme` means the same, and needs no
-config). You only set something else to *override* that: name a **scheme**
-(`talk`, `figure`) to choose a family that still follows the app's mode, pin a
-concrete variant (`talk-dark`, `talk-light`, `figure-light`, `figure-dark`)
-for a fixed ground the mode no longer moves, or set `canvas.background` to
-another ground — any `@token` or `#hex`, plain white `#ffffff` or plain black
-`#000000` included — which repaints the ground under every page (a page's own
-`background.fill` wins over it). After writing: `lint` then `render` (or
-`show --file`), and LOOK at the PNG.
+Chimaera app you're viewing it in — light or dark** (`auto`, what `new`/`show`
+write; an absent `theme` means the same). Override only deliberately: a
+**scheme** (`talk`, `figure`) still follows the app's mode, a concrete variant
+(`talk-dark`, `talk-light`, `figure-light`, `figure-dark`) pins the ground, and
+`canvas.background` repaints the ground under every page with any `@token` or
+`#hex` (a page's own `background.fill` wins over it; a literal ground also
+decides the board's appearance, so a `#000000` canvas renders dark-mode ink
+even in a light app).
+
+A **custom** theme is a `<id>.theme.json` under `.chimaera/board/themes/`,
+named by file stem, and resolution is **workspace-root-relative** — the root
+is the board's nearest `.git` ancestor, else the board's own directory. So the
+theme file must stay WITH the board, and two moves silently break the render:
+carrying the board out from under the workspace that holds its theme, and
+putting a `.git` anywhere between the board and that theme (the root moves,
+the theme is now outside it). Either way the board refuses with `unknown theme
+"<id>"; bundled variants are talk-dark, talk-light, figure-light,
+figure-dark`. Hand over the board and its
+`.chimaera/board/themes/<id>.theme.json` together, or use a bundled theme.
+
+**Paint with `@tokens`, never `#hex` literals.** A literal color is written
+through verbatim, which opts that object out of the theme entirely: it will
+not follow light/dark, it survives every restyle, and re-theming means finding
+each one by hand. One non-neutral literal accent per page is the budget
+`lint --style` enforces (`page carries N non-neutral literal accents …; one
+accent is the budget — route the rest through @tokens`). Want a specific
+palette? Put it in a theme's `@cat1..7` and reference the tokens — that is one
+line to restyle and it tracks the mode. After writing, close the loop below
+("Alignment, margins, and the closing lint").
 
 **Fonts** are bundled into the binary (no install, deterministic on a fontless
-compute node): themes lead with **Arimo**, a standard Helvetica/Arial-class sans
-that is metric-compatible with Arial (the figure standard for PLOS/Cell), so a
-figure is submission-safe by default on any host. Also baked in as selectable
-alternates: **Geist** (a brand/slides sans), **IBM Plex Sans** (a neutral
-alternate) and **JetBrains Mono** (the `code` role). You don't set a font on an
-object — font lives on the *theme*. To change it: `theme-export <id> --format
-json > .chimaera/board/themes/mine.theme.json`, edit each role's `family` array
-(first name that resolves wins — put your face first, e.g. `Geist` for a slides
-look, keep the rest as fallbacks), and set the board's `theme` to `mine`. Any
-other face works too: drop it in `.chimaera/board/fonts/` (vendored fonts win
-over the bundled ones) and name it first in the stack.
+compute node): themes lead with **Arimo**, metric-compatible with Arial (the
+PLOS/Cell figure standard), so a figure is submission-safe on any host;
+**Geist** (a brand/slides sans), **IBM Plex Sans** and **JetBrains Mono** (the
+`code` role) are baked in as alternates. Font lives on the *theme*, never on an
+object: `theme-export <id> --format json >
+.chimaera/board/themes/mine.theme.json`, put your face first in each role's
+`family` array (the first name that resolves wins; keep the rest as
+fallbacks), and set the board's `theme` to `mine`. Any other face works: drop
+it in `.chimaera/board/fonts/` (vendored wins over bundled) and name it first.
 
 ## Icons & rich composition
 
-Board is a composition tool, not just a diagram builder: bundled **icons**,
-imported **SVG/PNG** figures, and native shapes combine into real artwork, all
-editable after a PPTX export. Find an icon name in one call —
-`chimaera board icons flask`, `chimaera board icons arrow` (fuzzy over names +
-synonyms; `--list` prints the total) — then place it:
+Bundled **icons** and native shapes combine into real artwork, not just boxes
+and arrows. Find an icon name in one call — `chimaera board icons flask`,
+`chimaera board icons arrow` (fuzzy over names + synonyms; `--list` prints the
+total) — then place it:
 
     {"type":"icon","name":"flask","at":[80,80],"size":[48,48],"color":"@accent1"}
 
@@ -152,28 +184,29 @@ resize is free. A **diagram node** takes a leading icon the same way —
 `{"id":"train","label":"Train","icon":"flask"}` — sized to the node and laid
 out beside the label; that alone lifts a plain flow out of "too boring". An
 unknown name renders a visible placeholder and lints, never a silent blank.
-Compose icons with `import`ed `.svg`/`.png` and shapes for figures you keep
-editing, then `export --format pptx` to hand off for polishing in PowerPoint.
+
+**Structure is always native objects; a raster is decoration.** Anything the
+user may want to move, restyle or edit — nodes, lanes, labels, arrows — must be
+`shape`/`connector`/`icon`/`text`: only those stay editable in the pane and
+export as editable PowerPoint shapes. Search `chimaera board icons <query>`
+before reaching for anything generated. A picture from elsewhere (a generated
+illustration, a photo, a paper figure) rides along flat — `chimaera board
+import art.png --to FILE` copies it into `.chimaera/board/assets/` and places
+it — so use one for texture or illustration, never for the diagram itself.
 
 ## Designed figures — architecture & flow diagrams
 
 A **designed figure** is native objects you place by hand — background shapes,
 icon-in-box nodes, connectors — to compose an architecture or pipeline diagram
-that looks deliberate and stays editable (every object survives a PPTX export
-for polishing in PowerPoint). It is a different move from `board show`'s
-auto-charts and from `--mermaid`'s auto-layout: here YOU own the positions.
-Which tool for the picture in front of you:
+that looks deliberate and stays editable. Here YOU own the positions, which is
+a different move from `board show`'s auto-charts and `--mermaid`'s auto-layout:
 
 - **A quick result** (numbers, a comparison) → `board show` chart/table/text
   sugar — auto-mark, auto-layout, one pipe.
 - **A quick flowchart** you don't need to hand-place → `--mermaid` (auto-laid).
 - **A designed figure** (architecture, model, pipeline) → native shapes +
-  icons + connectors, composed by hand. This is the editable, PPTX-editable
-  path — the "drop it into PowerPoint and polish" hand-off.
-- **Finished external art** → `import` an `.svg`/`.png`. It rides along as a
-  picture, NOT as editable objects. So do **not** hand-author an SVG and
-  `import` it when the user may want to edit the figure — compose native
-  objects instead; every one stays movable and re-colorable.
+  icons + connectors, composed by hand. Never hand-author an SVG and `import`
+  it instead: that hands the user a flat picture of a figure.
 
 ### Structure with layers (groups)
 
@@ -198,18 +231,20 @@ sitting on it. Connectors and shared input/output nodes that span two regions
 stay at the top level and bind to child ids by name — a `connector` reaches a
 node inside a group fine, because ids are global.
 
-**Prefer a few well-named groups over a flat list of many objects — structure
-the board the way a designer would layer it.** A designed figure emitted as one
-long flat pile of shapes, text and icons is the tell that it was built object
-by object rather than region by region; group it.
+**Prefer a few well-named groups over a flat list of many objects.** One long
+pile of shapes, text and icons is the tell that a figure was built object by
+object rather than region by region; group it.
 
 Complete example — a two-lane architecture figure, built **in layers**: two
 lane groups (each holding its background, accent, title and node boxes/icons),
 the shared input and merge nodes as their own small groups, and the connectors
-between node ids at the top level. Copy it, rename the ids, change the
-text/positions; `chimaera board show --file boards/chrombpnet.board` cards it
-(write it under `boards/` only for a deliverable the user asked to keep —
-otherwise any path works):
+between node ids at the top level. Every coordinate below is a multiple of 8
+and sits inside the talk margin box (x 72…888, y 64…476), so it passes
+`lint --style` clean as printed — copy it, rename the ids, change the
+text/positions, and keep it linting clean;
+`chimaera board show --file boards/chrombpnet.board` cards it (write it under
+`boards/` only for a deliverable the user asked to keep — otherwise any path
+works):
 
 ```json
 {
@@ -221,57 +256,57 @@ otherwise any path works):
     {
       "id": "page-1",
       "objects": [
-        { "id": "title", "type": "text", "role": "title", "at": [56, 40], "size": [848, 48],
+        { "id": "title", "type": "text", "role": "title", "at": [72, 64], "size": [816, 48],
           "text": "ChromBPNet separates bias from signal" },
-        { "id": "subtitle", "type": "text", "role": "subtitle", "at": [56, 92], "size": [848, 34],
-          "text": "Two branches predict profile shape and total accessibility, then recombine." },
+        { "id": "subtitle", "type": "text", "role": "subtitle", "at": [72, 120], "size": [816, 40],
+          "text": "Two branches predict profile shape and read counts, then recombine." },
 
         { "id": "input", "type": "group", "objects": [
-          { "id": "dna", "type": "shape", "geo": "roundRect", "at": [56, 258], "size": [140, 44],
+          { "id": "dna", "type": "shape", "geo": "roundRect", "at": [72, 280], "size": [160, 48],
             "radius": 8, "fill": "@edge", "stroke": { "color": "@axis", "width": 1 } },
-          { "id": "dna-icon", "type": "icon", "name": "dna", "at": [66, 267], "size": [24, 24], "color": "@fg" },
-          { "id": "dna-label", "type": "text", "role": "label", "at": [98, 258], "size": [92, 44],
+          { "id": "dna-icon", "type": "icon", "name": "dna", "at": [80, 288], "size": [32, 32], "color": "@fg" },
+          { "id": "dna-label", "type": "text", "role": "label", "at": [120, 288], "size": [104, 32],
             "valign": "middle", "align": "left", "text": "DNA · 2,114 bp" }
         ] },
 
         { "id": "bias-lane", "type": "group", "objects": [
-          { "id": "lane-bias", "type": "shape", "geo": "roundRect", "at": [212, 140], "size": [560, 120],
-            "radius": 14, "fill": "@surface" },
-          { "id": "lane-bias-accent", "type": "shape", "geo": "rect", "at": [212, 140], "size": [5, 120],
+          { "id": "lane-bias", "type": "shape", "geo": "roundRect", "at": [248, 184], "size": [456, 112],
+            "radius": 16, "fill": "@surface" },
+          { "id": "lane-bias-accent", "type": "shape", "geo": "rect", "at": [248, 184], "size": [8, 112],
             "fill": "@cat2" },
-          { "id": "lane-bias-label", "type": "text", "role": "label", "at": [230, 150], "size": [520, 16],
+          { "id": "lane-bias-label", "type": "text", "role": "label", "at": [272, 200], "size": [408, 16],
             "align": "left", "text": "ASSAY BIAS · FROZEN" },
-          { "id": "frozen", "type": "shape", "geo": "roundRect", "at": [238, 186], "size": [150, 44],
+          { "id": "frozen", "type": "shape", "geo": "roundRect", "at": [272, 224], "size": [160, 48],
             "radius": 8, "fill": "@edge", "stroke": { "color": "@axis", "width": 1 } },
-          { "id": "frozen-icon", "type": "icon", "name": "snowflake", "at": [248, 195], "size": [24, 24], "color": "@fg" },
-          { "id": "frozen-label", "type": "text", "role": "label", "at": [280, 186], "size": [100, 44],
+          { "id": "frozen-icon", "type": "icon", "name": "snowflake", "at": [280, 232], "size": [32, 32], "color": "@fg" },
+          { "id": "frozen-label", "type": "text", "role": "label", "at": [320, 232], "size": [104, 32],
             "valign": "middle", "align": "left", "text": "Frozen bias" }
         ] },
 
         { "id": "signal-lane", "type": "group", "objects": [
-          { "id": "lane-signal", "type": "shape", "geo": "roundRect", "at": [212, 290], "size": [560, 168],
-            "radius": 14, "fill": "@surface" },
-          { "id": "lane-signal-accent", "type": "shape", "geo": "rect", "at": [212, 290], "size": [5, 168],
+          { "id": "lane-signal", "type": "shape", "geo": "roundRect", "at": [248, 312], "size": [456, 112],
+            "radius": 16, "fill": "@surface" },
+          { "id": "lane-signal-accent", "type": "shape", "geo": "rect", "at": [248, 312], "size": [8, 112],
             "fill": "@cat1" },
-          { "id": "lane-signal-label", "type": "text", "role": "label", "at": [230, 300], "size": [520, 16],
+          { "id": "lane-signal-label", "type": "text", "role": "label", "at": [272, 328], "size": [408, 16],
             "align": "left", "text": "REGULATORY SIGNAL · TRAINABLE" },
-          { "id": "conv", "type": "shape", "geo": "roundRect", "at": [238, 330], "size": [150, 44],
+          { "id": "conv", "type": "shape", "geo": "roundRect", "at": [272, 352], "size": [160, 48],
             "radius": 8, "fill": "@edge", "stroke": { "color": "@axis", "width": 1 } },
-          { "id": "conv-icon", "type": "icon", "name": "filter", "at": [248, 339], "size": [24, 24], "color": "@fg" },
-          { "id": "conv-label", "type": "text", "role": "label", "at": [280, 330], "size": [100, 44],
+          { "id": "conv-icon", "type": "icon", "name": "filter", "at": [280, 360], "size": [32, 32], "color": "@fg" },
+          { "id": "conv-label", "type": "text", "role": "label", "at": [320, 360], "size": [104, 32],
             "valign": "middle", "align": "left", "text": "Conv1D · k=21" },
-          { "id": "dilated", "type": "shape", "geo": "roundRect", "at": [238, 392], "size": [150, 44],
+          { "id": "dilated", "type": "shape", "geo": "roundRect", "at": [456, 352], "size": [160, 48],
             "radius": 8, "fill": "@edge", "stroke": { "color": "@axis", "width": 1 } },
-          { "id": "dilated-icon", "type": "icon", "name": "stack-2", "at": [248, 401], "size": [24, 24], "color": "@fg" },
-          { "id": "dilated-label", "type": "text", "role": "label", "at": [280, 392], "size": [100, 44],
+          { "id": "dilated-icon", "type": "icon", "name": "stack-2", "at": [464, 360], "size": [32, 32], "color": "@fg" },
+          { "id": "dilated-label", "type": "text", "role": "label", "at": [504, 360], "size": [104, 32],
             "valign": "middle", "align": "left", "text": "Dilated stack" }
         ] },
 
         { "id": "merge", "type": "group", "objects": [
-          { "id": "fuse", "type": "shape", "geo": "ellipse", "at": [582, 254], "size": [172, 64],
+          { "id": "fuse", "type": "shape", "geo": "ellipse", "at": [728, 272], "size": [152, 64],
             "fill": "@edge", "stroke": { "color": "@axis", "width": 1 } },
-          { "id": "fuse-icon", "type": "icon", "name": "math-function", "at": [600, 270], "size": [28, 28], "color": "@fg" },
-          { "id": "fuse-label", "type": "text", "role": "label", "at": [632, 254], "size": [112, 64],
+          { "id": "fuse-icon", "type": "icon", "name": "math-function", "at": [744, 288], "size": [32, 32], "color": "@fg" },
+          { "id": "fuse-label", "type": "text", "role": "label", "at": [784, 288], "size": [88, 32],
             "valign": "middle", "align": "left", "text": "Merge heads" }
         ] },
 
@@ -285,13 +320,13 @@ otherwise any path works):
           "from": { "object": "frozen", "side": "right" }, "to": { "object": "fuse", "side": "left" },
           "stroke": { "color": "@axis", "width": 1.5 }, "tailEnd": "arrow" },
         { "id": "c-conv-dilated", "type": "connector", "geo": "bent",
-          "from": { "object": "conv", "side": "bottom" }, "to": { "object": "dilated", "side": "top" },
+          "from": { "object": "conv", "side": "right" }, "to": { "object": "dilated", "side": "left" },
           "stroke": { "color": "@axis", "width": 1.5 }, "tailEnd": "arrow" },
         { "id": "c-dilated-fuse", "type": "connector", "geo": "bent",
           "from": { "object": "dilated", "side": "right" }, "to": { "object": "fuse", "side": "left" },
           "stroke": { "color": "@axis", "width": 1.5 }, "tailEnd": "arrow" },
 
-        { "id": "caption", "type": "text", "role": "caption", "at": [56, 500], "size": [848, 24],
+        { "id": "caption", "type": "text", "role": "caption", "at": [72, 448], "size": [816, 24],
           "text": "Profile merge: add logits · Count merge: LogSumExp · Output: central 1,000 bp" }
       ]
     }
@@ -312,13 +347,16 @@ The controls that example uses — the ones worth knowing before you compose:
   swimlane, and every piece stays movable.
 - **Icon-in-box nodes**: three objects sharing a spot — a `shape` box, an
   `icon` (`{"type":"icon","name":"snowflake"}`; find a name with `chimaera
-  board icons <query>`), and a `text` with `valign:"middle"`. `text` accepts a
-  **bare string** (`"text":"Conv1D"`), an **array** of lines
-  (`"text":["a","b"]`), OR **rich runs** (`"text":{"runs":[{"t":"x","b":true}]}`)
-  — all three are valid anywhere text appears (labels, shape text, connector
-  labels).
+  board icons <query>`), and a `text` with `valign:"middle"`. Inset the icon
+  and the label inside the box (8 pt in the example) rather than giving them
+  the box's own frame: a text frame more than 2.5× its own ink height lints
+  **underfull**, so a 16 pt label in a 48 pt box is a finding while the same
+  label in a 32 pt frame, centred, is not. `text` accepts a **bare string**
+  (`"text":"Conv1D"`), an **array** of lines (`"text":["a","b"]`), OR **rich
+  runs** (`"text":{"runs":[{"t":"x","b":true}]}`) — all three are valid
+  anywhere text appears (labels, shape text, connector labels).
 - **Connectors** bind endpoints by box edge — `"from":{"object":"conv",
-  "side":"bottom"}`, `"to":{"object":"dilated","side":"top"}` — so the line
+  "side":"right"}`, `"to":{"object":"dilated","side":"left"}` — so the line
   re-routes when a node moves. Routing lives in `geo`: `"bent"` is a rounded
   orthogonal route (the architecture look), `"straight"` a direct line. Omit
   `geo` for the **smart default** — two object-anchored ends auto-route `bent`
@@ -332,56 +370,113 @@ The controls that example uses — the ones worth knowing before you compose:
 - **Explicit `size`**: `shape`, `text`, `icon`, and a diagram `node` all take
   `"size":[w,h]` in points with `"at":[x,y]` as the top-left — pin it to make
   uniform boxes and reserve exact space instead of letting content measure the
-  box. After writing: `lint`, then `show --file`, and LOOK at the PNG.
+  box.
 
-## Alignment & the layout grid
+## Alignment, margins, and the closing lint
 
-When placement matters — a row of cards, a two-column split, aligned panels —
-give the canvas a **layout grid** and place objects on its cells instead of
-eyeballing coordinates. It is advisory geometry: objects still carry their own
-`at`/`size`; the grid is a shared coordinate system the pane draws and snaps to
-and you compute against.
+Place on numbers you computed, never by eye. Four scales govern a page, and
+`lint --style` measures every one of them:
 
-Declare it on the canvas: `"grid": { "cols": 12 }` (optionally `"rows"`,
-`"margin"`, `"gutter"` in points). The cell rect is deterministic math — for a
-canvas `W×H`, `cols` columns, margin `m`, gutter `g`:
+- **Margins come from the theme, widened by your own grid.** `talk` reserves
+  72 pt left and right, 64 pt top and bottom; `figure` reserves 8 pt all round.
+  Lint enforces the **wider** of the theme's margin and `canvas.grid.margin` on
+  every edge — declaring a grid margin is you stating where content starts, so
+  it binds, and a slack grid can never relax the theme's. On a 960×540 talk
+  slide with no grid that box is **x 72…888, y 64…476**; add
+  `"grid":{"margin":80}` and it tightens to **x 80…880, y 80…460**. Every
+  object — footers, page numbers, legend dots — sits inside it or it is a
+  margin violation. Read your grid's margin before you place anything: this is
+  the single most common way a page that "looks fine" lints dirty.
+- **Every `at` and `size` snaps to 8 pt on save**, so author on multiples of 8
+  or your placement shifts under you the first time the file is written. A
+  bottom edge is therefore always a multiple of 8 too: under a grid margin of
+  80 the last legal band ends at y 456, not 460.
+- **Columns come from `canvas.grid`** — `{cols, rows?, margin, gutter}`,
+  advisory geometry (objects keep their own `at`/`size`) that the pane draws
+  and snaps to and you compute against. The cell rect is deterministic math:
+  for a canvas `W×H`, `cols` columns, margin `m`, gutter `g` — column width
+  `cw = (W − 2m − g·(cols−1)) / cols`, cell `(col,row)` top-left
+  `x = m + col·(cw + g)`, a `colSpan` of `s` is `w = s·cw + (s−1)·g`; row
+  height `rh = (H − 2m − g·(rows−1)) / rows` when `rows` is set, else `cw` (a
+  square module) with `y = m + row·(rh + g)`. Choose `cols`/`margin`/`gutter`
+  so `cw` AND the pitch `cw + g` are multiples of 8 — otherwise the save-snap
+  knocks objects off your own cells. Two that work on a 960×540 talk slide,
+  both making the enforced box **x 80…880, y 80…460**:
+  `{"cols":10,"margin":80,"gutter":0}` (80 pt columns at x 80, 160, … 800, the
+  last ending at 880 — the default for a deck) and
+  `{"cols":3,"margin":80,"gutter":40}` (three 240 pt panels at x 80, 360, 640).
+  A `"margin":0` grid is the trap the other way: its outer columns start at
+  x 0 and end at x 960, both outside the talk margins, so placing on them lints
+  dirty on every page.
+- **Vertical rhythm is a scale, not a grid** — with `rows` unset the grid
+  constrains x alone, so y is yours: bands on multiples of 8, ~24 pt between
+  related blocks and 40+ between sections. A talk page that works under either
+  grid above: title at y 80, body band from y 192, caption/footer ending by
+  y 456.
 
-- column width `cw = (W − 2m − g·(cols−1)) / cols`
-- cell `(col, row)` top-left `x = m + col·(cw + g)`; a `colSpan` of `s` is
-  `w = s·cw + (s−1)·g`
-- row height `rh = (H − 2m − g·(rows−1)) / rows` when `rows` is set, else `cw`
-  (a square module); `y = m + row·(rh + g)`
-
-Pick 8 pt-friendly parameters so cells land on the 8 pt grid and survive the
-save byte-for-byte: a **960×540 canvas, 12 columns, no margin/gutter → 80 pt
-columns**. Then a full-width title is `"at":[0,0],"size":[960,64]`; a card in
-columns 3–5 (0-based col 2, span 3) is `"at":[160,y],"size":[240,h]`; three
-cards across sit at x `0`, `240`, `480`. Same row → same `y`; you get true
-alignment because you computed it, not because you nudged it.
-
-After placing, tidy a selection by id with **`arrange`** (`align-left`,
+Declaring a grid and then placing at eyeballed coordinates is worse than
+declaring none — lint reports every object that sits on no cell. Same row →
+same `y`, same column → same `x`, and reuse one `size` for peer boxes. After
+placing, tidy a selection by id with **`arrange`** (`align-left`,
 `align-right`, `align-top`, `align-bottom`, `align-center-h`,
 `align-center-v`, `distribute-h`, `distribute-v`, `grid`) — the first id is the
 anchor everything else snaps to. In the pane a selection can also **snap to the
-grid** and a group **moves as one unit**. Run `lint --style` to catch
-near-misses (an edge 1–2 pt off a peer or a grid column) and off-grid drift;
-`lint --style --fix` snaps them.
+grid** and a group **moves as one unit**.
+
+### Close the loop before you show the user
+
+Plain `lint FILE` proves only that the board is legal: it prints `clean` on a
+deck whose text overflows its boxes and whose footers hang past the margin.
+The check that matters, on every board you hand over:
+
+    chimaera board lint FILE --style        # margins, off-grid, overfull/underfull, budgets
+    chimaera board lint FILE --style --fix  # snap the mechanically unambiguous ones
+    chimaera board render FILE              # then LOOK at the PNG
+
+Every finding names the object, the field and the numbers, so fix them
+directly and re-run until `--style` prints `clean` — a `warning` you leave
+behind is a defect you shipped; an `info` (off-grid drift) is a nudge. Only
+then tell the user the board is ready.
 
 ## The other verbs, one line each
 
 - `describe FILE` — read back every object, position, and chart provenance;
   run it before editing a board the human may have moved things on.
-- `lint FILE [--target talk-16x9|pub-nature-single|…] [--style] [--fix]` —
-  legality + measured near-miss findings; errors name object, field, numbers.
+- `lint FILE [--target talk-16x9|pub-nature-single|…] [--style] [--strict]
+  [--fix]` — legality + the measured layout findings; always run `--style`.
 - `render FILE [--page N] [-o OUT]` — PNGs (no chat card).
-- `export FILE --format pptx|pdf|svg|svg-outlined` — PPTX keeps text
-  editable.
+- `export FILE --format pptx|pdf|svg|svg-outlined` — the hand-off; see
+  "Hand it off" below.
 - `adopt SHOWN_ID [--to board]` — promote a shown card into the workspace.
 - `import fig.svg|.png|.mmd --to FILE` — figures/mermaid into a board.
 - `icons [QUERY] [--list]` — find bundled icons by name/synonym in one call.
 - `journal FILE [--since N]` — what the human changed on the surface.
 - `arrange FILE --op align-left|distribute-h|grid --ids a,b,c` — tidy by id.
 - `theme-export ID --format mplstyle|json` — theme numbers for matplotlib.
+
+## Hand it off — export is ours
+
+A board IS the deliverable, and `chimaera board export` is the only way it
+leaves here:
+
+    chimaera board export boards/talk.board --format pptx   # an editable deck
+    chimaera board export boards/talk.board --format pdf    # the whole deck
+    chimaera board export boards/talk.board --format svg    # one file per page
+
+`--format pptx|pdf|svg|svg-outlined` (`svg-outlined` flattens glyphs to paths
+for a host without the fonts). Output lands in `.chimaera/board/exports/`
+unless `-o` says otherwise — one file for pptx/pdf, one per page for SVG — and
+pptx prints a fate line per object. PPTX is native, not a picture of a slide:
+text stays text, a `group` becomes a real PowerPoint group, a table a real
+table, a bent connector a `custGeom` path, an icon a group of editable vector
+shapes — the user opens it and moves anything.
+
+**Never re-convert a board through another presentation tool, another skill,
+or an HTML→pptx converter.** Those drop pages, flatten every object into
+unusable XML, and destroy the editability that is the whole point — and their
+font substitutions are not ours to debug. If a handed-over deck looks wrong,
+first check who wrote it: `docProps/app.xml` in our export says
+`Application: chimaera board`.
 
 ## Where boards live
 

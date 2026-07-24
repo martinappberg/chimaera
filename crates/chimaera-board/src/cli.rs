@@ -88,9 +88,10 @@ pub enum BoardCmd {
         quiet: bool,
     },
     /// Print the complete board manual: the show spec (sugar and the full
-    /// chart passthrough), hand-written board essentials, themes, every verb,
-    /// and where boards live. Self-contained — read this once instead of
-    /// --help chains or the source.
+    /// chart passthrough), hand-written board essentials, themes, the layout
+    /// grid and closing lint, the export hand-off, every verb, and where
+    /// boards live. Self-contained — read this once instead of --help chains
+    /// or the source.
     Guide,
     /// Create a blank board.
     New {
@@ -122,12 +123,18 @@ pub enum BoardCmd {
         #[arg(long)]
         theme: Option<String>,
     },
-    /// Export a board: SVG (per page), PDF (the whole deck), PPTX.
+    /// Export a board — the only way a board leaves chimaera: SVG (per page),
+    /// PDF (the whole deck), PPTX (every object a native editable shape).
+    /// Never re-convert a board through another presentation tool or an
+    /// HTML->pptx converter: that drops pages and flattens the editable
+    /// objects that are the point.
     Export {
         path: PathBuf,
-        /// Format: svg | svg-outlined | pdf | pptx. `svg` keeps real text
-        /// (editable, needs the fonts); `svg-outlined` flattens glyphs to
-        /// paths (renders identically without them).
+        /// Format: svg | svg-outlined | pdf | pptx. `pptx` writes native
+        /// PowerPoint objects — real groups, tables, and bent connectors as
+        /// custGeom. `svg` keeps real text (editable, needs the fonts);
+        /// `svg-outlined` flattens glyphs to paths (renders identically
+        /// without them).
         #[arg(long)]
         format: String,
         /// Page index (0-based) for the SVG variants; all pages when
@@ -226,7 +233,9 @@ pub enum BoardCmd {
         #[arg(long)]
         since: Option<u64>,
     },
-    /// Check a board without rendering it.
+    /// Check a board without rendering it. Bare, this is legality only — run
+    /// `--style` on every board before handing it over: that is the layout
+    /// check (margins, off-grid, overfull text, budgets).
     Lint {
         path: PathBuf,
         #[arg(long)]
@@ -303,7 +312,7 @@ pub enum BoardCmd {
     /// `chimaera board icons arrow`. Prints capped matches with the total;
     /// place `{"type":"icon","name":"…","at":[x,y],"size":[w,h]}` recolored
     /// with a theme `@token`. Icons compose with imported SVG/PNG and shapes
-    /// into real figures, all editable after a `export --format pptx`.
+    /// into real figures, all editable after `export --format pptx`.
     Icons {
         /// Substring / synonym query over icon names; omit it with `--list`
         /// to print just the total.
@@ -500,8 +509,16 @@ fn resolve_theme(reference: Option<&str>, board: &crate::Board, ws: &Path) -> Re
     let name = reference.map(String::from).or_else(|| board.theme.clone());
     // The CLI has no viewer to follow, so `auto` (and an absent theme)
     // resolves dark here — the pre-auto default; a mode-aware render is the
-    // daemon route's job.
-    crate::theme::resolve_for_mode(name.as_deref(), true, Some(ws))
+    // daemon route's job. A literal `canvas.background` outranks that default:
+    // the ground paints verbatim whatever the mode says, so the ink has to
+    // follow it or a white-ground board renders light ink on white. Same
+    // entry point the daemon render route takes, so both agree.
+    crate::theme::resolve_for_board(
+        name.as_deref(),
+        board.canvas.background.as_deref(),
+        true,
+        Some(ws),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -569,6 +586,9 @@ fn show(
     let ws = crate::workspace_root(&cwd);
     // `auto` rides into the emitted board so the card follows the viewer's
     // mode wherever it is rendered; the PNG written beside it resolves dark.
+    // No `resolve_for_board` here: a spec-built card never carries a
+    // `canvas.background`, so there is no literal ground to follow — and the
+    // theme is needed before `build_board` for the content-fit sizes.
     let theme_id = theme_ref.unwrap_or_else(|| crate::theme::AUTO_ID.to_string());
     let theme = crate::theme::resolve_for_mode(Some(&theme_id), true, Some(&ws))?;
     let fonts = FontStack::for_workspace(&ws);
@@ -677,7 +697,14 @@ fn show_file(path: &Path, theme_ref: Option<String>, quiet: bool) -> Result<()> 
     let theme_id = theme_ref
         .or_else(|| board.theme.clone())
         .unwrap_or_else(|| crate::theme::AUTO_ID.to_string());
-    let theme = crate::theme::resolve_for_mode(Some(&theme_id), true, Some(&ws))?;
+    // The board's own literal ground decides the appearance here too — the
+    // card PNG must match what the pane shows for the same file.
+    let theme = crate::theme::resolve_for_board(
+        Some(&theme_id),
+        board.canvas.background.as_deref(),
+        true,
+        Some(&ws),
+    )?;
     let fonts = FontStack::for_workspace(&ws);
     let params = RasterParams {
         scale: 2.0,
@@ -864,8 +891,8 @@ fn render(
     Ok(())
 }
 
-/// Export a board. SVG is per page (mirroring `render`); PDF — and PPTX,
-/// when its writer lands — take the whole deck as one document.
+/// Export a board. SVG is per page (mirroring `render`); PDF and PPTX take
+/// the whole deck as one document.
 fn export(
     path: &Path,
     format: &str,
@@ -2754,9 +2781,11 @@ mod tests {
         assert!(examples >= 2, "the sugar and boxplot examples are runnable");
 
         // The designed-figures section embeds a COMPLETE board (not a
-        // ShowSpec) in a fenced block. It must parse, normalize, and render —
-        // the worked architecture example is validated, not aspirational, so
-        // an agent that copies it gets a figure, not a schema error.
+        // ShowSpec) in a fenced block. It must parse, normalize, render AND
+        // pass the very `lint --style` the guide's closing section demands of
+        // every board handed over — an example that lints dirty teaches the
+        // opposite of what the page says, and this is the copy-paste starting
+        // point for hand-authored figures.
         let fence = guide
             .split_once("```json")
             .expect("guide has a fenced board example")
@@ -2775,6 +2804,20 @@ mod tests {
             crate::render::RasterParams::default(),
         )
         .expect("guide board renders");
+
+        // Clean under BOTH profiles, and under the default (non-strict) base
+        // severity the guide tells the agent to run.
+        let mut findings = crate::lint::lint(&board, &theme);
+        findings.extend(crate::lint::lint_style(&board, &theme, &fonts, false));
+        assert!(
+            findings.is_empty(),
+            "the guide's worked example must lint --style clean: {}",
+            findings
+                .iter()
+                .map(|d| d.render())
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
     }
 
     #[test]

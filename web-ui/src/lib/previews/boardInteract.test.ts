@@ -6,6 +6,7 @@ import {
   childFrameRect,
   composeBoardContext,
   configSig,
+  coversPoint,
   diagramNodeIndex,
   diagramNodeLabel,
   editableText,
@@ -13,8 +14,10 @@ import {
   editorTextToNodeLabel,
   editorTextToParagraphs,
   fateCensus,
+  findMember,
   gridLines,
   hitChild,
+  hitMember,
   MARK_SWAP_KINDS,
   nextPinId,
   paragraphsToEditorText,
@@ -45,6 +48,8 @@ function obj(raw: Record<string, unknown>): ObjInfo {
     text: editableText(raw.type as string | undefined, raw.text),
     raw,
     sig: configSig(raw),
+    children: [],
+    envelope: false,
   };
 }
 
@@ -531,6 +536,126 @@ describe("parseBoard grid", () => {
 
   it("is null when the board has no grid", () => {
     expect(parseBoard(bytes({ canvas: { size: [960, 540] } }))?.grid).toBeNull();
+  });
+});
+
+describe("parseBoard groups", () => {
+  const bytes = (v: unknown): Uint8Array => new TextEncoder().encode(JSON.stringify(v));
+  /** The specimen shape an agent writes: a group with NO at/size (both are
+   *  skip-if-none in the schema and `parse()` does not normalize), holding
+   *  page-absolute members. */
+  const boardWith = (objects: unknown[]): ReturnType<typeof parseBoard> =>
+    parseBoard(bytes({ canvas: { size: [960, 540] }, pages: [{ id: "p1", objects }] }));
+
+  const stage = {
+    id: "s01-genome-stage",
+    type: "group",
+    objects: [
+      { id: "disc", type: "shape", at: [88, 338], size: [72, 72] },
+      { id: "icon", type: "icon", at: [106, 356], size: [36, 36] },
+      { id: "label", type: "text", at: [56, 420], size: [136, 48] },
+    ],
+  };
+
+  it("computes a group's envelope as the union of its members", () => {
+    const g = boardWith([stage])?.pages[0].objects[0];
+    // Exactly normalize.rs's union_frame over the same three frames.
+    expect(g?.at).toEqual([56, 338]);
+    expect(g?.size).toEqual([136, 130]);
+    expect(g?.envelope).toBe(true);
+    expect(g?.children.map((c) => c.id)).toEqual(["disc", "icon", "label"]);
+  });
+
+  it("unions a nested group's own envelope (the subtree, not one level)", () => {
+    const g = boardWith([
+      {
+        id: "outer",
+        type: "group",
+        objects: [
+          { id: "far", type: "text", at: [400, 400], size: [40, 40] },
+          stage,
+        ],
+      },
+    ])?.pages[0].objects[0];
+    expect(g?.at).toEqual([56, 338]);
+    expect(g?.size).toEqual([384, 130]);
+  });
+
+  it("floors an extent at the daemon's minimum, and skips frameless members", () => {
+    const g = boardWith([
+      {
+        id: "g",
+        type: "group",
+        objects: [
+          { id: "line", type: "connector", from: { object: "a" }, to: { object: "b" } },
+          { id: "dot", type: "shape", at: [10, 10], size: [0, 0] },
+        ],
+      },
+    ])?.pages[0].objects[0];
+    expect(g?.at).toEqual([10, 10]);
+    expect(g?.size).toEqual([8, 8]);
+  });
+
+  it("leaves a group with nothing positioned unset, like the daemon's warning", () => {
+    const g = boardWith([
+      { id: "g", type: "group", objects: [{ id: "line", type: "connector" }] },
+    ])?.pages[0].objects[0];
+    expect(g?.at).toBeNull();
+    expect(g?.envelope).toBe(false);
+  });
+
+  it("drills to the deepest member under a point, topmost first", () => {
+    const g = boardWith([stage])?.pages[0].objects[0];
+    expect(hitMember(g!, [120, 370])?.id).toBe("icon");
+    // Inside the disc but outside the icon: the disc, not the group.
+    expect(hitMember(g!, [92, 342])?.id).toBe("disc");
+    // The envelope's own empty space keeps the group selected.
+    expect(hitMember(g!, [60, 340])).toBeNull();
+  });
+
+  it("covers a group only where a member is, so its empty space falls through", () => {
+    const objects = boardWith([stage])?.pages[0].objects ?? [];
+    const g = objects[0];
+    // Over a member: the group is the hit (the stage's press selects it).
+    expect(coversPoint(g, [120, 370])).toBe(true);
+    // Inside the envelope [56,338]+[136,130] but between the members: empty
+    // space, so a press there belongs to whatever sits underneath.
+    expect(coversPoint(g, [60, 340])).toBe(false);
+    // Outside the envelope entirely.
+    expect(coversPoint(g, [400, 400])).toBe(false);
+  });
+
+  it("keeps a neighbour under a group's envelope reachable (the shadowing bug)", () => {
+    // The hand-authored shape the field deck is full of: a top-level object
+    // that happens to sit inside a big group's envelope without being a member.
+    const page = boardWith([
+      { id: "caption", type: "text", at: [56, 338], size: [24, 16] },
+      stage,
+    ])?.pages[0].objects ?? [];
+    const topmostAt = (pt: [number, number]): string | null => {
+      for (let i = page.length - 1; i >= 0; i--) if (coversPoint(page[i], pt)) return page[i].id;
+      return null;
+    };
+    // The group is drawn LAST (topmost) and its envelope contains the caption,
+    // but the caption is what is actually painted there.
+    expect(topmostAt([60, 342])).toBe("caption");
+    expect(topmostAt([120, 370])).toBe("s01-genome-stage");
+  });
+
+  it("treats a group with no parsed members as its own box", () => {
+    // No `objects` to union: the stored box is all the group has, so it stays
+    // hittable rather than becoming unreachable.
+    const g = boardWith([{ id: "g", type: "group", at: [10, 10], size: [40, 40] }])?.pages[0]
+      .objects[0];
+    expect(coversPoint(g!, [20, 20])).toBe(true);
+  });
+
+  it("finds a member anywhere in the subtree by id", () => {
+    const g = boardWith([
+      { id: "outer", type: "group", objects: [stage] },
+    ])?.pages[0].objects[0];
+    expect(findMember(g!, "label")?.kind).toBe("text");
+    expect(findMember(g!, "nope")).toBeNull();
   });
 });
 

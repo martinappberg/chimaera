@@ -16,6 +16,13 @@ export const GRID_PT = 8;
 /** Client floor for a handle resize. Stricter than the daemon's 8 pt extent
  *  floor, so a handle can never collapse an object to a sliver. */
 export const MIN_RESIZE_PT = 16;
+/** The daemon's smallest representable extent (normalize.rs MIN_EXTENT_PT) —
+ *  the floor a computed group envelope takes on each axis. */
+const MIN_EXTENT_PT = 8;
+/** Depth ceiling for the nested-group parse. A board is agent-written, so a
+ *  pathological nesting must never recurse unbounded; members deeper than this
+ *  stay unparsed (and therefore out of the envelope). */
+const MAX_GROUP_DEPTH = 8;
 
 export function snap8(v: number): number {
   return Math.round(v / GRID_PT) * GRID_PT;
@@ -42,6 +49,16 @@ export interface ObjInfo {
    *  diff compares so an external restyle (which moves no frame) still
    *  flashes. */
   sig: string;
+  /** A group's own nested objects, parsed by these same rules (empty for every
+   *  other kind). Group nesting is REAL nesting in the file — members carry
+   *  page-absolute geometry — so the outline, the stage's drill-in and the
+   *  envelope union all read this one parse. */
+  children: ObjInfo[];
+  /** True when `at`/`size` are the group's computed envelope ([`unionFrame`])
+   *  rather than the file's own literals. Still not layout truth: it is the
+   *  same box the daemon's normalize() re-unions on every save, so the client's
+   *  number and the written file's agree. */
+  envelope: boolean;
 }
 export interface PageInfo {
   id: string;
@@ -89,23 +106,93 @@ function parseGrid(raw: unknown): GridInfo | null {
   };
 }
 
-/** Parse a board chunk for identity and geometry only (plus presenter notes). */
+/** One object as the file spells it — the only shape this parse reads. */
+interface RawObject {
+  id?: string;
+  type?: string;
+  at?: [number, number];
+  size?: [number, number];
+  text?: unknown;
+  /** A group's members. */
+  objects?: RawObject[];
+}
+
+/**
+ * The union of these objects' frames, floored at the daemon's minimum extent —
+ * an exact mirror of normalize.rs's `union_frame`, so a group envelope the
+ * client computes cannot disagree with the one the daemon writes. Only members
+ * carrying BOTH `at` and `size` count (a connector or sig-bracket carries
+ * neither; a nested group contributes its own computed envelope). Null when
+ * nothing below is positioned — the case the daemon diagnoses as "group has no
+ * positioned children" and leaves unset.
+ */
+export function unionFrame(objects: readonly ObjInfo[]): Frame | null {
+  let x0 = Infinity;
+  let y0 = Infinity;
+  let x1 = -Infinity;
+  let y1 = -Infinity;
+  let any = false;
+  for (const o of objects) {
+    if (o.at === null || o.size === null) continue;
+    any = true;
+    x0 = Math.min(x0, o.at[0]);
+    y0 = Math.min(y0, o.at[1]);
+    x1 = Math.max(x1, o.at[0] + o.size[0]);
+    y1 = Math.max(y1, o.at[1] + o.size[1]);
+  }
+  if (!any) return null;
+  return {
+    at: [x0, y0],
+    size: [Math.max(MIN_EXTENT_PT, x1 - x0), Math.max(MIN_EXTENT_PT, y1 - y0)],
+  };
+}
+
+/** One object's identity + geometry, recursing into a group's members. */
+function parseObject(o: RawObject, depth: number): ObjInfo {
+  const kind = o.type ?? "?";
+  const children =
+    kind === "group" && depth < MAX_GROUP_DEPTH && Array.isArray(o.objects)
+      ? o.objects.map((c) => parseObject(c, depth + 1))
+      : [];
+  let at: [number, number] | null = Array.isArray(o.at) ? [o.at[0], o.at[1]] : null;
+  let size: [number, number] | null = Array.isArray(o.size) ? [o.size[0], o.size[1]] : null;
+  // A group's box is ALWAYS the union of its members — it is a selection
+  // envelope, not a coordinate system, and the daemon re-unions it on every
+  // save, so a stored at/size is only ever a cache of this. Agent-written
+  // groups routinely carry neither (they are `skip_serializing_if = None` and
+  // `parse()` does not normalize); without this the whole group would be
+  // unhittable and undraggable on the stage.
+  let envelope = false;
+  if (kind === "group") {
+    const u = unionFrame(children);
+    if (u !== null) {
+      at = u.at;
+      size = u.size;
+      envelope = true;
+    }
+  }
+  return {
+    id: o.id ?? "",
+    kind,
+    at,
+    size,
+    text: editableText(o.type, o.text),
+    raw: o,
+    sig: configSig(o),
+    children,
+    envelope,
+  };
+}
+
+/** Parse a board's bytes for identity and geometry only (plus presenter
+ *  notes). The bytes must be the WHOLE file: a partial read is not a smaller
+ *  parse, it is a JSON error — the caller states that degrade, never hides it. */
 export function parseBoard(bytes: Uint8Array): BoardInfo | null {
   try {
     const raw = JSON.parse(new TextDecoder().decode(bytes)) as {
       title?: string;
       canvas?: { size?: [number, number]; background?: string; grid?: unknown };
-      pages?: {
-        id?: string;
-        notes?: string;
-        objects?: {
-          id?: string;
-          type?: string;
-          at?: [number, number];
-          size?: [number, number];
-          text?: unknown;
-        }[];
-      }[];
+      pages?: { id?: string; notes?: string; objects?: RawObject[] }[];
     };
     return {
       title: raw.title ?? null,
@@ -116,20 +203,62 @@ export function parseBoard(bytes: Uint8Array): BoardInfo | null {
       pages: (raw.pages ?? []).map((p, i) => ({
         id: p.id ?? `page-${i + 1}`,
         notes: typeof p.notes === "string" ? p.notes : null,
-        objects: (p.objects ?? []).map((o) => ({
-          id: o.id ?? "",
-          kind: o.type ?? "?",
-          at: Array.isArray(o.at) ? [o.at[0], o.at[1]] : null,
-          size: Array.isArray(o.size) ? [o.size[0], o.size[1]] : null,
-          text: editableText(o.type, o.text),
-          raw: o,
-          sig: configSig(o),
-        })),
+        objects: (p.objects ?? []).map((o) => parseObject(o, 1)),
       })),
     };
   } catch {
     return null;
   }
+}
+
+/** `pt` within this frame, edges inclusive — the stage's press test. */
+function inFrame(at: [number, number], size: [number, number], pt: [number, number]): boolean {
+  return pt[0] >= at[0] && pt[0] <= at[0] + size[0] && pt[1] >= at[1] && pt[1] <= at[1] + size[1];
+}
+
+/**
+ * Does this object actually COVER `pt`? A leaf's frame is solid, so its own box
+ * answers. A group's box does NOT: it is the union of its members
+ * ([`unionFrame`]), and the space between them is empty — on a hand-authored
+ * deck an unrelated top-level object routinely sits inside some group's
+ * envelope, and treating that envelope as solid would make the object
+ * unreachable by pointer (the rail still reaches it). So a group is covered
+ * only where one of its members is, recursively. A group with no parsed members
+ * falls back to its own box — that box is all it has.
+ */
+export function coversPoint(o: ObjInfo, pt: [number, number]): boolean {
+  if (o.at === null || o.size === null || !inFrame(o.at, o.size, pt)) return false;
+  if (o.kind !== "group" || o.children.length === 0) return true;
+  return o.children.some((c) => coversPoint(c, pt));
+}
+
+/**
+ * The member under `pt` inside a group, deepest first: array order is z-order
+ * at every level, so walk backwards, and a hit on a NESTED group yields the
+ * leaf inside it — two presses reach any leaf. Coverage is [`coversPoint`], so
+ * a nested group's own empty space falls through to the sibling underneath
+ * rather than swallowing the press. Null when the point lands in the group's
+ * envelope but on no member (its own empty space), which leaves the group
+ * itself selected.
+ */
+export function hitMember(group: ObjInfo, pt: [number, number]): ObjInfo | null {
+  for (let i = group.children.length - 1; i >= 0; i--) {
+    const c = group.children[i];
+    if (!coversPoint(c, pt)) continue;
+    return c.children.length > 0 ? (hitMember(c, pt) ?? c) : c;
+  }
+  return null;
+}
+
+/** A member anywhere in the subtree, by id — the drilled-into selection's own
+ *  kind and frame, for the outline highlight and the inspector. */
+export function findMember(group: ObjInfo, id: string): ObjInfo | null {
+  for (const c of group.children) {
+    if (c.id === id) return c;
+    const deep = findMember(c, id);
+    if (deep !== null) return deep;
+  }
+  return null;
 }
 
 // --- in-place text editing (the /board/edit text op's client half) ----------

@@ -16,7 +16,7 @@ use clap::{Parser, Subcommand};
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-/// Chimaera: agent-native IDE daemon and remote-control CLI.
+/// Chimaera: agent workbench daemon and remote-control CLI.
 #[derive(Parser)]
 #[command(name = "chimaera", version, about)]
 struct Cli {
@@ -88,7 +88,8 @@ enum Command {
         #[command(subcommand)]
         cmd: ComputeCmd,
     },
-    /// Boards: compose, render, and read back .board.json visual surfaces.
+    /// Boards: compose, render, and read back .board visual surfaces (the
+    /// legacy .board.json extension still opens).
     Board {
         #[command(subcommand)]
         cmd: board::BoardCmd,

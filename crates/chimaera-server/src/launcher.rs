@@ -706,7 +706,17 @@ may want to edit the figure. When the figure has distinct regions — lanes, \
 panels, clusters — wrap each region's objects in a `group` \
 (`{\"type\":\"group\",\"objects\":[…]}`) so it is one navigable, movable layer \
 the human can move and restyle as a unit; do not emit a flat pile of loose \
-objects. Favor binding real project files (`data.source`, \
+objects. Place objects on the canvas grid and inside the theme's margins \
+rather than by eye, and before handing a board over run `chimaera board lint \
+FILE --style` and fix what it names — plain `lint` only proves the file is \
+legal. A board is itself the deliverable: `chimaera board export FILE \
+--format pptx|pdf|svg` writes it out with every object still a native \
+editable shape (real groups, real tables, bent connectors as custGeom), so \
+never re-convert a board through another presentation tool, another skill, or \
+an HTML→pptx converter. Unless the user asked for a persuasive deck, a board \
+presents evidence rather than a pitch: title a page with the finding, label \
+what is measured vs modelled vs planned, and prefer the number and its units \
+over an adjective. Favor binding real project files (`data.source`, \
 workspace-relative) over inlined values, and when you computed the values \
 yourself record how in `data.trace` plus the files read in `data.inputs`. \
 When telling the user what you are doing, \

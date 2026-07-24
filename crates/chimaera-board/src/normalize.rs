@@ -17,8 +17,8 @@
 use serde_json::Value;
 
 use crate::schema::{
-    Board, Channel, ChannelType, ChartObject, Mark, MarkKind, Object, Page, Paragraph,
-    RichParagraph, FORMAT, FORMAT_VERSION,
+    Board, Channel, ChannelType, ChartObject, Frame, GroupObject, Mark, MarkKind, Object, Page,
+    Paragraph, RichParagraph, FORMAT, FORMAT_VERSION,
 };
 
 /// The design grid. Every position and extent snaps to a multiple of this, so
@@ -285,29 +285,98 @@ fn ensure_id(obj: &mut Object, page: &str, index: usize) {
     }
 }
 
-/// Snap geometry to the 8 pt grid.
+/// Clean float noise off geometry — **without relocating what the author
+/// placed.**
 ///
-/// `round` (not floor) so an object never drifts consistently up-left across
-/// repeated saves, and extents are floored at [`MIN_EXTENT_PT`] so snapping a
-/// thin rule cannot round it out of existence.
+/// This used to snap every coordinate to the 8 pt grid, and that was a defect,
+/// not a tidy-up: snapping `at` moves an object's CENTRE by up to 4 pt, so a
+/// child the author had centred exactly inside its parent came out off-centre.
+/// On one real 692-object deck it broke **117 exactly-centred pairs** — the
+/// icon inside its disc on page 1 among them — which read to the human as the
+/// composer being sloppy about alignment when the sloppiness was ours. No
+/// choice of lattice fixes that: for any grid, some legitimate size makes
+/// `at + size/2` unrepresentable on it.
+///
+/// So the grid is a *gesture* affordance (the pane snaps a drag to
+/// [`GRID_PT`], `arrange`'s `snap-grid` op snaps on request, and lint reports
+/// off-grid placement as a style note) and never a rewrite of the file. What
+/// survives here is the part that was always safe: pulling a value that is
+/// within [`SNAP_EPSILON_PT`] of the grid onto it, which can only ever be
+/// accumulated float error — `63.9999998` from a computed layout becomes `64`,
+/// while a deliberate `60` stays `60`. That keeps a save byte-stable against
+/// float drift, which is the invariant the snap actually had to hold.
+///
+/// Extents are still floored at [`MIN_EXTENT_PT`] so a hairline rule cannot
+/// round out of existence.
 fn snap_frame(obj: &mut Object) {
     if let Some(f) = obj.frame() {
-        obj.set_at([snap(f.x), snap(f.y)]);
-        obj.set_size([snap(f.w).max(MIN_EXTENT_PT), snap(f.h).max(MIN_EXTENT_PT)]);
+        obj.set_at([denoise(f.x), denoise(f.y)]);
+        obj.set_size([
+            denoise(f.w).max(MIN_EXTENT_PT),
+            denoise(f.h).max(MIN_EXTENT_PT),
+        ]);
     }
 }
 
-fn snap(v: f64) -> f64 {
+/// How close to the grid a value must already be for [`snap_frame`] to pull it
+/// on. Far below half a grid step, so it can never reach a value an author
+/// could plausibly have meant — a centred child sits 4 pt off the grid, and 4
+/// is eight times this.
+const SNAP_EPSILON_PT: f64 = 0.5;
+
+fn denoise(v: f64) -> f64 {
     if !v.is_finite() {
         return 0.0;
     }
-    (v / GRID_PT).round() * GRID_PT
+    let snapped = (v / GRID_PT).round() * GRID_PT;
+    if (v - snapped).abs() <= SNAP_EPSILON_PT {
+        snapped
+    } else {
+        v
+    }
 }
 
+/// A group's envelope: the union of its children's frames — bit for bit what
+/// [`normalize`] writes back onto the group on every save.
+///
+/// Public because a group's stored `at`/`size` are **derived, not
+/// authoritative**. A hand-authored group carries neither (an agent writes
+/// `objects` and stops), and even a stored pair is re-unioned on the next
+/// save, so a caller that must move a group as a rigid unit has to take its
+/// delta from THIS frame: off the stored `at` the delta is unknowable, the
+/// children stay put, and the re-union silently discards the gesture.
+pub fn group_envelope(group: &GroupObject) -> Option<Frame> {
+    union_frame(&group.objects).map(|(x, y, w, h)| Frame { x, y, w, h })
+}
+
+/// The frame an object *currently occupies*, whether or not it stores one:
+/// [`Object::frame`] for everything with explicit geometry, and
+/// [`group_envelope`] for a group — falling back to a group's own stored
+/// frame when its children contribute none, so a group of connectors (whose
+/// children are anchor-bound and frameless) keeps the box it was given.
+/// Slot-placed objects still read `None` — their geometry is derived at
+/// render time, not here.
+pub fn effective_frame(obj: &Object) -> Option<Frame> {
+    match obj {
+        Object::Group(g) => group_envelope(g).or_else(|| obj.frame()),
+        _ => obj.frame(),
+    }
+}
+
+/// The union is taken over [`effective_frame`], not `Object::frame`, so it
+/// descends through NESTED groups. A nested group in a hand-authored file
+/// stores no `at`/`size` (an agent writes `objects` and stops), so reading its
+/// stored frame would contribute nothing and shrink — or empty — the parent's
+/// envelope. `normalize_objects` recurses depth-first before unioning, so on
+/// an already-normalized board every child has stored geometry and this is the
+/// same answer; the recursion is what makes it the same answer BEFORE the
+/// first save too, which is the only state a freshly loaded board is ever in.
 fn union_frame(objects: &[Object]) -> Option<(f64, f64, f64, f64)> {
     let mut acc: Option<(f64, f64, f64, f64)> = None;
     for o in objects {
-        let Some(f) = o.frame() else { continue };
+        let Some(f) = effective_frame(o) else {
+            continue;
+        };
         acc = Some(match acc {
             None => (f.x, f.y, f.right(), f.bottom()),
             Some((x0, y0, x1, y1)) => (
@@ -686,12 +755,45 @@ mod tests {
     }
 
     #[test]
-    fn geometry_snaps_to_the_grid() {
+    fn float_noise_is_cleaned_off_geometry_but_placement_is_not_moved() {
+        // Within an epsilon of the grid: accumulated float error, pulled on.
+        let mut b = board_with(
+            r#"{"id":"t","type":"text","at":[79.9999998,128.0000003],
+                "size":[303.9999996,48.0000002],"text":["hi"]}"#,
+        );
+        normalize(&mut b);
+        let f = b.pages[0].objects[0].frame().unwrap();
+        assert_eq!((f.x, f.y, f.w, f.h), (80.0, 128.0, 304.0, 48.0));
+
+        // Deliberately off-grid: left exactly where the author put it. This is
+        // the regression — snapping these to 8 is what knocked 117 centred
+        // pairs off-centre on a real deck.
         let mut b =
             board_with(r#"{"id":"t","type":"text","at":[81,131],"size":[301,49],"text":["hi"]}"#);
         normalize(&mut b);
         let f = b.pages[0].objects[0].frame().unwrap();
-        assert_eq!((f.x, f.y, f.w, f.h), (80.0, 128.0, 304.0, 48.0));
+        assert_eq!((f.x, f.y, f.w, f.h), (81.0, 131.0, 301.0, 49.0));
+    }
+
+    #[test]
+    fn a_centred_child_stays_centred_across_a_save() {
+        // Page 1 of the specimen deck, verbatim: a 36 pt icon centred in a
+        // 72 pt disc. The old 8 pt snap moved the icon 2 pt and shrank it 4,
+        // putting it visibly off-centre inside its own disc.
+        let mut b = board_with(
+            r#"{"id":"g","type":"group","objects":[
+                 {"id":"disc","type":"shape","geo":"ellipse","at":[88,338],"size":[72,72]},
+                 {"id":"icon","type":"icon","name":"dna","at":[106,356],"size":[36,36]}]}"#,
+        );
+        let centre = |o: &Object| {
+            let f = o.frame().unwrap();
+            (f.x + f.w / 2.0, f.y + f.h / 2.0)
+        };
+        normalize(&mut b);
+        let Object::Group(g) = &b.pages[0].objects[0] else {
+            panic!("group")
+        };
+        assert_eq!(centre(&g.objects[0]), centre(&g.objects[1]));
     }
 
     #[test]
@@ -785,5 +887,46 @@ mod tests {
         normalize(&mut b);
         let f = b.pages[0].objects[0].frame().unwrap();
         assert_eq!((f.x, f.y, f.w, f.h), (0.0, 0.0, 240.0, 160.0));
+    }
+
+    #[test]
+    fn an_envelope_descends_through_nested_groups_before_the_first_save() {
+        // The shape every agent writes: nested groups carrying `objects` and
+        // no geometry at all. Read pre-normalize, a shallow union would see
+        // only the outer group's directly-framed children — here, none —
+        // and answer None, which is how a group move evaporated.
+        let mut b = board_with(
+            r#"{"id":"outer","type":"group","objects":[
+                 {"id":"inner","type":"group","objects":[
+                   {"id":"a","type":"shape","geo":"rect","at":[48,136],"size":[80,80]}]},
+                 {"id":"inner2","type":"group","objects":[
+                   {"id":"c","type":"shape","geo":"rect","at":[240,136],"size":[80,80]}]}]}"#,
+        );
+        let raw = &b.pages[0].objects[0];
+        assert!(raw.frame().is_none(), "the fixture stores no geometry");
+        let env = effective_frame(raw).expect("the envelope descends to the leaves");
+        assert_eq!((env.x, env.y, env.w, env.h), (48.0, 136.0, 272.0, 80.0));
+
+        // And it is the same answer normalize writes back, so the pane's
+        // pre-save number and the daemon's post-save number never disagree.
+        normalize(&mut b);
+        let saved = b.pages[0].objects[0].frame().unwrap();
+        assert_eq!(
+            (saved.x, saved.y, saved.w, saved.h),
+            (48.0, 136.0, 272.0, 80.0)
+        );
+    }
+
+    #[test]
+    fn a_group_of_frameless_children_keeps_its_own_stored_box() {
+        // Connectors are anchor-bound and carry no frame, so the union is
+        // empty — the group's explicitly given box is the only frame it has,
+        // and arrange must still be able to read it.
+        let b = board_with(
+            r#"{"id":"wires","type":"group","at":[100,100],"size":[200,50],"objects":[
+                 {"id":"w","type":"connector","from":{"object":"a"},"to":{"object":"b"}}]}"#,
+        );
+        let f = effective_frame(&b.pages[0].objects[0]).expect("falls back to the stored box");
+        assert_eq!((f.x, f.y, f.w, f.h), (100.0, 100.0, 200.0, 50.0));
     }
 }

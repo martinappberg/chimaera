@@ -6,6 +6,7 @@
    */
   import {
     chartConfig,
+    findMember,
     MARK_SWAP_KINDS,
     SORT_OPTIONS,
     type ChildFrame,
@@ -16,6 +17,11 @@
   interface Props {
     title: string;
     objects: ObjInfo[];
+    /** Why the outline is empty for a reason OTHER than an empty page — the
+     *  board is still loading, too large to read whole, or unparseable. The
+     *  "no objects on this page" empty state must only ever mean an empty
+     *  page, so this reason replaces it. */
+    unavailable?: string | null;
     selected: string | null;
     /** Composite id → derived children + laid-out frames (the render
      *  response's childFrames) — the composite branch of the layer tree. */
@@ -60,6 +66,7 @@
   let {
     title,
     objects,
+    unavailable = null,
     selected,
     childFrames,
     selectedChild,
@@ -92,52 +99,70 @@
     return expanded[id] ?? autoOpen.has(id);
   }
 
-  /** Whether a row wears the active-selection highlight. A group descendant
-   *  never does — its click selects the enclosing group, which is the row that
-   *  lights up. */
+  /** Whether a row wears the active-selection highlight: a top-level object
+   *  when it is the whole selection, a drilled-into child (a composite's
+   *  derived part or a group member) when it is the drill target. */
   function rowActive(node: LayerNode): boolean {
-    const s = node.select;
-    if (s.via === "child") return selectedChild === node.id;
-    if (node.id === s.id) return selected === node.id && selectedChild === null;
-    return false;
+    return node.select.via === "child"
+      ? selectedChild === node.id
+      : selected === node.id && selectedChild === null;
   }
 
-  /** Route a row click to the callback BoardView exposes for its kind. */
+  /** Route a row click to the callback BoardView exposes for its kind. A
+   *  member row drills into it under its enclosing top-level object, which
+   *  stays selected — that object is the unit the stage moves. */
   function selectNode(node: LayerNode): void {
     const s = node.select;
-    if (s.via === "child") {
-      onselectchild(s.parent, s.id === selectedChild ? null : s.id);
-    } else if (node.id === s.id) {
-      onselect(s.id === selected ? null : s.id);
-    } else {
-      // A group descendant: always select the enclosing top-level group.
-      onselect(s.id);
-    }
+    if (s.via === "child") onselectchild(s.parent, s.id === selectedChild ? null : s.id);
+    else onselect(s.id === selected ? null : s.id);
   }
 
   // --- theme picker: ground overrides -------------------------------------
-  /** Literal grounds the picker always offers beside the theme's own tones. */
-  const GROUNDS: { value: string; label: string }[] = [
-    { value: "#ffffff", label: "white" },
-    { value: "#000000", label: "black" },
+  /** Literal grounds the picker always offers beside the theme's own tones.
+   *  Picking one is a bigger statement than a backdrop: a `#hex` ground is
+   *  painted verbatim rather than resolved through the theme, so the engine
+   *  reads it as the board's stated appearance and resolves the WHOLE palette
+   *  to match (theme.rs `mode_from_ground`/`resolve_for_board`) — otherwise
+   *  light-mode ink would land on a black canvas. */
+  const GROUNDS: { value: string; label: string; note: string }[] = [
+    { value: "#ffffff", label: "white", note: "white — a fixed ground; the whole palette goes light" },
+    { value: "#000000", label: "black", note: "black — a fixed ground; the whole palette goes dark" },
   ];
   /** The file's literal ground, case-folded for the active-swatch check. */
   const activeGround = $derived(canvasBackground?.toLowerCase() ?? null);
-  /** The theme picker's caption for the current state (why it looks how it
-   *  looks) — the default reads as automatic, never a forced choice. */
+  /** A LITERAL ground — the `#rgb`/`#rrggbb` forms `theme::parse_hex` accepts.
+   *  Unlike an `@token` ground (which resolves through the theme and therefore
+   *  keeps following the app's mode), a literal one fixes this board's
+   *  appearance and picks its light/dark variant. */
+  const fixedGround = $derived(
+    activeGround !== null && /^#(?:[0-9a-f]{3}|[0-9a-f]{6})$/.test(activeGround),
+  );
+  /** The theme section's caption for the current state (why it looks how it
+   *  looks) — the default reads as automatic, never a forced choice. A pinned
+   *  theme is checked first: "ignore the mode" is explicit, so the ground does
+   *  not redirect it (resolve_for_board). */
   const themeNote = $derived(
-    themeSelection === "auto"
-      ? "default — matches the app's light/dark"
-      : themeSelection === "pinned"
-        ? "pinned — ignores the app's mode"
-        : "a scheme, still following the app's mode",
+    themeSelection === "pinned"
+      ? "pinned — ignores the app's mode"
+      : fixedGround
+        ? `fixed ${activeGround} ground — it sets this board's light/dark, not the app's mode`
+        : themeSelection === "auto"
+          ? "default — matches the app's light/dark"
+          : "a scheme, still following the app's mode",
   );
 
   // --- lint notes: collapsed by default -----------------------------------
   const lintNotes = $derived(diagnostics.filter((d) => d.severity !== "info"));
   let lintOpen = $state(false);
 
-  /** The selected child's live frame, for the read-only inspector line. */
+  /** The drilled-into GROUP MEMBER, when the drill went into a group rather
+   *  than a composite (disjoint kinds, so at most one of the two resolves). */
+  const selectedMember = $derived.by<ObjInfo | null>(() =>
+    selectedObj !== null && selectedChild !== null ? findMember(selectedObj, selectedChild) : null,
+  );
+
+  /** The selected composite child's live frame, for the read-only inspector
+   *  line. */
   const selectedChildFrame = $derived.by<ChildFrame | null>(() => {
     if (selected === null || selectedChild === null) return null;
     return (childFrames[selected] ?? []).find((c) => c.id === selectedChild) ?? null;
@@ -231,11 +256,26 @@
       {@render layerRow(node, 0)}
     {/each}
     {#if objects.length === 0}
-      <div class="empty">no objects on this page</div>
+      <div class="empty">{unavailable ?? "no objects on this page"}</div>
     {/if}
   </div>
 
-  {#if selectedChild !== null}
+  {#if selectedMember !== null}
+    <!-- A group member: the geometry is the FILE's own (members are
+         page-absolute), but there is no member-move gesture — the group is the
+         unit the stage translates, so the numbers read rather than edit. -->
+    <div class="inspector">
+      <div class="insp-head">{selectedMember.id}</div>
+      {#if selectedMember.at !== null && selectedMember.size !== null}
+        <div class="insp-unit mono">
+          at [{fmt(selectedMember.at[0])}, {fmt(selectedMember.at[1])}] · size [{fmt(
+            selectedMember.size[0],
+          )}, {fmt(selectedMember.size[1])}]
+        </div>
+      {/if}
+      <div class="insp-unit">in {selected} · drag the group to move it</div>
+    </div>
+  {:else if selectedChild !== null}
     <!-- A derived child: geometry is the layout's, not the file's, so the
          numbers are read-only — a node drag pins `nodes.<i>.at` instead. -->
     <div class="inspector">
@@ -257,12 +297,21 @@
           onchange={(e) => oncommitfield("x", (e.currentTarget as HTMLInputElement).value)} /></label>
         <label>y <input type="number" step="8" value={selectedObj.at[1]}
           onchange={(e) => oncommitfield("y", (e.currentTarget as HTMLInputElement).value)} /></label>
+        <!-- A group's w/h are its envelope, which the daemon re-unions from
+             its members on every save — editable inputs would promise a
+             gesture the edit route refuses by design. -->
         <label>w <input type="number" step="8" value={selectedObj.size[0]}
+          readonly={selectedObj.kind === "group"}
           onchange={(e) => oncommitfield("w", (e.currentTarget as HTMLInputElement).value)} /></label>
         <label>h <input type="number" step="8" value={selectedObj.size[1]}
+          readonly={selectedObj.kind === "group"}
           onchange={(e) => oncommitfield("h", (e.currentTarget as HTMLInputElement).value)} /></label>
       </div>
-      <div class="insp-unit">pt · snaps to the 8 pt grid</div>
+      <div class="insp-unit">
+        {selectedObj.kind === "group"
+          ? "pt · x/y moves the whole group; w/h is the envelope its members union"
+          : "pt · snaps to the 8 pt grid"}
+      </div>
       {#if chart !== null}
         <!-- Chart configuration: a chart is one declarative object; its
              axes/sort/marks are config the engine lays out, edited here as
@@ -352,17 +401,19 @@
           >
         {/if}
       </div>
-      <div class="theme-note">{themeNote}</div>
     {/if}
-    <!-- The canvas ground: "match theme" (the default) lets the ground follow
-         the theme/app; white and black are literal grounds; the rest are THIS
-         theme's own tones. The file's literal value marks the active swatch. -->
+    <!-- The canvas ground is not just a backdrop: "match theme" (the default)
+         and the theme's own @tokens resolve THROUGH the theme and keep
+         following the app's mode, while white/black are LITERAL grounds — a
+         #hex is painted verbatim, so it states the board's appearance and the
+         whole palette resolves to match it. The file's literal value marks the
+         active swatch. -->
     <div class="insp-row swatch-row" role="group" aria-label="canvas ground">
       <span class="swatch-label">ground</span>
       <button
         class="swatch auto"
         class:on={canvasBackground === null}
-        title="match theme"
+        title="match theme — the ground follows the theme (and the app's mode)"
         aria-label="canvas ground: match theme"
         onclick={() => oncommitcanvas(null)}
       >–</button>
@@ -371,8 +422,8 @@
           class="swatch"
           class:on={activeGround === g.value}
           style:background={g.value}
-          title={g.label}
-          aria-label={`canvas ground ${g.label}`}
+          title={g.note}
+          aria-label={`canvas ground ${g.note}`}
           onclick={() => oncommitcanvas(g.value)}
         ></button>
       {/each}
@@ -381,12 +432,20 @@
           class="swatch"
           class:on={canvasBackground === s.token}
           style:background={s.hex}
-          title={s.token}
+          title={`${s.token} — a theme tone; still follows the app's mode`}
           aria-label={`canvas ground ${s.token}`}
           onclick={() => oncommitcanvas(s.token)}
         ></button>
       {/each}
     </div>
+    <!-- One caption for the whole section: what actually decides this board's
+         light/dark right now — the app, a pinned theme, or its own ground. The
+         ground branch reads the FILE, so it holds before the first render
+         lands; the rest needs the render's `themeSelection`, so without it (and
+         without a fixed ground) there is nothing honest to say yet. -->
+    {#if fixedGround || schemes.length > 0}
+      <div class="theme-note">{themeNote}</div>
+    {/if}
   </div>
 
   {#if lintNotes.length > 0}
@@ -547,6 +606,14 @@
     font-size: var(--text-xs);
     font-family: var(--mono);
     padding: 2px 4px;
+  }
+  /* A read-only field (a group's envelope extent) reads as reported, not as an
+     input the user failed to type into. */
+  .insp-grid input:read-only {
+    background: none;
+    border-color: transparent;
+    color: var(--muted);
+    cursor: default;
   }
   .insp-unit {
     margin-top: 6px;

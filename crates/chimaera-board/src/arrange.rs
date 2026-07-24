@@ -6,6 +6,11 @@
 //! auto-layout) belongs to the slot engine, which places by construction
 //! rather than by correction.
 //!
+//! Beside them live the two **structural** verbs, `group` and `ungroup`
+//! ([`structural`]): the same refuse-before-mutate contract, but they change
+//! page membership rather than geometry, so they answer with the group's
+//! identity instead of a list of moves.
+//!
 //! Only objects with **explicit** geometry can be arranged: a slot-placed
 //! object's frame is derived at read time, so writing an `at` to it would
 //! silently convert it to hand-placed — that conversion is the author's call,
@@ -14,7 +19,7 @@
 
 use anyhow::{bail, Result};
 
-use crate::schema::{Board, Frame, Object};
+use crate::schema::{Board, Extra, Frame, GroupKind, GroupObject, Object};
 
 /// A frame measurement (an edge or an extent), named so tuple types carrying
 /// one stay readable.
@@ -66,7 +71,10 @@ pub fn arrange(
                  convert it to hand-placed — give it an explicit at/size first"
             );
         }
-        let Some(f) = obj.frame() else {
+        // `effective_frame`, not `frame`: a group's box is derived from its
+        // children, and a hand-authored one stores none at all — reading its
+        // stored pair would refuse (or mis-anchor) every agent-written group.
+        let Some(f) = crate::normalize::effective_frame(obj) else {
             bail!("{id:?} has no explicit at/size to arrange");
         };
         frames.push(f);
@@ -185,9 +193,187 @@ pub fn arrange_ids(board: &mut Board, op: &str, ids: &[&str]) -> Result<Vec<Stri
         "snap-grid" => snap_to_grid(board, ids),
         op if OPS.contains(&op) => arrange(board, op, ids, None, None),
         other => bail!(
-            "unknown arrange op {other:?}; ops are {}, snap-grid",
-            OPS.join(", ")
+            "unknown arrange op {other:?}; ops are {}, snap-grid, {}",
+            OPS.join(", "),
+            STRUCTURAL_OPS.join(", ")
         ),
+    }
+}
+
+/// The structural verbs. They change page **membership**, not geometry, so
+/// they answer with the group's identity rather than a list of moves — which
+/// is why they sit beside [`arrange_ids`] instead of inside it.
+pub const STRUCTURAL_OPS: &[&str] = &["group", "ungroup"];
+
+/// What a structural verb did: the group it created or dissolved, the page it
+/// lives on, and its members in z-order (array order).
+#[derive(Debug, Clone)]
+pub struct Structural {
+    /// The verb, echoed as the crate's own spelling.
+    pub op: &'static str,
+    pub group: String,
+    pub page: String,
+    pub members: Vec<String>,
+}
+
+/// Apply a [`STRUCTURAL_OPS`] verb to `ids`. Every refusal is raised before a
+/// single object is touched, exactly like [`arrange`], so a rejected gesture
+/// leaves the board byte-identical.
+pub fn structural(board: &mut Board, op: &str, ids: &[&str]) -> Result<Structural> {
+    match op {
+        "group" => group_ids(board, ids),
+        "ungroup" => ungroup_id(board, ids),
+        other => bail!(
+            "unknown structural op {other:?}; ops are {}",
+            STRUCTURAL_OPS.join(", ")
+        ),
+    }
+}
+
+/// Wrap the named top-level objects in a new group, preserving their relative
+/// z-order and landing the group where the topmost member sat.
+///
+/// The members must be top-level on ONE page: a group's children are the
+/// page's own array entries moved wholesale, so an id that is already inside
+/// another group, or on a different page, has no well-defined slice to lift.
+/// The new group states no `at`/`size` — the envelope is
+/// [`crate::normalize`]'s to mint from the children, and writing a second
+/// copy here would be a source of truth that drifts on the first child move.
+fn group_ids(board: &mut Board, ids: &[&str]) -> Result<Structural> {
+    if ids.len() < 2 {
+        bail!("group wants at least two ids; got {}", ids.len());
+    }
+    let mut named = std::collections::BTreeSet::new();
+    for id in ids {
+        if !named.insert(*id) {
+            bail!("{id:?} is named twice; a group's members are a set");
+        }
+    }
+
+    // Resolve every member to its page slot first, so the gesture is
+    // all-or-nothing and the z-order below computes over a consistent
+    // snapshot.
+    let mut page: Option<usize> = None;
+    let mut picks: Vec<usize> = Vec::with_capacity(ids.len());
+    for id in ids {
+        let (pi, oi) = top_level_position(board, id).ok_or_else(|| not_top_level(board, id))?;
+        match page {
+            None => page = Some(pi),
+            Some(p) if p == pi => {}
+            Some(_) => bail!("{id:?} is on another page; a group's members must share one page"),
+        }
+        let obj = &board.pages[pi].objects[oi];
+        if obj.slot().is_some() && obj.frame().is_none() {
+            bail!(
+                "{id:?} is slot-placed; its geometry is derived, so grouping it would silently \
+                 convert it to hand-placed — give it an explicit at/size first"
+            );
+        }
+        picks.push(oi);
+    }
+    let pi = page.expect("at least two ids resolved");
+    picks.sort_unstable();
+
+    // The group takes the topmost member's place once the members are lifted
+    // out, so the selection keeps its depth in the page instead of jumping to
+    // the front of the z-order.
+    let insert_at = picks[picks.len() - 1] + 1 - picks.len();
+    let page_id = board.pages[pi].id.clone();
+    let group_id = fresh_group_id(board, &page_id, insert_at);
+
+    // Removed high index first, so the lower indices stay valid.
+    let mut objects: Vec<Object> = Vec::with_capacity(picks.len());
+    for &oi in picks.iter().rev() {
+        objects.push(board.pages[pi].objects.remove(oi));
+    }
+    objects.reverse();
+    let members: Vec<String> = objects.iter().map(|o| o.id().to_string()).collect();
+    board.pages[pi].objects.insert(
+        insert_at,
+        Object::Group(GroupObject {
+            id: group_id.clone(),
+            kind: GroupKind,
+            at: None,
+            size: None,
+            objects,
+            alt: None,
+            extra: Extra::new(),
+        }),
+    );
+    Ok(Structural {
+        op: "group",
+        group: group_id,
+        page: page_id,
+        members,
+    })
+}
+
+/// Dissolve a group: its children take its own index on the page, in order.
+/// They are already page-absolute, so nothing moves — the page renders
+/// identically, minus one level of selection.
+fn ungroup_id(board: &mut Board, ids: &[&str]) -> Result<Structural> {
+    let [id] = ids else {
+        bail!("ungroup takes exactly one group id; got {}", ids.len());
+    };
+    let (pi, oi) = top_level_position(board, id).ok_or_else(|| not_top_level(board, id))?;
+    if !matches!(board.pages[pi].objects[oi], Object::Group(_)) {
+        bail!(
+            "{id:?} is a {}, not a group",
+            board.pages[pi].objects[oi].kind()
+        );
+    }
+    let Object::Group(group) = board.pages[pi].objects.remove(oi) else {
+        unreachable!("checked above");
+    };
+    let members: Vec<String> = group.objects.iter().map(|o| o.id().to_string()).collect();
+    for (k, child) in group.objects.into_iter().enumerate() {
+        board.pages[pi].objects.insert(oi + k, child);
+    }
+    Ok(Structural {
+        op: "ungroup",
+        group: group.id,
+        page: board.pages[pi].id.clone(),
+        members,
+    })
+}
+
+/// The refusal for an id that is not a page-level object, naming which of the
+/// two reasons applies — an id nested in another group is a different (and
+/// unsupported) gesture from a typo, and saying so saves a round trip.
+fn not_top_level(board: &Board, id: &str) -> anyhow::Error {
+    if board.objects().any(|(_, o)| o.id() == id) {
+        anyhow::anyhow!(
+            "{id:?} is not a top-level object; group/ungroup take objects that sit directly on a \
+             page"
+        )
+    } else {
+        anyhow::anyhow!("no object {id:?} in this board")
+    }
+}
+
+fn top_level_position(board: &Board, id: &str) -> Option<(usize, usize)> {
+    board.pages.iter().enumerate().find_map(|(pi, page)| {
+        page.objects
+            .iter()
+            .position(|o| o.id() == id)
+            .map(|oi| (pi, oi))
+    })
+}
+
+/// A new group's id in the crate's own generated-id shape (`<page>-group-<n>`
+/// — exactly what [`crate::normalize`] mints for an id-less object), advanced
+/// past any collision: an id is the diff anchor, the agent's Edit anchor, the
+/// journal subject and the merge key at once, so a duplicate is an error the
+/// format never auto-renames away.
+fn fresh_group_id(board: &Board, page: &str, index: usize) -> String {
+    let taken: std::collections::BTreeSet<&str> = board.objects().map(|(_, o)| o.id()).collect();
+    let mut n = index + 1;
+    loop {
+        let candidate = format!("{page}-group-{n}");
+        if !taken.contains(candidate.as_str()) {
+            return candidate;
+        }
+        n += 1;
     }
 }
 
@@ -222,7 +408,7 @@ fn snap_to_grid(board: &mut Board, ids: &[&str]) -> Result<Vec<String>> {
                  convert it to hand-placed — give it an explicit at/size first"
             );
         }
-        let Some(f) = obj.frame() else {
+        let Some(f) = crate::normalize::effective_frame(obj) else {
             bail!("{id:?} has no explicit at/size to snap");
         };
         let nx = nearest(&xs, f.x).unwrap_or(f.x);
@@ -456,6 +642,183 @@ mod tests {
         assert_eq!(frame_of(&b, "g").x, 0.0, "the envelope moved");
         assert_eq!(find_object(&b, "c1").unwrap().at(), Some([0.0, 100.0]));
         assert_eq!(find_object(&b, "c2").unwrap().at(), Some([120.0, 100.0]));
+    }
+
+    /// The shape an agent actually writes: a group with children and no
+    /// stored envelope. Aligning it must work off the child union, not refuse
+    /// for "no explicit at/size".
+    #[test]
+    fn aligning_a_group_with_no_stored_envelope_uses_the_child_union() {
+        let mut b = board(
+            &[
+                rect("anchor", [0.0, 64.0], [80.0, 80.0]),
+                r#"{"id":"g","type":"group","objects":[
+                    {"id":"c1","type":"shape","geo":"rect","at":[100,100],"size":[80,80]},
+                    {"id":"c2","type":"shape","geo":"rect","at":[220,100],"size":[80,80]}]}"#
+                    .to_string(),
+            ]
+            .join(","),
+        );
+        let lines = arrange(&mut b, "align-left", &["anchor", "g"], None, None).unwrap();
+        assert_eq!(lines, ["moved g to x=0"]);
+        assert_eq!(find_object(&b, "c1").unwrap().at(), Some([0.0, 100.0]));
+        assert_eq!(find_object(&b, "c2").unwrap().at(), Some([120.0, 100.0]));
+    }
+
+    fn ids_of(b: &Board) -> Vec<&str> {
+        b.pages[0].objects.iter().map(|o| o.id()).collect()
+    }
+
+    #[test]
+    fn group_wraps_three_objects_keeping_z_order_at_the_topmost_index() {
+        let mut b = board(
+            &[
+                rect("a", [0.0, 0.0], [80.0, 40.0]),
+                rect("b", [100.0, 0.0], [80.0, 40.0]),
+                rect("c", [200.0, 0.0], [80.0, 40.0]),
+                rect("d", [300.0, 0.0], [80.0, 40.0]),
+            ]
+            .join(","),
+        );
+        // Named out of z-order on purpose: membership order follows the page.
+        let out = structural(&mut b, "group", &["c", "a", "b"]).unwrap();
+        assert_eq!(out.op, "group");
+        assert_eq!(out.members, ["a", "b", "c"], "relative z-order preserved");
+        assert_eq!(out.page, "p");
+        // Topmost member was index 2; after lifting three members the group
+        // takes index 0 — still below d, which was above all of them.
+        assert_eq!(ids_of(&b), [out.group.as_str(), "d"]);
+        let Object::Group(g) = &b.pages[0].objects[0] else {
+            panic!("a group landed on the page");
+        };
+        assert_eq!(
+            g.objects.iter().map(|o| o.id()).collect::<Vec<_>>(),
+            ["a", "b", "c"]
+        );
+        assert_eq!(g.at, None, "the envelope is normalize's to mint");
+        assert_eq!(g.size, None);
+        // The children kept their page-absolute geometry verbatim.
+        assert_eq!(find_object(&b, "b").unwrap().at(), Some([100.0, 0.0]));
+        // Generated in the crate's own id shape, off the group's page + index.
+        assert_eq!(out.group, "p-group-1");
+    }
+
+    #[test]
+    fn group_lands_under_the_objects_that_were_above_it() {
+        let mut b = board(
+            &[
+                rect("bottom", [0.0, 0.0], [80.0, 40.0]),
+                rect("a", [100.0, 0.0], [80.0, 40.0]),
+                rect("b", [200.0, 0.0], [80.0, 40.0]),
+                rect("top", [300.0, 0.0], [80.0, 40.0]),
+            ]
+            .join(","),
+        );
+        let out = structural(&mut b, "group", &["a", "b"]).unwrap();
+        assert_eq!(ids_of(&b), ["bottom", out.group.as_str(), "top"]);
+    }
+
+    #[test]
+    fn a_generated_group_id_never_collides() {
+        let mut b = board(
+            &[
+                rect("p-group-1", [0.0, 0.0], [80.0, 40.0]),
+                rect("a", [100.0, 0.0], [80.0, 40.0]),
+                rect("b", [200.0, 0.0], [80.0, 40.0]),
+            ]
+            .join(","),
+        );
+        let out = structural(&mut b, "group", &["a", "b"]).unwrap();
+        assert_eq!(out.group, "p-group-2", "advanced past the taken id");
+    }
+
+    #[test]
+    fn ungroup_restores_the_children_at_the_groups_index() {
+        let mut b = board(
+            &[
+                rect("bottom", [0.0, 0.0], [80.0, 40.0]),
+                r#"{"id":"g","type":"group","at":[100,100],"size":[200,80],"objects":[
+                    {"id":"c1","type":"shape","geo":"rect","at":[100,100],"size":[80,80]},
+                    {"id":"c2","type":"shape","geo":"rect","at":[220,100],"size":[80,80]}]}"#
+                    .to_string(),
+                rect("top", [400.0, 0.0], [80.0, 40.0]),
+            ]
+            .join(","),
+        );
+        let out = structural(&mut b, "ungroup", &["g"]).unwrap();
+        assert_eq!(out.op, "ungroup");
+        assert_eq!(out.group, "g");
+        assert_eq!(out.members, ["c1", "c2"]);
+        assert_eq!(ids_of(&b), ["bottom", "c1", "c2", "top"]);
+        // Children are page-absolute, so dissolving the group moves nothing.
+        assert_eq!(find_object(&b, "c1").unwrap().at(), Some([100.0, 100.0]));
+        assert_eq!(find_object(&b, "c2").unwrap().at(), Some([220.0, 100.0]));
+    }
+
+    #[test]
+    fn group_then_ungroup_round_trips_the_page() {
+        let mut b = board(
+            &[
+                rect("a", [0.0, 0.0], [80.0, 40.0]),
+                rect("b", [100.0, 0.0], [80.0, 40.0]),
+                rect("c", [200.0, 0.0], [80.0, 40.0]),
+            ]
+            .join(","),
+        );
+        let before = crate::to_string(&b).unwrap();
+        let out = structural(&mut b, "group", &["a", "b"]).unwrap();
+        structural(&mut b, "ungroup", &[&out.group]).unwrap();
+        assert_eq!(crate::to_string(&b).unwrap(), before, "byte-identical");
+    }
+
+    #[test]
+    fn group_and_ungroup_refuse_before_mutating() {
+        let mut b = board(
+            &[
+                rect("a", [0.0, 0.0], [80.0, 40.0]),
+                rect("b", [100.0, 0.0], [80.0, 40.0]),
+                r#"{"id":"s","type":"shape","geo":"rect","slot":"body"}"#.to_string(),
+                r#"{"id":"g","type":"group","objects":[
+                    {"id":"c1","type":"shape","geo":"rect","at":[300,0],"size":[80,40]}]}"#
+                    .to_string(),
+            ]
+            .join(","),
+        );
+        let before = crate::to_string(&b).unwrap();
+        let cases: &[(&str, &[&str], &str)] = &[
+            ("group", &["a"], "at least two"),
+            ("group", &["a", "a"], "named twice"),
+            ("group", &["a", "ghost"], "no object \"ghost\""),
+            ("group", &["a", "s"], "slot-placed"),
+            ("group", &["a", "c1"], "not a top-level object"),
+            ("ungroup", &["a", "b"], "exactly one"),
+            ("ungroup", &["a"], "not a group"),
+            ("ungroup", &["ghost"], "no object \"ghost\""),
+            ("ungroup", &["c1"], "not a top-level object"),
+            ("regroup", &["a", "b"], "unknown structural op"),
+        ];
+        for (op, ids, needle) in cases {
+            let err = structural(&mut b, op, ids).unwrap_err();
+            assert!(
+                err.to_string().contains(needle),
+                "{op} {ids:?}: expected {needle:?}, got {err}"
+            );
+        }
+        assert_eq!(crate::to_string(&b).unwrap(), before, "nothing mutated");
+    }
+
+    #[test]
+    fn group_refuses_members_on_different_pages() {
+        let mut b = crate::parse(
+            r#"{"format":"chimaera.board","formatVersion":1,
+                "canvas":{"size":[960,540]},
+                "pages":[
+                  {"id":"p1","objects":[{"id":"a","type":"shape","geo":"rect","at":[0,0],"size":[8,8]}]},
+                  {"id":"p2","objects":[{"id":"b","type":"shape","geo":"rect","at":[0,0],"size":[8,8]}]}]}"#,
+        )
+        .unwrap();
+        let err = structural(&mut b, "group", &["a", "b"]).unwrap_err();
+        assert!(err.to_string().contains("share one page"), "{err}");
     }
 
     #[test]

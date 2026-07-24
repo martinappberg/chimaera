@@ -15,10 +15,12 @@ import type { ChildFrame, ObjInfo } from "./boardInteract";
 /**
  * How a click on a layer row selects on the stage, mapped to the two callbacks
  * BoardView already exposes to the rail:
- * - `object` → `onselect(id)`. A top-level object, or a GROUP DESCENDANT whose
- *   `id` is its enclosing top-level group (the only unit the stage moves — the
- *   engine ships group-move, not per-child "enter the group").
- * - `child` → `onselectchild(parent, id)`. A composite's derived child.
+ * - `object` → `onselect(id)`. A top-level object.
+ * - `child` → `onselectchild(parent, id)`. A composite's derived child, or a
+ *   GROUP MEMBER drilled into under its enclosing top-level group — one idiom
+ *   for both nestings. `parent` stays the top-level object because that is the
+ *   unit the stage moves (a group translates its whole subtree; a member has no
+ *   move gesture of its own), so drilling in never costs draggability.
  */
 export type LayerSelect =
   | { via: "object"; id: string }
@@ -46,7 +48,7 @@ const MAX_NODES = 800;
 
 /**
  * Build the outline tree for one page. Top-level objects come from the parsed
- * board (`objects`); a group's own nested objects are read from its raw JSON;
+ * board (`objects`); a group's members come from that same parse (`children`);
  * a composite's children come from the render's `childFrames`. A group and a
  * composite are disjoint kinds, so an object never carries both.
  */
@@ -73,24 +75,23 @@ export function buildLayerTree(
     return out;
   };
 
-  const groupChildren = (raw: unknown, groupId: string, depth: number): LayerNode[] => {
+  const groupChildren = (
+    members: readonly ObjInfo[],
+    groupId: string,
+    depth: number,
+  ): LayerNode[] => {
     if (depth > MAX_DEPTH) return [];
-    const nested = (raw as { objects?: unknown } | null)?.objects;
-    if (!Array.isArray(nested)) return [];
     const out: LayerNode[] = [];
-    for (const c of nested) {
+    for (const c of members) {
       if (!take()) break;
-      if (typeof c !== "object" || c === null) continue;
-      const rec = c as { id?: unknown; type?: unknown };
-      const id = typeof rec.id === "string" ? rec.id : "";
       out.push({
-        id,
-        label: id,
-        kind: typeof rec.type === "string" ? rec.type : "?",
-        // A nested group recurses; every descendant still selects the OUTER
-        // top-level group — the whole-unit the stage translates.
-        children: groupChildren(c, groupId, depth + 1),
-        select: { via: "object", id: groupId },
+        id: c.id,
+        label: c.id,
+        kind: c.kind,
+        // A nested group recurses; every descendant drills in under the OUTER
+        // top-level group — the whole unit the stage translates.
+        children: groupChildren(c.children, groupId, depth + 1),
+        select: { via: "child", parent: groupId, id: c.id },
       });
     }
     return out;
@@ -104,7 +105,7 @@ export function buildLayerTree(
       label: o.id,
       kind: o.kind,
       children:
-        o.kind === "group" ? groupChildren(o.raw, o.id, 1) : compositeChildren(o.id),
+        o.kind === "group" ? groupChildren(o.children, o.id, 1) : compositeChildren(o.id),
       select: { via: "object", id: o.id },
     });
   }

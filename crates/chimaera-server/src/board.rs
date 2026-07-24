@@ -102,8 +102,10 @@ pub(crate) struct RenderRequest {
     pub theme: Option<String>,
     /// The viewer's appearance, `"light"` or `"dark"` — what a board whose
     /// theme is `auto` (or absent) resolves to, so the pane and a shown card
-    /// match the app around them. A pinned theme ignores it. Absent (an older
-    /// client) keeps the pre-auto behavior: auto resolves dark.
+    /// match the app around them. A pinned theme ignores it, and so does a
+    /// literal `#rrggbb` `canvas.background`, which states an appearance of
+    /// its own (see [`resolve_theme`]). Absent (an older client) keeps the
+    /// pre-auto behavior: auto resolves dark.
     #[serde(default)]
     pub mode: Option<String>,
 }
@@ -163,11 +165,13 @@ pub(crate) struct EditRequest {
     )]
     pub canvas_background: Option<Option<String>>,
     /// The multi-object arrange gesture: a verb over an id-set (align a
-    /// selection, distribute it, or snap it to the layout grid). Present =
-    /// this is an arrange edit; the singular `object` fields are unused. Runs
-    /// the crate's pure `arrange_ids` server-side, then the same
-    /// normalize→canonical-save→journal pipeline every gesture takes, so an
-    /// alignment lands with the same atomicity and byte-stability as a `set`.
+    /// selection, distribute it, snap it to the layout grid, or the two
+    /// structural verbs — `group` the selection, `ungroup` one group).
+    /// Present = this is an arrange edit; the singular `object` fields are
+    /// unused. Runs the crate's pure `arrange_ids`/`structural` server-side,
+    /// then the same normalize→canonical-save→journal pipeline every gesture
+    /// takes, so an alignment lands with the same atomicity and
+    /// byte-stability as a `set`.
     #[serde(default)]
     pub arrange: Option<ArrangeRequest>,
     /// The other board-level field edit: pin a scheme (`talk`/`figure`), a
@@ -180,8 +184,10 @@ pub(crate) struct EditRequest {
 }
 
 /// The arrange gesture's payload: the verb and the ids it applies to, in the
-/// order given (the first id is the alignment anchor). The vocabulary is
-/// `chimaera_board::arrange::OPS` plus `snap-grid`.
+/// order given (the first id is the alignment anchor; the structural verbs
+/// read the selection as a set and take z-order from the page). The
+/// vocabulary is `chimaera_board::arrange::OPS` plus `snap-grid` and
+/// `chimaera_board::arrange::STRUCTURAL_OPS` (`group` / `ungroup`).
 #[derive(Deserialize)]
 pub(crate) struct ArrangeRequest {
     pub op: String,
@@ -215,6 +221,50 @@ impl std::fmt::Display for SetRejected {
 
 impl std::error::Error for SetRejected {}
 
+/// A structural-arrange refusal: the request was well-formed but the
+/// selection cannot be grouped or ungrouped — too few ids, an unknown or
+/// non-top-level id, a slot-placed target, ids spread across pages, or an
+/// `ungroup` that names something other than one group. Mapped to 422 like
+/// [`SetRejected`] ("fix the selection", not "fix the request"); the crate
+/// raises every one of them before it mutates, so nothing is written.
+#[derive(Debug)]
+struct ArrangeRefused(String);
+
+impl std::fmt::Display for ArrangeRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ArrangeRefused {}
+
+/// The theme a board renders (or exports) under, plus the appearance the
+/// mode-following theme tiers actually landed on.
+///
+/// Split out of the handlers so the rule — not the plumbing — is testable
+/// without standing up an `AppState`, the same reason [`perform_export`] is
+/// split. The rule lives in `theme::resolve_for_board`: a **literal**
+/// `#rrggbb` `canvas.background` is painted verbatim whatever the theme
+/// resolves to, so it fixes the board's appearance and the ink has to follow
+/// it — light-mode ink on a literal black canvas is unreadable. An `@token`
+/// ground resolves *through* the theme, so it fixes nothing.
+///
+/// The returned appearance is the ground's when it fixes one, else the
+/// caller's. That is what the picker needs too: it is what a scheme button
+/// would resolve to *if clicked*, which holds even while the board still pins
+/// a concrete variant (a pin the ground deliberately does not move).
+fn resolve_theme(
+    board: &chimaera_board::Board,
+    theme_ref: Option<&str>,
+    dark: bool,
+    ws: &Path,
+) -> anyhow::Result<(Theme, bool)> {
+    let ground = board.canvas.background.as_deref();
+    let theme = chimaera_board::theme::resolve_for_board(theme_ref, ground, dark, Some(ws))?;
+    let dark = chimaera_board::theme::mode_from_ground(ground).unwrap_or(dark);
+    Ok((theme, dark))
+}
+
 /// POST /api/v1/board/render → `{ticket, width, height, pageCount, pages,
 /// diagnostics}`. The PNG is fetched as `/raw/{ticket}`.
 pub(crate) async fn render(
@@ -233,13 +283,15 @@ pub(crate) async fn render(
         let page_count = board.pages.len();
 
         // `auto` (and an absent theme) follows the viewer's mode; a pinned
-        // theme wins regardless. The cache key hashes the RESOLVED theme (its
-        // whole serialized form), so an auto board's light and dark renders
-        // are distinct entries by construction — "auto" itself never keys.
+        // theme wins regardless; a literal ground overrules the mode for the
+        // tiers that were following it (`resolve_theme`). The cache key hashes
+        // the RESOLVED theme (its whole serialized form), never the requested
+        // mode, so the entries are exactly as distinct as the pixels are: an
+        // auto board's light and dark renders key apart, and a literal-ground
+        // board's two modes — which render identically — correctly share one.
         let dark = req.mode.as_deref() != Some("light");
         let theme_name = req.theme.clone().or_else(|| board.theme.clone());
-        let theme =
-            chimaera_board::theme::resolve_for_mode(theme_name.as_deref(), dark, Some(&ws))?;
+        let (theme, ground_dark) = resolve_theme(&board, theme_name.as_deref(), dark, &ws)?;
         let params = RasterParams {
             scale: req.scale.unwrap_or(2.0).clamp(0.25, 4.0),
             workspace: Some(ws.clone()),
@@ -317,18 +369,21 @@ pub(crate) async fn render(
             // (`talk`/`figure` — a family that still follows the app's mode) or
             // `"pinned"` (a fixed concrete variant / workspace theme file).
             // `schemes` are the override choices: each scheme's id, human
-            // label, and the concrete variant it resolves to under THIS
-            // render's mode — schemes, not raw variant ids. (Ground overrides —
-            // any `@token` or `#hex`, plain white `#ffffff` / black `#000000`
-            // included — ride the separate `canvas.background` control.)
-            // Additive; a small static list, so it rides the cached-render path
-            // without a sidecar.
+            // label, and the concrete variant picking it would resolve to —
+            // schemes, not raw variant ids. That variant follows the render's
+            // EFFECTIVE appearance (`ground_dark`), not the requested mode, so
+            // a literal-ground board's picker names the variant it would
+            // actually get rather than one the ground would immediately
+            // overrule. (Ground overrides — any `@token` or `#hex`, plain white
+            // `#ffffff` / black `#000000` included — ride the separate
+            // `canvas.background` control.) Additive; a small static list, so
+            // it rides the cached-render path without a sidecar.
             "schemes": chimaera_board::theme::SCHEMES
                 .iter()
                 .map(|s| json!({
                     "id": s.id,
                     "label": s.label,
-                    "variant": s.variant(dark),
+                    "variant": s.variant(ground_dark),
                 }))
                 .collect::<Vec<_>>(),
             "themeSelection": chimaera_board::theme::theme_selection(theme_name.as_deref()),
@@ -429,11 +484,16 @@ pub(crate) async fn edit(
             schedule_git_settle(state.clone(), path.to_string_lossy().into_owned());
             Json(value).into_response()
         }
-        Err(err) if err.downcast_ref::<SetRejected>().is_some() => (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(json!({"error": format!("{err:#}")})),
-        )
-            .into_response(),
+        Err(err)
+            if err.downcast_ref::<SetRejected>().is_some()
+                || err.downcast_ref::<ArrangeRefused>().is_some() =>
+        {
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({"error": format!("{err:#}")})),
+            )
+                .into_response()
+        }
         Err(err) => board_error(&err),
     }
 }
@@ -495,17 +555,25 @@ fn perform_edit(path: &Path, req: &EditRequest) -> anyhow::Result<serde_json::Va
                     continue;
                 }
                 found = true;
-                prior = obj.frame();
+                // The EFFECTIVE frame: a group's stored box is derived (and a
+                // hand-authored group — what an agent writes — stores none),
+                // so its real geometry is the child union both here and in
+                // the journal's `from`.
+                prior = chimaera_board::normalize::effective_frame(obj);
                 if let Some(at) = req.at {
                     // Translate by the delta so a group carries its
                     // (page-absolute) children as a rigid unit; for a leaf
-                    // object this is exactly `set_at(at)`. A group with no
-                    // stored `at` yet (never normalized) falls back to
-                    // set_at — normalize re-unions its envelope regardless.
-                    match obj.at() {
+                    // object this is exactly `set_at(at)`. The delta must come
+                    // off the union, not the stored `at`: normalize() re-unions
+                    // the envelope from the children on save, so a `set_at` on
+                    // the group alone is discarded and the move evaporates.
+                    match prior {
                         Some(cur) => {
-                            chimaera_board::translate_object(obj, at[0] - cur[0], at[1] - cur[1])
+                            chimaera_board::translate_object(obj, at[0] - cur.x, at[1] - cur.y)
                         }
+                        // Nothing positioned to translate (an empty group, or
+                        // an object that has never been placed): state the
+                        // requested origin and let normalize settle it.
                         None => obj.set_at(at),
                     }
                 }
@@ -545,23 +613,37 @@ fn perform_edit(path: &Path, req: &EditRequest) -> anyhow::Result<serde_json::Va
         anyhow::bail!("an edit names an object, a board-level field, or an arrange gesture");
     }
 
-    // The arrange gesture: align/distribute a selection or snap it to the
-    // layout grid. `arrange_ids` refuses (unknown op, slot-placed target,
-    // too few ids) before any mutation, so a bad request writes nothing —
-    // the same atomicity `set` gives. Prior frames are captured here for the
-    // journal's per-object move events.
+    // The arrange gesture: align/distribute a selection, snap it to the
+    // layout grid, or restructure it (group/ungroup). The crate refuses
+    // (unknown op, slot-placed target, too few ids, a non-top-level member)
+    // before any mutation, so a bad request writes nothing — the same
+    // atomicity `set` gives. Prior frames are captured here for the journal's
+    // per-object move events.
     let mut arrange_priors: std::collections::BTreeMap<String, chimaera_board::schema::Frame> =
         std::collections::BTreeMap::new();
+    let mut structural: Option<chimaera_board::arrange::Structural> = None;
     if let Some(arr) = &req.arrange {
-        for id in &arr.objects {
-            if let Some((_, o)) = board.objects().find(|(_, o)| o.id() == id) {
-                if let Some(f) = o.frame() {
-                    arrange_priors.insert(id.clone(), f);
+        let ids: Vec<&str> = arr.objects.iter().map(String::as_str).collect();
+        if chimaera_board::arrange::STRUCTURAL_OPS.contains(&arr.op.as_str()) {
+            // A structural verb changes membership, not geometry: it answers
+            // with the group's identity, and its refusals are 422s (fix the
+            // selection) rather than the generic 400.
+            structural = Some(
+                chimaera_board::arrange::structural(&mut board, &arr.op, &ids)
+                    .map_err(|err| anyhow::Error::new(ArrangeRefused(format!("{err:#}"))))?,
+            );
+        } else {
+            for id in &arr.objects {
+                if let Some((_, o)) = board.objects().find(|(_, o)| o.id() == id) {
+                    // The effective frame, so a hand-authored group's move is
+                    // journaled from where it actually was.
+                    if let Some(f) = chimaera_board::normalize::effective_frame(o) {
+                        arrange_priors.insert(id.clone(), f);
+                    }
                 }
             }
+            chimaera_board::arrange::arrange_ids(&mut board, &arr.op, &ids)?;
         }
-        let ids: Vec<&str> = arr.objects.iter().map(String::as_str).collect();
-        chimaera_board::arrange::arrange_ids(&mut board, &arr.op, &ids)?;
     }
 
     // Normalize (grid snap, group re-union) before the canonical save —
@@ -570,7 +652,14 @@ fn perform_edit(path: &Path, req: &EditRequest) -> anyhow::Result<serde_json::Va
     chimaera_board::normalize(&mut board);
     chimaera_board::save(path, &board)?;
 
-    let journal_seq = journal_edit(path, &board, req, prior, &arrange_priors);
+    let journal_seq = journal_edit(
+        path,
+        &board,
+        req,
+        prior,
+        &arrange_priors,
+        structural.as_ref(),
+    );
 
     let meta = std::fs::metadata(path)?;
     let mut response = json!({
@@ -578,6 +667,13 @@ fn perform_edit(path: &Path, req: &EditRequest) -> anyhow::Result<serde_json::Va
     });
     if let Some(seq) = journal_seq {
         response["journalSeq"] = json!(seq);
+    }
+    // A structural gesture mints (or dissolves) an id the client did not
+    // choose, so the response names it — the pane can reselect the new group
+    // without waiting to diff the next parse against the old one.
+    if let Some(s) = &structural {
+        response["group"] = json!(s.group);
+        response["members"] = json!(s.members);
     }
     Ok(response)
 }
@@ -926,8 +1022,9 @@ fn perform_export(req: &ExportRequest) -> anyhow::Result<serde_json::Value> {
     chimaera_board::normalize(&mut board);
     // Exports resolve `auto` (and an absent theme) dark — the pre-auto
     // default; the artifact is leaving the app, so there is no viewer mode
-    // for it to follow.
-    let theme = chimaera_board::theme::resolve_for_mode(board.theme.as_deref(), true, Some(&ws))?;
+    // for it to follow. A literal ground still overrules that: it travels with
+    // the artifact, so the ink has to match it in the deck, not just the pane.
+    let (theme, _) = resolve_theme(&board, board.theme.as_deref(), true, &ws)?;
     let fonts = FontStack::for_workspace(&ws);
     let stem = path
         .file_name()
@@ -1039,11 +1136,26 @@ fn journal_edit(
     req: &EditRequest,
     prior: Option<chimaera_board::schema::Frame>,
     arrange_priors: &std::collections::BTreeMap<String, chimaera_board::schema::Frame>,
+    structural: Option<&chimaera_board::arrange::Structural>,
 ) -> Option<u64> {
     use chimaera_board::journal::{Actor, Event, EventKind};
 
     let mut events = Vec::new();
 
+    // A structural gesture is not a move — nothing changed position. It puts
+    // a group object on the page or takes one off, which is exactly what the
+    // journal's object-added/object-removed pair already says; the members it
+    // wrapped or freed are the file's diff to tell.
+    if let Some(s) = structural {
+        let (object, kind, page) = (s.group.clone(), "group".to_string(), s.page.clone());
+        events.push(Event::new(
+            Actor::Human,
+            match s.op {
+                "ungroup" => EventKind::ObjectRemoved { object, kind, page },
+                _ => EventKind::ObjectAdded { object, kind, page },
+            },
+        ));
+    }
     // The arrange gesture narrates as one `move` per object that actually
     // moved (from the captured prior to the SAVED, post-normalize position) —
     // the closest existing event, reused rather than a new kind.
@@ -1802,6 +1914,44 @@ mod tests {
         (ws, path)
     }
 
+    /// The board an AGENT writes: a group whose `objects` carry page-absolute
+    /// geometry and whose own `at`/`size` are simply absent. `parse` does not
+    /// normalize, so nothing mints the envelope on load — this is the exact
+    /// shape of every group in a real authored deck.
+    fn hand_group_board(label: &str) -> (PathBuf, PathBuf) {
+        let ws = std::env::temp_dir().join(format!(
+            "chimaera-board-handgroup-{label}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(ws.join(".git")).unwrap();
+        let path = ws.join("deck.board");
+        let board: chimaera_board::Board = serde_json::from_str(
+            r#"{"format":"chimaera.board","formatVersion":1,
+                "canvas":{"size":[960,540]},
+                "pages":[{"id":"title","objects":[
+                  {"id":"loose","type":"shape","geo":"rect","at":[800,64],"size":[80,80]},
+                  {"id":"stage","type":"group","objects":[
+                    {"id":"disc","type":"shape","geo":"ellipse","at":[88,336],"size":[72,72]},
+                    {"id":"icon","type":"icon","name":"dna","at":[104,352],"size":[40,40]},
+                    {"id":"label","type":"text","at":[56,424],"size":[136,48],
+                     "text":"Personal genome"}]}]}]}"#,
+        )
+        .unwrap();
+        chimaera_board::save(&path, &board).unwrap();
+        // The fixture must reach the mutation path exactly as authored.
+        let reread = chimaera_board::load(&path).unwrap();
+        assert_eq!(
+            reread
+                .objects()
+                .find(|(_, o)| o.id() == "stage")
+                .and_then(|(_, o)| o.at()),
+            None,
+            "the fixture group stores no envelope"
+        );
+        (ws, path)
+    }
+
     fn arrange_req(path: &Path, op: &str, objects: &[&str]) -> EditRequest {
         EditRequest {
             path: path.to_string_lossy().into_owned(),
@@ -1894,6 +2044,149 @@ mod tests {
         let _ = std::fs::remove_dir_all(&ws);
     }
 
+    fn page_ids(board: &chimaera_board::Board) -> Vec<&str> {
+        board.pages[0].objects.iter().map(|o| o.id()).collect()
+    }
+
+    /// `group` wraps the selection in a new group at the topmost member's
+    /// place, mints an id in the crate's own shape, answers with it, and
+    /// journals the structural change as `object-added` — not as a move,
+    /// because nothing moved.
+    #[test]
+    fn arrange_group_wraps_the_selection_and_journals_object_added() {
+        let (ws, path) = layout_board("group");
+        let out = perform_edit(&path, &arrange_req(&path, "group", &["a", "b", "c"])).unwrap();
+        let id = out
+            .get("group")
+            .and_then(|g| g.as_str())
+            .unwrap()
+            .to_string();
+        assert_eq!(id, "p1-group-1");
+        assert_eq!(
+            out.get("members").unwrap(),
+            &serde_json::json!(["a", "b", "c"])
+        );
+
+        let board = chimaera_board::load(&path).unwrap();
+        // Topmost member was index 2, so the group takes index 0 and the
+        // pre-existing group `g` stays above it.
+        assert_eq!(page_ids(&board), [id.as_str(), "g"]);
+        let chimaera_board::Object::Group(new) = &board.pages[0].objects[0] else {
+            panic!("a group landed on the page");
+        };
+        assert_eq!(
+            new.objects.iter().map(|o| o.id()).collect::<Vec<_>>(),
+            ["a", "b", "c"]
+        );
+        // Members keep their page-absolute geometry; normalize mints the
+        // envelope from their union.
+        assert_eq!(at_of(&board, "a"), [80.0, 64.0]);
+        assert_eq!(at_of(&board, &id), [80.0, 64.0]);
+        assert_eq!(
+            new.size,
+            Some([480.0, 336.0]),
+            "union of a, b, c: [80,64]..[560,400]"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            chimaera_board::to_string(&board).unwrap()
+        );
+
+        let seq = out.get("journalSeq").and_then(|s| s.as_u64()).unwrap();
+        let journal_path = chimaera_board::journal::journal_path(&ws, &path);
+        let events = chimaera_board::journal::read_since(&journal_path, 0).unwrap();
+        assert_eq!(events.len(), 1, "no bogus move events ride along");
+        match &events.iter().find(|e| e.seq == seq).unwrap().kind {
+            chimaera_board::journal::EventKind::ObjectAdded { object, kind, page } => {
+                assert_eq!(
+                    (object.as_str(), kind.as_str(), page.as_str()),
+                    (id.as_str(), "group", "p1")
+                );
+            }
+            other => panic!("expected object-added, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// `ungroup` splices the children back at the group's own index — nothing
+    /// moves, the page reads identically — and journals `object-removed`.
+    /// Grouping then ungrouping is byte-identical to where it started.
+    #[test]
+    fn arrange_ungroup_dissolves_the_group_and_round_trips() {
+        let (ws, path) = layout_board("ungroup");
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let out = perform_edit(&path, &arrange_req(&path, "group", &["a", "b"])).unwrap();
+        let id = out
+            .get("group")
+            .and_then(|g| g.as_str())
+            .unwrap()
+            .to_string();
+        let board = chimaera_board::load(&path).unwrap();
+        assert_eq!(page_ids(&board), [id.as_str(), "c", "g"]);
+
+        let out = perform_edit(&path, &arrange_req(&path, "ungroup", &[&id])).unwrap();
+        assert_eq!(out.get("group").unwrap(), &serde_json::json!(id));
+        assert_eq!(out.get("members").unwrap(), &serde_json::json!(["a", "b"]));
+        let board = chimaera_board::load(&path).unwrap();
+        assert_eq!(page_ids(&board), ["a", "b", "c", "g"]);
+        assert_eq!(at_of(&board, "a"), [80.0, 64.0]);
+        assert_eq!(at_of(&board, "b"), [88.0, 200.0]);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "group→ungroup returns the file byte-for-byte"
+        );
+
+        let seq = out.get("journalSeq").and_then(|s| s.as_u64()).unwrap();
+        let journal_path = chimaera_board::journal::journal_path(&ws, &path);
+        let events = chimaera_board::journal::read_since(&journal_path, 0).unwrap();
+        match &events.iter().find(|e| e.seq == seq).unwrap().kind {
+            chimaera_board::journal::EventKind::ObjectRemoved { object, kind, page } => {
+                assert_eq!(
+                    (object.as_str(), kind.as_str(), page.as_str()),
+                    (id.as_str(), "group", "p1")
+                );
+            }
+            other => panic!("expected object-removed, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// Every structural refusal is a 422-class [`ArrangeRefused`] raised
+    /// before a byte is written — no board write, no journal line.
+    #[test]
+    fn structural_refusals_are_422_and_write_nothing() {
+        let (ws, path) = layout_board("structrefuse");
+        let before = std::fs::read_to_string(&path).unwrap();
+        let cases: &[(&str, &[&str], &str)] = &[
+            ("group", &["a"], "at least two"),
+            ("group", &["a", "a"], "named twice"),
+            ("group", &["a", "ghost"], "no object \"ghost\""),
+            // g1 is a child of `g`: grouping across nesting levels has no
+            // well-defined slice to lift.
+            ("group", &["a", "g1"], "not a top-level object"),
+            ("ungroup", &["a", "b"], "exactly one"),
+            ("ungroup", &["a"], "not a group"),
+            ("ungroup", &["ghost"], "no object \"ghost\""),
+        ];
+        for (op, ids, needle) in cases {
+            let err = perform_edit(&path, &arrange_req(&path, op, ids)).unwrap_err();
+            assert!(
+                err.downcast_ref::<ArrangeRefused>().is_some(),
+                "{op} {ids:?} must be 422-class: {err:#}"
+            );
+            assert!(
+                format!("{err:#}").contains(needle),
+                "{op} {ids:?}: expected {needle:?}, got {err:#}"
+            );
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        let journal_path = chimaera_board::journal::journal_path(&ws, &path);
+        assert!(!journal_path.exists(), "no journal for a refused gesture");
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
     /// Moving a group translates ALL its page-absolute children by the same
     /// delta, so group + 3 children shift together and stay internally
     /// consistent; the saved file is byte-canonical.
@@ -1931,6 +2224,36 @@ mod tests {
         let _ = std::fs::remove_dir_all(&ws);
     }
 
+    /// The regression that made "layers don't work the way you'd expect":
+    /// a group with NO stored envelope moves as a rigid unit anyway. Its
+    /// origin is the union of its children — the same frame normalize()
+    /// re-computes on save — so the delta is real and every child rides it.
+    #[test]
+    fn moving_a_group_with_no_stored_envelope_translates_its_children() {
+        let (ws, path) = hand_group_board("nostored");
+        // Union of the children is [56, 336]; ask for [136, 416] = delta [80, 80].
+        let mut req = edit_req(&path, "stage", serde_json::json!({}));
+        req.set = None;
+        req.at = Some([136.0, 416.0]);
+        perform_edit(&path, &req).unwrap();
+
+        let board = chimaera_board::load(&path).unwrap();
+        assert_eq!(
+            at_of(&board, "stage"),
+            [136.0, 416.0],
+            "the envelope normalize re-unions lands where the gesture asked"
+        );
+        assert_eq!(at_of(&board, "disc"), [168.0, 416.0]);
+        assert_eq!(at_of(&board, "icon"), [184.0, 432.0]);
+        assert_eq!(at_of(&board, "label"), [136.0, 504.0]);
+        assert_eq!(at_of(&board, "loose"), [800.0, 64.0], "untouched");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            chimaera_board::to_string(&board).unwrap()
+        );
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
     /// Moving a NON-group object stays a plain single-object move — the
     /// translate path collapses to `set_at` for a leaf.
     #[test]
@@ -1943,5 +2266,75 @@ mod tests {
         let board = chimaera_board::load(&path).unwrap();
         assert_eq!(at_of(&board, "c"), [320.0, 240.0]);
         let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    fn ground_board(background: &str) -> chimaera_board::Board {
+        serde_json::from_str(&format!(
+            r#"{{"format":"chimaera.board","formatVersion":1,
+                 "canvas":{{"size":[960,540],"background":"{background}"}},
+                 "pages":[{{"id":"p1","objects":[
+                   {{"id":"t","type":"text","at":[80,80],"size":[400,80],
+                    "text":["hello"]}}]}}]}}"#
+        ))
+        .unwrap()
+    }
+
+    /// The field regression: a board that pins NO theme but paints a literal
+    /// black canvas is unreadable in light mode — the ground is painted
+    /// verbatim while the ink follows the app. Rendering it with
+    /// `mode: "light"` must resolve the DARK variant anyway, and the picker's
+    /// scheme variants must follow the ground for the same reason.
+    #[test]
+    fn a_literal_black_ground_resolves_the_dark_variant_in_light_mode() {
+        let ws = std::env::temp_dir();
+        let board = ground_board("#000000");
+        assert!(board.theme.is_none(), "the board pins no theme");
+
+        let (theme, ground_dark) = resolve_theme(&board, None, false, &ws).unwrap();
+        assert_eq!(theme.id, "talk-dark", "the ground carries the variant");
+        assert!(ground_dark, "the picker's variants follow the ground too");
+        assert_eq!(
+            resolve_theme(&board, Some("figure"), false, &ws)
+                .unwrap()
+                .0
+                .id,
+            "figure-dark",
+            "a scheme was already following the mode; the ground redirects it"
+        );
+        // A pin is an explicit "ignore the mode" and survives the ground —
+        // saying so out loud is lint's job, not resolution's.
+        assert_eq!(
+            resolve_theme(&board, Some("talk-light"), false, &ws)
+                .unwrap()
+                .0
+                .id,
+            "talk-light"
+        );
+
+        // The cache: the key hashes the RESOLVED theme, so the two modes of a
+        // literal-ground board share one entry (they render the same pixels)
+        // while a token-ground board's modes stay distinct. A key that keyed
+        // on the requested mode would do the opposite of both.
+        let params = RasterParams {
+            scale: 2.0,
+            workspace: Some(ws.clone()),
+        };
+        let key = |b: &chimaera_board::Board, dark: bool| {
+            let t = resolve_theme(b, b.theme.as_deref(), dark, &ws).unwrap().0;
+            chimaera_board::render::render_key(
+                &chimaera_board::to_string(b).unwrap(),
+                &t,
+                0,
+                params.clone(),
+            )
+        };
+        assert_eq!(key(&board, false), key(&board, true));
+        let token = ground_board("@bg");
+        assert_eq!(
+            resolve_theme(&token, None, false, &ws).unwrap().0.id,
+            "talk-light",
+            "an @token ground resolves through the theme and fixes nothing"
+        );
+        assert_ne!(key(&token, false), key(&token, true));
     }
 }

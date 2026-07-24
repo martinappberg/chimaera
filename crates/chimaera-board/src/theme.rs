@@ -417,6 +417,49 @@ pub fn resolve_for_mode(
     }
 }
 
+/// Relative-luminance cut for [`mode_from_ground`]. WCAG luminance is heavily
+/// green-weighted and strongly non-linear, so mid-grey `#808080` lands near
+/// 0.216, not 0.5 — this sits above that so anything from black through a mid
+/// grey reads as a dark ground.
+const GROUND_DARK_MAX: f64 = 0.25;
+
+/// The appearance a **literal** ground implies, or `None` when the ground does
+/// not fix one.
+///
+/// A `canvas.background` written as a `#rrggbb` literal opts the ground out of
+/// the theme — it is painted verbatim, whatever the mode resolves to — while
+/// every `@token` on every object keeps following the mode. That split is a
+/// trap: a board with a literal black canvas viewed in a light app renders
+/// light-mode ink on black and is unreadable. So a literal ground is read as
+/// what it plainly is, a statement about the board's appearance, and the ink
+/// follows it.
+///
+/// An `@token` ground (`@bg`, `@surface`) resolves *through* the theme and
+/// therefore already tracks the mode — it fixes nothing and returns `None`.
+pub fn mode_from_ground(background: Option<&str>) -> Option<bool> {
+    parse_hex(background?).map(|c| c.luminance() < GROUND_DARK_MAX)
+}
+
+/// [`resolve_for_mode`], with a board's literal ground allowed to decide the
+/// appearance — the entry point every render path should use when it has the
+/// board in hand.
+///
+/// The ground only redirects the tiers that were *already* following the mode
+/// (`auto`, a scheme). A pinned concrete variant stays pinned: "ignore the
+/// app's mode" is itself an explicit choice, and quietly flipping it would make
+/// `theme` mean less than it says. Pinning a dark variant under a light literal
+/// ground is a genuine authoring mistake, and lint — not resolution — is where
+/// that gets said out loud.
+pub fn resolve_for_board(
+    reference: Option<&str>,
+    background: Option<&str>,
+    dark: bool,
+    workspace: Option<&Path>,
+) -> Result<Theme> {
+    let dark = mode_from_ground(background).unwrap_or(dark);
+    resolve_for_mode(reference, dark, workspace)
+}
+
 /// The bundled themes, as the very `.theme.json` documents `board init`
 /// writes out. Keeping them as source text rather than Rust literals means
 /// the shipped defaults are exercised through the same parser a user's theme
@@ -618,6 +661,63 @@ mod tests {
                 .unwrap()
                 .id,
             "figure-dark"
+        );
+    }
+
+    #[test]
+    fn a_literal_ground_picks_the_variant_but_a_token_ground_does_not() {
+        // Only a #hex literal fixes an appearance: it is painted verbatim, so
+        // the ink has to follow it or the board is unreadable in one mode.
+        assert_eq!(mode_from_ground(Some("#000000")), Some(true));
+        assert_eq!(mode_from_ground(Some("#0b0b0b")), Some(true));
+        assert_eq!(mode_from_ground(Some("#ffffff")), Some(false));
+        assert_eq!(mode_from_ground(Some("#fafafa")), Some(false));
+        // A token ground resolves through the theme, so it already tracks the
+        // mode and fixes nothing.
+        assert_eq!(mode_from_ground(Some("@bg")), None);
+        assert_eq!(mode_from_ground(Some("@surface")), None);
+        assert_eq!(mode_from_ground(None), None);
+
+        // The regression this exists for: an `auto` board with a literal black
+        // canvas, viewed in a LIGHT app, used to render light-mode ink on
+        // black. The ground now carries the variant with it.
+        assert_eq!(
+            resolve_for_board(None, Some("#000000"), false, None)
+                .unwrap()
+                .id,
+            "talk-dark"
+        );
+        assert_eq!(
+            resolve_for_board(Some("figure"), Some("#000000"), false, None)
+                .unwrap()
+                .id,
+            "figure-dark",
+            "a scheme was already following the mode; the ground redirects it"
+        );
+        assert_eq!(
+            resolve_for_board(Some("auto"), Some("#ffffff"), true, None)
+                .unwrap()
+                .id,
+            "talk-light"
+        );
+        // No literal ground: unchanged from resolve_for_mode.
+        assert_eq!(
+            resolve_for_board(None, None, true, None).unwrap().id,
+            "talk-dark"
+        );
+        assert_eq!(
+            resolve_for_board(None, Some("@bg"), false, None)
+                .unwrap()
+                .id,
+            "talk-light"
+        );
+        // A PINNED variant is an explicit "ignore the mode" and stays pinned —
+        // the conflict is lint's to report, not resolution's to paper over.
+        assert_eq!(
+            resolve_for_board(Some("talk-dark"), Some("#ffffff"), false, None)
+                .unwrap()
+                .id,
+            "talk-dark"
         );
     }
 

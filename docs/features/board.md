@@ -42,15 +42,30 @@ on the full `.board` (or legacy `.board.json`) suffix. Chat card:
   composites: `chart`, `diagram`, `panelLabel`, `scalebar`, `sigBracket`,
   `legend`, `colorbar`, `callout`, `inset` — each expands deterministically
   to primitives at render/export time.
-- **Groups are layers.** `{type:"group", objects:[…]}` is a z-order and
+- **Groups are movable layers.** `{type:"group", objects:[…]}` is a z-order and
   selection envelope — its children keep page-absolute `at`/`size` (ids,
   `describe`, journal moves, lint and merge stay identical whether grouped or
-  not), and the group box is just the union of what it holds. When authoring a
+  not), and the group box is **derived, never authoritative**: it is the union
+  of what the group holds (recursively, so a nested group contributes its own
+  computed envelope), which `normalize()` re-unions on every save. A
+  hand-authored group routinely carries no stored `at`/`size` at all; the
+  daemon's `group_envelope`/`effective_frame` (and the pane's mirror in
+  `boardInteract.ts`) recompute it, so a `move` on a group takes its delta from
+  the child union and translates every child as one rigid unit. When authoring a
   designed figure, wrap each logical region — a swimlane and its boxes, a panel
   and its parts, a node's box + icon + label — in a group instead of emitting a
   flat pile of loose objects: the pane's outline rail then shows it as a
-  collapsible layer, a `move` on the group translates all its children as a
-  unit, and the human can restyle the region at once. The guide's
+  collapsible layer, dragging the group moves all its children together, and the
+  human can restyle the region at once. Because a group envelope is mostly empty
+  space, the pane hit-tests a group by its *members*, not its bounding box: a
+  press over a member selects the group (a second press drills into the member),
+  while a press in the envelope's empty space falls through to whatever sits
+  beneath — so an unrelated object under a large group's envelope stays
+  reachable. Group/ungroup are direct gestures too: shift/⌘-click objects on
+  the stage and the pagebar's **align** popover offers **Group** (wrap the
+  selection, the new group becomes the draggable unit) and **Ungroup**
+  (dissolve, its members become page objects again) — structural `/board/edit`
+  ops the daemon answers with the minted/dissolved id. The guide's
   designed-figures section carries a fully-layered worked example, and
   `lint --style` nudges a busy figure with no groups toward layering.
 - **Connectors** bind endpoints to object box edges (`from`/`to`
@@ -136,11 +151,29 @@ on the full `.board` (or legacy `.board.json`) suffix. Chat card:
   app, the default + selected state; a scheme id; or `"pinned"`) and the
   available `schemes` (id + label + the variant resolved for this render's
   mode) — so the pane shows "Match app (default)" out of the box with schemes
-  (and grounds, via `canvas.background`) as overrides. `canvas.background` (an `@token` or `#hex`, normalize-validated by
-  form) repaints the ground under every page — the pane's rail has a
-  ground-token swatch row (+ "match theme" reset) writing it through the
-  board-level `canvasBackground` edit op, journaled as `canvas-changed`; a
-  page's own `background.fill` still wins.
+  (and grounds, via `canvas.background`) as overrides.
+- **A literal `#hex` ground picks the variant.** `canvas.background` (an
+  `@token` or `#hex`, normalize-validated by form) repaints the ground under
+  every page — but the two forms differ in *kind*, which is the split a field
+  test exposed. An `@token` ground resolves *through* the theme, so it keeps
+  following the app's mode. A **literal** `#rrggbb` is painted verbatim, opting
+  the ground out of the theme — so an `auto` board with a black `#000000`
+  canvas viewed in a *light* app used to render light-mode ink on black,
+  unreadable. The literal ground now decides the appearance: it is read as a
+  statement about the board, and the palette follows it (a dark literal → the
+  dark variant, regardless of the app's mode), for the tiers that were already
+  following the mode (`auto`, a scheme). A pinned concrete variant stays pinned
+  — "ignore the app's mode" is itself explicit, and that conflict is lint's to
+  flag, not resolution's to paper over. This lives in
+  `theme::mode_from_ground` / `theme::resolve_for_board`, which both render and
+  export funnel through (`board::resolve_theme`), so the cache keys on the
+  *effective* variant. The pane's rail states which one is in force: a
+  ground-token/white/black swatch row (+ "match theme" reset) writing through
+  the board-level `canvasBackground` edit op (journaled `canvas-changed`), and
+  a caption that reads "fixed `#hex` ground — it sets this board's light/dark,
+  not the app's mode" for a literal ground, "matches the app" for the default,
+  or "pinned" / "a scheme, still following the app's mode" otherwise. A page's
+  own `background.fill` still wins.
 - **Fonts are bundled, with a submission-safe default.** Four SIL OFL 1.1
   families are baked into the binary (`include_bytes!`, registered into the
   render `fontdb` on every stack) so a board draws the same face on a laptop and
@@ -187,7 +220,12 @@ whole tool in one call instead of exploring `--help`/the source; its examples
 are test-pinned runnable, including a **designed-figures** section — a complete,
 copy-worthy two-lane architecture board plus the routing/`size`/lane controls —
 so an agent composing an architecture diagram uses native shapes + bent
-connectors + icons rather than hand-authoring a non-editable SVG) ·
+connectors + icons rather than hand-authoring a non-editable SVG; plus the
+three rules a live field test proved agents lack: **export is ours** (a board
+leaves through `board export`, never a foreign converter), **evidence not a
+pitch** (title the finding, label measured vs modelled, numbers over
+adjectives), and the **closing lint** — theme margins, on-grid placement, and
+`lint --style` until clean before the board is handed over) ·
 `new` · `render` · `describe` (positions + slot resolutions + journal
 summary + chart provenance: `source` digest-verified fresh/stale, `inputs`,
 a `trace` excerpt) · `journal [--since N]` · `lint [--target PRESET] [--style]
@@ -290,6 +328,13 @@ variants — all off the single `page_svg` emission. Per-object export tiers
 (`native`/`grouped`/`vector`/`raster`) with reason strings, gated by preset
 `exportFloor` in `lint --target`.
 
+**Export is the only sanctioned way a board leaves chimaera** — the guide and
+`BOARD_SYSTEM_PROMPT` both say so, because a field-test agent handed the user
+a deck re-converted by a foreign HTML→pptx tool: 13 slides instead of 16, no
+editable objects, and a font hunt in desktop PowerPoint that was not ours to
+debug. Our writer stamps `docProps/app.xml` `Application: chimaera board`,
+which is how you tell a handed-over deck's origin in one command.
+
 Charts default to grouped editable shapes; `export --format pptx --charts
 native` opts into real `c:chart` parts with an embedded minimal workbook
 behind Edit Data, for charts that map cleanly (plain/grouped/stacked bars,
@@ -303,13 +348,20 @@ flattens `c:chart` to a non-editable object either way.
 
 Bearer-authed `POST /api/v1/board/render` (content-addressed cache — keyed by
 content *and* the render engine's version/epoch, so an upgraded daemon never
-serves the old engine's pixels — + diagnostics sidecar → `/raw` ticket),
-`/board/describe`, `/board/edit`
+serves the old engine's pixels — + diagnostics sidecar → `/raw` ticket; takes
+an optional `mode: "light"|"dark"` an `auto`/absent board theme resolves to,
+funnelled through `board::resolve_theme` → `theme::resolve_for_board` so a
+literal `#hex` ground outranks the mode and the response's `schemes[].variant`
+names the *effective* variant), `/board/describe`, `/board/edit`
 (move/resize/text/`set`/`canvasBackground` ops by object id, plus an
 `arrange` op — `{op, objects}` for align/distribute/`snap-grid` over a
-selection; a `move` on a `group` translates all its page-absolute children so
-the group moves as one unit; canonical save; appends actor-`human`
-journal events; returns `X-Mtime` + `journalSeq`), and `/board/export`
+selection, and the two structural verbs `group`/`ungroup` that rewrite the
+page's object tree and answer with the minted/dissolved `group` id + its
+`members`; a `move` on a `group` translates all its page-absolute children so
+the group moves as one unit, taking its delta from the child union; canonical
+save; appends actor-`human` journal events (a structural verb journals
+`object-added`/`object-removed`); returns `X-Mtime` + `journalSeq`), and
+`/board/export`
 (`{path, format, page?, chartsNative?}` → `{ticket, filename, pageCount}` +
 per-object `objects` fates for pptx; `chartsNative` is the CLI's
 `--charts native` and answers 422 off pptx; the ticket rides
@@ -326,7 +378,18 @@ page navigator, click-select, drag-move, corner resize handles, **actor-aware
 undo** (⌘Z never reverts agent work — mismatched entries drop with a toast),
 **present mode** (fullscreen, keyboard nav, `n` presenter notes, auto-hiding
 chrome), and **agent-edit attribution** (external changes flash an accent
-outline; own writes don't). Export lives in the pane too: a pagebar chip
+outline; own writes don't). The pane parses the board's bytes for its whole
+interaction model — hit-testing, the outline, the inspector, every commit
+anchor — so it reads the file **whole**, at the daemon's `/fs/file` ceiling
+(2 MB, `BOARD_MAX_BYTES`), not the code view's 256 KB chunk. The open costs
+exactly one whole-file read: the read gates on a settled `X-Mtime` token
+(seeded once, then moved only by an actual change) so the token *landing* never
+triggers a duplicate 2 MB read. A board past the ceiling — or one that failed
+to parse or read — is an **honest view-only degrade**: the stage still shows
+the engine's own (leniently-parsed) render and an agent can still edit the
+file, but the pane states in full that nothing here is selectable or editable,
+rather than presenting an empty rail as if the page had no objects. Export
+lives in the pane too: a pagebar chip
 opens a popover (pptx/pdf/svg/svg-outlined + the pptx-only native-charts
 toggle) whose pptx path shows the §11 fidelity preflight — the per-object
 fates from the very export the download button then hands over, never a
