@@ -7,7 +7,9 @@
   import {
     chartConfig,
     findMember,
+    GRID_PT,
     MARK_SWAP_KINDS,
+    snap8,
     SORT_OPTIONS,
     type ChildFrame,
     type ObjInfo,
@@ -59,6 +61,10 @@
      *  (null collapses back to the composite itself). */
     onselectchild: (parentId: string, childId: string | null) => void;
     oncommitfield: (field: "x" | "y" | "w" | "h", raw: string) => void;
+    /** Snap the selected object's frame onto the 8 pt grid in one commit — the
+     *  discoverable form of arrange's snap-grid (which needs a declared
+     *  `canvas.grid`). Idempotent; a no-op when already on-grid. */
+    oncommitsnap: () => void;
     /** Sparse config edit on the selected object (the /board/edit set op):
      *  dot-path → value, null clears. */
     oncommitset: (set: Record<string, unknown>) => void;
@@ -81,10 +87,23 @@
     onselect,
     onselectchild,
     oncommitfield,
+    oncommitsnap,
     oncommitset,
   }: Props = $props();
 
   const selectedObj = $derived(objects.find((o) => o.id === selected) ?? null);
+
+  /** Whether the selected object's frame sits off the 8 pt grid — the snap
+   *  button is only meaningful (and only enabled) then. A group is judged by
+   *  its `at`; its envelope w/h are its members' union, not a snap target. */
+  const offGrid = $derived.by<boolean>(() => {
+    const o = selectedObj;
+    if (o === null || o.at === null || o.size === null) return false;
+    const off = (v: number): boolean => snap8(v) !== v;
+    if (off(o.at[0]) || off(o.at[1])) return true;
+    if (o.kind === "group") return false;
+    return off(o.size[0]) || off(o.size[1]) || o.size[0] < GRID_PT || o.size[1] < GRID_PT;
+  });
 
   // --- the layer tree -----------------------------------------------------
   /** Top-level objects, group descendants, and composite children folded into
@@ -307,10 +326,20 @@
           readonly={selectedObj.kind === "group"}
           onchange={(e) => oncommitfield("h", (e.currentTarget as HTMLInputElement).value)} /></label>
       </div>
-      <div class="insp-unit">
-        {selectedObj.kind === "group"
-          ? "pt · x/y moves the whole group; w/h is the envelope its members union"
-          : "pt · snaps to the 8 pt grid"}
+      <div class="insp-unit insp-unit-row">
+        <span
+          >{selectedObj.kind === "group"
+            ? "pt · x/y moves the whole group; w/h is the envelope its members union"
+            : "pt · snaps to the 8 pt grid"}</span
+        >
+        <button
+          class="snap-btn"
+          disabled={!offGrid}
+          title={offGrid
+            ? "snap this object onto the 8 pt grid"
+            : "already on the 8 pt grid"}
+          onclick={() => oncommitsnap()}>Snap to grid</button
+        >
       </div>
       {#if chart !== null}
         <!-- Chart configuration: a chart is one declarative object; its
@@ -623,6 +652,34 @@
   .insp-unit.mono {
     font-family: var(--mono);
     color: var(--fg);
+  }
+  .insp-unit-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+  .insp-unit-row > span {
+    min-width: 0;
+  }
+  .snap-btn {
+    flex: none;
+    padding: 3px 8px;
+    font-size: var(--text-xs);
+    color: var(--fg);
+    background: var(--surface);
+    border: 1px solid var(--edge);
+    border-radius: 4px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .snap-btn:hover:not(:disabled) {
+    background: var(--row-hover);
+    border-color: var(--accent);
+  }
+  .snap-btn:disabled {
+    opacity: 0.4;
+    cursor: default;
   }
   .insp-sect {
     margin-top: 10px;

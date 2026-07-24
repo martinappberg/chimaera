@@ -1110,6 +1110,19 @@
     };
   });
 
+  /** The effective page-ground colour, for the drag-origin slot. A lifted
+   *  object is painted into the flattened board PNG we can't unpaint, so a
+   *  same-coloured cover over its origin is what makes it read as *moved*
+   *  rather than duplicated at both places. A literal `#hex` canvas.background
+   *  is the ground verbatim; otherwise the resolved theme's `@bg` swatch from
+   *  the render response. Null only when neither is known — the slot then
+   *  falls back to a CSS scrim, which still hides the double. */
+  const groundHex = $derived.by<string | null>(() => {
+    const bg = board?.canvasBackground;
+    if (typeof bg === "string" && /^#[0-9a-fA-F]{3,8}$/.test(bg)) return bg;
+    return render?.bgSwatches?.find((s) => s.token === "@bg")?.hex ?? null;
+  });
+
   /** The crop's live transform: a translate for a move, translate+scale for a
    *  resize, or the frozen drop transform between pointer-up and re-render. */
   const ghostTransform = $derived.by(() => {
@@ -1360,6 +1373,38 @@
       undoStack.push({ object: o.id, fields: [{ field: "size", from: o.size, to: size }] });
       void commit(o.id, { size });
     }
+  }
+
+  /** Snap the selected object's frame onto the 8 pt design grid in one commit
+   *  — the discoverable, always-available counterpart to `arrange`'s snap-grid
+   *  (which needs a declared `canvas.grid`). A drag already lands on-grid, so
+   *  this is for a hand-authored object placed at odd points. A group snaps by
+   *  its `at` only — its envelope w/h are re-unioned from its members, which
+   *  the edit route refuses to set directly. Idempotent: an already-snapped
+   *  object commits nothing. */
+  function commitSnap(): void {
+    const o = selectedObj;
+    if (o === null || o.at === null || o.size === null) return;
+    const isGroup = o.kind === "group";
+    const at: [number, number] = [snap8(o.at[0]), snap8(o.at[1])];
+    const size: [number, number] = isGroup
+      ? o.size
+      : [Math.max(GRID_PT, snap8(o.size[0])), Math.max(GRID_PT, snap8(o.size[1]))];
+    const atSame = samePair(at, o.at);
+    const sizeSame = isGroup || samePair(size, o.size);
+    if (atSame && sizeSame) return;
+    const fields: FieldChange[] = [];
+    const payload: { at?: [number, number]; size?: [number, number] } = {};
+    if (!atSame) {
+      fields.push({ field: "at", from: o.at, to: at });
+      payload.at = at;
+    }
+    if (!sizeSame) {
+      fields.push({ field: "size", from: o.size, to: size });
+      payload.size = size;
+    }
+    undoStack.push({ object: o.id, fields });
+    void commit(o.id, payload);
   }
 
   /** Inspector config commit (the chart section): one sparse `set` on the
@@ -2272,6 +2317,23 @@
                under the cursor at 60fps with no server round-trip. Held frozen
                at the drop until the fresh render swaps the real pixels in. -->
           {#if dragVisual !== null && ghostBox !== null && dragVisual.mode === "crop"}
+            <!-- The slot the lifted object leaves behind. The object is baked
+                 into the flattened board PNG under the ghost, so without this
+                 it shows in TWO places at once (origin + ghost). A ground-
+                 coloured cover over the origin hides the baked copy so the
+                 drag reads as a move. Lives for the whole ghost lifetime
+                 (through the frozen drop) so the original never flashes back
+                 before the re-render lands. No transform — it stays at the
+                 origin while the ghost travels. -->
+            <div
+              class="board-drag-slot"
+              class:has-ground={groundHex !== null}
+              style:left={`${ghostBox.left}px`}
+              style:top={`${ghostBox.top}px`}
+              style:width={`${ghostBox.width}px`}
+              style:height={`${ghostBox.height}px`}
+              style:background-color={groundHex ?? undefined}
+            ></div>
             <canvas
               bind:this={ghostCanvas}
               class="board-drag-ghost"
@@ -2739,6 +2801,7 @@
         childOverlay = null;
       }}
       oncommitfield={commitField}
+      oncommitsnap={commitSnap}
       oncommitset={commitSet}
     />
   {/if}
@@ -2827,6 +2890,25 @@
   .board-drag-ghost.frozen {
     /* Held at the drop until the fresh render lands — no shadow flicker. */
     box-shadow: none;
+  }
+  /* The slot a lifted object leaves at its origin. `background-color` is set
+     inline to the page ground so it hides the baked-in copy under the ghost;
+     the dashed inset reads it as an empty slot the object came from. Sits
+     under the ghost canvas (DOM order) so a short move still shows the ghost
+     on top of its own slot. */
+  .board-drag-slot {
+    position: absolute;
+    pointer-events: none;
+    border-radius: 2px;
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--fg) 16%, transparent);
+    outline: 1px dashed color-mix(in srgb, var(--fg) 26%, transparent);
+    outline-offset: -2px;
+  }
+  .board-drag-slot:not(.has-ground) {
+    /* Ground unknown (no literal canvas.background, no @bg swatch): a strong
+       scrim in the pane backdrop still hides the double rather than leaving it
+       painted twice. */
+    background-color: color-mix(in srgb, var(--term-bg) 92%, transparent);
   }
   /* The overlapped-object footprint: a clean translucent box, never a raster
      crop that would drag the pixels stacked on top of the object. */
