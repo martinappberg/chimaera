@@ -2844,6 +2844,13 @@
     align-items: center;
     justify-content: center;
     padding: 16px;
+    /* A neutral "desk" the board floats on, so a canvas of ANY ground colour
+       (a pinned-black figure in a light app, a white board in a dark one)
+       reads as sitting on a mat rather than glued straight onto the app
+       chrome. Theme-aware: a hair off the pane in both modes, which — with the
+       board's own shadow + edge — frames the canvas the way Keynote/Figma do.
+       Presenting mode overrides this below with a full black surround. */
+    background: color-mix(in srgb, var(--fg) 6%, var(--term-bg));
     /* Zoomed-in pixels overflow the fit box; clip them to the stage. */
     overflow: hidden;
     touch-action: none;
