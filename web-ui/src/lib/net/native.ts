@@ -87,6 +87,25 @@ export interface LocalDaemonState {
   dev_build: boolean;
 }
 
+/** Bounded first-paint palette persisted by the native shell per host. */
+export interface AppearanceBootstrap {
+  mode: "light" | "dark";
+  themeId: string;
+  background: string;
+  accent: string | null;
+}
+
+/**
+ * Keep the confirmed palette outside origin-scoped browser storage. Native
+ * daemon/tunnel ports are volatile, so the shell carries this snapshot into
+ * the next URL before its document is parsed.
+ */
+export async function cacheAppearanceBootstrap(
+  appearance: AppearanceBootstrap,
+): Promise<void> {
+  await tauri()?.core.invoke<void>("cache_appearance", { appearance });
+}
+
 export async function listHosts(): Promise<HostState[]> {
   const t = tauri();
   if (t === null) return [];

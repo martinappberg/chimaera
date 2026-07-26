@@ -29,6 +29,7 @@ pub const DAEMON_UI_COMMANDS: &[&str] = &[
     "caffeinate_state",
     "answer_askpass",
     "list_askpass",
+    "cache_appearance",
 ];
 
 // The application crate consumes only the daemon list at runtime; this list is

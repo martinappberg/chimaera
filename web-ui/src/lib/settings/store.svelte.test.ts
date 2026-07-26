@@ -2,9 +2,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
   api: vi.fn(),
+  cacheAppearanceBootstrap: vi.fn(),
 }));
 
 vi.mock("../net/api", () => ({ api: mocks.api }));
+vi.mock("../net/native", () => ({
+  cacheAppearanceBootstrap: mocks.cacheAppearanceBootstrap,
+}));
 
 const BOOTSTRAP_KEY = "chimaera.appearanceBootstrap.v1";
 
@@ -12,6 +16,13 @@ describe("settings appearance bootstrap", () => {
   beforeEach(() => {
     vi.resetModules();
     mocks.api.mockReset();
+    mocks.cacheAppearanceBootstrap.mockReset();
+    mocks.cacheAppearanceBootstrap.mockResolvedValue(undefined);
+    delete (
+      globalThis as typeof globalThis & {
+        __CHIMAERA_APPEARANCE_BOOTSTRAP__?: unknown;
+      }
+    ).__CHIMAERA_APPEARANCE_BOOTSTRAP__;
 
     const storage = new Map<string, string>();
     storage.set(
@@ -48,7 +59,31 @@ describe("settings appearance bootstrap", () => {
   });
 
   afterEach(() => {
+    delete (
+      globalThis as typeof globalThis & {
+        __CHIMAERA_APPEARANCE_BOOTSTRAP__?: unknown;
+      }
+    ).__CHIMAERA_APPEARANCE_BOOTSTRAP__;
     vi.unstubAllGlobals();
+  });
+
+  it("prefers a shell-carried snapshot over storage from a different origin visit", async () => {
+    (
+      globalThis as typeof globalThis & {
+        __CHIMAERA_APPEARANCE_BOOTSTRAP__?: unknown;
+      }
+    ).__CHIMAERA_APPEARANCE_BOOTSTRAP__ = {
+      mode: "light",
+      themeId: "chimaera-light",
+      background: "#fbfbfc",
+      accent: null,
+    };
+
+    await import("./store.svelte");
+
+    expect(document.documentElement.dataset.theme).toBe("light");
+    expect(document.documentElement.style.colorScheme).toBe("light");
+    expect(document.documentElement.style.getPropertyValue("--bg")).toBe("#fbfbfc");
   });
 
   it("replaces a stale bootstrap on the first authoritative frame after GET failure", async () => {
@@ -68,5 +103,11 @@ describe("settings appearance bootstrap", () => {
     expect(document.documentElement.style.colorScheme).toBe("light");
     expect(document.documentElement.style.getPropertyValue("--bg")).toBe("#fbfbfc");
     expect(document.documentElement.style.getPropertyValue("--accent")).toBe("#2e9e6b");
+    expect(mocks.cacheAppearanceBootstrap).toHaveBeenLastCalledWith({
+      mode: "light",
+      themeId: "chimaera-light",
+      background: "#fbfbfc",
+      accent: null,
+    });
   });
 });

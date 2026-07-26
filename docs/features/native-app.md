@@ -10,7 +10,7 @@ it talks to is a separate, longer-lived process (see
 **Where it lives:** `crates/chimaera-app/src/` — its own **standalone cargo workspace** (Tauri is
 kept out of the daemon workspace so musl/HPC builds stay lean). `main.rs` (three-role argv
 dispatch), `shell.rs` + `shell/{commands,connect,restore}.rs`, `daemon.rs`, `windows.rs`,
-`update.rs`, `askpass.rs`, `menu.rs`. UI bridge `web-ui/src/lib/net/native.ts`; toast
+`update.rs`, `askpass.rs`, `appearance.rs`, `menu.rs`. UI bridge `web-ui/src/lib/net/native.ts`; toast
 `web-ui/src/lib/workspace/{UpdateToast.svelte,update.svelte.ts}`. Rules:
 [rules/native-app.md](../../.claude/rules/native-app.md); map:
 [chimaera-app/AGENTS.md](../../crates/chimaera-app/AGENTS.md). Build with `just app-dev` / `just
@@ -57,9 +57,10 @@ app-build` (never the root `cargo`).
   window into an ordinary restorable workbench; the next New Window therefore creates a fresh Home
   without replacing any open workspace. The explicit new-window action (or Cmd/Ctrl-click) can still
   open another workbench directly. Restore retires duplicate unused Home records left by older builds.
-  The document head restores an origin-local bootstrap of the persisted Chimaera palette before the
-  module graph loads (system light/dark is the first-visit fallback), so newly created webviews never
-  expose WebKit's unthemed white canvas.
+  Before the module graph loads, the document head restores the persisted Chimaera palette from a
+  bounded per-host shell cache carried in the window URL. The cache is independent of volatile local
+  daemon and tunnel ports (with origin-local storage retained for browser tabs); system light/dark is
+  only the first-visit fallback, so new and re-homed webviews do not expose WebKit's unthemed white canvas.
   The shell is process-singleton because its registry, tunnels, and askpass endpoint are process-global;
   launching the app again raises the complete existing window set rather than starting a competing
   owner. On macOS, clicking the Dock icon likewise brings every Chimaera window forward while keeping

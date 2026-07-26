@@ -73,6 +73,7 @@ pub fn open_ui_window(
     record: &WindowRecord,
 ) -> tauri::Result<()> {
     let home_hub = record.alias.is_none() && record.ws.is_none() && record.compute.is_none();
+    let appearance = lock(&app.state::<Shell>().appearance).get(record.alias.as_deref());
     let url = daemon_window_url(
         port,
         token,
@@ -80,6 +81,7 @@ pub fn open_ui_window(
         record.ws.as_deref(),
         record.alias.as_deref(),
         home_hub,
+        appearance.as_ref(),
     )?;
     let title = match &record.alias {
         Some(alias) => format!("{alias} — chimaera"),
@@ -99,6 +101,7 @@ pub(super) fn daemon_window_url(
     ws: Option<&str>,
     alias: Option<&str>,
     home_hub: bool,
+    appearance: Option<&crate::appearance::AppearanceBootstrap>,
 ) -> tauri::Result<tauri::Url> {
     let mut hash = format!("token={}", urlencoding::encode(token));
     hash.push_str(&format!("&win={}", urlencoding::encode(stable_id)));
@@ -110,6 +113,10 @@ pub(super) fn daemon_window_url(
     }
     if home_hub {
         hash.push_str("&hub=1");
+    }
+    if let Some(appearance) = appearance {
+        hash.push_str("&appearance=");
+        hash.push_str(&urlencoding::encode(&appearance.json()));
     }
     format!("http://127.0.0.1:{port}/#{hash}")
         .parse()
@@ -130,7 +137,12 @@ pub(super) fn open_compute_window(
     record: &WindowRecord,
     scope_alias: &str,
 ) -> tauri::Result<()> {
-    let url = format!("{url}&win={}", urlencoding::encode(&record.id));
+    let mut url = format!("{url}&win={}", urlencoding::encode(&record.id));
+    let appearance = lock(&app.state::<Shell>().appearance).get(record.alias.as_deref());
+    if let Some(appearance) = appearance {
+        url.push_str("&appearance=");
+        url.push_str(&urlencoding::encode(&appearance.json()));
+    }
     let login_alias = record
         .alias
         .clone()

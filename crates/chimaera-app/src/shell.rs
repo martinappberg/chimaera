@@ -95,6 +95,9 @@ pub struct Shell {
     allowed_daemon_ports: Mutex<HashMap<String, u16>>,
     /// The persisted window set (windows.json) — what the next launch reopens.
     registry: Mutex<WindowRegistry>,
+    /// Last confirmed first-paint palette per host. Unlike web storage this
+    /// survives volatile daemon/tunnel ports and app restarts.
+    appearance: Mutex<crate::appearance::AppearanceCache>,
     /// Set on ExitRequested: window teardown during quit must NOT remove
     /// records from the registry, or quitting would forget every window.
     quitting: AtomicBool,
@@ -458,10 +461,45 @@ pub(crate) fn navigate_home_hub(
     if !previous_scope.home_hub || previous_scope.ws.is_some() {
         return Err(anyhow::anyhow!("this window is not the Home navigation hub").into());
     }
+    // A remote detail page is host-scoped, so navigating the only Home
+    // fallback there while another ssh owns authentication would unload its
+    // modal and make later prompts unreachable. Keep the fallback in place
+    // and let the user finish that authentication before changing hosts.
+    if let Some(target_alias) = alias.as_deref() {
+        let askpass = app.state::<crate::askpass::Askpass>();
+        let pending_other = askpass
+            .pending_scoped(&previous_scope)
+            .into_iter()
+            .find(|prompt| prompt.alias() != Some(target_alias))
+            .map(|prompt| prompt.alias().map(str::to_string));
+        let mut connecting_other: Vec<String> = lock(&shell.connecting)
+            .keys()
+            .filter(|candidate| candidate.as_str() != target_alias)
+            .cloned()
+            .collect();
+        connecting_other.sort();
+        if let Some(owner) = pending_other
+            .as_ref()
+            .and_then(Clone::clone)
+            .or_else(|| connecting_other.into_iter().next())
+        {
+            return Err(anyhow::anyhow!(
+                "finish authentication for {owner} before opening {target_alias}"
+            )
+            .into());
+        }
+        if pending_other.is_some() {
+            return Err(anyhow::anyhow!(
+                "finish the pending SSH authentication before opening {target_alias}"
+            )
+            .into());
+        }
+    }
     let previous_port = lock(&shell.allowed_daemon_ports)
         .get(window.label())
         .copied();
     let stable_id = previous_scope.stable_id.clone();
+    let appearance = lock(&shell.appearance).get(alias.as_deref());
     let mut url = restore::daemon_window_url(
         port,
         token,
@@ -469,6 +507,7 @@ pub(crate) fn navigate_home_hub(
         ws.as_deref(),
         alias.as_deref(),
         true,
+        appearance.as_ref(),
     )?;
     url.query_pairs_mut().append_pair(
         "home-nav",
@@ -700,6 +739,7 @@ pub(crate) fn finish_startup(handle: &tauri::AppHandle, local: LocalDaemon) -> t
             home_opening: Mutex::new(()),
             allowed_daemon_ports: Mutex::new(HashMap::new()),
             registry: Mutex::new(WindowRegistry::load_default()),
+            appearance: Mutex::new(crate::appearance::AppearanceCache::load_default()),
             quitting: AtomicBool::new(false),
             caffeinate: Mutex::new(None),
         });
@@ -786,6 +826,7 @@ pub fn run() {
             commands::caffeinate_state,
             commands::answer_askpass,
             commands::list_askpass,
+            commands::cache_appearance,
             commands::report_window_scope,
             commands::wsl_status,
             commands::wsl_install,

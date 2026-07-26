@@ -210,6 +210,7 @@
   import * as pool from "./lib/terminal/termPool";
   import * as chatPool from "./lib/chat/chatPool";
   import {
+    appearanceBootstrapForNavigation,
     applyRemoteSettings,
     flushSettings,
     getSetting,
@@ -424,6 +425,7 @@
       if (activeWsId !== null) params.set("ws", activeWsId);
       if (isHomeHub()) params.set("hub", "1");
       params.set("host", hostAlias);
+      params.set("appearance", JSON.stringify(appearanceBootstrapForNavigation()));
       if (jobCtx !== null) {
         params.set("job", jobCtx.jobId);
         if (jobCtx.node !== null) params.set("node", jobCtx.node);
@@ -1021,6 +1023,7 @@
           params.set("win", windowKey());
           if (activeWsId !== null) params.set("ws", activeWsId);
           if (isHomeHub()) params.set("hub", "1");
+          params.set("appearance", JSON.stringify(appearanceBootstrapForNavigation()));
           requireAssetNavigation(
             "build",
             `http://127.0.0.1:${port}/#${params.toString()}`,

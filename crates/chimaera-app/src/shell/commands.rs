@@ -843,6 +843,23 @@ pub(super) fn list_askpass(
     Ok(askpass.pending_scoped(&scope))
 }
 
+/// Remember the daemon-confirmed first-paint palette outside web storage.
+/// The calling window's shell-owned host scope is the cache key, so a remote
+/// page cannot overwrite another host's bootstrap by claiming an alias.
+#[tauri::command]
+pub(super) fn cache_appearance(
+    webview: tauri::WebviewWindow,
+    state: State<'_, Shell>,
+    appearance: crate::appearance::AppearanceBootstrap,
+) -> Result<(), String> {
+    let scope = state
+        .window_scope(webview.label())
+        .ok_or_else(|| "this window is not registered".to_string())?;
+    lock(&state.appearance)
+        .set(scope.alias.as_deref(), appearance)
+        .map_err(|error| format!("could not persist appearance: {error:#}"))
+}
+
 /// The SPA reporting what this window now shows — it swaps `ws` client-side,
 /// so the shell can't see it otherwise. Keyed by the calling window's label;
 /// the persisted record follows so the next launch reopens the window on

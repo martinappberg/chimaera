@@ -14,6 +14,10 @@
 
 import { api } from "../net/api";
 import {
+  cacheAppearanceBootstrap,
+  type AppearanceBootstrap,
+} from "../net/native";
+import {
   defaultValue,
   sanitize,
   settingDef,
@@ -26,28 +30,32 @@ const PUT_DEBOUNCE_MS = 400;
 /** Keep in lockstep with the pre-module bootstrap in web-ui/index.html. */
 const APPEARANCE_BOOTSTRAP_KEY = "chimaera.appearanceBootstrap.v1";
 
-interface AppearanceBootstrap {
-  mode: "light" | "dark";
-  themeId: string;
-  background: string;
-  accent: string | null;
+function isAppearanceBootstrap(
+  value: Partial<AppearanceBootstrap> | null | undefined,
+): value is AppearanceBootstrap {
+  return (
+    (value?.mode === "light" || value?.mode === "dark") &&
+    typeof value.themeId === "string" &&
+    typeof value.background === "string" &&
+    (value.accent === null || typeof value.accent === "string")
+  );
 }
 
-/** The last daemon-confirmed appearance for this origin. It bridges the short
- *  gap before `/settings` answers; the confirmed response always replaces it. */
+/** The last daemon-confirmed appearance carried by the native shell or saved
+ *  on this origin. It bridges the short gap before `/settings` answers; the
+ *  confirmed response always replaces it. */
 function readAppearanceBootstrap(): AppearanceBootstrap | null {
+  const carried = (
+    globalThis as typeof globalThis & {
+      __CHIMAERA_APPEARANCE_BOOTSTRAP__?: Partial<AppearanceBootstrap> | null;
+    }
+  ).__CHIMAERA_APPEARANCE_BOOTSTRAP__;
+  if (isAppearanceBootstrap(carried)) return carried;
   try {
     const value = JSON.parse(localStorage.getItem(APPEARANCE_BOOTSTRAP_KEY) ?? "null") as
       | Partial<AppearanceBootstrap>
       | null;
-    if (
-      (value?.mode === "light" || value?.mode === "dark") &&
-      typeof value.themeId === "string" &&
-      typeof value.background === "string" &&
-      (value.accent === null || typeof value.accent === "string")
-    ) {
-      return value as AppearanceBootstrap;
-    }
+    if (isAppearanceBootstrap(value)) return value;
   } catch {
     // Storage can be unavailable or from an older malformed build.
   }
@@ -231,11 +239,24 @@ export function resolvedTheme(): "light" | "dark" {
 
 // $state.raw: swapped wholesale on theme change, so Svelte consumers (the
 // accent swatch) track it while plain-TS consumers (termPool) just read it.
-let activeThemeDef = $state.raw<ThemeDef>(defaultThemeFor("light"));
+const initialThemeDef = defaultThemeFor("light");
+let activeThemeDef = $state.raw<ThemeDef>(initialThemeDef);
+let appliedAppearance: AppearanceBootstrap = {
+  mode: "light",
+  themeId: initialThemeDef.id,
+  background: initialThemeDef.tokens["--bg"],
+  accent: null,
+};
+let lastNativeAppearance = "";
 
 /** The full theme currently applied (termPool reads its ANSI palette). */
 export function activeTheme(): ThemeDef {
   return activeThemeDef;
+}
+
+/** Snapshot carried in native re-home URLs before the next origin paints. */
+export function appearanceBootstrapForNavigation(): AppearanceBootstrap {
+  return { ...appliedAppearance };
 }
 
 function applyAppearance(): void {
@@ -260,6 +281,12 @@ function applyAppearance(): void {
   const accent = bootstrapping
     ? (appearanceBootstrap.accent ?? "")
     : getSetting("appearance.accentColor");
+  appliedAppearance = {
+    mode,
+    themeId: theme.id,
+    background: theme.tokens["--bg"],
+    accent: accent === "" ? null : accent,
+  };
   // Always replace the bootstrap value. An empty user setting means the
   // selected theme's accent, not "leave whatever inline custom accent the
   // bootstrap installed". Themes live inline too, so removing the property
@@ -270,18 +297,18 @@ function applyAppearance(): void {
   // the module-load defaults pass; wait for a daemon-confirmed map or a local
   // edit.
   if (loaded || dirtySince !== null) {
+    const serialized = JSON.stringify(appliedAppearance);
     try {
-      localStorage.setItem(
-        APPEARANCE_BOOTSTRAP_KEY,
-        JSON.stringify({
-          mode,
-          themeId: theme.id,
-          background: theme.tokens["--bg"],
-          accent: accent === "" ? null : accent,
-        }),
-      );
+      localStorage.setItem(APPEARANCE_BOOTSTRAP_KEY, serialized);
     } catch {
       // Private/restricted storage: the system fallback in index.html holds.
+    }
+    if (serialized !== lastNativeAppearance) {
+      lastNativeAppearance = serialized;
+      void cacheAppearanceBootstrap(appliedAppearance).catch(() => {
+        // A browser has no shell, and a shell write failure must not disturb
+        // the live theme; this cache is only the next document's first paint.
+      });
     }
   }
 
