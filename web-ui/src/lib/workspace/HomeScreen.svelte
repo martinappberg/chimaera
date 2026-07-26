@@ -85,7 +85,7 @@
    *  local daemon doesn't have — which lands right back on the launcher (the
    *  "can't open a second workspace on a remote" bug). */
   const ownAlias = $derived(hostLabel === "local" ? null : hostLabel);
-  /** Back belongs to the singleton native navigation window, regardless of
+  /** Back belongs to the unused native launcher window, regardless of
    *  what kind of daemon the selected remote turns out to be. Compute-node
    *  detection only controls compute UI; it must never strand Home on a
    *  remote route without a way back. */

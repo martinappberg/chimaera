@@ -144,11 +144,12 @@ a `RemoteOps` trait. See also [native-app.md](native-app.md) for the windows/hos
 
 ## Remote host management (native app)
 
-- **What & when.** From the singleton local Home: enter a connected host's page, browse its workspaces,
-  and control its daemon. Connecting or selecting a host navigates that same Home window onto the
-  remote detail page; **Back to Home** navigates it back to the local daemon. No extra host-detail
-  window is created. Selecting a remote workspace continues in that window; only the explicit
-  new-window action opens another workbench window.
+- **What & when.** From the unused local Home launcher: enter a connected host's page, browse its
+  workspaces, and control its daemon. Connecting or selecting a host navigates that same launcher onto
+  the remote detail page; **Back to Home** navigates it back to the local daemon. No extra host-detail
+  window is created. Selecting a remote workspace promotes the launcher into an ordinary workbench;
+  a later New Window opens a fresh Home without replacing it. The explicit new-window action opens
+  another workbench directly.
 - **How it's used.** Connected host rows enter the host page and offer `end sessions` (kill everything
   on the host; the daemon + tunnel stay up), `disconnect` (tunnel down; sessions + daemon keep running),
   `shut down` (end sessions *and* stop the daemon, then drop the tunnel — the real off switch), and

@@ -515,9 +515,9 @@ export async function openWindow(
 }
 
 /**
- * Navigate the singleton native Home window to its local launcher, a connected
- * remote's detail page, or a workspace on that daemon. Only explicit
- * new-window gestures create another native workbench.
+ * Navigate the unused native launcher to local Home, a connected remote detail,
+ * or a workspace on that daemon. A workspace consumes the launcher and becomes
+ * an ordinary workbench; the next New Window can then create a fresh Home.
  */
 export async function navigateHome(alias: string | null, wsId: string | null = null): Promise<void> {
   const t = tauri();

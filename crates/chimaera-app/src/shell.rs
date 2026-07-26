@@ -113,9 +113,10 @@ pub struct WindowScope {
     pub alias: Option<String>,
     pub ws: Option<String>,
     pub stable_id: String,
-    /// This is the singleton navigation window, even while it temporarily
-    /// browses a remote host. Its registry record remains the local Home so
-    /// app restore never turns a transient detail route into another window.
+    /// This is the singleton launcher window, even while it temporarily
+    /// browses a remote host. Opening a workspace promotes it into an ordinary
+    /// restorable workspace window, leaving the next New Window free to create
+    /// a fresh Home launcher.
     home_hub: bool,
     /// Shell-owned askpass identity. This is separate from `alias`: compute
     /// windows use a composite alias for focus/liveness, but authenticate
@@ -186,6 +187,21 @@ impl WindowScope {
 
     pub(crate) fn allows_askpass(&self, prompt_alias: Option<&str>) -> bool {
         askpass_scope_matches(&self.askpass_scope, prompt_alias)
+    }
+
+    /// Apply the SPA's current route. Entering a workspace consumes the Home
+    /// launcher: it becomes a normal window and its broad startup-askpass
+    /// fallback narrows to this window's already shell-authorized host.
+    pub(crate) fn report_page_scope(&mut self, ws: Option<String>, label: String) {
+        if self.home_hub && ws.is_some() {
+            self.home_hub = false;
+            self.askpass_scope = self
+                .alias
+                .clone()
+                .map_or(AskpassScope::None, AskpassScope::Host);
+        }
+        self.ws = ws;
+        self.label = label;
     }
 }
 
@@ -384,9 +400,9 @@ pub(crate) fn raise_all_windows(app: &AppHandle) {
 
 /// Re-home the singleton navigation window onto the local daemon or one live
 /// remote tunnel, optionally scoped to a workspace. The shell updates its
-/// trusted host scope before navigation; the registry deliberately remains the
-/// local Home record because this is navigation, not a separately restorable
-/// native window.
+/// trusted host scope before navigation. Launcher/detail navigation keeps the
+/// local Home record; entering a workspace promotes and persists the window
+/// when the SPA reports that route.
 pub(crate) fn navigate_home_hub(
     app: &AppHandle,
     window: &tauri::WebviewWindow,
@@ -406,6 +422,7 @@ pub(crate) fn navigate_home_hub(
     let previous_port = lock(&shell.allowed_daemon_ports)
         .get(window.label())
         .copied();
+    let stable_id = previous_scope.stable_id.clone();
     let mut url = restore::daemon_window_url(
         port,
         token,
@@ -426,13 +443,13 @@ pub(crate) fn navigate_home_hub(
             .get_mut(window.label())
             .ok_or_else(|| anyhow::anyhow!("this window is not registered"))?;
         scope.alias = alias.clone();
-        scope.ws = ws.clone();
-        scope.label = match (&alias, &ws) {
+        let label = match (&alias, &ws) {
             (None, None) => "Home".to_string(),
             (Some(host), None) => format!("{host} Home"),
             (Some(host), Some(_)) => format!("{host} Workbench"),
             (None, Some(_)) => "Workbench".to_string(),
         };
+        scope.report_page_scope(ws.clone(), label);
     }
     if let Err(error) = window.navigate(url) {
         lock(&shell.windows).insert(window.label().to_string(), previous_scope);
@@ -447,6 +464,9 @@ pub(crate) fn navigate_home_hub(
         }
         return Err(error);
     }
+    if ws.is_some() && !stable_id.is_empty() {
+        lock(&shell.registry).set_scope(&stable_id, alias.clone(), ws);
+    }
 
     let title = alias.map_or_else(
         || "chimaera".to_string(),
@@ -458,10 +478,9 @@ pub(crate) fn navigate_home_hub(
     Ok(())
 }
 
-/// Show the one local Home window. Home is a singleton navigation hub: menu,
-/// tray, IPC, and recovery all route through this function so none of them can
-/// accidentally create a second copy. If the hub is browsing a remote host,
-/// showing Home navigates that same window back to the local daemon.
+/// Fulfil New Window with the one unused Home launcher. If a launcher/detail
+/// window exists, focus it (and re-home a remote detail); otherwise create a
+/// fresh Home without touching any ordinary workspace windows.
 pub(crate) fn show_local_home(
     app: &AppHandle,
     preferred_record: Option<WindowRecord>,
@@ -933,11 +952,18 @@ mod origin_tests {
     }
 
     #[test]
-    fn askpass_scope_is_immutable_and_explicit() {
+    fn askpass_scope_is_explicit_and_home_promotion_narrows_it() {
         let mut fallback = WindowScope::new(None, None, "home".into());
         assert!(fallback.allows_askpass(Some("remote-2")));
-        fallback.ws = Some("local-workspace".into());
-        assert!(fallback.allows_askpass(Some("remote-2")));
+        fallback.report_page_scope(Some("local-workspace".into()), "Workspace".into());
+        assert!(!fallback.home_hub);
+        assert!(!fallback.allows_askpass(Some("remote-2")));
+
+        let mut remote_hub = WindowScope::new(None, None, "remote-home".into());
+        remote_hub.alias = Some("Sherlock".into());
+        remote_hub.report_page_scope(Some("workspace".into()), "Sherlock Workspace".into());
+        assert!(!remote_hub.allows_askpass(Some("remote-2")));
+        assert!(remote_hub.allows_askpass(Some("Sherlock")));
 
         let local = WindowScope::new(None, Some("local-workspace".into()), "local".into());
         assert!(!local.allows_askpass(Some("remote-2")));

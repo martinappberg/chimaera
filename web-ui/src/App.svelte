@@ -6,6 +6,7 @@
     getHostLabel,
     getJobContext,
     getToken,
+    leaveHomeHub,
     notifyUnauthorized,
     pollHealth,
     setActiveWorkspaceId,
@@ -1968,6 +1969,10 @@
     void touchWorkspace(w.id).catch(() => {});
     const switched = activeWsId !== w.id;
     if (!switched) return;
+    // Home is the new-window launcher, not a permanent identity attached to
+    // this native window. Once it enters a workspace, a later New Window must
+    // be able to create a fresh Home without replacing this workbench.
+    if (activeWsId === null) leaveHomeHub();
     // Flush the outgoing workspace's pending layout write under its own key,
     // then restore (or default) the incoming workspace's tree.
     void flushViewState();

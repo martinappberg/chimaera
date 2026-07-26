@@ -742,10 +742,10 @@ pub(super) async fn open_window(
         .map_err(|e| format!("could not open window: {e}"))
 }
 
-/// Navigate the singleton Home hub to the local launcher, a connected remote's
-/// detail page, or a workspace on either daemon. This is deliberately distinct
-/// from `open_window`: browsing and ordinary workspace clicks replace the hub's
-/// current route instead of multiplying native windows.
+/// Navigate the unused Home launcher to the local launcher, a connected
+/// remote's detail page, or a workspace on either daemon. Browsing keeps the
+/// singleton launcher identity; a workspace consumes it and promotes the
+/// window into an ordinary workbench.
 #[tauri::command]
 pub(super) async fn navigate_home(
     app: AppHandle,
@@ -859,16 +859,13 @@ pub(super) fn report_window_scope(
     let scope = windows
         .get_mut(webview.label())
         .ok_or_else(|| "this window is not registered".to_string())?;
-    // The shell fixed the host when it created this window. A daemon-served
-    // page may report workspace/label changes, but must never rewrite its
-    // host to gain another remote's native command scope. The shell-owned
-    // askpass fallback capability is deliberately not derived from this
-    // mutable workspace report.
+    // The shell fixed the host when it created/navigated this window. A
+    // daemon-served page may report workspace/label changes, but must never
+    // rewrite its host to gain another remote's native command scope.
     if scope.alias != alias {
         return Err("a window cannot change its registered host".to_string());
     }
-    scope.ws = ws.clone();
-    scope.label = label.unwrap_or_default();
+    scope.report_page_scope(ws.clone(), label.unwrap_or_default());
     let stable_id = scope.stable_id.clone();
     let registered_alias = scope.alias.clone();
     let home_hub = scope.home_hub;

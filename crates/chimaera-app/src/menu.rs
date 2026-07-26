@@ -1,8 +1,8 @@
 //! Native menu: the shell finally owns the chords a browser reserves.
 //! Cmd+W closes the focused VIEW (the web UI decides what that means);
-//! Cmd+T / Cmd+Shift+T start sessions; Cmd+Shift+N shows the singleton Home
-//! window. Items the page handles are forwarded as a "menu" event to the
-//! focused window (see onMenu in native.ts).
+//! Cmd+T / Cmd+Shift+T start sessions; Cmd+Shift+N opens a New Window at Home
+//! (or focuses the one unused launcher). Items the page handles are forwarded
+//! as a "menu" event to the focused window (see onMenu in native.ts).
 
 use tauri::menu::{MenuBuilder, MenuItem, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder};
 use tauri::{App, AppHandle, Emitter, Manager, Wry};
@@ -52,7 +52,7 @@ pub fn install(app: &App) -> tauri::Result<()> {
 
     let file = SubmenuBuilder::new(handle, "File")
         .item(
-            &MenuItemBuilder::with_id("home", "Home")
+            &MenuItemBuilder::with_id("new-window", "New Window")
                 .accelerator("CmdOrCtrl+Shift+N")
                 .build(handle)?,
         )
@@ -120,7 +120,7 @@ pub fn install(app: &App) -> tauri::Result<()> {
     app.on_menu_event(|app: &AppHandle, event| {
         let id = event.id().0.as_str();
         match id {
-            "home" => {
+            "new-window" => {
                 let _ = crate::shell::show_local_home(app, None);
             }
             "quit" => crate::shell::request_quit(app),

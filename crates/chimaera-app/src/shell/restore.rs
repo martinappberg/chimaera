@@ -89,9 +89,9 @@ pub fn open_ui_window(
     open_shell_window(app, url.as_str(), &title, record, scope)
 }
 
-/// One daemon-served window URL. The singleton Home carries `hub=1` across
-/// local↔remote navigation so each origin clears stale workspace state while
-/// ordinary workspace clicks keep navigating this same window.
+/// One daemon-served window URL. The unused Home launcher carries `hub=1`
+/// across local↔remote navigation so each origin clears stale route state.
+/// Entering a workspace then promotes it into an ordinary workbench window.
 pub(super) fn daemon_window_url(
     port: u16,
     token: &str,

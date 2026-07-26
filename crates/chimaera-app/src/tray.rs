@@ -30,7 +30,7 @@ pub fn install(app: &App) -> tauri::Result<()> {
         .menu(&menu)
         .on_menu_event(|app: &AppHandle, event| match event.id().0.as_str() {
             "quit" => crate::shell::request_quit(app),
-            "tray-home" => show_home(app),
+            "tray-new-window" => show_home(app),
             "tray-caffeinate" => {
                 let _ = crate::shell::apply_caffeinate(app, !crate::shell::caffeinate_armed(app));
                 // On success the `caffeinate-changed` listener rebuilds the tray
@@ -92,8 +92,8 @@ pub fn rebuild(app: &AppHandle) {
 }
 
 /// The current menu: [macOS: Keep Awake ✓] · one item per open workspace window
-/// · Home · Quit. Rebuilt (not mutated) on every change so the check state
-/// and window list are always freshly correct.
+/// · New Window · Quit. Rebuilt (not mutated) on every change so the check
+/// state and window list are always freshly correct.
 fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
     let mut b = MenuBuilder::new(app);
 
@@ -119,11 +119,11 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
         b = b.separator();
     }
 
-    let home = MenuItemBuilder::with_id("tray-home", "Home").build(app)?;
+    let new_window = MenuItemBuilder::with_id("tray-new-window", "New Window").build(app)?;
     // Custom Quit (not predefined) so it flags the quit intent via
     // `request_quit` — see menu.rs and the CloseRequested handler.
     let quit = MenuItemBuilder::with_id("quit", "Quit Chimaera").build(app)?;
-    b = b.item(&home).separator().item(&quit);
+    b = b.item(&new_window).separator().item(&quit);
     b.build()
 }
 
@@ -166,7 +166,7 @@ fn focus_window(app: &AppHandle, label: &str) {
     }
 }
 
-/// Show the singleton local Home, creating it only when no copy exists.
+/// Open a new launcher at Home, or focus the existing unused launcher.
 fn show_home(app: &AppHandle) {
     let _ = crate::shell::show_local_home(app, None);
 }

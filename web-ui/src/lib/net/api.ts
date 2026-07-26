@@ -5,7 +5,7 @@ const WS_KEY = "chimaera.ws";
 const HOST_KEY = "chimaera.host";
 /** Same key viewState.windowKey() reads — the hash seeds it. */
 const WIN_KEY = "chimaera.win";
-/** The singleton native Home navigation window (local or remote detail). */
+/** The singleton unused native launcher (local Home or remote detail). */
 const HOME_HUB_KEY = "chimaera.homeHub";
 /** Set when this window was opened onto a compute-node daemon (Mode 2). */
 const JOB_KEY = "chimaera.job";
@@ -33,14 +33,19 @@ function initFromHash(): string | null {
   const jobFromHash = params.get("job");
   const nodeFromHash = params.get("node");
   if (homeHubFromHash) {
-    sessionStorage.setItem(HOME_HUB_KEY, "1");
-    // The hub is always a launcher/detail route, never a workspace or compute
-    // route. Each daemon origin has its own sessionStorage, so clear anything
-    // an earlier visit to that origin left behind.
+    // Each daemon origin has its own sessionStorage, so clear anything an
+    // earlier visit to that origin left behind before applying this route.
     sessionStorage.removeItem(WS_KEY);
     sessionStorage.removeItem(JOB_KEY);
     sessionStorage.removeItem(NODE_KEY);
     if (hostFromHash === null) sessionStorage.removeItem(HOST_KEY);
+    if (wsFromHash === null) {
+      sessionStorage.setItem(HOME_HUB_KEY, "1");
+    } else {
+      // A workspace consumes the launcher window. The native shell makes the
+      // same one-way promotion when the page reports its scope.
+      sessionStorage.removeItem(HOME_HUB_KEY);
+    }
   } else if (winFromHash !== null) {
     // A separately opened native workbench must not inherit hub semantics.
     sessionStorage.removeItem(HOME_HUB_KEY);
@@ -84,10 +89,15 @@ export function getToken(): string | null {
   return token;
 }
 
-/** True in the singleton native Home navigation window, including while it
- * is browsing a remote host's detail page. */
+/** True in the unused native launcher, including while it browses a remote
+ * host detail page. Entering a workspace clears this identity. */
 export function isHomeHub(): boolean {
   return sessionStorage.getItem(HOME_HUB_KEY) === "1";
+}
+
+/** A launcher that entered a workspace is now an ordinary workbench window. */
+export function leaveHomeHub(): void {
+  sessionStorage.removeItem(HOME_HUB_KEY);
 }
 
 /**

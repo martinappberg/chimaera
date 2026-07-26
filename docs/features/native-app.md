@@ -50,15 +50,16 @@ app-build` (never the root `cargo`).
   Closing a window removes its record (macOS convention) **except during quit** (guarded by an
   `AtomicBool quitting` so teardown doesn't forget every window). Geometry is stored in logical pixels
   (correct across scale factors) on a slow 2s tick. Closing the final window exits directly; the shell
-  never inserts an extra Home that needs a second close. The local **Home is a singleton navigation
-  window**: File/tray Home, IPC, recovery, and restore all raise the existing copy, restore retires
-  duplicate Home records left by older builds, and browsing a connected host navigates that same
-  window to its detail page. Back re-homes it onto the local daemon. Selecting a local or remote
-  workspace replaces the current launcher/detail route; only the explicit new-window action (or
-  Cmd/Ctrl-click) opens another workbench window. Opening a workspace already shown raises that window
-  instead of duplicating. The document head restores an origin-local bootstrap of the persisted
-  Chimaera palette before the module graph loads (system light/dark is the first-visit fallback), so
-  newly created webviews never expose WebKit's unthemed white canvas.
+  never inserts an extra Home that needs a second close. **Home is the New Window launcher**: File/tray
+  New Window creates a Home window when no unused launcher exists, otherwise it raises that singleton
+  launcher. Browsing a connected host navigates the launcher to its detail page and Back re-homes it
+  onto the local daemon. Selecting a local or remote workspace consumes the launcher and promotes that
+  window into an ordinary restorable workbench; the next New Window therefore creates a fresh Home
+  without replacing any open workspace. The explicit new-window action (or Cmd/Ctrl-click) can still
+  open another workbench directly. Restore retires duplicate unused Home records left by older builds.
+  The document head restores an origin-local bootstrap of the persisted Chimaera palette before the
+  module graph loads (system light/dark is the first-visit fallback), so newly created webviews never
+  expose WebKit's unthemed white canvas.
   The shell is process-singleton because its registry, tunnels, and askpass endpoint are process-global;
   launching the app again raises the complete existing window set rather than starting a competing
   owner. On macOS, clicking the Dock icon likewise brings every Chimaera window forward while keeping
@@ -127,15 +128,15 @@ app-build` (never the root `cargo`).
 ## Menu bar & tray
 
 - **Menu bar** (`menu.rs`): the macOS **Chimaera** submenu (About · **Settings…** ⌘, · Services ·
-  Hide/Hide Others/Show All · Quit), **File** (Home ⇧⌘N · New Terminal ⌘T · New Agent ⇧⌘T ·
+  Hide/Hide Others/Show All · Quit), **File** (New Window ⇧⌘N · New Terminal ⌘T · New Agent ⇧⌘T ·
   Close View ⌘W · Close Window; +Settings…/Quit on Windows/Linux, which have no app submenu),
   **Edit**, **View** (fullscreen), **Window**, and **Help** (About, non-macOS only). Items the page
   owns — `close-view`/`new-terminal`/`new-agent`/`settings` — are `emit_to`'d as a `menu` event to the
-  focused window (`onMenu` in `App.svelte`, via `native.ts`); Home is handled shell-side.
+  focused window (`onMenu` in `App.svelte`, via `native.ts`); New Window is handled shell-side.
   **Settings** is daemon-scoped: it opens the settings surface for the focused window's daemon (a
   remote window → the remote daemon's settings), same as the in-UI gear.
 - **System tray / menu-bar status item** (`tray.rs`, `tray-icon` feature): a persistent icon whose
-  menu lists the **open workspace windows** (click one to raise it), then Home and Quit — the
+  menu lists the **open workspace windows** (click one to raise it), then New Window and Quit — the
   entry point when all windows are closed but the app is still resident. The icon is a real
   **brand-mark template** (a C-in-hexagon monogram, black on transparent) that macOS tints to the
   menu-bar theme (`icon_as_template`) — not the full app icon, which the template mask would render as
