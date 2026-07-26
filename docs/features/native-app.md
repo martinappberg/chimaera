@@ -137,12 +137,12 @@ app-build` (never the root `cargo`).
   remote window → the remote daemon's settings), same as the in-UI gear.
 - **System tray / menu-bar status item** (`tray.rs`, `tray-icon` feature): a persistent icon whose
   menu lists the **open workspace windows** (click one to raise it), then New Window and Quit — the
-  entry point when all windows are closed but the app is still resident. The icon is a real
-  **brand-mark template** (a C-in-hexagon monogram, black on transparent) that macOS tints to the
-  menu-bar theme (`icon_as_template`) — not the full app icon, which the template mask would render as
-  a solid blob. On macOS the menu also carries the **Keep Awake** check item (see Caffeinate). The menu
-  is rebuilt via `tray::rebuild` on the events that change it (a window opens/closes/renames, caffeinate
-  flips).
+  tray stays available while any app window is open, but closing the final window exits the app
+  directly rather than leaving a windowless tray process. The icon is a real **brand-mark template**
+  (a C-in-hexagon monogram, black on transparent) that macOS tints to the menu-bar theme
+  (`icon_as_template`) — not the full app icon, which the template mask would render as a solid blob.
+  On macOS the menu also carries the **Keep Awake** check item (see Caffeinate). The menu is rebuilt
+  via `tray::rebuild` on the events that change it (a window opens/closes/renames, caffeinate flips).
   Enabling the feature pulls **libayatana-appindicator** into the Linux bundle (a packaging dependency).
 
 ## Caffeinate
