@@ -57,8 +57,13 @@ a `RemoteOps` trait. See also [native-app.md](native-app.md) for the windows/hos
   it registered when the window opened — a daemon-served page cannot widen it client-side. Startup
   registers a home fallback before launching restored remote connects when only local workspace
   windows were persisted, so an early password or 2FA prompt always has an eligible surface. A
-  window created as local Home retains that shell-owned fallback identity if it opens a workspace
-  while SSH is still waiting; mutable workspace reports cannot revoke or grant another host scope.
+  local Home that enters a workspace while an SSH flight or prompt is active first creates a
+  successor Home; only after that succeeds does the promoted workbench lose cross-host fallback
+  access and hand any visible pending prompt to the successor. If the successor cannot be created,
+  promotion is rolled back so authentication is never stranded. Local workspace windows therefore
+  never retain the fallback identity, and cross-daemon navigation stays non-privileged until the
+  allowed destination document commits; page reports may update workspace state but cannot rewrite
+  the shell-registered host.
   Compute windows store their login-host askpass identity separately from the composite per-job
   tunnel key, so the shape of an ordinary SSH alias can never imply access to another host's prompt.
 - **Liveness is an authenticated HTTP state machine, not a bare TCP connect.** After laptop sleep an
