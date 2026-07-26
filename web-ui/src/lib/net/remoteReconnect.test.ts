@@ -1,5 +1,31 @@
 import { describe, expect, it } from "vitest";
-import { selectRemoteReconnectSurface } from "./remoteReconnect";
+import {
+  createReconnectListenerGate,
+  selectRemoteReconnectSurface,
+} from "./remoteReconnect";
+
+describe("remote reconnect listener gate", () => {
+  it("does not start recovery before the non-replayed listener is attached", async () => {
+    const gate = createReconnectListenerGate();
+    let reconnectStarted = false;
+    const reconnect = gate.ready.then(() => {
+      reconnectStarted = true;
+    });
+
+    await Promise.resolve();
+    expect(reconnectStarted).toBe(false);
+
+    gate.attached();
+    await reconnect;
+    expect(reconnectStarted).toBe(true);
+  });
+
+  it("surfaces listener setup failure instead of waiting forever", async () => {
+    const gate = createReconnectListenerGate();
+    gate.failed(new Error("listener unavailable"));
+    await expect(gate.ready).rejects.toThrow("listener unavailable");
+  });
+});
 
 describe("remote reconnect recovery surface", () => {
   it("downgrades a dismissed failure to a persistent retry", () => {
