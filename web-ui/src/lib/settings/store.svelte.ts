@@ -60,6 +60,11 @@ const appearanceBootstrap =
 /** Sparse user map, exactly as stored in settings.json (unknown keys kept). */
 let user = $state<Record<string, unknown>>({});
 let loaded = $state(false);
+/** Whether a daemon-confirmed map has actually made it past the local-edit
+ *  guard. `loaded` also becomes true after a failed GET so the rest of the UI
+ *  can proceed with defaults; it therefore cannot identify the first
+ *  authoritative appearance frame. */
+let authoritativeSettingsApplied = false;
 
 const listeners = new Set<() => void>();
 let putTimer: ReturnType<typeof setTimeout> | null = null;
@@ -156,14 +161,15 @@ export async function flushSettings(): Promise<void> {
 
 /** A settings frame from /ws/events (including the echo of our own PUT). */
 export function applyRemoteSettings(map: Record<string, unknown>): void {
-  const firstLoad = !loaded;
   loaded = true;
   // Never clobber unsent local edits with an older broadcast.
   if (dirtySince !== null) return;
+  const firstAuthoritativeMap = !authoritativeSettingsApplied;
+  authoritativeSettingsApplied = true;
   if (JSON.stringify(map) === JSON.stringify(user)) {
     // The first confirmed empty/default map still needs to replace a stale
     // bootstrap cached by an older daemon setting.
-    if (firstLoad) applyAppearance();
+    if (firstAuthoritativeMap) applyAppearance();
     return;
   }
   user = map;

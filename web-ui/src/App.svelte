@@ -6,6 +6,7 @@
     getHostLabel,
     getJobContext,
     getToken,
+    isHomeHub,
     leaveHomeHub,
     notifyUnauthorized,
     pollHealth,
@@ -421,6 +422,7 @@
       if (token !== null) params.set("token", token);
       params.set("win", windowKey());
       if (activeWsId !== null) params.set("ws", activeWsId);
+      if (isHomeHub()) params.set("hub", "1");
       params.set("host", hostAlias);
       if (jobCtx !== null) {
         params.set("job", jobCtx.jobId);
@@ -1018,6 +1020,7 @@
           params.set("token", token);
           params.set("win", windowKey());
           if (activeWsId !== null) params.set("ws", activeWsId);
+          if (isHomeHub()) params.set("hub", "1");
           requireAssetNavigation(
             "build",
             `http://127.0.0.1:${port}/#${params.toString()}`,

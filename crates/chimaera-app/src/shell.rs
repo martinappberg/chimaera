@@ -189,6 +189,22 @@ impl WindowScope {
         askpass_scope_matches(&self.askpass_scope, prompt_alias)
     }
 
+    /// Apply a shell-owned Home navigation. The unused launcher is a broad
+    /// askpass fallback only while it is on the local Home screen: a remote
+    /// detail page may observe prompts for that host and no other, and entering
+    /// any workspace consumes the launcher altogether.
+    fn navigate_home(&mut self, alias: Option<String>, ws: Option<String>, label: String) {
+        self.alias = alias;
+        self.ws = ws;
+        self.label = label;
+        self.home_hub = self.ws.is_none();
+        self.askpass_scope = match &self.alias {
+            Some(alias) => AskpassScope::Host(alias.clone()),
+            None if self.home_hub => AskpassScope::Fallback,
+            None => AskpassScope::None,
+        };
+    }
+
     /// Apply the SPA's current route. Entering a workspace consumes the Home
     /// launcher: it becomes a normal window and its broad startup-askpass
     /// fallback narrows to this window's already shell-authorized host.
@@ -399,10 +415,15 @@ pub(crate) fn raise_all_windows(app: &AppHandle) {
 }
 
 /// Re-home the singleton navigation window onto the local daemon or one live
-/// remote tunnel, optionally scoped to a workspace. The shell updates its
-/// trusted host scope before navigation. Launcher/detail navigation keeps the
-/// local Home record; entering a workspace promotes and persists the window
-/// when the SPA reports that route.
+/// remote tunnel, optionally scoped to a workspace. Launcher/detail navigation
+/// keeps the local Home record; entering a workspace promotes and persists the
+/// window.
+///
+/// A Home hub can never contain an editable workspace: local workspace entry
+/// is an SPA route that immediately consumes the hub, while cross-daemon entry
+/// starts from a detail page with no workspace. That invariant is what makes
+/// this document navigation safe from the workbench's unsaved-edit
+/// `beforeunload` guard.
 pub(crate) fn navigate_home_hub(
     app: &AppHandle,
     window: &tauri::WebviewWindow,
@@ -416,7 +437,7 @@ pub(crate) fn navigate_home_hub(
         .get(window.label())
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("this window is not registered"))?;
-    if !previous_scope.home_hub {
+    if !previous_scope.home_hub || previous_scope.ws.is_some() {
         return Err(anyhow::anyhow!("this window is not the Home navigation hub").into());
     }
     let previous_port = lock(&shell.allowed_daemon_ports)
@@ -442,14 +463,13 @@ pub(crate) fn navigate_home_hub(
         let scope = windows
             .get_mut(window.label())
             .ok_or_else(|| anyhow::anyhow!("this window is not registered"))?;
-        scope.alias = alias.clone();
         let label = match (&alias, &ws) {
             (None, None) => "Home".to_string(),
             (Some(host), None) => format!("{host} Home"),
             (Some(host), Some(_)) => format!("{host} Workbench"),
             (None, Some(_)) => "Workbench".to_string(),
         };
-        scope.report_page_scope(ws.clone(), label);
+        scope.navigate_home(alias.clone(), ws.clone(), label);
     }
     if let Err(error) = window.navigate(url) {
         lock(&shell.windows).insert(window.label().to_string(), previous_scope);
@@ -960,10 +980,21 @@ mod origin_tests {
         assert!(!fallback.allows_askpass(Some("remote-2")));
 
         let mut remote_hub = WindowScope::new(None, None, "remote-home".into());
-        remote_hub.alias = Some("Sherlock".into());
-        remote_hub.report_page_scope(Some("workspace".into()), "Sherlock Workspace".into());
-        assert!(!remote_hub.allows_askpass(Some("remote-2")));
+        remote_hub.navigate_home(Some("Sherlock".into()), None, "Sherlock Home".into());
+        assert!(remote_hub.home_hub);
         assert!(remote_hub.allows_askpass(Some("Sherlock")));
+        assert!(!remote_hub.allows_askpass(Some("remote-2")));
+        assert!(!remote_hub.allows_askpass(None));
+        remote_hub.navigate_home(None, None, "Home".into());
+        assert!(remote_hub.allows_askpass(Some("remote-2")));
+        remote_hub.navigate_home(
+            Some("Sherlock".into()),
+            Some("workspace".into()),
+            "Sherlock Workspace".into(),
+        );
+        assert!(!remote_hub.home_hub);
+        assert!(remote_hub.allows_askpass(Some("Sherlock")));
+        assert!(!remote_hub.allows_askpass(Some("remote-2")));
 
         let local = WindowScope::new(None, Some("local-workspace".into()), "local".into());
         assert!(!local.allows_askpass(Some("remote-2")));
