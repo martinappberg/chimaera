@@ -131,6 +131,10 @@ pub struct WindowScope {
     /// reported by the SPA alongside the scope so the tray never has to read the
     /// racy OS titlebar. Empty until the first scope report lands.
     pub label: String,
+    /// Destination metadata is installed before `window.navigate`, but its
+    /// askpass privilege stays disabled until the new document starts. This
+    /// prevents the unloading origin from borrowing the destination's scope.
+    navigation_pending: bool,
 }
 
 #[derive(Clone, PartialEq)]
@@ -166,6 +170,7 @@ impl WindowScope {
             home_hub: askpass_scope == AskpassScope::Fallback,
             askpass_scope,
             label: String::new(),
+            navigation_pending: false,
         }
     }
 
@@ -185,6 +190,7 @@ impl WindowScope {
             home_hub: false,
             askpass_scope: AskpassScope::Host(login_alias),
             label: String::new(),
+            navigation_pending: false,
         }
     }
 
@@ -202,15 +208,30 @@ impl WindowScope {
         }
     }
 
+    pub(crate) fn navigation_pending(&self) -> bool {
+        self.navigation_pending
+    }
+
     /// Apply a shell-owned Home navigation. The unused launcher is a broad
     /// askpass fallback only while it is on the local Home screen: a remote
     /// detail page may observe prompts for that host and no other, and entering
     /// any workspace consumes the launcher altogether.
-    fn navigate_home(&mut self, alias: Option<String>, ws: Option<String>, label: String) {
+    fn begin_home_navigation(&mut self, alias: Option<String>, ws: Option<String>, label: String) {
         self.alias = alias;
         self.ws = ws;
         self.label = label;
         self.home_hub = self.ws.is_none();
+        self.askpass_scope = AskpassScope::None;
+        self.navigation_pending = true;
+    }
+
+    /// Activate the destination's prompt scope at page-start, after the old
+    /// document has gone but before the new document's scripts run.
+    fn complete_home_navigation(&mut self) {
+        if !self.navigation_pending {
+            return;
+        }
+        self.navigation_pending = false;
         self.askpass_scope = match &self.alias {
             Some(alias) => AskpassScope::Host(alias.clone()),
             None if self.home_hub => AskpassScope::Fallback,
@@ -224,6 +245,7 @@ impl WindowScope {
     /// retaining broad fallback askpass access.
     fn relinquish_home(&mut self) {
         self.home_hub = false;
+        self.navigation_pending = false;
         self.askpass_scope = self
             .alias
             .clone()
@@ -468,7 +490,10 @@ pub(crate) fn navigate_home_hub(
         .get(window.label())
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("this window is not registered"))?;
-    if !previous_scope.home_hub || previous_scope.ws.is_some() {
+    if !previous_scope.home_hub
+        || previous_scope.ws.is_some()
+        || previous_scope.navigation_pending()
+    {
         return Err(anyhow::anyhow!("this window is not the Home navigation hub").into());
     }
     // A remote detail page is host-scoped, so navigating the only Home
@@ -536,7 +561,7 @@ pub(crate) fn navigate_home_hub(
             (Some(host), Some(_)) => format!("{host} Workbench"),
             (None, Some(_)) => "Workbench".to_string(),
         };
-        scope.navigate_home(alias.clone(), ws.clone(), label);
+        scope.begin_home_navigation(alias.clone(), ws.clone(), label);
     }
     if let Err(error) = window.navigate(url) {
         lock(&shell.windows).insert(window.label().to_string(), previous_scope);
@@ -1055,18 +1080,26 @@ mod origin_tests {
         assert!(!fallback.allows_askpass(Some("remote-2")));
 
         let mut remote_hub = WindowScope::new(None, None, "remote-home".into());
-        remote_hub.navigate_home(Some("Sherlock".into()), None, "Sherlock Home".into());
+        remote_hub.begin_home_navigation(Some("Sherlock".into()), None, "Sherlock Home".into());
+        assert!(remote_hub.navigation_pending());
+        assert!(!remote_hub.allows_askpass(Some("Sherlock")));
+        assert!(!remote_hub.allows_askpass(Some("remote-2")));
+        remote_hub.complete_home_navigation();
         assert!(remote_hub.home_hub);
         assert!(remote_hub.allows_askpass(Some("Sherlock")));
         assert!(!remote_hub.allows_askpass(Some("remote-2")));
         assert!(!remote_hub.allows_askpass(None));
-        remote_hub.navigate_home(None, None, "Home".into());
+        remote_hub.begin_home_navigation(None, None, "Home".into());
+        assert!(!remote_hub.allows_askpass(Some("Sherlock")));
+        remote_hub.complete_home_navigation();
         assert!(remote_hub.allows_askpass(Some("remote-2")));
-        remote_hub.navigate_home(
+        remote_hub.begin_home_navigation(
             Some("Sherlock".into()),
             Some("workspace".into()),
             "Sherlock Workspace".into(),
         );
+        assert!(!remote_hub.allows_askpass(Some("Sherlock")));
+        remote_hub.complete_home_navigation();
         assert!(!remote_hub.home_hub);
         assert!(remote_hub.allows_askpass(Some("Sherlock")));
         assert!(!remote_hub.allows_askpass(Some("remote-2")));

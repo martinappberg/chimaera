@@ -855,6 +855,9 @@ pub(super) fn cache_appearance(
     let scope = state
         .window_scope(webview.label())
         .ok_or_else(|| "this window is not registered".to_string())?;
+    if scope.navigation_pending() {
+        return Err("this window is still navigating".to_string());
+    }
     lock(&state.appearance)
         .set(scope.appearance_alias(), appearance)
         .map_err(|error| format!("could not persist appearance: {error:#}"))
@@ -882,6 +885,9 @@ pub(super) fn report_window_scope(
     // rewrite its host to gain another remote's native command scope.
     if current.alias != alias {
         return Err("a window cannot change its registered host".to_string());
+    }
+    if current.navigation_pending() {
+        return Err("this window is still navigating".to_string());
     }
     // A local Home may still be the only eligible surface for password/2FA
     // while an SSH flight is running. Before consuming that launcher, arrange

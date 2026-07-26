@@ -171,9 +171,25 @@ fn open_shell_window(
     authorize_daemon_origin(app, &label, port)?;
     let navigation_app = app.clone();
     let navigation_label = label.clone();
+    let page_load_app = app.clone();
+    let page_load_label = label.clone();
     let mut builder = WebviewWindowBuilder::new(app, label.clone(), WebviewUrl::External(url))
         .on_navigation(move |url| {
             daemon_navigation_allowed(&navigation_app, &navigation_label, url)
+        })
+        .on_page_load(move |_window, payload| {
+            if !matches!(payload.event(), tauri::webview::PageLoadEvent::Started)
+                || !daemon_navigation_allowed(&page_load_app, &page_load_label, payload.url())
+            {
+                return;
+            }
+            let Some(shell) = page_load_app.try_state::<Shell>() else {
+                return;
+            };
+            let mut windows = lock(&shell.windows);
+            if let Some(scope) = windows.get_mut(&page_load_label) {
+                scope.complete_home_navigation();
+            }
         })
         .title(title)
         // Tauri's own drag-drop handler intercepts OS file drops and suppresses
