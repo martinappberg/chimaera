@@ -851,6 +851,7 @@ pub(super) fn list_askpass(
 pub(super) fn report_window_scope(
     webview: tauri::WebviewWindow,
     state: State<'_, Shell>,
+    askpass: State<'_, crate::askpass::Askpass>,
     alias: Option<String>,
     ws: Option<String>,
     label: Option<String>,
@@ -911,9 +912,21 @@ pub(super) fn report_window_scope(
     let stable_id = scope.stable_id.clone();
     let registered_alias = scope.alias.clone();
     let home_hub = scope.home_hub;
+    let reclaimed_scope = reclaimed_home.then(|| scope.clone());
     drop(windows);
     if (!home_hub || reclaimed_home) && !stable_id.is_empty() {
         lock(&state.registry).set_scope(&stable_id, registered_alias, ws);
+    }
+    // `AskpassModal` fetched pending prompts when this document mounted, back
+    // while a promoted workbench was ineligible. Re-emit every now-authorized
+    // prompt after it reclaims Home so closing the previous launcher cannot
+    // strand an already-waiting SSH password/2FA request.
+    if let Some(scope) = reclaimed_scope {
+        for prompt in askpass.pending_scoped(&scope) {
+            if let Err(error) = webview.emit("ssh-askpass", prompt) {
+                tracing::warn!(%error, window = webview.label(), "could not replay SSH prompt");
+            }
+        }
     }
     // The reported label names this window in the tray's list; rebuild so it
     // shows the fresh name (the store above happened before this call).

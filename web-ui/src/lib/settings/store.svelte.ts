@@ -250,6 +250,10 @@ function applyAppearance(): void {
   // data-theme keeps carrying the MODE (color-scheme + the app.css fallback
   // blocks); the palette itself lands inline, every theme treated alike.
   root.dataset.theme = mode;
+  // The pre-module bootstrap sets this inline to prevent a light native
+  // scrollbar flash. Keep that higher-specificity declaration synchronized
+  // once daemon settings (or a live user change) resolve a different mode.
+  root.style.colorScheme = mode;
   for (const [name, value] of Object.entries(theme.tokens)) {
     root.style.setProperty(name, value);
   }

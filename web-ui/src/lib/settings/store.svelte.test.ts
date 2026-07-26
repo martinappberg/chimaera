@@ -34,6 +34,7 @@ describe("settings appearance bootstrap", () => {
       documentElement: {
         dataset: {} as Record<string, string>,
         style: {
+          colorScheme: "",
           setProperty: (name: string, value: string) => properties.set(name, value),
           removeProperty: (name: string) => properties.delete(name),
           getPropertyValue: (name: string) => properties.get(name) ?? "",
@@ -55,6 +56,7 @@ describe("settings appearance bootstrap", () => {
     const store = await import("./store.svelte");
 
     expect(document.documentElement.dataset.theme).toBe("dark");
+    expect(document.documentElement.style.colorScheme).toBe("dark");
     expect(document.documentElement.style.getPropertyValue("--accent")).toBe("#ff00ff");
     await store.loadSettings();
     expect(store.settingsLoaded()).toBe(true);
@@ -63,6 +65,7 @@ describe("settings appearance bootstrap", () => {
     store.applyRemoteSettings({});
 
     expect(document.documentElement.dataset.theme).toBe("light");
+    expect(document.documentElement.style.colorScheme).toBe("light");
     expect(document.documentElement.style.getPropertyValue("--bg")).toBe("#fbfbfc");
     expect(document.documentElement.style.getPropertyValue("--accent")).toBe("#2e9e6b");
   });
