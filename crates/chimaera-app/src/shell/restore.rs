@@ -345,6 +345,14 @@ pub(super) fn restore_windows(handle: &AppHandle, port: u16, token: &str) -> tau
         let records = lock(&shell.registry).list();
         records
     };
+    let (records, duplicate_home_ids) = dedupe_local_homes(records);
+    if !duplicate_home_ids.is_empty() {
+        let shell = handle.state::<Shell>();
+        let mut registry = lock(&shell.registry);
+        for id in duplicate_home_ids {
+            registry.remove(&id);
+        }
+    }
     let mut opened = false;
     let mut home_opened = false;
     let mut remote_aliases: Vec<String> = Vec::new();
@@ -398,13 +406,34 @@ pub(super) fn restore_windows(handle: &AppHandle, port: u16, token: &str) -> tau
     Ok(())
 }
 
+/// Older builds allowed File → New Window to persist several local Home
+/// records. Keep the oldest stable identity and retire the rest before
+/// restoring, while leaving remote host pages and workspace windows alone.
+fn dedupe_local_homes(records: Vec<WindowRecord>) -> (Vec<WindowRecord>, Vec<String>) {
+    let mut saw_home = false;
+    let mut kept = Vec::with_capacity(records.len());
+    let mut duplicates = Vec::new();
+    for record in records {
+        let local_home = record.compute.is_none() && record.alias.is_none() && record.ws.is_none();
+        if local_home && std::mem::replace(&mut saw_home, true) {
+            duplicates.push(record.id);
+        } else {
+            kept.push(record);
+        }
+    }
+    (kept, duplicates)
+}
+
 fn needs_startup_home(opened: bool, home_opened: bool, has_remote: bool) -> bool {
     !opened || (has_remote && !home_opened)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{needs_startup_home, HealthConfidence, HEALTH_FAILURES_BEFORE_DOWN};
+    use super::{
+        dedupe_local_homes, needs_startup_home, HealthConfidence, HEALTH_FAILURES_BEFORE_DOWN,
+    };
+    use crate::windows::WindowRecord;
 
     #[test]
     fn startup_home_precedes_remote_auth_when_no_home_was_restored() {
@@ -446,5 +475,23 @@ mod tests {
         for expected in [None, None, Some(false)] {
             assert_eq!(health.sample(false), expected);
         }
+    }
+
+    #[test]
+    fn restore_keeps_one_local_home_without_collapsing_host_pages() {
+        let first = WindowRecord::new(None, None);
+        let duplicate = WindowRecord::new(None, None);
+        let remote = WindowRecord::new(Some("cluster".into()), None);
+        let workspace = WindowRecord::new(None, Some("ws-1".into()));
+        let first_id = first.id.clone();
+        let duplicate_id = duplicate.id.clone();
+        let remote_id = remote.id.clone();
+
+        let (kept, duplicates) = dedupe_local_homes(vec![first, remote, duplicate, workspace]);
+
+        assert_eq!(duplicates, vec![duplicate_id]);
+        assert!(kept.iter().any(|record| record.id == first_id));
+        assert!(kept.iter().any(|record| record.id == remote_id));
+        assert_eq!(kept.len(), 3);
     }
 }

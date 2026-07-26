@@ -10,6 +10,7 @@
     checkAppUpdate,
     connectComputeSession,
     connectHost,
+    closeThisWindow,
     disconnectHost,
     endHostSessions,
     isNativeShell,
@@ -340,6 +341,9 @@
       const state = await connectHost(alias, updateDaemon);
       hosts = hosts.map((h) => (h.alias === alias ? state : h));
       void refreshCompute(alias);
+      // Enter the host as soon as its tunnel is ready. The local Home remains
+      // behind as the durable hub; the host page's Back action returns to it.
+      await openWindow(alias, null);
       const list = await remoteWorkspaces(alias);
       remoteWs = new Map(remoteWs).set(
         alias,
@@ -724,6 +728,13 @@
       onOpen(w);
     }
   }
+
+  async function backToHome(): Promise<void> {
+    // Raise (or recreate) the singleton local Home before retiring this host
+    // page, so Back never exposes an unrelated window or an empty desktop.
+    await openWindow(null, null);
+    closeThisWindow();
+  }
 </script>
 
 <div class="home">
@@ -744,9 +755,26 @@
   {/if}
   <div class="inner">
     <header class="masthead">
-      <div class="brand">
-        <BrandMark size={24} draw title="chimaera" />
-        <h1>chimaera</h1>
+      <div class="masthead-leading">
+        {#if isHostPage}
+          <button class="back-home" aria-label="Back to Home" title="Back to Home" onclick={() => void backToHome()}>
+            <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+              <path
+                d="M10.5 3.5 6 8l4.5 4.5M6.5 8H14"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.4"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              />
+            </svg>
+            <span>Home</span>
+          </button>
+        {/if}
+        <div class="brand">
+          <BrandMark size={24} draw title="chimaera" />
+          <h1>chimaera</h1>
+        </div>
       </div>
       <div class="where" title={health?.hostname}>
         <span class="daemon-dot" class:ok={connected} aria-hidden="true"></span>
@@ -1326,6 +1354,37 @@
     justify-content: space-between;
     gap: 16px;
     flex-wrap: wrap;
+  }
+
+  .masthead-leading {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    min-width: 0;
+  }
+
+  .back-home {
+    appearance: none;
+    border: none;
+    background: none;
+    color: var(--muted);
+    font: inherit;
+    font-family: var(--mono);
+    font-size: var(--text-sm);
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 5px 7px 5px 4px;
+    border-radius: 5px;
+    cursor: pointer;
+    transition:
+      color 0.12s ease,
+      background-color 0.12s ease;
+  }
+
+  .back-home:hover {
+    color: var(--fg);
+    background: var(--row-hover);
   }
 
   /* Quiet build-parity note: a second masthead row, right-aligned under

@@ -1,6 +1,6 @@
 //! Native menu: the shell finally owns the chords a browser reserves.
 //! Cmd+W closes the focused VIEW (the web UI decides what that means);
-//! Cmd+T / Cmd+Shift+T start sessions; Cmd+Shift+N opens a fresh home
+//! Cmd+T / Cmd+Shift+T start sessions; Cmd+Shift+N shows the singleton Home
 //! window. Items the page handles are forwarded as a "menu" event to the
 //! focused window (see onMenu in native.ts).
 
@@ -52,7 +52,7 @@ pub fn install(app: &App) -> tauri::Result<()> {
 
     let file = SubmenuBuilder::new(handle, "File")
         .item(
-            &MenuItemBuilder::with_id("new-window", "New Window")
+            &MenuItemBuilder::with_id("home", "Home")
                 .accelerator("CmdOrCtrl+Shift+N")
                 .build(handle)?,
         )
@@ -120,19 +120,8 @@ pub fn install(app: &App) -> tauri::Result<()> {
     app.on_menu_event(|app: &AppHandle, event| {
         let id = event.id().0.as_str();
         match id {
-            "new-window" => {
-                if let Some(shell) = app.try_state::<crate::shell::Shell>() {
-                    let (port, token) = {
-                        let local = crate::shell::lock(&shell.local);
-                        (local.port, local.token.clone())
-                    };
-                    let _ = crate::shell::open_ui_window(
-                        app,
-                        port,
-                        &token,
-                        &crate::windows::WindowRecord::new(None, None),
-                    );
-                }
+            "home" => {
+                let _ = crate::shell::show_local_home(app, None);
             }
             "quit" => crate::shell::request_quit(app),
             "close-view" | "new-terminal" | "new-agent" | "settings" => {

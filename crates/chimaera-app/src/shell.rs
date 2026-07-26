@@ -78,6 +78,10 @@ pub struct Shell {
     /// duplicate). The SPA reports its own scope because it swaps `ws`
     /// client-side without a shell round-trip.
     windows: Mutex<HashMap<String, WindowScope>>,
+    /// Serializes the check-or-create path for the singleton local Home. IPC
+    /// commands can arrive concurrently, so inspecting `windows` and opening
+    /// without this gate would leave a narrow duplicate-window race.
+    home_opening: Mutex<()>,
     /// The only loopback port each daemon window may navigate to right now.
     /// Runtime ACLs are additive, so this guard also makes an origin granted
     /// before a reconnect unusable if its port is later recycled.
@@ -324,6 +328,80 @@ pub(crate) fn request_quit(app: &AppHandle) {
     app.exit(0);
 }
 
+/// Bring every native window into the app's foreground, preserving the
+/// currently focused window as the frontmost one. macOS emits `Reopen` when
+/// the Dock icon is clicked; the single-instance callback uses the same path
+/// for a repeated launch. Focusing each window once raises the whole window
+/// set above other applications (only one OS window can remain focused).
+pub(crate) fn raise_all_windows(app: &AppHandle) {
+    #[cfg(target_os = "macos")]
+    let _ = app.show();
+
+    let mut windows: Vec<_> = app.webview_windows().into_values().collect();
+    windows.sort_by(|a, b| a.label().cmp(b.label()));
+    let front = windows
+        .iter()
+        .find(|window| window.is_focused().unwrap_or(false))
+        .map(|window| window.label().to_string())
+        .or_else(|| {
+            app.try_state::<Shell>().and_then(|shell| {
+                lock(&shell.windows)
+                    .iter()
+                    .find(|(_, scope)| scope.alias.is_none() && scope.ws.is_none())
+                    .map(|(label, _)| label.clone())
+            })
+        })
+        .or_else(|| windows.last().map(|window| window.label().to_string()));
+
+    for window in windows
+        .iter()
+        .filter(|window| Some(window.label()) != front.as_deref())
+    {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+    if let Some(label) = front {
+        if let Some(window) = app.get_webview_window(&label) {
+            let _ = window.unminimize();
+            let _ = window.show();
+            let _ = window.set_focus();
+        }
+    }
+}
+
+/// Show the one local Home window. Home is a singleton navigation hub: menu,
+/// tray, IPC, recovery, and last-window fallback all route through this
+/// function so none of them can accidentally create a second copy.
+pub(crate) fn show_local_home(
+    app: &AppHandle,
+    preferred_record: Option<WindowRecord>,
+) -> tauri::Result<()> {
+    if let Some(shell) = app.try_state::<Shell>() {
+        let _opening = lock(&shell.home_opening);
+        let existing = lock(&shell.windows)
+            .iter()
+            .find(|(_, scope)| scope.alias.is_none() && scope.ws.is_none())
+            .map(|(label, _)| label.clone());
+        if let Some(label) = existing {
+            if let Some(window) = app.get_webview_window(&label) {
+                window.unminimize()?;
+                window.show()?;
+                window.set_focus()?;
+                return Ok(());
+            }
+        }
+
+        let (port, token) = {
+            let local = lock(&shell.local);
+            (local.port, local.token.clone())
+        };
+        let record = preferred_record.unwrap_or_else(|| WindowRecord::new(None, None));
+        return open_ui_window(app, port, &token, &record);
+    }
+    Ok(())
+}
+
 /// Whether the currently-focused window has a workspace open (vs the home
 /// screen or no window focused). Drives the menu's Settings item, which is
 /// workspace/daemon-scoped. Reads the scope map (populated by `open_ui_window`
@@ -429,9 +507,9 @@ pub(crate) fn release_startup(success: bool) {
 /// wizard lingered — open the home window so retiring the wizard can never
 /// leave the app window-less (last-window-closed would exit it).
 pub(crate) fn recover_windows(handle: &tauri::AppHandle) {
-    let Some(shell) = handle.try_state::<Shell>() else {
+    if handle.try_state::<Shell>().is_none() {
         return;
-    };
+    }
     let has_real = handle
         .webview_windows()
         .keys()
@@ -439,11 +517,7 @@ pub(crate) fn recover_windows(handle: &tauri::AppHandle) {
     if has_real {
         return;
     }
-    let (port, token) = {
-        let local = lock(&shell.local);
-        (local.port, local.token.clone())
-    };
-    if let Err(e) = open_ui_window(handle, port, &token, &WindowRecord::new(None, None)) {
+    if let Err(e) = show_local_home(handle, None) {
         tracing::error!("could not recover a home window: {e}");
     }
 }
@@ -469,6 +543,7 @@ pub(crate) fn finish_startup(handle: &tauri::AppHandle, local: LocalDaemon) -> t
             compute_connecting: Mutex::new(std::collections::HashSet::new()),
             connecting: Mutex::new(HashMap::new()),
             windows: Mutex::new(HashMap::new()),
+            home_opening: Mutex::new(()),
             allowed_daemon_ports: Mutex::new(HashMap::new()),
             registry: Mutex::new(WindowRegistry::load_default()),
             quitting: AtomicBool::new(false),
@@ -525,19 +600,10 @@ pub fn run() {
         // Must be registered first: the plugin intercepts a second launch
         // before any other plugin or process-global shell resource starts.
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            // Bring the existing instance forward. During the first process's
-            // early daemon startup there may not be a window yet; its normal
-            // startup path will open one as soon as the daemon is ready.
-            let windows = app.webview_windows();
-            let target = windows
-                .values()
-                .find(|window| window.is_focused().unwrap_or(false))
-                .or_else(|| windows.values().next());
-            if let Some(window) = target {
-                let _ = window.unminimize();
-                let _ = window.show();
-                let _ = window.set_focus();
-            }
+            // Bring the existing instance's complete window set forward.
+            // During early daemon startup there may not be a window yet; the
+            // normal startup path opens Home as soon as the daemon is ready.
+            raise_all_windows(app);
         }))
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_clipboard_manager::init())
@@ -620,10 +686,6 @@ pub fn run() {
                     if is_home {
                         return; // closing the home screen itself exits the app
                     }
-                    let (port, token) = {
-                        let local = lock(&shell.local);
-                        (local.port, local.token.clone())
-                    };
                     // Reopen home where this window sat, so it doesn't jump.
                     let mut record = WindowRecord::new(None, None);
                     let scale = window.scale_factor().unwrap_or(1.0);
@@ -635,7 +697,7 @@ pub fn run() {
                         record.width = Some(size.width);
                         record.height = Some(size.height);
                     }
-                    if let Err(e) = open_ui_window(app, port, &token, &record) {
+                    if let Err(e) = show_local_home(app, Some(record)) {
                         // Couldn't open home — keep THIS window rather than
                         // exiting into nothing. Veto the close and forget it.
                         tracing::error!("could not open home window on last-window close: {e}");
@@ -764,6 +826,11 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building chimaera")
         .run(|app, event| match event {
+            // Clicking the macOS Dock icon activates the whole workbench, not
+            // an arbitrary single window. Raise every Chimaera window and
+            // restore focus to whichever one was active before the click.
+            #[cfg(target_os = "macos")]
+            tauri::RunEvent::Reopen { .. } => raise_all_windows(app),
             // Quit teardown destroys every window; flag it FIRST so those
             // Destroyed events keep the registry intact for the next launch.
             tauri::RunEvent::ExitRequested { .. } => {

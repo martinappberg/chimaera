@@ -144,11 +144,14 @@ a `RemoteOps` trait. See also [native-app.md](native-app.md) for the windows/hos
 
 ## Remote host management (native app)
 
-- **What & when.** From the home screen: browse a connected host's workspaces, and control its daemon.
-- **How it's used.** Connected host rows offer `end sessions` (kill everything on the host; the daemon
-  + tunnel stay up), `disconnect` (tunnel down; sessions + daemon keep running), `shut down` (end
-  sessions *and* stop the daemon, then drop the tunnel — the real off switch), and forget (`×`). An
-  outdated remote daemon offers an inline "update" that reconnects with `updateDaemon=true`.
+- **What & when.** From the singleton local Home: enter a connected host's page, browse its workspaces,
+  and control its daemon. A newly connected host opens automatically; **Back to Home** closes that host
+  page and raises the original local Home.
+- **How it's used.** Connected host rows enter the host page and offer `end sessions` (kill everything
+  on the host; the daemon + tunnel stay up), `disconnect` (tunnel down; sessions + daemon keep running),
+  `shut down` (end sessions *and* stop the daemon, then drop the tunnel — the real off switch), and
+  forget (`×`). An outdated remote daemon offers an inline "update" that reconnects with
+  `updateDaemon=true`.
 - **Where it lives.** `crates/chimaera-app/src/shell/commands.rs` (`end_host_sessions`,
   `disconnect_host`, `shutdown_host`, `remote_workspaces`); daemon side `DELETE /api/v1/sessions` and
   `POST /api/v1/shutdown` through the tunnel.

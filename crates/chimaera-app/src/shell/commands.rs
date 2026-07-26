@@ -710,6 +710,12 @@ pub(super) async fn open_window(
 ) -> Result<(), String> {
     let new_window = new_window.unwrap_or(false);
     tracing::info!("ipc: open_window alias={alias:?} ws={ws_id:?} new_window={new_window}");
+    // Home is the one exception to explicit `new_window`: it is the app's
+    // singleton navigation hub, so every route raises or recreates that same
+    // surface instead of multiplying blank launchers.
+    if alias.is_none() && ws_id.is_none() {
+        return super::show_local_home(&app, None).map_err(|e| format!("could not show Home: {e}"));
+    }
     if !new_window {
         if let Some(label) = find_by_scope(&state.windows, &alias, &ws_id, None) {
             if let Some(win) = app.get_webview_window(&label) {
