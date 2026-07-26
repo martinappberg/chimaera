@@ -856,7 +856,7 @@ pub(super) fn cache_appearance(
         .window_scope(webview.label())
         .ok_or_else(|| "this window is not registered".to_string())?;
     lock(&state.appearance)
-        .set(scope.alias.as_deref(), appearance)
+        .set(scope.appearance_alias(), appearance)
         .map_err(|error| format!("could not persist appearance: {error:#}"))
 }
 

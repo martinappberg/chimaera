@@ -192,6 +192,16 @@ impl WindowScope {
         askpass_scope_matches(&self.askpass_scope, prompt_alias)
     }
 
+    /// Stable host identity for shell-owned per-host caches. Compute windows
+    /// display a composite job alias but authenticate through (and inherit
+    /// appearance from) their login host.
+    pub(crate) fn appearance_alias(&self) -> Option<&str> {
+        match &self.askpass_scope {
+            AskpassScope::Host(alias) => Some(alias),
+            AskpassScope::None | AskpassScope::Fallback => None,
+        }
+    }
+
     /// Apply a shell-owned Home navigation. The unused launcher is a broad
     /// askpass fallback only while it is on the local Home screen: a remote
     /// detail page may observe prompts for that host and no other, and entering
@@ -1063,6 +1073,7 @@ mod origin_tests {
 
         let local = WindowScope::new(None, Some("local-workspace".into()), "local".into());
         assert!(!local.allows_askpass(Some("remote-2")));
+        assert_eq!(local.appearance_alias(), None);
 
         let remote = WindowScope::new(
             Some("Sherlock".into()),
@@ -1085,6 +1096,7 @@ mod origin_tests {
             "colliding-remote".into(),
         );
         assert!(!colliding_remote.allows_askpass(Some("Sherlock")));
+        assert_eq!(colliding_remote.appearance_alias(), Some("Sherlock#job123"));
 
         let compute = WindowScope::new_compute(
             "Sherlock#job123".into(),
@@ -1094,5 +1106,6 @@ mod origin_tests {
         );
         assert!(compute.allows_askpass(Some("Sherlock")));
         assert!(!compute.allows_askpass(Some("Sherlock#job123")));
+        assert_eq!(compute.appearance_alias(), Some("Sherlock"));
     }
 }

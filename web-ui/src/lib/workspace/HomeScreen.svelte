@@ -358,6 +358,18 @@
     }
   }
 
+  async function navigateHost(alias: string, wsId: string | null = null): Promise<void> {
+    hostErrors = mapWithout(hostErrors, alias);
+    try {
+      await navigateHome(alias, wsId);
+    } catch (error) {
+      hostErrors = new Map(hostErrors).set(
+        alias,
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+  }
+
   async function disconnect(alias: string): Promise<void> {
     await disconnectHost(alias);
     remoteWs = mapWithout(remoteWs, alias);
@@ -1206,7 +1218,7 @@
                       disabled={h.status === "connecting"}
                       onclick={() =>
                         h.status === "connected"
-                          ? void navigateHome(h.alias)
+                          ? void navigateHost(h.alias)
                           : void connect(h.alias)}
                     >
                       <span
@@ -1288,7 +1300,7 @@
                           <button
                             class="row sub"
                             title={rw.root}
-                            onclick={() => void navigateHome(h.alias, rw.id)}
+                            onclick={() => void navigateHost(h.alias, rw.id)}
                           >
                             <span class="name">{rw.name}</span>
                             <span class="path">{tildify(rw.root)}</span>
@@ -1306,7 +1318,7 @@
                           <button
                             class="row sub comp-count"
                             title={computeTitle(h.alias, comp)}
-                            onclick={() => void navigateHome(h.alias)}
+                            onclick={() => void navigateHost(h.alias)}
                           >
                             <svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
                               <rect x="2" y="2" width="5" height="5" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.4" />
@@ -1340,7 +1352,7 @@
                         </div>
                       {/if}
                       <div class="rowwrap" role="presentation">
-                        <button class="row sub browse" onclick={() => void navigateHome(h.alias)}>
+                        <button class="row sub browse" onclick={() => void navigateHost(h.alias)}>
                           <span class="name">browse {h.alias}…</span>
                         </button>
                       </div>
