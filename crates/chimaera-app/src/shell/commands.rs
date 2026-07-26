@@ -71,14 +71,18 @@ pub(super) async fn list_hosts(state: State<'_, Shell>) -> Result<Vec<HostState>
     let store = HostsStore::load_default();
     let tunnels = state.tunnels.lock().await;
     let connecting: HashSet<String> = lock(&state.connecting).keys().cloned().collect();
+    let unhealthy = lock(&state.unhealthy_tunnels).clone();
     Ok(store
         .list()
         .iter()
         .map(|h| {
-            if let Some(t) = tunnels.get(&h.alias) {
-                state_for(h, "connected", Some(t))
-            } else if connecting.contains(&h.alias) {
+            if connecting.contains(&h.alias) {
                 state_for(h, "connecting", None)
+            } else if let Some(t) = tunnels
+                .get(&h.alias)
+                .filter(|_| !unhealthy.contains(&h.alias))
+            {
+                state_for(h, "connected", Some(t))
             } else {
                 state_for(h, "disconnected", None)
             }
@@ -103,6 +107,7 @@ pub(super) async fn add_host(alias: String) -> Result<HostState, String> {
 #[tauri::command]
 pub(super) async fn remove_host(state: State<'_, Shell>, alias: String) -> Result<(), String> {
     let tunnel = state.tunnels.lock().await.remove(&alias);
+    lock(&state.unhealthy_tunnels).remove(&alias);
     if let Some(tunnel) = tunnel {
         tunnel.close().await;
     }
@@ -135,6 +140,7 @@ pub(super) async fn connect_host(
 #[tauri::command]
 pub(super) async fn disconnect_host(state: State<'_, Shell>, alias: String) -> Result<(), String> {
     let tunnel = state.tunnels.lock().await.remove(&alias);
+    lock(&state.unhealthy_tunnels).remove(&alias);
     if let Some(tunnel) = tunnel {
         tunnel.close().await;
     }
@@ -203,6 +209,7 @@ pub(super) async fn shutdown_host(state: State<'_, Shell>, alias: String) -> Res
     // The daemon is on its way out; cancel our forward so the host reads as
     // down instead of lingering on a socket that's about to close.
     let tunnel = state.tunnels.lock().await.remove(&alias);
+    lock(&state.unhealthy_tunnels).remove(&alias);
     if let Some(tunnel) = tunnel {
         tunnel.close().await;
     }
@@ -507,6 +514,7 @@ pub(super) async fn cancel_compute_session(
         .lock()
         .await
         .remove(&compute_key(&alias, &job_id));
+    lock(&state.unhealthy_tunnels).remove(&compute_key(&alias, &job_id));
     if let Some(tunnel) = tunnel {
         tunnel.close().await;
     }
@@ -673,6 +681,7 @@ pub(super) async fn connect_compute_session(
     // Cheap status ping so a home screen can flip the card to "connected".
     // No token: compute tokens stay in Rust — the window URL above is the
     // only carrier, and only for the window that needs it.
+    lock(&state.unhealthy_tunnels).remove(&key);
     let _ = app.emit(
         "host-status",
         HostStatus {

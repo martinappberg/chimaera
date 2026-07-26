@@ -330,9 +330,6 @@
   let reconnectError = $state<string | null>(null);
   /** Context from the shell's liveness monitor for the current drop. */
   let reconnectReason = $state<string | null>(null);
-  /** The user dismissed the overlay; don't auto-reshow until state changes. */
-  let reconnectDismissed = $state(false);
-  let reconnectGrace: ReturnType<typeof setTimeout> | null = null;
   /** Dismissing a failed reconnect downgrades it to an ambient Retry instead
    *  of removing the only recovery path. Unauthorized native windows never
    *  fall through to the browser-only manual auth overlay. */
@@ -361,8 +358,8 @@
       } else {
         await connectHost(hostAlias);
       }
-      // Same-port heal → our WebSocket reconnects and eventsUp clears the
-      // overlay; a moved port/token re-homes this window via onHostStatus.
+      // Every successful shell connect republishes `host-status: connected`,
+      // which clears the overlay and re-homes this window when needed.
     } catch (e) {
       reconnectError = e instanceof Error ? e.message : String(e);
     } finally {
@@ -370,29 +367,26 @@
     }
   }
 
-  function beginReconnect(reason: string | null = null): void {
-    // A shell liveness event is authoritative and skips the socket grace even
-    // if Svelte has not observed the corresponding events-socket close yet.
-    if (!canReconnect || (reason === null && eventsUp)) return;
-    if (reason !== null) reconnectReason = reason;
-    reconnectDismissed = false;
+  function beginReconnect(reason: string): void {
+    if (!canReconnect) return;
+    reconnectReason = reason;
     showReconnect = true;
     void attemptReconnect();
   }
 
   function retryReconnect(): void {
-    reconnectDismissed = false;
     showReconnect = true;
     void attemptReconnect();
   }
 
   function dismissReconnect(): void {
     showReconnect = false;
-    reconnectDismissed = true;
-    if (reconnectGrace !== null) {
-      clearTimeout(reconnectGrace);
-      reconnectGrace = null;
-    }
+  }
+
+  function finishReconnect(): void {
+    showReconnect = false;
+    reconnectError = null;
+    reconnectReason = null;
   }
 
   // A 401 in a native remote window usually means the daemon restarted and
@@ -408,29 +402,10 @@
     );
   });
 
-  // A remote window whose events socket stays down past a short grace has lost
-  // its tunnel (not just a daemon blip): show the overlay and reconnect. When
-  // it recovers, clear everything. host-status "down" skips the grace.
-  $effect(() => {
-    if (!canReconnect) return;
-    if (eventsUp) {
-      if (reconnectGrace !== null) {
-        clearTimeout(reconnectGrace);
-        reconnectGrace = null;
-      }
-      showReconnect = false;
-      reconnectError = null;
-      reconnectReason = null;
-      reconnectDismissed = false;
-      return;
-    }
-    if (reconnectGrace === null && !showReconnect && !reconnectDismissed) {
-      reconnectGrace = setTimeout(() => {
-        reconnectGrace = null;
-        beginReconnect();
-      }, 1500);
-    }
-  });
+  // `/ws/events` owns its own backoff and is not SSH liveness: it can restart
+  // while authenticated HTTP remains healthy. Only the shell's consecutive
+  // authenticated health failures (or a 401 above) start SSH recovery, and
+  // only its `connected` event finishes that recovery.
 
   // Keep the shell's window registry current so "open this workspace" raises
   // this window instead of duplicating it (the SPA swaps `ws` client-side, so
@@ -1009,6 +984,8 @@
             beginReconnect(e.reason ?? "The remote connection stopped responding.");
             return;
           }
+          if (e.status === "error") return;
+          finishReconnect();
           const port = e.local_port;
           // Compute-status events carry no token (compute tokens stay in the
           // shell's Rust side); a rebuilt job tunnel lands on the SAME daemon,

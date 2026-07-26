@@ -120,6 +120,7 @@ async fn publish_connected_state(app: &AppHandle, state: &Shell, alias: &str) ->
     };
     // Emit after dropping the tunnel lock. Event handlers can immediately
     // navigate and invoke native commands; none should queue behind delivery.
+    lock(&state.unhealthy_tunnels).remove(alias);
     let _ = app.emit("host-status", event);
     Some(reply)
 }

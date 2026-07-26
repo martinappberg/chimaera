@@ -622,8 +622,8 @@ pub async fn http_alive(port: u16) -> bool {
 /// shared login node can be squatted by a stale relay or a foreign process,
 /// and "something answered HTTP" would bless the wrong endpoint (found live:
 /// a health probe passed through a previous connect's leaked relay while the
-/// new tunnel's own forward was already dying). Only the daemon holding THIS
-/// job's token can answer 200.
+/// new tunnel's own forward was already dying). Only the intended daemon
+/// holding this endpoint's token can answer 200.
 pub async fn http_alive_authed(port: u16, token: &str) -> bool {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let attempt = async {
@@ -633,7 +633,7 @@ pub async fn http_alive_authed(port: u16, token: &str) -> bool {
         stream
             .write_all(
                 format!(
-                    "GET /api/v1/workspaces HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\
+                    "GET /api/v1/health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\
                      Authorization: Bearer {token}\r\nConnection: close\r\n\r\n"
                 )
                 .as_bytes(),
@@ -855,21 +855,21 @@ pub async fn connect(
 
     let mut local_port = pick_local_port(opts.local_port, manifest.port)?;
     progress(Phase::Tunneling { local_port });
-    let mut child = spawn_tunnel(host, local_port, manifest.port)?;
-    let mux_delegated = match wait_for_port(local_port, &mut child).await {
-        Ok(m) => m,
+    let tunnel = open_proven_tunnel(host, local_port, manifest.port, &manifest.token).await;
+    let (child, mux_delegated) = match tunnel {
+        Ok(tunnel) => tunnel,
         // The availability probe binds on OUR side, but under the WSL
         // transport ssh's -L binds inside the distro — a different port
         // namespace — so the first pick can collide with an in-distro
-        // listener the probe cannot see. One retry on a fresh OS-assigned
-        // port covers it; an EXPLICITLY requested port stays a hard error.
+        // listener the probe cannot see. A stale mux forward can also accept
+        // locally without reaching this daemon. One retry on a fresh
+        // OS-assigned port covers both; an EXPLICITLY requested port stays a
+        // hard error.
         Err(e) if opts.local_port.is_none() => {
-            child.kill().await.ok();
             tracing::warn!("tunnel on 127.0.0.1:{local_port} failed ({e:#}); retrying fresh");
             local_port = ephemeral_port()?;
             progress(Phase::Tunneling { local_port });
-            child = spawn_tunnel(host, local_port, manifest.port)?;
-            wait_for_port(local_port, &mut child).await?
+            open_proven_tunnel(host, local_port, manifest.port, &manifest.token).await?
         }
         Err(e) => return Err(e),
     };
@@ -1540,6 +1540,68 @@ fn spawn_tunnel(host: &str, local: u16, remote: u16) -> anyhow::Result<Child> {
         .map_err(|e| TunnelPhaseError(format!("failed to spawn ssh tunnel: {e}")).into())
 }
 
+/// Bring up one login-host forward and prove the intended daemon answers
+/// through it before publishing "connected". A local `-L` listener appears
+/// before the path behind it is usable, and a stale ControlMaster forward can
+/// keep accepting after its transport died; TCP readiness alone therefore
+/// creates a connected-but-everything-fails window.
+async fn open_proven_tunnel(
+    host: &str,
+    local: u16,
+    remote: u16,
+    token: &str,
+) -> anyhow::Result<(Child, bool)> {
+    let mut child = spawn_tunnel(host, local, remote)?;
+    let mux_observed = match wait_for_port(local, &mut child).await {
+        Ok(mux) => mux,
+        Err(error) => {
+            // `wait_for_port` may have observed a successful mux exit before
+            // timing out on its listener. That proves this attempt registered
+            // the forward, so it also owns cancelling it.
+            let cancel_master = forward_delegated(false, &mut child);
+            abandon_tunnel_attempt(host, local, remote, child, cancel_master).await;
+            return Err(error);
+        }
+    };
+    let Some(mux_delegated) = tunnel_proven(local, token, 15, mux_observed, &mut child).await
+    else {
+        let cancel_master = forward_delegated(mux_observed, &mut child);
+        abandon_tunnel_attempt(host, local, remote, child, cancel_master).await;
+        return Err(TunnelPhaseError(format!(
+            "ssh tunnel on 127.0.0.1:{local} opened, but the authenticated remote daemon did not answer"
+        ))
+        .into());
+    };
+    Ok((child, mux_delegated))
+}
+
+/// Tear down the ownership shape of an abandoned attempt. Only issue
+/// `-O cancel` when this child proved it delegated: cancelling speculatively
+/// after a bind collision could tear down a different healthy caller's
+/// identical forward.
+async fn abandon_tunnel_attempt(
+    host: &str,
+    local: u16,
+    remote: u16,
+    mut child: Child,
+    cancel_master: bool,
+) {
+    let _ = child.start_kill();
+    let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+    if cancel_master {
+        cancel_master_forward(host, &format!("{local}:127.0.0.1:{remote}")).await;
+    }
+}
+
+fn forward_delegated(observed: bool, child: &mut Child) -> bool {
+    observed
+        || child
+            .try_wait()
+            .ok()
+            .flatten()
+            .is_some_and(|status| status.success())
+}
+
 /// Poll the local tunnel port until it accepts connections (15s timeout).
 /// Returns true if the forward was delegated to an ssh ControlMaster: the mux
 /// client registers the forward with the master and exits 0 immediately, so a
@@ -1840,11 +1902,14 @@ pub async fn connect_compute_node(
     let local = pick_local_port(None, port)?;
     match spawn_node_tunnel(host, &target, local, port) {
         Ok(mut child) => match wait_for_port(local, &mut child).await {
-            Ok(mux) if tunnel_proven(local, token, 10, mux, &mut child).await => {
-                tracing::info!(%node, %job_id, "compute tunnel up (rung B, ssh-adopt)");
-                return Ok(mk(local, ComputeRung::SshAdopt, None, child));
-            }
-            Ok(_) => {
+            Ok(mux) => {
+                if tunnel_proven(local, token, 10, mux, &mut child)
+                    .await
+                    .is_some()
+                {
+                    tracing::info!(%node, %job_id, "compute tunnel up (rung B, ssh-adopt)");
+                    return Ok(mk(local, ComputeRung::SshAdopt, None, child));
+                }
                 child.kill().await.ok();
                 tracing::info!(%node, "rung B forwarded but the job daemon did not answer");
             }
@@ -1872,7 +1937,11 @@ pub async fn connect_compute_node(
         // registered, and cancelling a never-registered spec is a no-op.
         let outer_spec = format!("{local}:127.0.0.1:{relay_port}");
         match wait_for_port(local, &mut child).await {
-            Ok(mux) if tunnel_proven(local, token, 15, mux, &mut child).await => {
+            Ok(mux)
+                if tunnel_proven(local, token, 15, mux, &mut child)
+                    .await
+                    .is_some() =>
+            {
                 tracing::info!(%node, %job_id, relay_port, "compute tunnel up (rung B, chained via login node)");
                 return Ok(mk(local, ComputeRung::Chained, Some(outer_spec), child));
             }
@@ -1895,21 +1964,23 @@ pub async fn connect_compute_node(
         let spec = format!("{local}:{node}:{port}");
         if let Ok(mut child) = spawn_direct_node_tunnel(host, node, local, port) {
             match wait_for_port(local, &mut child).await {
-                Ok(mux) if tunnel_proven(local, token, 10, mux, &mut child).await => {
-                    tracing::info!(%node, %job_id, "compute tunnel up (rung A, direct)");
-                    return Ok(mk(
-                        local,
-                        ComputeRung::Direct,
-                        mux.then(|| spec.clone()),
-                        child,
-                    ));
-                }
-                // A delegated forward outlives the exited mux client — the
-                // probe failing does not tear it down, so cancel or the
-                // master keeps proxying the local port until it expires.
                 Ok(mux) => {
+                    if let Some(mux) = tunnel_proven(local, token, 10, mux, &mut child).await {
+                        tracing::info!(%node, %job_id, "compute tunnel up (rung A, direct)");
+                        return Ok(mk(
+                            local,
+                            ComputeRung::Direct,
+                            mux.then(|| spec.clone()),
+                            child,
+                        ));
+                    }
+                    // A delegated forward outlives the exited mux client —
+                    // the probe failing does not tear it down, so cancel or
+                    // the master keeps proxying the local port until it
+                    // expires.
+                    let cancel_master = forward_delegated(mux, &mut child);
                     child.kill().await.ok();
-                    if mux {
+                    if cancel_master {
                         cancel_master_forward(host, &spec).await;
                     }
                 }
@@ -1938,32 +2009,34 @@ pub async fn connect_compute_node(
 /// whose login-side bind clashed can die (ExitOnForwardFailure) moments
 /// AFTER a stale relay on the same port answered the probe for it.
 ///
-/// `mux` (from [`wait_for_port`]) exempts a DELEGATED child from that
-/// still-running requirement: it registered the forward with the
-/// ControlMaster and exited 0 by design, so the authed answer alone is the
-/// proof — demanding a live child there made rung A unfailable-yet-
-/// unpassable whenever a master was up (which it essentially always is).
+/// Returns the effective mux ownership on success. `wait_for_port` can observe
+/// the listener in the tiny interval before the mux client exits 0; a
+/// successful exit after the authenticated answer therefore upgrades the
+/// result to delegated instead of falsely rejecting a healthy forward.
 async fn tunnel_proven(
     port: u16,
     token: &str,
     deadline_secs: u64,
     mux: bool,
     child: &mut Child,
-) -> bool {
+) -> Option<bool> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(deadline_secs);
     loop {
         if http_alive_authed(port, token).await {
             break;
         }
         if tokio::time::Instant::now() > deadline {
-            return false;
+            return None;
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     match child.try_wait() {
-        Ok(None) => true,
-        Ok(Some(status)) => mux && status.success(),
-        Err(_) => false,
+        Ok(None) => Some(mux),
+        // A direct `ssh -N` never exits successfully while it owns a live
+        // forward. Success here means the ControlMaster accepted ownership,
+        // even if `wait_for_port` saw the listener a scheduling tick first.
+        Ok(Some(status)) if status.success() => Some(true),
+        Ok(Some(_)) | Err(_) => None,
     }
 }
 
@@ -2284,6 +2357,83 @@ mod tests {
             !http_alive(free_port).await,
             "closed port must read as down"
         );
+    }
+
+    #[tokio::test]
+    async fn http_alive_authed_probes_health_with_endpoint_identity() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut chunk = [0u8; 512];
+                    let n = stream.read(&mut chunk).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..n]);
+                    if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request = String::from_utf8(request).unwrap();
+                assert!(
+                    request.starts_with("GET /api/v1/health HTTP/1.1\r\n"),
+                    "liveness must use the cheap health route: {request:?}"
+                );
+                let status = if request.contains("\r\nAuthorization: Bearer right-token\r\n") {
+                    "200 OK"
+                } else {
+                    "401 Unauthorized"
+                };
+                stream
+                    .write_all(format!("HTTP/1.1 {status}\r\ncontent-length: 0\r\n\r\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+
+        assert!(http_alive_authed(port, "right-token").await);
+        assert!(
+            !http_alive_authed(port, "wrong-token").await,
+            "an HTTP answer from the wrong endpoint identity is not live"
+        );
+        server.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tunnel_proof_detects_mux_exit_after_listener_readiness() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 512];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let mut exited = Command::new("sh").args(["-c", "exit 0"]).spawn().unwrap();
+        exited.wait().await.unwrap();
+
+        assert_eq!(
+            tunnel_proven(port, "token", 1, false, &mut exited).await,
+            Some(true),
+            "a successful exit after the listener appeared is mux delegation"
+        );
+        server.await.unwrap();
     }
 
     /// The remote-home fragments are load-bearing shell strings: every remote

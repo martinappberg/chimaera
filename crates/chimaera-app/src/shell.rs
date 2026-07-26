@@ -50,6 +50,11 @@ pub struct Shell {
     pub local: Mutex<LocalDaemon>,
     /// Live tunnels by host alias.
     tunnels: tokio::sync::Mutex<HashMap<String, Tunnel>>,
+    /// Tunnels that still have an owned forward but missed enough
+    /// end-to-end probes to be considered down. Keeping this separate from
+    /// `tunnels` lets reconnect do one final proof before teardown while
+    /// `list_hosts` remains honest in a home-only window.
+    unhealthy_tunnels: Mutex<HashSet<String>>,
     /// Live tunnels to compute-node daemons (Mode 2), keyed
     /// `"{alias}#job{job_id}"`. Separate from `tunnels`: a job tunnel is its
     /// own type with its own two-rung ladder and a walltime-bounded lifetime.
@@ -458,6 +463,7 @@ pub(crate) fn finish_startup(handle: &tauri::AppHandle, local: LocalDaemon) -> t
         handle.manage(Shell {
             local: Mutex::new(local),
             tunnels: tokio::sync::Mutex::new(HashMap::new()),
+            unhealthy_tunnels: Mutex::new(HashSet::new()),
             compute_tunnels: tokio::sync::Mutex::new(HashMap::new()),
             compute_endpoints: Mutex::new(HashMap::new()),
             compute_connecting: Mutex::new(std::collections::HashSet::new()),

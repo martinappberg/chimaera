@@ -1,9 +1,10 @@
 //! Opening UI windows, the live-tunnel health monitor, and reopening the
-//! persisted window set at launch. The single health-monitor task is the sole
-//! emitter of `host-status`, so windows and the home screen just listen —
-//! there is no per-window reconnect stampede.
+//! persisted window set at launch. One central monitor owns liveness
+//! transitions; successful connect flights publish endpoint identity too.
+//! Windows and the home screen only listen, so there is no per-window probe
+//! stampede.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -14,6 +15,50 @@ use super::{authorize_daemon_origin, daemon_navigation_allowed, lock, Shell, Win
 use crate::windows::WindowRecord;
 
 static WINDOW_SEQ: AtomicU64 = AtomicU64::new(0);
+/// One timeout is weak evidence on an SSH/ProxyJump/HPC path. Three
+/// consecutive authenticated misses still detect a dead forward promptly,
+/// while a scheduler or network hiccup does not tear down a usable tunnel.
+const HEALTH_FAILURES_BEFORE_DOWN: u8 = 3;
+
+#[derive(Default)]
+struct HealthConfidence {
+    consecutive_failures: u8,
+    down: bool,
+}
+
+impl HealthConfidence {
+    /// `Some(true)` = recovered, `Some(false)` = confirmed down, `None` = no
+    /// externally visible transition. A newly installed tunnel starts from a
+    /// proven-good baseline: `open_proven_tunnel` authenticated it before the
+    /// shell inserted it.
+    fn sample(&mut self, up: bool) -> Option<bool> {
+        if up {
+            self.consecutive_failures = 0;
+            return std::mem::take(&mut self.down).then_some(true);
+        }
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        if !self.down && self.consecutive_failures >= HEALTH_FAILURES_BEFORE_DOWN {
+            self.down = true;
+            Some(false)
+        } else {
+            None
+        }
+    }
+
+    /// A connect flight performed its own authenticated proof and published
+    /// the recovery edge, so monitoring starts a fresh confidence window
+    /// without emitting a duplicate `connected`.
+    fn reset_after_external_proof(&mut self) {
+        *self = Self::default();
+    }
+}
+
+struct TunnelEndpoint {
+    key: String,
+    port: u16,
+    token: String,
+    is_compute: bool,
+}
 
 /// Open a UI window on a daemon: local (`record.alias` None) or a connected
 /// remote's tunnel. `record.ws` scopes the window to a workspace; None lands
@@ -146,17 +191,17 @@ fn open_shell_window(
     Ok(())
 }
 
-/// Watch live tunnels and broadcast `host-status` on up↔down transitions.
-/// Without this a dropped forward (remote daemon or ssh died) goes unnoticed
-/// until the user clicks. A single task is the sole emitter — windows and the
-/// home screen just listen, so there is no per-window reconnect stampede. The
-/// probe is an end-to-end HTTP health check on the loopback port (no extra
-/// ssh child): a bare TCP connect would keep reporting "up" after laptop
-/// sleep, when ssh's local listener survives its dead connection — the state
-/// that made reconnect a silent no-op.
+/// Watch live tunnels and broadcast confirmed `host-status` up↔down
+/// transitions. The probes are concurrent across hosts (one slow cluster
+/// cannot delay every other host) and hysteretic (one timeout is suspect, not
+/// down). A probe is an authenticated end-to-end HTTP health check on the
+/// loopback port, with no extra ssh child: a bare TCP connect keeps reporting
+/// "up" after laptop sleep when ssh's local listener survives its dead
+/// connection.
 pub(super) fn spawn_health_monitor(handle: AppHandle) {
     tauri::async_runtime::spawn(async move {
-        let mut prev: HashMap<String, bool> = HashMap::new();
+        tracing::debug!("ssh health monitor started");
+        let mut confidence: HashMap<String, HealthConfidence> = HashMap::new();
         loop {
             tokio::time::sleep(Duration::from_secs(3)).await;
             // No managed Shell means the app is tearing down — stop the loop.
@@ -172,39 +217,99 @@ pub(super) fn spawn_health_monitor(handle: AppHandle) {
             // the wire. Every probe is authed with its tunnel's own token:
             // identity, not just liveness, because a stale relay or unrelated
             // loopback server can answer on a recycled port.
-            let mut snap: Vec<(String, u16, String, bool)> = {
+            let mut snap: Vec<TunnelEndpoint> = {
                 let tunnels = shell.tunnels.lock().await;
                 tunnels
                     .iter()
-                    .map(|(a, t)| (a.clone(), t.local_port, t.manifest.token.clone(), false))
+                    .map(|(key, tunnel)| TunnelEndpoint {
+                        key: key.clone(),
+                        port: tunnel.local_port,
+                        token: tunnel.manifest.token.clone(),
+                        is_compute: false,
+                    })
                     .collect()
             };
             {
                 let compute = shell.compute_tunnels.lock().await;
-                snap.extend(
-                    compute
-                        .iter()
-                        .map(|(k, t)| (k.clone(), t.local_port, t.token.clone(), true)),
-                );
+                snap.extend(compute.iter().map(|(key, tunnel)| TunnelEndpoint {
+                    key: key.clone(),
+                    port: tunnel.local_port,
+                    token: tunnel.token.clone(),
+                    is_compute: true,
+                }));
             }
+            tracing::trace!(tunnels = snap.len(), "ssh health monitor snapshot");
             // Keys gone from the maps were disconnected by the user; forget
             // them without emitting a spurious `down`.
-            prev.retain(|a, _| snap.iter().any(|(s, ..)| s == a));
-            for (key, port, token, is_compute) in &snap {
-                let up = chimaera_remote::http_alive_authed(*port, token).await;
-                if prev.insert(key.clone(), up) == Some(up) {
-                    continue; // no transition
+            let current_keys: HashSet<String> =
+                snap.iter().map(|endpoint| endpoint.key.clone()).collect();
+            confidence.retain(|key, _| current_keys.contains(key));
+            let unhealthy = {
+                let mut unhealthy = lock(&shell.unhealthy_tunnels);
+                unhealthy.retain(|key| current_keys.contains(key));
+                unhealthy.clone()
+            };
+            // A successful connect flight clears `unhealthy_tunnels` after
+            // its own authenticated proof. Reset this monitor's old down
+            // edge too, including when the healed tunnel reused the same
+            // port/token; otherwise a second outage could never emit down.
+            for (key, health) in &mut confidence {
+                if health.down && !unhealthy.contains(key) {
+                    health.reset_after_external_proof();
+                }
+            }
+
+            // Every host gets the same observation time regardless of how
+            // many other hosts are saved or how slowly one of them answers.
+            let mut probes = tokio::task::JoinSet::new();
+            for endpoint in snap {
+                probes.spawn(async move {
+                    let up =
+                        chimaera_remote::http_alive_authed(endpoint.port, &endpoint.token).await;
+                    (endpoint, up)
+                });
+            }
+            while let Some(result) = probes.join_next().await {
+                let Ok((endpoint, up)) = result else {
+                    continue;
+                };
+                // A connect flight may have replaced this endpoint while its
+                // probe was in flight. Never let an old port/token mark the
+                // new tunnel down (or recovered).
+                if !endpoint_is_current(&shell, &endpoint).await {
+                    confidence.remove(&endpoint.key);
+                    continue;
+                }
+                let transition = confidence
+                    .entry(endpoint.key.clone())
+                    .or_default()
+                    .sample(up);
+                tracing::trace!(
+                    alias = %endpoint.key,
+                    port = endpoint.port,
+                    up,
+                    ?transition,
+                    "ssh health sample"
+                );
+                let Some(recovered) = transition else {
+                    continue;
+                };
+                if recovered {
+                    lock(&shell.unhealthy_tunnels).remove(&endpoint.key);
+                } else {
+                    lock(&shell.unhealthy_tunnels).insert(endpoint.key.clone());
                 }
                 let _ = handle.emit(
                     "host-status",
                     HostStatus {
-                        alias: key.clone(),
-                        status: if up { "connected" } else { "down" },
-                        local_port: Some(*port),
-                        token: (up && !*is_compute).then(|| token.clone()),
+                        alias: endpoint.key,
+                        status: if recovered { "connected" } else { "down" },
+                        local_port: Some(endpoint.port),
+                        token: (recovered && !endpoint.is_compute).then_some(endpoint.token),
                         error: None,
-                        reason: (!up).then(|| {
-                            "The SSH tunnel or remote daemon stopped answering health checks."
+                        reason: (!recovered).then(|| {
+                            "Several authenticated health checks failed. Already-loaded views \
+                             stay visible while remote actions reconnect."
                                 .to_string()
                         }),
                         build: None,
@@ -213,6 +318,20 @@ pub(super) fn spawn_health_monitor(handle: AppHandle) {
             }
         }
     });
+}
+
+async fn endpoint_is_current(shell: &Shell, endpoint: &TunnelEndpoint) -> bool {
+    if endpoint.is_compute {
+        let tunnels = shell.compute_tunnels.lock().await;
+        tunnels.get(&endpoint.key).is_some_and(|tunnel| {
+            tunnel.local_port == endpoint.port && tunnel.token == endpoint.token
+        })
+    } else {
+        let tunnels = shell.tunnels.lock().await;
+        tunnels.get(&endpoint.key).is_some_and(|tunnel| {
+            tunnel.local_port == endpoint.port && tunnel.manifest.token == endpoint.token
+        })
+    }
 }
 
 /// Reopen the persisted window set: local-daemon windows immediately;
@@ -285,7 +404,7 @@ fn needs_startup_home(opened: bool, home_opened: bool, has_remote: bool) -> bool
 
 #[cfg(test)]
 mod tests {
-    use super::needs_startup_home;
+    use super::{needs_startup_home, HealthConfidence, HEALTH_FAILURES_BEFORE_DOWN};
 
     #[test]
     fn startup_home_precedes_remote_auth_when_no_home_was_restored() {
@@ -293,5 +412,39 @@ mod tests {
         assert!(!needs_startup_home(true, false, false));
         assert!(needs_startup_home(true, false, true));
         assert!(!needs_startup_home(true, true, true));
+    }
+
+    #[test]
+    fn one_health_miss_never_drops_a_tunnel() {
+        let mut health = HealthConfidence::default();
+        for _ in 0..HEALTH_FAILURES_BEFORE_DOWN - 1 {
+            assert_eq!(health.sample(false), None);
+        }
+        assert_eq!(health.sample(true), None, "a success clears suspicion");
+        assert_eq!(health.sample(false), None, "the failure count must reset");
+    }
+
+    #[test]
+    fn health_requires_consecutive_failures_and_emits_each_edge_once() {
+        let mut health = HealthConfidence::default();
+        for _ in 1..HEALTH_FAILURES_BEFORE_DOWN {
+            assert_eq!(health.sample(false), None);
+        }
+        assert_eq!(health.sample(false), Some(false));
+        assert_eq!(health.sample(false), None, "down is one transition");
+        assert_eq!(health.sample(true), Some(true));
+        assert_eq!(health.sample(true), None, "recovery is one transition");
+    }
+
+    #[test]
+    fn proven_reconnect_arms_a_second_down_edge() {
+        let mut health = HealthConfidence::default();
+        for expected in [None, None, Some(false)] {
+            assert_eq!(health.sample(false), expected);
+        }
+        health.reset_after_external_proof();
+        for expected in [None, None, Some(false)] {
+            assert_eq!(health.sample(false), expected);
+        }
     }
 }
