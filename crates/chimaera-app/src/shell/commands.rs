@@ -856,21 +856,63 @@ pub(super) fn report_window_scope(
     label: Option<String>,
 ) -> Result<(), String> {
     let mut windows = lock(&state.windows);
-    let scope = windows
-        .get_mut(webview.label())
+    let current = windows
+        .get(webview.label())
         .ok_or_else(|| "this window is not registered".to_string())?;
     // The shell fixed the host when it created/navigated this window. A
     // daemon-served page may report workspace/label changes, but must never
     // rewrite its host to gain another remote's native command scope.
-    if scope.alias != alias {
+    if current.alias != alias {
         return Err("a window cannot change its registered host".to_string());
     }
+    // A promoted local workbench whose workspace disappeared is visibly Home
+    // again. If another unused launcher already exists, retire that older
+    // surface and let this in-place Home reclaim the singleton identity. The
+    // old hub cannot carry editor state, so its close does not cross the
+    // workbench's beforeunload guard.
+    let existing_home = (current.alias.is_none() && ws.is_none() && !current.home_hub)
+        .then(|| {
+            windows
+                .iter()
+                .find(|(window_label, scope)| {
+                    window_label.as_str() != webview.label() && scope.home_hub
+                })
+                .map(|(window_label, _)| window_label.clone())
+        })
+        .flatten();
+    if let Some(existing_label) = existing_home {
+        let existing_scope = windows
+            .get_mut(&existing_label)
+            .expect("the Home label came from this scope map");
+        let previous_home = existing_scope.clone();
+        existing_scope.relinquish_home();
+        drop(windows);
+        if let Some(existing_window) = webview.app_handle().get_webview_window(&existing_label) {
+            if let Err(error) = existing_window.close() {
+                lock(&state.windows).insert(existing_label, previous_home);
+                return Err(format!("could not close the previous Home: {error}"));
+            }
+        } else {
+            // A Destroyed event normally owns this cleanup. If the webview
+            // disappeared just before this report, remove its stale scope and
+            // record here so it cannot return on restart.
+            lock(&state.windows).remove(&existing_label);
+            lock(&state.registry).remove(&previous_home.stable_id);
+        }
+        windows = lock(&state.windows);
+    }
+
+    let scope = windows
+        .get_mut(webview.label())
+        .ok_or_else(|| "this window is not registered".to_string())?;
+    let was_home_hub = scope.home_hub;
     scope.report_page_scope(ws.clone(), label.unwrap_or_default());
+    let reclaimed_home = !was_home_hub && scope.home_hub;
     let stable_id = scope.stable_id.clone();
     let registered_alias = scope.alias.clone();
     let home_hub = scope.home_hub;
     drop(windows);
-    if !home_hub && !stable_id.is_empty() {
+    if (!home_hub || reclaimed_home) && !stable_id.is_empty() {
         lock(&state.registry).set_scope(&stable_id, registered_alias, ws);
     }
     // The reported label names this window in the tray's list; rebuild so it

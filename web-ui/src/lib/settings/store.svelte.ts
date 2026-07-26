@@ -256,7 +256,11 @@ function applyAppearance(): void {
   const accent = bootstrapping
     ? (appearanceBootstrap.accent ?? "")
     : getSetting("appearance.accentColor");
-  if (accent !== "") root.style.setProperty("--accent", accent);
+  // Always replace the bootstrap value. An empty user setting means the
+  // selected theme's accent, not "leave whatever inline custom accent the
+  // bootstrap installed". Themes live inline too, so removing the property
+  // would incorrectly fall back to app.css instead of the selected palette.
+  root.style.setProperty("--accent", accent === "" ? theme.tokens["--accent"] : accent);
   // The HTML head reads this before the JavaScript module graph on the next
   // navigation/window creation. Do not overwrite a real saved choice during
   // the module-load defaults pass; wait for a daemon-confirmed map or a local

@@ -205,11 +205,29 @@ impl WindowScope {
         };
     }
 
+    /// Retire an older unused launcher before another local Home reclaims the
+    /// singleton identity. The window is closed immediately afterwards; scope
+    /// narrowing first prevents even that short teardown interval from
+    /// retaining broad fallback askpass access.
+    fn relinquish_home(&mut self) {
+        self.home_hub = false;
+        self.askpass_scope = self
+            .alias
+            .clone()
+            .map_or(AskpassScope::None, AskpassScope::Host);
+    }
+
     /// Apply the SPA's current route. Entering a workspace consumes the Home
     /// launcher: it becomes a normal window and its broad startup-askpass
-    /// fallback narrows to this window's already shell-authorized host.
+    /// fallback narrows to this window's already shell-authorized host. If a
+    /// promoted local workspace later disappears, its now-empty window can
+    /// become the launcher again instead of making New Window create a second
+    /// Home.
     pub(crate) fn report_page_scope(&mut self, ws: Option<String>, label: String) {
-        if self.home_hub && ws.is_some() {
+        if self.alias.is_none() && ws.is_none() {
+            self.home_hub = true;
+            self.askpass_scope = AskpassScope::Fallback;
+        } else if self.home_hub && ws.is_some() {
             self.home_hub = false;
             self.askpass_scope = self
                 .alias
@@ -978,6 +996,12 @@ mod origin_tests {
         fallback.report_page_scope(Some("local-workspace".into()), "Workspace".into());
         assert!(!fallback.home_hub);
         assert!(!fallback.allows_askpass(Some("remote-2")));
+        fallback.report_page_scope(None, "Home".into());
+        assert!(fallback.home_hub);
+        assert!(fallback.allows_askpass(Some("remote-2")));
+        fallback.relinquish_home();
+        assert!(!fallback.home_hub);
+        assert!(!fallback.allows_askpass(Some("remote-2")));
 
         let mut remote_hub = WindowScope::new(None, None, "remote-home".into());
         remote_hub.navigate_home(Some("Sherlock".into()), None, "Sherlock Home".into());
@@ -1007,6 +1031,10 @@ mod origin_tests {
         assert!(remote.allows_askpass(Some("Sherlock")));
         assert!(!remote.allows_askpass(Some("remote-2")));
         assert!(!remote.allows_askpass(None));
+        let mut remote_home = remote.clone();
+        remote_home.report_page_scope(None, "Sherlock Home".into());
+        assert!(!remote_home.home_hub);
+        assert!(remote_home.allows_askpass(Some("Sherlock")));
 
         // `Sherlock#job123` is itself a valid ordinary ssh alias. Its shape
         // must not grant access to Sherlock's prompt.

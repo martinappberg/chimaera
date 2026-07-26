@@ -20,7 +20,7 @@ describe("settings appearance bootstrap", () => {
         mode: "dark",
         themeId: "chimaera-dark",
         background: "#17171c",
-        accent: null,
+        accent: "#ff00ff",
       }),
     );
     vi.stubGlobal("localStorage", {
@@ -55,6 +55,7 @@ describe("settings appearance bootstrap", () => {
     const store = await import("./store.svelte");
 
     expect(document.documentElement.dataset.theme).toBe("dark");
+    expect(document.documentElement.style.getPropertyValue("--accent")).toBe("#ff00ff");
     await store.loadSettings();
     expect(store.settingsLoaded()).toBe(true);
     expect(document.documentElement.dataset.theme).toBe("dark");
@@ -63,5 +64,6 @@ describe("settings appearance bootstrap", () => {
 
     expect(document.documentElement.dataset.theme).toBe("light");
     expect(document.documentElement.style.getPropertyValue("--bg")).toBe("#fbfbfc");
+    expect(document.documentElement.style.getPropertyValue("--accent")).toBe("#2e9e6b");
   });
 });
