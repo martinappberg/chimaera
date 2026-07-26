@@ -866,6 +866,19 @@ pub(super) fn report_window_scope(
     if current.alias != alias {
         return Err("a window cannot change its registered host".to_string());
     }
+    // A local Home may still be the only eligible surface for password/2FA
+    // while an SSH flight is running. Before consuming that launcher, arrange
+    // for a fresh Home to inherit fallback duty; otherwise both already-shown
+    // and later sequential prompts become unanswerable.
+    let local_home_promotion = current.home_hub && current.alias.is_none() && ws.is_some();
+    let pending_before_promotion = if local_home_promotion {
+        askpass.pending_scoped(current)
+    } else {
+        Vec::new()
+    };
+    let promotion_needs_auth_home = local_home_promotion
+        && (!lock(&state.connecting).is_empty() || !pending_before_promotion.is_empty());
+    let pre_promotion_scope = promotion_needs_auth_home.then(|| current.clone());
     // A promoted local workbench whose workspace disappeared is visibly Home
     // again. If another unused launcher already exists, retire that older
     // surface and let this in-place Home reclaim the singleton identity. The
@@ -914,6 +927,28 @@ pub(super) fn report_window_scope(
     let home_hub = scope.home_hub;
     let reclaimed_scope = reclaimed_home.then(|| scope.clone());
     drop(windows);
+    if let Some(previous_scope) = pre_promotion_scope {
+        if let Err(error) = super::show_local_home(webview.app_handle(), None) {
+            // Creating the successor failed: restore prompt eligibility on
+            // this window rather than stranding an in-flight ssh process.
+            lock(&state.windows).insert(webview.label().to_string(), previous_scope);
+            return Err(format!(
+                "could not keep Home available for SSH authentication: {error}"
+            ));
+        }
+        // The replacement Home re-lists these prompts on mount. Remove their
+        // stale copies from the promoted workbench, whose narrowed scope can
+        // no longer answer them.
+        for prompt in pending_before_promotion {
+            if let Err(error) = webview.emit("ssh-askpass-done", prompt.id()) {
+                tracing::warn!(
+                    %error,
+                    window = webview.label(),
+                    "could not dismiss transferred SSH prompt"
+                );
+            }
+        }
+    }
     if (!home_hub || reclaimed_home) && !stable_id.is_empty() {
         lock(&state.registry).set_scope(&stable_id, registered_alias, ws);
     }

@@ -84,6 +84,12 @@ pub struct PromptEvent {
     prompt: String,
 }
 
+impl PromptEvent {
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+}
+
 impl Askpass {
     fn register(
         &self,

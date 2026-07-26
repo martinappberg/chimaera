@@ -732,11 +732,24 @@
   }
 
   async function backToHome(): Promise<void> {
+    const legacyWindow = !isHomeHub();
     try {
       await navigateHome(null);
-    } catch {
+    } catch (error) {
       // Compatibility for a host-detail window persisted by an older build:
       // return to the singleton hub, then retire that legacy extra window.
+      // An actual hub must remain open on transient navigation failures:
+      // openWindow would focus that same window and the close below would
+      // otherwise immediately destroy the successfully restored Home.
+      if (
+        !legacyWindow ||
+        !String(error).includes("this window is not the Home navigation hub")
+      ) {
+        if (ownAlias !== null) {
+          hostErrors = new Map(hostErrors).set(ownAlias, String(error));
+        }
+        return;
+      }
       await openWindow(null, null);
       closeThisWindow();
     }
