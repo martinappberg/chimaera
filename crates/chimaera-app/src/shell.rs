@@ -38,6 +38,9 @@ const DAEMON_UI_CORE_PERMISSIONS: &[&str] = &[
 ];
 
 static DAEMON_CAPABILITY_SEQ: AtomicU64 = AtomicU64::new(0);
+/// Forces same-origin Home re-homes to be full document navigations instead
+/// of hash-only changes (which do not rerun the SPA's scope bootstrap).
+static HOME_NAV_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// A connect attempt's shared outcome: `None` while in flight, then the
 /// result. Joiners wait on this instead of racing their own ssh — see
@@ -78,6 +81,10 @@ pub struct Shell {
     /// duplicate). The SPA reports its own scope because it swaps `ws`
     /// client-side without a shell round-trip.
     windows: Mutex<HashMap<String, WindowScope>>,
+    /// Most recently focused native window. macOS clears every window's
+    /// focused flag when the application deactivates, so Dock reopen and a
+    /// repeated launch need this label to restore the prior frontmost window.
+    last_focused_window: Mutex<Option<String>>,
     /// Serializes the check-or-create path for the singleton local Home. IPC
     /// commands can arrive concurrently, so inspecting `windows` and opening
     /// without this gate would leave a narrow duplicate-window race.
@@ -91,12 +98,6 @@ pub struct Shell {
     /// Set on ExitRequested: window teardown during quit must NOT remove
     /// records from the registry, or quitting would forget every window.
     quitting: AtomicBool,
-    /// Labels whose `CloseRequested` has fired but whose `Destroyed` has not.
-    /// The drop-to-home check counts OTHER live windows; without this, a
-    /// batched "close all windows" (both CloseRequested delivered before either
-    /// Destroyed, so each still sees the other in `webview_windows()`) would
-    /// miscount and let the app quit. Cleared on Destroyed. macOS-only path.
-    closing: Mutex<HashSet<String>>,
     /// The held power assertion for the "caffeinate" toggle — Some = armed
     /// (this machine won't idle/display/system-sleep). Dropped to disarm; the
     /// guard drops on quit, so the assertion never outlives the app.
@@ -112,6 +113,10 @@ pub struct WindowScope {
     pub alias: Option<String>,
     pub ws: Option<String>,
     pub stable_id: String,
+    /// This is the singleton navigation window, even while it temporarily
+    /// browses a remote host. Its registry record remains the local Home so
+    /// app restore never turns a transient detail route into another window.
+    home_hub: bool,
     /// Shell-owned askpass identity. This is separate from `alias`: compute
     /// windows use a composite alias for focus/liveness, but authenticate
     /// through their explicitly recorded login host. Keeping the two facts
@@ -154,6 +159,7 @@ impl WindowScope {
             alias,
             ws,
             stable_id,
+            home_hub: askpass_scope == AskpassScope::Fallback,
             askpass_scope,
             label: String::new(),
         }
@@ -172,6 +178,7 @@ impl WindowScope {
             alias: Some(alias),
             ws,
             stable_id,
+            home_hub: false,
             askpass_scope: AskpassScope::Host(login_alias),
             label: String::new(),
         }
@@ -344,10 +351,15 @@ pub(crate) fn raise_all_windows(app: &AppHandle) {
         .find(|window| window.is_focused().unwrap_or(false))
         .map(|window| window.label().to_string())
         .or_else(|| {
+            app.try_state::<Shell>()
+                .and_then(|shell| lock(&shell.last_focused_window).clone())
+                .filter(|label| app.get_webview_window(label).is_some())
+        })
+        .or_else(|| {
             app.try_state::<Shell>().and_then(|shell| {
                 lock(&shell.windows)
                     .iter()
-                    .find(|(_, scope)| scope.alias.is_none() && scope.ws.is_none())
+                    .find(|(_, scope)| scope.home_hub)
                     .map(|(label, _)| label.clone())
             })
         })
@@ -370,9 +382,86 @@ pub(crate) fn raise_all_windows(app: &AppHandle) {
     }
 }
 
+/// Re-home the singleton navigation window onto the local daemon or one live
+/// remote tunnel, optionally scoped to a workspace. The shell updates its
+/// trusted host scope before navigation; the registry deliberately remains the
+/// local Home record because this is navigation, not a separately restorable
+/// native window.
+pub(crate) fn navigate_home_hub(
+    app: &AppHandle,
+    window: &tauri::WebviewWindow,
+    port: u16,
+    token: &str,
+    alias: Option<String>,
+    ws: Option<String>,
+) -> tauri::Result<()> {
+    let shell = app.state::<Shell>();
+    let previous_scope = lock(&shell.windows)
+        .get(window.label())
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("this window is not registered"))?;
+    if !previous_scope.home_hub {
+        return Err(anyhow::anyhow!("this window is not the Home navigation hub").into());
+    }
+    let previous_port = lock(&shell.allowed_daemon_ports)
+        .get(window.label())
+        .copied();
+    let mut url = restore::daemon_window_url(
+        port,
+        token,
+        &previous_scope.stable_id,
+        ws.as_deref(),
+        alias.as_deref(),
+        true,
+    )?;
+    url.query_pairs_mut().append_pair(
+        "home-nav",
+        &HOME_NAV_SEQ.fetch_add(1, Ordering::Relaxed).to_string(),
+    );
+
+    authorize_daemon_origin(app, window.label(), port)?;
+    {
+        let mut windows = lock(&shell.windows);
+        let scope = windows
+            .get_mut(window.label())
+            .ok_or_else(|| anyhow::anyhow!("this window is not registered"))?;
+        scope.alias = alias.clone();
+        scope.ws = ws.clone();
+        scope.label = match (&alias, &ws) {
+            (None, None) => "Home".to_string(),
+            (Some(host), None) => format!("{host} Home"),
+            (Some(host), Some(_)) => format!("{host} Workbench"),
+            (None, Some(_)) => "Workbench".to_string(),
+        };
+    }
+    if let Err(error) = window.navigate(url) {
+        lock(&shell.windows).insert(window.label().to_string(), previous_scope);
+        let mut allowed = lock(&shell.allowed_daemon_ports);
+        match previous_port {
+            Some(port) => {
+                allowed.insert(window.label().to_string(), port);
+            }
+            None => {
+                allowed.remove(window.label());
+            }
+        }
+        return Err(error);
+    }
+
+    let title = alias.map_or_else(
+        || "chimaera".to_string(),
+        |host| format!("{host} — chimaera"),
+    );
+    let _ = window.set_title(&title);
+    crate::tray::rebuild(app);
+    crate::menu::sync_settings_enabled(app);
+    Ok(())
+}
+
 /// Show the one local Home window. Home is a singleton navigation hub: menu,
-/// tray, IPC, recovery, and last-window fallback all route through this
-/// function so none of them can accidentally create a second copy.
+/// tray, IPC, and recovery all route through this function so none of them can
+/// accidentally create a second copy. If the hub is browsing a remote host,
+/// showing Home navigates that same window back to the local daemon.
 pub(crate) fn show_local_home(
     app: &AppHandle,
     preferred_record: Option<WindowRecord>,
@@ -381,10 +470,17 @@ pub(crate) fn show_local_home(
         let _opening = lock(&shell.home_opening);
         let existing = lock(&shell.windows)
             .iter()
-            .find(|(_, scope)| scope.alias.is_none() && scope.ws.is_none())
-            .map(|(label, _)| label.clone());
-        if let Some(label) = existing {
+            .find(|(_, scope)| scope.home_hub)
+            .map(|(label, scope)| (label.clone(), scope.alias.is_some() || scope.ws.is_some()));
+        if let Some((label, needs_local_navigation)) = existing {
             if let Some(window) = app.get_webview_window(&label) {
+                if needs_local_navigation {
+                    let (port, token) = {
+                        let local = lock(&shell.local);
+                        (local.port, local.token.clone())
+                    };
+                    navigate_home_hub(app, &window, port, &token, None, None)?;
+                }
                 window.unminimize()?;
                 window.show()?;
                 window.set_focus()?;
@@ -543,11 +639,11 @@ pub(crate) fn finish_startup(handle: &tauri::AppHandle, local: LocalDaemon) -> t
             compute_connecting: Mutex::new(std::collections::HashSet::new()),
             connecting: Mutex::new(HashMap::new()),
             windows: Mutex::new(HashMap::new()),
+            last_focused_window: Mutex::new(None),
             home_opening: Mutex::new(()),
             allowed_daemon_ports: Mutex::new(HashMap::new()),
             registry: Mutex::new(WindowRegistry::load_default()),
             quitting: AtomicBool::new(false),
-            closing: Mutex::new(HashSet::new()),
             caffeinate: Mutex::new(None),
         });
     } else {
@@ -623,6 +719,7 @@ pub fn run() {
             commands::cancel_compute_session,
             commands::connect_compute_session,
             commands::open_window,
+            commands::navigate_home,
             commands::check_app_update,
             commands::begin_update,
             commands::shell_build,
@@ -644,67 +741,6 @@ pub fn run() {
                 return;
             };
             match event {
-                // macOS convention: closing the LAST window drops you back to
-                // the home screen instead of quitting the app — you exit only by
-                // closing the home screen itself (or an explicit Quit / ⌘Q,
-                // which sets `quitting` and terminates without reaching here).
-                // We open a fresh home window (inheriting this one's geometry)
-                // *before* letting this one close, so the window count never
-                // hits zero — which is what fires the exit. When the window
-                // being closed already IS the local home screen, we don't
-                // reopen; the count falls to zero and the app exits, as
-                // intended. Not on Windows/Linux, where closing the last window
-                // conventionally quits (and their tray/wizard change the math).
-                #[cfg(target_os = "macos")]
-                tauri::WindowEvent::CloseRequested { api, .. } => {
-                    if shell.quitting.load(Ordering::Relaxed) {
-                        return; // an explicit quit is already in progress
-                    }
-                    let app = window.app_handle();
-                    // Mark this one closing first, then count the windows NOT
-                    // already on their way out — so a batched "close all" (both
-                    // CloseRequested before either Destroyed) still recognises
-                    // the true last window instead of each seeing the other.
-                    lock(&shell.closing).insert(window.label().to_string());
-                    let others = {
-                        let closing = lock(&shell.closing);
-                        app.webview_windows()
-                            .into_keys()
-                            .filter(|l| {
-                                l.as_str() != window.label()
-                                    && !l.starts_with("wsl-setup")
-                                    && !closing.contains(l)
-                            })
-                            .count()
-                    };
-                    if others > 0 {
-                        return; // not the last window — an ordinary close
-                    }
-                    let is_home = lock(&shell.windows)
-                        .get(window.label())
-                        .is_some_and(|s| s.alias.is_none() && s.ws.is_none());
-                    if is_home {
-                        return; // closing the home screen itself exits the app
-                    }
-                    // Reopen home where this window sat, so it doesn't jump.
-                    let mut record = WindowRecord::new(None, None);
-                    let scale = window.scale_factor().unwrap_or(1.0);
-                    if let (Ok(pos), Ok(size)) = (window.outer_position(), window.inner_size()) {
-                        let pos = pos.to_logical::<f64>(scale);
-                        let size = size.to_logical::<f64>(scale);
-                        record.x = Some(pos.x);
-                        record.y = Some(pos.y);
-                        record.width = Some(size.width);
-                        record.height = Some(size.height);
-                    }
-                    if let Err(e) = show_local_home(app, Some(record)) {
-                        // Couldn't open home — keep THIS window rather than
-                        // exiting into nothing. Veto the close and forget it.
-                        tracing::error!("could not open home window on last-window close: {e}");
-                        lock(&shell.closing).remove(window.label());
-                        api.prevent_close();
-                    }
-                }
                 // Forget a window's scope once it's gone, so focus-existing
                 // never raises a dead label. Destroyed (not CloseRequested,
                 // which can be vetoed) fires after teardown completes. The
@@ -713,8 +749,12 @@ pub fn run() {
                 // teardown destroys every window and forgetting them would
                 // defeat restore.
                 tauri::WindowEvent::Destroyed => {
-                    lock(&shell.closing).remove(window.label());
                     lock(&shell.allowed_daemon_ports).remove(window.label());
+                    let mut last_focused = lock(&shell.last_focused_window);
+                    if last_focused.as_deref() == Some(window.label()) {
+                        *last_focused = None;
+                    }
+                    drop(last_focused);
                     let scope = lock(&shell.windows).remove(window.label());
                     if !shell.quitting.load(Ordering::Relaxed) {
                         if let Some(scope) = scope {
@@ -730,6 +770,7 @@ pub fn run() {
                 // Focus moved to this window — Settings tracks whether the now-
                 // focused window has a workspace open.
                 tauri::WindowEvent::Focused(true) => {
+                    *lock(&shell.last_focused_window) = Some(window.label().to_string());
                     crate::menu::sync_settings_enabled(window.app_handle());
                 }
                 // Track geometry in memory on every move/resize; a slow tick

@@ -5,13 +5,15 @@ const WS_KEY = "chimaera.ws";
 const HOST_KEY = "chimaera.host";
 /** Same key viewState.windowKey() reads — the hash seeds it. */
 const WIN_KEY = "chimaera.win";
+/** The singleton native Home navigation window (local or remote detail). */
+const HOME_HUB_KEY = "chimaera.homeHub";
 /** Set when this window was opened onto a compute-node daemon (Mode 2). */
 const JOB_KEY = "chimaera.job";
 const NODE_KEY = "chimaera.node";
 
 /**
  * Read the access token, workspace id, host label, and window id from the
- * URL fragment (#token=...&ws=...&host=...&win=...) once, persist them to
+ * URL fragment (#token=...&ws=...&host=...&win=...&hub=1) once, persist them to
  * sessionStorage, and strip the fragment from the address bar. Falls back
  * to previously stored values on reload.
  *
@@ -27,8 +29,22 @@ function initFromHash(): string | null {
   const wsFromHash = params.get("ws");
   const hostFromHash = params.get("host");
   const winFromHash = params.get("win");
+  const homeHubFromHash = params.get("hub") === "1";
   const jobFromHash = params.get("job");
   const nodeFromHash = params.get("node");
+  if (homeHubFromHash) {
+    sessionStorage.setItem(HOME_HUB_KEY, "1");
+    // The hub is always a launcher/detail route, never a workspace or compute
+    // route. Each daemon origin has its own sessionStorage, so clear anything
+    // an earlier visit to that origin left behind.
+    sessionStorage.removeItem(WS_KEY);
+    sessionStorage.removeItem(JOB_KEY);
+    sessionStorage.removeItem(NODE_KEY);
+    if (hostFromHash === null) sessionStorage.removeItem(HOST_KEY);
+  } else if (winFromHash !== null) {
+    // A separately opened native workbench must not inherit hub semantics.
+    sessionStorage.removeItem(HOME_HUB_KEY);
+  }
   if (tokenFromHash !== null) {
     sessionStorage.setItem(TOKEN_KEY, tokenFromHash);
   }
@@ -52,6 +68,7 @@ function initFromHash(): string | null {
     wsFromHash !== null ||
     hostFromHash !== null ||
     winFromHash !== null ||
+    homeHubFromHash ||
     jobFromHash !== null ||
     nodeFromHash !== null
   ) {
@@ -65,6 +82,12 @@ let token = initFromHash();
 /** The bearer token for this session, if one was provided. */
 export function getToken(): string | null {
   return token;
+}
+
+/** True in the singleton native Home navigation window, including while it
+ * is browsing a remote host's detail page. */
+export function isHomeHub(): boolean {
+  return sessionStorage.getItem(HOME_HUB_KEY) === "1";
 }
 
 /**

@@ -16,6 +16,7 @@
     isNativeShell,
     listHosts,
     localDaemonState,
+    navigateHome,
     onConnectProgress,
     onHostStatus,
     openWindow,
@@ -42,7 +43,7 @@
     rememberScheduler,
   } from "./compute";
   import ComputeBanner from "./ComputeBanner.svelte";
-  import { getJobContext, type Health } from "../net/api";
+  import { getJobContext, isHomeHub, type Health } from "../net/api";
   import { asyncDisposer } from "../shared/asyncDisposer";
 
   interface Props {
@@ -84,6 +85,11 @@
    *  local daemon doesn't have — which lands right back on the launcher (the
    *  "can't open a second workspace on a remote" bug). */
   const ownAlias = $derived(hostLabel === "local" ? null : hostLabel);
+  /** Back belongs to the singleton native navigation window, regardless of
+   *  what kind of daemon the selected remote turns out to be. Compute-node
+   *  detection only controls compute UI; it must never strand Home on a
+   *  remote route without a way back. */
+  const showBackToHome = $derived(native && isHomeHub() && ownAlias !== null);
 
   const sorted = $derived(
     [...workspaces].sort((a, b) => (b.last_opened_at ?? 0) - (a.last_opened_at ?? 0)),
@@ -341,14 +347,10 @@
       const state = await connectHost(alias, updateDaemon);
       hosts = hosts.map((h) => (h.alias === alias ? state : h));
       void refreshCompute(alias);
-      // Enter the host as soon as its tunnel is ready. The local Home remains
-      // behind as the durable hub; the host page's Back action returns to it.
-      await openWindow(alias, null);
-      const list = await remoteWorkspaces(alias);
-      remoteWs = new Map(remoteWs).set(
-        alias,
-        [...list].sort((a, b) => (b.last_opened_at ?? 0) - (a.last_opened_at ?? 0)),
-      );
+      // Host browsing is navigation inside the singleton Home hub. A workspace
+      // click continues in that window; only an explicit new-window gesture
+      // creates another native workbench.
+      await navigateHome(alias);
     } catch (e) {
       hostErrors = new Map(hostErrors).set(alias, e instanceof Error ? e.message : String(e));
       void refreshHosts();
@@ -730,10 +732,14 @@
   }
 
   async function backToHome(): Promise<void> {
-    // Raise (or recreate) the singleton local Home before retiring this host
-    // page, so Back never exposes an unrelated window or an empty desktop.
-    await openWindow(null, null);
-    closeThisWindow();
+    try {
+      await navigateHome(null);
+    } catch {
+      // Compatibility for a host-detail window persisted by an older build:
+      // return to the singleton hub, then retire that legacy extra window.
+      await openWindow(null, null);
+      closeThisWindow();
+    }
   }
 </script>
 
@@ -756,7 +762,7 @@
   <div class="inner">
     <header class="masthead">
       <div class="masthead-leading">
-        {#if isHostPage}
+        {#if showBackToHome}
           <button class="back-home" aria-label="Back to Home" title="Back to Home" onclick={() => void backToHome()}>
             <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
               <path
@@ -777,10 +783,29 @@
         </div>
       </div>
       <div class="where" title={health?.hostname}>
-        <span class="daemon-dot" class:ok={connected} aria-hidden="true"></span>
         <span class="host-label">{hostLabel}</span>
         {#if health !== null && health.hostname !== hostLabel}
           <span class="hostname">{health.hostname}</span>
+        {/if}
+        {#if ownAlias !== null}
+          <span
+            class="remote-status"
+            class:online={connected}
+            role="status"
+            title={connected
+              ? `${hostLabel} daemon is reachable`
+              : `${hostLabel} daemon is not currently reachable`}
+          >
+            <span class="daemon-dot" class:ok={connected} aria-hidden="true"></span>
+            {connected ? "online" : "offline"}
+          </span>
+        {:else}
+          <span
+            class="daemon-dot"
+            class:ok={connected}
+            title={connected ? "local daemon is online" : "local daemon is offline"}
+            aria-label={connected ? "local daemon online" : "local daemon offline"}
+          ></span>
         {/if}
       </div>
       {#if native && hostLabel === "local" && localState?.outdated}
@@ -1169,7 +1194,7 @@
                       disabled={h.status === "connecting"}
                       onclick={() =>
                         h.status === "connected"
-                          ? void openWindow(h.alias, null)
+                          ? void navigateHome(h.alias)
                           : void connect(h.alias)}
                     >
                       <span
@@ -1195,7 +1220,7 @@
                       {#if phase !== undefined}
                         <span class="phase">{phase}</span>
                       {:else if h.status === "connected"}
-                        <span class="phase quiet">connected · 127.0.0.1:{h.local_port}</span>
+                        <span class="phase quiet">online · 127.0.0.1:{h.local_port}</span>
                       {:else}
                         <span class="when">{ago(h.last_connected_at)}</span>
                       {/if}
@@ -1251,7 +1276,7 @@
                           <button
                             class="row sub"
                             title={rw.root}
-                            onclick={() => void openWindow(h.alias, rw.id)}
+                            onclick={() => void navigateHome(h.alias, rw.id)}
                           >
                             <span class="name">{rw.name}</span>
                             <span class="path">{tildify(rw.root)}</span>
@@ -1269,7 +1294,7 @@
                           <button
                             class="row sub comp-count"
                             title={computeTitle(h.alias, comp)}
-                            onclick={() => void openWindow(h.alias, null)}
+                            onclick={() => void navigateHome(h.alias)}
                           >
                             <svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
                               <rect x="2" y="2" width="5" height="5" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.4" />
@@ -1303,7 +1328,7 @@
                         </div>
                       {/if}
                       <div class="rowwrap" role="presentation">
-                        <button class="row sub browse" onclick={() => void openWindow(h.alias, null)}>
+                        <button class="row sub browse" onclick={() => void navigateHome(h.alias)}>
                           <span class="name">browse {h.alias}…</span>
                         </button>
                       </div>
@@ -1490,6 +1515,23 @@
   .daemon-dot.ok {
     background: var(--accent);
     opacity: 1;
+  }
+
+  .remote-status {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 2px 7px;
+    border: 1px solid color-mix(in srgb, var(--muted) 26%, transparent);
+    border-radius: 999px;
+    color: var(--muted);
+    font-size: var(--text-xs);
+    white-space: nowrap;
+  }
+
+  .remote-status.online {
+    border-color: color-mix(in srgb, var(--accent) 35%, transparent);
+    color: var(--accent);
   }
 
   .host-label {

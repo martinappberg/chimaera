@@ -49,9 +49,16 @@ app-build` (never the root `cargo`).
   keys its daemon-side view-state (layout tree) on it, so a reopened window *is* the same window.
   Closing a window removes its record (macOS convention) **except during quit** (guarded by an
   `AtomicBool quitting` so teardown doesn't forget every window). Geometry is stored in logical pixels
-  (correct across scale factors) on a slow 2s tick. The local **Home is a singleton**: File/tray Home,
-  IPC, recovery, and restore all raise the existing copy, and restore retires duplicate Home records
-  left by older builds. Opening a workspace already shown raises that window instead of duplicating.
+  (correct across scale factors) on a slow 2s tick. Closing the final window exits directly; the shell
+  never inserts an extra Home that needs a second close. The local **Home is a singleton navigation
+  window**: File/tray Home, IPC, recovery, and restore all raise the existing copy, restore retires
+  duplicate Home records left by older builds, and browsing a connected host navigates that same
+  window to its detail page. Back re-homes it onto the local daemon. Selecting a local or remote
+  workspace replaces the current launcher/detail route; only the explicit new-window action (or
+  Cmd/Ctrl-click) opens another workbench window. Opening a workspace already shown raises that window
+  instead of duplicating. The document head restores an origin-local bootstrap of the persisted
+  Chimaera palette before the module graph loads (system light/dark is the first-visit fallback), so
+  newly created webviews never expose WebKit's unthemed white canvas.
   The shell is process-singleton because its registry, tunnels, and askpass endpoint are process-global;
   launching the app again raises the complete existing window set rather than starting a competing
   owner. On macOS, clicking the Dock icon likewise brings every Chimaera window forward while keeping

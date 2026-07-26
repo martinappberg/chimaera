@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-navigate-home"
+description = "Enables the navigate_home command without any pre-configured scope."
+commands.allow = ["navigate_home"]
+
+[[permission]]
+identifier = "deny-navigate-home"
+description = "Denies the navigate_home command without any pre-configured scope."
+commands.deny = ["navigate_home"]

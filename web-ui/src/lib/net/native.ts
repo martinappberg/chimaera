@@ -513,3 +513,14 @@ export async function openWindow(
   // access is safe and avoids coupling the two app tabs.
   window.open(`${location.origin}/${hash}`, "_blank", "noopener");
 }
+
+/**
+ * Navigate the singleton native Home window to its local launcher, a connected
+ * remote's detail page, or a workspace on that daemon. Only explicit
+ * new-window gestures create another native workbench.
+ */
+export async function navigateHome(alias: string | null, wsId: string | null = null): Promise<void> {
+  const t = tauri();
+  if (t === null) throw new Error("Home navigation requires the native shell");
+  await t.core.invoke<void>("navigate_home", { alias, wsId });
+}

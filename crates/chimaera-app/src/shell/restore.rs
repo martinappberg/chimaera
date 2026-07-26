@@ -72,21 +72,48 @@ pub fn open_ui_window(
     token: &str,
     record: &WindowRecord,
 ) -> tauri::Result<()> {
-    let mut hash = format!("token={}", urlencoding::encode(token));
-    hash.push_str(&format!("&win={}", urlencoding::encode(&record.id)));
-    if let Some(ws) = &record.ws {
-        hash.push_str(&format!("&ws={}", urlencoding::encode(ws)));
-    }
-    if let Some(alias) = &record.alias {
-        hash.push_str(&format!("&host={}", urlencoding::encode(alias)));
-    }
-    let url = format!("http://127.0.0.1:{port}/#{hash}");
+    let home_hub = record.alias.is_none() && record.ws.is_none() && record.compute.is_none();
+    let url = daemon_window_url(
+        port,
+        token,
+        &record.id,
+        record.ws.as_deref(),
+        record.alias.as_deref(),
+        home_hub,
+    )?;
     let title = match &record.alias {
         Some(alias) => format!("{alias} — chimaera"),
         None => "chimaera".to_string(),
     };
     let scope = WindowScope::new(record.alias.clone(), record.ws.clone(), record.id.clone());
-    open_shell_window(app, &url, &title, record, scope)
+    open_shell_window(app, url.as_str(), &title, record, scope)
+}
+
+/// One daemon-served window URL. The singleton Home carries `hub=1` across
+/// local↔remote navigation so each origin clears stale workspace state while
+/// ordinary workspace clicks keep navigating this same window.
+pub(super) fn daemon_window_url(
+    port: u16,
+    token: &str,
+    stable_id: &str,
+    ws: Option<&str>,
+    alias: Option<&str>,
+    home_hub: bool,
+) -> tauri::Result<tauri::Url> {
+    let mut hash = format!("token={}", urlencoding::encode(token));
+    hash.push_str(&format!("&win={}", urlencoding::encode(stable_id)));
+    if let Some(ws) = ws {
+        hash.push_str(&format!("&ws={}", urlencoding::encode(ws)));
+    }
+    if let Some(alias) = alias {
+        hash.push_str(&format!("&host={}", urlencoding::encode(alias)));
+    }
+    if home_hub {
+        hash.push_str("&hub=1");
+    }
+    format!("http://127.0.0.1:{port}/#{hash}")
+        .parse()
+        .map_err(tauri::Error::InvalidUrl)
 }
 
 /// Open a window on a compute-node daemon (Mode 2). Same shell wiring as

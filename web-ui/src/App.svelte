@@ -1962,11 +1962,11 @@
     workspaces = workspaces.some((x) => x.id === w.id)
       ? workspaces.map((x) => (x.id === w.id ? w : x))
       : [w, ...workspaces];
-    const switched = activeWsId !== w.id;
     closePicker();
     createError = null;
     // Stamp recency for the home screen (fire-and-forget; old daemons 404).
     void touchWorkspace(w.id).catch(() => {});
+    const switched = activeWsId !== w.id;
     if (!switched) return;
     // Flush the outgoing workspace's pending layout write under its own key,
     // then restore (or default) the incoming workspace's tree.

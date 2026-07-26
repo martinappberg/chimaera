@@ -742,6 +742,35 @@ pub(super) async fn open_window(
         .map_err(|e| format!("could not open window: {e}"))
 }
 
+/// Navigate the singleton Home hub to the local launcher, a connected remote's
+/// detail page, or a workspace on either daemon. This is deliberately distinct
+/// from `open_window`: browsing and ordinary workspace clicks replace the hub's
+/// current route instead of multiplying native windows.
+#[tauri::command]
+pub(super) async fn navigate_home(
+    app: AppHandle,
+    webview: tauri::WebviewWindow,
+    state: State<'_, Shell>,
+    alias: Option<String>,
+    ws_id: Option<String>,
+) -> Result<(), String> {
+    let (port, token) = match alias.as_deref() {
+        None => {
+            let local = lock(&state.local);
+            (local.port, local.token.clone())
+        }
+        Some(alias) => {
+            let tunnels = state.tunnels.lock().await;
+            let tunnel = tunnels
+                .get(alias)
+                .ok_or_else(|| format!("{alias} is not connected"))?;
+            (tunnel.local_port, tunnel.manifest.token.clone())
+        }
+    };
+    super::navigate_home_hub(&app, &webview, port, &token, alias, ws_id)
+        .map_err(|e| format!("could not navigate Home: {e}"))
+}
+
 /// Check GitHub releases for a newer signed app build. Returns the new
 /// version string when one is available, `None` when up to date. All
 /// updater work runs in Rust; the web UI can only ask, never drive the
@@ -842,8 +871,9 @@ pub(super) fn report_window_scope(
     scope.label = label.unwrap_or_default();
     let stable_id = scope.stable_id.clone();
     let registered_alias = scope.alias.clone();
+    let home_hub = scope.home_hub;
     drop(windows);
-    if !stable_id.is_empty() {
+    if !home_hub && !stable_id.is_empty() {
         lock(&state.registry).set_scope(&stable_id, registered_alias, ws);
     }
     // The reported label names this window in the tray's list; rebuild so it

@@ -18,6 +18,7 @@ pub const DAEMON_UI_COMMANDS: &[&str] = &[
     "cancel_compute_session",
     "connect_compute_session",
     "open_window",
+    "navigate_home",
     "report_window_scope",
     "check_app_update",
     "begin_update",
