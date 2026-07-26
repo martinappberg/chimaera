@@ -85,11 +85,10 @@
    *  local daemon doesn't have — which lands right back on the launcher (the
    *  "can't open a second workspace on a remote" bug). */
   const ownAlias = $derived(hostLabel === "local" ? null : hostLabel);
-  /** Back belongs to the unused native launcher window, regardless of
-   *  what kind of daemon the selected remote turns out to be. Compute-node
-   *  detection only controls compute UI; it must never strand Home on a
-   *  remote route without a way back. */
-  const showBackToHome = $derived(native && isHomeHub() && ownAlias !== null);
+  /** Every native remote detail needs a route back to local Home. The normal
+   *  in-place flow navigates its hub, while a persisted pre-hub window uses
+   *  the compatibility path below to open Home and retire itself. */
+  const showBackToHome = $derived(native && ownAlias !== null);
 
   const sorted = $derived(
     [...workspaces].sort((a, b) => (b.last_opened_at ?? 0) - (a.last_opened_at ?? 0)),
