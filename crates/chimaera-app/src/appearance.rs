@@ -140,8 +140,47 @@ impl AppearanceCache {
         let tmp = self.path.with_extension("json.tmp");
         std::fs::write(&tmp, serde_json::to_vec(entries)?)
             .with_context(|| format!("failed to write {}", tmp.display()))?;
-        std::fs::rename(&tmp, &self.path)
-            .with_context(|| format!("failed to rename into {}", self.path.display()))?;
+        if let Err(error) = replace_file(&tmp, &self.path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(error)
+                .with_context(|| format!("failed to replace {}", self.path.display()));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn replace_file(source: &std::path::Path, destination: &std::path::Path) -> std::io::Result<()> {
+    std::fs::rename(source, destination)
+}
+
+#[cfg(windows)]
+fn replace_file(source: &std::path::Path, destination: &std::path::Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    // Rust's std::fs::rename cannot replace an existing destination on
+    // Windows. MoveFileExW provides the same-volume atomic replacement the
+    // cache needs after its first snapshot, with write-through durability.
+    let moved = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
         Ok(())
     }
 }
@@ -174,12 +213,15 @@ mod tests {
         let mut cache = AppearanceCache::load(path.clone());
 
         cache.set(None, dark()).unwrap();
+        let mut updated_local = dark();
+        updated_local.background = "#f4f1eb".to_string();
+        cache.set(None, updated_local.clone()).unwrap();
         let mut remote = dark();
         remote.background = "#000000".to_string();
         cache.set(Some("cluster"), remote.clone()).unwrap();
 
         let loaded = AppearanceCache::load(path);
-        assert_eq!(loaded.get(None), Some(dark()));
+        assert_eq!(loaded.get(None), Some(updated_local));
         assert_eq!(loaded.get(Some("cluster")), Some(remote));
 
         let mut invalid = dark();
