@@ -496,6 +496,25 @@ pub(crate) fn navigate_home_hub(
     {
         return Err(anyhow::anyhow!("this window is not the Home navigation hub").into());
     }
+    // Before Home became the singleton navigation hub, remote detail pages
+    // were persisted as ordinary `(alias, None)` windows. Startup restore can
+    // still bring one back while also creating the new local Home fallback.
+    // Reuse that legacy surface instead of turning the hub into a duplicate;
+    // leaving Home in place also preserves the app's New Window launcher.
+    if let (Some(target_alias), None) = (alias.as_deref(), ws.as_ref()) {
+        let legacy_label = {
+            let windows = lock(&shell.windows);
+            legacy_host_detail_label(&windows, target_alias, window.label())
+        };
+        if let Some(label) = legacy_label {
+            if let Some(existing) = app.get_webview_window(&label) {
+                existing.unminimize()?;
+                existing.show()?;
+                existing.set_focus()?;
+                return Ok(());
+            }
+        }
+    }
     // A remote detail page is host-scoped, so navigating the only Home
     // fallback there while another ssh owns authentication would unload its
     // modal and make later prompts unreachable. Keep the fallback in place
@@ -588,6 +607,22 @@ pub(crate) fn navigate_home_hub(
     crate::tray::rebuild(app);
     crate::menu::sync_settings_enabled(app);
     Ok(())
+}
+
+fn legacy_host_detail_label(
+    windows: &HashMap<String, WindowScope>,
+    alias: &str,
+    exclude: &str,
+) -> Option<String> {
+    windows
+        .iter()
+        .find(|(label, scope)| {
+            label.as_str() != exclude
+                && !scope.home_hub
+                && scope.alias.as_deref() == Some(alias)
+                && scope.ws.is_none()
+        })
+        .map(|(label, _)| label.clone())
 }
 
 /// Fulfil New Window with the one unused Home launcher. If a launcher/detail
@@ -1046,7 +1081,9 @@ pub fn run() {
 
 #[cfg(test)]
 mod origin_tests {
-    use super::{daemon_origin_matches, WindowScope};
+    use std::collections::HashMap;
+
+    use super::{daemon_origin_matches, legacy_host_detail_label, WindowScope};
 
     #[test]
     fn daemon_origin_requires_exact_scheme_host_and_port() {
@@ -1063,6 +1100,42 @@ mod origin_tests {
             assert!(!daemon_origin_matches(Some(43123), &url), "{rejected}");
         }
         assert!(!daemon_origin_matches(None, &allowed));
+    }
+
+    #[test]
+    fn legacy_host_detail_reuse_ignores_hub_and_workspace_windows() {
+        let windows = HashMap::from([
+            (
+                "home".into(),
+                WindowScope::new(None, None, "home-record".into()),
+            ),
+            (
+                "legacy-detail".into(),
+                WindowScope::new(Some("Sherlock".into()), None, "legacy-record".into()),
+            ),
+            (
+                "workspace".into(),
+                WindowScope::new(
+                    Some("Sherlock".into()),
+                    Some("ws-1".into()),
+                    "workspace-record".into(),
+                ),
+            ),
+            (
+                "other-detail".into(),
+                WindowScope::new(Some("Other".into()), None, "other-record".into()),
+            ),
+        ]);
+
+        assert_eq!(
+            legacy_host_detail_label(&windows, "Sherlock", "home").as_deref(),
+            Some("legacy-detail")
+        );
+        assert_eq!(
+            legacy_host_detail_label(&windows, "Sherlock", "legacy-detail"),
+            None
+        );
+        assert_eq!(legacy_host_detail_label(&windows, "Missing", "home"), None);
     }
 
     #[test]
