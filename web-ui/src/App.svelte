@@ -1977,8 +1977,22 @@
     if (!switched) return;
     // Home is the new-window launcher, not a permanent identity attached to
     // this native window. Once it enters a workspace, a later New Window must
-    // be able to create a fresh Home without replacing this workbench.
-    if (activeWsId === null) leaveHomeHub();
+    // be able to create a fresh Home without replacing this workbench. Report
+    // that one-way promotion at the selection boundary: leaving it to the
+    // reactive fire-and-forget scope report below lets an immediate native
+    // New Window still observe (and merely focus) the stale Home launcher.
+    if (activeWsId === null) {
+      if (isNativeShell()) {
+        const promotedLabel = w.name + (isRemoteWindow ? ` •${hostAlias}` : "");
+        try {
+          await reportWindowScope(scopeAlias, w.id, promotedLabel);
+        } catch (error) {
+          console.error("could not promote Home to a workspace window", error);
+          return;
+        }
+      }
+      leaveHomeHub();
+    }
     // Flush the outgoing workspace's pending layout write under its own key,
     // then restore (or default) the incoming workspace's tree.
     void flushViewState();
