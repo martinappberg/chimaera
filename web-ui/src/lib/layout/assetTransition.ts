@@ -18,7 +18,36 @@ export interface AssetTransition {
   revision: number;
 }
 
+export type AssetNavigation =
+  | { kind: "reload" }
+  | { kind: "replace"; target: string }
+  | { kind: "replace-and-reload"; target: string };
+
 export const assetTransition = writable<AssetTransition | null>(null);
+
+/**
+ * Choose a navigation primitive that always replaces the loaded document.
+ *
+ * `location.replace()` treats a same-origin URL whose only difference is its
+ * hash as an in-document navigation. SSH recovery commonly reuses the loopback
+ * port while rotating the token in that hash, so explicitly update the URL and
+ * reload in that case.
+ */
+export function planAssetNavigation(
+  currentHref: string,
+  target: string | null,
+): AssetNavigation {
+  if (target === null) return { kind: "reload" };
+  const current = new URL(currentHref);
+  const next = new URL(target, current);
+  const sameDocument =
+    current.origin === next.origin &&
+    current.pathname === next.pathname &&
+    current.search === next.search;
+  return sameDocument
+    ? { kind: "replace-and-reload", target: next.href }
+    : { kind: "replace", target: next.href };
+}
 
 /** Source identity of a build id, matching chimaera_core::builds_match. */
 export function buildSource(build: string | null | undefined): string | null {

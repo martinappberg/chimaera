@@ -60,7 +60,10 @@
   } from "./lib/workspace/agentLinks";
   import { typeIntoDetachedSession } from "./lib/terminal/ws";
   import { reconnectingSockets } from "./lib/net/reconnect";
-  import { selectRemoteReconnectSurface } from "./lib/net/remoteReconnect";
+  import {
+    createReconnectListenerGate,
+    selectRemoteReconnectSurface,
+  } from "./lib/net/remoteReconnect";
   import { attachImageToComposer, insertIntoComposer } from "./lib/chat/composerBus";
   import { volatileChatDrafts } from "./lib/chat/drafts";
   import { imageToAttachment } from "./lib/chat/images";
@@ -198,6 +201,7 @@
     setCaffeinate,
     setNativeWindowTitle,
     shellBuild,
+    type HostStatusEvent,
   } from "./lib/net/native";
   import UpdateToast from "./lib/workspace/UpdateToast.svelte";
   import { currentOffer, updateState } from "./lib/workspace/update.svelte";
@@ -246,6 +250,7 @@
     clearChunkFailure,
     documentBuildSource,
     noteChunkFailure,
+    planAssetNavigation,
     rearmAssetNavigation,
     requestAssetReload,
     requireAssetNavigation,
@@ -320,6 +325,9 @@
   const statusAlias = jobCtx !== null ? `${hostAlias}#job${jobCtx.jobId}` : hostAlias;
   /** Only the native shell can re-run ssh; a browser tunnel is the CLI's job. */
   const canReconnect = isRemoteWindow && isNativeShell();
+  /** Native events are not replayed. A stale-token page must not invoke
+   *  reconnect until its connected endpoint/token listener is attached. */
+  const reconnectListener = createReconnectListenerGate();
   /** This window's scope key for the shell registry (null alias = local). */
   const scopeAlias = isRemoteWindow ? (jobCtx !== null ? statusAlias : hostAlias) : null;
   /** The reconnect status or failure dialog is showing. */
@@ -330,9 +338,6 @@
   let reconnectError = $state<string | null>(null);
   /** Context from the shell's liveness monitor for the current drop. */
   let reconnectReason = $state<string | null>(null);
-  /** The user dismissed the overlay; don't auto-reshow until state changes. */
-  let reconnectDismissed = $state(false);
-  let reconnectGrace: ReturnType<typeof setTimeout> | null = null;
   /** Dismissing a failed reconnect downgrades it to an ambient Retry instead
    *  of removing the only recovery path. Unauthorized native windows never
    *  fall through to the browser-only manual auth overlay. */
@@ -356,13 +361,14 @@
     reconnecting = true;
     reconnectError = null;
     try {
+      await reconnectListener.ready;
       if (jobCtx !== null) {
         await connectComputeSession(hostAlias, jobCtx.jobId);
       } else {
         await connectHost(hostAlias);
       }
-      // Same-port heal → our WebSocket reconnects and eventsUp clears the
-      // overlay; a moved port/token re-homes this window via onHostStatus.
+      // Every successful shell connect republishes `host-status: connected`,
+      // which clears the overlay and re-homes this window when needed.
     } catch (e) {
       reconnectError = e instanceof Error ? e.message : String(e);
     } finally {
@@ -370,28 +376,61 @@
     }
   }
 
-  function beginReconnect(reason: string | null = null): void {
-    // A shell liveness event is authoritative and skips the socket grace even
-    // if Svelte has not observed the corresponding events-socket close yet.
-    if (!canReconnect || (reason === null && eventsUp)) return;
-    if (reason !== null) reconnectReason = reason;
-    reconnectDismissed = false;
+  function beginReconnect(reason: string): void {
+    if (!canReconnect) return;
+    reconnectReason = reason;
     showReconnect = true;
     void attemptReconnect();
   }
 
   function retryReconnect(): void {
-    reconnectDismissed = false;
     showReconnect = true;
     void attemptReconnect();
   }
 
   function dismissReconnect(): void {
     showReconnect = false;
-    reconnectDismissed = true;
-    if (reconnectGrace !== null) {
-      clearTimeout(reconnectGrace);
-      reconnectGrace = null;
+  }
+
+  function finishReconnect(): void {
+    showReconnect = false;
+    reconnectError = null;
+    reconnectReason = null;
+  }
+
+  function handleHostStatus(e: HostStatusEvent): void {
+    if (!canReconnect || e.alias !== statusAlias) return;
+    if (e.status === "down") {
+      beginReconnect(e.reason ?? "The remote connection stopped responding.");
+      return;
+    }
+    if (e.status === "error") return;
+    finishReconnect();
+    const port = e.local_port;
+    // Compute-status events carry no token (compute tokens stay in the
+    // shell's Rust side); a rebuilt job tunnel lands on the SAME daemon,
+    // so this window's own token still holds — carry it across the origin
+    // move ourselves.
+    const token = e.token ?? (jobCtx !== null ? getToken() : null);
+    const portMoved = port !== null && String(port) !== location.port;
+    const tokenMoved = token !== null && token !== getToken();
+    const buildMoved = daemonBuildChanged(e.build);
+    if (portMoved || tokenMoved) {
+      const params = new URLSearchParams();
+      if (token !== null) params.set("token", token);
+      params.set("win", windowKey());
+      if (activeWsId !== null) params.set("ws", activeWsId);
+      params.set("host", hostAlias);
+      if (jobCtx !== null) {
+        params.set("job", jobCtx.jobId);
+        if (jobCtx.node !== null) params.set("node", jobCtx.node);
+      }
+      requireAssetNavigation(
+        buildMoved ? "build" : "connection",
+        `http://127.0.0.1:${port ?? location.port}/#${params.toString()}`,
+      );
+    } else if (buildMoved) {
+      requireAssetNavigation("build", null);
     }
   }
 
@@ -408,29 +447,10 @@
     );
   });
 
-  // A remote window whose events socket stays down past a short grace has lost
-  // its tunnel (not just a daemon blip): show the overlay and reconnect. When
-  // it recovers, clear everything. host-status "down" skips the grace.
-  $effect(() => {
-    if (!canReconnect) return;
-    if (eventsUp) {
-      if (reconnectGrace !== null) {
-        clearTimeout(reconnectGrace);
-        reconnectGrace = null;
-      }
-      showReconnect = false;
-      reconnectError = null;
-      reconnectReason = null;
-      reconnectDismissed = false;
-      return;
-    }
-    if (reconnectGrace === null && !showReconnect && !reconnectDismissed) {
-      reconnectGrace = setTimeout(() => {
-        reconnectGrace = null;
-        beginReconnect();
-      }, 1500);
-    }
-  });
+  // `/ws/events` owns its own backoff and is not SSH liveness: it can restart
+  // while authenticated HTTP remains healthy. Only the shell's consecutive
+  // authenticated health failures (or a 401 above) start SSH recovery, and
+  // only its `connected` event finishes that recovery.
 
   // Keep the shell's window registry current so "open this workspace" raises
   // this window instead of duplicating it (the SPA swaps `ws` client-side, so
@@ -778,8 +798,15 @@
     if (transition.revision === handledAssetRevision) return;
     handledAssetRevision = transition.revision;
     untrack(() => {
-      if (transition.target === null) location.reload();
-      else location.replace(transition.target);
+      const navigation = planAssetNavigation(location.href, transition.target);
+      if (navigation.kind === "reload") {
+        location.reload();
+      } else if (navigation.kind === "replace") {
+        location.replace(navigation.target);
+      } else {
+        history.replaceState(history.state, "", navigation.target);
+        location.reload();
+      }
       // This callback can run only if the document survived the navigation
       // call (normally because the user chose Stay in beforeunload). Re-arm
       // with `forced` cleared: dirty state holds the next attempt, and saving
@@ -1002,41 +1029,9 @@
       // same-build heal stays in place and its WebSocket just reconnects.
       // Matching is on statusAlias: a job window heeds ONLY its composite
       // key's events — the login alias's port/token are another daemon.
-      unlistenHostStatus = asyncDisposer(
-        onHostStatus((e) => {
-          if (!canReconnect || e.alias !== statusAlias) return;
-          if (e.status === "down") {
-            beginReconnect(e.reason ?? "The remote connection stopped responding.");
-            return;
-          }
-          const port = e.local_port;
-          // Compute-status events carry no token (compute tokens stay in the
-          // shell's Rust side); a rebuilt job tunnel lands on the SAME daemon,
-          // so this window's own token still holds — carry it across the
-          // origin move ourselves.
-          const token = e.token ?? (jobCtx !== null ? getToken() : null);
-          const portMoved = port !== null && String(port) !== location.port;
-          const tokenMoved = token !== null && token !== getToken();
-          const buildMoved = daemonBuildChanged(e.build);
-          if (portMoved || tokenMoved) {
-            const params = new URLSearchParams();
-            if (token !== null) params.set("token", token);
-            params.set("win", windowKey());
-            if (activeWsId !== null) params.set("ws", activeWsId);
-            params.set("host", hostAlias);
-            if (jobCtx !== null) {
-              params.set("job", jobCtx.jobId);
-              if (jobCtx.node !== null) params.set("node", jobCtx.node);
-            }
-            requireAssetNavigation(
-              buildMoved ? "build" : "connection",
-              `http://127.0.0.1:${port ?? location.port}/#${params.toString()}`,
-            );
-          } else if (buildMoved) {
-            requireAssetNavigation("build", null);
-          }
-        }),
-      );
+      const listening = onHostStatus(handleHostStatus);
+      void listening.then(reconnectListener.attached, reconnectListener.failed);
+      unlistenHostStatus = asyncDisposer(listening);
     }
 
     const onPagehide = () => {

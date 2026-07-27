@@ -37,8 +37,10 @@ a `RemoteOps` trait. See also [native-app.md](native-app.md) for the windows/hos
   via `scp` (staged `.new` + `mv -f`), **start** (`chimaera serve --daemonize`, which forks +
   `setsid(2)`s in-process so it needs no util-linux `setsid`/`nohup` and works on any POSIX remote —
   Linux, macOS, BSD; falls back to `setsid nohup … & disown` for a pre-flag remote binary; poll the
-  manifest ≤15s). (5) **Tunnel** (`ssh -N -L` with `ExitOnForwardFailure`, poll the port ≤15s) and
-  open `http://127.0.0.1:{port}/#token={token}&host={alias}`.
+  manifest ≤15s). (5) **Tunnel** (`ssh -N -L` with `ExitOnForwardFailure`), wait for the local
+  listener, then require a bearer-authenticated health 200 through that exact forward before
+  publishing `connected` and opening
+  `http://127.0.0.1:{port}/#token={token}&host={alias}`. A listener that merely accepts is not ready.
 
 ## Key behaviors & gotchas
 
@@ -59,13 +61,24 @@ a `RemoteOps` trait. See also [native-app.md](native-app.md) for the windows/hos
   while SSH is still waiting; mutable workspace reports cannot revoke or grant another host scope.
   Compute windows store their login-host askpass identity separately from the composite per-job
   tunnel key, so the shape of an ordinary SSH alias can never imply access to another host's prompt.
-- **Liveness is an HTTP probe, not a bare TCP connect** — after laptop sleep an ssh forward's local
-  listener still accepts while the connection behind it is dead. Initial tunnel polling accepts any
-  HTTP response (`http_alive`); once a manifest/token is known, native reuse and health monitoring
-  require a bearer-authenticated 200 (`http_alive_authed`), so a 401 or a foreign service on a
-  recycled port cannot be mistaken for the intended daemon. Every successful connect call
-  republishes the tunnel's current port, token, and build even when it only reused a healthy
-  tunnel, so a window holding credentials from before another window's reconnect can re-home.
+- **Liveness is an authenticated HTTP state machine, not a bare TCP connect.** After laptop sleep an
+  ssh forward's local listener still accepts while the connection behind it is dead. Initial
+  tunnel bring-up, native reuse, and monitoring all require a bearer-authenticated health 200
+  (`http_alive_authed`), so a 401 or a foreign service on a recycled port cannot be mistaken for the
+  intended daemon. The monitor probes hosts concurrently — one slow cluster cannot delay another —
+  and needs three consecutive misses before publishing `down`; one timeout is only suspicion and a
+  success resets it. Results from an endpoint replaced while its probe was in flight are discarded.
+  Every successful connect republishes the tunnel's current port, token, and build even when it only
+  reused a healthy tunnel, so a window holding credentials from before another window's reconnect
+  can re-home.
+- **WebSocket recovery is not SSH recovery.** `/ws/events` reconnects with its own backoff and the UI
+  falls back to bounded polling while it is down. Losing that one socket cannot tear down a healthy
+  SSH tunnel or show a host-level reconnect warning; only the shell's authenticated health state
+  machine (or an authorization rejection) starts the coalesced SSH reconnect.
+- **Disconnected windows preserve context, not capability.** Already-rendered tabs, file contents,
+  and navigation remain readable during a confirmed outage so a network blip does not blank the
+  user's work. The reconnect status says that explicitly; remote reads/writes resume only after the
+  authenticated tunnel is back, and an actual reconnect failure surfaces Retry.
 - **TOFU host keys.** `StrictHostKeyChecking=accept-new` lets a windowed app with no tty reach a
   never-seen host (it still refuses a *changed* key). `ServerAliveInterval/CountMax` notice a dead
   link within ~45s.

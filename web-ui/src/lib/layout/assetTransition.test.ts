@@ -7,6 +7,7 @@ import {
   clearChunkFailure,
   documentBuildSource,
   noteChunkFailure,
+  planAssetNavigation,
   rearmAssetNavigation,
   requestAssetReload,
   requireAssetNavigation,
@@ -20,6 +21,27 @@ describe("asset transition identity", () => {
     expect(buildSource("abc1234.200")).toBe("abc1234");
     expect(buildSource("unknown.100")).toBe("unknown.100");
     expect(documentBuildSource(BUILD_META_PLACEHOLDER)).toBeNull();
+  });
+
+  it("reloads after replacing a rotated token on the same loopback origin", () => {
+    expect(
+      planAssetNavigation(
+        "http://127.0.0.1:9800/#token=stale",
+        "http://127.0.0.1:9800/#token=fresh",
+      ),
+    ).toEqual({
+      kind: "replace-and-reload",
+      target: "http://127.0.0.1:9800/#token=fresh",
+    });
+    expect(
+      planAssetNavigation(
+        "http://127.0.0.1:9800/#token=stale",
+        "http://127.0.0.1:9801/#token=fresh",
+      ),
+    ).toEqual({
+      kind: "replace",
+      target: "http://127.0.0.1:9801/#token=fresh",
+    });
   });
 
   it("keeps the strongest reason and the freshest navigation target", () => {
