@@ -65,6 +65,13 @@ fn find_by_alias(windows: &Mutex<HashMap<String, WindowScope>>, alias: &str) -> 
         .map(|(label, _)| label.clone())
 }
 
+/// Only a local page with no workspace can reclaim the singleton Home
+/// launcher. Keep this predicate beside the command that takes the Home gate
+/// so future scope variants cannot silently bypass its serialization.
+fn report_can_reclaim_local_home(alias: &Option<String>, ws: &Option<String>) -> bool {
+    alias.is_none() && ws.is_none()
+}
+
 #[tauri::command]
 pub(super) async fn list_hosts(state: State<'_, Shell>) -> Result<Vec<HostState>, String> {
     tracing::debug!("ipc: list_hosts");
@@ -876,6 +883,12 @@ pub(super) fn report_window_scope(
     ws: Option<String>,
     label: Option<String>,
 ) -> Result<(), String> {
+    // New Window takes `home_opening` before inspecting `windows`. Match that
+    // lock order and hold the gate until this local-empty report has retired
+    // any older launcher and marked its claimant. Otherwise New Window can
+    // observe the handoff's temporary zero-hub state and create a duplicate.
+    let home_reclaim_gate =
+        report_can_reclaim_local_home(&alias, &ws).then(|| lock(&state.home_opening));
     let mut windows = lock(&state.windows);
     let current = windows
         .get(webview.label())
@@ -950,6 +963,9 @@ pub(super) fn report_window_scope(
     let home_hub = scope.home_hub;
     let reclaimed_scope = reclaimed_home.then(|| scope.clone());
     drop(windows);
+    // The singleton identity is now visible atomically to New Window. Do not
+    // retain its gate across persistence, prompt replay, or tray rebuilding.
+    drop(home_reclaim_gate);
     if let Some(previous_scope) = pre_promotion_scope {
         if let Err(error) = super::show_local_home(webview.app_handle(), None) {
             // Creating the successor failed: restore prompt eligibility on
@@ -1185,7 +1201,7 @@ pub(super) async fn wsl_setup_daemon(app: AppHandle, distro: Option<String>) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::compute_response_body;
+    use super::{compute_response_body, report_can_reclaim_local_home};
 
     fn response(status: u16, body: &str) -> ureq::http::Response<ureq::Body> {
         ureq::http::Response::builder()
@@ -1217,5 +1233,22 @@ mod tests {
                 .expect("200 response"),
             r#"{"sessions":[]}"#
         );
+    }
+
+    #[test]
+    fn only_local_empty_reports_enter_the_home_reclamation_gate() {
+        assert!(report_can_reclaim_local_home(&None, &None));
+        assert!(!report_can_reclaim_local_home(
+            &None,
+            &Some("workspace".into())
+        ));
+        assert!(!report_can_reclaim_local_home(
+            &Some("Sherlock".into()),
+            &None
+        ));
+        assert!(!report_can_reclaim_local_home(
+            &Some("Sherlock".into()),
+            &Some("workspace".into())
+        ));
     }
 }

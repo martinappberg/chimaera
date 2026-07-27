@@ -85,9 +85,10 @@ pub struct Shell {
     /// focused flag when the application deactivates, so Dock reopen and a
     /// repeated launch need this label to restore the prior frontmost window.
     last_focused_window: Mutex<Option<String>>,
-    /// Serializes the check-or-create path for the singleton local Home. IPC
-    /// commands can arrive concurrently, so inspecting `windows` and opening
-    /// without this gate would leave a narrow duplicate-window race.
+    /// Serializes every check/create/reclaim handoff for the singleton local
+    /// Home. IPC commands can arrive concurrently, so inspecting `windows`,
+    /// retiring an older launcher, and claiming or opening its replacement
+    /// must share this gate or expose a narrow duplicate-window race.
     home_opening: Mutex<()>,
     /// The only loopback port each daemon window may navigate to right now.
     /// Runtime ACLs are additive, so this guard also makes an origin granted
