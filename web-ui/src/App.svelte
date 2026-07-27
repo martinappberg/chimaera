@@ -10,6 +10,7 @@
     leaveHomeHub,
     notifyUnauthorized,
     pollHealth,
+    reclaimHomeHub,
     setActiveWorkspaceId,
     unauthorized,
     type Health,
@@ -336,6 +337,12 @@
   const reconnectListener = createReconnectListenerGate();
   /** This window's scope key for the shell registry (null alias = local). */
   const scopeAlias = isRemoteWindow ? (jobCtx !== null ? statusAlias : hostAlias) : null;
+  /** Carry hub identity across daemon origins. `sessionStorage` remembers the
+   *  original launcher, while the current local-empty scope covers a promoted
+   *  workbench that the shell is reclaiming as Home right now. */
+  function shouldCarryHomeHub(): boolean {
+    return isHomeHub() || (isNativeShell() && scopeAlias === null && activeWsId === null);
+  }
   /** The reconnect status or failure dialog is showing. */
   let showReconnect = $state(false);
   /** A connectHost call is in flight. */
@@ -426,7 +433,7 @@
       if (token !== null) params.set("token", token);
       params.set("win", windowKey());
       if (activeWsId !== null) params.set("ws", activeWsId);
-      if (isHomeHub()) params.set("hub", "1");
+      if (shouldCarryHomeHub()) params.set("hub", "1");
       params.set("host", hostAlias);
       params.set("appearance", JSON.stringify(appearanceBootstrapForNavigation()));
       if (jobCtx !== null) {
@@ -464,7 +471,23 @@
   // this window instead of duplicating it (the SPA swaps `ws` client-side, so
   // the shell can't see the change otherwise).
   $effect(() => {
-    if (isNativeShell()) void reportWindowScope(scopeAlias, activeWsId, windowLabel || null);
+    if (!isNativeShell()) return;
+    const reportedWsId = activeWsId;
+    void reportWindowScope(scopeAlias, reportedWsId, windowLabel || null).then(
+      () => {
+        // A promoted local workbench becomes the singleton Home again when
+        // its workspace disappears. Restore the browser half of that identity
+        // only while the reported empty scope is still current: an older IPC
+        // completion must not undo a newer workspace promotion.
+        if (scopeAlias === null && reportedWsId === null && activeWsId === null) {
+          reclaimHomeHub();
+        }
+      },
+      () => {
+        // Navigation can transiently reject reconciliation; only a confirmed
+        // report is allowed to reclaim the browser's Home identity.
+      },
+    );
   });
   // --- the agent launcher (split button + popover) ---
   /** The persisted default agent the split button's main surface spawns. */
@@ -1028,7 +1051,7 @@
           params.set("token", token);
           params.set("win", windowKey());
           if (activeWsId !== null) params.set("ws", activeWsId);
-          if (isHomeHub()) params.set("hub", "1");
+          if (shouldCarryHomeHub()) params.set("hub", "1");
           params.set("appearance", JSON.stringify(appearanceBootstrapForNavigation()));
           requireAssetNavigation(
             "build",
@@ -1983,10 +2006,11 @@
     if (!switched) return;
     // Home is the new-window launcher, not a permanent identity attached to
     // this native window. Once it enters a workspace, a later New Window must
-    // be able to create a fresh Home without replacing this workbench. Report
-    // that one-way promotion at the selection boundary: leaving it to the
-    // reactive fire-and-forget scope report below lets an immediate native
-    // New Window still observe (and merely focus) the stale Home launcher.
+    // be able to create a fresh Home without replacing this workbench (the
+    // shell may reclaim it if the workspace later disappears). Report that
+    // promotion at the selection boundary: leaving it to the reactive
+    // fire-and-forget scope report above lets an immediate native New Window
+    // still observe (and merely focus) the stale Home launcher.
     if (activeWsId === null) {
       if (isNativeShell()) {
         const promotedLabel = w.name + (isRemoteWindow ? ` •${hostAlias}` : "");

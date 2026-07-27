@@ -42,8 +42,8 @@ function initFromHash(): string | null {
     if (wsFromHash === null) {
       sessionStorage.setItem(HOME_HUB_KEY, "1");
     } else {
-      // A workspace consumes the launcher window. The native shell makes the
-      // same one-way promotion when the page reports its scope.
+      // A workspace consumes the launcher window. If that workspace later
+      // disappears, the native shell can explicitly reclaim this identity.
       sessionStorage.removeItem(HOME_HUB_KEY);
     }
   } else if (winFromHash !== null) {
@@ -98,6 +98,11 @@ export function isHomeHub(): boolean {
 /** A launcher that entered a workspace is now an ordinary workbench window. */
 export function leaveHomeHub(): void {
   sessionStorage.removeItem(HOME_HUB_KEY);
+}
+
+/** The native shell confirmed that this local empty window reclaimed Home. */
+export function reclaimHomeHub(): void {
+  sessionStorage.setItem(HOME_HUB_KEY, "1");
 }
 
 /**
