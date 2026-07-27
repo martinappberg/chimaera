@@ -267,6 +267,9 @@
   import Pane from "./lib/layout/Pane.svelte";
 
   let health = $state<Health | null>(null);
+  /** Last authenticated HTTP health result. The event stream can reconnect
+   *  independently while the daemon and SSH tunnel remain reachable. */
+  let healthUp = $state(false);
   /** Source identity of the daemon that supplied this document. A different
    *  source means its immutable lazy-chunk namespace changed underneath us. */
   let servedBuild = documentBuildSource(
@@ -757,11 +760,14 @@
     return names;
   });
 
-  // Health polling keeps the hostname fresh and trips the 401 overlay; the
-  // daemon dot itself tracks the authenticated events socket.
+  // Health polling keeps the hostname fresh, trips the 401 overlay, and
+  // independently tracks authenticated daemon reachability. The events
+  // socket can restart while HTTP remains healthy, so the Home badge accepts
+  // either successful channel instead of calling that transient "offline".
   $effect(() =>
     pollHealth(
       (h) => {
+        healthUp = true;
         if (daemonBuildChanged(h.build)) {
           // The origin can stay stable across a daemon handoff, but the
           // hashed JS namespace cannot. Reload before the user opens a lazy
@@ -773,7 +779,7 @@
         health = h;
       },
       () => {
-        // unreachable daemon; the events socket state already reflects this
+        healthUp = false;
       },
     ),
   );
@@ -3280,7 +3286,7 @@
       sessions={sessions.filter((s) => !isMastermind(s))}
       hostLabel={getHostLabel()}
       {health}
-      connected={eventsUp}
+      daemonReachable={eventsUp || healthUp}
       onOpen={activateWorkspace}
       onRemove={removeWorkspace}
       onStop={stopWorkspace}

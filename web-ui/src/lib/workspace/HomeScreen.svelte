@@ -51,8 +51,8 @@
     sessions: Session[];
     hostLabel: string;
     health: Health | null;
-    /** The authenticated events socket is up (daemon reachable). */
-    connected: boolean;
+    /** Authenticated HTTP health or the authenticated events socket is up. */
+    daemonReachable: boolean;
     /** Open `w` in THIS window. */
     onOpen: (w: Workspace) => void;
     /** Remove `w` from the daemon's registry (files untouched). */
@@ -68,7 +68,7 @@
     sessions,
     hostLabel,
     health,
-    connected,
+    daemonReachable,
     onOpen,
     onRemove,
     onStop,
@@ -814,21 +814,21 @@
         {#if ownAlias !== null}
           <span
             class="remote-status"
-            class:online={connected}
+            class:online={daemonReachable}
             role="status"
-            title={connected
+            title={daemonReachable
               ? `${hostLabel} daemon is reachable`
               : `${hostLabel} daemon is not currently reachable`}
           >
-            <span class="daemon-dot" class:ok={connected} aria-hidden="true"></span>
-            {connected ? "online" : "offline"}
+            <span class="daemon-dot" class:ok={daemonReachable} aria-hidden="true"></span>
+            {daemonReachable ? "online" : "offline"}
           </span>
         {:else}
           <span
             class="daemon-dot"
-            class:ok={connected}
-            title={connected ? "local daemon is online" : "local daemon is offline"}
-            aria-label={connected ? "local daemon online" : "local daemon offline"}
+            class:ok={daemonReachable}
+            title={daemonReachable ? "local daemon is online" : "local daemon is offline"}
+            aria-label={daemonReachable ? "local daemon online" : "local daemon offline"}
           ></span>
         {/if}
       </div>
