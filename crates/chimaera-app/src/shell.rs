@@ -90,6 +90,11 @@ pub struct Shell {
     /// retiring an older launcher, and claiming or opening its replacement
     /// must share this gate or expose a narrow duplicate-window race.
     home_opening: Mutex<()>,
+    /// Serializes Home navigation from scope validation through the
+    /// `navigation_pending` transition. Two host clicks may arrive through
+    /// concurrent IPC commands; only the first may authorize and stage a
+    /// destination for the singleton launcher.
+    home_navigation: Mutex<()>,
     /// The only loopback port each daemon window may navigate to right now.
     /// Runtime ACLs are additive, so this guard also makes an origin granted
     /// before a reconnect unusable if its port is later recycled.
@@ -487,6 +492,7 @@ pub(crate) fn navigate_home_hub(
     ws: Option<String>,
 ) -> tauri::Result<()> {
     let shell = app.state::<Shell>();
+    let home_navigation = lock(&shell.home_navigation);
     let previous_scope = lock(&shell.windows)
         .get(window.label())
         .cloned()
@@ -583,6 +589,9 @@ pub(crate) fn navigate_home_hub(
         };
         scope.begin_home_navigation(alias.clone(), ws.clone(), label);
     }
+    // A competing navigation can now acquire the gate, but it will observe
+    // `navigation_pending` and fail before changing authorization or scope.
+    drop(home_navigation);
     if let Err(error) = window.navigate(url) {
         lock(&shell.windows).insert(window.label().to_string(), previous_scope);
         let mut allowed = lock(&shell.allowed_daemon_ports);
@@ -808,6 +817,7 @@ pub(crate) fn finish_startup(handle: &tauri::AppHandle, local: LocalDaemon) -> t
             windows: Mutex::new(HashMap::new()),
             last_focused_window: Mutex::new(None),
             home_opening: Mutex::new(()),
+            home_navigation: Mutex::new(()),
             allowed_daemon_ports: Mutex::new(HashMap::new()),
             registry: Mutex::new(WindowRegistry::load_default()),
             appearance: Mutex::new(crate::appearance::AppearanceCache::load_default()),
