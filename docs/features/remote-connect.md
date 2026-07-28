@@ -57,8 +57,13 @@ a `RemoteOps` trait. See also [native-app.md](native-app.md) for the windows/hos
   it registered when the window opened — a daemon-served page cannot widen it client-side. Startup
   registers a home fallback before launching restored remote connects when only local workspace
   windows were persisted, so an early password or 2FA prompt always has an eligible surface. A
-  window created as local Home retains that shell-owned fallback identity if it opens a workspace
-  while SSH is still waiting; mutable workspace reports cannot revoke or grant another host scope.
+  local Home that enters a workspace while an SSH flight or prompt is active first creates a
+  successor Home; only after that succeeds does the promoted workbench lose cross-host fallback
+  access and hand any visible pending prompt to the successor. If the successor cannot be created,
+  promotion is rolled back so authentication is never stranded. Local workspace windows therefore
+  never retain the fallback identity, and cross-daemon navigation stays non-privileged until the
+  allowed destination document commits; page reports may update workspace state but cannot rewrite
+  the shell-registered host.
   Compute windows store their login-host askpass identity separately from the composite per-job
   tunnel key, so the shape of an ordinary SSH alias can never imply access to another host's prompt.
 - **Liveness is an authenticated HTTP state machine, not a bare TCP connect.** After laptop sleep an
@@ -144,13 +149,22 @@ a `RemoteOps` trait. See also [native-app.md](native-app.md) for the windows/hos
 
 ## Remote host management (native app)
 
-- **What & when.** From the home screen: browse a connected host's workspaces, and control its daemon.
-- **How it's used.** Connected host rows offer `end sessions` (kill everything on the host; the daemon
-  + tunnel stay up), `disconnect` (tunnel down; sessions + daemon keep running), `shut down` (end
-  sessions *and* stop the daemon, then drop the tunnel — the real off switch), and forget (`×`). An
-  outdated remote daemon offers an inline "update" that reconnects with `updateDaemon=true`.
-- **Where it lives.** `crates/chimaera-app/src/shell/commands.rs` (`end_host_sessions`,
-  `disconnect_host`, `shutdown_host`, `remote_workspaces`); daemon side `DELETE /api/v1/sessions` and
+- **What & when.** From the unused local Home launcher: enter a connected host's page, browse its
+  workspaces, and control its daemon. Connecting or selecting a host navigates that same launcher onto
+  the remote detail page; **Back to Home** navigates it back to the local daemon. No extra host-detail
+  window is created. Selecting a remote workspace promotes the launcher into an ordinary workbench;
+  a later New Window opens a fresh Home without replacing it. The explicit new-window action opens
+  another workbench directly.
+- **How it's used.** Connected host rows enter the host page and offer `end sessions` (kill everything
+  on the host; the daemon + tunnel stay up), `disconnect` (tunnel down; sessions + daemon keep running),
+  `shut down` (end sessions *and* stop the daemon, then drop the tunnel — the real off switch), and
+  forget (`×`). A connected row says **online** and carries its live-session count (including an
+  active Mastermind); the remote detail masthead repeats that daemon reachability as an explicit
+  online/offline badge. An outdated remote daemon offers an inline "update" that reconnects with
+  `updateDaemon=true`.
+- **Where it lives.** `crates/chimaera-app/src/shell/commands.rs` (`navigate_home`,
+  `end_host_sessions`, `disconnect_host`, `shutdown_host`, `remote_workspaces`),
+  `web-ui/src/lib/workspace/HomeScreen.svelte`; daemon side `DELETE /api/v1/sessions` and
   `POST /api/v1/shutdown` through the tunnel.
 
 ## Reauth overlay

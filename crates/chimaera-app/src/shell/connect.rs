@@ -10,8 +10,28 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 
 use super::restore::open_ui_window;
-use super::{authorize_scope_origin, lock, Shell};
+use super::{authorize_scope_origin, lock, ConnectFlight, Shell};
 use crate::windows::WindowRecord;
+
+type ConnectFlightOwner = tokio::sync::watch::Sender<Option<Result<(), String>>>;
+
+/// Claim the complete connect invocation synchronously, before its first
+/// tunnel lock or liveness-probe await. Home promotion treats this map as the
+/// authoritative "SSH may still ask for credentials" set.
+fn claim_connect_flight(
+    connecting: &std::sync::Mutex<std::collections::HashMap<String, ConnectFlight>>,
+    alias: &str,
+) -> Result<ConnectFlightOwner, ConnectFlight> {
+    let mut connecting = lock(connecting);
+    match connecting.get(alias) {
+        Some(rx) => Err(rx.clone()),
+        None => {
+            let (tx, rx) = tokio::sync::watch::channel(None);
+            connecting.insert(alias.to_string(), rx);
+            Ok(tx)
+        }
+    }
+}
 
 /// Host list entry as the UI sees it (see HostState in native.ts).
 #[derive(Clone, Serialize)]
@@ -179,44 +199,7 @@ pub(super) async fn do_connect(
     let state = app.state::<Shell>();
     tracing::info!("ipc: connect_host {alias} (update_daemon: {update_daemon})");
     loop {
-        // Reuse a live tunnel. `is_up` is an end-to-end HTTP probe: after
-        // laptop sleep ssh's local listener often survives its dead
-        // connection, and a bare TCP check here would return "connected"
-        // without healing anything. An update never reuses — the old tunnel
-        // points at the daemon being replaced.
-        if !update_daemon {
-            // Probe liveness WITHOUT holding the tunnels lock: `is_up` is a
-            // ~2s HTTP round-trip, and holding the map locked across it would
-            // stall every other tunnel op (an `open_window`, another window's
-            // health check) behind it. Grab the endpoint identity, drop the
-            // lock, probe, then re-lock only to build the reply. A 401 from a
-            // stale/foreign daemon on a recycled port is not a live tunnel.
-            let endpoint = state
-                .tunnels
-                .lock()
-                .await
-                .get(&alias)
-                .map(|t| (t.local_port, t.manifest.token.clone()));
-            if let Some((port, token)) = endpoint {
-                if chimaera_remote::http_alive_authed(port, &token).await {
-                    if let Some(reply) = publish_connected_state(app, &state, &alias).await {
-                        return Ok(reply);
-                    }
-                }
-            }
-        }
-        let flight = {
-            let mut connecting = lock(&state.connecting);
-            match connecting.get(&alias) {
-                Some(rx) => Err(rx.clone()),
-                None => {
-                    let (tx, rx) = tokio::sync::watch::channel(None);
-                    connecting.insert(alias.clone(), rx);
-                    Ok(tx)
-                }
-            }
-        };
-        let tx = match flight {
+        let tx = match claim_connect_flight(&state.connecting, &alias) {
             // Someone else owns the attempt: await its outcome. The clone
             // frees the watch borrow before we touch `rx` again below.
             Err(mut rx) => {
@@ -253,9 +236,38 @@ pub(super) async fn do_connect(
             Ok(tx) => tx,
         };
 
-        // We own the flight: run it, then publish the outcome — every path
-        // out of `run_flight` must land here or joiners would hang.
-        let result = run_flight(app, &alias, update_daemon).await;
+        // We own the complete invocation, including the healthy-tunnel probe.
+        // Publishing the flight before that first await keeps the only Home
+        // fallback alive in case this path proceeds into password/2FA SSH.
+        let reused = if update_daemon {
+            None
+        } else {
+            // Probe liveness WITHOUT holding the tunnels lock: this is a ~2s
+            // HTTP round-trip, and holding the map locked across it would
+            // stall every other tunnel op. A 401 from a stale/foreign daemon
+            // on a recycled port is not a live tunnel.
+            let endpoint = state
+                .tunnels
+                .lock()
+                .await
+                .get(&alias)
+                .map(|t| (t.local_port, t.manifest.token.clone()));
+            if let Some((port, token)) = endpoint {
+                if chimaera_remote::http_alive_authed(port, &token).await {
+                    publish_connected_state(app, &state, &alias).await
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        // Every owner path lands in the shared cleanup below so joiners never
+        // hang, whether this reused a healthy tunnel or built a new one.
+        let result = match reused {
+            Some(reply) => Ok(reply),
+            None => run_flight(app, &alias, update_daemon).await,
+        };
         lock(&state.connecting).remove(&alias);
         let _ = tx.send(Some(match &result {
             Ok(_) => Ok(()),
@@ -388,7 +400,11 @@ fn host_entry(alias: &str) -> chimaera_remote::hosts::HostEntry {
 
 #[cfg(test)]
 mod tests {
-    use super::{connected_status, reusable_tunnel_port};
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    use super::{claim_connect_flight, connected_status, reusable_tunnel_port};
+    use crate::shell::lock;
 
     #[test]
     fn tunnel_port_is_reused_only_for_the_same_source_build() {
@@ -407,5 +423,20 @@ mod tests {
         assert_eq!(status.local_port, Some(43123));
         assert_eq!(status.token.as_deref(), Some("fresh-token"));
         assert_eq!(status.build.as_deref(), Some("build.2"));
+    }
+
+    #[test]
+    fn connect_flight_is_published_before_async_work_can_begin() {
+        let connecting = Mutex::new(HashMap::new());
+        let owner = claim_connect_flight(&connecting, "Sherlock").expect("first caller owns");
+        let joiner =
+            claim_connect_flight(&connecting, "Sherlock").expect_err("second caller joins");
+
+        let registered = lock(&connecting)
+            .get("Sherlock")
+            .expect("flight was published synchronously")
+            .clone();
+        assert!(registered.same_channel(&joiner));
+        drop(owner);
     }
 }

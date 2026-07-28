@@ -65,6 +65,13 @@ fn find_by_alias(windows: &Mutex<HashMap<String, WindowScope>>, alias: &str) -> 
         .map(|(label, _)| label.clone())
 }
 
+/// Only a local page with no workspace can reclaim the singleton Home
+/// launcher. Keep this predicate beside the command that takes the Home gate
+/// so future scope variants cannot silently bypass its serialization.
+fn report_can_reclaim_local_home(alias: &Option<String>, ws: &Option<String>) -> bool {
+    alias.is_none() && ws.is_none()
+}
+
 #[tauri::command]
 pub(super) async fn list_hosts(state: State<'_, Shell>) -> Result<Vec<HostState>, String> {
     tracing::debug!("ipc: list_hosts");
@@ -710,6 +717,12 @@ pub(super) async fn open_window(
 ) -> Result<(), String> {
     let new_window = new_window.unwrap_or(false);
     tracing::info!("ipc: open_window alias={alias:?} ws={ws_id:?} new_window={new_window}");
+    // Home is the one exception to explicit `new_window`: it is the app's
+    // singleton navigation hub, so every route raises or recreates that same
+    // surface instead of multiplying blank launchers.
+    if alias.is_none() && ws_id.is_none() {
+        return super::show_local_home(&app, None).map_err(|e| format!("could not show Home: {e}"));
+    }
     if !new_window {
         if let Some(label) = find_by_scope(&state.windows, &alias, &ws_id, None) {
             if let Some(win) = app.get_webview_window(&label) {
@@ -734,6 +747,35 @@ pub(super) async fn open_window(
     };
     open_ui_window(&app, port, &token, &WindowRecord::new(host, ws_id))
         .map_err(|e| format!("could not open window: {e}"))
+}
+
+/// Navigate the unused Home launcher to the local launcher, a connected
+/// remote's detail page, or a workspace on either daemon. Browsing keeps the
+/// singleton launcher identity; a workspace consumes it and promotes the
+/// window into an ordinary workbench.
+#[tauri::command]
+pub(super) async fn navigate_home(
+    app: AppHandle,
+    webview: tauri::WebviewWindow,
+    state: State<'_, Shell>,
+    alias: Option<String>,
+    ws_id: Option<String>,
+) -> Result<(), String> {
+    let (port, token) = match alias.as_deref() {
+        None => {
+            let local = lock(&state.local);
+            (local.port, local.token.clone())
+        }
+        Some(alias) => {
+            let tunnels = state.tunnels.lock().await;
+            let tunnel = tunnels
+                .get(alias)
+                .ok_or_else(|| format!("{alias} is not connected"))?;
+            (tunnel.local_port, tunnel.manifest.token.clone())
+        }
+    };
+    super::navigate_home_hub(&app, &webview, port, &token, alias, ws_id)
+        .map_err(|e| format!("could not navigate Home: {e}"))
 }
 
 /// Check GitHub releases for a newer signed app build. Returns the new
@@ -808,6 +850,26 @@ pub(super) fn list_askpass(
     Ok(askpass.pending_scoped(&scope))
 }
 
+/// Remember the daemon-confirmed first-paint palette outside web storage.
+/// The calling window's shell-owned host scope is the cache key, so a remote
+/// page cannot overwrite another host's bootstrap by claiming an alias.
+#[tauri::command]
+pub(super) fn cache_appearance(
+    webview: tauri::WebviewWindow,
+    state: State<'_, Shell>,
+    appearance: crate::appearance::AppearanceBootstrap,
+) -> Result<(), String> {
+    let scope = state
+        .window_scope(webview.label())
+        .ok_or_else(|| "this window is not registered".to_string())?;
+    if scope.navigation_pending() {
+        return Err("this window is still navigating".to_string());
+    }
+    lock(&state.appearance)
+        .set(scope.appearance_alias(), appearance)
+        .map_err(|error| format!("could not persist appearance: {error:#}"))
+}
+
 /// The SPA reporting what this window now shows — it swaps `ws` client-side,
 /// so the shell can't see it otherwise. Keyed by the calling window's label;
 /// the persisted record follows so the next launch reopens the window on
@@ -816,29 +878,129 @@ pub(super) fn list_askpass(
 pub(super) fn report_window_scope(
     webview: tauri::WebviewWindow,
     state: State<'_, Shell>,
+    askpass: State<'_, crate::askpass::Askpass>,
     alias: Option<String>,
     ws: Option<String>,
     label: Option<String>,
 ) -> Result<(), String> {
+    // New Window takes `home_opening` before inspecting `windows`. Match that
+    // lock order and hold the gate until this local-empty report has retired
+    // any older launcher and marked its claimant. Otherwise New Window can
+    // observe the handoff's temporary zero-hub state and create a duplicate.
+    let home_reclaim_gate =
+        report_can_reclaim_local_home(&alias, &ws).then(|| lock(&state.home_opening));
     let mut windows = lock(&state.windows);
+    let current = windows
+        .get(webview.label())
+        .ok_or_else(|| "this window is not registered".to_string())?;
+    // The shell fixed the host when it created/navigated this window. A
+    // daemon-served page may report workspace/label changes, but must never
+    // rewrite its host to gain another remote's native command scope.
+    if current.alias != alias {
+        return Err("a window cannot change its registered host".to_string());
+    }
+    if current.navigation_pending() {
+        return Err("this window is still navigating".to_string());
+    }
+    // A local Home may still be the only eligible surface for password/2FA
+    // while an SSH flight is running. Before consuming that launcher, arrange
+    // for a fresh Home to inherit fallback duty; otherwise both already-shown
+    // and later sequential prompts become unanswerable.
+    let local_home_promotion = current.home_hub && current.alias.is_none() && ws.is_some();
+    let pending_before_promotion = if local_home_promotion {
+        askpass.pending_scoped(current)
+    } else {
+        Vec::new()
+    };
+    let promotion_needs_auth_home = local_home_promotion
+        && (!lock(&state.connecting).is_empty() || !pending_before_promotion.is_empty());
+    let pre_promotion_scope = promotion_needs_auth_home.then(|| current.clone());
+    // A promoted local workbench whose workspace disappeared is visibly Home
+    // again. If another unused launcher already exists, retire that older
+    // surface and let this in-place Home reclaim the singleton identity. The
+    // old hub cannot carry editor state, so its close does not cross the
+    // workbench's beforeunload guard.
+    let existing_home = (current.alias.is_none() && ws.is_none() && !current.home_hub)
+        .then(|| {
+            windows
+                .iter()
+                .find(|(window_label, scope)| {
+                    window_label.as_str() != webview.label() && scope.home_hub
+                })
+                .map(|(window_label, _)| window_label.clone())
+        })
+        .flatten();
+    if let Some(existing_label) = existing_home {
+        let existing_scope = windows
+            .get_mut(&existing_label)
+            .expect("the Home label came from this scope map");
+        let previous_home = existing_scope.clone();
+        existing_scope.relinquish_home();
+        drop(windows);
+        if let Some(existing_window) = webview.app_handle().get_webview_window(&existing_label) {
+            if let Err(error) = existing_window.close() {
+                lock(&state.windows).insert(existing_label, previous_home);
+                return Err(format!("could not close the previous Home: {error}"));
+            }
+        } else {
+            // A Destroyed event normally owns this cleanup. If the webview
+            // disappeared just before this report, remove its stale scope and
+            // record here so it cannot return on restart.
+            lock(&state.windows).remove(&existing_label);
+            lock(&state.registry).remove(&previous_home.stable_id);
+        }
+        windows = lock(&state.windows);
+    }
+
     let scope = windows
         .get_mut(webview.label())
         .ok_or_else(|| "this window is not registered".to_string())?;
-    // The shell fixed the host when it created this window. A daemon-served
-    // page may report workspace/label changes, but must never rewrite its
-    // host to gain another remote's native command scope. The shell-owned
-    // askpass fallback capability is deliberately not derived from this
-    // mutable workspace report.
-    if scope.alias != alias {
-        return Err("a window cannot change its registered host".to_string());
-    }
-    scope.ws = ws.clone();
-    scope.label = label.unwrap_or_default();
+    let was_home_hub = scope.home_hub;
+    scope.report_page_scope(ws.clone(), label.unwrap_or_default());
+    let reclaimed_home = !was_home_hub && scope.home_hub;
     let stable_id = scope.stable_id.clone();
     let registered_alias = scope.alias.clone();
+    let home_hub = scope.home_hub;
+    let reclaimed_scope = reclaimed_home.then(|| scope.clone());
     drop(windows);
-    if !stable_id.is_empty() {
+    // The singleton identity is now visible atomically to New Window. Do not
+    // retain its gate across persistence, prompt replay, or tray rebuilding.
+    drop(home_reclaim_gate);
+    if let Some(previous_scope) = pre_promotion_scope {
+        if let Err(error) = super::show_local_home(webview.app_handle(), None) {
+            // Creating the successor failed: restore prompt eligibility on
+            // this window rather than stranding an in-flight ssh process.
+            lock(&state.windows).insert(webview.label().to_string(), previous_scope);
+            return Err(format!(
+                "could not keep Home available for SSH authentication: {error}"
+            ));
+        }
+        // The replacement Home re-lists these prompts on mount. Remove their
+        // stale copies from the promoted workbench, whose narrowed scope can
+        // no longer answer them.
+        for prompt in pending_before_promotion {
+            if let Err(error) = webview.emit("ssh-askpass-done", prompt.id()) {
+                tracing::warn!(
+                    %error,
+                    window = webview.label(),
+                    "could not dismiss transferred SSH prompt"
+                );
+            }
+        }
+    }
+    if (!home_hub || reclaimed_home) && !stable_id.is_empty() {
         lock(&state.registry).set_scope(&stable_id, registered_alias, ws);
+    }
+    // `AskpassModal` fetched pending prompts when this document mounted, back
+    // while a promoted workbench was ineligible. Re-emit every now-authorized
+    // prompt after it reclaims Home so closing the previous launcher cannot
+    // strand an already-waiting SSH password/2FA request.
+    if let Some(scope) = reclaimed_scope {
+        for prompt in askpass.pending_scoped(&scope) {
+            if let Err(error) = webview.emit("ssh-askpass", prompt) {
+                tracing::warn!(%error, window = webview.label(), "could not replay SSH prompt");
+            }
+        }
     }
     // The reported label names this window in the tray's list; rebuild so it
     // shows the fresh name (the store above happened before this call).
@@ -1039,7 +1201,7 @@ pub(super) async fn wsl_setup_daemon(app: AppHandle, distro: Option<String>) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::compute_response_body;
+    use super::{compute_response_body, report_can_reclaim_local_home};
 
     fn response(status: u16, body: &str) -> ureq::http::Response<ureq::Body> {
         ureq::http::Response::builder()
@@ -1071,5 +1233,22 @@ mod tests {
                 .expect("200 response"),
             r#"{"sessions":[]}"#
         );
+    }
+
+    #[test]
+    fn only_local_empty_reports_enter_the_home_reclamation_gate() {
+        assert!(report_can_reclaim_local_home(&None, &None));
+        assert!(!report_can_reclaim_local_home(
+            &None,
+            &Some("workspace".into())
+        ));
+        assert!(!report_can_reclaim_local_home(
+            &Some("Sherlock".into()),
+            &None
+        ));
+        assert!(!report_can_reclaim_local_home(
+            &Some("Sherlock".into()),
+            &Some("workspace".into())
+        ));
     }
 }

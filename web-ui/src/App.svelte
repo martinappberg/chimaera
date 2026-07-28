@@ -6,8 +6,11 @@
     getHostLabel,
     getJobContext,
     getToken,
+    isHomeHub,
+    leaveHomeHub,
     notifyUnauthorized,
     pollHealth,
+    reclaimHomeHub,
     setActiveWorkspaceId,
     unauthorized,
     type Health,
@@ -208,6 +211,7 @@
   import * as pool from "./lib/terminal/termPool";
   import * as chatPool from "./lib/chat/chatPool";
   import {
+    appearanceBootstrapForNavigation,
     applyRemoteSettings,
     flushSettings,
     getSetting,
@@ -264,6 +268,9 @@
   import Pane from "./lib/layout/Pane.svelte";
 
   let health = $state<Health | null>(null);
+  /** Last authenticated HTTP health result. The event stream can reconnect
+   *  independently while the daemon and SSH tunnel remain reachable. */
+  let healthUp = $state(false);
   /** Source identity of the daemon that supplied this document. A different
    *  source means its immutable lazy-chunk namespace changed underneath us. */
   let servedBuild = documentBuildSource(
@@ -330,6 +337,12 @@
   const reconnectListener = createReconnectListenerGate();
   /** This window's scope key for the shell registry (null alias = local). */
   const scopeAlias = isRemoteWindow ? (jobCtx !== null ? statusAlias : hostAlias) : null;
+  /** Carry hub identity across daemon origins. `sessionStorage` remembers the
+   *  original launcher, while the current local-empty scope covers a promoted
+   *  workbench that the shell is reclaiming as Home right now. */
+  function shouldCarryHomeHub(): boolean {
+    return isHomeHub() || (isNativeShell() && scopeAlias === null && activeWsId === null);
+  }
   /** The reconnect status or failure dialog is showing. */
   let showReconnect = $state(false);
   /** A connectHost call is in flight. */
@@ -420,7 +433,9 @@
       if (token !== null) params.set("token", token);
       params.set("win", windowKey());
       if (activeWsId !== null) params.set("ws", activeWsId);
+      if (shouldCarryHomeHub()) params.set("hub", "1");
       params.set("host", hostAlias);
+      params.set("appearance", JSON.stringify(appearanceBootstrapForNavigation()));
       if (jobCtx !== null) {
         params.set("job", jobCtx.jobId);
         if (jobCtx.node !== null) params.set("node", jobCtx.node);
@@ -456,7 +471,23 @@
   // this window instead of duplicating it (the SPA swaps `ws` client-side, so
   // the shell can't see the change otherwise).
   $effect(() => {
-    if (isNativeShell()) void reportWindowScope(scopeAlias, activeWsId, windowLabel || null);
+    if (!isNativeShell()) return;
+    const reportedWsId = activeWsId;
+    void reportWindowScope(scopeAlias, reportedWsId, windowLabel || null).then(
+      () => {
+        // A promoted local workbench becomes the singleton Home again when
+        // its workspace disappears. Restore the browser half of that identity
+        // only while the reported empty scope is still current: an older IPC
+        // completion must not undo a newer workspace promotion.
+        if (scopeAlias === null && reportedWsId === null && activeWsId === null) {
+          reclaimHomeHub();
+        }
+      },
+      () => {
+        // Navigation can transiently reject reconciliation; only a confirmed
+        // report is allowed to reclaim the browser's Home identity.
+      },
+    );
   });
   // --- the agent launcher (split button + popover) ---
   /** The persisted default agent the split button's main surface spawns. */
@@ -752,11 +783,14 @@
     return names;
   });
 
-  // Health polling keeps the hostname fresh and trips the 401 overlay; the
-  // daemon dot itself tracks the authenticated events socket.
+  // Health polling keeps the hostname fresh, trips the 401 overlay, and
+  // independently tracks authenticated daemon reachability. The events
+  // socket can restart while HTTP remains healthy, so the Home badge accepts
+  // either successful channel instead of calling that transient "offline".
   $effect(() =>
     pollHealth(
       (h) => {
+        healthUp = true;
         if (daemonBuildChanged(h.build)) {
           // The origin can stay stable across a daemon handoff, but the
           // hashed JS namespace cannot. Reload before the user opens a lazy
@@ -768,7 +802,7 @@
         health = h;
       },
       () => {
-        // unreachable daemon; the events socket state already reflects this
+        healthUp = false;
       },
     ),
   );
@@ -1017,6 +1051,8 @@
           params.set("token", token);
           params.set("win", windowKey());
           if (activeWsId !== null) params.set("ws", activeWsId);
+          if (shouldCarryHomeHub()) params.set("hub", "1");
+          params.set("appearance", JSON.stringify(appearanceBootstrapForNavigation()));
           requireAssetNavigation(
             "build",
             `http://127.0.0.1:${port}/#${params.toString()}`,
@@ -1962,12 +1998,31 @@
     workspaces = workspaces.some((x) => x.id === w.id)
       ? workspaces.map((x) => (x.id === w.id ? w : x))
       : [w, ...workspaces];
-    const switched = activeWsId !== w.id;
     closePicker();
     createError = null;
     // Stamp recency for the home screen (fire-and-forget; old daemons 404).
     void touchWorkspace(w.id).catch(() => {});
+    const switched = activeWsId !== w.id;
     if (!switched) return;
+    // Home is the new-window launcher, not a permanent identity attached to
+    // this native window. Once it enters a workspace, a later New Window must
+    // be able to create a fresh Home without replacing this workbench (the
+    // shell may reclaim it if the workspace later disappears). Report that
+    // promotion at the selection boundary: leaving it to the reactive
+    // fire-and-forget scope report above lets an immediate native New Window
+    // still observe (and merely focus) the stale Home launcher.
+    if (activeWsId === null) {
+      if (isNativeShell()) {
+        const promotedLabel = w.name + (isRemoteWindow ? ` •${hostAlias}` : "");
+        try {
+          await reportWindowScope(scopeAlias, w.id, promotedLabel);
+        } catch (error) {
+          console.error("could not promote Home to a workspace window", error);
+          return;
+        }
+      }
+      leaveHomeHub();
+    }
     // Flush the outgoing workspace's pending layout write under its own key,
     // then restore (or default) the incoming workspace's tree.
     void flushViewState();
@@ -3255,7 +3310,7 @@
       sessions={sessions.filter((s) => !isMastermind(s))}
       hostLabel={getHostLabel()}
       {health}
-      connected={eventsUp}
+      daemonReachable={eventsUp || healthUp}
       onOpen={activateWorkspace}
       onRemove={removeWorkspace}
       onStop={stopWorkspace}

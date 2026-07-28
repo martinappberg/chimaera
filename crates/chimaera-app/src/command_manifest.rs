@@ -18,6 +18,7 @@ pub const DAEMON_UI_COMMANDS: &[&str] = &[
     "cancel_compute_session",
     "connect_compute_session",
     "open_window",
+    "navigate_home",
     "report_window_scope",
     "check_app_update",
     "begin_update",
@@ -28,6 +29,7 @@ pub const DAEMON_UI_COMMANDS: &[&str] = &[
     "caffeinate_state",
     "answer_askpass",
     "list_askpass",
+    "cache_appearance",
 ];
 
 // The application crate consumes only the daemon list at runtime; this list is

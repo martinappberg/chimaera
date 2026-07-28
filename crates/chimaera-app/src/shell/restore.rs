@@ -72,21 +72,55 @@ pub fn open_ui_window(
     token: &str,
     record: &WindowRecord,
 ) -> tauri::Result<()> {
-    let mut hash = format!("token={}", urlencoding::encode(token));
-    hash.push_str(&format!("&win={}", urlencoding::encode(&record.id)));
-    if let Some(ws) = &record.ws {
-        hash.push_str(&format!("&ws={}", urlencoding::encode(ws)));
-    }
-    if let Some(alias) = &record.alias {
-        hash.push_str(&format!("&host={}", urlencoding::encode(alias)));
-    }
-    let url = format!("http://127.0.0.1:{port}/#{hash}");
+    let home_hub = record.alias.is_none() && record.ws.is_none() && record.compute.is_none();
+    let appearance = lock(&app.state::<Shell>().appearance).get(record.alias.as_deref());
+    let url = daemon_window_url(
+        port,
+        token,
+        &record.id,
+        record.ws.as_deref(),
+        record.alias.as_deref(),
+        home_hub,
+        appearance.as_ref(),
+    )?;
     let title = match &record.alias {
         Some(alias) => format!("{alias} — chimaera"),
         None => "chimaera".to_string(),
     };
     let scope = WindowScope::new(record.alias.clone(), record.ws.clone(), record.id.clone());
-    open_shell_window(app, &url, &title, record, scope)
+    open_shell_window(app, url.as_str(), &title, record, scope)
+}
+
+/// One daemon-served window URL. The unused Home launcher carries `hub=1`
+/// across local↔remote navigation so each origin clears stale route state.
+/// Entering a workspace then promotes it into an ordinary workbench window.
+pub(super) fn daemon_window_url(
+    port: u16,
+    token: &str,
+    stable_id: &str,
+    ws: Option<&str>,
+    alias: Option<&str>,
+    home_hub: bool,
+    appearance: Option<&crate::appearance::AppearanceBootstrap>,
+) -> tauri::Result<tauri::Url> {
+    let mut hash = format!("token={}", urlencoding::encode(token));
+    hash.push_str(&format!("&win={}", urlencoding::encode(stable_id)));
+    if let Some(ws) = ws {
+        hash.push_str(&format!("&ws={}", urlencoding::encode(ws)));
+    }
+    if let Some(alias) = alias {
+        hash.push_str(&format!("&host={}", urlencoding::encode(alias)));
+    }
+    if home_hub {
+        hash.push_str("&hub=1");
+    }
+    if let Some(appearance) = appearance {
+        hash.push_str("&appearance=");
+        hash.push_str(&urlencoding::encode(&appearance.json()));
+    }
+    format!("http://127.0.0.1:{port}/#{hash}")
+        .parse()
+        .map_err(tauri::Error::InvalidUrl)
 }
 
 /// Open a window on a compute-node daemon (Mode 2). Same shell wiring as
@@ -103,7 +137,12 @@ pub(super) fn open_compute_window(
     record: &WindowRecord,
     scope_alias: &str,
 ) -> tauri::Result<()> {
-    let url = format!("{url}&win={}", urlencoding::encode(&record.id));
+    let mut url = format!("{url}&win={}", urlencoding::encode(&record.id));
+    let appearance = lock(&app.state::<Shell>().appearance).get(record.alias.as_deref());
+    if let Some(appearance) = appearance {
+        url.push_str("&appearance=");
+        url.push_str(&urlencoding::encode(&appearance.json()));
+    }
     let login_alias = record
         .alias
         .clone()
@@ -132,9 +171,25 @@ fn open_shell_window(
     authorize_daemon_origin(app, &label, port)?;
     let navigation_app = app.clone();
     let navigation_label = label.clone();
+    let page_load_app = app.clone();
+    let page_load_label = label.clone();
     let mut builder = WebviewWindowBuilder::new(app, label.clone(), WebviewUrl::External(url))
         .on_navigation(move |url| {
             daemon_navigation_allowed(&navigation_app, &navigation_label, url)
+        })
+        .on_page_load(move |_window, payload| {
+            if !matches!(payload.event(), tauri::webview::PageLoadEvent::Started)
+                || !daemon_navigation_allowed(&page_load_app, &page_load_label, payload.url())
+            {
+                return;
+            }
+            let Some(shell) = page_load_app.try_state::<Shell>() else {
+                return;
+            };
+            let mut windows = lock(&shell.windows);
+            if let Some(scope) = windows.get_mut(&page_load_label) {
+                scope.complete_home_navigation();
+            }
         })
         .title(title)
         // Tauri's own drag-drop handler intercepts OS file drops and suppresses
@@ -345,6 +400,14 @@ pub(super) fn restore_windows(handle: &AppHandle, port: u16, token: &str) -> tau
         let records = lock(&shell.registry).list();
         records
     };
+    let (records, duplicate_home_ids) = dedupe_local_homes(records);
+    if !duplicate_home_ids.is_empty() {
+        let shell = handle.state::<Shell>();
+        let mut registry = lock(&shell.registry);
+        for id in duplicate_home_ids {
+            registry.remove(&id);
+        }
+    }
     let mut opened = false;
     let mut home_opened = false;
     let mut remote_aliases: Vec<String> = Vec::new();
@@ -398,13 +461,34 @@ pub(super) fn restore_windows(handle: &AppHandle, port: u16, token: &str) -> tau
     Ok(())
 }
 
+/// Older builds allowed File → New Window to persist several local Home
+/// records. Keep the oldest stable identity and retire the rest before
+/// restoring, while leaving remote host pages and workspace windows alone.
+fn dedupe_local_homes(records: Vec<WindowRecord>) -> (Vec<WindowRecord>, Vec<String>) {
+    let mut saw_home = false;
+    let mut kept = Vec::with_capacity(records.len());
+    let mut duplicates = Vec::new();
+    for record in records {
+        let local_home = record.compute.is_none() && record.alias.is_none() && record.ws.is_none();
+        if local_home && std::mem::replace(&mut saw_home, true) {
+            duplicates.push(record.id);
+        } else {
+            kept.push(record);
+        }
+    }
+    (kept, duplicates)
+}
+
 fn needs_startup_home(opened: bool, home_opened: bool, has_remote: bool) -> bool {
     !opened || (has_remote && !home_opened)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{needs_startup_home, HealthConfidence, HEALTH_FAILURES_BEFORE_DOWN};
+    use super::{
+        dedupe_local_homes, needs_startup_home, HealthConfidence, HEALTH_FAILURES_BEFORE_DOWN,
+    };
+    use crate::windows::WindowRecord;
 
     #[test]
     fn startup_home_precedes_remote_auth_when_no_home_was_restored() {
@@ -446,5 +530,23 @@ mod tests {
         for expected in [None, None, Some(false)] {
             assert_eq!(health.sample(false), expected);
         }
+    }
+
+    #[test]
+    fn restore_keeps_one_local_home_without_collapsing_host_pages() {
+        let first = WindowRecord::new(None, None);
+        let duplicate = WindowRecord::new(None, None);
+        let remote = WindowRecord::new(Some("cluster".into()), None);
+        let workspace = WindowRecord::new(None, Some("ws-1".into()));
+        let first_id = first.id.clone();
+        let duplicate_id = duplicate.id.clone();
+        let remote_id = remote.id.clone();
+
+        let (kept, duplicates) = dedupe_local_homes(vec![first, remote, duplicate, workspace]);
+
+        assert_eq!(duplicates, vec![duplicate_id]);
+        assert!(kept.iter().any(|record| record.id == first_id));
+        assert!(kept.iter().any(|record| record.id == remote_id));
+        assert_eq!(kept.len(), 3);
     }
 }

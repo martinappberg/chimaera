@@ -10,7 +10,7 @@ it talks to is a separate, longer-lived process (see
 **Where it lives:** `crates/chimaera-app/src/` — its own **standalone cargo workspace** (Tauri is
 kept out of the daemon workspace so musl/HPC builds stay lean). `main.rs` (three-role argv
 dispatch), `shell.rs` + `shell/{commands,connect,restore}.rs`, `daemon.rs`, `windows.rs`,
-`update.rs`, `askpass.rs`, `menu.rs`. UI bridge `web-ui/src/lib/net/native.ts`; toast
+`update.rs`, `askpass.rs`, `appearance.rs`, `menu.rs`. UI bridge `web-ui/src/lib/net/native.ts`; toast
 `web-ui/src/lib/workspace/{UpdateToast.svelte,update.svelte.ts}`. Rules:
 [rules/native-app.md](../../.claude/rules/native-app.md); map:
 [chimaera-app/AGENTS.md](../../crates/chimaera-app/AGENTS.md). Build with `just app-dev` / `just
@@ -49,10 +49,22 @@ app-build` (never the root `cargo`).
   keys its daemon-side view-state (layout tree) on it, so a reopened window *is* the same window.
   Closing a window removes its record (macOS convention) **except during quit** (guarded by an
   `AtomicBool quitting` so teardown doesn't forget every window). Geometry is stored in logical pixels
-  (correct across scale factors) on a slow 2s tick. Opening a workspace already shown raises that
-  window instead of duplicating. The shell is process-singleton because its registry, tunnels, and
-  askpass endpoint are process-global; launching the app again raises an existing window rather than
-  starting a competing owner.
+  (correct across scale factors) on a slow 2s tick. Closing the final window exits directly; the shell
+  never inserts an extra Home that needs a second close. **Home is the New Window launcher**: File/tray
+  New Window creates a Home window when no unused launcher exists, otherwise it raises that singleton
+  launcher. Browsing a connected host navigates the launcher to its detail page and Back re-homes it
+  onto the local daemon. Selecting a local or remote workspace consumes the launcher and promotes that
+  window into an ordinary restorable workbench; the next New Window therefore creates a fresh Home
+  without replacing any open workspace. The explicit new-window action (or Cmd/Ctrl-click) can still
+  open another workbench directly. Restore retires duplicate unused Home records left by older builds.
+  Before the module graph loads, the document head restores the persisted Chimaera palette from a
+  bounded per-host shell cache carried in the window URL. The cache is independent of volatile local
+  daemon and tunnel ports (with origin-local storage retained for browser tabs); system light/dark is
+  only the first-visit fallback, so new and re-homed webviews do not expose WebKit's unthemed white canvas.
+  The shell is process-singleton because its registry, tunnels, and askpass endpoint are process-global;
+  launching the app again raises the complete existing window set rather than starting a competing
+  owner. On macOS, clicking the Dock icon likewise brings every Chimaera window forward while keeping
+  the previously active one frontmost.
 
 ## Signed self-update (app + daemon)
 
@@ -121,16 +133,17 @@ app-build` (never the root `cargo`).
   Close View ⌘W · Close Window; +Settings…/Quit on Windows/Linux, which have no app submenu),
   **Edit**, **View** (fullscreen), **Window**, and **Help** (About, non-macOS only). Items the page
   owns — `close-view`/`new-terminal`/`new-agent`/`settings` — are `emit_to`'d as a `menu` event to the
-  focused window (`onMenu` in `App.svelte`, via `native.ts`); `new-window` is handled shell-side.
+  focused window (`onMenu` in `App.svelte`, via `native.ts`); New Window is handled shell-side.
   **Settings** is daemon-scoped: it opens the settings surface for the focused window's daemon (a
   remote window → the remote daemon's settings), same as the in-UI gear.
 - **System tray / menu-bar status item** (`tray.rs`, `tray-icon` feature): a persistent icon whose
   menu lists the **open workspace windows** (click one to raise it), then New Window and Quit — the
-  entry point when all windows are closed but the app is still resident. The icon is a real **brand-mark
-  template** (a C-in-hexagon monogram, black on transparent) that macOS tints to the menu-bar theme
-  (`icon_as_template`) — not the full app icon, which the template mask would render as a solid blob. On
-  macOS the menu also carries the **Keep Awake** check item (see Caffeinate). The menu is rebuilt via
-  `tray::rebuild` on the events that change it (a window opens/closes/renames, caffeinate flips).
+  tray stays available while any app window is open, but closing the final window exits the app
+  directly rather than leaving a windowless tray process. The icon is a real **brand-mark template**
+  (a C-in-hexagon monogram, black on transparent) that macOS tints to the menu-bar theme
+  (`icon_as_template`) — not the full app icon, which the template mask would render as a solid blob.
+  On macOS the menu also carries the **Keep Awake** check item (see Caffeinate). The menu is rebuilt
+  via `tray::rebuild` on the events that change it (a window opens/closes/renames, caffeinate flips).
   Enabling the feature pulls **libayatana-appindicator** into the Linux bundle (a packaging dependency).
 
 ## Caffeinate

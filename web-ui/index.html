@@ -8,6 +8,71 @@
     <meta name="chimaera-build" content="__CHIMAERA_BUILD_ID__" />
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
     <title>chimaera</title>
+    <!-- Paint a themed canvas before the module graph/CSS arrives. The native
+         shell carries its port-independent cache in the URL; browser pages
+         retain the same snapshot in origin-local storage. A first-ever host
+         falls back to the system light/dark preference. -->
+    <style>
+      :root {
+        --chimaera-bootstrap-bg: #fbfbfc;
+        background: var(--chimaera-bootstrap-bg);
+      }
+      :root[data-theme="dark"] {
+        --chimaera-bootstrap-bg: #17171c;
+      }
+      body {
+        background: var(--chimaera-bootstrap-bg);
+      }
+    </style>
+    <script>
+      (() => {
+        const root = document.documentElement;
+        let mode =
+          typeof matchMedia === "function" && matchMedia("(prefers-color-scheme: dark)").matches
+            ? "dark"
+            : "light";
+        let background = mode === "dark" ? "#17171c" : "#fbfbfc";
+        let cached = null;
+        let carried = null;
+        let stored = null;
+        try {
+          carried = JSON.parse(
+            new URLSearchParams(location.hash.slice(1)).get("appearance") ?? "null",
+          );
+        } catch {
+          // A malformed hand-authored fragment must not hide the saved cache.
+        }
+        try {
+          stored = JSON.parse(
+            localStorage.getItem("chimaera.appearanceBootstrap.v1") ?? "null",
+          );
+        } catch {
+          // Storage can be unavailable; the carried/system fallback still holds.
+        }
+        for (const candidate of [carried, stored]) {
+          if (
+            (candidate?.mode === "light" || candidate?.mode === "dark") &&
+            typeof candidate.themeId === "string" &&
+            typeof candidate.background === "string" &&
+            CSS.supports("color", candidate.background) &&
+            (candidate.accent === null ||
+              (typeof candidate.accent === "string" &&
+                CSS.supports("color", candidate.accent)))
+          ) {
+            cached = candidate;
+            break;
+          }
+        }
+        if (cached !== null) {
+          mode = cached.mode;
+          background = cached.background;
+        }
+        globalThis.__CHIMAERA_APPEARANCE_BOOTSTRAP__ = cached;
+        root.dataset.theme = mode;
+        root.style.colorScheme = mode;
+        root.style.setProperty("--chimaera-bootstrap-bg", background);
+      })();
+    </script>
   </head>
   <body>
     <div id="app"></div>

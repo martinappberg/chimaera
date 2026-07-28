@@ -38,6 +38,9 @@ const DAEMON_UI_CORE_PERMISSIONS: &[&str] = &[
 ];
 
 static DAEMON_CAPABILITY_SEQ: AtomicU64 = AtomicU64::new(0);
+/// Forces same-origin Home re-homes to be full document navigations instead
+/// of hash-only changes (which do not rerun the SPA's scope bootstrap).
+static HOME_NAV_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// A connect attempt's shared outcome: `None` while in flight, then the
 /// result. Joiners wait on this instead of racing their own ssh — see
@@ -78,21 +81,32 @@ pub struct Shell {
     /// duplicate). The SPA reports its own scope because it swaps `ws`
     /// client-side without a shell round-trip.
     windows: Mutex<HashMap<String, WindowScope>>,
+    /// Most recently focused native window. macOS clears every window's
+    /// focused flag when the application deactivates, so Dock reopen and a
+    /// repeated launch need this label to restore the prior frontmost window.
+    last_focused_window: Mutex<Option<String>>,
+    /// Serializes every check/create/reclaim handoff for the singleton local
+    /// Home. IPC commands can arrive concurrently, so inspecting `windows`,
+    /// retiring an older launcher, and claiming or opening its replacement
+    /// must share this gate or expose a narrow duplicate-window race.
+    home_opening: Mutex<()>,
+    /// Serializes Home navigation from scope validation through the
+    /// `navigation_pending` transition. Two host clicks may arrive through
+    /// concurrent IPC commands; only the first may authorize and stage a
+    /// destination for the singleton launcher.
+    home_navigation: Mutex<()>,
     /// The only loopback port each daemon window may navigate to right now.
     /// Runtime ACLs are additive, so this guard also makes an origin granted
     /// before a reconnect unusable if its port is later recycled.
     allowed_daemon_ports: Mutex<HashMap<String, u16>>,
     /// The persisted window set (windows.json) — what the next launch reopens.
     registry: Mutex<WindowRegistry>,
+    /// Last confirmed first-paint palette per host. Unlike web storage this
+    /// survives volatile daemon/tunnel ports and app restarts.
+    appearance: Mutex<crate::appearance::AppearanceCache>,
     /// Set on ExitRequested: window teardown during quit must NOT remove
     /// records from the registry, or quitting would forget every window.
     quitting: AtomicBool,
-    /// Labels whose `CloseRequested` has fired but whose `Destroyed` has not.
-    /// The drop-to-home check counts OTHER live windows; without this, a
-    /// batched "close all windows" (both CloseRequested delivered before either
-    /// Destroyed, so each still sees the other in `webview_windows()`) would
-    /// miscount and let the app quit. Cleared on Destroyed. macOS-only path.
-    closing: Mutex<HashSet<String>>,
     /// The held power assertion for the "caffeinate" toggle — Some = armed
     /// (this machine won't idle/display/system-sleep). Dropped to disarm; the
     /// guard drops on quit, so the assertion never outlives the app.
@@ -108,6 +122,11 @@ pub struct WindowScope {
     pub alias: Option<String>,
     pub ws: Option<String>,
     pub stable_id: String,
+    /// This is the singleton launcher window, even while it temporarily
+    /// browses a remote host. Opening a workspace promotes it into an ordinary
+    /// restorable workspace window, leaving the next New Window free to create
+    /// a fresh Home launcher.
+    home_hub: bool,
     /// Shell-owned askpass identity. This is separate from `alias`: compute
     /// windows use a composite alias for focus/liveness, but authenticate
     /// through their explicitly recorded login host. Keeping the two facts
@@ -118,6 +137,10 @@ pub struct WindowScope {
     /// reported by the SPA alongside the scope so the tray never has to read the
     /// racy OS titlebar. Empty until the first scope report lands.
     pub label: String,
+    /// Destination metadata is installed before `window.navigate`, but its
+    /// askpass privilege stays disabled until the new document starts. This
+    /// prevents the unloading origin from borrowing the destination's scope.
+    navigation_pending: bool,
 }
 
 #[derive(Clone, PartialEq)]
@@ -150,8 +173,10 @@ impl WindowScope {
             alias,
             ws,
             stable_id,
+            home_hub: askpass_scope == AskpassScope::Fallback,
             askpass_scope,
             label: String::new(),
+            navigation_pending: false,
         }
     }
 
@@ -168,13 +193,90 @@ impl WindowScope {
             alias: Some(alias),
             ws,
             stable_id,
+            home_hub: false,
             askpass_scope: AskpassScope::Host(login_alias),
             label: String::new(),
+            navigation_pending: false,
         }
     }
 
     pub(crate) fn allows_askpass(&self, prompt_alias: Option<&str>) -> bool {
         askpass_scope_matches(&self.askpass_scope, prompt_alias)
+    }
+
+    /// Stable host identity for shell-owned per-host caches. Compute windows
+    /// display a composite job alias but authenticate through (and inherit
+    /// appearance from) their login host.
+    pub(crate) fn appearance_alias(&self) -> Option<&str> {
+        match &self.askpass_scope {
+            AskpassScope::Host(alias) => Some(alias),
+            AskpassScope::None | AskpassScope::Fallback => None,
+        }
+    }
+
+    pub(crate) fn navigation_pending(&self) -> bool {
+        self.navigation_pending
+    }
+
+    /// Apply a shell-owned Home navigation. The unused launcher is a broad
+    /// askpass fallback only while it is on the local Home screen: a remote
+    /// detail page may observe prompts for that host and no other, and entering
+    /// any workspace consumes the launcher altogether.
+    fn begin_home_navigation(&mut self, alias: Option<String>, ws: Option<String>, label: String) {
+        self.alias = alias;
+        self.ws = ws;
+        self.label = label;
+        self.home_hub = self.ws.is_none();
+        self.askpass_scope = AskpassScope::None;
+        self.navigation_pending = true;
+    }
+
+    /// Activate the destination's prompt scope at page-start, after the old
+    /// document has gone but before the new document's scripts run.
+    fn complete_home_navigation(&mut self) {
+        if !self.navigation_pending {
+            return;
+        }
+        self.navigation_pending = false;
+        self.askpass_scope = match &self.alias {
+            Some(alias) => AskpassScope::Host(alias.clone()),
+            None if self.home_hub => AskpassScope::Fallback,
+            None => AskpassScope::None,
+        };
+    }
+
+    /// Retire an older unused launcher before another local Home reclaims the
+    /// singleton identity. The window is closed immediately afterwards; scope
+    /// narrowing first prevents even that short teardown interval from
+    /// retaining broad fallback askpass access.
+    fn relinquish_home(&mut self) {
+        self.home_hub = false;
+        self.navigation_pending = false;
+        self.askpass_scope = self
+            .alias
+            .clone()
+            .map_or(AskpassScope::None, AskpassScope::Host);
+    }
+
+    /// Apply the SPA's current route. Entering a workspace consumes the Home
+    /// launcher: it becomes a normal window and its broad startup-askpass
+    /// fallback narrows to this window's already shell-authorized host. If a
+    /// promoted local workspace later disappears, its now-empty window can
+    /// become the launcher again instead of making New Window create a second
+    /// Home.
+    pub(crate) fn report_page_scope(&mut self, ws: Option<String>, label: String) {
+        if self.alias.is_none() && ws.is_none() {
+            self.home_hub = true;
+            self.askpass_scope = AskpassScope::Fallback;
+        } else if self.home_hub && ws.is_some() {
+            self.home_hub = false;
+            self.askpass_scope = self
+                .alias
+                .clone()
+                .map_or(AskpassScope::None, AskpassScope::Host);
+        }
+        self.ws = ws;
+        self.label = label;
     }
 }
 
@@ -324,6 +426,254 @@ pub(crate) fn request_quit(app: &AppHandle) {
     app.exit(0);
 }
 
+/// Bring every native window into the app's foreground, preserving the
+/// currently focused window as the frontmost one. macOS emits `Reopen` when
+/// the Dock icon is clicked; the single-instance callback uses the same path
+/// for a repeated launch. Focusing each window once raises the whole window
+/// set above other applications (only one OS window can remain focused).
+pub(crate) fn raise_all_windows(app: &AppHandle) {
+    #[cfg(target_os = "macos")]
+    let _ = app.show();
+
+    let mut windows: Vec<_> = app.webview_windows().into_values().collect();
+    windows.sort_by(|a, b| a.label().cmp(b.label()));
+    let front = windows
+        .iter()
+        .find(|window| window.is_focused().unwrap_or(false))
+        .map(|window| window.label().to_string())
+        .or_else(|| {
+            app.try_state::<Shell>()
+                .and_then(|shell| lock(&shell.last_focused_window).clone())
+                .filter(|label| app.get_webview_window(label).is_some())
+        })
+        .or_else(|| {
+            app.try_state::<Shell>().and_then(|shell| {
+                lock(&shell.windows)
+                    .iter()
+                    .find(|(_, scope)| scope.home_hub)
+                    .map(|(label, _)| label.clone())
+            })
+        })
+        .or_else(|| windows.last().map(|window| window.label().to_string()));
+
+    for window in windows
+        .iter()
+        .filter(|window| Some(window.label()) != front.as_deref())
+    {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+    if let Some(label) = front {
+        if let Some(window) = app.get_webview_window(&label) {
+            let _ = window.unminimize();
+            let _ = window.show();
+            let _ = window.set_focus();
+        }
+    }
+}
+
+/// Re-home the singleton navigation window onto the local daemon or one live
+/// remote tunnel, optionally scoped to a workspace. Launcher/detail navigation
+/// keeps the local Home record; entering a workspace promotes and persists the
+/// window.
+///
+/// A Home hub can never contain an editable workspace: local workspace entry
+/// is an SPA route that immediately consumes the hub, while cross-daemon entry
+/// starts from a detail page with no workspace. That invariant is what makes
+/// this document navigation safe from the workbench's unsaved-edit
+/// `beforeunload` guard.
+pub(crate) fn navigate_home_hub(
+    app: &AppHandle,
+    window: &tauri::WebviewWindow,
+    port: u16,
+    token: &str,
+    alias: Option<String>,
+    ws: Option<String>,
+) -> tauri::Result<()> {
+    let shell = app.state::<Shell>();
+    let home_navigation = lock(&shell.home_navigation);
+    let previous_scope = lock(&shell.windows)
+        .get(window.label())
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("this window is not registered"))?;
+    if !previous_scope.home_hub
+        || previous_scope.ws.is_some()
+        || previous_scope.navigation_pending()
+    {
+        return Err(anyhow::anyhow!("this window is not the Home navigation hub").into());
+    }
+    // Before Home became the singleton navigation hub, remote detail pages
+    // were persisted as ordinary `(alias, None)` windows. Startup restore can
+    // still bring one back while also creating the new local Home fallback.
+    // Reuse that legacy surface instead of turning the hub into a duplicate;
+    // leaving Home in place also preserves the app's New Window launcher.
+    if let (Some(target_alias), None) = (alias.as_deref(), ws.as_ref()) {
+        let legacy_label = {
+            let windows = lock(&shell.windows);
+            legacy_host_detail_label(&windows, target_alias, window.label())
+        };
+        if let Some(label) = legacy_label {
+            if let Some(existing) = app.get_webview_window(&label) {
+                existing.unminimize()?;
+                existing.show()?;
+                existing.set_focus()?;
+                return Ok(());
+            }
+        }
+    }
+    // A remote detail page is host-scoped, so navigating the only Home
+    // fallback there while another ssh owns authentication would unload its
+    // modal and make later prompts unreachable. Keep the fallback in place
+    // and let the user finish that authentication before changing hosts.
+    if let Some(target_alias) = alias.as_deref() {
+        let askpass = app.state::<crate::askpass::Askpass>();
+        let pending_other = askpass
+            .pending_scoped(&previous_scope)
+            .into_iter()
+            .find(|prompt| prompt.alias() != Some(target_alias))
+            .map(|prompt| prompt.alias().map(str::to_string));
+        let mut connecting_other: Vec<String> = lock(&shell.connecting)
+            .keys()
+            .filter(|candidate| candidate.as_str() != target_alias)
+            .cloned()
+            .collect();
+        connecting_other.sort();
+        if let Some(owner) = pending_other
+            .as_ref()
+            .and_then(Clone::clone)
+            .or_else(|| connecting_other.into_iter().next())
+        {
+            return Err(anyhow::anyhow!(
+                "finish authentication for {owner} before opening {target_alias}"
+            )
+            .into());
+        }
+        if pending_other.is_some() {
+            return Err(anyhow::anyhow!(
+                "finish the pending SSH authentication before opening {target_alias}"
+            )
+            .into());
+        }
+    }
+    let previous_port = lock(&shell.allowed_daemon_ports)
+        .get(window.label())
+        .copied();
+    let stable_id = previous_scope.stable_id.clone();
+    let appearance = lock(&shell.appearance).get(alias.as_deref());
+    let mut url = restore::daemon_window_url(
+        port,
+        token,
+        &previous_scope.stable_id,
+        ws.as_deref(),
+        alias.as_deref(),
+        true,
+        appearance.as_ref(),
+    )?;
+    url.query_pairs_mut().append_pair(
+        "home-nav",
+        &HOME_NAV_SEQ.fetch_add(1, Ordering::Relaxed).to_string(),
+    );
+
+    authorize_daemon_origin(app, window.label(), port)?;
+    {
+        let mut windows = lock(&shell.windows);
+        let scope = windows
+            .get_mut(window.label())
+            .ok_or_else(|| anyhow::anyhow!("this window is not registered"))?;
+        let label = match (&alias, &ws) {
+            (None, None) => "Home".to_string(),
+            (Some(host), None) => format!("{host} Home"),
+            (Some(host), Some(_)) => format!("{host} Workbench"),
+            (None, Some(_)) => "Workbench".to_string(),
+        };
+        scope.begin_home_navigation(alias.clone(), ws.clone(), label);
+    }
+    // A competing navigation can now acquire the gate, but it will observe
+    // `navigation_pending` and fail before changing authorization or scope.
+    drop(home_navigation);
+    if let Err(error) = window.navigate(url) {
+        lock(&shell.windows).insert(window.label().to_string(), previous_scope);
+        let mut allowed = lock(&shell.allowed_daemon_ports);
+        match previous_port {
+            Some(port) => {
+                allowed.insert(window.label().to_string(), port);
+            }
+            None => {
+                allowed.remove(window.label());
+            }
+        }
+        return Err(error);
+    }
+    if ws.is_some() && !stable_id.is_empty() {
+        lock(&shell.registry).set_scope(&stable_id, alias.clone(), ws);
+    }
+
+    let title = alias.map_or_else(
+        || "chimaera".to_string(),
+        |host| format!("{host} — chimaera"),
+    );
+    let _ = window.set_title(&title);
+    crate::tray::rebuild(app);
+    crate::menu::sync_settings_enabled(app);
+    Ok(())
+}
+
+fn legacy_host_detail_label(
+    windows: &HashMap<String, WindowScope>,
+    alias: &str,
+    exclude: &str,
+) -> Option<String> {
+    windows
+        .iter()
+        .find(|(label, scope)| {
+            label.as_str() != exclude
+                && !scope.home_hub
+                && scope.alias.as_deref() == Some(alias)
+                && scope.ws.is_none()
+        })
+        .map(|(label, _)| label.clone())
+}
+
+/// Fulfil New Window with the one unused Home launcher. If a launcher/detail
+/// window exists, focus it (and re-home a remote detail); otherwise create a
+/// fresh Home without touching any ordinary workspace windows.
+pub(crate) fn show_local_home(
+    app: &AppHandle,
+    preferred_record: Option<WindowRecord>,
+) -> tauri::Result<()> {
+    if let Some(shell) = app.try_state::<Shell>() {
+        let _opening = lock(&shell.home_opening);
+        let existing = lock(&shell.windows)
+            .iter()
+            .find(|(_, scope)| scope.home_hub)
+            .map(|(label, scope)| (label.clone(), scope.alias.is_some() || scope.ws.is_some()));
+        if let Some((label, needs_local_navigation)) = existing {
+            if let Some(window) = app.get_webview_window(&label) {
+                if needs_local_navigation {
+                    let (port, token) = {
+                        let local = lock(&shell.local);
+                        (local.port, local.token.clone())
+                    };
+                    navigate_home_hub(app, &window, port, &token, None, None)?;
+                }
+                window.unminimize()?;
+                window.show()?;
+                window.set_focus()?;
+                return Ok(());
+            }
+        }
+
+        let (port, token) = {
+            let local = lock(&shell.local);
+            (local.port, local.token.clone())
+        };
+        let record = preferred_record.unwrap_or_else(|| WindowRecord::new(None, None));
+        return open_ui_window(app, port, &token, &record);
+    }
+    Ok(())
+}
+
 /// Whether the currently-focused window has a workspace open (vs the home
 /// screen or no window focused). Drives the menu's Settings item, which is
 /// workspace/daemon-scoped. Reads the scope map (populated by `open_ui_window`
@@ -429,9 +779,9 @@ pub(crate) fn release_startup(success: bool) {
 /// wizard lingered — open the home window so retiring the wizard can never
 /// leave the app window-less (last-window-closed would exit it).
 pub(crate) fn recover_windows(handle: &tauri::AppHandle) {
-    let Some(shell) = handle.try_state::<Shell>() else {
+    if handle.try_state::<Shell>().is_none() {
         return;
-    };
+    }
     let has_real = handle
         .webview_windows()
         .keys()
@@ -439,11 +789,7 @@ pub(crate) fn recover_windows(handle: &tauri::AppHandle) {
     if has_real {
         return;
     }
-    let (port, token) = {
-        let local = lock(&shell.local);
-        (local.port, local.token.clone())
-    };
-    if let Err(e) = open_ui_window(handle, port, &token, &WindowRecord::new(None, None)) {
+    if let Err(e) = show_local_home(handle, None) {
         tracing::error!("could not recover a home window: {e}");
     }
 }
@@ -469,10 +815,13 @@ pub(crate) fn finish_startup(handle: &tauri::AppHandle, local: LocalDaemon) -> t
             compute_connecting: Mutex::new(std::collections::HashSet::new()),
             connecting: Mutex::new(HashMap::new()),
             windows: Mutex::new(HashMap::new()),
+            last_focused_window: Mutex::new(None),
+            home_opening: Mutex::new(()),
+            home_navigation: Mutex::new(()),
             allowed_daemon_ports: Mutex::new(HashMap::new()),
             registry: Mutex::new(WindowRegistry::load_default()),
+            appearance: Mutex::new(crate::appearance::AppearanceCache::load_default()),
             quitting: AtomicBool::new(false),
-            closing: Mutex::new(HashSet::new()),
             caffeinate: Mutex::new(None),
         });
     } else {
@@ -525,19 +874,10 @@ pub fn run() {
         // Must be registered first: the plugin intercepts a second launch
         // before any other plugin or process-global shell resource starts.
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            // Bring the existing instance forward. During the first process's
-            // early daemon startup there may not be a window yet; its normal
-            // startup path will open one as soon as the daemon is ready.
-            let windows = app.webview_windows();
-            let target = windows
-                .values()
-                .find(|window| window.is_focused().unwrap_or(false))
-                .or_else(|| windows.values().next());
-            if let Some(window) = target {
-                let _ = window.unminimize();
-                let _ = window.show();
-                let _ = window.set_focus();
-            }
+            // Bring the existing instance's complete window set forward.
+            // During early daemon startup there may not be a window yet; the
+            // normal startup path opens Home as soon as the daemon is ready.
+            raise_all_windows(app);
         }))
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_clipboard_manager::init())
@@ -557,6 +897,7 @@ pub fn run() {
             commands::cancel_compute_session,
             commands::connect_compute_session,
             commands::open_window,
+            commands::navigate_home,
             commands::check_app_update,
             commands::begin_update,
             commands::shell_build,
@@ -566,6 +907,7 @@ pub fn run() {
             commands::caffeinate_state,
             commands::answer_askpass,
             commands::list_askpass,
+            commands::cache_appearance,
             commands::report_window_scope,
             commands::wsl_status,
             commands::wsl_install,
@@ -578,71 +920,6 @@ pub fn run() {
                 return;
             };
             match event {
-                // macOS convention: closing the LAST window drops you back to
-                // the home screen instead of quitting the app — you exit only by
-                // closing the home screen itself (or an explicit Quit / ⌘Q,
-                // which sets `quitting` and terminates without reaching here).
-                // We open a fresh home window (inheriting this one's geometry)
-                // *before* letting this one close, so the window count never
-                // hits zero — which is what fires the exit. When the window
-                // being closed already IS the local home screen, we don't
-                // reopen; the count falls to zero and the app exits, as
-                // intended. Not on Windows/Linux, where closing the last window
-                // conventionally quits (and their tray/wizard change the math).
-                #[cfg(target_os = "macos")]
-                tauri::WindowEvent::CloseRequested { api, .. } => {
-                    if shell.quitting.load(Ordering::Relaxed) {
-                        return; // an explicit quit is already in progress
-                    }
-                    let app = window.app_handle();
-                    // Mark this one closing first, then count the windows NOT
-                    // already on their way out — so a batched "close all" (both
-                    // CloseRequested before either Destroyed) still recognises
-                    // the true last window instead of each seeing the other.
-                    lock(&shell.closing).insert(window.label().to_string());
-                    let others = {
-                        let closing = lock(&shell.closing);
-                        app.webview_windows()
-                            .into_keys()
-                            .filter(|l| {
-                                l.as_str() != window.label()
-                                    && !l.starts_with("wsl-setup")
-                                    && !closing.contains(l)
-                            })
-                            .count()
-                    };
-                    if others > 0 {
-                        return; // not the last window — an ordinary close
-                    }
-                    let is_home = lock(&shell.windows)
-                        .get(window.label())
-                        .is_some_and(|s| s.alias.is_none() && s.ws.is_none());
-                    if is_home {
-                        return; // closing the home screen itself exits the app
-                    }
-                    let (port, token) = {
-                        let local = lock(&shell.local);
-                        (local.port, local.token.clone())
-                    };
-                    // Reopen home where this window sat, so it doesn't jump.
-                    let mut record = WindowRecord::new(None, None);
-                    let scale = window.scale_factor().unwrap_or(1.0);
-                    if let (Ok(pos), Ok(size)) = (window.outer_position(), window.inner_size()) {
-                        let pos = pos.to_logical::<f64>(scale);
-                        let size = size.to_logical::<f64>(scale);
-                        record.x = Some(pos.x);
-                        record.y = Some(pos.y);
-                        record.width = Some(size.width);
-                        record.height = Some(size.height);
-                    }
-                    if let Err(e) = open_ui_window(app, port, &token, &record) {
-                        // Couldn't open home — keep THIS window rather than
-                        // exiting into nothing. Veto the close and forget it.
-                        tracing::error!("could not open home window on last-window close: {e}");
-                        lock(&shell.closing).remove(window.label());
-                        api.prevent_close();
-                    }
-                }
                 // Forget a window's scope once it's gone, so focus-existing
                 // never raises a dead label. Destroyed (not CloseRequested,
                 // which can be vetoed) fires after teardown completes. The
@@ -651,8 +928,12 @@ pub fn run() {
                 // teardown destroys every window and forgetting them would
                 // defeat restore.
                 tauri::WindowEvent::Destroyed => {
-                    lock(&shell.closing).remove(window.label());
                     lock(&shell.allowed_daemon_ports).remove(window.label());
+                    let mut last_focused = lock(&shell.last_focused_window);
+                    if last_focused.as_deref() == Some(window.label()) {
+                        *last_focused = None;
+                    }
+                    drop(last_focused);
                     let scope = lock(&shell.windows).remove(window.label());
                     if !shell.quitting.load(Ordering::Relaxed) {
                         if let Some(scope) = scope {
@@ -668,6 +949,7 @@ pub fn run() {
                 // Focus moved to this window — Settings tracks whether the now-
                 // focused window has a workspace open.
                 tauri::WindowEvent::Focused(true) => {
+                    *lock(&shell.last_focused_window) = Some(window.label().to_string());
                     crate::menu::sync_settings_enabled(window.app_handle());
                 }
                 // Track geometry in memory on every move/resize; a slow tick
@@ -764,6 +1046,11 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building chimaera")
         .run(|app, event| match event {
+            // Clicking the macOS Dock icon activates the whole workbench, not
+            // an arbitrary single window. Raise every Chimaera window and
+            // restore focus to whichever one was active before the click.
+            #[cfg(target_os = "macos")]
+            tauri::RunEvent::Reopen { .. } => raise_all_windows(app),
             // Quit teardown destroys every window; flag it FIRST so those
             // Destroyed events keep the registry intact for the next launch.
             tauri::RunEvent::ExitRequested { .. } => {
@@ -805,7 +1092,9 @@ pub fn run() {
 
 #[cfg(test)]
 mod origin_tests {
-    use super::{daemon_origin_matches, WindowScope};
+    use std::collections::HashMap;
+
+    use super::{daemon_origin_matches, legacy_host_detail_label, WindowScope};
 
     #[test]
     fn daemon_origin_requires_exact_scheme_host_and_port() {
@@ -825,14 +1114,83 @@ mod origin_tests {
     }
 
     #[test]
-    fn askpass_scope_is_immutable_and_explicit() {
+    fn legacy_host_detail_reuse_ignores_hub_and_workspace_windows() {
+        let windows = HashMap::from([
+            (
+                "home".into(),
+                WindowScope::new(None, None, "home-record".into()),
+            ),
+            (
+                "legacy-detail".into(),
+                WindowScope::new(Some("Sherlock".into()), None, "legacy-record".into()),
+            ),
+            (
+                "workspace".into(),
+                WindowScope::new(
+                    Some("Sherlock".into()),
+                    Some("ws-1".into()),
+                    "workspace-record".into(),
+                ),
+            ),
+            (
+                "other-detail".into(),
+                WindowScope::new(Some("Other".into()), None, "other-record".into()),
+            ),
+        ]);
+
+        assert_eq!(
+            legacy_host_detail_label(&windows, "Sherlock", "home").as_deref(),
+            Some("legacy-detail")
+        );
+        assert_eq!(
+            legacy_host_detail_label(&windows, "Sherlock", "legacy-detail"),
+            None
+        );
+        assert_eq!(legacy_host_detail_label(&windows, "Missing", "home"), None);
+    }
+
+    #[test]
+    fn askpass_scope_is_explicit_and_home_promotion_narrows_it() {
         let mut fallback = WindowScope::new(None, None, "home".into());
         assert!(fallback.allows_askpass(Some("remote-2")));
-        fallback.ws = Some("local-workspace".into());
+        fallback.report_page_scope(Some("local-workspace".into()), "Workspace".into());
+        assert!(!fallback.home_hub);
+        assert!(!fallback.allows_askpass(Some("remote-2")));
+        fallback.report_page_scope(None, "Home".into());
+        assert!(fallback.home_hub);
         assert!(fallback.allows_askpass(Some("remote-2")));
+        fallback.relinquish_home();
+        assert!(!fallback.home_hub);
+        assert!(!fallback.allows_askpass(Some("remote-2")));
+
+        let mut remote_hub = WindowScope::new(None, None, "remote-home".into());
+        remote_hub.begin_home_navigation(Some("Sherlock".into()), None, "Sherlock Home".into());
+        assert!(remote_hub.navigation_pending());
+        assert!(!remote_hub.allows_askpass(Some("Sherlock")));
+        assert!(!remote_hub.allows_askpass(Some("remote-2")));
+        remote_hub.complete_home_navigation();
+        assert!(remote_hub.home_hub);
+        assert!(remote_hub.allows_askpass(Some("Sherlock")));
+        assert!(!remote_hub.allows_askpass(Some("remote-2")));
+        assert!(!remote_hub.allows_askpass(None));
+        remote_hub.begin_home_navigation(None, None, "Home".into());
+        assert!(!remote_hub.allows_askpass(Some("Sherlock")));
+        remote_hub.complete_home_navigation();
+        assert!(remote_hub.allows_askpass(Some("remote-2")));
+        remote_hub.begin_home_navigation(
+            Some("Sherlock".into()),
+            Some("workspace".into()),
+            "Sherlock Workspace".into(),
+        );
+        assert!(!remote_hub.allows_askpass(Some("Sherlock")));
+        remote_hub.complete_home_navigation();
+        assert!(!remote_hub.home_hub);
+        assert!(remote_hub.allows_askpass(Some("Sherlock")));
+        assert!(!remote_hub.allows_askpass(Some("remote-2")));
 
         let local = WindowScope::new(None, Some("local-workspace".into()), "local".into());
         assert!(!local.allows_askpass(Some("remote-2")));
+        assert_eq!(local.appearance_alias(), None);
 
         let remote = WindowScope::new(
             Some("Sherlock".into()),
@@ -842,6 +1200,10 @@ mod origin_tests {
         assert!(remote.allows_askpass(Some("Sherlock")));
         assert!(!remote.allows_askpass(Some("remote-2")));
         assert!(!remote.allows_askpass(None));
+        let mut remote_home = remote.clone();
+        remote_home.report_page_scope(None, "Sherlock Home".into());
+        assert!(!remote_home.home_hub);
+        assert!(remote_home.allows_askpass(Some("Sherlock")));
 
         // `Sherlock#job123` is itself a valid ordinary ssh alias. Its shape
         // must not grant access to Sherlock's prompt.
@@ -851,6 +1213,7 @@ mod origin_tests {
             "colliding-remote".into(),
         );
         assert!(!colliding_remote.allows_askpass(Some("Sherlock")));
+        assert_eq!(colliding_remote.appearance_alias(), Some("Sherlock#job123"));
 
         let compute = WindowScope::new_compute(
             "Sherlock#job123".into(),
@@ -860,5 +1223,6 @@ mod origin_tests {
         );
         assert!(compute.allows_askpass(Some("Sherlock")));
         assert!(!compute.allows_askpass(Some("Sherlock#job123")));
+        assert_eq!(compute.appearance_alias(), Some("Sherlock"));
     }
 }

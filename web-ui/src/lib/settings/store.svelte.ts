@@ -14,6 +14,10 @@
 
 import { api } from "../net/api";
 import {
+  cacheAppearanceBootstrap,
+  type AppearanceBootstrap,
+} from "../net/native";
+import {
   defaultValue,
   sanitize,
   settingDef,
@@ -23,10 +27,52 @@ import {
 import { defaultThemeFor, themeById, type ThemeDef } from "./themes";
 
 const PUT_DEBOUNCE_MS = 400;
+/** Keep in lockstep with the pre-module bootstrap in web-ui/index.html. */
+const APPEARANCE_BOOTSTRAP_KEY = "chimaera.appearanceBootstrap.v1";
+
+function isAppearanceBootstrap(
+  value: Partial<AppearanceBootstrap> | null | undefined,
+): value is AppearanceBootstrap {
+  return (
+    (value?.mode === "light" || value?.mode === "dark") &&
+    typeof value.themeId === "string" &&
+    typeof value.background === "string" &&
+    (value.accent === null || typeof value.accent === "string")
+  );
+}
+
+/** The last daemon-confirmed appearance carried by the native shell or saved
+ *  on this origin. It bridges the short gap before `/settings` answers; the
+ *  confirmed response always replaces it. */
+function readAppearanceBootstrap(): AppearanceBootstrap | null {
+  const carried = (
+    globalThis as typeof globalThis & {
+      __CHIMAERA_APPEARANCE_BOOTSTRAP__?: Partial<AppearanceBootstrap> | null;
+    }
+  ).__CHIMAERA_APPEARANCE_BOOTSTRAP__;
+  if (isAppearanceBootstrap(carried)) return carried;
+  try {
+    const value = JSON.parse(localStorage.getItem(APPEARANCE_BOOTSTRAP_KEY) ?? "null") as
+      | Partial<AppearanceBootstrap>
+      | null;
+    if (isAppearanceBootstrap(value)) return value;
+  } catch {
+    // Storage can be unavailable or from an older malformed build.
+  }
+  return null;
+}
+
+const appearanceBootstrap =
+  typeof localStorage === "undefined" ? null : readAppearanceBootstrap();
 
 /** Sparse user map, exactly as stored in settings.json (unknown keys kept). */
 let user = $state<Record<string, unknown>>({});
 let loaded = $state(false);
+/** Whether a daemon-confirmed map has actually made it past the local-edit
+ *  guard. `loaded` also becomes true after a failed GET so the rest of the UI
+ *  can proceed with defaults; it therefore cannot identify the first
+ *  authoritative appearance frame. */
+let authoritativeSettingsApplied = false;
 
 const listeners = new Set<() => void>();
 let putTimer: ReturnType<typeof setTimeout> | null = null;
@@ -126,7 +172,14 @@ export function applyRemoteSettings(map: Record<string, unknown>): void {
   loaded = true;
   // Never clobber unsent local edits with an older broadcast.
   if (dirtySince !== null) return;
-  if (JSON.stringify(map) === JSON.stringify(user)) return;
+  const firstAuthoritativeMap = !authoritativeSettingsApplied;
+  authoritativeSettingsApplied = true;
+  if (JSON.stringify(map) === JSON.stringify(user)) {
+    // The first confirmed empty/default map still needs to replace a stale
+    // bootstrap cached by an older daemon setting.
+    if (firstAuthoritativeMap) applyAppearance();
+    return;
+  }
   user = map;
   applyAppearance();
   notify();
@@ -176,6 +229,9 @@ systemDark?.addEventListener("change", () => {
 
 /** The mode actually in effect right now ("light" | "dark"). */
 export function resolvedTheme(): "light" | "dark" {
+  if (!loaded && dirtySince === null && appearanceBootstrap !== null) {
+    return appearanceBootstrap.mode;
+  }
   const pref = getSetting("appearance.theme");
   if (pref === "system") return (systemDark?.matches ?? false) ? "dark" : "light";
   return pref;
@@ -183,27 +239,78 @@ export function resolvedTheme(): "light" | "dark" {
 
 // $state.raw: swapped wholesale on theme change, so Svelte consumers (the
 // accent swatch) track it while plain-TS consumers (termPool) just read it.
-let activeThemeDef = $state.raw<ThemeDef>(defaultThemeFor("light"));
+const initialThemeDef = defaultThemeFor("light");
+let activeThemeDef = $state.raw<ThemeDef>(initialThemeDef);
+let appliedAppearance: AppearanceBootstrap = {
+  mode: "light",
+  themeId: initialThemeDef.id,
+  background: initialThemeDef.tokens["--bg"],
+  accent: null,
+};
+let lastNativeAppearance = "";
 
 /** The full theme currently applied (termPool reads its ANSI palette). */
 export function activeTheme(): ThemeDef {
   return activeThemeDef;
 }
 
+/** Snapshot carried in native re-home URLs before the next origin paints. */
+export function appearanceBootstrapForNavigation(): AppearanceBootstrap {
+  return { ...appliedAppearance };
+}
+
 function applyAppearance(): void {
   const root = document.documentElement;
   const mode = resolvedTheme();
-  const id = getSetting(mode === "dark" ? "appearance.darkTheme" : "appearance.lightTheme");
+  const bootstrapping = !loaded && dirtySince === null && appearanceBootstrap !== null;
+  const id = bootstrapping
+    ? appearanceBootstrap.themeId
+    : getSetting(mode === "dark" ? "appearance.darkTheme" : "appearance.lightTheme");
   const theme = themeById(id) ?? defaultThemeFor(mode);
   activeThemeDef = theme;
   // data-theme keeps carrying the MODE (color-scheme + the app.css fallback
   // blocks); the palette itself lands inline, every theme treated alike.
   root.dataset.theme = mode;
+  // The pre-module bootstrap sets this inline to prevent a light native
+  // scrollbar flash. Keep that higher-specificity declaration synchronized
+  // once daemon settings (or a live user change) resolve a different mode.
+  root.style.colorScheme = mode;
   for (const [name, value] of Object.entries(theme.tokens)) {
     root.style.setProperty(name, value);
   }
-  const accent = getSetting("appearance.accentColor");
-  if (accent !== "") root.style.setProperty("--accent", accent);
+  const accent = bootstrapping
+    ? (appearanceBootstrap.accent ?? "")
+    : getSetting("appearance.accentColor");
+  appliedAppearance = {
+    mode,
+    themeId: theme.id,
+    background: theme.tokens["--bg"],
+    accent: accent === "" ? null : accent,
+  };
+  // Always replace the bootstrap value. An empty user setting means the
+  // selected theme's accent, not "leave whatever inline custom accent the
+  // bootstrap installed". Themes live inline too, so removing the property
+  // would incorrectly fall back to app.css instead of the selected palette.
+  root.style.setProperty("--accent", accent === "" ? theme.tokens["--accent"] : accent);
+  // The HTML head reads this before the JavaScript module graph on the next
+  // navigation/window creation. Do not overwrite a real saved choice during
+  // the module-load defaults pass; wait for a daemon-confirmed map or a local
+  // edit.
+  if (loaded || dirtySince !== null) {
+    const serialized = JSON.stringify(appliedAppearance);
+    try {
+      localStorage.setItem(APPEARANCE_BOOTSTRAP_KEY, serialized);
+    } catch {
+      // Private/restricted storage: the system fallback in index.html holds.
+    }
+    if (serialized !== lastNativeAppearance) {
+      lastNativeAppearance = serialized;
+      void cacheAppearanceBootstrap(appliedAppearance).catch(() => {
+        // A browser has no shell, and a shell write failure must not disturb
+        // the live theme; this cache is only the next document's first paint.
+      });
+    }
+  }
 
   // One application-wide interface scale. Components consume only the four
   // --text-* tokens; updating them here makes a settings edit apply to every

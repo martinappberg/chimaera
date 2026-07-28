@@ -87,6 +87,25 @@ export interface LocalDaemonState {
   dev_build: boolean;
 }
 
+/** Bounded first-paint palette persisted by the native shell per host. */
+export interface AppearanceBootstrap {
+  mode: "light" | "dark";
+  themeId: string;
+  background: string;
+  accent: string | null;
+}
+
+/**
+ * Keep the confirmed palette outside origin-scoped browser storage. Native
+ * daemon/tunnel ports are volatile, so the shell carries this snapshot into
+ * the next URL before its document is parsed.
+ */
+export async function cacheAppearanceBootstrap(
+  appearance: AppearanceBootstrap,
+): Promise<void> {
+  await tauri()?.core.invoke<void>("cache_appearance", { appearance });
+}
+
 export async function listHosts(): Promise<HostState[]> {
   const t = tauri();
   if (t === null) return [];
@@ -512,4 +531,15 @@ export async function openWindow(
   // The hash now carries every piece of per-window state, so severing opener
   // access is safe and avoids coupling the two app tabs.
   window.open(`${location.origin}/${hash}`, "_blank", "noopener");
+}
+
+/**
+ * Navigate the unused native launcher to local Home, a connected remote detail,
+ * or a workspace on that daemon. A workspace consumes the launcher and becomes
+ * an ordinary workbench; the next New Window can then create a fresh Home.
+ */
+export async function navigateHome(alias: string | null, wsId: string | null = null): Promise<void> {
+  const t = tauri();
+  if (t === null) throw new Error("Home navigation requires the native shell");
+  await t.core.invoke<void>("navigate_home", { alias, wsId });
 }
