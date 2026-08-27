@@ -1856,6 +1856,10 @@
         detachedWindow && typeof r.origin === "string" && /^[A-Za-z0-9_-]{1,64}$/.test(r.origin)
           ? r.origin
           : null;
+      // A solo window IS focus mode — no rail, ever (the reveal affordances
+      // and the chord are gated). Heal a blob persisted before that rule so
+      // an old dt window can't come up stranded rail-open, stripless.
+      if (detachedWindow && !layout.focusMode) layout = { ...layout, focusMode: true };
     }
     layoutReady = true;
     pruneAndAutoOpen();
@@ -2006,6 +2010,14 @@
         return;
       case "focusMode":
         intercept();
+        // A detached solo window has no rail to reveal — it is just its pane
+        // (the button is gone too; re-attach is the way back to the full
+        // workbench). Without this gate the chord would strand the window
+        // rail-open with no strip.
+        if (detachedWindow) {
+          showFlash("this is a detached window — re-attach to get the full workbench");
+          return;
+        }
         layout = { ...layout, focusMode: !layout.focusMode };
         return;
       case "cyclePrev":
@@ -4393,40 +4405,49 @@
     <!-- Focus-mode session strip: the rail is gone, but the window always
          says where you are. Hidden whenever the rail is visible. -->
     <footer class="strip">
-      <button
-        class="strip-show"
-        title="show sidebar ({keyHint("focusMode")})"
-        aria-label="show sidebar"
-        onclick={() => (layout = { ...layout, focusMode: false })}
-      >
-        <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true">
-          <rect
-            x="1.75"
-            y="2.75"
-            width="12.5"
-            height="10.5"
-            rx="2"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="1.3"
-          />
-          <line x1="6.5" y1="2.75" x2="6.5" y2="13.25" stroke="currentColor" stroke-width="1.3" />
-          <path
-            d="M9.4 6.2 11.4 8l-2 1.8"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="1.3"
-            stroke-linecap="round"
-            stroke-linejoin="round"
-          />
-        </svg>
-      </button>
-      <button
-        class="strip-ws"
-        title="show sidebar ({keyHint("focusMode")})"
-        onclick={() => (layout = { ...layout, focusMode: false })}
-        >{workspace?.name ?? "chimaera"}</button
-      >
+      {#if !detachedWindow}
+        <!-- Sidebar reveal is the MAIN window's affordance. A detached solo
+             window offers no rail at all — it is just its pane; the way back
+             to the full workbench is re-attach (maintainer call). -->
+        <button
+          class="strip-show"
+          title="show sidebar ({keyHint("focusMode")})"
+          aria-label="show sidebar"
+          onclick={() => (layout = { ...layout, focusMode: false })}
+        >
+          <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true">
+            <rect
+              x="1.75"
+              y="2.75"
+              width="12.5"
+              height="10.5"
+              rx="2"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.3"
+            />
+            <line x1="6.5" y1="2.75" x2="6.5" y2="13.25" stroke="currentColor" stroke-width="1.3" />
+            <path
+              d="M9.4 6.2 11.4 8l-2 1.8"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.3"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            />
+          </svg>
+        </button>
+        <button
+          class="strip-ws"
+          title="show sidebar ({keyHint("focusMode")})"
+          onclick={() => (layout = { ...layout, focusMode: false })}
+          >{workspace?.name ?? "chimaera"}</button
+        >
+      {:else}
+        <!-- Same place, same look — but a plain label: nothing in a solo
+             window opens the rail. -->
+        <span class="strip-ws inert">{workspace?.name ?? "chimaera"}</span>
+      {/if}
       {#if !detachedWindow}
         <!-- The workspace's session chips are the MAIN window's wayfinding; a
              detached solo window is just its own tabs — the roster following
@@ -5697,6 +5718,11 @@
 
   .strip-ws:hover {
     background: var(--row-hover);
+  }
+
+  /* The detached window's plain workspace label: same slot, no affordance. */
+  .strip-ws.inert:hover {
+    background: none;
   }
 
   .chips {
