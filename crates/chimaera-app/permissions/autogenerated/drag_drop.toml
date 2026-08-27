@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-drag-drop"
+description = "Enables the drag_drop command without any pre-configured scope."
+commands.allow = ["drag_drop"]
+
+[[permission]]
+identifier = "deny-drag-drop"
+description = "Denies the drag_drop command without any pre-configured scope."
+commands.deny = ["drag_drop"]

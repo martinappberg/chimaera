@@ -402,8 +402,11 @@ export async function reportWindowScope(
   alias: string | null,
   ws: string | null,
   label: string | null,
+  detached = false,
 ): Promise<void> {
-  await tauri()?.core.invoke<void>("report_window_scope", { alias, ws, label });
+  // `detached` is set-only shell-side: true re-asserts a restored detached
+  // window's flag (its blob carries dt:1); false never clears anything.
+  await tauri()?.core.invoke<void>("report_window_scope", { alias, ws, label, detached });
 }
 
 /**
@@ -542,6 +545,110 @@ export async function navigateHome(alias: string | null, wsId: string | null = n
   const t = tauri();
   if (t === null) throw new Error("Home navigation requires the native shell");
   await t.core.invoke<void>("navigate_home", { alias, wsId });
+}
+
+/**
+ * Native half of pane detach: a real OS window booting on a PRE-SEEDED
+ * window id (the caller PUT the `dt:1` solo layout blob under `winId`
+ * first). `at` is the drop point in THIS window's client coords plus the
+ * desired inner size — the shell lifts them into screen space itself; it
+ * never trusts webview screen coordinates. The shell also derives the host
+ * from this window's registered scope, so there is no alias parameter.
+ */
+export async function openDetachedWindow(
+  wsId: string,
+  winId: string,
+  at: { x: number; y: number; w: number; h: number },
+): Promise<void> {
+  const t = tauri();
+  if (t === null) throw new Error("not in the native shell");
+  await t.core.invoke<void>("open_detached_window", {
+    wsId,
+    winId,
+    x: at.x,
+    y: at.y,
+    width: at.w,
+    height: at.h,
+  });
+}
+
+// --- cross-window drag / adopt (shell-routed; see crossWindow.ts) ----------
+
+/** A sibling window tabs can move to (list_scope_windows / the tray). */
+export interface ScopeWindow {
+  win_id: string;
+  label: string;
+  detached: boolean;
+}
+
+/** An `xdrag` event targeted at THIS window, coords in its client px. */
+export interface XdragEvent {
+  phase: "over" | "leave" | "drop";
+  x?: number;
+  y?: number;
+  transfer?: number;
+  payload?: unknown;
+}
+
+/** Track an out-of-window drag: resolves whether a sibling window is under
+ *  the pointer (client coords — the shell owns the screen-space math). */
+export async function dragTrack(x: number, y: number): Promise<boolean> {
+  return (await tauri()?.core.invoke<boolean>("drag_track", { x, y })) ?? false;
+}
+
+export async function dragDrop(
+  x: number,
+  y: number,
+  payload: unknown,
+): Promise<{ routed: boolean; transfer?: number }> {
+  return (
+    (await tauri()?.core.invoke<{ routed: boolean; transfer?: number }>("drag_drop", {
+      x,
+      y,
+      payload,
+    })) ?? { routed: false }
+  );
+}
+
+export async function dragCancel(): Promise<void> {
+  await tauri()?.core.invoke<void>("drag_cancel", {});
+}
+
+export async function adoptAck(transfer: number, ok: boolean): Promise<void> {
+  await tauri()?.core.invoke<void>("adopt_ack", { transfer, ok });
+}
+
+/** Menu-path adopt into the window with stable id `targetWinId`; resolves
+ *  the transfer id whose ack authorizes removing the local copies. */
+export async function adoptTab(targetWinId: string, payload: unknown): Promise<number> {
+  const t = tauri();
+  if (t === null) throw new Error("not in the native shell");
+  return t.core.invoke<number>("adopt_tab", { targetWinId, payload });
+}
+
+export async function listScopeWindows(): Promise<ScopeWindow[]> {
+  return (await tauri()?.core.invoke<ScopeWindow[]>("list_scope_windows", {})) ?? [];
+}
+
+/** Incoming cross-window drag traffic for THIS window (window-scoped, like
+ *  onMenu). No-op unsubscriber in the browser. */
+export function onXdrag(handler: (e: XdragEvent) => void): Promise<() => void> {
+  const t = tauri();
+  if (t === null) return Promise.resolve(() => {});
+  return t.webviewWindow
+    .getCurrentWebviewWindow()
+    .listen<XdragEvent>("xdrag", (e) => handler(e.payload));
+}
+
+/** Acks for transfers THIS window initiated (drag drops and menu adopts). */
+export function onXdragAck(
+  handler: (e: { transfer: number; ok: boolean }) => void,
+): Promise<() => void> {
+  const t = tauri();
+  if (t === null) return Promise.resolve(() => {});
+  return t.webviewWindow
+    .getCurrentWebviewWindow()
+    .listen<{ transfer: number; ok: boolean }>("xdrag-ack", (e) => handler(e.payload));
 }
 
 /**

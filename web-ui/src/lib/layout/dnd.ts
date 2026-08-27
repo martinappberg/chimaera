@@ -146,6 +146,21 @@ export interface LayoutCtrl {
    * pane-bar toggle). Confirms with the user when the agent is mid-task.
    */
   switchView(sessionId: string, target: "chat" | "term"): void;
+  /**
+   * Tear the tab at `index` out into its own window (the context-menu
+   * sibling of the drag-out gesture; the new window opens near the pane).
+   */
+  detachTabToWindow(paneId: string, index: number): void;
+  /**
+   * Sibling windows (same host + workspace) the move menu offers. A cached
+   * snapshot — `refreshMoveTargets` updates it in the background, so a menu
+   * built synchronously reads the previous refresh's roster.
+   */
+  moveTargets(): { winId: string; label: string; detached: boolean }[];
+  refreshMoveTargets(): void;
+  /** Move the tab at `index` into the sibling window `winId` (adopt-on-ack:
+   *  the tab leaves this window only when the other one confirms). */
+  moveTabToWindow(paneId: string, index: number, winId: string): void;
 }
 
 interface PaneReg {
@@ -412,6 +427,16 @@ function spotAt(
   return null;
 }
 
+/**
+ * Hit-test for an INCOMING cross-window drag: the shell forwards a sibling
+ * window's pointer in THIS window's client coords, and the target renders
+ * the same zone/tab/edge previews a local drag would. No ref/link bands —
+ * those belong to in-window payload drags.
+ */
+export function dropSpotAt(x: number, y: number): DropSpot | null {
+  return spotAt(x, y, null, undefined, undefined, false);
+}
+
 function makeGhost(label: string): HTMLDivElement {
   const ghost = document.createElement("div");
   ghost.className = "drag-ghost";
@@ -539,6 +564,16 @@ export interface DragOptions {
    * never do.
    */
   allowOut?: boolean;
+  /**
+   * Native shell only: called (rAF-throttled) while the pointer is out, so
+   * the shell can hit-test sibling windows and light the hovered one up.
+   * Resolves whether a sibling is under the pointer — the ghost hint flips
+   * between "open as new window" and "move into window" accordingly.
+   */
+  trackOut?: (clientX: number, clientY: number) => Promise<boolean>;
+  /** The pointer came back inside the viewport mid-drag: clear any sibling
+   *  highlight trackOut lit (the shell's leave event). */
+  trackEnd?: () => void;
 }
 
 /**
@@ -568,6 +603,10 @@ export function startDrag(
   let lastSY = e.screenY;
   let spot: DropSpot | null = null;
   let done = false;
+  // Out-of-window tracking (native cross-window drags).
+  let wasOut = false;
+  let outTarget = false;
+  let trackSeq = 0;
 
   try {
     source?.setPointerCapture(pointerId);
@@ -582,6 +621,25 @@ export function startDrag(
   const update = () => {
     raf = 0;
     const out = opts.allowOut === true && outOfViewport(lastX, lastY);
+    if (out !== wasOut) {
+      wasOut = out;
+      if (!out) {
+        // Back inside: whatever sibling window the shell lit up must unlight.
+        outTarget = false;
+        opts.trackEnd?.();
+      }
+    }
+    if (out && opts.trackOut !== undefined) {
+      const seq = ++trackSeq;
+      void opts.trackOut(lastX, lastY).then((over) => {
+        if (seq !== trackSeq || done || over === outTarget) return;
+        outTarget = over;
+        const hint = ghost?.querySelector<HTMLElement>(".ghost-hint");
+        if (hint !== null && hint !== undefined) {
+          hint.textContent = over ? "move into window" : "open as new window";
+        }
+      });
+    }
     if (ghost !== null) {
       // Outside the viewport the ghost clamps to the nearest edge (it cannot
       // follow the OS cursor out) and wears the "open as new window" hint.

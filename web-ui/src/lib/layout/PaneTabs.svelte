@@ -337,13 +337,48 @@
     }
   }
 
+  /** The cross-window section every surface gets: tear out into a new
+   *  window, or move into a live sibling window (same host + workspace).
+   *  Dirty files are blocked — their unsaved buffer lives in THIS window.
+   *  The roster is the last refresh's snapshot; refreshing here (fire-and-
+   *  forget) keeps it current for the next open. */
+  function moveEntries(tab: Tab, i: number): ContextMenuEntry[] {
+    ctrl.refreshMoveTargets();
+    const dirty = tab.surface === "file" && $dirtyFiles.has(tab.path);
+    const hint = dirty ? "save the file first — moving would drop unsaved edits" : undefined;
+    const rows: ContextMenuEntry[] = [
+      {
+        label: "Move to New Window",
+        disabled: dirty,
+        hint,
+        onSelect: () => ctrl.detachTabToWindow(node.id, i),
+      },
+    ];
+    for (const w of ctrl.moveTargets()) {
+      rows.push({
+        label: `Move to “${w.label || "window"}”`,
+        disabled: dirty,
+        hint,
+        onSelect: () => ctrl.moveTabToWindow(node.id, i, w.winId),
+      });
+    }
+    rows.push("separator");
+    return rows;
+  }
+
   function tabMenu(tab: Tab, i: number): ContextMenuEntry[] {
     const close: ContextMenuEntry = {
       label: "Close",
       onSelect: () => ctrl.closeTab(node.id, i),
     };
+    const move = moveEntries(tab, i);
     if (tab.surface === "terminal") {
-      return [{ label: "Rename…", onSelect: () => beginTabRename(tab) }, "separator", close];
+      return [
+        { label: "Rename…", onSelect: () => beginTabRename(tab) },
+        "separator",
+        ...move,
+        close,
+      ];
     }
     if (tab.surface === "browser") {
       return [
@@ -357,6 +392,7 @@
               "separator" as const,
             ]
           : []),
+        ...move,
         close,
       ];
     }
@@ -379,10 +415,11 @@
           : []),
         { label: "Copy Path", onSelect: () => void copyPath(tab.path) },
         "separator",
+        ...move,
         close,
       ];
     }
-    return [close];
+    return [...move, close];
   }
 </script>
 

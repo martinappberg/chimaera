@@ -23,6 +23,7 @@ use crate::windows::{WindowRecord, WindowRegistry};
 
 mod commands;
 mod connect;
+mod drag;
 mod restore;
 
 pub use restore::open_ui_window;
@@ -111,7 +112,28 @@ pub struct Shell {
     /// (this machine won't idle/display/system-sleep). Dropped to disarm; the
     /// guard drops on quit, so the assertion never outlives the app.
     caffeinate: Mutex<Option<keepawake::KeepAwake>>,
+    /// Live cross-window drags: source label → the sibling label its pointer
+    /// currently hovers (None over desktop). Entries live for one drag.
+    drags: Mutex<HashMap<String, Option<String>>>,
+    /// Adopt transfers awaiting the target window's ack. The source removes
+    /// its tabs only when the ok-ack comes back through here.
+    transfers: Mutex<HashMap<u64, Transfer>>,
+    /// Window labels, most-recently-focused first. The drag hit-test's
+    /// tie-break for overlapping windows — the windowing API exposes no
+    /// z-order, and recency is the closest observable proxy.
+    focus_order: Mutex<Vec<String>>,
 }
+
+/// One in-flight cross-window tab move (drag drop or menu adopt).
+struct Transfer {
+    source: String,
+    target: String,
+    started: std::time::Instant,
+}
+
+/// Forget transfers old enough that both sides have given up (the source
+/// toasts at 2s and stops listening at 10s — see crossWindow.ts).
+const TRANSFER_TTL: Duration = Duration::from_secs(15);
 
 /// The (host, workspace) a window is showing. `alias` None = the local
 /// daemon; `ws` None = the home screen. `stable_id` is the window's
@@ -141,6 +163,13 @@ pub struct WindowScope {
     /// askpass privilege stays disabled until the new document starts. This
     /// prevents the unloading origin from borrowing the destination's scope.
     navigation_pending: bool,
+    /// A solo window born by tearing a pane out of another window (its blob
+    /// carries `dt:1`). Excluded from focus-existing raises — "open this
+    /// workspace" must land on the real workspace window, never a torn-off
+    /// pane that happens to share its scope. Set-only: the shell sets it at
+    /// creation, the SPA may re-assert it after a restart restore, and
+    /// nothing clears it.
+    pub detached: bool,
 }
 
 #[derive(Clone, PartialEq)]
@@ -177,6 +206,20 @@ impl WindowScope {
             askpass_scope,
             label: String::new(),
             navigation_pending: false,
+            detached: false,
+        }
+    }
+
+    /// The scope of a detached (torn-off) solo window: same host/askpass
+    /// facts as `new`, but flagged so focus-existing never raises it.
+    pub(crate) fn new_detached(
+        alias: Option<String>,
+        ws: Option<String>,
+        stable_id: String,
+    ) -> Self {
+        Self {
+            detached: true,
+            ..Self::new(alias, ws, stable_id)
         }
     }
 
@@ -197,6 +240,7 @@ impl WindowScope {
             askpass_scope: AskpassScope::Host(login_alias),
             label: String::new(),
             navigation_pending: false,
+            detached: false,
         }
     }
 
@@ -823,6 +867,9 @@ pub(crate) fn finish_startup(handle: &tauri::AppHandle, local: LocalDaemon) -> t
             appearance: Mutex::new(crate::appearance::AppearanceCache::load_default()),
             quitting: AtomicBool::new(false),
             caffeinate: Mutex::new(None),
+            drags: Mutex::new(HashMap::new()),
+            transfers: Mutex::new(HashMap::new()),
+            focus_order: Mutex::new(Vec::new()),
         });
     } else {
         *lock(&handle.state::<Shell>().local) = local;
@@ -898,6 +945,13 @@ pub fn run() {
             commands::connect_compute_session,
             commands::open_window,
             commands::navigate_home,
+            commands::open_detached_window,
+            commands::drag_track,
+            commands::drag_drop,
+            commands::drag_cancel,
+            commands::adopt_ack,
+            commands::adopt_tab,
+            commands::list_scope_windows,
             commands::check_app_update,
             commands::begin_update,
             commands::shell_build,
@@ -934,6 +988,14 @@ pub fn run() {
                         *last_focused = None;
                     }
                     drop(last_focused);
+                    // Cross-window drag state involving a dead window is
+                    // meaningless: its outgoing drag ends, its pending
+                    // transfers can never ack (the source's own timeout
+                    // handles the UX), and it leaves the focus order.
+                    lock(&shell.drags).remove(window.label());
+                    lock(&shell.transfers)
+                        .retain(|_, t| t.source != window.label() && t.target != window.label());
+                    lock(&shell.focus_order).retain(|l| l != window.label());
                     let scope = lock(&shell.windows).remove(window.label());
                     if !shell.quitting.load(Ordering::Relaxed) {
                         if let Some(scope) = scope {
@@ -947,9 +1009,15 @@ pub fn run() {
                     }
                 }
                 // Focus moved to this window — Settings tracks whether the now-
-                // focused window has a workspace open.
+                // focused window has a workspace open, and the drag hit-test's
+                // recency order promotes it.
                 tauri::WindowEvent::Focused(true) => {
                     *lock(&shell.last_focused_window) = Some(window.label().to_string());
+                    {
+                        let mut order = lock(&shell.focus_order);
+                        order.retain(|l| l != window.label());
+                        order.insert(0, window.label().to_string());
+                    }
                     crate::menu::sync_settings_enabled(window.app_handle());
                 }
                 // Track geometry in memory on every move/resize; a slow tick

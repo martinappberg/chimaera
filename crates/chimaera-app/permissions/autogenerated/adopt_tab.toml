@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-adopt-tab"
+description = "Enables the adopt_tab command without any pre-configured scope."
+commands.allow = ["adopt_tab"]
+
+[[permission]]
+identifier = "deny-adopt-tab"
+description = "Denies the adopt_tab command without any pre-configured scope."
+commands.deny = ["adopt_tab"]

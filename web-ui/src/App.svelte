@@ -139,6 +139,8 @@
     pruneFiles,
     pruneSessions,
     rewriteTabPaths,
+    adoptTabs,
+    allTabs,
     serializeLayout,
     sessionPaneId,
     setPaneFont,
@@ -147,7 +149,9 @@
     splitPane,
     moveTabDirection,
     tabCount,
+    tabKey,
     toggleZoom,
+    type AdoptSpot,
     type FocusDir,
     type Layout,
     type SplitDir,
@@ -170,6 +174,7 @@
   import { computeStatus, initCompute, queuedJobCount } from "./lib/workspace/compute";
   import ComputeStrip from "./lib/workspace/ComputeStrip.svelte";
   import {
+    dropSpotAt,
     paneContentEl,
     paneIdAt,
     paneRootEl,
@@ -181,6 +186,16 @@
     type DropSpot,
     type LayoutCtrl,
   } from "./lib/layout/dnd";
+  import {
+    ACK_LATE_MS,
+    ACK_TIMEOUT_MS,
+    broadcastTransport,
+    nativeTransport,
+    TransferLedger,
+    type AdoptDrop,
+    type XwinTransport,
+    type XwinWindowInfo,
+  } from "./lib/layout/crossWindow";
   import { chordDigit, fontChord, isMac, matchChord, REFERENCE_CHORD } from "./lib/shared/keys";
   import {
     activeModLabel,
@@ -202,6 +217,7 @@
     onLocalDaemonUpdated,
     onMenu,
     openDetachedPopup,
+    openDetachedWindow,
     reportWindowScope,
     setCaffeinate,
     setNativeWindowTitle,
@@ -477,11 +493,14 @@
 
   // Keep the shell's window registry current so "open this workspace" raises
   // this window instead of duplicating it (the SPA swaps `ws` client-side, so
-  // the shell can't see the change otherwise).
+  // the shell can't see the change otherwise). `detachedWindow` rides along:
+  // a restart restores a detached window as a plain record, and this report
+  // is what re-flags its scope (set-only shell-side) so focus-existing keeps
+  // skipping it.
   $effect(() => {
     if (!isNativeShell()) return;
     const reportedWsId = activeWsId;
-    void reportWindowScope(scopeAlias, reportedWsId, windowLabel || null).then(
+    void reportWindowScope(scopeAlias, reportedWsId, windowLabel || null, detachedWindow).then(
       () => {
         // A promoted local workbench becomes the singleton Home again when
         // its workspace disappears. Restore the browser half of that identity
@@ -589,6 +608,103 @@
     flashTimer = setTimeout(() => (flash = null), 3200);
   }
 
+  // --- cross-window moves (crossWindow.ts is the protocol) -------------------
+
+  /** The active transport: shell-routed in the native app, a per-workspace
+   *  BroadcastChannel in the browser. Null on the home screen (browser). */
+  let xwin: XwinTransport | null = null;
+  /** Cached sibling-window roster for the "Move to ⟨window⟩" menu rows —
+   *  menus build synchronously, so they read the last refresh. */
+  let xwinRoster = $state<XwinWindowInfo[]>([]);
+  /** Tabs sent to another window, awaiting its ack (remove-only-on-ok). */
+  const pendingMoves = new TransferLedger<Tab[]>();
+
+  function refreshXwinRoster(): void {
+    void xwin?.roster().then((r) => (xwinRoster = r));
+  }
+
+  /** Sent tabs enter the ledger; the soft/hard deadlines drive the "didn't
+   *  complete" toast and the late-ack window (see crossWindow.ts). */
+  function armTransfer(transfer: number, tabs: Tab[]): void {
+    pendingMoves.add(transfer, tabs, Date.now());
+    setTimeout(() => {
+      for (const _ of pendingMoves.timeouts(Date.now())) {
+        showFlash("the move didn't complete — the tab stays here");
+      }
+    }, ACK_TIMEOUT_MS + 50);
+    setTimeout(() => pendingMoves.expire(Date.now()), ACK_LATE_MS + 100);
+  }
+
+  function resolveTransfer(transfer: number, ok: boolean): void {
+    const known = pendingMoves.has(transfer);
+    const tabs = pendingMoves.ack(transfer, ok, Date.now());
+    if (tabs === null) {
+      if (known && !ok) showFlash("the other window declined the move");
+      return;
+    }
+    let next = layout;
+    for (const t of tabs) {
+      const loc = paneForTab(next.root, t);
+      if (loc !== null) next = detachTab(next, loc.paneId, loc.index);
+    }
+    layout = next;
+  }
+
+  /** The receiving half: validate the payload (a serialized solo blob),
+   *  adopt at the drop spot, and ack. A malformed payload acks false — the
+   *  sender keeps its tabs. */
+  function acceptAdopt(drop: AdoptDrop): void {
+    dropSpot = null;
+    const decoded = deserializeLayout(drop.payload);
+    const incoming = decoded !== null ? allTabs(decoded) : [];
+    if (decoded === null || incoming.length === 0) {
+      xwin?.ack(drop.transfer, false);
+      return;
+    }
+    const pane0 = panesOf(decoded.root)[0];
+    const activeTab = pane0?.tabs[Math.min(pane0.active, pane0.tabs.length - 1)];
+    const raw = drop.at !== undefined ? dropSpotAt(drop.at.x, drop.at.y) : null;
+    const spot: AdoptSpot | null =
+      raw !== null && (raw.kind === "zone" || raw.kind === "tab" || raw.kind === "edge")
+        ? raw
+        : null;
+    layout = adoptTabs(layout, incoming, spot, activeTab !== undefined ? tabKey(activeTab) : undefined);
+    xwin?.ack(drop.transfer, true);
+    const sid = focusedSessionOf(layout);
+    if (sid !== null) pool.focusTerminal(sid);
+  }
+
+  // One transport per (window, workspace scope); incoming adoption and acks
+  // ride it. The effect keys on the workspace only — handlers read live
+  // state at event time, not at subscription time.
+  $effect(() => {
+    const wsId = activeWsId;
+    const t = isNativeShell()
+      ? nativeTransport()
+      : wsId !== null
+        ? broadcastTransport(wsId, {
+            winId: () => winKey,
+            label: () => windowLabel,
+            detached: () => detachedWindow,
+          })
+        : null;
+    xwin = t;
+    if (t === null) return;
+    const unIncoming = t.incoming({
+      onOver: (at) => (dropSpot = dropSpotAt(at.x, at.y)),
+      onLeave: () => (dropSpot = null),
+      onDrop: (drop) => acceptAdopt(drop),
+    });
+    const unAcks = t.acks((transfer, ok) => resolveTransfer(transfer, ok));
+    refreshXwinRoster();
+    return () => {
+      unIncoming();
+      unAcks();
+      t.close();
+      if (xwin === t) xwin = null;
+    };
+  });
+
   // Rail chrome (width + FILES section) is a window preference, persisted
   // locally so it survives reload and holds across workspace switches. Collapse
   // is not stored here — it maps onto the layout's focus mode (which persists
@@ -643,13 +759,17 @@
    *  NOT the OS titlebar (which appends "| chimaera"). Reported with the scope
    *  so the tray never falls back to the generic app title. Empty while the
    *  workspace is still loading; the tray shows a placeholder until it lands. */
-  const windowLabel = $derived(
-    activeWsId === null
-      ? isRemoteWindow
-        ? `Home •${hostAlias}`
-        : "Home"
-      : (workspace?.name ?? "") + (isRemoteWindow ? ` •${hostAlias}` : ""),
-  );
+  const windowLabel = $derived.by(() => {
+    if (activeWsId === null) return isRemoteWindow ? `Home •${hostAlias}` : "Home";
+    const base = (workspace?.name ?? "") + (isRemoteWindow ? ` •${hostAlias}` : "");
+    if (!detachedWindow) return base;
+    // A detached solo window is named for what it shows, so the tray and the
+    // "Move to ⟨window⟩" menu can tell it apart from the real workspace
+    // window (which wears the bare workspace name).
+    const p = findPane(layout.root, layout.focusedPaneId);
+    const t = p?.tabs[p.active];
+    return t !== undefined && base !== "" ? `${tabLabel(t)} — ${base}` : base;
+  });
 
   /** The daemon-wide events socket (created in onMount); used to register the
    *  workspace this window watches, which gates the daemon's git backstop. */
@@ -2831,6 +2951,39 @@
     switchView(sessionId, target) {
       void switchView(sessionId, target);
     },
+    detachTabToWindow(paneId, index) {
+      const p = findPane(layout.root, paneId);
+      const tab = p?.tabs[index];
+      if (p === null || tab === undefined) return;
+      // No drop point on the menu path: open near the pane, offset a touch
+      // so the new window reads as "came out of here".
+      const rect = paneRootEl(paneId)?.getBoundingClientRect();
+      const cx = (rect?.left ?? 80) + 48;
+      const cy = (rect?.top ?? 80) + 48;
+      void detachOut([tab], {
+        clientX: cx,
+        clientY: cy,
+        screenX: window.screenX + cx,
+        screenY: window.screenY + cy,
+      }, 0, p.fontSize);
+    },
+    moveTargets() {
+      return xwinRoster;
+    },
+    refreshMoveTargets() {
+      refreshXwinRoster();
+    },
+    moveTabToWindow(paneId, index, winId) {
+      const p = findPane(layout.root, paneId);
+      const tab = p?.tabs[index];
+      if (p === null || tab === undefined || xwin === null) return;
+      if (guardDirtyMove([tab])) return;
+      const payload = serializeLayout(soloLayout([tab], 0, p.fontSize));
+      xwin
+        .adoptInto(winId, payload)
+        .then((transfer) => armTransfer(transfer, [tab]))
+        .catch(() => showFlash("that window isn't open anymore"));
+    },
   };
 
   /**
@@ -2927,11 +3080,70 @@
     return out.size > 0 ? out : undefined;
   }
 
-  /** Whether drags in this window may tear out into a new window. Browser
-   *  only until the native shell grows its open-detached-window command —
-   *  in the webview window.open is swallowed by the navigation guard. */
+  /** Whether drags in this window may tear out into a new window. */
   function canDetachOut(): boolean {
-    return activeWsId !== null && !isNativeShell();
+    return activeWsId !== null;
+  }
+
+  /** A dirty file must not leave this window: its CodeMirror buffer is
+   *  realm-local and the unsaved edit would be dropped on the floor. Same
+   *  guard as the tab rename. True = blocked (with the reason flashed). */
+  function guardDirtyMove(tabs: Tab[]): boolean {
+    const dirty = get(dirtyFiles);
+    if (tabs.some((t) => t.surface === "file" && dirty.has(t.path))) {
+      showFlash("save the file before moving it to another window");
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * An out-of-window RELEASE: over a sibling chimaera window it becomes a
+   * cross-window move (shell-routed, remove-on-ack); over the desktop it
+   * detaches into a new window. The browser has no sibling geometry, so
+   * there it always detaches.
+   */
+  async function outDrop(
+    tabs: Tab[],
+    at: { clientX: number; clientY: number; screenX: number; screenY: number },
+    active = 0,
+    fontSize?: number,
+  ): Promise<void> {
+    if (guardDirtyMove(tabs)) return;
+    if (isNativeShell() && xwin !== null) {
+      const payload = serializeLayout(soloLayout(tabs, active, fontSize));
+      const r = await xwin.drop(at.clientX, at.clientY, payload);
+      if (r.routed && r.transfer !== undefined) {
+        armTransfer(r.transfer, tabs);
+        return;
+      }
+    }
+    await detachOut(tabs, at, active, fontSize);
+  }
+
+  /**
+   * The solo strip's one-click undo: send everything in this detached window
+   * back to the window it came from. On the ok-ack the ledger removes the
+   * tabs, the layout empties, and the empty-close effect closes this window
+   * — the whole flow is the ordinary move machinery.
+   */
+  async function reattachToOrigin(): Promise<void> {
+    if (xwin === null || detachOrigin === null) return;
+    const tabs = allTabs(layout);
+    if (tabs.length === 0 || guardDirtyMove(tabs)) return;
+    const p = findPane(layout.root, layout.focusedPaneId);
+    const activeTab = p?.tabs[p.active];
+    const activeIndex =
+      activeTab !== undefined
+        ? tabs.findIndex((t) => tabKey(t) === tabKey(activeTab))
+        : 0;
+    const payload = serializeLayout(soloLayout(tabs, Math.max(activeIndex, 0), p?.fontSize));
+    try {
+      const transfer = await xwin.adoptInto(detachOrigin, payload);
+      armTransfer(transfer, tabs);
+    } catch {
+      showFlash("the original window isn't open anymore — use a tab's Move menu instead");
+    }
   }
 
   /**
@@ -2943,19 +3155,12 @@
    */
   async function detachOut(
     tabs: Tab[],
-    at: { screenX: number; screenY: number },
+    at: { clientX: number; clientY: number; screenX: number; screenY: number },
     active = 0,
     fontSize?: number,
   ): Promise<void> {
     const wsId = activeWsId;
-    if (wsId === null || tabs.length === 0) return;
-    const dirty = get(dirtyFiles);
-    if (tabs.some((t) => t.surface === "file" && dirty.has(t.path))) {
-      // The CodeMirror buffer lives in THIS window; a detach would drop the
-      // unsaved edit on the floor. Same guard as the tab rename.
-      showFlash("save the file before moving it to another window");
-      return;
-    }
+    if (wsId === null || tabs.length === 0 || guardDirtyMove(tabs)) return;
     const solo = soloLayout(tabs, active, fontSize);
     const winId = `w-${crypto.randomUUID()}`;
     const blob: Record<string, unknown> = {
@@ -2975,7 +3180,15 @@
     const rect = srcPane !== undefined ? paneRootEl(srcPane)?.getBoundingClientRect() : undefined;
     const w = Math.max(rect?.width ?? 900, 680);
     const h = Math.max(rect?.height ?? 600, 440);
-    if (!openDetachedPopup(winId, wsId, { x: at.screenX, y: at.screenY, w, h })) {
+    if (isNativeShell()) {
+      try {
+        // Client coords: the shell lifts them into screen space itself.
+        await openDetachedWindow(wsId, winId, { x: at.clientX, y: at.clientY, w, h });
+      } catch (e) {
+        showFlash(`couldn't open the window — ${String(e)}`);
+        return;
+      }
+    } else if (!openDetachedPopup(winId, wsId, { x: at.screenX, y: at.screenY, w, h })) {
       showFlash("the browser blocked the popup — allow popups to detach tabs");
       return;
     }
@@ -3044,10 +3257,11 @@
           // anywhere but an agent is a no-op, never a surprise tab move.
           if (linkIntent) return;
           if (spot.kind === "out") {
-            // Released outside the window: this tab becomes its own window.
+            // Released outside the window: move into the sibling window
+            // under the pointer, or detach into a new one.
             const src = paneForTab(layout.root, tab);
             const fs = src !== undefined && src !== null ? findPane(layout.root, src.paneId)?.fontSize : undefined;
-            void detachOut([tab], spot, 0, fs);
+            void outDrop([tab], spot, 0, fs);
             return;
           }
           // `upload` never reaches this pointer-drag callback (it is only ever
@@ -3073,6 +3287,9 @@
         onEnd: () => {
           dropSpot = null;
           bandPanes = new Set();
+          // Clear any sibling-window highlight the drag lit up. After a
+          // routed drop the shell already forgot the drag — a no-op then.
+          xwin?.cancel();
         },
         // The "@ reference" band exists over panes showing a LIVE session
         // (dnd only consults this for file drags).
@@ -3087,7 +3304,14 @@
           );
         },
       },
-      { linkTargets, linkSessions, linkIntent, allowOut: !linkIntent && canDetachOut() },
+      {
+        linkTargets,
+        linkSessions,
+        linkIntent,
+        allowOut: !linkIntent && canDetachOut(),
+        trackOut: isNativeShell() ? (x, y) => xwin?.track(x, y) ?? Promise.resolve(false) : undefined,
+        trackEnd: isNativeShell() ? () => xwin?.cancel() : undefined,
+      },
     );
   }
 
@@ -3114,7 +3338,7 @@
           if (spot.kind === "out") {
             // The whole pane (all its tabs, active index, font) tears out.
             const p = findPane(layout.root, paneId);
-            if (p !== null) void detachOut(p.tabs, spot, p.active, p.fontSize);
+            if (p !== null) void outDrop(p.tabs, spot, p.active, p.fontSize);
             return;
           }
           layout =
@@ -3132,9 +3356,14 @@
         onEnd: () => {
           dropSpot = null;
           bandPanes = new Set();
+          xwin?.cancel();
         },
       },
-      { allowOut: canDetachOut() },
+      {
+        allowOut: canDetachOut(),
+        trackOut: isNativeShell() ? (x, y) => xwin?.track(x, y) ?? Promise.resolve(false) : undefined,
+        trackEnd: isNativeShell() ? () => xwin?.cancel() : undefined,
+      },
     );
   }
 
@@ -4213,6 +4442,13 @@
       {/if}
       {#if needsYou > 0}
         <span class="strip-needs">{needsYou} need{needsYou === 1 ? "s" : ""} you</span>
+      {/if}
+      {#if detachedWindow && detachOrigin !== null}
+        <!-- Send everything in this solo window back where it came from; the
+             ok-ack empties the layout and the window closes itself. -->
+        <button class="strip-reattach" title="move this window's tabs back to their original window" onclick={() => void reattachToOrigin()}>
+          re-attach
+        </button>
       {/if}
       <span class="strip-host" class:remote={isRemoteWindow} title={health?.hostname}
         >{getHostLabel()}</span
@@ -5725,6 +5961,22 @@
     font-size: var(--text-xs);
     color: var(--muted);
     animation: upload-in 0.16s ease-out;
+  }
+
+  /* The solo strip's one-click re-attach (dt windows with a known origin). */
+  .strip-reattach {
+    flex: none;
+    padding: 2px 10px;
+    background: transparent;
+    border: 1px solid var(--edge);
+    border-radius: 999px;
+    color: var(--muted);
+    font-size: var(--text-xs);
+    cursor: pointer;
+  }
+  .strip-reattach:hover {
+    color: var(--fg);
+    border-color: var(--accent);
   }
 
   /* The emptied detached window whose self-close the browser refused. */

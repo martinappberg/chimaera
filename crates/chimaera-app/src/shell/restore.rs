@@ -91,6 +91,36 @@ pub fn open_ui_window(
     open_shell_window(app, url.as_str(), &title, record, scope)
 }
 
+/// Open a DETACHED solo window (a pane torn out of another window). Same
+/// wiring as `open_ui_window` — the record's id points at the pre-seeded
+/// `dt:1` view-state blob; never a home hub (it always carries a workspace) —
+/// but the registered scope is flagged detached so focus-existing raises
+/// never mistake it for the real workspace window.
+pub(super) fn open_detached_ui_window(
+    app: &AppHandle,
+    port: u16,
+    token: &str,
+    record: &WindowRecord,
+) -> tauri::Result<()> {
+    let appearance = lock(&app.state::<Shell>().appearance).get(record.alias.as_deref());
+    let url = daemon_window_url(
+        port,
+        token,
+        &record.id,
+        record.ws.as_deref(),
+        record.alias.as_deref(),
+        false,
+        appearance.as_ref(),
+    )?;
+    let title = match &record.alias {
+        Some(alias) => format!("{alias} — chimaera"),
+        None => "chimaera".to_string(),
+    };
+    let scope =
+        WindowScope::new_detached(record.alias.clone(), record.ws.clone(), record.id.clone());
+    open_shell_window(app, url.as_str(), &title, record, scope)
+}
+
 /// One daemon-served window URL. The unused Home launcher carries `hub=1`
 /// across local↔remote navigation so each origin clears stale route state.
 /// Entering a workspace then promotes it into an ordinary workbench window.
