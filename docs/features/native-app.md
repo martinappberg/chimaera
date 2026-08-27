@@ -47,6 +47,12 @@ app-build` (never the root `cargo`).
   `shell/restore.rs` (`restore_windows`, `open_ui_window`), `shell/commands.rs::open_window`.
 - **Key behaviors.** Each record carries a **stable id** that rides the window URL as `win=`; the SPA
   keys its daemon-side view-state (layout tree) on it, so a reopened window *is* the same window.
+  **Detached solo windows** (a pane torn out of another window — see
+  [workbench.md](workbench.md)) are ordinary records opened on a pre-seeded id via
+  `open_detached_window`; their scope is flagged `detached` (set-only, re-asserted by the SPA
+  after a restart restore) so focus-existing raises skip them, and the shell routes
+  cross-window drags between same-scope windows (`drag_track`/`drag_drop` + `xdrag` events,
+  coordinate math in `shell/drag.rs` — logical space on macOS, physical elsewhere).
   Closing a window removes its record (macOS convention) **except during quit** (guarded by an
   `AtomicBool quitting` so teardown doesn't forget every window). Geometry is stored in logical pixels
   (correct across scale factors) on a slow 2s tick. Closing the final window exits directly; the shell

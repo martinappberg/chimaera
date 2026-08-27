@@ -91,6 +91,43 @@ Daemon side: `crates/chimaera-server/src/{workspaces.rs,view_state.rs,quickopen.
   which also covers OS-desktop file drops and screenshot paste) and a **"link to agent"** band (a
   terminal drag leashes it — see [linked-terminals.md](linked-terminals.md)).
 
+## Detach & cross-window moves
+
+- **What & when.** Tear a tab (or a whole pane) out of the window into its own standalone
+  window — a real OS window in the native shell, a popup in the browser — and move it back,
+  or into any sibling window, later. For putting an agent, a terminal, or a preview on its
+  own screen.
+- **How it's used.** Drag a tab (or the pane grip) **past the window edge**: the drag ghost
+  grows an "open as new window" hint; release to detach at the drop point. In the native
+  shell, dragging **over another chimaera window** on the same host+workspace flips the hint
+  to "move into window" — the target lights up its normal drop-spot previews and the drop
+  lands there (Escape cancels and clears the highlight). Without a drag: every tab's context
+  menu carries **Move to New Window** and **Move to ⟨window⟩** rows, and a detached window's
+  strip has a one-click **re-attach** that sends everything back to its origin window (on
+  success the emptied solo window closes itself). Browser windows have the menu paths but no
+  cross-window drag (nothing there can know sibling geometry).
+- **Where it lives.** Detach/adopt layout ops `soloLayout`/`adoptTabs`/`allTabs` in
+  `web-ui/src/lib/layout/layout.ts`; the `out` drop spot + `dropSpotAt` in `layout/dnd.ts`;
+  the adopt protocol + `TransferLedger` + both transports in `layout/crossWindow.ts`;
+  `detachOut`/`outDrop`/`acceptAdopt`/`reattachToOrigin` in `App.svelte`; menu rows in
+  `layout/PaneTabs.svelte`. Native: IPC `open_detached_window`, `drag_track`/`drag_drop`/
+  `drag_cancel`, `adopt_tab`/`adopt_ack`, `list_scope_windows` (`crates/chimaera-app/src/
+  shell/commands.rs`), coordinate math + window hit-test in `shell/drag.rs`, `xdrag`/
+  `xdrag-ack` window-targeted events. Browser transport: `BroadcastChannel("chimaera.xwin.
+  {wsId}")`. Daemon: **no new surface** — a detached window is an ordinary window whose
+  view-state blob was pre-seeded (`PUT /api/v1/view-state/{win}_{ws}` before opening).
+- **Key behaviors.** A detached window is a full workbench window born in focus mode with
+  `dt:1` in its blob: it titles itself after its tab, never writes the `ws_` layout mirror
+  (a partial layout must not poison the workspace window's restore fallback), self-closes
+  when its last tab goes, is excluded from "open this workspace" raises
+  (`WindowScope.detached`, set-only), and restores on app relaunch like any window. Moves
+  are **remove-only-on-ack**: the sender drops its copy only when the receiver confirms
+  (2s soft-timeout toast, late ok still converges, `tabKey` dedupe merges instead of
+  duplicating — the surface is daemon-owned, so worst case is briefly two views, never a
+  loss). Dirty file tabs refuse to move (the unsaved CodeMirror buffer is window-local);
+  detaching from a compute (job) window is refused for now. Coordinate spaces are
+  per-platform (logical on macOS, physical elsewhere; unit-tested in `shell/drag.rs`).
+
 ## Tab context menu & the "master name" rename
 
 - **What & when.** Right-click a pane tab for surface-appropriate actions; renaming is the
@@ -182,6 +219,9 @@ _Captured 2026-07-11 (from the maintainer)._
   double-clicking a tab or tree row, or moving a tab **pins** it — muscle-memory parity with VS Code.
 - **Grade — addition, improvable.** Deliberate today (the preview flag persists in the layout blob),
   but not a core bet — rework it freely if a better shape appears.
+
+### Detach & cross-window moves — why they exist
+_Intent: pending — to be captured via **capture-feature-intent** when the feat ships._
 
 ### Workspace-keyed window restore — why it's shaped this way
 _Captured 2026-07-12 (from the maintainer)._
