@@ -12,7 +12,9 @@
  * an icon-only button can never have a label word-wrapped or reveal-hidden.
  */
 
-const COPY_BUTTON_SVG =
+/** Exported for the markdown live preview's fence copy widget (a CodeMirror
+ *  widget, not an `{@html}` host), so both surfaces share one icon. */
+export const COPY_BUTTON_SVG =
   '<svg class="ic-copy" viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">' +
   '<rect x="6" y="6" width="7.5" height="7.5" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.5"/>' +
   '<path d="M4 10h-.5A1.5 1.5 0 0 1 2 8.5v-5A1.5 1.5 0 0 1 3.5 2h5A1.5 1.5 0 0 1 10 3.5V4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>' +
@@ -27,18 +29,25 @@ export function copyLabel(host: Element): string {
   return host.tagName === "BLOCKQUOTE" ? "copy" : "copy code";
 }
 
+/** One construction site for the icon-only copy button, shared by the
+ *  `{@html}` decorator below and the markdown live preview's editor widgets
+ *  (which style it under their own class). */
+export function makeCopyButton(className: string, label: string): HTMLButtonElement {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = className;
+  btn.setAttribute("aria-label", label);
+  btn.title = "copy";
+  btn.innerHTML = COPY_BUTTON_SVG;
+  return btn;
+}
+
 /** Inject the copy button into every pre/blockquote under `root` that lacks
  *  one. Idempotent per host; safe to re-run after every `{@html}` flush. */
 export function decorateCopyTargets(root: HTMLElement): void {
   for (const host of root.querySelectorAll("pre, blockquote")) {
     if (host.querySelector(":scope > button.md-copy") !== null) continue;
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = "md-copy";
-    btn.setAttribute("aria-label", copyLabel(host));
-    btn.title = "copy";
-    btn.innerHTML = COPY_BUTTON_SVG;
-    host.appendChild(btn);
+    host.appendChild(makeCopyButton("md-copy", copyLabel(host)));
   }
 }
 

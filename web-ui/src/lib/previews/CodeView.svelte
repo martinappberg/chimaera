@@ -10,7 +10,7 @@
    * xterm instances in termPool).
    */
   import { onMount } from "svelte";
-  import { Compartment, EditorState, StateEffect } from "@codemirror/state";
+  import { Compartment, EditorState, StateEffect, type Extension } from "@codemirror/state";
   import {
     EditorView,
     lineNumbers,
@@ -63,9 +63,18 @@
      *  edit|preview shell uses it to re-render the preview as you type — the
      *  file is still only written on Cmd/Ctrl+S. */
     onDoc?: (text: string) => void;
+    /** Host-supplied surface extensions, swapped live in their own compartment
+     *  (the markdown live preview rides here). Reconfigured only when the
+     *  reference changes, so an unstable host degrades to no-ops instead of
+     *  state-destroying reconfigures. */
+    extra?: Extension;
+    /** Set false when `extra` already provides the language — skips the lazy
+     *  filename-matched pack, which would otherwise load a second, permanently
+     *  inert language instance into the config. */
+    autoLanguage?: boolean;
   }
 
-  let { path, first, onDoc = undefined }: Props = $props();
+  let { path, first, onDoc = undefined, extra = [], autoLanguage = true }: Props = $props();
 
   let host = $state<HTMLDivElement | null>(null);
   let loadedBytes = $state(0);
@@ -92,6 +101,7 @@
   let view: EditorView | null = null;
   const editCompartment = new Compartment();
   const settingsCompartment = new Compartment();
+  const extraCompartment = new Compartment();
 
   // Context bridge: this view's selection, published for the reference
   // affordance + chord. The chip floats near the selection's end.
@@ -162,6 +172,19 @@
     const extensions = settingsExtensions();
     if (view !== null) {
       view.dispatch({ effects: settingsCompartment.reconfigure(extensions) });
+    }
+  });
+
+  // Host extension swaps (e.g. markdown live ⇄ source) reconfigure in place —
+  // the document, undo history, and dirty state all survive the flip. The
+  // identity guard absorbs the effect's first post-mount run (onMount records
+  // the value the view was created with) and any unstable-host churn.
+  let lastExtra: Extension | null = null;
+  $effect(() => {
+    const ext = extra;
+    if (view !== null && ext !== lastExtra) {
+      lastExtra = ext;
+      view.dispatch({ effects: extraCompartment.reconfigure(ext) });
     }
   });
 
@@ -246,6 +269,9 @@
       doc: text,
       extensions: [
         settingsCompartment.of(settingsExtensions()),
+        // Before the appended filename-matched language pack, so a host
+        // language in `extra` (markdown live) wins the language facet.
+        extraCompartment.of((lastExtra = extra)),
         highlightSpecialChars(),
         drawSelection(),
         bracketMatching(),
@@ -278,7 +304,7 @@
     }
 
     // Language by filename, loaded lazily; appended once ready.
-    const desc = LanguageDescription.matchFilename(languages, basename(path));
+    const desc = autoLanguage ? LanguageDescription.matchFilename(languages, basename(path)) : null;
     if (desc !== null) {
       void desc
         .load()

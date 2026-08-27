@@ -70,6 +70,13 @@ export function proxyableUrl(raw: string): UrlTarget | null {
   };
 }
 
+/** Whether a reference is absolute (carries a URI scheme) as opposed to a
+ *  document-relative path. Shared so every surface that splits "resolve
+ *  against the document" from "pass through" draws the same line. */
+export function hasUrlScheme(raw: string): boolean {
+  return /^[a-z][a-z0-9+.-]*:/i.test(raw);
+}
+
 /** Only ever hand a web URL onward — an `href` is attacker-influenced (agents
  *  author chat prose and markdown), and `javascript:`/`file:`/app schemes must
  *  never reach an opener. The shell re-checks; this is the client-side wall. */

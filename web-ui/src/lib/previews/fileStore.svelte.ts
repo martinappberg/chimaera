@@ -23,6 +23,7 @@
  * chunk on their own.
  */
 
+import { untrack } from "svelte";
 import { get } from "svelte/store";
 import { fsFile, fsMarkdown, fsRawUrl, fsTable, type FileChunk, type TablePage } from "./files";
 import { fsEpoch, lastFsMutation, type FsMutation } from "../workspace/fsEvents";
@@ -81,10 +82,18 @@ export class FileEntry {
   rawMintedAt = 0;
   /** Last global unknown-change generation this entry has checked against. */
   seenAllStaleEpoch = 0;
-  /** In-flight guards so concurrent readers don't double-fetch. */
-  private loading = { mtime: false, chunk: false, md: false, table: false };
+  /** In-flight guard so concurrent mtime probes don't double-fetch. */
+  private loading = { mtime: false };
   /** Raw consumers must await the same ticket mint, not merely suppress duplicates. */
   private rawLoad: Promise<void> | null = null;
+  /** In-flight payload loads. Every ensure* joins its slot's promise — a bare
+   *  boolean guard let a second caller resolve instantly and observe a
+   *  still-null payload (views read the result right after awaiting). */
+  private inflight: Record<"chunk" | "md" | "table", Promise<void> | null> = {
+    chunk: null,
+    md: null,
+    table: null,
+  };
 
   constructor(path: string) {
     this.path = path;
@@ -100,7 +109,7 @@ export class FileEntry {
   /** Seed the invalidation token for preview kinds whose payload endpoint does
    *  not carry X-Mtime (rendered markdown/tables, tickets, spreadsheets). */
   async ensureMtime(): Promise<void> {
-    if (this.mtime !== null || this.loading.mtime) return;
+    if (untrack(() => this.mtime !== null) || this.loading.mtime) return;
     this.loading.mtime = true;
     try {
       this.adoptMtime((await fsFile(this.path, 0, 1)).mtime);
@@ -111,53 +120,86 @@ export class FileEntry {
     }
   }
 
+  /** Run `work` once per slot: concurrent callers join the in-flight promise,
+   *  so every awaiter resolves with the payload (or its error) populated. */
+  private async singleFlight(slot: "chunk" | "md" | "table", work: () => Promise<void>): Promise<void> {
+    const cur = this.inflight[slot];
+    if (cur !== null) {
+      await cur;
+      return;
+    }
+    const load = work();
+    this.inflight[slot] = load;
+    try {
+      await load;
+    } finally {
+      if (this.inflight[slot] === load) this.inflight[slot] = null;
+    }
+  }
+
+  // The ensure* guards read their $state payload fields under `untrack`:
+  // callers run these inside $effects, and a tracked guard would re-run every
+  // such effect each time a payload is refreshed in place (a save, an agent
+  // write) — the exact churn that once remounted the markdown editor over a
+  // dirty buffer. Views that WANT payload reactivity read the fields directly.
+
   /** Fetch the first 256KB chunk (text/binary sniff) if not already present. */
   async ensureChunk(): Promise<void> {
-    if (this.chunk !== null || this.loading.chunk) return;
-    this.loading.chunk = true;
+    if (untrack(() => this.chunk !== null)) return;
+    await this.singleFlight("chunk", async () => {
+      this.chunkError = null;
+      try {
+        const c = await fsFile(this.path);
+        this.chunk = c;
+        this.adoptMtime(c.mtime);
+      } catch (e) {
+        this.chunkError = e instanceof Error ? e.message : "failed to load file";
+      }
+    });
+  }
+
+  /**
+   * Forget a cached chunk a view fetched but can never use (an over-cap or
+   * binary markdown source): revalidation refreshes only populated payloads,
+   * so keeping it would re-download 256KB on every disk change for nothing.
+   * Safe because chunk consumers snapshot it (CodeView's `first`); only
+   * FileView's text probe reads it reactively, and that path never hosts the
+   * markdown view this exists for.
+   */
+  dropChunk(): void {
+    this.chunk = null;
     this.chunkError = null;
-    try {
-      const c = await fsFile(this.path);
-      this.chunk = c;
-      this.adoptMtime(c.mtime);
-    } catch (e) {
-      this.chunkError = e instanceof Error ? e.message : "failed to load file";
-    } finally {
-      this.loading.chunk = false;
-    }
   }
 
   /** Fetch server-rendered markdown HTML if not already present. */
   async ensureMarkdown(): Promise<void> {
-    if (this.markdown !== null || this.loading.md) return;
-    this.loading.md = true;
-    this.markdownError = null;
-    try {
-      this.markdown = await fsMarkdown(this.path);
-    } catch (e) {
-      this.markdownError = e instanceof Error ? e.message : "failed to render markdown";
-    } finally {
-      this.loading.md = false;
-    }
+    if (untrack(() => this.markdown !== null)) return;
+    await this.singleFlight("md", async () => {
+      this.markdownError = null;
+      try {
+        this.markdown = await fsMarkdown(this.path);
+      } catch (e) {
+        this.markdownError = e instanceof Error ? e.message : "failed to render markdown";
+      }
+    });
   }
 
   /** Fetch the first table page if not already present. */
   async ensureTable(): Promise<void> {
-    if (this.table !== null || this.loading.table) return;
-    this.loading.table = true;
-    this.tableError = null;
-    try {
-      this.table = await fsTable(this.path, 0, getSetting("files.tableRowsPerPage"));
-    } catch (e) {
-      this.tableError = e instanceof Error ? e.message : "failed to load table";
-    } finally {
-      this.loading.table = false;
-    }
+    if (untrack(() => this.table !== null)) return;
+    await this.singleFlight("table", async () => {
+      this.tableError = null;
+      try {
+        this.table = await fsTable(this.path, 0, getSetting("files.tableRowsPerPage"));
+      } catch (e) {
+        this.tableError = e instanceof Error ? e.message : "failed to load table";
+      }
+    });
   }
 
   /** Mint (or reuse a still-fresh) `/raw` URL for image/pdf/html surfaces. */
   async ensureRawUrl(): Promise<void> {
-    const fresh = this.rawUrl !== null && Date.now() - this.rawMintedAt < TICKET_TTL_MS;
+    const fresh = untrack(() => this.rawUrl !== null) && Date.now() - this.rawMintedAt < TICKET_TTL_MS;
     if (fresh) return;
     if (this.rawLoad !== null) {
       await this.rawLoad;
@@ -190,6 +232,13 @@ export class FileEntry {
    * not react to it (it live-updates via the mtime watch instead).
    */
   private async refreshPayloads(): Promise<void> {
+    // Let in-flight first loads land before deciding what is populated: a
+    // payload fetched moments before this disk change would otherwise slip
+    // past the null-skip below and be pinned stale until the NEXT change.
+    const pending = [...Object.values(this.inflight), this.rawLoad].filter(
+      (p): p is Promise<void> => p !== null,
+    );
+    if (pending.length > 0) await Promise.all(pending);
     // The populated payloads are independent reads — refetch them concurrently
     // so a live refresh costs one round-trip, not the sum. Each keeps its
     // last-known value on failure.
@@ -323,8 +372,10 @@ export function retain(path: string): FileEntry {
   // A warm entry reclaimed after time off-screen (the keep-alive live set
   // evicted its view, but the bytes are still cached) may have missed a change.
   // Re-probe only when this exact path was marked stale, is currently dirty, or
-  // an unknown-path change happened while it was away.
-  if (e.hasPayload && shouldRevalidateOnRetain(e)) void e.revalidate();
+  // an unknown-path change happened while it was away. Untracked: retain() runs
+  // inside view $effects, and tracking the payload fields here would re-run
+  // every such effect on each in-place payload refresh (see the ensure* note).
+  if (untrack(() => e.hasPayload && shouldRevalidateOnRetain(e))) void e.revalidate();
   return e;
 }
 

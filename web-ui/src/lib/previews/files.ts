@@ -484,6 +484,36 @@ export function joinPath(dir: string, leaf: string): string {
   return dir.endsWith("/") ? `${dir}${leaf}` : `${dir}/${leaf}`;
 }
 
+/**
+ * Resolve a document-relative reference (`figs/plot.png`, `../notes.md`)
+ * against the directory of `docPath` into an absolute-path candidate, folding
+ * `.`/`..` segments. Only builds the string — the server still canonicalizes
+ * and enforces access. Shared by the markdown reading view's image stamping
+ * and the live preview's image widgets.
+ */
+/** `decodeURI` that returns the raw string on malformed input — the server
+ *  rejects what it can't canonicalize, so a broken escape isn't fatal here. */
+export function safeDecodeUri(s: string): string {
+  try {
+    return decodeURI(s);
+  } catch {
+    return s;
+  }
+}
+
+export function resolveDocPath(docPath: string, rel: string): string {
+  const i = docPath.lastIndexOf("/");
+  const base = i <= 0 ? "" : docPath.slice(0, i);
+  const parts = (rel.startsWith("/") ? rel : `${base}/${rel}`).split("/");
+  const out: string[] = [];
+  for (const seg of parts) {
+    if (seg === "" || seg === ".") continue;
+    if (seg === "..") out.pop();
+    else out.push(seg);
+  }
+  return `/${out.join("/")}`;
+}
+
 export function extension(path: string): string {
   const name = basename(path).toLowerCase();
   const i = name.lastIndexOf(".");

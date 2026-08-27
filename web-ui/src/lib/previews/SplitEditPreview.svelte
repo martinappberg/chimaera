@@ -1,8 +1,9 @@
 <script lang="ts">
   /**
    * The split edit|preview layout: an editor pane and a live-preview pane with a
-   * draggable divider. Surface-agnostic — the host (MarkdownView / HtmlView)
-   * passes the editor and the preview as snippets, so this owns only geometry.
+   * draggable divider. Surface-agnostic — the host (HtmlView; markdown instead
+   * renders its live preview inline via mdLive) passes the editor and the
+   * preview as snippets, so this owns only geometry.
    *
    * The editor pane is ALWAYS the first child, in a fixed slot: toggling `split`
    * off collapses to editor-only WITHOUT re-rendering the editor snippet, so the
