@@ -52,25 +52,39 @@ export interface XwinHandlers {
 
 export interface XwinTransport {
   /** Route an out-drag's pointer to sibling windows; resolves whether one is
-   *  under it (the ghost flips its hint). Browser: always false. */
-  track(clientX: number, clientY: number): Promise<boolean>;
-  /** Route the drop. Not routed → the caller opens a detached window. */
+   *  under it (the ghost flips its hint). `drag` fences late frames after a
+   *  cancel/drop. Browser: always false. */
+  track(clientX: number, clientY: number, drag: number): Promise<boolean>;
+  /** Route the drop under the SENDER-minted `transfer` (armed in the ledger
+   *  before this call — the ack can never beat its entry). Not routed → the
+   *  caller opens a detached window. */
   drop(
     clientX: number,
     clientY: number,
+    drag: number,
+    transfer: number,
     payload: unknown,
-  ): Promise<{ routed: boolean; transfer?: number }>;
+  ): Promise<{ routed: boolean }>;
   /** The drag ended without a routed drop — clear any target highlight. */
-  cancel(): void;
+  cancel(drag: number): void;
   roster(): Promise<XwinWindowInfo[]>;
-  /** Menu adopt into one window; resolves the transfer id to await. */
-  adoptInto(winId: string, payload: unknown): Promise<number>;
+  /** Menu adopt into one window under a sender-minted, pre-armed transfer. */
+  adoptInto(winId: string, payload: unknown, transfer: number): Promise<void>;
   ack(transfer: number, ok: boolean): void;
   /** Incoming protocol traffic addressed to THIS window. */
   incoming(handlers: XwinHandlers): () => void;
   /** Acks for transfers THIS window sent. */
   acks(handler: (transfer: number, ok: boolean) => void): () => void;
   close(): void;
+}
+
+/** A transfer id from crypto randomness (≤2^53 so it round-trips a JS
+ *  number ↔ u64). Sender-minted so the ledger can be armed BEFORE the
+ *  routing call; the shell refuses a duplicate rather than overwriting. */
+export function mintTransfer(): number {
+  const words = new Uint32Array(2);
+  crypto.getRandomValues(words);
+  return (words[0] % 0x20_0000) * 0x1_0000_0000 + words[1];
 }
 
 // --- sender-side transfer bookkeeping (pure; vitest-covered) ---------------
@@ -143,18 +157,21 @@ export class TransferLedger<T> {
 export function nativeTransport(): XwinTransport | null {
   if (!isNativeShell()) return null;
   return {
-    track: (x, y) => dragTrack(x, y),
-    drop: (x, y, payload) => dragDrop(x, y, payload),
-    cancel: () => void dragCancel(),
+    track: (x, y, drag) => dragTrack(x, y, drag),
+    drop: (x, y, drag, transfer, payload) => dragDrop(x, y, drag, transfer, payload),
+    cancel: (drag) => void dragCancel(drag).catch(() => {}),
     roster: async () =>
       (await listScopeWindows()).map((w) => ({
         winId: w.win_id,
         label: w.label,
         detached: w.detached,
       })),
-    adoptInto: (winId, payload) => adoptTab(winId, payload),
+    adoptInto: (winId, payload, transfer) => adoptTab(winId, transfer, payload),
     ack: (transfer, ok) => void adoptAck(transfer, ok),
     incoming: (handlers) => {
+      // A rejected listen() must not surface as an unhandled rejection — a
+      // window that cannot subscribe simply receives nothing (and the drag
+      // paths already treat silence as "no sibling there").
       const un = onXdrag((e) => {
         if (e.phase === "over" && e.x !== undefined && e.y !== undefined) {
           handlers.onOver({ x: e.x, y: e.y });
@@ -167,11 +184,17 @@ export function nativeTransport(): XwinTransport | null {
             at: e.x !== undefined && e.y !== undefined ? { x: e.x, y: e.y } : undefined,
           });
         }
-      });
+      }).then(
+        (f) => f,
+        () => () => {},
+      );
       return () => void un.then((f) => f());
     },
     acks: (handler) => {
-      const un = onXdragAck((e) => handler(e.transfer, e.ok));
+      const un = onXdragAck((e) => handler(e.transfer, e.ok)).then(
+        (f) => f,
+        () => () => {},
+      );
       return () => void un.then((f) => f());
     },
     close: () => {},
@@ -203,7 +226,6 @@ export interface BrowserSelf {
  */
 export function broadcastTransport(wsId: string, self: BrowserSelf): XwinTransport {
   const channel = new BroadcastChannel(`chimaera.xwin.${wsId}`);
-  let seq = Math.floor(Math.random() * 2 ** 30);
   const ackHandlers = new Set<(transfer: number, ok: boolean) => void>();
   const dropHandlers = new Set<(drop: AdoptDrop) => void>();
   /** Where each received transfer's ack goes (the adopt's sender). */
@@ -249,9 +271,7 @@ export function broadcastTransport(wsId: string, self: BrowserSelf): XwinTranspo
           resolve([...seen.values()]);
         }, ROSTER_COLLECT_MS);
       }),
-    adoptInto: (winId, payload) => {
-      seq += 1;
-      const transfer = seq;
+    adoptInto: (winId, payload, transfer) => {
       channel.postMessage({
         t: "adopt",
         to: winId,
@@ -259,7 +279,7 @@ export function broadcastTransport(wsId: string, self: BrowserSelf): XwinTranspo
         transfer,
         payload,
       } satisfies XwinMessage);
-      return Promise.resolve(transfer);
+      return Promise.resolve();
     },
     ack: (transfer, ok) => {
       const to = ackTo.get(transfer);

@@ -112,9 +112,15 @@ pub struct Shell {
     /// (this machine won't idle/display/system-sleep). Dropped to disarm; the
     /// guard drops on quit, so the assertion never outlives the app.
     caffeinate: Mutex<Option<keepawake::KeepAwake>>,
-    /// Live cross-window drags: source label → the sibling label its pointer
-    /// currently hovers (None over desktop). Entries live for one drag.
+    /// Live cross-window drags: source label → the sibling its pointer
+    /// currently hovers (None over desktop). Entries live for one drag;
+    /// `done_drags` is what fences late per-frame updates, so the entry
+    /// itself needs no id.
     drags: Mutex<HashMap<String, Option<String>>>,
+    /// Highest drag id per source already ENDED by a drop or cancel. An
+    /// in-flight rAF `drag_track` that lands after its drag ended must not
+    /// re-insert the entry and re-light a target the cancel just cleared.
+    done_drags: Mutex<HashMap<String, u64>>,
     /// Adopt transfers awaiting the target window's ack. The source removes
     /// its tabs only when the ok-ack comes back through here.
     transfers: Mutex<HashMap<u64, Transfer>>,
@@ -309,6 +315,14 @@ impl WindowScope {
     /// become the launcher again instead of making New Window create a second
     /// Home.
     pub(crate) fn report_page_scope(&mut self, ws: Option<String>, label: String) {
+        // A torn-off solo window is never a Home surface: reporting an empty
+        // scope (its workspace vanished) must not hand it the hub identity or
+        // the cross-host askpass Fallback — the page keeps only ws/label.
+        if self.detached {
+            self.ws = ws;
+            self.label = label;
+            return;
+        }
         if self.alias.is_none() && ws.is_none() {
             self.home_hub = true;
             self.askpass_scope = AskpassScope::Fallback;
@@ -611,7 +625,7 @@ pub(crate) fn navigate_home_hub(
         &previous_scope.stable_id,
         ws.as_deref(),
         alias.as_deref(),
-        true,
+        restore::WindowUrlKind::HomeHub,
         appearance.as_ref(),
     )?;
     url.query_pairs_mut().append_pair(
@@ -868,6 +882,7 @@ pub(crate) fn finish_startup(handle: &tauri::AppHandle, local: LocalDaemon) -> t
             quitting: AtomicBool::new(false),
             caffeinate: Mutex::new(None),
             drags: Mutex::new(HashMap::new()),
+            done_drags: Mutex::new(HashMap::new()),
             transfers: Mutex::new(HashMap::new()),
             focus_order: Mutex::new(Vec::new()),
         });
@@ -989,10 +1004,14 @@ pub fn run() {
                     }
                     drop(last_focused);
                     // Cross-window drag state involving a dead window is
-                    // meaningless: its outgoing drag ends, its pending
-                    // transfers can never ack (the source's own timeout
-                    // handles the UX), and it leaves the focus order.
-                    lock(&shell.drags).remove(window.label());
+                    // meaningless: its outgoing drag ends (the sibling it was
+                    // hovering gets the leave nothing else would send), its
+                    // pending transfers can never ack (the source's own
+                    // timeout handles the UX), and it leaves the focus order.
+                    if let Some(Some(target)) = lock(&shell.drags).remove(window.label()) {
+                        commands::emit_drag_leave(window.app_handle(), &target);
+                    }
+                    lock(&shell.done_drags).remove(window.label());
                     lock(&shell.transfers)
                         .retain(|_, t| t.source != window.label() && t.target != window.label());
                     lock(&shell.focus_order).retain(|l| l != window.label());

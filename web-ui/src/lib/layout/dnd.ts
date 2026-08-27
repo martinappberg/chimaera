@@ -246,7 +246,9 @@ export interface DragCallbacks {
 
 const DRAG_THRESHOLD_PX = 4;
 
-function sameSpot(a: DropSpot | null, b: DropSpot | null): boolean {
+/** Logical drop-spot equality (exported for the cross-window over stream,
+ *  which must not rewrite `dropSpot` — and force layout — on every frame). */
+export function sameSpot(a: DropSpot | null, b: DropSpot | null): boolean {
   if (a === null || b === null) return a === b;
   if (a.kind !== b.kind) return false;
   if (a.kind === "edge" && b.kind === "edge") return a.edge === b.edge;
@@ -441,6 +443,7 @@ function makeGhost(label: string): HTMLDivElement {
   const ghost = document.createElement("div");
   ghost.className = "drag-ghost";
   const name = document.createElement("span");
+  name.className = "ghost-label";
   name.textContent = label;
   // The out-of-window hint: hidden by CSS until the ghost wears `.out`
   // (the pointer left the viewport on a detach-armed drag).
@@ -624,8 +627,13 @@ export function startDrag(
     if (out !== wasOut) {
       wasOut = out;
       if (!out) {
-        // Back inside: whatever sibling window the shell lit up must unlight.
+        // Back inside: whatever sibling window the shell lit up must unlight
+        // — and the hint TEXT resets with the cached state, or the next
+        // out-phase's `over === outTarget` short-circuit would leave a stale
+        // "move into window" showing over bare desktop.
         outTarget = false;
+        const hint = ghost?.querySelector<HTMLElement>(".ghost-hint");
+        if (hint !== null && hint !== undefined) hint.textContent = "open as new window";
         opts.trackEnd?.();
       }
     }
@@ -642,8 +650,9 @@ export function startDrag(
     }
     if (ghost !== null) {
       // Outside the viewport the ghost clamps to the nearest edge (it cannot
-      // follow the OS cursor out) and wears the "open as new window" hint.
-      const gx = out ? Math.min(Math.max(lastX + 14, 8), window.innerWidth - 190) : lastX + 14;
+      // follow the OS cursor out) and wears the hint. The reserve matches the
+      // .drag-ghost.out max-width so the widened ghost never overhangs.
+      const gx = out ? Math.min(Math.max(lastX + 14, 8), window.innerWidth - 350) : lastX + 14;
       const gy = out ? Math.min(Math.max(lastY + 10, 8), window.innerHeight - 40) : lastY + 10;
       ghost.style.transform = `translate(${gx}px, ${gy}px)`;
       ghost.classList.toggle("out", out);

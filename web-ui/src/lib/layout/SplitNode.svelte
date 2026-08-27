@@ -24,7 +24,6 @@
     /** Panes whose bottom band is armed for the current drag. */
     bandPanes: ReadonlySet<string>;
     /** True when the window has exactly one pane (hides the move-pane grip). */
-    soloPane?: boolean;
     /** App-level context for the dashboard surface. */
     dash: DashCtx;
     ctrl: LayoutCtrl;
@@ -42,7 +41,6 @@
     wsRoot,
     wsId,
     bandPanes,
-    soloPane = false,
     dash,
     ctrl,
   }: Props = $props();
@@ -131,12 +129,12 @@
 </script>
 
 {#if node.type === "pane"}
-  <Pane {node} {focusedPaneId} {soloPane} {dropSpot} {sessions} {names} {fileNames} {links} {linkCtrl} {wsRoot} {wsId} {bandPanes} {dash} {ctrl} />
+  <Pane {node} {focusedPaneId} {dropSpot} {sessions} {names} {fileNames} {links} {linkCtrl} {wsRoot} {wsId} {bandPanes} {dash} {ctrl} />
 {:else}
   <div class="split" class:col={node.dir === "col"} bind:this={el}>
     <div class="cell" style:flex-grow={node.ratio}>
       <!-- Inside a split there are ≥2 panes, so children are never solo. -->
-      <Self node={node.a} {focusedPaneId} {dropSpot} {sessions} {names} {fileNames} {links} {linkCtrl} {wsRoot} {wsId} {bandPanes} soloPane={false} {dash} {ctrl} />
+      <Self node={node.a} {focusedPaneId} {dropSpot} {sessions} {names} {fileNames} {links} {linkCtrl} {wsRoot} {wsId} {bandPanes} {dash} {ctrl} />
     </div>
     <div
       class="divider"
@@ -150,7 +148,7 @@
       }}
     ></div>
     <div class="cell" style:flex-grow={1 - node.ratio}>
-      <Self node={node.b} {focusedPaneId} {dropSpot} {sessions} {names} {fileNames} {links} {linkCtrl} {wsRoot} {wsId} {bandPanes} soloPane={false} {dash} {ctrl} />
+      <Self node={node.b} {focusedPaneId} {dropSpot} {sessions} {names} {fileNames} {links} {linkCtrl} {wsRoot} {wsId} {bandPanes} {dash} {ctrl} />
     </div>
   </div>
 {/if}

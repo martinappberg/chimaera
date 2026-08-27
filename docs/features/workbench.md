@@ -70,7 +70,9 @@ Daemon side: `crates/chimaera-server/src/{workspaces.rs,view_state.rs,quickopen.
   move to another pane, tear off into a split, or slam a **window edge** to split the whole window.
   A **pane grip** (a small window icon) fades in at the top-left of the tab strip on hover; drag
   it to move the **whole pane** (all its tabs) to another split — center merges, edges tear a
-  split, a window edge re-roots. It hides when the window has one pane or the pane is zoomed.
+  split, a window edge re-roots — or drag it past the window edge to tear the whole pane out
+  into its own window. It hides only while the pane is zoomed (a single-pane window's grip
+  still has somewhere to go: out).
 - **Preview (italic) tabs.** File opens are **preview** tabs, VS Code-style: the name renders
   italic, opening another file **replaces** the one preview slot per pane (so single-clicking
   through files doesn't pile up tabs), and it **pins** (non-italic, permanent) on a

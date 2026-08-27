@@ -823,7 +823,7 @@ pub(super) async fn open_detached_window(
     // via list_scope_windows), and its later close would then drop the
     // shared record.
     if lock(&state.windows).values().any(|s| s.stable_id == win_id)
-        || lock(&state.registry).list().iter().any(|r| r.id == win_id)
+        || lock(&state.registry).contains(&win_id)
     {
         return Err("that window id is already in use".to_string());
     }
@@ -831,11 +831,7 @@ pub(super) async fn open_detached_window(
     // URL vocabulary (job/node hash params) — a detached window opened onto
     // it with plain host wiring would misidentify itself. Refuse for now; the
     // tab stays where it is.
-    if lock(&state.registry)
-        .list()
-        .iter()
-        .any(|r| r.id == scope.stable_id && r.compute.is_some())
-    {
+    if lock(&state.registry).is_compute(&scope.stable_id) {
         return Err("detaching from a job window isn't supported yet".to_string());
     }
     let (port, token) = match &scope.alias {
@@ -855,6 +851,7 @@ pub(super) async fn open_detached_window(
     // into screen space, then store as logical px (the registry's unit).
     let mut record = WindowRecord::new(scope.alias.clone(), Some(ws_id));
     record.id = win_id;
+    record.detached = true;
     record.width = Some(at.width.max(680.0));
     record.height = Some(at.height.max(440.0));
     if let Some(rect) = super::drag::rect_of(&webview) {
@@ -862,6 +859,21 @@ pub(super) async fn open_detached_window(
         let (lx, ly) = super::drag::logical_of_global(&rect, gx, gy);
         record.x = Some(lx);
         record.y = Some(ly);
+    }
+    // The drop math ran in the INNER frame, but WindowRecord.x/y is OUTER
+    // (builder.position and the Moved handler both use the frame origin).
+    // Shift by this window's own decoration delta — zero on the macOS
+    // overlay, the titlebar height where real decorations exist; exact when
+    // both windows share a decoration style.
+    if let (Ok(outer), Ok(inner), Ok(scale)) = (
+        webview.outer_position(),
+        webview.inner_position(),
+        webview.scale_factor(),
+    ) {
+        let o = outer.to_logical::<f64>(scale);
+        let i = inner.to_logical::<f64>(scale);
+        record.x = record.x.map(|x| x - (i.x - o.x));
+        record.y = record.y.map(|y| y - (i.y - o.y));
     }
     super::restore::open_detached_ui_window(&app, port, &token, &record)
         .map_err(|e| format!("could not open window: {e}"))
@@ -875,8 +887,6 @@ pub(super) async fn open_detached_window(
 // `xdrag` events in the TARGET's client coords. Adoption is sender-removes-
 // on-ack: the `xdrag-ack` relay is what authorizes the source to drop its
 // copies (see crossWindow.ts for the timeout policy).
-
-static TRANSFER_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// The `xdrag` event a target window receives, all coords in ITS client px.
 #[derive(Clone, Serialize)]
@@ -928,6 +938,38 @@ fn emit_xdrag(app: &AppHandle, label: &str, event: XdragEvent) {
     let _ = app.emit_to(label, "xdrag", event);
 }
 
+/// Unlight a hovered target. Every path that ends a drag must send this —
+/// including the source window dying (shell.rs's Destroyed arm), which is why
+/// it is visible outside this module.
+pub(super) fn emit_drag_leave(app: &AppHandle, label: &str) {
+    emit_xdrag(
+        app,
+        label,
+        XdragEvent {
+            phase: "leave",
+            x: None,
+            y: None,
+            transfer: None,
+            payload: None,
+        },
+    );
+}
+
+/// A late rAF `drag_track` must not act after its drag ended: drops and
+/// cancels record the ended id here, and any track carrying an id at or
+/// below it is ignored (see Shell::done_drags).
+fn drag_ended(state: &Shell, label: &str, drag: u64) -> bool {
+    lock(&state.done_drags)
+        .get(label)
+        .is_some_and(|done| drag <= *done)
+}
+
+fn mark_drag_done(state: &Shell, label: &str, drag: u64) {
+    let mut done = lock(&state.done_drags);
+    let entry = done.entry(label.to_string()).or_insert(0);
+    *entry = (*entry).max(drag);
+}
+
 /// Track an out-of-window drag: hit-test siblings at the pointer, keep the
 /// hovered target's highlight current (over/leave events), and tell the
 /// source whether anything is under it (its ghost flips "new window" ↔
@@ -939,7 +981,13 @@ pub(super) fn drag_track(
     state: State<'_, Shell>,
     x: f64,
     y: f64,
+    drag: u64,
 ) -> Result<bool, String> {
+    // A cancel/drop for this drag may already have landed — this call was in
+    // flight when it did. Acting now would re-light the target it cleared.
+    if drag_ended(&state, webview.label(), drag) {
+        return Ok(false);
+    }
     let scope = state
         .window_scope(webview.label())
         .ok_or_else(|| "this window is not registered".to_string())?;
@@ -951,22 +999,21 @@ pub(super) fn drag_track(
     let focus = lock(&state.focus_order).clone();
     let hit = super::drag::hit_test(&rects, &focus, gx, gy);
     let hit_label = hit.map(|r| r.label.clone());
-    let prev = lock(&state.drags)
-        .insert(webview.label().to_string(), hit_label.clone())
-        .flatten();
+    let prev = {
+        let mut drags = lock(&state.drags);
+        // Re-check under the lock: the cancel may have raced in between the
+        // gate above and here. Lock order is drags → done_drags; nothing
+        // acquires them reversed while holding either.
+        if drag_ended(&state, webview.label(), drag) {
+            return Ok(false);
+        }
+        drags
+            .insert(webview.label().to_string(), hit_label.clone())
+            .flatten()
+    };
     if prev != hit_label {
         if let Some(prev) = prev {
-            emit_xdrag(
-                &app,
-                &prev,
-                XdragEvent {
-                    phase: "leave",
-                    x: None,
-                    y: None,
-                    transfer: None,
-                    payload: None,
-                },
-            );
+            emit_drag_leave(&app, &prev);
         }
     }
     if let Some(rect) = hit {
@@ -986,14 +1033,21 @@ pub(super) fn drag_track(
     Ok(hit_label.is_some())
 }
 
-/// Route an out-of-window RELEASE. Hit → forward the drop (with a minted
-/// transfer id) to the target and raise it; the caller then awaits the ack.
-/// No hit → `routed:false`, and the caller opens a detached window instead.
+/// Route an out-of-window RELEASE. Hit → forward the drop (carrying the
+/// SENDER-minted `transfer` id — minted client-side so the sender can arm
+/// its ledger BEFORE this call, closing the race where the target's ack
+/// beats the invoke's own response) to the target and raise it. No hit →
+/// `routed:false`, and the caller opens a detached window instead.
 #[derive(Serialize)]
 pub(super) struct DropOutcome {
     routed: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    transfer: Option<u64>,
+}
+
+/// The release point in the SOURCE window's client coords.
+#[derive(serde::Deserialize)]
+pub(super) struct DropAt {
+    x: f64,
+    y: f64,
 }
 
 #[tauri::command]
@@ -1001,21 +1055,25 @@ pub(super) fn drag_drop(
     app: AppHandle,
     webview: tauri::WebviewWindow,
     state: State<'_, Shell>,
-    x: f64,
-    y: f64,
+    at: DropAt,
+    drag: u64,
+    transfer: u64,
     payload: serde_json::Value,
 ) -> Result<DropOutcome, String> {
     let scope = state
         .window_scope(webview.label())
         .ok_or_else(|| "this window is not registered".to_string())?;
     let prev = lock(&state.drags).remove(webview.label()).flatten();
+    mark_drag_done(&state, webview.label(), drag);
     let Some(src) = super::drag::rect_of(&webview) else {
-        return Ok(DropOutcome {
-            routed: false,
-            transfer: None,
-        });
+        // The drag still ended: the hovered sibling must unlight even though
+        // this window could not report its own geometry.
+        if let Some(prev) = prev {
+            emit_drag_leave(&app, &prev);
+        }
+        return Ok(DropOutcome { routed: false });
     };
-    let (gx, gy) = super::drag::global_of_client(&src, x, y);
+    let (gx, gy) = super::drag::global_of_client(&src, at.x, at.y);
     // Re-hit-test at the release point against LIVE windows — the hover
     // target may have closed or moved since the last track.
     let rects = target_rects(&app, &state, webview.label(), &scope);
@@ -1023,38 +1081,13 @@ pub(super) fn drag_drop(
     let hit = super::drag::hit_test(&rects, &focus, gx, gy);
     if let Some(prev) = prev {
         if hit.map(|r| r.label.as_str()) != Some(prev.as_str()) {
-            emit_xdrag(
-                &app,
-                &prev,
-                XdragEvent {
-                    phase: "leave",
-                    x: None,
-                    y: None,
-                    transfer: None,
-                    payload: None,
-                },
-            );
+            emit_drag_leave(&app, &prev);
         }
     }
     let Some(rect) = hit else {
-        return Ok(DropOutcome {
-            routed: false,
-            transfer: None,
-        });
+        return Ok(DropOutcome { routed: false });
     };
-    let transfer = TRANSFER_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    {
-        let mut transfers = lock(&state.transfers);
-        transfers.retain(|_, t| t.started.elapsed() < super::TRANSFER_TTL);
-        transfers.insert(
-            transfer,
-            super::Transfer {
-                source: webview.label().to_string(),
-                target: rect.label.clone(),
-                started: std::time::Instant::now(),
-            },
-        );
-    }
+    register_transfer(&state, transfer, webview.label(), &rect.label)?;
     let (cx, cy) = super::drag::client_of_global(rect, gx, gy);
     emit_xdrag(
         &app,
@@ -1071,10 +1104,33 @@ pub(super) fn drag_drop(
     if let Some(win) = app.get_webview_window(&rect.label) {
         let _ = win.set_focus();
     }
-    Ok(DropOutcome {
-        routed: true,
-        transfer: Some(transfer),
-    })
+    Ok(DropOutcome { routed: true })
+}
+
+/// Record a sender-minted transfer awaiting the target's ack. Ids are minted
+/// from crypto randomness client-side; refusing a duplicate (rather than
+/// overwriting) means a colliding or replayed id can never re-route an
+/// existing pending move's ack.
+fn register_transfer(
+    state: &Shell,
+    transfer: u64,
+    source: &str,
+    target: &str,
+) -> Result<(), String> {
+    let mut transfers = lock(&state.transfers);
+    transfers.retain(|_, t| t.started.elapsed() < super::TRANSFER_TTL);
+    if transfers.contains_key(&transfer) {
+        return Err("that transfer id is already pending".to_string());
+    }
+    transfers.insert(
+        transfer,
+        super::Transfer {
+            source: source.to_string(),
+            target: target.to_string(),
+            started: std::time::Instant::now(),
+        },
+    );
+    Ok(())
 }
 
 /// The drag ended without a routed drop (Escape, or an in-window drop):
@@ -1085,19 +1141,12 @@ pub(super) fn drag_cancel(
     app: AppHandle,
     webview: tauri::WebviewWindow,
     state: State<'_, Shell>,
+    drag: u64,
 ) -> Result<(), String> {
-    if let Some(Some(target)) = lock(&state.drags).remove(webview.label()) {
-        emit_xdrag(
-            &app,
-            &target,
-            XdragEvent {
-                phase: "leave",
-                x: None,
-                y: None,
-                transfer: None,
-                payload: None,
-            },
-        );
+    let removed = lock(&state.drags).remove(webview.label());
+    mark_drag_done(&state, webview.label(), drag);
+    if let Some(Some(target)) = removed {
+        emit_drag_leave(&app, &target);
     }
     Ok(())
 }
@@ -1174,8 +1223,9 @@ pub(super) fn adopt_tab(
     webview: tauri::WebviewWindow,
     state: State<'_, Shell>,
     target_win_id: String,
+    transfer: u64,
     payload: serde_json::Value,
-) -> Result<u64, String> {
+) -> Result<(), String> {
     let scope = state
         .window_scope(webview.label())
         .ok_or_else(|| "this window is not registered".to_string())?;
@@ -1189,19 +1239,7 @@ pub(super) fn adopt_tab(
         })
         .map(|(label, _)| label.clone())
         .ok_or_else(|| "that window is no longer open".to_string())?;
-    let transfer = TRANSFER_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    {
-        let mut transfers = lock(&state.transfers);
-        transfers.retain(|_, t| t.started.elapsed() < super::TRANSFER_TTL);
-        transfers.insert(
-            transfer,
-            super::Transfer {
-                source: webview.label().to_string(),
-                target: target_label.clone(),
-                started: std::time::Instant::now(),
-            },
-        );
-    }
+    register_transfer(&state, transfer, webview.label(), &target_label)?;
     emit_xdrag(
         &app,
         &target_label,
@@ -1216,7 +1254,7 @@ pub(super) fn adopt_tab(
     if let Some(win) = app.get_webview_window(&target_label) {
         let _ = win.set_focus();
     }
-    Ok(transfer)
+    Ok(())
 }
 
 /// Check GitHub releases for a newer signed app build. Returns the new
@@ -1362,7 +1400,12 @@ pub(super) fn report_window_scope(
     // surface and let this in-place Home reclaim the singleton identity. The
     // old hub cannot carry editor state, so its close does not cross the
     // workbench's beforeunload guard.
-    let existing_home = (current.alias.is_none() && ws.is_none() && !current.home_hub)
+    let existing_home = (current.alias.is_none()
+        && ws.is_none()
+        && !current.home_hub
+        // A detached window reporting an empty scope (its workspace vanished)
+        // is NOT reclaiming Home — it must never retire the real launcher.
+        && !current.detached)
         .then(|| {
             windows
                 .iter()
@@ -1400,12 +1443,16 @@ pub(super) fn report_window_scope(
     let was_home_hub = scope.home_hub;
     scope.report_page_scope(ws.clone(), label.unwrap_or_default());
     let reclaimed_home = !was_home_hub && scope.home_hub;
-    // Set-only: a restart restores a detached window as a plain record, and
-    // the SPA re-asserts detachedness once it reads `dt:1` from its blob. A
-    // page can never CLEAR the flag to make itself raise-eligible.
-    if detached == Some(true) {
-        scope.detached = true;
+    // Two-way, record-backed: a solo window converting to a full workbench
+    // (workspace switch) reports false; a torn-off pane reports true. The
+    // worst a page can do with either direction is change its own
+    // raise-eligibility — never its host or askpass scope (report_page_scope
+    // ignores hub promotion while detached).
+    let detached_changed = detached.is_some_and(|d| d != scope.detached);
+    if let Some(d) = detached {
+        scope.detached = d;
     }
+    let detached_now = scope.detached;
     let stable_id = scope.stable_id.clone();
     let registered_alias = scope.alias.clone();
     let home_hub = scope.home_hub;
@@ -1437,7 +1484,13 @@ pub(super) fn report_window_scope(
         }
     }
     if (!home_hub || reclaimed_home) && !stable_id.is_empty() {
-        lock(&state.registry).set_scope(&stable_id, registered_alias, ws);
+        let mut registry = lock(&state.registry);
+        registry.set_scope(&stable_id, registered_alias, ws);
+        // Detachedness follows into the record so the NEXT launch reopens
+        // the window in the mode it actually ended up in.
+        if detached_changed {
+            registry.set_detached(&stable_id, detached_now);
+        }
     }
     // `AskpassModal` fetched pending prompts when this document mounted, back
     // while a promoted workbench was ineligible. Re-emit every now-authorized

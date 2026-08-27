@@ -590,39 +590,56 @@ export interface XdragEvent {
 }
 
 /** Track an out-of-window drag: resolves whether a sibling window is under
- *  the pointer (client coords — the shell owns the screen-space math). */
-export async function dragTrack(x: number, y: number): Promise<boolean> {
-  return (await tauri()?.core.invoke<boolean>("drag_track", { x, y })) ?? false;
+ *  the pointer (client coords — the shell owns the screen-space math).
+ *  `drag` fences late frames: a track for an already-ended drag is ignored
+ *  shell-side, so it can never re-light a target a cancel just cleared.
+ *  Rejections degrade to "nothing there" — this runs per animation frame. */
+export async function dragTrack(x: number, y: number, drag: number): Promise<boolean> {
+  try {
+    return (await tauri()?.core.invoke<boolean>("drag_track", { x, y, drag })) ?? false;
+  } catch {
+    return false;
+  }
 }
 
+/** Route the release. `transfer` is SENDER-minted (see mintTransfer) so the
+ *  ledger is armed before this call — the target's ack can never beat the
+ *  entry it resolves against. */
 export async function dragDrop(
   x: number,
   y: number,
+  drag: number,
+  transfer: number,
   payload: unknown,
-): Promise<{ routed: boolean; transfer?: number }> {
+): Promise<{ routed: boolean }> {
   return (
-    (await tauri()?.core.invoke<{ routed: boolean; transfer?: number }>("drag_drop", {
-      x,
-      y,
+    (await tauri()?.core.invoke<{ routed: boolean }>("drag_drop", {
+      at: { x, y },
+      drag,
+      transfer,
       payload,
     })) ?? { routed: false }
   );
 }
 
-export async function dragCancel(): Promise<void> {
-  await tauri()?.core.invoke<void>("drag_cancel", {});
+export async function dragCancel(drag: number): Promise<void> {
+  await tauri()?.core.invoke<void>("drag_cancel", { drag });
 }
 
 export async function adoptAck(transfer: number, ok: boolean): Promise<void> {
   await tauri()?.core.invoke<void>("adopt_ack", { transfer, ok });
 }
 
-/** Menu-path adopt into the window with stable id `targetWinId`; resolves
- *  the transfer id whose ack authorizes removing the local copies. */
-export async function adoptTab(targetWinId: string, payload: unknown): Promise<number> {
+/** Menu-path adopt into the window with stable id `targetWinId`. The
+ *  sender-minted `transfer` was armed in the ledger before this call. */
+export async function adoptTab(
+  targetWinId: string,
+  transfer: number,
+  payload: unknown,
+): Promise<void> {
   const t = tauri();
   if (t === null) throw new Error("not in the native shell");
-  return t.core.invoke<number>("adopt_tab", { targetWinId, payload });
+  await t.core.invoke<void>("adopt_tab", { targetWinId, transfer, payload });
 }
 
 export async function listScopeWindows(): Promise<ScopeWindow[]> {
@@ -670,6 +687,10 @@ export function openDetachedPopup(
   if (token !== null) params.set("token", token);
   params.set("ws", wsId);
   params.set("win", winId);
+  // dt=1 is how the child knows it is a solo window BEFORE its layout blob
+  // loads (no workspace-mirror fallback), and what triggers its purge of the
+  // chat-draft keys this auxiliary context cloned from us.
+  params.set("dt", "1");
   const host = getHostLabel();
   if (host !== "local") params.set("host", host);
   const job = getJobContext();

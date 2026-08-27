@@ -23,6 +23,7 @@
   import { contextMenu, type ContextMenuEntry } from "../shared/contextMenu.svelte";
   import { writeClipboard } from "../net/native";
   import { dirtyFiles } from "../shared/editing";
+  import { volatileChatDrafts } from "../chat/drafts";
   import { gitIndex } from "../workspace/git";
   import { decoFor } from "../workspace/gitDeco";
   import { PINNED } from "../shared/keys";
@@ -37,9 +38,6 @@
     node: PaneNode;
     /** True while this pane is rendered zoomed (fullscreen in the window). */
     zoomed?: boolean;
-    /** True when this is the only pane — the grip (which moves a pane between
-     *  splits) has nowhere to go, so it hides. */
-    soloPane?: boolean;
     sessions: Map<string, Session>;
     names: Map<string, string>;
     /** Open-file tab titles (basename, disambiguated), keyed by path. */
@@ -56,7 +54,6 @@
   let {
     node,
     zoomed = false,
-    soloPane = false,
     sessions,
     names,
     fileNames,
@@ -344,8 +341,14 @@
    *  forget) keeps it current for the next open. */
   function moveEntries(tab: Tab, i: number): ContextMenuEntry[] {
     ctrl.refreshMoveTargets();
-    const dirty = tab.surface === "file" && $dirtyFiles.has(tab.path);
-    const hint = dirty ? "save the file first — moving would drop unsaved edits" : undefined;
+    const dirty =
+      (tab.surface === "file" && $dirtyFiles.has(tab.path)) ||
+      (tab.surface === "terminal" && $volatileChatDrafts.has(tab.sessionId));
+    const hint = dirty
+      ? tab.surface === "file"
+        ? "save the file first — moving would drop unsaved edits"
+        : "send or clear the chat draft first — it cannot follow to another window"
+      : undefined;
     const rows: ContextMenuEntry[] = [
       {
         label: "Move to New Window",
@@ -424,7 +427,7 @@
 </script>
 
 <div class="bar" bind:this={el} onpointerdowncapture={onBarPointerDown}>
-  {#if !zoomed && !soloPane}
+  {#if !zoomed}
     <!-- Pane grip: fades in on bar hover; drag it to move the WHOLE pane (all
          tabs) to another split. A plain click focuses the pane. Being a
          <button>, the bar's active-tab drag ignores it (closest("button")). -->

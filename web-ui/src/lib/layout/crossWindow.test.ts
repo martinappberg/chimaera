@@ -3,6 +3,7 @@ import {
   ACK_LATE_MS,
   ACK_TIMEOUT_MS,
   broadcastTransport,
+  mintTransfer,
   ROSTER_COLLECT_MS,
   TransferLedger,
   type XwinTransport,
@@ -85,7 +86,8 @@ describe("broadcastTransport (browser windows on one workspace)", () => {
     const acks: [number, boolean][] = [];
     a.acks((transfer, ok) => acks.push([transfer, ok]));
 
-    const transfer = await a.adoptInto("win-b", { v: 1 });
+    const transfer = mintTransfer();
+    await a.adoptInto("win-b", { v: 1 }, transfer);
     await tick(50);
     expect(dropsC).toEqual([]);
     expect(dropsB).toHaveLength(1);
@@ -110,14 +112,22 @@ describe("broadcastTransport (browser windows on one workspace)", () => {
     const other = win("ws4", "win-x", "elsewhere");
     const drops: unknown[] = [];
     other.incoming({ onOver: () => {}, onLeave: () => {}, onDrop: (d) => drops.push(d) });
-    await a.adoptInto("win-x", {});
+    await a.adoptInto("win-x", {}, mintTransfer());
     await tick(50);
     expect(drops).toEqual([]);
   });
 
   it("drag routing is inert in the browser (no sibling geometry exists)", async () => {
     const a = win("ws5", "win-a", "main");
-    expect(await a.track(10, 10)).toBe(false);
-    expect(await a.drop(10, 10, {})).toEqual({ routed: false });
+    expect(await a.track(10, 10, 1)).toBe(false);
+    expect(await a.drop(10, 10, 1, mintTransfer(), {})).toEqual({ routed: false });
+  });
+
+  it("mintTransfer stays inside the u64-safe JS integer range", () => {
+    for (let i = 0; i < 64; i++) {
+      const id = mintTransfer();
+      expect(Number.isSafeInteger(id)).toBe(true);
+      expect(id).toBeGreaterThanOrEqual(0);
+    }
   });
 });

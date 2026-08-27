@@ -41,6 +41,12 @@ pub struct WindowRecord {
     /// `default` keeps existing windows.json registries parsing.
     #[serde(default)]
     pub compute: Option<ComputeScope>,
+    /// A torn-off solo window (see WindowScope::detached). Persisted so a
+    /// restart reopens it AS detached — without this the restored scope is a
+    /// plain one until the SPA re-asserts, a window where "open this
+    /// workspace" can raise the torn-off pane.
+    #[serde(default)]
+    pub detached: bool,
     /// Outer position + inner size, logical pixels.
     #[serde(default)]
     pub x: Option<f64>,
@@ -60,6 +66,7 @@ impl WindowRecord {
             alias,
             ws,
             compute: None,
+            detached: false,
             x: None,
             y: None,
             width: None,
@@ -130,6 +137,28 @@ impl WindowRegistry {
                 self.persist();
             }
         }
+    }
+
+    /// Update a window's detachedness (a torn-off pane re-attaching, or a
+    /// solo window converting to a full workbench on a workspace switch).
+    pub fn set_detached(&mut self, id: &str, detached: bool) {
+        if let Some(record) = self.items.iter_mut().find(|r| r.id == id) {
+            if record.detached != detached {
+                record.detached = detached;
+                self.persist();
+            }
+        }
+    }
+
+    /// Whether any record carries `id` — a cheap membership probe that,
+    /// unlike `list()`, does not clone the whole registry.
+    pub fn contains(&self, id: &str) -> bool {
+        self.items.iter().any(|r| r.id == id)
+    }
+
+    /// Whether the record with `id` is a compute (job) window.
+    pub fn is_compute(&self, id: &str) -> bool {
+        self.items.iter().any(|r| r.id == id && r.compute.is_some())
     }
 
     /// Update where a window sits (logical pixels). Deferred persistence:

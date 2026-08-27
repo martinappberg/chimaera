@@ -22,7 +22,6 @@
     /** True when this pane is rendered zoomed (fullscreen in the window). */
     zoomed?: boolean;
     /** True when this is the only pane (hides the move-pane grip). */
-    soloPane?: boolean;
     dropSpot: DropSpot | null;
     sessions: Map<string, Session>;
     names: Map<string, string>;
@@ -45,7 +44,6 @@
     node,
     focusedPaneId,
     zoomed = false,
-    soloPane = false,
     dropSpot,
     sessions,
     names,
@@ -395,8 +393,7 @@
   <PaneTabs
     {node}
     {zoomed}
-    {soloPane}
-    {sessions}
+        {sessions}
     {names}
     {fileNames}
     {links}
