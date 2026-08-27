@@ -1,7 +1,7 @@
 <script lang="ts">
   /**
-   * HTML file view with a preview | split | edit toggle (parity with
-   * MarkdownView). Preview is the sandboxed iframe the daemon serves under CSP
+   * HTML file view with a preview | split | edit toggle. Preview is the
+   * sandboxed iframe the daemon serves under CSP
    * "sandbox allow-scripts" (relative assets resolve through the /raw ticket).
    * Edit is the shared CodeMirror editor in HTML mode (Cmd/Ctrl+S saves; dirty
    * dot + conflict handling come from CodeView). SPLIT puts the editor beside a

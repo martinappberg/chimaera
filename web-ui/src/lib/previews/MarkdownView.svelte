@@ -15,9 +15,16 @@
    * Editing is offered only for files under the 1MB cap; larger markdown
    * opens straight into reading and stays there.
   */
-  import { untrack, type Component } from "svelte";
+  import type { Component } from "svelte";
   import type { Extension } from "@codemirror/state";
-  import { EDIT_MAX_BYTES, rawTicketUrl, resolveDocPath, type FileChunk } from "./files";
+  import {
+    EDIT_MAX_BYTES,
+    looksBinary,
+    rawTicketUrl,
+    resolveDocPath,
+    safeDecodeUri,
+    type FileChunk,
+  } from "./files";
   import { retain, release, type FileEntry } from "./fileStore.svelte";
   import { clearSelection, setSelection } from "../shared/reference";
   import { getSetting } from "../settings/store.svelte";
@@ -25,7 +32,7 @@
   import { copyLabel, copyPayload, decorateCopyTargets } from "../shared/copyDecor";
   import ReferenceChip from "../shared/ReferenceChip.svelte";
   import Spinner from "./Spinner.svelte";
-  import { activateUrl, isWebUrl, urlMenuEntries } from "../shared/urlOpen";
+  import { activateUrl, hasUrlScheme, isWebUrl, urlMenuEntries } from "../shared/urlOpen";
   import { contextMenu } from "../shared/contextMenu.svelte";
 
   interface Props {
@@ -46,18 +53,32 @@
   let mode = $state<Mode>("live");
   let chunk = $state<FileChunk | null>(null);
   let chunkError = $state<string | null>(null);
-  /** Null until the first fetch tells us whether the file fits the edit cap. */
-  let editable = $state<boolean | null>(null);
+  /** Size + binary sniff of the source, once probed (null = not yet known). */
+  let srcSize = $state<number | null>(null);
+  let srcBinary = $state(false);
+  /** Whether the editor modes are offered; null until the first probe. */
+  const editable = $derived(
+    srcSize === null ? null : !srcBinary && srcSize <= EDIT_MAX_BYTES,
+  );
+  const disabledReason = $derived(
+    srcBinary ? "binary content — reading only" : "over 1 MB — reading only",
+  );
   /** The editor mounts on the first live/source entry and then persists
    *  (CSS-hidden in reading) so no toggle drops the unsaved buffer. */
   let entered = $state(false);
+  /** Stamps user mode choices; async continuations apply only when theirs is
+   *  still the latest, so a pending fetch can't override a later click. */
+  let modeReq = 0;
   let CodeView = $state<
-    Component<{ path: string; first: FileChunk; extra?: Extension }> | null
+    Component<{ path: string; first: FileChunk; extra?: Extension; autoLanguage?: boolean }> | null
   >(null);
   let liveMod = $state<typeof import("./mdLive") | null>(null);
   let codeLoadError = $state<string | null>(null);
+  // Loaded eagerly on mount (not gated on entering an editor mode) so the
+  // default live open doesn't serialize the bundle import behind the chunk
+  // fetch; both are cached after the first markdown file.
   $effect(() => {
-    if (!entered || CodeView !== null) return;
+    if (CodeView !== null) return;
     void Promise.all([import("./CodeView.svelte"), import("./mdLive")]).then(
       ([cv, live]) => {
         liveMod = live;
@@ -66,22 +87,19 @@
       () => (codeLoadError = "failed to load the editor"),
     );
   });
-  // Pieces memoized on their real inputs, so a reconfigure hands CodeMirror
-  // the SAME extension objects wherever possible and it preserves their state:
-  // the markdown language is a module singleton kept active in BOTH editor
-  // modes (a live ⇄ source flip never reparses), the decoration plugin is
-  // per-path, and only the prose theme rebuilds when A−/A+ resizes.
-  const liveCore = $derived(liveMod === null ? null : liveMod.markdownLive(path));
-  const liveStyle = $derived(
-    liveMod === null ? null : liveMod.markdownLiveTheme(bodyFont, bodyLineHeight),
+  // The two extra-extension sets are memoized so mode flips hand CodeMirror
+  // the SAME extension objects and it preserves their state: the markdown
+  // language is a module singleton active in BOTH editor modes (a live ⇄
+  // source flip never reparses) and the live set is per-path. Entering
+  // reading changes nothing — the hidden editor keeps its current set.
+  const liveSet = $derived(
+    liveMod === null ? null : [liveMod.markdownLanguageExt, liveMod.markdownLive(path)],
   );
-  const extra = $derived.by((): Extension => {
-    const m = liveMod;
-    if (m === null) return [];
-    return mode === "live" && liveCore !== null && liveStyle !== null
-      ? [m.markdownLanguageExt, liveCore, liveStyle]
-      : [m.markdownLanguageExt];
-  });
+  const sourceSet = $derived(liveMod === null ? null : [liveMod.markdownLanguageExt]);
+  let editorMode = $state<"live" | "source">("live");
+  const extra = $derived.by(
+    (): Extension => (editorMode === "live" ? liveSet : sourceSet) ?? [],
+  );
 
   // The shared store entry: reading HTML lives here (cached across tab
   // switches, and re-rendered in place when the file changes on disk — a save
@@ -95,73 +113,93 @@
   $effect(() => {
     void path;
     mode = "live";
+    editorMode = "live";
+    modeReq++;
     chunk = null;
     chunkError = null;
-    editable = null;
+    srcSize = null;
+    srcBinary = false;
     entered = false;
     codeLoadError = null;
   });
 
-  // Retain + open the default mode: live when the file fits the edit cap,
-  // reading otherwise (or when the source fetch fails). `path` is the ONLY
-  // tracked dependency: retain() and ensureChunk() read the entry's $state
-  // payload fields internally, and tracking those would re-run this effect —
-  // resetting the mode and REMOUNTING the editor, clobbering an unsaved
-  // buffer — every time the store refreshes a payload in place (an in-app
-  // save, an agent write). untrack keeps the store's internals out of scope.
+  // Retain + open the default mode: live when the source is editable (text
+  // under the cap), reading otherwise. `path` is the only tracked dependency
+  // — the store's retain()/ensure* guards are untracked by design, so an
+  // in-place payload refresh (a save, an agent write) can never re-run this
+  // effect and remount the editor over a dirty buffer.
   $effect(() => {
     void path;
-    const e = untrack(() => retain(path));
+    const e = retain(path);
     entry = e;
-    void untrack(() => openDefault(e));
+    void openDefault(e);
     return () => release(path);
   });
 
+  /** Adopt the fetched source into local state. Oversized/binary chunks are
+   *  dropped from the store — this view can never use them, and a retained
+   *  useless payload would be re-downloaded on every disk revalidation. */
+  function adoptChunk(e: FileEntry): "ok" | "failed" | "unusable" {
+    if (e.chunk === null) return "failed";
+    srcSize = e.chunk.size;
+    srcBinary = looksBinary(e.chunk.bytes);
+    if (srcBinary || e.chunk.size > EDIT_MAX_BYTES) {
+      e.dropChunk();
+      return "unusable";
+    }
+    chunk = e.chunk;
+    chunkError = null;
+    return "ok";
+  }
+
   async function openDefault(e: FileEntry): Promise<void> {
+    const req = modeReq;
     await e.ensureChunk();
     if (entry !== e || chunk !== null) return; // path changed, or a toggle won
-    if (e.chunk !== null) {
-      chunk = e.chunk;
-      chunkError = null;
-      editable = e.chunk.size <= EDIT_MAX_BYTES;
-      if (editable) entered = true;
-      else mode = "reading";
-    } else {
-      chunkError = e.chunkError ?? "failed to load source";
-      mode = "reading";
+    const r = adoptChunk(e);
+    if (r === "ok") {
+      // Only auto-enter while the user hasn't picked a mode themselves — a
+      // reading click during the fetch must not get a hidden editor mount.
+      if (req === modeReq) entered = true;
+      return;
     }
+    // Binary/oversized falls back to reading; so does a TRANSIENT fetch
+    // failure, quietly — the error belongs to an explicit edit attempt
+    // (enterEditor), not to a plain open that renders fine.
+    if (req === modeReq) mode = "reading";
   }
 
   // The server render is fetched on the first reading entry (not eagerly —
   // the default live mode only needs the raw source). Once populated, the
   // store refreshes it in place on every disk change or in-app save.
-  // untracked: the ensure guard reads the entry's $state markdown field.
   $effect(() => {
     if (mode !== "reading") return;
-    const e = entry;
-    if (e !== null) void untrack(() => e.ensureMarkdown());
+    void entry?.ensureMarkdown();
   });
 
   async function enterEditor(target: "live" | "source"): Promise<void> {
     const e = entry;
     if (e === null || editable === false) return;
+    const req = modeReq;
     if (chunk === null) {
       await e.ensureChunk();
-      if (entry !== e) return;
-      if (e.chunk === null) {
+      // Bail when the path changed OR the user clicked another mode while the
+      // fetch was in flight — finishing would override their later choice.
+      if (entry !== e || req !== modeReq) return;
+      const r = adoptChunk(e);
+      if (r === "failed") {
         chunkError = e.chunkError ?? "failed to load source";
         return;
       }
-      chunk = e.chunk;
-      chunkError = null;
-      editable = e.chunk.size <= EDIT_MAX_BYTES;
-      if (editable === false) return; // too large; stay in reading
+      if (r === "unusable") return; // binary / too large; stay in reading
     }
     entered = true;
     mode = target;
+    editorMode = target;
   }
 
   function setMode(m: Mode): void {
+    modeReq++;
     if (m === "reading") mode = "reading";
     else void enterEditor(m);
   }
@@ -183,10 +221,14 @@
    */
   // Copy chrome on fenced blocks + blockquotes (the same affordance as the
   // chat transcript, via the shared decorator), plus document-relative image
-  // resolution. Re-runs after every render of the reading view.
+  // resolution. Scoped to the reading scroll (never the editor subtree) and
+  // gated on reading being shown — a hidden render pane skips the DOM walk
+  // and catches up when reading is next entered (mode is a dependency).
+  let readingEl = $state<HTMLDivElement | null>(null);
   $effect(() => {
     void html;
-    const content = contentEl;
+    if (mode !== "reading") return;
+    const content = readingEl;
     if (content === null) return;
     decorateCopyTargets(content);
     stampImages(content);
@@ -201,16 +243,10 @@
   function stampImages(root: HTMLElement): void {
     for (const img of root.querySelectorAll("img")) {
       const src = img.getAttribute("src") ?? "";
-      if (src === "" || /^[a-z][a-z0-9+.-]*:/i.test(src) || src.startsWith("/raw/")) continue;
+      if (src === "" || hasUrlScheme(src) || src.startsWith("/raw/")) continue;
       if (img.dataset.mdSrc === src) continue;
       img.dataset.mdSrc = src;
-      let decoded = src;
-      try {
-        decoded = decodeURI(src);
-      } catch {
-        // keep the raw string; the server rejects what it can't canonicalize
-      }
-      const target = resolveDocPath(path, decoded);
+      const target = resolveDocPath(path, safeDecodeUri(src));
       rawTicketUrl(target).then(
         (url) => {
           if (img.isConnected && img.dataset.mdSrc === src) img.src = url;
@@ -326,7 +362,6 @@
     };
   });
 
-  const tooLarge = "over 1 MB — reading only";
 </script>
 
 <div class="md-view" style:--markdown-line-height={bodyLineHeight}>
@@ -337,7 +372,7 @@
         class:on={mode === "live"}
         role="tab"
         aria-selected={mode === "live"}
-        title={editable === false ? tooLarge : "reading view you can edit (live preview)"}
+        title={editable === false ? disabledReason : "reading view you can edit (live preview)"}
         disabled={editable === false}
         onclick={() => setMode("live")}>live</button
       >
@@ -354,7 +389,7 @@
         class:on={mode === "source"}
         role="tab"
         aria-selected={mode === "source"}
-        title={editable === false ? tooLarge : "raw markdown source"}
+        title={editable === false ? disabledReason : "raw markdown source"}
         disabled={editable === false}
         onclick={() => setMode("source")}>source</button
       >
@@ -380,7 +415,12 @@
 
     <!-- Authoritative server render (comrak). Shown in reading mode; kept in
          the DOM (just hidden) so re-entering reading needs no re-render. -->
-    <div class="md-scroll" class:hidden={mode !== "reading"} onscroll={syncPreviewSelection}>
+    <div
+      class="md-scroll"
+      class:hidden={mode !== "reading"}
+      bind:this={readingEl}
+      onscroll={syncPreviewSelection}
+    >
       {#if error !== null}
         <div class="file-error">{error}</div>
       {:else if html !== null}
@@ -395,12 +435,19 @@
 
     <!-- The one editor (live preview ⇄ raw source via the extra-extension
          swap). Mounts on the first live/source entry and then persists,
-         CSS-hidden in reading, so no toggle drops the buffer. -->
+         CSS-hidden in reading, so no toggle drops the buffer. The prose size
+         rides CSS variables so an A−/A+ resize never reconfigures the editor
+         (the live theme is static — see mdLive). -->
     {#if entered && chunk !== null}
       {@const first = chunk}
-      <div class="edit-layer" class:hidden={mode === "reading"}>
+      <div
+        class="edit-layer"
+        class:hidden={mode === "reading"}
+        style:--lp-font-size="{bodyFont}px"
+        style:--lp-line-height={bodyLineHeight}
+      >
         {#if CodeView !== null}
-          <CodeView {path} {first} {extra} />
+          <CodeView {path} {first} {extra} autoLanguage={false} />
         {:else if codeLoadError !== null}
           <div class="file-error">{codeLoadError}</div>
         {:else}
@@ -408,13 +455,10 @@
         {/if}
       </div>
     {:else if mode !== "reading"}
-      <!-- The source is still on its way in (openDefault's first fetch). -->
+      <!-- The source is still on its way in (openDefault's first fetch); a
+           fetch failure lands in reading, so this is only ever a wait. -->
       <div class="md-scroll">
-        {#if chunkError !== null}
-          <div class="file-error">{chunkError}</div>
-        {:else}
-          <Spinner />
-        {/if}
+        <Spinner />
       </div>
     {/if}
   </div>

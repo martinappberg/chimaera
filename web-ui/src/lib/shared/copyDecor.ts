@@ -29,18 +29,25 @@ export function copyLabel(host: Element): string {
   return host.tagName === "BLOCKQUOTE" ? "copy" : "copy code";
 }
 
+/** One construction site for the icon-only copy button, shared by the
+ *  `{@html}` decorator below and the markdown live preview's editor widgets
+ *  (which style it under their own class). */
+export function makeCopyButton(className: string, label: string): HTMLButtonElement {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = className;
+  btn.setAttribute("aria-label", label);
+  btn.title = "copy";
+  btn.innerHTML = COPY_BUTTON_SVG;
+  return btn;
+}
+
 /** Inject the copy button into every pre/blockquote under `root` that lacks
  *  one. Idempotent per host; safe to re-run after every `{@html}` flush. */
 export function decorateCopyTargets(root: HTMLElement): void {
   for (const host of root.querySelectorAll("pre, blockquote")) {
     if (host.querySelector(":scope > button.md-copy") !== null) continue;
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = "md-copy";
-    btn.setAttribute("aria-label", copyLabel(host));
-    btn.title = "copy";
-    btn.innerHTML = COPY_BUTTON_SVG;
-    host.appendChild(btn);
+    host.appendChild(makeCopyButton("md-copy", copyLabel(host)));
   }
 }
 

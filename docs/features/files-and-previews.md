@@ -125,8 +125,10 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
     base): headings sized, emphasis/links/inline code styled, syntax marks hidden on every
     line the selection doesn't touch, images/task-checkboxes/rules rendered as widgets
     (clicking a checkbox edits the source), blockquotes drawn as the shared quote card, and
-    a small always-visible copy affordance on each fence line. Tables/raw HTML/frontmatter
-    stay as mono source (the full render lives in reading). Mod+click follows links.
+    a small always-visible copy affordance on each fence line and quote card. Tables/raw
+    HTML/frontmatter stay as mono source (the full render lives in reading), and so does
+    any construct the decorator can't render faithfully (reference links, multi-line image
+    syntax). Mod+click follows links; right-click gives the same URL menu as reading.
   - **reading** is the complete non-editable render: `GET /api/v1/fs/markdown?path=` →
     server-side comrak GFM → **ammonia-sanitized** HTML (source cap 4 MB), fetched on first
     entry and refreshed in place on saves/agent writes.
@@ -138,10 +140,12 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   get the same hover copy button as the chat transcript (`shared/copyDecor.ts`, one decorator
   for both surfaces), and **document-relative images** (a `figs/plot.png`-style src) resolve
   against the file's directory through short-lived `/raw/` tickets (`rawTicketUrl`, memoized
-  so re-renders keep the `src` stable) — web/data URLs pass through untouched. The live mode
-  mirrors all of it (quote cards, ticketed image widgets, fence copy) inside the editor;
-  raw HTML in a document is **never rendered** there — it stays visible source. Files over
-  the 1MB edit cap open straight into reading and stay there.
+  so re-renders keep the `src` stable) — absolute URLs pass through untouched in reading
+  (the server sanitizer already constrains them), while live's image widgets render only
+  http(s)/`data:image` URLs and leave other schemes as source. The live mode mirrors all of
+  it (quote cards, ticketed image widgets, fence + quote copy) inside the editor; raw HTML
+  in a document is **never rendered** there — it stays visible source. Files over the 1MB
+  edit cap, and binary-content files, open straight into reading and stay there.
 - **Tables (CSV/TSV, incl. gzip).** `GET /api/v1/fs/table?path=&offset_rows=&limit_rows=&delim=auto`
   returns one page (header row + string cells; rows cap 1000/page; delimiter auto-sniffed; `.gz`/`.bgz`
   transparent). `TableView.svelte`. Bioinformatics reality — big delimited files are the norm.

@@ -491,6 +491,16 @@ export function joinPath(dir: string, leaf: string): string {
  * and enforces access. Shared by the markdown reading view's image stamping
  * and the live preview's image widgets.
  */
+/** `decodeURI` that returns the raw string on malformed input — the server
+ *  rejects what it can't canonicalize, so a broken escape isn't fatal here. */
+export function safeDecodeUri(s: string): string {
+  try {
+    return decodeURI(s);
+  } catch {
+    return s;
+  }
+}
+
 export function resolveDocPath(docPath: string, rel: string): string {
   const i = docPath.lastIndexOf("/");
   const base = i <= 0 ? "" : docPath.slice(0, i);

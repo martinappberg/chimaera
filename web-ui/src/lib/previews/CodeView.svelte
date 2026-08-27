@@ -64,12 +64,17 @@
      *  file is still only written on Cmd/Ctrl+S. */
     onDoc?: (text: string) => void;
     /** Host-supplied surface extensions, swapped live in their own compartment
-     *  (the markdown live preview rides here). Keep the value referentially
-     *  stable across renders — every new reference reconfigures the editor. */
+     *  (the markdown live preview rides here). Reconfigured only when the
+     *  reference changes, so an unstable host degrades to no-ops instead of
+     *  state-destroying reconfigures. */
     extra?: Extension;
+    /** Set false when `extra` already provides the language — skips the lazy
+     *  filename-matched pack, which would otherwise load a second, permanently
+     *  inert language instance into the config. */
+    autoLanguage?: boolean;
   }
 
-  let { path, first, onDoc = undefined, extra = [] }: Props = $props();
+  let { path, first, onDoc = undefined, extra = [], autoLanguage = true }: Props = $props();
 
   let host = $state<HTMLDivElement | null>(null);
   let loadedBytes = $state(0);
@@ -171,10 +176,14 @@
   });
 
   // Host extension swaps (e.g. markdown live ⇄ source) reconfigure in place —
-  // the document, undo history, and dirty state all survive the flip.
+  // the document, undo history, and dirty state all survive the flip. The
+  // identity guard absorbs the effect's first post-mount run (onMount records
+  // the value the view was created with) and any unstable-host churn.
+  let lastExtra: Extension | null = null;
   $effect(() => {
     const ext = extra;
-    if (view !== null) {
+    if (view !== null && ext !== lastExtra) {
+      lastExtra = ext;
       view.dispatch({ effects: extraCompartment.reconfigure(ext) });
     }
   });
@@ -262,7 +271,7 @@
         settingsCompartment.of(settingsExtensions()),
         // Before the appended filename-matched language pack, so a host
         // language in `extra` (markdown live) wins the language facet.
-        extraCompartment.of(extra),
+        extraCompartment.of((lastExtra = extra)),
         highlightSpecialChars(),
         drawSelection(),
         bracketMatching(),
@@ -295,7 +304,7 @@
     }
 
     // Language by filename, loaded lazily; appended once ready.
-    const desc = LanguageDescription.matchFilename(languages, basename(path));
+    const desc = autoLanguage ? LanguageDescription.matchFilename(languages, basename(path)) : null;
     if (desc !== null) {
       void desc
         .load()
