@@ -90,8 +90,10 @@
     }
   }
 
+  // Blockquote buttons stay an unlabeled plain "copy" (the icon carries it);
+  // only code blocks name their payload.
   function copyLabel(host: Element): string {
-    return host.tagName === "BLOCKQUOTE" ? "copy quote" : "copy code";
+    return host.tagName === "BLOCKQUOTE" ? "copy" : "copy code";
   }
 
   // Copied feedback: one button at a time; a streaming rebuild mid-feedback
