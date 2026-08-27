@@ -496,25 +496,33 @@
   // the shell can't see the change otherwise). `detachedWindow` rides along:
   // a restart restores a detached window as a plain record, and this report
   // is what re-flags its scope (set-only shell-side) so focus-existing keeps
-  // skipping it.
+  // skipping it. Debounced: a detached window's label tracks its tab (which
+  // for an agent tracks the agent's own mutating title), and every report
+  // costs a shell-side tray rebuild — coalesce the bursts.
   $effect(() => {
     if (!isNativeShell()) return;
+    const alias = scopeAlias;
     const reportedWsId = activeWsId;
-    void reportWindowScope(scopeAlias, reportedWsId, windowLabel || null, detachedWindow).then(
-      () => {
-        // A promoted local workbench becomes the singleton Home again when
-        // its workspace disappears. Restore the browser half of that identity
-        // only while the reported empty scope is still current: an older IPC
-        // completion must not undo a newer workspace promotion.
-        if (scopeAlias === null && reportedWsId === null && activeWsId === null) {
-          reclaimHomeHub();
-        }
-      },
-      () => {
-        // Navigation can transiently reject reconciliation; only a confirmed
-        // report is allowed to reclaim the browser's Home identity.
-      },
-    );
+    const label = windowLabel || null;
+    const detached = detachedWindow;
+    const timer = setTimeout(() => {
+      void reportWindowScope(alias, reportedWsId, label, detached).then(
+        () => {
+          // A promoted local workbench becomes the singleton Home again when
+          // its workspace disappears. Restore the browser half of that identity
+          // only while the reported empty scope is still current: an older IPC
+          // completion must not undo a newer workspace promotion.
+          if (alias === null && reportedWsId === null && activeWsId === null) {
+            reclaimHomeHub();
+          }
+        },
+        () => {
+          // Navigation can transiently reject reconciliation; only a confirmed
+          // report is allowed to reclaim the browser's Home identity.
+        },
+      );
+    }, 250);
+    return () => clearTimeout(timer);
   });
   // --- the agent launcher (split button + popover) ---
   /** The persisted default agent the split button's main surface spawns. */
@@ -3308,7 +3316,12 @@
         linkTargets,
         linkSessions,
         linkIntent,
-        allowOut: !linkIntent && canDetachOut(),
+        // A dirty file never arms the out spot: the ghost must not advertise
+        // "open as new window" for a move the drop would refuse.
+        allowOut:
+          !linkIntent &&
+          canDetachOut() &&
+          !(tab.surface === "file" && get(dirtyFiles).has(tab.path)),
         trackOut: isNativeShell() ? (x, y) => xwin?.track(x, y) ?? Promise.resolve(false) : undefined,
         trackEnd: isNativeShell() ? () => xwin?.cancel() : undefined,
       },
@@ -3360,7 +3373,7 @@
         },
       },
       {
-        allowOut: canDetachOut(),
+        allowOut: canDetachOut() && !pane.tabs.some((t) => t.surface === "file" && get(dirtyFiles).has(t.path)),
         trackOut: isNativeShell() ? (x, y) => xwin?.track(x, y) ?? Promise.resolve(false) : undefined,
         trackEnd: isNativeShell() ? () => xwin?.cancel() : undefined,
       },

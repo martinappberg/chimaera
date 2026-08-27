@@ -818,6 +818,15 @@ pub(super) async fn open_detached_window(
     let scope = state
         .window_scope(webview.label())
         .ok_or_else(|| "this window is not registered".to_string())?;
+    // The id must be FRESH: an upsert on an existing record would silently
+    // rebind a sibling window's registry identity (sibling ids are learnable
+    // via list_scope_windows), and its later close would then drop the
+    // shared record.
+    if lock(&state.windows).values().any(|s| s.stable_id == win_id)
+        || lock(&state.registry).list().iter().any(|r| r.id == win_id)
+    {
+        return Err("that window id is already in use".to_string());
+    }
     // A job window's daemon is a walltime-bounded compute tunnel with its own
     // URL vocabulary (job/node hash params) — a detached window opened onto
     // it with plain host wiring would misidentify itself. Refuse for now; the
@@ -1106,6 +1115,9 @@ pub(super) fn adopt_ack(
 ) -> Result<(), String> {
     let entry = {
         let mut transfers = lock(&state.transfers);
+        // Opportunistic sweep: without it an unanswered transfer between two
+        // long-lived windows would sit until the next insert.
+        transfers.retain(|_, t| t.started.elapsed() < super::TRANSFER_TTL);
         match transfers.get(&transfer) {
             None => return Ok(()), // pruned or already answered: the source's timeout owns it
             Some(t) if t.target != webview.label() => {

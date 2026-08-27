@@ -562,13 +562,12 @@ export async function openDetachedWindow(
 ): Promise<void> {
   const t = tauri();
   if (t === null) throw new Error("not in the native shell");
+  // `at` is one nested argument (the command takes a DetachAt struct) — a
+  // flat spread would fail Tauri's per-key argument extraction.
   await t.core.invoke<void>("open_detached_window", {
     wsId,
     winId,
-    x: at.x,
-    y: at.y,
-    width: at.w,
-    height: at.h,
+    at: { x: at.x, y: at.y, width: at.w, height: at.h },
   });
 }
 
