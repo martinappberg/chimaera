@@ -902,6 +902,107 @@ export function movePaneToIndex(l: Layout, paneId: string, targetPaneId: string,
   return normalize({ ...l, root, focusedPaneId: targetPaneId });
 }
 
+// --- detach / adopt (tabs moving BETWEEN windows) ---------------------------
+//
+// A detached window is a normal window whose layout starts as one pane holding
+// the torn-off tabs (soloLayout, serialized into a pre-seeded view-state blob).
+// Adoption is the receiving half of a cross-window move: the payload is that
+// same serialized one-pane blob, so deserializeLayout validates it for free.
+
+/**
+ * A one-pane layout for a freshly detached window: the torn-off tabs, focus
+ * mode on (the slim solo chrome — still a full workbench underneath). Preview
+ * tabs pin on the way in (a detach is a deliberate move, VS Code semantics)
+ * and the batch dedupes by tabKey so the no-duplicates invariant holds from
+ * birth.
+ */
+export function soloLayout(tabs: Tab[], active = 0, fontSize?: number): Layout {
+  const seen = new Set<string>();
+  const list: Tab[] = [];
+  for (const t of tabs) {
+    const key = tabKey(t);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    list.push(pinned(t));
+  }
+  const pane: PaneNode = {
+    type: "pane",
+    id: uid(),
+    tabs: list,
+    active: Math.min(Math.max(active, 0), Math.max(list.length - 1, 0)),
+  };
+  const l: Layout = { root: pane, focusedPaneId: pane.id, zoomedPaneId: null, focusMode: true };
+  return fontSize !== undefined ? setPaneFont(l, pane.id, fontSize) : l;
+}
+
+/** Every tab in the tree, in pane order (decoding an adopt payload). */
+export function allTabs(l: Layout): Tab[] {
+  const out: Tab[] = [];
+  for (const p of panes(l.root)) out.push(...p.tabs);
+  return out;
+}
+
+/** Where an adopted batch lands. Null = append to the focused pane (the
+ *  menu/re-attach path, which has no pointer position). A subset of dnd's
+ *  DropSpot — layout.ts stays DOM-free and cannot import it. */
+export type AdoptSpot =
+  | { kind: "zone"; paneId: string; zone: Zone }
+  | { kind: "tab"; paneId: string; index: number }
+  | { kind: "edge"; edge: Side };
+
+/**
+ * Adopt tabs arriving from ANOTHER window. Dedupe is per tab: a surface
+ * already open here just activates (still a successful adoption — the sender
+ * closes its copy either way, converging on one view). The first fresh tab
+ * lands at `spot`; the rest stack into the same pane. A stale spot (its pane
+ * closed since the hover) degrades to a plain append, never a dropped tab.
+ * `activeKey` (the sender's active tab) ends up focused when present.
+ */
+export function adoptTabs(
+  l: Layout,
+  tabs: Tab[],
+  spot: AdoptSpot | null,
+  activeKey?: string,
+): Layout {
+  const seen = new Set<string>();
+  const batch: Tab[] = [];
+  for (const t of tabs) {
+    const key = tabKey(t);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    batch.push(pinned(t));
+  }
+  if (batch.length === 0) return l;
+
+  const place = (cur: Layout, t: Tab): Layout => {
+    let out = cur;
+    if (spot !== null) {
+      if (spot.kind === "zone") out = dropTab(cur, t, spot.paneId, spot.zone);
+      else if (spot.kind === "tab") out = moveTabToIndex(cur, t, spot.paneId, spot.index);
+      else out = dropTabAtRootEdge(cur, t, spot.edge);
+    }
+    return paneForTab(out.root, t) !== null ? out : openTab(out, t);
+  };
+
+  let next = l;
+  let placedFirst = false;
+  for (const t of batch) {
+    if (paneForTab(next.root, t) !== null) continue; // already open: converge
+    // The spot places only the first fresh tab (an edge spot must not mint a
+    // split per tab); the rest follow into the pane it focused.
+    next = placedFirst ? openTab(next, t) : place(next, t);
+    placedFirst = true;
+  }
+  const targetKey = activeKey !== undefined && seen.has(activeKey) ? activeKey : null;
+  if (targetKey !== null) {
+    for (const p of panes(next.root)) {
+      const i = p.tabs.findIndex((t) => tabKey(t) === targetKey);
+      if (i >= 0) return activateTab(next, p.id, i);
+    }
+  }
+  return next;
+}
+
 /**
  * Drop tabs failing `keep`; panes emptied by pruning close (the last pane
  * survives, empty). The active tab follows its surface when it survives.
