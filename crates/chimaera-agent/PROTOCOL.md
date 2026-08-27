@@ -59,6 +59,24 @@ The extension's embedded SDK builds argv from:
 
 Env: `DISABLE_AUTOUPDATER=1` (ours; pins the verified binary).
 
+**Text-block boundaries carry the paragraph break.** One assistant message
+routinely holds SEVERAL `text` content blocks (interleaved thinking splits
+them constantly), and the model never re-emits `\n\n` across the boundary —
+concatenating `content_block_delta` text verbatim renders
+`…prose.#### Heading` as one literal line. The mechanism is
+`Coalescer::break_paragraph` (model.rs): a block/item boundary MARKS the
+break, and the coalescer materializes the `\n\n` with the next non-empty
+text of that kind in that turn's scope — so a scope's first block never
+opens with one, empty blocks and interrupts never dangle one, and turns
+opened out-of-band (idle send, queued flush) never inherit one. Claude marks
+at `content_block_start` (text/thinking) and per block on the
+complete-`assistant` fallback; codex marks on `item/agentMessage/delta` /
+`item/plan/delta` / reasoning-delta itemId changes plus `summaryPartAdded`
+sections, resetting its item trackers on `turn/started` and the
+turn-adoption paths; the transcript importer applies the same rule to
+seeded history. The UI reducer additionally trims a separator that lands at
+the START of a new transcript block (a thought/tool split the stream).
+
 ### Handshake (live)
 
 `system/init` is NOT emitted at spawn — only after the first user message.

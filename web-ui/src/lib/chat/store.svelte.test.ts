@@ -26,6 +26,42 @@ const QUEUED_MID_TURN: Record<string, unknown>[] = [
   { type: "user_message_update", id: "q1", state: "sent" },
 ];
 
+describe("ChatStore block-boundary normalization", () => {
+  it("strips driver separators that open a NEW block and drops whitespace-only chunks", () => {
+    const store = fold([
+      { type: "turn_started", turn_id: "t1" },
+      { type: "message_chunk", turn_id: "t1", text: "before the thought" },
+      { type: "thought_chunk", turn_id: "t1", text: "thinking" },
+      // The drivers mark paragraph breaks at block boundaries; when a thought
+      // (or tool card) split the same-kind stream, the break arrives at the
+      // START of a fresh block and must not render/copy as leading blanks.
+      { type: "message_chunk", turn_id: "t1", text: "\n\nafter the thought" },
+      // A whitespace-only chunk must not mint a phantom empty bubble.
+      { type: "thought_chunk", turn_id: "t1", text: "more thinking" },
+      { type: "message_chunk", turn_id: "t1", text: "\n\n" },
+    ]);
+    const texts = store.blocks
+      .filter((b) => b.kind === "message" || b.kind === "thought")
+      .map((b) => ({ kind: b.kind, text: b.text }));
+    expect(texts).toEqual([
+      { kind: "message", text: "before the thought" },
+      { kind: "thought", text: "thinking" },
+      { kind: "message", text: "after the thought" },
+      { kind: "thought", text: "more thinking" },
+    ]);
+  });
+
+  it("keeps separators that CONTINUE a block verbatim", () => {
+    const store = fold([
+      { type: "turn_started", turn_id: "t1" },
+      { type: "message_chunk", turn_id: "t1", text: "para one" },
+      { type: "message_chunk", turn_id: "t1", text: "\n\npara two" },
+    ]);
+    const msg = store.blocks.find((b) => b.kind === "message");
+    expect(msg?.text).toBe("para one\n\npara two");
+  });
+});
+
 describe("ChatStore transcript activity", () => {
   it("separates visible conversation changes from control telemetry", () => {
     const store = new ChatStore();
