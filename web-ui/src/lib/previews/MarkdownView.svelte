@@ -15,7 +15,7 @@
    * Editing is offered only for files under the 1MB cap; larger markdown
    * opens straight into reading and stays there.
   */
-  import type { Component } from "svelte";
+  import { untrack, type Component } from "svelte";
   import type { Extension } from "@codemirror/state";
   import { EDIT_MAX_BYTES, rawTicketUrl, resolveDocPath, type FileChunk } from "./files";
   import { retain, release, type FileEntry } from "./fileStore.svelte";
@@ -23,7 +23,6 @@
   import { getSetting } from "../settings/store.svelte";
   import { copyText } from "../shared/clipboard";
   import { copyLabel, copyPayload, decorateCopyTargets } from "../shared/copyDecor";
-  import type { MarkdownLiveOptions } from "./mdLive";
   import ReferenceChip from "../shared/ReferenceChip.svelte";
   import Spinner from "./Spinner.svelte";
   import { activateUrl, isWebUrl, urlMenuEntries } from "../shared/urlOpen";
@@ -55,27 +54,34 @@
   let CodeView = $state<
     Component<{ path: string; first: FileChunk; extra?: Extension }> | null
   >(null);
-  let liveFactory = $state<((opts: MarkdownLiveOptions) => Extension) | null>(null);
+  let liveMod = $state<typeof import("./mdLive") | null>(null);
   let codeLoadError = $state<string | null>(null);
   $effect(() => {
     if (!entered || CodeView !== null) return;
     void Promise.all([import("./CodeView.svelte"), import("./mdLive")]).then(
       ([cv, live]) => {
-        liveFactory = live.markdownLive;
+        liveMod = live;
         CodeView = cv.default;
       },
       () => (codeLoadError = "failed to load the editor"),
     );
   });
-  // The live extension set is memoized apart from `mode`, so toggling
-  // live ⇄ source reconfigures with the SAME extension objects — CodeMirror
-  // keeps the language/plugin state instead of reparsing the document.
-  const liveExt = $derived(
-    liveFactory === null
-      ? null
-      : liveFactory({ path, fontSize: bodyFont, lineHeight: bodyLineHeight }),
+  // Pieces memoized on their real inputs, so a reconfigure hands CodeMirror
+  // the SAME extension objects wherever possible and it preserves their state:
+  // the markdown language is a module singleton kept active in BOTH editor
+  // modes (a live ⇄ source flip never reparses), the decoration plugin is
+  // per-path, and only the prose theme rebuilds when A−/A+ resizes.
+  const liveCore = $derived(liveMod === null ? null : liveMod.markdownLive(path));
+  const liveStyle = $derived(
+    liveMod === null ? null : liveMod.markdownLiveTheme(bodyFont, bodyLineHeight),
   );
-  const extra = $derived(mode === "live" && liveExt !== null ? liveExt : []);
+  const extra = $derived.by((): Extension => {
+    const m = liveMod;
+    if (m === null) return [];
+    return mode === "live" && liveCore !== null && liveStyle !== null
+      ? [m.markdownLanguageExt, liveCore, liveStyle]
+      : [m.markdownLanguageExt];
+  });
 
   // The shared store entry: reading HTML lives here (cached across tab
   // switches, and re-rendered in place when the file changes on disk — a save
@@ -84,18 +90,30 @@
   const html = $derived(entry?.markdown ?? null);
   const error = $derived(entry?.markdownError ?? null);
 
-  // Retain + reset per path, then open the default mode: live when the file
-  // fits the edit cap, reading otherwise (or when the source fetch fails).
+  // Reset per path — BEFORE the retain effect in source order, so a path swap
+  // resets the view before the new entry is opened.
   $effect(() => {
-    const e = retain(path);
+    void path;
     mode = "live";
     chunk = null;
     chunkError = null;
     editable = null;
     entered = false;
     codeLoadError = null;
+  });
+
+  // Retain + open the default mode: live when the file fits the edit cap,
+  // reading otherwise (or when the source fetch fails). `path` is the ONLY
+  // tracked dependency: retain() and ensureChunk() read the entry's $state
+  // payload fields internally, and tracking those would re-run this effect —
+  // resetting the mode and REMOUNTING the editor, clobbering an unsaved
+  // buffer — every time the store refreshes a payload in place (an in-app
+  // save, an agent write). untrack keeps the store's internals out of scope.
+  $effect(() => {
+    void path;
+    const e = untrack(() => retain(path));
     entry = e;
-    void openDefault(e);
+    void untrack(() => openDefault(e));
     return () => release(path);
   });
 
@@ -104,6 +122,7 @@
     if (entry !== e || chunk !== null) return; // path changed, or a toggle won
     if (e.chunk !== null) {
       chunk = e.chunk;
+      chunkError = null;
       editable = e.chunk.size <= EDIT_MAX_BYTES;
       if (editable) entered = true;
       else mode = "reading";
@@ -116,9 +135,11 @@
   // The server render is fetched on the first reading entry (not eagerly —
   // the default live mode only needs the raw source). Once populated, the
   // store refreshes it in place on every disk change or in-app save.
+  // untracked: the ensure guard reads the entry's $state markdown field.
   $effect(() => {
     if (mode !== "reading") return;
-    void entry?.ensureMarkdown();
+    const e = entry;
+    if (e !== null) void untrack(() => e.ensureMarkdown());
   });
 
   async function enterEditor(target: "live" | "source"): Promise<void> {
@@ -132,6 +153,7 @@
         return;
       }
       chunk = e.chunk;
+      chunkError = null;
       editable = e.chunk.size <= EDIT_MAX_BYTES;
       if (editable === false) return; // too large; stay in reading
     }

@@ -82,9 +82,13 @@ export class FileEntry {
   /** Last global unknown-change generation this entry has checked against. */
   seenAllStaleEpoch = 0;
   /** In-flight guards so concurrent readers don't double-fetch. */
-  private loading = { mtime: false, chunk: false, md: false, table: false };
+  private loading = { mtime: false, md: false, table: false };
   /** Raw consumers must await the same ticket mint, not merely suppress duplicates. */
   private rawLoad: Promise<void> | null = null;
+  /** Chunk consumers likewise await the same in-flight fetch — a bare boolean
+   *  guard let a second caller resolve instantly and observe a still-null
+   *  chunk (the markdown view reads the result right after awaiting). */
+  private chunkLoad: Promise<void> | null = null;
 
   constructor(path: string) {
     this.path = path;
@@ -111,19 +115,30 @@ export class FileEntry {
     }
   }
 
-  /** Fetch the first 256KB chunk (text/binary sniff) if not already present. */
+  /** Fetch the first 256KB chunk (text/binary sniff) if not already present.
+   *  Concurrent callers join the same in-flight fetch, so every awaiter
+   *  resolves with the chunk (or its error) actually populated. */
   async ensureChunk(): Promise<void> {
-    if (this.chunk !== null || this.loading.chunk) return;
-    this.loading.chunk = true;
-    this.chunkError = null;
+    if (this.chunk !== null) return;
+    if (this.chunkLoad !== null) {
+      await this.chunkLoad;
+      return;
+    }
+    const load = (async (): Promise<void> => {
+      this.chunkError = null;
+      try {
+        const c = await fsFile(this.path);
+        this.chunk = c;
+        this.adoptMtime(c.mtime);
+      } catch (e) {
+        this.chunkError = e instanceof Error ? e.message : "failed to load file";
+      }
+    })();
+    this.chunkLoad = load;
     try {
-      const c = await fsFile(this.path);
-      this.chunk = c;
-      this.adoptMtime(c.mtime);
-    } catch (e) {
-      this.chunkError = e instanceof Error ? e.message : "failed to load file";
+      await load;
     } finally {
-      this.loading.chunk = false;
+      if (this.chunkLoad === load) this.chunkLoad = null;
     }
   }
 

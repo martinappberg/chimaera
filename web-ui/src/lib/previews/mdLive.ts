@@ -36,14 +36,17 @@ import { copyText } from "../shared/clipboard";
 import { COPY_BUTTON_SVG } from "../shared/copyDecor";
 import { activateUrl, isWebUrl } from "../shared/urlOpen";
 
-export interface MarkdownLiveOptions {
-  /** Absolute path of the document (image targets resolve against its dir). */
-  path: string;
-  /** Prose base size (px) — the same value the reading view's body uses. */
-  fontSize: number;
-  /** Prose line-height — editor.markdownLineHeight. */
-  lineHeight: number;
-}
+/**
+ * The GFM markdown language (tables, task lists, strikethrough, autolinks;
+ * nested fenced-code highlighting via the shared registry). A module
+ * SINGLETON: the host keeps it active in both live and source modes, so a
+ * mode flip reconfigures around the same Language instance and CodeMirror
+ * never reparses the document.
+ */
+export const markdownLanguageExt: Extension = markdown({
+  base: markdownLanguage,
+  codeLanguages: languages,
+});
 
 // --- widgets -----------------------------------------------------------------
 
@@ -257,13 +260,26 @@ function buildDecorations(view: EditorView, path: string): DecorationSet {
       pos = line.to + 1;
     }
   };
-  /** Hide [from,to], swallowing one adjacent space on the given side. */
+  // The current visibleRange being iterated: per-line walks clamp to it so a
+  // huge node overlapping the viewport (a 10k-line pasted-log fence) costs
+  // only its visible lines per rebuild, never the whole node.
+  let rangeFrom = 0;
+  let rangeTo = 0;
+  const eachVisibleLine = (from: number, to: number, f: (line: Line) => void): void => {
+    const f0 = Math.max(from, rangeFrom);
+    const t0 = Math.min(to, rangeTo);
+    if (f0 <= t0) eachLine(f0, t0, f);
+  };
+  /** Hide [from,to], swallowing one adjacent space on the given side. A range
+   *  that would cross a line break is left visible: view plugins may not
+   *  provide replace decorations over line breaks (CodeMirror throws and
+   *  disables the plugin — the whole document would degrade to source). */
   const hide = (from: number, to: number, spaceAfter = false, spaceBefore = false): void => {
     let f = from;
     let t = to;
     if (spaceAfter && doc.sliceString(t, t + 1) === " ") t += 1;
     if (spaceBefore && doc.sliceString(f - 1, f) === " ") f -= 1;
-    if (t > f) deco.push(hidden.range(f, t));
+    if (t > f && doc.lineAt(f).to >= t) deco.push(hidden.range(f, t));
   };
 
   const fmEnd = frontmatterEnd(state);
@@ -283,7 +299,7 @@ function buildDecorations(view: EditorView, path: string): DecorationSet {
     if (name === "SetextHeading1" || name === "SetextHeading2") {
       const mark = node.node.getChild("HeaderMark");
       const underFrom = mark === null ? -1 : doc.lineAt(mark.from).from;
-      eachLine(node.from, node.to, (l) => {
+      eachVisibleLine(node.from, node.to, (l) => {
         if (l.from === underFrom) return; // the ===/--- line stays small chrome
         addLineClass(l.from, "lp-heading");
         addLineClass(l.from, name === "SetextHeading1" ? "lp-h1" : "lp-h2");
@@ -294,8 +310,11 @@ function buildDecorations(view: EditorView, path: string): DecorationSet {
       const parent = node.node.parent;
       if (parent !== null && parent.name.startsWith("ATXHeading")) {
         if (!lineActive(node.from)) {
-          const line = doc.lineAt(node.from);
-          const opener = /^\s*$/.test(doc.sliceString(line.from, node.from));
+          // Opener iff the mark starts the heading node itself — a line-prefix
+          // test misfires inside blockquotes/lists (`> # Title`), where the
+          // closer path's backward space-swallow would overlap the QuoteMark's
+          // own hide range (partially overlapping replaces are illegal).
+          const opener = node.from === parent.from;
           hide(node.from, node.to, opener, !opener);
         }
       } else {
@@ -331,7 +350,7 @@ function buildDecorations(view: EditorView, path: string): DecorationSet {
     if (name === "FencedCode" || name === "CodeBlock") {
       const firstLine = doc.lineAt(node.from);
       const lastFrom = doc.lineAt(node.to).from;
-      eachLine(node.from, node.to, (l) => {
+      eachVisibleLine(node.from, node.to, (l) => {
         addLineClass(l.from, "lp-codeblock");
         if (l.from === firstLine.from) addLineClass(l.from, "lp-codeblock-first");
         if (l.from === lastFrom) addLineClass(l.from, "lp-codeblock-last");
@@ -347,10 +366,11 @@ function buildDecorations(view: EditorView, path: string): DecorationSet {
           outermost = false;
           break;
         }
+      const firstFrom = doc.lineAt(node.from).from;
       const lastFrom = doc.lineAt(node.to).from;
-      eachLine(node.from, node.to, (l) => {
+      eachVisibleLine(node.from, node.to, (l) => {
         addLineClass(l.from, "lp-quote");
-        if (outermost && l.from === doc.lineAt(node.from).from) addLineClass(l.from, "lp-quote-first");
+        if (outermost && l.from === firstFrom) addLineClass(l.from, "lp-quote-first");
         if (outermost && l.from === lastFrom) addLineClass(l.from, "lp-quote-last");
       });
       return;
@@ -397,9 +417,9 @@ function buildDecorations(view: EditorView, path: string): DecorationSet {
       return;
     }
     if (name === "Image") {
-      const lineFrom = doc.lineAt(node.from).from;
-      const lineTo = doc.lineAt(node.to).to;
-      if (active(lineFrom, lineTo)) return false; // show source while editing it
+      const line = doc.lineAt(node.from);
+      if (line.to < node.to) return false; // spans lines: replace is illegal from a plugin
+      if (active(line.from, line.to)) return false; // show source while editing it
       const urlNode = node.node.getChild("URL");
       if (urlNode === null) return false; // reference-style: leave as source
       const url = doc.sliceString(urlNode.from, urlNode.to);
@@ -443,17 +463,20 @@ function buildDecorations(view: EditorView, path: string): DecorationSet {
       return;
     }
     if (name === "Table") {
-      eachLine(node.from, node.to, (l) => addLineClass(l.from, "lp-table"));
+      eachVisibleLine(node.from, node.to, (l) => addLineClass(l.from, "lp-table"));
       return false; // pipes align in mono; the full grid lives in reading mode
     }
     if (name === "HTMLBlock" || name === "CommentBlock") {
-      eachLine(node.from, node.to, (l) => addLineClass(l.from, "lp-html"));
+      eachVisibleLine(node.from, node.to, (l) => addLineClass(l.from, "lp-html"));
       return false; // raw HTML stays visible source — never rendered here
     }
   };
 
-  for (const range of view.visibleRanges)
+  for (const range of view.visibleRanges) {
+    rangeFrom = range.from;
+    rangeTo = range.to;
     syntaxTree(state).iterate({ from: range.from, to: range.to, enter });
+  }
 
   for (const [pos, cls] of lineClasses)
     deco.push(Decoration.line({ class: [...cls].join(" ") }).range(pos));
@@ -670,17 +693,23 @@ const liveTheme = (fontSize: number, lineHeight: number): Extension =>
   });
 
 /**
- * The full live-preview extension set for CodeView's `extra` slot. GFM base
- * (tables, task lists, strikethrough, autolinks) with nested fenced-code
- * highlighting via the shared language registry.
+ * The live-preview behavior set (decorations, link clicks, wrapping, the
+ * root class the theme scopes on) for CodeView's `extra` slot. Keyed only on
+ * the document path so the host can memoize it — pair with the module's
+ * `markdownLanguageExt` singleton and a `markdownLiveTheme(...)`.
  */
-export function markdownLive(opts: MarkdownLiveOptions): Extension {
+export function markdownLive(path: string): Extension {
   return [
-    markdown({ base: markdownLanguage, codeLanguages: languages }),
     EditorView.lineWrapping,
     EditorView.editorAttributes.of({ class: "cm-md-live" }),
-    liveTheme(opts.fontSize, opts.lineHeight),
-    livePlugin(opts.path),
+    livePlugin(path),
     linkClicks,
   ];
+}
+
+/** The prose theme at a given size/line-height (the same values the reading
+ *  view's body uses). Separate from `markdownLive` so an A−/A+ resize swaps
+ *  only the theme and the language/plugin state survives. */
+export function markdownLiveTheme(fontSize: number, lineHeight: number): Extension {
+  return liveTheme(fontSize, lineHeight);
 }
