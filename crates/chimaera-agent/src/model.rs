@@ -1201,6 +1201,18 @@ pub struct Coalescer {
     buf: String,
     turn_id: String,
     kind: ChunkKind,
+    /// Paragraph-boundary bookkeeping, scoped PER TURN: which kinds have
+    /// emitted text (`seen`) and which owe a deferred break (`pending`).
+    /// `break_paragraph` only MARKS the boundary; `push` materializes the
+    /// "\n\n" in front of the next non-empty text of that kind — so an empty
+    /// block, an interrupted stream, or a turn switch never leaves a dangling
+    /// separator, a scope's first block never opens with one, and consecutive
+    /// boundaries collapse into one break. The scope resets itself whenever
+    /// the pushed turn id changes, which is what makes the mechanism safe on
+    /// drivers that open turns lazily or out-of-band.
+    scope_turn: String,
+    seen: [bool; 2],
+    pending: [bool; 2],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1220,12 +1232,54 @@ impl Coalescer {
             buf: String::new(),
             turn_id: String::new(),
             kind: ChunkKind::Message,
+            scope_turn: String::new(),
+            seen: [false; 2],
+            pending: [false; 2],
         }
+    }
+
+    const fn idx(kind: ChunkKind) -> usize {
+        match kind {
+            ChunkKind::Message => 0,
+            ChunkKind::Thought => 1,
+        }
+    }
+
+    fn enter_scope(&mut self, turn_id: &str) {
+        if turn_id != self.scope_turn {
+            self.scope_turn = turn_id.to_string();
+            self.seen = [false; 2];
+            self.pending = [false; 2];
+        }
+    }
+
+    /// Mark that a block/item boundary owes a paragraph break: one assistant
+    /// message routinely carries several text blocks whose separation lives
+    /// in the boundary itself (the model never re-emits "\n\n" across it).
+    /// The break is materialized by the next non-empty `push` of `kind` in
+    /// this turn's scope — never before the scope's first text, never
+    /// dangling if no text follows.
+    pub fn break_paragraph(&mut self, turn_id: &str, kind: ChunkKind) {
+        self.enter_scope(turn_id);
+        self.pending[Self::idx(kind)] = true;
+    }
+
+    /// Start a fresh boundary scope mid-turn (a supersede: the replacement
+    /// content owes nothing to prose the client is about to drop).
+    pub fn reset_scope(&mut self) {
+        self.seen = [false; 2];
+        self.pending = [false; 2];
     }
 
     /// Add a delta. Returns an event to emit first when the buffered chunk
     /// must flush (kind/turn changed or the size threshold was crossed).
     pub fn push(&mut self, turn_id: &str, kind: ChunkKind, text: &str) -> Option<AgentEvent> {
+        self.enter_scope(turn_id);
+        let i = Self::idx(kind);
+        let brk = !text.is_empty() && std::mem::take(&mut self.pending[i]) && self.seen[i];
+        if !text.is_empty() {
+            self.seen[i] = true;
+        }
         let flushed = if !self.buf.is_empty() && (self.turn_id != turn_id || self.kind != kind) {
             self.flush()
         } else {
@@ -1233,6 +1287,9 @@ impl Coalescer {
         };
         self.turn_id = turn_id.to_string();
         self.kind = kind;
+        if brk {
+            self.buf.push_str("\n\n");
+        }
         self.buf.push_str(text);
         if flushed.is_some() {
             return flushed;
@@ -1270,6 +1327,45 @@ impl Default for Coalescer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The paragraph-boundary contract: `break_paragraph` MARKS, `push`
+    /// materializes — never before the scope's first text, never dangling
+    /// when no text follows, collapsed across consecutive boundaries, and
+    /// reset whenever the turn changes (drivers open turns out-of-band).
+    #[test]
+    fn coalescer_paragraph_breaks_are_deferred_guarded_and_turn_scoped() {
+        let mut c = Coalescer::new();
+        // A boundary marked before any text is a no-op.
+        c.break_paragraph("t1", ChunkKind::Message);
+        assert!(c.push("t1", ChunkKind::Message, "one").is_none());
+        // A later boundary materializes once, even when marked twice (an
+        // empty block between two real ones).
+        c.break_paragraph("t1", ChunkKind::Message);
+        c.break_paragraph("t1", ChunkKind::Message);
+        assert!(c.push("t1", ChunkKind::Message, "two").is_none());
+        match c.flush() {
+            Some(AgentEvent::MessageChunk { turn_id, text }) => {
+                assert_eq!(turn_id, "t1");
+                assert_eq!(text, "one\n\ntwo");
+            }
+            other => panic!("expected MessageChunk, got {other:?}"),
+        }
+        // A pending boundary with no following text never dangles…
+        c.break_paragraph("t1", ChunkKind::Message);
+        assert!(c.flush().is_none());
+        // …and a turn switch starts a fresh scope: no inherited break, and
+        // the kinds are independent within a scope.
+        assert!(c.push("t2", ChunkKind::Message, "fresh").is_none());
+        c.break_paragraph("t2", ChunkKind::Thought);
+        assert!(c.push("t2", ChunkKind::Thought, "first thought").is_some()); // kind switch flushes "fresh"
+        match c.flush() {
+            Some(AgentEvent::ThoughtChunk { turn_id, text }) => {
+                assert_eq!(turn_id, "t2");
+                assert_eq!(text, "first thought"); // no break before a kind's first text
+            }
+            other => panic!("expected ThoughtChunk, got {other:?}"),
+        }
+    }
 
     #[test]
     fn event_serde_round_trips_with_stable_tags() {

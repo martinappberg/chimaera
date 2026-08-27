@@ -799,11 +799,15 @@ struct CodexMapper {
     coalescer: Coalescer,
     /// agentMessage item ids that streamed deltas (skip their completed text).
     streamed: HashSet<String>,
-    /// The agentMessage item currently contributing prose this turn. A LATER
-    /// item's paragraph separation lives in the item boundary — the model does
-    /// not re-emit "\n\n" across items — so the driver inserts it when the id
-    /// changes (the claude driver does the same at content-block starts).
+    /// The item currently contributing Message-kind prose this turn (agent
+    /// messages AND plan drafts share the stream). A LATER item's paragraph
+    /// separation lives in the item boundary — the model never re-emits
+    /// "\n\n" across items — so an id change marks `Coalescer::break_paragraph`
+    /// (the claude driver does the same at content-block starts).
     last_msg_item: Option<String>,
+    /// Same, for Thought-kind prose: reasoning items delimit paragraphs by
+    /// item boundary too (summary SECTIONS additionally via summaryPartAdded).
+    last_thought_item: Option<String>,
     /// Outstanding server approval requests: our request_id →
     /// (JSON-RPC id, option_id → prebuilt decision payload).
     pending_approvals: HashMap<String, (Value, HashMap<String, Value>)>,
@@ -899,6 +903,7 @@ impl CodexMapper {
             coalescer: Coalescer::new(),
             streamed: HashSet::new(),
             last_msg_item: None,
+            last_thought_item: None,
             pending_approvals: HashMap::new(),
             pending_questions: HashMap::new(),
             safety_notified: false,
@@ -1054,6 +1059,7 @@ impl CodexMapper {
                 self.compaction_completed = false;
                 // Fresh turn, fresh prose: no item-boundary break is owed yet.
                 self.last_msg_item = None;
+                self.last_thought_item = None;
                 // A fresh turn is a clean slate for the interrupt watchdog: an
                 // interrupt armed against a previous (or idle) state must not
                 // abort this new turn.
@@ -1068,15 +1074,23 @@ impl CodexMapper {
             }
             // A new reasoning-summary section: keep the thought stream
             // readable with a paragraph break instead of one run-on blob.
+            // break_paragraph is deferred + guarded, so a turn's FIRST part
+            // no longer buffers a stray leading break.
             "item/reasoning/summaryPartAdded" => {
                 let turn = self.turn_id.clone();
-                if let Some(flushed) = self.coalescer.push(&turn, ChunkKind::Thought, "\n\n") {
-                    step.events.push(flushed);
-                }
+                self.coalescer.break_paragraph(&turn, ChunkKind::Thought);
             }
             "item/reasoning/textDelta" | "item/reasoning/summaryTextDelta" => {
                 if let Some(delta) = frame["params"]["delta"].as_str() {
                     let turn = self.turn_id.clone();
+                    // A new reasoning ITEM delimits a paragraph too (summary
+                    // SECTIONS additionally break via summaryPartAdded).
+                    if let Some(item) = frame["params"]["itemId"].as_str() {
+                        if self.last_thought_item.as_deref() != Some(item) {
+                            self.coalescer.break_paragraph(&turn, ChunkKind::Thought);
+                            self.last_thought_item = Some(item.to_string());
+                        }
+                    }
                     if let Some(flushed) = self.coalescer.push(&turn, ChunkKind::Thought, delta) {
                         step.events.push(flushed);
                     }
@@ -1086,22 +1100,14 @@ impl CodexMapper {
                 if let Some(delta) = frame["params"]["delta"].as_str() {
                     let turn = self.turn_id.clone();
                     if let Some(item) = frame["params"]["itemId"].as_str() {
-                        // A SECOND message item this turn: re-insert the
-                        // paragraph break its boundary represents, or the new
-                        // item's opening heading/prose glues to the last one.
-                        if self
-                            .last_msg_item
-                            .as_deref()
-                            .is_some_and(|prev| prev != item)
-                        {
-                            if let Some(flushed) =
-                                self.coalescer.push(&turn, ChunkKind::Message, "\n\n")
-                            {
-                                step.events.push(flushed);
-                            }
+                        // A new message item this turn: mark the paragraph
+                        // break its boundary represents, or the item's opening
+                        // heading/prose glues to the last one.
+                        if self.last_msg_item.as_deref() != Some(item) {
+                            self.coalescer.break_paragraph(&turn, ChunkKind::Message);
+                            self.last_msg_item = Some(item.to_string());
+                            self.streamed.insert(item.to_string());
                         }
-                        self.last_msg_item = Some(item.to_string());
-                        self.streamed.insert(item.to_string());
                     }
                     if let Some(flushed) = self.coalescer.push(&turn, ChunkKind::Message, delta) {
                         step.events.push(flushed);
@@ -1109,10 +1115,18 @@ impl CodexMapper {
                 }
             }
             // The proposed plan streams as markdown in plan collaboration
-            // mode — user-facing prose, so it renders as agent message.
+            // mode — user-facing prose, so it renders as agent message. It
+            // shares the Message stream, so it joins the same item-boundary
+            // tracking (sentinel key when the frame carries no itemId) —
+            // otherwise plan markdown glues onto surrounding message prose.
             "item/plan/delta" => {
                 if let Some(delta) = frame["params"]["delta"].as_str() {
                     let turn = self.turn_id.clone();
+                    let item = frame["params"]["itemId"].as_str().unwrap_or("item/plan");
+                    if self.last_msg_item.as_deref() != Some(item) {
+                        self.coalescer.break_paragraph(&turn, ChunkKind::Message);
+                        self.last_msg_item = Some(item.to_string());
+                    }
                     if let Some(flushed) = self.coalescer.push(&turn, ChunkKind::Message, delta) {
                         step.events.push(flushed);
                     }
@@ -1437,6 +1451,10 @@ impl CodexMapper {
                 if let Some(live) = parse_expected_turn_id(msg) {
                     self.turn_id = live;
                     self.turn_active = true;
+                    // An adopted turn is fresh prose: the previous turn's
+                    // item ids must not mark a boundary onto its first text.
+                    self.last_msg_item = None;
+                    self.last_thought_item = None;
                     self.flush_requested_steers(step);
                 } else {
                     step.events.push(AgentEvent::Error {
@@ -1464,6 +1482,9 @@ impl CodexMapper {
                 match parse_expected_turn_id(msg) {
                     Some(live_turn) => {
                         self.turn_id = live_turn.clone();
+                        // Adopted id ⇒ fresh boundary state (see turn/start).
+                        self.last_msg_item = None;
+                        self.last_thought_item = None;
                         let id = self.rpc_id();
                         self.pending_rpcs.insert(
                             id,
@@ -1725,16 +1746,13 @@ impl CodexMapper {
                     if let Some(text) = item["text"].as_str() {
                         if !text.is_empty() {
                             let turn = self.turn_id.clone();
-                            // Same item-boundary break as the streamed path.
-                            let sep = if self.last_msg_item.as_deref().is_some_and(|p| p != id) {
-                                "\n\n"
-                            } else {
-                                ""
-                            };
+                            // A completed-but-never-streamed item is by
+                            // definition a NEW item: its boundary owes the
+                            // break (a no-op before the turn's first prose).
+                            self.coalescer.break_paragraph(&turn, ChunkKind::Message);
                             self.last_msg_item = Some(id.clone());
-                            let payload = format!("{sep}{text}");
                             if let Some(flushed) =
-                                self.coalescer.push(&turn, ChunkKind::Message, &payload)
+                                self.coalescer.push(&turn, ChunkKind::Message, text)
                             {
                                 step.events.push(flushed);
                             }
@@ -6247,6 +6265,77 @@ mod tests {
             }
         }
         assert_eq!(text, "the allelic loss.\n\n#### Aim 2");
+    }
+
+    /// A turn's FIRST reasoning summary part must not buffer a leading break
+    /// (the old unconditional push did); later parts still break between.
+    #[test]
+    fn summary_parts_break_between_but_not_before_thought_text() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        let mut text = String::new();
+        for frame in [
+            json!({ "method": "item/reasoning/summaryPartAdded", "params": {} }),
+            json!({ "method": "item/reasoning/summaryTextDelta",
+                    "params": { "itemId": "r1", "delta": "part one" } }),
+            json!({ "method": "item/reasoning/summaryPartAdded", "params": {} }),
+            json!({ "method": "item/reasoning/summaryTextDelta",
+                    "params": { "itemId": "r1", "delta": "part two" } }),
+        ] {
+            for e in m.on_frame(&frame).events.into_iter().chain(m.flush()) {
+                if let AgentEvent::ThoughtChunk { text: t, .. } = e {
+                    text.push_str(&t);
+                }
+            }
+        }
+        assert_eq!(text, "part one\n\npart two");
+    }
+
+    /// Two reasoning ITEMS in one turn delimit a paragraph even in raw
+    /// textDelta mode (no summary parts) — the thought-side twin of the
+    /// agentMessage item boundary.
+    #[test]
+    fn reasoning_item_boundary_restores_paragraph_break() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        let mut text = String::new();
+        for frame in [
+            json!({ "method": "item/reasoning/textDelta",
+                    "params": { "itemId": "r1", "delta": "thinking about A" } }),
+            json!({ "method": "item/reasoning/textDelta",
+                    "params": { "itemId": "r2", "delta": "now about B" } }),
+        ] {
+            for e in m.on_frame(&frame).events.into_iter().chain(m.flush()) {
+                if let AgentEvent::ThoughtChunk { text: t, .. } = e {
+                    text.push_str(&t);
+                }
+            }
+        }
+        assert_eq!(text, "thinking about A\n\nnow about B");
+    }
+
+    /// Plan markdown shares the Message stream with agent prose; the item
+    /// boundary between them must break, not glue (`…done.## Plan`).
+    #[test]
+    fn plan_and_message_items_break_at_their_boundary() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        let mut text = String::new();
+        for frame in [
+            json!({ "method": "item/agentMessage/delta",
+                    "params": { "itemId": "m1", "delta": "Here is the plan." } }),
+            json!({ "method": "item/plan/delta",
+                    "params": { "delta": "## Plan" } }),
+            json!({ "method": "item/plan/delta",
+                    "params": { "delta": "\n- step one" } }),
+        ] {
+            for e in m.on_frame(&frame).events.into_iter().chain(m.flush()) {
+                if let AgentEvent::MessageChunk { text: t, .. } = e {
+                    text.push_str(&t);
+                }
+            }
+        }
+        assert_eq!(text, "Here is the plan.\n\n## Plan\n- step one");
     }
 
     #[test]

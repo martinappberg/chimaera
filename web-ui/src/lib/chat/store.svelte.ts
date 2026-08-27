@@ -1210,17 +1210,25 @@ export class ChatStore {
       if (last.kind === "message") last.forkSeq = seq;
       return;
     }
+    // A driver-inserted block-boundary separator can arrive at the START of
+    // what becomes a NEW transcript block (a thought or tool card split the
+    // same-kind stream). Leading newlines carry nothing at a block start —
+    // markdown ignores them, but full-message copy would keep them and a
+    // whitespace-only chunk would mint a phantom empty bubble — so normalize
+    // them away. Pure, so replay (old journals included) converges.
+    const clean = text.replace(/^\n+/, "");
+    if (clean.length === 0) return;
     if (kind === "message") {
       this.blocks.push({
         kind,
-        text,
+        text: clean,
         turnId,
         sentAtMs: timestampMs,
         forkSeq: seq,
         nativeTurnComplete: false,
       });
     } else {
-      this.blocks.push({ kind, text, turnId });
+      this.blocks.push({ kind, text: clean, turnId });
     }
   }
 

@@ -150,6 +150,12 @@ fn read_line_capped<R: BufRead>(
 struct Translator {
     turn_n: u64,
     turn_open: bool,
+    /// Whether prose/thinking text was emitted this turn — later blocks owe
+    /// the paragraph break their boundary represents (the live drivers'
+    /// `Coalescer::break_paragraph` rule; the model never re-emits "\n\n"
+    /// across blocks), so imported history renders exactly like live did.
+    msg_seen: bool,
+    thought_seen: bool,
     /// tool_use id → kind, so a tool_result renders the same way the live
     /// driver does (edit acks are suppressed, everything else shows output).
     tool_kinds: HashMap<String, ToolKind>,
@@ -168,6 +174,8 @@ impl Translator {
         if !self.turn_open {
             self.turn_n += 1;
             self.turn_open = true;
+            self.msg_seen = false;
+            self.thought_seen = false;
             out.push(AgentEvent::TurnStarted {
                 turn_id: self.turn_id(),
             });
@@ -251,9 +259,11 @@ impl Translator {
                 Some("text") => {
                     if let Some(text) = block["text"].as_str() {
                         if !text.is_empty() {
+                            let sep = if self.msg_seen { "\n\n" } else { "" };
+                            self.msg_seen = true;
                             out.push(AgentEvent::MessageChunk {
                                 turn_id: turn.clone(),
-                                text: text.to_string(),
+                                text: format!("{sep}{text}"),
                             });
                         }
                     }
@@ -261,9 +271,11 @@ impl Translator {
                 Some("thinking") => {
                     if let Some(text) = block["thinking"].as_str() {
                         if !text.is_empty() {
+                            let sep = if self.thought_seen { "\n\n" } else { "" };
+                            self.thought_seen = true;
                             out.push(AgentEvent::ThoughtChunk {
                                 turn_id: turn.clone(),
-                                text: text.to_string(),
+                                text: format!("{sep}{text}"),
                             });
                         }
                     }
@@ -438,6 +450,23 @@ mod tests {
         let path = dir.path().join("t.jsonl");
         std::fs::write(&path, s).unwrap();
         import_transcript(&path)
+    }
+
+    /// Imported assistant messages with several text blocks re-render with
+    /// their boundary breaks, exactly like the live drivers — otherwise the
+    /// same message displays glued after an import but correct live.
+    #[test]
+    fn imported_text_blocks_keep_their_paragraph_break() {
+        let line = r#####"{"type":"assistant","uuid":"a1","message":{"id":"m1","content":[{"type":"text","text":"prose."},{"type":"text","text":"#### Heading"}]}}"#####;
+        let events = import_str(&(line.to_string() + "\n"));
+        let text: String = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::MessageChunk { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "prose.\n\n#### Heading");
     }
 
     #[test]

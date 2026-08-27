@@ -553,14 +553,6 @@ struct ClaudeMapper {
     /// `assistant` frames must not be emitted again.
     streamed: HashSet<String>,
     current_stream_msg: Option<String>,
-    /// Whether prose / thinking text has been emitted THIS turn. A message can
-    /// carry several text blocks (interleaved thinking splits them constantly)
-    /// whose paragraph separation lives in the BLOCK BOUNDARY — the model never
-    /// re-emits "\n\n" across blocks. Concatenating them verbatim glues
-    /// "…prose.#### Heading" into one literal line client-side, so the driver
-    /// re-inserts the break at each later block start. Per turn, per kind.
-    msg_text_seen: bool,
-    thought_text_seen: bool,
     /// tool_use_id → kind, to choose result rendering; cleared per turn.
     tool_kinds: HashMap<String, ToolKind>,
     /// Outstanding can_use_tool requests, keyed by request_id.
@@ -725,8 +717,6 @@ impl ClaudeMapper {
             turn_active: false,
             streamed: HashSet::new(),
             current_stream_msg: None,
-            msg_text_seen: false,
-            thought_text_seen: false,
             tool_kinds: HashMap::new(),
             pending_permissions: HashMap::new(),
             pending_questions: HashMap::new(),
@@ -808,9 +798,6 @@ impl ClaudeMapper {
             self.reset_compaction_for_new_turn();
             self.turn_n += 1;
             self.turn_active = true;
-            // Fresh turn, fresh prose: no block-boundary break is owed yet.
-            self.msg_text_seen = false;
-            self.thought_text_seen = false;
             // A turn opening is a clean slate for the interrupt watchdog: an
             // interrupt armed against a previous (or idle) state must not abort
             // this fresh turn.
@@ -1601,18 +1588,20 @@ impl ClaudeMapper {
                 self.current_stream_msg = event["message"]["id"].as_str().map(String::from);
             }
             Some("content_block_start") => {
-                // A LATER text/thinking block in a turn owes the paragraph
-                // break its boundary represents (see msg_text_seen).
+                // A later text/thinking block in a turn owes the paragraph
+                // break its boundary represents. break_paragraph only MARKS —
+                // the coalescer materializes the break with the block's first
+                // real text, so an empty block, an interrupt, or a turn that
+                // opened out-of-band (idle send, queued flush) never yields a
+                // stray or wrongly-attributed separator.
                 let kind = match event["content_block"]["type"].as_str() {
-                    Some("text") if self.msg_text_seen => Some(ChunkKind::Message),
-                    Some("thinking") if self.thought_text_seen => Some(ChunkKind::Thought),
+                    Some("text") => Some(ChunkKind::Message),
+                    Some("thinking") => Some(ChunkKind::Thought),
                     _ => None,
                 };
                 if let Some(kind) = kind {
                     let turn = self.turn_id();
-                    if let Some(flushed) = self.coalescer.push(&turn, kind, "\n\n") {
-                        step.events.push(flushed);
-                    }
+                    self.coalescer.break_paragraph(&turn, kind);
                 }
             }
             Some("content_block_delta") => {
@@ -1626,12 +1615,6 @@ impl ClaudeMapper {
                     _ => return,
                 };
                 let Some(text) = text else { return };
-                if !text.is_empty() {
-                    match kind {
-                        ChunkKind::Message => self.msg_text_seen = true,
-                        ChunkKind::Thought => self.thought_text_seen = true,
-                    }
-                }
                 if let Some(id) = &self.current_stream_msg {
                     self.streamed.insert(id.clone());
                 }
@@ -1661,8 +1644,7 @@ impl ClaudeMapper {
             step.events.push(AgentEvent::MessagesSuperseded);
             // The replacement content starts a fresh transcript block — it
             // owes no boundary break to prose the client just dropped.
-            self.msg_text_seen = false;
-            self.thought_text_seen = false;
+            self.coalescer.reset_scope();
         }
         let message = &frame["message"];
         // Every assistant message names the model that ACTUALLY served it —
@@ -1688,30 +1670,22 @@ impl ClaudeMapper {
             match block["type"].as_str() {
                 Some("text") if !streamed => {
                     if let Some(text) = block["text"].as_str().filter(|t| !t.is_empty()) {
-                        // Same boundary rule as the streamed path: a later
-                        // block's paragraph break lives between blocks.
-                        let sep = if self.msg_text_seen { "\n\n" } else { "" };
-                        self.msg_text_seen = true;
-                        let payload = format!("{sep}{text}");
-                        if let Some(flushed) = self.coalescer.push(
-                            &self.turn_id().clone(),
-                            ChunkKind::Message,
-                            &payload,
-                        ) {
+                        // Same boundary rule as the streamed path; the
+                        // coalescer no-ops the break before the first block.
+                        let turn = self.turn_id();
+                        self.coalescer.break_paragraph(&turn, ChunkKind::Message);
+                        if let Some(flushed) = self.coalescer.push(&turn, ChunkKind::Message, text)
+                        {
                             step.events.push(flushed);
                         }
                     }
                 }
                 Some("thinking") if !streamed => {
                     if let Some(text) = block["thinking"].as_str().filter(|t| !t.is_empty()) {
-                        let sep = if self.thought_text_seen { "\n\n" } else { "" };
-                        self.thought_text_seen = true;
-                        let payload = format!("{sep}{text}");
-                        if let Some(flushed) = self.coalescer.push(
-                            &self.turn_id().clone(),
-                            ChunkKind::Thought,
-                            &payload,
-                        ) {
+                        let turn = self.turn_id();
+                        self.coalescer.break_paragraph(&turn, ChunkKind::Thought);
+                        if let Some(flushed) = self.coalescer.push(&turn, ChunkKind::Thought, text)
+                        {
                             step.events.push(flushed);
                         }
                     }
@@ -3780,6 +3754,39 @@ mod tests {
         );
     }
 
+    /// All MessageChunk text for `turn` (empty filter = every turn), joined.
+    fn message_text(steps: &[DriverStep], turn: &str) -> String {
+        steps
+            .iter()
+            .flat_map(|s| &s.events)
+            .filter_map(|e| match e {
+                AgentEvent::MessageChunk { turn_id, text }
+                    if turn.is_empty() || turn_id == turn =>
+                {
+                    Some(text.as_str())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn block_start(kind: &str) -> Value {
+        json!({ "type": "stream_event",
+                "event": { "type": "content_block_start",
+                           "content_block": { "type": kind } } })
+    }
+
+    fn text_delta(text: &str) -> Value {
+        json!({ "type": "stream_event",
+                "event": { "type": "content_block_delta",
+                           "delta": { "type": "text_delta", "text": text } } })
+    }
+
+    fn result_frame() -> Value {
+        json!({ "type": "result", "is_error": false,
+                "usage": { "output_tokens": 1 }, "duration_ms": 10 })
+    }
+
     /// Prose arriving as TWO text content blocks (interleaved thinking splits
     /// messages constantly): the paragraph break lives in the BLOCK BOUNDARY,
     /// so the driver re-inserts it — without this, a second block opening
@@ -3790,32 +3797,15 @@ mod tests {
         let mut m = mapper();
         let mut steps = Vec::new();
         for frame in [
-            json!({ "type": "stream_event",
-                    "event": { "type": "content_block_start",
-                               "content_block": { "type": "text" } } }),
-            json!({ "type": "stream_event",
-                    "event": { "type": "content_block_delta",
-                               "delta": { "type": "text_delta", "text": "the allelic loss." } } }),
-            json!({ "type": "stream_event",
-                    "event": { "type": "content_block_start",
-                               "content_block": { "type": "text" } } }),
-            json!({ "type": "stream_event",
-                    "event": { "type": "content_block_delta",
-                               "delta": { "type": "text_delta", "text": "#### Aim 2" } } }),
-            json!({ "type": "result", "is_error": false,
-                    "usage": { "output_tokens": 1 }, "duration_ms": 10 }),
+            block_start("text"),
+            text_delta("the allelic loss."),
+            block_start("text"),
+            text_delta("#### Aim 2"),
+            result_frame(),
         ] {
             steps.push(m.on_frame(&frame));
         }
-        let text: String = steps
-            .iter()
-            .flat_map(|s| &s.events)
-            .filter_map(|e| match e {
-                AgentEvent::MessageChunk { text, .. } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(text, "the allelic loss.\n\n#### Aim 2");
+        assert_eq!(message_text(&steps, ""), "the allelic loss.\n\n#### Aim 2");
     }
 
     /// The non-streamed fallback (a complete `assistant` frame that never
@@ -3831,19 +3821,81 @@ mod tests {
                 { "type": "text", "text": "#### Heading" },
             ] },
         })));
-        steps.push(m.on_frame(&json!({
-            "type": "result", "is_error": false,
-            "usage": { "output_tokens": 1 }, "duration_ms": 10,
-        })));
-        let text: String = steps
-            .iter()
-            .flat_map(|s| &s.events)
-            .filter_map(|e| match e {
-                AgentEvent::MessageChunk { text, .. } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(text, "prose.\n\n#### Heading");
+        steps.push(m.on_frame(&result_frame()));
+        assert_eq!(message_text(&steps, ""), "prose.\n\n#### Heading");
+    }
+
+    /// The COMMON path: an idle send opens the next turn itself (send path,
+    /// not ensure_turn). Its first block must not inherit a boundary from the
+    /// previous turn's prose — the flag-based first cut leaked a spurious
+    /// leading "\n\n" onto every reply after the first.
+    #[test]
+    fn send_opened_turns_never_lead_with_a_break() {
+        let mut m = mapper();
+        let mut steps = Vec::new();
+        for frame in [block_start("text"), text_delta("first"), result_frame()] {
+            steps.push(m.on_frame(&frame));
+        }
+        m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text {
+                text: "again".into(),
+            }],
+        });
+        for frame in [block_start("text"), text_delta("second"), result_frame()] {
+            steps.push(m.on_frame(&frame));
+        }
+        assert_eq!(message_text(&steps, "t1"), "first");
+        assert_eq!(message_text(&steps, "t2"), "second");
+    }
+
+    /// The lazy queued-flush path: a block start arrives BEFORE any delta
+    /// opens the next turn. The old eager separator was buffered under the
+    /// CLOSED turn's id and flushed as a phantom whitespace-only chunk (an
+    /// empty agent bubble in the transcript).
+    #[test]
+    fn lazy_turn_open_never_emits_a_phantom_chunk() {
+        let mut m = mapper();
+        let mut steps = Vec::new();
+        for frame in [
+            block_start("text"),
+            text_delta("first"),
+            result_frame(),
+            block_start("text"),
+            text_delta("second"),
+            result_frame(),
+        ] {
+            steps.push(m.on_frame(&frame));
+        }
+        for e in steps.iter().flat_map(|s| &s.events) {
+            if let AgentEvent::MessageChunk { turn_id, text } = e {
+                assert!(
+                    !text.trim().is_empty(),
+                    "whitespace-only chunk on {turn_id}: {text:?}"
+                );
+            }
+        }
+        assert_eq!(message_text(&steps, "t2"), "second");
+    }
+
+    /// An empty text block between two real ones collapses into ONE break,
+    /// and a trailing block start with no text leaves no dangling separator
+    /// (the break is materialized by text, never committed eagerly).
+    #[test]
+    fn empty_blocks_neither_double_nor_dangle_breaks() {
+        let mut m = mapper();
+        let mut steps = Vec::new();
+        for frame in [
+            block_start("text"),
+            text_delta("hello"),
+            block_start("text"), // empty block: no delta follows
+            block_start("text"),
+            text_delta("world"),
+            block_start("text"), // trailing empty block
+            result_frame(),
+        ] {
+            steps.push(m.on_frame(&frame));
+        }
+        assert_eq!(message_text(&steps, ""), "hello\n\nworld");
     }
 
     /// Two mid-turn sends: the CLI's native queue is FIFO, so each finished
