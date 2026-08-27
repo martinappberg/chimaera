@@ -143,6 +143,7 @@
     sessionPaneId,
     setPaneFont,
     setRatio,
+    soloLayout,
     splitPane,
     moveTabDirection,
     tabCount,
@@ -200,6 +201,7 @@
     onHostStatus,
     onLocalDaemonUpdated,
     onMenu,
+    openDetachedPopup,
     reportWindowScope,
     setCaffeinate,
     setNativeWindowTitle,
@@ -220,7 +222,13 @@
     settingsLoaded,
   } from "./lib/settings/store.svelte";
   import type { DashCtx } from "./lib/dashboard/dash";
-  import { flushViewState, loadViewState, saveViewState, windowKey } from "./lib/layout/viewState";
+  import {
+    flushViewState,
+    loadViewState,
+    putViewState,
+    saveViewState,
+    windowKey,
+  } from "./lib/layout/viewState";
   import {
     FILES_FRAC_MAX,
     FILES_FRAC_MIN,
@@ -555,6 +563,31 @@
 
   /** File-tree reveal request (terminal dir links); nonce distinguishes repeats. */
   let treeReveal = $state<{ path: string; nonce: number } | null>(null);
+
+  // A window born by tearing a pane out of another window (`dt:1` in its
+  // view-state blob — the blob, never the URL: restore/re-home paths rebuild
+  // the hash and would drop a hash-carried flag). Being detached changes three
+  // behaviors only: the ws_ mirror is never written (a partial layout must not
+  // poison the workspace's restore fallback), the window closes itself when
+  // its last tab goes, and the title leads with the tab. It is otherwise a
+  // full workbench window.
+  let detachedWindow = $state(false);
+  /** The winKey of the window this one detached from (re-attach target). */
+  let detachOrigin = $state<string | null>(null);
+  /** Self-close was requested but the browser refused (a popup we didn't
+   *  open script-side): show the "this window is empty" state instead. */
+  let detachedEmpty = $state(false);
+
+  /** Transient feedback chip (bottom center, auto-fades): the outcome of an
+   *  action that would otherwise fail silently (a refused detach, a blocked
+   *  popup, a cross-window move that didn't complete). */
+  let flash = $state<string | null>(null);
+  let flashTimer: ReturnType<typeof setTimeout> | null = null;
+  function showFlash(message: string): void {
+    flash = message;
+    if (flashTimer !== null) clearTimeout(flashTimer);
+    flashTimer = setTimeout(() => (flash = null), 3200);
+  }
 
   // Rail chrome (width + FILES section) is a window preference, persisted
   // locally so it survives reload and holds across workspace switches. Collapse
@@ -892,12 +925,18 @@
   // Persist the layout (debounced in viewState) whenever it changes, keyed
   // by (window, workspace) so each workspace keeps its own tree.
   $effect(() => {
-    const blob = { v: 1, ws: activeWsId, layout: serializeLayout(layout) };
+    const blob: Record<string, unknown> = { v: 1, ws: activeWsId, layout: serializeLayout(layout) };
+    if (detachedWindow) {
+      blob.dt = 1;
+      if (detachOrigin !== null) blob.origin = detachOrigin;
+    }
     if (!layoutReady) return;
     saveViewState(stateKey(activeWsId), blob);
     // Mirror under the workspace-only key so a reopened window (fresh id)
     // restores this workspace instead of the empty default (see wsKey).
-    if (activeWsId !== null) saveViewState(wsKey(activeWsId), blob);
+    // A detached window's deliberately partial layout never writes the
+    // mirror — it would poison the real workspace window's restore fallback.
+    if (activeWsId !== null && !detachedWindow) saveViewState(wsKey(activeWsId), blob);
   });
 
   // Persist rail chrome (width + FILES section) locally on any change. Drags
@@ -1672,6 +1711,15 @@
     if (matches(raw)) {
       const restored = deserializeLayout((raw as { layout?: unknown }).layout);
       if (restored !== null) layout = restored;
+      // Detachedness travels in the window-keyed blob (the ws_ mirror never
+      // carries it — dt windows don't write the mirror), so only a window
+      // restoring ITS OWN blob can come up detached.
+      const r = raw as { dt?: unknown; origin?: unknown };
+      detachedWindow = r.dt === 1;
+      detachOrigin =
+        detachedWindow && typeof r.origin === "string" && /^[A-Za-z0-9_-]{1,64}$/.test(r.origin)
+          ? r.origin
+          : null;
     }
     layoutReady = true;
     pruneAndAutoOpen();
@@ -1868,11 +1916,19 @@
     const node = $computeStatus?.self?.node;
     const hostWithNode = node ? `${hostAlias} › ${node}` : hostAlias;
     const host = isRemoteWindow ? hostWithNode : null;
-    const scope = workspace
+    let scope = workspace
       ? host
         ? `${workspace.name} •${host}`
         : workspace.name
       : (host ?? "");
+    // A detached solo window is named for what it shows: the tab leads, the
+    // workspace scope trails — "claude (2) — crc_finish | chimaera".
+    if (detachedWindow) {
+      const only = tabCount(layout) === 1 ? panesOf(layout.root)[0]?.tabs[0] : undefined;
+      const p = findPane(layout.root, layout.focusedPaneId);
+      const shown = only ?? p?.tabs[p.active];
+      if (shown !== undefined) scope = scope ? `${tabLabel(shown)} — ${scope}` : tabLabel(shown);
+    }
     const base = scope ? `${scope} | chimaera` : "chimaera";
     const title = needsYou > 0 ? `(${needsYou}) ${base}` : base;
     document.title = title;
@@ -2138,7 +2194,9 @@
     // the default would override an explicit "never". loadSettings flips
     // loaded even on failure (defaults then genuinely apply) and re-calls
     // this, so the gate can never wedge the landing.
-    if (!autoOpened && settingsLoaded()) {
+    if (!autoOpened && settingsLoaded() && !detachedWindow) {
+      // A detached window never auto-opens the dashboard: emptied (its
+      // session died, or its tabs moved back) it closes itself instead.
       autoOpened = true;
       if (tabCount(layout) === 0) {
         // An empty layout lands on the dashboard — the workspace overview —
@@ -2153,6 +2211,21 @@
       }
     }
   }
+
+  // A detached window with nothing left to show closes itself: its one job
+  // was the torn-off tabs, and "close the view, never the session" makes the
+  // close safe. gotSessions gates the boot window (an empty default layout
+  // before restore must not kill the window). The browser can refuse
+  // window.close on a tab it didn't script-open — then the empty state
+  // renders and offers a manual close.
+  $effect(() => {
+    if (!detachedWindow || !layoutReady || !gotSessions || tabCount(layout) !== 0) return;
+    void flushViewState().then(() => {
+      if (isNativeShell()) closeThisWindow();
+      else window.close();
+      setTimeout(() => (detachedEmpty = true), 800);
+    });
+  });
 
   function onTitle(id: string, title: string): void {
     const s = sessions.find((x) => x.id === id);
@@ -2854,6 +2927,66 @@
     return out.size > 0 ? out : undefined;
   }
 
+  /** Whether drags in this window may tear out into a new window. Browser
+   *  only until the native shell grows its open-detached-window command —
+   *  in the webview window.open is swallowed by the navigation guard. */
+  function canDetachOut(): boolean {
+    return activeWsId !== null && !isNativeShell();
+  }
+
+  /**
+   * Detach tabs into their own window: pre-seed the new window's view-state
+   * blob (`dt:1` + this window as origin), open a window on that id, then —
+   * only once the open genuinely happened — remove the tabs here. The tabs
+   * are views onto daemon-owned state, so the new window reattaches its own
+   * sockets; nothing is ever moved but layout.
+   */
+  async function detachOut(
+    tabs: Tab[],
+    at: { screenX: number; screenY: number },
+    active = 0,
+    fontSize?: number,
+  ): Promise<void> {
+    const wsId = activeWsId;
+    if (wsId === null || tabs.length === 0) return;
+    const dirty = get(dirtyFiles);
+    if (tabs.some((t) => t.surface === "file" && dirty.has(t.path))) {
+      // The CodeMirror buffer lives in THIS window; a detach would drop the
+      // unsaved edit on the floor. Same guard as the tab rename.
+      showFlash("save the file before moving it to another window");
+      return;
+    }
+    const solo = soloLayout(tabs, active, fontSize);
+    const winId = `w-${crypto.randomUUID()}`;
+    const blob: Record<string, unknown> = {
+      v: 1,
+      ws: wsId,
+      layout: serializeLayout(solo),
+      dt: 1,
+      origin: winKey,
+    };
+    if (!(await putViewState(`${winId}_${wsId}`, blob))) {
+      showFlash("couldn't reach the daemon — the tab stays here");
+      return;
+    }
+    // Size the new window on the source pane when the payload lives in one
+    // (a rail-row drag doesn't), clamped to a sane floor.
+    const srcPane = paneForTab(layout.root, tabs[0])?.paneId;
+    const rect = srcPane !== undefined ? paneRootEl(srcPane)?.getBoundingClientRect() : undefined;
+    const w = Math.max(rect?.width ?? 900, 680);
+    const h = Math.max(rect?.height ?? 600, 440);
+    if (!openDetachedPopup(winId, wsId, { x: at.screenX, y: at.screenY, w, h })) {
+      showFlash("the browser blocked the popup — allow popups to detach tabs");
+      return;
+    }
+    let next = layout;
+    for (const t of tabs) {
+      const loc = paneForTab(next.root, t);
+      if (loc !== null) next = detachTab(next, loc.paneId, loc.index);
+    }
+    layout = next;
+  }
+
   /**
    * Shared drag start for rail rows and pane tabs (any surface). `linkIntent`
    * (set when the drag starts from a pane's link icon) restricts a shell
@@ -2861,20 +2994,7 @@
    * tab move.
    */
   function beginDrag(e: PointerEvent, tab: Tab, onClick: () => void, linkIntent = false): void {
-    const label =
-      tab.surface === "terminal"
-        ? (displayNames.get(tab.sessionId) ??
-          sessionsById.get(tab.sessionId)?.name ??
-          tab.sessionId.slice(0, 8))
-        : tab.surface === "file"
-          ? (fileTitles.get(tab.path) ?? basename(tab.path))
-          : tab.surface === "finder"
-            ? (basename(tab.path) || "Finder")
-            : tab.surface === "diff"
-              ? `${basename(tab.path)} (diff)`
-              : tab.surface === "git"
-                ? "Source Control"
-                : "Settings";
+    const label = tabLabel(tab);
     // Arm the bottom bands for this drag: reference targets for path drags
     // (file previews and Finder/dir payloads), link targets for shell-
     // terminal drags. Drives the partitioned zone previews (the band region
@@ -2923,6 +3043,13 @@
           // A link-intent drag (from the link icon) only ever links — a drop
           // anywhere but an agent is a no-op, never a surprise tab move.
           if (linkIntent) return;
+          if (spot.kind === "out") {
+            // Released outside the window: this tab becomes its own window.
+            const src = paneForTab(layout.root, tab);
+            const fs = src !== undefined && src !== null ? findPane(layout.root, src.paneId)?.fontSize : undefined;
+            void detachOut([tab], spot, 0, fs);
+            return;
+          }
           // `upload` never reaches this pointer-drag callback (it is only ever
           // set on dropSpot by App's OS-drop handlers), so the zone arm is
           // explicit and the impossible case is a no-op.
@@ -2960,7 +3087,7 @@
           );
         },
       },
-      { linkTargets, linkSessions, linkIntent },
+      { linkTargets, linkSessions, linkIntent, allowOut: !linkIntent && canDetachOut() },
     );
   }
 
@@ -2984,6 +3111,12 @@
         },
         onDrop: (spot) => {
           if ("paneId" in spot && spot.paneId === paneId) return;
+          if (spot.kind === "out") {
+            // The whole pane (all its tabs, active index, font) tears out.
+            const p = findPane(layout.root, paneId);
+            if (p !== null) void detachOut(p.tabs, spot, p.active, p.fontSize);
+            return;
+          }
           layout =
             spot.kind === "tab"
               ? movePaneToIndex(layout, paneId, spot.paneId, spot.index)
@@ -3001,10 +3134,11 @@
           bandPanes = new Set();
         },
       },
+      { allowOut: canDetachOut() },
     );
   }
 
-  /** A tab's display label (shared by tab and whole-pane drags). */
+  /** A tab's display label (drags, the detached-window title). */
   function tabLabel(tab: Tab): string {
     return tab.surface === "terminal"
       ? (displayNames.get(tab.sessionId) ?? sessionsById.get(tab.sessionId)?.name ?? tab.sessionId.slice(0, 8))
@@ -3018,7 +3152,11 @@
               ? "Source Control"
               : tab.surface === "changes"
                 ? "Changes"
-                : "Settings";
+                : tab.surface === "dashboard"
+                  ? "Dashboard"
+                  : tab.surface === "browser"
+                    ? (tab.host || "Browser")
+                    : "Settings";
   }
 
   // --- linked terminals ------------------------------------------------------
@@ -3988,6 +4126,15 @@
           <!-- Window-edge preview: the root split's new pane, full height/width. -->
           <div class="edge-drop {dropSpot.edge}"></div>
         {/if}
+        {#if detachedEmpty && tabCount(layout) === 0}
+          <!-- A detached window that emptied but the browser refused
+               window.close (a tab we didn't script-open): say so instead of
+               leaving a mute blank stage. -->
+          <div class="detached-empty">
+            <p>This window has nothing left to show.</p>
+            <button onclick={() => window.close()}>close window</button>
+          </div>
+        {/if}
       {/if}
     </main>
   </div>
@@ -4147,6 +4294,12 @@
 
 {#if updateOffer !== null && $assetTransition === null}
   <UpdateToast offer={updateOffer} />
+{/if}
+
+<!-- Transient outcome chip: an action that would otherwise fail in silence
+     (a refused detach, a blocked popup, a cross-window move that timed out). -->
+{#if flash !== null}
+  <div class="flash-chip" role="status" aria-live="polite">{flash}</div>
 {/if}
 
 <!-- OS-drop / paste uploads in flight (and, briefly, why one failed) —
@@ -5554,6 +5707,50 @@
   .reconnect-retry:disabled {
     color: var(--muted);
     cursor: default;
+  }
+
+  /* Outcome chip: the upload-chip recipe, one line, auto-fading (showFlash). */
+  .flash-chip {
+    position: fixed;
+    left: 50%;
+    bottom: 14px;
+    transform: translateX(-50%);
+    z-index: 171; /* one over the upload stack; still under the update toast */
+    max-width: 480px;
+    padding: 5px 14px;
+    background: var(--bg);
+    border: 1px solid var(--edge);
+    border-radius: 999px;
+    box-shadow: 0 8px 28px color-mix(in srgb, var(--fg) 12%, transparent);
+    font-size: var(--text-xs);
+    color: var(--muted);
+    animation: upload-in 0.16s ease-out;
+  }
+
+  /* The emptied detached window whose self-close the browser refused. */
+  .detached-empty {
+    position: absolute;
+    inset: 0;
+    z-index: 20;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    color: var(--muted);
+    font-size: var(--text-sm);
+  }
+  .detached-empty button {
+    padding: 5px 14px;
+    background: var(--bg);
+    border: 1px solid var(--edge);
+    border-radius: 6px;
+    color: var(--fg);
+    font-size: var(--text-xs);
+    cursor: pointer;
+  }
+  .detached-empty button:hover {
+    border-color: var(--accent);
   }
 
   /* Upload chips: same quiet toast recipe as the update toast, stacked

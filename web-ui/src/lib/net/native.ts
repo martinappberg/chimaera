@@ -543,3 +543,43 @@ export async function navigateHome(alias: string | null, wsId: string | null = n
   if (t === null) throw new Error("Home navigation requires the native shell");
   await t.core.invoke<void>("navigate_home", { alias, wsId });
 }
+
+/**
+ * Browser half of pane detach: a popup window booting on a PRE-SEEDED window
+ * id (the caller PUT the solo layout blob under `winId` first — same
+ * sessionStorage-clone defense as openWindow, the id just isn't fresh-minted
+ * here). Position/size are best-effort screen coords from the drop point.
+ * Returns false when a popup blocker ate it, so the caller keeps the tabs —
+ * which is why this opens WITH an opener (a `noopener` open always returns
+ * null and would make a block undetectable); the handle's opener is severed
+ * right after, keeping the two windows as uncoupled as openWindow's.
+ */
+export function openDetachedPopup(
+  winId: string,
+  wsId: string,
+  at: { x: number; y: number; w: number; h: number },
+): boolean {
+  const token = getToken();
+  const params = new URLSearchParams();
+  if (token !== null) params.set("token", token);
+  params.set("ws", wsId);
+  params.set("win", winId);
+  const host = getHostLabel();
+  if (host !== "local") params.set("host", host);
+  const job = getJobContext();
+  if (job !== null) {
+    params.set("job", job.jobId);
+    if (job.node !== null) params.set("node", job.node);
+  }
+  const features = [
+    "popup=yes",
+    `width=${Math.round(at.w)}`,
+    `height=${Math.round(at.h)}`,
+    `left=${Math.round(at.x)}`,
+    `top=${Math.round(at.y)}`,
+  ].join(",");
+  const popup = window.open(`${location.origin}/#${params.toString()}`, "_blank", features);
+  if (popup === null) return false;
+  popup.opener = null;
+  return true;
+}

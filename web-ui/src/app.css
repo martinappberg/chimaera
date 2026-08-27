@@ -290,6 +290,24 @@ body {
   will-change: transform;
 }
 
+/* Out-of-window state: the pointer left the viewport on a detach-armed drag.
+   The ghost clamps to the edge (dnd.ts) and grows the hint chip; the accent
+   border says "releasing does something new". */
+.drag-ghost .ghost-hint {
+  display: none;
+}
+.drag-ghost.out {
+  border-color: var(--accent);
+}
+.drag-ghost.out .ghost-hint {
+  display: inline;
+  margin-left: 8px;
+  padding-left: 8px;
+  border-left: 1px solid var(--edge);
+  color: var(--accent);
+  font-family: var(--ui-font);
+}
+
 body.dragging {
   cursor: grabbing;
   user-select: none;
