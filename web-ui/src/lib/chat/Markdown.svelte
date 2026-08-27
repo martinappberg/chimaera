@@ -23,6 +23,7 @@
 
 <script lang="ts">
   import { copyText } from "../shared/clipboard";
+  import { copyLabel, copyPayload, decorateCopyTargets } from "../shared/copyDecor";
   import { pathCandidate, trimPathWord, type PathHit, type ResolvePaths } from "./paths";
   import { activateUrl, isWebUrl, urlMenuEntries } from "../shared/urlOpen";
   import { contextMenu } from "../shared/contextMenu.svelte";
@@ -52,49 +53,13 @@
   const resolved = new Map<string, PathHit | "miss">();
   const inflight = new Set<string>();
 
-  // Copy-button chrome, injected post-sanitize (DOMPurify never sees it, and
-  // it is built from these literals only — never from agent-derived strings).
-  // SVG-only content: wrapWords wraps text nodes, so an icon-only button can
-  // never have its label word-wrapped or reveal-hidden piecemeal.
-  const COPY_BUTTON_SVG =
-    '<svg class="ic-copy" viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">' +
-    '<rect x="6" y="6" width="7.5" height="7.5" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.5"/>' +
-    '<path d="M4 10h-.5A1.5 1.5 0 0 1 2 8.5v-5A1.5 1.5 0 0 1 3.5 2h5A1.5 1.5 0 0 1 10 3.5V4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>' +
-    "</svg>" +
-    '<svg class="ic-check" viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">' +
-    '<path d="M3.5 8.5l3 3 6-6.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>' +
-    "</svg>";
-
-  /** Give every fenced block AND blockquote a copy affordance (agents quote
-   *  source prose back constantly — pasting a quote onward is the same need as
-   *  copying code). The {@html} flush rebuilds the whole subtree per streaming
-   *  chunk, so this re-runs from the same per-chunk hook as stampPaths — fresh
-   *  DOM each pass, nothing leaks. APPEND-only, no reparenting: Svelte tears
-   *  {@html} content down by walking the live sibling chain between its tracked
-   *  first/last nodes, so wrapping a TOP-LEVEL pre in a new div would strand
-   *  the walk inside the wrapper and leak/duplicate DOM every chunk. Instead
-   *  the button lives inside the host and (for pre) the CODE child is made the
-   *  horizontal scroller, so the host stays a non-scrolling anchor the button
-   *  can pin to. Runs BEFORE wrapWords so the reveal bookkeeping hides the
-   *  button with its still-unrevealed block. */
-  function decorateCopyTargets(root: HTMLElement) {
-    for (const host of root.querySelectorAll("pre, blockquote")) {
-      if (host.querySelector(":scope > button.md-copy") !== null) continue;
-      const btn = document.createElement("button");
-      btn.type = "button";
-      btn.className = "md-copy";
-      btn.setAttribute("aria-label", copyLabel(host));
-      btn.title = "copy";
-      btn.innerHTML = COPY_BUTTON_SVG;
-      host.appendChild(btn);
-    }
-  }
-
-  // Blockquote buttons stay an unlabeled plain "copy" (the icon carries it);
-  // only code blocks name their payload.
-  function copyLabel(host: Element): string {
-    return host.tagName === "BLOCKQUOTE" ? "copy" : "copy code";
-  }
+  // Copy-button chrome comes from the shared decorator (also used by the
+  // markdown file preview): injected post-sanitize from literals only, never
+  // from agent-derived strings; APPEND-only inside the host (see copyDecor.ts
+  // for the {@html}-teardown constraint); for pre the CODE child is the
+  // horizontal scroller so the host stays a non-scrolling anchor the button
+  // can pin to. Runs BEFORE wrapWords so the reveal bookkeeping hides the
+  // button with its still-unrevealed block.
 
   // Copied feedback: one button at a time; a streaming rebuild mid-feedback
   // simply drops the state with the old DOM (the next chunk replaces it).
@@ -241,14 +206,7 @@
     // into the payload; innerText copies exactly what is rendered.
     const copyBtn = target?.closest?.("button.md-copy");
     if (copyBtn instanceof HTMLElement) {
-      const host = copyBtn.closest("pre, blockquote");
-      // Fences render as pre>code (the button is code's sibling); a raw-HTML
-      // bare pre falls back to the whole pre; a blockquote copies its rendered
-      // prose whole (the SVG-only button adds no text either way). marked ends
-      // every fence with a newline the author never typed.
-      const src = host?.tagName === "PRE" ? (host.querySelector("code") ?? host) : host;
-      const code =
-        src instanceof HTMLElement ? src.innerText.replace(/^\n+/, "").replace(/\s+$/, "") : "";
+      const code = copyPayload(copyBtn);
       if (code.length > 0) {
         void copyText(code).then((ok) => {
           if (ok && copyBtn.isConnected) showCopied(copyBtn);
@@ -541,13 +499,32 @@
     width: max-content;
     min-width: 100%;
   }
+  /* Heading ladder: real hierarchy (agents lean on markdown constantly), with
+     a hairline under the top two ranks — quiet document structure, not chrome. */
   .md :global(h1),
   .md :global(h2),
   .md :global(h3),
   .md :global(h4) {
-    margin: 0.7em 0 0.3em;
-    font-size: 1.05em;
+    margin: 0.85em 0 0.35em;
     font-weight: 600;
+    line-height: 1.3;
+  }
+  .md :global(h1) {
+    font-size: 1.3em;
+  }
+  .md :global(h2) {
+    font-size: 1.18em;
+  }
+  .md :global(h3) {
+    font-size: 1.08em;
+  }
+  .md :global(h4) {
+    font-size: 1em;
+  }
+  .md :global(h1),
+  .md :global(h2) {
+    padding-bottom: 0.15em;
+    border-bottom: 1px solid color-mix(in srgb, var(--edge) 70%, transparent);
   }
   .md :global(ul),
   .md :global(ol) {
@@ -556,6 +533,9 @@
   }
   .md :global(li) {
     margin: 0.15em 0;
+  }
+  .md :global(li)::marker {
+    color: color-mix(in srgb, var(--accent) 70%, var(--muted));
   }
   .md :global(code) {
     font-family: var(--mono, monospace);
@@ -639,15 +619,28 @@
   }
   /* Quoted material (agents echo source prose back for review) reads as a
      quiet card — prose-set and wrapped, deliberately unlike code chrome, but
-     carrying the same pinned copy affordance. */
+     carrying the same pinned copy affordance. The wash fades accent→neutral so
+     the quote sits a half-step off the page in both themes without shouting. */
   .md :global(blockquote) {
     position: relative; /* the copy button's anchor */
-    margin: 0.45em 0;
-    padding: 5px 12px;
-    border-left: 2px solid color-mix(in srgb, var(--accent) 45%, var(--edge));
-    border-radius: 0 6px 6px 0;
-    background: color-mix(in srgb, var(--fg) 4%, transparent);
-    color: var(--muted);
+    margin: 0.5em 0;
+    padding: 8px 14px;
+    border-left: 2.5px solid color-mix(in srgb, var(--accent) 60%, transparent);
+    border-radius: 0 7px 7px 0;
+    background: linear-gradient(
+      to right,
+      color-mix(in srgb, var(--accent) 5%, transparent),
+      color-mix(in srgb, var(--fg) 3%, transparent) 55%
+    );
+    color: color-mix(in srgb, var(--fg) 45%, var(--muted));
+  }
+  /* Trim the card's inner rhythm: first/last CONTENT blocks sit flush (the
+     appended copy button is the structural last child, hence the `of` form). */
+  .md :global(blockquote > :first-child) {
+    margin-top: 0;
+  }
+  .md :global(blockquote > :nth-last-child(1 of :not(.md-copy))) {
+    margin-bottom: 0;
   }
   .md :global(a) {
     color: var(--accent);
@@ -662,6 +655,10 @@
     border: 1px solid var(--edge);
     padding: 3px 8px;
     text-align: left;
+  }
+  .md :global(th) {
+    font-weight: 600;
+    background: color-mix(in srgb, var(--fg) 4%, transparent);
   }
   .md :global(hr) {
     border: none;

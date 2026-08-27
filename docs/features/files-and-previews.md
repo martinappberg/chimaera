@@ -125,7 +125,13 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   buffer *client-side* as you type (marked + DOMPurify, `mdRender.ts`) — the file is still
   only written on Cmd/Ctrl+S, and plain `preview` stays the authoritative server render. The
   editor mounts once and survives every toggle (CSS-hidden in preview), so no mode flip drops
-  an unsaved buffer. The split geometry is the shared `SplitEditPreview.svelte`.
+  an unsaved buffer. The split geometry is the shared `SplitEditPreview.svelte`. Rendered
+  documents carry the workbench's reading chrome: fenced code blocks and blockquotes get the
+  same hover copy button as the chat transcript (`shared/copyDecor.ts`, one decorator for both
+  surfaces), and **document-relative images** (a `figs/plot.png`-style src) resolve against the file's
+  directory through short-lived `/raw/` tickets (`rawTicketUrl`, memoized so re-renders keep
+  the `src` stable) — web/data URLs pass through untouched. Both apply to the authoritative
+  preview and the live split render.
 - **Tables (CSV/TSV, incl. gzip).** `GET /api/v1/fs/table?path=&offset_rows=&limit_rows=&delim=auto`
   returns one page (header row + string cells; rows cap 1000/page; delimiter auto-sniffed; `.gz`/`.bgz`
   transparent). `TableView.svelte`. Bioinformatics reality — big delimited files are the norm.
@@ -270,3 +276,9 @@ _Captured 2026-07-10 (from the maintainer)._
   folder** are the same capability rounding out the file surfaces — same *why*, same **addition**
   grade (open to change). The download-hidden-on-local / shown-on-remote rule follows directly from
   the remote→local retrieval *why* above.
+
+### Why markdown previews carry reading chrome (copy + inline images) — _Intent pending_
+
+_2026-08-27: shipped with the chat clean-copy fix; the maintainer's stated driver was that
+markdown is a primary working surface ("we interact a lot with markdown files") and quoted
+prose/figures must move cleanly into external documents (Word). Full questionnaire pending._

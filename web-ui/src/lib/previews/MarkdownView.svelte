@@ -12,11 +12,13 @@
    * preview-only.
   */
   import type { Component } from "svelte";
-  import { EDIT_MAX_BYTES, type FileChunk } from "./files";
+  import { EDIT_MAX_BYTES, rawTicketUrl, type FileChunk } from "./files";
   import { retain, release, type FileEntry } from "./fileStore.svelte";
   import { clearSelection, setSelection } from "../shared/reference";
   import { getSetting } from "../settings/store.svelte";
   import { renderMarkdown } from "./mdRender";
+  import { copyText } from "../shared/clipboard";
+  import { copyLabel, copyPayload, decorateCopyTargets } from "../shared/copyDecor";
   import SplitEditPreview from "./SplitEditPreview.svelte";
   import ReferenceChip from "../shared/ReferenceChip.svelte";
   import Spinner from "./Spinner.svelte";
@@ -111,7 +113,99 @@
    * pane, anything else in the user's real browser. Delegated on `.md-content`
    * so it covers the authoritative render AND the live split preview.
    */
+  // Copy chrome on fenced blocks + blockquotes (the same affordance as the
+  // chat transcript, via the shared decorator), plus document-relative image
+  // resolution. Re-runs after every render of the authoritative preview or
+  // the split live preview.
+  $effect(() => {
+    void html;
+    void liveHtml;
+    const content = contentEl;
+    if (content === null) return;
+    decorateCopyTargets(content);
+    stampImages(content);
+  });
+
+  /** Resolve `..`/`.` against the document's directory (the server still
+   *  canonicalizes; this only builds the candidate). */
+  function resolveDocPath(rel: string): string {
+    const i = path.lastIndexOf("/");
+    const base = i <= 0 ? "" : path.slice(0, i);
+    const parts = (rel.startsWith("/") ? rel : `${base}/${rel}`).split("/");
+    const out: string[] = [];
+    for (const seg of parts) {
+      if (seg === "" || seg === ".") continue;
+      if (seg === "..") out.pop();
+      else out.push(seg);
+    }
+    return `/${out.join("/")}`;
+  }
+
+  /** `![](figs/plot.png)` in a document: the rendered src is relative, which
+   *  the browser would resolve against the APP origin (a guaranteed 404).
+   *  Re-point each such image at a short-lived ticketed /raw/ URL for the
+   *  path relative to the file — the same mechanism as inline chat previews;
+   *  `rawTicketUrl` memoizes so re-renders keep the src stable (no flash).
+   *  Web/data URLs pass through untouched. */
+  function stampImages(root: HTMLElement): void {
+    for (const img of root.querySelectorAll("img")) {
+      const src = img.getAttribute("src") ?? "";
+      if (src === "" || /^[a-z][a-z0-9+.-]*:/i.test(src) || src.startsWith("/raw/")) continue;
+      if (img.dataset.mdSrc === src) continue;
+      img.dataset.mdSrc = src;
+      let decoded = src;
+      try {
+        decoded = decodeURI(src);
+      } catch {
+        // keep the raw string; the server rejects what it can't canonicalize
+      }
+      const target = resolveDocPath(decoded);
+      rawTicketUrl(target).then(
+        (url) => {
+          if (img.isConnected && img.dataset.mdSrc === src) img.src = url;
+        },
+        () => {
+          // missing/unreadable target: leave the img alone (alt text shows)
+        },
+      );
+    }
+  }
+
+  let copiedBtn: HTMLElement | null = null;
+  let copiedTimer: ReturnType<typeof setTimeout> | null = null;
+  function flashCopied(btn: HTMLElement): void {
+    if (copiedTimer !== null) clearTimeout(copiedTimer);
+    if (copiedBtn !== null && copiedBtn.isConnected && copiedBtn !== btn) {
+      copiedBtn.classList.remove("copied");
+      copiedBtn.setAttribute("aria-label", copyLabel(copiedBtn.closest("pre, blockquote") ?? copiedBtn));
+    }
+    copiedBtn = btn;
+    btn.classList.add("copied");
+    btn.setAttribute("aria-label", "copied");
+    copiedTimer = setTimeout(() => {
+      copiedTimer = null;
+      if (btn.isConnected) {
+        btn.classList.remove("copied");
+        btn.setAttribute("aria-label", copyLabel(btn.closest("pre, blockquote") ?? btn));
+      }
+      copiedBtn = null;
+    }, 1400);
+  }
+  $effect(() => () => {
+    if (copiedTimer !== null) clearTimeout(copiedTimer);
+  });
+
   function onLinkClick(e: MouseEvent): void {
+    const copyBtn = (e.target as Element | null)?.closest?.("button.md-copy");
+    if (copyBtn instanceof HTMLElement) {
+      const payload = copyPayload(copyBtn);
+      if (payload.length > 0) {
+        void copyText(payload).then((ok) => {
+          if (ok && copyBtn.isConnected) flashCopied(copyBtn);
+        });
+      }
+      return;
+    }
     const anchor = (e.target as Element | null)?.closest?.("a[href]");
     const href = anchor?.getAttribute("href") ?? "";
     if (anchor === null || anchor === undefined) return;
@@ -452,26 +546,90 @@
     padding: 0.12em 0.34em;
   }
 
+  /* The CODE child is the horizontal scroller (not the pre), so the pinned
+     copy button never rides away with scrolled content. */
   .md-body :global(pre) {
+    position: relative; /* the copy button's anchor */
     background: color-mix(in srgb, var(--fg) 4.5%, transparent);
     border: 1px solid var(--edge);
     border-radius: 8px;
     padding: 0.8em 1em;
-    overflow-x: auto;
+    overflow: hidden;
     line-height: 1.5;
   }
 
   .md-body :global(pre code) {
+    display: block;
+    overflow-x: auto;
     background: none;
     padding: 0;
     font-size: 0.848em;
   }
 
+  /* Quoted material as a quiet card — the same treatment as the chat
+     transcript: an accent→neutral wash a half-step off the page. */
   .md-body :global(blockquote) {
+    position: relative; /* the copy button's anchor */
     margin: 0.8em 0;
-    padding: 0.1em 1em;
-    border-left: 3px solid var(--edge);
+    padding: 0.55em 1em;
+    border-left: 3px solid color-mix(in srgb, var(--accent) 60%, transparent);
+    border-radius: 0 8px 8px 0;
+    background: linear-gradient(
+      to right,
+      color-mix(in srgb, var(--accent) 5%, transparent),
+      color-mix(in srgb, var(--fg) 3%, transparent) 55%
+    );
+    color: color-mix(in srgb, var(--fg) 45%, var(--muted));
+  }
+
+  .md-body :global(blockquote > :first-child) {
+    margin-top: 0;
+  }
+
+  .md-body :global(blockquote > :nth-last-child(1 of :not(.md-copy))) {
+    margin-bottom: 0;
+  }
+
+  /* Hover-reveal copy chrome (shared decorator; the chat transcript's
+     language). Token-only scrim so both themes hold. */
+  .md-body :global(.md-copy) {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 4px;
+    background: color-mix(in srgb, var(--term-bg) 82%, transparent);
+    border: 1px solid var(--edge);
+    border-radius: 5px;
     color: var(--muted);
+    cursor: pointer;
+    opacity: 0;
+    transition:
+      opacity 0.12s ease,
+      color 0.12s ease;
+  }
+
+  .md-body :global(pre:hover .md-copy),
+  .md-body :global(blockquote:hover > .md-copy),
+  .md-body :global(.md-copy:focus-visible),
+  .md-body :global(.md-copy.copied) {
+    opacity: 1;
+  }
+
+  .md-body :global(.md-copy:hover),
+  .md-body :global(.md-copy.copied) {
+    color: var(--accent);
+  }
+
+  .md-body :global(.md-copy .ic-check),
+  .md-body :global(.md-copy.copied .ic-copy) {
+    display: none;
+  }
+
+  .md-body :global(.md-copy.copied .ic-check) {
+    display: block;
   }
 
   .md-body :global(ul),
@@ -482,6 +640,10 @@
 
   .md-body :global(li) {
     margin: 0.2em 0;
+  }
+
+  .md-body :global(li)::marker {
+    color: color-mix(in srgb, var(--accent) 70%, var(--muted));
   }
 
   .md-body :global(hr) {
