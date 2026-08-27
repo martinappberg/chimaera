@@ -116,10 +116,14 @@ Daemon side: `crates/chimaera-server/src/{workspaces.rs,view_state.rs,quickopen.
   `xdrag-ack` window-targeted events. Browser transport: `BroadcastChannel("chimaera.xwin.
   {wsId}")`. Daemon: **no new surface** — a detached window is an ordinary window whose
   view-state blob was pre-seeded (`PUT /api/v1/view-state/{win}_{ws}` before opening).
-- **Key behaviors.** A detached window is a full workbench window born in focus mode with
-  `dt:1` in its blob: it titles itself after its tab, never writes the `ws_` layout mirror
-  (a partial layout must not poison the workspace window's restore fallback), self-closes
-  when its last tab goes, is excluded from "open this workspace" raises
+- **Key behaviors.** A detached window is **just its pane** — `dt:1` in its blob, always in
+  focus mode with **no rail and no way to reveal one** (the sidebar affordances are absent,
+  the focus-mode chord is gated, and boot heals a blob persisted rail-open; re-attach is the
+  way back to the full workbench). Its slim strip shows only its own things: workspace label
+  (inert), re-attach, host, and an attention badge scoped to the sessions THIS window shows —
+  never the workspace-wide roster. It titles itself after its tab, never writes the `ws_`
+  layout mirror (a partial layout must not poison the workspace window's restore fallback),
+  self-closes when its last tab goes, is excluded from "open this workspace" raises
   (`WindowScope.detached`, set-only), and restores on app relaunch like any window. Moves
   are **remove-only-on-ack**: the sender drops its copy only when the receiver confirms
   (2s soft-timeout toast, late ok still converges, `tabKey` dedupe merges instead of
