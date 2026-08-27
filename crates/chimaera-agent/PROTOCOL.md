@@ -59,6 +59,16 @@ The extension's embedded SDK builds argv from:
 
 Env: `DISABLE_AUTOUPDATER=1` (ours; pins the verified binary).
 
+**Text-block boundaries carry the paragraph break.** One assistant message
+routinely holds SEVERAL `text` content blocks (interleaved thinking splits
+them constantly), and the model never re-emits `\n\n` across the boundary —
+concatenating `content_block_delta` text verbatim renders
+`…prose.#### Heading` as one literal line. The driver re-inserts `\n\n` at
+each later `content_block_start` of an already-seen kind (per turn, per
+text/thinking kind), on both the streamed and the complete-`assistant`
+fallback paths. Codex is symmetric at `item/agentMessage/delta` itemId
+changes (its `summaryPartAdded` reasoning boundary already did this).
+
 ### Handshake (live)
 
 `system/init` is NOT emitted at spawn — only after the first user message.

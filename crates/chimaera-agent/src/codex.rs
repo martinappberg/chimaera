@@ -799,6 +799,11 @@ struct CodexMapper {
     coalescer: Coalescer,
     /// agentMessage item ids that streamed deltas (skip their completed text).
     streamed: HashSet<String>,
+    /// The agentMessage item currently contributing prose this turn. A LATER
+    /// item's paragraph separation lives in the item boundary — the model does
+    /// not re-emit "\n\n" across items — so the driver inserts it when the id
+    /// changes (the claude driver does the same at content-block starts).
+    last_msg_item: Option<String>,
     /// Outstanding server approval requests: our request_id →
     /// (JSON-RPC id, option_id → prebuilt decision payload).
     pending_approvals: HashMap<String, (Value, HashMap<String, Value>)>,
@@ -893,6 +898,7 @@ impl CodexMapper {
             idle_flush_grace: None,
             coalescer: Coalescer::new(),
             streamed: HashSet::new(),
+            last_msg_item: None,
             pending_approvals: HashMap::new(),
             pending_questions: HashMap::new(),
             safety_notified: false,
@@ -1046,6 +1052,8 @@ impl CodexMapper {
                 self.turn_pending = false;
                 self.compaction_active = false;
                 self.compaction_completed = false;
+                // Fresh turn, fresh prose: no item-boundary break is owed yet.
+                self.last_msg_item = None;
                 // A fresh turn is a clean slate for the interrupt watchdog: an
                 // interrupt armed against a previous (or idle) state must not
                 // abort this new turn.
@@ -1076,10 +1084,25 @@ impl CodexMapper {
             }
             "item/agentMessage/delta" => {
                 if let Some(delta) = frame["params"]["delta"].as_str() {
+                    let turn = self.turn_id.clone();
                     if let Some(item) = frame["params"]["itemId"].as_str() {
+                        // A SECOND message item this turn: re-insert the
+                        // paragraph break its boundary represents, or the new
+                        // item's opening heading/prose glues to the last one.
+                        if self
+                            .last_msg_item
+                            .as_deref()
+                            .is_some_and(|prev| prev != item)
+                        {
+                            if let Some(flushed) =
+                                self.coalescer.push(&turn, ChunkKind::Message, "\n\n")
+                            {
+                                step.events.push(flushed);
+                            }
+                        }
+                        self.last_msg_item = Some(item.to_string());
                         self.streamed.insert(item.to_string());
                     }
-                    let turn = self.turn_id.clone();
                     if let Some(flushed) = self.coalescer.push(&turn, ChunkKind::Message, delta) {
                         step.events.push(flushed);
                     }
@@ -1702,8 +1725,16 @@ impl CodexMapper {
                     if let Some(text) = item["text"].as_str() {
                         if !text.is_empty() {
                             let turn = self.turn_id.clone();
+                            // Same item-boundary break as the streamed path.
+                            let sep = if self.last_msg_item.as_deref().is_some_and(|p| p != id) {
+                                "\n\n"
+                            } else {
+                                ""
+                            };
+                            self.last_msg_item = Some(id.clone());
+                            let payload = format!("{sep}{text}");
                             if let Some(flushed) =
-                                self.coalescer.push(&turn, ChunkKind::Message, text)
+                                self.coalescer.push(&turn, ChunkKind::Message, &payload)
                             {
                                 step.events.push(flushed);
                             }
@@ -6193,6 +6224,29 @@ mod tests {
         assert!(m.turn_active, "parent turn survives foreign turn ends");
         assert_eq!(m.pending_effort.as_deref(), Some("xhigh"));
         assert_eq!(m.reported_effort, Some(Some("xhigh".into())));
+    }
+
+    /// Prose split across TWO agentMessage items in one turn: the item
+    /// boundary carries the paragraph break, so the driver re-inserts it —
+    /// the symmetric case of the claude driver's content-block boundary.
+    #[test]
+    fn agent_message_item_boundary_restores_paragraph_break() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        let mut text = String::new();
+        for frame in [
+            json!({ "method": "item/agentMessage/delta",
+                    "params": { "itemId": "m1", "delta": "the allelic loss." } }),
+            json!({ "method": "item/agentMessage/delta",
+                    "params": { "itemId": "m2", "delta": "#### Aim 2" } }),
+        ] {
+            for e in m.on_frame(&frame).events.into_iter().chain(m.flush()) {
+                if let AgentEvent::MessageChunk { text: t, .. } = e {
+                    text.push_str(&t);
+                }
+            }
+        }
+        assert_eq!(text, "the allelic loss.\n\n#### Aim 2");
     }
 
     #[test]
