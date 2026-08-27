@@ -140,6 +140,7 @@
     pruneSessions,
     rewriteTabPaths,
     adoptTabs,
+    allSessionIds,
     allTabs,
     serializeLayout,
     sessionPaneId,
@@ -836,7 +837,14 @@
   );
 
   /** Sessions in the active workspace waiting on the user. */
-  const needsYou = $derived(wsSessions.filter(needsAttention).length);
+  // A detached solo window badges only ITS OWN sessions: workspace-wide
+  // attention is the main window's wayfinding, and a torn-off pane wearing
+  // the whole roster's badge reads as a false alarm (found live).
+  const needsYou = $derived.by(() => {
+    if (!detachedWindow) return wsSessions.filter(needsAttention).length;
+    const mine = new Set(allSessionIds(layout));
+    return wsSessions.filter((s) => mine.has(s.id) && needsAttention(s)).length;
+  });
 
   /** The focused pane is showing the dashboard (its rail row highlights). */
   const dashboardOpen = $derived.by(() => {
@@ -4419,34 +4427,39 @@
         onclick={() => (layout = { ...layout, focusMode: false })}
         >{workspace?.name ?? "chimaera"}</button
       >
-      <div class="chips">
-        {#each railSessions as s (s.id)}
-          <button
-            class="chip"
-            class:focused={s.id === focusedSessionId}
-            class:unread={isUnread(s.id)}
-            title={isUnread(s.id) ? "finished — output you haven't looked at" : (s.title ?? undefined)}
-            onclick={() => openSess(s.id)}
-          >
-            <!-- The type glyph replaces both the dot and the old "$ "
-                 prefix — same mark as tabs and rail rows (parity), breathing
-                 while alive or working in the background. -->
-            <SessionGlyph
-              kind={s.kind}
-              agentKind={s.agent_kind}
-              state={dotState(s)}
-              size={10}
-              title={dotTitle(s)}
-              pulse
-              backgrounded={backgrounded(s)}
-            />
-            <span class="chip-name">{displayNames.get(s.id) ?? displayName(s)}</span>
-            {#if hintsActive() && chordDigits.has(s.id)}
-              <span class="chip-badge" aria-hidden="true">{chordDigits.get(s.id)}</span>
-            {/if}
-          </button>
-        {/each}
-      </div>
+      {#if !detachedWindow}
+        <!-- The workspace's session chips are the MAIN window's wayfinding; a
+             detached solo window is just its own tabs — the roster following
+             it in reads as the whole workbench tagging along (found live). -->
+        <div class="chips">
+          {#each railSessions as s (s.id)}
+            <button
+              class="chip"
+              class:focused={s.id === focusedSessionId}
+              class:unread={isUnread(s.id)}
+              title={isUnread(s.id) ? "finished — output you haven't looked at" : (s.title ?? undefined)}
+              onclick={() => openSess(s.id)}
+            >
+              <!-- The type glyph replaces both the dot and the old "$ "
+                   prefix — same mark as tabs and rail rows (parity), breathing
+                   while alive or working in the background. -->
+              <SessionGlyph
+                kind={s.kind}
+                agentKind={s.agent_kind}
+                state={dotState(s)}
+                size={10}
+                title={dotTitle(s)}
+                pulse
+                backgrounded={backgrounded(s)}
+              />
+              <span class="chip-name">{displayNames.get(s.id) ?? displayName(s)}</span>
+              {#if hintsActive() && chordDigits.has(s.id)}
+                <span class="chip-badge" aria-hidden="true">{chordDigits.get(s.id)}</span>
+              {/if}
+            </button>
+          {/each}
+        </div>
+      {/if}
       {#if nativeTitlebarOverlay}
         <!-- Native focus mode promotes this strip to the titlebar. Keep a
              generous, control-height empty target so dragging never competes
@@ -4454,6 +4467,9 @@
         <div class="strip-drag" data-tauri-drag-region aria-hidden="true"></div>
       {/if}
       {#if needsYou > 0}
+        <!-- Scoped upstream: in a detached window this counts only the
+             sessions THIS window shows, so it never false-alarms for the
+             rest of the workspace. -->
         <span class="strip-needs">{needsYou} need{needsYou === 1 ? "s" : ""} you</span>
       {/if}
       {#if detachedWindow && detachOrigin !== null}
