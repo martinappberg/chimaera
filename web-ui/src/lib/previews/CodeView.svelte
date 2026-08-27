@@ -10,7 +10,7 @@
    * xterm instances in termPool).
    */
   import { onMount } from "svelte";
-  import { Compartment, EditorState, StateEffect } from "@codemirror/state";
+  import { Compartment, EditorState, StateEffect, type Extension } from "@codemirror/state";
   import {
     EditorView,
     lineNumbers,
@@ -63,9 +63,13 @@
      *  edit|preview shell uses it to re-render the preview as you type — the
      *  file is still only written on Cmd/Ctrl+S. */
     onDoc?: (text: string) => void;
+    /** Host-supplied surface extensions, swapped live in their own compartment
+     *  (the markdown live preview rides here). Keep the value referentially
+     *  stable across renders — every new reference reconfigures the editor. */
+    extra?: Extension;
   }
 
-  let { path, first, onDoc = undefined }: Props = $props();
+  let { path, first, onDoc = undefined, extra = [] }: Props = $props();
 
   let host = $state<HTMLDivElement | null>(null);
   let loadedBytes = $state(0);
@@ -92,6 +96,7 @@
   let view: EditorView | null = null;
   const editCompartment = new Compartment();
   const settingsCompartment = new Compartment();
+  const extraCompartment = new Compartment();
 
   // Context bridge: this view's selection, published for the reference
   // affordance + chord. The chip floats near the selection's end.
@@ -162,6 +167,15 @@
     const extensions = settingsExtensions();
     if (view !== null) {
       view.dispatch({ effects: settingsCompartment.reconfigure(extensions) });
+    }
+  });
+
+  // Host extension swaps (e.g. markdown live ⇄ source) reconfigure in place —
+  // the document, undo history, and dirty state all survive the flip.
+  $effect(() => {
+    const ext = extra;
+    if (view !== null) {
+      view.dispatch({ effects: extraCompartment.reconfigure(ext) });
     }
   });
 
@@ -246,6 +260,9 @@
       doc: text,
       extensions: [
         settingsCompartment.of(settingsExtensions()),
+        // Before the appended filename-matched language pack, so a host
+        // language in `extra` (markdown live) wins the language facet.
+        extraCompartment.of(extra),
         highlightSpecialChars(),
         drawSelection(),
         bracketMatching(),

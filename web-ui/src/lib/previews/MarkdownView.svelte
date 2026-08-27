@@ -1,25 +1,29 @@
 <script lang="ts">
   /**
-   * Markdown preview (server-rendered comrak GFM, sanitized) with a
-   * preview | split | edit toggle. The edit side is the shared CodeMirror editor
-   * in markdown mode (Cmd/Ctrl+S saves; dirty dot + conflict handling all come
-   * from CodeView). SPLIT shows the editor beside a live preview that re-renders
-   * the editor's buffer client-side as you type — the file is still only written
-   * on save; the plain Preview mode stays the authoritative server render, which
-   * refreshes from disk on save (or an agent write). The editor mounts once and
-   * survives every toggle, so flipping modes never drops an unsaved buffer.
-   * Editing is offered only for files under the 1MB cap; larger markdown stays
-   * preview-only.
+   * Markdown with Obsidian-style modes: live | reading | source.
+   *
+   * LIVE (the default) is an editable reading view — the shared CodeMirror
+   * editor with the mdLive decoration set rendering formatting inline (marks
+   * hidden off the selection's lines, images/checkboxes/rules as widgets).
+   * READING is the complete, non-editable render — the authoritative
+   * server-side comrak GFM (sanitized), which refreshes from disk on save or
+   * an agent write. SOURCE is the same editor as plain raw markdown. Live and
+   * source share ONE editor instance (an extension swap, never a remount), and
+   * the editor mounts once and survives every toggle, so flipping modes never
+   * drops an unsaved buffer or its undo history. Saves, the dirty dot, and
+   * conflict handling all come from CodeView (Cmd/Ctrl+S).
+   * Editing is offered only for files under the 1MB cap; larger markdown
+   * opens straight into reading and stays there.
   */
   import type { Component } from "svelte";
-  import { EDIT_MAX_BYTES, rawTicketUrl, type FileChunk } from "./files";
+  import type { Extension } from "@codemirror/state";
+  import { EDIT_MAX_BYTES, rawTicketUrl, resolveDocPath, type FileChunk } from "./files";
   import { retain, release, type FileEntry } from "./fileStore.svelte";
   import { clearSelection, setSelection } from "../shared/reference";
   import { getSetting } from "../settings/store.svelte";
-  import { renderMarkdown } from "./mdRender";
   import { copyText } from "../shared/clipboard";
   import { copyLabel, copyPayload, decorateCopyTargets } from "../shared/copyDecor";
-  import SplitEditPreview from "./SplitEditPreview.svelte";
+  import type { MarkdownLiveOptions } from "./mdLive";
   import ReferenceChip from "../shared/ReferenceChip.svelte";
   import Spinner from "./Spinner.svelte";
   import { activateUrl, isWebUrl, urlMenuEntries } from "../shared/urlOpen";
@@ -34,74 +38,116 @@
 
   let { path, fontSize = undefined }: Props = $props();
 
-  // Preview base size: the pane override, else the Markdown preference. This
-  // used to fall through to terminal.fontSize, coupling two unrelated content
-  // surfaces and making the Editor settings appear only partly enforced.
+  // Prose base size: the pane override, else the Markdown preference. Drives
+  // the reading body AND the live editor, so the two views read identically.
   const bodyFont = $derived(fontSize ?? getSetting("editor.markdownFontSize"));
   const bodyLineHeight = $derived(getSetting("editor.markdownLineHeight"));
 
-  type Mode = "preview" | "split" | "edit";
-  let mode = $state<Mode>("preview");
+  type Mode = "live" | "reading" | "source";
+  let mode = $state<Mode>("live");
   let chunk = $state<FileChunk | null>(null);
   let chunkError = $state<string | null>(null);
   /** Null until the first fetch tells us whether the file fits the edit cap. */
   let editable = $state<boolean | null>(null);
-  /** The editor mounts on the first split/edit and then persists (CSS-hidden in
-   *  preview) so no toggle drops the unsaved buffer. */
+  /** The editor mounts on the first live/source entry and then persists
+   *  (CSS-hidden in reading) so no toggle drops the unsaved buffer. */
   let entered = $state(false);
   let CodeView = $state<
-    Component<{ path: string; first: FileChunk; onDoc?: (text: string) => void }> | null
+    Component<{ path: string; first: FileChunk; extra?: Extension }> | null
   >(null);
+  let liveFactory = $state<((opts: MarkdownLiveOptions) => Extension) | null>(null);
   let codeLoadError = $state<string | null>(null);
   $effect(() => {
     if (!entered || CodeView !== null) return;
-    void import("./CodeView.svelte").then(
-      (m) => (CodeView = m.default),
+    void Promise.all([import("./CodeView.svelte"), import("./mdLive")]).then(
+      ([cv, live]) => {
+        liveFactory = live.markdownLive;
+        CodeView = cv.default;
+      },
       () => (codeLoadError = "failed to load the editor"),
     );
   });
-  /** The editor's live buffer, and its debounced mirror for the split preview —
-   *  marked.parse + DOMPurify.sanitize over the whole buffer is too heavy to run
-   *  on every keystroke (HtmlView debounces its iframe for the same reason). */
-  let liveSource = $state("");
-  let liveDebounced = $state("");
-  $effect(() => {
-    const src = liveSource;
-    const t = setTimeout(() => (liveDebounced = src), 200);
-    return () => clearTimeout(t);
-  });
-  const liveHtml = $derived(mode === "split" ? renderMarkdown(liveDebounced) : "");
+  // The live extension set is memoized apart from `mode`, so toggling
+  // live ⇄ source reconfigures with the SAME extension objects — CodeMirror
+  // keeps the language/plugin state instead of reparsing the document.
+  const liveExt = $derived(
+    liveFactory === null
+      ? null
+      : liveFactory({ path, fontSize: bodyFont, lineHeight: bodyLineHeight }),
+  );
+  const extra = $derived(mode === "live" && liveExt !== null ? liveExt : []);
 
-  // The shared store entry: preview HTML lives here (cached across tab switches,
-  // and re-rendered in place when the file changes on disk — a save on the edit
-  // side, or an agent write, both flow through the store's revalidation).
+  // The shared store entry: reading HTML lives here (cached across tab
+  // switches, and re-rendered in place when the file changes on disk — a save
+  // in the editor, or an agent write, both flow through the store).
   let entry = $state<FileEntry | null>(null);
-  $effect(() => {
-    const e = retain(path);
-    entry = e;
-    void e.ensureMarkdown();
-    return () => release(path);
-  });
   const html = $derived(entry?.markdown ?? null);
   const error = $derived(entry?.markdownError ?? null);
 
-  // Reset per path.
+  // Retain + reset per path, then open the default mode: live when the file
+  // fits the edit cap, reading otherwise (or when the source fetch fails).
   $effect(() => {
-    void path;
-    mode = "preview";
+    const e = retain(path);
+    mode = "live";
     chunk = null;
     chunkError = null;
     editable = null;
     entered = false;
     codeLoadError = null;
-    liveSource = "";
-    liveDebounced = "";
+    entry = e;
+    void openDefault(e);
+    return () => release(path);
   });
 
-  // --- context bridge: selection in the RENDERED preview ---------------------
+  async function openDefault(e: FileEntry): Promise<void> {
+    await e.ensureChunk();
+    if (entry !== e || chunk !== null) return; // path changed, or a toggle won
+    if (e.chunk !== null) {
+      chunk = e.chunk;
+      editable = e.chunk.size <= EDIT_MAX_BYTES;
+      if (editable) entered = true;
+      else mode = "reading";
+    } else {
+      chunkError = e.chunkError ?? "failed to load source";
+      mode = "reading";
+    }
+  }
+
+  // The server render is fetched on the first reading entry (not eagerly —
+  // the default live mode only needs the raw source). Once populated, the
+  // store refreshes it in place on every disk change or in-app save.
+  $effect(() => {
+    if (mode !== "reading") return;
+    void entry?.ensureMarkdown();
+  });
+
+  async function enterEditor(target: "live" | "source"): Promise<void> {
+    const e = entry;
+    if (e === null || editable === false) return;
+    if (chunk === null) {
+      await e.ensureChunk();
+      if (entry !== e) return;
+      if (e.chunk === null) {
+        chunkError = e.chunkError ?? "failed to load source";
+        return;
+      }
+      chunk = e.chunk;
+      editable = e.chunk.size <= EDIT_MAX_BYTES;
+      if (editable === false) return; // too large; stay in reading
+    }
+    entered = true;
+    mode = target;
+  }
+
+  function setMode(m: Mode): void {
+    if (m === "reading") mode = "reading";
+    else void enterEditor(m);
+  }
+
+  // --- context bridge: selection in the RENDERED reading view ---------------
   // No line mapping exists for rendered markdown, so the reference carries
-  // the path + quoted excerpt only (the edit side goes through CodeView,
-  // which has real line numbers).
+  // the path + quoted excerpt only (live/source go through CodeView, which
+  // has real line numbers).
   const selOwner = {};
   let contentEl = $state<HTMLDivElement | null>(null);
 
@@ -111,35 +157,18 @@
    * and in the native app the shell's navigation guard swallows it. Route it
    * instead — a live local app (loopback / explicit port) opens in a browser
    * pane, anything else in the user's real browser. Delegated on `.md-content`
-   * so it covers the authoritative render AND the live split preview.
+   * so it covers the reading render (the editor consumes its own clicks).
    */
   // Copy chrome on fenced blocks + blockquotes (the same affordance as the
   // chat transcript, via the shared decorator), plus document-relative image
-  // resolution. Re-runs after every render of the authoritative preview or
-  // the split live preview.
+  // resolution. Re-runs after every render of the reading view.
   $effect(() => {
     void html;
-    void liveHtml;
     const content = contentEl;
     if (content === null) return;
     decorateCopyTargets(content);
     stampImages(content);
   });
-
-  /** Resolve `..`/`.` against the document's directory (the server still
-   *  canonicalizes; this only builds the candidate). */
-  function resolveDocPath(rel: string): string {
-    const i = path.lastIndexOf("/");
-    const base = i <= 0 ? "" : path.slice(0, i);
-    const parts = (rel.startsWith("/") ? rel : `${base}/${rel}`).split("/");
-    const out: string[] = [];
-    for (const seg of parts) {
-      if (seg === "" || seg === ".") continue;
-      if (seg === "..") out.pop();
-      else out.push(seg);
-    }
-    return `/${out.join("/")}`;
-  }
 
   /** `![](figs/plot.png)` in a document: the rendered src is relative, which
    *  the browser would resolve against the APP origin (a guaranteed 404).
@@ -159,7 +188,7 @@
       } catch {
         // keep the raw string; the server rejects what it can't canonicalize
       }
-      const target = resolveDocPath(decoded);
+      const target = resolveDocPath(path, decoded);
       rawTicketUrl(target).then(
         (url) => {
           if (img.isConnected && img.dataset.mdSrc === src) img.src = url;
@@ -262,7 +291,7 @@
   }
 
   $effect(() => {
-    if (mode !== "preview") {
+    if (mode !== "reading") {
       chipPos = null;
       clearSelection(selOwner);
       return;
@@ -275,26 +304,7 @@
     };
   });
 
-  async function enterEditor(target: "split" | "edit"): Promise<void> {
-    // Read the raw source from the shared store (cached with the preview HTML);
-    // CodeView handles the rest (background fill for under-cap truncated files
-    // and the save/dirty/conflict flow).
-    const e = entry;
-    if (e === null) return;
-    if (chunk === null && chunkError === null) {
-      await e.ensureChunk();
-      if (e.chunk !== null) {
-        chunk = e.chunk;
-        editable = e.chunk.size <= EDIT_MAX_BYTES;
-      } else {
-        chunkError = e.chunkError ?? "failed to load source";
-        return;
-      }
-    }
-    if (editable === false) return; // too large; stay in preview
-    entered = true;
-    mode = target;
-  }
+  const tooLarge = "over 1 MB — reading only";
 </script>
 
 <div class="md-view" style:--markdown-line-height={bodyLineHeight}>
@@ -302,28 +312,29 @@
     <div class="toggle" role="tablist" aria-label="markdown mode">
       <button
         class="seg"
-        class:on={mode === "preview"}
+        class:on={mode === "live"}
         role="tab"
-        aria-selected={mode === "preview"}
-        onclick={() => (mode = "preview")}>preview</button
+        aria-selected={mode === "live"}
+        title={editable === false ? tooLarge : "reading view you can edit (live preview)"}
+        disabled={editable === false}
+        onclick={() => setMode("live")}>live</button
       >
       <button
         class="seg"
-        class:on={mode === "split"}
+        class:on={mode === "reading"}
         role="tab"
-        aria-selected={mode === "split"}
-        title={editable === false ? "over 1 MB — preview only" : "edit with a live preview"}
-        disabled={editable === false}
-        onclick={() => void enterEditor("split")}>split</button
+        aria-selected={mode === "reading"}
+        title="rendered document"
+        onclick={() => setMode("reading")}>reading</button
       >
       <button
         class="seg"
-        class:on={mode === "edit"}
+        class:on={mode === "source"}
         role="tab"
-        aria-selected={mode === "edit"}
-        title={editable === false ? "over 1 MB — preview only" : "edit source"}
+        aria-selected={mode === "source"}
+        title={editable === false ? tooLarge : "raw markdown source"}
         disabled={editable === false}
-        onclick={() => void enterEditor("edit")}>edit</button
+        onclick={() => setMode("source")}>source</button
       >
     </div>
     {#if chunkError !== null}<span class="md-bar-err">{chunkError}</span>{/if}
@@ -341,13 +352,13 @@
     onclick={onLinkClick}
     oncontextmenu={onLinkContextMenu}
   >
-    {#if mode === "preview" && chipPos !== null}
+    {#if mode === "reading" && chipPos !== null}
       <ReferenceChip x={chipPos.x} y={chipPos.y} />
     {/if}
 
-    <!-- Authoritative server render (comrak). Shown in preview mode; kept in the
-         DOM (just hidden) so re-entering preview needs no re-render. -->
-    <div class="md-scroll" class:hidden={mode !== "preview"} onscroll={syncPreviewSelection}>
+    <!-- Authoritative server render (comrak). Shown in reading mode; kept in
+         the DOM (just hidden) so re-entering reading needs no re-render. -->
+    <div class="md-scroll" class:hidden={mode !== "reading"} onscroll={syncPreviewSelection}>
       {#if error !== null}
         <div class="file-error">{error}</div>
       {:else if html !== null}
@@ -360,27 +371,25 @@
       {/if}
     </div>
 
-    <!-- Editor (+ live preview in split). Mounts on the first split/edit and
-         then persists, CSS-hidden in preview, so no toggle drops the buffer. -->
+    <!-- The one editor (live preview ⇄ raw source via the extra-extension
+         swap). Mounts on the first live/source entry and then persists,
+         CSS-hidden in reading, so no toggle drops the buffer. -->
     {#if entered && chunk !== null}
       {@const first = chunk}
-      <div class="edit-layer" class:hidden={mode === "preview"}>
+      <div class="edit-layer" class:hidden={mode === "reading"}>
         {#if CodeView !== null}
-          <SplitEditPreview split={mode === "split"}>
-            {#snippet editor()}
-              <CodeView {path} {first} onDoc={(t) => (liveSource = t)} />
-            {/snippet}
-            {#snippet preview()}
-              <div class="md-scroll">
-                <article class="md-body" style:font-size="{bodyFont}px">
-                  <!-- eslint-disable-next-line svelte/no-at-html-tags — sanitized in renderMarkdown -->
-                  {@html liveHtml}
-                </article>
-              </div>
-            {/snippet}
-          </SplitEditPreview>
+          <CodeView {path} {first} {extra} />
         {:else if codeLoadError !== null}
           <div class="file-error">{codeLoadError}</div>
+        {:else}
+          <Spinner />
+        {/if}
+      </div>
+    {:else if mode !== "reading"}
+      <!-- The source is still on its way in (openDefault's first fetch). -->
+      <div class="md-scroll">
+        {#if chunkError !== null}
+          <div class="file-error">{chunkError}</div>
         {:else}
           <Spinner />
         {/if}

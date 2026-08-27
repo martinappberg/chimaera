@@ -119,19 +119,29 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
 
 ## Rendered previews
 
-- **Markdown.** `GET /api/v1/fs/markdown?path=` renders GFM → **ammonia-sanitized** HTML
-  (source cap 4 MB). `MarkdownView.svelte`. The mode toggle is **preview | split | edit**:
-  `split` shows the CodeMirror editor beside a **live** preview that re-renders the editor's
-  buffer *client-side* as you type (marked + DOMPurify, `mdRender.ts`) — the file is still
-  only written on Cmd/Ctrl+S, and plain `preview` stays the authoritative server render. The
-  editor mounts once and survives every toggle (CSS-hidden in preview), so no mode flip drops
-  an unsaved buffer. The split geometry is the shared `SplitEditPreview.svelte`. Rendered
-  documents carry the workbench's reading chrome: fenced code blocks and blockquotes get the
-  same hover copy button as the chat transcript (`shared/copyDecor.ts`, one decorator for both
-  surfaces), and **document-relative images** (a `figs/plot.png`-style src) resolve against the file's
-  directory through short-lived `/raw/` tickets (`rawTicketUrl`, memoized so re-renders keep
-  the `src` stable) — web/data URLs pass through untouched. Both apply to the authoritative
-  preview and the live split render.
+- **Markdown.** `MarkdownView.svelte`, with Obsidian-style modes **live | reading | source**:
+  - **live** (the default) is an *editable reading view* — the shared CodeMirror editor
+    (`CodeView`) carrying the `mdLive.ts` extension set (`@codemirror/lang-markdown`, GFM
+    base): headings sized, emphasis/links/inline code styled, syntax marks hidden on every
+    line the selection doesn't touch, images/task-checkboxes/rules rendered as widgets
+    (clicking a checkbox edits the source), blockquotes drawn as the shared quote card, and
+    a small always-visible copy affordance on each fence line. Tables/raw HTML/frontmatter
+    stay as mono source (the full render lives in reading). Mod+click follows links.
+  - **reading** is the complete non-editable render: `GET /api/v1/fs/markdown?path=` →
+    server-side comrak GFM → **ammonia-sanitized** HTML (source cap 4 MB), fetched on first
+    entry and refreshed in place on saves/agent writes.
+  - **source** is the same editor as plain raw markdown (an extension swap in CodeView's
+    `extra` compartment — never a remount, so the buffer, undo history, and dirty state
+    survive every toggle; the file is only written on Cmd/Ctrl+S).
+
+  Rendered documents carry the workbench's reading chrome: fenced code blocks and blockquotes
+  get the same hover copy button as the chat transcript (`shared/copyDecor.ts`, one decorator
+  for both surfaces), and **document-relative images** (a `figs/plot.png`-style src) resolve
+  against the file's directory through short-lived `/raw/` tickets (`rawTicketUrl`, memoized
+  so re-renders keep the `src` stable) — web/data URLs pass through untouched. The live mode
+  mirrors all of it (quote cards, ticketed image widgets, fence copy) inside the editor;
+  raw HTML in a document is **never rendered** there — it stays visible source. Files over
+  the 1MB edit cap open straight into reading and stay there.
 - **Tables (CSV/TSV, incl. gzip).** `GET /api/v1/fs/table?path=&offset_rows=&limit_rows=&delim=auto`
   returns one page (header row + string cells; rows cap 1000/page; delimiter auto-sniffed; `.gz`/`.bgz`
   transparent). `TableView.svelte`. Bioinformatics reality — big delimited files are the norm.
@@ -150,7 +160,8 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
 - **PDF / image / HTML.** Fetched via a short-lived **ticket**: `POST /api/v1/fs/ticket {path}` →
   `GET /raw/{ticket}` (no bearer header — iframes/`<img>`/pdf.js can't send one; ticket TTL 600s,
   range-aware). HTML is sandboxed (`CSP: sandbox allow-scripts`, no-referrer); SVG is sandboxed too.
-  `PdfView`/`ImageView`/`HtmlView`. `HtmlView` carries the same **preview | split | edit** toggle;
+  `PdfView`/`ImageView`/`HtmlView`. `HtmlView` carries a **preview | split | edit** toggle
+  (`SplitEditPreview.svelte` owns the split geometry);
   its split live-preview is a `sandbox="allow-scripts"` `srcdoc` iframe fed the (debounced) editor
   buffer — same origin-less isolation, but relative assets only load in the authoritative `/raw`
   preview, so that mode stays the fidelity reference.
@@ -286,3 +297,15 @@ _Captured 2026-08-27 — confirmed with the maintainer as the feature shipped._
 - **Nothing pinned.** No aspect of the quote-card look or the copy affordances is
   deliberately fixed — later passes may restyle or rework them freely (an Obsidian-like
   editable reading view is already on the wish list).
+
+### Why markdown gets Obsidian-style modes (live | reading | source)
+_Intent pending — drafted from the maintainer's request, 2026-08-27; questionnaire not yet run._
+
+- **Problem it solves (from the request).** The maintainer asked for markdown to behave
+  like Obsidian: "by default a nice reading view that is editable, but also a complete
+  reading mode (that replaces split) and then an edit that shows the source." Markdown is a
+  primary working surface, and the old default (a read-only render with editing a toggle
+  away) put friction in front of the common case — read a document, touch it up in place.
+- **Pending.** The mode names (`live`/`reading`/`source`), the default-to-live choice, and
+  which constructs the live view renders vs leaves as source have not been confirmed with
+  the maintainer — capture via **capture-feature-intent** when available.
