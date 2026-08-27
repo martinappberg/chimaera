@@ -10,6 +10,7 @@ const HOME_HUB_KEY = "chimaera.homeHub";
 /** Set when this window was opened onto a compute-node daemon (Mode 2). */
 const JOB_KEY = "chimaera.job";
 const NODE_KEY = "chimaera.node";
+const DETACHED_KEY = "chimaera.dt";
 
 /**
  * Read the access token, workspace id, host label, and window id from the
@@ -30,8 +31,28 @@ function initFromHash(): string | null {
   const hostFromHash = params.get("host");
   const winFromHash = params.get("win");
   const homeHubFromHash = params.get("hub") === "1";
+  const detachedFromHash = params.get("dt") === "1";
   const jobFromHash = params.get("job");
   const nodeFromHash = params.get("node");
+  if (detachedFromHash) {
+    sessionStorage.setItem(DETACHED_KEY, "1");
+    // A detached browser popup is an auxiliary context: it inherited a CLONE
+    // of the opener's sessionStorage (noopener would make popup-blocking
+    // undetectable, so the opener keeps the handle and severs it instead).
+    // The window-scoped keys are overwritten from the hash above, but chat
+    // drafts are keyed by SESSION — stale copies here would resurrect text
+    // the user already sent or rewrote in the source window. Purge them.
+    const stale: string[] = [];
+    for (let i = 0; i < sessionStorage.length; i++) {
+      const k = sessionStorage.key(i);
+      if (k !== null && k.startsWith("chimaera.chatDraft.")) stale.push(k);
+    }
+    for (const k of stale) sessionStorage.removeItem(k);
+  } else if (winFromHash !== null) {
+    // A hash that names a window without dt=1 is authoritative: this window
+    // is (or became) a plain workbench.
+    sessionStorage.removeItem(DETACHED_KEY);
+  }
   if (homeHubFromHash) {
     // Each daemon origin has its own sessionStorage, so clear anything an
     // earlier visit to that origin left behind before applying this route.
@@ -91,6 +112,20 @@ export function getToken(): string | null {
 
 /** True in the unused native launcher, including while it browses a remote
  * host detail page. Entering a workspace clears this identity. */
+/** Whether this window was opened as a DETACHED solo window (the `dt=1`
+ *  hash param, carried by the shell's window URL and the browser popup).
+ *  Known before the layout blob loads — it is what keeps a solo window off
+ *  the workspace-mirror restore fallback. */
+export function isDetachedWindow(): boolean {
+  return sessionStorage.getItem(DETACHED_KEY) === "1";
+}
+
+/** A solo window converted to (or from) a full workbench in place. */
+export function setDetachedWindow(detached: boolean): void {
+  if (detached) sessionStorage.setItem(DETACHED_KEY, "1");
+  else sessionStorage.removeItem(DETACHED_KEY);
+}
+
 export function isHomeHub(): boolean {
   return sessionStorage.getItem(HOME_HUB_KEY) === "1";
 }

@@ -39,6 +39,9 @@ import {
   sessionPaneId,
   MAX_PANES,
   findPane,
+  soloLayout,
+  adoptTabs,
+  allTabs,
 } from "./layout";
 
 // Pure layout-tree logic — the single most refactor-fragile pure module in the
@@ -341,6 +344,104 @@ describe("whole-pane moves", () => {
     l = splitPane(l, only, "row");
     const before = l;
     expect(movePane(l, l.focusedPaneId, l.focusedPaneId, "center")).toBe(before); // self
+  });
+});
+
+describe("soloLayout (the detached-window seed)", () => {
+  it("is one focus-mode pane holding the torn-off tabs, deduped and pinned", () => {
+    const l = soloLayout(
+      [
+        { surface: "terminal", sessionId: "s1" },
+        { surface: "file", path: "/a.txt", preview: true },
+        { surface: "terminal", sessionId: "s1" }, // dup in the batch
+      ],
+      1,
+    );
+    expect(l.focusMode).toBe(true);
+    expect(panes(l.root)).toHaveLength(1);
+    expect(allTabs(l).map(tabKey)).toEqual(["s:s1", "f:/a.txt"]);
+    // A detach is a deliberate move: the preview tab pinned on the way in.
+    const file = allTabs(l).find((t) => t.surface === "file");
+    expect(file?.surface === "file" && file.preview).toBeUndefined();
+    // The sender's active index survives.
+    const p = panes(l.root)[0];
+    expect(tabKey(p.tabs[p.active])).toBe("f:/a.txt");
+  });
+
+  it("carries the source pane's font override, clamped, and round-trips", () => {
+    const l = soloLayout([{ surface: "terminal", sessionId: "s1" }], 0, 15);
+    expect(panes(l.root)[0].fontSize).toBe(15);
+    const restored = deserializeLayout(serializeLayout(l));
+    expect(restored).not.toBeNull();
+    expect(restored!.focusMode).toBe(true);
+    expect(panes(restored!.root)[0].fontSize).toBe(15);
+    expect(allSessionIds(restored!)).toEqual(["s1"]);
+  });
+
+  it("an out-of-range active index clamps instead of corrupting the pane", () => {
+    const l = soloLayout([{ surface: "terminal", sessionId: "s1" }], 7);
+    expect(panes(l.root)[0].active).toBe(0);
+  });
+});
+
+describe("adoptTabs (the receiving half of a cross-window move)", () => {
+  const term = (id: string): Tab => ({ surface: "terminal", sessionId: id });
+
+  it("null spot appends to the focused pane and honors activeKey", () => {
+    let l = openSession(defaultLayout(), "here");
+    l = adoptTabs(l, [term("a"), term("b")], null, "s:a");
+    expect(panes(l.root)).toHaveLength(1);
+    expect(allSessionIds(l)).toEqual(["here", "a", "b"]);
+    expect(focusedSession(l)).toBe("a");
+  });
+
+  it("an edge spot splits the root ONCE; the rest stack into the new pane", () => {
+    let l = openSession(defaultLayout(), "here");
+    l = adoptTabs(l, [term("a"), term("b")], { kind: "edge", edge: "right" }, "s:b");
+    expect(panes(l.root)).toHaveLength(2);
+    const landed = sessionPaneId(l, "a");
+    expect(sessionPaneId(l, "b")).toBe(landed);
+    expect(landed).not.toBe(sessionPaneId(l, "here"));
+    expect(focusedSession(l)).toBe("b");
+  });
+
+  it("a zone spot drops into the target pane", () => {
+    let l = openSession(defaultLayout(), "here");
+    const target = l.focusedPaneId;
+    l = adoptTabs(l, [term("a")], { kind: "zone", paneId: target, zone: "center" }, "s:a");
+    expect(sessionPaneId(l, "a")).toBe(target);
+  });
+
+  it("a surface already open here just activates (adoption still converges)", () => {
+    let l = openSession(defaultLayout(), "dup");
+    l = openFile(l, "/other.txt"); // /other.txt active now
+    const before = tabCount(l);
+    l = adoptTabs(l, [term("dup")], null, "s:dup");
+    expect(tabCount(l)).toBe(before); // no duplicate minted
+    expect(focusedSession(l)).toBe("dup"); // but the existing tab activated
+  });
+
+  it("a stale spot (its pane closed) degrades to append, never a dropped tab", () => {
+    const l0 = openSession(defaultLayout(), "here");
+    const l = adoptTabs(l0, [term("a")], { kind: "zone", paneId: "gone", zone: "center" });
+    expect(allSessionIds(l)).toContain("a");
+  });
+
+  it("adopting a serialized solo payload round-trips tabs and active", () => {
+    const payload = serializeLayout(soloLayout([term("a"), term("b")], 1));
+    const decoded = deserializeLayout(JSON.parse(JSON.stringify(payload)));
+    expect(decoded).not.toBeNull();
+    const pane = panes(decoded!.root)[0];
+    const activeKey = tabKey(pane.tabs[pane.active]);
+    let l = openSession(defaultLayout(), "here");
+    l = adoptTabs(l, allTabs(decoded!), null, activeKey);
+    expect(allSessionIds(l)).toEqual(["here", "a", "b"]);
+    expect(focusedSession(l)).toBe("b");
+  });
+
+  it("an empty batch is a no-op with the same reference", () => {
+    const l = openSession(defaultLayout(), "here");
+    expect(adoptTabs(l, [], null)).toBe(l);
   });
 });
 

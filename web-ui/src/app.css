@@ -267,17 +267,19 @@ body {
   padding: 12px 8px 12px 14px;
 }
 
-/* Drag & drop chrome (the ghost is a body-level element). */
+/* Drag & drop chrome (the ghost is a body-level element). Flex so the label
+   truncates while the out-of-window hint — the detach affordance — always
+   renders whole. */
 .drag-ghost {
   position: fixed;
   top: 0;
   left: 0;
   z-index: 1000;
   pointer-events: none;
+  display: flex;
+  align-items: center;
   padding: 3px 10px;
   max-width: 240px;
-  overflow: hidden;
-  text-overflow: ellipsis;
   white-space: nowrap;
   background: var(--overlay-bg);
   border: 1px solid var(--edge);
@@ -288,6 +290,34 @@ body {
   color: var(--fg);
   opacity: 0.92;
   will-change: transform;
+}
+
+.drag-ghost .ghost-label {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Out-of-window state: the pointer left the viewport on a detach-armed drag.
+   The ghost clamps to the edge (dnd.ts) and grows the hint chip; the accent
+   border says "releasing does something new". */
+.drag-ghost .ghost-hint {
+  display: none;
+}
+.drag-ghost.out {
+  border-color: var(--accent);
+  /* Room for label + the whole hint; dnd's edge clamp reserves this width. */
+  max-width: 340px;
+}
+.drag-ghost.out .ghost-hint {
+  display: inline;
+  flex: none;
+  margin-left: 8px;
+  padding-left: 8px;
+  border-left: 1px solid var(--edge);
+  color: var(--accent);
+  font-family: var(--ui-font);
 }
 
 body.dragging {

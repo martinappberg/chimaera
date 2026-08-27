@@ -23,6 +23,7 @@
   import { contextMenu, type ContextMenuEntry } from "../shared/contextMenu.svelte";
   import { writeClipboard } from "../net/native";
   import { dirtyFiles } from "../shared/editing";
+  import { volatileChatDrafts } from "../chat/drafts";
   import { gitIndex } from "../workspace/git";
   import { decoFor } from "../workspace/gitDeco";
   import { PINNED } from "../shared/keys";
@@ -37,9 +38,6 @@
     node: PaneNode;
     /** True while this pane is rendered zoomed (fullscreen in the window). */
     zoomed?: boolean;
-    /** True when this is the only pane — the grip (which moves a pane between
-     *  splits) has nowhere to go, so it hides. */
-    soloPane?: boolean;
     sessions: Map<string, Session>;
     names: Map<string, string>;
     /** Open-file tab titles (basename, disambiguated), keyed by path. */
@@ -56,7 +54,6 @@
   let {
     node,
     zoomed = false,
-    soloPane = false,
     sessions,
     names,
     fileNames,
@@ -337,13 +334,54 @@
     }
   }
 
+  /** The cross-window section every surface gets: tear out into a new
+   *  window, or move into a live sibling window (same host + workspace).
+   *  Dirty files are blocked — their unsaved buffer lives in THIS window.
+   *  The roster is the last refresh's snapshot; refreshing here (fire-and-
+   *  forget) keeps it current for the next open. */
+  function moveEntries(tab: Tab, i: number): ContextMenuEntry[] {
+    ctrl.refreshMoveTargets();
+    const dirty =
+      (tab.surface === "file" && $dirtyFiles.has(tab.path)) ||
+      (tab.surface === "terminal" && $volatileChatDrafts.has(tab.sessionId));
+    const hint = dirty
+      ? tab.surface === "file"
+        ? "save the file first — moving would drop unsaved edits"
+        : "send or clear the chat draft first — it cannot follow to another window"
+      : undefined;
+    const rows: ContextMenuEntry[] = [
+      {
+        label: "Move to New Window",
+        disabled: dirty,
+        hint,
+        onSelect: () => ctrl.detachTabToWindow(node.id, i),
+      },
+    ];
+    for (const w of ctrl.moveTargets()) {
+      rows.push({
+        label: `Move to “${w.label || "window"}”`,
+        disabled: dirty,
+        hint,
+        onSelect: () => ctrl.moveTabToWindow(node.id, i, w.winId),
+      });
+    }
+    rows.push("separator");
+    return rows;
+  }
+
   function tabMenu(tab: Tab, i: number): ContextMenuEntry[] {
     const close: ContextMenuEntry = {
       label: "Close",
       onSelect: () => ctrl.closeTab(node.id, i),
     };
+    const move = moveEntries(tab, i);
     if (tab.surface === "terminal") {
-      return [{ label: "Rename…", onSelect: () => beginTabRename(tab) }, "separator", close];
+      return [
+        { label: "Rename…", onSelect: () => beginTabRename(tab) },
+        "separator",
+        ...move,
+        close,
+      ];
     }
     if (tab.surface === "browser") {
       return [
@@ -357,6 +395,7 @@
               "separator" as const,
             ]
           : []),
+        ...move,
         close,
       ];
     }
@@ -379,15 +418,16 @@
           : []),
         { label: "Copy Path", onSelect: () => void copyPath(tab.path) },
         "separator",
+        ...move,
         close,
       ];
     }
-    return [close];
+    return [...move, close];
   }
 </script>
 
 <div class="bar" bind:this={el} onpointerdowncapture={onBarPointerDown}>
-  {#if !zoomed && !soloPane}
+  {#if !zoomed}
     <!-- Pane grip: fades in on bar hover; drag it to move the WHOLE pane (all
          tabs) to another split. A plain click focuses the pane. Being a
          <button>, the bar's active-tab drag ignores it (closest("button")). -->

@@ -402,8 +402,11 @@ export async function reportWindowScope(
   alias: string | null,
   ws: string | null,
   label: string | null,
+  detached = false,
 ): Promise<void> {
-  await tauri()?.core.invoke<void>("report_window_scope", { alias, ws, label });
+  // `detached` is set-only shell-side: true re-asserts a restored detached
+  // window's flag (its blob carries dt:1); false never clears anything.
+  await tauri()?.core.invoke<void>("report_window_scope", { alias, ws, label, detached });
 }
 
 /**
@@ -542,4 +545,168 @@ export async function navigateHome(alias: string | null, wsId: string | null = n
   const t = tauri();
   if (t === null) throw new Error("Home navigation requires the native shell");
   await t.core.invoke<void>("navigate_home", { alias, wsId });
+}
+
+/**
+ * Native half of pane detach: a real OS window booting on a PRE-SEEDED
+ * window id (the caller PUT the `dt:1` solo layout blob under `winId`
+ * first). `at` is the drop point in THIS window's client coords plus the
+ * desired inner size — the shell lifts them into screen space itself; it
+ * never trusts webview screen coordinates. The shell also derives the host
+ * from this window's registered scope, so there is no alias parameter.
+ */
+export async function openDetachedWindow(
+  wsId: string,
+  winId: string,
+  at: { x: number; y: number; w: number; h: number },
+): Promise<void> {
+  const t = tauri();
+  if (t === null) throw new Error("not in the native shell");
+  // `at` is one nested argument (the command takes a DetachAt struct) — a
+  // flat spread would fail Tauri's per-key argument extraction.
+  await t.core.invoke<void>("open_detached_window", {
+    wsId,
+    winId,
+    at: { x: at.x, y: at.y, width: at.w, height: at.h },
+  });
+}
+
+// --- cross-window drag / adopt (shell-routed; see crossWindow.ts) ----------
+
+/** A sibling window tabs can move to (list_scope_windows / the tray). */
+export interface ScopeWindow {
+  win_id: string;
+  label: string;
+  detached: boolean;
+}
+
+/** An `xdrag` event targeted at THIS window, coords in its client px. */
+export interface XdragEvent {
+  phase: "over" | "leave" | "drop";
+  x?: number;
+  y?: number;
+  transfer?: number;
+  payload?: unknown;
+}
+
+/** Track an out-of-window drag: resolves whether a sibling window is under
+ *  the pointer (client coords — the shell owns the screen-space math).
+ *  `drag` fences late frames: a track for an already-ended drag is ignored
+ *  shell-side, so it can never re-light a target a cancel just cleared.
+ *  Rejections degrade to "nothing there" — this runs per animation frame. */
+export async function dragTrack(x: number, y: number, drag: number): Promise<boolean> {
+  try {
+    return (await tauri()?.core.invoke<boolean>("drag_track", { x, y, drag })) ?? false;
+  } catch {
+    return false;
+  }
+}
+
+/** Route the release. `transfer` is SENDER-minted (see mintTransfer) so the
+ *  ledger is armed before this call — the target's ack can never beat the
+ *  entry it resolves against. */
+export async function dragDrop(
+  x: number,
+  y: number,
+  drag: number,
+  transfer: number,
+  payload: unknown,
+): Promise<{ routed: boolean }> {
+  return (
+    (await tauri()?.core.invoke<{ routed: boolean }>("drag_drop", {
+      at: { x, y },
+      drag,
+      transfer,
+      payload,
+    })) ?? { routed: false }
+  );
+}
+
+export async function dragCancel(drag: number): Promise<void> {
+  await tauri()?.core.invoke<void>("drag_cancel", { drag });
+}
+
+export async function adoptAck(transfer: number, ok: boolean): Promise<void> {
+  await tauri()?.core.invoke<void>("adopt_ack", { transfer, ok });
+}
+
+/** Menu-path adopt into the window with stable id `targetWinId`. The
+ *  sender-minted `transfer` was armed in the ledger before this call. */
+export async function adoptTab(
+  targetWinId: string,
+  transfer: number,
+  payload: unknown,
+): Promise<void> {
+  const t = tauri();
+  if (t === null) throw new Error("not in the native shell");
+  await t.core.invoke<void>("adopt_tab", { targetWinId, transfer, payload });
+}
+
+export async function listScopeWindows(): Promise<ScopeWindow[]> {
+  return (await tauri()?.core.invoke<ScopeWindow[]>("list_scope_windows", {})) ?? [];
+}
+
+/** Incoming cross-window drag traffic for THIS window (window-scoped, like
+ *  onMenu). No-op unsubscriber in the browser. */
+export function onXdrag(handler: (e: XdragEvent) => void): Promise<() => void> {
+  const t = tauri();
+  if (t === null) return Promise.resolve(() => {});
+  return t.webviewWindow
+    .getCurrentWebviewWindow()
+    .listen<XdragEvent>("xdrag", (e) => handler(e.payload));
+}
+
+/** Acks for transfers THIS window initiated (drag drops and menu adopts). */
+export function onXdragAck(
+  handler: (e: { transfer: number; ok: boolean }) => void,
+): Promise<() => void> {
+  const t = tauri();
+  if (t === null) return Promise.resolve(() => {});
+  return t.webviewWindow
+    .getCurrentWebviewWindow()
+    .listen<{ transfer: number; ok: boolean }>("xdrag-ack", (e) => handler(e.payload));
+}
+
+/**
+ * Browser half of pane detach: a popup window booting on a PRE-SEEDED window
+ * id (the caller PUT the solo layout blob under `winId` first — same
+ * sessionStorage-clone defense as openWindow, the id just isn't fresh-minted
+ * here). Position/size are best-effort screen coords from the drop point.
+ * Returns false when a popup blocker ate it, so the caller keeps the tabs —
+ * which is why this opens WITH an opener (a `noopener` open always returns
+ * null and would make a block undetectable); the handle's opener is severed
+ * right after, keeping the two windows as uncoupled as openWindow's.
+ */
+export function openDetachedPopup(
+  winId: string,
+  wsId: string,
+  at: { x: number; y: number; w: number; h: number },
+): boolean {
+  const token = getToken();
+  const params = new URLSearchParams();
+  if (token !== null) params.set("token", token);
+  params.set("ws", wsId);
+  params.set("win", winId);
+  // dt=1 is how the child knows it is a solo window BEFORE its layout blob
+  // loads (no workspace-mirror fallback), and what triggers its purge of the
+  // chat-draft keys this auxiliary context cloned from us.
+  params.set("dt", "1");
+  const host = getHostLabel();
+  if (host !== "local") params.set("host", host);
+  const job = getJobContext();
+  if (job !== null) {
+    params.set("job", job.jobId);
+    if (job.node !== null) params.set("node", job.node);
+  }
+  const features = [
+    "popup=yes",
+    `width=${Math.round(at.w)}`,
+    `height=${Math.round(at.h)}`,
+    `left=${Math.round(at.x)}`,
+    `top=${Math.round(at.y)}`,
+  ].join(",");
+  const popup = window.open(`${location.origin}/#${params.toString()}`, "_blank", features);
+  if (popup === null) return false;
+  popup.opener = null;
+  return true;
 }

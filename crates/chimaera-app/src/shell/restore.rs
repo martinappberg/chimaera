@@ -72,6 +72,13 @@ pub fn open_ui_window(
     token: &str,
     record: &WindowRecord,
 ) -> tauri::Result<()> {
+    // Detachedness is the record's property, routed here so EVERY reopen
+    // path — launch restore, a remote reconnect's window reopening, recover —
+    // resurrects a torn-off solo window as detached instead of as a plain,
+    // raise-eligible workbench that only becomes solo once the SPA notices.
+    if record.detached {
+        return open_detached_ui_window(app, port, token, record);
+    }
     let home_hub = record.alias.is_none() && record.ws.is_none() && record.compute.is_none();
     let appearance = lock(&app.state::<Shell>().appearance).get(record.alias.as_deref());
     let url = daemon_window_url(
@@ -80,7 +87,11 @@ pub fn open_ui_window(
         &record.id,
         record.ws.as_deref(),
         record.alias.as_deref(),
-        home_hub,
+        if home_hub {
+            WindowUrlKind::HomeHub
+        } else {
+            WindowUrlKind::Workbench
+        },
         appearance.as_ref(),
     )?;
     let title = match &record.alias {
@@ -91,16 +102,58 @@ pub fn open_ui_window(
     open_shell_window(app, url.as_str(), &title, record, scope)
 }
 
-/// One daemon-served window URL. The unused Home launcher carries `hub=1`
-/// across local↔remote navigation so each origin clears stale route state.
-/// Entering a workspace then promotes it into an ordinary workbench window.
+/// Open a DETACHED solo window (a pane torn out of another window). Same
+/// wiring as `open_ui_window` — the record's id points at the pre-seeded
+/// `dt:1` view-state blob; never a home hub (it always carries a workspace) —
+/// but the registered scope is flagged detached so focus-existing raises
+/// never mistake it for the real workspace window, and the URL carries `dt=1`
+/// so the SPA knows it is a solo window BEFORE its blob loads (no mirror
+/// fallback, no re-assert window).
+pub(super) fn open_detached_ui_window(
+    app: &AppHandle,
+    port: u16,
+    token: &str,
+    record: &WindowRecord,
+) -> tauri::Result<()> {
+    let appearance = lock(&app.state::<Shell>().appearance).get(record.alias.as_deref());
+    let url = daemon_window_url(
+        port,
+        token,
+        &record.id,
+        record.ws.as_deref(),
+        record.alias.as_deref(),
+        WindowUrlKind::Detached,
+        appearance.as_ref(),
+    )?;
+    let title = match &record.alias {
+        Some(alias) => format!("{alias} — chimaera"),
+        None => "chimaera".to_string(),
+    };
+    let scope =
+        WindowScope::new_detached(record.alias.clone(), record.ws.clone(), record.id.clone());
+    open_shell_window(app, url.as_str(), &title, record, scope)
+}
+
+/// What the window at a daemon URL IS — the three modes are mutually
+/// exclusive: the unused Home launcher carries `hub=1` across local↔remote
+/// navigation so each origin clears stale route state, and a torn-off solo
+/// window carries `dt=1` so the SPA knows it is detached BEFORE its layout
+/// blob loads.
+#[derive(Clone, Copy, PartialEq)]
+pub(super) enum WindowUrlKind {
+    Workbench,
+    HomeHub,
+    Detached,
+}
+
+/// One daemon-served window URL.
 pub(super) fn daemon_window_url(
     port: u16,
     token: &str,
     stable_id: &str,
     ws: Option<&str>,
     alias: Option<&str>,
-    home_hub: bool,
+    kind: WindowUrlKind,
     appearance: Option<&crate::appearance::AppearanceBootstrap>,
 ) -> tauri::Result<tauri::Url> {
     let mut hash = format!("token={}", urlencoding::encode(token));
@@ -111,8 +164,10 @@ pub(super) fn daemon_window_url(
     if let Some(alias) = alias {
         hash.push_str(&format!("&host={}", urlencoding::encode(alias)));
     }
-    if home_hub {
-        hash.push_str("&hub=1");
+    match kind {
+        WindowUrlKind::Workbench => {}
+        WindowUrlKind::HomeHub => hash.push_str("&hub=1"),
+        WindowUrlKind::Detached => hash.push_str("&dt=1"),
     }
     if let Some(appearance) = appearance {
         hash.push_str("&appearance=");

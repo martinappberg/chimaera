@@ -37,6 +37,25 @@ export async function loadViewState(key: string): Promise<unknown> {
   }
 }
 
+/**
+ * Immediate PUT, bypassing the debounce: pre-seeding a DETACHED window's blob
+ * must complete before that window opens and GETs it, an ordering the
+ * debounced path cannot promise. Resolves false when the daemon refused or
+ * was unreachable (the caller keeps the tabs instead of detaching).
+ */
+export async function putViewState(key: string, state: unknown): Promise<boolean> {
+  try {
+    const res = await api(`/view-state/${key}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(state),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
 let timer: ReturnType<typeof setTimeout> | null = null;
 // Pending writes keyed BY view-state key: a single flush window may target more
 // than one key (e.g. the window-scoped key AND the workspace-scoped mirror), so

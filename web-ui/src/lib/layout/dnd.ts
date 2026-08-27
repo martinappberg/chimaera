@@ -40,7 +40,13 @@ export type DropSpot =
   /** An agent's rail row, highlighted while a shell terminal is dragged over
    *  it — the always-present link target (the agent needn't be open in a
    *  pane). See startDrag's linkSessions. */
-  | { kind: "linkrow"; sessionId: string };
+  | { kind: "linkrow"; sessionId: string }
+  /** The pointer left the WINDOW (past the viewport + a small hysteresis):
+   *  releasing detaches the payload into its own window at the drop point.
+   *  Client coords are the last in-window frame's; screen coords are the
+   *  browser's best effort for placing the new window. Armed only by
+   *  DragOptions.allowOut — link/reference drags never tear out. */
+  | { kind: "out"; clientX: number; clientY: number; screenX: number; screenY: number };
 
 export interface DragPayload {
   /** The surface being dragged (terminal session or file preview). Absent for
@@ -140,6 +146,21 @@ export interface LayoutCtrl {
    * pane-bar toggle). Confirms with the user when the agent is mid-task.
    */
   switchView(sessionId: string, target: "chat" | "term"): void;
+  /**
+   * Tear the tab at `index` out into its own window (the context-menu
+   * sibling of the drag-out gesture; the new window opens near the pane).
+   */
+  detachTabToWindow(paneId: string, index: number): void;
+  /**
+   * Sibling windows (same host + workspace) the move menu offers. A cached
+   * snapshot — `refreshMoveTargets` updates it in the background, so a menu
+   * built synchronously reads the previous refresh's roster.
+   */
+  moveTargets(): { winId: string; label: string; detached: boolean }[];
+  refreshMoveTargets(): void;
+  /** Move the tab at `index` into the sibling window `winId` (adopt-on-ack:
+   *  the tab leaves this window only when the other one confirms). */
+  moveTabToWindow(paneId: string, index: number, winId: string): void;
 }
 
 interface PaneReg {
@@ -225,7 +246,9 @@ export interface DragCallbacks {
 
 const DRAG_THRESHOLD_PX = 4;
 
-function sameSpot(a: DropSpot | null, b: DropSpot | null): boolean {
+/** Logical drop-spot equality (exported for the cross-window over stream,
+ *  which must not rewrite `dropSpot` — and force layout — on every frame). */
+export function sameSpot(a: DropSpot | null, b: DropSpot | null): boolean {
   if (a === null || b === null) return a === b;
   if (a.kind !== b.kind) return false;
   if (a.kind === "edge" && b.kind === "edge") return a.edge === b.edge;
@@ -237,7 +260,23 @@ function sameSpot(a: DropSpot | null, b: DropSpot | null): boolean {
   if (a.kind === "linktab" && b.kind === "linktab")
     return a.paneId === b.paneId && a.index === b.index;
   if (a.kind === "linkrow" && b.kind === "linkrow") return a.sessionId === b.sessionId;
+  // Out is one logical spot regardless of coords (update() refreshes the
+  // coords in place so the eventual drop still lands at the release point).
+  if (a.kind === "out" && b.kind === "out") return true;
   return false;
+}
+
+/** Hysteresis past the viewport edge before a drag reads as "out the window",
+ *  so pixel jitter at the boundary can't flicker between edge and out spots. */
+const OUT_MARGIN_PX = 8;
+
+function outOfViewport(x: number, y: number): boolean {
+  return (
+    x < -OUT_MARGIN_PX ||
+    y < -OUT_MARGIN_PX ||
+    x > window.innerWidth + OUT_MARGIN_PX ||
+    y > window.innerHeight + OUT_MARGIN_PX
+  );
 }
 
 /** Edge bands are ~25% of the pane; the middle half-by-half is "center". */
@@ -390,10 +429,28 @@ function spotAt(
   return null;
 }
 
+/**
+ * Hit-test for an INCOMING cross-window drag: the shell forwards a sibling
+ * window's pointer in THIS window's client coords, and the target renders
+ * the same zone/tab/edge previews a local drag would. No ref/link bands —
+ * those belong to in-window payload drags.
+ */
+export function dropSpotAt(x: number, y: number): DropSpot | null {
+  return spotAt(x, y, null, undefined, undefined, false);
+}
+
 function makeGhost(label: string): HTMLDivElement {
   const ghost = document.createElement("div");
   ghost.className = "drag-ghost";
-  ghost.textContent = label;
+  const name = document.createElement("span");
+  name.className = "ghost-label";
+  name.textContent = label;
+  // The out-of-window hint: hidden by CSS until the ghost wears `.out`
+  // (the pointer left the viewport on a detach-armed drag).
+  const hint = document.createElement("span");
+  hint.className = "ghost-hint";
+  hint.textContent = "open as new window";
+  ghost.append(name, hint);
   document.body.appendChild(ghost);
   return ghost;
 }
@@ -503,6 +560,23 @@ export interface DragOptions {
    * move. (A plain tab drag keeps the precise band via linkTargets instead.)
    */
   linkIntent?: boolean;
+  /**
+   * Leaving the viewport arms the {kind:"out"} spot: releasing detaches the
+   * payload into its own window. Off by default — only drags whose drop
+   * handler actually implements detach opt in, and link/reference gestures
+   * never do.
+   */
+  allowOut?: boolean;
+  /**
+   * Native shell only: called (rAF-throttled) while the pointer is out, so
+   * the shell can hit-test sibling windows and light the hovered one up.
+   * Resolves whether a sibling is under the pointer — the ghost hint flips
+   * between "open as new window" and "move into window" accordingly.
+   */
+  trackOut?: (clientX: number, clientY: number) => Promise<boolean>;
+  /** The pointer came back inside the viewport mid-drag: clear any sibling
+   *  highlight trackOut lit (the shell's leave event). */
+  trackEnd?: () => void;
 }
 
 /**
@@ -526,8 +600,16 @@ export function startDrag(
   let raf = 0;
   let lastX = sx;
   let lastY = sy;
+  // Screen coords ride along for the out-of-window drop (window placement);
+  // client coords are useless outside the viewport.
+  let lastSX = e.screenX;
+  let lastSY = e.screenY;
   let spot: DropSpot | null = null;
   let done = false;
+  // Out-of-window tracking (native cross-window drags).
+  let wasOut = false;
+  let outTarget = false;
+  let trackSeq = 0;
 
   try {
     source?.setPointerCapture(pointerId);
@@ -541,20 +623,50 @@ export function startDrag(
 
   const update = () => {
     raf = 0;
-    if (ghost !== null) {
-      ghost.style.transform = `translate(${lastX + 14}px, ${lastY + 10}px)`;
+    const out = opts.allowOut === true && outOfViewport(lastX, lastY);
+    if (out !== wasOut) {
+      wasOut = out;
+      if (!out) {
+        // Back inside: whatever sibling window the shell lit up must unlight
+        // — and the hint TEXT resets with the cached state, or the next
+        // out-phase's `over === outTarget` short-circuit would leave a stale
+        // "move into window" showing over bare desktop.
+        outTarget = false;
+        const hint = ghost?.querySelector<HTMLElement>(".ghost-hint");
+        if (hint !== null && hint !== undefined) hint.textContent = "open as new window";
+        opts.trackEnd?.();
+      }
     }
-    const next = spotAt(
-      lastX,
-      lastY,
-      refFor,
-      opts.linkTargets,
-      opts.linkSessions,
-      opts.linkIntent === true,
-    );
+    if (out && opts.trackOut !== undefined) {
+      const seq = ++trackSeq;
+      void opts.trackOut(lastX, lastY).then((over) => {
+        if (seq !== trackSeq || done || over === outTarget) return;
+        outTarget = over;
+        const hint = ghost?.querySelector<HTMLElement>(".ghost-hint");
+        if (hint !== null && hint !== undefined) {
+          hint.textContent = over ? "move into window" : "open as new window";
+        }
+      });
+    }
+    if (ghost !== null) {
+      // Outside the viewport the ghost clamps to the nearest edge (it cannot
+      // follow the OS cursor out) and wears the hint. The reserve matches the
+      // .drag-ghost.out max-width so the widened ghost never overhangs.
+      const gx = out ? Math.min(Math.max(lastX + 14, 8), window.innerWidth - 350) : lastX + 14;
+      const gy = out ? Math.min(Math.max(lastY + 10, 8), window.innerHeight - 40) : lastY + 10;
+      ghost.style.transform = `translate(${gx}px, ${gy}px)`;
+      ghost.classList.toggle("out", out);
+    }
+    const next: DropSpot | null = out
+      ? { kind: "out", clientX: lastX, clientY: lastY, screenX: lastSX, screenY: lastSY }
+      : spotAt(lastX, lastY, refFor, opts.linkTargets, opts.linkSessions, opts.linkIntent === true);
     if (!sameSpot(next, spot)) {
       spot = next;
       cb.onSpot(spot);
+    } else if (next !== null && next.kind === "out") {
+      // Same logical spot, fresher coords: keep them without re-notifying so
+      // the drop lands where the pointer actually released.
+      spot = next;
     }
     if (leash !== null) drawLeash(leash, sx, sy, lastX, lastY, spot);
   };
@@ -563,6 +675,8 @@ export function startDrag(
     if (ev.pointerId !== pointerId) return;
     lastX = ev.clientX;
     lastY = ev.clientY;
+    lastSX = ev.screenX;
+    lastSY = ev.screenY;
     if (!active) {
       if (Math.hypot(lastX - sx, lastY - sy) < DRAG_THRESHOLD_PX) return;
       active = true;

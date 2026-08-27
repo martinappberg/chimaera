@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-drag-cancel"
+description = "Enables the drag_cancel command without any pre-configured scope."
+commands.allow = ["drag_cancel"]
+
+[[permission]]
+identifier = "deny-drag-cancel"
+description = "Denies the drag_cancel command without any pre-configured scope."
+commands.deny = ["drag_cancel"]
