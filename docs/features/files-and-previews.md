@@ -277,8 +277,12 @@ _Captured 2026-07-10 (from the maintainer)._
   grade (open to change). The download-hidden-on-local / shown-on-remote rule follows directly from
   the remote→local retrieval *why* above.
 
-### Why markdown previews carry reading chrome (copy + inline images) — _Intent pending_
+### Why markdown previews carry reading chrome (copy + inline images)
+_Captured 2026-08-27 — confirmed with the maintainer as the feature shipped._
 
-_2026-08-27: shipped with the chat clean-copy fix; the maintainer's stated driver was that
-markdown is a primary working surface ("we interact a lot with markdown files") and quoted
-prose/figures must move cleanly into external documents (Word). Full questionnaire pending._
+- **Problem it solves.** Markdown is a primary working surface ("we interact a lot with
+  markdown files"), and quoted prose/figures must move cleanly into external documents
+  (Word). Confirmed verbatim by the maintainer.
+- **Nothing pinned.** No aspect of the quote-card look or the copy affordances is
+  deliberately fixed — later passes may restyle or rework them freely (an Obsidian-like
+  editable reading view is already on the wish list).
