@@ -65,27 +65,33 @@
     '<path d="M3.5 8.5l3 3 6-6.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>' +
     "</svg>";
 
-  /** Give every fenced block a copy affordance. The {@html} flush rebuilds the
-   *  whole subtree per streaming chunk, so this re-runs from the same per-chunk
-   *  hook as stampPaths — fresh DOM each pass, nothing leaks. APPEND-only, no
-   *  reparenting: Svelte tears {@html} content down by walking the live sibling
-   *  chain between its tracked first/last nodes, so wrapping a TOP-LEVEL pre
-   *  in a new div would strand the walk inside the wrapper and leak/duplicate
-   *  DOM every chunk. Instead the button lives inside the pre and the CODE
-   *  child is made the horizontal scroller, so the pre stays a non-scrolling
-   *  anchor the button can pin to. Runs BEFORE wrapWords so the reveal
-   *  bookkeeping hides the button with its still-unrevealed block. */
-  function decorateCodeBlocks(root: HTMLElement) {
-    for (const pre of root.querySelectorAll("pre")) {
-      if (pre.querySelector(":scope > button.md-copy") !== null) continue;
+  /** Give every fenced block AND blockquote a copy affordance (agents quote
+   *  source prose back constantly — pasting a quote onward is the same need as
+   *  copying code). The {@html} flush rebuilds the whole subtree per streaming
+   *  chunk, so this re-runs from the same per-chunk hook as stampPaths — fresh
+   *  DOM each pass, nothing leaks. APPEND-only, no reparenting: Svelte tears
+   *  {@html} content down by walking the live sibling chain between its tracked
+   *  first/last nodes, so wrapping a TOP-LEVEL pre in a new div would strand
+   *  the walk inside the wrapper and leak/duplicate DOM every chunk. Instead
+   *  the button lives inside the host and (for pre) the CODE child is made the
+   *  horizontal scroller, so the host stays a non-scrolling anchor the button
+   *  can pin to. Runs BEFORE wrapWords so the reveal bookkeeping hides the
+   *  button with its still-unrevealed block. */
+  function decorateCopyTargets(root: HTMLElement) {
+    for (const host of root.querySelectorAll("pre, blockquote")) {
+      if (host.querySelector(":scope > button.md-copy") !== null) continue;
       const btn = document.createElement("button");
       btn.type = "button";
       btn.className = "md-copy";
-      btn.setAttribute("aria-label", "copy code");
+      btn.setAttribute("aria-label", copyLabel(host));
       btn.title = "copy";
       btn.innerHTML = COPY_BUTTON_SVG;
-      pre.appendChild(btn);
+      host.appendChild(btn);
     }
+  }
+
+  function copyLabel(host: Element): string {
+    return host.tagName === "BLOCKQUOTE" ? "copy quote" : "copy code";
   }
 
   // Copied feedback: one button at a time; a streaming rebuild mid-feedback
@@ -100,7 +106,7 @@
     }
     if (copiedBtn !== null && copiedBtn.isConnected) {
       copiedBtn.classList.remove("copied");
-      copiedBtn.setAttribute("aria-label", "copy code");
+      copiedBtn.setAttribute("aria-label", copyLabel(copiedBtn.closest("pre, blockquote") ?? copiedBtn));
       copiedBtn.title = "copy";
     }
     copiedBtn = null;
@@ -233,12 +239,14 @@
     // into the payload; innerText copies exactly what is rendered.
     const copyBtn = target?.closest?.("button.md-copy");
     if (copyBtn instanceof HTMLElement) {
-      const pre = copyBtn.closest("pre");
+      const host = copyBtn.closest("pre, blockquote");
       // Fences render as pre>code (the button is code's sibling); a raw-HTML
-      // bare pre falls back to the whole pre (the SVG-only button adds no
-      // text). marked ends every fence with a newline the author never typed.
-      const src = pre?.querySelector("code") ?? pre;
-      const code = (src?.innerText ?? "").replace(/\n+$/, "");
+      // bare pre falls back to the whole pre; a blockquote copies its rendered
+      // prose whole (the SVG-only button adds no text either way). marked ends
+      // every fence with a newline the author never typed.
+      const src = host?.tagName === "PRE" ? (host.querySelector("code") ?? host) : host;
+      const code =
+        src instanceof HTMLElement ? src.innerText.replace(/^\n+/, "").replace(/\s+$/, "") : "";
       if (code.length > 0) {
         void copyText(code).then((ok) => {
           if (ok && copyBtn.isConnected) showCopied(copyBtn);
@@ -386,6 +394,23 @@
     for (const c of containers) c.el.classList.toggle("rw-hidden", c.first >= revealed);
   }
 
+  /** Dissolve the reveal spans back into plain text nodes once a block settles.
+   *  Merely unhiding them is not enough: the copy/selection serializer emits a
+   *  line break instead of the collapsed space wherever the text wraps between
+   *  inline elements, so a transcript left word-per-span copies out with a hard
+   *  newline at every visual wrap point (the same text copies clean after a
+   *  reload, which renders span-free). Children are preserved, not flattened —
+   *  stampPaths may have nested a path affordance inside a word span. */
+  function unwrapWords(root: HTMLElement) {
+    for (const span of root.querySelectorAll("span.rw")) {
+      const parent = span.parentNode;
+      if (parent === null) continue;
+      while (span.firstChild !== null) parent.insertBefore(span.firstChild, span);
+      parent.removeChild(span);
+    }
+    root.normalize();
+  }
+
   function step() {
     revealTimer = null;
     const total = words.length;
@@ -413,10 +438,10 @@
     if (el === null) return;
     if (current !== lastHtml) {
       lastHtml = current;
-      // The {@html} flush rebuilt the subtree: re-inject the code-block copy
-      // chrome, (re)wrap words for a live block and re-stamp path affordances
+      // The {@html} flush rebuilt the subtree: re-inject the copy chrome,
+      // (re)wrap words for a live block and re-stamp path affordances
       // — all once per chunk, not per tick.
-      decorateCodeBlocks(el);
+      decorateCopyTargets(el);
       if (live) wrapWords(el);
       else {
         words = [];
@@ -426,14 +451,11 @@
     }
     if (!live) {
       // Settled (or reduced-motion): make sure nothing stays hidden from an
-      // earlier streaming pass, then idle.
+      // earlier streaming pass, dissolve the word spans (they poison copy —
+      // see unwrapWords), then idle.
       clearReveal();
-      if (words.length > 0 || containers.length > 0) {
-        for (const w of words) w.classList.remove("rw-hidden");
-        for (const c of containers) c.el.classList.remove("rw-hidden");
-      } else {
-        el.querySelectorAll(".rw-hidden").forEach((n) => n.classList.remove("rw-hidden"));
-      }
+      el.querySelectorAll(".rw-hidden").forEach((n) => n.classList.remove("rw-hidden"));
+      unwrapWords(el);
       words = [];
       containers = [];
       revealed = 0;
@@ -597,6 +619,7 @@
       color 0.12s ease;
   }
   .md :global(pre:hover .md-copy),
+  .md :global(blockquote:hover > .md-copy),
   .md :global(.md-copy:focus-visible),
   .md :global(.md-copy.copied) {
     opacity: 1;
@@ -612,10 +635,16 @@
   .md :global(.md-copy.copied .ic-check) {
     display: block;
   }
+  /* Quoted material (agents echo source prose back for review) reads as a
+     quiet card — prose-set and wrapped, deliberately unlike code chrome, but
+     carrying the same pinned copy affordance. */
   .md :global(blockquote) {
-    margin: 0.4em 0;
-    padding-left: 10px;
-    border-left: 2px solid var(--edge);
+    position: relative; /* the copy button's anchor */
+    margin: 0.45em 0;
+    padding: 5px 12px;
+    border-left: 2px solid color-mix(in srgb, var(--accent) 45%, var(--edge));
+    border-radius: 0 6px 6px 0;
+    background: color-mix(in srgb, var(--fg) 4%, transparent);
     color: var(--muted);
   }
   .md :global(a) {

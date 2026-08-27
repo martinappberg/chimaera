@@ -58,9 +58,12 @@ hard-resets and rebuilds.
 | `drafts.ts` | Per-session composer draft persistence (survives the per-session ChatView remount + a page reload) — text layers into sessionStorage, images stay in-memory; both bounded. It also publishes which drafts remain memory-only so an interface-build transition cannot silently reload over them. |
 | `images.ts` | Pasted/dropped image → downscale + base64 encode into an `ImageAttachment` (the canonical home of that type); size-bounded. |
 
-The transcript's copy affordances — fenced code blocks and whole assistant
-messages — reuse `../shared/clipboard.ts` (the native-first clipboard writer
-lifted out of the terminal pool) — see the shared/ area.
+The transcript's copy affordances — fenced code blocks, blockquotes, and whole
+assistant messages — reuse `../shared/clipboard.ts` (the native-first clipboard
+writer lifted out of the terminal pool) — see the shared/ area. Selection-copy
+depends on settled prose being plain text nodes: `Markdown.svelte` dissolves its
+streaming word spans on settle because span-fragmented text copies with a hard
+newline at every visual wrap point.
 
 ## Invariants / gotchas
 
