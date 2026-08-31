@@ -172,6 +172,30 @@ export class SessionSocket {
     }
   }
 
+  /**
+   * Force a clean re-attach: drop the current socket and reconnect now. The
+   * server fully re-snapshots on a fresh attach (ready → reset → snapshot),
+   * which is the recovery path for a parked terminal whose buffered output
+   * overflowed. A session that exited while parked gets one more connect so
+   * the server's last-words replay can paint the final screen; it re-closes
+   * on the replayed exited frame.
+   */
+  resync(): void {
+    if (this.closed || this.fatal) return;
+    this.exited = false;
+    const ws = this.ws;
+    this.ws = null;
+    if (ws !== null) {
+      // Detach handlers first: this close is intentional, not a reconnect
+      // trigger, and late frames must not interleave with the fresh socket.
+      ws.onclose = null;
+      ws.onmessage = null;
+      ws.close();
+    }
+    this.recon.cancel();
+    this.connect();
+  }
+
   /** Permanently close the socket (no reconnect). */
   close(): void {
     this.closed = true;

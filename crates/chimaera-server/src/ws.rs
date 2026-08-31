@@ -35,6 +35,75 @@ const TERMINAL_INPUT_CHUNK: usize = 64 * 1024;
 /// interactive divider drag fires resizes in bursts, and every repaint is a
 /// full-screen rewrite.
 const RESYNC_DEBOUNCE: Duration = Duration::from_millis(120);
+/// PTY output coalescing window. The first chunk after an idle gap is sent
+/// immediately (leading edge — typing echo never waits); chunks arriving
+/// within the window after a send accumulate into one frame. A repainting TUI
+/// otherwise produces one ≤8 KiB WS frame per PTY read, dozens per second,
+/// and every frame costs each attached client a wakeup + parse slice.
+const OUTPUT_COALESCE_WINDOW: Duration = Duration::from_millis(8);
+/// Byte ceiling for one coalesced output frame; a full batch flushes without
+/// waiting out the window.
+const OUTPUT_COALESCE_MAX_BYTES: usize = 32 * 1024;
+
+/// Accumulates broadcast output chunks into one WS frame. A single-chunk
+/// batch is sent as the original refcounted `Bytes` (zero-copy — the same
+/// buffer is shared by every attached client); only multi-chunk batches
+/// concatenate into a fresh per-client allocation.
+struct OutputBatch {
+    chunks: Vec<Bytes>,
+    bytes: usize,
+}
+
+impl OutputBatch {
+    fn new() -> Self {
+        OutputBatch {
+            chunks: Vec::new(),
+            bytes: 0,
+        }
+    }
+
+    fn push(&mut self, chunk: Bytes) {
+        self.bytes = self.bytes.saturating_add(chunk.len());
+        self.chunks.push(chunk);
+    }
+
+    fn is_full(&self) -> bool {
+        self.bytes >= OUTPUT_COALESCE_MAX_BYTES
+    }
+
+    /// Drain the batch into one frame; `None` when empty.
+    fn take_frame(&mut self) -> Option<Bytes> {
+        let frame = match self.chunks.len() {
+            0 => None,
+            1 => self.chunks.pop(),
+            _ => {
+                let mut buf = Vec::with_capacity(self.bytes);
+                for chunk in &self.chunks {
+                    buf.extend_from_slice(chunk);
+                }
+                self.chunks.clear();
+                Some(Bytes::from(buf))
+            }
+        };
+        self.bytes = 0;
+        frame
+    }
+
+    /// Discard the batch (a resync's fresh snapshot supersedes it: batched
+    /// bytes are already parsed into the server grid the snapshot renders).
+    fn clear(&mut self) {
+        self.chunks.clear();
+        self.bytes = 0;
+    }
+}
+
+/// What the opportunistic `try_recv` drain of the output channel ended on.
+#[derive(PartialEq)]
+enum Drained {
+    Open,
+    Lagged,
+    Closed,
+}
 
 /// Client -> server text frames.
 #[derive(Deserialize)]
@@ -102,7 +171,17 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
         }
     }
 
-    let mut attachment = match state.sessions.attach(&id) {
+    // The snapshot render walks the whole scrollback under the term lock
+    // (default 10k lines, cap 200k — tens of ms): blocking work. Keep it off
+    // the reactor so one attach can't stall every connection on this worker.
+    let attach_res = {
+        let state = state.clone();
+        let id = id.clone();
+        tokio::task::spawn_blocking(move || state.sessions.attach(&id))
+            .await
+            .unwrap_or_else(|err| Err(anyhow::anyhow!("attach task failed: {err}")))
+    };
+    let mut attachment = match attach_res {
         Ok(attachment) => attachment,
         Err(err) => {
             // A session that died before this client could attach (fast
@@ -186,6 +265,12 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
     // Pending repaint for a *foreign* resize (another window attached to the
     // same session), debounced so drag bursts coalesce into one repaint.
     let mut resync_at: Option<tokio::time::Instant> = None;
+    // Output coalescing (see OUTPUT_COALESCE_WINDOW): `flush_at` armed means
+    // a frame just went out — chunks batch until the window elapses or the
+    // batch fills; disarmed means the stream went idle and the next chunk is
+    // sent immediately.
+    let mut batch = OutputBatch::new();
+    let mut flush_at: Option<tokio::time::Instant> = None;
     loop {
         tokio::select! {
             _ = async move {
@@ -195,24 +280,96 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
                 }
             } => {
                 resync_at = None;
+                batch.clear();
+                flush_at = None;
                 if !resync(&mut socket, &id, &state, &mut attachment).await {
                     return;
                 }
             },
+            _ = async move {
+                match flush_at {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match batch.take_frame() {
+                    Some(frame) => {
+                        if socket.send(Message::Binary(frame)).await.is_err() {
+                            return;
+                        }
+                        // Still streaming: keep flushing at the window cadence.
+                        flush_at = Some(tokio::time::Instant::now() + OUTPUT_COALESCE_WINDOW);
+                    }
+                    // The window elapsed idle: disarm so the next chunk leads.
+                    None => flush_at = None,
+                }
+            },
             out = attachment.output.recv(), if output_open => match out {
                 Ok(bytes) => {
-                    if socket.send(Message::Binary(bytes)).await.is_err() {
-                        return;
+                    batch.push(bytes);
+                    // Fold in whatever is already queued — batching without
+                    // waiting (the wait, when any, is the flush timer's).
+                    let mut drained = Drained::Open;
+                    while !batch.is_full() {
+                        use tokio::sync::broadcast::error::TryRecvError;
+                        match attachment.output.try_recv() {
+                            Ok(more) => batch.push(more),
+                            Err(TryRecvError::Empty) => break,
+                            Err(TryRecvError::Lagged(_)) => {
+                                drained = Drained::Lagged;
+                                break;
+                            }
+                            Err(TryRecvError::Closed) => {
+                                drained = Drained::Closed;
+                                break;
+                            }
+                        }
+                    }
+                    if drained == Drained::Lagged {
+                        tracing::debug!(%id, "ws output lagged; resyncing");
+                        batch.clear();
+                        flush_at = None;
+                        resync_at = None;
+                        if !resync(&mut socket, &id, &state, &mut attachment).await {
+                            return;
+                        }
+                    } else {
+                        if flush_at.is_none() || batch.is_full() || drained == Drained::Closed {
+                            if let Some(frame) = batch.take_frame() {
+                                if socket.send(Message::Binary(frame)).await.is_err() {
+                                    return;
+                                }
+                            }
+                            flush_at = match drained {
+                                Drained::Closed => None,
+                                _ => Some(tokio::time::Instant::now() + OUTPUT_COALESCE_WINDOW),
+                            };
+                        }
+                        if drained == Drained::Closed {
+                            output_open = false;
+                        }
                     }
                 }
                 Err(RecvError::Lagged(skipped)) => {
                     tracing::debug!(%id, skipped, "ws output lagged; resyncing");
+                    batch.clear();
+                    flush_at = None;
                     resync_at = None;
                     if !resync(&mut socket, &id, &state, &mut attachment).await {
                         return;
                     }
                 }
-                Err(RecvError::Closed) => output_open = false,
+                Err(RecvError::Closed) => {
+                    // The child died inside a window: the batched tail is its
+                    // last words — flush before going quiet.
+                    if let Some(frame) = batch.take_frame() {
+                        if socket.send(Message::Binary(frame)).await.is_err() {
+                            return;
+                        }
+                    }
+                    flush_at = None;
+                    output_open = false;
+                }
             },
             event = attachment.events.recv(), if events_open => match event {
                 Ok(event) => {
@@ -290,10 +447,19 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
 async fn resync(
     socket: &mut WebSocket,
     id: &str,
-    state: &AppState,
+    state: &Arc<AppState>,
     attachment: &mut chimaera_pty::Attachment,
 ) -> bool {
-    match state.sessions.attach(id) {
+    // Same off-reactor discipline as the initial attach: the snapshot render
+    // is blocking work under the term lock.
+    let fresh = {
+        let state = Arc::clone(state);
+        let id = id.to_string();
+        tokio::task::spawn_blocking(move || state.sessions.attach(&id))
+            .await
+            .unwrap_or_else(|err| Err(anyhow::anyhow!("resync attach task failed: {err}")))
+    };
+    match fresh {
         Ok(mut fresh) => {
             let frame = json!({
                 "type": "resync",
@@ -899,6 +1065,52 @@ mod tests {
         let replay = vec![replay_entry(1, &large), replay_entry(2, &large)];
         assert_eq!(chat_batch_end(&replay, 0), 1);
         assert_eq!(chat_batch_end(&replay, 1), 2);
+    }
+
+    #[test]
+    fn output_batch_single_chunk_is_zero_copy() {
+        let chunk = Bytes::from_static(b"echo hello");
+        let mut batch = OutputBatch::new();
+        batch.push(chunk.clone());
+        let frame = batch.take_frame().expect("frame");
+        // The refcounted buffer itself must ride through, not a copy: every
+        // attached client shares the broadcast chunk's allocation.
+        assert_eq!(frame.as_ptr(), chunk.as_ptr());
+        assert!(batch.take_frame().is_none());
+    }
+
+    #[test]
+    fn output_batch_concatenates_in_order() {
+        let mut batch = OutputBatch::new();
+        batch.push(Bytes::from_static(b"ab"));
+        batch.push(Bytes::from_static(b"cd"));
+        batch.push(Bytes::from_static(b"ef"));
+        assert_eq!(batch.take_frame().expect("frame").as_ref(), b"abcdef");
+        assert!(batch.take_frame().is_none());
+        assert_eq!(batch.bytes, 0);
+    }
+
+    #[test]
+    fn output_batch_full_at_byte_ceiling() {
+        let mut batch = OutputBatch::new();
+        batch.push(Bytes::from(vec![0u8; OUTPUT_COALESCE_MAX_BYTES - 1]));
+        assert!(!batch.is_full());
+        batch.push(Bytes::from_static(b"x"));
+        assert!(batch.is_full());
+        assert_eq!(
+            batch.take_frame().expect("frame").len(),
+            OUTPUT_COALESCE_MAX_BYTES
+        );
+        assert!(!batch.is_full());
+    }
+
+    #[test]
+    fn output_batch_clear_discards_pending() {
+        let mut batch = OutputBatch::new();
+        batch.push(Bytes::from_static(b"stale"));
+        batch.clear();
+        assert!(batch.take_frame().is_none());
+        assert_eq!(batch.bytes, 0);
     }
 
     #[test]

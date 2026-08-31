@@ -4,6 +4,17 @@
  * session. Panes call show()/release(); detached instances park in a hidden
  * stash (sockets stay open, buffers stay warm) until the LRU cap evicts them.
  *
+ * Parked terminals buffer, don't parse: output for a stashed instance queues
+ * as raw bytes in a bounded per-entry buffer and replays into term.write on
+ * adopt, so a busy hidden session costs no main-thread escape parsing (one
+ * busy TUI parsed hidden measured 10-17% renderer CPU, × up to POOL_CAP).
+ * Overflowing the buffer discards it and forces a socket resync on adopt —
+ * the server fully re-snapshots on a fresh attach. Nothing depends on parked
+ * parsing: titles/cwd/busy state are all daemon-derived, and the link
+ * prefetch hooks onRender (inert while hidden). The one deferred side effect
+ * is OSC 52 clipboard writes, which now land on adopt instead of while
+ * hidden (or not at all after an overflow) — an improvement, not a loss.
+ *
  * Refits are per-container (each entry owns a ResizeObserver on its slot),
  * debounced 80ms, and suppressed entirely while a divider drag is active —
  * setDragging(false) flushes the deferred fits once the drag ends.
@@ -24,6 +35,14 @@ import { copyText } from "../shared/clipboard";
 
 const POOL_CAP = 12;
 const REFIT_DEBOUNCE_MS = 80;
+/**
+ * Cap on bytes buffered for a parked (hidden) terminal. Beyond this the
+ * buffer is discarded and the entry marked needs-resync: replaying a
+ * truncated escape stream would corrupt the grid, and a fresh attach
+ * re-snapshots the authoritative server state anyway. 512 KiB comfortably
+ * holds minutes of ordinary shell output; only a firehose overflows it.
+ */
+const PARKED_BUFFER_MAX_BYTES = 512 * 1024;
 
 /** Fold several dispose callbacks into one (the path- and URL-link providers
  *  a pooled terminal registers share a single `disposeLinks`). */
@@ -80,6 +99,27 @@ interface PoolEntry {
   fontOverride: number | undefined;
   /** Dispose the path link provider + its viewport prefetch. */
   disposeLinks: () => void;
+  /** Output buffered while parked (parsing deferred until adopt). */
+  parkedChunks: Uint8Array[];
+  parkedBytes: number;
+  /**
+   * The parked buffer overflowed: the terminal's grid is behind the server's
+   * and cannot catch up from the (discarded) stream — adopt must resync the
+   * socket instead of flushing.
+   */
+  needsResync: boolean;
+  /**
+   * A reset (server resync or reconnect snapshot) arrived while parked; the
+   * grid it carries is applied before the flush replays the snapshot bytes.
+   */
+  pendingReset: { cols?: number; rows?: number } | null;
+  /** Live WebGL addon while the renderer is accelerated; null after loss. */
+  webgl: WebglAddon | null;
+  /**
+   * WebGL construction threw (unavailable): never retried. Context LOSS
+   * clears `webgl` but not this — the next adopt retries acceleration once.
+   */
+  webglFailed: boolean;
 }
 
 // Plain non-reactive module state: xterm instances must never be $state.
@@ -134,6 +174,86 @@ function ensureStash(): HTMLDivElement {
 
 function isVisible(entry: PoolEntry): boolean {
   return entry.el.isConnected && entry.el.parentElement !== stash;
+}
+
+/**
+ * Resize-before-reset, the grid-adoption ordering for an incoming snapshot:
+ * it was rendered at (cols, rows), and replaying at any other width re-wraps
+ * every soft-wrapped row at the wrong column. The onResize echo the resize
+ * fires is a server-side no-op.
+ */
+function applyReset(term: Terminal, cols?: number, rows?: number): void {
+  if (cols !== undefined && rows !== undefined && (term.cols !== cols || term.rows !== rows)) {
+    term.resize(cols, rows);
+  }
+  term.reset();
+}
+
+/** Queue one output chunk for a parked entry, discarding on overflow. */
+function bufferParked(entry: PoolEntry, data: Uint8Array): void {
+  if (entry.needsResync) return; // already dropped; the adopt resync replaces it all
+  entry.parkedBytes += data.byteLength;
+  if (entry.parkedBytes > PARKED_BUFFER_MAX_BYTES) {
+    entry.parkedChunks = [];
+    entry.parkedBytes = 0;
+    entry.pendingReset = null;
+    entry.needsResync = true;
+    return;
+  }
+  entry.parkedChunks.push(data);
+}
+
+/** Apply a parked entry's deferred reset + buffered output, in order. */
+function flushParked(entry: PoolEntry): void {
+  if (entry.pendingReset !== null) {
+    applyReset(entry.term, entry.pendingReset.cols, entry.pendingReset.rows);
+    entry.pendingReset = null;
+  }
+  if (entry.parkedChunks.length > 0) {
+    for (const chunk of entry.parkedChunks) entry.term.write(chunk);
+    entry.parkedChunks = [];
+    entry.parkedBytes = 0;
+  }
+}
+
+/**
+ * Catch a just-adopted entry up with its session: flush the deferred bytes,
+ * or — when the parked buffer overflowed — resync the socket so the server
+ * re-snapshots from the authoritative grid. Must run synchronously with the
+ * reparent into the host: once visible, live writes bypass the buffer, and
+ * nothing may interleave ahead of the flush.
+ */
+function adoptParked(entry: PoolEntry): void {
+  if (entry.needsResync) {
+    entry.needsResync = false;
+    entry.pendingReset = null;
+    entry.parkedChunks = [];
+    entry.parkedBytes = 0;
+    entry.socket.resync();
+    return;
+  }
+  flushParked(entry);
+}
+
+/**
+ * Load (or re-load) the WebGL renderer. On context loss the addon disposes
+ * itself and xterm's DOM renderer takes over; the next adopt retries once —
+ * losses are usually transient (GPU pressure from too many live contexts,
+ * a backgrounded tab). A constructor throw marks WebGL unavailable for good.
+ */
+function loadWebgl(entry: PoolEntry): void {
+  if (entry.webgl !== null || entry.webglFailed) return;
+  try {
+    const webgl = new WebglAddon();
+    webgl.onContextLoss(() => {
+      webgl.dispose();
+      if (entry.webgl === webgl) entry.webgl = null;
+    });
+    entry.term.loadAddon(webgl);
+    entry.webgl = webgl;
+  } catch {
+    entry.webglFailed = true; // WebGL unavailable; the DOM renderer stays.
+  }
 }
 
 function fitEntry(entry: PoolEntry): void {
@@ -235,16 +355,6 @@ function createEntry(id: string, parent: HTMLElement, fontOverride: number | und
   term.loadAddon(fit);
   term.open(el);
 
-  // WebGL renderer with DOM fallback: on construction failure or context
-  // loss, dispose the addon and let the DOM renderer take over.
-  try {
-    const webgl = new WebglAddon();
-    webgl.onContextLoss(() => webgl.dispose());
-    term.loadAddon(webgl);
-  } catch {
-    // WebGL unavailable; DOM renderer is already active.
-  }
-
   registerTerminalClipboard(term);
 
   const entry: PoolEntry = {
@@ -273,21 +383,37 @@ function createEntry(id: string, parent: HTMLElement, fontOverride: number | und
         menu: (event, url) => handlers?.onUrlMenu(event, url),
       }),
     ),
+    parkedChunks: [],
+    parkedBytes: 0,
+    needsResync: false,
+    pendingReset: null,
+    webgl: null,
+    webglFailed: false,
   };
+  // WebGL renderer with DOM fallback (and an adopt-time retry after loss).
+  loadWebgl(entry);
   fitEntry(entry);
 
   // Connect only after the terminal is open, visible, and fitted, so the
   // snapshot frame lands in a fully initialized terminal.
   entry.socket = new SessionSocket(id, {
-    onBinary: (data) => term.write(data),
+    onBinary: (data) => {
+      // Parked terminals buffer, don't parse (see the module header): the
+      // deferred bytes replay on adopt, in order, ahead of live writes.
+      if (isVisible(entry)) term.write(data);
+      else bufferParked(entry, data);
+    },
     onReset: (cols, rows) => {
-      // The incoming snapshot was rendered at (cols, rows); adopt that grid
-      // before replaying or every soft-wrapped row re-wraps at the wrong
-      // column. The onResize echo this fires is a server-side no-op.
-      if (cols !== undefined && rows !== undefined && (term.cols !== cols || term.rows !== rows)) {
-        term.resize(cols, rows);
+      if (isVisible(entry)) {
+        applyReset(term, cols, rows);
+      } else {
+        // The snapshot that follows supersedes everything buffered so far;
+        // remember the reset (with its grid) to apply ahead of the flush.
+        entry.parkedChunks = [];
+        entry.parkedBytes = 0;
+        entry.needsResync = false;
+        entry.pendingReset = { cols, rows };
       }
-      term.reset();
     },
     dims: () => ({ cols: term.cols, rows: term.rows }),
     onTitle: (title) => handlers?.onTitle(id, title),
@@ -295,6 +421,11 @@ function createEntry(id: string, parent: HTMLElement, fontOverride: number | und
       if (term.cols !== cols || term.rows !== rows) term.resize(cols, rows);
     },
     onExited: (status) => {
+      // A parked terminal's buffered tail is its last words — parse it now
+      // (one-time, bounded) so the final screen isn't lost. After an
+      // overflow the flush is empty and needsResync stands: adopt reconnects
+      // and the server's last-words replay paints the final screen instead.
+      flushParked(entry);
       term.write("\r\n\x1b[2m[exited]\x1b[0m\r\n");
       handlers?.onExited(id, status);
     },
@@ -361,6 +492,11 @@ function attach(id: string, host: HTMLElement, fontOverride: number | undefined)
     if (entry.el.parentElement !== host) {
       host.appendChild(entry.el);
     }
+    // Now visible: replay what parking deferred (or resync after overflow) —
+    // synchronously, before any live write can land — and give a WebGL
+    // renderer lost to a context loss one shot at coming back.
+    adoptParked(entry);
+    loadWebgl(entry);
     // The destination pane's font size wins (override, else the settings
     // default); changing it re-measures the glyph atlas, so refit.
     entry.fontOverride = fontOverride;
