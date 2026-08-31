@@ -25,6 +25,7 @@
   import { copyText } from "../shared/clipboard";
   import { copyLabel, copyPayload, decorateCopyTargets } from "../shared/copyDecor";
   import { advanceSegments, type SegmenterState } from "./streamSegments";
+  import { RevealLedger } from "./revealLedger";
   import { pathCandidate, trimPathWord, type PathHit, type ResolvePaths } from "./paths";
   import { activateUrl, isWebUrl, urlMenuEntries } from "../shared/urlOpen";
   import { contextMenu } from "../shared/contextMenu.svelte";
@@ -33,8 +34,13 @@
     text: string;
     /** Live streaming block: reveal newly parsed words in fading batches
      *  instead of showing the whole (chunky) text at once. Settled blocks pass
-     *  false and render statically. */
+     *  false and render statically. This is TURN state ("this row is the
+     *  streaming tail"), deliberately independent of visibility. */
     streaming?: boolean;
+    /** False while the owning tab/pane is hidden. A hidden live block FREEZES
+     *  in place — no per-chunk work, no ticker, no canonical-parse swap (the
+     *  hide-tax) — and resumes with its reveal cursor intact on show. */
+    visible?: boolean;
     /** Open a VALIDATED path the prose references — files land in a viewer
      *  pane, directories in the Finder. */
     onOpenPath?: (path: string, kind: "file" | "dir") => void;
@@ -47,7 +53,14 @@
     onReveal?: () => void;
   }
 
-  let { text, streaming = false, onOpenPath, resolvePaths, onReveal }: Props = $props();
+  let {
+    text,
+    streaming = false,
+    visible = true,
+    onOpenPath,
+    resolvePaths,
+    onReveal,
+  }: Props = $props();
 
   /** candidate text → validated hit or "miss"; lives for the component so
    *  streaming re-renders re-stamp from cache instead of refetching. */
@@ -59,8 +72,9 @@
   // from agent-derived strings; APPEND-only inside the host (see copyDecor.ts
   // for the {@html}-teardown constraint); for pre the CODE child is the
   // horizontal scroller so the host stays a non-scrolling anchor the button
-  // can pin to. Runs BEFORE wrapWords so the reveal bookkeeping hides the
-  // button with its still-unrevealed block.
+  // can pin to. During streaming it runs per segment BEFORE that segment's
+  // word wrap, so the reveal bookkeeping hides the button with its
+  // still-unrevealed block.
 
   // Copied feedback: one button at a time; a streaming rebuild mid-feedback
   // simply drops the state with the old DOM (the next chunk replaces it).
@@ -186,11 +200,29 @@
             resolved.set(u, hits.get(u) ?? "miss");
             inflight.delete(u);
           }
-          if (el !== null) stampPaths(el);
+          // Re-stamp ONLY the root this sweep walked, and at idle: a
+          // synchronous whole-tree re-walk here re-created the O(message)
+          // per-chunk cost this pipeline removed (once per segment that
+          // found unknown candidates).
+          enqueueStamp(root);
         })
         .catch(() => {
           for (const u of unknown) inflight.delete(u);
         });
+    }
+  }
+
+  /** Synchronously mark schemeless (non-#) anchors `md-local` so the click
+   *  handler swallows them from the FIRST paint of a streamed fragment: an
+   *  unclassified relative href would fall through to real SPA navigation
+   *  and blow away the workbench. Classification is a cheap class toggle;
+   *  the expensive daemon VALIDATION (stampPaths) stays deferred to idle,
+   *  which later upgrades these into openable path affordances. */
+  function classifyLocalAnchors(root: HTMLElement): void {
+    for (const a of root.querySelectorAll("a")) {
+      const href = a.getAttribute("href") ?? "";
+      if (href === "" || /^[a-z][a-z0-9+.-]*:/i.test(href) || href.startsWith("#")) continue;
+      a.classList.add("md-local");
     }
   }
 
@@ -297,17 +329,25 @@
   // + re-wrapping the WHOLE accumulated message per chunk is O(n²) — a
   // multi-thousand-word reply burns tens of ms per chunk near its end. Instead
   // the source is segmented at SAFE top-level block boundaries
-  // (streamSegments.ts): a closed segment parses, sanitizes, decorates, and
-  // word-wraps exactly once and its DOM is never touched again; only the
-  // trailing open segment re-renders per chunk, so per-chunk work tracks the
-  // tail's size, not the message's. Word-reveal spans exist only for words not
-  // yet revealed (the settled prefix stays span-free plain text), and path
-  // stamping defers to idle. When `streaming` flips false the template swaps
-  // to the canonical `{@html html}` full parse: one whole-message re-parse
-  // that also guarantees a span-free settled DOM (word-per-span text copies
-  // with a hard newline at every visual wrap point — the canonical swap is
-  // what keeps selection-copy clean).
+  // (streamSegments.ts — which also owns the security invariant: streaming
+  // must never render MORE than the settled parse would): a closed segment
+  // parses, sanitizes, decorates, and word-wraps exactly once and its DOM is
+  // never touched again; only the trailing open segment re-renders per chunk,
+  // so per-chunk work tracks the tail's size, not the message's. Word-reveal
+  // spans exist only for words not yet revealed (revealed segments dissolve
+  // their spans — see scheduleUnwrap), and path stamping defers to idle.
+  // A HIDDEN live block freezes in place: no per-chunk work, no ticker, and
+  // crucially no canonical-parse swap at hide time; it resumes with the
+  // reveal cursor intact on show. When `streaming` flips false (the row
+  // stops being the streaming tail — new block appended, or turn end) the
+  // template swaps to the canonical `{@html html}` full parse: one
+  // whole-message re-parse that also guarantees a span-free settled DOM
+  // (word-per-span text copies with a hard newline at every visual wrap
+  // point — the canonical swap is what keeps settled selection-copy clean).
   const REVEAL_TICK_MS = 75;
+  /** Slightly past the 0.32s stream-fade, so dissolving a drained segment's
+   *  spans never cuts a running fade short. */
+  const UNWRAP_DELAY_MS = 400;
   const reducedMotion =
     typeof matchMedia === "function" && matchMedia("(prefers-reduced-motion: reduce)").matches;
 
@@ -315,15 +355,16 @@
   /** Wrapper of the open segment — always liveEl's last child. */
   let tailEl: HTMLElement | null = null;
   let lastTailSource: string | null = null;
-  /** Hidden word spans in CLOSED segments (document order). Their DOM
-   *  persists across chunks, so entries stay valid until revealed. */
-  let prefixQueue: HTMLElement[] = [];
+  /** The reveal-cursor arithmetic (pure, tested in revealLedger.test.ts).
+   *  The queues below mirror its counts entry-for-entry. */
+  const ledger = new RevealLedger();
+  /** Hidden word spans in CLOSED segments (document order), each with its
+   *  segment root so a drained segment can dissolve its spans. */
+  let prefixQueue: { span: HTMLElement; root: HTMLElement }[] = [];
   /** Hidden word spans in the open tail — rebuilt with it every chunk. */
   let tailQueue: HTMLElement[] = [];
-  /** Words of the current tail already revealed, carried across tail rebuilds
-   *  (and into a closing segment) so text the reader has seen never re-hides
-   *  or double-fades. */
-  let tailRevealed = 0;
+  /** Remaining hidden spans per closed-segment root — the drain detector. */
+  const hiddenPerRoot = new Map<HTMLElement, number>();
   /** Blocks whose chrome hides until their first word (the probe) reveals —
    *  a heading or list bullet must not flash its margins/marker above the
    *  reveal point. */
@@ -332,6 +373,8 @@
   /** Closed-segment roots awaiting deferred (idle) path stamping. */
   let unstamped: HTMLElement[] = [];
   let cancelIdleStamp: (() => void) | null = null;
+  /** Pending span-dissolve timers for drained segments (teardown-tracked). */
+  const unwrapTimers = new Set<ReturnType<typeof setTimeout>>();
 
   function clearReveal() {
     if (revealTimer !== null) {
@@ -347,24 +390,24 @@
         : NodeFilter.FILTER_REJECT,
   };
 
-  /** Count whitespace-delimited runs without touching the tree — the cheap
-   *  path for a closing segment whose words are all already revealed. */
-  function countWords(root: HTMLElement): number {
-    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, wordFilter);
-    let count = 0;
-    while (walker.nextNode()) {
-      count += [...(walker.currentNode.textContent ?? "").matchAll(/\S+/g)].length;
-    }
-    return count;
-  }
-
-  /** Wrap every whitespace-delimited run under `root` in a `.rw` span, in
-   *  document order. Inline spans preserve flow and whitespace, so a wrapped
-   *  word is visually inert until hidden. */
-  function wrapWordsIn(root: HTMLElement): HTMLElement[] {
+  /** One walk collects the word-bearing text nodes AND the word count, so a
+   *  fully-revealed closing segment never pays a second wrap pass. */
+  function collectWordNodes(root: HTMLElement): { nodes: Text[]; count: number } {
     const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, wordFilter);
     const nodes: Text[] = [];
-    while (walker.nextNode()) nodes.push(walker.currentNode as Text);
+    let count = 0;
+    while (walker.nextNode()) {
+      const node = walker.currentNode as Text;
+      nodes.push(node);
+      count += [...(node.textContent ?? "").matchAll(/\S+/g)].length;
+    }
+    return { nodes, count };
+  }
+
+  /** Wrap every whitespace-delimited run of the pre-collected nodes in a
+   *  `.rw` span, in document order. Inline spans preserve flow and
+   *  whitespace, so a wrapped word is visually inert until hidden. */
+  function wrapFromNodes(nodes: Text[]): HTMLElement[] {
     const spans: HTMLElement[] = [];
     for (const node of nodes) {
       const matches = [...(node.textContent ?? "").matchAll(/\S+/g)];
@@ -384,6 +427,39 @@
       spans.push(...local);
     }
     return spans;
+  }
+
+  /** Dissolve a drained segment's reveal spans back into plain text nodes.
+   *  Merely revealed spans are not enough: the copy/selection serializer
+   *  emits a line break instead of the collapsed space wherever text wraps
+   *  between inline elements, so word-per-span prose copies out with a hard
+   *  newline at every visual wrap point — and closed-segment DOM now
+   *  SURVIVES across chunks, making mid-stream selection meaningful.
+   *  Children are preserved, not flattened — stampPaths may have nested a
+   *  path affordance inside a word span. */
+  function unwrapWords(root: HTMLElement) {
+    for (const span of root.querySelectorAll("span.rw")) {
+      const parent = span.parentNode;
+      if (parent === null) continue;
+      while (span.firstChild !== null) parent.insertBefore(span.firstChild, span);
+      parent.removeChild(span);
+    }
+    root.normalize();
+  }
+
+  /** Dissolve after the last fade finishes, so the final batch's animation
+   *  isn't cut short. The timer set is torn down with the stream. */
+  function scheduleUnwrap(root: HTMLElement): void {
+    const timer = setTimeout(() => {
+      unwrapTimers.delete(timer);
+      if (root.isConnected) unwrapWords(root);
+    }, UNWRAP_DELAY_MS);
+    unwrapTimers.add(timer);
+  }
+
+  function clearUnwrapTimers(): void {
+    for (const timer of unwrapTimers) clearTimeout(timer);
+    unwrapTimers.clear();
   }
 
   /** Hide `spans[shown..]` and every block whose FIRST word is past the
@@ -435,9 +511,11 @@
     liveEl.replaceChildren();
     prefixQueue = [];
     tailQueue = [];
-    tailRevealed = 0;
+    ledger.reset();
+    hiddenPerRoot.clear();
     hiddenContainers = [];
     unstamped = [];
+    clearUnwrapTimers();
     freshTail();
   }
 
@@ -445,6 +523,7 @@
    *  itself is Svelte's to remove (the `{#if streaming}` branch). */
   function resetStreamState(): void {
     clearReveal();
+    clearUnwrapTimers();
     cancelIdleStamp?.();
     cancelIdleStamp = null;
     segState = null;
@@ -452,9 +531,22 @@
     lastTailSource = null;
     prefixQueue = [];
     tailQueue = [];
-    tailRevealed = 0;
+    ledger.reset();
+    hiddenPerRoot.clear();
     hiddenContainers = [];
     unstamped = [];
+  }
+
+  /** Parse + sanitize a streamed fragment into `target`, falling back to
+   *  PLAIN TEXT on a parser throw — a segment must never be silently dropped
+   *  (it would already be marked consumed), and textContent is inert, so the
+   *  fallback cannot be more permissive than the settled render. */
+  function renderFragment(target: HTMLElement, source: string): void {
+    try {
+      target.innerHTML = parseSanitized(source); // sanitized above
+    } catch {
+      target.textContent = source;
+    }
   }
 
   /** A segment closed: parse + sanitize + decorate + wrap it ONCE, splice it
@@ -463,20 +555,21 @@
     if (liveEl === null || tailEl === null) return;
     const root = document.createElement("div");
     root.className = "md-seg";
-    root.innerHTML = parseSanitized(source); // sanitized above
+    renderFragment(root, source);
     decorateCopyTargets(root);
+    classifyLocalAnchors(root);
     if (!reducedMotion) {
       // This segment was the HEAD of the previous open tail — carry the
       // reveal cursor over so already-shown words don't re-hide or re-fade.
-      const total = countWords(root);
-      if (tailRevealed >= total) {
-        tailRevealed -= total; // fully revealed: no spans at all
-      } else {
-        const spans = wrapWordsIn(root);
-        hideFrom(root, spans, tailRevealed);
-        for (let i = tailRevealed; i < spans.length; i++) prefixQueue.push(spans[i]);
-        tailRevealed = 0;
+      const { nodes, count } = collectWordNodes(root);
+      const shown = ledger.closeSegment(count);
+      if (shown < count) {
+        const spans = wrapFromNodes(nodes);
+        hideFrom(root, spans, shown);
+        hiddenPerRoot.set(root, count - shown);
+        for (let i = shown; i < spans.length; i++) prefixQueue.push({ span: spans[i], root });
       }
+      // Fully revealed: no spans at all — born clean for selection-copy.
     }
     liveEl.insertBefore(root, tailEl);
     unstamped.push(root);
@@ -486,23 +579,38 @@
   function renderTail(source: string): void {
     if (tailEl === null || source === lastTailSource) return;
     lastTailSource = source;
-    tailEl.innerHTML = source.trim().length === 0 ? "" : parseSanitized(source);
+    if (source.trim().length === 0) {
+      tailEl.replaceChildren();
+    } else {
+      renderFragment(tailEl, source);
+    }
     decorateCopyTargets(tailEl);
+    classifyLocalAnchors(tailEl);
     tailQueue = [];
     // The swap disconnected the old tail's tracked containers — drop them.
     hiddenContainers = hiddenContainers.filter((h) => h.el.isConnected);
     if (!reducedMotion) {
-      const spans = wrapWordsIn(tailEl);
-      const shown = Math.min(tailRevealed, spans.length);
-      tailRevealed = shown;
-      hideFrom(tailEl, spans, shown);
-      for (let i = shown; i < spans.length; i++) tailQueue.push(spans[i]);
+      const { nodes, count } = collectWordNodes(tailEl);
+      const shown = ledger.rebuildTail(count);
+      if (shown < count) {
+        const spans = wrapFromNodes(nodes);
+        hideFrom(tailEl, spans, shown);
+        tailQueue = spans.slice(shown);
+      }
     }
+  }
+
+  /** Queue a root for the deferred path sweep (idempotent per pending pass). */
+  function enqueueStamp(root: HTMLElement): void {
+    if (!unstamped.includes(root)) unstamped.push(root);
+    scheduleIdleStamp();
   }
 
   /** Stamp path affordances on settled segments at IDLE — the TreeWalker +
    *  per-word regex sweep never runs on the per-chunk hot path. The open tail
-   *  is stamped when its segment closes (or by the canonical settle pass). */
+   *  is stamped when its segment closes (or by the canonical settle pass).
+   *  Note the setTimeout fallback: WKWebView (the native app) has no
+   *  requestIdleCallback, so stamping there lands on a short fixed delay. */
   function scheduleIdleStamp(): void {
     if (cancelIdleStamp !== null || unstamped.length === 0) return;
     const run = () => {
@@ -535,42 +643,62 @@
       clearLiveDom();
     }
     segState = adv.state;
-    for (const source of adv.newlyClosed) appendClosedSegment(source);
+    if (adv.newlyClosed.length > 0) {
+      // The closes consumed the reveal cursor; the tail MUST re-render even
+      // when its new source is string-equal to the old one (a duplicate
+      // paragraph) — see the RevealLedger order contract.
+      lastTailSource = null;
+      for (const source of adv.newlyClosed) appendClosedSegment(source);
+    }
     renderTail(adv.open);
     scheduleIdleStamp();
-    if (!reducedMotion && prefixQueue.length + tailQueue.length > 0 && revealTimer === null) {
+    if (!reducedMotion && ledger.pending > 0 && revealTimer === null) {
       revealTimer = setTimeout(step, REVEAL_TICK_MS);
     }
   }
 
   function step() {
     revealTimer = null;
-    const pending = prefixQueue.length + tailQueue.length;
-    if (pending === 0) return; // caught up — the next chunk resumes us
-    // Advance a few words, more when the buffer runs ahead — the stream never
-    // lags visibly, it just breathes.
-    const take = Math.min(pending, Math.max(2, Math.ceil(pending / 6)));
-    for (let k = 0; k < take; k++) {
-      let span: HTMLElement;
-      if (prefixQueue.length > 0) {
-        span = prefixQueue.shift()!;
+    const { fromPrefix, fromTail } = ledger.take();
+    if (fromPrefix + fromTail === 0) return; // caught up — the next chunk resumes us
+    for (let k = 0; k < fromPrefix; k++) {
+      const entry = prefixQueue.shift();
+      if (entry === undefined) break;
+      entry.span.classList.remove("rw-hidden");
+      entry.span.classList.add("stream-fade");
+      const left = (hiddenPerRoot.get(entry.root) ?? 1) - 1;
+      if (left <= 0) {
+        hiddenPerRoot.delete(entry.root);
+        scheduleUnwrap(entry.root); // drained: dissolve spans post-fade
       } else {
-        span = tailQueue.shift()!;
-        tailRevealed += 1;
+        hiddenPerRoot.set(entry.root, left);
       }
+    }
+    for (let k = 0; k < fromTail; k++) {
+      const span = tailQueue.shift();
+      if (span === undefined) break;
       span.classList.remove("rw-hidden");
       span.classList.add("stream-fade");
     }
     syncHiddenContainers();
     onReveal?.();
-    if (prefixQueue.length + tailQueue.length > 0) revealTimer = setTimeout(step, REVEAL_TICK_MS);
+    if (ledger.pending > 0) revealTimer = setTimeout(step, REVEAL_TICK_MS);
   }
 
   // Streaming: drive the incremental pipeline off every coalesced chunk. Runs
   // post-DOM / pre-paint, so hiding the not-yet-revealed tail never flashes.
+  // A HIDDEN live block does nothing at all — the segment DOM freezes in
+  // place (queues, ledger, and segState intact) and the effect re-runs on
+  // show, where renderStream catches up on the accumulated delta and the
+  // ticker resumes from the preserved cursor.
   $effect(() => {
     const t = text; // dep: every coalesced chunk
     if (!streaming) return; // dep: live only
+    if (!visible) {
+      // dep: freeze — stop the ticker; keep every queue and the DOM.
+      clearReveal();
+      return;
+    }
     if (liveEl === null) return; // dep: container mounted
     renderStream(t);
   });
@@ -592,11 +720,13 @@
     stampPaths(el);
   });
 
-  // Stop the ticker, the copied-feedback timer, and any pending idle stamp
-  // when the component unmounts (a keyed block can be torn down mid-stream).
+  // Stop the ticker, the copied-feedback timer, unwrap timers, and any
+  // pending idle stamp when the component unmounts (a keyed block can be
+  // torn down mid-stream).
   $effect(() => () => {
     clearReveal();
     clearCopied();
+    clearUnwrapTimers();
     cancelIdleStamp?.();
   });
 </script>

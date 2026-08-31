@@ -1198,6 +1198,55 @@ describe("ChatStore live tool-output cap", () => {
     expect(outputOf(fold(events)).text).toBe(outputOf(fold(events)).text);
   });
 
+  it("budgets are UTF-8 bytes and slices land on code-point boundaries", () => {
+    // 3-byte € and 4-byte 🚀 deltas: 400 units of € is 1200 bytes, so ~25
+    // deltas (30 000 bytes) must overflow the 20 480-byte enter threshold
+    // even though the UTF-16 length (10 000 units) is far below it.
+    const deltas = Array.from({ length: 25 }, () => ({
+      type: "tool_output_delta",
+      id: "x1",
+      text: "€".repeat(398) + "🚀",
+    }));
+    const store = fold([CALL, ...deltas]);
+    const content = outputOf(store);
+    expect(content.truncated).toBe(true);
+    expect(content.text).toMatch(/… \[\d+ bytes omitted\] …/);
+    // No lone surrogates anywhere — the cuts respected code points.
+    expect(/(^|[^\uD800-\uDBFF])[\uDC00-\uDFFF]|[\uD800-\uDBFF]($|[^\uDC00-\uDFFF])/u.test(
+      content.text ?? "",
+    )).toBe(false);
+    expect(content.text!.endsWith("🚀")).toBe(true);
+  });
+
+  it("re-capping text that already carries the server marker absorbs it (never nests)", () => {
+    const store = fold([
+      CALL,
+      {
+        type: "tool_call_update",
+        id: "x1",
+        status: "completed",
+        content: {
+          kind: "output",
+          text: `head-part\n… [999 bytes omitted] …\ntail-part`,
+          truncated: true,
+        },
+      },
+      // Straggler deltas push the server-capped text past the budget again.
+      ...Array.from({ length: 30 }, () => ({
+        type: "tool_output_delta",
+        id: "x1",
+        text: "y".repeat(1024),
+      })),
+    ]);
+    const content = outputOf(store);
+    const markers = (content.text ?? "").match(/bytes omitted/g) ?? [];
+    expect(markers).toHaveLength(1);
+    // The absorbed base count rides along in the merged marker.
+    const omitted = Number(/\[(\d+) bytes omitted\]/.exec(content.text ?? "")?.[1]);
+    expect(omitted).toBeGreaterThanOrEqual(999);
+    expect(content.text!.startsWith("head-part")).toBe(true);
+  });
+
   it("the authoritative result replaces the capped live text entirely", () => {
     const store = fold([
       CALL,

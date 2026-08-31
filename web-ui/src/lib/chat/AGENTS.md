@@ -42,7 +42,8 @@ hard-resets and rebuilds.
 | `EffortPopover.svelte` | The reasoning-effort ladder picker (uses the agent-native vocabulary verbatim — never relabel `xhigh`). |
 | `Composer.svelte` / `composer.ts` | Input chrome plus the pure slash-context, argument-completion, and Codex skill-block helpers (covered by `composer.test.ts`). Slash discovery is whitespace-boundary aware; path fragments must stay ordinary text. |
 | `Markdown.svelte` / `MathText.svelte` / `math.ts` | Render agent prose and plain user-message LaTeX (`$`/`$$` and Codex's `\(`/`\[` forms) as KaTeX MathML under one bounded policy. **Sanitize untrusted/replayed content** (marked/KaTeX → DOMPurify, KaTeX trust off, `<style>` forbidden, external links `noopener`); Markdown also stamps validated file paths as clickable. **Streaming renders incrementally** (see the pipeline section below): closed segments parse once, only the open tail re-renders per chunk, and settle swaps in one canonical full parse. |
-| `streamSegments.ts` | Pure incremental segmentation of streaming markdown source at SAFE top-level blank-line boundaries (fences, block math, lists/indentation, HTML-ish blocks, and reference definitions all conservatively refuse). Lossless partition (segments concatenate back to the source, byte for byte) with prefix-cache invalidation when a rewrite doesn't extend the prior text. Own vitest suite (`streamSegments.test.ts`). |
+| `streamSegments.ts` | Pure INCREMENTAL segmentation of streaming markdown source at SAFE top-level blank-line boundaries — and the owner of the streaming security invariant (never more permissive than settle): fences and block math never split (mirrored against math.ts exactly), an HTML-block-opening line bails the message, lists (incl. lazy continuations) and indentation refuse, reference definitions make boundaries sticky until a ~16 KiB tail cap. Lossless partition (segments concatenate back to the source, byte for byte) with prefix-cache invalidation when a rewrite doesn't extend the prior text. Own vitest suite (`streamSegments.test.ts`) incl. hostile-HTML and marked-equivalence pins. |
+| `revealLedger.ts` | Pure reveal-cursor arithmetic for the streaming pipeline (close-segment carry, tail rebuilds that never re-hide, prefix-first ticker takes) — the DOM queues in `Markdown.svelte` mirror it entry-for-entry. Own vitest suite (`revealLedger.test.ts`), incl. the duplicate-tail order contract. |
 | `ToolCallCard` / `ToolGroup` | Tool-call rendering (title, status, diff/output, grouping). Terminal rows may accept late output text but must never revive their streaming cursor. |
 | `AgentsTray.svelte` / `BackgroundTray.svelte` | Two of the three pinned strips above the composer: live subagents (derived from in-flight Agent tool rows) and live background tasks (the `background_tasks` level-set), each with a stop affordance. Chrome lives in the shared `../shared/WorkTray.svelte` + `WorkTrayRow.svelte` shell; elapsed/duration text uses `../shared/time.ts`. The **plan strip** is the third, rendered inline in `ChatView` on the same `WorkTray` shell (`pulse` off unless a step is in flight) — three orthogonal readings of the same session: what the agent *means* to do (plan), *who* is working (subagents), what is *detached* (background). |
 | `PermissionCard` / `QuestionCard` | The permission prompt and structured-question cards (their answers ride `socket.send`; `PermissionCard` also carries the deny-with-feedback field; `QuestionCard` presents Codex auto-resolution deadlines without owning the authoritative timeout). |
@@ -73,41 +74,79 @@ every coalesced wire chunk (2 KiB / 100 ms) is O(n²) — a multi-thousand-word
 reply burned tens of ms per chunk near its end. The live pipeline instead makes
 per-chunk work proportional to the TRAILING OPEN SEGMENT, not the message:
 
-- **Segmentation** (`streamSegments.ts`, pure): the source splits at safe
-  top-level blank-line boundaries. "Safe" is conservative — an open fence or
-  `$$`/`\[` block math never splits; a segment whose last content line is a
-  list item, indented, or HTML-ish refuses to close (loose lists, indented
-  code, and raw HTML can continue across blank lines); a reference-link
-  definition anywhere bails segmentation for the whole message (its effect is
-  document-global). The partition is lossless — closed segments + the open
-  tail concatenate back to the source byte-for-byte, so the reducer's
-  materialized `\n\n` block separators (PR #122) can't be eaten or doubled.
+- **The security invariant** (owned by `streamSegments.ts`): the streaming
+  render must NEVER be more permissive than the settled render. Splitting
+  inside a construct whose interior is inert when parsed whole (fenced code,
+  block math, raw HTML) would hand that interior to marked as ordinary
+  markdown — turning inert text into live DOM (`<img>` beacons, clickable
+  links) that DOMPurify allows. So fences and block math are tracked and never
+  split, and any line that can OPEN a CommonMark HTML block bails segmentation
+  for the whole message. Nothing ever force-closes a fence/math/HTML tail.
+- **Segmentation** (`streamSegments.ts`, pure, incremental): the source splits
+  at safe top-level blank-line boundaries; the scanner persists its cursor +
+  construct state, so each advance walks only the new lines. "Safe" is
+  conservative — open fences and `$$`/`\[` block math never split (open/close
+  lines mirror math.ts EXACTLY, pinned by tests, and `\r\n` is normalized the
+  way marked's lexer does); a list refuses to close until a flush non-list
+  block starts (loose continuations AND lazy-continuation lines); indented
+  tails refuse; a reference-link definition makes boundaries sticky for the
+  message (document-global targets), relaxed only past a ~16 KiB tail cap and
+  even then only at the ordinary safe boundaries. The partition is lossless —
+  closed segments + the open tail concatenate back to the source
+  byte-for-byte, so the reducer's materialized `\n\n` block separators
+  (PR #122) can't be eaten or doubled. Residual worst case, accepted: one
+  giant never-closing fence (or an HTML bail) keeps the whole tail open, so
+  its parse cost stays O(open) per chunk by construction.
 - **Per chunk**: closed segments were parsed + DOMPurify-sanitized + copy-
-  decorated + word-wrapped ONCE (each in its own `display: contents` wrapper,
-  so layout matches the wrapper-free settled render); their DOM is never
-  touched again. Only the open tail's wrapper re-renders. A text update that
-  does NOT extend the previous source (a retraction/reroute rewrite)
-  invalidates the whole cached prefix and rebuilds from the fresh split.
-- **Reveal**: word spans exist only for not-yet-revealed words (the settled
-  prefix stays plain text). The 75 ms ticker drains a prefix-then-tail queue
-  in document order; the reveal cursor carries across tail rebuilds and into
-  closing segments so shown words never re-hide or re-fade. Blocks whose first
-  word is unrevealed hide whole (probe spans). Reduced motion skips spans and
-  the ticker entirely — content lands instantly, still incrementally.
+  decorated + local-anchor-classified + word-wrapped ONCE (each in its own
+  `display: contents` wrapper, so layout matches the wrapper-free settled
+  render); their DOM is never touched again. Only the open tail's wrapper
+  re-renders. A parser throw falls back to inert plain text (never a dropped
+  segment); a text update that does NOT extend the previous source (a
+  retraction/reroute rewrite) invalidates the whole cached prefix and rebuilds
+  from the fresh split.
+- **Reveal** (`revealLedger.ts` owns the cursor arithmetic, pure + tested):
+  word spans exist only for not-yet-revealed words. The 75 ms ticker drains a
+  prefix-then-tail queue in document order; the cursor carries across tail
+  rebuilds and into closing segments so shown words never re-hide or re-fade —
+  and every advance that closed segments MUST rebuild the tail, even when its
+  source is string-equal (the duplicate-paragraph trap; the tail memo is
+  invalidated on closes). A drained closed segment dissolves its spans shortly
+  after the fade (span-fragmented text copies with hard newlines at wrap
+  points, and closed-segment DOM now survives long enough to be selected).
+  Blocks whose first word is unrevealed hide whole (probe spans). Reduced
+  motion skips spans and the ticker entirely — content lands instantly, still
+  incrementally.
+- **Hidden ≠ settled.** `streaming` is TURN state (this row is the streaming
+  tail, compared by block uid), `visible` rides separately: hiding a tab
+  mid-stream FREEZES the live segment DOM in place — no canonical-parse swap
+  at tab-switch-away, no ticker — and thaw resumes with the reveal cursor
+  intact (catch-up segments append; the already-read prefix never
+  re-animates). The swap to the canonical parse happens only when the row
+  genuinely stops streaming.
 - **Deferred decorations**: `stampPaths` (TreeWalker + per-word path regex)
-  runs at idle on closed segments and never on the per-chunk hot path; the
-  open tail is stamped when its segment closes or at settle.
+  runs at idle on closed segments — never on the per-chunk hot path — and its
+  async resolve callback re-stamps only the affected root, again at idle. On
+  WKWebView (the native app) `requestIdleCallback` is absent and the fallback
+  is a short fixed delay. The open tail is stamped when its segment closes or
+  at settle — but its schemeless anchors get the `md-local` class
+  SYNCHRONOUSLY at every render (a streamed relative link must be swallowed by
+  the click handler from first paint, or it navigates the workbench away).
 - **Settle = ONE canonical full re-parse.** When `streaming` flips false the
   template swaps to the memoized `{@html html}` whole-message parse (computed
   lazily — a live block never pays it per chunk) and full decorations run. The
   settled transcript is therefore identical to a never-streamed render BY
   CONSTRUCTION — any conservative-segmentation artifact is transient — and the
-  settled DOM is span-free, which keeps selection-copy clean.
+  settled DOM is span-free, which keeps selection-copy clean. (Tradeoff, also
+  by construction: the settle swap replaces the subtree, so a selection held
+  ACROSS the settle moment is dropped — strictly better than the old
+  per-chunk whole-subtree rebuild, which dropped selections every 100 ms
+  mid-stream.)
 - **Safety rail**: EVERY fragment that reaches `innerHTML`/`{@html}` — each
-  closed segment, each tail render, the canonical parse — passes through the
-  same DOMPurify config first. Unsanitized fragments are never concatenated.
-  The non-streaming path (history rows, reading mode) is the same single
-  memoized parse as before.
+  closed segment, each tail render, the plain-text fallback, the canonical
+  parse — passes through the same DOMPurify config first. Unsanitized
+  fragments are never concatenated. The non-streaming path (history rows,
+  reading mode) is the same single memoized parse as before.
 
 ## Invariants / gotchas
 

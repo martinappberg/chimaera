@@ -147,9 +147,11 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
 - **Block copy affordances + clean selection copy.** Fenced code blocks and blockquotes carry a
   hover copy button (the shared `shared/copyDecor.ts` decorator, also used by the markdown file
   preview); a blockquote copies its rendered prose whole. Selection-copy of settled prose is
-  clean by construction: the streaming reveal's word spans are dissolved back into plain text
-  nodes on settle, because span-fragmented text copies with a hard newline at every visual wrap
-  point. Blockquotes render as a quiet accent-washed quote card, distinct from code chrome.
+  clean by construction: when a stream settles the transcript swaps to one canonical span-free
+  re-parse of the whole message (and during streaming, each fully revealed segment dissolves its
+  reveal spans shortly after its fade), because span-fragmented text copies with a hard newline
+  at every visual wrap point. Blockquotes render as a quiet accent-washed quote card, distinct
+  from code chrome.
 - **Hydration + history window.** A fresh attach folds replay into the reducer behind one quiet
   "loading recent conversation" state until the advertised journal `head` arrives; it then mounts
   the newest 64 blocks bottom-anchored in one paint, rather than visibly growing from the oldest
