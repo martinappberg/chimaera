@@ -13,6 +13,7 @@
   import { onDestroy, untrack } from "svelte";
   import { get } from "svelte/store";
   import Spinner from "../previews/Spinner.svelte";
+  import { pageVisible } from "../shared/visibility";
   import { computeStatus } from "../workspace/compute";
   import { isWebUrl, openInSystemBrowser } from "../shared/urlOpen";
   import {
@@ -325,11 +326,17 @@
 
   // Same-document navigations don't reload the iframe, so `onload` never fires
   // for them; a slow poll is what keeps the address bar and persisted path in
-  // step for hash-router / History-API apps. 1/s is imperceptible latency for a
-  // user-driven route change and the read is a bare property access — no I/O.
+  // step for hash-router / History-API apps. Real navigations are event-driven
+  // (the iframe's onload → readIframeState), so this is only the fallback:
+  // 5s of address-bar staleness on a same-document route change is fine, and
+  // it runs only while both the pane AND the document are visible — with a
+  // catch-up read when either returns (the effect re-runs; the read is a bare
+  // same-origin property access, no I/O). untrack: syncLocation reads AND
+  // writes `livePath` — tracking it would loop the effect.
   $effect(() => {
-    if (!visible || phase.kind !== "ready") return;
-    const t = setInterval(syncLocation, 1000);
+    if (!visible || !$pageVisible || phase.kind !== "ready") return;
+    untrack(() => syncLocation());
+    const t = setInterval(syncLocation, 5000);
     return () => clearInterval(t);
   });
 

@@ -11,13 +11,16 @@
     onStop?: () => void;
     /** The stop button's tooltip ("stop this subagent"). */
     stopTitle?: string;
+    /** False while the owning surface is hidden — the presence dot must not
+     *  animate rows nobody can see (the WorkTray `visible` contract). */
+    visible?: boolean;
     /** The row body (name, progress/status/elapsed spans — caller-styled). */
     children: Snippet;
   }
-  let { onStop, stopTitle, children }: Props = $props();
+  let { onStop, stopTitle, visible = true, children }: Props = $props();
 </script>
 
-<div class="row">
+<div class="row" class:visible>
   <span class="dot" aria-hidden="true"></span>
   <div class="body">
     {@render children()}
@@ -45,6 +48,14 @@
     border-radius: 50%;
     background: var(--accent);
     animation: pulse 1.4s ease-in-out infinite; /* shared keyframe in app.css */
+  }
+  .row:not(.visible) .dot {
+    animation: none;
+  }
+  /* Hidden document: nobody sees the pulse — stop burning frames (the
+     html.app-hidden contract; see app.css). */
+  :global(html.app-hidden) .dot {
+    animation-play-state: paused;
   }
   .body {
     flex: 1;

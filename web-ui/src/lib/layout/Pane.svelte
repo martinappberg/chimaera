@@ -500,25 +500,42 @@
   }
 
   /* The agent is executing here: the border breathes in the agent's hue —
-     peripheral-vision signal that the leash is being pulled. */
-  .pane.agent-exec {
+     peripheral-vision signal that the leash is being pulled. The glow is a
+     STATIC ring on an overlay pseudo-element breathed via opacity: animating
+     box-shadow repaints the whole pane edge every frame for the length of an
+     agent turn, while opacity composites. (.pane clips its descendants, so
+     the ring hugs the border from inside rather than outside — the same
+     breathing hue edge to a human.) */
+  .pane.agent-exec::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    /* Above the keep-alive content layers, under the drop-zone overlays. */
+    z-index: 5;
+    pointer-events: none;
+    border: 2px solid hsl(var(--hue) 60% 55% / 0.35);
+    border-radius: 9px; /* the pane's 10px, inside its 1px border */
+    opacity: 0;
     animation: agent-exec-pulse 1.4s ease-in-out infinite;
   }
 
   @keyframes agent-exec-pulse {
-    0%,
-    100% {
-      box-shadow: 0 0 0 0 hsl(var(--hue) 60% 55% / 0);
-    }
     50% {
-      box-shadow: 0 0 0 2px hsl(var(--hue) 60% 55% / 0.35);
+      opacity: 1;
     }
   }
 
+  /* Hidden document: nobody sees the breath — stop burning frames (the
+     html.app-hidden contract; see app.css). */
+  :global(html.app-hidden) .pane.agent-exec::after {
+    animation-play-state: paused;
+  }
+
   @media (prefers-reduced-motion: reduce) {
-    .pane.agent-exec {
+    .pane.agent-exec::after {
       animation: none;
-      box-shadow: 0 0 0 2px hsl(var(--hue) 60% 55% / 0.3);
+      opacity: 1;
+      border-color: hsl(var(--hue) 60% 55% / 0.3);
     }
   }
 

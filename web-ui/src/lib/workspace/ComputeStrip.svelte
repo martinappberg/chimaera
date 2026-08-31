@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { pageVisible } from "../shared/visibility";
   import {
     formatSlurmDuration,
     parseSlurmTimeLeft,
@@ -16,9 +17,13 @@
 
   // The fetched time_left only moves per poll (60s) — tick locally against
   // the receipt time so the countdown reads live, and re-sync on every fetch
-  // (a new `receivedAt` resets the baseline).
+  // (a new `receivedAt` resets the baseline). Gated on document visibility
+  // (the compute.ts idiom): a hidden window must not wake per second for
+  // hours; the effect re-runs on return, so `now` catches up immediately.
   let now = $state(Date.now());
   $effect(() => {
+    if (!$pageVisible) return;
+    now = Date.now();
     const t = setInterval(() => (now = Date.now()), 1000);
     return () => clearInterval(t);
   });

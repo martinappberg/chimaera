@@ -525,6 +525,13 @@
     box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 16%, transparent);
     animation: pulse 2.4s ease-in-out infinite;
   }
+  /* Hidden document: nobody sees the card pulses — stop burning frames (the
+     html.app-hidden contract; see app.css). */
+  :global(html.app-hidden) .card.backgrounded .dot,
+  :global(html.app-hidden) .dot.alive,
+  :global(html.app-hidden) .plan-row.in_progress .plan-mark {
+    animation-play-state: paused;
+  }
   .dot.attn {
     background: var(--warn);
     opacity: 1;

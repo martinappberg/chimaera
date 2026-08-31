@@ -1,5 +1,7 @@
 import { writable } from "svelte/store";
 
+import { healthPollDelayMs, startVisibilityPoll } from "./poll";
+
 const TOKEN_KEY = "chimaera:token";
 const WS_KEY = "chimaera.ws";
 const HOST_KEY = "chimaera.host";
@@ -258,27 +260,28 @@ export async function health(): Promise<Health> {
 }
 
 /**
- * Poll /api/v1/health on an interval. Fires immediately, then every
- * `intervalMs`. Returns a stop function.
+ * Poll /api/v1/health. Fires immediately, then at `delayMs(hidden)` —
+ * re-evaluated per arm, with a catch-up fetch on visibility return (see
+ * net/poll.ts). The caller picks the cadence: /ws/events is the real
+ * liveness signal, so App passes `healthPollDelayMs` keyed on it. Returns
+ * a stop function.
  */
 export function pollHealth(
   onResult: (h: Health) => void,
   onError: (e: unknown) => void,
-  intervalMs = 5000,
+  delayMs: (hidden: boolean) => number = (hidden) => healthPollDelayMs(false, hidden),
 ): () => void {
   let stopped = false;
-  const tick = async () => {
+  const stop = startVisibilityPoll(async () => {
     try {
       const h = await health();
       if (!stopped) onResult(h);
     } catch (e) {
       if (!stopped) onError(e);
     }
-  };
-  void tick();
-  const id = setInterval(tick, intervalMs);
+  }, delayMs);
   return () => {
     stopped = true;
-    clearInterval(id);
+    stop();
   };
 }

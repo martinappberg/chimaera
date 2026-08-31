@@ -196,3 +196,14 @@ nodes, Duo 2FA, ControlMaster-only non-interactive ssh). Findings:
   problem class containers address (old glibc, missing deps) — and the bugs we actually hit
   were ssh/shell semantics that would reproduce identically inside a container. Keep an
   Apptainer recipe as a documented fallback for pathological hosts, not as the plan.
+
+## PR C — idle battery sweep (2026-08-31)
+
+The perf audit (docs/perf-plan.md) found idle/background cost everywhere the same shape: recurring work with no visibility gate. Landed in one sweep:
+
+- **Health poll**: `/health` every 5s per window forever (~17k req/day) → 60s safety net while `/ws/events` is up (the socket IS the liveness signal), 5s recovery probe only in a visible window, slow tier hidden, catch-up fetch on `visibilitychange` (`net/poll.ts`; the sessions fallback poll rides the same tiers).
+- **Reconnect storm**: an unreachable daemon (resumed laptop, dead tunnel) ran ~150 conn attempts/min indefinitely. The shared `Reconnector` + events socket now jitter ±20%, floor delays at 60s while hidden, and two nudges keep the slow tier from delaying recovery: events-socket recovery fires every waiting reconnector immediately, and so does visibility return.
+- **Pulse animations**: the box-shadow keyframes (pane `agent-exec-pulse`, composer `stop-breathe`, tab `chip-pulse`) repainted every frame for whole agent turns — now static glows on pseudo-elements breathed via opacity/transform (composited). All enumerated infinite "presence" animations pause under `html.app-hidden` (set by App while the document is hidden). `WorkTrayRow` dots gained the `visible` gate their tray siblings had.
+- **1 Hz tickers** (ComputeStrip/ComputeBanner/Dashboard compute chip) and the browser pane 1s `syncLocation` poll (now 5s, load-event-driven for real navigations) gate on `$pageVisible` with catch-up on return.
+
+The invariant is now a web-ui rule (.claude/rules/web-ui.md): recurring work must be gated on document visibility or an equivalent liveness signal.
