@@ -133,7 +133,8 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   `target="_blank" rel="noopener noreferrer"`, and bad local anchors are neutralized on click.
   Client-side transcript cap of ~2000 blocks, trimmed in batches with a 64-block hysteresis slack
   (oldest dropped behind one "earlier history trimmed" notice; the live tail is never touched, and
-  rows keep stable identities across trims so an at-cap trim never re-renders the visible window). User bubbles remain verbatim plain text—not Markdown—but
+  rows keep stable identities across trims, so a trim never remounts the kept rows — the one
+  exception is a tool group whose first row is trimmed away, whose render key shifts). User bubbles remain verbatim plain text—not Markdown—but
   recognized LaTeX spans use the same sanitized MathML renderer, so typed equations do not show raw
   delimiters.
 - **Assistant message metadata + actions.** Hover an assistant message (or focus one of its actions)

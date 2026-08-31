@@ -18,9 +18,10 @@ const TRANSCRIPT_EVENTS = new Set([
   "init",
   "user_message",
   "user_message_update",
-  // Mutates a rendered user block (its rewind affordance) in place; without a
-  // version bump the activation early-out would keep a frozen row stale.
-  "checkpoint",
+  // "checkpoint" is deliberately absent: it touches the version conditionally
+  // (only when it mutates a rendered block — see its reducer case), because a
+  // checkpoint landing on a still-queued send changes nothing the reader sees
+  // and must not defeat the activation early-out or light the unread chip.
   "message_chunk",
   "thought_chunk",
   "tool_call",
@@ -404,13 +405,40 @@ export class ChatStore {
    *  removes it; `dropped` marks it "not delivered" and it stays here. */
   pendingSends = $state<PendingSend[]>([]);
 
-  /** Blocks the client cap has spliced off the FRONT of `blocks`, cumulative.
-   *  `blocks.length + trimmedCount` is a monotonic VIRTUAL total: unlike the
-   *  raw length (pinned near the cap), it still grows on every append, so the
-   *  DOM window can tell "new block arrived" from "in-place chunk" at cap and
-   *  saved window cursors stay coherent across trims (a block's virtual index
-   *  `trimmedCount + i` never moves while it lives). */
+  /** The NET front shift the client cap has applied to `blocks`, cumulative:
+   *  each trim drops the oldest batch and inserts one notice in its place, so
+   *  the counter advances by dropped − 1. That makes a block's virtual index
+   *  (`trimmedCount + i`) invariant while it lives, and
+   *  `blocks.length + trimmedCount` a monotonic VIRTUAL total — unlike the raw
+   *  length (pinned near the cap), it still grows on every append — so saved
+   *  window cursors stay coherent across trims. */
   trimmedCount = $state(0);
+
+  /** `blocks.length + trimmedCount` — every block ever appended this
+   *  generation; grows even while the cap pins the raw length. */
+  get virtualTotal(): number {
+    return this.blocks.length + this.trimmedCount;
+  }
+
+  /** Monotonic count of STRUCTURAL changes to `blocks` — insertions and
+   *  removals ({@link stamp} bumps it on every insert; tail retractions,
+   *  trims, and resets bump it too). In-place text/status mutation does not.
+   *  Views key "the row set changed" on this, never on net lengths: a
+   *  retracted-then-reappended tail leaves blocks.length AND the virtual
+   *  total unchanged while the rows are new. Plain field, deliberately not
+   *  reactive: every structural change also touches `transcriptVersion` (all
+   *  block-producing events are TRANSCRIPT_EVENTS, `notice()` touches, and
+   *  reset/retract paths touch), which wakes the view. */
+  structuralVersion = 0;
+
+  /** Transcript generation, bumped by {@link resetTranscript} when a
+   *  server-side journal reset rebuilds the transcript. Every absolute range,
+   *  trim count, and saved window cursor minted before the bump is
+   *  dead-coordinate data — views and pool cursors must DISCARD across
+   *  generations, never shift (trimmedCount restarts, so deltas spanning a
+   *  reset are meaningless). Plain field: every bump rides a
+   *  transcriptVersion touch for reactivity. */
+  epoch = 0;
 
   /** Highest seq applied; the reconnect auth carries it for gap replay.
    *  Reactive so views can track "any event applied" (in-place chunk appends
@@ -430,9 +458,15 @@ export class ChatStore {
    *  a keyed render may still hold the old rows, and recycled keys would make
    *  Svelte patch stale DOM into unrelated new blocks instead of remounting. */
   private uidSeq = 0;
-  /** Stamp a block body with its stable row identity (see BlockIdentity). */
+  /** Stamp a block body with its stable row identity (see BlockIdentity) and
+   *  count the insertion in `structuralVersion` — every stamped block enters
+   *  `blocks` immediately. Bodies are freshly-built literals at every call
+   *  site, so stamping in place is safe and avoids a second object per block. */
   private stamp(body: BlockBody): ChatBlock {
-    return { ...body, uid: this.uidSeq++ } as ChatBlock;
+    const block = body as ChatBlock;
+    block.uid = this.uidSeq++;
+    this.structuralVersion += 1;
+    return block;
   }
   /** tool_call id -> index into blocks, for in-place status/content patches. */
   private toolIndex = new Map<string, number>();
@@ -505,7 +539,12 @@ export class ChatStore {
     this.pending = [];
     this.pendingSends = [];
     this.questions = [];
+    // trimmedCount restarts with the transcript; the generation bump is what
+    // tells views/cursors their old coordinates are dead (a trim delta across
+    // a reset would be a comparison between unrelated numbering systems).
     this.trimmedCount = 0;
+    this.epoch += 1;
+    this.structuralVersion += 1;
     this.lastSeq = 0;
     this.hydrating = false;
     this.replayHead = 0;
@@ -711,6 +750,8 @@ export class ChatStore {
         const cp: CheckpointRef = { id: umid, preceding: (ev.preceding_uuid as string) ?? null };
         const p = this.pendingSends.find((s) => s.id === umid);
         if (p !== undefined) {
+          // Still queued: nothing rendered changes yet (the anchor rides
+          // along at promotion), so no transcript-version bump here.
           p.checkpoint = cp;
           break;
         }
@@ -720,6 +761,9 @@ export class ChatStore {
           if (block.kind === "user") {
             block.checkpoint = cp;
             block.forkSeq = entry.seq;
+            // In-place mutation of a rendered row (its rewind affordance) —
+            // bump the version so a frozen view knows to reconcile.
+            this.touchTranscript();
             break;
           }
         }
@@ -730,6 +774,7 @@ export class ChatStore {
           if (block.kind === "user") {
             block.checkpoint = cp;
             block.forkSeq = entry.seq;
+            this.touchTranscript();
             break;
           }
         }
@@ -1410,7 +1455,9 @@ export class ChatStore {
     }
     if (start < end) {
       this.blocks.splice(start, end - start);
-      if (end < this.blocks.length) this.rebuildIndexes();
+      this.structuralVersion += 1;
+      // No index rebuild: only message/thought rows were dropped — kinds the
+      // id→index maps never hold — and a pure tail cut moves no earlier row.
     }
   }
 }

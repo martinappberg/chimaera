@@ -24,6 +24,9 @@
     sourceIndex?: number;
     /** Inclusive source end; a prepended page can merge adjacent tool runs. */
     sourceEnd?: number;
+    /** First tool row's stable block uid — the anchor policy's trim-proof
+     *  identity (index labels go stale when the reducer cap trims). */
+    sourceUid?: number;
   }
 
   let {
@@ -34,6 +37,7 @@
     visible = true,
     sourceIndex,
     sourceEnd,
+    sourceUid,
   }: Props = $props();
 
   const running = $derived(
@@ -99,6 +103,7 @@
   class:visible
   data-block-index={sourceIndex}
   data-block-end={sourceEnd}
+  data-block-uid={sourceUid}
 >
   <button
     class="summary"

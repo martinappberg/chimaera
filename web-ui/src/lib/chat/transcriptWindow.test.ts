@@ -4,10 +4,13 @@ import {
   autoPageEarlier,
   pageEarlier,
   pageLater,
+  restoreVirtualWindow,
   restoreWindow,
   tailWindow,
   toArrayCoords,
+  TRANSCRIPT_PAGE,
   TRANSCRIPT_WINDOW,
+  trimShift,
   type TranscriptWindow,
 } from "./transcriptWindow";
 
@@ -98,12 +101,51 @@ describe("virtual-coordinate cursors across cap trims", () => {
       end: 2100,
     });
   });
+});
 
-  it("advances the tail for at-cap appends when tracked virtually", () => {
-    // At the reducer cap the ARRAY length stops growing, but the virtual
-    // total (length + trimmedCount) still counts every append — so the same
-    // window math keeps advancing instead of freezing the tail.
-    const atCap = advanceTailWindow({ start: 1873, end: 2065 }, 2066);
-    expect(atCap).toEqual({ start: 1874, end: 2066 });
+describe("restoreVirtualWindow (the one stale-cursor restore policy)", () => {
+  it("restores a deep-history cursor across later trims", () => {
+    // Saved at array [1800,1992] with 100 already trimmed; 60 more trimmed
+    // while parked — same rows, shifted coordinates.
+    expect(restoreVirtualWindow({ start: 1900, end: 2092 }, 160, 2000)).toEqual({
+      start: 1740,
+      end: 1932,
+    });
+  });
+
+  it("floors a straddling sliver to one full page", () => {
+    // Only 2 rows of the saved window survive the trim point. A 2-row window
+    // would strand the compat (no-IntersectionObserver) path in a sliver.
+    expect(restoreVirtualWindow({ start: 100, end: 292 }, 290, 2000)).toEqual({
+      start: 0,
+      end: TRANSCRIPT_PAGE,
+    });
+  });
+
+  it("discards a cursor with nothing surviving", () => {
+    expect(restoreVirtualWindow({ start: 0, end: 192 }, 500, 2000)).toBeNull();
+  });
+});
+
+describe("trim shift for a mounted window", () => {
+  it("relabels without loss while the trim stays behind the window", () => {
+    expect(trimShift({ start: 130, end: 322 }, 65)).toEqual({
+      window: { start: 65, end: 257 },
+      lost: 0,
+    });
+  });
+
+  it("drops exactly the trimmed head rows when the trim reaches into it", () => {
+    // Width shrinks by `lost`, so the range and the rendered slice (which
+    // must drop the same rows) stay in step: end − start === slice length.
+    expect(trimShift({ start: 10, end: 202 }, 75)).toEqual({
+      window: { start: 0, end: 127 },
+      lost: 65,
+    });
+  });
+
+  it("signals a fully-trimmed window — the caller falls back to the tail", () => {
+    expect(trimShift({ start: 0, end: 192 }, 192)).toBeNull();
+    expect(trimShift({ start: 0, end: 192 }, 500)).toBeNull();
   });
 });

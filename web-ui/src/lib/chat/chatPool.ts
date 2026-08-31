@@ -26,10 +26,13 @@ interface ChatEntry {
   /** Block range last rendered by ChatView, in trim-stable VIRTUAL
    *  coordinates (array index + the store's trimmedCount at save time), so a
    *  reducer cap trim while the view is unmounted cannot leave the cursor
-   *  naming the wrong rows. Keeping this tiny view cursor separate from the
-   *  reducer lets an evicted view restore the same reading window without
-   *  remounting the entire transcript. */
-  renderWindow: { start: number; end: number; tail: boolean } | null;
+   *  naming the wrong rows. `epoch` stamps the transcript generation the
+   *  coordinates belong to — a journal reset restarts the numbering, so a
+   *  cursor from another generation must be discarded, never converted.
+   *  Keeping this tiny view cursor separate from the reducer lets an evicted
+   *  view restore the same reading window without remounting the entire
+   *  transcript. */
+  renderWindow: { start: number; end: number; tail: boolean; epoch: number } | null;
   /** Transcript revision the reader has actually followed. This is separate
    *  from the socket sequence: model/rate-limit/control events should not
    *  manufacture a "new activity" badge, and an MRU eviction must not forget
@@ -146,21 +149,22 @@ export function chatScroll(sessionId: string): { scrollTop: number; atBottom: bo
 }
 
 /** Save the bounded block window currently mounted by a ChatView (virtual
- *  coordinates — see the entry field's doc). */
+ *  coordinates + transcript generation — see the entry field's doc). */
 export function saveChatRenderWindow(
   sessionId: string,
   start: number,
   end: number,
   tail: boolean,
+  epoch: number,
 ): void {
   const entry = pool.get(sessionId);
-  if (entry !== undefined) entry.renderWindow = { start, end, tail };
+  if (entry !== undefined) entry.renderWindow = { start, end, tail, epoch };
 }
 
 /** Last mounted block window, if this session had a rendered view before. */
 export function chatRenderWindow(
   sessionId: string,
-): { start: number; end: number; tail: boolean } | null {
+): { start: number; end: number; tail: boolean; epoch: number } | null {
   const saved = pool.get(sessionId)?.renderWindow;
   return saved === undefined || saved === null ? null : { ...saved };
 }

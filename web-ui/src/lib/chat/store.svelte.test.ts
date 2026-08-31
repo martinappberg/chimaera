@@ -560,7 +560,7 @@ describe("ChatStore pending-send ordering", () => {
     // cap), then grew the remaining 35 into the slack.
     expect(store.blocks).toHaveLength(2_035);
     expect(store.blocks[0]).toMatchObject({ kind: "notice", text: "earlier history trimmed" });
-    expect(store.blocks.length + store.trimmedCount).toBe(2_100);
+    expect(store.virtualTotal).toBe(2_100);
   });
 
   it("leaves an already-completed tool from a prior turn untouched on a later turn end", () => {
@@ -993,13 +993,13 @@ describe("ChatStore transcript cap: hysteresis, uids, virtual total", () => {
     const appended = CAP + SLACK + 40; // one trim landed along the way
     for (let i = 0; i < appended; i++) store.notice(`n${i}`, "info");
     expect(store.trimmedCount).toBeGreaterThan(0);
-    // blocks.length alone under-counts at cap; length + trimmedCount still
-    // equals every block ever appended, and grows by one per at-cap append —
-    // the signal the DOM window uses to keep advancing its tail.
-    expect(store.blocks.length + store.trimmedCount).toBe(appended);
-    const before = store.blocks.length + store.trimmedCount;
+    // blocks.length alone under-counts at cap; the virtual total still equals
+    // every block ever appended, and grows by one per at-cap append — the
+    // trim-stable coordinate system saved window cursors persist in.
+    expect(store.virtualTotal).toBe(appended);
+    const before = store.virtualTotal;
     store.notice("one more", "info");
-    expect(store.blocks.length + store.trimmedCount).toBe(before + 1);
+    expect(store.virtualTotal).toBe(before + 1);
   });
 
   it("row uids are stable across trims and never repeat", () => {
@@ -1028,6 +1028,83 @@ describe("ChatStore transcript cap: hysteresis, uids, virtual total", () => {
     apply({ type: "tool_call_update", id: "t1", status: "completed" });
     const tool = store.blocks.find((b) => b.kind === "tool" && b.id === "t1");
     expect(tool).toMatchObject({ status: "completed" });
+  });
+
+  it("a checkpoint bumps the transcript version only when it touches a rendered block", () => {
+    const store = new ChatStore();
+    store.apply({
+      seq: 1,
+      ts: 1,
+      ev: { type: "user_message", text: "queued", id: "q1", queued: true },
+    } as SeqEvent);
+    const afterQueue = store.transcriptVersion;
+    // Lands on the still-queued send (pendingSends, not a block): nothing the
+    // reader sees changes — must not defeat the activation early-out or light
+    // the unread chip. The anchor rides along at promotion.
+    store.apply({
+      seq: 2,
+      ts: 2,
+      ev: { type: "checkpoint", user_message_id: "q1", preceding_uuid: "p0" },
+    } as SeqEvent);
+    expect(store.transcriptVersion).toBe(afterQueue);
+
+    store.apply({
+      seq: 3,
+      ts: 3,
+      ev: { type: "user_message", text: "sent", id: "u1", queued: false },
+    } as SeqEvent);
+    const afterUser = store.transcriptVersion;
+    // Lands on a RENDERED user block (its rewind affordance mutates in
+    // place): a frozen view must learn to reconcile, so the version bumps.
+    store.apply({
+      seq: 4,
+      ts: 4,
+      ev: { type: "checkpoint", user_message_id: "u1", preceding_uuid: "p1" },
+    } as SeqEvent);
+    expect(store.transcriptVersion).toBe(afterUser + 1);
+  });
+
+  it("a retract-and-reappend that nets out still reads as a structural change", () => {
+    const store = fold([
+      { type: "turn_started", turn_id: "t1" },
+      { type: "message_chunk", turn_id: "t1", text: "the wrong answer" },
+    ]);
+    const structuralBefore = store.structuralVersion;
+    const lengthBefore = store.blocks.length;
+    const virtualBefore = store.virtualTotal;
+    store.apply({ seq: 3, ts: 3, ev: { type: "messages_superseded" } } as SeqEvent);
+    store.apply({
+      seq: 4,
+      ts: 4,
+      ev: { type: "message_chunk", turn_id: "t2", text: "the retry" },
+    } as SeqEvent);
+    // Net lengths cancel out — even the virtual total — so only the
+    // structural counter can tell a view its rendered rows are stale.
+    expect(store.blocks.length).toBe(lengthBefore);
+    expect(store.virtualTotal).toBe(virtualBefore);
+    expect(store.structuralVersion).toBeGreaterThan(structuralBefore);
+  });
+
+  it("a journal reset bumps the transcript generation", () => {
+    const store = fold([{ type: "user_message", text: "hi" }]);
+    expect(store.epoch).toBe(0);
+    // head below lastSeq ⇒ pruned/recreated journal: old coordinates (ranges,
+    // trim counts, saved cursors) belong to a dead numbering system.
+    store.onReady(
+      {
+        id: "s1",
+        agent: "claude",
+        alive: true,
+        exit_status: null,
+        native_session_id: null,
+        model: null,
+        current_mode: null,
+        pending_permission: false,
+      },
+      0,
+      0,
+    );
+    expect(store.epoch).toBe(1);
   });
 
   it("a journal reset zeroes the trim count but never recycles uids", () => {
