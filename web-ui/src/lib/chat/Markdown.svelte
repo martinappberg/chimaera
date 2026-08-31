@@ -24,6 +24,7 @@
 <script lang="ts">
   import { copyText } from "../shared/clipboard";
   import { copyLabel, copyPayload, decorateCopyTargets } from "../shared/copyDecor";
+  import { advanceSegments, type SegmenterState } from "./streamSegments";
   import { pathCandidate, trimPathWord, type PathHit, type ResolvePaths } from "./paths";
   import { activateUrl, isWebUrl, urlMenuEntries } from "../shared/urlOpen";
   import { contextMenu } from "../shared/contextMenu.svelte";
@@ -265,36 +266,72 @@
   }
 
   // Agent prose is untrusted model output rendered into the workbench DOM:
-  // sanitize EVERYTHING marked emits, always. The style tag is on DOMPurify's
-  // default allowlist, so forbid it explicitly (and the style attribute) —
-  // otherwise injected CSS applies document-wide.
-  const html = $derived(
-    DOMPurify.sanitize(marked.parse(text, { async: false, breaks: true }) as string, {
-      FORBID_TAGS: ["style"],
-      FORBID_ATTR: ["style"],
-    }),
-  );
+  // sanitize EVERYTHING marked emits, always — the full canonical parse AND
+  // every per-segment streaming fragment go through here before touching the
+  // DOM. The style tag is on DOMPurify's default allowlist, so forbid it
+  // explicitly (and the style attribute) — otherwise injected CSS applies
+  // document-wide.
+  function sanitizeHtml(raw: string): string {
+    return DOMPurify.sanitize(raw, { FORBID_TAGS: ["style"], FORBID_ATTR: ["style"] });
+  }
+
+  function parseSanitized(source: string): string {
+    return sanitizeHtml(marked.parse(source, { async: false, breaks: true }) as string);
+  }
+
+  /** Canonical full parse — the settled transcript's single source of truth.
+   *  Lazily computed: the template reads it ONLY when not streaming, so a live
+   *  block never pays a whole-message parse per chunk, and the moment the
+   *  stream settles this one read IS the canonical re-parse that heals any
+   *  segmentation artifact — the settled render is identical to a
+   *  never-streamed render by construction. */
+  const html = $derived(parseSanitized(text));
 
   let el = $state<HTMLElement | null>(null);
+  /** The streaming container (Svelte-owned shell, imperatively-managed
+   *  children) — present only while `streaming`. */
+  let liveEl = $state<HTMLElement | null>(null);
 
-  // --- streaming reveal -------------------------------------------------------
-  // Wire chunks arrive coalesced (2 KiB / 100 ms); rendering them raw makes text
-  // land in ugly slabs. But re-slicing + re-parsing the whole message on a fast
-  // reveal ticker is O(n²). So we parse/sanitize ONCE per chunk (the `html`
-  // derived changes only when the full text does), wrap the rendered words in
-  // spans, and unhide them a batch at a time on a ~75 ms cadence — the same fade
-  // cascade, driven off the already-rendered DOM instead of a re-parse.
+  // --- incremental streaming render ------------------------------------------
+  // Wire chunks arrive coalesced (2 KiB / 100 ms). Re-parsing + re-sanitizing
+  // + re-wrapping the WHOLE accumulated message per chunk is O(n²) — a
+  // multi-thousand-word reply burns tens of ms per chunk near its end. Instead
+  // the source is segmented at SAFE top-level block boundaries
+  // (streamSegments.ts): a closed segment parses, sanitizes, decorates, and
+  // word-wraps exactly once and its DOM is never touched again; only the
+  // trailing open segment re-renders per chunk, so per-chunk work tracks the
+  // tail's size, not the message's. Word-reveal spans exist only for words not
+  // yet revealed (the settled prefix stays span-free plain text), and path
+  // stamping defers to idle. When `streaming` flips false the template swaps
+  // to the canonical `{@html html}` full parse: one whole-message re-parse
+  // that also guarantees a span-free settled DOM (word-per-span text copies
+  // with a hard newline at every visual wrap point — the canonical swap is
+  // what keeps selection-copy clean).
   const REVEAL_TICK_MS = 75;
   const reducedMotion =
     typeof matchMedia === "function" && matchMedia("(prefers-reduced-motion: reduce)").matches;
-  let words: HTMLElement[] = [];
-  /** Every element that CONTAINS words, with the index of its first word — so a
-   *  block whose words are all still hidden (a heading, an empty list bullet)
-   *  is hidden WHOLE, never flashing its margins/marker above the reveal. */
-  let containers: { el: HTMLElement; first: number }[] = [];
-  let revealed = 0;
-  let lastHtml = "";
+
+  let segState: SegmenterState | null = null;
+  /** Wrapper of the open segment — always liveEl's last child. */
+  let tailEl: HTMLElement | null = null;
+  let lastTailSource: string | null = null;
+  /** Hidden word spans in CLOSED segments (document order). Their DOM
+   *  persists across chunks, so entries stay valid until revealed. */
+  let prefixQueue: HTMLElement[] = [];
+  /** Hidden word spans in the open tail — rebuilt with it every chunk. */
+  let tailQueue: HTMLElement[] = [];
+  /** Words of the current tail already revealed, carried across tail rebuilds
+   *  (and into a closing segment) so text the reader has seen never re-hides
+   *  or double-fades. */
+  let tailRevealed = 0;
+  /** Blocks whose chrome hides until their first word (the probe) reveals —
+   *  a heading or list bullet must not flash its margins/marker above the
+   *  reveal point. */
+  let hiddenContainers: { el: HTMLElement; probe: HTMLElement }[] = [];
   let revealTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Closed-segment roots awaiting deferred (idle) path stamping. */
+  let unstamped: HTMLElement[] = [];
+  let cancelIdleStamp: (() => void) | null = null;
 
   function clearReveal() {
     if (revealTimer !== null) {
@@ -303,16 +340,29 @@
     }
   }
 
-  /** Wrap every whitespace-delimited run in the tree in a `.rw` span, in
-   *  document order, and record the containing elements. Inline spans preserve
-   *  flow and whitespace, so a wrapped word is visually inert until hidden. */
-  function wrapWords(root: HTMLElement): void {
-    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
-      acceptNode: (n) =>
-        (n.textContent ?? "").trim().length > 0 && n.parentElement?.closest(".katex") == null
-          ? NodeFilter.FILTER_ACCEPT
-          : NodeFilter.FILTER_REJECT,
-    });
+  const wordFilter = {
+    acceptNode: (n: Node) =>
+      (n.textContent ?? "").trim().length > 0 && n.parentElement?.closest(".katex") == null
+        ? NodeFilter.FILTER_ACCEPT
+        : NodeFilter.FILTER_REJECT,
+  };
+
+  /** Count whitespace-delimited runs without touching the tree — the cheap
+   *  path for a closing segment whose words are all already revealed. */
+  function countWords(root: HTMLElement): number {
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, wordFilter);
+    let count = 0;
+    while (walker.nextNode()) {
+      count += [...(walker.currentNode.textContent ?? "").matchAll(/\S+/g)].length;
+    }
+    return count;
+  }
+
+  /** Wrap every whitespace-delimited run under `root` in a `.rw` span, in
+   *  document order. Inline spans preserve flow and whitespace, so a wrapped
+   *  word is visually inert until hidden. */
+  function wrapWordsIn(root: HTMLElement): HTMLElement[] {
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, wordFilter);
     const nodes: Text[] = [];
     while (walker.nextNode()) nodes.push(walker.currentNode as Text);
     const spans: HTMLElement[] = [];
@@ -333,110 +383,221 @@
       local.reverse();
       spans.push(...local);
     }
-    words = spans;
-    // Walk each word's ancestors up to (not including) root; the first word to
-    // reach an ancestor stamps its index. Stop at an already-stamped ancestor —
-    // its parents were stamped by whatever word reached it first.
+    return spans;
+  }
+
+  /** Hide `spans[shown..]` and every block whose FIRST word is past the
+   *  reveal cursor (registering a probe so the ticker can unhide it). */
+  function hideFrom(root: HTMLElement, spans: HTMLElement[], shown: number): void {
+    for (let i = shown; i < spans.length; i++) spans[i].classList.add("rw-hidden");
+    // Walk each word's ancestors up to (not including) root; the first word
+    // to reach an ancestor stamps its index. Stop at an already-stamped
+    // ancestor — its parents were stamped by whatever word reached it first.
     const firstOf = new Map<HTMLElement, number>();
-    words.forEach((span, i) => {
+    spans.forEach((span, i) => {
       let a: HTMLElement | null = span.parentElement;
       while (a !== null && a !== root && !firstOf.has(a)) {
         firstOf.set(a, i);
         a = a.parentElement;
       }
     });
-    containers = [...firstOf].map(([el2, first]) => ({ el: el2, first }));
-  }
-
-  /** Hide whole blocks that haven't started revealing (their first word is past
-   *  the cursor) so their chrome never shows above the reveal point. */
-  function syncContainers() {
-    for (const c of containers) c.el.classList.toggle("rw-hidden", c.first >= revealed);
-  }
-
-  /** Dissolve the reveal spans back into plain text nodes once a block settles.
-   *  Merely unhiding them is not enough: the copy/selection serializer emits a
-   *  line break instead of the collapsed space wherever the text wraps between
-   *  inline elements, so a transcript left word-per-span copies out with a hard
-   *  newline at every visual wrap point (the same text copies clean after a
-   *  reload, which renders span-free). Children are preserved, not flattened —
-   *  stampPaths may have nested a path affordance inside a word span. */
-  function unwrapWords(root: HTMLElement) {
-    for (const span of root.querySelectorAll("span.rw")) {
-      const parent = span.parentNode;
-      if (parent === null) continue;
-      while (span.firstChild !== null) parent.insertBefore(span.firstChild, span);
-      parent.removeChild(span);
+    for (const [box, first] of firstOf) {
+      if (first >= shown) {
+        box.classList.add("rw-hidden");
+        hiddenContainers.push({ el: box, probe: spans[first] });
+      }
     }
-    root.normalize();
+  }
+
+  /** Unhide containers whose probe word has revealed; drop dead entries. */
+  function syncHiddenContainers(): void {
+    if (hiddenContainers.length === 0) return;
+    hiddenContainers = hiddenContainers.filter((h) => {
+      if (!h.el.isConnected || !h.probe.isConnected) return false;
+      if (h.probe.classList.contains("rw-hidden")) return true;
+      h.el.classList.remove("rw-hidden");
+      return false;
+    });
+  }
+
+  function freshTail(): void {
+    if (liveEl === null) return;
+    tailEl = document.createElement("div");
+    tailEl.className = "md-seg md-tail";
+    liveEl.appendChild(tailEl);
+    lastTailSource = null;
+  }
+
+  /** Drop every imperative node + reveal bookkeeping (prefix-cache
+   *  invalidation: the text rewrote earlier content, so the cached DOM lies). */
+  function clearLiveDom(): void {
+    if (liveEl === null) return;
+    liveEl.replaceChildren();
+    prefixQueue = [];
+    tailQueue = [];
+    tailRevealed = 0;
+    hiddenContainers = [];
+    unstamped = [];
+    freshTail();
+  }
+
+  /** Full teardown when the stream ends or the component unmounts. The DOM
+   *  itself is Svelte's to remove (the `{#if streaming}` branch). */
+  function resetStreamState(): void {
+    clearReveal();
+    cancelIdleStamp?.();
+    cancelIdleStamp = null;
+    segState = null;
+    tailEl = null;
+    lastTailSource = null;
+    prefixQueue = [];
+    tailQueue = [];
+    tailRevealed = 0;
+    hiddenContainers = [];
+    unstamped = [];
+  }
+
+  /** A segment closed: parse + sanitize + decorate + wrap it ONCE, splice it
+   *  in before the tail, and never touch its DOM again. */
+  function appendClosedSegment(source: string): void {
+    if (liveEl === null || tailEl === null) return;
+    const root = document.createElement("div");
+    root.className = "md-seg";
+    root.innerHTML = parseSanitized(source); // sanitized above
+    decorateCopyTargets(root);
+    if (!reducedMotion) {
+      // This segment was the HEAD of the previous open tail — carry the
+      // reveal cursor over so already-shown words don't re-hide or re-fade.
+      const total = countWords(root);
+      if (tailRevealed >= total) {
+        tailRevealed -= total; // fully revealed: no spans at all
+      } else {
+        const spans = wrapWordsIn(root);
+        hideFrom(root, spans, tailRevealed);
+        for (let i = tailRevealed; i < spans.length; i++) prefixQueue.push(spans[i]);
+        tailRevealed = 0;
+      }
+    }
+    liveEl.insertBefore(root, tailEl);
+    unstamped.push(root);
+  }
+
+  /** Re-render ONLY the open segment — the per-chunk cost. */
+  function renderTail(source: string): void {
+    if (tailEl === null || source === lastTailSource) return;
+    lastTailSource = source;
+    tailEl.innerHTML = source.trim().length === 0 ? "" : parseSanitized(source);
+    decorateCopyTargets(tailEl);
+    tailQueue = [];
+    // The swap disconnected the old tail's tracked containers — drop them.
+    hiddenContainers = hiddenContainers.filter((h) => h.el.isConnected);
+    if (!reducedMotion) {
+      const spans = wrapWordsIn(tailEl);
+      const shown = Math.min(tailRevealed, spans.length);
+      tailRevealed = shown;
+      hideFrom(tailEl, spans, shown);
+      for (let i = shown; i < spans.length; i++) tailQueue.push(spans[i]);
+    }
+  }
+
+  /** Stamp path affordances on settled segments at IDLE — the TreeWalker +
+   *  per-word regex sweep never runs on the per-chunk hot path. The open tail
+   *  is stamped when its segment closes (or by the canonical settle pass). */
+  function scheduleIdleStamp(): void {
+    if (cancelIdleStamp !== null || unstamped.length === 0) return;
+    const run = () => {
+      cancelIdleStamp = null;
+      const batch = unstamped.splice(0);
+      for (const root of batch) {
+        if (root.isConnected) stampPaths(root);
+      }
+    };
+    if (typeof requestIdleCallback === "function") {
+      const id = requestIdleCallback(run, { timeout: 500 });
+      cancelIdleStamp = () => cancelIdleCallback(id);
+    } else {
+      const id = setTimeout(run, 150);
+      cancelIdleStamp = () => clearTimeout(id);
+    }
+  }
+
+  function renderStream(t: string): void {
+    if (liveEl === null) return;
+    if (tailEl === null || tailEl.parentNode !== liveEl) {
+      // (Re)entered live mode with a fresh Svelte-owned container.
+      resetStreamState();
+      freshTail();
+    }
+    const adv = advanceSegments(segState, t);
+    if (!adv.extended && segState !== null) {
+      // The text rewrote earlier content (a retraction/reroute): the cached
+      // prefix is dead. `adv` already carries the fresh full split.
+      clearLiveDom();
+    }
+    segState = adv.state;
+    for (const source of adv.newlyClosed) appendClosedSegment(source);
+    renderTail(adv.open);
+    scheduleIdleStamp();
+    if (!reducedMotion && prefixQueue.length + tailQueue.length > 0 && revealTimer === null) {
+      revealTimer = setTimeout(step, REVEAL_TICK_MS);
+    }
   }
 
   function step() {
     revealTimer = null;
-    const total = words.length;
-    if (revealed >= total) return; // caught up — the next chunk resumes us
-    const remaining = total - revealed;
+    const pending = prefixQueue.length + tailQueue.length;
+    if (pending === 0) return; // caught up — the next chunk resumes us
     // Advance a few words, more when the buffer runs ahead — the stream never
     // lags visibly, it just breathes.
-    const take = Math.min(remaining, Math.max(2, Math.ceil(remaining / 6)));
-    for (let i = revealed; i < revealed + take && i < total; i++) {
-      words[i].classList.remove("rw-hidden");
-      words[i].classList.add("stream-fade");
+    const take = Math.min(pending, Math.max(2, Math.ceil(pending / 6)));
+    for (let k = 0; k < take; k++) {
+      let span: HTMLElement;
+      if (prefixQueue.length > 0) {
+        span = prefixQueue.shift()!;
+      } else {
+        span = tailQueue.shift()!;
+        tailRevealed += 1;
+      }
+      span.classList.remove("rw-hidden");
+      span.classList.add("stream-fade");
     }
-    revealed += take;
-    syncContainers();
+    syncHiddenContainers();
     onReveal?.();
-    if (revealed < total) revealTimer = setTimeout(step, REVEAL_TICK_MS);
+    if (prefixQueue.length + tailQueue.length > 0) revealTimer = setTimeout(step, REVEAL_TICK_MS);
   }
 
-  // One effect drives both concerns off `html` (a re-parse — per chunk) and
-  // `streaming`. It runs post-DOM / pre-paint, so hiding the not-yet-revealed
-  // tail here never flashes the full text.
+  // Streaming: drive the incremental pipeline off every coalesced chunk. Runs
+  // post-DOM / pre-paint, so hiding the not-yet-revealed tail never flashes.
   $effect(() => {
-    const current = html; // dep: re-parse only when the FULL text changes
-    const live = streaming && !reducedMotion; // dep
-    if (el === null) return;
-    if (current !== lastHtml) {
-      lastHtml = current;
-      // The {@html} flush rebuilt the subtree: re-inject the copy chrome,
-      // (re)wrap words for a live block and re-stamp path affordances
-      // — all once per chunk, not per tick.
-      decorateCopyTargets(el);
-      if (live) wrapWords(el);
-      else {
-        words = [];
-        containers = [];
-      }
-      stampPaths(el);
-    }
-    if (!live) {
-      // Settled (or reduced-motion): make sure nothing stays hidden from an
-      // earlier streaming pass, dissolve the word spans (they poison copy —
-      // see unwrapWords), then idle.
-      clearReveal();
-      el.querySelectorAll(".rw-hidden").forEach((n) => n.classList.remove("rw-hidden"));
-      unwrapWords(el);
-      words = [];
-      containers = [];
-      revealed = 0;
-      return;
-    }
-    // Show the settled prefix immediately (no fade), hide the rest until the
-    // ticker reaches it.
-    for (let i = 0; i < words.length; i++) {
-      words[i].classList.toggle("rw-hidden", i >= revealed);
-    }
-    syncContainers();
-    if (revealed < words.length && revealTimer === null) {
-      revealTimer = setTimeout(step, REVEAL_TICK_MS);
-    }
+    const t = text; // dep: every coalesced chunk
+    if (!streaming) return; // dep: live only
+    if (liveEl === null) return; // dep: container mounted
+    renderStream(t);
   });
 
-  // Stop the ticker and the copied-feedback timer when the component unmounts
-  // (a keyed message block can be torn down mid-stream).
+  // Settled (and blocks that never streamed): the canonical parse landed in
+  // the DOM via `{@html html}` — decorate it fully, once per content change.
+  let lastSettledHtml: string | null = null;
+  $effect(() => {
+    if (streaming) {
+      lastSettledHtml = null; // the next settle re-decorates the fresh subtree
+      return;
+    }
+    resetStreamState();
+    const current = html; // dep: the canonical parse (lazily computed here)
+    if (el === null) return;
+    if (current === lastSettledHtml) return;
+    lastSettledHtml = current;
+    decorateCopyTargets(el);
+    stampPaths(el);
+  });
+
+  // Stop the ticker, the copied-feedback timer, and any pending idle stamp
+  // when the component unmounts (a keyed block can be torn down mid-stream).
   $effect(() => () => {
     clearReveal();
     clearCopied();
+    cancelIdleStamp?.();
   });
 </script>
 
@@ -448,8 +609,15 @@
   onkeydown={onKeydown}
   oncontextmenu={onContextMenu}
 >
-  <!-- eslint-disable-next-line svelte/no-at-html-tags -- sanitized above -->
-  {@html html}
+  {#if streaming}
+    <!-- Streaming: children are managed imperatively (renderStream) — closed
+         segments append once, only the open tail rebuilds per chunk. Every
+         fragment passes through DOMPurify before touching innerHTML. -->
+    <div class="md-live" bind:this={liveEl}></div>
+  {:else}
+    <!-- eslint-disable-next-line svelte/no-at-html-tags -- sanitized above -->
+    {@html html}
+  {/if}
 </div>
 
 <style>
@@ -457,6 +625,14 @@
     line-height: var(--chat-line-height, 1.55);
     font-size: var(--text-md);
     word-break: break-word;
+  }
+  /* Streaming containers are layout-neutral: display:contents removes the
+     live shell and each segment wrapper from the box tree, so block margins,
+     margin collapsing, and every .md descendant rule behave exactly as in the
+     settled (wrapper-free) canonical render. */
+  .md-live,
+  .md :global(.md-seg) {
+    display: contents;
   }
   /* Streaming reveal: words are wrapped in .rw spans; the not-yet-revealed tail
      is display:none (occupies no space, exactly like the old text slice), and

@@ -1138,3 +1138,147 @@ describe("ChatStore transcript cap: hysteresis, uids, virtual total", () => {
     expect(store.blocks[0].uid).toBeGreaterThan(maxUid);
   });
 });
+
+describe("ChatStore live tool-output cap", () => {
+  // Mirrors chimaera-agent cap_output: 12 KiB head + 4 KiB rolling tail, one
+  // 4 KiB slack before each re-slice.
+  const HEAD = 12 * 1024;
+  const TAIL = 4 * 1024;
+  const SLACK = 4 * 1024;
+  const CALL = { type: "tool_call", id: "x1", kind: "execute", title: "run", status: "in_progress" };
+  const outputOf = (store: ChatStore) => {
+    const tool = store.blocks.find((b) => b.kind === "tool" && b.id === "x1");
+    if (tool?.kind !== "tool" || tool.content?.kind !== "output") throw new Error("no output");
+    return tool.content;
+  };
+
+  it("keeps small streams verbatim, unmarked", () => {
+    const store = fold([CALL, { type: "tool_output_delta", id: "x1", text: "a".repeat(1000) }]);
+    const content = outputOf(store);
+    expect(content.text).toBe("a".repeat(1000));
+    expect(content.truncated).not.toBe(true);
+  });
+
+  it("caps an overflowing stream to head + marker + tail, server-style", () => {
+    const store = fold([CALL, { type: "tool_output_delta", id: "x1", text: "x".repeat(30000) }]);
+    const content = outputOf(store);
+    expect(content.truncated).toBe(true);
+    expect(content.text!.startsWith("x".repeat(HEAD))).toBe(true);
+    // The server's marker shape (model.rs cap_head_tail), byte count honest.
+    expect(content.text).toContain(`… [${30000 - HEAD - TAIL} bytes omitted] …`);
+    expect(content.text!.endsWith("x".repeat(TAIL))).toBe(true);
+    expect(content.text!.length).toBeLessThanOrEqual(HEAD + TAIL + 40);
+  });
+
+  it("retained size stays bounded under a sustained stream, keeping the tail", () => {
+    const deltas = Array.from({ length: 100 }, (_, i) => ({
+      type: "tool_output_delta",
+      id: "x1",
+      text: `chunk-${String(i).padStart(3, "0")}-`.repeat(100), // 1.1 KB each
+    }));
+    const store = fold([CALL, ...deltas]);
+    const content = outputOf(store);
+    expect(content.truncated).toBe(true);
+    // Head + rolling tail + slack + the marker line — never the ~110 KB fed.
+    expect(content.text!.length).toBeLessThanOrEqual(HEAD + TAIL + SLACK + 40);
+    expect(content.text!.endsWith("chunk-099-")).toBe(true);
+    expect(content.text!.startsWith("chunk-000-")).toBe(true);
+    expect(content.text).toContain("bytes omitted");
+  });
+
+  it("replay rebuilds the identical capped text (pure reducer)", () => {
+    const events = [
+      CALL,
+      ...Array.from({ length: 40 }, (_, i) => ({
+        type: "tool_output_delta",
+        id: "x1",
+        text: `line ${i} `.repeat(120),
+      })),
+    ];
+    expect(outputOf(fold(events)).text).toBe(outputOf(fold(events)).text);
+  });
+
+  it("the authoritative result replaces the capped live text entirely", () => {
+    const store = fold([
+      CALL,
+      { type: "tool_output_delta", id: "x1", text: "x".repeat(30000) },
+      {
+        type: "tool_call_update",
+        id: "x1",
+        status: "completed",
+        content: { kind: "output", text: "authoritative", truncated: false },
+      },
+      // A straggler delta appends to the authoritative text, uncapped small.
+      { type: "tool_output_delta", id: "x1", text: " + late" },
+    ]);
+    const content = outputOf(store);
+    expect(content.text).toBe("authoritative + late");
+    expect(content.truncated).not.toBe(true);
+  });
+});
+
+describe("ChatStore live subagents set (activeAgents)", () => {
+  const AGENT = (id: string, over: Record<string, unknown> = {}): Record<string, unknown> => ({
+    type: "tool_call",
+    id,
+    kind: "agent",
+    title: `Agent: ${id}`,
+    status: "in_progress",
+    ...over,
+  });
+
+  it("tracks agent rows incrementally: join on launch, leave on completion", () => {
+    const store = fold([
+      { type: "turn_started", turn_id: "t1" },
+      AGENT("a1"),
+      { type: "tool_call", id: "b1", kind: "execute", title: "make", status: "in_progress" },
+      AGENT("a2"),
+    ]);
+    expect(store.activeAgents.map((a) => a.id)).toEqual(["a1", "a2"]);
+    store.apply({
+      seq: 5,
+      ts: 5,
+      ev: { type: "tool_call_update", id: "a1", status: "completed" },
+    } as SeqEvent);
+    expect(store.activeAgents.map((a) => a.id)).toEqual(["a2"]);
+  });
+
+  it("entries are the SAME rows the transcript renders — patches land in both", () => {
+    const store = fold([AGENT("a1")]);
+    store.apply({
+      seq: 2,
+      ts: 2,
+      ev: AGENT("a1", { title: "Agent: renamed" }),
+    } as SeqEvent);
+    expect(store.activeAgents).toHaveLength(1);
+    expect(store.activeAgents[0].title).toBe("Agent: renamed");
+    const row = store.blocks.find((b) => b.kind === "tool" && b.id === "a1");
+    expect(store.activeAgents[0]).toBe(row);
+  });
+
+  it("turn-end reconciliation drops dangling agents but keeps cross-turn ones", () => {
+    const store = fold([
+      { type: "turn_started", turn_id: "t1" },
+      AGENT("a1"),
+      AGENT("c1", { cross_turn: true }),
+      { type: "turn_completed", turn_id: "t1", usage: {} },
+    ]);
+    // a1 was reconciled to completed; the cross-turn collab agent stays live.
+    expect(store.activeAgents.map((a) => a.id)).toEqual(["c1"]);
+    store.apply({ seq: 5, ts: 5, ev: { type: "exited", status: 0 } } as SeqEvent);
+    expect(store.activeAgents).toEqual([]);
+  });
+
+  it("replay rebuilds the identical set", () => {
+    const events = [
+      { type: "turn_started", turn_id: "t1" },
+      AGENT("a1"),
+      AGENT("a2"),
+      { type: "tool_call_update", id: "a2", status: "failed" },
+    ];
+    expect(fold(events).activeAgents.map((a) => a.id)).toEqual(
+      fold(events).activeAgents.map((a) => a.id),
+    );
+    expect(fold(events).activeAgents.map((a) => a.id)).toEqual(["a1"]);
+  });
+});

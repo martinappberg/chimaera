@@ -33,7 +33,7 @@ hard-resets and rebuilds.
 
 | File | What it owns |
 |---|---|
-| `store.svelte.ts` | `ChatStore` — the reducer + all reactive view state (`blocks`, `pending`, `pendingSends`, `questions`, model/mode, activity, exited/degraded/connected), including initial replay hydration through the ready-frame `head`. **The single source of truth for the view.** Every block carries a monotonic per-store `uid` (the transcript's keyed-render key — never an array index). `blocks` is capped at ~2000 with hysteresis: it runs one 64-block slack past the cap, then one batch splice trims back to the cap behind a single "earlier history trimmed" notice (so the O(n) index rebuild runs once per batch, not per event at cap); `trimmedCount` counts the NET front shift (dropped − the replacing notice), making a block's virtual index (`trimmedCount + i`) invariant and `virtualTotal` (`blocks.length + trimmedCount`) monotonic at cap. `structuralVersion` counts insertions/removals (net lengths are a false proxy — a retracted-then-reappended tail cancels out) and `epoch` stamps the transcript generation (a journal reset restarts the trim numbering). Its reducer has a vitest test (`store.svelte.test.ts`) — the one place the UI is unit-tested. |
+| `store.svelte.ts` | `ChatStore` — the reducer + all reactive view state (`blocks`, `pending`, `pendingSends`, `questions`, model/mode, activity, exited/degraded/connected), including initial replay hydration through the ready-frame `head`. **The single source of truth for the view.** Every block carries a monotonic per-store `uid` (the transcript's keyed-render key — never an array index). `blocks` is capped at ~2000 with hysteresis: it runs one 64-block slack past the cap, then one batch splice trims back to the cap behind a single "earlier history trimmed" notice (so the O(n) index rebuild runs once per batch, not per event at cap); `trimmedCount` counts the NET front shift (dropped − the replacing notice), making a block's virtual index (`trimmedCount + i`) invariant and `virtualTotal` (`blocks.length + trimmedCount`) monotonic at cap. `structuralVersion` counts insertions/removals (net lengths are a false proxy — a retracted-then-reappended tail cancels out) and `epoch` stamps the transcript generation (a journal reset restarts the trim numbering). `activeAgents` is the reducer-maintained live-subagents set (same proxies as `blocks`, so tray rows update in place — no per-event full-blocks filter), and `tool_output_delta` accumulation is capped client-side (12 KiB head + rolling 4 KiB tail behind the server's own "[N bytes omitted]" marker; the authoritative result replaces it). Its reducer has a vitest test (`store.svelte.test.ts`) — the one place the UI is unit-tested. |
 | `chatWs.ts` / `cooperativeQueue.ts` | `ChatSocket` — connect/auth/reconnect(backoff)/gap-replay, then dispatch replay/live/control frames through one order-preserving cooperative queue so a cold history cannot starve browser input. Per-command refusals (`command_failed` / `invalid_command`) are visible but nonfatal. Shares reconnect accounting with `../terminal/ws.ts`. |
 | `chatPool.ts` | Session-keyed warm reducer/socket + scroll/render-window/followed-revision cursor. The agent keeps folding while a tab's bounded DOM snapshot is hidden or its view is evicted; client-pool eviction never stops the daemon-owned process. |
 | `ChatView.svelte` | The host: renders a bottom-anchored transcript window (64 blocks initially, 192 maximum; automatically pages earlier near the top, with a compatibility fallback button; explicit later pages + a direct jump to newest), and hangs the header/composer/overlays/panels off itself. Non-tool rows are keyed `b-${block.uid}` and tool groups `g-${firstTool.id}` — **stable identities, never array indices**, so an at-cap trim's front-splice cannot remount the whole window (one caveat: a group whose FIRST tool is trimmed away changes key and remounts). "New rows vs in-place chunk" detection keys on the store's `structuralVersion` (never net lengths), a reducer trim shifts the view's absolute range AND its rendered slice by the trim delta (`trimShift`) so range, rows, and index labels keep agreeing — falling back to the tail when the whole window was trimmed — and cursors/ranges are discarded, never shifted, across a store `epoch` change. Re-activating a hidden tab whose window+content are unchanged since its freeze skips the range rebuild entirely (the frozen rows rebind to live proxies on the next event or bottom-reach). Visible tail rows are reducer proxies; hidden/history rows are one inert snapshot. A fresh replay stays gated until `head`, so it never paints oldest-to-newest. Still the big one — keep new chrome in child components, not inline. |
@@ -41,7 +41,8 @@ hard-resets and rebuilds.
 | `ChatHeader.svelte` | The header row: model / mode / effort pickers, usage + `/mcp` entry, session identity (always names which agent — Claude or Codex). |
 | `EffortPopover.svelte` | The reasoning-effort ladder picker (uses the agent-native vocabulary verbatim — never relabel `xhigh`). |
 | `Composer.svelte` / `composer.ts` | Input chrome plus the pure slash-context, argument-completion, and Codex skill-block helpers (covered by `composer.test.ts`). Slash discovery is whitespace-boundary aware; path fragments must stay ordinary text. |
-| `Markdown.svelte` / `MathText.svelte` / `math.ts` | Render agent prose and plain user-message LaTeX (`$`/`$$` and Codex's `\(`/`\[` forms) as KaTeX MathML under one bounded policy. **Sanitize untrusted/replayed content** (marked/KaTeX → DOMPurify, KaTeX trust off, `<style>` forbidden, external links `noopener`); Markdown also stamps validated file paths as clickable. |
+| `Markdown.svelte` / `MathText.svelte` / `math.ts` | Render agent prose and plain user-message LaTeX (`$`/`$$` and Codex's `\(`/`\[` forms) as KaTeX MathML under one bounded policy. **Sanitize untrusted/replayed content** (marked/KaTeX → DOMPurify, KaTeX trust off, `<style>` forbidden, external links `noopener`); Markdown also stamps validated file paths as clickable. **Streaming renders incrementally** (see the pipeline section below): closed segments parse once, only the open tail re-renders per chunk, and settle swaps in one canonical full parse. |
+| `streamSegments.ts` | Pure incremental segmentation of streaming markdown source at SAFE top-level blank-line boundaries (fences, block math, lists/indentation, HTML-ish blocks, and reference definitions all conservatively refuse). Lossless partition (segments concatenate back to the source, byte for byte) with prefix-cache invalidation when a rewrite doesn't extend the prior text. Own vitest suite (`streamSegments.test.ts`). |
 | `ToolCallCard` / `ToolGroup` | Tool-call rendering (title, status, diff/output, grouping). Terminal rows may accept late output text but must never revive their streaming cursor. |
 | `AgentsTray.svelte` / `BackgroundTray.svelte` | Two of the three pinned strips above the composer: live subagents (derived from in-flight Agent tool rows) and live background tasks (the `background_tasks` level-set), each with a stop affordance. Chrome lives in the shared `../shared/WorkTray.svelte` + `WorkTrayRow.svelte` shell; elapsed/duration text uses `../shared/time.ts`. The **plan strip** is the third, rendered inline in `ChatView` on the same `WorkTray` shell (`pulse` off unless a step is in flight) — three orthogonal readings of the same session: what the agent *means* to do (plan), *who* is working (subagents), what is *detached* (background). |
 | `PermissionCard` / `QuestionCard` | The permission prompt and structured-question cards (their answers ride `socket.send`; `PermissionCard` also carries the deny-with-feedback field; `QuestionCard` presents Codex auto-resolution deadlines without owning the authoritative timeout). |
@@ -61,9 +62,52 @@ hard-resets and rebuilds.
 The transcript's copy affordances — fenced code blocks, blockquotes, and whole
 assistant messages — reuse `../shared/clipboard.ts` (the native-first clipboard
 writer lifted out of the terminal pool) — see the shared/ area. Selection-copy
-depends on settled prose being plain text nodes: `Markdown.svelte` dissolves its
-streaming word spans on settle because span-fragmented text copies with a hard
-newline at every visual wrap point.
+depends on settled prose being plain text nodes: the settle swap to the
+canonical parse (below) renders span-free, because span-fragmented text copies
+with a hard newline at every visual wrap point.
+
+## The streaming render pipeline (Markdown.svelte + streamSegments.ts)
+
+Re-parsing + re-sanitizing + re-word-wrapping the WHOLE accumulated message on
+every coalesced wire chunk (2 KiB / 100 ms) is O(n²) — a multi-thousand-word
+reply burned tens of ms per chunk near its end. The live pipeline instead makes
+per-chunk work proportional to the TRAILING OPEN SEGMENT, not the message:
+
+- **Segmentation** (`streamSegments.ts`, pure): the source splits at safe
+  top-level blank-line boundaries. "Safe" is conservative — an open fence or
+  `$$`/`\[` block math never splits; a segment whose last content line is a
+  list item, indented, or HTML-ish refuses to close (loose lists, indented
+  code, and raw HTML can continue across blank lines); a reference-link
+  definition anywhere bails segmentation for the whole message (its effect is
+  document-global). The partition is lossless — closed segments + the open
+  tail concatenate back to the source byte-for-byte, so the reducer's
+  materialized `\n\n` block separators (PR #122) can't be eaten or doubled.
+- **Per chunk**: closed segments were parsed + DOMPurify-sanitized + copy-
+  decorated + word-wrapped ONCE (each in its own `display: contents` wrapper,
+  so layout matches the wrapper-free settled render); their DOM is never
+  touched again. Only the open tail's wrapper re-renders. A text update that
+  does NOT extend the previous source (a retraction/reroute rewrite)
+  invalidates the whole cached prefix and rebuilds from the fresh split.
+- **Reveal**: word spans exist only for not-yet-revealed words (the settled
+  prefix stays plain text). The 75 ms ticker drains a prefix-then-tail queue
+  in document order; the reveal cursor carries across tail rebuilds and into
+  closing segments so shown words never re-hide or re-fade. Blocks whose first
+  word is unrevealed hide whole (probe spans). Reduced motion skips spans and
+  the ticker entirely — content lands instantly, still incrementally.
+- **Deferred decorations**: `stampPaths` (TreeWalker + per-word path regex)
+  runs at idle on closed segments and never on the per-chunk hot path; the
+  open tail is stamped when its segment closes or at settle.
+- **Settle = ONE canonical full re-parse.** When `streaming` flips false the
+  template swaps to the memoized `{@html html}` whole-message parse (computed
+  lazily — a live block never pays it per chunk) and full decorations run. The
+  settled transcript is therefore identical to a never-streamed render BY
+  CONSTRUCTION — any conservative-segmentation artifact is transient — and the
+  settled DOM is span-free, which keeps selection-copy clean.
+- **Safety rail**: EVERY fragment that reaches `innerHTML`/`{@html}` — each
+  closed segment, each tail render, the canonical parse — passes through the
+  same DOMPurify config first. Unsanitized fragments are never concatenated.
+  The non-streaming path (history rows, reading mode) is the same single
+  memoized parse as before.
 
 ## Invariants / gotchas
 

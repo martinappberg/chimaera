@@ -1347,14 +1347,10 @@
    *  immediately. On a retained hidden tab they become one plain snapshot:
    *  no hidden plan-row, task-dot, permission, or queued-message churn, while
    *  the keyed components stay mounted and keep local open/input state. */
-  const liveActiveAgents = $derived(
-    store.blocks.filter(
-      (b): b is ActiveAgent =>
-        b.kind === "tool" &&
-        b.tool === "agent" &&
-        (b.status === "in_progress" || b.status === "pending"),
-    ),
-  );
+  // Maintained incrementally by the reducer (audit B2): the old derived here
+  // re-filtered EVERY block through its Svelte proxy on each structural/tool
+  // event — O(blocks) per event just to keep a usually-empty tray current.
+  const liveActiveAgents = $derived(store.activeAgents);
   let pinnedAgents = $state.raw<ActiveAgent[]>([]);
   let pinnedBackgroundTasks = $state.raw<BackgroundTask[]>([]);
   let pinnedPlan = $state.raw<PlanEntry[]>([]);
