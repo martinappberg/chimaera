@@ -1,4 +1,5 @@
 import { getToken } from "./api";
+import { retryDelayMs, retryWaitingNow } from "./reconnect";
 import type { Link } from "../workspace/agentLinks";
 import type { Session } from "../workspace/sessions";
 import type { UpdateStatus } from "../workspace/update.svelte";
@@ -94,8 +95,22 @@ export class EventsSocket {
   private watchedDirs: string[] = [];
 
   constructor(private readonly handlers: EventsSocketHandlers) {
+    // Reconnect delays take the slow tier while the document is hidden
+    // (see scheduleReconnect); this catch-up keeps that tier from delaying
+    // recovery once someone is looking again.
+    if (typeof document !== "undefined") {
+      document.addEventListener("visibilitychange", this.onVisibility);
+    }
     this.connect();
   }
+
+  /** Visibility return with a retry pending: probe NOW, not in up to 60s. */
+  private readonly onVisibility = (): void => {
+    if (document.visibilityState !== "visible" || this.retryTimer === null) return;
+    clearTimeout(this.retryTimer);
+    this.retryTimer = null;
+    this.connect();
+  };
 
   /**
    * Tell the daemon which workspace this window is looking at. That registration
@@ -209,20 +224,36 @@ export class EventsSocket {
     if (this.connected !== up) {
       this.connected = up;
       this.handlers.onStatus(up);
+      // The daemon is demonstrably reachable again: every session socket
+      // sitting out a backoff (including the hidden slow tier) retries NOW —
+      // one recovery signal instead of ~20 independent probe schedules.
+      if (up) retryWaitingNow();
     }
   }
 
   private scheduleReconnect(): void {
-    this.retryTimer = setTimeout(() => {
-      this.retryTimer = null;
-      this.connect();
-    }, this.backoffMs);
+    // Jitter + the hidden slow tier (shared with the per-session sockets):
+    // a resumed laptop with a dead tunnel must not probe 12x/min per window
+    // forever while nobody is even looking. onVisibility restores the fast
+    // path with an immediate attempt.
+    const hidden =
+      typeof document !== "undefined" && document.visibilityState === "hidden";
+    this.retryTimer = setTimeout(
+      () => {
+        this.retryTimer = null;
+        this.connect();
+      },
+      retryDelayMs(this.backoffMs, hidden),
+    );
     this.backoffMs = Math.min(this.backoffMs * 2, MAX_BACKOFF_MS);
   }
 
   /** Permanently close the socket (no reconnect). */
   close(): void {
     this.closed = true;
+    if (typeof document !== "undefined") {
+      document.removeEventListener("visibilitychange", this.onVisibility);
+    }
     if (this.retryTimer !== null) {
       clearTimeout(this.retryTimer);
       this.retryTimer = null;

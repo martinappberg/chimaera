@@ -191,6 +191,16 @@
   background: var(--row-hover);
 }
 
+/* html.app-hidden — set by App.svelte while the document is hidden. The
+   INFINITE "presence" animations (exec pulses, breathing glyphs, live dots)
+   pause under it: nobody sees them, and 4-6 concurrent pulses otherwise
+   burn frames for hours in a backgrounded window. Enumerated, not blanket —
+   each component gates its own long-runner with an
+   `:global(html.app-hidden) … { animation-play-state: paused; }` rule next
+   to the animation it pauses; transient spinners and one-shot entrances
+   stay untouched. (rules/web-ui.md: recurring work must be gated on
+   document visibility.) */
+
 /* Entrance animation shared by chat cards, notices, and dialogs (opacity + a
    small rise). Each component keeps its own prefers-reduced-motion override,
    which targets the specific animated element. */

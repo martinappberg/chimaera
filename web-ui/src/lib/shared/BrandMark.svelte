@@ -130,6 +130,12 @@
     }
   }
 
+  /* Hidden document: nobody sees the breath — stop burning frames (the
+     html.app-hidden contract; see app.css). */
+  :global(html.app-hidden) .hexmark.busy {
+    animation-play-state: paused;
+  }
+
   @keyframes bm-breathe {
     0%,
     100% {

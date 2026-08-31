@@ -74,6 +74,7 @@
     <WorkTrayRow
       onStop={onStop !== undefined ? () => onStop?.(task.id) : undefined}
       stopTitle="stop this background task"
+      {visible}
     >
       <!-- The lane name (local_bash, …) stays canonical in the tooltip;
            a workflow row leads with its meta.name. -->

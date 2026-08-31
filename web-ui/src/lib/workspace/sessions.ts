@@ -1,6 +1,7 @@
 import { writable } from "svelte/store";
 
 import { api, ApiError } from "../net/api";
+import { sessionsPollDelayMs, startVisibilityPoll } from "../net/poll";
 import { getSetting, resolvedTheme } from "../settings/store.svelte";
 
 export interface Workspace {
@@ -618,27 +619,28 @@ export async function renameSession(id: string, name: string): Promise<void> {
 }
 
 /**
- * Poll GET /api/v1/sessions on an interval to refresh names/titles/alive.
- * Fires immediately, then every `intervalMs`. Returns a stop function.
+ * Poll GET /api/v1/sessions to refresh names/titles/alive. Fires
+ * immediately, then at `delayMs(hidden)` with a catch-up fetch on
+ * visibility return (see net/poll.ts). Only armed while /ws/events is down
+ * (App gates it), so the default cadence is the recovery-probe tiering:
+ * fast while visible, slow while hidden. Returns a stop function.
  */
 export function pollSessions(
   onResult: (sessions: Session[]) => void,
   onError: (e: unknown) => void,
-  intervalMs = 5000,
+  delayMs: (hidden: boolean) => number = sessionsPollDelayMs,
 ): () => void {
   let stopped = false;
-  const tick = async () => {
+  const stop = startVisibilityPoll(async () => {
     try {
       const list = await listSessions();
       if (!stopped) onResult(list);
     } catch (e) {
       if (!stopped) onError(e);
     }
-  };
-  void tick();
-  const id = setInterval(tick, intervalMs);
+  }, delayMs);
   return () => {
     stopped = true;
-    clearInterval(id);
+    stop();
   };
 }

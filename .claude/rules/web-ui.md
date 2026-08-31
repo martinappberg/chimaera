@@ -37,3 +37,14 @@ domain surfaces + their stores: files tree, git, sessions, launcher, home) · **
   `$state` loops.
 - **Never lose a user action to a closed socket** — `socket.send` returns `false` when
   not OPEN; respect it. Reconnect replays the gap; don't invent a client-side queue.
+- **Recurring work is gated on document visibility** (or an equivalent liveness
+  signal): timers, polls, reconnect probes, and infinite "presence" animations must
+  stop or slow while nobody can see them — a hidden window on battery costs
+  ~nothing, and one turned into a background heater is exactly what the 2026-08
+  perf audit kept finding. Copy the idioms instead of hand-rolling: the
+  visibility gate + catch-up-on-`visibilitychange` in `workspace/compute.ts`,
+  the fast/slow poll tiers in `net/poll.ts`, the jittered + hidden-tier backoff
+  (with the events-recovery "retry now" nudge) in `net/reconnect.ts`, the
+  `$pageVisible`-gated 1 Hz tickers (`shared/visibility.ts`), and the
+  `html.app-hidden` root class that pauses the enumerated infinite animations
+  (see app.css).

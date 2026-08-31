@@ -17,6 +17,8 @@
     unauthorized,
     type Health,
   } from "./lib/net/api";
+  import { healthPollDelayMs } from "./lib/net/poll";
+  import { pageVisible } from "./lib/shared/visibility";
   import {
     backgrounded,
     createSession,
@@ -1018,8 +1020,14 @@
   // independently tracks authenticated daemon reachability. The events
   // socket can restart while HTTP remains healthy, so the Home badge accepts
   // either successful channel instead of calling that transient "offline".
-  $effect(() =>
-    pollHealth(
+  // Cadence (net/poll.ts): the events socket is the real liveness signal, so
+  // while it's up this is a 60s safety net; while it's down the 5s recovery
+  // probe runs only in a visible window (hidden takes the slow tier, with a
+  // catch-up fetch on visibility return). Reading `eventsUp` re-arms the
+  // poll on every transition — an immediate probe either way.
+  $effect(() => {
+    const up = eventsUp;
+    return pollHealth(
       (h) => {
         healthUp = true;
         if (daemonBuildChanged(h.build)) {
@@ -1035,8 +1043,18 @@
       () => {
         healthUp = false;
       },
-    ),
-  );
+      (hidden) => healthPollDelayMs(up, hidden),
+    );
+  });
+
+  // While this document is hidden nobody sees the presence animations: a
+  // root class lets each component pause its own infinite keyframes with an
+  // enumerated `html.app-hidden` rule (see app.css) — box-shadow/opacity
+  // pulses otherwise burn frames for hours in a backgrounded window.
+  $effect(() => {
+    document.documentElement.classList.toggle("app-hidden", !$pageVisible);
+    return () => document.documentElement.classList.remove("app-hidden");
+  });
 
   // Vite reports every failed production dynamic import here, including the
   // nested PDF/editor/spreadsheet chunks that never pass through Pane's
@@ -5642,6 +5660,12 @@
 
   .daemon-dot.pulse {
     animation: pulse 1.2s ease-in-out infinite;
+  }
+
+  /* Hidden document: nobody sees the reconnect pulse — stop burning frames
+     (the html.app-hidden contract; see app.css). */
+  :global(html.app-hidden) .daemon-dot.pulse {
+    animation-play-state: paused;
   }
 
   @keyframes pulse {

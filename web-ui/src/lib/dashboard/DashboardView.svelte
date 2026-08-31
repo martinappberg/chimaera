@@ -24,6 +24,7 @@
   import { gitStatus } from "../workspace/git";
   import { computeStatus, formatSlurmDuration, parseSlurmTimeLeft } from "../workspace/compute";
   import { keyHint } from "../shared/keybindings";
+  import { pageVisible } from "../shared/visibility";
   import { relativeAge } from "../workspace/launcher";
   import {
     agentKind,
@@ -301,11 +302,12 @@
 
   /** Local countdown baseline — ticks at 1 Hz ONLY inside an allocation
    *  (the ComputeStrip idiom: time_left moves per 60s fetch; the chip ticks
-   *  against the snapshot's client receipt time). */
+   *  against the snapshot's client receipt time) and only while the document
+   *  is visible (compute.ts idiom — catch-up on return via the re-run). */
   let computeNow = $state(Date.now());
   $effect(() => {
     const snap = $computeStatus;
-    if (snap === null || snap.self === null) return;
+    if (snap === null || snap.self === null || !$pageVisible) return;
     computeNow = Date.now();
     const timer = setInterval(() => (computeNow = Date.now()), 1000);
     return () => clearInterval(timer);
