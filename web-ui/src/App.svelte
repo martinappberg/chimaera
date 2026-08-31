@@ -4621,9 +4621,12 @@
         <!-- Same place, same look — but a plain label: nothing in a solo
              window opens the rail. The spacer replaces the hidden chips row
              as the strip's flex grower — without it every non-macOS-native
-             window (no .strip-drag) bunches the controls at the left edge. -->
-        <span class="strip-ws inert">{workspace?.name ?? "chimaera"}</span>
-        <div class="strip-spacer" aria-hidden="true"></div>
+             window (no .strip-drag) bunches the controls at the left edge.
+             Under the macOS titlebar overlay the spacer grows ALONGSIDE
+             .strip-drag, so it (and the inert label) must be drag regions
+             too or half the titlebar goes dead for moving the window. -->
+        <span class="strip-ws inert" data-tauri-drag-region>{workspace?.name ?? "chimaera"}</span>
+        <div class="strip-spacer" data-tauri-drag-region aria-hidden="true"></div>
       {/if}
       {#if !detachedWindow}
         <!-- The workspace's session chips are the MAIN window's wayfinding; a
@@ -5897,7 +5900,11 @@
     background: var(--row-hover);
   }
 
-  /* The detached window's plain workspace label: same slot, no affordance. */
+  /* The detached window's plain workspace label: same slot, no affordance.
+     It doubles as titlebar drag surface, so its text must never select. */
+  .strip-ws.inert {
+    user-select: none;
+  }
   .strip-ws.inert:hover {
     background: none;
   }
