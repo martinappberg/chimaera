@@ -19,14 +19,16 @@ const [sid, turnsArg] = process.argv.slice(2);
 const TURNS = Number(turnsArg ?? 400);
 const PORT = process.env.CHIMAERA_PORT ?? "9700";
 const TOKEN = process.env.CHIMAERA_TOKEN ?? "";
-if (!sid || !TOKEN) {
+if (!sid || !TOKEN || !Number.isFinite(TURNS) || TURNS < 1) {
   console.error("usage: CHIMAERA_PORT=<port> CHIMAERA_TOKEN=<token> node pump-turns.mjs <sessionId> [turns]");
   process.exit(2);
 }
 const ws = new WebSocket(`ws://127.0.0.1:${PORT}/ws/chat/${sid}`);
 let sent = 0;
 let lastSeq = 0;
+let replayHead = 0;
 let idleTimer = null;
+const answered = new Set();
 
 function sendTurn() {
   sent++;
@@ -54,6 +56,8 @@ ws.onmessage = (ev) => {
   let msg;
   try { msg = JSON.parse(ev.data); } catch { return; }
   if (msg.type === "ready") {
+    // Requests at or below head are history replay — don't re-answer them.
+    replayHead = typeof msg.head === "number" ? msg.head : 0;
     sendTurn();
     return;
   }
@@ -64,7 +68,11 @@ ws.onmessage = (ev) => {
     for (const e of entries) {
       if (typeof e.seq === "number" && e.seq > lastSeq) lastSeq = e.seq;
       const evt = e.ev;
-      if (evt && evt.type === "permission_request" && evt.request_id) {
+      if (
+        evt && evt.type === "permission_request" && evt.request_id &&
+        e.seq > replayHead && !answered.has(evt.request_id)
+      ) {
+        answered.add(evt.request_id);
         const opt = Array.isArray(evt.options) && evt.options[0]?.id ? evt.options[0].id : "allow_once";
         ws.send(JSON.stringify({ type: "permission", request_id: evt.request_id, option_id: opt }));
       }
@@ -72,5 +80,8 @@ ws.onmessage = (ev) => {
     maybeNext();
   }
 };
-ws.onclose = () => { console.log(`closed at ${sent} turns, lastSeq=${lastSeq}`); process.exit(0); };
+ws.onclose = () => {
+  console.log(`closed at ${sent} turns, lastSeq=${lastSeq}`);
+  process.exit(sent >= TURNS ? 0 : 1);
+};
 setTimeout(() => { console.error(`timeout at ${sent} turns, lastSeq=${lastSeq}`); process.exit(1); }, 600000);
