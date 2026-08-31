@@ -434,8 +434,8 @@ export async function deleteMastermind(workspaceId: string): Promise<void> {
   await json<void>(await api(`/workspaces/${workspaceId}/mastermind`, { method: "DELETE" }));
 }
 
-export async function listSessions(): Promise<Session[]> {
-  return json(await api("/sessions"));
+export async function listSessions(signal?: AbortSignal): Promise<Session[]> {
+  return json(await api("/sessions", signal !== undefined ? { signal } : {}));
 }
 
 /** Launcher extras for kind-"agent" spawns (POST /sessions passthrough). */
@@ -618,6 +618,14 @@ export async function renameSession(id: string, name: string): Promise<void> {
   );
 }
 
+/** The last poll-driven /sessions fetch (module-wide): App re-arms this
+ *  poller on every events-socket transition, and each arm fires an
+ *  immediate tick — without a damper a crash-looping daemon (a flap per
+ *  second) turns that into a fetch per second. Flap-adjacent fetches are
+ *  redundant anyway: the socket snapshot just delivered the same data. */
+let lastSessionsFetchAt = 0;
+const SESSIONS_POLL_DAMP_MS = 3_000;
+
 /**
  * Poll GET /api/v1/sessions to refresh names/titles/alive. Fires
  * immediately, then at `delayMs(hidden)` with a catch-up fetch on
@@ -631,9 +639,14 @@ export function pollSessions(
   delayMs: (hidden: boolean) => number = sessionsPollDelayMs,
 ): () => void {
   let stopped = false;
-  const stop = startVisibilityPoll(async () => {
+  const handle = startVisibilityPoll(async () => {
+    const now = Date.now();
+    if (now - lastSessionsFetchAt < SESSIONS_POLL_DAMP_MS) return;
+    lastSessionsFetchAt = now;
     try {
-      const list = await listSessions();
+      // 4s abort: the chain arms the next tick only after this settles — a
+      // hanging TCP connect must not stretch the recovery cadence.
+      const list = await listSessions(AbortSignal.timeout(4000));
       if (!stopped) onResult(list);
     } catch (e) {
       if (!stopped) onError(e);
@@ -641,6 +654,6 @@ export function pollSessions(
   }, delayMs);
   return () => {
     stopped = true;
-    stop();
+    handle.stop();
   };
 }

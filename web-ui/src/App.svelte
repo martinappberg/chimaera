@@ -17,7 +17,7 @@
     unauthorized,
     type Health,
   } from "./lib/net/api";
-  import { healthPollDelayMs } from "./lib/net/poll";
+  import { healthPollDelayMs, type PollHandle } from "./lib/net/poll";
   import { pageVisible } from "./lib/shared/visibility";
   import {
     backgrounded,
@@ -1023,13 +1023,18 @@
   // Cadence (net/poll.ts): the events socket is the real liveness signal, so
   // while it's up this is a 60s safety net; while it's down the 5s recovery
   // probe runs only in a visible window (hidden takes the slow tier, with a
-  // catch-up fetch on visibility return). Reading `eventsUp` re-arms the
-  // poll on every transition — an immediate probe either way.
+  // catch-up fetch on visibility return). The delay getter reads `eventsUp`
+  // live at each arm — the poller itself is armed once (no teardown churn).
+  let healthPoll: PollHandle | null = null;
   $effect(() => {
-    const up = eventsUp;
-    return pollHealth(
+    const handle = pollHealth(
       (h) => {
         healthUp = true;
+        // Cross-nudge: HTTP just proved the daemon reachable — if the events
+        // socket is sitting out a backoff (or gave up as fatal), retry it
+        // now instead of letting two independent slow clocks ignore each
+        // other. It in turn nudges the per-session sockets on recovery.
+        if (!eventsUp) eventsSocket?.retryNow();
         if (daemonBuildChanged(h.build)) {
           // The origin can stay stable across a daemon handoff, but the
           // hashed JS namespace cannot. Reload before the user opens a lazy
@@ -1043,8 +1048,21 @@
       () => {
         healthUp = false;
       },
-      (hidden) => healthPollDelayMs(up, hidden),
+      (hidden) => healthPollDelayMs(eventsUp, hidden),
     );
+    healthPoll = handle;
+    return () => {
+      healthPoll = null;
+      handle.stop();
+    };
+  });
+
+  // An events up/down transition warrants a prompt reachability probe —
+  // kick() is deferred and damped (KICK_DAMP_MS), so a crash-looping daemon
+  // flapping the socket once a second cannot become a fetch per transition.
+  $effect(() => {
+    void eventsUp;
+    healthPoll?.kick();
   });
 
   // While this document is hidden nobody sees the presence animations: a

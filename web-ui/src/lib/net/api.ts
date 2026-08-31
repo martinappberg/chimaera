@@ -1,6 +1,6 @@
 import { writable } from "svelte/store";
 
-import { healthPollDelayMs, startVisibilityPoll } from "./poll";
+import { healthPollDelayMs, startVisibilityPoll, type PollHandle } from "./poll";
 
 const TOKEN_KEY = "chimaera:token";
 const WS_KEY = "chimaera.ws";
@@ -252,7 +252,10 @@ export interface Health {
 }
 
 export async function health(): Promise<Health> {
-  const res = await api("/health");
+  // 4s abort: pollHealth arms its next tick only after this settles, so an
+  // unbounded hang (a dead tunnel's ~75s TCP connect) would otherwise
+  // stretch the 5s recovery cadence to ~80s.
+  const res = await api("/health", { signal: AbortSignal.timeout(4000) });
   if (!res.ok) {
     throw new ApiError(res.status, `health check failed with status ${res.status}`);
   }
@@ -264,15 +267,16 @@ export async function health(): Promise<Health> {
  * re-evaluated per arm, with a catch-up fetch on visibility return (see
  * net/poll.ts). The caller picks the cadence: /ws/events is the real
  * liveness signal, so App passes `healthPollDelayMs` keyed on it. Returns
- * a stop function.
+ * the poll handle — `kick()` requests a prompt (damped) probe on an events
+ * transition; `stop()` tears down.
  */
 export function pollHealth(
   onResult: (h: Health) => void,
   onError: (e: unknown) => void,
   delayMs: (hidden: boolean) => number = (hidden) => healthPollDelayMs(false, hidden),
-): () => void {
+): PollHandle {
   let stopped = false;
-  const stop = startVisibilityPoll(async () => {
+  const handle = startVisibilityPoll(async () => {
     try {
       const h = await health();
       if (!stopped) onResult(h);
@@ -280,8 +284,13 @@ export function pollHealth(
       if (!stopped) onError(e);
     }
   }, delayMs);
-  return () => {
-    stopped = true;
-    stop();
+  return {
+    stop(): void {
+      stopped = true;
+      handle.stop();
+    },
+    kick(): void {
+      handle.kick();
+    },
   };
 }

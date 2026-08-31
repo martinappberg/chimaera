@@ -41,10 +41,14 @@ domain surfaces + their stores: files tree, git, sessions, launcher, home) · **
   signal): timers, polls, reconnect probes, and infinite "presence" animations must
   stop or slow while nobody can see them — a hidden window on battery costs
   ~nothing, and one turned into a background heater is exactly what the 2026-08
-  perf audit kept finding. Copy the idioms instead of hand-rolling: the
-  visibility gate + catch-up-on-`visibilitychange` in `workspace/compute.ts`,
-  the fast/slow poll tiers in `net/poll.ts`, the jittered + hidden-tier backoff
-  (with the events-recovery "retry now" nudge) in `net/reconnect.ts`, the
-  `$pageVisible`-gated 1 Hz tickers (`shared/visibility.ts`), and the
-  `html.app-hidden` root class that pauses the enumerated infinite animations
-  (see app.css).
+  perf audit kept finding. Copy the idioms instead of hand-rolling — and pick
+  the right one for the layer: **components** gate `$effect` tickers on pane
+  visibility && the `$pageVisible` store (`shared/visibility.ts` — the effect
+  re-run is the catch-up); **store modules** own their own `visibilitychange`
+  listener when the return needs an immediate refetch (`workspace/compute.ts`);
+  polls ride the fast/slow tiers + catch-up loop in `net/poll.ts` (every poll
+  fetch carries an abort timeout — a hung fetch stalls the chain); sockets ride
+  the jittered, grace-then-floored backoff + damped recovery nudge in
+  `net/reconnect.ts`; and infinite animations pause under the `html.app-hidden`
+  root class, enumerated per component (see app.css). A deliberate exemption
+  (e.g. a keep-alive that must outlive hiding) says so in a comment.

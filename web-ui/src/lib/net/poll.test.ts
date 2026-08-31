@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   healthPollDelayMs,
+  KICK_DAMP_MS,
   POLL_FAST_MS,
   POLL_SLOW_MS,
   sessionsPollDelayMs,
@@ -60,7 +61,7 @@ describe("startVisibilityPoll", () => {
 
   it("ticks immediately, then at the returned delay", async () => {
     let ticks = 0;
-    const stop = startVisibilityPoll(
+    const handle = startVisibilityPoll(
       () => {
         ticks += 1;
       },
@@ -72,12 +73,12 @@ describe("startVisibilityPoll", () => {
     expect(ticks).toBe(2);
     await vi.advanceTimersByTimeAsync(10_000);
     expect(ticks).toBe(4);
-    stop();
+    handle.stop();
   });
 
   it("re-evaluates the delay per arm (tier changes take effect)", async () => {
     const seen: boolean[] = [];
-    const stop = startVisibilityPoll(
+    const handle = startVisibilityPoll(
       () => {},
       (hidden) => {
         seen.push(hidden);
@@ -89,12 +90,12 @@ describe("startVisibilityPoll", () => {
     visibility = "hidden"; // no event: the next arm still sees the new state
     await vi.advanceTimersByTimeAsync(5000);
     expect(seen).toEqual([false, true]);
-    stop();
+    handle.stop();
   });
 
   it("catches up immediately on visibility return instead of waiting out the slow tier", async () => {
     let ticks = 0;
-    const stop = startVisibilityPoll(
+    const handle = startVisibilityPoll(
       () => {
         ticks += 1;
       },
@@ -114,21 +115,58 @@ describe("startVisibilityPoll", () => {
     fireVisibility("visible");
     await vi.advanceTimersByTimeAsync(0);
     expect(ticks).toBe(3);
-    stop();
+    handle.stop();
   });
 
   it("stop() cancels the timer and unhooks the listener", async () => {
     let ticks = 0;
-    const stop = startVisibilityPoll(
+    const handle = startVisibilityPoll(
       () => {
         ticks += 1;
       },
       () => 5000,
     );
     await vi.advanceTimersByTimeAsync(0);
-    stop();
+    handle.stop();
     expect(listeners).toEqual([]);
     await vi.advanceTimersByTimeAsync(60_000);
     expect(ticks).toBe(1);
+  });
+
+  it("kick() is damped against the last tick, then probes promptly", async () => {
+    let ticks = 0;
+    const handle = startVisibilityPoll(
+      () => {
+        ticks += 1;
+      },
+      () => 60_000,
+    );
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ticks).toBe(1);
+    handle.kick(); // right after the immediate tick: damped
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ticks).toBe(1);
+    await vi.advanceTimersByTimeAsync(KICK_DAMP_MS); // damp budget restored
+    expect(ticks).toBe(1); // (the 60s cadence hasn't come around)
+    handle.kick();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ticks).toBe(2);
+    handle.stop();
+  });
+
+  it("a rejecting tick is caught and the cadence continues", async () => {
+    let calls = 0;
+    const handle = startVisibilityPoll(
+      () => {
+        calls += 1;
+        return Promise.reject(new Error("boom"));
+      },
+      () => 5000,
+    );
+    await vi.advanceTimersByTimeAsync(0);
+    expect(calls).toBe(1);
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(calls).toBe(2);
+    handle.stop();
   });
 });

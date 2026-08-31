@@ -302,12 +302,13 @@
 
   /** Local countdown baseline — ticks at 1 Hz ONLY inside an allocation
    *  (the ComputeStrip idiom: time_left moves per 60s fetch; the chip ticks
-   *  against the snapshot's client receipt time) and only while the document
-   *  is visible (compute.ts idiom — catch-up on return via the re-run). */
+   *  against the snapshot's client receipt time) and only while this pane
+   *  is shown AND the document is visible (the compound gate — catch-up on
+   *  return via the re-run). */
   let computeNow = $state(Date.now());
   $effect(() => {
     const snap = $computeStatus;
-    if (snap === null || snap.self === null || !$pageVisible) return;
+    if (snap === null || snap.self === null || !visible || !$pageVisible) return;
     computeNow = Date.now();
     const timer = setInterval(() => (computeNow = Date.now()), 1000);
     return () => clearInterval(timer);
@@ -514,6 +515,7 @@
                     onStopTask={s.ui === "chat" && agentKind(s) === "claude"
                       ? (taskId) => stopTask(s.id, taskId)
                       : undefined}
+                    {visible}
                   />
                 </div>
               {/each}

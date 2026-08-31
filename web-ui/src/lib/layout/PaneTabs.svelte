@@ -1164,6 +1164,7 @@
     content: "";
     position: absolute;
     inset: -3.5px;
+    pointer-events: none;
     border-radius: 50%;
     background: hsl(var(--hue) 65% 55% / 0.35);
     opacity: 0;

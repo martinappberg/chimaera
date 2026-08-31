@@ -16,6 +16,7 @@
   import WorkTrayRow from "../shared/WorkTrayRow.svelte";
   import { basename } from "../previews/files";
   import { formatElapsedSeconds } from "../shared/time";
+  import { pageVisible } from "../shared/visibility";
   import { relativeAge } from "../workspace/launcher";
   import {
     agentKind,
@@ -44,6 +45,9 @@
     /** Stop a work row — a subagent or a background task; both ride the
      *  same stop_task wire (claude chat only). Omitted when unsupported. */
     onStopTask?: (id: string) => void;
+    /** False while the dashboard pane is a hidden tab — a parked dashboard
+     *  must not keep every card's clock and row dots running. */
+    visible?: boolean;
   }
 
   let {
@@ -56,6 +60,7 @@
     onOpen,
     onOpenChanges,
     onStopTask,
+    visible = true,
   }: Props = $props();
 
   const prov = $derived(provenanceOf(session));
@@ -164,10 +169,12 @@
   /** 1 Hz clock for the rows' elapsed/age columns (background elapsed, wire
    *  subagent age) — only while the rows are actually visible (the
    *  BackgroundTray idiom: collapsed cards must not tick a wake-up per
-   *  second for hours). */
+   *  second for hours), the pane is shown, AND the document is visible
+   *  (catch-up on return via the re-run). */
   let now = $state(Date.now());
   $effect(() => {
-    if (!workOpen || (bgTasks.length === 0 && wireAgents.length === 0)) return;
+    if (!visible || !$pageVisible || !workOpen || (bgTasks.length === 0 && wireAgents.length === 0))
+      return;
     now = Date.now();
     const timer = setInterval(() => (now = Date.now()), 1000);
     return () => clearInterval(timer);
@@ -315,11 +322,12 @@
          card's open-the-session handler. -->
     <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
     <div class="work" onclick={(e) => e.stopPropagation()}>
-      <WorkTray glyph={workGlyph} bind:open={workOpen} label={workLabel}>
+      <WorkTray glyph={workGlyph} bind:open={workOpen} label={workLabel} {visible}>
         {#each activeAgents as a (a.id)}
           <WorkTrayRow
             onStop={onStopTask !== undefined ? () => onStopTask(a.id) : undefined}
             stopTitle="stop this subagent"
+            {visible}
           >
             <span class="subname" title={subName(a.title)}>{subName(a.title)}</span>
             {#if subProgress(a) !== ""}
@@ -331,7 +339,7 @@
           <!-- Hook-tier rows are read-only: hooks can't stop a TUI subagent,
                and a stop button that can't work would be a lie. The label is
                the agent's own type name — canonical, never relabeled. -->
-          <WorkTrayRow>
+          <WorkTrayRow {visible}>
             <span class="subname" title={a.label}>{a.label}</span>
             <span class="subage">{relativeAge(Math.floor(a.started_at / 1000), now)}</span>
           </WorkTrayRow>
@@ -341,6 +349,7 @@
           <WorkTrayRow
             onStop={onStopTask !== undefined ? () => onStopTask(t.id) : undefined}
             stopTitle="stop this background task"
+            {visible}
           >
             <!-- The lane name (local_bash, …) stays canonical in the tooltip;
                  workflow lanes wear their meta.name + agent tally (the

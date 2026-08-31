@@ -378,6 +378,11 @@
   {/if}
 {/snippet}
 
+<!-- The shell exists solely so the exec ring below can live OUTSIDE .pane:
+     the pane clips its descendants (overflow: hidden), so a ring inside it
+     would have to overlap the outermost content pixels. Layout-transparent —
+     it takes over the pane's flex-child contract and the pane fills it. -->
+<div class="pane-shell">
 <section
   class="pane"
   class:focused
@@ -471,8 +476,25 @@
     </div>
   {/if}
 </section>
+{#if agentExec}
+  <!-- The agent is executing here: the border breathes in the agent's hue —
+       peripheral-vision signal that the leash is being pulled. A STATIC ring
+       breathed via opacity (composited) instead of box-shadow keyframes (a
+       repaint per frame for the whole turn); centered on the pane's border
+       line so it occludes no content or scrollbars. -->
+  <div class="exec-ring" style:--hue={linkHue} aria-hidden="true"></div>
+{/if}
+</div>
 
 <style>
+  .pane-shell {
+    flex: 1;
+    min-width: 0;
+    min-height: 0;
+    display: flex;
+    position: relative;
+  }
+
   .pane {
     flex: 1;
     min-width: 0;
@@ -499,22 +521,18 @@
     border-color: color-mix(in srgb, hsl(var(--hue) 50% 55%) 38%, var(--edge));
   }
 
-  /* The agent is executing here: the border breathes in the agent's hue —
-     peripheral-vision signal that the leash is being pulled. The glow is a
-     STATIC ring on an overlay pseudo-element breathed via opacity: animating
-     box-shadow repaints the whole pane edge every frame for the length of an
-     agent turn, while opacity composites. (.pane clips its descendants, so
-     the ring hugs the border from inside rather than outside — the same
-     breathing hue edge to a human.) */
-  .pane.agent-exec::after {
-    content: "";
+  /* The exec ring (see the template comment): 2px wide, centered on the
+     pane's 1px border — [-1px, +1px] around the border box — so the inner
+     half paints over chrome (the border line), never content, and the outer
+     half breathes into the surrounding gap where the old box-shadow lived
+     (an ancestor that clips at the pane's bounds — a split .cell — clipped
+     the old shadow's outer ring identically). */
+  .exec-ring {
     position: absolute;
-    inset: 0;
-    /* Above the keep-alive content layers, under the drop-zone overlays. */
-    z-index: 5;
+    inset: -1px;
     pointer-events: none;
     border: 2px solid hsl(var(--hue) 60% 55% / 0.35);
-    border-radius: 9px; /* the pane's 10px, inside its 1px border */
+    border-radius: 11px; /* the pane's 10px, 1px further out */
     opacity: 0;
     animation: agent-exec-pulse 1.4s ease-in-out infinite;
   }
@@ -527,12 +545,12 @@
 
   /* Hidden document: nobody sees the breath — stop burning frames (the
      html.app-hidden contract; see app.css). */
-  :global(html.app-hidden) .pane.agent-exec::after {
+  :global(html.app-hidden) .exec-ring {
     animation-play-state: paused;
   }
 
   @media (prefers-reduced-motion: reduce) {
-    .pane.agent-exec::after {
+    .exec-ring {
       animation: none;
       opacity: 1;
       border-color: hsl(var(--hue) 60% 55% / 0.3);

@@ -172,8 +172,11 @@
   /** Job id pending the in-row two-step scancel confirm. */
   let confirmCancel = $state<string | null>(null);
   let launchOpen = $state(false);
-  /** Poll gate: the sessions list only refreshes while the page is visible. */
-  let pageVisible = $state(document.visibilityState === "visible");
+  /** Poll gate: the sessions list only refreshes while the page is visible.
+   *  A local mirror rather than shared/visibility.ts's `pageVisible` store —
+   *  this component's one visibilitychange listener also fires immediate
+   *  refreshes on return, which a bare store subscription wouldn't carry. */
+  let docVisible = $state(document.visibilityState === "visible");
   /** The open currently in flight (job id) — the card pulses "connecting…",
    *  its actions freeze, and a second click is impossible until it settles. */
   let connectingJob = $state<string | null>(null);
@@ -241,11 +244,11 @@
       if (!isHostPage) return;
       void refreshHostCompute();
       const onVis = (): void => {
-        pageVisible = document.visibilityState === "visible";
+        docVisible = document.visibilityState === "visible";
         // Hidden paused the poller; catch up NOW instead of waiting a period.
         // Re-check isHostPage: it can flip false after mount (the daemon's
         // `self` block arriving) and this handler must not outlive the fact.
-        if (pageVisible && isHostPage) void refreshHostCompute();
+        if (docVisible && isHostPage) void refreshHostCompute();
       };
       document.addEventListener("visibilitychange", onVis);
       return () => document.removeEventListener("visibilitychange", onVis);
@@ -264,8 +267,8 @@
     // Local home: pause the compute-indicator refresh while hidden, and
     // catch up the moment the page is visible again.
     const onVis = (): void => {
-      pageVisible = document.visibilityState === "visible";
-      if (pageVisible) {
+      docVisible = document.visibilityState === "visible";
+      if (docVisible) {
         for (const h of hosts) {
           if (h.status === "connected") void refreshCompute(h.alias);
         }
@@ -460,7 +463,7 @@
   // hammering anything — one proxied call per connected host per minute,
   // visible only (the remote daemon caches its snapshot ~30s anyway).
   $effect(() => {
-    if (!native || ownAlias !== null || !pageVisible) return;
+    if (!native || ownAlias !== null || !docVisible) return;
     const t = setInterval(() => {
       for (const h of hosts) {
         if (h.status === "connected") void refreshCompute(h.alias);
@@ -519,7 +522,7 @@
     hostCompute !== null && hostCompute.scheduler !== "slurm",
   );
   $effect(() => {
-    if (!isHostPage || !pageVisible || schedulerKnownNone) return;
+    if (!isHostPage || !docVisible || schedulerKnownNone) return;
     // 5s while anything is pending: the list call now reads the fast-twitch
     // signals (process table + manifests) fresh each time WITHOUT touching
     // the controller — squeue still refreshes on its own 30s cadence — so a
@@ -642,7 +645,7 @@
   // The shared ticker: one interval for the whole list, only while the page
   // is visible and something is actually counting down.
   $effect(() => {
-    if (!isHostPage || !pageVisible || !anyRunning) return;
+    if (!isHostPage || !docVisible || !anyRunning) return;
     const t = setInterval(() => (nowTick = Date.now()), 1000);
     return () => clearInterval(t);
   });
@@ -1826,6 +1829,16 @@
     50% {
       opacity: 0.3;
     }
+  }
+
+  /* Hidden document: pause the presence dots — nobody sees them breathe
+     (the html.app-hidden contract; see app.css). */
+  :global(html.app-hidden) .dot.starting,
+  :global(html.app-hidden) .dot.queued,
+  :global(html.app-hidden) .dot.booting,
+  :global(html.app-hidden) .row.comp-count.checking,
+  :global(html.app-hidden) .probe-line {
+    animation-play-state: paused;
   }
 
   /* Inside a count pill the halo would clip against the border — the pill's
