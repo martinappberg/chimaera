@@ -206,7 +206,10 @@ pub(crate) async fn create_worktree(
     };
 
     // The repo's worktree list changed: every window watching it refetches.
+    // Invalidate too — the refetch this bump triggers must recompute, not be
+    // served a pre-op result still inside the share's reuse window.
     state.git.bump(&body.workspace_id);
+    state.git.invalidate(&body.workspace_id);
     state.changes.notify_waiters();
 
     Json(json!({
@@ -354,9 +357,15 @@ pub(crate) async fn remove_worktree(
         if let Err(err) = crate::lock(&state.workspaces).remove(&id) {
             tracing::warn!(%err, %id, "failed to unregister removed worktree");
         }
+        // The unregistered workspace's git state goes with it (see
+        // `delete_workspace` — same eviction).
+        state.git.forget_workspace(&id);
     }
 
+    // Bump + invalidate, same pairing as the add path: the triggered
+    // refetch must never reuse a pre-removal shared result.
     state.git.bump(&body.workspace_id);
+    state.git.invalidate(&body.workspace_id);
     state.changes.notify_waiters();
     StatusCode::NO_CONTENT.into_response()
 }

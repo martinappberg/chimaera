@@ -15,6 +15,11 @@
 //
 // fake-claude's canned turn parks on a Bash permission ask, so the pump
 // answers every permission_request with its first option.
+//
+// Known limitation: a LIVE ask parked from before this pump connected sits at
+// seq <= the replay head, so the replay guard below never answers it and the
+// session stays parked — start the pump against a fresh session (or answer
+// the pending ask in the UI first) rather than resuming a parked one.
 const [sid, turnsArg] = process.argv.slice(2);
 const TURNS = Number(turnsArg ?? 400);
 const PORT = process.env.CHIMAERA_PORT ?? "9700";
@@ -28,7 +33,6 @@ let sent = 0;
 let lastSeq = 0;
 let replayHead = 0;
 let idleTimer = null;
-const answered = new Set();
 
 function sendTurn() {
   sent++;
@@ -68,11 +72,10 @@ ws.onmessage = (ev) => {
     for (const e of entries) {
       if (typeof e.seq === "number" && e.seq > lastSeq) lastSeq = e.seq;
       const evt = e.ev;
-      if (
-        evt && evt.type === "permission_request" && evt.request_id &&
-        e.seq > replayHead && !answered.has(evt.request_id)
-      ) {
-        answered.add(evt.request_id);
+      // No request-id dedupe here: fake-claude reuses request_id ("req-1")
+      // for EVERY turn's ask, so a dedupe set answers turn 1 and stalls
+      // forever; the seq > replayHead guard alone prevents replay re-answers.
+      if (evt && evt.type === "permission_request" && evt.request_id && e.seq > replayHead) {
         const opt = Array.isArray(evt.options) && evt.options[0]?.id ? evt.options[0].id : "allow_once";
         ws.send(JSON.stringify({ type: "permission", request_id: evt.request_id, option_id: opt }));
       }

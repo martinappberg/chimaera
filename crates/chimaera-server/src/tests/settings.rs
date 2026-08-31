@@ -89,3 +89,35 @@ async fn settings_hand_edit_on_disk_is_picked_up() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["settings"]["terminal.fontSize"], 16);
 }
+
+/// The events bus reads only the CACHED settings generation/map (no reactor
+/// stat) — external edits reach it through the watcher's off-reactor poll,
+/// which reloads and reports a change so the caller can broadcast.
+#[tokio::test]
+async fn settings_watcher_poll_surfaces_hand_edits_off_reactor() {
+    let data_dir = test_dir("settings-watch");
+    let state = test_state_with_data_dir(0, data_dir.clone());
+
+    let before = lock(&state.settings).generation_cached();
+
+    // Simulate `vim ~/.config/chimaera/settings.json`.
+    let path = data_dir.join("config").join("settings.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, r#"{"terminal.fontSize": 17}"#).unwrap();
+    // Same mtime-granularity dodge as the hand-edit test above.
+    lock(&state.settings).force_stale_for_tests();
+
+    // One watcher pass: detects the edit, reloads, reports the change.
+    assert!(crate::settings::poll_external_edit(&state).await);
+    {
+        let store = lock(&state.settings);
+        assert!(store.generation_cached() > before);
+        assert_eq!(
+            store.map_cached().get("terminal.fontSize"),
+            Some(&serde_json::json!(17))
+        );
+    }
+
+    // Settled: the next pass sees the recorded mtime and does nothing.
+    assert!(!crate::settings::poll_external_edit(&state).await);
+}
