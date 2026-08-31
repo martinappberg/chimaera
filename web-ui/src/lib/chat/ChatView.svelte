@@ -1347,14 +1347,10 @@
    *  immediately. On a retained hidden tab they become one plain snapshot:
    *  no hidden plan-row, task-dot, permission, or queued-message churn, while
    *  the keyed components stay mounted and keep local open/input state. */
-  const liveActiveAgents = $derived(
-    store.blocks.filter(
-      (b): b is ActiveAgent =>
-        b.kind === "tool" &&
-        b.tool === "agent" &&
-        (b.status === "in_progress" || b.status === "pending"),
-    ),
-  );
+  // Maintained incrementally by the reducer (audit B2): the old derived here
+  // re-filtered EVERY block through its Svelte proxy on each structural/tool
+  // event — O(blocks) per event just to keep a usually-empty tray current.
+  const liveActiveAgents = $derived(store.activeAgents);
   let pinnedAgents = $state.raw<ActiveAgent[]>([]);
   let pinnedBackgroundTasks = $state.raw<BackgroundTask[]>([]);
   let pinnedPlan = $state.raw<PlanEntry[]>([]);
@@ -1478,10 +1474,16 @@
     return items;
   });
 
-  /** Index of the last block (the streaming reveal keys off it). Queued sends
-   *  render from their own pending tail, not `blocks`, so this is simply the
-   *  delivered-block tail. */
-  const lastInlineIndex = $derived(store.blocks.length - 1);
+  /** Identity of the last block (the streaming reveal keys off it). Queued
+   *  sends render from their own pending tail, not `blocks`, so this is
+   *  simply the delivered-block tail. Compared by UID, not index: a frozen
+   *  hidden row keeps its live counterpart's uid, so the check stays true for
+   *  exactly the still-streaming tail while the tab is hidden (the freeze
+   *  contract) and can never alias a different row after trims shift
+   *  indices. */
+  const lastInlineUid = $derived(
+    store.blocks.length > 0 ? store.blocks[store.blocks.length - 1].uid : -1,
+  );
 
   /** One precise wall-clock timer for every assistant timestamp in this view.
    *  Each row reports its next label boundary; scheduling the earliest avoids
@@ -1640,9 +1642,15 @@
         </div>
       {:else if item.block.kind === "message"}
         <div class="msg agent" data-block-index={item.index} data-block-uid={item.block.uid}>
+          <!-- streaming is TURN state (this row is the streaming tail);
+               visibility rides separately so hiding a tab mid-stream freezes
+               the live segment DOM in place instead of paying a synchronous
+               whole-message canonical parse at tab-switch-away, and thaw
+               resumes the reveal cursor instead of re-animating the row. -->
           <Markdown
             text={item.block.text}
-            streaming={visible && store.running && item.index === lastInlineIndex}
+            streaming={store.running && item.block.uid === lastInlineUid}
+            {visible}
             onOpenPath={openProsePath}
             resolvePaths={resolveProsePaths}
             onReveal={() => {

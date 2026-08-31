@@ -11,6 +11,79 @@ import type { AgentEvent, ChatSessionInfo, SeqEvent } from "./chatWs";
 /** The single leading notice a client-side transcript trim leaves behind. */
 const TRIM_NOTICE = "earlier history trimmed";
 
+/** Client-side cap for LIVE tool output accumulated from `tool_output_delta`.
+ *  The server caps the AUTHORITATIVE result it journals (chimaera-agent
+ *  `cap_output`: 12 KiB head + 4 KiB tail behind a "[N bytes omitted]"
+ *  marker), but the deltas streamed AHEAD of that result used to accumulate
+ *  unboundedly here. Mirror the server's budget and marker so the live and
+ *  settled presentations agree: keep the fixed head, roll the tail. All
+ *  budgets are UTF-8 BYTES, like the server's — counted incrementally (one
+ *  TextEncoder pass per delta), never by re-encoding the accumulation. */
+const TOOL_OUTPUT_HEAD = 12 * 1024;
+const TOOL_OUTPUT_TAIL = 4 * 1024;
+/** Trim hysteresis: let the rolling tail run this far past its budget, then
+ *  re-slice once — one string rebuild per ~4 KiB of overflow, not per delta. */
+const TOOL_OUTPUT_SLACK = 4 * 1024;
+
+const utf8 = new TextEncoder();
+const utf8Len = (s: string): number => utf8.encode(s).length;
+
+function codePointBytes(cp: number): number {
+  return cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
+}
+
+/** Largest UTF-16 index whose prefix fits `budget` UTF-8 bytes — always a
+ *  code-point boundary (surrogate pairs move as one). */
+function byteFloorIndex(s: string, budget: number): number {
+  let bytes = 0;
+  let i = 0;
+  while (i < s.length) {
+    const cp = s.codePointAt(i) as number;
+    const size = codePointBytes(cp);
+    if (bytes + size > budget) break;
+    bytes += size;
+    i += cp > 0xffff ? 2 : 1;
+  }
+  return i;
+}
+
+/** Smallest UTF-16 index from which the suffix fits `budget` UTF-8 bytes,
+ *  plus that suffix's exact byte size — code-point boundaries throughout. */
+function byteTailIndex(s: string, budget: number): { index: number; bytes: number } {
+  let bytes = 0;
+  let i = s.length;
+  while (i > 0) {
+    let j = i - 1;
+    const unit = s.charCodeAt(j);
+    if (unit >= 0xdc00 && unit <= 0xdfff && j > 0) j -= 1; // low surrogate → whole pair
+    const size = codePointBytes(s.codePointAt(j) as number);
+    if (bytes + size > budget) break;
+    bytes += size;
+    i = j;
+  }
+  return { index: i, bytes };
+}
+
+/** Bookkeeping for one live output stream — the sole holder of the byte
+ *  counts and (once capped) the head/tail split, so the rendered text is
+ *  rebuilt without re-parsing its own elision marker back out of display
+ *  text (agent output could forge one). */
+type OutputClip =
+  | { capped: false; bytes: number }
+  | { capped: true; head: string; tail: string; tailBytes: number; omittedBytes: number };
+
+/** The server's own marker shape (model.rs `cap_head_tail`). */
+function clipText(clip: { head: string; tail: string; omittedBytes: number }): string {
+  return `${clip.head}\n… [${clip.omittedBytes} bytes omitted] …\n${clip.tail}`;
+}
+
+/** That same marker, for ABSORBING an existing elision when re-capping text
+ *  that already carries one (a straggler delta appended to a server-capped
+ *  authoritative result) — the counts merge so markers can never nest. A
+ *  forged marker in agent output merges too; that only perturbs the
+ *  display-only byte count, never what is retained. */
+const ELISION_MARKER = /\n… \[(\d+) bytes omitted\] …\n/;
+
 /** Events that materially change the scrollable conversation. The socket seq
  * also advances for header/control telemetry (models, rate limits, context),
  * which must not read as unread chat activity. */
@@ -367,6 +440,14 @@ export class ChatStore {
    *  CLI's children). */
   backgroundTasks = $state<BackgroundTask[]>([]);
 
+  /** Live subagent rows (`tool === "agent"`, pending/in_progress) — the
+   *  AgentsTray's source, maintained INCREMENTALLY by the reducer (the
+   *  backgroundTasks level-set pattern). Entries are the same reactive block
+   *  proxies that live in `blocks`, so in-place progress/status patches land
+   *  in the tray directly — without the old per-event re-filter of EVERY
+   *  block through its Svelte proxy (O(blocks) per structural/tool event). */
+  activeAgents = $state<Extract<ChatBlock, { kind: "tool" }>[]>([]);
+
   /** Extended-thinking preference (claude). NOT journal-derived — the CLI has
    *  no read-back — but kept HERE (pooled per session, surviving a ChatView
    *  tab remount) rather than in the view, so switching tabs can neither reset
@@ -470,6 +551,10 @@ export class ChatStore {
   }
   /** tool_call id -> index into blocks, for in-place status/content patches. */
   private toolIndex = new Map<string, number>();
+  /** tool_call id -> live-output byte accounting (see
+   *  {@link appendToolOutput}) — one entry per stream receiving deltas; they
+   *  die with the authoritative result, reconciliation, trim, or reset. */
+  private outputClip = new Map<string, OutputClip>();
   /** user-message delivery id -> index into blocks (user_message_update). */
   private userIndex = new Map<string, number>();
   /** question request_id -> index into blocks, for the resolution fold. */
@@ -534,6 +619,8 @@ export class ChatStore {
     this.toolIndex.clear();
     this.userIndex.clear();
     this.questionIndex.clear();
+    this.outputClip.clear();
+    this.activeAgents = [];
     // Pending asks and sends belong to the journal being rebuilt; the fresh
     // replay re-delivers any that are still live.
     this.pending = [];
@@ -816,6 +903,7 @@ export class ChatStore {
             row.status = ev.status as "pending" | "in_progress";
           }
           if (ev.cross_turn === true) row.crossTurn = true;
+          this.syncAgentRow(row);
         } else {
           this.blocks.push(
             this.stamp({
@@ -833,6 +921,10 @@ export class ChatStore {
             }),
           );
           this.toolIndex.set(ev.id as string, this.blocks.length - 1);
+          // Register through the PROXY the array minted, so tray rows share
+          // the transcript row's reactivity.
+          const inserted = this.blocks[this.blocks.length - 1];
+          if (inserted.kind === "tool") this.syncAgentRow(inserted);
         }
         this.activity = { kind: "tool", detail: ev.title as string };
         break;
@@ -857,6 +949,13 @@ export class ChatStore {
           block.content = content;
           block.streaming = false;
         }
+        // The authoritative result (or a terminal status) ends the live
+        // output stream — its cap bookkeeping is dead. A straggler delta
+        // after this re-enters the cap from the rendered text; still bounded.
+        if (content != null || block.status === "completed" || block.status === "failed") {
+          this.outputClip.delete(block.id);
+        }
+        this.syncAgentRow(block);
         // A tool that JUST finished hands the floor back to the model: the
         // status row returns to "working" until the next delta names a
         // phase. Gated on the transition — updates to an already-terminal
@@ -881,11 +980,7 @@ export class ChatStore {
         if (block.kind !== "tool") break;
         const text = ev.text as string;
         const terminal = block.status === "completed" || block.status === "failed";
-        if (block.content !== null && block.content.kind === "output") {
-          block.content.text = (block.content.text ?? "") + text;
-        } else {
-          block.content = { kind: "output", text };
-        }
+        this.appendToolOutput(block, text);
         // A delayed output frame may enrich a settled row, but it can never
         // resurrect the live cursor after completion/reconciliation.
         block.streaming = !terminal;
@@ -1292,6 +1387,15 @@ export class ChatStore {
     this.trimmedCount += drop - 1;
     // The front-splice invalidated every id→index position — rebuild them all.
     this.rebuildIndexes();
+    // Rows the trim dropped can never resolve again — release their live-set
+    // entries and cap bookkeeping (the cap sits far above the live tail, so
+    // this is a correctness backstop, not a hot path).
+    if (this.activeAgents.length > 0) {
+      this.activeAgents = this.activeAgents.filter((a) => this.toolIndex.has(a.id));
+    }
+    for (const id of [...this.outputClip.keys()]) {
+      if (!this.toolIndex.has(id)) this.outputClip.delete(id);
+    }
   }
 
   private appendText(
@@ -1330,6 +1434,84 @@ export class ChatStore {
     } else {
       this.blocks.push(this.stamp({ kind, text: clean, turnId }));
     }
+  }
+
+  /** Append live tool output, BOUNDED — in UTF-8 BYTES, like the server.
+   *  Within the head+tail budget this is a plain append (bytes counted
+   *  incrementally, one encode per delta); past it the retained text keeps
+   *  the fixed head and a rolling tail behind the server's own "[N bytes
+   *  omitted]" marker (chimaera-agent `cap_output`), so a runaway stream
+   *  can't grow client memory with the turn. Slices land on code-point
+   *  boundaries (surrogate pairs never split) and a marker already present
+   *  in re-capped text is absorbed, never nested. The bookkeeping lives in
+   *  `outputClip`, not parsed back out of rendered text. Pure per event, so
+   *  replay rebuilds the identical capped text. The authoritative result
+   *  replaces all of this. */
+  private appendToolOutput(block: Extract<ChatBlock, { kind: "tool" }>, text: string): void {
+    const existing = this.outputClip.get(block.id);
+    if (existing !== undefined && existing.capped) {
+      // Roll the tail in exact bytes; re-slice once per SLACK of overflow.
+      existing.tail += text;
+      existing.tailBytes += utf8Len(text);
+      if (existing.tailBytes > TOOL_OUTPUT_TAIL + TOOL_OUTPUT_SLACK) {
+        const { index, bytes } = byteTailIndex(existing.tail, TOOL_OUTPUT_TAIL);
+        existing.omittedBytes += existing.tailBytes - bytes;
+        existing.tail = existing.tail.slice(index);
+        existing.tailBytes = bytes;
+      }
+      block.content = { kind: "output", text: clipText(existing), truncated: true };
+      return;
+    }
+    const prior =
+      block.content !== null && block.content.kind === "output" ? (block.content.text ?? "") : "";
+    // Incremental byte accounting: encode each delta once (prior only when
+    // this stream has no entry yet — a straggler enriching a settled row).
+    const bytes = (existing?.bytes ?? utf8Len(prior)) + utf8Len(text);
+    const full = prior + text;
+    if (bytes <= TOOL_OUTPUT_HEAD + TOOL_OUTPUT_TAIL + TOOL_OUTPUT_SLACK) {
+      this.outputClip.set(block.id, { capped: false, bytes });
+      if (block.content !== null && block.content.kind === "output") block.content.text = full;
+      else block.content = { kind: "output", text: full };
+      return;
+    }
+    // Entering capped mode: absorb any elision marker already present (see
+    // ELISION_MARKER) so markers never nest, then split head/tail by bytes.
+    let omittedBase = 0;
+    let body = full;
+    const marker = ELISION_MARKER.exec(full);
+    if (marker !== null) {
+      omittedBase = Number(marker[1]);
+      body = full.slice(0, marker.index) + "\n" + full.slice(marker.index + marker[0].length);
+    }
+    const headEnd = byteFloorIndex(body, TOOL_OUTPUT_HEAD);
+    const { index: tailStart, bytes: tailBytes } = byteTailIndex(body, TOOL_OUTPUT_TAIL);
+    if (tailStart <= headEnd) {
+      // Head and tail overlap (pathological short-but-heavy text): keep it
+      // whole rather than fabricate an elision.
+      this.outputClip.set(block.id, { capped: false, bytes });
+      if (block.content !== null && block.content.kind === "output") block.content.text = full;
+      else block.content = { kind: "output", text: full };
+      return;
+    }
+    const fresh: OutputClip = {
+      capped: true,
+      head: body.slice(0, headEnd),
+      tail: body.slice(tailStart),
+      tailBytes,
+      omittedBytes: omittedBase + utf8Len(body.slice(headEnd, tailStart)),
+    };
+    this.outputClip.set(block.id, fresh);
+    block.content = { kind: "output", text: clipText(fresh), truncated: true };
+  }
+
+  /** Keep {@link activeAgents} consistent with one agent tool row's status.
+   *  Idempotent; entries stay in event (= transcript) order. */
+  private syncAgentRow(block: Extract<ChatBlock, { kind: "tool" }>): void {
+    if (block.tool !== "agent") return;
+    const live = block.status === "pending" || block.status === "in_progress";
+    const i = this.activeAgents.findIndex((a) => a.id === block.id);
+    if (live && i === -1) this.activeAgents.push(block);
+    else if (!live && i !== -1) this.activeAgents.splice(i, 1);
   }
 
   /** Also the client's own channel for local notices (usage summaries,
@@ -1395,7 +1577,15 @@ export class ChatStore {
       ) {
         b.status = "completed";
         b.streaming = false;
+        this.outputClip.delete(b.id);
       }
+    }
+    // Rows the loop just settled (and any closed outside its scan range)
+    // leave the live-subagents set in one sweep over the SMALL set.
+    if (this.activeAgents.length > 0) {
+      this.activeAgents = this.activeAgents.filter(
+        (a) => a.status === "pending" || a.status === "in_progress",
+      );
     }
   }
 
