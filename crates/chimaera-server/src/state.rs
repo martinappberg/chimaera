@@ -301,3 +301,30 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The never-stale argument of the shared snapshot cache rests on this
+    /// ordering: by the time a waiter wakes from `notify_waiters`, the
+    /// generation ALREADY reflects the change that woke it — a woken client
+    /// can never rebuild keyed to the pre-change generation.
+    #[tokio::test]
+    async fn change_bus_stamps_generation_before_waking() {
+        let bus = ChangeBus::new();
+        assert_eq!(bus.generation(), 0);
+        let notified = bus.notified();
+        tokio::pin!(notified);
+        // Register the waiter before the wake (Notify wakes only waiters
+        // registered at notify time — same contract as the events loop).
+        assert!(futures::poll!(notified.as_mut()).is_pending());
+        bus.notify_waiters();
+        notified.await;
+        assert_eq!(
+            bus.generation(),
+            1,
+            "a woken waiter must observe the generation stamped by its wake"
+        );
+    }
+}

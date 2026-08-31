@@ -208,10 +208,14 @@ const SETTINGS_POLL: Duration = Duration::from_secs(2);
 
 /// Surface hand-edits of settings.json to `/ws/events` without any reactor
 /// stat. The events hot path (`ws::send_settings_snapshot`) reads only the
-/// cached generation/map — an NFS hiccup under the old stat-on-every-wake
-/// stalled the reactor under the settings mutex — so this task owns the
-/// external-edit detection instead. REST reads (`current`) still refresh
-/// inline, so GET /settings is exactly as fresh as before.
+/// cached generation/map — the old stat-on-every-wake ran per client under
+/// the settings mutex ON the reactor, where one NFS hiccup stalls everything
+/// — so this task owns the steady-state external-edit detection instead.
+/// Scope note: REST reads (`current` — GET /settings, the daemon-consumed
+/// key getters, `git::configured_git`) still refresh inline, and PUT still
+/// writes, on the reactor; those are rare, user-driven paths, accepted
+/// as-is. The loop has no exit path; a failed poll pass is logged inside
+/// [`poll_external_edit`] rather than silently swallowed.
 pub(crate) async fn watch_external_edits(state: Arc<AppState>) {
     loop {
         tokio::time::sleep(SETTINGS_POLL).await;
@@ -222,29 +226,46 @@ pub(crate) async fn watch_external_edits(state: Arc<AppState>) {
 }
 
 /// One poll pass: true when the on-disk file changed the settings content
-/// (the caller broadcasts). The stat and the reload both run under
-/// `spawn_blocking`; the settings mutex is held only for the reload, and only
-/// when the mtime actually moved — a rare, bounded window (≤256 KiB read),
-/// not a stat per events wake.
+/// (the caller broadcasts). Stat and conditional reload run in ONE
+/// `spawn_blocking` hop; the settings mutex is held only for the reload, and
+/// only when the mtime actually moved — a rare, bounded window (≤256 KiB
+/// read), not a stat per events wake. A FAILED stat (an NFS hiccup — not the
+/// file being absent, which is a legitimate state) is treated as no-change:
+/// reloading through a failing filesystem would broadcast an empty map and
+/// flash every window's theme/font back to defaults until the next pass.
 pub(crate) async fn poll_external_edit(state: &Arc<AppState>) -> bool {
-    let (path, recorded) = {
-        let store = crate::lock(&state.settings);
-        (store.path.clone(), store.mtime)
+    let task = {
+        let state = state.clone();
+        tokio::task::spawn_blocking(move || {
+            let (path, recorded) = {
+                let store = crate::lock(&state.settings);
+                (store.path.clone(), store.mtime)
+            };
+            let on_disk = match std::fs::metadata(&path) {
+                Ok(meta) => meta.modified().ok(),
+                Err(err) if err.kind() == ErrorKind::NotFound => None,
+                Err(err) => {
+                    tracing::debug!(path = %path.display(), %err,
+                        "settings watcher stat failed; skipping this pass");
+                    return false;
+                }
+            };
+            if on_disk == recorded {
+                return false;
+            }
+            let mut store = crate::lock(&state.settings);
+            let before = store.generation;
+            store.read_from_disk();
+            store.generation != before
+        })
     };
-    let on_disk = tokio::task::spawn_blocking(move || file_mtime(&path)).await;
-    let Ok(on_disk) = on_disk else { return false };
-    if on_disk == recorded {
-        return false;
+    match task.await {
+        Ok(changed) => changed,
+        Err(err) => {
+            tracing::warn!(%err, "settings watcher poll task failed");
+            false
+        }
     }
-    let state = state.clone();
-    tokio::task::spawn_blocking(move || {
-        let mut store = crate::lock(&state.settings);
-        let before = store.generation;
-        store.read_from_disk();
-        store.generation != before
-    })
-    .await
-    .unwrap_or(false)
 }
 
 /// GET /api/v1/settings

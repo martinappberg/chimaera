@@ -274,10 +274,11 @@ pub(crate) fn sessions_json(state: &AppState) -> Vec<serde_json::Value> {
 
 /// How long a built events-bus sessions frame stays reusable within one
 /// change generation. Time-derived fields (`stalled`, `output_active`) flip
-/// without any generation bump, so the cache must expire on its own; matching
-/// `ws::EVENTS_THROTTLE` keeps their flip latency inside the worst case the
-/// per-client throttle already imposes.
-const EVENTS_SNAPSHOT_REUSE: Duration = Duration::from_millis(250);
+/// without any generation bump, so the cache must expire on its own. Tied to
+/// `ws::EVENTS_THROTTLE`: a boundary flip's worst-case latency is one
+/// fallback tick + one throttle sleep + this reuse window (~1.5s with the
+/// current constants, vs ~1.25s before the cache existed).
+const EVENTS_SNAPSHOT_REUSE: Duration = crate::ws::EVENTS_THROTTLE;
 
 /// The `/ws/events` sessions-frame cache. Every connected window's events
 /// loop wakes on the same change notify (plus its own 1s tick) and used to
@@ -288,7 +289,13 @@ const EVENTS_SNAPSHOT_REUSE: Duration = Duration::from_millis(250);
 /// (fs_watch, git epochs, settings sends) stays per-client. No wire change:
 /// the frame bytes are exactly what each client built before.
 pub(crate) struct SnapshotCache {
-    inner: Mutex<Option<CachedSnapshot>>,
+    /// Serializes builds — the single-flight. Async, so a client waiting on
+    /// an in-progress build YIELDS its reactor worker instead of parking it
+    /// (with clients ≥ workers, sync waiting on one change could park every
+    /// worker and stall PTY pumps for the build duration).
+    build: tokio::sync::Mutex<()>,
+    /// The last built frame; sync-guarded, never held across an `.await`.
+    cached: Mutex<Option<CachedSnapshot>>,
 }
 
 struct CachedSnapshot {
@@ -300,34 +307,50 @@ struct CachedSnapshot {
 impl SnapshotCache {
     pub(crate) fn new() -> Self {
         SnapshotCache {
-            inner: Mutex::new(None),
+            build: tokio::sync::Mutex::new(()),
+            cached: Mutex::new(None),
         }
     }
 
-    /// Return the cached payload when it was built for `generation` less than
-    /// `reuse` ago; otherwise build and cache. The lock is held ACROSS the
-    /// build on purpose — that is the single-flight: concurrent clients wait
-    /// for one build instead of each running their own. The build is fully
-    /// synchronous (no `.await` under this `std::sync` guard), and nothing
-    /// that runs inside it ever takes this lock, so the ordering is safe.
-    pub(crate) fn get_or_build(
+    fn lookup(&self, generation: u64, reuse: Duration) -> Option<Arc<String>> {
+        let cached = crate::lock(&self.cached);
+        cached
+            .as_ref()
+            .filter(|c| c.generation == generation && c.built_at.elapsed() < reuse)
+            .map(|c| c.payload.clone())
+    }
+
+    /// Return the cached payload when it was built for `generation` less
+    /// than `reuse` ago; otherwise build (at most one build at a time — a
+    /// waiter re-checks after the build it queued behind, which is usually
+    /// exactly the one it needed) and cache. The build itself stays fully
+    /// synchronous; only the waiting is async.
+    pub(crate) async fn get_or_build(
         &self,
         generation: u64,
         reuse: Duration,
         build: impl FnOnce() -> String,
     ) -> Arc<String> {
-        let mut cached = crate::lock(&self.inner);
-        if let Some(entry) = cached.as_ref() {
-            if entry.generation == generation && entry.built_at.elapsed() < reuse {
-                return entry.payload.clone();
-            }
+        if let Some(hit) = self.lookup(generation, reuse) {
+            return hit;
+        }
+        let _guard = self.build.lock().await;
+        if let Some(hit) = self.lookup(generation, reuse) {
+            return hit;
         }
         let payload = Arc::new(build());
-        *cached = Some(CachedSnapshot {
-            generation,
-            built_at: Instant::now(),
-            payload: payload.clone(),
-        });
+        let mut cached = crate::lock(&self.cached);
+        // Generation-keyed store: a straggler that read an OLD generation
+        // before queueing must not overwrite a newer build (that would make
+        // the next current-generation reader rebuild again). Its own payload
+        // is still returned — it was built from live state.
+        if cached.as_ref().is_none_or(|c| c.generation <= generation) {
+            *cached = Some(CachedSnapshot {
+                generation,
+                built_at: Instant::now(),
+                payload: payload.clone(),
+            });
+        }
         payload
     }
 }
@@ -338,7 +361,7 @@ impl SnapshotCache {
 /// generation, so the next reader rebuilds rather than trusting a snapshot
 /// that may have missed it (a spare build, never staleness past the reuse
 /// window).
-pub(crate) fn shared_sessions_snapshot(state: &AppState) -> Arc<String> {
+pub(crate) async fn shared_sessions_snapshot(state: &AppState) -> Arc<String> {
     let generation = state.changes.generation();
     state
         .sessions_snapshot
@@ -350,6 +373,7 @@ pub(crate) fn shared_sessions_snapshot(state: &AppState) -> Arc<String> {
             })
             .to_string()
         })
+        .await
 }
 
 #[cfg(test)]
@@ -499,27 +523,33 @@ mod tests {
     /// The shared-snapshot contract: one build per change generation. A
     /// second reader on the same generation must get the SAME allocation
     /// (Arc identity, not just equal bytes) without its build running.
-    #[test]
-    fn snapshot_cache_builds_once_per_generation() {
+    #[tokio::test]
+    async fn snapshot_cache_builds_once_per_generation() {
         let cache = SnapshotCache::new();
         let reuse = Duration::from_secs(60);
         let mut builds = 0;
-        let first = cache.get_or_build(1, reuse, || {
-            builds += 1;
-            "snapshot".to_string()
-        });
-        let second = cache.get_or_build(1, reuse, || {
-            builds += 1;
-            unreachable!("a fresh same-generation entry must be reused")
-        });
+        let first = cache
+            .get_or_build(1, reuse, || {
+                builds += 1;
+                "snapshot".to_string()
+            })
+            .await;
+        let second = cache
+            .get_or_build(1, reuse, || {
+                builds += 1;
+                unreachable!("a fresh same-generation entry must be reused")
+            })
+            .await;
         assert_eq!(builds, 1);
         assert!(Arc::ptr_eq(&first, &second));
 
         // A new generation invalidates regardless of age.
-        let third = cache.get_or_build(2, reuse, || {
-            builds += 1;
-            "snapshot".to_string()
-        });
+        let third = cache
+            .get_or_build(2, reuse, || {
+                builds += 1;
+                "snapshot".to_string()
+            })
+            .await;
         assert_eq!(builds, 2);
         assert!(!Arc::ptr_eq(&first, &third));
     }
@@ -527,16 +557,108 @@ mod tests {
     /// Time-derived fields (`stalled`, `output_active`) flip with no
     /// generation bump, so a cached frame must expire on its own: past the
     /// reuse window the same generation rebuilds.
-    #[test]
-    fn snapshot_cache_expires_within_a_generation() {
+    #[tokio::test]
+    async fn snapshot_cache_expires_within_a_generation() {
         let cache = SnapshotCache::new();
         let mut builds = 0;
         for _ in 0..2 {
-            cache.get_or_build(7, Duration::ZERO, || {
-                builds += 1;
-                "snapshot".to_string()
-            });
+            cache
+                .get_or_build(7, Duration::ZERO, || {
+                    builds += 1;
+                    "snapshot".to_string()
+                })
+                .await;
         }
         assert_eq!(builds, 2);
+    }
+
+    /// A straggler holding an OLD generation must not clobber a newer cached
+    /// build (that would force the next current-generation reader to rebuild
+    /// yet again); it still gets its own freshly built payload back.
+    #[tokio::test]
+    async fn snapshot_cache_old_generation_never_overwrites_newer() {
+        let cache = SnapshotCache::new();
+        let reuse = Duration::from_secs(60);
+        let builds = std::sync::atomic::AtomicU64::new(0);
+        let build = || {
+            builds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            "snapshot".to_string()
+        };
+        let newer = cache.get_or_build(2, reuse, build).await;
+        let stale = cache.get_or_build(1, reuse, build).await;
+        assert!(!Arc::ptr_eq(&newer, &stale));
+        // The gen-2 entry survived the straggler's store attempt.
+        let again = cache.get_or_build(2, reuse, build).await;
+        assert_eq!(builds.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(Arc::ptr_eq(&newer, &again));
+    }
+
+    /// The reactor-safety contract behind fix "events-side single-flight":
+    /// a client waiting on an in-progress build must YIELD its worker, not
+    /// park it. With two workers, a leader whose build occupies one worker
+    /// synchronously must not stop (a) a canary task from running on the
+    /// other worker while a follower waits, and (b) the follower from then
+    /// sharing the leader's build. Under the old std-mutex wait, the
+    /// follower parked the second worker and the canary starved until the
+    /// build finished.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn snapshot_cache_waiters_yield_instead_of_parking_workers() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        let cache = Arc::new(SnapshotCache::new());
+        let builds = Arc::new(AtomicU64::new(0));
+        let build_done = Arc::new(AtomicBool::new(false));
+        let canary_ran_during_build = Arc::new(AtomicBool::new(false));
+        let reuse = Duration::from_secs(60);
+
+        let leader = {
+            let (cache, builds, build_done) = (cache.clone(), builds.clone(), build_done.clone());
+            tokio::spawn(async move {
+                cache
+                    .get_or_build(1, reuse, || {
+                        builds.fetch_add(1, Ordering::SeqCst);
+                        // A deliberately slow, fully synchronous build.
+                        std::thread::sleep(Duration::from_millis(150));
+                        build_done.store(true, Ordering::SeqCst);
+                        "snapshot".to_string()
+                    })
+                    .await
+            })
+        };
+        // Give the leader a head start into its build.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let follower = {
+            let (cache, builds) = (cache.clone(), builds.clone());
+            tokio::spawn(async move {
+                cache
+                    .get_or_build(1, reuse, || {
+                        builds.fetch_add(1, Ordering::SeqCst);
+                        "snapshot".to_string()
+                    })
+                    .await
+            })
+        };
+        let canary = {
+            let (build_done, canary_ran_during_build) =
+                (build_done.clone(), canary_ran_during_build.clone());
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                if !build_done.load(Ordering::SeqCst) {
+                    canary_ran_during_build.store(true, Ordering::SeqCst);
+                }
+            })
+        };
+
+        let (leader, follower, _) = tokio::join!(leader, follower, canary);
+        let (leader, follower) = (leader.unwrap(), follower.unwrap());
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            1,
+            "follower must join, not rebuild"
+        );
+        assert!(Arc::ptr_eq(&leader, &follower));
+        assert!(
+            canary_ran_during_build.load(Ordering::SeqCst),
+            "the second worker was parked during the build — waiters must yield"
+        );
     }
 }

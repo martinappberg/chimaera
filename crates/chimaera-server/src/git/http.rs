@@ -82,15 +82,25 @@ pub(crate) async fn status(
         .status_shared(&git.path, &q.workspace_id, &repo)
         .await
     {
-        Ok(data) => {
-            // Publishing may discover an unannounced change (an external editor,
-            // a terminal `git` command) and bump the epoch; read the epoch after,
-            // so THIS response is already current and the caller won't refetch.
-            let (epoch, bumped) = state.git.publish(&q.workspace_id, &data);
+        Ok(shared) => {
+            let (epoch, bumped) = if shared.flushed {
+                // A change was announced while this run was in flight: the
+                // data may predate it. Serve it (it is what a direct run
+                // would have returned) but don't re-seed it as the published
+                // baseline — that would force a second bump and a second
+                // full fan-out per announced change.
+                (state.git.epoch(&q.workspace_id), false)
+            } else {
+                // Publishing may discover an unannounced change (an external
+                // editor, a terminal `git` command) and bump the epoch; read
+                // the epoch after, so THIS response is already current and
+                // the caller won't refetch.
+                state.git.publish(&q.workspace_id, &shared.data)
+            };
             if bumped {
                 state.changes.notify_waiters();
             }
-            let mut body = status_json(&q.workspace_id, epoch, &repo, &data);
+            let mut body = status_json(&q.workspace_id, epoch, &repo, &shared.data);
             body["git_ok"] = json!(true);
             body["git"] = git.json();
             Json(body).into_response()

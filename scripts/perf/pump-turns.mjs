@@ -15,6 +15,11 @@
 //
 // fake-claude's canned turn parks on a Bash permission ask, so the pump
 // answers every permission_request with its first option.
+//
+// Known limitation: a LIVE ask parked from before this pump connected sits at
+// seq <= the replay head, so the replay guard below never answers it and the
+// session stays parked — start the pump against a fresh session (or answer
+// the pending ask in the UI first) rather than resuming a parked one.
 const [sid, turnsArg] = process.argv.slice(2);
 const TURNS = Number(turnsArg ?? 400);
 const PORT = process.env.CHIMAERA_PORT ?? "9700";

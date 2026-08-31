@@ -816,8 +816,10 @@ pub(crate) async fn events_ws(
         .on_upgrade(move |socket| handle_events(socket, state))
 }
 
-/// Minimum gap between snapshot frames (<= 4/s).
-const EVENTS_THROTTLE: Duration = Duration::from_millis(250);
+/// Minimum gap between snapshot frames (<= 4/s). Also the reuse window of
+/// the shared sessions-snapshot cache (`session_view::EVENTS_SNAPSHOT_REUSE`
+/// is defined AS this constant so the two can't drift apart).
+pub(crate) const EVENTS_THROTTLE: Duration = Duration::from_millis(250);
 /// Fallback poll: catches changes that never signal `changes` (e.g. a PTY
 /// child exiting on its own).
 const EVENTS_TICK: Duration = Duration::from_secs(1);
@@ -843,6 +845,16 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
     let mut last_git: Option<String> = None;
     let mut last_update_epoch: Option<u64> = None;
     let mut last_recents_epoch: Option<u64> = None;
+    // A new window's FIRST settings frame gets one fresh disk read (off the
+    // reactor): a hand-edit inside the watcher's poll window must not greet
+    // a fresh window with stale settings. Steady-state sends stay cached.
+    {
+        let state = state.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            let _ = crate::lock(&state.settings).current();
+        })
+        .await;
+    }
     if send_settings_snapshot(&mut socket, &state, &mut last_settings_gen)
         .await
         .is_err()
@@ -1063,7 +1075,7 @@ async fn send_sessions_snapshot(
     state: &AppState,
     last_sent: &mut Option<Arc<String>>,
 ) -> Result<(), axum::Error> {
-    let snapshot = crate::session_view::shared_sessions_snapshot(state);
+    let snapshot = crate::session_view::shared_sessions_snapshot(state).await;
     if last_sent
         .as_ref()
         .is_some_and(|prev| Arc::ptr_eq(prev, &snapshot) || **prev == *snapshot)
