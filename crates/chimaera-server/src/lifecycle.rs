@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::Context;
 use tokio::net::TcpListener;
 
-use crate::{agent_updates, git, ledger, proxy, recents, runtimes, update};
+use crate::{agent_updates, git, ledger, proxy, recents, runtimes, settings, update};
 use crate::{app, lock, AppState, ServerConfig};
 
 /// Bind on 127.0.0.1, write the manifest, and serve until SIGINT/SIGTERM.
@@ -92,6 +92,10 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
     // Backstop poll for out-of-band git changes (external editor, terminal
     // `git` commands); event-driven refresh covers the rest. Idle-cheap.
     tokio::spawn(git::backstop_poll(state.clone()));
+
+    // Settings hand-edit watcher: one off-reactor stat every couple of
+    // seconds, so the events bus never stats settings.json on the reactor.
+    tokio::spawn(settings::watch_external_edits(state.clone()));
 
     // Session ledger: consume what the previous daemon left (resurrect /
     // retire), then keep sessions.json reconciled until shutdown. Flip

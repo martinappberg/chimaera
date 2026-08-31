@@ -816,8 +816,10 @@ pub(crate) async fn events_ws(
         .on_upgrade(move |socket| handle_events(socket, state))
 }
 
-/// Minimum gap between snapshot frames (<= 4/s).
-const EVENTS_THROTTLE: Duration = Duration::from_millis(250);
+/// Minimum gap between snapshot frames (<= 4/s). Also the reuse window of
+/// the shared sessions-snapshot cache (`session_view::EVENTS_SNAPSHOT_REUSE`
+/// is defined AS this constant so the two can't drift apart).
+pub(crate) const EVENTS_THROTTLE: Duration = Duration::from_millis(250);
 /// Fallback poll: catches changes that never signal `changes` (e.g. a PTY
 /// child exiting on its own).
 const EVENTS_TICK: Duration = Duration::from_secs(1);
@@ -838,11 +840,21 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
     // registration, so a closed window costs zero filesystem work.
     let mut fs_watch = crate::fs_watch::FsWatch::new();
 
-    let mut last_sent: Option<String> = None;
+    let mut last_sent: Option<Arc<String>> = None;
     let mut last_settings_gen: Option<u64> = None;
     let mut last_git: Option<String> = None;
     let mut last_update_epoch: Option<u64> = None;
     let mut last_recents_epoch: Option<u64> = None;
+    // A new window's FIRST settings frame gets one fresh disk read (off the
+    // reactor): a hand-edit inside the watcher's poll window must not greet
+    // a fresh window with stale settings. Steady-state sends stay cached.
+    {
+        let state = state.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            let _ = crate::lock(&state.settings).current();
+        })
+        .await;
+    }
     if send_settings_snapshot(&mut socket, &state, &mut last_settings_gen)
         .await
         .is_err()
@@ -1006,19 +1018,24 @@ async fn send_recents_snapshot(
 }
 
 /// Send a `{"type":"settings","settings":{...}}` frame when the settings
-/// content generation moved (PUT or hand-edit; the store re-stats the file).
+/// content generation moved (PUT, or a hand-edit surfaced by the settings
+/// watcher task). Deliberately reads the CACHED generation/map — no re-stat:
+/// this runs per client on every events wake, and a blocking stat here under
+/// the settings mutex would stall the reactor on an NFS hiccup. External
+/// edits reach this path via `settings::watch_external_edits` (off-reactor
+/// stat + reload + notify).
 async fn send_settings_snapshot(
     socket: &mut WebSocket,
     state: &AppState,
     last_gen: &mut Option<u64>,
 ) -> Result<(), axum::Error> {
     let (generation, map) = {
-        let mut store = crate::lock(&state.settings);
-        let generation = store.generation();
+        let store = crate::lock(&state.settings);
+        let generation = store.generation_cached();
         if *last_gen == Some(generation) {
             return Ok(());
         }
-        (generation, store.current().clone())
+        (generation, store.map_cached().clone())
     };
     let frame = json!({"type": "settings", "settings": map}).to_string();
     socket.send(Message::Text(frame.into())).await?;
@@ -1048,21 +1065,24 @@ async fn send_git_snapshot(
 }
 
 /// Send the current session snapshot if it differs from the last one sent.
+/// The snapshot itself is built once per change generation and shared across
+/// every connected client (`session_view::shared_sessions_snapshot`); only
+/// the last-sent compare — and the send — stay per-client. The `Arc` identity
+/// check makes the common no-change case free: an unchanged cache hands every
+/// client the same allocation.
 async fn send_sessions_snapshot(
     socket: &mut WebSocket,
     state: &AppState,
-    last_sent: &mut Option<String>,
+    last_sent: &mut Option<Arc<String>>,
 ) -> Result<(), axum::Error> {
-    let snapshot = json!({
-        "type": "sessions",
-        "sessions": crate::session_view::sessions_json(state),
-        "links": crate::links::links_json(state),
-    })
-    .to_string();
-    if last_sent.as_deref() == Some(snapshot.as_str()) {
+    let snapshot = crate::session_view::shared_sessions_snapshot(state).await;
+    if last_sent
+        .as_ref()
+        .is_some_and(|prev| Arc::ptr_eq(prev, &snapshot) || **prev == *snapshot)
+    {
         return Ok(());
     }
-    socket.send(Message::Text(snapshot.clone().into())).await?;
+    socket.send(Message::Text(snapshot.as_str().into())).await?;
     *last_sent = Some(snapshot);
     Ok(())
 }
