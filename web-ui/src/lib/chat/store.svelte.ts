@@ -18,6 +18,10 @@ const TRANSCRIPT_EVENTS = new Set([
   "init",
   "user_message",
   "user_message_update",
+  // "checkpoint" is deliberately absent: it touches the version conditionally
+  // (only when it mutates a rendered block — see its reducer case), because a
+  // checkpoint landing on a still-queued send changes nothing the reader sees
+  // and must not defeat the activation early-out or light the unread chip.
   "message_chunk",
   "thought_chunk",
   "tool_call",
@@ -136,8 +140,22 @@ export interface PendingSend {
   state: "queued" | "dropped";
 }
 
-export type ChatBlock =
-  | {
+/** Identity every transcript block carries alongside its variant body. */
+interface BlockIdentity {
+  /** Stable per-store row identity — the transcript's keyed-render key.
+   *  Array indices shift when the cap trims the front, remounting every
+   *  index-keyed row at once; this uid never does. Minted monotonically per
+   *  store instance (the pooled store outlives tab switches and view
+   *  eviction; a full page reload rebuilds everything anyway). */
+  uid: number;
+}
+
+/** A block body before {@link ChatStore} stamps its identity. Distributes over
+ *  the union so each variant keeps its discriminant. */
+type BlockBody<T = ChatBlock> = T extends unknown ? Omit<T, "uid"> : never;
+
+export type ChatBlock = BlockIdentity &
+  ({
       /** A DELIVERED user message, in transcript order. A queued send is NOT a
        *  block — it lives in `pendingSends` until it resolves `sent`, then it
        *  is appended here at the current end (after the turn it waited behind),
@@ -210,7 +228,7 @@ export type ChatBlock =
        *  a small gallery after the closing prose. */
       artifacts: string[];
     }
-  | { kind: "usage"; windows: UsageWindow[] };
+  | { kind: "usage"; windows: UsageWindow[] });
 
 export interface RateLimitInfo {
   utilization: number;
@@ -387,6 +405,41 @@ export class ChatStore {
    *  removes it; `dropped` marks it "not delivered" and it stays here. */
   pendingSends = $state<PendingSend[]>([]);
 
+  /** The NET front shift the client cap has applied to `blocks`, cumulative:
+   *  each trim drops the oldest batch and inserts one notice in its place, so
+   *  the counter advances by dropped − 1. That makes a block's virtual index
+   *  (`trimmedCount + i`) invariant while it lives, and
+   *  `blocks.length + trimmedCount` a monotonic VIRTUAL total — unlike the raw
+   *  length (pinned near the cap), it still grows on every append — so saved
+   *  window cursors stay coherent across trims. */
+  trimmedCount = $state(0);
+
+  /** `blocks.length + trimmedCount` — every block ever appended this
+   *  generation; grows even while the cap pins the raw length. */
+  get virtualTotal(): number {
+    return this.blocks.length + this.trimmedCount;
+  }
+
+  /** Monotonic count of STRUCTURAL changes to `blocks` — insertions and
+   *  removals ({@link stamp} bumps it on every insert; tail retractions,
+   *  trims, and resets bump it too). In-place text/status mutation does not.
+   *  Views key "the row set changed" on this, never on net lengths: a
+   *  retracted-then-reappended tail leaves blocks.length AND the virtual
+   *  total unchanged while the rows are new. Plain field, deliberately not
+   *  reactive: every structural change also touches `transcriptVersion` (all
+   *  block-producing events are TRANSCRIPT_EVENTS, `notice()` touches, and
+   *  reset/retract paths touch), which wakes the view. */
+  structuralVersion = 0;
+
+  /** Transcript generation, bumped by {@link resetTranscript} when a
+   *  server-side journal reset rebuilds the transcript. Every absolute range,
+   *  trim count, and saved window cursor minted before the bump is
+   *  dead-coordinate data — views and pool cursors must DISCARD across
+   *  generations, never shift (trimmedCount restarts, so deltas spanning a
+   *  reset are meaningless). Plain field: every bump rides a
+   *  transcriptVersion touch for reactivity. */
+  epoch = 0;
+
   /** Highest seq applied; the reconnect auth carries it for gap replay.
    *  Reactive so views can track "any event applied" (in-place chunk appends
    *  and tool patches change no collection lengths). */
@@ -401,6 +454,20 @@ export class ChatStore {
    *  the oldest message down or eagerly load every historical artifact. */
   hydrating = $state(true);
   private replayHead = 0;
+  /** Uid mint for {@link stamp}. Deliberately NOT reset with the transcript:
+   *  a keyed render may still hold the old rows, and recycled keys would make
+   *  Svelte patch stale DOM into unrelated new blocks instead of remounting. */
+  private uidSeq = 0;
+  /** Stamp a block body with its stable row identity (see BlockIdentity) and
+   *  count the insertion in `structuralVersion` — every stamped block enters
+   *  `blocks` immediately. Bodies are freshly-built literals at every call
+   *  site, so stamping in place is safe and avoids a second object per block. */
+  private stamp(body: BlockBody): ChatBlock {
+    const block = body as ChatBlock;
+    block.uid = this.uidSeq++;
+    this.structuralVersion += 1;
+    return block;
+  }
   /** tool_call id -> index into blocks, for in-place status/content patches. */
   private toolIndex = new Map<string, number>();
   /** user-message delivery id -> index into blocks (user_message_update). */
@@ -472,6 +539,12 @@ export class ChatStore {
     this.pending = [];
     this.pendingSends = [];
     this.questions = [];
+    // trimmedCount restarts with the transcript; the generation bump is what
+    // tells views/cursors their old coordinates are dead (a trim delta across
+    // a reset would be a comparison between unrelated numbering systems).
+    this.trimmedCount = 0;
+    this.epoch += 1;
+    this.structuralVersion += 1;
     this.lastSeq = 0;
     this.hydrating = false;
     this.replayHead = 0;
@@ -556,14 +629,16 @@ export class ChatStore {
         } else {
           // A fresh (turn-opening) send, or a permission-feedback echo — it was
           // received, so it goes straight into history.
-          this.blocks.push({
-            kind: "user",
-            text,
-            attachments,
-            checkpoint: null,
-            id,
-            forkSeq: entry.seq,
-          });
+          this.blocks.push(
+            this.stamp({
+              kind: "user",
+              text,
+              attachments,
+              checkpoint: null,
+              id,
+              forkSeq: entry.seq,
+            }),
+          );
           if (id !== null) this.userIndex.set(id, this.blocks.length - 1);
         }
         this.promptSuggestion = null;
@@ -641,14 +716,16 @@ export class ChatStore {
           // into it. appendText only inspects the tail, so a following agent
           // chunk starts a fresh block: the agent's message is never split.
           this.pendingSends.splice(pIdx, 1);
-          this.blocks.push({
-            kind: "user",
-            text: pending.text,
-            attachments: pending.attachments,
-            checkpoint: pending.checkpoint,
-            id: pending.id,
-            forkSeq: entry.seq,
-          });
+          this.blocks.push(
+            this.stamp({
+              kind: "user",
+              text: pending.text,
+              attachments: pending.attachments,
+              checkpoint: pending.checkpoint,
+              id: pending.id,
+              forkSeq: entry.seq,
+            }),
+          );
           this.userIndex.set(pending.id, this.blocks.length - 1);
         } else if (state === "cancelled") {
           // Pulled back before the agent saw it — it never happened. Vanish
@@ -673,6 +750,8 @@ export class ChatStore {
         const cp: CheckpointRef = { id: umid, preceding: (ev.preceding_uuid as string) ?? null };
         const p = this.pendingSends.find((s) => s.id === umid);
         if (p !== undefined) {
+          // Still queued: nothing rendered changes yet (the anchor rides
+          // along at promotion), so no transcript-version bump here.
           p.checkpoint = cp;
           break;
         }
@@ -682,6 +761,9 @@ export class ChatStore {
           if (block.kind === "user") {
             block.checkpoint = cp;
             block.forkSeq = entry.seq;
+            // In-place mutation of a rendered row (its rewind affordance) —
+            // bump the version so a frozen view knows to reconcile.
+            this.touchTranscript();
             break;
           }
         }
@@ -692,6 +774,7 @@ export class ChatStore {
           if (block.kind === "user") {
             block.checkpoint = cp;
             block.forkSeq = entry.seq;
+            this.touchTranscript();
             break;
           }
         }
@@ -734,19 +817,21 @@ export class ChatStore {
           }
           if (ev.cross_turn === true) row.crossTurn = true;
         } else {
-          this.blocks.push({
-            kind: "tool",
-            id: ev.id as string,
-            tool: ev.kind as string,
-            title: ev.title as string,
-            locations: (ev.locations as string[]) ?? [],
-            status: ev.status as "pending" | "in_progress",
-            content: null,
-            denied: false,
-            allowed: false,
-            streaming: false,
-            crossTurn: ev.cross_turn === true,
-          });
+          this.blocks.push(
+            this.stamp({
+              kind: "tool",
+              id: ev.id as string,
+              tool: ev.kind as string,
+              title: ev.title as string,
+              locations: (ev.locations as string[]) ?? [],
+              status: ev.status as "pending" | "in_progress",
+              content: null,
+              denied: false,
+              allowed: false,
+              streaming: false,
+              crossTurn: ev.cross_turn === true,
+            }),
+          );
           this.toolIndex.set(ev.id as string, this.blocks.length - 1);
         }
         this.activity = { kind: "tool", detail: ev.title as string };
@@ -889,13 +974,15 @@ export class ChatStore {
         if (existing !== undefined && existing.kind === "question" && !existing.resolved) {
           existing.questions = questions;
         } else {
-          this.blocks.push({
-            kind: "question",
-            id: requestId,
-            questions,
-            answers: {},
-            resolved: false,
-          });
+          this.blocks.push(
+            this.stamp({
+              kind: "question",
+              id: requestId,
+              questions,
+              answers: {},
+              resolved: false,
+            }),
+          );
           this.questionIndex.set(requestId, this.blocks.length - 1);
         }
         break;
@@ -977,7 +1064,9 @@ export class ChatStore {
         break;
       }
       case "usage_report":
-        this.blocks.push({ kind: "usage", windows: (ev.windows as UsageWindow[]) ?? [] });
+        this.blocks.push(
+          this.stamp({ kind: "usage", windows: (ev.windows as UsageWindow[]) ?? [] }),
+        );
         break;
       case "rate_limit":
         this.rateLimit = {
@@ -1046,13 +1135,15 @@ export class ChatStore {
           output_tokens?: number;
           duration_ms?: number;
         };
-        this.blocks.push({
-          kind: "turn_end",
-          costUsd: usage.cost_usd ?? null,
-          outputTokens: usage.output_tokens ?? 0,
-          durationMs: usage.duration_ms ?? 0,
-          artifacts: this.collectTurnArtifacts(),
-        });
+        this.blocks.push(
+          this.stamp({
+            kind: "turn_end",
+            costUsd: usage.cost_usd ?? null,
+            outputTokens: usage.output_tokens ?? 0,
+            durationMs: usage.duration_ms ?? 0,
+            artifacts: this.collectTurnArtifacts(),
+          }),
+        );
         break;
       }
       case "turn_aborted": {
@@ -1183,15 +1274,22 @@ export class ChatStore {
    *  compaction. The cap is far above the live tail, so the streaming message
    *  and its tool cards are never touched. */
   private static readonly BLOCK_CAP = 2000;
+  /** Trim hysteresis: let the array run this far past the cap, then splice one
+   *  batch back to it, so the O(n) front-splice + index rebuild runs once per
+   *  batch instead of on EVERY event at cap. The slack is never rendered whole
+   *  (the DOM window is far smaller); the semantic cap stays ~BLOCK_CAP. */
+  private static readonly TRIM_SLACK = 64;
   private trimBlocks(): void {
     const cap = ChatStore.BLOCK_CAP;
-    if (this.blocks.length <= cap) return;
+    if (this.blocks.length <= cap + ChatStore.TRIM_SLACK) return;
     // Drop the oldest overflow plus one more, and land a single leading notice
     // in their place (an earlier trim's notice is among the dropped, so it
     // never stacks). Result length settles at exactly the cap.
     const drop = this.blocks.length - cap + 1;
-    const notice: ChatBlock = { kind: "notice", text: TRIM_NOTICE, tone: "info" };
-    this.blocks.splice(0, drop, notice);
+    this.blocks.splice(0, drop, this.stamp({ kind: "notice", text: TRIM_NOTICE, tone: "info" }));
+    // Advance by the NET front shift (`drop` removed, one notice inserted) so
+    // every surviving block keeps its virtual index — see `trimmedCount`.
+    this.trimmedCount += drop - 1;
     // The front-splice invalidated every id→index position — rebuild them all.
     this.rebuildIndexes();
   }
@@ -1219,23 +1317,25 @@ export class ChatStore {
     const clean = text.replace(/^\n+/, "");
     if (clean.length === 0) return;
     if (kind === "message") {
-      this.blocks.push({
-        kind,
-        text: clean,
-        turnId,
-        sentAtMs: timestampMs,
-        forkSeq: seq,
-        nativeTurnComplete: false,
-      });
+      this.blocks.push(
+        this.stamp({
+          kind,
+          text: clean,
+          turnId,
+          sentAtMs: timestampMs,
+          forkSeq: seq,
+          nativeTurnComplete: false,
+        }),
+      );
     } else {
-      this.blocks.push({ kind, text: clean, turnId });
+      this.blocks.push(this.stamp({ kind, text: clean, turnId }));
     }
   }
 
   /** Also the client's own channel for local notices (usage summaries,
    *  intercepted commands) — they are NOT journaled, deliberately. */
   notice(text: string, tone: "info" | "error"): void {
-    this.blocks.push({ kind: "notice", text, tone });
+    this.blocks.push(this.stamp({ kind: "notice", text, tone }));
     // Local notices do not pass through `apply`, whose epilogue normally
     // enforces the transcript cap. Repeated disconnected-action feedback must
     // not become an unbounded side channel around that cap.
@@ -1355,7 +1455,9 @@ export class ChatStore {
     }
     if (start < end) {
       this.blocks.splice(start, end - start);
-      if (end < this.blocks.length) this.rebuildIndexes();
+      this.structuralVersion += 1;
+      // No index rebuild: only message/thought rows were dropped — kinds the
+      // id→index maps never hold — and a pure tail cut moves no earlier row.
     }
   }
 }

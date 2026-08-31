@@ -2,6 +2,14 @@
 export const TRANSCRIPT_PAGE = 64;
 export const TRANSCRIPT_WINDOW = TRANSCRIPT_PAGE * 3;
 
+/**
+ * All ranges here are the reducer's ARRAY coordinates. Virtual coordinates
+ * (array index + the store's `trimmedCount` at save time — a position among
+ * every block ever appended) exist only in SAVED cursors, where the cap's
+ * front-splices can't move them; {@link restoreVirtualWindow} converts back
+ * at the restore boundary, and {@link trimShift} keeps a mounted view's array
+ * range naming the same rows across a trim.
+ */
 export interface TranscriptWindow {
   start: number;
   end: number;
@@ -47,6 +55,67 @@ export function restoreWindow(saved: TranscriptWindow, total: number): Transcrip
   if (start === end && width > 0) start = Math.max(0, end - width);
   if (end - start > TRANSCRIPT_WINDOW) start = end - TRANSCRIPT_WINDOW;
   return { start, end };
+}
+
+/**
+ * Convert a window saved in virtual coordinates back to array coordinates
+ * against the reducer's current trim count and length. Null when nothing of
+ * the saved range survives — every row it covered was trimmed away, or a
+ * reset/rewind left it beyond the transcript — so the caller falls back to
+ * the tail rather than restoring an empty window.
+ */
+export function toArrayCoords(
+  saved: TranscriptWindow,
+  trimmedCount: number,
+  total: number,
+): TranscriptWindow | null {
+  const bounded = boundedTotal(total);
+  const end = Math.min(Math.floor(saved.end) - Math.floor(trimmedCount), bounded);
+  const start = Math.min(Math.max(0, Math.floor(saved.start) - Math.floor(trimmedCount)), bounded);
+  if (end <= start) return null;
+  return { start, end };
+}
+
+/**
+ * The ONE stale-cursor policy for restoring a pool-saved virtual window:
+ * convert, repair against the current total, and floor the result to a full
+ * page — a window straddling the trim point can survive as a 1-2 row sliver,
+ * which the no-IntersectionObserver fallback path could never page out of.
+ * Null means nothing survives; the caller falls back to the tail (and should
+ * discard the saved scroll position with it).
+ */
+export function restoreVirtualWindow(
+  saved: TranscriptWindow,
+  trimmedCount: number,
+  total: number,
+): TranscriptWindow | null {
+  const converted = toArrayCoords(saved, trimmedCount, total);
+  if (converted === null) return null;
+  const repaired = restoreWindow(converted, total);
+  if (repaired.end - repaired.start >= TRANSCRIPT_PAGE) return repaired;
+  const bounded = boundedTotal(total);
+  const end = Math.min(bounded, repaired.start + TRANSCRIPT_PAGE);
+  return { start: Math.max(0, end - TRANSCRIPT_PAGE), end };
+}
+
+/**
+ * Shift a mounted view's array range across a reducer trim of `trimDelta`
+ * rows so it keeps naming the same surviving rows. `lost` is how many of the
+ * range's own leading rows were trimmed away (the rendered slice must drop
+ * exactly that many to stay aligned). Null when the whole range was trimmed —
+ * the mounted mirror of {@link restoreVirtualWindow}'s null: fall back to the
+ * tail.
+ */
+export function trimShift(
+  current: TranscriptWindow,
+  trimDelta: number,
+): { window: TranscriptWindow; lost: number } | null {
+  const delta = Math.max(0, Math.floor(trimDelta));
+  const end = Math.floor(current.end) - delta;
+  if (end <= 0) return null;
+  const start = Math.max(0, Math.floor(current.start) - delta);
+  const lost = Math.min(Math.floor(current.end), Math.max(0, delta - Math.floor(current.start)));
+  return { window: { start, end }, lost };
 }
 
 export interface PagePlan {

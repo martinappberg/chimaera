@@ -556,8 +556,11 @@ describe("ChatStore pending-send ordering", () => {
   it("keeps client-side notices under the transcript cap", () => {
     const store = new ChatStore();
     for (let i = 0; i < 2_100; i++) store.notice(`offline ${i}`, "error");
-    expect(store.blocks).toHaveLength(2_000);
+    // Crossed the hysteresis threshold once (at 2065 → trimmed back to the
+    // cap), then grew the remaining 35 into the slack.
+    expect(store.blocks).toHaveLength(2_035);
     expect(store.blocks[0]).toMatchObject({ kind: "notice", text: "earlier history trimmed" });
+    expect(store.virtualTotal).toBe(2_100);
   });
 
   it("leaves an already-completed tool from a prior turn untouched on a later turn end", () => {
@@ -957,5 +960,181 @@ describe("ChatStore background tasks", () => {
     expect(replay.backgroundTasks).toEqual(live.backgroundTasks);
     expect(replay.blocks).toEqual(live.blocks);
     expect(live.backgroundTasks.map((t) => t.id)).toEqual(["bg-2"]);
+  });
+});
+
+describe("ChatStore transcript cap: hysteresis, uids, virtual total", () => {
+  const CAP = 2_000;
+  const SLACK = 64;
+
+  it("trims in batches: the array runs to cap+slack, then settles at the cap", () => {
+    const store = new ChatStore();
+    for (let i = 0; i < CAP + SLACK; i++) store.notice(`n${i}`, "info");
+    // At the threshold, still untrimmed — the O(n) rebuild has not run once.
+    expect(store.blocks).toHaveLength(CAP + SLACK);
+    expect(store.trimmedCount).toBe(0);
+
+    store.notice("over", "info");
+    expect(store.blocks).toHaveLength(CAP);
+    expect(store.blocks[0]).toMatchObject({ kind: "notice", text: "earlier history trimmed" });
+    expect(store.trimmedCount).toBe(SLACK + 1);
+
+    // The next trim needs another full slack of appends, not one per event.
+    for (let i = 0; i < SLACK; i++) store.notice(`m${i}`, "info");
+    expect(store.blocks).toHaveLength(CAP + SLACK);
+    expect(store.trimmedCount).toBe(SLACK + 1);
+    store.notice("over again", "info");
+    expect(store.blocks).toHaveLength(CAP);
+    expect(store.trimmedCount).toBe(2 * (SLACK + 1));
+  });
+
+  it("the virtual total keeps counting appends at the cap", () => {
+    const store = new ChatStore();
+    const appended = CAP + SLACK + 40; // one trim landed along the way
+    for (let i = 0; i < appended; i++) store.notice(`n${i}`, "info");
+    expect(store.trimmedCount).toBeGreaterThan(0);
+    // blocks.length alone under-counts at cap; the virtual total still equals
+    // every block ever appended, and grows by one per at-cap append — the
+    // trim-stable coordinate system saved window cursors persist in.
+    expect(store.virtualTotal).toBe(appended);
+    const before = store.virtualTotal;
+    store.notice("one more", "info");
+    expect(store.virtualTotal).toBe(before + 1);
+  });
+
+  it("row uids are stable across trims and never repeat", () => {
+    const store = new ChatStore();
+    for (let i = 0; i < CAP + SLACK; i++) store.notice(`n${i}`, "info");
+    const tailUid = store.blocks[store.blocks.length - 1].uid;
+    store.notice("trigger trim", "info");
+    // The surviving block kept its uid at its shifted array position.
+    const survivor = store.blocks.find(
+      (b) => b.kind === "notice" && b.text === `n${CAP + SLACK - 1}`,
+    );
+    expect(survivor?.uid).toBe(tailUid);
+    const uids = store.blocks.map((b) => b.uid);
+    expect(new Set(uids).size).toBe(uids.length);
+  });
+
+  it("id-indexed patches still land after a trim's index rebuild", () => {
+    const store = new ChatStore();
+    let seq = 0;
+    const apply = (ev: Record<string, unknown>) =>
+      store.apply({ seq: ++seq, ts: seq, ev } as SeqEvent);
+    for (let i = 0; i < CAP; i++) apply({ type: "notice", text: `n${i}` });
+    apply({ type: "tool_call", id: "t1", kind: "execute", title: "build", status: "in_progress" });
+    for (let i = 0; i < 2 * SLACK; i++) apply({ type: "notice", text: `m${i}` });
+    expect(store.trimmedCount).toBeGreaterThan(0);
+    apply({ type: "tool_call_update", id: "t1", status: "completed" });
+    const tool = store.blocks.find((b) => b.kind === "tool" && b.id === "t1");
+    expect(tool).toMatchObject({ status: "completed" });
+  });
+
+  it("a checkpoint bumps the transcript version only when it touches a rendered block", () => {
+    const store = new ChatStore();
+    store.apply({
+      seq: 1,
+      ts: 1,
+      ev: { type: "user_message", text: "queued", id: "q1", queued: true },
+    } as SeqEvent);
+    const afterQueue = store.transcriptVersion;
+    // Lands on the still-queued send (pendingSends, not a block): nothing the
+    // reader sees changes — must not defeat the activation early-out or light
+    // the unread chip. The anchor rides along at promotion.
+    store.apply({
+      seq: 2,
+      ts: 2,
+      ev: { type: "checkpoint", user_message_id: "q1", preceding_uuid: "p0" },
+    } as SeqEvent);
+    expect(store.transcriptVersion).toBe(afterQueue);
+
+    store.apply({
+      seq: 3,
+      ts: 3,
+      ev: { type: "user_message", text: "sent", id: "u1", queued: false },
+    } as SeqEvent);
+    const afterUser = store.transcriptVersion;
+    // Lands on a RENDERED user block (its rewind affordance mutates in
+    // place): a frozen view must learn to reconcile, so the version bumps.
+    store.apply({
+      seq: 4,
+      ts: 4,
+      ev: { type: "checkpoint", user_message_id: "u1", preceding_uuid: "p1" },
+    } as SeqEvent);
+    expect(store.transcriptVersion).toBe(afterUser + 1);
+  });
+
+  it("a retract-and-reappend that nets out still reads as a structural change", () => {
+    const store = fold([
+      { type: "turn_started", turn_id: "t1" },
+      { type: "message_chunk", turn_id: "t1", text: "the wrong answer" },
+    ]);
+    const structuralBefore = store.structuralVersion;
+    const lengthBefore = store.blocks.length;
+    const virtualBefore = store.virtualTotal;
+    store.apply({ seq: 3, ts: 3, ev: { type: "messages_superseded" } } as SeqEvent);
+    store.apply({
+      seq: 4,
+      ts: 4,
+      ev: { type: "message_chunk", turn_id: "t2", text: "the retry" },
+    } as SeqEvent);
+    // Net lengths cancel out — even the virtual total — so only the
+    // structural counter can tell a view its rendered rows are stale.
+    expect(store.blocks.length).toBe(lengthBefore);
+    expect(store.virtualTotal).toBe(virtualBefore);
+    expect(store.structuralVersion).toBeGreaterThan(structuralBefore);
+  });
+
+  it("a journal reset bumps the transcript generation", () => {
+    const store = fold([{ type: "user_message", text: "hi" }]);
+    expect(store.epoch).toBe(0);
+    // head below lastSeq ⇒ pruned/recreated journal: old coordinates (ranges,
+    // trim counts, saved cursors) belong to a dead numbering system.
+    store.onReady(
+      {
+        id: "s1",
+        agent: "claude",
+        alive: true,
+        exit_status: null,
+        native_session_id: null,
+        model: null,
+        current_mode: null,
+        pending_permission: false,
+      },
+      0,
+      0,
+    );
+    expect(store.epoch).toBe(1);
+  });
+
+  it("a journal reset zeroes the trim count but never recycles uids", () => {
+    const store = new ChatStore();
+    // Journaled events (they advance lastSeq, so ready's head-below-lastSeq
+    // reset actually triggers), enough of them to cross the trim threshold.
+    for (let i = 0; i < CAP + SLACK + 1; i++) {
+      store.apply({ seq: i + 1, ts: i, ev: { type: "notice", text: `n${i}` } } as SeqEvent);
+    }
+    expect(store.trimmedCount).toBeGreaterThan(0);
+    const maxUid = Math.max(...store.blocks.map((b) => b.uid));
+    // head below lastSeq ⇒ the journal was pruned/recreated: hard reset.
+    store.onReady(
+      {
+        id: "s1",
+        agent: "claude",
+        alive: true,
+        exit_status: null,
+        native_session_id: null,
+        model: null,
+        current_mode: null,
+        pending_permission: false,
+      },
+      0,
+      0,
+    );
+    expect(store.trimmedCount).toBe(0);
+    store.notice("fresh", "info");
+    // A keyed render may still hold pre-reset rows; a recycled uid would make
+    // Svelte patch stale DOM into an unrelated block instead of remounting.
+    expect(store.blocks[0].uid).toBeGreaterThan(maxUid);
   });
 });

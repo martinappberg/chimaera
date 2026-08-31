@@ -51,8 +51,10 @@
     autoPageEarlier,
     pageEarlier,
     pageLater,
+    restoreVirtualWindow,
     restoreWindow,
     tailWindow,
+    trimShift,
     type PagePlan,
   } from "./transcriptWindow";
   import { getSetting } from "../settings/store.svelte";
@@ -155,7 +157,25 @@
   let renderEnd = $state(0);
   let renderReady = $state(false);
   let renderedVersion = $state(-1);
-  let renderedTotal = $state(0);
+  // Plain (non-reactive) bookkeeping, like tracksTail/rendersLive: only ever
+  // read inside the windowing effect's untracked body or handlers.
+  /** store.structuralVersion at the last range write. "Did the row set
+   *  change" keys on this, never on lengths: at cap append+trim nets the
+   *  length out, and a retracted-then-reappended tail nets even the virtual
+   *  total out, while the rows are new either way. */
+  let renderedStructural = -1;
+  /** store.trimmedCount at the last range write. A trim front-splices the
+   *  array under this view's absolute range; the delta says how far to shift
+   *  renderStart/renderEnd so they keep naming the same rows. */
+  let renderedTrim = 0;
+  /** store.epoch at the last range write. A journal reset restarts the trim
+   *  numbering — ranges are discarded across generations, never shifted. */
+  let renderedEpoch = store.epoch;
+  /** False while a setRangeAnchored scroll correction is scheduled but not
+   *  applied. A hide in the same frame cancels the tick (anchorRevision
+   *  bump); activation must then reconcile instead of early-outing on top of
+   *  an uncorrected scroll position. */
+  let anchorSettled = true;
   // svelte-ignore state_referenced_locally
   let followedVersion = $state(chatFollowedVersion(session.id) ?? -1);
   /** A non-empty draft pauses bottom-following, never transcript rendering. */
@@ -176,6 +196,16 @@
   }
 
   let anchorRevision = 0;
+
+  /** Persist the current window into the pool in trim-stable virtual
+   *  coordinates, stamped with the transcript generation — a trim or journal
+   *  reset while the view is unmounted then can't leave the cursor naming
+   *  the wrong rows (stale ones are discarded at restore). */
+  function saveWindowVirtual(start: number, end: number, tail: boolean): void {
+    const trimmed = store.trimmedCount;
+    saveChatRenderWindow(session.id, start + trimmed, end + trimmed, tail, store.epoch);
+  }
+
   function setRange(
     start: number,
     end: number,
@@ -191,10 +221,14 @@
     rendersLive = options.live;
     tracksTail = options.tail;
     renderedVersion = store.transcriptVersion;
-    renderedTotal = total;
+    renderedStructural = store.structuralVersion;
+    renderedTrim = store.trimmedCount;
+    renderedEpoch = store.epoch;
     renderReady = true;
     anchorRevision += 1;
-    saveChatRenderWindow(session.id, safeStart, safeEnd, tracksTail);
+    // A fresh range write supersedes any still-unapplied anchor correction.
+    anchorSettled = true;
+    saveWindowVirtual(safeStart, safeEnd, tracksTail);
   }
 
   function setTail(live = true): void {
@@ -209,13 +243,24 @@
     if (!renderReady || !rendersLive) return;
     renderBlocks = $state.snapshot(renderBlocks);
     rendersLive = false;
-    renderedVersion = store.transcriptVersion;
-    renderedTotal = store.blocks.length;
+    // The snapshot captured every in-place mutation the live proxies had
+    // delivered, but no structural change beyond the range — advance the
+    // version stamp only when none occurred, so the activation early-out can
+    // never skip rows this freeze did not capture. renderedTrim likewise stays
+    // at its last range write (the range was not shifted here); activation
+    // shifts by the missed delta.
+    if (store.structuralVersion === renderedStructural) {
+      renderedVersion = store.transcriptVersion;
+    }
     anchorRevision += 1;
   }
 
   interface TranscriptAnchor {
     node: HTMLElement;
+    /** The anchored row's block uid (a group's first tool) — trim-proof
+     *  identity, unlike the index label which goes stale by the trim delta
+     *  the moment a reducer trim outruns the last render. */
+    uid: number | null;
     index: number | null;
     top: number;
     scrollTop: number;
@@ -231,18 +276,33 @@
     );
     if (node === undefined) return null;
     const parsed = Number(node.dataset.blockIndex);
+    const uidParsed = Number(node.dataset.blockUid);
     return {
       node,
+      uid: Number.isFinite(uidParsed) ? uidParsed : null,
       index: Number.isFinite(parsed) ? parsed : null,
       top: node.getBoundingClientRect().top,
       scrollTop: el.scrollTop,
     };
   }
 
+  /** The anchored row's CURRENT absolute index, resolved by uid identity
+   *  against the rendered slice (immune to stale DOM labels after a trim
+   *  shift); the parsed label is the fallback for a row already dropped. */
+  function anchorArrayIndex(anchor: TranscriptAnchor): number | null {
+    if (anchor.uid !== null) {
+      const offset = renderBlocks.findIndex((b) => b.uid === anchor.uid);
+      if (offset !== -1) return renderStart + offset;
+    }
+    return anchor.index;
+  }
+
   function canDiscardBefore(start: number): boolean {
     if (start <= renderStart) return true;
     const anchor = readTranscriptAnchor();
-    return anchor?.index !== null && anchor?.index !== undefined && anchor.index >= start;
+    if (anchor === null) return false;
+    const index = anchorArrayIndex(anchor);
+    return index !== null && index >= start;
   }
 
   /** Replace a range while keeping the same source row at the same screen
@@ -255,26 +315,40 @@
     const anchor = readTranscriptAnchor();
     setRange(start, end, options);
     const revision = anchorRevision;
+    anchorSettled = false;
     void tick().then(() => {
+      // A cancelled correction (a freeze bumped the revision before this ran)
+      // leaves anchorSettled false, so the next activation reconciles instead
+      // of early-outing on an uncorrected scroll position.
       if (revision !== anchorRevision) return;
       const current = transcriptEl;
       if (current === null) return;
-      let after: HTMLElement | null = null;
-      if (anchor?.index !== null && anchor?.index !== undefined) {
-        after =
-          Array.from(columnEl?.querySelectorAll<HTMLElement>("[data-block-index]") ?? []).find(
-            (candidate) => {
+      // Node identity first: uid-keyed rows survive a range replacement.
+      // Then the anchor's block uid (trim-proof — a cap trim can shift every
+      // index label between the anchor read and this tick); the index-range
+      // match is the last resort for a row whose uid left the window.
+      let after: HTMLElement | null = anchor?.node.isConnected === true ? anchor.node : null;
+      if (after === null && anchor !== null) {
+        const candidates = Array.from(
+          columnEl?.querySelectorAll<HTMLElement>("[data-block-index]") ?? [],
+        );
+        if (anchor.uid !== null) {
+          after = candidates.find((c) => Number(c.dataset.blockUid) === anchor.uid) ?? null;
+        }
+        if (after === null && anchor.index !== null) {
+          after =
+            candidates.find((candidate) => {
               const start = Number(candidate.dataset.blockIndex);
               const end = Number(candidate.dataset.blockEnd ?? candidate.dataset.blockIndex);
               return Number.isFinite(start) && start <= anchor.index! && end >= anchor.index!;
-            },
-          ) ?? null;
+            }) ?? null;
+        }
       }
-      after ??= anchor?.node.isConnected ? anchor.node : null;
       current.scrollTop =
         anchor !== null && after !== null
           ? anchor.scrollTop + after.getBoundingClientRect().top - anchor.top
           : (anchor?.scrollTop ?? current.scrollTop);
+      anchorSettled = true;
       saveChatScroll(session.id, current.scrollTop, false);
     });
   }
@@ -292,21 +366,65 @@
       return;
     }
     const activating = !wasVisible;
-    wasVisible = true;
     if (store.hydrating) return;
+    // Marked only once a reconcile actually runs: a thaw during rehydration
+    // must not burn `activating` before the post-hydration pass can use it.
+    wasVisible = true;
     const total = store.blocks.length;
     const version = store.transcriptVersion;
+    const trimmed = store.trimmedCount;
     const following = atBottom;
     const drafting = composerEngaged;
     untrack(() => {
+      const structural = store.structuralVersion;
+      if (renderReady && store.epoch !== renderedEpoch) {
+        // The journal was reset and the transcript rebuilt: this range (and
+        // any trim delta against it) is dead-coordinate data from another
+        // generation. Discard to the live tail — never shift across epochs.
+        setTail();
+        if (!atBottom) atBottom = true;
+        queueBottomScroll(true);
+        return;
+      }
+      // Cap trims splice the array's front out from under this absolute
+      // range; shift with them — and drop the same rows from the rendered
+      // slice (frozen snapshots included) — so range, rows, and index labels
+      // keep agreeing. Same-epoch only, where trimmedCount is monotonic.
+      const trimDelta = trimmed - renderedTrim;
+      if (trimDelta > 0 && renderReady) {
+        const shifted = trimShift({ start: renderStart, end: renderEnd }, trimDelta);
+        if (shifted === null) {
+          // Every rendered row was trimmed away under this view — the mounted
+          // mirror of a stale saved cursor: fall back to the live tail.
+          setTail();
+          if (!atBottom) atBottom = true;
+          queueBottomScroll(true);
+          return;
+        }
+        renderStart = shifted.window.start;
+        renderEnd = shifted.window.end;
+        if (shifted.lost > 0) renderBlocks = renderBlocks.slice(shifted.lost);
+      }
+      renderedTrim = trimmed;
       if (!renderReady) {
-        if (!atBottom && savedRenderWindow !== null) {
-          const restored = restoreWindow(savedRenderWindow, total);
-          setRange(restored.start, restored.end, {
+        // Saved cursors are virtual and generation-stamped. One that predates
+        // a journal reset, or whose rows were all trimmed away, is discarded
+        // together with its scroll position — an arbitrary reading offset
+        // must not land on the tail we fall back to.
+        const saved =
+          savedRenderWindow === null || savedRenderWindow.epoch !== store.epoch
+            ? null
+            : restoreVirtualWindow(savedRenderWindow, trimmed, total);
+        if (!atBottom && savedRenderWindow !== null && saved !== null) {
+          setRange(saved.start, saved.end, {
             live: savedRenderWindow.tail,
             tail: savedRenderWindow.tail,
           });
         } else {
+          if (!atBottom && savedRenderWindow !== null) {
+            saveChatScroll(session.id, 0, true);
+            atBottom = true;
+          }
           setTail();
         }
         if (followedVersion < 0 || followedVersion > version) markFollowed(version);
@@ -318,7 +436,28 @@
           tail: tracksTail,
         });
       } else if (activating) {
-        if (!tracksTail) return;
+        if (!tracksTail) {
+          if (!anchorSettled) {
+            // The pending scroll correction died with a freeze and its
+            // pre-change geometry is gone — re-pin: the current position
+            // becomes the saved reading position.
+            anchorSettled = true;
+            const el = transcriptEl;
+            if (el !== null) saveChatScroll(session.id, el.scrollTop, false);
+          }
+          return;
+        }
+        if (version === renderedVersion && structural === renderedStructural && anchorSettled) {
+          // Nothing arrived while hidden: the frozen page is already exact, so
+          // skip the slice/rebuild entirely. Rows stay inert snapshots until
+          // the next event or a bottom-reach rebinds live proxies (both call
+          // setRange), so a quiet tab switch costs no transcript work. Still
+          // settle the unread stamp: an in-place chunk landing in the same
+          // flush as the hide is IN the snapshot but was never marked
+          // followed, and nothing after this would heal the phantom chip.
+          if (following && !drafting) markFollowed(version);
+          return;
+        }
         const next = advanceTailWindow({ start: renderStart, end: renderEnd }, total);
         if (following && !drafting) {
           setRange(next.start, next.end, { live: true, tail: true });
@@ -333,12 +472,21 @@
             tail: false,
           });
         }
-      } else if (tracksTail && (version !== renderedVersion || total !== renderedTotal)) {
-        if (drafting && version !== renderedVersion) atBottom = false;
+      } else if (
+        tracksTail &&
+        (version !== renderedVersion || structural !== renderedStructural)
+      ) {
+        if (drafting && version !== renderedVersion && atBottom) atBottom = false;
         const next = advanceTailWindow({ start: renderStart, end: renderEnd }, total);
-        if (total === renderedTotal) {
-          // The live proxy already delivered this in-place chunk to its row.
-          renderedVersion = version;
+        if (structural === renderedStructural) {
+          // In-place chunk growth: the row set is unchanged. The live proxy
+          // already delivered it to its row — unless an early-out activation
+          // left the rows frozen; rebind them now.
+          if (!rendersLive) {
+            setRange(renderStart, renderEnd, { live: true, tail: true });
+          } else {
+            renderedVersion = version;
+          }
           if (following && !drafting) markFollowed(version);
         } else if (following && !drafting) {
           setRange(next.start, next.end, { live: true, tail: true });
@@ -350,7 +498,7 @@
           // preserve the page and make the deferred gap explicit.
           freezeRenderedRange();
           tracksTail = false;
-          saveChatRenderWindow(session.id, renderStart, renderEnd, false);
+          saveWindowVirtual(renderStart, renderEnd, false);
         }
       }
     });
@@ -1320,7 +1468,11 @@
         group.endIndex = originalIndex;
       } else {
         group = null;
-        items.push({ t: "single", key: `b-${originalIndex}`, index: originalIndex, block });
+        // Keyed by the store's stable uid, never the array index: at cap every
+        // append front-splices the array, and index keys would remount the
+        // whole window (a full marked+KaTeX+DOMPurify pass per row) on the
+        // next range write.
+        items.push({ t: "single", key: `b-${block.uid}`, index: originalIndex, block });
       }
     });
     return items;
@@ -1440,6 +1592,7 @@
           tools={item.tools}
           sourceIndex={item.index}
           sourceEnd={item.endIndex}
+          sourceUid={item.tools[0]?.uid}
           {visible}
           {onOpenFile}
           onBackground={agentKind === "claude" ? backgroundTool : undefined}
@@ -1449,7 +1602,7 @@
         {@const block = item.block}
         <!-- Only delivered (sent) user messages render inline; queued/dropped
              ones live in the pending tail below. -->
-        <div class="msg user" data-block-index={item.index}>
+        <div class="msg user" data-block-index={item.index} data-block-uid={block.uid}>
           <div class="bubble-row">
             <button
               class="message-action fork-btn"
@@ -1486,7 +1639,7 @@
           {/if}
         </div>
       {:else if item.block.kind === "message"}
-        <div class="msg agent" data-block-index={item.index}>
+        <div class="msg agent" data-block-index={item.index} data-block-uid={item.block.uid}>
           <Markdown
             text={item.block.text}
             streaming={visible && store.running && item.index === lastInlineIndex}
@@ -1504,7 +1657,7 @@
           />
         </div>
       {:else if item.block.kind === "thought"}
-        <details class="thought" data-block-index={item.index}>
+        <details class="thought" data-block-index={item.index} data-block-uid={item.block.uid}>
           <summary>thinking · {item.block.text.length} chars</summary>
           <div class="thought-body">{item.block.text}</div>
         </details>
@@ -1513,7 +1666,7 @@
              overlay below is the answerable card, a quiet question+answer
              card once resolved (replay rebuilds the same). -->
         {#if item.block.resolved}
-          <div class="source-block" data-block-index={item.index}>
+          <div class="source-block" data-block-index={item.index} data-block-uid={item.block.uid}>
             <QuestionCard
               request={{ requestId: item.block.id, questions: item.block.questions, expiresAtMs: null }}
               answered={item.block.answers}
@@ -1522,12 +1675,15 @@
           </div>
         {/if}
       {:else if item.block.kind === "notice"}
-        <div class="notice" class:error={item.block.tone === "error"} data-block-index={item.index}
-          >{item.block.text}</div
+        <div
+          class="notice"
+          class:error={item.block.tone === "error"}
+          data-block-index={item.index}
+          data-block-uid={item.block.uid}>{item.block.text}</div
         >
       {:else if item.block.kind === "turn_end"}
         {@const block = item.block}
-        <div class="source-block" data-block-index={item.index}>
+        <div class="source-block" data-block-index={item.index} data-block-uid={item.block.uid}>
           <!-- The turn's artifacts preview here, after the closing prose. -->
           {#if block.artifacts.length > 0}
             <ArtifactGallery paths={block.artifacts} onOpen={onOpenFile} />
@@ -1541,7 +1697,7 @@
           {/if}
         </div>
       {:else if item.block.kind === "usage"}
-        <div class="source-block" data-block-index={item.index}>
+        <div class="source-block" data-block-index={item.index} data-block-uid={item.block.uid}>
           <UsagePanel windows={item.block.windows} />
         </div>
       {/if}
