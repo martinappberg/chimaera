@@ -36,9 +36,11 @@ has subtle repaint invariants — read the architecture guide before touching th
 - **Snapshot must round-trip.** `snapshot_replay_matches_live_grid` is the contract:
   a snapshot fed back through a fresh `Term` reproduces the live grid. Keep it green.
 - **Snapshot renders are blocking work.** `attach()` walks the whole scrollback
-  under the term lock (tens of ms at the 10k default; the cap is 200k lines).
-  Async callers must not run it on a reactor worker — the daemon's ws
-  attach/resync paths wrap it in `spawn_blocking`.
+  under the term lock (~95 ms measured at the 10k default; the cap is 200k
+  lines), and `resize` reflows the grid under the same lock. Async callers must
+  not run either on a reactor worker — the daemon's ws attach/resync/resize
+  paths wrap them in `spawn_blocking` (known gap: the daemon's MCP screen-text
+  scrape still takes the term lock on the reactor).
 - **Known accepted gap:** a resync while on the alternate screen can't restore the
   primary screen's scrollback.
 - Leaf crate: depends on nothing else in the workspace. `serde::Serialize` on the

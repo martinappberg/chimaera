@@ -13,7 +13,7 @@ use axum::response::Response;
 use bytes::Bytes;
 use serde::Deserialize;
 use serde_json::json;
-use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 
 use crate::AppState;
 
@@ -71,21 +71,22 @@ impl OutputBatch {
         self.bytes >= OUTPUT_COALESCE_MAX_BYTES
     }
 
+    fn is_empty(&self) -> bool {
+        self.chunks.is_empty()
+    }
+
     /// Drain the batch into one frame; `None` when empty.
     fn take_frame(&mut self) -> Option<Bytes> {
         let frame = match self.chunks.len() {
             0 => None,
             1 => self.chunks.pop(),
             _ => {
-                let mut buf = Vec::with_capacity(self.bytes);
-                for chunk in &self.chunks {
-                    buf.extend_from_slice(chunk);
-                }
+                let joined = self.chunks.concat();
                 self.chunks.clear();
-                Some(Bytes::from(buf))
+                Some(Bytes::from(joined))
             }
         };
-        self.bytes = 0;
+        self.reset_storage();
         frame
     }
 
@@ -93,16 +94,15 @@ impl OutputBatch {
     /// bytes are already parsed into the server grid the snapshot renders).
     fn clear(&mut self) {
         self.chunks.clear();
-        self.bytes = 0;
+        self.reset_storage();
     }
-}
 
-/// What the opportunistic `try_recv` drain of the output channel ended on.
-#[derive(PartialEq)]
-enum Drained {
-    Open,
-    Lagged,
-    Closed,
+    fn reset_storage(&mut self) {
+        self.bytes = 0;
+        // A pathological drain of many tiny chunks must not pin its
+        // high-water Vec capacity for the connection's whole life.
+        self.chunks.shrink_to(32);
+    }
 }
 
 /// Client -> server text frames.
@@ -166,20 +166,18 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
     // Adopt the client's grid BEFORE attaching so the snapshot below is
     // rendered at the size the client will actually display it.
     if let Some((cols, rows)) = auth_dims {
-        if let Err(err) = state.sessions.resize(&id, cols, rows) {
-            tracing::debug!(%id, %err, "pre-attach resize failed");
-        }
+        resize_off_reactor(&state, &id, cols, rows, "pre-attach resize").await;
     }
 
-    // The snapshot render walks the whole scrollback under the term lock
-    // (default 10k lines, cap 200k — tens of ms): blocking work. Keep it off
-    // the reactor so one attach can't stall every connection on this worker.
-    let attach_res = {
-        let state = state.clone();
-        let id = id.clone();
-        tokio::task::spawn_blocking(move || state.sessions.attach(&id))
-            .await
-            .unwrap_or_else(|err| Err(anyhow::anyhow!("attach task failed: {err}")))
+    let attach_res = match attach_off_reactor(&state, &id).await {
+        Ok(res) => res,
+        Err(err) => {
+            // A panicked render task is an internal failure, not session
+            // death: close (the client's reconnect retries) rather than
+            // replaying last words for a session that may be alive.
+            tracing::warn!(%id, %err, "attach render task failed");
+            return;
+        }
     };
     let mut attachment = match attach_res {
         Ok(attachment) => attachment,
@@ -248,7 +246,10 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
         return;
     }
 
-    // Snapshot as one binary frame, then enter the bridge loop.
+    // Snapshot as one binary frame, then enter the bridge loop. Adjacency is
+    // a contract: after any reset-bearing frame (`ready` here, `resync` in
+    // repaint) the NEXT binary frame is the complete snapshot — the client's
+    // parked write-through path relies on nothing interleaving.
     let snapshot = Bytes::from(std::mem::take(&mut attachment.snapshot));
     if socket.send(Message::Binary(snapshot)).await.is_err() {
         return;
@@ -271,37 +272,35 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
     // sent immediately.
     let mut batch = OutputBatch::new();
     let mut flush_at: Option<tokio::time::Instant> = None;
+    // One reusable timer per debounce, reset in place when (re)armed:
+    // re-creating a Sleep every loop iteration would churn the timer wheel
+    // on the output hot path. The `is_some()` guards keep an elapsed,
+    // un-reset Sleep from being polled again.
+    let resync_sleep = tokio::time::sleep(Duration::ZERO);
+    tokio::pin!(resync_sleep);
+    let flush_sleep = tokio::time::sleep(Duration::ZERO);
+    tokio::pin!(flush_sleep);
     loop {
         tokio::select! {
-            _ = async move {
-                match resync_at {
-                    Some(at) => tokio::time::sleep_until(at).await,
-                    None => std::future::pending().await,
-                }
-            } => {
+            _ = &mut resync_sleep, if resync_at.is_some() => {
                 resync_at = None;
-                batch.clear();
-                flush_at = None;
-                if !resync(&mut socket, &id, &state, &mut attachment).await {
+                if !repaint(&mut socket, &id, &state, &mut attachment,
+                            &mut batch, &mut flush_at, &mut output_open).await {
                     return;
                 }
             },
-            _ = async move {
-                match flush_at {
-                    Some(at) => tokio::time::sleep_until(at).await,
-                    None => std::future::pending().await,
-                }
-            } => {
-                match batch.take_frame() {
-                    Some(frame) => {
-                        if socket.send(Message::Binary(frame)).await.is_err() {
-                            return;
-                        }
-                        // Still streaming: keep flushing at the window cadence.
-                        flush_at = Some(tokio::time::Instant::now() + OUTPUT_COALESCE_WINDOW);
-                    }
+            _ = &mut flush_sleep, if flush_at.is_some() => {
+                if batch.is_empty() {
                     // The window elapsed idle: disarm so the next chunk leads.
-                    None => flush_at = None,
+                    flush_at = None;
+                } else {
+                    if !send_batch(&mut socket, &mut batch).await {
+                        return;
+                    }
+                    // Still streaming: keep flushing at the window cadence.
+                    let at = tokio::time::Instant::now() + OUTPUT_COALESCE_WINDOW;
+                    flush_sleep.as_mut().reset(at);
+                    flush_at = Some(at);
                 }
             },
             out = attachment.output.recv(), if output_open => match out {
@@ -309,63 +308,56 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
                     batch.push(bytes);
                     // Fold in whatever is already queued — batching without
                     // waiting (the wait, when any, is the flush timer's).
-                    let mut drained = Drained::Open;
+                    let mut drain_err: Option<TryRecvError> = None;
                     while !batch.is_full() {
-                        use tokio::sync::broadcast::error::TryRecvError;
                         match attachment.output.try_recv() {
                             Ok(more) => batch.push(more),
                             Err(TryRecvError::Empty) => break,
-                            Err(TryRecvError::Lagged(_)) => {
-                                drained = Drained::Lagged;
-                                break;
-                            }
-                            Err(TryRecvError::Closed) => {
-                                drained = Drained::Closed;
+                            Err(err) => {
+                                drain_err = Some(err);
                                 break;
                             }
                         }
                     }
-                    if drained == Drained::Lagged {
+                    if matches!(drain_err, Some(TryRecvError::Lagged(_))) {
                         tracing::debug!(%id, "ws output lagged; resyncing");
-                        batch.clear();
-                        flush_at = None;
                         resync_at = None;
-                        if !resync(&mut socket, &id, &state, &mut attachment).await {
+                        if !repaint(&mut socket, &id, &state, &mut attachment,
+                                    &mut batch, &mut flush_at, &mut output_open).await {
                             return;
                         }
                     } else {
-                        if flush_at.is_none() || batch.is_full() || drained == Drained::Closed {
-                            if let Some(frame) = batch.take_frame() {
-                                if socket.send(Message::Binary(frame)).await.is_err() {
-                                    return;
-                                }
+                        let closed = matches!(drain_err, Some(TryRecvError::Closed));
+                        if flush_at.is_none() || batch.is_full() || closed {
+                            if !send_batch(&mut socket, &mut batch).await {
+                                return;
                             }
-                            flush_at = match drained {
-                                Drained::Closed => None,
-                                _ => Some(tokio::time::Instant::now() + OUTPUT_COALESCE_WINDOW),
+                            flush_at = if closed {
+                                None
+                            } else {
+                                let at = tokio::time::Instant::now() + OUTPUT_COALESCE_WINDOW;
+                                flush_sleep.as_mut().reset(at);
+                                Some(at)
                             };
                         }
-                        if drained == Drained::Closed {
+                        if closed {
                             output_open = false;
                         }
                     }
                 }
                 Err(RecvError::Lagged(skipped)) => {
                     tracing::debug!(%id, skipped, "ws output lagged; resyncing");
-                    batch.clear();
-                    flush_at = None;
                     resync_at = None;
-                    if !resync(&mut socket, &id, &state, &mut attachment).await {
+                    if !repaint(&mut socket, &id, &state, &mut attachment,
+                                &mut batch, &mut flush_at, &mut output_open).await {
                         return;
                     }
                 }
                 Err(RecvError::Closed) => {
                     // The child died inside a window: the batched tail is its
                     // last words — flush before going quiet.
-                    if let Some(frame) = batch.take_frame() {
-                        if socket.send(Message::Binary(frame)).await.is_err() {
-                            return;
-                        }
+                    if !send_batch(&mut socket, &mut batch).await {
+                        return;
                     }
                     flush_at = None;
                     output_open = false;
@@ -379,7 +371,9 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
                     };
                     match serde_json::to_value(&event) {
                         Ok(value) => {
-                            if send_json(&mut socket, &value).await.is_err() {
+                            // Ordered send: batched output first, so an event
+                            // never overtakes the bytes it postdates.
+                            if !send_ordered_json(&mut socket, &mut batch, &value).await {
                                 return;
                             }
                         }
@@ -391,7 +385,9 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
                     // The initiator is skipped: its xterm already reflowed.
                     if let Some(dims) = resized_to {
                         if client_dims != Some(dims) {
-                            resync_at = Some(tokio::time::Instant::now() + RESYNC_DEBOUNCE);
+                            let at = tokio::time::Instant::now() + RESYNC_DEBOUNCE;
+                            resync_sleep.as_mut().reset(at);
+                            resync_at = Some(at);
                         }
                     }
                 }
@@ -407,9 +403,11 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
                             .await
                             .is_err()
                         {
-                            // Session is gone; tell the client and hang up.
-                            let _ = send_json(
+                            // Session is gone; flush the batched tail (its
+                            // last words), tell the client, and hang up.
+                            let _ = send_ordered_json(
                                 &mut socket,
+                                &mut batch,
                                 &json!({"type": "exited", "status": null}),
                             )
                             .await;
@@ -421,9 +419,14 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
                     match serde_json::from_str::<ClientMessage>(&text) {
                         Ok(ClientMessage::Resize { cols, rows }) => {
                             client_dims = Some((cols, rows));
-                            if let Err(err) = state.sessions.resize(&id, cols, rows) {
-                                tracing::debug!(%id, %err, "ws resize failed");
+                            // Flush output rendered at the old width before
+                            // the grid reflows under it — the initiator is
+                            // excluded from resync, so an inverted flush
+                            // here would never be repaired.
+                            if !send_batch(&mut socket, &mut batch).await {
+                                return;
                             }
+                            resize_off_reactor(&state, &id, cols, rows, "ws resize").await;
                         }
                         // Ignore re-auth, the events-bus `watch` frame, and
                         // unknown message types.
@@ -438,53 +441,106 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
     }
 }
 
-/// Repaint the client from the authoritative grid: fresh attach, a
-/// dims-tagged resync frame (the client resizes BEFORE replaying — a snapshot
-/// replayed at any other width re-wraps into garbage), then the snapshot.
-/// The events subscription is deliberately kept: swapping it could drop an
-/// Exited/Title event broadcast during the swap. Returns false when the
-/// socket is gone.
-async fn resync(
+/// `SessionManager::attach` renders the whole scrollback under the term lock
+/// (~95 ms measured client-visible at the 10k-line default; the cap is 200k)
+/// — blocking work that must never run on a reactor worker. Outer `Err` =
+/// the render task itself failed (a panic), inner `Err` = unknown session.
+async fn attach_off_reactor(
+    state: &Arc<AppState>,
+    id: &str,
+) -> Result<anyhow::Result<chimaera_pty::Attachment>, tokio::task::JoinError> {
+    let state = Arc::clone(state);
+    let id = id.to_string();
+    tokio::task::spawn_blocking(move || state.sessions.attach(&id)).await
+}
+
+/// `resize` winches the PTY and reflows the headless grid under the same
+/// term lock the snapshot render holds — off the reactor for the same
+/// reason. Failures are logged, not fatal (resizes are advisory; a dead or
+/// unknown session simply ignores them).
+async fn resize_off_reactor(state: &Arc<AppState>, id: &str, cols: u16, rows: u16, what: &str) {
+    let state = Arc::clone(state);
+    let task_id = id.to_string();
+    match tokio::task::spawn_blocking(move || state.sessions.resize(&task_id, cols, rows)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => tracing::debug!(%id, %err, "{what} failed"),
+        Err(err) => tracing::warn!(%id, %err, "{what} task failed"),
+    }
+}
+
+/// Send the batched output as one frame, if any; false = socket gone.
+async fn send_batch(socket: &mut WebSocket, batch: &mut OutputBatch) -> bool {
+    match batch.take_frame() {
+        Some(frame) => socket.send(Message::Binary(frame)).await.is_ok(),
+        None => true,
+    }
+}
+
+/// Send a JSON side-channel frame, flushing batched output FIRST: an event
+/// must never overtake the bytes it postdates (`exited` before the final
+/// output, `resized` before pre-reflow output — and the resize initiator is
+/// excluded from resync, so an inverted flush there would never be
+/// repaired). False = socket gone.
+async fn send_ordered_json(
+    socket: &mut WebSocket,
+    batch: &mut OutputBatch,
+    value: &serde_json::Value,
+) -> bool {
+    send_batch(socket, batch).await && send_json(socket, value).await.is_ok()
+}
+
+/// Repaint the client from the authoritative grid: fresh attach (off the
+/// reactor), a dims-tagged resync frame (the client resizes BEFORE replaying
+/// — a snapshot replayed at any other width re-wraps into garbage), then the
+/// snapshot, sent adjacent to the resync frame (the client's parked
+/// write-through path relies on the next binary frame after a reset being
+/// the complete snapshot). Batched output is discarded first: those bytes
+/// were already parsed into the grid this snapshot renders. The events
+/// subscription is deliberately kept: swapping it could drop an Exited/Title
+/// event broadcast during the swap; the output receiver IS swapped, so it is
+/// re-opened even after a Closed. Returns false when the connection is done
+/// — socket gone, or the re-attach failed (closing lets the client's normal
+/// reconnect self-heal with a fresh snapshot instead of silently streaming
+/// onto a stale grid whose resync trigger was already consumed).
+async fn repaint(
     socket: &mut WebSocket,
     id: &str,
     state: &Arc<AppState>,
     attachment: &mut chimaera_pty::Attachment,
+    batch: &mut OutputBatch,
+    flush_at: &mut Option<tokio::time::Instant>,
+    output_open: &mut bool,
 ) -> bool {
-    // Same off-reactor discipline as the initial attach: the snapshot render
-    // is blocking work under the term lock.
-    let fresh = {
-        let state = Arc::clone(state);
-        let id = id.to_string();
-        tokio::task::spawn_blocking(move || state.sessions.attach(&id))
-            .await
-            .unwrap_or_else(|err| Err(anyhow::anyhow!("resync attach task failed: {err}")))
-    };
-    match fresh {
-        Ok(mut fresh) => {
-            let frame = json!({
-                "type": "resync",
-                "cols": fresh.info.cols,
-                "rows": fresh.info.rows,
-            });
-            if send_json(socket, &frame).await.is_err() {
-                return false;
-            }
-            let snapshot = Bytes::from(std::mem::take(&mut fresh.snapshot));
-            if socket.send(Message::Binary(snapshot)).await.is_err() {
-                return false;
-            }
-            attachment.info = fresh.info;
-            attachment.output = fresh.output;
-            attachment.input = fresh.input;
-            true
+    batch.clear();
+    *flush_at = None;
+    let mut fresh = match attach_off_reactor(state, id).await {
+        Ok(Ok(fresh)) => fresh,
+        Ok(Err(err)) => {
+            tracing::debug!(%id, %err, "resync attach failed; closing for a clean reconnect");
+            return false;
         }
         Err(err) => {
-            // Session gone mid-resync; the kept events channel delivers the
-            // Exited that explains it.
-            tracing::debug!(%id, %err, "resync attach failed");
-            true
+            tracing::warn!(%id, %err, "resync render task failed; closing for a clean reconnect");
+            return false;
         }
+    };
+    let frame = json!({
+        "type": "resync",
+        "cols": fresh.info.cols,
+        "rows": fresh.info.rows,
+    });
+    if send_json(socket, &frame).await.is_err() {
+        return false;
     }
+    let snapshot = Bytes::from(std::mem::take(&mut fresh.snapshot));
+    if socket.send(Message::Binary(snapshot)).await.is_err() {
+        return false;
+    }
+    attachment.info = fresh.info;
+    attachment.output = fresh.output;
+    attachment.input = fresh.input;
+    *output_open = true;
+    true
 }
 
 /// GET /ws/chat/{id} — the structured chat bridge: JSON events out (seq-
