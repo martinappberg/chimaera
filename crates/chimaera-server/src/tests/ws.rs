@@ -82,6 +82,87 @@ async fn ws_bridge_auth_snapshot_and_echo() {
     state.sessions.kill(&info.id).ok();
 }
 
+/// A client resize round-trips through the off-reactor resize path: the
+/// server winches the PTY + headless grid and broadcasts a `resized` event
+/// back to every attachment (including the initiator, which uses it as its
+/// dims echo). Guards the spawn_blocking resize seam in the bridge loop.
+#[tokio::test]
+async fn ws_resize_round_trip() {
+    use futures::SinkExt;
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+    let state = test_state();
+    let info = state
+        .sessions
+        .spawn(chimaera_pty::SpawnOpts {
+            cwd: test_dir("ws-resize-cwd"),
+            name: None,
+            cols: 80,
+            rows: 24,
+            command: None,
+            id: None,
+            env: Vec::new(),
+            env_remove: Vec::new(),
+            scrollback: None,
+        })
+        .expect("spawn session");
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = app(state.clone());
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+
+    let url = format!("ws://{addr}/ws/sessions/{}", info.id);
+    let (mut socket, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    socket
+        .send(WsMessage::text(
+            serde_json::json!({"type": "auth", "token": "test-token"}).to_string(),
+        ))
+        .await
+        .unwrap();
+    match next_ws_frame(&mut socket).await {
+        WsMessage::Text(text) => {
+            let ready: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(ready["type"], "ready");
+            assert_eq!(ready["cols"], 80);
+        }
+        other => panic!("expected ready text frame, got {other:?}"),
+    }
+    match next_ws_frame(&mut socket).await {
+        WsMessage::Binary(_) => {}
+        other => panic!("expected snapshot binary frame, got {other:?}"),
+    }
+
+    socket
+        .send(WsMessage::text(
+            serde_json::json!({"type": "resize", "cols": 100, "rows": 30}).to_string(),
+        ))
+        .await
+        .unwrap();
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no resized event frame"
+        );
+        let frame = match next_ws_frame(&mut socket).await {
+            WsMessage::Text(text) => serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+            _ => continue, // shell output interleaves as binary frames
+        };
+        if frame["type"] == "resized" {
+            assert_eq!(frame["cols"], 100);
+            assert_eq!(frame["rows"], 30);
+            break;
+        }
+    }
+    assert_eq!(state.sessions.get(&info.id).map(|i| i.cols), Some(100));
+
+    state.sessions.kill(&info.id).ok();
+}
+
 /// Attaching to a session that already died replays its final screen
 /// (last words) and closes as exited — never a blank pane. This is the
 /// fast-agent-failure path: codex without OPENAI_API_KEY printed its

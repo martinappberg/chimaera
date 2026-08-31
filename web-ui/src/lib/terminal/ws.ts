@@ -48,6 +48,14 @@ export class SessionSocket {
   private closed = false;
   private fatal = false;
   private exited = false;
+  /**
+   * The session reported exited at least once. Unlike `exited` (which
+   * resync() clears to allow a last-words reconnect), this never resets:
+   * it distinguishes "unknown session" after a witnessed exit (the daemon
+   * simply forgot the dead session — terminal-graceful) from a genuinely
+   * missing session (fatal after retries).
+   */
+  private sawExited = false;
   private everReady = false;
   private unknownRetries = 0;
   private readonly recon = new Reconnector(() => this.connect());
@@ -103,16 +111,22 @@ export class SessionSocket {
       case "ready": {
         this.recon.succeeded();
         this.unknownRetries = 0;
+        // Grid truth BEFORE the reset below may resize the terminal: a fit
+        // that landed mid-handshake is what the reconcile must preserve.
+        const d = this.handlers.dims?.() ?? null;
         // On a reconnect the server re-sends a full snapshot; wipe the stale
-        // screen so the snapshot reconstructs state exactly.
-        if (this.everReady) this.handlers.onReset();
+        // screen so the snapshot reconstructs state exactly. The ready frame
+        // carries the dims the snapshot was rendered at — for a live session
+        // the server already adopted the auth-frame grid, and for a dead
+        // session's last-words replay these are the death-time dims the
+        // final screen must parse at — so adopt them like a resync's.
+        if (this.everReady) this.handlers.onReset(msg.cols, msg.rows);
         this.everReady = true;
         // Reconcile grids: resizes are silently dropped while the socket is
         // down or mid-handshake (the first fit often lands during CONNECTING),
         // and ResizeObserver never re-fires for an unchanged container. The
         // ready frame carries the server's dims — correct any drift exactly
         // once, here.
-        const d = this.handlers.dims?.() ?? null;
         if (
           d !== null &&
           typeof msg.cols === "number" &&
@@ -136,14 +150,25 @@ export class SessionSocket {
         break;
       case "exited":
         this.exited = true;
+        this.sawExited = true;
         this.handlers.onExited(msg.status ?? null);
         break;
       case "error":
-        // A missing session may just be mid view-switch: let the normal
-        // onclose reconnect path retry before giving up.
-        if (msg.code === "unknown_session" && this.unknownRetries < UNKNOWN_SESSION_RETRIES) {
-          this.unknownRetries += 1;
-          break;
+        if (msg.code === "unknown_session") {
+          // After a witnessed exit, "unknown" means even the session's
+          // last words are gone (bounded server-side memory) — terminal-
+          // graceful: keep the grid + [exited] marker, stop reconnecting,
+          // never surface an error for a session that merely finished.
+          if (this.sawExited) {
+            this.exited = true;
+            break;
+          }
+          // Otherwise it may just be mid view-switch: let the normal
+          // onclose reconnect path retry before giving up.
+          if (this.unknownRetries < UNKNOWN_SESSION_RETRIES) {
+            this.unknownRetries += 1;
+            break;
+          }
         }
         this.fatal = true;
         this.handlers.onError(msg.message ?? "unknown error");
@@ -172,13 +197,48 @@ export class SessionSocket {
     }
   }
 
+  /**
+   * Force a clean re-attach: drop the current socket and reconnect now. The
+   * server fully re-snapshots on a fresh attach (ready → reset → snapshot),
+   * which is the recovery path for a parked terminal whose buffered stream
+   * was discarded. A session that exited while parked gets one more connect
+   * so the server's last-words replay can paint the final screen; it
+   * re-closes on the replayed exited frame. Returns whether a reconnect was
+   * actually initiated — false on a fatal/closed socket, so callers don't
+   * clear recovery latches for a resync that never happened.
+   */
+  resync(): boolean {
+    if (this.closed || this.fatal) return false;
+    this.exited = false;
+    this.dropSocket();
+    this.recon.cancel();
+    this.connect();
+    return true;
+  }
+
   /** Permanently close the socket (no reconnect). */
   close(): void {
     this.closed = true;
     this.recon.cancel();
     this.recon.clear();
-    this.ws?.close();
+    this.dropSocket();
+  }
+
+  /**
+   * Abandon the current WebSocket, handlers detached first: these closes
+   * are intentional (not reconnect triggers), and an already-queued frame
+   * or open event must not fire into a socket we no longer own.
+   */
+  private dropSocket(): void {
+    const ws = this.ws;
     this.ws = null;
+    if (ws !== null) {
+      ws.onopen = null;
+      ws.onmessage = null;
+      ws.onerror = null;
+      ws.onclose = null;
+      ws.close();
+    }
   }
 }
 

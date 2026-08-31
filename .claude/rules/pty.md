@@ -19,4 +19,10 @@ refinement).
   the primary screen's scrollback.)
 - **Bounded buffers.** The per-session output broadcast is capped; a lagging client
   is `Lagged`→resynced, not buffered without bound (login-node RSS discipline).
+- **Snapshot renders run off the reactor.** `attach()`'s render is synchronous
+  blocking work under the term lock (the whole scrollback, ~95 ms measured at the
+  10k default), and `resize` reflows the grid under the same lock; async callers
+  wrap both in `spawn_blocking` (the daemon's ws attach/resync/resize paths do) —
+  never take the term lock directly on a reactor worker. (Known gap: the daemon's
+  MCP screen-text scrape still does.)
 - Extend `tests.rs` (real PTY + snapshot-replay) when you change terminal state.
