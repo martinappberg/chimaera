@@ -1,8 +1,9 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
@@ -33,6 +34,17 @@ const MAX_CONCURRENT_GIT: usize = 4;
 /// command in a terminal) that fire none of the event-driven refresh triggers.
 const BACKSTOP_INTERVAL: Duration = Duration::from_secs(12);
 
+/// How long one workspace's COMPLETED status keeps serving callers that
+/// arrive after it finished. Callers that were already queued when a run
+/// completes take its result regardless of this window (the single-flight
+/// join — see [`StatusShare`]); the window only extends sharing to the
+/// stragglers of the same fan-out. Event-driven invalidations (`invalidate`)
+/// flush the share, so a refetch after a save never reuses a pre-save
+/// result. Out-of-band git ops (a `git commit` in a terminal) fire no
+/// invalidation, so the HTTP path accepts ≤ this much staleness there — the
+/// MCP path does not (see [`GitService::status_fresh`]).
+const STATUS_REUSE: Duration = Duration::from_secs(1);
+
 /// The read-only git service: discovery cache, per-workspace nudge epochs, and
 /// the concurrency permit shared by every invocation.
 pub(crate) struct GitService {
@@ -61,6 +73,172 @@ pub(crate) struct GitService {
     resolved_git: Mutex<Option<(Option<String>, Arc<GitBinary>)>>,
     /// Bounds concurrent `git` processes across the whole daemon.
     pub(super) procs: Arc<Semaphore>,
+    /// Per-workspace single-flight + short reuse for status runs.
+    status_share: StatusShare,
+}
+
+/// A status result from the share: the data, plus whether the run that
+/// produced it was invalidated mid-flight. A flushed result is a valid
+/// RESPONSE (it is what a direct run would have returned) but must not be
+/// re-seeded as the published epoch baseline — the announced change's own
+/// fan-out publishes the post-change status, and publishing pre-change data
+/// here would force a second bump and a second full fan-out.
+pub(super) struct SharedStatus {
+    pub(super) data: Arc<StatusData>,
+    pub(super) flushed: bool,
+}
+
+/// Single-flight for `git status`, per workspace. Concurrent callers queue
+/// on one async run lock; the leader runs, and every caller that was already
+/// WAITING when the run completes takes that run's outcome unconditionally —
+/// success or failure — unless a flush invalidated it (classic single-flight:
+/// you get the result of the run you waited on, so one epoch bump's fan-out
+/// costs one `git status` no matter how long the run takes). The
+/// [`STATUS_REUSE`] window applies only to callers arriving AFTER a run
+/// completed, and never resurrects an error. Event-driven invalidations
+/// ([`StatusShare::flush`]) drop the cached outcome — payload included, so a
+/// dead result never stays pinned — and mark any in-flight run so its data
+/// is served but neither shared nor published. Slots are evicted with their
+/// workspace ([`GitService::forget_workspace`]); until then each pins at
+/// most one parsed status.
+struct StatusShare {
+    slots: Mutex<HashMap<String, Arc<StatusSlot>>>,
+}
+
+#[derive(Default)]
+struct StatusSlot {
+    /// Serializes underlying runs for one workspace — the join point.
+    /// Async, so queued callers yield instead of parking reactor workers;
+    /// `run_git`'s semaphore + timeout still bound the process underneath.
+    run_lock: tokio::sync::Mutex<()>,
+    /// Sync-guarded bookkeeping. Every access is short and never held
+    /// across an `.await`, which is what lets `flush` run from sync
+    /// contexts while a leader is mid-run.
+    inner: Mutex<SlotInner>,
+}
+
+#[derive(Default)]
+struct SlotInner {
+    /// Bumped by [`StatusShare::flush`]. A run that started before the
+    /// current value must not be shared or published.
+    flushes: u64,
+    /// Completed-run counter. A caller snapshots it BEFORE queueing on
+    /// `run_lock`; if it moved by the time the caller holds the lock, the
+    /// caller waited out an in-flight run and joins its outcome.
+    runs: u64,
+    /// The last completed, un-flushed run's outcome. `flush` drops it —
+    /// invalidation and payload release in one move.
+    outcome: Option<RunOutcome>,
+}
+
+struct RunOutcome {
+    /// When the run STARTED — the honest freshness bound for late arrivals
+    /// (a slow run's result is already `run duration` old when it lands).
+    started: Instant,
+    /// Errors are kept ONLY so joiners of the failed run share the failure
+    /// instead of serially eating their own timeout on a wedged repo; a
+    /// caller arriving after the failure never reuses it.
+    result: Result<Arc<StatusData>, String>,
+}
+
+impl StatusShare {
+    fn new() -> Self {
+        StatusShare {
+            slots: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn slot(&self, ws_id: &str) -> Arc<StatusSlot> {
+        crate::lock(&self.slots)
+            .entry(ws_id.to_string())
+            .or_default()
+            .clone()
+    }
+
+    /// Invalidate `ws_id`'s share: a change was announced, so the next
+    /// caller must recompute and any in-flight run must not be shared or
+    /// published. Dropping the outcome also unpins its parsed payload.
+    fn flush(&self, ws_id: &str) {
+        let slot = crate::lock(&self.slots).get(ws_id).cloned();
+        if let Some(slot) = slot {
+            let mut inner = crate::lock(&slot.inner);
+            inner.flushes += 1;
+            inner.outcome = None;
+        }
+    }
+
+    /// Drop `ws_id`'s slot entirely (the workspace is gone).
+    fn evict(&self, ws_id: &str) {
+        crate::lock(&self.slots).remove(ws_id);
+    }
+
+    /// The single-flight entry: join the run this caller waited out, reuse
+    /// a fresh completed result, or lead a new run.
+    async fn get_or_run<F, Fut>(
+        &self,
+        ws_id: &str,
+        reuse: Duration,
+        run: F,
+    ) -> anyhow::Result<SharedStatus>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = anyhow::Result<StatusData>>,
+    {
+        let slot = self.slot(ws_id);
+        let arrived_runs = crate::lock(&slot.inner).runs;
+        let _guard = slot.run_lock.lock().await;
+        {
+            let inner = crate::lock(&slot.inner);
+            if let Some(outcome) = inner.outcome.as_ref() {
+                // `joined`: a run completed while this caller queued — take
+                // its outcome unconditionally (a flush would have dropped
+                // it). Otherwise the caller arrived after completion, and
+                // only a still-fresh SUCCESS is reusable.
+                let joined = inner.runs != arrived_runs;
+                match &outcome.result {
+                    Ok(data) if joined || outcome.started.elapsed() < reuse => {
+                        return Ok(SharedStatus {
+                            data: data.clone(),
+                            flushed: false,
+                        });
+                    }
+                    Err(msg) if joined => anyhow::bail!("{msg}"),
+                    _ => {}
+                }
+            }
+        }
+        Self::lead(&slot, run).await
+    }
+
+    /// Run under an already-held `run_lock`: execute, record the outcome for
+    /// joiners and late arrivals, and report whether a flush landed mid-run.
+    async fn lead<F, Fut>(slot: &StatusSlot, run: F) -> anyhow::Result<SharedStatus>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = anyhow::Result<StatusData>>,
+    {
+        let flushes_at_start = crate::lock(&slot.inner).flushes;
+        let started = Instant::now();
+        let result = run().await.map(Arc::new);
+        let mut inner = crate::lock(&slot.inner);
+        inner.runs += 1;
+        let flushed = inner.flushes != flushes_at_start;
+        inner.outcome = if flushed {
+            // This run may predate the announced change: joiners re-run
+            // (the first becomes the next leader) instead of sharing it.
+            None
+        } else {
+            Some(RunOutcome {
+                started,
+                result: result
+                    .as_ref()
+                    .map(Arc::clone)
+                    .map_err(|e| format!("{e:#}")),
+            })
+        };
+        drop(inner);
+        result.map(|data| SharedStatus { data, flushed })
+    }
 }
 
 impl GitService {
@@ -72,6 +250,7 @@ impl GitService {
             hashes: Mutex::new(HashMap::new()),
             resolved_git: Mutex::new(None),
             procs: Arc::new(Semaphore::new(MAX_CONCURRENT_GIT)),
+            status_share: StatusShare::new(),
         }
     }
 
@@ -110,9 +289,25 @@ impl GitService {
 
     /// Forget the published hash: the next computed status is accepted as the new
     /// baseline WITHOUT a second epoch bump. Paired with an event-driven bump
-    /// (a save / an agent write), whose change we have already announced.
-    fn invalidate(&self, ws_id: &str) {
+    /// (a save / an agent write), whose change we have already announced. Also
+    /// flushes the single-flight share — the refetch this announcement
+    /// triggers must recompute, never reuse a pre-change result.
+    pub(super) fn invalidate(&self, ws_id: &str) {
         crate::lock(&self.hashes).remove(ws_id);
+        self.status_share.flush(ws_id);
+    }
+
+    /// Drop everything held for a deleted workspace: the discovery cache,
+    /// its epoch, the published-status hash, and — the part that actually
+    /// weighs something — the status share's slot with its parsed payload.
+    /// `watchers` is left alone: it is refcounted by connected clients and
+    /// their guards release it (a stale entry there is a usize, and the
+    /// backstop skips unknown workspace ids anyway).
+    pub(crate) fn forget_workspace(&self, ws_id: &str) {
+        crate::lock(&self.repos).remove(ws_id);
+        crate::lock(&self.epochs).remove(ws_id);
+        crate::lock(&self.hashes).remove(ws_id);
+        self.status_share.evict(ws_id);
     }
 
     /// Record a freshly computed status as the published baseline.
@@ -177,7 +372,48 @@ impl GitService {
         outcome
     }
 
-    pub(super) async fn status(&self, git: &Path, repo: &RepoInfo) -> anyhow::Result<StatusData> {
+    /// The status entry for the repeat-caller pull paths (the HTTP handler
+    /// and the backstop poll): single-flighted per workspace — callers that
+    /// waited out a run join its result, late arrivals reuse it for
+    /// [`STATUS_REUSE`] — so an epoch bump's fan-out of refetches costs one
+    /// `git status`, not one per window. Event-driven invalidations flush
+    /// the share (see [`GitService::invalidate`]); check the returned
+    /// [`SharedStatus::flushed`] before publishing.
+    pub(super) async fn status_shared(
+        &self,
+        git: &Path,
+        ws_id: &str,
+        repo: &RepoInfo,
+    ) -> anyhow::Result<SharedStatus> {
+        self.status_share
+            .get_or_run(ws_id, STATUS_REUSE, || self.status_uncached(git, repo))
+            .await
+    }
+
+    /// A guaranteed-fresh status for the MCP tier: agents make decisions on
+    /// this wire, and an out-of-band `git commit` in a terminal fires no
+    /// invalidation — so even a ≤[`STATUS_REUSE`]-stale answer is wrong
+    /// there. Serialized on the workspace's run lock (never a concurrent
+    /// duplicate of an HTTP-triggered run, and its outcome is shared with
+    /// queued callers), but it always runs — never reuses.
+    pub(super) async fn status_fresh(
+        &self,
+        git: &Path,
+        ws_id: &str,
+        repo: &RepoInfo,
+    ) -> anyhow::Result<Arc<StatusData>> {
+        let slot = self.status_share.slot(ws_id);
+        let _guard = slot.run_lock.lock().await;
+        StatusShare::lead(&slot, || self.status_uncached(git, repo))
+            .await
+            .map(|shared| shared.data)
+    }
+
+    /// One raw `git status` run. WARNING: do not call this from a request
+    /// path — it bypasses the per-workspace single-flight. Go through
+    /// [`Self::status_shared`] (pull paths) or [`Self::status_fresh`]
+    /// (freshness-critical paths) instead.
+    async fn status_uncached(&self, git: &Path, repo: &RepoInfo) -> anyhow::Result<StatusData> {
         // `--no-optional-locks` is load-bearing: refreshing the index for status
         // must never contend on the index lock with a `git commit` the user or an
         // agent runs in a terminal (slow/shared FS makes that contention real).
@@ -517,10 +753,16 @@ pub(crate) async fn backstop_poll(state: Arc<AppState>) {
             else {
                 continue;
             };
-            let Ok(data) = state.git.status(&git.path, &repo).await else {
+            let Ok(shared) = state.git.status_shared(&git.path, &ws_id, &repo).await else {
                 continue;
             };
-            let (_, changed) = state.git.publish(&ws_id, &data);
+            if shared.flushed {
+                // Invalidated mid-run: the announced change's own fan-out
+                // publishes the post-change status — don't re-seed pre-change
+                // data as the baseline.
+                continue;
+            }
+            let (_, changed) = state.git.publish(&ws_id, &shared.data);
             bumped |= changed;
         }
         if bumped {
@@ -563,7 +805,10 @@ pub(crate) async fn git_facts(state: &AppState, ws_id: &str, root: &Path) -> Opt
         .discover(&git.path, ws_id, root)
         .await
         .into_repo()?;
-    let data = state.git.status(&git.path, &repo).await.ok()?;
+    // Fresh, never shared-stale: an agent that just ran `git commit` in a
+    // terminal (no invalidation fires) must not be answered with the
+    // pre-commit dirty list it would use to make decisions.
+    let data = state.git.status_fresh(&git.path, ws_id, &repo).await.ok()?;
     let dirty: Vec<String> = data
         .rel_paths()
         .take(GIT_FACTS_DIRTY_CAP)
@@ -637,5 +882,341 @@ mod tests {
         svc.bump("w");
         svc.invalidate("w");
         assert_eq!(svc.publish("w", &clean), (2, false));
+    }
+
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// The single-flight join: concurrent statuses for one workspace run the
+    /// underlying git once, and every caller shares the SAME result (Arc
+    /// identity — a follower must not build its own copy).
+    #[tokio::test]
+    async fn status_share_joins_concurrent_callers() {
+        let share = StatusShare::new();
+        let runs = AtomicU64::new(0);
+        let reuse = Duration::from_secs(60);
+        let (a, b) = tokio::join!(
+            share.get_or_run("w", reuse, || async {
+                runs.fetch_add(1, Ordering::SeqCst);
+                // Yield mid-run so the second caller demonstrably queues on
+                // the in-flight computation rather than racing past it.
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                Ok(StatusData::default())
+            }),
+            share.get_or_run("w", reuse, || async {
+                runs.fetch_add(1, Ordering::SeqCst);
+                Ok(StatusData::default())
+            }),
+        );
+        let (a, b) = (a.unwrap(), b.unwrap());
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        assert!(Arc::ptr_eq(&a.data, &b.data));
+        assert!(!a.flushed && !b.flushed);
+    }
+
+    /// THE production case: a run that outlives the reuse window. Callers
+    /// that were already queued when it completes must JOIN its result — one
+    /// underlying run for the whole fan-out — not each find the entry
+    /// "expired on arrival" and lead their own serial run (N windows × run
+    /// duration wall time, worse than no share at all). The TTL applies only
+    /// to callers arriving after completion: the trailing call here re-runs.
+    #[tokio::test]
+    async fn status_share_waiters_join_a_run_that_outlives_reuse() {
+        let share = StatusShare::new();
+        let runs = AtomicU64::new(0);
+        // Every completed entry is expired on arrival under a zero window.
+        let reuse = Duration::ZERO;
+        let (a, b, c) = tokio::join!(
+            share.get_or_run("w", reuse, || async {
+                runs.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                Ok(StatusData::default())
+            }),
+            share.get_or_run("w", reuse, || async {
+                runs.fetch_add(1, Ordering::SeqCst);
+                Ok(StatusData::default())
+            }),
+            share.get_or_run("w", reuse, || async {
+                runs.fetch_add(1, Ordering::SeqCst);
+                Ok(StatusData::default())
+            }),
+        );
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            1,
+            "queued callers must join the slow run, not serialize behind it"
+        );
+        let (a, b, c) = (a.unwrap(), b.unwrap(), c.unwrap());
+        assert!(Arc::ptr_eq(&a.data, &b.data));
+        assert!(Arc::ptr_eq(&a.data, &c.data));
+
+        // A caller arriving AFTER completion is a late arrival: the zero
+        // window has expired the entry, so it leads a fresh run.
+        share
+            .get_or_run("w", reuse, || async {
+                runs.fetch_add(1, Ordering::SeqCst);
+                Ok(StatusData::default())
+            })
+            .await
+            .unwrap();
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+    }
+
+    /// Waiters share a failed run's failure instead of serially eating their
+    /// own timeout on a wedged repo; a caller arriving after the failure
+    /// never reuses it and runs fresh.
+    #[tokio::test]
+    async fn status_share_waiters_share_a_failed_run() {
+        let share = StatusShare::new();
+        let runs = AtomicU64::new(0);
+        let reuse = Duration::from_secs(60);
+        let (a, b) = tokio::join!(
+            share.get_or_run("w", reuse, || async {
+                runs.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                anyhow::bail!("git timed out after 8s")
+            }),
+            share.get_or_run("w", reuse, || async {
+                runs.fetch_add(1, Ordering::SeqCst);
+                Ok(StatusData::default())
+            }),
+        );
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            1,
+            "the waiter ran its own status"
+        );
+        assert!(a.is_err());
+        match b {
+            Err(err) => assert!(err.to_string().contains("git timed out")),
+            Ok(_) => panic!("the waiter must share the failed run's error"),
+        }
+
+        // Errors are never TTL-cached: the next arrival runs fresh.
+        let c = share
+            .get_or_run("w", reuse, || async {
+                runs.fetch_add(1, Ordering::SeqCst);
+                Ok(StatusData::default())
+            })
+            .await;
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+        assert!(c.is_ok());
+    }
+
+    /// `flush` (an event-driven invalidation) must force the next caller to
+    /// recompute — a refetch triggered by a save may never reuse a pre-save
+    /// result, however fresh.
+    #[tokio::test]
+    async fn status_share_flush_forces_recompute() {
+        let share = StatusShare::new();
+        let runs = AtomicU64::new(0);
+        let reuse = Duration::from_secs(60);
+        for expected in [1u64, 1, 2] {
+            if expected == 2 {
+                share.flush("w");
+            }
+            share
+                .get_or_run("w", reuse, || async {
+                    runs.fetch_add(1, Ordering::SeqCst);
+                    Ok(StatusData::default())
+                })
+                .await
+                .unwrap();
+            // Pass 2 (fresh + un-flushed) reuses; the flush before pass 3
+            // forces the recompute.
+            assert_eq!(runs.load(Ordering::SeqCst), expected);
+        }
+        // The flush dropped the pinned payload immediately, not just marked it.
+        share.flush("w");
+        let slot = share.slot("w");
+        assert!(crate::lock(&slot.inner).outcome.is_none());
+    }
+
+    /// A flush landing WHILE a run is in flight means that run's result may
+    /// predate the announced change: it is returned to its own caller marked
+    /// `flushed` (so the caller skips publish) and never installed as the
+    /// shared result.
+    #[tokio::test]
+    async fn status_share_discards_result_flushed_mid_run() {
+        let share = StatusShare::new();
+        let runs = AtomicU64::new(0);
+        let reuse = Duration::from_secs(60);
+        let first = share
+            .get_or_run("w", reuse, || async {
+                runs.fetch_add(1, Ordering::SeqCst);
+                share.flush("w"); // the change announcement, mid-run
+                Ok(StatusData::default())
+            })
+            .await
+            .unwrap();
+        assert!(first.flushed, "the caller must know not to publish this");
+        let second = share
+            .get_or_run("w", reuse, || async {
+                runs.fetch_add(1, Ordering::SeqCst);
+                Ok(StatusData::default())
+            })
+            .await
+            .unwrap();
+        assert_eq!(runs.load(Ordering::SeqCst), 2, "stale result was shared");
+        assert!(!second.flushed);
+    }
+
+    /// The reuse window is a ceiling for LATE arrivals: with it at zero,
+    /// strictly sequential callers each recompute.
+    #[tokio::test]
+    async fn status_share_expires_past_the_reuse_window() {
+        let share = StatusShare::new();
+        let runs = AtomicU64::new(0);
+        for _ in 0..2 {
+            share
+                .get_or_run("w", Duration::ZERO, || async {
+                    runs.fetch_add(1, Ordering::SeqCst);
+                    Ok(StatusData::default())
+                })
+                .await
+                .unwrap();
+        }
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+    }
+
+    /// The freshness-critical path (`status_fresh` / `StatusShare::lead`
+    /// under the slot lock) always runs — even over a perfectly fresh cached
+    /// result — and its outcome is installed for later shared callers.
+    #[tokio::test]
+    async fn status_fresh_semantics_always_run_then_share() {
+        let share = StatusShare::new();
+        let runs = AtomicU64::new(0);
+        let reuse = Duration::from_secs(60);
+        share
+            .get_or_run("w", reuse, || async {
+                runs.fetch_add(1, Ordering::SeqCst);
+                Ok(StatusData::default())
+            })
+            .await
+            .unwrap();
+        // The MCP-style fresh read: runs despite the fresh cache.
+        let fresh = {
+            let slot = share.slot("w");
+            let _guard = slot.run_lock.lock().await;
+            StatusShare::lead(&slot, || async {
+                runs.fetch_add(1, Ordering::SeqCst);
+                Ok(StatusData::default())
+            })
+            .await
+            .unwrap()
+        };
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+        // ...and a shared caller right after reuses ITS result.
+        let shared = share
+            .get_or_run("w", reuse, || async {
+                runs.fetch_add(1, Ordering::SeqCst);
+                Ok(StatusData::default())
+            })
+            .await
+            .unwrap();
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+        assert!(Arc::ptr_eq(&fresh.data, &shared.data));
+    }
+
+    /// The service-level wiring: `invalidate` (what `mark_path_dirty` and the
+    /// worktree add/remove handlers call) flushes the share.
+    #[tokio::test]
+    async fn invalidate_flushes_the_status_share() {
+        let svc = GitService::new();
+        let runs = AtomicU64::new(0);
+        let reuse = Duration::from_secs(60);
+        for expected in [1u64, 2] {
+            svc.status_share
+                .get_or_run("w", reuse, || async {
+                    runs.fetch_add(1, Ordering::SeqCst);
+                    Ok(StatusData::default())
+                })
+                .await
+                .unwrap();
+            assert_eq!(runs.load(Ordering::SeqCst), expected);
+            svc.invalidate("w");
+        }
+    }
+
+    /// End-to-end through the announcement path: a save inside a registered
+    /// workspace (`mark_path_dirty`) bumps the epoch AND flushes the share,
+    /// so the refetch it triggers recomputes instead of reusing pre-save data.
+    #[tokio::test]
+    async fn mark_path_dirty_flushes_the_share_end_to_end() {
+        let base = std::env::temp_dir().join(format!(
+            "chimaera-test-git-e2e-{}-{}",
+            std::process::id(),
+            now_nanos()
+        ));
+        let root = base.join("ws");
+        std::fs::create_dir_all(&root).unwrap();
+        // Workspace roots are stored canonical (the create handler
+        // canonicalizes) — match that, or the macOS /var -> /private/var
+        // symlink defeats mark_path_dirty's prefix check.
+        let root = std::fs::canonicalize(&root).unwrap();
+        let state = crate::AppState::new(
+            "t".into(),
+            "h".into(),
+            1,
+            0,
+            base.join("data"),
+            base.join("config"),
+        );
+        let ws = crate::lock(&state.workspaces).add(root.clone()).unwrap();
+
+        let runs = AtomicU64::new(0);
+        let reuse = Duration::from_secs(60);
+        state
+            .git
+            .status_share
+            .get_or_run(&ws.id, reuse, || async {
+                runs.fetch_add(1, Ordering::SeqCst);
+                Ok(StatusData::default())
+            })
+            .await
+            .unwrap();
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+
+        // The save announcement: epoch bumped, share flushed → recompute.
+        let saved = root.join("file.txt");
+        std::fs::write(&saved, "x").unwrap();
+        mark_path_dirty(&state, saved.to_str().unwrap()).await;
+        assert_eq!(state.git.epoch(&ws.id), 1);
+        state
+            .git
+            .status_share
+            .get_or_run(&ws.id, reuse, || async {
+                runs.fetch_add(1, Ordering::SeqCst);
+                Ok(StatusData::default())
+            })
+            .await
+            .unwrap();
+        assert_eq!(runs.load(Ordering::SeqCst), 2, "pre-save result was reused");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Deleting a workspace evicts its share slot (and the parsed status it
+    /// pins) along with the discovery/epoch/hash entries.
+    #[tokio::test]
+    async fn forget_workspace_evicts_the_share_slot() {
+        let svc = GitService::new();
+        svc.status_share
+            .get_or_run("w", Duration::from_secs(60), || async {
+                Ok(StatusData::default())
+            })
+            .await
+            .unwrap();
+        svc.bump("w");
+        assert_eq!(crate::lock(&svc.status_share.slots).len(), 1);
+        svc.forget_workspace("w");
+        assert!(crate::lock(&svc.status_share.slots).is_empty());
+        assert_eq!(svc.epoch("w"), 0);
+    }
+
+    fn now_nanos() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
     }
 }

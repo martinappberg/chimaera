@@ -905,27 +905,39 @@
     background: color-mix(in srgb, var(--accent) 12%, transparent);
     border-color: color-mix(in srgb, var(--accent) 55%, var(--edge));
     color: var(--accent);
-    /* Faint breathing ring while the agent works — presence, not alarm. */
+  }
+  /* Faint breathing ring while the agent works — presence, not alarm. A
+     STATIC halo on a pseudo-element breathed via opacity: animating
+     box-shadow repaints every frame for the whole turn; opacity composites. */
+  .stop::after {
+    content: "";
+    position: absolute;
+    inset: -1px;
+    border-radius: 7px; /* .action's 6px, outside its 1px border */
+    pointer-events: none;
+    box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 8%, transparent);
+    opacity: 0;
     animation: stop-breathe 1.8s ease-in-out infinite;
   }
-  .composer:not(.visible) .stop {
+  .composer:not(.visible) .stop::after {
     animation: none;
+  }
+  /* Hidden document: nobody sees the breath — stop burning frames (the
+     html.app-hidden contract; see app.css). */
+  :global(html.app-hidden) .stop::after {
+    animation-play-state: paused;
   }
   .stop:hover {
     background: color-mix(in srgb, var(--accent) 22%, transparent);
     border-color: var(--accent);
   }
   @keyframes stop-breathe {
-    0%,
-    100% {
-      box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 22%, transparent);
-    }
     50% {
-      box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 8%, transparent);
+      opacity: 1;
     }
   }
   @media (prefers-reduced-motion: reduce) {
-    .stop {
+    .stop::after {
       animation: none;
     }
   }

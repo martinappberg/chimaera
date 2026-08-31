@@ -48,6 +48,7 @@
     <WorkTrayRow
       onStop={onStop !== undefined ? () => onStop?.(agent.id) : undefined}
       stopTitle="stop this subagent"
+      {visible}
     >
       <span class="name">{name(agent.title)}</span>
       {#if progress(agent)}

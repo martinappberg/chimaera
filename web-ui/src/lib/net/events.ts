@@ -1,4 +1,5 @@
 import { getToken } from "./api";
+import { nudgeReconnectors, retryDelayMs } from "./reconnect";
 import type { Link } from "../workspace/agentLinks";
 import type { Session } from "../workspace/sessions";
 import type { UpdateStatus } from "../workspace/update.svelte";
@@ -84,8 +85,14 @@ export class EventsSocket {
   private ws: WebSocket | null = null;
   private closed = false;
   private fatal = false;
+  /** A fatal socket has been revived by the health cross-nudge (once ever —
+   *  a daemon that fatals every revival must not turn health ticks into a
+   *  reconnect loop). */
+  private fatalRevived = false;
   private connected = false;
   private backoffMs = INITIAL_BACKOFF_MS;
+  /** Consecutive connect failures (the hidden-floor grace counter). */
+  private attempts = 0;
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
   /** The workspace this window shows; re-sent after every (re)connect. */
   private watching: string | null = null;
@@ -94,6 +101,44 @@ export class EventsSocket {
   private watchedDirs: string[] = [];
 
   constructor(private readonly handlers: EventsSocketHandlers) {
+    // Reconnect delays take the slow tier while the document is hidden
+    // (see scheduleReconnect); this catch-up keeps that tier from delaying
+    // recovery once someone is looking again.
+    if (typeof document !== "undefined") {
+      document.addEventListener("visibilitychange", this.onVisibility);
+    }
+    this.connect();
+  }
+
+  /** Visibility return with a retry pending: probe NOW, not in up to 60s. */
+  private readonly onVisibility = (): void => {
+    if (document.visibilityState !== "visible" || this.retryTimer === null) return;
+    clearTimeout(this.retryTimer);
+    this.retryTimer = null;
+    this.connect();
+  };
+
+  /**
+   * The health cross-nudge: a SUCCESSFUL /health probe while this socket is
+   * down proves the daemon is reachable — pull a pending retry in to now
+   * instead of letting two independent 60s clocks ignore each other. Also
+   * revives a fatal socket exactly once (a server "error" frame gave up
+   * permanently; HTTP auth succeeding afterwards is strong evidence the
+   * fatal was transient — a restarting daemon mid-handshake). A closed
+   * socket stays closed.
+   */
+  retryNow(): void {
+    if (this.closed) return;
+    if (this.fatal) {
+      if (this.fatalRevived) return;
+      this.fatalRevived = true;
+      this.fatal = false;
+      this.connect();
+      return;
+    }
+    if (this.retryTimer === null) return;
+    clearTimeout(this.retryTimer);
+    this.retryTimer = null;
     this.connect();
   }
 
@@ -206,23 +251,46 @@ export class EventsSocket {
   }
 
   private setConnected(up: boolean): void {
+    if (up) this.attempts = 0; // a real frame arrived: grace restored
     if (this.connected !== up) {
       this.connected = up;
       this.handlers.onStatus(up);
+      // The daemon is demonstrably reachable again: nudge every session
+      // socket sitting out a backoff (including the hidden slow tier) — one
+      // recovery signal instead of ~20 independent probe schedules. The
+      // nudge is deferred/spread/damped inside nudgeReconnectors, so this
+      // message handler finishes applying the snapshot first and a
+      // crash-looping daemon can't turn its flaps into connect herds.
+      if (up) nudgeReconnectors();
     }
   }
 
   private scheduleReconnect(): void {
-    this.retryTimer = setTimeout(() => {
-      this.retryTimer = null;
-      this.connect();
-    }, this.backoffMs);
+    // Jitter + the hidden slow tier (shared with the per-session sockets):
+    // a resumed laptop with a dead tunnel must not probe 12x/min per window
+    // forever while nobody is even looking. The first two retries keep the
+    // fast backoff even hidden (grace attempts — a transient blip must not
+    // cost a minute); onVisibility and the health cross-nudge (retryNow)
+    // restore the fast path with an immediate attempt.
+    const hidden =
+      typeof document !== "undefined" && document.visibilityState === "hidden";
+    this.attempts += 1;
+    this.retryTimer = setTimeout(
+      () => {
+        this.retryTimer = null;
+        this.connect();
+      },
+      retryDelayMs(this.backoffMs, hidden, this.attempts),
+    );
     this.backoffMs = Math.min(this.backoffMs * 2, MAX_BACKOFF_MS);
   }
 
   /** Permanently close the socket (no reconnect). */
   close(): void {
     this.closed = true;
+    if (typeof document !== "undefined") {
+      document.removeEventListener("visibilitychange", this.onVisibility);
+    }
     if (this.retryTimer !== null) {
       clearTimeout(this.retryTimer);
       this.retryTimer = null;

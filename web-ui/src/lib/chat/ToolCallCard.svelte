@@ -289,6 +289,12 @@
     animation: none;
     opacity: 0.55;
   }
+  /* Hidden document: pause the blink/pulse for the visible tab too (the
+     html.app-hidden contract; see app.css). */
+  :global(html.app-hidden) .cursor,
+  :global(html.app-hidden) .dot.run {
+    animation-play-state: paused;
+  }
   .head {
     display: flex;
     align-items: center;
