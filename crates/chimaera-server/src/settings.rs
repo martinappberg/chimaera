@@ -4,14 +4,17 @@
 //! in the web-ui schema (web-ui/src/lib/settings/schema.ts). Values are
 //! opaque to the server except for the few daemon-consumed keys below.
 //!
-//! Hand-edits are first-class: reads re-stat the file and pick up external
-//! changes, and /ws/events broadcasts a fresh `{"type":"settings"}` frame
-//! whenever the content generation moves (PUT or on-disk edit).
+//! Hand-edits are first-class: REST reads re-stat the file and pick up
+//! external changes, a slow off-reactor poll ([`watch_external_edits`])
+//! catches edits no read observes, and /ws/events broadcasts a fresh
+//! `{"type":"settings"}` frame whenever the content generation moves (PUT or
+//! on-disk edit). The events path itself never stats — see
+//! [`SettingsStore::generation_cached`].
 
 use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use axum::body::Bytes;
 use axum::extract::State;
@@ -94,9 +97,17 @@ impl SettingsStore {
         &self.map
     }
 
-    /// The current content generation (mtime-checked).
-    pub(crate) fn generation(&mut self) -> u64 {
-        self.refresh();
+    /// The cached map WITHOUT the disk re-stat — for the `/ws/events` hot
+    /// path, which runs per client on every wake and must never do blocking
+    /// fs on the reactor. External edits are folded in by
+    /// [`watch_external_edits`] (off-reactor), not by this read.
+    pub(crate) fn map_cached(&self) -> &serde_json::Map<String, serde_json::Value> {
+        &self.map
+    }
+
+    /// The cached content generation WITHOUT the disk re-stat (same contract
+    /// as [`Self::map_cached`]).
+    pub(crate) fn generation_cached(&self) -> u64 {
         self.generation
     }
 
@@ -187,6 +198,53 @@ impl SettingsStore {
 
 fn file_mtime(path: &std::path::Path) -> Option<SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// Cadence of the external-edit poll. Hand-edits are rare and were already
+/// only broadcast on the next events wake, so a couple of seconds' surfacing
+/// latency changes nothing a user can see — while each pass costs exactly one
+/// stat, off the reactor, instead of one per client per wake.
+const SETTINGS_POLL: Duration = Duration::from_secs(2);
+
+/// Surface hand-edits of settings.json to `/ws/events` without any reactor
+/// stat. The events hot path (`ws::send_settings_snapshot`) reads only the
+/// cached generation/map — an NFS hiccup under the old stat-on-every-wake
+/// stalled the reactor under the settings mutex — so this task owns the
+/// external-edit detection instead. REST reads (`current`) still refresh
+/// inline, so GET /settings is exactly as fresh as before.
+pub(crate) async fn watch_external_edits(state: Arc<AppState>) {
+    loop {
+        tokio::time::sleep(SETTINGS_POLL).await;
+        if poll_external_edit(&state).await {
+            state.changes.notify_waiters();
+        }
+    }
+}
+
+/// One poll pass: true when the on-disk file changed the settings content
+/// (the caller broadcasts). The stat and the reload both run under
+/// `spawn_blocking`; the settings mutex is held only for the reload, and only
+/// when the mtime actually moved — a rare, bounded window (≤256 KiB read),
+/// not a stat per events wake.
+pub(crate) async fn poll_external_edit(state: &Arc<AppState>) -> bool {
+    let (path, recorded) = {
+        let store = crate::lock(&state.settings);
+        (store.path.clone(), store.mtime)
+    };
+    let on_disk = tokio::task::spawn_blocking(move || file_mtime(&path)).await;
+    let Ok(on_disk) = on_disk else { return false };
+    if on_disk == recorded {
+        return false;
+    }
+    let state = state.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut store = crate::lock(&state.settings);
+        let before = store.generation;
+        store.read_from_disk();
+        store.generation != before
+    })
+    .await
+    .unwrap_or(false)
 }
 
 /// GET /api/v1/settings

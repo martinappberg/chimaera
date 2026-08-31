@@ -28,7 +28,6 @@ let sent = 0;
 let lastSeq = 0;
 let replayHead = 0;
 let idleTimer = null;
-const answered = new Set();
 
 function sendTurn() {
   sent++;
@@ -68,11 +67,10 @@ ws.onmessage = (ev) => {
     for (const e of entries) {
       if (typeof e.seq === "number" && e.seq > lastSeq) lastSeq = e.seq;
       const evt = e.ev;
-      if (
-        evt && evt.type === "permission_request" && evt.request_id &&
-        e.seq > replayHead && !answered.has(evt.request_id)
-      ) {
-        answered.add(evt.request_id);
+      // No request-id dedupe here: fake-claude reuses request_id ("req-1")
+      // for EVERY turn's ask, so a dedupe set answers turn 1 and stalls
+      // forever; the seq > replayHead guard alone prevents replay re-answers.
+      if (evt && evt.type === "permission_request" && evt.request_id && e.seq > replayHead) {
         const opt = Array.isArray(evt.options) && evt.options[0]?.id ? evt.options[0].id : "allow_once";
         ws.send(JSON.stringify({ type: "permission", request_id: evt.request_id, option_id: opt }));
       }

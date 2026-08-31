@@ -1,5 +1,6 @@
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::json;
 
@@ -271,6 +272,86 @@ pub(crate) fn sessions_json(state: &AppState) -> Vec<serde_json::Value> {
     rows.into_iter().map(|(_, row)| row).collect()
 }
 
+/// How long a built events-bus sessions frame stays reusable within one
+/// change generation. Time-derived fields (`stalled`, `output_active`) flip
+/// without any generation bump, so the cache must expire on its own; matching
+/// `ws::EVENTS_THROTTLE` keeps their flip latency inside the worst case the
+/// per-client throttle already imposes.
+const EVENTS_SNAPSHOT_REUSE: Duration = Duration::from_millis(250);
+
+/// The `/ws/events` sessions-frame cache. Every connected window's events
+/// loop wakes on the same change notify (plus its own 1s tick) and used to
+/// rebuild + serialize the full snapshot itself — N windows, N identical
+/// builds per change. This caches one serialized frame keyed by the change
+/// generation (see `ChangeBus`), so a wake burst costs one build; each
+/// client still keeps its own last-sent compare, and per-client state
+/// (fs_watch, git epochs, settings sends) stays per-client. No wire change:
+/// the frame bytes are exactly what each client built before.
+pub(crate) struct SnapshotCache {
+    inner: Mutex<Option<CachedSnapshot>>,
+}
+
+struct CachedSnapshot {
+    generation: u64,
+    built_at: Instant,
+    payload: Arc<String>,
+}
+
+impl SnapshotCache {
+    pub(crate) fn new() -> Self {
+        SnapshotCache {
+            inner: Mutex::new(None),
+        }
+    }
+
+    /// Return the cached payload when it was built for `generation` less than
+    /// `reuse` ago; otherwise build and cache. The lock is held ACROSS the
+    /// build on purpose — that is the single-flight: concurrent clients wait
+    /// for one build instead of each running their own. The build is fully
+    /// synchronous (no `.await` under this `std::sync` guard), and nothing
+    /// that runs inside it ever takes this lock, so the ordering is safe.
+    pub(crate) fn get_or_build(
+        &self,
+        generation: u64,
+        reuse: Duration,
+        build: impl FnOnce() -> String,
+    ) -> Arc<String> {
+        let mut cached = crate::lock(&self.inner);
+        if let Some(entry) = cached.as_ref() {
+            if entry.generation == generation && entry.built_at.elapsed() < reuse {
+                return entry.payload.clone();
+            }
+        }
+        let payload = Arc::new(build());
+        *cached = Some(CachedSnapshot {
+            generation,
+            built_at: Instant::now(),
+            payload: payload.clone(),
+        });
+        payload
+    }
+}
+
+/// The serialized `{"type":"sessions",...}` events frame, shared across every
+/// connected `/ws/events` client via [`SnapshotCache`]. The generation is
+/// read BEFORE the build: a change landing mid-build then stamps a newer
+/// generation, so the next reader rebuilds rather than trusting a snapshot
+/// that may have missed it (a spare build, never staleness past the reuse
+/// window).
+pub(crate) fn shared_sessions_snapshot(state: &AppState) -> Arc<String> {
+    let generation = state.changes.generation();
+    state
+        .sessions_snapshot
+        .get_or_build(generation, EVENTS_SNAPSHOT_REUSE, || {
+            json!({
+                "type": "sessions",
+                "sessions": sessions_json(state),
+                "links": crate::links::links_json(state),
+            })
+            .to_string()
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -413,5 +494,49 @@ mod tests {
         assert_eq!(row(Some(&record), true), json!(true));
         assert_eq!(row(Some(&record), false), json!(null));
         assert_eq!(row(None, false), json!(null));
+    }
+
+    /// The shared-snapshot contract: one build per change generation. A
+    /// second reader on the same generation must get the SAME allocation
+    /// (Arc identity, not just equal bytes) without its build running.
+    #[test]
+    fn snapshot_cache_builds_once_per_generation() {
+        let cache = SnapshotCache::new();
+        let reuse = Duration::from_secs(60);
+        let mut builds = 0;
+        let first = cache.get_or_build(1, reuse, || {
+            builds += 1;
+            "snapshot".to_string()
+        });
+        let second = cache.get_or_build(1, reuse, || {
+            builds += 1;
+            unreachable!("a fresh same-generation entry must be reused")
+        });
+        assert_eq!(builds, 1);
+        assert!(Arc::ptr_eq(&first, &second));
+
+        // A new generation invalidates regardless of age.
+        let third = cache.get_or_build(2, reuse, || {
+            builds += 1;
+            "snapshot".to_string()
+        });
+        assert_eq!(builds, 2);
+        assert!(!Arc::ptr_eq(&first, &third));
+    }
+
+    /// Time-derived fields (`stalled`, `output_active`) flip with no
+    /// generation bump, so a cached frame must expire on its own: past the
+    /// reuse window the same generation rebuilds.
+    #[test]
+    fn snapshot_cache_expires_within_a_generation() {
+        let cache = SnapshotCache::new();
+        let mut builds = 0;
+        for _ in 0..2 {
+            cache.get_or_build(7, Duration::ZERO, || {
+                builds += 1;
+                "snapshot".to_string()
+            });
+        }
+        assert_eq!(builds, 2);
     }
 }

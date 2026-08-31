@@ -74,7 +74,14 @@ pub(crate) async fn status(
             .into_response();
         }
     };
-    match state.git.status(&git.path, &repo).await {
+    // Single-flighted per workspace: an epoch bump makes every watching
+    // window call this handler at once, and they all share one status run
+    // (see `GitService::status_shared`).
+    match state
+        .git
+        .status_shared(&git.path, &q.workspace_id, &repo)
+        .await
+    {
         Ok(data) => {
             // Publishing may discover an unannounced change (an external editor,
             // a terminal `git` command) and bump the epoch; read the epoch after,

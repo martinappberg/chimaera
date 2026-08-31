@@ -113,7 +113,13 @@ pub(crate) struct AppState {
     pub(crate) compute: compute::ComputeService,
     /// Signalled whenever the session list / agent state / titles change;
     /// wakes /ws/events subscribers (a 1s tick catches anything missed).
-    pub(crate) changes: tokio::sync::Notify,
+    /// Every wake stamps a change generation — the shared sessions-snapshot
+    /// cache's key, so N connected windows cost one snapshot build per
+    /// change instead of one each.
+    pub(crate) changes: ChangeBus,
+    /// The `/ws/events` sessions-frame cache (see `session_view`): built once
+    /// per change generation and fanned out to every connected window.
+    pub(crate) sessions_snapshot: crate::session_view::SnapshotCache,
     /// False while the boot ledger is being consumed (sessions resurrected /
     /// retired). Sessions snapshots wait for it: serving starts concurrently
     /// with resurrection, and a snapshot taken mid-restore reads as "those
@@ -222,7 +228,8 @@ impl AppState {
             quickopen: Mutex::new(quickopen::QuickOpenCache::default()),
             git: git::GitService::new(),
             compute: compute::ComputeService::new(),
-            changes: tokio::sync::Notify::new(),
+            changes: ChangeBus::new(),
+            sessions_snapshot: crate::session_view::SnapshotCache::new(),
             restored: tokio::sync::watch::channel(true).0,
             shutdown: tokio::sync::Notify::new(),
             agent_bins: Mutex::new(HashMap::new()),
@@ -244,6 +251,46 @@ impl AppState {
     pub(crate) async fn wait_restored(&self) {
         let mut rx = self.restored.subscribe();
         let _ = tokio::time::timeout(RESTORE_WAIT_CAP, rx.wait_for(|done| *done)).await;
+    }
+}
+
+/// The change-notification bus: a `Notify` plus a monotonically increasing
+/// change generation, bumped on every wake. The generation is a cache key,
+/// not a truth signal — `/ws/events` clients still wake on the 1s fallback
+/// tick and each keeps its own last-sent compare; the generation only lets
+/// the sessions-snapshot build run once per change instead of once per
+/// connected window (see `session_view::SnapshotCache`).
+pub(crate) struct ChangeBus {
+    notify: tokio::sync::Notify,
+    generation: std::sync::atomic::AtomicU64,
+}
+
+impl ChangeBus {
+    pub(crate) fn new() -> Self {
+        ChangeBus {
+            notify: tokio::sync::Notify::new(),
+            generation: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Announce a change: bump the generation, then wake every waiter. The
+    /// bump comes first so a woken client that reads the generation always
+    /// sees a value at least as new as the change that woke it.
+    pub(crate) fn notify_waiters(&self) {
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    /// Wait for the next `notify_waiters` (same semantics as
+    /// `Notify::notified`: only waiters registered at wake time are woken —
+    /// the 1s events tick remains the backstop for missed edges).
+    pub(crate) async fn notified(&self) {
+        self.notify.notified().await
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
