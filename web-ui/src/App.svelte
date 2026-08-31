@@ -17,6 +17,8 @@
     unauthorized,
     type Health,
   } from "./lib/net/api";
+  import { healthPollDelayMs, type PollHandle } from "./lib/net/poll";
+  import { pageVisible } from "./lib/shared/visibility";
   import {
     backgrounded,
     createSession,
@@ -1018,10 +1020,21 @@
   // independently tracks authenticated daemon reachability. The events
   // socket can restart while HTTP remains healthy, so the Home badge accepts
   // either successful channel instead of calling that transient "offline".
-  $effect(() =>
-    pollHealth(
+  // Cadence (net/poll.ts): the events socket is the real liveness signal, so
+  // while it's up this is a 60s safety net; while it's down the 5s recovery
+  // probe runs only in a visible window (hidden takes the slow tier, with a
+  // catch-up fetch on visibility return). The delay getter reads `eventsUp`
+  // live at each arm — the poller itself is armed once (no teardown churn).
+  let healthPoll: PollHandle | null = null;
+  $effect(() => {
+    const handle = pollHealth(
       (h) => {
         healthUp = true;
+        // Cross-nudge: HTTP just proved the daemon reachable — if the events
+        // socket is sitting out a backoff (or gave up as fatal), retry it
+        // now instead of letting two independent slow clocks ignore each
+        // other. It in turn nudges the per-session sockets on recovery.
+        if (!eventsUp) eventsSocket?.retryNow();
         if (daemonBuildChanged(h.build)) {
           // The origin can stay stable across a daemon handoff, but the
           // hashed JS namespace cannot. Reload before the user opens a lazy
@@ -1035,8 +1048,31 @@
       () => {
         healthUp = false;
       },
-    ),
-  );
+      (hidden) => healthPollDelayMs(eventsUp, hidden),
+    );
+    healthPoll = handle;
+    return () => {
+      healthPoll = null;
+      handle.stop();
+    };
+  });
+
+  // An events up/down transition warrants a prompt reachability probe —
+  // kick() is deferred and damped (KICK_DAMP_MS), so a crash-looping daemon
+  // flapping the socket once a second cannot become a fetch per transition.
+  $effect(() => {
+    void eventsUp;
+    healthPoll?.kick();
+  });
+
+  // While this document is hidden nobody sees the presence animations: a
+  // root class lets each component pause its own infinite keyframes with an
+  // enumerated `html.app-hidden` rule (see app.css) — box-shadow/opacity
+  // pulses otherwise burn frames for hours in a backgrounded window.
+  $effect(() => {
+    document.documentElement.classList.toggle("app-hidden", !$pageVisible);
+    return () => document.documentElement.classList.remove("app-hidden");
+  });
 
   // Vite reports every failed production dynamic import here, including the
   // nested PDF/editor/spreadsheet chunks that never pass through Pane's
@@ -5642,6 +5678,12 @@
 
   .daemon-dot.pulse {
     animation: pulse 1.2s ease-in-out infinite;
+  }
+
+  /* Hidden document: nobody sees the reconnect pulse — stop burning frames
+     (the html.app-hidden contract; see app.css). */
+  :global(html.app-hidden) .daemon-dot.pulse {
+    animation-play-state: paused;
   }
 
   @keyframes pulse {

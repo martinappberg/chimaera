@@ -110,6 +110,11 @@
     animation: none;
     color: var(--muted);
   }
+  /* Hidden document: nobody sees the breath — stop burning frames (the
+     html.app-hidden contract; see app.css). */
+  :global(html.app-hidden) .spark {
+    animation-play-state: paused;
+  }
   @media (prefers-reduced-motion: reduce) {
     .tray,
     .spark {

@@ -11,6 +11,7 @@
     isNativeShell,
   } from "../net/native";
   import { ApiError, getHostLabel } from "../net/api";
+  import { pageVisible } from "../shared/visibility";
 
   interface Props {
     /** The daemon's own allocation (present in every compute-node window). */
@@ -36,10 +37,12 @@
 
   // Same live-tick discipline as ComputeStrip: the fetched time_left only
   // moves per poll, so tick locally against the receipt time and re-sync on
-  // every fetch. Once ended there's nothing left to count down.
+  // every fetch. Once ended there's nothing left to count down. Gated on
+  // document visibility (the compute.ts idiom) with a catch-up on return.
   let now = $state(Date.now());
   $effect(() => {
-    if (phase === "ended") return;
+    if (phase === "ended" || !$pageVisible) return;
+    now = Date.now();
     const t = setInterval(() => (now = Date.now()), 1000);
     return () => clearInterval(t);
   });

@@ -2229,6 +2229,13 @@
     font-family: var(--mono, monospace);
     animation: label-pulse 1.6s ease-in-out infinite;
   }
+  /* Hidden document: nobody sees the shimmer — stop burning frames for the
+     length of an agent turn (the html.app-hidden contract; see app.css). */
+  :global(html.app-hidden) .status-spark,
+  :global(html.app-hidden) .status-label,
+  :global(html.app-hidden) .compaction-progress > span {
+    animation-play-state: paused;
+  }
   /* Ellipsis that breathes with the spark, without layout shift. */
   .status-label::after {
     content: "…";

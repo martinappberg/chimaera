@@ -1151,20 +1151,38 @@
     border: 1.5px solid hsl(var(--hue) 60% 55%);
   }
 
-  /* Agent exec running: the leash is being pulled — a gentle hue pulse. */
+  /* Agent exec running: the leash is being pulled — a gentle hue pulse. The
+     halo is a STATIC disc on a pseudo-element breathed via transform/opacity
+     (composited) instead of box-shadow keyframes (a repaint per frame for
+     the whole agent turn). */
   .chip-dot.exec {
+    position: relative;
     background: hsl(var(--hue) 65% 55%);
+  }
+
+  .chip-dot.exec::after {
+    content: "";
+    position: absolute;
+    inset: -3.5px;
+    pointer-events: none;
+    border-radius: 50%;
+    background: hsl(var(--hue) 65% 55% / 0.35);
+    opacity: 0;
+    transform: scale(0.5);
     animation: chip-pulse 1.4s ease-in-out infinite;
   }
 
   @keyframes chip-pulse {
-    0%,
-    100% {
-      box-shadow: 0 0 0 0 hsl(var(--hue) 65% 55% / 0.55);
-    }
     50% {
-      box-shadow: 0 0 0 3.5px hsl(var(--hue) 65% 55% / 0);
+      opacity: 1;
+      transform: scale(1);
     }
+  }
+
+  /* Hidden document: nobody sees the pulse — stop burning frames (the
+     html.app-hidden contract; see app.css). */
+  :global(html.app-hidden) .chip-dot.exec::after {
+    animation-play-state: paused;
   }
 
   .chip-x {
@@ -1237,7 +1255,7 @@
   }
 
   @media (prefers-reduced-motion: reduce) {
-    .chip-dot.exec {
+    .chip-dot.exec::after {
       animation: none;
     }
   }

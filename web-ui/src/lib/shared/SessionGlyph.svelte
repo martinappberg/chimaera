@@ -103,6 +103,11 @@
   .sglyph.pulse {
     animation: pulse 2.4s ease-in-out infinite;
   }
+  /* Hidden document: nobody sees the breath — stop burning frames (the
+     html.app-hidden contract; see app.css). */
+  :global(html.app-hidden) .sglyph.pulse {
+    animation-play-state: paused;
+  }
   @media (prefers-reduced-motion: reduce) {
     .sglyph.pulse {
       animation: none;

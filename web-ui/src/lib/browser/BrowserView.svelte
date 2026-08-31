@@ -13,6 +13,7 @@
   import { onDestroy, untrack } from "svelte";
   import { get } from "svelte/store";
   import Spinner from "../previews/Spinner.svelte";
+  import { pageVisible } from "../shared/visibility";
   import { computeStatus } from "../workspace/compute";
   import { isWebUrl, openInSystemBrowser } from "../shared/urlOpen";
   import {
@@ -187,8 +188,8 @@
       probedFor = null;
       // Drop the OLD target's iframe immediately. Leaving base/iframeSrc live
       // would keep the previous page mounted through the new `connecting`
-      // phase, and a late onload — or the 1s poll — could read it against the
-      // now-stale base and persist the wrong location onto the NEW target.
+      // phase, and a late onload — or the slow location poll — could read it
+      // against the now-stale base and persist the wrong location onto the NEW target.
       // connect() sets them fresh once the new session is minted (codex R4).
       base = null;
       proxyId = null;
@@ -223,16 +224,22 @@
   }
 
   // While unreachable and on screen, retry quietly — "I clicked the URL a
-  // beat before Jupyter finished booting" must fix itself.
+  // beat before Jupyter finished booting" must fix itself. Gated on document
+  // visibility too: each probe is 2 HTTP round-trips, and a hidden window at
+  // a dead URL must not keep paying them; the effect re-runs on return, so
+  // the retry resumes (and connect() fires within 5s) once someone looks.
   $effect(() => {
-    if (!visible || phase.kind !== "unreachable") return;
+    if (!visible || !$pageVisible || phase.kind !== "unreachable") return;
     const t = setInterval(() => void connect(), 5000);
     return () => clearInterval(t);
   });
 
   // Keep-alive + liveness while showing the app: refreshes the proxy
   // session's idle clock and notices a died server (banner) or an expired
-  // session (transparent re-mint).
+  // session (transparent re-mint). Deliberately NOT gated on document
+  // visibility (rules/web-ui.md exemption): the keep-alive is what stops the
+  // daemon expiring the proxy session, and a hidden window must come back to
+  // a working app, not an expired ticket. 1 request/min is the accepted cost.
   $effect(() => {
     if (!visible || phase.kind !== "ready") return;
     const t = setInterval(() => {
@@ -325,11 +332,17 @@
 
   // Same-document navigations don't reload the iframe, so `onload` never fires
   // for them; a slow poll is what keeps the address bar and persisted path in
-  // step for hash-router / History-API apps. 1/s is imperceptible latency for a
-  // user-driven route change and the read is a bare property access — no I/O.
+  // step for hash-router / History-API apps. Real navigations are event-driven
+  // (the iframe's onload → readIframeState), so this is only the fallback:
+  // 5s of address-bar staleness on a same-document route change is fine, and
+  // it runs only while both the pane AND the document are visible — with a
+  // catch-up read when either returns (the effect re-runs; the read is a bare
+  // same-origin property access, no I/O). untrack: syncLocation reads AND
+  // writes `livePath` — tracking it would loop the effect.
   $effect(() => {
-    if (!visible || phase.kind !== "ready") return;
-    const t = setInterval(syncLocation, 1000);
+    if (!visible || !$pageVisible || phase.kind !== "ready") return;
+    untrack(() => syncLocation());
+    const t = setInterval(syncLocation, 5000);
     return () => clearInterval(t);
   });
 
