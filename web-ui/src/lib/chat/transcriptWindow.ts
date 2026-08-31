@@ -2,6 +2,13 @@
 export const TRANSCRIPT_PAGE = 64;
 export const TRANSCRIPT_WINDOW = TRANSCRIPT_PAGE * 3;
 
+/**
+ * The range math below is coordinate-agnostic: callers may pass the reducer's
+ * array indices, or trim-stable VIRTUAL indices (array index + the store's
+ * `trimmedCount`, a position among every block ever appended). Saved cursors
+ * persist in virtual coordinates — the cap's front-splices can't move them —
+ * and {@link toArrayCoords} converts back at restore time.
+ */
 export interface TranscriptWindow {
   start: number;
   end: number;
@@ -46,6 +53,25 @@ export function restoreWindow(saved: TranscriptWindow, total: number): Transcrip
   let start = Math.max(0, Math.min(Math.floor(saved.start), end));
   if (start === end && width > 0) start = Math.max(0, end - width);
   if (end - start > TRANSCRIPT_WINDOW) start = end - TRANSCRIPT_WINDOW;
+  return { start, end };
+}
+
+/**
+ * Convert a window saved in virtual coordinates back to array coordinates
+ * against the reducer's current trim count and length. Null when nothing of
+ * the saved range survives — every row it covered was trimmed away, or a
+ * reset/rewind left it beyond the transcript — so the caller falls back to
+ * the tail rather than restoring an empty window.
+ */
+export function toArrayCoords(
+  saved: TranscriptWindow,
+  trimmedCount: number,
+  total: number,
+): TranscriptWindow | null {
+  const bounded = boundedTotal(total);
+  const end = Math.min(Math.floor(saved.end) - Math.floor(trimmedCount), bounded);
+  const start = Math.min(Math.max(0, Math.floor(saved.start) - Math.floor(trimmedCount)), bounded);
+  if (end <= start) return null;
   return { start, end };
 }
 

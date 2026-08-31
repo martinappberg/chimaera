@@ -53,6 +53,7 @@
     pageLater,
     restoreWindow,
     tailWindow,
+    toArrayCoords,
     type PagePlan,
   } from "./transcriptWindow";
   import { getSetting } from "../settings/store.svelte";
@@ -155,7 +156,14 @@
   let renderEnd = $state(0);
   let renderReady = $state(false);
   let renderedVersion = $state(-1);
-  let renderedTotal = $state(0);
+  /** Virtual total (blocks.length + trimmedCount) at the last range write.
+   *  The raw length pins at the cap, where append+trim would masquerade as
+   *  in-place growth and the tail window would silently stop advancing. */
+  let renderedVirtualTotal = $state(0);
+  /** store.trimmedCount at the last range write. A trim front-splices the
+   *  array under this view's absolute range; the delta says how far to shift
+   *  renderStart/renderEnd so they keep naming the same rows. */
+  let renderedTrim = $state(0);
   // svelte-ignore state_referenced_locally
   let followedVersion = $state(chatFollowedVersion(session.id) ?? -1);
   /** A non-empty draft pauses bottom-following, never transcript rendering. */
@@ -182,6 +190,7 @@
     options: { live: boolean; tail: boolean },
   ): void {
     const total = store.blocks.length;
+    const trimmed = store.trimmedCount;
     const safeEnd = Math.max(0, Math.min(end, total));
     const safeStart = Math.max(0, Math.min(start, safeEnd));
     renderStart = safeStart;
@@ -191,10 +200,13 @@
     rendersLive = options.live;
     tracksTail = options.tail;
     renderedVersion = store.transcriptVersion;
-    renderedTotal = total;
+    renderedVirtualTotal = total + trimmed;
+    renderedTrim = trimmed;
     renderReady = true;
     anchorRevision += 1;
-    saveChatRenderWindow(session.id, safeStart, safeEnd, tracksTail);
+    // Pool cursors persist in trim-stable virtual coordinates, so a trim while
+    // the view is unmounted cannot leave them naming the wrong rows.
+    saveChatRenderWindow(session.id, safeStart + trimmed, safeEnd + trimmed, tracksTail);
   }
 
   function setTail(live = true): void {
@@ -209,8 +221,15 @@
     if (!renderReady || !rendersLive) return;
     renderBlocks = $state.snapshot(renderBlocks);
     rendersLive = false;
-    renderedVersion = store.transcriptVersion;
-    renderedTotal = store.blocks.length;
+    // The snapshot captured every in-place mutation the live proxies had
+    // delivered, but no structural append beyond the range — advance the
+    // version stamp only when none occurred, so the activation early-out can
+    // never skip rows this freeze did not capture. renderedTrim likewise stays
+    // at its last range write (the range was not shifted here); activation
+    // shifts by the missed delta.
+    if (store.blocks.length + store.trimmedCount === renderedVirtualTotal) {
+      renderedVersion = store.transcriptVersion;
+    }
     anchorRevision += 1;
   }
 
@@ -259,8 +278,11 @@
       if (revision !== anchorRevision) return;
       const current = transcriptEl;
       if (current === null) return;
-      let after: HTMLElement | null = null;
-      if (anchor?.index !== null && anchor?.index !== undefined) {
+      // Node identity first: uid-keyed rows survive a range replacement, and a
+      // cap trim can shift every index between the anchor read and this tick.
+      // The index match remains the fallback for a keyed group replacement.
+      let after: HTMLElement | null = anchor?.node.isConnected === true ? anchor.node : null;
+      if (after === null && anchor?.index !== null && anchor?.index !== undefined) {
         after =
           Array.from(columnEl?.querySelectorAll<HTMLElement>("[data-block-index]") ?? []).find(
             (candidate) => {
@@ -270,7 +292,6 @@
             },
           ) ?? null;
       }
-      after ??= anchor?.node.isConnected ? anchor.node : null;
       current.scrollTop =
         anchor !== null && after !== null
           ? anchor.scrollTop + after.getBoundingClientRect().top - anchor.top
@@ -296,12 +317,29 @@
     if (store.hydrating) return;
     const total = store.blocks.length;
     const version = store.transcriptVersion;
+    const virtualTotal = total + store.trimmedCount;
     const following = atBottom;
     const drafting = composerEngaged;
     untrack(() => {
+      // Cap trims splice the array's front out from under this absolute
+      // range; shift with them so it keeps naming the same rows. (A journal
+      // reset lowers trimmedCount to zero instead — its now-invalid range is
+      // repaired below, never shifted.)
+      const trimDelta = store.trimmedCount - renderedTrim;
+      if (trimDelta > 0 && renderReady) {
+        renderStart = Math.max(0, renderStart - trimDelta);
+        renderEnd = Math.max(0, renderEnd - trimDelta);
+      }
+      renderedTrim = store.trimmedCount;
       if (!renderReady) {
-        if (!atBottom && savedRenderWindow !== null) {
-          const restored = restoreWindow(savedRenderWindow, total);
+        // Saved cursors are virtual; rows they covered may have been trimmed
+        // away while the view was unmounted — then fall back to the tail.
+        const saved =
+          savedRenderWindow === null
+            ? null
+            : toArrayCoords(savedRenderWindow, store.trimmedCount, total);
+        if (!atBottom && savedRenderWindow !== null && saved !== null) {
+          const restored = restoreWindow(saved, total);
           setRange(restored.start, restored.end, {
             live: savedRenderWindow.tail,
             tail: savedRenderWindow.tail,
@@ -319,6 +357,13 @@
         });
       } else if (activating) {
         if (!tracksTail) return;
+        if (version === renderedVersion && virtualTotal === renderedVirtualTotal) {
+          // Nothing arrived while hidden: the frozen page is already exact, so
+          // skip the slice/rebuild entirely. Rows stay inert snapshots until
+          // the next event or a bottom-reach rebinds live proxies (both call
+          // setRange), so a quiet tab switch costs no transcript work.
+          return;
+        }
         const next = advanceTailWindow({ start: renderStart, end: renderEnd }, total);
         if (following && !drafting) {
           setRange(next.start, next.end, { live: true, tail: true });
@@ -333,11 +378,19 @@
             tail: false,
           });
         }
-      } else if (tracksTail && (version !== renderedVersion || total !== renderedTotal)) {
+      } else if (
+        tracksTail &&
+        (version !== renderedVersion || virtualTotal !== renderedVirtualTotal)
+      ) {
         if (drafting && version !== renderedVersion) atBottom = false;
         const next = advanceTailWindow({ start: renderStart, end: renderEnd }, total);
-        if (total === renderedTotal) {
-          // The live proxy already delivered this in-place chunk to its row.
+        if (virtualTotal === renderedVirtualTotal) {
+          // In-place chunk growth: no block appended or trimmed. The live
+          // proxy already delivered it to its row — unless an early-out
+          // activation left the rows frozen; rebind them now.
+          if (!rendersLive) {
+            setRange(renderStart, renderEnd, { live: true, tail: true });
+          }
           renderedVersion = version;
           if (following && !drafting) markFollowed(version);
         } else if (following && !drafting) {
@@ -350,7 +403,12 @@
           // preserve the page and make the deferred gap explicit.
           freezeRenderedRange();
           tracksTail = false;
-          saveChatRenderWindow(session.id, renderStart, renderEnd, false);
+          saveChatRenderWindow(
+            session.id,
+            renderStart + store.trimmedCount,
+            renderEnd + store.trimmedCount,
+            false,
+          );
         }
       }
     });
@@ -1320,7 +1378,11 @@
         group.endIndex = originalIndex;
       } else {
         group = null;
-        items.push({ t: "single", key: `b-${originalIndex}`, index: originalIndex, block });
+        // Keyed by the store's stable uid, never the array index: at cap every
+        // append front-splices the array, and index keys would remount the
+        // whole window (a full marked+KaTeX+DOMPurify pass per row) on the
+        // next range write.
+        items.push({ t: "single", key: `b-${block.uid}`, index: originalIndex, block });
       }
     });
     return items;

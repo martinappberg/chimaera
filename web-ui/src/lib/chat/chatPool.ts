@@ -23,9 +23,12 @@ interface ChatEntry {
   /** Saved transcript scroll position, restored on the next mount. */
   scrollTop: number;
   atBottom: boolean;
-  /** Absolute block range last rendered by ChatView. Keeping this tiny view
-   *  cursor separate from the reducer lets an evicted view restore the same
-   *  reading window without remounting the entire transcript. */
+  /** Block range last rendered by ChatView, in trim-stable VIRTUAL
+   *  coordinates (array index + the store's trimmedCount at save time), so a
+   *  reducer cap trim while the view is unmounted cannot leave the cursor
+   *  naming the wrong rows. Keeping this tiny view cursor separate from the
+   *  reducer lets an evicted view restore the same reading window without
+   *  remounting the entire transcript. */
   renderWindow: { start: number; end: number; tail: boolean } | null;
   /** Transcript revision the reader has actually followed. This is separate
    *  from the socket sequence: model/rate-limit/control events should not
@@ -142,7 +145,8 @@ export function chatScroll(sessionId: string): { scrollTop: number; atBottom: bo
     : { scrollTop: 0, atBottom: true };
 }
 
-/** Save the bounded block window currently mounted by a ChatView. */
+/** Save the bounded block window currently mounted by a ChatView (virtual
+ *  coordinates — see the entry field's doc). */
 export function saveChatRenderWindow(
   sessionId: string,
   start: number,

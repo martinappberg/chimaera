@@ -196,3 +196,9 @@ nodes, Duo 2FA, ControlMaster-only non-interactive ssh). Findings:
   problem class containers address (old glibc, missing deps) — and the bugs we actually hit
   were ssh/shell semantics that would reproduce identically inside a container. Keep an
   Apptainer recipe as a documented fallback for pathological hosts, not as the plan.
+
+## PR A — stable chat row keys + trim-aware windowing (2026-08-31)
+
+- **The tab-switch hang:** transcript rows were keyed `b-${arrayIndex}`. Once `blocks` hit the 2000 cap, every append front-spliced the array, shifting all indices — the next activation saw ~192 changed keys and remounted the whole DOM window (marked+DOMPurify+KaTeX per row, 249ms measured). Rows now carry a monotonic per-store `uid` and are keyed by it.
+- **New blocks silently stopped rendering at cap:** with length pinned at 2000, appends looked like in-place chunk growth and the tail window never advanced. The store now exposes `trimmedCount`; windowing compares the virtual total (`length + trimmedCount`), and view ranges/pool cursors shift with trims (cursors persist in virtual coordinates).
+- **Per-switch tax:** re-activating an unchanged hidden tab now early-outs of the range rebuild; trims run with a 64-block hysteresis slack so the O(2000) index rebuild costs 1/64th as often at cap.
