@@ -277,6 +277,21 @@ body {
   padding: 12px 8px 12px 14px;
 }
 
+/* Predictive local-echo ghost (terminal/localEcho.ts): the not-yet-echoed
+   keystrokes on a high-RTT remote, overlaid after the cursor inside
+   .xterm-screen. Palette rides theme tokens so live theme flips repaint
+   already-visible ghosts; only geometry + the terminal font are set inline
+   (as individual properties — never cssText). */
+.term-ghost {
+  display: none;
+  position: absolute;
+  pointer-events: none;
+  z-index: 20;
+  white-space: pre;
+  color: var(--fg);
+  opacity: 0.55;
+}
+
 /* Drag & drop chrome (the ghost is a body-level element). Flex so the label
    truncates while the out-of-window hint — the detach affordance — always
    renders whole. */

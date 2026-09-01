@@ -39,6 +39,13 @@ export interface SessionSocketHandlers {
    * into a fresh visible attach.
    */
   onParkedReady?(): void;
+  /**
+   * The socket dropped uncleanly (a reconnect is scheduled). The output gap
+   * begins HERE, not at the eventual ready frame — the pool desyncs a parked
+   * buffer immediately, so an adopt racing the reconnect handshake resyncs
+   * instead of flushing pre-gap bytes into a visible grid.
+   */
+  onDrop?(): void;
 }
 
 interface ServerTextFrame {
@@ -118,6 +125,7 @@ export class SessionSocket {
         this.recon.clear();
         return;
       }
+      this.handlers.onDrop?.();
       this.recon.schedule();
     };
   }
@@ -219,33 +227,34 @@ export class SessionSocket {
     }
   }
 
+  /** One guard for every control frame: silently dropped when the socket is
+   *  down — reconnect re-establishes the state these frames carry (dims via
+   *  the ready reconcile, parked via the auth flag). */
+  private sendJson(msg: unknown): void {
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify(msg));
+    }
+  }
+
   /** Send a resize request as a text frame. */
   sendResize(cols: number, rows: number): void {
-    if (this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({ type: "resize", cols, rows }));
-    }
+    this.sendJson({ type: "resize", cols, rows });
   }
 
   /**
    * Tell the server this terminal parked: output forwarding stops (the
-   * session's server-side ring buffers the stream) until unpark. Dropped
-   * when the socket is down — the reconnect's parked auth carries the state.
-   * Old servers ignore the frame and keep streaming; the client-side
-   * ParkedBuffer still handles that stream, so both directions degrade
-   * gracefully.
+   * session's server-side ring buffers the stream) until unpark. Old servers
+   * ignore the frame and keep streaming; the client-side ParkedBuffer still
+   * handles that stream, so both directions degrade gracefully.
    */
   sendPark(): void {
-    if (this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({ type: "park" }));
-    }
+    this.sendJson({ type: "park" });
   }
 
   /** Resume after park: the server catches up from its ring, or repaints
    *  (resync + snapshot) when the ring can't cover the gap. */
   sendUnpark(): void {
-    if (this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({ type: "unpark" }));
-    }
+    this.sendJson({ type: "unpark" });
   }
 
   /**

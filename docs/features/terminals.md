@@ -19,8 +19,10 @@ pipe), `POST /api/v1/sessions` (spawn), `POST /api/v1/sessions/{id}/exec`,
   terminal is exactly where it was; run with zero attached clients and it keeps going.
 - **How it's used.** The server calls `SessionManager::spawn(SpawnOpts{cwd,name,cols,rows,
   command,id,env,…})` (`command:None` = the user's interactive shell). The browser opens
-  `GET /ws/sessions/{id}`: first frame `{type:auth,token,cols,rows}` → `ready` → a binary
-  **snapshot** → the live byte stream.
+  `GET /ws/sessions/{id}`: first frame `{type:auth,token,cols,rows,parked?}` → `ready` → a
+  binary **snapshot** → the live byte stream. A `parked:true` auth (a hidden pooled terminal
+  reconnecting) gets `ready` only — no snapshot, no stream, and its dims are NOT adopted —
+  until an `unpark` frame repaints it.
 - **Where it lives.** `chimaera-pty/src/lib.rs` (`SessionManager`, `SpawnOpts`, `SessionInfo`),
   `session.rs` (`Session::spawn` — reader/writer/reaper threads), `snapshot.rs`
   (`render_snapshot`). Daemon: `spawn.rs`, `ws.rs::session_ws`.
@@ -39,8 +41,9 @@ pipe), `POST /api/v1/sessions` (spawn), `POST /api/v1/sessions/{id}/exec`,
   daemon restart) and rebuilds the exact screen; resizing reflows the PTY and the headless Term
   together.
 - **How it's used.** Invisible in the happy path. On reconnect the screen is wiped and rebuilt
-  from a fresh snapshot; the client sends its current grid in the `auth` frame so the server
-  adopts client dims *before* rendering.
+  from a fresh snapshot; a visible client sends its current grid in the `auth` frame so the
+  server adopts client dims *before* rendering (a parked reconnect sends none — its first
+  adopt resyncs through a fresh visible attach that carries them).
 - **Where it lives.** `web-ui/src/lib/terminal/ws.ts` (`SessionSocket`), `net/reconnect.ts`
   (`Reconnector`), server `ws.rs` (`resync`, `authenticate`), `session.rs::resize`.
 - **Key behaviors.** The snapshot must render at the grid it was captured at — resize *before*
@@ -61,7 +64,15 @@ pipe), `POST /api/v1/sessions` (spawn), `POST /api/v1/sessions/{id}/exec`,
   `termPoolRuntime.ts` (`pool`, `attach`/`show`/`release`, hidden `stash`, `POOL_CAP = 12`,
   `evictLru`), plus `Terminal.svelte` and `layout/Pane.svelte` (only an active PTY component stays
   mounted, so inactive instances actually park; structured-chat tabs retain their separate DOM).
-- **Key behaviors.** Up to 12 terminals stay warm; the LRU *parked* one is disposed past the cap.
+- **Key behaviors.** Parking is a **wire state**, not just a client one: `release()` sends a
+  `park` frame (the server stops forwarding output — the session's bounded broadcast ring is
+  the catch-up buffer) and adopt sends `unpark` (ring replay for small backlogs; a repaint —
+  `resync` + snapshot — when the grid reflowed, was never sent, or the backlog crossed
+  `UNPARK_REPLAY_MAX_CHUNKS`). A hidden terminal therefore costs the tunnel ~nothing; old
+  servers ignore the frames and the client's ParkedBuffer still absorbs their stream. On
+  high-RTT remotes, `localEcho.ts` ghosts predicted keystrokes as a DOM overlay (never buffer
+  writes), armed only at the OSC 133 prompt on a measurably slow link. Up to 12 terminals stay
+  warm; the LRU *parked* one is disposed past the cap.
   A visible terminal outlives its dead session on purpose (an agent's last words stay on screen
   until you close the tab). WebGL renderer with DOM fallback on context loss; fonts are awaited
   before first open so glyph metrics measure correctly. Refits are debounced 80ms and suppressed

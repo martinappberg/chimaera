@@ -216,6 +216,10 @@ function applyReset(term: Terminal, cols?: number, rows?: number): void {
  * (fatal/closed socket) keeps it, and the existing error surface stands.
  */
 function adoptParked(entry: PoolEntry): void {
+  // show() re-invokes attach() on already-visible entries (live font
+  // changes): only a genuinely parked entry may emit protocol traffic —
+  // unpark without a preceding park is not a well-formed lifecycle event.
+  const wasParked = entry.buf.isParked();
   const directive = entry.buf.adopt();
   if (directive.resync) {
     // A fresh visible connect re-auths with parked:false — the server sends
@@ -227,7 +231,7 @@ function adoptParked(entry: PoolEntry): void {
   // Resume the server stream: it catches up from its ring (contiguous with
   // the flushed bytes — the server stopped sending exactly where the park
   // frame landed), or repaints when the ring can't cover the gap.
-  entry.socket.sendUnpark();
+  if (wasParked) entry.socket.sendUnpark();
 }
 
 /**
@@ -387,7 +391,9 @@ function createEntry(id: string, parent: HTMLElement, fontOverride: number | und
       }),
     ),
     buf: new ParkedBuffer(PARKED_BUFFER_MAX_BYTES),
-    echo: createLocalEcho(term, () => handlers?.echoArmed?.(id) ?? false),
+    // Ghosting a keystroke the closed socket silently dropped would show
+    // input that was never delivered — the socket gate is non-negotiable.
+    echo: createLocalEcho(term, () => entry.socket.isOpen && (handlers?.echoArmed?.(id) ?? false)),
     webgl: null,
     webglFailed: false,
     webglLosses: 0,
@@ -405,8 +411,17 @@ function createEntry(id: string, parent: HTMLElement, fontOverride: number | und
       // one exception is the snapshot write-through after a reset.
       if (entry.disposed) return;
       if (entry.buf.binary(data) === "write") {
-        entry.echo.onOutput(data);
-        term.write(data);
+        if (entry.echo.hasGhosts()) {
+          entry.echo.onOutput(data);
+          // Re-anchor surviving ghosts only once xterm has PARSED the chunk
+          // (its write pipeline is async) — a rAF can fire mid-parse and
+          // re-draw ghosts at the stale cursor over already-echoed text.
+          term.write(data, () => {
+            if (!entry.disposed) entry.echo.rerender();
+          });
+        } else {
+          term.write(data);
+        }
       }
     },
     onReset: (cols, rows) => {
@@ -424,17 +439,21 @@ function createEntry(id: string, parent: HTMLElement, fontOverride: number | und
       if (entry.disposed) return;
       // While parked this discards old-width bytes and latches desynced —
       // they are unreplayable in the reflowed grid (the server's debounced
-      // foreign-resize resync, or adopt, repaints).
+      // foreign-resize resync, or adopt, repaints). A reflow is a grid
+      // discontinuity: pending ghosts hold stale pixel coordinates.
       entry.buf.resized();
+      entry.echo.clear();
       if (term.cols !== cols || term.rows !== rows) term.resize(cols, rows);
     },
     onExited: (status) => {
       if (entry.disposed) return;
       // A parked terminal's buffered tail is its last words — parse it now
-      // (one-time, bounded) so the final screen isn't lost. After a discard
-      // the flush is empty and the desynced latch stands: adopt reconnects
-      // into the server's last-words replay instead.
+      // (one-time, bounded) so the final screen isn't lost. A parked exit
+      // also latches desynced (the buffer can't be trusted to be complete
+      // when a park-aware server withheld output): adopt reconnects into
+      // the server's last-words replay for the authoritative final screen.
       for (const chunk of entry.buf.exited()) term.write(chunk);
+      entry.echo.clear();
       term.write("\r\n\x1b[2m[exited]\x1b[0m\r\n");
       handlers?.onExited(id, status);
     },
@@ -451,13 +470,21 @@ function createEntry(id: string, parent: HTMLElement, fontOverride: number | und
       // instead of one per parked socket at reconnect time.
       if (!entry.disposed) entry.buf.desync();
     },
+    onDrop: () => {
+      // The output gap starts at the drop, so desync NOW: an adopt that
+      // races the reconnect handshake must resync, never flush pre-gap
+      // bytes into a visible grid. No-op for a visible entry (its own
+      // reconnect ready repaints it).
+      if (!entry.disposed) entry.buf.desync();
+    },
   });
 
   term.onData((data) => {
-    // Ghost first, then send: the prediction shows in the same frame as the
-    // keystroke while the real echo makes its round trip.
-    entry.echo.onInput(data);
+    // Send first: the ghost's DOM work (layout read + style writes) must
+    // never sit between the keystroke and the wire — both run in the same
+    // task, so the prediction still paints in the same frame.
     entry.socket.sendInput(data);
+    entry.echo.onInput(data);
   });
   term.onResize(({ cols, rows }) => entry.socket.sendResize(cols, rows));
   term.onSelectionChange(() => {
@@ -565,7 +592,9 @@ function applySettingsToPool(): void {
     // Panes without a per-pane override follow the default size live.
     const size = e.fontOverride ?? baseFontSize();
     if (e.term.options.fontSize !== size) e.term.options.fontSize = size;
-    // Metrics-affecting options (font, line height) change the cell grid.
+    // Metrics-affecting options (font, line height) change the cell grid —
+    // a grid discontinuity for any pending ghost's pixel coordinates.
+    e.echo.clear();
     scheduleFit(e);
   }
 }

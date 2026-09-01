@@ -82,6 +82,221 @@ async fn ws_bridge_auth_snapshot_and_echo() {
     state.sessions.kill(&info.id).ok();
 }
 
+/// The park protocol, end to end on the real bridge: `auth.parked` attaches
+/// with NO snapshot frame (attach_quiet), output produced while parked is
+/// withheld, and the first `unpark` repaints — a `resync` text frame with
+/// the adjacent full snapshot carrying everything produced meanwhile.
+#[tokio::test]
+async fn ws_parked_attach_withholds_until_unpark_repaints() {
+    use futures::SinkExt;
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+    let state = test_state();
+    let info = state
+        .sessions
+        .spawn(chimaera_pty::SpawnOpts {
+            cwd: test_dir("ws-park-cwd"),
+            name: None,
+            cols: 80,
+            rows: 24,
+            command: None,
+            id: None,
+            env: Vec::new(),
+            env_remove: Vec::new(),
+            scrollback: None,
+        })
+        .expect("spawn session");
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = app(state.clone());
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+
+    let url = format!("ws://{addr}/ws/sessions/{}", info.id);
+    let (mut socket, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    socket
+        .send(WsMessage::text(
+            serde_json::json!({"type": "auth", "token": "test-token", "parked": true}).to_string(),
+        ))
+        .await
+        .unwrap();
+
+    // Ready arrives — and nothing else: no snapshot binary follows a parked
+    // attach, and output typed into the PTY meanwhile is withheld.
+    let ready = match next_ws_frame(&mut socket).await {
+        WsMessage::Text(text) => serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+        other => panic!("expected ready text frame, got {other:?}"),
+    };
+    assert_eq!(ready["type"], "ready");
+
+    // Produce output while parked (typed via a second, visible attachment's
+    // input handle so this connection's own pipe stays quiet).
+    let mut side = state.sessions.attach(&info.id).expect("side attach");
+    side.input
+        .send(bytes::Bytes::from_static(b"echo park-withheld-marker\n"))
+        .await
+        .expect("side input");
+    // Wait until the session demonstrably produced the output.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match tokio::time::timeout_at(deadline, side.output.recv()).await {
+            Ok(Ok(chunk)) => {
+                if String::from_utf8_lossy(&chunk).contains("park-withheld-marker") {
+                    break;
+                }
+            }
+            Ok(Err(_)) => panic!("side output channel closed early"),
+            Err(_) => panic!("timed out waiting for the marker on the side attachment"),
+        }
+    }
+
+    // The parked connection must have received NO frames beyond ready.
+    let quiet = tokio::time::timeout(std::time::Duration::from_millis(300), async {
+        use futures::StreamExt;
+        socket.next().await
+    })
+    .await;
+    assert!(
+        quiet.is_err(),
+        "a parked connection must stay silent; got {quiet:?}"
+    );
+
+    // Unpark: a parked attach has no grid yet, so the server repaints —
+    // resync text frame, then the adjacent snapshot binary containing the
+    // withheld output.
+    socket
+        .send(WsMessage::text(
+            serde_json::json!({"type": "unpark"}).to_string(),
+        ))
+        .await
+        .unwrap();
+    let resync = match next_ws_frame(&mut socket).await {
+        WsMessage::Text(text) => serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+        other => panic!("expected resync text frame, got {other:?}"),
+    };
+    assert_eq!(resync["type"], "resync");
+    match next_ws_frame(&mut socket).await {
+        WsMessage::Binary(bytes) => {
+            let snapshot = String::from_utf8_lossy(&bytes).into_owned();
+            assert!(
+                snapshot.contains("park-withheld-marker"),
+                "unpark snapshot must carry the withheld output; got: {snapshot:?}"
+            );
+        }
+        other => panic!("expected snapshot binary after resync, got {other:?}"),
+    }
+
+    state.sessions.kill(&info.id).ok();
+}
+
+/// A live connection that parks mid-stream stops receiving output, and a
+/// small backlog resumes from the ring on unpark (no repaint) — the frames
+/// after unpark are plain binary chunks, not a resync.
+#[tokio::test]
+async fn ws_park_frame_stops_output_and_unpark_resumes_from_ring() {
+    use futures::SinkExt;
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+    let state = test_state();
+    let info = state
+        .sessions
+        .spawn(chimaera_pty::SpawnOpts {
+            cwd: test_dir("ws-park-resume-cwd"),
+            name: None,
+            cols: 80,
+            rows: 24,
+            command: None,
+            id: None,
+            env: Vec::new(),
+            env_remove: Vec::new(),
+            scrollback: None,
+        })
+        .expect("spawn session");
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = app(state.clone());
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+
+    let url = format!("ws://{addr}/ws/sessions/{}", info.id);
+    let (mut socket, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    socket
+        .send(WsMessage::text(
+            serde_json::json!({"type": "auth", "token": "test-token"}).to_string(),
+        ))
+        .await
+        .unwrap();
+    // Consume the visible handshake: ready + snapshot.
+    match next_ws_frame(&mut socket).await {
+        WsMessage::Text(_) => {}
+        other => panic!("expected ready, got {other:?}"),
+    }
+    match next_ws_frame(&mut socket).await {
+        WsMessage::Binary(_) => {}
+        other => panic!("expected snapshot, got {other:?}"),
+    }
+
+    // Park, then produce a bounded burst of output.
+    socket
+        .send(WsMessage::text(
+            serde_json::json!({"type": "park"}).to_string(),
+        ))
+        .await
+        .unwrap();
+    let mut side = state.sessions.attach(&info.id).expect("side attach");
+    side.input
+        .send(bytes::Bytes::from_static(b"echo ring-resume-marker\n"))
+        .await
+        .expect("side input");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match tokio::time::timeout_at(deadline, side.output.recv()).await {
+            Ok(Ok(chunk)) => {
+                if String::from_utf8_lossy(&chunk).contains("ring-resume-marker") {
+                    break;
+                }
+            }
+            Ok(Err(_)) => panic!("side output channel closed early"),
+            Err(_) => panic!("timed out waiting for the marker on the side attachment"),
+        }
+    }
+
+    // Unpark: a small backlog replays from the ring as ordinary binary
+    // frames — no resync (the client's grid is current, nothing reflowed).
+    socket
+        .send(WsMessage::text(
+            serde_json::json!({"type": "unpark"}).to_string(),
+        ))
+        .await
+        .unwrap();
+    let mut collected = Vec::new();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !String::from_utf8_lossy(&collected).contains("ring-resume-marker") {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "ring replay never delivered the marker; got: {}",
+            String::from_utf8_lossy(&collected)
+        );
+        match next_ws_frame(&mut socket).await {
+            WsMessage::Binary(bytes) => collected.extend_from_slice(&bytes),
+            WsMessage::Text(text) => {
+                let v = serde_json::from_str::<serde_json::Value>(&text).unwrap();
+                assert_ne!(
+                    v["type"], "resync",
+                    "a small ring backlog must resume, not repaint"
+                );
+            }
+            other => panic!("unexpected frame {other:?}"),
+        }
+    }
+
+    state.sessions.kill(&info.id).ok();
+}
+
 /// A client resize round-trips through the off-reactor resize path: the
 /// server winches the PTY + headless grid and broadcasts a `resized` event
 /// back to every attachment (including the initiator, which uses it as its

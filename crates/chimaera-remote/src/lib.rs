@@ -2280,6 +2280,12 @@ mod tests {
         assert_eq!(opts[11], "ServerAliveInterval=15");
         assert_eq!(opts[12], "-o");
         assert_eq!(opts[13], "ServerAliveCountMax=3");
+        assert_eq!(opts[14], "-o");
+        // The documented one-line revert if a fast-LAN flow ever regresses
+        // (docs/perf-remote-plan.md R5) — pinned so dropping or reordering
+        // it is a visible, deliberate change.
+        assert_eq!(opts[15], "Compression=yes");
+        assert_eq!(opts.len(), 16, "pin the whole option list");
     }
 
     #[test]

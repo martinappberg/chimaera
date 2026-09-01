@@ -5,22 +5,27 @@
 //   - keystroke echo RTT on the visible terminal, idle vs under flood
 // Findings + fix plan: docs/perf-remote-plan.md
 // Usage: node scripts/perf/tunnel-gauge.mjs <base> <token> <flood-count> <id> <id> ...
-//   PARK=1 …  sends {"type":"park"} on every parked socket before the flood
-//   (the R1 protocol): parked bytes should then be ~0, and the script unparks
-//   one flooded socket at the end to verify the resync+snapshot catch-up.
+//   PARK=1 …  parked sockets auth with {"parked": true} (the R2 attach — no
+//   snapshot) AND send {"type":"park"} before the flood (the R1 frames):
+//   parked bytes should then be ~0, and the script unparks one flooded
+//   socket at the end to verify the resync+snapshot catch-up repaint.
 const [base, token, floodCountStr, ...ids] = process.argv.slice(2);
 const floodCount = Number(floodCountStr);
 const usePark = process.env.PARK === "1";
 const wsBase = base.replace(/^http/, "ws");
 
 const sockets = [];
-function connect(id) {
+function connect(id, parked = false) {
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(`${wsBase}/ws/sessions/${id}`);
     ws.binaryType = "arraybuffer";
     const s = { id, ws, bytes: 0, frames: 0, ready: false, onOutput: null };
     ws.onopen = () =>
-      ws.send(JSON.stringify({ type: "auth", token, cols: 120, rows: 30 }));
+      ws.send(
+        parked
+          ? JSON.stringify({ type: "auth", token, parked: true })
+          : JSON.stringify({ type: "auth", token, cols: 120, rows: 30 }),
+      );
     ws.onmessage = (ev) => {
       if (typeof ev.data === "string") {
         const m = JSON.parse(ev.data);
@@ -57,21 +62,27 @@ async function echoRtt(s, probes, spacingMs) {
   // Clear the line so the shell prompt stays sane.
   s.ws.send(new TextEncoder().encode("\x15"));
   rtts.sort((a, b) => a - b);
+  if (rtts.length === 0) return { n: 0, error: "every probe timed out" };
   const pct = (p) => Math.round(rtts[Math.min(rtts.length - 1, Math.floor(rtts.length * p))] * 10) / 10;
   return { n: rtts.length, p50: pct(0.5), p95: pct(0.95), max: pct(0.999) };
 }
 
-async function exec(id, command, timeout_ms) {
-  // Fire-and-forget: don't await completion, just start it.
-  return fetch(`${base}/api/v1/sessions/${id}/exec`, {
+function exec(id, command, timeout_ms) {
+  // Fire-and-forget for real: the daemon's exec route responds only after
+  // the command COMPLETES, so awaiting it would run the whole flood before
+  // any "under-flood" measurement (the bug the first audit run shipped —
+  // its under-flood RTT was measured on an idle link).
+  fetch(`${base}/api/v1/sessions/${id}/exec`, {
     method: "POST",
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
     body: JSON.stringify({ command, timeout_ms }),
-  });
+  }).catch(() => {});
 }
 
 const t0 = performance.now();
-await Promise.all(ids.map(connect));
+// In PARK mode every non-visible socket attaches parked (R2): no snapshot,
+// no dims. The first id stays the visible control.
+await Promise.all(ids.map((id, i) => connect(id, usePark && i > 0)));
 console.log(`connected+ready ${sockets.length} session sockets in ${Math.round(performance.now() - t0)}ms`);
 
 const visible = sockets[0];
@@ -95,10 +106,10 @@ if (usePark) {
 for (const s of sockets) { s.bytes = 0; s.frames = 0; }
 const floodStart = performance.now();
 // ~40 MB of output per flooder, fast producer.
-await Promise.all(flooders.map((s) =>
-  exec(s.id, `yes "the quick brown fox jumps over the lazy dog 0123456789 abcdefghijklmnopqrstuvwxyz" | head -n 500000`, 60000),
-));
-console.log(`flood started in ${floodCount} parked terminals`);
+for (const s of flooders) {
+  exec(s.id, `yes "the quick brown fox jumps over the lazy dog 0123456789 abcdefghijklmnopqrstuvwxyz" | head -n 500000`, 60000);
+}
+console.log(`flood requested in ${floodCount} parked terminals`);
 await new Promise((r) => setTimeout(r, 3000)); // let it ramp
 const under = await echoRtt(visible, 30, 100);
 const floodWindowMs = performance.now() - floodStart;

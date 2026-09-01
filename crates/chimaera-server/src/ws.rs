@@ -44,6 +44,12 @@ const OUTPUT_COALESCE_WINDOW: Duration = Duration::from_millis(8);
 /// Byte ceiling for one coalesced output frame; a full batch flushes without
 /// waiting out the window.
 const OUTPUT_COALESCE_MAX_BYTES: usize = 32 * 1024;
+/// Unpark catch-up ceiling, in ring chunks: a parked connection whose
+/// backlog exceeds this repaints from the authoritative grid instead of
+/// replaying the ring — a long replay ships megabytes of scrollback the
+/// snapshot paints in kilobytes. 64 chunks ≈ ≤512 KiB worst case, aligned
+/// with the client pool's own parked-buffer bound.
+const UNPARK_REPLAY_MAX_CHUNKS: usize = 64;
 
 /// Accumulates broadcast output chunks into one WS frame. A single-chunk
 /// batch is sent as the original refcounted `Bytes` (zero-copy — the same
@@ -217,10 +223,15 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
                 {
                     return;
                 }
-                if socket
-                    .send(Message::Binary(Bytes::from(words.snapshot)))
-                    .await
-                    .is_err()
+                // A parked client discards any snapshot on this connection
+                // (its buffer desynced at the parked ready) and replays last
+                // words via the fresh visible attach its adopt makes — don't
+                // render bytes it is guaranteed to drop.
+                if !auth.parked
+                    && socket
+                        .send(Message::Binary(Bytes::from(words.snapshot)))
+                        .await
+                        .is_err()
                 {
                     return;
                 }
@@ -280,15 +291,18 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
     let mut output_open = true;
     let mut events_open = true;
     // Parked: output forwarding is off (the select arm below is disabled),
-    // and the session's bounded broadcast ring holds the stream — shared
-    // with every attachment, so parking costs no extra daemon memory.
+    // and the session's bounded broadcast ring holds the stream. The ring is
+    // shared by every attachment, so N parked windows don't multiply it —
+    // but a non-consuming receiver does keep the ring's rolling window of
+    // recent chunks alive (bounded at OUTPUT_CHANNEL_CAPACITY × chunk size;
+    // the same retention any slow attachment already imposes, freed as the
+    // ring wraps).
     let mut parked = auth.parked;
-    // The client has a current grid (initial snapshot or a later repaint).
-    // False for a parked attach until its first unpark repaints.
-    let mut snapshot_sent = !auth.parked;
-    // A foreign resize landed while parked: the ring's bytes predate the
-    // reflow and are unreplayable — unpark must repaint, not resume.
-    let mut parked_stale = false;
+    // The next unpark must repaint instead of resuming the ring: the client
+    // has no grid yet (parked attach — no snapshot was sent), or the grid
+    // reflowed while parked (foreign resize; a pending resync consumed by
+    // park), so the ring's bytes cannot catch it up. True only while parked.
+    let mut unpark_repaint = auth.parked;
     // Dims this connection itself asked for. Its xterm reflowed natively when
     // it resized, so a Resized event echoing these back needs no repaint —
     // resyncing the initiator is exactly the "terminal resets when I change
@@ -320,7 +334,6 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
                             &mut batch, &mut flush_at, &mut output_open).await {
                     return;
                 }
-                snapshot_sent = true;
             },
             _ = &mut flush_sleep, if flush_at.is_some() => {
                 if batch.is_empty() {
@@ -359,7 +372,6 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
                                     &mut batch, &mut flush_at, &mut output_open).await {
                             return;
                         }
-                        snapshot_sent = true;
                     } else {
                         let closed = matches!(drain_err, Some(TryRecvError::Closed));
                         if flush_at.is_none() || batch.is_full() || closed {
@@ -386,7 +398,6 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
                                 &mut batch, &mut flush_at, &mut output_open).await {
                         return;
                     }
-                    snapshot_sent = true;
                 }
                 Err(RecvError::Closed) => {
                     // The child died inside a window: the batched tail is its
@@ -404,22 +415,14 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
                         chimaera_pty::SessionEvent::Resized { cols, rows } => Some((*cols, *rows)),
                         _ => None,
                     };
-                    // A parked client's [exited] must still show the last
-                    // words: the withheld tail sits in the ring — drain it
-                    // into the batch (bounded by the ring's capacity) so the
-                    // ordered send below flushes it ahead of the event. A
-                    // ring overflow while parked loses the oldest bytes;
-                    // the tail that fits is still the honest final screen.
-                    if parked && matches!(event, chimaera_pty::SessionEvent::Exited { .. }) {
-                        while let Ok(bytes) = attachment.output.try_recv() {
-                            batch.push(bytes);
-                            // Flush in bounded slices — a full ring must not
-                            // concatenate into one giant frame allocation.
-                            if batch.is_full() && !send_batch(&mut socket, &mut batch).await {
-                                return;
-                            }
-                        }
-                    }
+                    // Exited while parked: do NOT drain the ring here. The
+                    // Exited broadcast races the reader thread's final bytes
+                    // (session.rs sends the event, then sleeps, then reaps),
+                    // and a lagged/overflowing ring cannot promise a coherent
+                    // escape stream anyway. The honest final screen comes
+                    // from the last-words replay: the client latches its
+                    // parked buffer desynced on an exit while parked, and
+                    // adopt resyncs into a fresh attach that replays it.
                     match serde_json::to_value(&event) {
                         Ok(value) => {
                             // Ordered send: batched output first, so an event
@@ -440,7 +443,7 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
                     if let Some(dims) = resized_to {
                         if client_dims != Some(dims) {
                             if parked {
-                                parked_stale = true;
+                                unpark_repaint = true;
                             } else {
                                 let at = tokio::time::Instant::now() + RESYNC_DEBOUNCE;
                                 resync_sleep.as_mut().reset(at);
@@ -498,23 +501,29 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
                                 // A pending foreign-resize repaint defers to
                                 // the unpark repaint.
                                 if resync_at.take().is_some() {
-                                    parked_stale = true;
+                                    unpark_repaint = true;
                                 }
                             }
                         }
                         Ok(ClientMessage::Unpark) => {
                             if parked {
                                 parked = false;
-                                if !snapshot_sent || parked_stale {
-                                    // Never snapshotted (parked attach), or
-                                    // the grid reflowed while parked: the
-                                    // ring cannot catch this client up.
-                                    parked_stale = false;
+                                // Repaint when the ring can't (or shouldn't)
+                                // catch the client up: no grid yet / reflow
+                                // while parked, or a backlog past the replay
+                                // ceiling — one snapshot paints in KBs what
+                                // a long replay ships in MBs. len() counts
+                                // sent-minus-received (it can exceed the
+                                // ring's capacity when lagged), which is
+                                // exactly the "too much happened" signal.
+                                if unpark_repaint
+                                    || attachment.output.len() > UNPARK_REPLAY_MAX_CHUNKS
+                                {
+                                    unpark_repaint = false;
                                     if !repaint(&mut socket, &id, &state, &mut attachment,
                                                 &mut batch, &mut flush_at, &mut output_open).await {
                                         return;
                                     }
-                                    snapshot_sent = true;
                                 }
                                 // Otherwise the re-enabled output arm resumes
                                 // from the ring; an overflow surfaces as

@@ -59,7 +59,10 @@ more busy terminals streaming invisibly, and on a slow uplink (hotel wifi, VPN,
 LTE) F3+F4's tens of Mbit/s will saturate the tunnel — at which point
 keystrokes and every UI fetch queue behind the flood and *everything* goes
 clunky at once. (Saturation was not reproducible on the fast measured link;
-listed as the expected failure mode, not a measured one.)
+listed as the expected failure mode, not a measured one. Post-review correction: the gauge's
+original "under-flood" echo probe ran AFTER the flood — the exec route responds only on command
+completion and the script awaited it — so "no HOL degradation observed" was measured on an idle
+link and is retracted as unverified; the gauge now fires floods without awaiting.)
 
 ## Fix plan
 
@@ -67,17 +70,26 @@ Ordered by leverage. Each lands with a before/after run of the tunnel gauge
 (`scripts/perf/tunnel-gauge.mjs` — the harness that produced the numbers above;
 `PARK=1` exercises the R1 protocol).
 
-**R1 — park/unpark on `/ws/sessions/{id}` (daemon + client pool). SHIPPED.**
-The pool sends `{"type":"park"}` when it stashes an entry and
-`{"type":"unpark"}` on adopt. Parked, the server disables the output select
-arm — the session's bounded broadcast ring (shared by every attachment, so
-parking costs no extra daemon memory) becomes the catch-up buffer; events
-still flow, an exit drains the withheld tail first (bounded slices), and a
-foreign resize defers its repaint to unpark. Unpark re-enables the arm: the
-ring replays contiguously, and an overflow surfaces as `Lagged` and repaints
-through the existing path. Wire-compat is graceful both ways: old servers
-ignore unknown client text frames (the client-side ParkedBuffer still absorbs
-their stream); old clients never send park and get today's behavior.
+**R1 — park/unpark on `/ws/sessions/{id}` (daemon + client pool). SHIPPED
+(hardened in review).** The pool sends `{"type":"park"}` when it stashes an
+entry and `{"type":"unpark"}` on adopt. Parked, the server disables the
+output select arm — the session's bounded broadcast ring becomes the catch-up
+buffer (shared by every attachment; a non-consuming receiver does pin the
+ring's rolling window of recent chunks, the same bounded retention any slow
+attachment already imposes). Events still flow; an exit while parked sends
+`exited` WITHOUT draining the ring (the exit broadcast races the PTY
+reader's final bytes, and a lagged ring can't produce a coherent stream —
+the client latches desynced instead and its adopt resyncs into the
+last-words replay, the authoritative final screen); a foreign resize defers
+its repaint to unpark. Unpark re-enables the arm: small backlogs replay from
+the ring, anything past `UNPARK_REPLAY_MAX_CHUNKS` (or a reflow, or a
+never-sent snapshot) repaints — one snapshot instead of a megabyte replay.
+Wire-compat is graceful both ways: old servers ignore unknown client text
+frames (the client-side ParkedBuffer still absorbs their stream); old
+clients never send park and get today's behavior. Pinned by two server-side
+protocol tests in `tests/ws.rs` (parked attach withholds until the unpark
+repaint; a live park stops output and a small backlog resumes from the
+ring).
 
 **R2 — attach-parked (no initial snapshot for hidden terminals). SHIPPED.**
 `auth` gains `parked: true`: the server attaches via `attach_quiet` (subscribe
@@ -113,7 +125,11 @@ audit session: compression is negotiated at master creation, the live master
 predated the option, and a fresh connection needs an interactive Duo auth.
 Rationale stands on the traffic shape (terminal text and escape-sequence
 snapshots compress enormously; zlib CPU measured negligible at these rates);
-if a fast-LAN workflow ever regresses, this is one line to revert.
+if a fast-LAN workflow ever regresses, this is one line to revert. Two
+operational notes: an already-running master (ControlPersist keeps them for
+10m past last use) ignores the option for its whole life — the win only
+lands on freshly created masters — and the option also rides `scp` of the
+release binary (mildly compressible; harmless).
 
 **Non-goals:** transport replacement (QUIC/mosh-style datagrams) and HTTP/2 for
 the tunnel (browsers require TLS for h2; a localhost-tunnel TLS story costs

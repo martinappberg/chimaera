@@ -15,6 +15,14 @@
 
 import { writable, type Readable } from "svelte/store";
 
+/**
+ * Above this estimate a remote window wears the RTT in its host chip. Kept
+ * beside the estimator (with localEcho's LOCAL_ECHO_MIN_RTT_MS as its
+ * sibling threshold) so the two halves of "this link is slow" are tuned
+ * together: the badge appears before prediction arms.
+ */
+export const LINK_RTT_BADGE_MS = 30;
+
 const WINDOW = 8;
 
 const samples: number[] = [];

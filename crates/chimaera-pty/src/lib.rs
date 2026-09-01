@@ -127,7 +127,9 @@ pub struct Attachment {
     pub info: SessionInfo,
     /// ANSI escape stream reconstructing the session's current screen state
     /// (scrollback, visible grid, SGR attributes, cursor, title) in a fresh
-    /// terminal of `info.cols` x `info.rows`.
+    /// terminal of `info.cols` x `info.rows`. Empty for an `attach_quiet`
+    /// attachment — a parked client renders nothing until its first unpark
+    /// repaints via a full `attach`.
     pub snapshot: Vec<u8>,
     pub output: tokio::sync::broadcast::Receiver<bytes::Bytes>,
     pub events: tokio::sync::broadcast::Receiver<SessionEvent>,
@@ -224,10 +226,7 @@ impl SessionManager {
     /// snapshot of the current screen state. Multiple concurrent attachments
     /// are allowed; sessions run fine with zero attachments.
     pub fn attach(&self, id: &str) -> anyhow::Result<Attachment> {
-        let session = self
-            .session(id)
-            .ok_or_else(|| anyhow!("unknown session: {id}"))?;
-        Ok(session.attach())
+        Ok(self.require(id)?.attach())
     }
 
     /// Attach without rendering a snapshot (`snapshot` comes back empty) —
@@ -235,10 +234,13 @@ impl SessionManager {
     /// `attach()` when first shown. Skips the ~95 ms full-scrollback render
     /// under the term lock and the snapshot bytes on the wire.
     pub fn attach_quiet(&self, id: &str) -> anyhow::Result<Attachment> {
-        let session = self
-            .session(id)
-            .ok_or_else(|| anyhow!("unknown session: {id}"))?;
-        Ok(session.attach_quiet())
+        Ok(self.require(id)?.attach_quiet())
+    }
+
+    /// Registry lookup with the shared unknown-session error.
+    fn require(&self, id: &str) -> anyhow::Result<Arc<session::Session>> {
+        self.session(id)
+            .ok_or_else(|| anyhow!("unknown session: {id}"))
     }
 
     /// Resize the PTY and the server-side terminal together. The last resize

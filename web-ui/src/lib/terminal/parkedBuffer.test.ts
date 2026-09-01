@@ -136,7 +136,15 @@ describe("ParkedBuffer", () => {
     buf.binary(a);
     buf.binary(b);
     expect(buf.exited()).toEqual([a, b]);
-    // The tail was flushed at exit time; adopt has nothing left to do.
+    // A parked exit cannot trust the buffer to be the complete tail (a
+    // park-aware server withheld output): adopt resyncs into the server's
+    // last-words replay for the authoritative final screen.
+    expect(buf.adopt()).toEqual({ flush: [], resync: true });
+  });
+
+  it("a visible exit stays in sync (no resync on adopt)", () => {
+    const buf = new ParkedBuffer(MAX);
+    expect(buf.exited()).toEqual([]);
     expect(buf.adopt()).toEqual({ flush: [], resync: false });
   });
 

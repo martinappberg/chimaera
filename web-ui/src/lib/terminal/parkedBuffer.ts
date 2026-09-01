@@ -122,8 +122,12 @@ export class ParkedBuffer {
 
   /**
    * The session exited. Returns the buffered tail to flush (the last words)
-   * — empty when the stream was already discarded, in which case the entry
-   * stays desynced and adopt resyncs into the server's last-words replay.
+   * — empty when the stream was already discarded. Either way a PARKED exit
+   * latches desynced: a park-aware server withholds output while parked, so
+   * the buffer cannot be trusted to hold the complete tail (and the exit
+   * event can even outrun the PTY's final bytes server-side) — adopt
+   * resyncs into the server's last-words replay, which IS the final screen.
+   * A visible exit flushes and stays in sync, as before.
    */
   exited(): Uint8Array[] {
     if (this.awaitingSnapshot) {
@@ -135,6 +139,7 @@ export class ParkedBuffer {
     if (this.desynced) return [];
     const flush = this.chunks;
     this.discard();
+    this.desynced = this.parked;
     return flush;
   }
 
