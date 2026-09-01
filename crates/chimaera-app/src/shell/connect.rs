@@ -124,7 +124,7 @@ pub(super) fn state_for(
 /// joined flights: a caller may still hold an old daemon token even though
 /// another window already rebuilt the shared tunnel.
 async fn publish_connected_state(app: &AppHandle, state: &Shell, alias: &str) -> Option<HostState> {
-    let entry = host_entry(alias);
+    let entry = host_entry(alias).await;
     let (reply, event) = {
         let tunnels = state.tunnels.lock().await;
         let tunnel = tunnels.get(alias)?;
@@ -175,15 +175,20 @@ async fn run_connect(
             Phase::Starting => "starting",
             Phase::Tunneling { .. } => "tunneling",
         };
-        let _ = progress_app.emit(
-            "connect-progress",
-            ConnectProgress {
-                alias: progress_alias.clone(),
-                phase,
-            },
-        );
+        emit_progress(&progress_app, &progress_alias, phase);
     })
     .await
+}
+
+/// One `connect-progress` event: the phase label a host row shows.
+fn emit_progress(app: &AppHandle, alias: &str, phase: &'static str) {
+    let _ = app.emit(
+        "connect-progress",
+        ConnectProgress {
+            alias: alias.to_string(),
+            phase,
+        },
+    );
 }
 
 /// The connect flow behind the `connect_host` command, callable from
@@ -317,9 +322,11 @@ async fn run_flight(
         }
         None => None,
     };
-    let entry = HostsStore::load_default()
-        .add(alias, None)
-        .map_err(|e| format!("{e:#}"))?;
+    let entry = {
+        let alias = alias.to_string();
+        with_hosts(move |hosts| hosts.add(&alias, None)).await?
+    }
+    .map_err(|e| format!("{e:#}"))?;
     let result = run_connect(app, alias, &entry, reuse_port, update_daemon).await;
     // The reused port was free a moment ago (we just cancelled the forward),
     // but socket teardown can lag; fall back to an OS-assigned port so a
@@ -339,7 +346,11 @@ async fn run_flight(
     };
 
     let tunnel = result.map_err(|e| format!("{e:#}"))?;
-    if let Err(e) = HostsStore::load_default().record_connected(alias) {
+    let stamped = {
+        let alias = alias.to_string();
+        with_hosts(move |hosts| hosts.record_connected(&alias)).await
+    };
+    if let Err(e) = stamped.and_then(|saved| saved.map_err(|e| format!("{e:#}"))) {
         tracing::debug!("could not record host {alias}: {e}");
     }
     authorize_scope_origin(app, Some(alias), tunnel.local_port)
@@ -387,15 +398,30 @@ fn reopen_windows(app: &AppHandle, alias: &str, port: u16, token: &str) {
     }
 }
 
-fn host_entry(alias: &str) -> chimaera_remote::hosts::HostEntry {
-    HostsStore::load_default()
-        .get(alias)
+async fn host_entry(alias: &str) -> chimaera_remote::hosts::HostEntry {
+    let owned = alias.to_string();
+    with_hosts(move |hosts| hosts.get(&owned))
+        .await
+        .ok()
+        .flatten()
         .unwrap_or(chimaera_remote::hosts::HostEntry {
             alias: alias.to_string(),
             binary: None,
             added_at: 0,
             last_connected_at: None,
         })
+}
+
+/// One load → mutate → save against hosts.json, off the reactor. `HostsStore`
+/// is plain `std::fs` (a read, then an atomic tmp + rename write), and its
+/// callers — IPC commands and connect flights — run on the tokio reactor,
+/// where a slow home directory would stall every other tunnel op.
+pub(super) async fn with_hosts<T: Send + 'static>(
+    f: impl FnOnce(&mut HostsStore) -> T + Send + 'static,
+) -> Result<T, String> {
+    tokio::task::spawn_blocking(move || f(&mut HostsStore::load_default()))
+        .await
+        .map_err(|e| format!("hosts.json task failed: {e}"))
 }
 
 #[cfg(test)]
