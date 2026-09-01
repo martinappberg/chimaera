@@ -10,6 +10,7 @@
     isHomeHub,
     leaveHomeHub,
     setDetachedWindow,
+    clearUnauthorized,
     notifyUnauthorized,
     pollHealth,
     reclaimHomeHub,
@@ -485,8 +486,14 @@
         buildMoved ? "build" : "connection",
         `http://127.0.0.1:${port ?? location.port}/#${params.toString()}`,
       );
-    } else if (buildMoved) {
-      requireAssetNavigation("build", null);
+    } else {
+      // Neither port nor token moved: the heal was IN PLACE and nothing
+      // navigates, so this is the one path that must release a latched 401
+      // itself. A moved token stays dead until the reload lands — blocked on
+      // unsaved work or not — so releasing there would only burn a slot on a
+      // doomed reconnect.
+      closeUnauthorizedReconnect();
+      if (buildMoved) requireAssetNavigation("build", null);
     }
   }
 
@@ -502,6 +509,32 @@
       beginReconnect("The remote daemon changed credentials; reconnecting will refresh this window."),
     );
   });
+  /** Minimum spacing between releases of the 401 latch. A daemon that keeps
+   *  rejecting this token while the shell keeps reporting `connected` would
+   *  otherwise loop 401 → reconnect → release → 401; with the damp an
+   *  episode gets at most two automatic rounds, then the latch parks with
+   *  the ambient Retry until a manual retry. */
+  const UNAUTHORIZED_REARM_MS = 30_000;
+  let lastUnauthorizedReconnectAt: number | null = null;
+  /** The shell reported `connected` on the SAME port + token while a 401
+   *  was latched: an in-place heal, which never navigates, so the latch
+   *  must be released here — or the "needs fresh credentials" chip outlives
+   *  a working window — and the one-shot above re-armed, or the next daemon
+   *  restart's 401 gets no automatic recovery. Only `handleHostStatus`'s
+   *  no-move branch calls this; a moved token is dead until its reload. */
+  function closeUnauthorizedReconnect(): void {
+    if (!$unauthorized) return;
+    const now = Date.now();
+    if (
+      lastUnauthorizedReconnectAt !== null &&
+      now - lastUnauthorizedReconnectAt < UNAUTHORIZED_REARM_MS
+    ) {
+      return;
+    }
+    lastUnauthorizedReconnectAt = now;
+    clearUnauthorized();
+    handledRemoteUnauthorized = false;
+  }
 
   // `/ws/events` owns its own backoff and is not SSH liveness: it can restart
   // while authenticated HTTP remains healthy. Only the shell's consecutive
