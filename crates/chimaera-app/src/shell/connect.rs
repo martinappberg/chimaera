@@ -340,7 +340,14 @@ async fn run_flight(
     // `-O exit`ed. A user-initiated connect over a healthy tunnel never
     // pays it.
     let suspect = lock(&state.wedge_suspects).contains(alias);
-    if (suspect || old.is_none()) && chimaera_remote::clear_wedged_master(alias).await {
+    // A confirmed-down alias gets the short session bound (the node load that
+    // made the health probes miss is the same load that slows `true`); a
+    // flight with no verdict — launch restore, a click on a warm master —
+    // gets twice that, so a merely loaded node never costs a healthy master.
+    let session_bound = if suspect { 15 } else { 30 };
+    if (suspect || old.is_none())
+        && chimaera_remote::clear_wedged_master(alias, session_bound).await
+    {
         tracing::info!("cleared a wedged ControlMaster to {alias} before reconnecting");
         drop_compute_tunnels_of(app, &state, alias).await;
     }
@@ -466,7 +473,7 @@ async fn drop_compute_tunnels_of(app: &AppHandle, state: &Shell, alias: &str) {
                 token: None,
                 error: None,
                 reason: Some(
-                    "The login host's ssh connection was reset after a link loss; this job's                      tunnel went with it and reconnects through the new one."
+                    "The login host's ssh connection was reset after a link loss; this job's tunnel went with it and reconnects through the new one."
                         .to_string(),
                 ),
                 build: None,

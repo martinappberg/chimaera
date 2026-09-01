@@ -110,7 +110,9 @@ a `RemoteOps` trait. See also [native-app.md](native-app.md) for the windows/hos
   BEFORE tearing the old tunnel down (that teardown's `-O cancel` would hang on the wedge): `ssh -O
   check` (a mux control request the master answers from its local event loop — instant even on a
   dead link; unanswered within 10 s = "could not tell", left alone), then a `BatchMode`
-  `ssh host true` bounded at 15 s (one `ServerAliveInterval`); a stall OR a fast failure →
+  `ssh host true` bounded at 15 s (one `ServerAliveInterval`) for a confirmed suspect, 30 s for a
+  flight with no verdict at all (a launch restore, a click on a warm master) so a merely loaded
+  node never costs a healthy master and its Duo session; a stall OR a fast failure →
   `ssh -O exit`, so the connect dials a fresh master (one prompt, like a first connect), and that
   alias's compute-job tunnels — their forwards rode the same master — are dropped and told `down`
   at once. A link that answers → left alone; a user-initiated connect over a healthy tunnel never

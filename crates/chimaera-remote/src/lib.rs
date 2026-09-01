@@ -599,7 +599,13 @@ async fn cancel_master_forward(host: &str, spec: &str) {
 /// confirms a tunnel down — a false positive here kills a healthy master,
 /// forcing the Duo re-auth the master exists to avoid and dropping that
 /// alias's compute forwards.
-pub async fn clear_wedged_master(host: &str) -> bool {
+/// `session_bound_secs` is how long the session-open test may take before
+/// the master is declared wedged: 15 s when the health monitor already
+/// confirmed the tunnel down (that same node load produced the misses), but
+/// longer when there is no verdict at all — a launch-time restore or a click
+/// on a host whose warm master merely sits on a loaded node must not lose
+/// its master (and its Duo session) to a slow `true`.
+pub async fn clear_wedged_master(host: &str, session_bound_secs: u64) -> bool {
     match bounded_mux_ssh(host, &["-O", "check"], &[], 10).await {
         // No master (or ssh cannot even run): nothing to clear.
         Some(false) => return false,
@@ -616,7 +622,7 @@ pub async fn clear_wedged_master(host: &str) -> bool {
     // either way — a stall (dead link) or a fast failure ("read from master
     // failed" from one mid-teardown) — and the flight would otherwise dial
     // it under 240 s bounds.
-    if bounded_mux_ssh(host, &[], &["true"], 15).await == Some(true) {
+    if bounded_mux_ssh(host, &[], &["true"], session_bound_secs).await == Some(true) {
         return false;
     }
     match bounded_mux_ssh(host, &["-O", "exit"], &[], 5).await {
@@ -908,7 +914,23 @@ async fn resolve_daemon(
                     ops.stop_remote(host, m.pid).await?;
                     ops.deploy_binary(host, &bin, progress).await?;
                     progress(Phase::Starting);
-                    ops.start_remote(host).await?
+                    let started = ops.start_remote(host).await?;
+                    // A stop whose exit went unconfirmed (a link blip during
+                    // the wait) leaves the old daemon serving: the new one
+                    // refuses to start beside it and the wait hands back the
+                    // OLD manifest. That is a working daemon, so connect to
+                    // it — but as outdated, never as a completed update.
+                    if started.pid == m.pid
+                        || !chimaera_core::builds_match(local_build, started.build.as_deref())
+                    {
+                        tracing::warn!(
+                            "daemon on {host} was not replaced — the previous build (pid {}) is still serving; connecting to it as outdated",
+                            started.pid
+                        );
+                        outdated = true;
+                        live_sessions = sessions;
+                    }
+                    started
                 }
                 Decision::ConnectOutdated => {
                     tracing::info!(
@@ -1004,11 +1026,6 @@ pub async fn remote_manifest(host: &str, home: RemoteHome) -> anyhow::Result<Opt
     Ok(serde_json::from_str(text.trim()).ok())
 }
 
-/// Whether `pid` is alive on the host (signal 0 probe over ssh).
-pub async fn remote_alive(host: &str, pid: u32) -> anyhow::Result<bool> {
-    ssh_check(host, &sh_wrap(&format!("kill -0 {pid} 2>/dev/null"))).await
-}
-
 /// Frame the manifest in [`remote_probe`] / [`start_remote`] output on BOTH
 /// sides: an echoing `~/.bashrc` under non-interactive ssh (common on HPC)
 /// puts noise before AND after a script's output, so the client parses
@@ -1067,7 +1084,7 @@ fn sh_wrap(script: &str) -> String {
 
 /// Fetch the manifest under `home` AND whether its recorded pid answers
 /// `kill -0`, in ONE remote exec — the decision phase's whole probe.
-/// [`remote_manifest`] + [`remote_alive`] cost two serial execs, and every
+/// [`remote_manifest`] + a `kill -0` exec cost two serial round trips, and every
 /// exec through the ControlMaster is a channel-open RTT plus a remote fork
 /// (~300-500 ms on a loaded login node at WAN latency); computing the alive
 /// flag remotely halves the probe's wall time. `None` = no readable manifest
@@ -2037,12 +2054,6 @@ async fn wait_for_port(port: u16, tunnel: &mut Child) -> anyhow::Result<bool> {
 /// (password / Duo) for up to its 180s window — a tighter bound here would
 /// cut users off mid-typing.
 const SSH_ONESHOT_SECS: u64 = 240;
-
-/// Run a remote command, treating its exit status as a boolean.
-async fn ssh_check(host: &str, cmd: &str) -> anyhow::Result<bool> {
-    let output = output_bounded(ssh_cmd(host).arg(cmd), SSH_ONESHOT_SECS, "ssh").await?;
-    Ok(output.status.success())
-}
 
 /// Run a remote command, failing loudly if it does not exit 0.
 async fn ssh_run(host: &str, cmd: &str) -> anyhow::Result<()> {
@@ -3513,7 +3524,7 @@ mod tests {
             alive: true,
             sessions: Some(3),
             resolved_bin: PathBuf::from("/unused"),
-            start_manifest: fake_manifest(Some("fresh.1"), 999),
+            start_manifest: fake_manifest(Some(chimaera_core::BUILD_ID), 999),
         };
         let ((manifest, outdated, live), phases) = run_resolve(&fake, false).await;
         assert_eq!(manifest.pid, 42, "returns the probed daemon");
@@ -3536,7 +3547,7 @@ mod tests {
             alive: true,
             sessions: Some(0),
             resolved_bin: PathBuf::from("/tmp/chimaera"),
-            start_manifest: fake_manifest(Some("fresh.1"), 999),
+            start_manifest: fake_manifest(Some(chimaera_core::BUILD_ID), 999),
         };
         let ((manifest, outdated, live), phases) = run_resolve(&fake, false).await;
         assert_eq!(manifest.pid, 999, "returns the freshly started daemon");
@@ -3568,7 +3579,7 @@ mod tests {
             alive: true,
             sessions: Some(5),
             resolved_bin: PathBuf::from("/tmp/chimaera"),
-            start_manifest: fake_manifest(Some("fresh.1"), 999),
+            start_manifest: fake_manifest(Some(chimaera_core::BUILD_ID), 999),
         };
         let ((manifest, outdated, _live), phases) = run_resolve(&fake, true).await;
         assert_eq!(manifest.pid, 999);
@@ -3587,6 +3598,33 @@ mod tests {
         assert_eq!(phases, vec!["probing", "updating", "starting"]);
     }
 
+    /// Update whose stop went unconfirmed: the start-wait hands back the OLD
+    /// daemon's manifest (same pid, old build) because the new one refused to
+    /// start beside it. That is a working daemon, so connect — but report it
+    /// as outdated with its live count, never as a completed update.
+    #[tokio::test]
+    async fn resolve_daemon_update_that_did_not_replace_reports_outdated() {
+        let fake = FakeOps {
+            calls: RefCell::new(Vec::new()),
+            probe_manifest: Some(fake_manifest(Some("old.1"), 42)),
+            alive: true,
+            sessions: Some(0),
+            resolved_bin: PathBuf::from("/tmp/chimaera"),
+            start_manifest: fake_manifest(Some("old.1"), 42),
+        };
+        let ((manifest, outdated, live), phases) = run_resolve(&fake, false).await;
+        assert_eq!(
+            manifest.pid, 42,
+            "connects to the daemon that is actually serving"
+        );
+        assert!(
+            outdated,
+            "an update that left the old build serving is not a success"
+        );
+        assert_eq!(live, Some(0));
+        assert_eq!(phases, vec!["probing", "updating", "starting"]);
+    }
+
     /// ConnectOutdated: a build mismatch with live sessions and no forced
     /// update attaches to the old daemon as-is — surfacing the mismatch and the
     /// live count, with no stop/deploy/start and only the probe phase.
@@ -3598,7 +3636,7 @@ mod tests {
             alive: true,
             sessions: Some(2),
             resolved_bin: PathBuf::from("/unused"),
-            start_manifest: fake_manifest(Some("fresh.1"), 999),
+            start_manifest: fake_manifest(Some(chimaera_core::BUILD_ID), 999),
         };
         let ((manifest, outdated, live), phases) = run_resolve(&fake, false).await;
         assert_eq!(manifest.pid, 42, "attaches to the old daemon");
@@ -3622,7 +3660,7 @@ mod tests {
             alive: false,
             sessions: None,
             resolved_bin: PathBuf::from("/unused"),
-            start_manifest: fake_manifest(Some("fresh.1"), 999),
+            start_manifest: fake_manifest(Some(chimaera_core::BUILD_ID), 999),
         };
         let ((manifest, outdated, live), phases) = run_resolve(&fake, false).await;
         assert_eq!(manifest.pid, 999);
@@ -3649,7 +3687,7 @@ mod tests {
             alive: false,
             sessions: None,
             resolved_bin: PathBuf::from("/unused"),
-            start_manifest: fake_manifest(Some("fresh.1"), 999),
+            start_manifest: fake_manifest(Some(chimaera_core::BUILD_ID), 999),
         };
         let ((manifest, _outdated, _live), phases) = run_resolve(&fake, false).await;
         assert_eq!(manifest.pid, 999);
