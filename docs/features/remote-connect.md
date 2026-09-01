@@ -78,7 +78,10 @@ a `RemoteOps` trait. See also [native-app.md](native-app.md) for the windows/hos
   (`http_alive_authed`), so a 401 or a foreign service on a recycled port cannot be mistaken for the
   intended daemon. The monitor probes hosts concurrently — one slow cluster cannot delay another —
   and needs three consecutive misses before publishing `down`; one timeout is only suspicion and a
-  success resets it. Results from an endpoint replaced while its probe was in flight are discarded.
+  success resets it. Once a tunnel is confirmed down its probe interval doubles per miss (3 s → 30 s
+  cap) so a dead host does not cost a failed 2 s probe every tick forever; any success, a replacing
+  connect flight, or an external proof restores the every-tick cadence. Results from an endpoint
+  replaced while its probe was in flight are discarded.
   Every successful connect republishes the tunnel's current port, token, and build even when it only
   reused a healthy tunnel, so a window holding credentials from before another window's reconnect
   can re-home.

@@ -37,7 +37,7 @@ in-app SSH askpass, a signed auto-updater). Parent map: repo-root
 | `shell.rs` | Module root: app-global `Shell` state, `WindowScope`, `lock`, and the Tauri `Builder` assembly (`run`). Re-exports `open_ui_window`. |
 | `shell/commands.rs` | The IPC command surface (`#[tauri::command]` fns wired into `generate_handler!`) — thin delegators. |
 | `shell/connect.rs` | The `connect` flight state machine (one coalesced ssh attempt per host) + the host-row wire vocabulary (`HostState`/`HostStatus`). |
-| `shell/restore.rs` | `open_ui_window`, the tunnel health monitor, and launch-time window restore. |
+| `shell/restore.rs` | `open_ui_window`, the tunnel health monitor (3-miss hysteresis; confirmed-down tunnels back off 3 s → 30 s), and launch-time window restore. |
 | `daemon.rs` | Launch/adopt the local daemon; version/parity policy (unix: spawn-self; windows: delegates to `wsl.rs`). |
 | `wsl.rs` | The WSL2 engine: registry-first detection + version gate, hardened wsl.exe spawns, the persisted target (distro + PINNED `-u` user — wsl.json), provision/replace/spawn/probe/stop, connect wiring (pure parts unit-tested on any host; e2e via wsl-smoke). Startup only ADOPTS; anything that provisions runs in the wizard, visibly. |
 | `assets/setup.html` | The Windows first-run wizard (shell-local page — no daemon origin exists yet to serve the real UI). |
