@@ -152,16 +152,28 @@ async fn ws_parked_attach_withholds_until_unpark_repaints() {
         }
     }
 
-    // The parked connection must have received NO frames beyond ready.
-    let quiet = tokio::time::timeout(std::time::Duration::from_millis(300), async {
+    // The parked connection must receive NO output (binary) frames and no
+    // resync. Events still flow by design — cheap JSON like the `title`
+    // frame the CI runner's bash PROMPT_COMMAND emits — so drain text
+    // frames for the quiet window instead of asserting total silence.
+    let quiet_until = tokio::time::Instant::now() + std::time::Duration::from_millis(300);
+    loop {
         use futures::StreamExt;
-        socket.next().await
-    })
-    .await;
-    assert!(
-        quiet.is_err(),
-        "a parked connection must stay silent; got {quiet:?}"
-    );
+        match tokio::time::timeout_at(quiet_until, socket.next()).await {
+            Ok(Some(Ok(WsMessage::Binary(bytes)))) => {
+                panic!(
+                    "a parked connection must withhold output; got {} bytes",
+                    bytes.len()
+                );
+            }
+            Ok(Some(Ok(WsMessage::Text(text)))) => {
+                let v = serde_json::from_str::<serde_json::Value>(&text).unwrap();
+                assert_ne!(v["type"], "resync", "no repaint may start while parked");
+            }
+            Ok(other) => panic!("unexpected frame while parked: {other:?}"),
+            Err(_) => break, // the quiet window elapsed with no output
+        }
+    }
 
     // Unpark: a parked attach has no grid yet, so the server repaints —
     // resync text frame, then the adjacent snapshot binary containing the
@@ -172,11 +184,20 @@ async fn ws_parked_attach_withholds_until_unpark_repaints() {
         ))
         .await
         .unwrap();
-    let resync = match next_ws_frame(&mut socket).await {
-        WsMessage::Text(text) => serde_json::from_str::<serde_json::Value>(&text).unwrap(),
-        other => panic!("expected resync text frame, got {other:?}"),
-    };
-    assert_eq!(resync["type"], "resync");
+    // Events queued before the unpark was processed (e.g. a title change)
+    // may precede the resync; the repaint's own resync + snapshot pair is
+    // adjacent once it starts.
+    loop {
+        match next_ws_frame(&mut socket).await {
+            WsMessage::Text(text) => {
+                let v = serde_json::from_str::<serde_json::Value>(&text).unwrap();
+                if v["type"] == "resync" {
+                    break;
+                }
+            }
+            other => panic!("expected text frames until resync, got {other:?}"),
+        }
+    }
     match next_ws_frame(&mut socket).await {
         WsMessage::Binary(bytes) => {
             let snapshot = String::from_utf8_lossy(&bytes).into_owned();
