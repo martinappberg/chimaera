@@ -947,10 +947,15 @@
   // A detached solo window badges only ITS OWN sessions: workspace-wide
   // attention is the main window's wayfinding, and a torn-off pane wearing
   // the whole roster's badge reads as a false alarm (found live).
+  // Alive-gated like the dashboard lane: the daemon keeps a crashed chat
+  // driver registered (alive:false, state errored) until the user deletes it,
+  // so its row still wears the red glyph — but nobody can answer a dead
+  // session, and a pill/title saying 1 while the dashboard says 0 is exactly
+  // the stale state this count exists to prevent.
   const needsYou = $derived.by(() => {
-    if (!detachedWindow) return wsSessions.filter(needsAttention).length;
+    if (!detachedWindow) return wsSessions.filter((s) => s.alive && needsAttention(s)).length;
     const mine = new Set(allSessionIds(layout));
-    return wsSessions.filter((s) => mine.has(s.id) && needsAttention(s)).length;
+    return wsSessions.filter((s) => s.alive && mine.has(s.id) && needsAttention(s)).length;
   });
 
   /** The focused pane is showing the dashboard (its rail row highlights). */
@@ -4915,15 +4920,22 @@
   </div>
 {/if}
 
-{#if reconnectSurface !== "hidden" && !$askpassActive && $assetTransition === null}
+{#if reconnectSurface !== "hidden" && !$askpassActive}
   <!-- An automatic reconnect is status, not a blocking decision: keep the
        rendered workbench readable while the tunnel heals. Only a failed
        attempt becomes a modal with Retry. A scoped askpass prompt temporarily
        owns this space when this host actually needs authentication. Dismissing
        a failure leaves a compact Retry surface: a native 401 must never become
-       an unrecoverable blank state. -->
+       an unrecoverable blank state. An asset-transition notice must not hide
+       it either: a build/connection transition blocked on unsaved work has no
+       dismiss and can sit there indefinitely, so the strip stacks below it. -->
   {#if reconnectSurface === "status"}
-    <div class="reconnect-status" role="status" aria-live="polite">
+    <div
+      class="reconnect-status"
+      class:stacked={$assetTransition !== null}
+      role="status"
+      aria-live="polite"
+    >
       <span class="reconnect-spinner" class:spin={reconnecting} aria-hidden="true"></span>
       <span class="reconnect-status-copy">
         <strong>{reconnecting ? `reconnecting to ${hostAlias}…` : `waiting for ${hostAlias}…`}</strong>
@@ -4960,7 +4972,12 @@
       </div>
     </div>
   {:else}
-    <div class="reconnect-status" role="status" aria-live="polite">
+    <div
+      class="reconnect-status"
+      class:stacked={$assetTransition !== null}
+      role="status"
+      aria-live="polite"
+    >
       <span class="reconnect-spinner" aria-hidden="true"></span>
       <span class="reconnect-status-copy">
         <strong>reconnect to {hostAlias}</strong>
@@ -6157,6 +6174,13 @@
     border-radius: 9px;
     box-shadow: 0 8px 28px color-mix(in srgb, var(--fg) 12%, transparent);
     animation: reconnect-in 0.1s ease-out;
+  }
+
+  /* The asset-transition notice docks in the same top-centre slot and a
+     blocked transition can sit there indefinitely, so the strip yields the
+     slot and drops below it rather than the two overlapping. */
+  .reconnect-status.stacked {
+    top: calc(14px + var(--notice-stack-offset));
   }
 
   .reconnect-status-copy {

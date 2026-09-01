@@ -233,7 +233,12 @@ export function dotState(s: Session): string {
   }
   switch (s.agent_state) {
     case "running":
-      return "alive";
+      // The hooks tier's inverse liveness check: a claude TUI that claims
+      // "running" but has been silent past the daemon's stall window is
+      // likely stale (a working TUI repaints constantly), so the dot goes
+      // honestly-unknown instead of a confident live accent. The record's
+      // claim itself is untouched — isBusy/needsAttention still read it.
+      return s.stalled === true ? "unk" : "alive";
     case "needs_permission":
     case "idle_prompt":
       return "attn";
@@ -299,7 +304,7 @@ function turnDotTitle(s: Session): string {
   }
   switch (s.agent_state) {
     case "running":
-      return "agent working";
+      return s.stalled === true ? "agent says working — no output for a while" : "agent working";
     case "needs_permission":
       return "needs permission";
     case "idle_prompt":
