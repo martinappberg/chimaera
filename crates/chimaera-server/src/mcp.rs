@@ -496,7 +496,7 @@ async fn tools_call(
     match name {
         "list_terminals" => Ok(list_terminals(state, agent_id)),
         "run_in_terminal" => Ok(run_in_terminal(state, agent_id, &args).await),
-        "read_terminal" => Ok(read_terminal(state, agent_id, &args)),
+        "read_terminal" => Ok(read_terminal(state, agent_id, &args).await),
         "workspace_status" | "read_session" | "list_changed_files" | "spawn_agent"
         | "spawn_terminal" | "message_agent" | "interrupt_agent" => {
             let Some(workspace) = workspace_of(state, agent_id) else {
@@ -615,7 +615,7 @@ async fn read_session(
             (v as usize).clamp(1, READ_SESSION_MAX)
         });
     if state.sessions.get(&sid).is_some() {
-        let screen = state.sessions.screen_text(&sid, lines).unwrap_or_default();
+        let screen = screen_text_blocking(state, sid, lines).await;
         return tool_text(if screen.trim().is_empty() {
             "(screen is empty)".to_string()
         } else {
@@ -1295,7 +1295,17 @@ async fn run_in_terminal(state: &Arc<AppState>, agent_id: &str, args: &Value) ->
     }
 }
 
-fn read_terminal(state: &AppState, agent_id: &str, args: &Value) -> Value {
+/// Render a session's screen text on the blocking pool: the render walks
+/// the grid under the term lock, which a flooding PTY reader contends for —
+/// never on a reactor worker.
+async fn screen_text_blocking(state: &AppState, id: String, lines: usize) -> String {
+    let sessions = state.sessions.clone();
+    tokio::task::spawn_blocking(move || sessions.screen_text(&id, lines).unwrap_or_default())
+        .await
+        .unwrap_or_default()
+}
+
+async fn read_terminal(state: &AppState, agent_id: &str, args: &Value) -> Value {
     let id = match resolve_linked(state, agent_id, args) {
         Ok(id) => id,
         Err(err) => return tool_error(err),
@@ -1305,10 +1315,7 @@ fn read_terminal(state: &AppState, agent_id: &str, args: &Value) -> Value {
         .and_then(|s| s.as_bool())
         .unwrap_or(false)
     {
-        let screen = state
-            .sessions
-            .screen_text(&id, SCREEN_LINES)
-            .unwrap_or_default();
+        let screen = screen_text_blocking(state, id, SCREEN_LINES).await;
         return tool_text(if screen.is_empty() {
             "(screen is empty)".to_string()
         } else {

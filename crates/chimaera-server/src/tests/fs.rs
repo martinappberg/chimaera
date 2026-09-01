@@ -715,27 +715,30 @@ fn quickopen_walk_guards_cap_entries_depth_and_time() {
     let far = std::time::Instant::now() + std::time::Duration::from_secs(60);
 
     // Entry cap: the walk stops at max_files entries (partial, not an error).
-    let files = quickopen::walk_bounded(&root, None, 3, quickopen::MAX_INDEX_DEPTH, far);
-    assert_eq!(files.len(), 3);
+    let walk = quickopen::walk_bounded(&root, None, 3, quickopen::MAX_INDEX_DEPTH, far);
+    assert_eq!(walk.files.len(), 3);
+    assert!(walk.partial);
 
     // Depth cap: max_depth levels of directories are read, nothing deeper.
     // With max_depth=2 the root and l1 are read (one.txt indexed), l2 is
     // recorded as an entry but never descended (two.txt absent).
-    let files = quickopen::walk_bounded(&root, None, 100_000, 2, far);
-    let names: Vec<&str> = files.iter().map(|f| f.name.as_str()).collect();
+    let walk = quickopen::walk_bounded(&root, None, 100_000, 2, far);
+    assert!(!walk.partial, "a depth cut is a bound, not a truncation");
+    let names: Vec<&str> = walk.files.iter().map(|f| f.name.as_str()).collect();
     assert!(names.contains(&"one.txt"), "{names:?}");
     assert!(names.contains(&"l2"), "{names:?}");
     assert!(!names.contains(&"two.txt"), "{names:?}");
 
     // Time cap: an already-expired deadline yields an empty (partial) index.
-    let files = quickopen::walk_bounded(
+    let walk = quickopen::walk_bounded(
         &root,
         None,
         100_000,
         quickopen::MAX_INDEX_DEPTH,
         std::time::Instant::now() - std::time::Duration::from_secs(1),
     );
-    assert!(files.is_empty());
+    assert!(walk.files.is_empty());
+    assert!(walk.partial);
 
     std::fs::remove_dir_all(&root).ok();
 }

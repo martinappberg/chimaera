@@ -34,8 +34,13 @@ pub const KILL_ESCALATION_GRACE: Duration = Duration::from_secs(2);
 
 /// Scrollback history kept per session.
 const SCROLLBACK_LINES: usize = 10_000;
-/// Capacity of the live-output broadcast channel (in chunks, not bytes).
-const OUTPUT_CHANNEL_CAPACITY: usize = 4096;
+/// Capacity of the live-output broadcast channel — in chunks, not bytes, so
+/// the memory bound is this × the 8 KiB read buffer: 8 MiB per session with
+/// at least one (possibly parked) receiver pinning the ring. The ring only
+/// serves catch-up; a receiver that falls further behind repaints from the
+/// server-side grid instead, so a deeper ring buys nothing but RSS (it was
+/// 4096 = 32 MiB/session, a fifth of the login-node budget each).
+const OUTPUT_CHANNEL_CAPACITY: usize = 1024;
 /// Capacity of the session-event broadcast channel.
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 /// Capacity of the stdin mpsc channel. Terminal WebSocket input is split into

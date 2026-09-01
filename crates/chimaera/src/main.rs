@@ -161,7 +161,17 @@ fn main() -> anyhow::Result<()> {
         .log_internal_errors(false)
         .init();
 
+    // A login node has 64-192 cores; tokio's default of one worker per core
+    // (plus up to 512 blocking threads) is the wrong shape for a daemon that
+    // measures <1 core steady-state — dozens of idle worker stacks and
+    // per-thread allocator heaps (87 threads observed on a 64-core node with
+    // six sessions), and a spiky blocking pool under repaint bursts. Four
+    // workers carry the async side (PTY reads run on their own threads); the
+    // blocking pool stays generous because file walks, snapshot renders and
+    // NFS stats park there and one wedged stat must not starve the rest.
     tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .max_blocking_threads(64)
         .enable_all()
         .build()?
         .block_on(dispatch(cli.command))

@@ -716,9 +716,20 @@ pub(crate) fn spawn_agent_watch(state: Arc<AppState>, session_id: String) {
     });
 }
 
+/// Bytes read per tail pass. A resumed claude session's transcript is often
+/// tens of MB and the first pass starts at offset 0; the watcher only needs
+/// the newest lines (titles, activity), never the history — so a delta past
+/// this cap skips ahead to its last `TAIL_READ_MAX` bytes instead of
+/// materializing the whole file (and its line copies) in daemon RSS.
+const TAIL_READ_MAX: u64 = 1024 * 1024;
+/// A single line past this is dropped: transcripts carry multi-MB tool
+/// outputs on one line, and nothing here needs them intact.
+const PARTIAL_LINE_MAX: usize = 256 * 1024;
+
 /// Read bytes appended to `path` since `offset`, returning complete lines.
 /// A trailing partial line is buffered until its newline arrives. Truncation
-/// (file shrank below `offset`) restarts from the beginning.
+/// (file shrank below `offset`) restarts from the beginning; a delta larger
+/// than [`TAIL_READ_MAX`] resumes from its tail on a line boundary.
 async fn read_appended_lines(
     path: &std::path::Path,
     offset: &mut u64,
@@ -733,17 +744,36 @@ async fn read_appended_lines(
     if len == *offset {
         return Ok(Vec::new());
     }
+    let skipped = len - *offset > TAIL_READ_MAX;
+    if skipped {
+        *offset = len - TAIL_READ_MAX;
+        partial.clear();
+    }
     file.seek(std::io::SeekFrom::Start(*offset)).await?;
+    // Bound the read to the delta measured above: a transcript growing under
+    // the read must not stretch this pass past the cap.
     let mut buf = Vec::with_capacity((len - *offset) as usize);
-    file.read_to_end(&mut buf).await?;
+    (&mut file)
+        .take(len - *offset)
+        .read_to_end(&mut buf)
+        .await?;
     *offset += buf.len() as u64;
 
+    let mut bytes = buf.as_slice();
+    if skipped {
+        // The skip landed mid-line: drop the fragment before the first
+        // newline so every returned line is whole.
+        bytes = match bytes.iter().position(|&b| b == b'\n') {
+            Some(i) => &bytes[i + 1..],
+            None => &[],
+        };
+    }
     let mut lines = Vec::new();
-    for byte in buf {
+    for &byte in bytes {
         if byte == b'\n' {
             lines.push(String::from_utf8_lossy(partial).into_owned());
             partial.clear();
-        } else {
+        } else if partial.len() < PARTIAL_LINE_MAX {
             partial.push(byte);
         }
     }

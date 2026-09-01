@@ -93,18 +93,32 @@ struct Capture {
 }
 
 impl Capture {
+    /// Bulk append. This runs on the PTY reader thread ahead of the vte
+    /// parser for every byte a shell emits, so it moves slices, never bytes:
+    /// fill the head, then keep only the newest `TAIL_CAP` of what remains.
     fn push(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            if self.head.len() < HEAD_CAP {
-                self.head.push(b);
-            } else {
-                if self.tail.len() == TAIL_CAP {
-                    self.tail.pop_front();
-                    self.truncated += 1;
-                }
-                self.tail.push_back(b);
-            }
+        let mut bytes = bytes;
+        if self.head.len() < HEAD_CAP {
+            let take = (HEAD_CAP - self.head.len()).min(bytes.len());
+            self.head.extend_from_slice(&bytes[..take]);
+            bytes = &bytes[take..];
         }
+        if bytes.is_empty() {
+            return;
+        }
+        if bytes.len() >= TAIL_CAP {
+            // The whole tail and the chunk's own prefix fall out at once.
+            self.truncated += (self.tail.len() + bytes.len() - TAIL_CAP) as u64;
+            self.tail.clear();
+            self.tail.extend(&bytes[bytes.len() - TAIL_CAP..]);
+            return;
+        }
+        let overflow = (self.tail.len() + bytes.len()).saturating_sub(TAIL_CAP);
+        if overflow > 0 {
+            self.tail.drain(..overflow);
+            self.truncated += overflow as u64;
+        }
+        self.tail.extend(bytes);
     }
 
     fn len(&self) -> usize {
