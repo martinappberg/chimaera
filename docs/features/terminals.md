@@ -53,7 +53,8 @@ pipe), `POST /api/v1/sessions` (spawn), `POST /api/v1/sessions/{id}/exec`,
   *initiator* is skipped (its xterm already reflowed — resyncing it is the "terminal resets when
   I change font size" bug). `unknown_session` is retried a bounded number of times (mid
   view-switch race) before going fatal. A broadcast-lagged client is `Lagged` → resynced, never
-  buffered without bound (login-node RSS discipline; `OUTPUT_CHANNEL_CAPACITY = 4096`).
+  buffered without bound (login-node RSS discipline; `OUTPUT_CHANNEL_CAPACITY = 1024` chunks
+  of ≤8 KiB — the ring only serves catch-up, so a deeper one bought RSS, not fidelity).
 
 ## Warm terminal pool (client)
 

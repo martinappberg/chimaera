@@ -680,17 +680,18 @@ pub(crate) fn spawn_agent_watch(state: Arc<AppState>, session_id: String) {
                 partial.clear();
             }
 
-            let lines = match read_appended_lines(&path, &mut offset, &mut partial).await {
-                Ok(lines) => lines,
+            let read = match read_appended_lines(&path, &mut offset, &mut partial).await {
+                Ok(read) => read,
                 Err(err) => {
                     tracing::debug!(session = %session_id, path = %path.display(), %err,
                         "transcript tail read failed");
                     continue;
                 }
             };
-            if lines.is_empty() {
+            if !read.grew {
                 continue;
             }
+            let lines = read.lines;
 
             let mut changed = false;
             {
@@ -716,25 +717,45 @@ pub(crate) fn spawn_agent_watch(state: Arc<AppState>, session_id: String) {
     });
 }
 
-/// Bytes read per tail pass. A resumed claude session's transcript is often
-/// tens of MB and the first pass starts at offset 0; the watcher only needs
-/// the newest lines (titles, activity), never the history — so a delta past
-/// this cap skips ahead to its last `TAIL_READ_MAX` bytes instead of
-/// materializing the whole file (and its line copies) in daemon RSS.
-const TAIL_READ_MAX: u64 = 1024 * 1024;
-/// A single line past this is dropped: transcripts carry multi-MB tool
-/// outputs on one line, and nothing here needs them intact.
-const PARTIAL_LINE_MAX: usize = 256 * 1024;
+/// A delta larger than this is a bulk catch-up (a resumed claude session's
+/// first pass starts at offset 0 against a transcript that is often tens of
+/// MB): only the lines the watcher acts on — the title records — are kept
+/// from it, so the pass never materializes the file's line copies in RSS.
+const BULK_CATCHUP_BYTES: u64 = 1024 * 1024;
+/// A single line past this is truncated to its prefix and left to fail the
+/// JSON parse: transcripts carry multi-MB tool outputs on one line, and
+/// nothing here needs them intact.
+const LINE_MAX: usize = 256 * 1024;
 
-/// Read bytes appended to `path` since `offset`, returning complete lines.
+/// One tail pass: the lines to apply, and whether the transcript grew at all
+/// (a bulk catch-up may keep no line while still consuming bytes).
+struct TailRead {
+    lines: Vec<String>,
+    grew: bool,
+}
+
+/// The two record shapes [`apply_title_line`] acts on. A bulk catch-up keeps
+/// only these, so a previous run's `/rename` or ai-title near the HEAD of a
+/// big transcript still lands after a `--resume`.
+fn is_title_line(line: &[u8]) -> bool {
+    contains(line, b"\"customTitle\"") || contains(line, b"\"ai-title\"")
+}
+
+fn contains(hay: &[u8], needle: &[u8]) -> bool {
+    hay.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Read bytes appended to `path` since `offset` as complete lines, streaming
+/// one line at a time so RSS is bounded by [`LINE_MAX`] rather than the delta.
 /// A trailing partial line is buffered until its newline arrives. Truncation
-/// (file shrank below `offset`) restarts from the beginning; a delta larger
-/// than [`TAIL_READ_MAX`] resumes from its tail on a line boundary.
+/// (file shrank below `offset`) restarts from the beginning.
 async fn read_appended_lines(
     path: &std::path::Path,
     offset: &mut u64,
     partial: &mut Vec<u8>,
-) -> anyhow::Result<Vec<String>> {
+) -> anyhow::Result<TailRead> {
+    use tokio::io::AsyncBufReadExt;
+
     let mut file = tokio::fs::File::open(path).await?;
     let len = file.metadata().await?.len();
     if len < *offset {
@@ -742,42 +763,42 @@ async fn read_appended_lines(
         partial.clear();
     }
     if len == *offset {
-        return Ok(Vec::new());
+        return Ok(TailRead {
+            lines: Vec::new(),
+            grew: false,
+        });
     }
-    let skipped = len - *offset > TAIL_READ_MAX;
-    if skipped {
-        *offset = len - TAIL_READ_MAX;
+    let bulk = len - *offset > BULK_CATCHUP_BYTES;
+    file.seek(std::io::SeekFrom::Start(*offset)).await?;
+    // Bound the pass to the delta measured above: a transcript growing under
+    // the read must not stretch it indefinitely.
+    let mut reader = tokio::io::BufReader::new((&mut file).take(len - *offset));
+    let mut lines = Vec::new();
+    let mut chunk = Vec::new();
+    loop {
+        chunk.clear();
+        let n = reader.read_until(b'\n', &mut chunk).await?;
+        if n == 0 {
+            break;
+        }
+        *offset += n as u64;
+        let complete = chunk.last() == Some(&b'\n');
+        if complete {
+            chunk.pop();
+        }
+        if partial.len() < LINE_MAX {
+            let room = LINE_MAX - partial.len();
+            partial.extend_from_slice(&chunk[..chunk.len().min(room)]);
+        }
+        if !complete {
+            break;
+        }
+        if !bulk || is_title_line(partial) {
+            lines.push(String::from_utf8_lossy(partial).into_owned());
+        }
         partial.clear();
     }
-    file.seek(std::io::SeekFrom::Start(*offset)).await?;
-    // Bound the read to the delta measured above: a transcript growing under
-    // the read must not stretch this pass past the cap.
-    let mut buf = Vec::with_capacity((len - *offset) as usize);
-    (&mut file)
-        .take(len - *offset)
-        .read_to_end(&mut buf)
-        .await?;
-    *offset += buf.len() as u64;
-
-    let mut bytes = buf.as_slice();
-    if skipped {
-        // The skip landed mid-line: drop the fragment before the first
-        // newline so every returned line is whole.
-        bytes = match bytes.iter().position(|&b| b == b'\n') {
-            Some(i) => &bytes[i + 1..],
-            None => &[],
-        };
-    }
-    let mut lines = Vec::new();
-    for &byte in bytes {
-        if byte == b'\n' {
-            lines.push(String::from_utf8_lossy(partial).into_owned());
-            partial.clear();
-        } else if partial.len() < PARTIAL_LINE_MAX {
-            partial.push(byte);
-        }
-    }
-    Ok(lines)
+    Ok(TailRead { lines, grew: true })
 }
 
 #[cfg(test)]

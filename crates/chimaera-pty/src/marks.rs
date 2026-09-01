@@ -925,6 +925,32 @@ mod tests {
         assert!(entry.output.ends_with("THE-END"));
     }
 
+    /// `Capture::push` moves slices; its head/tail/`truncated` accounting
+    /// must match the per-byte loop it replaced, including the chunk-larger-
+    /// than-the-tail branch that replaces the tail wholesale.
+    #[test]
+    fn capture_push_bulk_matches_per_byte_semantics() {
+        let mut c = Capture::default();
+        c.push(&vec![b'h'; HEAD_CAP - 1]);
+        // One byte completes the head, the next starts the tail.
+        c.push(b"HT");
+        assert_eq!(c.head.len(), HEAD_CAP);
+        assert_eq!(c.head[HEAD_CAP - 1], b'H');
+        assert_eq!(c.tail.iter().copied().collect::<Vec<u8>>(), b"T");
+        assert_eq!(c.truncated, 0);
+        // A chunk larger than the tail: the old tail (1 byte) and the chunk's
+        // own prefix (100 bytes) fall out at once.
+        c.push(&vec![b'x'; TAIL_CAP + 100]);
+        assert_eq!(c.tail.len(), TAIL_CAP);
+        assert_eq!(c.truncated, 101);
+        // A small overflow drains from the front, newest bytes at the back.
+        c.push(b"yz");
+        assert_eq!(c.tail.len(), TAIL_CAP);
+        assert_eq!(c.truncated, 103);
+        assert_eq!(c.tail.back(), Some(&b'z'));
+        assert_eq!(c.tail.front(), Some(&b'x'));
+    }
+
     #[test]
     fn oversized_osc_is_skipped_whole() {
         let marks = Marks::new();

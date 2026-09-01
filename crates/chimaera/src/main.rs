@@ -169,6 +169,10 @@ fn main() -> anyhow::Result<()> {
     // workers carry the async side (PTY reads run on their own threads); the
     // blocking pool stays generous because file walks, snapshot renders and
     // NFS stats park there and one wedged stat must not starve the rest.
+    // The flip side: any filesystem call still inline in an async handler
+    // (the session-create prelude/settings writes are the known ones) now
+    // stalls a quarter of the reactor instead of a sixty-fourth — keep
+    // moving those off.
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .max_blocking_threads(64)

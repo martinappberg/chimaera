@@ -30,9 +30,11 @@ const MAX_KEYS: usize = 128;
 pub(crate) struct ViewStateStore {
     path: PathBuf,
     items: serde_json::Map<String, serde_json::Value>,
-    /// Keys oldest-first by last write, for eviction. Load order (the file
-    /// is an unordered object) seeds it arbitrarily; every PUT moves its key
-    /// to the back, so the front is always the least recently written.
+    /// Keys oldest-first by last write, for eviction. Load seeds it in the
+    /// map's order — alphabetical (`serde_json::Map` is a BTreeMap here), so
+    /// hex window ids sort ahead of the `ws_*` workspace fallbacks and a
+    /// one-time over-cap trim reaches dead windows first; every PUT moves
+    /// its key to the back, so the front is the least recently written.
     recency: VecDeque<String>,
     /// Serializes writers on the blocking pool so a slow NFS rename can never
     /// let an older snapshot land after a newer one (see [`Self::put`]).

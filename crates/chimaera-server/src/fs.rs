@@ -1176,8 +1176,11 @@ fn bare_basename(candidate: &str) -> bool {
 /// and the hit is re-canonicalized so a file deleted since the walk stays a
 /// miss (existence-verified links only, same as the direct path). Bounds: the
 /// index is the quickopen walk — entry/depth/time-capped, ignore-respecting,
-/// cached per workspace with a short TTL — fetched at most once per request
-/// and only when a fallback-eligible candidate actually missed.
+/// served stale-while-revalidating per workspace (up to two minutes plus one
+/// walk behind the disk on a slow tree, so a file created after the last
+/// walk may take that long to earn a bare-basename link) — fetched at most
+/// once per request and only when a fallback-eligible candidate actually
+/// missed.
 pub(crate) async fn validate(
     State(state): State<Arc<AppState>>,
     Json(body): Json<ValidateRequest>,
@@ -1233,9 +1236,10 @@ pub(crate) async fn validate(
             let Some(path) = crate::quickopen::unique_file_named(files, candidate) else {
                 continue;
             };
-            // The index may be up to its TTL stale: re-canonicalize so only a
-            // file that exists RIGHT NOW links (and the answer is canonical,
-            // matching the direct path's contract).
+            // The index is served stale (up to its freshness window plus a
+            // walk): re-canonicalize so only a file that exists RIGHT NOW
+            // links (and the answer is canonical, matching the direct path's
+            // contract).
             let Ok(resolved) = std::fs::canonicalize(path) else {
                 continue;
             };

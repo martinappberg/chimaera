@@ -254,25 +254,28 @@ pub(crate) fn workspace_index(
     Some(build(&slot, &workspace.root, ignore.as_deref()))
 }
 
-/// Re-walk `root` for `slot` off the calling thread. Inside the daemon this
-/// rides the blocking pool; with no runtime (unit tests) it runs inline so
-/// the semantics stay observable.
+/// Re-walk `root` for `slot` on the blocking pool. Every caller already runs
+/// under `spawn_blocking`, whose threads carry the runtime context, so the
+/// handle is always there.
 fn spawn_refresh(state: &Arc<AppState>, slot: Arc<Slot>, root: PathBuf) {
     let state = state.clone();
-    let run = move || {
+    tokio::runtime::Handle::current().spawn_blocking(move || {
         let _done = RefreshGuard(slot.clone());
         let _walking = crate::lock(&slot.walk);
         // settings.json ground truth: user-tuned ignore list, else the
         // built-in default (read at walk time so an edit lands next refresh).
         let ignore = crate::lock(&state.settings).quickopen_ignore_dirs();
         build(&slot, &root, ignore.as_deref());
-    };
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => {
-            handle.spawn_blocking(run);
-        }
-        Err(_) => run(),
-    }
+    });
+}
+
+/// Test hook: age a workspace's index past its freshness window so the next
+/// query serves it stale and kicks a refresh.
+#[cfg(test)]
+pub(crate) fn age_index(state: &Arc<AppState>, workspace_id: &str) {
+    let slot = crate::lock(&state.quickopen).slot(workspace_id);
+    let mut st = crate::lock(&slot.state);
+    st.built = Some(Instant::now() - CACHE_TTL_MAX - Duration::from_secs(1));
 }
 
 /// Walk `root` and install the result as `slot`'s index, sizing its
