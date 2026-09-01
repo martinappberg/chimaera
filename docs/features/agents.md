@@ -81,9 +81,12 @@ spawn.rs,recents.rs}`. Wire: `POST/GET/DELETE/PATCH /api/v1/sessions*`, `GET /ap
 - **Key behaviors.** Scripts are composed by the daemon (never the client), `set -euo pipefail`,
   HTTPS-only, no sudo, version charset-whitelisted, downloads in a `mktemp` dir. Layout
   `~/.chimaera/agents/<agent>/<version>/bin/` with an atomic per-agent symlink swap (running
-  sessions keep their exec'd inode — the update session says so up front). One install/update per
-  agent (409 while running, either verb). Gemini has no
-  managed install (needs a node runtime — phase 2; POST → honest 400). Shims are written **only**
+  sessions keep their exec'd inode — the update session says so up front). Codex installs as its
+  whole release package rather than just the entrypoint — it spawns companions
+  (`codex-code-mode-host`, bundled rg/zsh) from beside its own executable, and an entrypoint-only
+  install shipped a codex whose code mode failed closed. One install/update per agent (409 while
+  running, either verb). Gemini has no managed install (needs a node runtime — phase 2; POST →
+  honest 400). Shims are written **only**
   when chimaera owns the binary (never shadow your own install) and theme injection is skipped when
   your own config already sets a theme (fill the gap, never fight a choice). Typing
   `<agent> update` in a chimaera terminal against a **managed** binary is intercepted by the shim
