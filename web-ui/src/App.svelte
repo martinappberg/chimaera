@@ -17,6 +17,8 @@
     unauthorized,
     type Health,
   } from "./lib/net/api";
+  import { linkRtt, linkRttNow, resetLinkRtt, LINK_RTT_BADGE_MS } from "./lib/net/rtt";
+  import { LOCAL_ECHO_MIN_RTT_MS } from "./lib/terminal/localEcho";
   import { healthPollDelayMs, type PollHandle } from "./lib/net/poll";
   import { pageVisible } from "./lib/shared/visibility";
   import {
@@ -340,6 +342,14 @@
   let lastRecentsEpoch: number | null = null;
   let workspaces = $state<Workspace[]>([]);
   let sessions = $state<Session[]>([]);
+  /** Sessions whose shell provably sits at its OSC 133 prompt AND isn't
+   *  running anything via the exec engine — the set predictive local echo
+   *  may arm for. Recomputed per sessions snapshot (a few times a minute)
+   *  so the per-keystroke echoArmed check is one Set lookup, not a walk of
+   *  the $state proxy array. */
+  const echoReadyIds = $derived(
+    new Set(sessions.filter((s) => s.phase === "ready" && !isBusy(s)).map((s) => s.id)),
+  );
   /** Linked-terminal edges, mirrored from /ws/events snapshots. */
   let links = $state<Link[]>([]);
   let activeWsId = $state<string | null>(getActiveWorkspaceId());
@@ -1213,6 +1223,19 @@
       onOpenPath,
       onOpenUrl,
       onUrlMenu: (event, url) => contextMenu.openAt(event, urlMenuEntries(url)),
+      // Predictive local echo (localEcho.ts): only on a remote window, only
+      // once the link is measurably slow, only while the events bus is live
+      // (a frozen sessions snapshot must not vouch for a shell's phase), and
+      // only while the shell sits at its OSC 133 prompt AND isn't busy via
+      // the exec engine — agent TUIs (phase "unknown") and running commands
+      // (which may read without echoing) never ghost. echoReadyIds keeps the
+      // per-keystroke check O(1) instead of walking the $state proxy array.
+      echoArmed: (id) => {
+        if (!isRemoteWindow || !eventsUp) return false;
+        const rtt = linkRttNow();
+        if (rtt === null || rtt < LOCAL_ECHO_MIN_RTT_MS) return false;
+        return echoReadyIds.has(id);
+      },
     });
     // Every rendered link surface (chat prose, markdown previews, terminal
     // output) resolves a proxyable URL to a browser pane through here; App is
@@ -1245,7 +1268,14 @@
         }
       },
       onFs: notifyDiskChange,
-      onStatus: (up) => (eventsUp = up),
+      onStatus: (up) => {
+        // A recovered events socket often means a re-established tunnel — a
+        // different link. Drop the RTT window so the rolling minimum can't
+        // latch the old link's floor (the badge goes blank until the next
+        // health sample, which the recovery kick fetches promptly).
+        if (up && !eventsUp) resetLinkRtt();
+        eventsUp = up;
+      },
       onFatal: (message) => {
         if (message === "unauthorized") notifyUnauthorized();
       },
@@ -4354,6 +4384,16 @@
             ? `${getHostLabel()} › ${$computeStatus.self.node}`
             : getHostLabel()}</span
         >
+        {#if isRemoteWindow && $linkRtt !== null && $linkRtt >= LINK_RTT_BADGE_MS}
+          <!-- Honest latency signal: on a distant host every keystroke echo
+               and UI fetch pays at least this — better named than mysterious
+               (the remote perf audit's R4). -->
+          <span
+            class="daemon-rtt"
+            title={`link round trip ~${$linkRtt} ms — every keystroke echo and fetch pays at least this`}
+            >{$linkRtt}ms</span
+          >
+        {/if}
         {#if $gitStatus !== null}
           <!-- Always-on orientation: what branch you're on and how dirty the
                tree is; one click opens the source-control panel. -->
@@ -4719,6 +4759,15 @@
       <span class="strip-host" class:remote={isRemoteWindow} title={health?.hostname}
         >{getHostLabel()}</span
       >
+      {#if isRemoteWindow && $linkRtt !== null && $linkRtt >= LINK_RTT_BADGE_MS}
+        <!-- Detached windows ghost keystrokes like any remote window — they
+             get the same honest latency signal. -->
+        <span
+          class="daemon-rtt"
+          title={`link round trip ~${$linkRtt} ms — every keystroke echo and fetch pays at least this`}
+          >{$linkRtt}ms</span
+        >
+      {/if}
     </footer>
   {/if}
   {/if}
@@ -5708,6 +5757,15 @@
   .strip-host.remote {
     color: var(--accent);
     font-weight: 600;
+  }
+
+  /* The measured link RTT, quiet next to the host: only rendered on a remote
+     window once the estimate crosses 30 ms — a fast tunnel needs no badge. */
+  .daemon-rtt {
+    color: var(--muted);
+    font-size: 10px;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
   }
 
   /* Branch + dirty count: always-on git orientation, quiet until it matters. */

@@ -30,6 +30,40 @@ describe("ParkedBuffer", () => {
     expect(buf.adopt().flush).toEqual([]);
   });
 
+  it("reports the parked lifecycle for the socket's parked auth", () => {
+    const buf = new ParkedBuffer(MAX);
+    expect(buf.isParked()).toBe(false);
+    buf.park();
+    expect(buf.isParked()).toBe(true);
+    buf.adopt();
+    expect(buf.isParked()).toBe(false);
+  });
+
+  it("desync while parked discards and latches; adopt resyncs", () => {
+    const buf = new ParkedBuffer(MAX);
+    buf.park();
+    expect(buf.binary(bytes(8))).toBe("buffered");
+    buf.desync();
+    expect(buf.binary(bytes(8))).toBe("dropped");
+    expect(buf.adopt()).toEqual({ flush: [], resync: true });
+  });
+
+  it("desync while visible is a no-op (a live grid needs no resync)", () => {
+    const buf = new ParkedBuffer(MAX);
+    buf.desync();
+    expect(buf.binary(bytes(8))).toBe("write");
+  });
+
+  it("desync after adopt is a no-op (the parked-ready race)", () => {
+    // adopt() ran while the parked connection's ready frame was in flight:
+    // the late onParkedReady must not desync the now-visible entry.
+    const buf = new ParkedBuffer(MAX);
+    buf.park();
+    buf.adopt();
+    buf.desync();
+    expect(buf.binary(bytes(8))).toBe("write");
+  });
+
   it("latches desynced on overflow and drops everything after", () => {
     const buf = new ParkedBuffer(MAX);
     buf.park();
@@ -102,7 +136,15 @@ describe("ParkedBuffer", () => {
     buf.binary(a);
     buf.binary(b);
     expect(buf.exited()).toEqual([a, b]);
-    // The tail was flushed at exit time; adopt has nothing left to do.
+    // A parked exit cannot trust the buffer to be the complete tail (a
+    // park-aware server withheld output): adopt resyncs into the server's
+    // last-words replay for the authoritative final screen.
+    expect(buf.adopt()).toEqual({ flush: [], resync: true });
+  });
+
+  it("a visible exit stays in sync (no resync on adopt)", () => {
+    const buf = new ParkedBuffer(MAX);
+    expect(buf.exited()).toEqual([]);
     expect(buf.adopt()).toEqual({ flush: [], resync: false });
   });
 

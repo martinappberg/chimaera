@@ -19,7 +19,7 @@ has subtle repaint invariants — read the architecture guide before touching th
 
 | File | What it owns |
 |---|---|
-| `lib.rs` | `SessionManager`: the session registry + `attach` (snapshot stream + live receivers), `resize`, `kill_all`. The crate's public surface for `chimaera-server`. |
+| `lib.rs` | `SessionManager`: the session registry + `attach` (snapshot stream + live receivers) / `attach_quiet` (subscribe only, no snapshot — the parked attach), `resize`, `kill_all`. The crate's public surface for `chimaera-server`. |
 | `session.rs` | `Session`: PTY spawn, the output→`Term` mirror, `resize`, the wait/last-words reaper, the bounded output broadcast (`OUTPUT_CHANNEL_CAPACITY`). |
 | `snapshot.rs` | `render_snapshot` — rebuilds the terminal as an escape stream (SGR minimization + private-mode/cursor/title restoration). `screen_text` for text scrapes. |
 | `marks.rs` | The OSC 133/633/7 marks scanner → shell phase + a bounded command journal. Most methods are exec-internal correlation; the server uses `phase()`/`journal()`. |

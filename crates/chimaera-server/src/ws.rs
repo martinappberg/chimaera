@@ -44,6 +44,12 @@ const OUTPUT_COALESCE_WINDOW: Duration = Duration::from_millis(8);
 /// Byte ceiling for one coalesced output frame; a full batch flushes without
 /// waiting out the window.
 const OUTPUT_COALESCE_MAX_BYTES: usize = 32 * 1024;
+/// Unpark catch-up ceiling, in ring chunks: a parked connection whose
+/// backlog exceeds this repaints from the authoritative grid instead of
+/// replaying the ring — a long replay ships megabytes of scrollback the
+/// snapshot paints in kilobytes. 64 chunks ≈ ≤512 KiB worst case, aligned
+/// with the client pool's own parked-buffer bound.
+const UNPARK_REPLAY_MAX_CHUNKS: usize = 64;
 
 /// Accumulates broadcast output chunks into one WS frame. A single-chunk
 /// batch is sent as the original refcounted `Bytes` (zero-copy — the same
@@ -119,11 +125,26 @@ enum ClientMessage {
         cols: Option<u16>,
         #[serde(default)]
         rows: Option<u16>,
+        /// Session WS only: the client attaches parked (a hidden pooled
+        /// terminal reconnecting). The server skips the snapshot render and
+        /// withholds output until `unpark`; the client's grid dims are NOT
+        /// adopted (a hidden window's stale dims must never reflow the grid
+        /// out from under a visible one).
+        #[serde(default)]
+        parked: bool,
     },
     Resize {
         cols: u16,
         rows: u16,
     },
+    /// Session WS only: the client parked this terminal (hidden pooled
+    /// instance). Output forwarding stops; the session's bounded broadcast
+    /// ring becomes the catch-up buffer. Events still flow.
+    Park,
+    /// Session WS only: the terminal is shown again. Forwarding resumes from
+    /// the ring; a missed foreign resize, a never-sent snapshot, or a ring
+    /// overflow (`Lagged`) each repaint from the authoritative grid instead.
+    Unpark,
     /// `/ws/events` only: "this window is looking at workspace W" (null when it
     /// has none). Gates the git backstop poll — see `git::WatchGuard`.
     Watch {
@@ -151,8 +172,8 @@ pub(crate) async fn session_ws(
 }
 
 async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
-    let auth_dims = match authenticate(&mut socket, &state).await {
-        Some(dims) => dims,
+    let auth = match authenticate(&mut socket, &state).await {
+        Some(auth) => auth,
         None => {
             let _ = send_json(
                 &mut socket,
@@ -162,14 +183,17 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
             return;
         }
     };
+    let auth_dims = if auth.parked { None } else { auth.dims };
 
     // Adopt the client's grid BEFORE attaching so the snapshot below is
-    // rendered at the size the client will actually display it.
+    // rendered at the size the client will actually display it. A parked
+    // attach adopts nothing: a hidden window's stale dims must never reflow
+    // the grid out from under a visible one.
     if let Some((cols, rows)) = auth_dims {
         resize_off_reactor(&state, &id, cols, rows, "pre-attach resize").await;
     }
 
-    let attach_res = match attach_off_reactor(&state, &id).await {
+    let attach_res = match attach_off_reactor(&state, &id, auth.parked).await {
         Ok(res) => res,
         Err(err) => {
             // A panicked render task is an internal failure, not session
@@ -199,10 +223,15 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
                 {
                     return;
                 }
-                if socket
-                    .send(Message::Binary(Bytes::from(words.snapshot)))
-                    .await
-                    .is_err()
+                // A parked client discards any snapshot on this connection
+                // (its buffer desynced at the parked ready) and replays last
+                // words via the fresh visible attach its adopt makes — don't
+                // render bytes it is guaranteed to drop.
+                if !auth.parked
+                    && socket
+                        .send(Message::Binary(Bytes::from(words.snapshot)))
+                        .await
+                        .is_err()
                 {
                     return;
                 }
@@ -249,14 +278,31 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
     // Snapshot as one binary frame, then enter the bridge loop. Adjacency is
     // a contract: after any reset-bearing frame (`ready` here, `resync` in
     // repaint) the NEXT binary frame is the complete snapshot — the client's
-    // parked write-through path relies on nothing interleaving.
-    let snapshot = Bytes::from(std::mem::take(&mut attachment.snapshot));
-    if socket.send(Message::Binary(snapshot)).await.is_err() {
-        return;
+    // parked write-through path relies on nothing interleaving. A parked
+    // attach sends none (attach_quiet rendered none): the first unpark
+    // repaints instead.
+    if !auth.parked {
+        let snapshot = Bytes::from(std::mem::take(&mut attachment.snapshot));
+        if socket.send(Message::Binary(snapshot)).await.is_err() {
+            return;
+        }
     }
 
     let mut output_open = true;
     let mut events_open = true;
+    // Parked: output forwarding is off (the select arm below is disabled),
+    // and the session's bounded broadcast ring holds the stream. The ring is
+    // shared by every attachment, so N parked windows don't multiply it —
+    // but a non-consuming receiver does keep the ring's rolling window of
+    // recent chunks alive (bounded at OUTPUT_CHANNEL_CAPACITY × chunk size;
+    // the same retention any slow attachment already imposes, freed as the
+    // ring wraps).
+    let mut parked = auth.parked;
+    // The next unpark must repaint instead of resuming the ring: the client
+    // has no grid yet (parked attach — no snapshot was sent), or the grid
+    // reflowed while parked (foreign resize; a pending resync consumed by
+    // park), so the ring's bytes cannot catch it up. True only while parked.
+    let mut unpark_repaint = auth.parked;
     // Dims this connection itself asked for. Its xterm reflowed natively when
     // it resized, so a Resized event echoing these back needs no repaint —
     // resyncing the initiator is exactly the "terminal resets when I change
@@ -303,7 +349,7 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
                     flush_at = Some(at);
                 }
             },
-            out = attachment.output.recv(), if output_open => match out {
+            out = attachment.output.recv(), if output_open && !parked => match out {
                 Ok(bytes) => {
                     batch.push(bytes);
                     // Fold in whatever is already queued — batching without
@@ -369,6 +415,14 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
                         chimaera_pty::SessionEvent::Resized { cols, rows } => Some((*cols, *rows)),
                         _ => None,
                     };
+                    // Exited while parked: do NOT drain the ring here. The
+                    // Exited broadcast races the reader thread's final bytes
+                    // (session.rs sends the event, then sleeps, then reaps),
+                    // and a lagged/overflowing ring cannot promise a coherent
+                    // escape stream anyway. The honest final screen comes
+                    // from the last-words replay: the client latches its
+                    // parked buffer desynced on an exit while parked, and
+                    // adopt resyncs into a fresh attach that replays it.
                     match serde_json::to_value(&event) {
                         Ok(value) => {
                             // Ordered send: batched output first, so an event
@@ -383,11 +437,18 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
                     // server grid out from under the client's xterm; repaint
                     // from the authoritative grid (tmux redraw semantics).
                     // The initiator is skipped: its xterm already reflowed.
+                    // Parked, the repaint is deferred to unpark instead —
+                    // rendering a snapshot nobody displays is the waste this
+                    // protocol exists to avoid.
                     if let Some(dims) = resized_to {
                         if client_dims != Some(dims) {
-                            let at = tokio::time::Instant::now() + RESYNC_DEBOUNCE;
-                            resync_sleep.as_mut().reset(at);
-                            resync_at = Some(at);
+                            if parked {
+                                unpark_repaint = true;
+                            } else {
+                                let at = tokio::time::Instant::now() + RESYNC_DEBOUNCE;
+                                resync_sleep.as_mut().reset(at);
+                                resync_at = Some(at);
+                            }
                         }
                     }
                 }
@@ -428,6 +489,48 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
                             }
                             resize_off_reactor(&state, &id, cols, rows, "ws resize").await;
                         }
+                        Ok(ClientMessage::Park) => {
+                            if !parked {
+                                parked = true;
+                                // Bytes already read from the ring must not
+                                // be dropped — the client buffers them.
+                                if !send_batch(&mut socket, &mut batch).await {
+                                    return;
+                                }
+                                flush_at = None;
+                                // A pending foreign-resize repaint defers to
+                                // the unpark repaint.
+                                if resync_at.take().is_some() {
+                                    unpark_repaint = true;
+                                }
+                            }
+                        }
+                        Ok(ClientMessage::Unpark) => {
+                            if parked {
+                                parked = false;
+                                // Repaint when the ring can't (or shouldn't)
+                                // catch the client up: no grid yet / reflow
+                                // while parked, or a backlog past the replay
+                                // ceiling — one snapshot paints in KBs what
+                                // a long replay ships in MBs. len() counts
+                                // sent-minus-received (it can exceed the
+                                // ring's capacity when lagged), which is
+                                // exactly the "too much happened" signal.
+                                if unpark_repaint
+                                    || attachment.output.len() > UNPARK_REPLAY_MAX_CHUNKS
+                                {
+                                    unpark_repaint = false;
+                                    if !repaint(&mut socket, &id, &state, &mut attachment,
+                                                &mut batch, &mut flush_at, &mut output_open).await {
+                                        return;
+                                    }
+                                }
+                                // Otherwise the re-enabled output arm resumes
+                                // from the ring; an overflow surfaces as
+                                // Lagged there and repaints through the
+                                // existing path.
+                            }
+                        }
                         // Ignore re-auth, the events-bus `watch` frame, and
                         // unknown message types.
                         Ok(ClientMessage::Auth { .. }) | Ok(ClientMessage::Watch { .. }) | Err(_) => {}
@@ -448,10 +551,20 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
 async fn attach_off_reactor(
     state: &Arc<AppState>,
     id: &str,
+    quiet: bool,
 ) -> Result<anyhow::Result<chimaera_pty::Attachment>, tokio::task::JoinError> {
     let state = Arc::clone(state);
     let id = id.to_string();
-    tokio::task::spawn_blocking(move || state.sessions.attach(&id)).await
+    tokio::task::spawn_blocking(move || {
+        if quiet {
+            // Parked attach: subscribe only, no snapshot render — the first
+            // unpark repaints via a fresh full attach.
+            state.sessions.attach_quiet(&id)
+        } else {
+            state.sessions.attach(&id)
+        }
+    })
+    .await
 }
 
 /// `resize` winches the PTY and reflows the headless grid under the same
@@ -513,7 +626,7 @@ async fn repaint(
 ) -> bool {
     batch.clear();
     *flush_at = None;
-    let mut fresh = match attach_off_reactor(state, id).await {
+    let mut fresh = match attach_off_reactor(state, id, false).await {
         Ok(Ok(fresh)) => fresh,
         Ok(Err(err)) => {
             tracing::debug!(%id, %err, "resync attach failed; closing for a clean reconnect");
@@ -1090,12 +1203,25 @@ async fn send_sessions_snapshot(
 /// First-frame auth: text `{"type":"auth","token":...}` within 5 seconds.
 /// `None` = rejected; `Some(dims)` = accepted, with the client grid when the
 /// auth frame carried one.
-async fn authenticate(socket: &mut WebSocket, state: &AppState) -> Option<Option<(u16, u16)>> {
+/// The accepted auth frame's parameters: the client grid (if sent) and
+/// whether the client attached parked.
+struct AuthParams {
+    dims: Option<(u16, u16)>,
+    parked: bool,
+}
+
+async fn authenticate(socket: &mut WebSocket, state: &AppState) -> Option<AuthParams> {
     match tokio::time::timeout(AUTH_TIMEOUT, socket.recv()).await {
         Ok(Some(Ok(Message::Text(text)))) => match serde_json::from_str::<ClientMessage>(&text) {
-            Ok(ClientMessage::Auth { token, cols, rows }) if token == state.token => {
-                Some(cols.zip(rows))
-            }
+            Ok(ClientMessage::Auth {
+                token,
+                cols,
+                rows,
+                parked,
+            }) if token == state.token => Some(AuthParams {
+                dims: cols.zip(rows),
+                parked,
+            }),
             _ => None,
         },
         _ => None,

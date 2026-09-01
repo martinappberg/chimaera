@@ -23,6 +23,12 @@ export interface PoolHandlers {
   onOpenUrl(id: string, target: UrlTarget, newSplit: boolean): void;
   /** Right-click on a URL link: the shared Chimaera/Browser/Copy menu. */
   onUrlMenu(event: MouseEvent, url: string): void;
+  /**
+   * Whether predictive local echo should ghost keystrokes for this session
+   * right now (localEcho.ts): remote window, measured link RTT above the
+   * threshold, and the shell at its OSC 133 prompt. Read per keystroke.
+   */
+  echoArmed?(id: string): boolean;
 }
 
 type Runtime = typeof import("./termPoolRuntime");

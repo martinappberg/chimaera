@@ -427,15 +427,29 @@ impl Session {
         }
     }
 
-    pub(crate) fn attach(&self) -> Attachment {
-        // Hold the term lock across subscribe + render so no output chunk can
-        // land between the snapshot and the live stream (see reader thread).
-        let term = lock_unpoisoned(&self.term);
-        let output = self.output_tx.subscribe();
-        let events = self.events_tx.subscribe();
-        let title = lock_unpoisoned(&self.title).clone();
-        let snapshot = snapshot::render_snapshot(&term, title.as_deref());
-        drop(term);
+    /// The one attach body (both public shapes delegate here, so the
+    /// subscribe discipline can't drift between them). Rendering holds the
+    /// term lock across subscribe + render so no output chunk can land
+    /// between the snapshot and the live stream (see reader thread). The
+    /// quiet path renders nothing, so there is no snapshot/stream boundary
+    /// to protect and the plain atomic subscribes suffice — it never takes
+    /// the term lock the output mirror contends on.
+    fn attach_inner(&self, render: bool) -> Attachment {
+        let (snapshot, output, events) = if render {
+            let term = lock_unpoisoned(&self.term);
+            let output = self.output_tx.subscribe();
+            let events = self.events_tx.subscribe();
+            let title = lock_unpoisoned(&self.title).clone();
+            let snapshot = snapshot::render_snapshot(&term, title.as_deref());
+            drop(term);
+            (snapshot, output, events)
+        } else {
+            (
+                Vec::new(),
+                self.output_tx.subscribe(),
+                self.events_tx.subscribe(),
+            )
+        };
         Attachment {
             info: self.info(),
             snapshot,
@@ -443,6 +457,19 @@ impl Session {
             events,
             input: self.input_tx.clone(),
         }
+    }
+
+    pub(crate) fn attach(&self) -> Attachment {
+        self.attach_inner(true)
+    }
+
+    /// Attach without rendering a snapshot (empty `snapshot`): the parked
+    /// attach for clients that will not display the grid until later — a
+    /// full-scrollback render (~95 ms under the term lock, plus the bytes on
+    /// the wire) is pure waste for a hidden window. The caller repaints via a
+    /// fresh `attach()` when the terminal is first shown.
+    pub(crate) fn attach_quiet(&self) -> Attachment {
+        self.attach_inner(false)
     }
 
     pub(crate) fn resize(&self, cols: u16, rows: u16) -> anyhow::Result<()> {

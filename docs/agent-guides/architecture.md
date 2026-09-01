@@ -61,7 +61,9 @@ streams. This exact pattern was independently proposed in Zed's pty-host RFC
 ([zed#50584](https://github.com/zed-industries/zed/discussions/50584), Mar 2026) — validated,
 with one amendment from verification: **don't serialize `Term` grid state across the wire**
 (that only works when both ends share the same Rust crate; our client is xterm.js). Instead,
-on attach/resize the daemon re-emits an escape-sequence snapshot rendered from the grid (the
+on attach/resize the daemon re-emits an escape-sequence snapshot rendered from the grid (a
+`parked:true` attach — a hidden pooled terminal — deliberately skips it: the first unpark
+repaints instead; see the remote-performance plan) (the
 `@xterm/headless` + serialize-addon model, reimplemented server-side), explicitly carrying
 window title, cursor style, and tab stops. This is the single most underestimated component in
 every multiplexer project — budget accordingly.
@@ -74,10 +76,12 @@ echoed dims from attached clients must never broadcast; (2) each ws connection t
 it last requested and skips the resync for matching `Resized` events; foreign resizes repaint
 after a 120ms coalescing window (divider drags fire in bursts); (3) `resync` frames are
 dimension-tagged and the client resizes its xterm to match BEFORE replaying — a snapshot
-replayed at any other width re-wraps every soft-wrapped row wrong; (4) the auth frame carries
-the client's current grid so the server adopts it before rendering the attach snapshot
+replayed at any other width re-wraps every soft-wrapped row wrong; (4) a VISIBLE client's auth frame carries
+its current grid so the server adopts it before rendering the attach snapshot
 (resizes that happen while the socket is down are otherwise lost forever — ResizeObserver
-never re-fires for an unchanged container); (5) snapshots restore mouse/focus/keypad/auto-wrap
+never re-fires for an unchanged container); a parked auth carries none — a hidden window's
+stale dims must never reflow the grid, and its adopt-time resync reconciles dims through a
+fresh visible attach; (5) snapshots restore mouse/focus/keypad/auto-wrap
 modes, which TUIs assert once at startup and never again. Known gap, accepted: a resync while
 on the alternate screen cannot restore the primary screen's scrollback
 (`alacritty_terminal` does not expose the inactive grid); with resyncs now rare

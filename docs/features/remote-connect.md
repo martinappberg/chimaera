@@ -45,9 +45,11 @@ a `RemoteOps` trait. See also [native-app.md](native-app.md) for the windows/hos
 ## Key behaviors & gotchas
 
 - **One ControlMaster per host.** Every ssh/scp call rides one chimaera-owned master
-  (`ControlMaster=auto`, `ControlPersist=10m`): the user authenticates **once** (password or 2FA/Duo,
-  inherited from `~/.ssh/config` — the ssh client is never reimplemented), and every subsequent
-  command/tunnel/window multiplexes it.
+  (`ControlMaster=auto`, `ControlPersist=10m`, `Compression=yes`): the user authenticates **once**
+  (password or 2FA/Duo, inherited from `~/.ssh/config` — the ssh client is never reimplemented),
+  and every subsequent command/tunnel/window multiplexes it. Compression is negotiated at master
+  creation — a master that predates the upgrade (alive, or within its 10m persist window) keeps
+  running uncompressed until it expires; mux clients can't change it.
 - **In-app auth.** ssh has no tty under the native shell, so an `SSH_ASKPASS` relay surfaces the raw
   prompt (password, keyboard-interactive Duo passcode) in `AskpassModal.svelte`. Prompts **queue**
   (ssh asks sequentially). Every ssh/scp child stamps its host alias into the relay, so a remote

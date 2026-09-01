@@ -255,6 +255,32 @@ async fn spawn_env_remove_strips_inherited_variables() {
     std::env::remove_var("CHIMAERA_PTY_TEST_CONTAMINANT");
 }
 
+/// attach_quiet subscribes without rendering: the snapshot comes back empty
+/// (the parked-attach contract — the first unpark repaints via a full
+/// attach), but the output subscription is live from the attach point.
+#[tokio::test]
+async fn attach_quiet_skips_snapshot_but_streams_output() {
+    let mgr = SessionManager::new();
+    let info = mgr.spawn(opts(bash())).expect("spawn failed");
+
+    // Wait for the shell to be up (a rendered snapshot shows the prompt).
+    let _ = attach_when_snapshot_contains(&mgr, &info.id, "$").await;
+
+    let mut quiet = mgr.attach_quiet(&info.id).expect("attach_quiet failed");
+    assert!(
+        quiet.snapshot.is_empty(),
+        "quiet attach must not render a snapshot"
+    );
+
+    quiet
+        .input
+        .send(Bytes::from_static(b"echo quiet-attach-live\n"))
+        .await
+        .expect("input send failed");
+    let seen = read_until(&mut quiet.output, "quiet-attach-live").await;
+    assert!(seen.contains("quiet-attach-live"));
+}
+
 #[tokio::test]
 async fn spawn_echo_collects_output_and_exited_event() {
     let mgr = SessionManager::new();

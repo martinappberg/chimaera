@@ -1,6 +1,7 @@
 import { writable } from "svelte/store";
 
 import { healthPollDelayMs, startVisibilityPoll, type PollHandle } from "./poll";
+import { recordLinkRtt } from "./rtt";
 
 const TOKEN_KEY = "chimaera:token";
 const WS_KEY = "chimaera.ws";
@@ -255,11 +256,16 @@ export async function health(): Promise<Health> {
   // 4s abort: pollHealth arms its next tick only after this settles, so an
   // unbounded hang (a dead tunnel's ~75s TCP connect) would otherwise
   // stretch the 5s recovery cadence to ~80s.
+  const started = performance.now();
   const res = await api("/health", { signal: AbortSignal.timeout(4000) });
   if (!res.ok) {
     throw new ApiError(res.status, `health check failed with status ${res.status}`);
   }
-  return (await res.json()) as Health;
+  const body = (await res.json()) as Health;
+  // Only successful fetches sample the link RTT (net/rtt.ts) — an error
+  // status's timing measures the failure, not the link.
+  recordLinkRtt(performance.now() - started);
+  return body;
 }
 
 /**
