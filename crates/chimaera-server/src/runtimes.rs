@@ -14,7 +14,10 @@
 //! name, then `mv -f` = rename(2) over the old link). Running sessions keep
 //! their binary across updates; new spawns resolve the new link. A version
 //! dir is not always just that one binary: codex ships a package whose
-//! entrypoint needs its siblings, so the whole tree lands around its `bin/`.
+//! entrypoint needs its siblings, so the whole tree lands around its `bin/`
+//! — and it is the TREE, not just the exec'd inode, that a running session
+//! still needs (it spawns its code-mode host and bundled rg/zsh by path).
+//! That is why an update never reclaims the version dir it replaced.
 //!
 //! Artifact sources, each verified against the real endpoint on 2026-07-06:
 //! - claude: `https://downloads.claude.ai/claude-code-releases` — the exact
@@ -220,7 +223,9 @@ tmp="$(mktemp -d "${{TMPDIR:-/tmp}}/chimaera-codex.XXXXXX")"
 # The package extracts next to its destination rather than into $tmp, so
 # activation is a rename(2) on one filesystem instead of a ~270 MB copy off
 # a (commonly tmpfs or node-local) TMPDIR. Nothing can resolve the staging
-# tree: no link points at it until the rename, and the trap removes it.
+# tree: no link points at it until the rename. Killing the install pane
+# still reclaims it — the PTY engine kills with SIGHUP first so shells run
+# their exit traps — and a SIGKILLed run is swept by the next install.
 stage="$root/codex/.staging"
 trap 'rm -rf "$tmp" "$stage" "$stage.old"' EXIT
 curl -fsSL -o "$tmp/codex.tar.gz" "$base/codex-package-$triple.tar.gz"
@@ -582,8 +587,10 @@ fn remove_dir_if_exists(path: &Path) -> anyhow::Result<()> {
 /// DELETE /api/v1/agents/{id}/install — uninstall a chimaera-MANAGED agent: the
 /// active symlink plus its version tree under `~/.chimaera/agents`. Only ever
 /// touches chimaera's own prefix — the user's own install (and its auth in
-/// `$HOME`) is never touched. Running sessions keep their already-exec'd binary
-/// (the inode survives the unlink). 404 unknown id; 409 while an install for the
+/// `$HOME`) is never touched. A running session keeps its already-exec'd binary
+/// (the inode survives the unlink), but NOT companions its package resolves by
+/// path later: a live codex loses its code-mode host and bundled rg/zsh the
+/// moment its tree goes. 404 unknown id; 409 while an install for the
 /// same agent is in flight; 200 `{"removed": bool}` otherwise (`false` = nothing
 /// chimaera-managed to remove).
 pub(crate) async fn uninstall_agent(
@@ -1095,10 +1102,6 @@ mod tests {
         std::fs::create_dir_all(pkg.join("bin")).unwrap();
         std::fs::create_dir_all(pkg.join("codex-path")).unwrap();
         std::fs::create_dir_all(pkg.join("codex-resources/zsh/bin")).unwrap();
-        write_exec(
-            &pkg.join("bin/codex"),
-            "#!/bin/sh\necho 'codex-cli 9.9.9'\n",
-        );
         write_exec(&pkg.join("bin/codex-code-mode-host"), "#!/bin/sh\nexit 0\n");
         write_exec(&pkg.join("codex-path/rg"), "#!/bin/sh\nexit 0\n");
         write_exec(
@@ -1111,15 +1114,24 @@ mod tests {
         )
         .unwrap();
         let tarball = dir.join("codex-package.tar.gz");
-        let packed = std::process::Command::new("tar")
-            .arg("-czf")
-            .arg(&tarball)
-            .arg("-C")
-            .arg(&pkg)
-            .args(["bin", "codex-path", "codex-resources", "codex-package.json"])
-            .status()
-            .unwrap();
-        assert!(packed.success(), "packed the fixture package");
+        // Re-pack the fixture with the version its `codex --version` reports,
+        // so the release can be rolled forward mid-test.
+        let pack = |version: &str| {
+            write_exec(
+                &pkg.join("bin/codex"),
+                &format!("#!/bin/sh\necho 'codex-cli {version}'\n"),
+            );
+            let packed = std::process::Command::new("tar")
+                .arg("-czf")
+                .arg(&tarball)
+                .arg("-C")
+                .arg(&pkg)
+                .args(["bin", "codex-path", "codex-resources", "codex-package.json"])
+                .status()
+                .unwrap();
+            assert!(packed.success(), "packed the fixture package");
+        };
+        pack("9.9.9");
 
         // A `curl` that serves that tarball for whatever triple this host
         // asks for, plus a SUMS file digested the way the script verifies.
@@ -1160,7 +1172,7 @@ esac
             stub_bin.display(),
             std::env::var("PATH").unwrap_or_default()
         );
-        for pass in 1..=2 {
+        let install = |pass: &str| {
             let out = std::process::Command::new("/bin/bash")
                 .args(["-c", &script])
                 .env("PATH", &path)
@@ -1168,34 +1180,60 @@ esac
                 .unwrap();
             assert!(
                 out.status.success(),
-                "pass {pass}: {}{}",
+                "{pass}: {}{}",
                 String::from_utf8_lossy(&out.stdout),
                 String::from_utf8_lossy(&out.stderr),
             );
-            let version_dir = root.join("codex/9.9.9");
-            assert!(version_dir.join("bin/codex").exists(), "pass {pass}");
+        };
+        // Every file the package declares, not just the entrypoint.
+        let assert_complete = |version: &str, pass: &str| {
+            let version_dir = root.join("codex").join(version);
+            assert!(version_dir.join("bin/codex").exists(), "{pass}");
             assert!(
                 version_dir.join("bin/codex-code-mode-host").exists(),
-                "pass {pass}: the code-mode host ships beside the entrypoint"
+                "{pass}: the code-mode host ships beside the entrypoint"
             );
-            assert!(version_dir.join("codex-path/rg").exists(), "pass {pass}");
+            assert!(version_dir.join("codex-path/rg").exists(), "{pass}");
             assert!(
                 version_dir.join("codex-resources/zsh/bin/zsh").exists(),
-                "pass {pass}"
+                "{pass}"
             );
-            assert!(
-                version_dir.join("codex-package.json").exists(),
-                "pass {pass}"
-            );
-            // Activated through the managed symlink, nothing staged left.
+            assert!(version_dir.join("codex-package.json").exists(), "{pass}");
+        };
+        // Activated through the managed symlink, nothing staged left behind.
+        let assert_activated = |version: &str, pass: &str| {
             assert_eq!(
                 managed_fallback("codex", &managed_bin_dir(&root)),
                 Some(root.join("bin/codex")),
-                "pass {pass}"
+                "{pass}"
             );
-            assert!(!root.join("codex/.staging").exists(), "pass {pass}");
-            assert!(!root.join("codex/.staging.old").exists(), "pass {pass}");
-        }
+            assert_eq!(
+                std::fs::read_link(root.join("bin/codex")).unwrap(),
+                PathBuf::from(format!("../codex/{version}/bin/codex")),
+                "{pass}"
+            );
+            assert!(!root.join("codex/.staging").exists(), "{pass}");
+            assert!(!root.join("codex/.staging.old").exists(), "{pass}");
+        };
+
+        install("fresh install");
+        assert_complete("9.9.9", "fresh install");
+        assert_activated("9.9.9", "fresh install");
+
+        // The repair path: the version on disk is the one being installed.
+        install("same-version reinstall");
+        assert_complete("9.9.9", "same-version reinstall");
+        assert_activated("9.9.9", "same-version reinstall");
+
+        // A new release. The superseded tree must SURVIVE — a running codex
+        // spawns its code-mode host and bundled rg/zsh from it by path, so
+        // an update that reclaimed it would break live sessions.
+        pack("9.9.10");
+        install("upgrade");
+        assert_complete("9.9.10", "upgrade");
+        assert_activated("9.9.10", "upgrade");
+        assert_complete("9.9.9", "upgrade keeps the superseded tree");
+
         std::fs::remove_dir_all(&dir).ok();
     }
 
