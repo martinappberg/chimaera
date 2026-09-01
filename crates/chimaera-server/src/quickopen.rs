@@ -99,10 +99,24 @@ pub(crate) struct IndexedFile {
 
 /// Per-workspace index slots. The map lock is held only to look up or
 /// evict a slot — never across a walk.
-#[derive(Default)]
 pub(crate) struct QuickOpenCache {
     slots: HashMap<String, Arc<Slot>>,
+    /// The idle sweep runs at most once per [`IDLE_SWEEP`]: it locks every
+    /// slot, and every link-validation burst would otherwise pay it.
+    last_sweep: Instant,
 }
+
+impl Default for QuickOpenCache {
+    fn default() -> Self {
+        QuickOpenCache {
+            slots: HashMap::new(),
+            last_sweep: Instant::now(),
+        }
+    }
+}
+
+/// How often the idle sweep may run.
+const IDLE_SWEEP: Duration = Duration::from_secs(60);
 
 impl QuickOpenCache {
     fn slot(&mut self, workspace_id: &str) -> Arc<Slot> {
@@ -117,7 +131,14 @@ impl QuickOpenCache {
     /// next query mint a fresh slot — and a fresh walk lock — and crawl the
     /// same tree alongside the orphan, the fan-out the single-flight exists
     /// to prevent.
-    fn evict_idle(&mut self, now: Instant) {
+    /// Returns the evicted slots so the caller can drop their indexes —
+    /// tens of MB of strings — after releasing the map lock.
+    fn evict_idle(&mut self, now: Instant) -> Vec<Arc<Slot>> {
+        if now.duration_since(self.last_sweep) < IDLE_SWEEP {
+            return Vec::new();
+        }
+        self.last_sweep = now;
+        let mut evicted = Vec::new();
         self.slots.retain(|_, slot| {
             // Only contention means a walk is in flight; a poisoned lock is
             // a walk that already died.
@@ -126,8 +147,13 @@ impl QuickOpenCache {
                 Err(std::sync::TryLockError::WouldBlock)
             );
             let st = crate::lock(&slot.state);
-            walking || st.refreshing || now.duration_since(st.last_used) < IDLE_EVICT
+            let keep = walking || st.refreshing || now.duration_since(st.last_used) < IDLE_EVICT;
+            if !keep {
+                evicted.push(slot.clone());
+            }
+            keep
         });
+        evicted
     }
 
     /// A deleted workspace's index goes with it — its id can never be
@@ -136,10 +162,26 @@ impl QuickOpenCache {
         self.slots.remove(workspace_id);
     }
 
-    /// Drop every index: the ignore list changed, and an index built under
-    /// the old one must not be served stale for its whole freshness window.
+    /// The ignore list changed: an index built under the old one must not
+    /// be served for its whole freshness window. Slots with a walk in flight
+    /// are kept (dropping one would let the next query start a second walk
+    /// of the same tree) and marked dirty instead — the walk that is running
+    /// used the old list, so its result gets only the short window.
     pub(crate) fn clear(&mut self) {
-        self.slots.clear();
+        self.slots.retain(|_, slot| {
+            let walking = matches!(
+                slot.walk.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            );
+            let mut st = crate::lock(&slot.state);
+            if walking || st.refreshing {
+                st.dirty = true;
+                st.index = None;
+                true
+            } else {
+                false
+            }
+        });
     }
 }
 
@@ -169,6 +211,10 @@ struct SlotState {
     /// A background re-walk is in flight (stale-while-revalidate). Set by the
     /// query that kicks it, cleared by [`RefreshGuard`] however the walk ends.
     refreshing: bool,
+    /// The walk in flight started before the ignore list changed
+    /// (`QuickOpenCache::clear`): its result is installed on the short
+    /// window so a clean walk follows soon.
+    dirty: bool,
     last_used: Instant,
 }
 
@@ -177,6 +223,7 @@ impl Default for SlotState {
         SlotState {
             index: None,
             refreshing: false,
+            dirty: false,
             last_used: Instant::now(),
         }
     }
@@ -269,11 +316,12 @@ pub(crate) fn workspace_index_if_free(
 fn lookup(state: &Arc<AppState>, workspace_id: &str, wait: bool) -> Option<Arc<Vec<IndexedFile>>> {
     let workspace = crate::lock(&state.workspaces).get(workspace_id)?;
     let now = Instant::now();
-    let slot = {
+    let (slot, evicted) = {
         let mut cache = crate::lock(&state.quickopen);
-        cache.evict_idle(now);
-        cache.slot(&workspace.id)
+        let evicted = cache.evict_idle(now);
+        (cache.slot(&workspace.id), evicted)
     };
+    drop(evicted);
 
     // Warm path: serve what is there; a stale index kicks one refresh. The
     // flag is raised under the state lock; the guard that lowers it is built
@@ -388,8 +436,10 @@ fn build(slot: &Slot, root: &Path, ignore: Option<&[String]>) -> Arc<Vec<Indexed
     let files = Arc::new(walk.files);
     // An incomplete index is retried on the floor: the bare-basename
     // fallback's "exactly one match" defense only holds against a complete
-    // walk, so the wrong-file window must stay as short as it always was.
-    let fresh_for = if walk.partial {
+    // walk, so the wrong-file window must stay as short as it always was. A
+    // walk that started under a since-replaced ignore list gets the same.
+    let stale_list = std::mem::take(&mut st.dirty);
+    let fresh_for = if walk.partial || stale_list {
         CACHE_TTL
     } else {
         (took * FRESH_PER_WALK_COST).clamp(CACHE_TTL, CACHE_TTL_MAX)
@@ -455,6 +505,7 @@ pub(crate) fn walk_bounded(
         None => IGNORED_DIRS.contains(&name),
     };
     let mut files = Vec::new();
+    let mut cut = false;
     let mut stack = vec![(root.to_path_buf(), 0usize)];
     while let Some((dir, depth)) = stack.pop() {
         // Time guard checked per directory (not per entry): cheap, and a
@@ -487,6 +538,11 @@ pub(crate) fn walk_bounded(
                 }
                 if depth + 1 < max_depth {
                     stack.push((entry.path(), depth + 1));
+                } else {
+                    // A subtree the depth guard hides is as invisible to
+                    // the bare-basename "exactly one match" defense as one
+                    // the time guard cut: the index is incomplete.
+                    cut = true;
                 }
             } else if !file_type.is_file() {
                 continue;
@@ -521,7 +577,7 @@ pub(crate) fn walk_bounded(
     }
     Walk {
         files,
-        partial: false,
+        partial: cut,
     }
 }
 

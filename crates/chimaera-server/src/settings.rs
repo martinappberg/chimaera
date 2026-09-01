@@ -253,10 +253,22 @@ pub(crate) async fn poll_external_edit(state: &Arc<AppState>) -> bool {
             if on_disk == recorded {
                 return false;
             }
-            let mut store = crate::lock(&state.settings);
-            let before = store.generation;
-            store.read_from_disk();
-            store.generation != before
+            let (changed, ignore_changed) = {
+                let mut store = crate::lock(&state.settings);
+                let before = store.generation;
+                let ignore_before = store.current().get("quickOpen.ignoreDirs").cloned();
+                store.read_from_disk();
+                (
+                    store.generation != before,
+                    ignore_before != store.current().get("quickOpen.ignoreDirs").cloned(),
+                )
+            };
+            if ignore_changed {
+                // Same rule as the PUT path: an index built under the old
+                // ignore list must not be served for its freshness window.
+                crate::lock(&state.quickopen).clear();
+            }
+            changed
         })
     };
     match task.await {

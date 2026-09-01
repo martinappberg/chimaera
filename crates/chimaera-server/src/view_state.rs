@@ -2,7 +2,7 @@
 //! ids (layout tree, focus-mode flag, zoom state). Stored as a single JSON
 //! object file, `view-state.json`, load-tolerant like `workspaces.json`.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -26,10 +26,12 @@ const MAX_STATE_BYTES: usize = 64 * 1024;
 const MAX_KEYS: usize = 128;
 
 /// In-memory key -> JSON value map backed by a single JSON object file
-/// (save-on-change). Values are opaque to the server.
+/// (save-on-change). Values are opaque to the server and shared behind an
+/// `Arc`: the persist snapshot is 128 pointer bumps, not a deep copy of up
+/// to 8 MiB of JSON trees on a reactor worker.
 pub(crate) struct ViewStateStore {
     path: PathBuf,
-    items: serde_json::Map<String, serde_json::Value>,
+    items: BTreeMap<String, Arc<serde_json::Value>>,
     /// Keys oldest-first by last write, for eviction. Load seeds it in the
     /// map's order — alphabetical (`serde_json::Map` is a BTreeMap here), so
     /// hex window ids sort ahead of the `ws_*` workspace fallbacks and a
@@ -47,7 +49,7 @@ impl ViewStateStore {
     /// Load the store from `path`. A missing or corrupt file yields an empty
     /// store (with a warning for the corrupt case).
     pub(crate) fn load(path: PathBuf) -> Self {
-        let items = match std::fs::read_to_string(&path) {
+        let loaded = match std::fs::read_to_string(&path) {
             Ok(contents) => match serde_json::from_str::<serde_json::Value>(&contents) {
                 Ok(serde_json::Value::Object(map)) => map,
                 Ok(_) => {
@@ -65,6 +67,10 @@ impl ViewStateStore {
                 serde_json::Map::new()
             }
         };
+        let items: BTreeMap<String, Arc<serde_json::Value>> = loaded
+            .into_iter()
+            .map(|(key, value)| (key, Arc::new(value)))
+            .collect();
         // The file carries no write order, so a legacy over-cap store is
         // NOT trimmed here: its keys seed the queue alphabetically, and an
         // alphabetical trim could drop a live window's layout on the first
@@ -83,7 +89,7 @@ impl ViewStateStore {
     /// A read counts as use: a window that boots or switches workspace
     /// reads its blob, and that must keep it out of the eviction queue's
     /// front even when it never edits its layout afterwards.
-    pub(crate) fn get(&mut self, key: &str) -> Option<serde_json::Value> {
+    pub(crate) fn get(&mut self, key: &str) -> Option<Arc<serde_json::Value>> {
         let value = self.items.get(key).cloned()?;
         self.touch(key);
         Some(value)
@@ -105,19 +111,23 @@ impl ViewStateStore {
         key: String,
         value: serde_json::Value,
     ) -> tokio::task::JoinHandle<anyhow::Result<()>> {
-        self.items.insert(key.clone(), value);
+        self.items.insert(key.clone(), Arc::new(value));
         self.touch(&key);
         self.evict();
         self.seq += 1;
         let seq = self.seq;
         let path = self.path.clone();
         let writer = self.writer.clone();
-        // The clone is the consistent snapshot; formatting up to
-        // MAX_KEYS × MAX_STATE_BYTES of JSON is CPU that belongs on the pool,
-        // not on a reactor worker under the store lock.
-        let items = self.items.clone();
+        // The snapshot is the key list plus one Arc bump per value;
+        // formatting up to MAX_KEYS × MAX_STATE_BYTES of JSON is CPU that
+        // belongs on the pool, not on a reactor worker under the store lock.
+        let items: Vec<(String, Arc<serde_json::Value>)> = self
+            .items
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
         tokio::task::spawn_blocking(move || {
-            let bytes = serde_json::to_vec(&items)?;
+            let bytes = serialize_items(&items)?;
             // Writers queue on this lock; a snapshot older than the last one
             // flushed is dropped rather than rolling the file back.
             let mut last = crate::lock(&writer);
@@ -139,6 +149,20 @@ impl ViewStateStore {
             self.items.remove(&oldest);
         }
     }
+}
+
+/// The on-disk object, written without materializing a second tree: one
+/// map entry per key, each value serialized straight from its `Arc`.
+fn serialize_items(items: &[(String, Arc<serde_json::Value>)]) -> serde_json::Result<Vec<u8>> {
+    use serde::ser::{SerializeMap, Serializer};
+    let mut out = Vec::new();
+    let mut ser = serde_json::Serializer::new(&mut out);
+    let mut map = ser.serialize_map(Some(items.len()))?;
+    for (key, value) in items {
+        map.serialize_entry(key, &**value)?;
+    }
+    map.end()?;
+    Ok(out)
 }
 
 /// Keys are client-generated window ids: `[A-Za-z0-9_-]{1,64}`.
@@ -165,8 +189,12 @@ pub(crate) async fn get_view_state(
     if !valid_key(&key) {
         return bad_key(&key);
     }
-    match crate::lock(&state.view_state).get(&key) {
-        Some(value) => Json(json!({"state": value})).into_response(),
+    // Bound to its own statement: the guard drops before the blob is
+    // serialized, so one window's 64 KiB read never holds every other
+    // window's view-state traffic.
+    let value = crate::lock(&state.view_state).get(&key);
+    match value {
+        Some(value) => Json(json!({"state": *value})).into_response(),
         None => (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response(),
     }
 }
@@ -222,6 +250,10 @@ pub(crate) async fn put_view_state(
 mod tests {
     use super::*;
 
+    fn got(store: &mut ViewStateStore, key: &str) -> Option<serde_json::Value> {
+        store.get(key).map(|value| (*value).clone())
+    }
+
     fn temp_store(label: &str) -> ViewStateStore {
         let dir = std::env::temp_dir().join(format!(
             "chimaera-view-state-{label}-{}",
@@ -246,16 +278,16 @@ mod tests {
         let last = store.put("late-1".to_string(), json!(1));
         last.await.unwrap().unwrap();
         assert_eq!(store.items.len(), MAX_KEYS);
-        assert_eq!(store.get("w-0"), Some(json!("kept")));
-        assert_eq!(store.get("w-1"), None);
-        assert_eq!(store.get("w-2"), None);
-        assert_eq!(store.get("w-3"), Some(json!(3)));
-        assert_eq!(store.get("late-1"), Some(json!(1)));
+        assert_eq!(got(&mut store, "w-0"), Some(json!("kept")));
+        assert_eq!(got(&mut store, "w-1"), None);
+        assert_eq!(got(&mut store, "w-2"), None);
+        assert_eq!(got(&mut store, "w-3"), Some(json!(3)));
+        assert_eq!(got(&mut store, "late-1"), Some(json!(1)));
 
         let mut reloaded = ViewStateStore::load(store.path.clone());
         assert_eq!(reloaded.items.len(), MAX_KEYS);
-        assert_eq!(reloaded.get("w-0"), Some(json!("kept")));
-        assert_eq!(reloaded.get("w-1"), None);
+        assert_eq!(got(&mut reloaded, "w-0"), Some(json!("kept")));
+        assert_eq!(got(&mut reloaded, "w-1"), None);
         std::fs::remove_dir_all(store.path.parent().unwrap()).ok();
     }
 
@@ -274,16 +306,16 @@ mod tests {
         let mut reloaded = ViewStateStore::load(store.path.clone());
         assert_eq!(reloaded.items.len(), MAX_KEYS + 20);
         // Reading the alphabetically-first key marks it live.
-        assert_eq!(reloaded.get("k-000"), Some(json!(0)));
+        assert_eq!(got(&mut reloaded, "k-000"), Some(json!(0)));
         reloaded
             .put("fresh".to_string(), json!("x"))
             .await
             .unwrap()
             .unwrap();
         assert_eq!(reloaded.items.len(), MAX_KEYS);
-        assert_eq!(reloaded.get("k-000"), Some(json!(0)));
-        assert_eq!(reloaded.get("fresh"), Some(json!("x")));
-        assert_eq!(reloaded.get("k-001"), None);
+        assert_eq!(got(&mut reloaded, "k-000"), Some(json!(0)));
+        assert_eq!(got(&mut reloaded, "fresh"), Some(json!("x")));
+        assert_eq!(got(&mut reloaded, "k-001"), None);
         std::fs::remove_dir_all(store.path.parent().unwrap()).ok();
     }
 }

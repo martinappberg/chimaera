@@ -791,13 +791,24 @@ fn read_appended_lines(
         });
     }
     file.seek(SeekFrom::Start(cursor.offset))?;
+    let start = cursor.offset;
     // Bound the pass to the delta measured above: a transcript growing under
     // the read must not stretch it indefinitely.
     let mut reader =
         std::io::BufReader::with_capacity(TAIL_READ_BUF, file.take(len - cursor.offset));
     let mut lines = Vec::new();
     loop {
-        let buf = reader.fill_buf()?;
+        // The cursor already covers everything consumed, so a read that dies
+        // mid-pass (an NFS hiccup) hands back the lines parsed so far rather
+        // than losing them with their bytes; the next pass resumes after.
+        let buf = match reader.fill_buf() {
+            Ok(buf) => buf,
+            Err(err) if !lines.is_empty() || cursor.offset > start => {
+                tracing::debug!(path = %path.display(), %err, "transcript read ended early");
+                break;
+            }
+            Err(err) => return Err(err),
+        };
         if buf.is_empty() {
             break;
         }

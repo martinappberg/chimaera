@@ -723,7 +723,10 @@ fn quickopen_walk_guards_cap_entries_depth_and_time() {
     // With max_depth=2 the root and l1 are read (one.txt indexed), l2 is
     // recorded as an entry but never descended (two.txt absent).
     let walk = quickopen::walk_bounded(&root, None, 100_000, 2, far);
-    assert!(!walk.partial, "a depth cut is a bound, not a truncation");
+    assert!(
+        walk.partial,
+        "a subtree the depth guard hid makes the index incomplete"
+    );
     let names: Vec<&str> = walk.files.iter().map(|f| f.name.as_str()).collect();
     assert!(names.contains(&"one.txt"), "{names:?}");
     assert!(names.contains(&"l2"), "{names:?}");
