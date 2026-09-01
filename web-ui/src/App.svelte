@@ -17,6 +17,8 @@
     unauthorized,
     type Health,
   } from "./lib/net/api";
+  import { linkRtt, linkRttNow } from "./lib/net/rtt";
+  import { LOCAL_ECHO_MIN_RTT_MS } from "./lib/terminal/localEcho";
   import { healthPollDelayMs, type PollHandle } from "./lib/net/poll";
   import { pageVisible } from "./lib/shared/visibility";
   import {
@@ -1213,6 +1215,16 @@
       onOpenPath,
       onOpenUrl,
       onUrlMenu: (event, url) => contextMenu.openAt(event, urlMenuEntries(url)),
+      // Predictive local echo (localEcho.ts): only on a remote window, only
+      // once the link is measurably slow, and only while the shell sits at
+      // its OSC 133 prompt — agent TUIs (phase "unknown") and running
+      // commands (which may read without echoing) never ghost.
+      echoArmed: (id) => {
+        if (!isRemoteWindow) return false;
+        const rtt = linkRttNow();
+        if (rtt === null || rtt < LOCAL_ECHO_MIN_RTT_MS) return false;
+        return sessions.find((s) => s.id === id)?.phase === "ready";
+      },
     });
     // Every rendered link surface (chat prose, markdown previews, terminal
     // output) resolves a proxyable URL to a browser pane through here; App is
@@ -4354,6 +4366,16 @@
             ? `${getHostLabel()} › ${$computeStatus.self.node}`
             : getHostLabel()}</span
         >
+        {#if isRemoteWindow && $linkRtt !== null && $linkRtt >= 30}
+          <!-- Honest latency signal: on a distant host every keystroke echo
+               and UI fetch pays at least this — better named than mysterious
+               (the remote perf audit's R4). -->
+          <span
+            class="daemon-rtt"
+            title={`link round trip ~${$linkRtt} ms — every keystroke echo and fetch pays at least this`}
+            >{$linkRtt}ms</span
+          >
+        {/if}
         {#if $gitStatus !== null}
           <!-- Always-on orientation: what branch you're on and how dirty the
                tree is; one click opens the source-control panel. -->
@@ -5708,6 +5730,15 @@
   .strip-host.remote {
     color: var(--accent);
     font-weight: 600;
+  }
+
+  /* The measured link RTT, quiet next to the host: only rendered on a remote
+     window once the estimate crosses 30 ms — a fast tunnel needs no badge. */
+  .daemon-rtt {
+    color: var(--muted);
+    font-size: 10px;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
   }
 
   /* Branch + dirty count: always-on git orientation, quiet until it matters. */

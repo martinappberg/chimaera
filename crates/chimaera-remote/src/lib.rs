@@ -280,7 +280,7 @@ fn control_dir(data_dir: &std::path::Path) -> std::path::PathBuf {
 /// (laptop sleep, network change) within ~45s and exit; without them a dead
 /// tunnel keeps its local listener open for hours, so every liveness probe
 /// lies "up" and reconnect becomes a no-op.
-fn ssh_opts() -> [String; 14] {
+fn ssh_opts() -> [String; 16] {
     [
         "-o".into(),
         "ControlMaster=auto".into(),
@@ -296,6 +296,15 @@ fn ssh_opts() -> [String; 14] {
         "ServerAliveInterval=15".into(),
         "-o".into(),
         "ServerAliveCountMax=3".into(),
+        // Compression: negotiated once at master creation and inherited by
+        // every mux channel. Terminal streams and escape-sequence snapshots
+        // compress enormously; on the WAN links this product targets (HPC
+        // login nodes) that is bandwidth the tunnel doesn't spend, and the
+        // CPU cost measured negligible (~2% of one core encrypting a
+        // 75 Mbit/s flood, before compression shrinks it). Applies only to
+        // chimaera's own masters — the user's ssh config is untouched.
+        "-o".into(),
+        "Compression=yes".into(),
     ]
 }
 

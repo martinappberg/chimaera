@@ -64,44 +64,56 @@ listed as the expected failure mode, not a measured one.)
 ## Fix plan
 
 Ordered by leverage. Each lands with a before/after run of the tunnel gauge
-(`scripts/perf/tunnel-gauge.mjs` — the harness that produced the numbers above).
+(`scripts/perf/tunnel-gauge.mjs` — the harness that produced the numbers above;
+`PARK=1` exercises the R1 protocol).
 
-**R1 — park/unpark on `/ws/sessions/{id}` (daemon + client pool).** The pool
-sends `{"type":"park"}` when it stashes an entry and `{"type":"unpark"}` on
-adopt. Parked, the server stops forwarding output frames (events still flow —
-exit/title are cheap JSON) and remembers whether output occurred. Unpark
-answers with the existing repaint idiom (`resync` + fresh snapshot) — and skips
-it entirely when nothing happened while parked. Wire-compat is graceful both
-ways: old servers ignore unknown client text frames; old clients never send
-park and get today's behavior. Acceptance: gauge shows parked-socket bytes ≈ 0
-during flood; unpark burst bounded by one snapshot; F4's per-window
-multiplication applies only to *visible* terminals.
+**R1 — park/unpark on `/ws/sessions/{id}` (daemon + client pool). SHIPPED.**
+The pool sends `{"type":"park"}` when it stashes an entry and
+`{"type":"unpark"}` on adopt. Parked, the server disables the output select
+arm — the session's bounded broadcast ring (shared by every attachment, so
+parking costs no extra daemon memory) becomes the catch-up buffer; events
+still flow, an exit drains the withheld tail first (bounded slices), and a
+foreign resize defers its repaint to unpark. Unpark re-enables the arm: the
+ring replays contiguously, and an overflow surfaces as `Lagged` and repaints
+through the existing path. Wire-compat is graceful both ways: old servers
+ignore unknown client text frames (the client-side ParkedBuffer still absorbs
+their stream); old clients never send park and get today's behavior.
 
-**R2 — attach-parked (no initial snapshot for hidden terminals).** `auth` gains
-`parked: true`; the server skips the attach snapshot until first unpark. Window
-open/restore then transfers one visible snapshot instead of 12. Stacks on R1
-(same protocol surface, same PR or adjacent).
+**R2 — attach-parked (no initial snapshot for hidden terminals). SHIPPED.**
+`auth` gains `parked: true`: the server attaches via `attach_quiet` (subscribe
+only — no ~95 ms render under the term lock, no snapshot bytes) and does not
+adopt the hidden window's dims. The client desyncs its ParkedBuffer on a
+parked ready (no snapshot is coming; pre-drop bytes predate an output gap), so
+the first adopt resyncs into one fresh visible attach — a wake-from-sleep
+reconnect of 12 parked terminals now transfers ~0 snapshots instead of 12.
 
-**R3 — predictive local echo for remote shells (client-only).** Nothing
-server-side beats 1×RTT (F1), so mask it the mosh way: render predicted
-keystrokes immediately (subtly styled), reconcile when the real echo arrives.
-VS Code ships exactly this on xterm.js (`localEchoLatencyThreshold`), so it is
-proven feasible on our stack. Guardrails: arm only when measured RTT exceeds a
-threshold (~50 ms), and only in cooked-mode shell prompts — never inside
-agent TUIs / alt-screen apps (use the existing OSC 133 shell-phase state).
+**R3 — predictive local echo for remote shells (client-only). SHIPPED.**
+Nothing server-side beats 1×RTT (F1), so mask it the mosh way:
+`terminal/localEcho.ts` ghosts predicted keystrokes as a translucent DOM
+overlay — never buffer writes, so a wrong prediction needs no rollback (worst
+case is cosmetic). Armed only when: remote window, measured link RTT ≥ 45 ms,
+the shell at its OSC 133 prompt (agent TUIs stay "unknown" and never arm),
+primary screen, viewport at bottom, printable ASCII. Any control byte, escape
+sequence, or over-long paste clears every ghost — over-clearing is always
+safe, the truth is already painted.
 
-**R4 — RTT-aware UI plumbing.** (a) Measure and surface link RTT in the host
-chip — an honest "remote · 170 ms" beats a mystery. (b) Audit interaction
-waterfalls so one user action costs ≤1 round trip (no sequential fetch chains
-on file open / git view / quickopen); F2 makes every avoidable round trip cost
-⅓ s. (c) Where a small pull rides an epoch-invalidate, prefer carrying it on
-the already-open events WS over a fresh HTTP fetch.
+**R4 — RTT-aware UI plumbing. (a)+(b) SHIPPED, (c) open.** (a) `net/rtt.ts`
+estimates link RTT as the rolling minimum of /health fetch timings; a remote
+window's host chip shows it once it crosses 30 ms. (b) Waterfall spot-check:
+file open (fileStore single-flight, one fetch per surface), git view
+(epoch-invalidate → one /git/status pull), quickopen (one fetch) — no
+sequential chains found; the invalidate-and-pull architecture already keeps
+interactions at ≤1 round trip. (c) carrying small pulls on the events WS
+remains open — worth it only if a hot path shows up with a cold-fetch habit.
 
-**R5 — optional: `Compression=yes` on the chimaera ControlMaster.** Terminal
-text compresses enormously and CPU headroom exists (F5). With R1 the bulk case
-mostly disappears; compression still helps snapshots and file previews on slow
-links. Benchmark first (zlib latency on large bursts) — adopt only if it
-measures well.
+**R5 — `Compression=yes` on the chimaera ControlMaster. SHIPPED, with an
+honest caveat.** Adopted in `ssh_opts` (chimaera's own masters only; the
+user's ssh config is untouched). A clean A/B could NOT be measured in the
+audit session: compression is negotiated at master creation, the live master
+predated the option, and a fresh connection needs an interactive Duo auth.
+Rationale stands on the traffic shape (terminal text and escape-sequence
+snapshots compress enormously; zlib CPU measured negligible at these rates);
+if a fast-LAN workflow ever regresses, this is one line to revert.
 
 **Non-goals:** transport replacement (QUIC/mosh-style datagrams) and HTTP/2 for
 the tunnel (browsers require TLS for h2; a localhost-tunnel TLS story costs

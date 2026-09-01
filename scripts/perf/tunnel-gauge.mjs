@@ -5,8 +5,12 @@
 //   - keystroke echo RTT on the visible terminal, idle vs under flood
 // Findings + fix plan: docs/perf-remote-plan.md
 // Usage: node scripts/perf/tunnel-gauge.mjs <base> <token> <flood-count> <id> <id> ...
+//   PARK=1 …  sends {"type":"park"} on every parked socket before the flood
+//   (the R1 protocol): parked bytes should then be ~0, and the script unparks
+//   one flooded socket at the end to verify the resync+snapshot catch-up.
 const [base, token, floodCountStr, ...ids] = process.argv.slice(2);
 const floodCount = Number(floodCountStr);
+const usePark = process.env.PARK === "1";
 const wsBase = base.replace(/^http/, "ws");
 
 const sockets = [];
@@ -83,6 +87,11 @@ const idle = await echoRtt(visible, 30, 100);
 console.log(`IDLE echo RTT ms: ${JSON.stringify(idle)}`);
 
 // ---- Phase 2: flood N parked terminals, measure again
+if (usePark) {
+  for (const s of parked) s.ws.send(JSON.stringify({ type: "park" }));
+  console.log(`sent park on ${parked.length} sockets`);
+  await new Promise((r) => setTimeout(r, 500));
+}
 for (const s of sockets) { s.bytes = 0; s.frames = 0; }
 const floodStart = performance.now();
 // ~40 MB of output per flooder, fast producer.
@@ -107,6 +116,22 @@ const table = sockets.map((s) => ({
 console.table(table);
 console.log(`window ${Math.round(floodWindowMs / 1000)}s: parked sockets received ${Math.round(parkedBytes / 1048576 * 10) / 10} MB over the tunnel that nobody was looking at`);
 console.log(`visible socket received ${Math.round(visible.bytes / 1024)} KB in the same window`);
+
+if (usePark) {
+  // Unpark one flooded socket: the server must catch up — either the ring
+  // replays, or (after an overflow) a resync + full snapshot repaints.
+  const probe = flooders[0];
+  probe.bytes = 0;
+  let sawResync = false;
+  const origHandler = probe.ws.onmessage;
+  probe.ws.onmessage = (ev) => {
+    if (typeof ev.data === "string" && JSON.parse(ev.data).type === "resync") sawResync = true;
+    origHandler(ev);
+  };
+  probe.ws.send(JSON.stringify({ type: "unpark" }));
+  await new Promise((r) => setTimeout(r, 3000));
+  console.log(`unpark catch-up on ${probe.id}: ${Math.round(probe.bytes / 1024)} KB, resync=${sawResync}`);
+}
 
 for (const s of sockets) s.ws.close();
 process.exit(0);

@@ -52,6 +52,27 @@ export class ParkedBuffer {
     this.parked = true;
   }
 
+  /** Whether the entry is currently parked — the socket reads this to attach
+   *  (and re-auth after a reconnect) in parked mode, where the server
+   *  withholds output and skips the snapshot. */
+  isParked(): boolean {
+    return this.parked;
+  }
+
+  /**
+   * The grid can no longer catch up from the stream — discard and latch
+   * desynced so adopt resyncs (a fresh visible attach re-snapshots). Fired
+   * on a parked reconnect: the server sent no snapshot (parked auth), and
+   * any bytes buffered before the connection dropped predate an output gap
+   * of unknown size. No-op while visible.
+   */
+  desync(): void {
+    if (!this.parked) return;
+    this.discard();
+    this.awaitingSnapshot = false;
+    this.desynced = true;
+  }
+
   /**
    * Route one binary frame: "write" = parse into the terminal now (visible,
    * or the parked snapshot write-through), "buffered" = queued for adopt,
@@ -96,10 +117,7 @@ export class ParkedBuffer {
    * terminals are unaffected — xterm reflows its own buffer.
    */
   resized(): void {
-    if (!this.parked) return;
-    this.discard();
-    this.awaitingSnapshot = false;
-    this.desynced = true;
+    this.desync();
   }
 
   /**

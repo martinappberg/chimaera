@@ -445,6 +445,27 @@ impl Session {
         }
     }
 
+    /// Attach without rendering a snapshot (empty `snapshot`): the parked
+    /// attach for clients that will not display the grid until later — a
+    /// full-scrollback render (~95 ms under the term lock, plus the bytes on
+    /// the wire) is pure waste for a hidden window. The caller repaints via a
+    /// fresh `attach()` when the terminal is first shown. The term lock is
+    /// still held across the subscribes so the receivers' start point is
+    /// consistent with each other.
+    pub(crate) fn attach_quiet(&self) -> Attachment {
+        let term = lock_unpoisoned(&self.term);
+        let output = self.output_tx.subscribe();
+        let events = self.events_tx.subscribe();
+        drop(term);
+        Attachment {
+            info: self.info(),
+            snapshot: Vec::new(),
+            output,
+            events,
+            input: self.input_tx.clone(),
+        }
+    }
+
     pub(crate) fn resize(&self, cols: u16, rows: u16) -> anyhow::Result<()> {
         // Echoed dims are routine (every attached client mirrors resize
         // events back); a no-op must not winch the child or broadcast —

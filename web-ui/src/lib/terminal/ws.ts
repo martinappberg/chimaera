@@ -25,6 +25,20 @@ export interface SessionSocketHandlers {
   onExited(status: number | null): void;
   /** Server-side error, surfaced quietly. The socket will not reconnect. */
   onError(message: string): void;
+  /**
+   * Whether the terminal is currently parked (hidden pooled instance). Read
+   * at every (re)connect: a parked attach tells the server to withhold
+   * output and skip the snapshot (`auth.parked`), and omits the grid dims —
+   * a hidden window's stale dims must never reflow the server grid.
+   */
+  parked?(): boolean;
+  /**
+   * A connection that authenticated parked became ready: no snapshot is
+   * coming on this connection, and any bytes buffered before it dropped
+   * predate an output gap — the pool desyncs the buffer so adopt resyncs
+   * into a fresh visible attach.
+   */
+  onParkedReady?(): void;
 }
 
 interface ServerTextFrame {
@@ -57,6 +71,8 @@ export class SessionSocket {
    */
   private sawExited = false;
   private everReady = false;
+  /** The auth frame of the CURRENT connection carried `parked: true`. */
+  private sentParkedAuth = false;
   private unknownRetries = 0;
   private readonly recon = new Reconnector(() => this.connect());
   private readonly encoder = new TextEncoder();
@@ -76,10 +92,16 @@ export class SessionSocket {
     this.ws = ws;
 
     ws.onopen = () => {
+      // Parked attach: the server withholds output + snapshot until unpark,
+      // and must not adopt this hidden window's stale dims.
+      const parked = this.handlers.parked?.() ?? false;
+      this.sentParkedAuth = parked;
       // Carry the client grid so the server resizes BEFORE rendering the
       // snapshot; the frame then always matches what the terminal displays.
-      const dims = this.handlers.dims?.() ?? null;
-      ws.send(JSON.stringify({ type: "auth", token: getToken() ?? "", ...(dims ?? {}) }));
+      const dims = parked ? null : (this.handlers.dims?.() ?? null);
+      ws.send(
+        JSON.stringify({ type: "auth", token: getToken() ?? "", parked, ...(dims ?? {}) }),
+      );
     };
 
     ws.onmessage = (ev: MessageEvent) => {
@@ -111,6 +133,13 @@ export class SessionSocket {
       case "ready": {
         this.recon.succeeded();
         this.unknownRetries = 0;
+        if (this.sentParkedAuth) {
+          // No snapshot follows on a parked connection — never reset the
+          // grid for it, and skip the dims reconcile (no dims were sent).
+          this.everReady = true;
+          this.handlers.onParkedReady?.();
+          break;
+        }
         // Grid truth BEFORE the reset below may resize the terminal: a fit
         // that landed mid-handshake is what the reconcile must preserve.
         const d = this.handlers.dims?.() ?? null;
@@ -194,6 +223,28 @@ export class SessionSocket {
   sendResize(cols: number, rows: number): void {
     if (this.ws?.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify({ type: "resize", cols, rows }));
+    }
+  }
+
+  /**
+   * Tell the server this terminal parked: output forwarding stops (the
+   * session's server-side ring buffers the stream) until unpark. Dropped
+   * when the socket is down — the reconnect's parked auth carries the state.
+   * Old servers ignore the frame and keep streaming; the client-side
+   * ParkedBuffer still handles that stream, so both directions degrade
+   * gracefully.
+   */
+  sendPark(): void {
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({ type: "park" }));
+    }
+  }
+
+  /** Resume after park: the server catches up from its ring, or repaints
+   *  (resync + snapshot) when the ring can't cover the gap. */
+  sendUnpark(): void {
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({ type: "unpark" }));
     }
   }
 

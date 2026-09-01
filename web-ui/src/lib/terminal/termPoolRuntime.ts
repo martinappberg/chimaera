@@ -33,6 +33,7 @@ import { WebglAddon } from "@xterm/addon-webgl";
 import "@xterm/xterm/css/xterm.css";
 import { SessionSocket } from "./ws";
 import { ParkedBuffer } from "./parkedBuffer";
+import { createLocalEcho, type LocalEcho } from "./localEcho";
 import { registerPathLinks } from "./links";
 import { registerUrlLinks } from "./urlLinks";
 import type { PoolHandlers } from "./termPool";
@@ -118,6 +119,8 @@ interface PoolEntry {
   disposeLinks: () => void;
   /** Output routing while parked; see parkedBuffer.ts for the states. */
   buf: ParkedBuffer;
+  /** Predictive local echo for high-RTT remotes; see localEcho.ts. */
+  echo: LocalEcho;
   /** Live WebGL addon while the renderer is accelerated; null after loss. */
   webgl: WebglAddon | null;
   /**
@@ -215,10 +218,16 @@ function applyReset(term: Terminal, cols?: number, rows?: number): void {
 function adoptParked(entry: PoolEntry): void {
   const directive = entry.buf.adopt();
   if (directive.resync) {
+    // A fresh visible connect re-auths with parked:false — the server sends
+    // a full snapshot; no unpark needed on the abandoned connection.
     if (entry.socket.resync()) entry.buf.resyncIssued();
     return;
   }
   for (const chunk of directive.flush) entry.term.write(chunk);
+  // Resume the server stream: it catches up from its ring (contiguous with
+  // the flushed bytes — the server stopped sending exactly where the park
+  // frame landed), or repaints when the ring can't cover the gap.
+  entry.socket.sendUnpark();
 }
 
 /**
@@ -378,6 +387,7 @@ function createEntry(id: string, parent: HTMLElement, fontOverride: number | und
       }),
     ),
     buf: new ParkedBuffer(PARKED_BUFFER_MAX_BYTES),
+    echo: createLocalEcho(term, () => handlers?.echoArmed?.(id) ?? false),
     webgl: null,
     webglFailed: false,
     webglLosses: 0,
@@ -394,7 +404,10 @@ function createEntry(id: string, parent: HTMLElement, fontOverride: number | und
       // Parked terminals buffer, don't parse (see the module header) — the
       // one exception is the snapshot write-through after a reset.
       if (entry.disposed) return;
-      if (entry.buf.binary(data) === "write") term.write(data);
+      if (entry.buf.binary(data) === "write") {
+        entry.echo.onOutput(data);
+        term.write(data);
+      }
     },
     onReset: (cols, rows) => {
       if (entry.disposed) return;
@@ -402,6 +415,7 @@ function createEntry(id: string, parent: HTMLElement, fontOverride: number | und
       // are cheap enough to apply even while parked, and the snapshot then
       // writes through (see ParkedBuffer).
       entry.buf.reset();
+      entry.echo.clear();
       applyReset(term, cols, rows);
     },
     dims: () => ({ cols: term.cols, rows: term.rows }),
@@ -429,9 +443,22 @@ function createEntry(id: string, parent: HTMLElement, fontOverride: number | und
       // the app (which shows the re-auth overlay on "unauthorized").
       handlers?.onSocketError(id, message);
     },
+    parked: () => entry.buf.isParked(),
+    onParkedReady: () => {
+      // A parked (re)connect carries no snapshot, and pre-drop buffered
+      // bytes predate an output gap: desync so adopt resyncs into a fresh
+      // visible attach — one snapshot for the terminal actually shown,
+      // instead of one per parked socket at reconnect time.
+      if (!entry.disposed) entry.buf.desync();
+    },
   });
 
-  term.onData((data) => entry.socket.sendInput(data));
+  term.onData((data) => {
+    // Ghost first, then send: the prediction shows in the same frame as the
+    // keystroke while the real echo makes its round trip.
+    entry.echo.onInput(data);
+    entry.socket.sendInput(data);
+  });
   term.onResize(({ cols, rows }) => entry.socket.sendResize(cols, rows));
   term.onSelectionChange(() => {
     const text = term.getSelection();
@@ -458,6 +485,7 @@ function disposeEntry(entry: PoolEntry): void {
   entry.disposed = true;
   pool.delete(entry.id);
   if (entry.fitTimer !== null) clearTimeout(entry.fitTimer);
+  entry.echo.dispose();
   entry.disposeLinks();
   entry.socket.close();
   entry.ro.disconnect();
@@ -577,6 +605,12 @@ export function release(id: string, host: HTMLElement): void {
     // Park is the explicit lifecycle signal that flips output into the
     // ParkedBuffer — set before the move so no write races the stash.
     entry.buf.park();
+    entry.echo.clear();
+    // Tell the server too: it stops forwarding output entirely (its ring
+    // buffers the stream), so a hidden terminal costs the wire ~nothing —
+    // the difference between local and tunneled remotes. An old server
+    // ignores the frame; the ParkedBuffer above still absorbs its stream.
+    entry.socket.sendPark();
     ensureStash().appendChild(entry.el);
   }
 }

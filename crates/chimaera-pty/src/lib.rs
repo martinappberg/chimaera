@@ -230,6 +230,17 @@ impl SessionManager {
         Ok(session.attach())
     }
 
+    /// Attach without rendering a snapshot (`snapshot` comes back empty) —
+    /// for clients attaching parked (hidden), which repaint via a fresh
+    /// `attach()` when first shown. Skips the ~95 ms full-scrollback render
+    /// under the term lock and the snapshot bytes on the wire.
+    pub fn attach_quiet(&self, id: &str) -> anyhow::Result<Attachment> {
+        let session = self
+            .session(id)
+            .ok_or_else(|| anyhow!("unknown session: {id}"))?;
+        Ok(session.attach_quiet())
+    }
+
     /// Resize the PTY and the server-side terminal together. The last resize
     /// wins for every attachment; a `Resized` event is broadcast.
     pub fn resize(&self, id: &str, cols: u16, rows: u16) -> anyhow::Result<()> {
