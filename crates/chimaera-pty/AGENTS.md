@@ -39,8 +39,7 @@ has subtle repaint invariants — read the architecture guide before touching th
   under the term lock (~95 ms measured at the 10k default; the cap is 200k
   lines), and `resize` reflows the grid under the same lock. Async callers must
   not run either on a reactor worker — the daemon's ws attach/resync/resize
-  paths wrap them in `spawn_blocking` (known gap: the daemon's MCP screen-text
-  scrape still takes the term lock on the reactor).
+  paths wrap them in `spawn_blocking` (the daemon's MCP screen-text scrape, the last holdout, now goes through `mcp.rs::screen_text_blocking`).
 - **Known accepted gap:** a resync while on the alternate screen can't restore the
   primary screen's scrollback.
 - Leaf crate: depends on nothing else in the workspace. `serde::Serialize` on the

@@ -55,8 +55,21 @@ Daemon side: `crates/chimaera-server/src/{workspaces.rs,view_state.rs,quickopen.
 - **Key behaviors.** Cached results render instantly while the server call debounces 120ms
   (a `seq` guard drops out-of-order responses). The walk skips VCS/build/venv/pipeline dirs
   (`.git`, `node_modules`, `target`, `dist`, `__pycache__`, `.venv`, `.snakemake`, `work` —
-  overridable via `quickOpen.ignoreDirs`), never follows symlinks, guards at 100k files. Cmd+P
-  is files-only (`dirs=false`); the chat composer's `@`-mention opts into dirs.
+  overridable via `quickOpen.ignoreDirs`), never follows symlinks, guards at 100k files / 32
+  levels / 3 s wall. Cmd+P is files-only (`dirs=false`); the chat composer's `@`-mention opts
+  into dirs. **The index serves stale and refreshes behind:** only a workspace's very first
+  query waits on the walk (single-flighted — concurrent cold callers join it); afterwards every
+  query — the palette, `@`-mentions, and the terminal/chat link validator's bare-basename
+  fallback, which fires on every repaint — answers from the last index at once, and an index
+  past its freshness window kicks one background re-walk. Freshness scales with the walk's own
+  cost (10× its duration, floored at 5 s, capped at 120 s), so a 3 s NFS crawl is reused for
+  30 s while a 40 ms local walk refreshes every 5 s. Walks run on the blocking pool, never on
+  the reactor; an index unused for 10 min is dropped on the next query for any workspace
+  (eviction is lazy — a fully idle daemon keeps its last index until someone asks again), and
+  a deleted workspace's index goes at once. Measured live on a 20k-entry NFS workspace
+  before this: every link-validation burst fanned out into five concurrent 3 s walks on the
+  blocking pool (389 guard trips in one day), and the palette's own walk ran inline on a
+  reactor worker.
 
 ## Splitting, tabs & drag-and-drop
 
@@ -183,7 +196,8 @@ Daemon side: `crates/chimaera-server/src/{workspaces.rs,view_state.rs,quickopen.
   16 most recently saved windows since the key is per tab); the per-window and
   workspace-only keys (`stateKey`/`wsKey`) + boot fallback are in `web-ui/src/App.svelte`. Route:
   `GET/PUT /api/v1/view-state/{key}` (server `view_state.rs`, opaque blobs, key
-  `[A-Za-z0-9_-]{1,64}`, ≤64KB).
+  `[A-Za-z0-9_-]{1,64}`, ≤64KB; the store keeps the 128 most recently written keys — every
+  tab ever opened mints its own — and writes the file on the blocking pool, never the reactor).
 - **Key behaviors.** The layout is keyed per (window id, workspace) — the window id lives in
   `sessionStorage` — **and mirrored under a workspace-only key** (`ws_<wsId>`). A reopened window
   mints a fresh id (the native shell discards a closed window's identity by macOS convention), so

@@ -503,6 +503,14 @@ pub(crate) fn cleared_by_output(state: AgentState) -> Option<AgentState> {
     matches!(state, AgentState::IdlePrompt | AgentState::Errored).then_some(AgentState::Running)
 }
 
+/// The record shapes [`apply_title_line`] acts on, as a cheap prefilter
+/// shared by the live transcript tail and the launcher's resume scan — one
+/// predicate, so the two can never drift. A superset by design: the real
+/// parse in `apply_title_line` decides.
+pub(crate) fn is_title_line(line: &str) -> bool {
+    line.contains("\"customTitle\"") || line.contains("\"ai-title\"")
+}
+
 /// Apply one transcript line to the record's title fields. Returns whether
 /// the effective title changed. Recognizes `{"type":"ai-title","aiTitle":..}`
 /// records and any record carrying a top-level `customTitle` (string sets it,

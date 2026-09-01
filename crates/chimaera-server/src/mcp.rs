@@ -494,9 +494,9 @@ async fn tools_call(
         ));
     }
     match name {
-        "list_terminals" => Ok(list_terminals(state, agent_id)),
+        "list_terminals" => Ok(list_terminals(state, agent_id).await),
         "run_in_terminal" => Ok(run_in_terminal(state, agent_id, &args).await),
-        "read_terminal" => Ok(read_terminal(state, agent_id, &args)),
+        "read_terminal" => Ok(read_terminal(state, agent_id, &args).await),
         "workspace_status" | "read_session" | "list_changed_files" | "spawn_agent"
         | "spawn_terminal" | "message_agent" | "interrupt_agent" => {
             let Some(workspace) = workspace_of(state, agent_id) else {
@@ -615,7 +615,7 @@ async fn read_session(
             (v as usize).clamp(1, READ_SESSION_MAX)
         });
     if state.sessions.get(&sid).is_some() {
-        let screen = state.sessions.screen_text(&sid, lines).unwrap_or_default();
+        let screen = screen_text_blocking(state, sid, lines).await;
         return tool_text(if screen.trim().is_empty() {
             "(screen is empty)".to_string()
         } else {
@@ -1191,7 +1191,7 @@ fn resolve_linked(state: &AppState, agent_id: &str, args: &Value) -> Result<Stri
     })
 }
 
-fn list_terminals(state: &AppState, agent_id: &str) -> Value {
+async fn list_terminals(state: &Arc<AppState>, agent_id: &str) -> Value {
     let scope = crate::links::terminals_of(state, agent_id);
     if scope.is_empty() {
         return tool_text(
@@ -1200,9 +1200,24 @@ fn list_terminals(state: &AppState, agent_id: &str) -> Value {
                 .to_string(),
         );
     }
+    // Each terminal's phase + last command reads the Marks lock the PTY
+    // reader takes per chunk: the whole roster is one pool task, not N
+    // acquisitions on a reactor worker.
+    let state = state.clone();
+    let listed = tokio::task::spawn_blocking(move || list_terminals_blocking(&state, &scope)).await;
+    match listed {
+        Ok(text) => tool_text(text),
+        Err(join) => {
+            tracing::warn!(%join, "terminal roster task failed");
+            tool_error("could not list terminals: the roster read failed".to_string())
+        }
+    }
+}
+
+fn list_terminals_blocking(state: &AppState, scope: &[String]) -> String {
     let execs = crate::lock(&state.exec_status).clone();
     let mut out = String::new();
-    for id in &scope {
+    for id in scope {
         let Some(info) = state.sessions.get(id) else {
             continue;
         };
@@ -1233,7 +1248,7 @@ fn list_terminals(state: &AppState, agent_id: &str) -> Value {
             }
         }
     }
-    tool_text(out.trim_end().to_string())
+    out.trim_end().to_string()
 }
 
 async fn run_in_terminal(state: &Arc<AppState>, agent_id: &str, args: &Value) -> Value {
@@ -1295,7 +1310,28 @@ async fn run_in_terminal(state: &Arc<AppState>, agent_id: &str, args: &Value) ->
     }
 }
 
-fn read_terminal(state: &AppState, agent_id: &str, args: &Value) -> Value {
+/// Render a session's screen text on the blocking pool: the render walks
+/// the grid under the term lock, which a flooding PTY reader contends for —
+/// never on a reactor worker.
+async fn screen_text_blocking(state: &AppState, id: String, lines: usize) -> String {
+    let sessions = state.sessions.clone();
+    let render_id = id.clone();
+    match tokio::task::spawn_blocking(move || {
+        sessions.screen_text(&render_id, lines).unwrap_or_default()
+    })
+    .await
+    {
+        Ok(screen) => screen,
+        Err(join) => {
+            // A panicking render must not read as an idle terminal: the term
+            // lock recovers from poisoning, so nothing later would say so.
+            tracing::warn!(%id, %join, "screen render task failed");
+            "(screen unavailable — the render failed; see the daemon log)".to_string()
+        }
+    }
+}
+
+async fn read_terminal(state: &AppState, agent_id: &str, args: &Value) -> Value {
     let id = match resolve_linked(state, agent_id, args) {
         Ok(id) => id,
         Err(err) => return tool_error(err),
@@ -1305,10 +1341,7 @@ fn read_terminal(state: &AppState, agent_id: &str, args: &Value) -> Value {
         .and_then(|s| s.as_bool())
         .unwrap_or(false)
     {
-        let screen = state
-            .sessions
-            .screen_text(&id, SCREEN_LINES)
-            .unwrap_or_default();
+        let screen = screen_text_blocking(state, id, SCREEN_LINES).await;
         return tool_text(if screen.is_empty() {
             "(screen is empty)".to_string()
         } else {
@@ -1322,8 +1355,21 @@ fn read_terminal(state: &AppState, agent_id: &str, args: &Value) -> Value {
         .get("commands")
         .and_then(|v| v.as_u64())
         .map_or(DEFAULT_READ_COMMANDS, |v| (v as usize).clamp(1, 50));
-    let entries = marks.journal(limit);
-    let phase = marks.phase().as_str();
+    // The journal read holds the Marks lock the PTY reader takes per chunk
+    // and clones up to 50 × 80 KiB of captures — pool work, like the screen
+    // render above.
+    let (entries, phase) =
+        match tokio::task::spawn_blocking(move || (marks.journal(limit), marks.phase().as_str()))
+            .await
+        {
+            Ok(read) => read,
+            Err(join) => {
+                tracing::warn!(%id, %join, "journal read task failed");
+                return tool_error(format!(
+                    "could not read terminal {id}: the journal read failed"
+                ));
+            }
+        };
     if entries.is_empty() {
         return tool_text(format!(
             "phase: {phase} — journal empty (no commands seen yet, or this shell \

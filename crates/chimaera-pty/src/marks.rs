@@ -93,18 +93,26 @@ struct Capture {
 }
 
 impl Capture {
+    /// Bulk append. This runs on the PTY reader thread ahead of the vte
+    /// parser for every byte a shell emits, so it moves slices, never bytes:
+    /// fill the head, then keep only the newest `TAIL_CAP` of what remains.
     fn push(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            if self.head.len() < HEAD_CAP {
-                self.head.push(b);
-            } else {
-                if self.tail.len() == TAIL_CAP {
-                    self.tail.pop_front();
-                    self.truncated += 1;
-                }
-                self.tail.push_back(b);
-            }
+        let mut bytes = bytes;
+        if self.head.len() < HEAD_CAP {
+            let take = (HEAD_CAP - self.head.len()).min(bytes.len());
+            self.head.extend_from_slice(&bytes[..take]);
+            bytes = &bytes[take..];
         }
+        if bytes.is_empty() {
+            return;
+        }
+        // Everything past the newest TAIL_CAP bytes falls out: from the
+        // front of the tail first, then from the chunk's own prefix.
+        let overflow = (self.tail.len() + bytes.len()).saturating_sub(TAIL_CAP);
+        let from_tail = overflow.min(self.tail.len());
+        self.tail.drain(..from_tail);
+        self.tail.extend(&bytes[overflow - from_tail..]);
+        self.truncated += overflow as u64;
     }
 
     fn len(&self) -> usize {
@@ -909,6 +917,32 @@ mod tests {
         assert!(entry.truncated_bytes > 0);
         assert!(entry.output.contains("bytes omitted"));
         assert!(entry.output.ends_with("THE-END"));
+    }
+
+    /// `Capture::push` moves slices; its head/tail/`truncated` accounting
+    /// must match the per-byte loop it replaced, including the chunk-larger-
+    /// than-the-tail branch that replaces the tail wholesale.
+    #[test]
+    fn capture_push_bulk_matches_per_byte_semantics() {
+        let mut c = Capture::default();
+        c.push(&vec![b'h'; HEAD_CAP - 1]);
+        // One byte completes the head, the next starts the tail.
+        c.push(b"HT");
+        assert_eq!(c.head.len(), HEAD_CAP);
+        assert_eq!(c.head[HEAD_CAP - 1], b'H');
+        assert_eq!(c.tail.iter().copied().collect::<Vec<u8>>(), b"T");
+        assert_eq!(c.truncated, 0);
+        // A chunk larger than the tail: the old tail (1 byte) and the chunk's
+        // own prefix (100 bytes) fall out at once.
+        c.push(&vec![b'x'; TAIL_CAP + 100]);
+        assert_eq!(c.tail.len(), TAIL_CAP);
+        assert_eq!(c.truncated, 101);
+        // A small overflow drains from the front, newest bytes at the back.
+        c.push(b"yz");
+        assert_eq!(c.tail.len(), TAIL_CAP);
+        assert_eq!(c.truncated, 103);
+        assert_eq!(c.tail.back(), Some(&b'z'));
+        assert_eq!(c.tail.front(), Some(&b'x'));
     }
 
     #[test]
