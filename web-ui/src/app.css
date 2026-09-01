@@ -24,6 +24,12 @@
   --text-sm: 13px;
   --text-md: 14px;
   --text-lg: 16px;
+  /* Overlay stacking: the clearance a top-centre surface leaves for the
+     asset-transition notice above it (App.svelte's reconnect strip stacks
+     under it while a transition is pending). Sized to the notice's tallest
+     layout — 11px paddings, title row, a three-line body, actions — plus the
+     14px gutter both surfaces dock at. */
+  --notice-stack-offset: 140px;
   /* Single focus treatment for every keyboard-focusable control. */
   --focus-ring: color-mix(in srgb, var(--accent) 70%, transparent);
   --bg: #fbfbfc;

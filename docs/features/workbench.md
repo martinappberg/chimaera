@@ -179,7 +179,8 @@ Daemon side: `crates/chimaera-server/src/{workspaces.rs,view_state.rs,quickopen.
 - **How it's used.** Automatic. Reload the page — or **reopen a window on the same workspace**
   (even a brand-new one, e.g. after a deliberate close) — and the exact layout returns.
 - **Where it lives.** `web-ui/src/lib/layout/viewState.ts` (`windowKey` via `sessionStorage`,
-  `serializeLayout`/`deserializeLayout`), `railState.ts` (localStorage); the per-window and
+  `serializeLayout`/`deserializeLayout`), `railState.ts` (localStorage, stamped + bounded to the
+  16 most recently saved windows since the key is per tab); the per-window and
   workspace-only keys (`stateKey`/`wsKey`) + boot fallback are in `web-ui/src/App.svelte`. Route:
   `GET/PUT /api/v1/view-state/{key}` (server `view_state.rs`, opaque blobs, key
   `[A-Za-z0-9_-]{1,64}`, ≤64KB).
