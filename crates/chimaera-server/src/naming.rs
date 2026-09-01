@@ -60,10 +60,27 @@ pub(crate) fn spawn_shell_watch(state: Arc<AppState>, session_id: String) {
 
             // The shell's cwd, polled once per tick: feeds both the idle name
             // and the `cwd_current` field on session JSON (context bridge).
-            let cwd = info
-                .pid
-                .and_then(|pid| i32::try_from(pid).ok())
-                .and_then(proc_info::cwd);
+            // The probe is a handful of /proc reads plus a tty ioctl — cheap,
+            // but filesystem work all the same, and it runs per session
+            // every tick whether or not anyone is connected: off the reactor.
+            let probe = {
+                let state = state.clone();
+                tokio::task::spawn_blocking(move || {
+                    let cwd = info
+                        .pid
+                        .and_then(|pid| i32::try_from(pid).ok())
+                        .and_then(proc_info::cwd);
+                    let name = resolve_shell_name(&state, &info, cwd.clone());
+                    (cwd, name)
+                })
+                .await
+            };
+            // A probe that panics costs one tick's facts, not the watcher;
+            // say so, or a poisoned edge case retries forever in silence.
+            let (cwd, name) = probe.unwrap_or_else(|join| {
+                tracing::debug!(session = %session_id, %join, "shell probe failed");
+                Default::default()
+            });
             if let Some(cwd) = &cwd {
                 let mut cwds = crate::lock(&state.current_cwds);
                 if cwds.get(&session_id) != Some(cwd) {
@@ -72,7 +89,7 @@ pub(crate) fn spawn_shell_watch(state: Arc<AppState>, session_id: String) {
                 }
             }
 
-            if let Some(name) = resolve_shell_name(&state, &info, cwd) {
+            if let Some(name) = name {
                 let mut names = crate::lock(&state.display_names);
                 if names.get(&session_id).map(String::as_str) != Some(name.as_str()) {
                     names.insert(session_id.clone(), name);

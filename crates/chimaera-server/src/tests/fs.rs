@@ -715,27 +715,33 @@ fn quickopen_walk_guards_cap_entries_depth_and_time() {
     let far = std::time::Instant::now() + std::time::Duration::from_secs(60);
 
     // Entry cap: the walk stops at max_files entries (partial, not an error).
-    let files = quickopen::walk_bounded(&root, None, 3, quickopen::MAX_INDEX_DEPTH, far);
-    assert_eq!(files.len(), 3);
+    let walk = quickopen::walk_bounded(&root, None, 3, quickopen::MAX_INDEX_DEPTH, far);
+    assert_eq!(walk.files.len(), 3);
+    assert!(walk.partial);
 
     // Depth cap: max_depth levels of directories are read, nothing deeper.
     // With max_depth=2 the root and l1 are read (one.txt indexed), l2 is
     // recorded as an entry but never descended (two.txt absent).
-    let files = quickopen::walk_bounded(&root, None, 100_000, 2, far);
-    let names: Vec<&str> = files.iter().map(|f| f.name.as_str()).collect();
+    let walk = quickopen::walk_bounded(&root, None, 100_000, 2, far);
+    assert!(
+        walk.partial,
+        "a subtree the depth guard hid makes the index incomplete"
+    );
+    let names: Vec<&str> = walk.files.iter().map(|f| f.name.as_str()).collect();
     assert!(names.contains(&"one.txt"), "{names:?}");
     assert!(names.contains(&"l2"), "{names:?}");
     assert!(!names.contains(&"two.txt"), "{names:?}");
 
     // Time cap: an already-expired deadline yields an empty (partial) index.
-    let files = quickopen::walk_bounded(
+    let walk = quickopen::walk_bounded(
         &root,
         None,
         100_000,
         quickopen::MAX_INDEX_DEPTH,
         std::time::Instant::now() - std::time::Duration::from_secs(1),
     );
-    assert!(files.is_empty());
+    assert!(walk.files.is_empty());
+    assert!(walk.partial);
 
     std::fs::remove_dir_all(&root).ok();
 }
@@ -1494,6 +1500,59 @@ async fn fs_put_file_caps_at_1mb() {
     let err: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert!(err["error"].as_str().unwrap().contains("too large"));
     assert_eq!(std::fs::metadata(&path).unwrap().len(), 1024 * 1024);
+}
+
+/// The index serves stale and refreshes behind: a query past the freshness
+/// window answers from the old index immediately, and the background
+/// re-walk shows up on a later query.
+#[tokio::test]
+async fn fs_quickopen_serves_stale_then_refreshes_behind() {
+    let state = test_state();
+    let root = test_dir("quickopen-swr");
+    std::fs::write(root.join("alpha.txt"), "a").unwrap();
+    let (status, ws) = request(
+        &state,
+        Method::POST,
+        "/api/v1/workspaces",
+        Some(serde_json::json!({"root": root.to_string_lossy()})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let ws_id = ws["id"].as_str().unwrap().to_string();
+    let count = |q: &'static str| {
+        let state = state.clone();
+        let ws_id = ws_id.clone();
+        async move {
+            let uri = format!("/api/v1/fs/quickopen?workspace_id={ws_id}&q={q}");
+            let (status, json) = request(&state, Method::GET, &uri, None).await;
+            assert_eq!(status, StatusCode::OK);
+            json["entries"].as_array().unwrap().len()
+        }
+    };
+    assert_eq!(count("alpha").await, 1);
+
+    // A new file is invisible while the index is fresh (no walk runs)...
+    std::fs::write(root.join("beta.txt"), "b").unwrap();
+    assert_eq!(count("beta").await, 0);
+
+    // ...and STILL invisible on the first query past the window — that query
+    // is answered from the stale index and only kicks the refresh...
+    quickopen::age_index(&state, &ws_id);
+    assert_eq!(count("beta").await, 0);
+
+    // ...which lands shortly after.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if count("beta").await == 1 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "refresh never landed"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    std::fs::remove_dir_all(&root).ok();
 }
 
 #[tokio::test]

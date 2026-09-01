@@ -23,6 +23,7 @@ refinement).
   blocking work under the term lock (the whole scrollback, ~95 ms measured at the
   10k default), and `resize` reflows the grid under the same lock; async callers
   wrap both in `spawn_blocking` (the daemon's ws attach/resync/resize paths do) —
-  never take the term lock directly on a reactor worker. (Known gap: the daemon's
-  MCP screen-text scrape still does.)
+  never take the term lock directly on a reactor worker (the daemon's MCP
+  screen-text scrape was the last holdout; it now goes through
+  `screen_text_blocking`).
 - Extend `tests.rs` (real PTY + snapshot-replay) when you change terminal state.

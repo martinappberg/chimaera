@@ -1368,6 +1368,86 @@ async fn agent_title_tail_polls_transcript() {
     state.sessions.kill(&id).ok();
 }
 
+/// A resumed session's first pass is a bulk catch-up over a multi-MB
+/// transcript: it must not stream the file into RSS, but the title records
+/// near its HEAD (a previous run's ai-title, a `/rename`) must still land.
+#[tokio::test]
+async fn agent_title_tail_bulk_catchup_keeps_head_titles() {
+    let state = test_state();
+    let id = inject_agent(&state, "k");
+    agents::spawn_agent_watch(state.clone(), id.clone());
+
+    let transcript = test_dir("transcript-bulk").join("session.jsonl");
+    let mut body = String::new();
+    body.push_str(&serde_json::json!({"type": "ai-title", "aiTitle": "Head title"}).to_string());
+    body.push('\n');
+    let filler = serde_json::json!({"type": "message", "text": "x".repeat(4000)}).to_string();
+    for _ in 0..200 {
+        body.push_str(&filler);
+        body.push('\n');
+    }
+    body.push_str(
+        &serde_json::json!({"type": "custom-title", "customTitle": "Pinned run"}).to_string(),
+    );
+    body.push('\n');
+    for _ in 0..200 {
+        body.push_str(&filler);
+        body.push('\n');
+    }
+    assert!(
+        body.len() > 1024 * 1024,
+        "fixture must exceed the bulk threshold"
+    );
+    std::fs::write(&transcript, &body).unwrap();
+
+    let status = post_hook(
+        &state,
+        &id,
+        "k",
+        serde_json::json!({
+            "hook_event_name": "SessionStart",
+            "source": "resume",
+            "session_id": "5e0d64b2-abcd-abcd-abcd-000000000001",
+            "transcript_path": transcript.to_string_lossy(),
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let wait_for_title = |expected: &'static str| {
+        let state = state.clone();
+        let id = id.clone();
+        async move {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let title = session_entry(&state, &id).await["agent_title"].clone();
+                if title == expected {
+                    return;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "agent_title stuck at {title}, want {expected}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+    };
+    // The pinned title from the middle of the bulk region wins.
+    wait_for_title("Pinned run").await;
+
+    // Normal tailing continues after the catch-up.
+    let mut line = serde_json::json!({"type": "custom-title", "customTitle": "Later"}).to_string();
+    line.push('\n');
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&transcript)
+        .unwrap();
+    std::io::Write::write_all(&mut file, line.as_bytes()).unwrap();
+    wait_for_title("Later").await;
+
+    state.sessions.kill(&id).ok();
+}
+
 #[tokio::test]
 async fn agent_first_prompt_is_provisional_display_name() {
     let state = test_state();

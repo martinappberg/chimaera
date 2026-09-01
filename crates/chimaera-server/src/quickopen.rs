@@ -1,13 +1,35 @@
 //! Quick-open file index: GET /api/v1/fs/quickopen fuzzy-matches a
-//! workspace's files by name/path for the Cmd+P palette. A fresh walk is
-//! cheap at workspace scale; a short-TTL cache keeps a fast typer from
-//! hammering the disk on every keystroke. The same cached index backs the
-//! `/fs/validate` bare-basename fallback (see [`workspace_index`] /
-//! [`unique_file_named`]), so link validation never adds a second walker.
+//! workspace's files by name/path for the Cmd+P palette. The same cached
+//! index backs the `/fs/validate` bare-basename fallback (see
+//! [`workspace_index_if_free`] / [`unique_file_named`]), so link validation
+//! never adds a second walker.
+//!
+//! The index is a bounded walk of the workspace root, and on a login node
+//! that root is routinely a 20k-entry NFS tree that takes seconds to crawl.
+//! Three rules keep that cost off the user and off the reactor:
+//!
+//! - **Serve stale, refresh behind.** Once a workspace has an index, every
+//!   query answers from it immediately; a stale index kicks ONE background
+//!   re-walk. Nobody waits on the disk except the very first query.
+//! - **Single-flight.** One walk per workspace at a time — a burst of
+//!   `/fs/validate` calls (every terminal repaint, every chat message) or a
+//!   typing burst in the palette can never fan out into parallel crawls of
+//!   the same tree (measured live: five concurrent 3 s walks per burst).
+//!   The validator never parks behind an in-flight walk either: it takes the
+//!   index if one exists, walks only when nothing else is walking, and
+//!   otherwise skips (a link earns its underline on the next repaint).
+//! - **Freshness scales with cost.** A complete walk is trusted for
+//!   [`FRESH_PER_WALK_COST`] × its own duration (floored at [`CACHE_TTL`],
+//!   capped at [`CACHE_TTL_MAX`]): a 40 ms local walk refreshes every 5 s, a
+//!   2 s NFS crawl every 20 s. A walk cut by a guard is trusted only for the
+//!   floor — an incomplete index must be retried soon, not believed longest.
+//!
+//! Callers that walk block on the filesystem, so every entry point runs
+//! under `spawn_blocking` — never inline in an async handler.
 
 use std::collections::HashMap;
-use std::path::Path;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use axum::extract::{Query, State};
@@ -36,16 +58,29 @@ const IGNORED_DIRS: &[&str] = &[
 ];
 /// Walk guards. The daemon lives on shared HPC login nodes where a workspace
 /// can sit on NFS/Lustre, so every walk is bounded three ways and yields
-/// honest partial results (cached like a full walk) when a guard trips:
-/// entry count (a scratch dir with hundreds of thousands of files must not
-/// balloon the index), depth (runaway generated/looping trees; real
-/// workspaces stay well under this), and wall time (a cold NFS walk must not
-/// wedge the request that triggered it).
+/// honest partial results when a guard trips: entry count (a scratch dir
+/// with hundreds of thousands of files must not balloon the index), depth
+/// (runaway generated/looping trees; real workspaces stay well under this),
+/// and wall time (a cold NFS walk must not wedge the request that triggered
+/// it). The time guard is checked per directory, so one wedged `read_dir`
+/// on a dead mount is the one thing it cannot bound.
 const MAX_INDEX_FILES: usize = 100_000;
 pub(crate) const MAX_INDEX_DEPTH: usize = 32;
 const WALK_TIME_CAP: Duration = Duration::from_secs(3);
-/// How long a walk result stays fresh.
+/// The shortest a walk result stays fresh (a fast typer on a local tree),
+/// and the whole window a partial walk gets.
 const CACHE_TTL: Duration = Duration::from_secs(5);
+/// Freshness multiplier on a complete walk's own duration — an expensive
+/// tree is re-crawled proportionally less often.
+const FRESH_PER_WALK_COST: u32 = 10;
+/// The longest a walk result is trusted, however slow the walk was.
+const CACHE_TTL_MAX: Duration = Duration::from_secs(120);
+/// A workspace index nobody has queried for this long is dropped on the
+/// next query for any workspace: a 100k-entry index is tens of MB, and the
+/// daemon's RSS budget is ~150 MB. Eviction is lazy — a fully idle daemon
+/// keeps its last index until someone asks again — and a workspace that is
+/// deleted is dropped at once (`forget_workspace`).
+const IDLE_EVICT: Duration = Duration::from_secs(600);
 /// Default and maximum result counts.
 const DEFAULT_LIMIT: usize = 50;
 const MAX_LIMIT: usize = 200;
@@ -62,22 +97,148 @@ pub(crate) struct IndexedFile {
     pub(crate) is_dir: bool,
 }
 
-/// Per-workspace walk cache with a [`CACHE_TTL`] freshness window.
-#[derive(Default)]
+/// Per-workspace index slots. The map lock is held only to look up or
+/// evict a slot — never across a walk.
 pub(crate) struct QuickOpenCache {
-    walks: HashMap<String, (Instant, Arc<Vec<IndexedFile>>)>,
+    slots: HashMap<String, Arc<Slot>>,
+    /// The idle sweep runs at most once per [`IDLE_SWEEP`]: it locks every
+    /// slot, and every link-validation burst would otherwise pay it.
+    last_sweep: Instant,
 }
 
-impl QuickOpenCache {
-    fn get_fresh(&self, workspace_id: &str) -> Option<Arc<Vec<IndexedFile>>> {
-        match self.walks.get(workspace_id) {
-            Some((built, files)) if built.elapsed() < CACHE_TTL => Some(files.clone()),
-            _ => None,
+impl Default for QuickOpenCache {
+    fn default() -> Self {
+        QuickOpenCache {
+            slots: HashMap::new(),
+            last_sweep: Instant::now(),
         }
     }
+}
 
-    fn insert(&mut self, workspace_id: String, files: Arc<Vec<IndexedFile>>) {
-        self.walks.insert(workspace_id, (Instant::now(), files));
+/// How often the idle sweep may run.
+const IDLE_SWEEP: Duration = Duration::from_secs(60);
+
+impl QuickOpenCache {
+    fn slot(&mut self, workspace_id: &str) -> Arc<Slot> {
+        self.slots
+            .entry(workspace_id.to_string())
+            .or_insert_with(|| Arc::new(Slot::default()))
+            .clone()
+    }
+
+    /// Drop indexes nobody has queried for [`IDLE_EVICT`]. A slot with a
+    /// walk in flight is kept whatever its age: dropping it would let the
+    /// next query mint a fresh slot — and a fresh walk lock — and crawl the
+    /// same tree alongside the orphan, the fan-out the single-flight exists
+    /// to prevent.
+    /// Returns the evicted slots so the caller can drop their indexes —
+    /// tens of MB of strings — after releasing the map lock.
+    fn evict_idle(&mut self, now: Instant) -> Vec<Arc<Slot>> {
+        if now.duration_since(self.last_sweep) < IDLE_SWEEP {
+            return Vec::new();
+        }
+        self.last_sweep = now;
+        let mut evicted = Vec::new();
+        self.slots.retain(|_, slot| {
+            // Only contention means a walk is in flight; a poisoned lock is
+            // a walk that already died.
+            let walking = matches!(
+                slot.walk.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            );
+            let st = crate::lock(&slot.state);
+            let keep = walking || st.refreshing || now.duration_since(st.last_used) < IDLE_EVICT;
+            if !keep {
+                evicted.push(slot.clone());
+            }
+            keep
+        });
+        evicted
+    }
+
+    /// A deleted workspace's index goes with it — its id can never be
+    /// queried again, so the idle sweep would otherwise be its only reclaim.
+    pub(crate) fn forget_workspace(&mut self, workspace_id: &str) {
+        self.slots.remove(workspace_id);
+    }
+
+    /// The ignore list changed: an index built under the old one must not
+    /// be served for its whole freshness window. Slots with a walk in flight
+    /// are kept (dropping one would let the next query start a second walk
+    /// of the same tree) and marked dirty instead — the walk that is running
+    /// used the old list, so its result gets only the short window.
+    pub(crate) fn clear(&mut self) {
+        self.slots.retain(|_, slot| {
+            let walking = matches!(
+                slot.walk.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            );
+            let mut st = crate::lock(&slot.state);
+            if walking || st.refreshing {
+                st.dirty = true;
+                st.index = None;
+                true
+            } else {
+                false
+            }
+        });
+    }
+}
+
+/// One workspace's index plus its single-flight state.
+#[derive(Default)]
+struct Slot {
+    /// Held for the whole duration of a walk — the single-flight. A cold
+    /// palette query with nothing to serve parks here (it is on a blocking
+    /// thread) and finds the index filled when the lock frees; the link
+    /// validator never parks (see [`workspace_index_if_free`]).
+    walk: Mutex<()>,
+    state: Mutex<SlotState>,
+}
+
+/// A walk result and how long it is trusted.
+struct Index {
+    files: Arc<Vec<IndexedFile>>,
+    built: Instant,
+    fresh_for: Duration,
+    /// The walk tripped a guard. Logged at warn once per streak — a
+    /// permanently-partial NFS tree must not flood the log on every refresh.
+    partial: bool,
+}
+
+struct SlotState {
+    index: Option<Index>,
+    /// A background re-walk is in flight (stale-while-revalidate). Set by the
+    /// query that kicks it, cleared by [`RefreshGuard`] however the walk ends.
+    refreshing: bool,
+    /// The walk in flight started before the ignore list changed
+    /// (`QuickOpenCache::clear`): its result is installed on the short
+    /// window so a clean walk follows soon.
+    dirty: bool,
+    last_used: Instant,
+}
+
+impl Default for SlotState {
+    fn default() -> Self {
+        SlotState {
+            index: None,
+            refreshing: false,
+            dirty: false,
+            last_used: Instant::now(),
+        }
+    }
+}
+
+/// Clears the slot's `refreshing` flag when a background walk ends — by any
+/// path, including a panic or the task being dropped before it ever ran
+/// (runtime shutdown) — so a refresh that never happened can't wedge the
+/// slot into "stale forever". Constructed on the spawning side for exactly
+/// that reason: the closure owning it may never execute.
+struct RefreshGuard(Arc<Slot>);
+
+impl Drop for RefreshGuard {
+    fn drop(&mut self) {
+        crate::lock(&self.0.state).refreshing = false;
     }
 }
 
@@ -103,45 +264,193 @@ pub(crate) async fn quickopen(
     State(state): State<Arc<AppState>>,
     Query(query): Query<QuickOpenQuery>,
 ) -> Response {
-    let Some(files) = workspace_index(&state, &query.workspace_id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": format!("unknown workspace {}", query.workspace_id)})),
-        )
-            .into_response();
-    };
-
     let limit = query.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
-    Json(json!({"entries": search(&files, &query.q, limit, query.dirs)})).into_response()
+    let workspace_id = query.workspace_id.clone();
+    // A cold workspace walks the tree (seconds on NFS): off the reactor, or
+    // one palette keystroke stalls every terminal pump on that worker.
+    let searched = tokio::task::spawn_blocking(move || {
+        workspace_index(&state, &query.workspace_id)
+            .map(|files| search(&files, &query.q, limit, query.dirs))
+    })
+    .await;
+    match searched {
+        Ok(Some(entries)) => Json(json!({"entries": entries})).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("unknown workspace {workspace_id}")})),
+        )
+            .into_response(),
+        Err(join) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("quickopen task failed: {join}")})),
+        )
+            .into_response(),
+    }
 }
 
-/// The (possibly cached) file index for a workspace — the shared machinery
-/// behind GET /fs/quickopen and the `/fs/validate` bare-basename fallback.
-/// `None` for an unknown workspace. BLOCKING (a cache miss walks the tree):
-/// call from `spawn_blocking` or a handler that accepts the bounded inline
-/// walk. Cost ceiling: at most one [`walk`] per workspace per [`CACHE_TTL`],
-/// each bounded by the walk guards above — shared-login-node safe.
+/// The (possibly stale) file index for a workspace, for the palette: `None`
+/// for an unknown workspace. BLOCKING: call from `spawn_blocking`. A
+/// workspace with an index answers at once (a stale one kicks a background
+/// refresh); a workspace with none walks inline, single-flighted — a
+/// concurrent cold caller parks for that walk instead of starting its own.
 pub(crate) fn workspace_index(
     state: &Arc<AppState>,
     workspace_id: &str,
 ) -> Option<Arc<Vec<IndexedFile>>> {
-    let workspace = crate::lock(&state.workspaces).get(workspace_id)?;
+    lookup(state, workspace_id, true)
+}
 
-    // Walk outside the cache lock: two racing queries may both walk, which
-    // is fine at this scale — never hold a lock across disk I/O. (The lookup
-    // is bound to its own statement so the guard drops before the re-lock.)
-    let cached = crate::lock(&state.quickopen).get_fresh(&workspace.id);
-    Some(match cached {
-        Some(files) => files,
-        None => {
-            // settings.json ground truth: user-tuned ignore list, else the
-            // built-in default (the short cache TTL picks up changes fast).
-            let ignore = crate::lock(&state.settings).quickopen_ignore_dirs();
-            let files = Arc::new(walk(&workspace.root, ignore.as_deref()));
-            crate::lock(&state.quickopen).insert(workspace.id.clone(), files.clone());
-            files
+/// [`workspace_index`] for the link validator, which fires on every terminal
+/// repaint and chat message from inside its own `spawn_blocking`: it must
+/// never park a pool thread behind someone else's walk. Same answers, except
+/// that a workspace whose only walk is already in flight yields `None` —
+/// the validator degrades to "no link this round" and the next repaint finds
+/// the index built.
+pub(crate) fn workspace_index_if_free(
+    state: &Arc<AppState>,
+    workspace_id: &str,
+) -> Option<Arc<Vec<IndexedFile>>> {
+    lookup(state, workspace_id, false)
+}
+
+fn lookup(state: &Arc<AppState>, workspace_id: &str, wait: bool) -> Option<Arc<Vec<IndexedFile>>> {
+    let workspace = crate::lock(&state.workspaces).get(workspace_id)?;
+    let now = Instant::now();
+    let (slot, evicted) = {
+        let mut cache = crate::lock(&state.quickopen);
+        let evicted = cache.evict_idle(now);
+        (cache.slot(&workspace.id), evicted)
+    };
+    drop(evicted);
+
+    // Warm path: serve what is there; a stale index kicks one refresh. The
+    // flag is raised under the state lock; the guard that lowers it is built
+    // after the lock is released (its Drop takes that lock — a spawn that
+    // panicked with the guard in hand would self-deadlock) and before the
+    // task is spawned, so no interleaving leaves the flag stuck.
+    let warm = {
+        let mut st = crate::lock(&slot.state);
+        st.last_used = now;
+        let stale = st
+            .index
+            .as_ref()
+            .is_some_and(|index| now.duration_since(index.built) >= index.fresh_for);
+        // The kick is decided under the lock so two stale readers can't both
+        // claim it; the flag is theirs to clear via the guard from here on.
+        let kick = stale && !st.refreshing;
+        if kick {
+            st.refreshing = true;
         }
-    })
+        st.index.as_ref().map(|index| (index.files.clone(), kick))
+    };
+    if let Some((files, kick)) = warm {
+        if kick {
+            let done = RefreshGuard(slot.clone());
+            spawn_refresh(state, done, slot.clone(), workspace.root.clone());
+        }
+        return Some(files);
+    }
+
+    // Cold path: walk now. Taking `walk` parks behind any in-flight walk for
+    // this workspace; re-check afterwards because that walk may have filled
+    // the index for us. A poisoned lock (a walk that panicked) is still a
+    // usable lock — the state it guards is rebuilt by the next walk.
+    let _walking = if wait {
+        crate::lock(&slot.walk)
+    } else {
+        match slot.walk.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        }
+    };
+    if let Some(index) = &crate::lock(&slot.state).index {
+        return Some(index.files.clone());
+    }
+    let ignore = crate::lock(&state.settings).quickopen_ignore_dirs();
+    Some(build(&slot, &workspace.root, ignore.as_deref()))
+}
+
+/// Re-walk `root` for `slot` on the blocking pool. `done` clears the slot's
+/// `refreshing` flag when the task ends — or when it is dropped unrun.
+fn spawn_refresh(state: &Arc<AppState>, done: RefreshGuard, slot: Arc<Slot>, root: PathBuf) {
+    let state = state.clone();
+    tokio::task::spawn_blocking(move || {
+        let _done = done;
+        let _walking = crate::lock(&slot.walk);
+        // settings.json ground truth: user-tuned ignore list, else the
+        // built-in default (read at walk time; a settings PUT that changes
+        // the list also drops every slot, see `QuickOpenCache::clear`).
+        let ignore = crate::lock(&state.settings).quickopen_ignore_dirs();
+        build(&slot, &root, ignore.as_deref());
+    });
+}
+
+/// Test hook: age a workspace's index past its freshness window so the next
+/// query serves it stale and kicks a refresh.
+#[cfg(test)]
+pub(crate) fn age_index(state: &Arc<AppState>, workspace_id: &str) {
+    let slot = crate::lock(&state.quickopen).slot(workspace_id);
+    let mut st = crate::lock(&slot.state);
+    if let Some(index) = &mut st.index {
+        index.built = Instant::now() - CACHE_TTL_MAX - Duration::from_secs(1);
+    }
+}
+
+/// Walk `root` and install the result as `slot`'s index, sizing its
+/// freshness window from the walk's own cost. Caller holds `slot.walk`.
+fn build(slot: &Slot, root: &Path, ignore: Option<&[String]>) -> Arc<Vec<IndexedFile>> {
+    let started = Instant::now();
+    let walk = walk_outcome(root, ignore);
+    let took = started.elapsed();
+    let mut st = crate::lock(&slot.state);
+    let previous = st.index.as_ref();
+    // A walk that produced nothing and tripped a guard — an unreadable root
+    // (a mount that blipped, a permission change), or a deadline that fired
+    // before the first entry — says nothing about the tree. Keep serving the
+    // last index and retry on the short window instead of blanking the
+    // palette and every bare-basename link.
+    if walk.partial && walk.files.is_empty() {
+        if let Some(index) = previous.filter(|index| !index.files.is_empty()) {
+            let files = index.files.clone();
+            tracing::warn!(root = %root.display(), ?took,
+                "quickopen walk returned nothing (root unreadable?); keeping the previous index");
+            st.index = Some(Index {
+                files: files.clone(),
+                built: Instant::now(),
+                fresh_for: CACHE_TTL,
+                partial: true,
+            });
+            return files;
+        }
+    }
+    if walk.partial {
+        if previous.is_some_and(|index| index.partial) {
+            tracing::debug!(root = %root.display(), ?took, entries = walk.files.len(),
+                "quickopen index still partial (a walk guard tripped)");
+        } else {
+            tracing::warn!(root = %root.display(), ?took, entries = walk.files.len(),
+                "quickopen index hit a walk guard; results are partial until a full walk completes");
+        }
+    }
+    let files = Arc::new(walk.files);
+    // An incomplete index is retried on the floor: the bare-basename
+    // fallback's "exactly one match" defense only holds against a complete
+    // walk, so the wrong-file window must stay as short as it always was. A
+    // walk that started under a since-replaced ignore list gets the same.
+    let stale_list = std::mem::take(&mut st.dirty);
+    let fresh_for = if walk.partial || stale_list {
+        CACHE_TTL
+    } else {
+        (took * FRESH_PER_WALK_COST).clamp(CACHE_TTL, CACHE_TTL_MAX)
+    };
+    st.index = Some(Index {
+        files: files.clone(),
+        built: Instant::now(),
+        fresh_for,
+        partial: walk.partial,
+    });
+    files
 }
 
 /// The absolute path of the single FILE named `name` (exact, case-sensitive)
@@ -159,12 +468,15 @@ pub(crate) fn unique_file_named<'a>(files: &'a [IndexedFile], name: &str) -> Opt
     found
 }
 
-/// Walk `root` collecting regular files and directories, skipping the
-/// ignored dirs (`ignore` override from settings, else [`IGNORED_DIRS`]) and
-/// all symlinks (never followed: loop safety), bounded by [`MAX_INDEX_FILES`]
-/// / [`MAX_INDEX_DEPTH`] / [`WALK_TIME_CAP`]. Unreadable entries are skipped
-/// silently, matching `fs/list`.
-fn walk(root: &Path, ignore: Option<&[String]>) -> Vec<IndexedFile> {
+/// A walk's entries plus whether a guard (or an unreadable root) cut it
+/// short.
+pub(crate) struct Walk {
+    pub(crate) files: Vec<IndexedFile>,
+    pub(crate) partial: bool,
+}
+
+/// Walk `root` with the production bounds (see the guard constants).
+fn walk_outcome(root: &Path, ignore: Option<&[String]>) -> Walk {
     walk_bounded(
         root,
         ignore,
@@ -174,32 +486,43 @@ fn walk(root: &Path, ignore: Option<&[String]>) -> Vec<IndexedFile> {
     )
 }
 
-/// [`walk`] with explicit bounds, so tests can exercise the guards without
-/// building 100k-file trees.
+/// Walk `root` collecting regular files and directories, skipping the
+/// ignored dirs (`ignore` override from settings, else [`IGNORED_DIRS`]) and
+/// all symlinks (never followed: loop safety), bounded by `max_files` /
+/// `max_depth` / `deadline` — explicit so tests can exercise the guards
+/// without building 100k-file trees. Unreadable entries below the root are
+/// skipped silently, matching `fs/list`; an unreadable root is reported as
+/// partial, never as an empty tree.
 pub(crate) fn walk_bounded(
     root: &Path,
     ignore: Option<&[String]>,
     max_files: usize,
     max_depth: usize,
     deadline: Instant,
-) -> Vec<IndexedFile> {
+) -> Walk {
     let ignored = |name: &str| match ignore {
         Some(list) => list.iter().any(|d| d == name),
         None => IGNORED_DIRS.contains(&name),
     };
     let mut files = Vec::new();
+    let mut cut = false;
     let mut stack = vec![(root.to_path_buf(), 0usize)];
     while let Some((dir, depth)) = stack.pop() {
         // Time guard checked per directory (not per entry): cheap, and a
         // single directory read is the smallest unit worth interrupting.
         if Instant::now() >= deadline {
-            tracing::warn!(
-                root = %root.display(),
-                "quickopen index hit the time guard; results are partial"
-            );
-            return files;
+            return Walk {
+                files,
+                partial: true,
+            };
         }
         let Ok(read) = std::fs::read_dir(&dir) else {
+            if depth == 0 {
+                return Walk {
+                    files,
+                    partial: true,
+                };
+            }
             continue;
         };
         for entry in read {
@@ -215,17 +538,20 @@ pub(crate) fn walk_bounded(
                 }
                 if depth + 1 < max_depth {
                     stack.push((entry.path(), depth + 1));
+                } else {
+                    // A subtree the depth guard hides is as invisible to
+                    // the bare-basename "exactly one match" defense as one
+                    // the time guard cut: the index is incomplete.
+                    cut = true;
                 }
             } else if !file_type.is_file() {
                 continue;
             }
             if files.len() >= max_files {
-                tracing::warn!(
-                    root = %root.display(),
-                    cap = max_files,
-                    "quickopen index hit the file-count guard; results are partial"
-                );
-                return files;
+                return Walk {
+                    files,
+                    partial: true,
+                };
             }
             let path = entry.path();
             let rel = path
@@ -249,10 +575,17 @@ pub(crate) fn walk_bounded(
             });
         }
     }
-    files
+    Walk {
+        files,
+        partial: cut,
+    }
 }
 
-/// Rank, sort, and serialize the matching entries.
+/// Rank the matching entries and serialize the top `limit`. Order: match
+/// tier, then newest mtime, then relative path — a strict total order (paths
+/// are unique per walk), so selecting the top `limit` before sorting them
+/// yields exactly the prefix a full sort would; the empty query matches the
+/// whole index and must not sort 100k entries per keystroke.
 fn search(files: &[IndexedFile], q: &str, limit: usize, dirs: bool) -> Vec<serde_json::Value> {
     let q = q.trim().to_lowercase();
     let mut hits: Vec<(u8, &IndexedFile)> = files
@@ -260,13 +593,17 @@ fn search(files: &[IndexedFile], q: &str, limit: usize, dirs: bool) -> Vec<serde
         .filter(|f| dirs || !f.is_dir)
         .filter_map(|f| rank(f, &q).map(|r| (r, f)))
         .collect();
-    hits.sort_by(|a, b| {
+    let cmp = |a: &(u8, &IndexedFile), b: &(u8, &IndexedFile)| {
         a.0.cmp(&b.0)
             .then_with(|| b.1.mtime.cmp(&a.1.mtime))
             .then_with(|| a.1.rel.cmp(&b.1.rel))
-    });
+    };
+    if hits.len() > limit {
+        hits.select_nth_unstable_by(limit, cmp);
+        hits.truncate(limit);
+    }
+    hits.sort_unstable_by(cmp);
     hits.into_iter()
-        .take(limit)
         .map(|(_, f)| {
             json!({
                 "path": f.path,

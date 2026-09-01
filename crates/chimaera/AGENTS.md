@@ -19,7 +19,7 @@ is a thin delegation to a sibling library crate. Parent map: repo-root
 
 | File | Command / role |
 |---|---|
-| `main.rs` | clap `Cli`/`Command` defs, all flags, `main()` dispatch, `parse_port` (`$PORT` fallback), `#[global_allocator]` mimalloc, tracing→stderr. The crate's only tests (CLI parse assertions). |
+| `main.rs` | clap `Cli`/`Command` defs, all flags, `main()` dispatch, `parse_port` (`$PORT` fallback), `#[global_allocator]` mimalloc, tracing→stderr, and the tokio runtime's explicit sizing (4 workers / 128 blocking — see the invariants below). The crate's only tests (CLI parse assertions). |
 | `connect.rs` | `connect <host>`: calls `chimaera_remote::connect` with a progress closure, records the host, opens the tunnel URL, holds until Ctrl-C. |
 | `daemonize.rs` | `serve --daemonize`: fork + `setsid` + re-exec so the daemon outlives its launching shell/ssh channel; re-points non-regular-file stdio at `/dev/null` (a caller's log redirect is kept). |
 | `status.rs` | `status [host]`: local reads `chimaera_core::Manifest`; remote goes through `chimaera_remote`. |
@@ -37,6 +37,11 @@ is a thin delegation to a sibling library crate. Parent map: repo-root
   It is written/removed by `chimaera_server::run`; `status`/`kill` only read it (and
   clean it up when the pid is dead). It is 0600 (carries the bearer token).
 - **Port precedence:** explicit `--port` > `$PORT` env > OS-assigned free port.
+- **The reactor is four threads wide, not one per core.** `main()` pins
+  `worker_threads(4)` / `max_blocking_threads(128)` (a login node has 64–192 cores; the
+  daemon measures <1 core), and the app's `--daemon` builds the same shape. Any blocking
+  filesystem call left inline in a `chimaera-server` async handler now stalls a quarter of
+  the reactor, not a sixty-fourth — `spawn_blocking` is not optional there.
 
 Layering is clean and one-way: binary → `chimaera-server` / `chimaera-remote` →
 `chimaera-core`. Don't introduce a back-edge.
