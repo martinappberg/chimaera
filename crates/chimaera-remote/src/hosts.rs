@@ -169,33 +169,53 @@ impl HostsStore {
         Ok(removed)
     }
 
-    /// Stamp a successful connection to `alias`, adding it if unknown.
-    pub fn record_connected(&mut self, alias: &str) -> anyhow::Result<()> {
-        match self.items.iter_mut().find(|h| h.alias == alias) {
-            Some(entry) => entry.last_connected_at = Some(unix_now()),
+    /// Stamp a successful connection to `alias`, adding it if unknown, and
+    /// return the stamped entry (so callers publish it without a reload).
+    pub fn record_connected(&mut self, alias: &str) -> anyhow::Result<HostEntry> {
+        let entry = match self.items.iter_mut().find(|h| h.alias == alias) {
+            Some(entry) => {
+                entry.last_connected_at = Some(unix_now());
+                entry.clone()
+            }
             None => {
-                self.items.push(HostEntry {
+                let entry = HostEntry {
                     alias: alias.to_string(),
                     binary: None,
                     added_at: unix_now(),
                     last_connected_at: Some(unix_now()),
-                });
+                };
+                self.items.push(entry.clone());
+                entry
             }
-        }
-        self.save()
+        };
+        self.save()?;
+        Ok(entry)
     }
 
-    /// Atomically persist the list (tmp file + rename).
+    /// Atomically persist the list (tmp file + rename). The tmp name is
+    /// unique per writer: the app's concurrent connect flights and a CLI
+    /// `connect` in another process all write this file, and a shared
+    /// `hosts.json.tmp` interleaved between two of them renames a torn file
+    /// into place — which `load` then reads as corrupt: an EMPTY host list.
     fn save(&self) -> anyhow::Result<()> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
-        let tmp = self.path.with_extension("json.tmp");
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let tmp = self
+            .path
+            .with_extension(format!("json.{}.{nanos}.tmp", std::process::id()));
         std::fs::write(&tmp, serde_json::to_vec_pretty(&self.items)?)
             .with_context(|| format!("failed to write {}", tmp.display()))?;
-        std::fs::rename(&tmp, &self.path)
-            .with_context(|| format!("failed to rename into {}", self.path.display()))?;
+        if let Err(err) = std::fs::rename(&tmp, &self.path) {
+            std::fs::remove_file(&tmp).ok();
+            return Err(err)
+                .with_context(|| format!("failed to rename into {}", self.path.display()));
+        }
         Ok(())
     }
 }

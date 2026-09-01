@@ -79,7 +79,7 @@ fn report_can_reclaim_local_home(alias: &Option<String>, ws: &Option<String>) ->
 #[tauri::command]
 pub(super) async fn list_hosts(state: State<'_, Shell>) -> Result<Vec<HostState>, String> {
     tracing::debug!("ipc: list_hosts");
-    let hosts = with_hosts(|hosts| hosts.list()).await?;
+    let hosts = with_hosts(|hosts| Ok(hosts.list())).await?;
     let tunnels = state.tunnels.lock().await;
     let connecting: HashSet<String> = lock(&state.connecting).keys().cloned().collect();
     let unhealthy = lock(&state.unhealthy_tunnels).clone();
@@ -109,9 +109,7 @@ pub(super) async fn add_host(alias: String) -> Result<HostState, String> {
     if alias.is_empty() || alias.starts_with('-') {
         return Err("that does not look like an ssh alias".to_string());
     }
-    let entry = with_hosts(move |hosts| hosts.add(&alias, None))
-        .await?
-        .map_err(|e| format!("{e:#}"))?;
+    let entry = with_hosts(move |hosts| hosts.add(&alias, None)).await?;
     Ok(state_for(&entry, "disconnected", None))
 }
 
@@ -119,12 +117,12 @@ pub(super) async fn add_host(alias: String) -> Result<HostState, String> {
 pub(super) async fn remove_host(state: State<'_, Shell>, alias: String) -> Result<(), String> {
     let tunnel = state.tunnels.lock().await.remove(&alias);
     lock(&state.unhealthy_tunnels).remove(&alias);
+    lock(&state.wedge_suspects).remove(&alias);
+    lock(&state.host_entries).remove(&alias);
     if let Some(tunnel) = tunnel {
         tunnel.close().await;
     }
-    with_hosts(move |hosts| hosts.remove(&alias))
-        .await?
-        .map_err(|e| format!("{e:#}"))?;
+    with_hosts(move |hosts| hosts.remove(&alias)).await?;
     Ok(())
 }
 
@@ -152,6 +150,9 @@ pub(super) async fn connect_host(
 pub(super) async fn disconnect_host(state: State<'_, Shell>, alias: String) -> Result<(), String> {
     let tunnel = state.tunnels.lock().await.remove(&alias);
     lock(&state.unhealthy_tunnels).remove(&alias);
+    // A deliberate teardown: the next connect is a first connect, not a
+    // suspect's reconnect.
+    lock(&state.wedge_suspects).remove(&alias);
     if let Some(tunnel) = tunnel {
         tunnel.close().await;
     }
@@ -221,6 +222,7 @@ pub(super) async fn shutdown_host(state: State<'_, Shell>, alias: String) -> Res
     // down instead of lingering on a socket that's about to close.
     let tunnel = state.tunnels.lock().await.remove(&alias);
     lock(&state.unhealthy_tunnels).remove(&alias);
+    lock(&state.wedge_suspects).remove(&alias);
     if let Some(tunnel) = tunnel {
         tunnel.close().await;
     }

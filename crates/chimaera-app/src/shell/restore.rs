@@ -19,48 +19,51 @@ static WINDOW_SEQ: AtomicU64 = AtomicU64::new(0);
 /// consecutive authenticated misses still detect a dead forward promptly,
 /// while a scheduler or network hiccup does not tear down a usable tunnel.
 const HEALTH_FAILURES_BEFORE_DOWN: u8 = 3;
-/// The monitor's tick: a live tunnel is probed at most this often.
+/// The monitor's tick: a `tokio::time::interval` — every due tunnel is
+/// probed once per tick, and a tick that falls while the previous round is
+/// still draining is delayed, not queued, so the wall-clock period is
+/// max(HEALTH_TICK, slowest probe): a down host's probe burns its full 2 s
+/// timeout inside the tick. Cadences below are tick COUNTS, never a
+/// wall-clock promise.
 const HEALTH_TICK: Duration = Duration::from_secs(3);
 /// Once a tunnel is confirmed down, each further miss doubles its probe
-/// interval up to this many ticks (30 s). A dead host — a browser-only
-/// machine, a dismissed reconnect, a cluster in maintenance — otherwise
-/// costs a failed 2 s authenticated probe every tick, indefinitely.
+/// interval up to this many ticks. A dead host — a browser-only machine, a
+/// dismissed reconnect, a cluster in maintenance — otherwise costs a failed
+/// 2 s authenticated probe every tick, indefinitely.
 const HEALTH_BACKOFF_CAP_TICKS: u32 = 10;
+/// Compute-job keys cap lower: a job window whose reconnect banner was
+/// dismissed has the monitor as its ONLY recovery signal.
+const HEALTH_BACKOFF_CAP_COMPUTE_TICKS: u32 = 2;
 
-/// The probe interval (in ticks) after one more miss on a confirmed-down
-/// tunnel: doubling from every tick, capped. Pure so the cadence is testable.
-fn backoff_after_miss(interval_ticks: u32) -> u32 {
-    interval_ticks
-        .max(1)
-        .saturating_mul(2)
-        .min(HEALTH_BACKOFF_CAP_TICKS)
-}
-
+/// Per-tunnel probe confidence. `down` and the backoff interval are pure
+/// functions of the consecutive-miss count; the only other state is the
+/// skip countdown.
+#[derive(Default)]
 struct HealthConfidence {
     consecutive_failures: u8,
-    down: bool,
-    /// Ticks between probes: 1 while healthy (or merely suspect), growing
-    /// with each miss once down.
-    interval_ticks: u32,
     /// Ticks still to skip before this tunnel is probed again.
     skip_ticks: u32,
 }
 
-impl Default for HealthConfidence {
-    fn default() -> Self {
-        Self {
-            consecutive_failures: 0,
-            down: false,
-            interval_ticks: 1,
-            skip_ticks: 0,
-        }
-    }
-}
-
 impl HealthConfidence {
-    /// Whether this tick should probe the tunnel, counting the backoff down
-    /// otherwise. Healthy and not-yet-down tunnels are due every tick.
-    fn probe_due(&mut self) -> bool {
+    fn down(&self) -> bool {
+        self.consecutive_failures >= HEALTH_FAILURES_BEFORE_DOWN
+    }
+
+    /// Ticks between probes: every tick until confirmed down, then doubling
+    /// per further miss (1, 2, 4, 8, …) up to `cap`.
+    fn interval_ticks(&self, cap: u32) -> u32 {
+        let past_down = self
+            .consecutive_failures
+            .saturating_sub(HEALTH_FAILURES_BEFORE_DOWN);
+        1u32.checked_shl(u32::from(past_down))
+            .unwrap_or(u32::MAX)
+            .min(cap.max(1))
+    }
+
+    /// Claim this tick's probe slot: `true` = probe now; otherwise the tick
+    /// is consumed counting the backoff down.
+    fn take_probe_slot(&mut self) -> bool {
         if self.skip_ticks == 0 {
             return true;
         }
@@ -72,28 +75,23 @@ impl HealthConfidence {
     /// externally visible transition. A newly installed tunnel starts from a
     /// proven-good baseline: `open_proven_tunnel` authenticated it before the
     /// shell inserted it. Any success returns the cadence to every tick; a
-    /// miss on an already-down tunnel backs the next probe off.
-    fn sample(&mut self, up: bool) -> Option<bool> {
+    /// miss on an already-down tunnel backs the next probe off (`cap` ticks
+    /// at most).
+    fn sample(&mut self, up: bool, cap: u32) -> Option<bool> {
         if up {
-            self.consecutive_failures = 0;
-            self.interval_ticks = 1;
-            self.skip_ticks = 0;
-            return std::mem::take(&mut self.down).then_some(true);
+            let was_down = self.down();
+            *self = Self::default();
+            return was_down.then_some(true);
         }
+        let was_down = self.down();
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
-        if self.down {
+        if was_down {
             // Still dead: probe less often. The confirming miss itself keeps
             // the every-tick cadence, so the first gap while down is one tick.
-            self.interval_ticks = backoff_after_miss(self.interval_ticks);
-            self.skip_ticks = self.interval_ticks - 1;
+            self.skip_ticks = self.interval_ticks(cap) - 1;
             return None;
         }
-        if self.consecutive_failures >= HEALTH_FAILURES_BEFORE_DOWN {
-            self.down = true;
-            Some(false)
-        } else {
-            None
-        }
+        self.down().then_some(false)
     }
 
     /// A connect flight performed its own authenticated proof and published
@@ -358,16 +356,21 @@ fn open_shell_window(
 /// down). A probe is an authenticated end-to-end HTTP health check on the
 /// loopback port, with no extra ssh child: a bare TCP connect keeps reporting
 /// "up" after laptop sleep when ssh's local listener survives its dead
-/// connection. A confirmed-down tunnel backs off (doubling to 30 s) so a
-/// dead host does not cost a failed 2 s probe every tick forever; any
-/// success, a replacing connect flight, or an external proof restores the
-/// every-tick cadence.
+/// connection. A confirmed-down tunnel backs off (doubling per miss up to
+/// `HEALTH_BACKOFF_CAP_TICKS` ticks) so a dead host does not cost a failed
+/// 2 s probe every tick forever; any success, a replacing connect flight, or
+/// an external proof restores the every-tick cadence. A `down` edge also
+/// files the alias as a wedge suspect for the next connect flight.
 pub(super) fn spawn_health_monitor(handle: AppHandle) {
     tauri::async_runtime::spawn(async move {
         tracing::debug!("ssh health monitor started");
         let mut confidence: HashMap<String, HealthConfidence> = HashMap::new();
+        let mut ticks = tokio::time::interval(HEALTH_TICK);
+        // A round that drains longer than the tick must not be followed by a
+        // burst of catch-up ticks: the period is max(tick, slowest probe).
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            tokio::time::sleep(HEALTH_TICK).await;
+            ticks.tick().await;
             // No managed Shell means the app is tearing down — stop the loop.
             let Some(shell) = handle.try_state::<Shell>() else {
                 break;
@@ -418,7 +421,7 @@ pub(super) fn spawn_health_monitor(handle: AppHandle) {
             // edge too, including when the healed tunnel reused the same
             // port/token; otherwise a second outage could never emit down.
             for (key, health) in &mut confidence {
-                if health.down && !unhealthy.contains(key) {
+                if health.down() && !unhealthy.contains(key) {
                     health.reset_after_external_proof();
                 }
             }
@@ -432,7 +435,7 @@ pub(super) fn spawn_health_monitor(handle: AppHandle) {
                 if !confidence
                     .entry(endpoint.key.clone())
                     .or_default()
-                    .probe_due()
+                    .take_probe_slot()
                 {
                     continue;
                 }
@@ -453,10 +456,15 @@ pub(super) fn spawn_health_monitor(handle: AppHandle) {
                     confidence.remove(&endpoint.key);
                     continue;
                 }
+                let cap = if endpoint.is_compute {
+                    HEALTH_BACKOFF_CAP_COMPUTE_TICKS
+                } else {
+                    HEALTH_BACKOFF_CAP_TICKS
+                };
                 let transition = confidence
                     .entry(endpoint.key.clone())
                     .or_default()
-                    .sample(up);
+                    .sample(up, cap);
                 tracing::trace!(
                     alias = %endpoint.key,
                     port = endpoint.port,
@@ -469,8 +477,17 @@ pub(super) fn spawn_health_monitor(handle: AppHandle) {
                 };
                 if recovered {
                     lock(&shell.unhealthy_tunnels).remove(&endpoint.key);
+                    // A probe answered through this master: no wedge there.
+                    lock(&shell.wedge_suspects).remove(&endpoint.key);
                 } else {
                     lock(&shell.unhealthy_tunnels).insert(endpoint.key.clone());
+                    // The verdict the next connect flight's wedge check keys
+                    // on; outlives the tunnel (see `Shell::wedge_suspects`).
+                    // Compute keys ride the login alias's master, so only
+                    // the alias itself is a suspect.
+                    if !endpoint.is_compute {
+                        lock(&shell.wedge_suspects).insert(endpoint.key.clone());
+                    }
                 }
                 let _ = handle.emit(
                     "host-status",
@@ -604,33 +621,48 @@ fn needs_startup_home(opened: bool, home_opened: bool, has_remote: bool) -> bool
 #[cfg(test)]
 mod tests {
     use super::{
-        backoff_after_miss, dedupe_local_homes, needs_startup_home, HealthConfidence,
+        dedupe_local_homes, needs_startup_home, HealthConfidence, HEALTH_BACKOFF_CAP_COMPUTE_TICKS,
         HEALTH_BACKOFF_CAP_TICKS, HEALTH_FAILURES_BEFORE_DOWN,
     };
     use crate::windows::WindowRecord;
 
     #[test]
-    fn backoff_doubles_from_every_tick_and_caps() {
-        assert_eq!(backoff_after_miss(1), 2);
-        assert_eq!(backoff_after_miss(2), 4);
-        assert_eq!(backoff_after_miss(4), 8);
-        assert_eq!(backoff_after_miss(8), HEALTH_BACKOFF_CAP_TICKS);
+    fn backoff_interval_is_a_pure_function_of_the_miss_count() {
+        let mut health = HealthConfidence::default();
+        let mut intervals = Vec::new();
+        for _ in 0..9 {
+            health.consecutive_failures += 1;
+            intervals.push(health.interval_ticks(HEALTH_BACKOFF_CAP_TICKS));
+        }
+        assert_eq!(intervals, vec![1, 1, 1, 2, 4, 8, 10, 10, 10]);
+        health.consecutive_failures = u8::MAX;
         assert_eq!(
-            backoff_after_miss(HEALTH_BACKOFF_CAP_TICKS),
-            HEALTH_BACKOFF_CAP_TICKS
+            health.interval_ticks(HEALTH_BACKOFF_CAP_TICKS),
+            HEALTH_BACKOFF_CAP_TICKS,
+            "a saturated count never overflows the shift"
         );
+        assert_eq!(health.interval_ticks(HEALTH_BACKOFF_CAP_COMPUTE_TICKS), 2);
         assert_eq!(
-            backoff_after_miss(0),
-            2,
-            "a zero interval can never stall the cadence"
+            health.interval_ticks(0),
+            1,
+            "a zero cap can never stall the cadence"
         );
     }
 
+    #[test]
+    fn compute_keys_back_off_no_further_than_two_ticks() {
+        let mut health = HealthConfidence::default();
+        for _ in 0..HEALTH_FAILURES_BEFORE_DOWN + 4 {
+            health.sample(false, HEALTH_BACKOFF_CAP_COMPUTE_TICKS);
+        }
+        assert_eq!(ticks_skipped(&mut health) + 1, 2);
+    }
+
     /// Ticks the monitor skips before this tunnel is probed again
-    /// (`probe_due` is polled once per tick).
+    /// (`take_probe_slot` is called once per tick).
     fn ticks_skipped(health: &mut HealthConfidence) -> u32 {
         let mut skipped = 0;
-        while !health.probe_due() {
+        while !health.take_probe_slot() {
             skipped += 1;
             assert!(
                 skipped <= HEALTH_BACKOFF_CAP_TICKS,
@@ -644,8 +676,8 @@ mod tests {
     fn suspect_tunnels_are_probed_every_tick_until_confirmed_down() {
         let mut health = HealthConfidence::default();
         for _ in 0..HEALTH_FAILURES_BEFORE_DOWN - 1 {
-            assert!(health.probe_due());
-            assert_eq!(health.sample(false), None);
+            assert!(health.take_probe_slot());
+            assert_eq!(health.sample(false, HEALTH_BACKOFF_CAP_TICKS), None);
             assert_eq!(ticks_skipped(&mut health), 0, "suspicion never backs off");
         }
     }
@@ -654,23 +686,27 @@ mod tests {
     fn down_tunnel_backs_off_and_any_success_restores_every_tick() {
         let mut health = HealthConfidence::default();
         for _ in 0..HEALTH_FAILURES_BEFORE_DOWN {
-            assert!(health.probe_due());
-            health.sample(false);
+            assert!(health.take_probe_slot());
+            health.sample(false, HEALTH_BACKOFF_CAP_TICKS);
         }
         // The confirming miss keeps the every-tick cadence; each further miss
         // doubles the gap (in ticks) up to the cap.
         assert_eq!(ticks_skipped(&mut health), 0);
         let mut gaps = Vec::new();
         for _ in 0..6 {
-            assert_eq!(health.sample(false), None, "down is one transition");
+            assert_eq!(
+                health.sample(false, HEALTH_BACKOFF_CAP_TICKS),
+                None,
+                "down is one transition"
+            );
             gaps.push(ticks_skipped(&mut health) + 1);
         }
         assert_eq!(gaps, vec![2, 4, 8, 10, 10, 10]);
-        assert_eq!(health.sample(true), Some(true));
-        assert!(health.probe_due());
-        assert_eq!(health.sample(false), None);
+        assert_eq!(health.sample(true, HEALTH_BACKOFF_CAP_TICKS), Some(true));
+        assert!(health.take_probe_slot());
+        assert_eq!(health.sample(false, HEALTH_BACKOFF_CAP_TICKS), None);
         assert!(
-            health.probe_due(),
+            health.take_probe_slot(),
             "one miss after recovery is suspicion, not backoff"
         );
     }
@@ -679,13 +715,16 @@ mod tests {
     fn external_proof_restores_every_tick_cadence() {
         let mut health = HealthConfidence::default();
         for _ in 0..HEALTH_FAILURES_BEFORE_DOWN + 3 {
-            health.sample(false);
+            health.sample(false, HEALTH_BACKOFF_CAP_TICKS);
             ticks_skipped(&mut health);
         }
-        assert_eq!(health.sample(false), None);
-        assert!(!health.probe_due(), "deep in backoff: the next tick skips");
+        assert_eq!(health.sample(false, HEALTH_BACKOFF_CAP_TICKS), None);
+        assert!(
+            !health.take_probe_slot(),
+            "deep in backoff: the next tick skips"
+        );
         health.reset_after_external_proof();
-        assert!(health.probe_due());
+        assert!(health.take_probe_slot());
     }
 
     #[test]
@@ -700,33 +739,49 @@ mod tests {
     fn one_health_miss_never_drops_a_tunnel() {
         let mut health = HealthConfidence::default();
         for _ in 0..HEALTH_FAILURES_BEFORE_DOWN - 1 {
-            assert_eq!(health.sample(false), None);
+            assert_eq!(health.sample(false, HEALTH_BACKOFF_CAP_TICKS), None);
         }
-        assert_eq!(health.sample(true), None, "a success clears suspicion");
-        assert_eq!(health.sample(false), None, "the failure count must reset");
+        assert_eq!(
+            health.sample(true, HEALTH_BACKOFF_CAP_TICKS),
+            None,
+            "a success clears suspicion"
+        );
+        assert_eq!(
+            health.sample(false, HEALTH_BACKOFF_CAP_TICKS),
+            None,
+            "the failure count must reset"
+        );
     }
 
     #[test]
     fn health_requires_consecutive_failures_and_emits_each_edge_once() {
         let mut health = HealthConfidence::default();
         for _ in 1..HEALTH_FAILURES_BEFORE_DOWN {
-            assert_eq!(health.sample(false), None);
+            assert_eq!(health.sample(false, HEALTH_BACKOFF_CAP_TICKS), None);
         }
-        assert_eq!(health.sample(false), Some(false));
-        assert_eq!(health.sample(false), None, "down is one transition");
-        assert_eq!(health.sample(true), Some(true));
-        assert_eq!(health.sample(true), None, "recovery is one transition");
+        assert_eq!(health.sample(false, HEALTH_BACKOFF_CAP_TICKS), Some(false));
+        assert_eq!(
+            health.sample(false, HEALTH_BACKOFF_CAP_TICKS),
+            None,
+            "down is one transition"
+        );
+        assert_eq!(health.sample(true, HEALTH_BACKOFF_CAP_TICKS), Some(true));
+        assert_eq!(
+            health.sample(true, HEALTH_BACKOFF_CAP_TICKS),
+            None,
+            "recovery is one transition"
+        );
     }
 
     #[test]
     fn proven_reconnect_arms_a_second_down_edge() {
         let mut health = HealthConfidence::default();
         for expected in [None, None, Some(false)] {
-            assert_eq!(health.sample(false), expected);
+            assert_eq!(health.sample(false, HEALTH_BACKOFF_CAP_TICKS), expected);
         }
         health.reset_after_external_proof();
         for expected in [None, None, Some(false)] {
-            assert_eq!(health.sample(false), expected);
+            assert_eq!(health.sample(false, HEALTH_BACKOFF_CAP_TICKS), expected);
         }
     }
 

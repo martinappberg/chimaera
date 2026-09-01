@@ -59,6 +59,19 @@ pub struct Shell {
     /// `tunnels` lets reconnect do one final proof before teardown while
     /// `list_hosts` remains honest in a home-only window.
     unhealthy_tunnels: Mutex<HashSet<String>>,
+    /// Aliases whose tunnel the monitor confirmed down and no connect has
+    /// since proven — the "possibly a wedged ControlMaster" verdict. Unlike
+    /// `unhealthy_tunnels` it is NOT pruned when the tunnel goes away: a
+    /// retry after a failed flight must still clear the master, and a fresh
+    /// process (launch restore) starts empty while ControlPersist keeps a
+    /// wedged master alive for 10 m — `run_flight` covers that by also
+    /// checking whenever it has no live tunnel at all. Cleared only by a
+    /// successful publish or the user disconnecting/forgetting the host.
+    wedge_suspects: Mutex<HashSet<String>>,
+    /// The hosts.json entry each connected alias was last stamped with, so
+    /// publishing a connect (joiners, healthy-tunnel reuse) never reloads
+    /// the file.
+    host_entries: Mutex<HashMap<String, chimaera_remote::hosts::HostEntry>>,
     /// Live tunnels to compute-node daemons (Mode 2), keyed
     /// `"{alias}#job{job_id}"`. Separate from `tunnels`: a job tunnel is its
     /// own type with its own two-rung ladder and a walltime-bounded lifetime.
@@ -868,6 +881,8 @@ pub(crate) fn finish_startup(handle: &tauri::AppHandle, local: LocalDaemon) -> t
             local: Mutex::new(local),
             tunnels: tokio::sync::Mutex::new(HashMap::new()),
             unhealthy_tunnels: Mutex::new(HashSet::new()),
+            wedge_suspects: Mutex::new(HashSet::new()),
+            host_entries: Mutex::new(HashMap::new()),
             compute_tunnels: tokio::sync::Mutex::new(HashMap::new()),
             compute_endpoints: Mutex::new(HashMap::new()),
             compute_connecting: Mutex::new(std::collections::HashSet::new()),

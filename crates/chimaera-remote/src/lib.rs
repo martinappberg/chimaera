@@ -574,72 +574,52 @@ impl Tunnel {
 /// bound until the master expires, so every path that abandons such a
 /// forward must cancel it by the exact spec it was opened with.
 async fn cancel_master_forward(host: &str, spec: &str) {
-    // OpenSSH uses the first value it sees for most options. Put the tighter
-    // teardown timeout before the shared ConnectTimeout=15 rather than
-    // appending an option that looks effective but is silently ignored.
-    let mut command = transport_command("ssh");
-    command
-        .env(ASKPASS_ALIAS_ENV, host)
-        .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"])
-        .args(ssh_opts())
-        .args(["-O", "cancel", "-L"])
-        .arg(spec)
-        .arg(host);
-    let _ = output_bounded(&mut command, 10, "ssh -O cancel").await;
+    if bounded_mux_ssh(host, &["-O", "cancel", "-L", spec], &[], 10)
+        .await
+        .is_none()
+    {
+        tracing::warn!("ssh -O cancel -L {spec} to {host} did not finish within 10s");
+    }
 }
 
-/// Detect and terminate a ControlMaster to `host` whose TCP link is dead.
+/// Detect and `-O exit` a ControlMaster to `host` whose TCP link is dead:
+/// after laptop sleep the master PROCESS usually survives its connection,
+/// and until `ServerAliveInterval × CountMax` (~45 s) expires every mux
+/// client — the reconnect's probe included — queues on it. Returns whether
+/// a master was terminated.
 ///
-/// After laptop sleep or a network change the master PROCESS is usually
-/// still alive while the connection under it is gone. It only finds out when
-/// `ServerAliveInterval=15` × `ServerAliveCountMax=3` expire (~45 s), and
-/// until then every mux client — the connect flight's probe included —
-/// queues on it: a reconnect waits most of a minute and then fails into a
-/// manual retry. This asks the master directly, in three bounded steps:
-///
-/// 1. `ssh -O check`: is a master running at all? No → `false` (nothing to
-///    clear; the flight dials fresh and prompts once, like a first connect).
-/// 2. `ssh -o BatchMode=yes host true`, bounded at 15 s — one
-///    `ServerAliveInterval`, still 30 s better than the 45 s hang: a real
-///    session open through the master. It answers → `false` (the link is
-///    fine). `BatchMode` guarantees that if the master vanished between the
-///    steps and ssh falls back to a direct dial, it cannot stall on an
-///    askpass prompt (and the tighter `ConnectTimeout` keeps that dial under
-///    the bound, so an unreachable host is never misread as a wedge). NOT
-///    tighter: a merely LOADED login node (bash sourcing an NFS-backed module
-///    init under sshd — load 20 on 64 cores seen live) can take seconds to
-///    run `true`, and that same load is what makes the health probe miss 2 s
-///    three times, i.e. exactly a confirmed down. A false positive kills a
-///    HEALTHY master: a Duo re-auth (the thing the master exists to avoid)
-///    and every compute-tunnel forward riding it dropped until those
-///    windows' own reconnect flights re-dial through the fresh master.
-/// 3. Stalled → `ssh -O exit` (bounded 5 s), so the flight's next ssh raises
-///    a fresh master; `true`.
-///
-/// Why steps 1 and 3 are safe on a dead link: `-O check` / `-O exit` are mux
-/// CONTROL requests. The client connects to the ControlPath unix socket and
-/// the master's own local event loop answers them — no packet crosses the
-/// network — so they return instantly however dead the TCP side is (a bound
-/// is kept anyway). Only step 2's session open has to traverse the link,
-/// which is exactly what makes it the test.
+/// `-O check` / `-O exit` are answered by the master's own local event loop
+/// (no packet crosses the network), so they are safe on a dead link; only
+/// the `host true` session open traverses it, which is what makes it the
+/// test — and the only step that may declare a wedge: an unanswered check
+/// is "could not tell", not a verdict. The 15 s bound is one
+/// `ServerAliveInterval` and deliberately not tighter: a merely LOADED
+/// login node (an NFS-backed module init under sshd; load 20 on 64 cores
+/// seen live) takes seconds to run `true`, and that same load is what
+/// confirms a tunnel down — a false positive here kills a healthy master,
+/// forcing the Duo re-auth the master exists to avoid and dropping that
+/// alias's compute forwards.
 pub async fn clear_wedged_master(host: &str) -> bool {
-    let wedged = match bounded_mux_ssh(host, &["-O", "check", host], 3, "ssh -O check").await {
+    match bounded_mux_ssh(host, &["-O", "check"], &[], 10).await {
         // No master (or ssh cannot even run): nothing to clear.
         Some(false) => return false,
-        Some(true) => bounded_mux_ssh(host, &[host, "true"], 15, "ssh true")
-            .await
-            .is_none(),
-        // A control request the master's own event loop did not answer is
-        // the same verdict as a stalled session open.
+        Some(true) => {}
         None => {
-            tracing::warn!("ControlMaster to {host} did not answer `-O check` within 3s");
-            true
+            tracing::warn!(
+                "could not tell whether the ControlMaster to {host} is wedged: `-O check` did \
+                 not answer within 10s; leaving it alone"
+            );
+            return false;
         }
-    };
-    if !wedged {
+    }
+    // A master that answers `-O check` but cannot open a session is broken
+    // either way — a stall (dead link) or a fast failure ("read from master
+    // failed" from one mid-teardown) — and the flight would otherwise dial
+    // it under 240 s bounds.
+    if bounded_mux_ssh(host, &[], &["true"], 15).await == Some(true) {
         return false;
     }
-    match bounded_mux_ssh(host, &["-O", "exit", host], 5, "ssh -O exit").await {
+    match bounded_mux_ssh(host, &["-O", "exit"], &[], 5).await {
         Some(_) => tracing::info!(
             "ControlMaster to {host} was wedged after a link loss; terminated so the reconnect dials fresh"
         ),
@@ -651,27 +631,38 @@ pub async fn clear_wedged_master(host: &str) -> bool {
     true
 }
 
-/// A non-interactive ssh against `host`'s ControlMaster under a hard
-/// wall-clock bound: `Some(exit-success)` when it finished, `None` when it
-/// was still running at the deadline (then killed) — the wedge signal
-/// [`clear_wedged_master`] looks for. A spawn failure counts as `Some(false)`.
-async fn bounded_mux_ssh(host: &str, args: &[&str], secs: u64, what: &str) -> Option<bool> {
-    // OpenSSH uses the first value it sees for most options: BatchMode
-    // forbids any prompt, and the tighter ConnectTimeout goes BEFORE the
-    // shared ConnectTimeout=15 so a direct-dial fallback stays under `secs`.
+/// A non-interactive ssh at `host`'s ControlMaster: `BatchMode` (no prompt,
+/// ever) and a tight `ConnectTimeout` placed BEFORE [`ssh_opts`] — OpenSSH
+/// takes the first value it sees for most options, so one appended after
+/// the shared set would look effective and be silently ignored. Every mux
+/// control request and teardown probe starts here.
+fn mux_prologue(host: &str) -> Command {
     let mut command = transport_command("ssh");
     command
         .env(ASKPASS_ALIAS_ENV, host)
         .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"])
-        .args(ssh_opts())
-        .args(args)
+        .args(ssh_opts());
+    command
+}
+
+/// `ssh <prologue> <opts> host <remote>` under a hard wall-clock bound:
+/// `Some(exit-success)` when it finished, `None` when it was still running
+/// at the deadline (then killed). A spawn failure counts as `Some(false)`.
+async fn bounded_mux_ssh(host: &str, opts: &[&str], remote: &[&str], secs: u64) -> Option<bool> {
+    let label = format!("ssh {} {host} {}", opts.join(" "), remote.join(" "));
+    let what = label.trim();
+    let mut command = mux_prologue(host);
+    command
+        .args(opts)
+        .arg(host)
+        .args(remote)
         .kill_on_drop(true)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     let child = match command.spawn() {
         Ok(child) => child,
         Err(err) => {
-            tracing::debug!("could not spawn {what} for {host}: {err}");
+            tracing::debug!("could not spawn {what}: {err}");
             return Some(false);
         }
     };
@@ -1004,12 +995,8 @@ pub async fn connect(
 pub async fn remote_manifest(host: &str, home: RemoteHome) -> anyhow::Result<Option<Manifest>> {
     // SSH_ONESHOT_SECS, not shorter: the first call to a host raises the
     // ControlMaster and may sit in an askpass password/Duo prompt.
-    let output = output_bounded(
-        ssh_cmd(host).arg(format!("cat {} 2>/dev/null", home.manifest_path())),
-        SSH_ONESHOT_SECS,
-        "ssh",
-    )
-    .await?;
+    let cmd = sh_wrap(&format!("cat {} 2>/dev/null", home.manifest_path()));
+    let output = output_bounded(ssh_cmd(host).arg(cmd), SSH_ONESHOT_SECS, "ssh").await?;
     if !output.status.success() {
         return Ok(None);
     }
@@ -1019,42 +1006,63 @@ pub async fn remote_manifest(host: &str, home: RemoteHome) -> anyhow::Result<Opt
 
 /// Whether `pid` is alive on the host (signal 0 probe over ssh).
 pub async fn remote_alive(host: &str, pid: u32) -> anyhow::Result<bool> {
-    ssh_check(host, &format!("kill -0 {pid} 2>/dev/null")).await
+    ssh_check(host, &sh_wrap(&format!("kill -0 {pid} 2>/dev/null"))).await
 }
 
-/// The line between the manifest text and the alive flag in
-/// [`remote_probe`]'s output. Never a substring of serde JSON.
-const PROBE_SEPARATOR: &str = "---chimaera-probe---";
+/// Frame the manifest in [`remote_probe`] / [`start_remote`] output on BOTH
+/// sides: an echoing `~/.bashrc` under non-interactive ssh (common on HPC)
+/// puts noise before AND after a script's output, so the client parses
+/// strictly between these. Never substrings of serde JSON.
+const MANIFEST_BEGIN: &str = "---chimaera-manifest-begin---";
+const MANIFEST_END: &str = "---chimaera-manifest-end---";
 
-/// POSIX-sh fragment printing the daemon pid recorded in the manifest at
-/// `$f` (empty when there is no numeric `"pid"` field). The file is
-/// serde-pretty JSON (`"pid": 12345,` on its own line); the pattern also
-/// matches a compact single-line rendering. `sed` is POSIX and on every
-/// remote this crate targets — `jq` is not. It yields the FIRST `"pid"` line
-/// of pretty output and, through the greedy `.*`, the LAST `"pid"` on a
-/// compact line — safe only because `chimaera_core::Manifest` is flat: the
-/// manifest must stay flat, a nested `pid` would be picked first.
+/// POSIX-sh fragment printing the pid recorded in the manifest at `$f` (a
+/// serde-pretty JSON file; `sed` is on every remote, `jq` is not). It takes
+/// the FIRST `"pid"` line of pretty output and the LAST on a compact line,
+/// so `chimaera_core::Manifest` must stay FLAT — a nested pid would win.
 const SH_MANIFEST_PID: &str =
     r#"sed -n 's/.*"pid"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$f" | head -n 1"#;
 
-/// One half-second tick of a remote POSIX-sh wait loop counting in `$i`:
-/// `sleep 0.5` (GNU and BSD both accept fractions); a `sleep` that rejects
-/// them sleeps a whole second and counts two ticks, so a loop bounded in
-/// ticks keeps its wall-clock deadline instead of spinning through it.
-const SH_HALF_SECOND_STEP: &str = "sleep 0.5 2>/dev/null || { sleep 1; i=$((i+1)); }; i=$((i+1));";
+/// POSIX-sh predicate: read the manifest's pid into `$p` and `kill -0` it.
+/// Shared by the probe and the start-wait so the two can never disagree on
+/// what "alive" means (a fn, not a const: it interpolates the sed above).
+fn sh_manifest_alive() -> String {
+    format!("p=$({SH_MANIFEST_PID}); [ -n \"$p\" ] && kill -0 \"$p\" 2>/dev/null")
+}
 
-/// Wrap a POSIX-sh script for `ssh host <cmd>`. sshd hands the command to the
-/// user's LOGIN shell (`$SHELL -c`), which on HPC accounts may be tcsh or
-/// fish — neither reads `f=…`, `$(…)`, `$((…))`, `[ ]`, or `if`/`while`, so a
-/// bare script would fail on every attempt there. `sh -c '<script>'` makes
-/// every login shell defer to a POSIX sh. The only quoting sh, bash, zsh,
-/// fish, and csh all read identically is a single-quoted string with each
-/// inner `'` spelled `'\''` — close, an escaped quote OUTSIDE the quotes
-/// (where every shell honors the backslash), reopen. The script must not
-/// contain `!` (csh history expansion fires even inside single quotes); the
-/// builders don't, and the tests pin that.
+/// Exit code of a remote wait loop whose host has no usable `sleep`
+/// (neither `sleep 0.5` nor `sleep 1`). Without it the loop would spin
+/// through its tick budget in milliseconds — measured at 24 ms — and
+/// fabricate a "did not start" / "still running" verdict.
+const NO_SLEEP_EXIT: i32 = 5;
+
+/// Probe ONCE whether `sleep` accepts fractions (GNU and BSD do; a minimal
+/// busybox may not): `$frac` = 0 means half-second ticks, otherwise whole
+/// seconds counted double so a tick-bounded loop keeps its deadline. The
+/// probe's own half second is the loop's first wait, hence `i=1`.
+const SH_SLEEP_PROBE: &str = "sleep 0.5 2>/dev/null; frac=$?; i=0; [ \"$frac\" -eq 0 ] && i=1;";
+
+/// One tick of a remote wait loop after [`SH_SLEEP_PROBE`]: half a second,
+/// or a whole second counted twice; a `sleep` that fails outright exits
+/// [`NO_SLEEP_EXIT`] instead of spinning.
+fn sh_tick() -> String {
+    format!(
+        "if [ \"$frac\" -eq 0 ]; then sleep 0.5 || exit {NO_SLEEP_EXIT}; i=$((i+1)); \
+         else sleep 1 2>/dev/null || exit {NO_SLEEP_EXIT}; i=$((i+2)); fi;"
+    )
+}
+
+/// Wrap a POSIX-sh script for `ssh host <cmd>`: sshd hands the command to
+/// the user's LOGIN shell, which on HPC accounts may be tcsh or fish, so the
+/// script rides inside `sh -c '…'`. Two escapes make the single-quoted body
+/// read identically under sh, bash, zsh, dash, fish, and csh: an inner `'`
+/// becomes `'\''`, and — csh expands `!` even inside single quotes — an
+/// inner `!` becomes `'\!'` (the backslash sits outside the quotes, where
+/// every shell honors it and the POSIX ones drop it). Quotes first: the
+/// bang escape introduces quotes of its own.
 fn sh_wrap(script: &str) -> String {
-    format!("sh -c '{}'", script.replace('\'', r"'\''"))
+    let body = script.replace('\'', r"'\''").replace('!', r"'\!'");
+    format!("sh -c '{body}'")
 }
 
 /// Fetch the manifest under `home` AND whether its recorded pid answers
@@ -1064,8 +1072,7 @@ fn sh_wrap(script: &str) -> String {
 /// (~300-500 ms on a loaded login node at WAN latency); computing the alive
 /// flag remotely halves the probe's wall time. `None` = no readable manifest
 /// (or ssh itself failed — the same "nothing running" the two-exec probe
-/// reported); `Some((manifest, alive))` otherwise. POSIX sh only: the remote
-/// login shell may be dash or a BSD sh.
+/// reported); `Some((manifest, alive))` otherwise.
 pub async fn remote_probe(
     host: &str,
     home: RemoteHome,
@@ -1077,33 +1084,101 @@ pub async fn remote_probe(
     if !output.status.success() {
         return Ok(None);
     }
-    Ok(parse_probe_output(&String::from_utf8_lossy(&output.stdout)))
+    parse_probe_output(&String::from_utf8_lossy(&output.stdout))
+        .with_context(|| format!("probing the daemon on {host}"))
 }
 
 /// The POSIX-sh script [`remote_probe`] runs on the host: the manifest at
-/// `manifest_path` (if readable), a separator line, then `alive`/`dead` for
-/// the pid it records. `$HOME` in the path is expanded by the remote shell
-/// (as an assignment RHS it is never word-split). A missing or unreadable
-/// manifest prints nothing and exits 0: no separator = `None`. Pure so the
-/// tests can run it under a real `sh`.
+/// `manifest_path` (if readable) framed between [`MANIFEST_BEGIN`] and
+/// [`MANIFEST_END`], then a trailer with the pid it tested and an
+/// `alive`/`dead` verdict. `$HOME` in the path is expanded by the remote
+/// shell (as an assignment RHS it is never word-split). A missing or
+/// unreadable manifest prints nothing and exits 0. Pure so the tests can
+/// run it under real shells.
 fn probe_script(manifest_path: &str) -> String {
     format!(
-        "f={manifest_path}; [ -r \"$f\" ] || exit 0; cat \"$f\"; printf '\\n{sep}\\n'; \
-         p=$({pid}); if [ -n \"$p\" ] && kill -0 \"$p\" 2>/dev/null; \
-         then echo alive; else echo dead; fi",
-        sep = PROBE_SEPARATOR,
-        pid = SH_MANIFEST_PID,
+        "f={manifest_path}; [ -r \"$f\" ] || exit 0; if {alive}; then a=alive; else a=dead; fi; \
+         printf '\\n{begin}\\n'; cat \"$f\"; printf '\\n{end}\\npid=%s\\n%s\\n' \"$p\" \"$a\"",
+        alive = sh_manifest_alive(),
+        begin = MANIFEST_BEGIN,
+        end = MANIFEST_END,
     )
 }
 
-/// Split [`remote_probe`]'s stdout into `(manifest, alive)`. No separator
-/// means no manifest; an unparsable manifest counts as none (exactly as
-/// [`remote_manifest`] treats it), so a corrupt file falls through to a
-/// fresh start rather than an error.
-fn parse_probe_output(stdout: &str) -> Option<(Manifest, bool)> {
-    let (manifest, flag) = stdout.split_once(PROBE_SEPARATOR)?;
-    let manifest: Manifest = serde_json::from_str(manifest.trim()).ok()?;
-    Some((manifest, flag.trim() == "alive"))
+/// The manifest JSON framed between the markers in a remote script's
+/// stdout, plus the trailer the script printed after the end marker.
+/// `Ok(None)` = no begin marker (the script printed nothing: no manifest);
+/// a begin without an end is a cut-off transcript → `Err`.
+fn framed_manifest(stdout: &str) -> anyhow::Result<Option<(&str, &str)>> {
+    let Some((_, rest)) = stdout.split_once(MANIFEST_BEGIN) else {
+        return Ok(None);
+    };
+    let (json, trailer) = rest
+        .split_once(MANIFEST_END)
+        .context("remote output was cut off before the manifest end marker")?;
+    Ok(Some((json.trim(), trailer)))
+}
+
+/// The `pid=<n>` trailer line: the pid the remote `sed` extracted and
+/// tested. Cross-checked against the parsed manifest so a silent sed/serde
+/// disagreement is an error, never "dead" — which would start a second
+/// daemon next to a live one.
+fn trailer_pid(trailer: &str) -> Option<u32> {
+    trailer
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("pid="))
+        .and_then(|p| p.trim().parse().ok())
+}
+
+fn trailer_verdict(trailer: &str) -> Option<bool> {
+    trailer.lines().find_map(|l| match l.trim() {
+        "alive" => Some(true),
+        "dead" => Some(false),
+        _ => None,
+    })
+}
+
+fn check_trailer_pid(manifest: &Manifest, trailer: &str, what: &str) -> anyhow::Result<()> {
+    match trailer_pid(trailer) {
+        Some(p) if p == manifest.pid => Ok(()),
+        p => bail!(
+            "{what}: the remote tested pid {} but the manifest says {}",
+            p.map_or("<none>".to_string(), |p| p.to_string()),
+            manifest.pid
+        ),
+    }
+}
+
+/// [`remote_probe`]'s stdout → `(manifest, alive)`. No framed manifest =
+/// `None`; an unparsable one with nothing alive counts as none (as
+/// [`remote_manifest`] treats a corrupt file: a fresh start) — but never
+/// when the remote found a LIVE pid in it; a pid mismatch or a missing
+/// verdict is an `Err`.
+fn parse_probe_output(stdout: &str) -> anyhow::Result<Option<(Manifest, bool)>> {
+    let Some((json, trailer)) = framed_manifest(stdout)? else {
+        return Ok(None);
+    };
+    let manifest = match serde_json::from_str::<Manifest>(json) {
+        Ok(manifest) => manifest,
+        Err(err) => {
+            if trailer_pid(trailer).is_some() && trailer_verdict(trailer) == Some(true) {
+                bail!("the manifest is unparsable ({err}) yet its pid is alive; refusing to start a second daemon");
+            }
+            return Ok(None);
+        }
+    };
+    check_trailer_pid(&manifest, trailer, "probe")?;
+    let alive = trailer_verdict(trailer).context("probe output carried no alive/dead verdict")?;
+    Ok(Some((manifest, alive)))
+}
+
+/// [`start_remote`]'s wait output → the manifest of the daemon that came up.
+fn parse_start_wait_output(stdout: &str) -> anyhow::Result<Manifest> {
+    let (json, trailer) =
+        framed_manifest(stdout)?.context("the wait exited 0 without printing a manifest")?;
+    let manifest: Manifest = serde_json::from_str(json).context("unparsable manifest")?;
+    check_trailer_pid(&manifest, trailer, "start wait")?;
+    Ok(manifest)
 }
 
 /// Count live sessions on the daemon `manifest` describes by asking the
@@ -1168,42 +1243,74 @@ pub fn count_alive_sessions(payload: &str) -> Option<usize> {
     )
 }
 
-/// Gracefully stop the daemon on `host`: SIGTERM, then poll for exit for up
-/// to ~10s. Never escalates to SIGKILL — a daemon that will not die may be
-/// holding sessions that must not be torn out from under their owner, so
-/// this errors honestly instead.
+/// Gracefully stop the daemon on `host`: SIGTERM, then ONE remote exec waits
+/// up to ~10 s for it to go. Never escalates to SIGKILL — a daemon that will
+/// not die may be holding sessions that must not be torn out from under
+/// their owner, so that errors honestly. Three outcomes: gone (`Ok`), still
+/// running after the deadline (`Err`), or the wait's ssh ended early (a
+/// dropped link) — then one bounded `kill -0` re-check decides, and if even
+/// that cannot run, `Ok` with a warning: this sits between "stop" and
+/// "deploy" in the update path, where an `Err` would strand the host with a
+/// stopped daemon and the old binary (deploy stages `.new` + `mv -f`; a
+/// daemon that was in fact still running makes the restart's wait return
+/// its manifest).
 pub async fn stop_remote(host: &str, pid: u32) -> anyhow::Result<()> {
     tracing::info!("stopping daemon on {host} (pid {pid})");
-    // SIGTERM, then wait for exit in ONE remote loop (20 × 0.5 s = 10 s)
-    // instead of 20 client-side `kill -0` execs. The exit code is the wire:
-    // 0 = gone, STOP_STILL_ALIVE_EXIT = the deadline passed with the pid
-    // alive, STOP_SIGNAL_FAILED_EXIT = SIGTERM could not be delivered
-    // (stderr says why), anything else (ssh's own 255 on a dropped link) =
-    // unconfirmed. SIGTERM-only by design — the loop never escalates.
+    // The exit code is the wire: 0 = gone, STOP_STILL_ALIVE_EXIT,
+    // STOP_SIGNAL_FAILED_EXIT (stderr says why), NO_SLEEP_EXIT; anything
+    // else is ssh's own (255 on a dropped link) = unconfirmed.
     let cmd = sh_wrap(&stop_script(pid, STOP_WAIT_TICKS));
     let output = output_bounded(ssh_cmd(host).arg(cmd), SSH_ONESHOT_SECS, "ssh").await?;
     if output.status.success() {
         return Ok(());
     }
-    if output.status.code() == Some(STOP_STILL_ALIVE_EXIT) {
-        bail!(
-            "daemon on {host} (pid {pid}) is still running 10s after SIGTERM — \
-             refusing to kill -9 it; something is keeping it busy (open UI tabs \
-             hold its sockets). Close them and retry, or stop it by hand."
-        );
-    }
     let stderr = String::from_utf8_lossy(&output.stderr);
-    if output.status.code() == Some(STOP_SIGNAL_FAILED_EXIT) {
-        bail!("ssh {host} \"kill -TERM {pid}\" failed: {}", stderr.trim());
+    match output.status.code() {
+        Some(STOP_STILL_ALIVE_EXIT) => bail!(still_running_error(host, pid)),
+        Some(STOP_SIGNAL_FAILED_EXIT) => {
+            bail!("ssh {host} \"kill -TERM {pid}\" failed: {}", stderr.trim())
+        }
+        Some(NO_SLEEP_EXIT) => bail!(
+            "{host} has no usable `sleep`; cannot wait for the daemon to stop: {}",
+            stderr.trim()
+        ),
+        _ => {}
     }
-    // ssh itself ended (255: the link dropped mid-wait, a killed channel)
-    // after the kill was dispatched: the daemon is most likely stopping, but
-    // nothing confirmed it — distinct from the still-alive verdict above.
-    bail!(
-        "stop sent to the daemon on {host} (pid {pid}), but its exit could not be \
-         confirmed — ssh ended before the wait finished ({}): {}",
-        output.status,
-        stderr.trim()
+    // SIGTERM was dispatched, then ssh itself ended (255: the link dropped
+    // mid-wait). One non-interactive re-check: `kill -0` exits 1 once the
+    // pid is gone.
+    let mut check = mux_prologue(host);
+    check
+        .arg(host)
+        .arg(sh_wrap(&format!("kill -0 {pid} 2>/dev/null")));
+    match output_bounded(&mut check, 30, "ssh kill -0").await {
+        Ok(out) if out.status.success() => bail!(still_running_error(host, pid)),
+        Ok(out) if out.status.code() == Some(1) => Ok(()),
+        other => {
+            let recheck = match other {
+                Ok(out) => format!(
+                    "{}: {}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ),
+                Err(err) => format!("{err:#}"),
+            };
+            tracing::warn!(
+                "stop sent to the daemon on {host} (pid {pid}) but its exit could not be \
+                 confirmed (wait ended {}: {}; re-check: {recheck}) — proceeding as stopped",
+                output.status,
+                stderr.trim()
+            );
+            Ok(())
+        }
+    }
+}
+
+fn still_running_error(host: &str, pid: u32) -> String {
+    format!(
+        "daemon on {host} (pid {pid}) is still running 10s after SIGTERM — \
+         refusing to kill -9 it; something is keeping it busy (open UI tabs \
+         hold its sockets). Close them and retry, or stop it by hand."
     )
 }
 
@@ -1215,15 +1322,16 @@ const STOP_STILL_ALIVE_EXIT: i32 = 4;
 const STOP_WAIT_TICKS: u32 = 20;
 
 /// The POSIX-sh script [`stop_remote`] runs: SIGTERM `pid`, then up to
-/// `ticks` half-second waits for it to go. Pure so tests can run it under a
-/// real `sh` with a short deadline.
+/// `ticks` half-second waits for it to go. Pure so tests can run it under
+/// real shells with a short deadline.
 fn stop_script(pid: u32, ticks: u32) -> String {
     format!(
-        "kill -TERM {pid} || exit {failed}; i=0; while [ $i -lt {ticks} ]; do {step} \
-         kill -0 {pid} 2>/dev/null || exit 0; done; exit {alive}",
+        "kill -TERM {pid} || exit {failed}; {probe} while :; do \
+         kill -0 {pid} 2>/dev/null || exit 0; [ $i -lt {ticks} ] || exit {alive}; {tick} done",
         failed = STOP_SIGNAL_FAILED_EXIT,
-        step = SH_HALF_SECOND_STEP,
+        probe = SH_SLEEP_PROBE,
         alive = STOP_STILL_ALIVE_EXIT,
+        tick = sh_tick(),
     )
 }
 
@@ -1658,7 +1766,10 @@ async fn ensure_remote_binary(
 /// something unrecognizable — all "not usable, redeploy" to the caller.
 async fn remote_binary_version(host: &str, home: RemoteHome) -> anyhow::Result<Option<String>> {
     let output = output_bounded(
-        ssh_cmd(host).arg(format!("{} --version 2>/dev/null", home.bin_path())),
+        ssh_cmd(host).arg(sh_wrap(&format!(
+            "{} --version 2>/dev/null",
+            home.bin_path()
+        ))),
         SSH_ONESHOT_SECS,
         "ssh",
     )
@@ -1682,7 +1793,8 @@ fn parse_cli_version(text: &str) -> Option<String> {
     words.next().map(str::to_string)
 }
 
-/// Start the daemon on the host and poll until its manifest reports alive.
+/// Start the daemon on the host, then wait — in ONE remote exec — until its
+/// manifest reports a live pid.
 async fn start_remote(host: &str, home: RemoteHome) -> anyhow::Result<Manifest> {
     tracing::info!("starting chimaera daemon on {host} ({})", home.dir());
     ssh_run(
@@ -1693,7 +1805,7 @@ async fn start_remote(host: &str, home: RemoteHome) -> anyhow::Result<Manifest> 
         // containers) — that is what lets `connect` start a daemon on ANY POSIX
         // remote. Its parent exits 0 the instant the child owns its new session,
         // so `&& exit` ends the ssh command promptly and `connect` moves on to
-        // poll the manifest.
+        // the wait exec below.
         //
         // Fallback, reached only when `--daemonize` is rejected (a pre-flag
         // remote binary — an older release, which by definition sits on a Linux
@@ -1709,6 +1821,9 @@ async fn start_remote(host: &str, home: RemoteHome) -> anyhow::Result<Manifest> 
         // re-points everything else at /dev/null, so redirecting to a
         // fifo/pipe — or dropping the redirect — silently sends the remote
         // daemon's logs to /dev/null.
+        //
+        // Sent BARE (not through `sh_wrap`): pre-existing, and it still assumes
+        // a POSIX login shell — folding it into the wait exec is the follow-up.
         &format!(
             "mkdir -p {log_dir}; \
              {env}{bin} serve --daemonize >> {log} 2>&1 < /dev/null && exit; \
@@ -1722,24 +1837,41 @@ async fn start_remote(host: &str, home: RemoteHome) -> anyhow::Result<Manifest> 
     .await?;
     // Wait for the manifest AND a live pid in ONE remote loop instead of up
     // to 15 × 2 client-side execs (each a channel-open RTT + remote fork):
-    // 30 × 0.5 s steps = the same 15 s deadline. The manifest is written
+    // 30 half-second ticks = the same 15 s deadline. The manifest is written
     // atomically (tmp + rename), so a readable file is a complete one. The
-    // loop prints the manifest and exits 0 the moment the daemon is up, 1
-    // after the deadline. Wrapped `sh -c` (see `sh_wrap`) so a tcsh/fish
-    // login shell defers to a POSIX sh — the start line above predates that
-    // and still assumes a POSIX login shell.
+    // loop prints the manifest (framed) and exits 0 the moment the daemon is
+    // up, 1 at the deadline. The old per-exec poll shrugged off one transient
+    // ssh failure; a dropped channel (255) retries the wait once.
     let wait = sh_wrap(&start_wait_script(&home.manifest_path(), START_WAIT_TICKS));
-    let output = output_bounded(ssh_cmd(host).arg(wait), SSH_ONESHOT_SECS, "ssh").await?;
-    if output.status.success() {
-        let text = String::from_utf8_lossy(&output.stdout);
-        if let Ok(m) = serde_json::from_str::<Manifest>(text.trim()) {
-            return Ok(m);
-        }
+    let mut output = output_bounded(ssh_cmd(host).arg(&wait), SSH_ONESHOT_SECS, "ssh").await?;
+    if output.status.code() == Some(255) {
+        tracing::warn!(
+            "the start wait on {host} lost its ssh channel ({}); retrying once",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        output = output_bounded(ssh_cmd(host).arg(&wait), SSH_ONESHOT_SECS, "ssh").await?;
     }
-    bail!(
-        "daemon on {host} did not start within 15s (check {} there)",
-        home.log_path()
-    );
+    if output.status.success() {
+        return parse_start_wait_output(&String::from_utf8_lossy(&output.stdout)).with_context(
+            || format!("daemon on {host} started but its manifest could not be read"),
+        );
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    match output.status.code() {
+        Some(1) => bail!(
+            "daemon on {host} did not start within 15s (check {} there)",
+            home.log_path()
+        ),
+        Some(NO_SLEEP_EXIT) => bail!(
+            "{host} has no usable `sleep`; cannot wait for the daemon to start: {}",
+            stderr.trim()
+        ),
+        _ => bail!(
+            "waiting for the daemon on {host} failed before its deadline ({}): {}",
+            output.status,
+            stderr.trim()
+        ),
+    }
 }
 
 /// How many half-second ticks [`start_remote`] waits for the manifest (15 s).
@@ -1747,16 +1879,20 @@ const START_WAIT_TICKS: u32 = 30;
 
 /// The POSIX-sh script [`start_remote`] runs after the start line: up to
 /// `ticks` half-second waits for a readable manifest at `manifest_path`
-/// whose pid answers `kill -0`, then print it and exit 0; exit 1 at the
-/// deadline. Pure so tests can run it under a real `sh`.
+/// whose pid answers `kill -0`, then print it framed (with the tested pid)
+/// and exit 0; exit 1 at the deadline. Pure so tests can run it under real
+/// shells.
 fn start_wait_script(manifest_path: &str, ticks: u32) -> String {
     format!(
-        "f={manifest_path}; i=0; while [ $i -lt {ticks} ]; do \
-         if [ -r \"$f\" ]; then p=$({pid}); \
-         if [ -n \"$p\" ] && kill -0 \"$p\" 2>/dev/null; then cat \"$f\"; exit 0; fi; fi; \
-         {step} done; exit 1",
-        pid = SH_MANIFEST_PID,
-        step = SH_HALF_SECOND_STEP,
+        "f={manifest_path}; {probe} while :; do \
+         if [ -r \"$f\" ]; then if {alive}; then printf '\\n{begin}\\n'; cat \"$f\"; \
+         printf '\\n{end}\\npid=%s\\n' \"$p\"; exit 0; fi; fi; \
+         [ $i -lt {ticks} ] || exit 1; {tick} done",
+        probe = SH_SLEEP_PROBE,
+        alive = sh_manifest_alive(),
+        begin = MANIFEST_BEGIN,
+        end = MANIFEST_END,
+        tick = sh_tick(),
     )
 }
 
@@ -2424,24 +2560,67 @@ pub async fn compute_cancel(host: &str, manifest: &Manifest, job_id: &str) -> an
 mod tests {
     use super::*;
 
-    /// `remote_probe` folds manifest + liveness into one exec; its stdout is
-    /// `<manifest json>\n<separator>\n<alive|dead>`. No separator = nothing
-    /// running; a corrupt manifest is "none" (a fresh start), never an error.
+    /// The probe and start-wait frame the manifest on BOTH sides and print
+    /// the pid they tested: noise around the frame (an echoing ~/.bashrc) is
+    /// ignored, a cut-off frame, a pid that disagrees with the manifest, or a
+    /// missing verdict is an error — never a silent "dead" that would start a
+    /// second daemon — and a corrupt manifest is a fresh start only when
+    /// nothing was found alive in it.
     #[test]
-    fn probe_output_parses_manifest_and_alive_flag() {
+    fn probe_output_is_parsed_strictly_between_markers() {
         let manifest = serde_json::to_string_pretty(&fake_manifest(Some("b.1"), 42)).unwrap();
-        let (m, alive) = parse_probe_output(&format!("{manifest}\n{PROBE_SEPARATOR}\nalive\n"))
-            .expect("manifest + flag");
+        let framed = |trailer: &str| {
+            format!(
+                "noise from ~/.bashrc\n{MANIFEST_BEGIN}\n{manifest}\n{MANIFEST_END}\n{trailer}more noise\n"
+            )
+        };
+        let (m, alive) = parse_probe_output(&framed("pid=42\nalive\n"))
+            .unwrap()
+            .expect("manifest");
         assert_eq!(m.pid, 42);
         assert!(alive);
-        let (_, alive) = parse_probe_output(&format!("{manifest}\n{PROBE_SEPARATOR}\ndead\n"))
-            .expect("manifest + flag");
+        let (_, alive) = parse_probe_output(&framed("pid=42\ndead\n"))
+            .unwrap()
+            .expect("manifest");
         assert!(!alive);
-        assert!(parse_probe_output("").is_none(), "no manifest printed");
         assert!(
-            parse_probe_output(&format!("{{not json\n{PROBE_SEPARATOR}\nalive\n")).is_none(),
-            "a corrupt manifest is a fresh start, as remote_manifest treats it"
+            parse_probe_output("only noise\n").unwrap().is_none(),
+            "no begin marker = no manifest"
         );
+        assert!(
+            parse_probe_output(&format!("{MANIFEST_BEGIN}\n{manifest}\n")).is_err(),
+            "cut off before the end marker"
+        );
+        assert!(
+            parse_probe_output(&framed("pid=43\nalive\n")).is_err(),
+            "sed and serde disagree on the pid"
+        );
+        assert!(
+            parse_probe_output(&framed("pid=\ndead\n")).is_err(),
+            "sed found no pid"
+        );
+        assert!(
+            parse_probe_output(&framed("pid=42\n")).is_err(),
+            "no verdict"
+        );
+        let corrupt =
+            |trailer: &str| format!("{MANIFEST_BEGIN}\n{{not json\n{MANIFEST_END}\n{trailer}");
+        assert!(
+            parse_probe_output(&corrupt("pid=\ndead\n"))
+                .unwrap()
+                .is_none(),
+            "a corrupt manifest with nothing alive is a fresh start"
+        );
+        assert!(
+            parse_probe_output(&corrupt("pid=42\nalive\n")).is_err(),
+            "a corrupt manifest with a live pid is never a fresh start"
+        );
+        assert_eq!(
+            parse_start_wait_output(&framed("pid=42\n")).unwrap().pid,
+            42
+        );
+        assert!(parse_start_wait_output("nothing\n").is_err());
+        assert!(parse_start_wait_output(&framed("pid=7\n")).is_err());
     }
 
     /// The remote pid extraction is a `sed` over the manifest; pin its
@@ -2518,14 +2697,15 @@ mod tests {
     }
 
     /// `sh_wrap`'s quoting is the one form every login shell reads the same:
-    /// a script full of single quotes, double quotes, `$(…)`, `$((…))`, and
-    /// backslashes must reach `sh` byte-for-byte through each of them — tcsh
-    /// and fish included. And none of the real scripts may contain `!` (csh
-    /// history expansion fires even inside single quotes).
+    /// a script full of single quotes, double quotes, `$(…)`, `$((…))`,
+    /// backslashes, and a `!` (csh history expansion — `tcsh -c "sh -c 'echo
+    /// hello!world'"` dies with "Event not found") must reach `sh`
+    /// byte-for-byte through each of them, tcsh and fish included.
     #[cfg(unix)]
     #[test]
     fn sh_wrap_survives_every_login_shell() {
-        let script = r#"printf '%s\n' "a'b" 'c"d' $((1+2)) "$(printf '%s' '\(x\)')" '\1'"#;
+        let script =
+            r#"printf '%s\n' "a'b" 'c"d' $((1+2)) "$(printf '%s' '\(x\)')" '\1' hello!world"#;
         let shells = login_shells();
         // macOS ships tcsh: the hostile-login-shell case must really run here,
         // not silently skip.
@@ -2535,17 +2715,10 @@ mod tests {
             let out = run_script(shell, script);
             assert_eq!(
                 String::from_utf8_lossy(&out.stdout),
-                "a'b\nc\"d\n3\n\\(x\\)\n\\1\n",
+                "a'b\nc\"d\n3\n\\(x\\)\n\\1\nhello!world\n",
                 "{shell}: {}",
                 String::from_utf8_lossy(&out.stderr)
             );
-        }
-        for script in [
-            probe_script("$HOME/m.json"),
-            start_wait_script("$HOME/m.json", 30),
-            stop_script(1, 20),
-        ] {
-            assert!(!script.contains('!'), "csh history expansion: {script}");
         }
     }
 
@@ -2602,28 +2775,32 @@ mod tests {
                 "{shell}: {}",
                 String::from_utf8_lossy(&out.stderr)
             );
-            let (m, alive) =
-                parse_probe_output(&String::from_utf8_lossy(&out.stdout)).expect("manifest");
+            let (m, alive) = parse_probe_output(&String::from_utf8_lossy(&out.stdout))
+                .unwrap()
+                .expect("manifest");
             assert_eq!(m.pid, std::process::id());
             assert!(alive, "{shell}: this process is alive");
 
             write_manifest(&path, dead_pid());
             let out = run_script(shell, &script);
-            let (_, alive) =
-                parse_probe_output(&String::from_utf8_lossy(&out.stdout)).expect("manifest");
+            let (_, alive) = parse_probe_output(&String::from_utf8_lossy(&out.stdout))
+                .unwrap()
+                .expect("manifest");
             assert!(!alive, "{shell}: a reaped pid is dead");
 
             std::fs::remove_file(&path).unwrap();
             let out = run_script(shell, &script);
             assert!(out.status.success(), "{shell}: absent manifest exits 0");
-            assert!(parse_probe_output(&String::from_utf8_lossy(&out.stdout)).is_none());
+            assert!(parse_probe_output(&String::from_utf8_lossy(&out.stdout))
+                .unwrap()
+                .is_none());
         }
         std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The start-wait command through every login shell: prints the manifest
     /// as soon as one appears with a live pid (written mid-loop here, so the
-    /// sleep path is exercised) and exits non-zero at the deadline otherwise.
+    /// sleep path is exercised) and exits 1 at the deadline otherwise.
     #[cfg(unix)]
     #[test]
     fn start_wait_script_runs_under_every_login_shell() {
@@ -2645,14 +2822,17 @@ mod tests {
             write_manifest(&path, std::process::id());
             let out = child.wait_with_output().unwrap();
             assert!(out.status.success(), "{shell}: manifest appeared in time");
-            let m: Manifest =
-                serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+            let m = parse_start_wait_output(&String::from_utf8_lossy(&out.stdout)).unwrap();
             assert_eq!(m.pid, std::process::id());
 
             // A manifest whose pid is dead never satisfies the loop.
             write_manifest(&path, dead_pid());
             let out = run_script(shell, &start_wait_script(&path.display().to_string(), 2));
-            assert!(!out.status.success(), "{shell}: a dead pid must time out");
+            assert_eq!(
+                out.status.code(),
+                Some(1),
+                "{shell}: a dead pid must time out"
+            );
         }
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2691,6 +2871,47 @@ mod tests {
                 "{shell}: SIGTERM to a dead pid fails"
             );
         }
+    }
+
+    /// A remote with no `sleep` at all must not spin through its tick budget
+    /// in milliseconds and fabricate "still running" / "did not start": both
+    /// wait loops exit the distinct no-sleep code instead. Run with a PATH
+    /// holding only `sh`, so `sleep` (external) is missing while `sh -c`
+    /// still resolves.
+    #[cfg(unix)]
+    #[test]
+    fn wait_loops_report_a_missing_sleep_instead_of_spinning() {
+        let dir = std::env::temp_dir().join(format!("chimaera-no-sleep-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::os::unix::fs::symlink("/bin/sh", dir.join("sh")).ok();
+        let run = |script: &str| {
+            std::process::Command::new("/bin/sh")
+                .env("PATH", &dir)
+                .args(["-c", &sh_wrap(script)])
+                .output()
+                .unwrap()
+        };
+        let stubborn = spawn_orphan("sh -c 'trap \"\" TERM; exec sleep 30'");
+        std::thread::sleep(Duration::from_millis(200));
+        let out = run(&stop_script(stubborn, 20));
+        assert_eq!(
+            out.status.code(),
+            Some(NO_SLEEP_EXIT),
+            "stop: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let _ = run_script("sh", &format!("kill -9 {stubborn}"));
+        let out = run(&start_wait_script(
+            &dir.join("absent.json").display().to_string(),
+            30,
+        ));
+        assert_eq!(
+            out.status.code(),
+            Some(NO_SLEEP_EXIT),
+            "start wait: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
@@ -3397,6 +3618,7 @@ mod tests {
         let fake = FakeOps {
             calls: RefCell::new(Vec::new()),
             probe_manifest: None,
+            // Unused here: with no manifest the fake probe reports nothing.
             alive: false,
             sessions: None,
             resolved_bin: PathBuf::from("/unused"),

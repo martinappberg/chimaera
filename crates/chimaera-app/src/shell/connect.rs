@@ -4,8 +4,8 @@
 
 use std::collections::HashSet;
 
-use chimaera_remote::hosts::HostsStore;
-use chimaera_remote::{ConnectOpts, Phase, Tunnel};
+use chimaera_remote::hosts::{HostEntry, HostsStore};
+use chimaera_remote::{ComputeTunnel, ConnectOpts, Phase, Tunnel};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -124,7 +124,14 @@ pub(super) fn state_for(
 /// joined flights: a caller may still hold an old daemon token even though
 /// another window already rebuilt the shared tunnel.
 async fn publish_connected_state(app: &AppHandle, state: &Shell, alias: &str) -> Option<HostState> {
-    let entry = host_entry(alias).await;
+    // The entry the flight stamped; a miss (none this process) is the only
+    // publish that reads hosts.json.
+    // The guard must not live across the fallback's await.
+    let cached = lock(&state.host_entries).get(alias).cloned();
+    let entry = match cached {
+        Some(entry) => entry,
+        None => host_entry(alias).await,
+    };
     let (reply, event) = {
         let tunnels = state.tunnels.lock().await;
         let tunnel = tunnels.get(alias)?;
@@ -141,6 +148,7 @@ async fn publish_connected_state(app: &AppHandle, state: &Shell, alias: &str) ->
     // Emit after dropping the tunnel lock. Event handlers can immediately
     // navigate and invoke native commands; none should queue behind delivery.
     lock(&state.unhealthy_tunnels).remove(alias);
+    lock(&state.wedge_suspects).remove(alias);
     let _ = app.emit("host-status", event);
     Some(reply)
 }
@@ -309,15 +317,33 @@ async fn run_flight(
     update_daemon: bool,
 ) -> Result<HostState, String> {
     let state = app.state::<Shell>();
-    // The health monitor's verdict, read BEFORE the tunnel map changes (its
-    // next tick forgets keys whose tunnel is gone). Only a confirmed-down
-    // tunnel warrants the wedged-master check below: a user-initiated connect
-    // to a healthy host must not pay an extra mux round trip.
-    let confirmed_down = lock(&state.unhealthy_tunnels).contains(alias);
+    // Attribute the whole pre-connect stall — the wedge ladder and the old
+    // tunnel's teardown below — to the row's "probing" label (the same one
+    // `connect` re-emits when it starts).
+    emit_progress(app, alias, "probing");
     // Remove under the map lock, then do process/network teardown without it.
     // `Tunnel::close` is bounded but still asynchronous; holding this lock made
     // one dead host freeze health checks and commands for every other host.
     let old = state.tunnels.lock().await.remove(alias);
+    // After laptop sleep the host's ControlMaster is often alive on a dead
+    // TCP link, and every mux client then queues on it until ssh's own
+    // keepalive gives up (~45 s). Clear that first so the reconnect dials
+    // fresh instead of stalling into a manual retry. Gated on the monitor's
+    // confirmed-down verdict, which `wedge_suspects` keeps until a connect
+    // succeeds — the tunnel itself is gone by now (a retry after a failed
+    // flight has none), and a launch-time restore is a fresh process with
+    // empty sets while ControlPersist keeps a wedged master alive for 10 m;
+    // so a flight with no live tunnel at all runs the ladder too (an instant
+    // local `-O check` when no master exists, one session open on a live
+    // one). It runs BEFORE `old.close()`: that close `-O cancel`s a
+    // master-held forward, which hangs on a wedged master until it is
+    // `-O exit`ed. A user-initiated connect over a healthy tunnel never
+    // pays it.
+    let suspect = lock(&state.wedge_suspects).contains(alias);
+    if (suspect || old.is_none()) && chimaera_remote::clear_wedged_master(alias).await {
+        tracing::info!("cleared a wedged ControlMaster to {alias} before reconnecting");
+        drop_compute_tunnels_of(app, &state, alias).await;
+    }
     let reuse_port = match old {
         Some(old) => {
             let port = old.local_port;
@@ -330,19 +356,7 @@ async fn run_flight(
     let entry = {
         let alias = alias.to_string();
         with_hosts(move |hosts| hosts.add(&alias, None)).await?
-    }
-    .map_err(|e| format!("{e:#}"))?;
-    if confirmed_down {
-        // After laptop sleep the host's ControlMaster is often alive on a
-        // dead TCP link, and every mux client then queues on it until ssh's
-        // own keepalive gives up (~45 s). Clear that first so the reconnect
-        // dials fresh instead of stalling into a manual retry. To the row
-        // this IS the probe — the same label `connect` re-emits next.
-        emit_progress(app, alias, "probing");
-        if chimaera_remote::clear_wedged_master(alias).await {
-            tracing::info!("cleared a wedged ControlMaster to {alias} before reconnecting");
-        }
-    }
+    };
     let result = run_connect(app, alias, &entry, reuse_port, update_daemon).await;
     // The reused port was free a moment ago (we just cancelled the forward),
     // but socket teardown can lag; fall back to an OS-assigned port so a
@@ -362,13 +376,18 @@ async fn run_flight(
     };
 
     let tunnel = result.map_err(|e| format!("{e:#}"))?;
-    let stamped = {
+    // Stamp the connection and keep the stamped entry for every later publish
+    // of this alias (joiners, healthy-tunnel reuse); a failed stamp keeps the
+    // pre-connect entry rather than failing a connect that just landed.
+    let entry = {
         let alias = alias.to_string();
         with_hosts(move |hosts| hosts.record_connected(&alias)).await
-    };
-    if let Err(e) = stamped.and_then(|saved| saved.map_err(|e| format!("{e:#}"))) {
-        tracing::debug!("could not record host {alias}: {e}");
     }
+    .unwrap_or_else(|e| {
+        tracing::debug!("could not record host {alias}: {e}");
+        entry
+    });
+    lock(&state.host_entries).insert(alias.to_string(), entry);
     authorize_scope_origin(app, Some(alias), tunnel.local_port)
         .map_err(|e| format!("could not authorize {alias}'s daemon origin: {e}"))?;
     let (port, token) = (tunnel.local_port, tunnel.manifest.token.clone());
@@ -414,13 +433,55 @@ fn reopen_windows(app: &AppHandle, alias: &str, port: u16, token: &str) {
     }
 }
 
-async fn host_entry(alias: &str) -> chimaera_remote::hosts::HostEntry {
+/// `-O exit` on the login master also killed every compute forward riding
+/// it (both rungs share the ControlPath). Drop those tunnels now and tell
+/// their windows, instead of leaving them to three more monitor misses;
+/// their own reconnect flights re-dial through the fresh master.
+async fn drop_compute_tunnels_of(app: &AppHandle, state: &Shell, alias: &str) {
+    let prefix = format!("{alias}#job");
+    let dropped: Vec<(String, ComputeTunnel)> = {
+        let mut compute = state.compute_tunnels.lock().await;
+        let keys: Vec<String> = compute
+            .keys()
+            .filter(|key| key.starts_with(&prefix))
+            .cloned()
+            .collect();
+        keys.into_iter()
+            .filter_map(|key| compute.remove(&key).map(|tunnel| (key, tunnel)))
+            .collect()
+    };
+    for (key, tunnel) in dropped {
+        lock(&state.unhealthy_tunnels).remove(&key);
+        let port = tunnel.local_port;
+        // Its forward died with the master; this reaps the child (and its
+        // `-O cancel` fails fast against the socket that is no longer there).
+        tunnel.close().await;
+        tracing::info!("dropped compute tunnel {key}: its login ControlMaster was reset");
+        let _ = app.emit(
+            "host-status",
+            HostStatus {
+                alias: key,
+                status: "down",
+                local_port: Some(port),
+                token: None,
+                error: None,
+                reason: Some(
+                    "The login host's ssh connection was reset after a link loss; this job's                      tunnel went with it and reconnects through the new one."
+                        .to_string(),
+                ),
+                build: None,
+            },
+        );
+    }
+}
+
+async fn host_entry(alias: &str) -> HostEntry {
     let owned = alias.to_string();
-    with_hosts(move |hosts| hosts.get(&owned))
+    with_hosts(move |hosts| Ok(hosts.get(&owned)))
         .await
         .ok()
         .flatten()
-        .unwrap_or(chimaera_remote::hosts::HostEntry {
+        .unwrap_or(HostEntry {
             alias: alias.to_string(),
             binary: None,
             added_at: 0,
@@ -428,16 +489,27 @@ async fn host_entry(alias: &str) -> chimaera_remote::hosts::HostEntry {
         })
 }
 
-/// One load → mutate → save against hosts.json, off the reactor. `HostsStore`
-/// is plain `std::fs` (a read, then an atomic tmp + rename write), and its
-/// callers — IPC commands and connect flights — run on the tokio reactor,
-/// where a slow home directory would stall every other tunnel op.
+/// Serializes every hosts.json read-modify-write in this process: launch
+/// restore runs one connect flight per alias concurrently, and two
+/// interleaved load→mutate→save cycles lose an update. (A CLI `connect` in
+/// another process writes the same file; the unique tmp name in
+/// `HostsStore::save` is what keeps THAT from tearing it.)
+static HOSTS_IO: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// One load → mutate → save against hosts.json, serialized and off the
+/// reactor. `HostsStore` is plain `std::fs` (a read, then an atomic tmp +
+/// rename write), and its callers — IPC commands and connect flights — run
+/// on the tokio reactor, where a slow home directory would stall every other
+/// tunnel op. The closure's error is flattened here so call sites are a
+/// plain `?`.
 pub(super) async fn with_hosts<T: Send + 'static>(
-    f: impl FnOnce(&mut HostsStore) -> T + Send + 'static,
+    f: impl FnOnce(&mut HostsStore) -> anyhow::Result<T> + Send + 'static,
 ) -> Result<T, String> {
+    let _serialized = HOSTS_IO.lock().await;
     tokio::task::spawn_blocking(move || f(&mut HostsStore::load_default()))
         .await
-        .map_err(|e| format!("hosts.json task failed: {e}"))
+        .map_err(|e| format!("hosts.json task failed: {e}"))?
+        .map_err(|e| format!("{e:#}"))
 }
 
 #[cfg(test)]
