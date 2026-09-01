@@ -146,13 +146,22 @@ export function reclaimHomeHub(): void {
 /**
  * True once any REST call or events socket saw a 401/unauthorized. Browser
  * windows use the manual re-auth page; native remote windows use their
- * host-scoped SSH reconnect. Both successful paths reload the window.
+ * host-scoped SSH reconnect. A successful re-auth reloads the window — except
+ * a native tunnel healed in place (same port, same token), which releases the
+ * latch via {@link clearUnauthorized} instead.
  */
 export const unauthorized = writable(false);
 
 /** Mark this window's auth as dead (401 from REST or a WS auth error). */
 export function notifyUnauthorized(): void {
   unauthorized.set(true);
+}
+
+/** This window's credentials work again without a reload (a native remote
+ *  window's in-place tunnel heal). Every other recovery navigates, which
+ *  resets the latch by itself. */
+export function clearUnauthorized(): void {
+  unauthorized.set(false);
 }
 
 /**

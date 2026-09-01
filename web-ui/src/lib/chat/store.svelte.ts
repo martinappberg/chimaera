@@ -404,6 +404,13 @@ export class ChatStore {
   degraded = $state(false);
   connected = $state(false);
   fatalError = $state<string | null>(null);
+  /** Where the fatal came from. A SOCKET fatal (handshake failure) is
+   *  disproved by the next successful `ready` — chatPool recreates a fatal
+   *  socket against this surviving store with `lastSeq` intact, so no reset
+   *  or `init` would otherwise clear it. A JOURNAL fatal (`error{fatal}`) is
+   *  the driver's death, not the socket's: it outlives reconnects until a
+   *  fresh `init`, a fork, or a journal reset. */
+  private fatalSource: "socket" | "journal" | null = null;
   /** Context-window occupancy, 0-100 (claude get_context_usage after each
    *  turn; codex tokenUsage vs modelContextWindow). */
   contextPct = $state<number | null>(null);
@@ -562,6 +569,9 @@ export class ChatStore {
 
   onReady(session: ChatSessionInfo, _replayFrom: number, head: number | undefined): void {
     this.connected = true;
+    // This handshake succeeded, which is the one fact a socket-level fatal
+    // claimed was impossible; a journal fatal says nothing about the socket.
+    if (this.fatalSource === "socket") this.clearFatal();
     // The journal's head is below our own lastSeq: it was pruned/recreated and
     // numbering restarted, so every replayed and live event would be dropped by
     // the seq-dedupe guard, freezing the pane. Rebuild from the new journal.
@@ -609,7 +619,13 @@ export class ChatStore {
   onFatalError(message: string): void {
     this.hydrating = false;
     this.fatalError = message;
+    this.fatalSource = "socket";
     this.touchTranscript();
+  }
+
+  private clearFatal(): void {
+    this.fatalError = null;
+    this.fatalSource = null;
   }
 
   /** Drop the rendered transcript and seq cursor so a fresh replay rebuilds it
@@ -637,6 +653,10 @@ export class ChatStore {
     this.replayHead = 0;
     this.exited = null;
     this.degraded = false;
+    // A fatal banner (a handshake failure, a replayed fatal `error`) belongs
+    // to the dead journal too; the rebuilt replay re-raises one that is
+    // still true.
+    this.clearFatal();
     // Turn state and the plan belong to the dead journal too — a stale plan
     // (or a stuck "running") must not outlive the reset; the replay rebuilds
     // whatever is genuinely current.
@@ -659,9 +679,14 @@ export class ChatStore {
     switch (ev.type) {
       case "init": {
         // A fresh driver handshake: the session is live again whatever a
-        // replayed exit said (toggle round-trips, resumes).
+        // replayed exit or fatal error said (toggle round-trips, resumes, a
+        // relaunch after a protocol error) — a red banner pinned above a
+        // typable composer is exactly the stale state this clears. Replay
+        // order keeps a still-dead driver honest: its fatal `error` follows
+        // its `init`, so it lands after this reset.
         this.exited = null;
         this.degraded = false;
+        this.clearFatal();
         // This is a NEW driver process — the CLI defaults thinking OFF, so the
         // view must re-push the user's preference to it (seq-dedupe means only
         // a genuinely-new init re-applies here; a plain reconnect doesn't).
@@ -1307,7 +1332,7 @@ export class ChatStore {
           this.rewind = null;
           this.mcpServers = null;
           this.promptSuggestion = null;
-          this.fatalError = null;
+          this.clearFatal();
           this.plan = [];
           this.exited = null;
           this.degraded = false;
@@ -1328,6 +1353,7 @@ export class ChatStore {
         this.notice(ev.message as string, "error");
         if (ev.fatal === true) {
           this.fatalError = ev.message as string;
+          this.fatalSource = "journal";
           // A dead driver is not running — don't strand the stop button and
           // the "starting…" row waiting on a turn end that can't come.
           this.running = false;

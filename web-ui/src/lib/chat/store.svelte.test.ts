@@ -519,6 +519,72 @@ describe("ChatStore pending-send ordering", () => {
     expect(store.running).toBe(false);
   });
 
+  it("a fresh driver init clears a fatal error banner", () => {
+    // The daemon keeps a ProtocolError session registered with its fatal
+    // error; a relaunched driver (`init`) makes the pane live and typable
+    // again, so the red banner must not outlive the recovery.
+    const recovered = fold([
+      { type: "error", message: "driver protocol error", fatal: true },
+      { type: "init", native_session_id: "relaunched" },
+    ]);
+    expect(recovered.fatalError).toBeNull();
+    // Order keeps a still-dead driver honest: its fatal error follows its init.
+    const dead = fold([
+      { type: "init", native_session_id: "doomed" },
+      { type: "error", message: "driver protocol error", fatal: true },
+    ]);
+    expect(dead.fatalError).toBe("driver protocol error");
+  });
+
+  it("a journal reset drops a socket-level fatal error with the transcript", () => {
+    const store = fold([{ type: "turn_started", turn_id: "t1" }]);
+    store.onFatalError("handshake failed");
+    expect(store.fatalError).toBe("handshake failed");
+    // head below our lastSeq: the journal was recreated server-side.
+    store.onReady(
+      {
+        id: "s1",
+        agent: "claude",
+        alive: true,
+        exit_status: null,
+        native_session_id: null,
+        model: null,
+        current_mode: null,
+        pending_permission: false,
+      },
+      0,
+      0,
+    );
+    expect(store.fatalError).toBeNull();
+  });
+
+  it("a successful re-handshake clears a socket-level fatal but not a journal one", () => {
+    const session = {
+      id: "s1",
+      agent: "claude",
+      alive: true,
+      exit_status: null,
+      native_session_id: null,
+      model: null,
+      current_mode: null,
+      pending_permission: false,
+    };
+    // chatPool recreates a fatal socket against the surviving store with
+    // lastSeq intact: head ≥ lastSeq, so neither a reset nor a replayed init
+    // runs — the `ready` itself is what disproves the handshake failure.
+    const socketFatal = fold([{ type: "turn_started", turn_id: "t1" }]);
+    socketFatal.onFatalError("handshake failed");
+    socketFatal.onReady(session, 1, 1);
+    expect(socketFatal.fatalError).toBeNull();
+    // A journal fatal is the driver's death, not the socket's.
+    const journalFatal = fold([
+      { type: "turn_started", turn_id: "t1" },
+      { type: "error", message: "driver protocol error", fatal: true },
+    ]);
+    journalFatal.onReady(session, 2, 2);
+    expect(journalFatal.fatalError).toBe("driver protocol error");
+  });
+
   it("re-arms the thinking push on a fresh driver init", () => {
     // The pooled thinking preference must be re-pushed to each new driver
     // process (a fresh CLI defaults thinking off) — `init` resets the flag.

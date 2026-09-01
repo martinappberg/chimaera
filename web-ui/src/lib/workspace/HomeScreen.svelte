@@ -100,7 +100,10 @@
     for (const s of sessions) {
       const entry = map.get(s.workspace_id) ?? { live: 0, attn: 0 };
       if (s.alive) entry.live += 1;
-      if (needsAttention(s)) entry.attn += 1;
+      // A crashed chat driver stays registered (alive:false, errored) until
+      // deleted; only a LIVE ask is something the user can act on — the same
+      // gate as App's needsYou and the dashboard lane.
+      if (s.alive && needsAttention(s)) entry.attn += 1;
       map.set(s.workspace_id, entry);
     }
     return map;

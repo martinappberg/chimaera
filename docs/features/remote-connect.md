@@ -108,7 +108,14 @@ a `RemoteOps` trait. See also [native-app.md](native-app.md) for the windows/hos
   failure becomes a modal with Retry. Dismissing that modal downgrades it to a compact persistent
   Retry action instead of removing the disconnected window's only recovery path. A 401 in a native
   remote window follows that same scoped SSH recovery instead of showing the browser-only "paste a
-  fresh URL" page; while its credentials remain rejected, the Retry action cannot disappear.
+  fresh URL" page; while its credentials remain rejected, the Retry action cannot disappear. A
+  heal that lands on the same port + token never navigates, so that `connected` report releases
+  the 401 latch in place and re-arms the automatic recovery for the next restart (a moved token
+  is dead until its reload, so that path never releases it). A daemon that keeps rejecting the
+  token cannot loop: an episode gets at most two automatic connect rounds, then the latch parks
+  with the ambient Retry until a manual retry, with at least 30s between releases. A pending
+  asset-transition notice (e.g. a build reload waiting on unsaved edits) never hides the
+  reconnect surface; the strip stacks below it.
 - **A daemon build change is a navigation boundary.** A reconnect reuses its local forward only
   while the daemon source build still matches the app. Replacing the remote daemon gets a fresh
   loopback port, which makes every already-open window re-home onto the new entry bundle instead of

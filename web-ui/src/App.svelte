@@ -10,6 +10,7 @@
     isHomeHub,
     leaveHomeHub,
     setDetachedWindow,
+    clearUnauthorized,
     notifyUnauthorized,
     pollHealth,
     reclaimHomeHub,
@@ -485,8 +486,14 @@
         buildMoved ? "build" : "connection",
         `http://127.0.0.1:${port ?? location.port}/#${params.toString()}`,
       );
-    } else if (buildMoved) {
-      requireAssetNavigation("build", null);
+    } else {
+      // Neither port nor token moved: the heal was IN PLACE and nothing
+      // navigates, so this is the one path that must release a latched 401
+      // itself. A moved token stays dead until the reload lands — blocked on
+      // unsaved work or not — so releasing there would only burn a slot on a
+      // doomed reconnect.
+      closeUnauthorizedReconnect();
+      if (buildMoved) requireAssetNavigation("build", null);
     }
   }
 
@@ -502,6 +509,32 @@
       beginReconnect("The remote daemon changed credentials; reconnecting will refresh this window."),
     );
   });
+  /** Minimum spacing between releases of the 401 latch. A daemon that keeps
+   *  rejecting this token while the shell keeps reporting `connected` would
+   *  otherwise loop 401 → reconnect → release → 401; with the damp an
+   *  episode gets at most two automatic rounds, then the latch parks with
+   *  the ambient Retry until a manual retry. */
+  const UNAUTHORIZED_REARM_MS = 30_000;
+  let lastUnauthorizedReconnectAt: number | null = null;
+  /** The shell reported `connected` on the SAME port + token while a 401
+   *  was latched: an in-place heal, which never navigates, so the latch
+   *  must be released here — or the "needs fresh credentials" chip outlives
+   *  a working window — and the one-shot above re-armed, or the next daemon
+   *  restart's 401 gets no automatic recovery. Only `handleHostStatus`'s
+   *  no-move branch calls this; a moved token is dead until its reload. */
+  function closeUnauthorizedReconnect(): void {
+    if (!$unauthorized) return;
+    const now = Date.now();
+    if (
+      lastUnauthorizedReconnectAt !== null &&
+      now - lastUnauthorizedReconnectAt < UNAUTHORIZED_REARM_MS
+    ) {
+      return;
+    }
+    lastUnauthorizedReconnectAt = now;
+    clearUnauthorized();
+    handledRemoteUnauthorized = false;
+  }
 
   // `/ws/events` owns its own backoff and is not SSH liveness: it can restart
   // while authenticated HTTP remains healthy. Only the shell's consecutive
@@ -914,10 +947,15 @@
   // A detached solo window badges only ITS OWN sessions: workspace-wide
   // attention is the main window's wayfinding, and a torn-off pane wearing
   // the whole roster's badge reads as a false alarm (found live).
+  // Alive-gated like the dashboard lane: the daemon keeps a crashed chat
+  // driver registered (alive:false, state errored) until the user deletes it,
+  // so its row still wears the red glyph — but nobody can answer a dead
+  // session, and a pill/title saying 1 while the dashboard says 0 is exactly
+  // the stale state this count exists to prevent.
   const needsYou = $derived.by(() => {
-    if (!detachedWindow) return wsSessions.filter(needsAttention).length;
+    if (!detachedWindow) return wsSessions.filter((s) => s.alive && needsAttention(s)).length;
     const mine = new Set(allSessionIds(layout));
-    return wsSessions.filter((s) => mine.has(s.id) && needsAttention(s)).length;
+    return wsSessions.filter((s) => s.alive && mine.has(s.id) && needsAttention(s)).length;
   });
 
   /** The focused pane is showing the dashboard (its rail row highlights). */
@@ -4882,15 +4920,22 @@
   </div>
 {/if}
 
-{#if reconnectSurface !== "hidden" && !$askpassActive && $assetTransition === null}
+{#if reconnectSurface !== "hidden" && !$askpassActive}
   <!-- An automatic reconnect is status, not a blocking decision: keep the
        rendered workbench readable while the tunnel heals. Only a failed
        attempt becomes a modal with Retry. A scoped askpass prompt temporarily
        owns this space when this host actually needs authentication. Dismissing
        a failure leaves a compact Retry surface: a native 401 must never become
-       an unrecoverable blank state. -->
+       an unrecoverable blank state. An asset-transition notice must not hide
+       it either: a build/connection transition blocked on unsaved work has no
+       dismiss and can sit there indefinitely, so the strip stacks below it. -->
   {#if reconnectSurface === "status"}
-    <div class="reconnect-status" role="status" aria-live="polite">
+    <div
+      class="reconnect-status"
+      class:stacked={$assetTransition !== null}
+      role="status"
+      aria-live="polite"
+    >
       <span class="reconnect-spinner" class:spin={reconnecting} aria-hidden="true"></span>
       <span class="reconnect-status-copy">
         <strong>{reconnecting ? `reconnecting to ${hostAlias}…` : `waiting for ${hostAlias}…`}</strong>
@@ -4927,7 +4972,12 @@
       </div>
     </div>
   {:else}
-    <div class="reconnect-status" role="status" aria-live="polite">
+    <div
+      class="reconnect-status"
+      class:stacked={$assetTransition !== null}
+      role="status"
+      aria-live="polite"
+    >
       <span class="reconnect-spinner" aria-hidden="true"></span>
       <span class="reconnect-status-copy">
         <strong>reconnect to {hostAlias}</strong>
@@ -6124,6 +6174,13 @@
     border-radius: 9px;
     box-shadow: 0 8px 28px color-mix(in srgb, var(--fg) 12%, transparent);
     animation: reconnect-in 0.1s ease-out;
+  }
+
+  /* The asset-transition notice docks in the same top-centre slot and a
+     blocked transition can sit there indefinitely, so the strip yields the
+     slot and drops below it rather than the two overlapping. */
+  .reconnect-status.stacked {
+    top: calc(14px + var(--notice-stack-offset));
   }
 
   .reconnect-status-copy {
