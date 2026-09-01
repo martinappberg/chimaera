@@ -12,7 +12,12 @@
 //! Layout: `~/.chimaera/agents/<agent>/<version>/bin/<agent>` with an atomic
 //! per-agent symlink swap into `~/.chimaera/agents/bin/` (symlink to a fresh
 //! name, then `mv -f` = rename(2) over the old link). Running sessions keep
-//! their binary across updates; new spawns resolve the new link.
+//! their binary across updates; new spawns resolve the new link. A version
+//! dir is not always just that one binary: codex ships a package whose
+//! entrypoint needs its siblings, so the whole tree lands around its `bin/`
+//! — and it is the TREE, not just the exec'd inode, that a running session
+//! still needs (it spawns its code-mode host and bundled rg/zsh by path).
+//! That is why an update never reclaims the version dir it replaced.
 //!
 //! Artifact sources, each verified against the real endpoint on 2026-07-06:
 //! - claude: `https://downloads.claude.ai/claude-code-releases` — the exact
@@ -27,9 +32,15 @@
 //!   `codex-package_SHA256SUMS` covering it (the bare `codex-<triple>.tar.gz`
 //!   has no published checksum). Verified against the live release at
 //!   rust-v0.142.5 (2026-07-07): the package tarball's sha256 matches its
-//!   SUMS line, its layout is `bin/codex` (plus bundled rg/zsh resources,
-//!   unused), and that `bin/codex` is byte-identical to the bare tarball's
-//!   binary.
+//!   SUMS line and its `bin/codex` is byte-identical to the bare tarball's
+//!   binary. Re-verified at 0.152.0 (2026-09-01), where the tarball is a
+//!   self-describing package — `codex-package.json` names `bin/codex` the
+//!   entrypoint alongside a `codex-path/` (rg) and a `codex-resources/`
+//!   (zsh, and bwrap on linux) — and `bin/` gained a second binary,
+//!   `codex-code-mode-host`, which codex spawns from beside its own
+//!   executable. The install extracts the package whole (~270 MB
+//!   unpacked): with only the entrypoint on disk, code mode fails closed
+//!   at runtime ("host executable was not found").
 //! - agy: the manifest endpoint pinned inside the official
 //!   `https://antigravity.google/cli/install.sh` (version/url/sha512;
 //!   the tarball's one member is named `antigravity`). The official
@@ -195,12 +206,28 @@ echo "chimaera: installed claude -> $root/bin/claude"
         // codex-<triple>.tar.gz: only the package variant is covered by the
         // release's published codex-package_SHA256SUMS, and its bin/codex is
         // byte-identical to the bare binary (verified at rust-v0.142.5).
+        //
+        // The WHOLE package tree lands under the version dir, not just its
+        // bin/codex entrypoint: codex resolves its companions relative to
+        // its own executable. Extracting the entrypoint alone shipped a
+        // codex whose code mode fails closed at runtime ("failed to spawn
+        // code-mode host .../codex/0.152.0/bin/codex-code-mode-host: host
+        // executable was not found" — field failure on 0.152.0), and whose
+        // shell tooling has no bundled rg/zsh/bwrap to reach either
+        // (codex-package.json declares both companion dirs).
         AgentKind::Codex => format!(
             r#"base='{base}'
 case "$os" in darwin) triple="$arch-apple-darwin" ;; *) triple="$arch-unknown-linux-musl" ;; esac
 echo "chimaera: installing Codex from $base into $root/codex"
 tmp="$(mktemp -d "${{TMPDIR:-/tmp}}/chimaera-codex.XXXXXX")"
-trap 'rm -rf "$tmp"' EXIT
+# The package extracts next to its destination rather than into $tmp, so
+# activation is a rename(2) on one filesystem instead of a ~270 MB copy off
+# a (commonly tmpfs or node-local) TMPDIR. Nothing can resolve the staging
+# tree: no link points at it until the rename. Killing the install pane
+# still reclaims it — the PTY engine kills with SIGHUP first so shells run
+# their exit traps — and a SIGKILLed run is swept by the next install.
+stage="$root/codex/.staging"
+trap 'rm -rf "$tmp" "$stage" "$stage.old"' EXIT
 curl -fsSL -o "$tmp/codex.tar.gz" "$base/codex-package-$triple.tar.gz"
 curl -fsSL -o "$tmp/SHA256SUMS" "$base/codex-package_SHA256SUMS"
 checksum="$(sed -n "s/^\([0-9a-f]\{{64\}}\)[[:space:]][[:space:]]*codex-package-$triple\.tar\.gz$/\1/p" "$tmp/SHA256SUMS")"
@@ -211,18 +238,26 @@ actual="$(sha256 "$tmp/codex.tar.gz")"
 if [ "$actual" != "$checksum" ]; then
   echo "chimaera: sha256 mismatch (expected $checksum, got $actual)" >&2; exit 1
 fi
-tar -xzf "$tmp/codex.tar.gz" -C "$tmp" bin/codex
-chmod +x "$tmp/bin/codex"
-version="$("$tmp/bin/codex" --version | sed -n 's/^codex-cli //p')"
+# One install per agent is enforced by the daemon (409), so the fixed
+# staging names are unshared — reclaim whatever a SIGKILLed run stranded.
+rm -rf "$stage" "$stage.old"
+mkdir -p "$stage"
+tar -xzf "$tmp/codex.tar.gz" -C "$stage"
+chmod -R +x "$stage/bin"
+version="$("$stage/bin/codex" --version | sed -n 's/^codex-cli //p')"
 if [ -z "$version" ]; then echo "chimaera: could not read the codex version" >&2; exit 1; fi
 # The version builds filesystem paths and echo lines: anything outside
 # [0-9.A-Za-z-] (traversal, control bytes) is refused, unechoed.
 case "$version" in
   *[!0-9.A-Za-z-]*|'') echo "chimaera: unexpected codex version string" >&2; exit 1 ;;
 esac
-dest="$root/codex/$version/bin"
-mkdir -p "$dest"
-mv -f "$tmp/bin/codex" "$dest/codex"
+dest="$root/codex/$version"
+# Reinstalling the version already installed is the repair path, so it must
+# not rm -rf a tree sessions still resolve: swing the old one aside, rename
+# the new one in, then drop it (two syscalls, not an extraction-long gap).
+if [ -e "$dest" ]; then mv -f "$dest" "$stage.old"; fi
+mv -f "$stage" "$dest"
+rm -rf "$stage.old"
 swap codex "$version"
 echo "chimaera: installed codex -> $root/bin/codex"
 "$root/bin/codex" --version
@@ -552,8 +587,10 @@ fn remove_dir_if_exists(path: &Path) -> anyhow::Result<()> {
 /// DELETE /api/v1/agents/{id}/install — uninstall a chimaera-MANAGED agent: the
 /// active symlink plus its version tree under `~/.chimaera/agents`. Only ever
 /// touches chimaera's own prefix — the user's own install (and its auth in
-/// `$HOME`) is never touched. Running sessions keep their already-exec'd binary
-/// (the inode survives the unlink). 404 unknown id; 409 while an install for the
+/// `$HOME`) is never touched. A running session keeps its already-exec'd binary
+/// (the inode survives the unlink), but NOT companions its package resolves by
+/// path later: a live codex loses its code-mode host and bundled rg/zsh the
+/// moment its tree goes. 404 unknown id; 409 while an install for the
 /// same agent is in flight; 200 `{"removed": bool}` otherwise (`false` = nothing
 /// chimaera-managed to remove).
 pub(crate) async fn uninstall_agent(
@@ -1001,9 +1038,12 @@ mod tests {
             );
             // Downloads land in a mktemp dir removed on any exit, so a
             // mid-transfer death leaves no partials under the prefix.
+            // Codex unpacks beside its destination instead (a rename, not a
+            // cross-device copy of the package) — the same trap sweeps it.
             assert!(
-                script.contains(r#"trap 'rm -rf "$tmp"' EXIT"#),
-                "{kind:?} cleans up its temp dir"
+                script.contains(r#"trap 'rm -rf "$tmp"' EXIT"#)
+                    || script.contains(r#"trap 'rm -rf "$tmp" "$stage" "$stage.old"' EXIT"#),
+                "{kind:?} cleans up what it staged"
             );
         }
 
@@ -1023,7 +1063,18 @@ mod tests {
             codex.contains(r#"if [ "$actual" != "$checksum" ]"#),
             "codex verifies the tarball against the published checksum"
         );
-        assert!(codex.contains("tar -xzf \"$tmp/codex.tar.gz\" -C \"$tmp\" bin/codex"));
+        // The package unpacks WHOLE: codex spawns bin/codex-code-mode-host
+        // from beside its own executable, so an entrypoint-only extraction
+        // ships a codex whose code mode fails closed.
+        assert!(codex.contains(r#"tar -xzf "$tmp/codex.tar.gz" -C "$stage""#));
+        assert!(
+            !codex.contains(r#"-C "$tmp" bin/codex"#),
+            "codex extracts the package, not the entrypoint alone"
+        );
+        // Activation renames the staged tree in; reinstalling the version
+        // already on disk (the repair path) never rm -rf's a live one.
+        assert!(codex.contains(r#"if [ -e "$dest" ]; then mv -f "$dest" "$stage.old"; fi"#));
+        assert!(codex.contains(r#"mv -f "$stage" "$dest""#));
         let agy = install_script(AgentKind::Antigravity, &root).unwrap();
         assert!(agy.contains(AGY_MANIFEST_BASE));
         assert!(agy.contains("sha512"), "agy verifies the manifest checksum");
@@ -1034,6 +1085,156 @@ mod tests {
 
         // gemini: honestly no curated install (needs a node runtime).
         assert!(install_script(AgentKind::Gemini, &root).is_none());
+    }
+
+    /// The curated codex script, run for real against a stubbed release.
+    /// The field failure it guards: extracting only `bin/codex` left codex
+    /// unable to spawn its `bin/codex-code-mode-host` sibling, so code mode
+    /// failed closed at runtime. Pass 2 is the repair path — reinstalling
+    /// the version already on disk must land the same complete tree.
+    #[test]
+    fn codex_install_lands_the_whole_package() {
+        let dir = test_dir("codex-install");
+        let root = dir.join("agents");
+
+        // A miniature package with the real 0.152.0 layout.
+        let pkg = dir.join("pkg");
+        std::fs::create_dir_all(pkg.join("bin")).unwrap();
+        std::fs::create_dir_all(pkg.join("codex-path")).unwrap();
+        std::fs::create_dir_all(pkg.join("codex-resources/zsh/bin")).unwrap();
+        write_exec(&pkg.join("bin/codex-code-mode-host"), "#!/bin/sh\nexit 0\n");
+        write_exec(&pkg.join("codex-path/rg"), "#!/bin/sh\nexit 0\n");
+        write_exec(
+            &pkg.join("codex-resources/zsh/bin/zsh"),
+            "#!/bin/sh\nexit 0\n",
+        );
+        std::fs::write(
+            pkg.join("codex-package.json"),
+            r#"{"layoutVersion":1,"entrypoint":"bin/codex"}"#,
+        )
+        .unwrap();
+        let tarball = dir.join("codex-package.tar.gz");
+        // Re-pack the fixture with the version its `codex --version` reports,
+        // so the release can be rolled forward mid-test.
+        let pack = |version: &str| {
+            write_exec(
+                &pkg.join("bin/codex"),
+                &format!("#!/bin/sh\necho 'codex-cli {version}'\n"),
+            );
+            let packed = std::process::Command::new("tar")
+                .arg("-czf")
+                .arg(&tarball)
+                .arg("-C")
+                .arg(&pkg)
+                .args(["bin", "codex-path", "codex-resources", "codex-package.json"])
+                .status()
+                .unwrap();
+            assert!(packed.success(), "packed the fixture package");
+        };
+        pack("9.9.9");
+
+        // A `curl` that serves that tarball for whatever triple this host
+        // asks for, plus a SUMS file digested the way the script verifies.
+        let stub_bin = dir.join("stub-bin");
+        std::fs::create_dir_all(&stub_bin).unwrap();
+        write_exec(
+            &stub_bin.join("curl"),
+            &format!(
+                r#"#!/bin/bash
+out=''; url=''
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) out="$2"; shift 2 ;;
+    -*) shift ;;
+    *) url="$1"; shift ;;
+  esac
+done
+digest() {{ if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1"; else shasum -a 256 "$1"; fi | cut -d' ' -f1; }}
+case "${{url##*/}}" in
+  codex-package_SHA256SUMS)
+    d="$(digest {tarball})"
+    : > "$out"
+    for t in aarch64-apple-darwin x86_64-apple-darwin aarch64-unknown-linux-musl x86_64-unknown-linux-musl; do
+      printf '%s  codex-package-%s.tar.gz\n' "$d" "$t" >> "$out"
+    done
+    ;;
+  *) cp {tarball} "$out" ;;
+esac
+"#,
+                tarball = sq(&tarball.display().to_string()),
+            ),
+        );
+
+        // Installer sessions are spawned as `/bin/bash -c <script>`.
+        let script = install_script(AgentKind::Codex, &root).expect("curated install");
+        let path = format!(
+            "{}:{}",
+            stub_bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let install = |pass: &str| {
+            let out = std::process::Command::new("/bin/bash")
+                .args(["-c", &script])
+                .env("PATH", &path)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{pass}: {}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr),
+            );
+        };
+        // Every file the package declares, not just the entrypoint.
+        let assert_complete = |version: &str, pass: &str| {
+            let version_dir = root.join("codex").join(version);
+            assert!(version_dir.join("bin/codex").exists(), "{pass}");
+            assert!(
+                version_dir.join("bin/codex-code-mode-host").exists(),
+                "{pass}: the code-mode host ships beside the entrypoint"
+            );
+            assert!(version_dir.join("codex-path/rg").exists(), "{pass}");
+            assert!(
+                version_dir.join("codex-resources/zsh/bin/zsh").exists(),
+                "{pass}"
+            );
+            assert!(version_dir.join("codex-package.json").exists(), "{pass}");
+        };
+        // Activated through the managed symlink, nothing staged left behind.
+        let assert_activated = |version: &str, pass: &str| {
+            assert_eq!(
+                managed_fallback("codex", &managed_bin_dir(&root)),
+                Some(root.join("bin/codex")),
+                "{pass}"
+            );
+            assert_eq!(
+                std::fs::read_link(root.join("bin/codex")).unwrap(),
+                PathBuf::from(format!("../codex/{version}/bin/codex")),
+                "{pass}"
+            );
+            assert!(!root.join("codex/.staging").exists(), "{pass}");
+            assert!(!root.join("codex/.staging.old").exists(), "{pass}");
+        };
+
+        install("fresh install");
+        assert_complete("9.9.9", "fresh install");
+        assert_activated("9.9.9", "fresh install");
+
+        // The repair path: the version on disk is the one being installed.
+        install("same-version reinstall");
+        assert_complete("9.9.9", "same-version reinstall");
+        assert_activated("9.9.9", "same-version reinstall");
+
+        // A new release. The superseded tree must SURVIVE — a running codex
+        // spawns its code-mode host and bundled rg/zsh from it by path, so
+        // an update that reclaimed it would break live sessions.
+        pack("9.9.10");
+        install("upgrade");
+        assert_complete("9.9.10", "upgrade");
+        assert_activated("9.9.10", "upgrade");
+        assert_complete("9.9.9", "upgrade keeps the superseded tree");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The version charset gate, executed as real sh against the hostile
