@@ -131,6 +131,29 @@ operational notes: an already-running master (ControlPersist keeps them for
 lands on freshly created masters — and the option also rides `scp` of the
 release binary (mildly compressible; harmless).
 
+**R6 — connect/reconnect round trips (chimaera-remote + the app shell).
+Shipped; live-verified on Sherlock for connect/update timings (probe
+1.85→1.37 s, stop 1.70→1.08 s, start 2.80→1.38 s); the wedge path and the
+monitor backoff are unit-tested, not yet observed live.** Every separate
+`ssh host cmd` through the ControlMaster is a
+channel-open RTT plus a remote fork on a loaded login node (~300-500 ms at
+~170 ms RTT), so the connect path folds its serial execs: the probe is ONE
+exec (manifest + `kill -0` computed remotely — POSIX sh + `sed`, no `jq`),
+the post-start wait is ONE exec running a remote ≤15 s loop (was up to 30
+client-side execs), and stop is ONE exec (SIGTERM + a ≤10 s remote wait; the
+exit code is the wire; still SIGTERM-only). The app's health monitor backs a
+confirmed-down tunnel off (3 s doubling to a 30 s cap — a dead host was
+costing ~12-20 failed 2 s authenticated probes a minute, forever), and a
+reconnect after a confirmed down first clears a wedged ControlMaster (alive
+process, dead TCP after laptop sleep: `-O check` → bounded `BatchMode`
+session open → `-O exit`) so it dials fresh instead of queueing ~45 s behind
+ssh's keepalive. hosts.json I/O moved off the tokio reactor
+(`spawn_blocking`). The remote scripts are pure builders sent as `sh -c '…'`
+— sshd hands the command to the LOGIN shell, and tcsh/fish would not read
+them bare — pinned by tests that run the wrapped command through sh, dash,
+bash, zsh, tcsh, and fish where installed. Follow-up: the pre-existing start
+line is still sent bare and dies under a csh/fish login shell, as before.
+
 **Non-goals:** transport replacement (QUIC/mosh-style datagrams) and HTTP/2 for
 the tunnel (browsers require TLS for h2; a localhost-tunnel TLS story costs
 more than the channel-open RTT it saves).

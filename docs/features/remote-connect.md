@@ -96,6 +96,20 @@ a `RemoteOps` trait. See also [native-app.md](native-app.md) for the windows/hos
 - **TOFU host keys.** `StrictHostKeyChecking=accept-new` lets a windowed app with no tty reach a
   never-seen host (it still refuses a *changed* key). `ServerAliveInterval/CountMax` notice a dead
   link within ~45s.
+- **A wedged ControlMaster is cleared before a reconnect.** After laptop sleep the master *process*
+  is often alive on a dead TCP link, and every mux client queues on it until that ~45 s keepalive
+  fires — a reconnect would wait most of a minute and then fail into a manual retry. When the health
+  monitor has confirmed a tunnel down, the app's flight first runs `clear_wedged_master`: `ssh -O
+  check` (a mux control request the master answers from its local event loop — instant even on a dead
+  link), then a `BatchMode` `ssh host true` bounded at 15 s (one `ServerAliveInterval`); a stall →
+  `ssh -O exit`, so the connect dials a fresh master (one prompt, like a first connect). No master, or
+  a link that answers → left alone. A user-initiated connect to a healthy host never pays this. **The
+  false-positive cost is real**, which is why the bound is not tighter: a merely *loaded* login node
+  (bash sourcing an NFS-backed module init under sshd — load 20 on 64 cores observed) can take seconds
+  to run `true`, and that same load is what makes `/health` miss three times, i.e. a confirmed down.
+  Misjudging a healthy master kills it: the next connect re-prompts (Duo) — the very thing the
+  ControlMaster exists to avoid — and every compute-tunnel forward riding that master is dropped;
+  compute windows then re-dial through the fresh master on their own reconnect flights.
 - **A fresh start version-probes the installed binary** (`ensure_remote_binary` runs
   `~/.chimaera/bin/chimaera --version` over ssh): a dev (`0.0.1`) binary stranded in the real home —
   e.g. deployed by a pre-fix release that trusted the dist stash — is replaced with the release

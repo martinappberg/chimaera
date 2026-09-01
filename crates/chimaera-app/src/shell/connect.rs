@@ -309,6 +309,11 @@ async fn run_flight(
     update_daemon: bool,
 ) -> Result<HostState, String> {
     let state = app.state::<Shell>();
+    // The health monitor's verdict, read BEFORE the tunnel map changes (its
+    // next tick forgets keys whose tunnel is gone). Only a confirmed-down
+    // tunnel warrants the wedged-master check below: a user-initiated connect
+    // to a healthy host must not pay an extra mux round trip.
+    let confirmed_down = lock(&state.unhealthy_tunnels).contains(alias);
     // Remove under the map lock, then do process/network teardown without it.
     // `Tunnel::close` is bounded but still asynchronous; holding this lock made
     // one dead host freeze health checks and commands for every other host.
@@ -327,6 +332,17 @@ async fn run_flight(
         with_hosts(move |hosts| hosts.add(&alias, None)).await?
     }
     .map_err(|e| format!("{e:#}"))?;
+    if confirmed_down {
+        // After laptop sleep the host's ControlMaster is often alive on a
+        // dead TCP link, and every mux client then queues on it until ssh's
+        // own keepalive gives up (~45 s). Clear that first so the reconnect
+        // dials fresh instead of stalling into a manual retry. To the row
+        // this IS the probe — the same label `connect` re-emits next.
+        emit_progress(app, alias, "probing");
+        if chimaera_remote::clear_wedged_master(alias).await {
+            tracing::info!("cleared a wedged ControlMaster to {alias} before reconnecting");
+        }
+    }
     let result = run_connect(app, alias, &entry, reuse_port, update_daemon).await;
     // The reused port was free a moment ago (we just cancelled the forward),
     // but socket teardown can lag; fall back to an OS-assigned port so a

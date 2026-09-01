@@ -588,6 +588,107 @@ async fn cancel_master_forward(host: &str, spec: &str) {
     let _ = output_bounded(&mut command, 10, "ssh -O cancel").await;
 }
 
+/// Detect and terminate a ControlMaster to `host` whose TCP link is dead.
+///
+/// After laptop sleep or a network change the master PROCESS is usually
+/// still alive while the connection under it is gone. It only finds out when
+/// `ServerAliveInterval=15` × `ServerAliveCountMax=3` expire (~45 s), and
+/// until then every mux client — the connect flight's probe included —
+/// queues on it: a reconnect waits most of a minute and then fails into a
+/// manual retry. This asks the master directly, in three bounded steps:
+///
+/// 1. `ssh -O check`: is a master running at all? No → `false` (nothing to
+///    clear; the flight dials fresh and prompts once, like a first connect).
+/// 2. `ssh -o BatchMode=yes host true`, bounded at 15 s — one
+///    `ServerAliveInterval`, still 30 s better than the 45 s hang: a real
+///    session open through the master. It answers → `false` (the link is
+///    fine). `BatchMode` guarantees that if the master vanished between the
+///    steps and ssh falls back to a direct dial, it cannot stall on an
+///    askpass prompt (and the tighter `ConnectTimeout` keeps that dial under
+///    the bound, so an unreachable host is never misread as a wedge). NOT
+///    tighter: a merely LOADED login node (bash sourcing an NFS-backed module
+///    init under sshd — load 20 on 64 cores seen live) can take seconds to
+///    run `true`, and that same load is what makes the health probe miss 2 s
+///    three times, i.e. exactly a confirmed down. A false positive kills a
+///    HEALTHY master: a Duo re-auth (the thing the master exists to avoid)
+///    and every compute-tunnel forward riding it dropped until those
+///    windows' own reconnect flights re-dial through the fresh master.
+/// 3. Stalled → `ssh -O exit` (bounded 5 s), so the flight's next ssh raises
+///    a fresh master; `true`.
+///
+/// Why steps 1 and 3 are safe on a dead link: `-O check` / `-O exit` are mux
+/// CONTROL requests. The client connects to the ControlPath unix socket and
+/// the master's own local event loop answers them — no packet crosses the
+/// network — so they return instantly however dead the TCP side is (a bound
+/// is kept anyway). Only step 2's session open has to traverse the link,
+/// which is exactly what makes it the test.
+pub async fn clear_wedged_master(host: &str) -> bool {
+    let wedged = match bounded_mux_ssh(host, &["-O", "check", host], 3, "ssh -O check").await {
+        // No master (or ssh cannot even run): nothing to clear.
+        Some(false) => return false,
+        Some(true) => bounded_mux_ssh(host, &[host, "true"], 15, "ssh true")
+            .await
+            .is_none(),
+        // A control request the master's own event loop did not answer is
+        // the same verdict as a stalled session open.
+        None => {
+            tracing::warn!("ControlMaster to {host} did not answer `-O check` within 3s");
+            true
+        }
+    };
+    if !wedged {
+        return false;
+    }
+    match bounded_mux_ssh(host, &["-O", "exit", host], 5, "ssh -O exit").await {
+        Some(_) => tracing::info!(
+            "ControlMaster to {host} was wedged after a link loss; terminated so the reconnect dials fresh"
+        ),
+        None => tracing::warn!(
+            "ControlMaster to {host} was wedged after a link loss and did not answer `-O exit` \
+             within 5s; the reconnect may have to wait for ssh's own keepalive timeout"
+        ),
+    }
+    true
+}
+
+/// A non-interactive ssh against `host`'s ControlMaster under a hard
+/// wall-clock bound: `Some(exit-success)` when it finished, `None` when it
+/// was still running at the deadline (then killed) — the wedge signal
+/// [`clear_wedged_master`] looks for. A spawn failure counts as `Some(false)`.
+async fn bounded_mux_ssh(host: &str, args: &[&str], secs: u64, what: &str) -> Option<bool> {
+    // OpenSSH uses the first value it sees for most options: BatchMode
+    // forbids any prompt, and the tighter ConnectTimeout goes BEFORE the
+    // shared ConnectTimeout=15 so a direct-dial fallback stays under `secs`.
+    let mut command = transport_command("ssh");
+    command
+        .env(ASKPASS_ALIAS_ENV, host)
+        .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"])
+        .args(ssh_opts())
+        .args(args)
+        .kill_on_drop(true)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let child = match command.spawn() {
+        Ok(child) => child,
+        Err(err) => {
+            tracing::debug!("could not spawn {what} for {host}: {err}");
+            return Some(false);
+        }
+    };
+    // The outer deadline decides "stalled" and drops the child (killed via
+    // kill_on_drop); the inner bound only guards the pipe reads.
+    match tokio::time::timeout(
+        Duration::from_secs(secs),
+        collect_child_bounded(child, secs + 5, what),
+    )
+    .await
+    {
+        Ok(Ok(output)) => Some(output.status.success()),
+        Ok(Err(_)) => Some(false),
+        Err(_) => None,
+    }
+}
+
 /// Whether an HTTP server answers on `127.0.0.1:port` within 2s. A bare TCP
 /// connect is NOT a liveness probe here: after laptop sleep an ssh forward's
 /// local listener keeps accepting while the connection behind it is dead, so
