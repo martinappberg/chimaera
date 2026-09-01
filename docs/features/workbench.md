@@ -64,7 +64,9 @@ Daemon side: `crates/chimaera-server/src/{workspaces.rs,view_state.rs,quickopen.
   past its freshness window kicks one background re-walk. Freshness scales with the walk's own
   cost (10× its duration, floored at 5 s, capped at 120 s), so a 3 s NFS crawl is reused for
   30 s while a 40 ms local walk refreshes every 5 s. Walks run on the blocking pool, never on
-  the reactor; an index idle for 10 min is dropped. Measured live on a 20k-entry NFS workspace
+  the reactor; an index unused for 10 min is dropped on the next query for any workspace
+  (eviction is lazy — a fully idle daemon keeps its last index until someone asks again), and
+  a deleted workspace's index goes at once. Measured live on a 20k-entry NFS workspace
   before this: every link-validation burst fanned out into five concurrent 3 s walks on the
   blocking pool (389 guard trips in one day), and the palette's own walk ran inline on a
   reactor worker.

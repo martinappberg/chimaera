@@ -357,9 +357,10 @@ pub(crate) async fn remove_worktree(
         if let Err(err) = crate::lock(&state.workspaces).remove(&id) {
             tracing::warn!(%err, %id, "failed to unregister removed worktree");
         }
-        // The unregistered workspace's git state goes with it (see
-        // `delete_workspace` — same eviction).
+        // The unregistered workspace's git state and quick-open index go
+        // with it (see `delete_workspace` — same eviction).
         state.git.forget_workspace(&id);
+        crate::lock(&state.quickopen).forget_workspace(&id);
     }
 
     // Bump + invalidate, same pairing as the add path: the triggered

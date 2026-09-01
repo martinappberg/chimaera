@@ -23,7 +23,6 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Deserialize;
 use serde_json::json;
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use crate::AppState;
 
@@ -632,8 +631,7 @@ pub(crate) fn poll_interval() -> Duration {
 pub(crate) fn spawn_agent_watch(state: Arc<AppState>, session_id: String) {
     tokio::spawn(async move {
         let mut tailed: Option<PathBuf> = None;
-        let mut offset: u64 = 0;
-        let mut partial = Vec::new();
+        let mut cursor = TailCursor::default();
         // Last name facts seen live, for the recents entry: SessionInfo is
         // gone by the time the death tick fires.
         let mut last_pin: Option<String> = None;
@@ -676,11 +674,34 @@ pub(crate) fn spawn_agent_watch(state: Arc<AppState>, session_id: String) {
             let Some(path) = path else { continue };
             if tailed.as_ref() != Some(&path) {
                 tailed = Some(path.clone());
-                offset = 0;
-                partial.clear();
+                cursor = TailCursor::default();
             }
 
-            let read = match read_appended_lines(&path, &mut offset, &mut partial).await {
+            // The pass is file I/O over a transcript that can be tens of MB
+            // on a resume: one blocking hop for the whole pass (the idiom
+            // `recents` uses for the same files), never on a reactor worker.
+            let pass = {
+                let path = path.clone();
+                let mut cur = std::mem::take(&mut cursor);
+                tokio::task::spawn_blocking(move || {
+                    let read = read_appended_lines(&path, &mut cur);
+                    (cur, read)
+                })
+                .await
+            };
+            let read = match pass {
+                Ok((cur, read)) => {
+                    cursor = cur;
+                    read
+                }
+                Err(join) => {
+                    // The cursor went with the task: the next pass re-reads
+                    // from the start, which the title filter keeps cheap.
+                    tracing::debug!(session = %session_id, %join, "transcript tail task failed");
+                    continue;
+                }
+            };
+            let read = match read {
                 Ok(read) => read,
                 Err(err) => {
                     tracing::debug!(session = %session_id, path = %path.display(), %err,
@@ -717,86 +738,90 @@ pub(crate) fn spawn_agent_watch(state: Arc<AppState>, session_id: String) {
     });
 }
 
-/// A delta larger than this is a bulk catch-up (a resumed claude session's
-/// first pass starts at offset 0 against a transcript that is often tens of
-/// MB): only the lines the watcher acts on — the title records — are kept
-/// from it, so the pass never materializes the file's line copies in RSS.
-const BULK_CATCHUP_BYTES: u64 = 1024 * 1024;
-/// A single line past this is truncated to its prefix and left to fail the
-/// JSON parse: transcripts carry multi-MB tool outputs on one line, and
-/// nothing here needs them intact.
+/// A single transcript line past this is truncated to its prefix and left
+/// to fail the JSON parse: transcripts carry multi-MB tool outputs on one
+/// line, and nothing here needs them intact. Together with the read buffer
+/// this is a pass's whole RSS bound — the delta itself is never materialized.
 const LINE_MAX: usize = 256 * 1024;
+/// Read buffer for a tail pass: a multi-MB catch-up is a few hundred reads,
+/// each one syscall on the blocking thread that runs the pass.
+const TAIL_READ_BUF: usize = 256 * 1024;
 
-/// One tail pass: the lines to apply, and whether the transcript grew at all
-/// (a bulk catch-up may keep no line while still consuming bytes).
+/// Where the tail-poll is in a transcript: the byte offset to resume from and
+/// the newline-less fragment carried over from the previous pass.
+#[derive(Default)]
+struct TailCursor {
+    offset: u64,
+    partial: Vec<u8>,
+}
+
+/// One tail pass: the title-shaped lines to apply, and whether the
+/// transcript grew at all — any appended bytes, complete line or not, are
+/// evidence the agent is writing (a one-way state clear, see
+/// `cleared_by_output`), while a pass may consume bytes and keep no line.
 struct TailRead {
     lines: Vec<String>,
     grew: bool,
 }
 
-/// The two record shapes [`apply_title_line`] acts on. A bulk catch-up keeps
-/// only these, so a previous run's `/rename` or ai-title near the HEAD of a
-/// big transcript still lands after a `--resume`.
-fn is_title_line(line: &[u8]) -> bool {
-    contains(line, b"\"customTitle\"") || contains(line, b"\"ai-title\"")
-}
-
-fn contains(hay: &[u8], needle: &[u8]) -> bool {
-    hay.windows(needle.len()).any(|w| w == needle)
-}
-
-/// Read bytes appended to `path` since `offset` as complete lines, streaming
-/// one line at a time so RSS is bounded by [`LINE_MAX`] rather than the delta.
-/// A trailing partial line is buffered until its newline arrives. Truncation
-/// (file shrank below `offset`) restarts from the beginning.
-async fn read_appended_lines(
+/// Read bytes appended to `path` since `cursor.offset`, returning the complete
+/// title-shaped lines — the only records the watcher acts on
+/// (`agent_state::is_title_line`) — so a resumed session's multi-MB transcript
+/// costs one pass with bounded memory: the reader streams through a fixed
+/// buffer and holds at most one `LINE_MAX` line. A trailing partial line is
+/// carried in the cursor until its newline arrives. Truncation (file shrank
+/// below the offset) restarts from the beginning. BLOCKING: call from
+/// `spawn_blocking`.
+fn read_appended_lines(
     path: &std::path::Path,
-    offset: &mut u64,
-    partial: &mut Vec<u8>,
-) -> anyhow::Result<TailRead> {
-    use tokio::io::AsyncBufReadExt;
+    cursor: &mut TailCursor,
+) -> std::io::Result<TailRead> {
+    use std::io::{BufRead, Read, Seek, SeekFrom};
 
-    let mut file = tokio::fs::File::open(path).await?;
-    let len = file.metadata().await?.len();
-    if len < *offset {
-        *offset = 0;
-        partial.clear();
+    let mut file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    if len < cursor.offset {
+        cursor.offset = 0;
+        cursor.partial.clear();
     }
-    if len == *offset {
+    if len == cursor.offset {
         return Ok(TailRead {
             lines: Vec::new(),
             grew: false,
         });
     }
-    let bulk = len - *offset > BULK_CATCHUP_BYTES;
-    file.seek(std::io::SeekFrom::Start(*offset)).await?;
+    file.seek(SeekFrom::Start(cursor.offset))?;
     // Bound the pass to the delta measured above: a transcript growing under
     // the read must not stretch it indefinitely.
-    let mut reader = tokio::io::BufReader::new((&mut file).take(len - *offset));
+    let mut reader =
+        std::io::BufReader::with_capacity(TAIL_READ_BUF, file.take(len - cursor.offset));
     let mut lines = Vec::new();
-    let mut chunk = Vec::new();
     loop {
-        chunk.clear();
-        let n = reader.read_until(b'\n', &mut chunk).await?;
-        if n == 0 {
+        let buf = reader.fill_buf()?;
+        if buf.is_empty() {
             break;
         }
-        *offset += n as u64;
-        let complete = chunk.last() == Some(&b'\n');
+        let (piece, complete) = match buf.iter().position(|&b| b == b'\n') {
+            Some(i) => (&buf[..i], true),
+            None => (buf, false),
+        };
+        if cursor.partial.len() < LINE_MAX {
+            let room = LINE_MAX - cursor.partial.len();
+            cursor
+                .partial
+                .extend_from_slice(&piece[..piece.len().min(room)]);
+        }
+        let consumed = piece.len() + usize::from(complete);
+        reader.consume(consumed);
+        cursor.offset += consumed as u64;
         if complete {
-            chunk.pop();
+            // Borrowed for valid UTF-8 — no copy unless the line is kept.
+            let text = String::from_utf8_lossy(&cursor.partial);
+            if crate::agent_state::is_title_line(&text) {
+                lines.push(text.into_owned());
+            }
+            cursor.partial.clear();
         }
-        if partial.len() < LINE_MAX {
-            let room = LINE_MAX - partial.len();
-            partial.extend_from_slice(&chunk[..chunk.len().min(room)]);
-        }
-        if !complete {
-            break;
-        }
-        if !bulk || is_title_line(partial) {
-            lines.push(String::from_utf8_lossy(partial).into_owned());
-        }
-        partial.clear();
     }
     Ok(TailRead { lines, grew: true })
 }

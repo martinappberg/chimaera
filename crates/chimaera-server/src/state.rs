@@ -103,7 +103,9 @@ pub(crate) struct AppState {
     /// Browser-pane proxy sessions (/proxy/{id} targets; in-memory only —
     /// panes re-mint transparently after a restart). See `proxy`.
     pub(crate) proxies: Mutex<proxy::ProxyStore>,
-    /// Quick-open walk cache (short TTL, per workspace).
+    /// Per-workspace quick-open index: served stale-while-revalidating,
+    /// single-flighted per workspace, dropped when idle or deleted. See
+    /// `quickopen`.
     pub(crate) quickopen: Mutex<quickopen::QuickOpenCache>,
     /// Read-only git service (status/diff): discovery cache, per-workspace nudge
     /// epochs, and a bounded pool for `git` child processes. Never persisted.

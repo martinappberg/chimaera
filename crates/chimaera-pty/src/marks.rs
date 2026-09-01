@@ -106,19 +106,13 @@ impl Capture {
         if bytes.is_empty() {
             return;
         }
-        if bytes.len() >= TAIL_CAP {
-            // The whole tail and the chunk's own prefix fall out at once.
-            self.truncated += (self.tail.len() + bytes.len() - TAIL_CAP) as u64;
-            self.tail.clear();
-            self.tail.extend(&bytes[bytes.len() - TAIL_CAP..]);
-            return;
-        }
+        // Everything past the newest TAIL_CAP bytes falls out: from the
+        // front of the tail first, then from the chunk's own prefix.
         let overflow = (self.tail.len() + bytes.len()).saturating_sub(TAIL_CAP);
-        if overflow > 0 {
-            self.tail.drain(..overflow);
-            self.truncated += overflow as u64;
-        }
-        self.tail.extend(bytes);
+        let from_tail = overflow.min(self.tail.len());
+        self.tail.drain(..from_tail);
+        self.tail.extend(&bytes[overflow - from_tail..]);
+        self.truncated += overflow as u64;
     }
 
     fn len(&self) -> usize {

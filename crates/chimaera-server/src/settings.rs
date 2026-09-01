@@ -304,9 +304,10 @@ pub(crate) async fn put_settings(State(state): State<Arc<AppState>>, body: Bytes
     // Persist, tracking whether any per-agent path override moved so we can
     // rebuild the shims for it. Scoped so the settings lock is released before
     // regenerate_shims (which re-locks settings) — no deadlock.
-    let agent_paths_changed = {
+    let (agent_paths_changed, ignore_dirs_changed) = {
         let mut settings = crate::lock(&state.settings);
         let before = agent_path_snapshot(settings.current());
+        let ignore_before = settings.current().get("quickOpen.ignoreDirs").cloned();
         if let Err(err) = settings.put(map) {
             tracing::error!(%err, "failed to persist settings");
             return (
@@ -315,12 +316,20 @@ pub(crate) async fn put_settings(State(state): State<Arc<AppState>>, body: Bytes
             )
                 .into_response();
         }
-        before != agent_path_snapshot(settings.current())
+        (
+            before != agent_path_snapshot(settings.current()),
+            ignore_before != settings.current().get("quickOpen.ignoreDirs").cloned(),
+        )
     };
     if agent_paths_changed {
         // A per-agent binary override moved: rebuild the shims (add/remove/point
         // one) and drop the detection cache so the next spawn resolves anew.
         crate::runtimes::regenerate_shims(&state);
+    }
+    if ignore_dirs_changed {
+        // The quick-open index is served stale for its whole freshness window;
+        // an index built under the old ignore list must not outlive the edit.
+        crate::lock(&state.quickopen).clear();
     }
     // Wake /ws/events subscribers so every window converges live.
     state.changes.notify_waiters();

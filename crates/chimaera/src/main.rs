@@ -168,14 +168,16 @@ fn main() -> anyhow::Result<()> {
     // six sessions), and a spiky blocking pool under repaint bursts. Four
     // workers carry the async side (PTY reads run on their own threads); the
     // blocking pool stays generous because file walks, snapshot renders and
-    // NFS stats park there and one wedged stat must not starve the rest.
-    // The flip side: any filesystem call still inline in an async handler
-    // (the session-create prelude/settings writes are the known ones) now
-    // stalls a quarter of the reactor instead of a sixty-fourth — keep
-    // moving those off.
+    // NFS stats park there and one wedged stat must not starve the rest;
+    // the cap is a ceiling, not a preallocation (threads spawn on demand and
+    // retire after 10 s idle), so the margin is free. The flip side: any
+    // filesystem call still inline in an async handler (the session-create
+    // prelude/settings writes are the known ones) now stalls a quarter of the
+    // reactor instead of a sixty-fourth — keep moving those off. The app's
+    // `--daemon` builds the same shape (`chimaera-app/src/daemon.rs`).
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
-        .max_blocking_threads(64)
+        .max_blocking_threads(128)
         .enable_all()
         .build()?
         .block_on(dispatch(cli.command))

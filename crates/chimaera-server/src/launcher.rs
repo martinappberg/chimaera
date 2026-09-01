@@ -1021,7 +1021,7 @@ fn summarize_transcript(path: &Path) -> TranscriptSummary {
                 summary.first_prompt = first_prompt_text(&value);
             }
         }
-        if line.contains(r#""customTitle""#) || line.contains(r#""type":"ai-title""#) {
+        if crate::agent_state::is_title_line(&line) {
             crate::agents::apply_title_line(&line, &mut titles);
         }
     }

@@ -65,49 +65,62 @@ impl ViewStateStore {
                 serde_json::Map::new()
             }
         };
-        let mut store = ViewStateStore {
+        // The file carries no write order, so a legacy over-cap store is
+        // NOT trimmed here: its keys seed the queue alphabetically, and an
+        // alphabetical trim could drop a live window's layout on the first
+        // boot after an upgrade. It shrinks as puts arrive — each put moves
+        // its key to the back and evicts one from the front — and every GET
+        // refreshes its key too, so a window that merely reloads is safe.
+        ViewStateStore {
             path,
             recency: items.keys().cloned().collect(),
             items,
             writer: Arc::new(Mutex::new(0)),
             seq: 0,
-        };
-        // A store that grew past the cap under an older daemon shrinks once
-        // here; the trimmed file lands on the next put.
-        store.evict();
-        store
+        }
     }
 
-    pub(crate) fn get(&self, key: &str) -> Option<serde_json::Value> {
-        self.items.get(key).cloned()
+    /// A read counts as use: a window that boots or switches workspace
+    /// reads its blob, and that must keep it out of the eviction queue's
+    /// front even when it never edits its layout afterwards.
+    pub(crate) fn get(&mut self, key: &str) -> Option<serde_json::Value> {
+        let value = self.items.get(key).cloned()?;
+        self.touch(key);
+        Some(value)
     }
 
-    /// Store `value` under `key` and schedule the persist. Serialization
-    /// happens here, under the caller's lock, so the bytes are a consistent
-    /// snapshot; the disk write runs on the blocking pool (`~/.chimaera` may
-    /// be NFS, and this fires on a 500 ms debounce per divider drag, per
-    /// window — never on the reactor). Returns the write task so a handler
-    /// can await the outcome.
+    fn touch(&mut self, key: &str) {
+        self.recency.retain(|k| k != key);
+        self.recency.push_back(key.to_string());
+    }
+
+    /// Store `value` under `key` and schedule the persist. The map is
+    /// snapshotted under the caller's lock; serialization and the disk write
+    /// both run on the blocking pool (`~/.chimaera` may be NFS, and this
+    /// fires on a 500 ms debounce per divider drag, per window — never on
+    /// the reactor). Returns the write task so a handler can await the
+    /// outcome.
     pub(crate) fn put(
         &mut self,
         key: String,
         value: serde_json::Value,
     ) -> tokio::task::JoinHandle<anyhow::Result<()>> {
-        if self.items.insert(key.clone(), value).is_some() {
-            self.recency.retain(|k| k != &key);
-        }
-        self.recency.push_back(key);
+        self.items.insert(key.clone(), value);
+        self.touch(&key);
         self.evict();
         self.seq += 1;
         let seq = self.seq;
         let path = self.path.clone();
         let writer = self.writer.clone();
-        let bytes = serde_json::to_vec(&self.items);
+        // The clone is the consistent snapshot; formatting up to
+        // MAX_KEYS × MAX_STATE_BYTES of JSON is CPU that belongs on the pool,
+        // not on a reactor worker under the store lock.
+        let items = self.items.clone();
         tokio::task::spawn_blocking(move || {
-            let bytes = bytes?;
+            let bytes = serde_json::to_vec(&items)?;
             // Writers queue on this lock; a snapshot older than the last one
             // flushed is dropped rather than rolling the file back.
-            let mut last = writer.lock().unwrap_or_else(|p| p.into_inner());
+            let mut last = crate::lock(&writer);
             if seq <= *last {
                 return Ok(());
             }
@@ -239,34 +252,38 @@ mod tests {
         assert_eq!(store.get("w-3"), Some(json!(3)));
         assert_eq!(store.get("late-1"), Some(json!(1)));
 
-        let reloaded = ViewStateStore::load(store.path.clone());
+        let mut reloaded = ViewStateStore::load(store.path.clone());
         assert_eq!(reloaded.items.len(), MAX_KEYS);
         assert_eq!(reloaded.get("w-0"), Some(json!("kept")));
         assert_eq!(reloaded.get("w-1"), None);
         std::fs::remove_dir_all(store.path.parent().unwrap()).ok();
     }
 
-    /// An over-cap file from an older daemon shrinks on load.
+    /// An over-cap file from an older daemon is kept whole on load (the file
+    /// carries no write order, so trimming there could hit a live window)
+    /// and shrinks as puts arrive; a GET counts as use.
     #[tokio::test]
-    async fn load_trims_an_oversized_store() {
-        let mut store = temp_store("trim");
-        for i in 0..(MAX_KEYS + 10) {
-            drop(store.put(format!("k-{i}"), json!(i)));
-        }
-        store
-            .put("k-last".to_string(), json!("last"))
-            .await
-            .unwrap()
-            .unwrap();
-        // Forge a file past the cap (as an older daemon would have left).
-        let mut items = store.items.clone();
-        for i in 0..20 {
-            items.insert(format!("old-{i}"), json!(i));
+    async fn load_keeps_an_oversized_store_until_puts_trim_it() {
+        let store = temp_store("trim");
+        let mut items = serde_json::Map::new();
+        for i in 0..(MAX_KEYS + 20) {
+            items.insert(format!("k-{i:03}"), json!(i));
         }
         crate::persist::atomic_write_json(&store.path, serde_json::to_vec(&items).unwrap())
             .unwrap();
-        let reloaded = ViewStateStore::load(store.path.clone());
+        let mut reloaded = ViewStateStore::load(store.path.clone());
+        assert_eq!(reloaded.items.len(), MAX_KEYS + 20);
+        // Reading the alphabetically-first key marks it live.
+        assert_eq!(reloaded.get("k-000"), Some(json!(0)));
+        reloaded
+            .put("fresh".to_string(), json!("x"))
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(reloaded.items.len(), MAX_KEYS);
+        assert_eq!(reloaded.get("k-000"), Some(json!(0)));
+        assert_eq!(reloaded.get("fresh"), Some(json!("x")));
+        assert_eq!(reloaded.get("k-001"), None);
         std::fs::remove_dir_all(store.path.parent().unwrap()).ok();
     }
 }

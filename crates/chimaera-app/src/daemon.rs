@@ -45,7 +45,17 @@ pub fn run_headless() {
         )
         .with_writer(std::io::stderr)
         .init();
-    let runtime = tokio::runtime::Runtime::new().expect("failed to start tokio runtime");
+    // Same shape as `chimaera serve` (crates/chimaera/src/main.rs): the
+    // daemon measures <1 core steady-state, so four workers carry the async
+    // side and the blocking pool takes file walks, renders and NFS stats.
+    // Two daemons on two runtime shapes would make starvation bugs reproduce
+    // on one and not the other.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .max_blocking_threads(128)
+        .enable_all()
+        .build()
+        .expect("failed to start tokio runtime");
     if let Err(e) = runtime.block_on(chimaera_server::run(chimaera_server::ServerConfig {
         port: None,
         // The app's local daemon is never a compute-node daemon.

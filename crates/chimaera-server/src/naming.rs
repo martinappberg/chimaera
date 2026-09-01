@@ -75,10 +75,12 @@ pub(crate) fn spawn_shell_watch(state: Arc<AppState>, session_id: String) {
                 })
                 .await
             };
-            let Ok((cwd, name)) = probe else {
-                tokio::time::sleep(poll_interval()).await;
-                continue;
-            };
+            // A probe that panics costs one tick's facts, not the watcher;
+            // say so, or a poisoned edge case retries forever in silence.
+            let (cwd, name) = probe.unwrap_or_else(|join| {
+                tracing::debug!(session = %session_id, %join, "shell probe failed");
+                Default::default()
+            });
             if let Some(cwd) = &cwd {
                 let mut cwds = crate::lock(&state.current_cwds);
                 if cwds.get(&session_id) != Some(cwd) {

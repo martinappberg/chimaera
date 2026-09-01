@@ -1228,8 +1228,9 @@ pub(crate) async fn validate(
             if !bare_basename(candidate) {
                 continue;
             }
-            let files = index
-                .get_or_insert_with(|| crate::quickopen::workspace_index(&state, workspace_id));
+            let files = index.get_or_insert_with(|| {
+                crate::quickopen::workspace_index_if_free(&state, workspace_id)
+            });
             let Some(files) = files.as_deref() else {
                 continue;
             };
