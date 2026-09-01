@@ -679,8 +679,7 @@ pub async fn http_alive_authed(port: u16, token: &str) -> bool {
 /// the concrete closure type lets `Send` flow through exactly as it did before
 /// this seam existed.
 trait RemoteOps {
-    async fn remote_manifest(&self, host: &str) -> anyhow::Result<Option<Manifest>>;
-    async fn remote_alive(&self, host: &str, pid: u32) -> anyhow::Result<bool>;
+    async fn remote_probe(&self, host: &str) -> anyhow::Result<Option<(Manifest, bool)>>;
     async fn remote_sessions_count(
         &self,
         host: &str,
@@ -717,11 +716,8 @@ struct SshOps {
 }
 
 impl RemoteOps for SshOps {
-    async fn remote_manifest(&self, host: &str) -> anyhow::Result<Option<Manifest>> {
-        remote_manifest(host, self.home).await
-    }
-    async fn remote_alive(&self, host: &str, pid: u32) -> anyhow::Result<bool> {
-        remote_alive(host, pid).await
+    async fn remote_probe(&self, host: &str) -> anyhow::Result<Option<(Manifest, bool)>> {
+        remote_probe(host, self.home).await
     }
     async fn remote_sessions_count(
         &self,
@@ -778,8 +774,12 @@ async fn resolve_daemon(
     let local_build = chimaera_core::BUILD_ID;
     let mut outdated = false;
     let mut live_sessions = None;
-    let manifest = match ops.remote_manifest(host).await? {
-        Some(m) if ops.remote_alive(host, m.pid).await? => {
+    // One remote exec answers both "is there a manifest" and "is its pid
+    // alive" (`remote_probe`): every ssh exec through the ControlMaster costs
+    // a channel-open RTT plus a fork on a loaded login node, so the probe
+    // pays that once, not twice.
+    let manifest = match ops.remote_probe(host).await? {
+        Some((m, true)) => {
             // Only pay for the session-count round trip when it can change
             // the decision (build mismatch, or an explicit update request).
             let sessions = if opts.update_daemon
@@ -921,6 +921,90 @@ pub async fn remote_alive(host: &str, pid: u32) -> anyhow::Result<bool> {
     ssh_check(host, &format!("kill -0 {pid} 2>/dev/null")).await
 }
 
+/// The line between the manifest text and the alive flag in
+/// [`remote_probe`]'s output. Never a substring of serde JSON.
+const PROBE_SEPARATOR: &str = "---chimaera-probe---";
+
+/// POSIX-sh fragment printing the daemon pid recorded in the manifest at
+/// `$f` (empty when there is no numeric `"pid"` field). The file is
+/// serde-pretty JSON (`"pid": 12345,` on its own line); the pattern also
+/// matches a compact single-line rendering. `sed` is POSIX and on every
+/// remote this crate targets — `jq` is not. It yields the FIRST `"pid"` line
+/// of pretty output and, through the greedy `.*`, the LAST `"pid"` on a
+/// compact line — safe only because `chimaera_core::Manifest` is flat: the
+/// manifest must stay flat, a nested `pid` would be picked first.
+const SH_MANIFEST_PID: &str =
+    r#"sed -n 's/.*"pid"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$f" | head -n 1"#;
+
+/// One half-second tick of a remote POSIX-sh wait loop counting in `$i`:
+/// `sleep 0.5` (GNU and BSD both accept fractions); a `sleep` that rejects
+/// them sleeps a whole second and counts two ticks, so a loop bounded in
+/// ticks keeps its wall-clock deadline instead of spinning through it.
+const SH_HALF_SECOND_STEP: &str = "sleep 0.5 2>/dev/null || { sleep 1; i=$((i+1)); }; i=$((i+1));";
+
+/// Wrap a POSIX-sh script for `ssh host <cmd>`. sshd hands the command to the
+/// user's LOGIN shell (`$SHELL -c`), which on HPC accounts may be tcsh or
+/// fish — neither reads `f=…`, `$(…)`, `$((…))`, `[ ]`, or `if`/`while`, so a
+/// bare script would fail on every attempt there. `sh -c '<script>'` makes
+/// every login shell defer to a POSIX sh. The only quoting sh, bash, zsh,
+/// fish, and csh all read identically is a single-quoted string with each
+/// inner `'` spelled `'\''` — close, an escaped quote OUTSIDE the quotes
+/// (where every shell honors the backslash), reopen. The script must not
+/// contain `!` (csh history expansion fires even inside single quotes); the
+/// builders don't, and the tests pin that.
+fn sh_wrap(script: &str) -> String {
+    format!("sh -c '{}'", script.replace('\'', r"'\''"))
+}
+
+/// Fetch the manifest under `home` AND whether its recorded pid answers
+/// `kill -0`, in ONE remote exec — the decision phase's whole probe.
+/// [`remote_manifest`] + [`remote_alive`] cost two serial execs, and every
+/// exec through the ControlMaster is a channel-open RTT plus a remote fork
+/// (~300-500 ms on a loaded login node at WAN latency); computing the alive
+/// flag remotely halves the probe's wall time. `None` = no readable manifest
+/// (or ssh itself failed — the same "nothing running" the two-exec probe
+/// reported); `Some((manifest, alive))` otherwise. POSIX sh only: the remote
+/// login shell may be dash or a BSD sh.
+pub async fn remote_probe(
+    host: &str,
+    home: RemoteHome,
+) -> anyhow::Result<Option<(Manifest, bool)>> {
+    let cmd = sh_wrap(&probe_script(&home.manifest_path()));
+    // SSH_ONESHOT_SECS, not shorter: the first call to a host raises the
+    // ControlMaster and may sit in an askpass password/Duo prompt.
+    let output = output_bounded(ssh_cmd(host).arg(cmd), SSH_ONESHOT_SECS, "ssh").await?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    Ok(parse_probe_output(&String::from_utf8_lossy(&output.stdout)))
+}
+
+/// The POSIX-sh script [`remote_probe`] runs on the host: the manifest at
+/// `manifest_path` (if readable), a separator line, then `alive`/`dead` for
+/// the pid it records. `$HOME` in the path is expanded by the remote shell
+/// (as an assignment RHS it is never word-split). A missing or unreadable
+/// manifest prints nothing and exits 0: no separator = `None`. Pure so the
+/// tests can run it under a real `sh`.
+fn probe_script(manifest_path: &str) -> String {
+    format!(
+        "f={manifest_path}; [ -r \"$f\" ] || exit 0; cat \"$f\"; printf '\\n{sep}\\n'; \
+         p=$({pid}); if [ -n \"$p\" ] && kill -0 \"$p\" 2>/dev/null; \
+         then echo alive; else echo dead; fi",
+        sep = PROBE_SEPARATOR,
+        pid = SH_MANIFEST_PID,
+    )
+}
+
+/// Split [`remote_probe`]'s stdout into `(manifest, alive)`. No separator
+/// means no manifest; an unparsable manifest counts as none (exactly as
+/// [`remote_manifest`] treats it), so a corrupt file falls through to a
+/// fresh start rather than an error.
+fn parse_probe_output(stdout: &str) -> Option<(Manifest, bool)> {
+    let (manifest, flag) = stdout.split_once(PROBE_SEPARATOR)?;
+    let manifest: Manifest = serde_json::from_str(manifest.trim()).ok()?;
+    Some((manifest, flag.trim() == "alive"))
+}
+
 /// Count live sessions on the daemon `manifest` describes by asking the
 /// daemon itself: `curl` over ssh against its loopback port, authenticated
 /// with the manifest's own token. `Ok(None)` = could not determine (no
@@ -989,17 +1073,56 @@ pub fn count_alive_sessions(payload: &str) -> Option<usize> {
 /// this errors honestly instead.
 pub async fn stop_remote(host: &str, pid: u32) -> anyhow::Result<()> {
     tracing::info!("stopping daemon on {host} (pid {pid})");
-    ssh_run(host, &format!("kill -TERM {pid}")).await?;
-    for _ in 0..20 {
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        if !remote_alive(host, pid).await? {
-            return Ok(());
-        }
+    // SIGTERM, then wait for exit in ONE remote loop (20 × 0.5 s = 10 s)
+    // instead of 20 client-side `kill -0` execs. The exit code is the wire:
+    // 0 = gone, STOP_STILL_ALIVE_EXIT = the deadline passed with the pid
+    // alive, STOP_SIGNAL_FAILED_EXIT = SIGTERM could not be delivered
+    // (stderr says why), anything else (ssh's own 255 on a dropped link) =
+    // unconfirmed. SIGTERM-only by design — the loop never escalates.
+    let cmd = sh_wrap(&stop_script(pid, STOP_WAIT_TICKS));
+    let output = output_bounded(ssh_cmd(host).arg(cmd), SSH_ONESHOT_SECS, "ssh").await?;
+    if output.status.success() {
+        return Ok(());
     }
+    if output.status.code() == Some(STOP_STILL_ALIVE_EXIT) {
+        bail!(
+            "daemon on {host} (pid {pid}) is still running 10s after SIGTERM — \
+             refusing to kill -9 it; something is keeping it busy (open UI tabs \
+             hold its sockets). Close them and retry, or stop it by hand."
+        );
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if output.status.code() == Some(STOP_SIGNAL_FAILED_EXIT) {
+        bail!("ssh {host} \"kill -TERM {pid}\" failed: {}", stderr.trim());
+    }
+    // ssh itself ended (255: the link dropped mid-wait, a killed channel)
+    // after the kill was dispatched: the daemon is most likely stopping, but
+    // nothing confirmed it — distinct from the still-alive verdict above.
     bail!(
-        "daemon on {host} (pid {pid}) is still running 10s after SIGTERM — \
-         refusing to kill -9 it; something is keeping it busy (open UI tabs \
-         hold its sockets). Close them and retry, or stop it by hand."
+        "stop sent to the daemon on {host} (pid {pid}), but its exit could not be \
+         confirmed — ssh ended before the wait finished ({}): {}",
+        output.status,
+        stderr.trim()
+    )
+}
+
+/// Remote exit codes of [`stop_remote`]'s one-shot script: small, and
+/// distinct from what the shell (1, 2, 126, 127) or ssh itself (255) emits.
+const STOP_SIGNAL_FAILED_EXIT: i32 = 3;
+const STOP_STILL_ALIVE_EXIT: i32 = 4;
+/// How many half-second ticks [`stop_remote`] waits after SIGTERM (10 s).
+const STOP_WAIT_TICKS: u32 = 20;
+
+/// The POSIX-sh script [`stop_remote`] runs: SIGTERM `pid`, then up to
+/// `ticks` half-second waits for it to go. Pure so tests can run it under a
+/// real `sh` with a short deadline.
+fn stop_script(pid: u32, ticks: u32) -> String {
+    format!(
+        "kill -TERM {pid} || exit {failed}; i=0; while [ $i -lt {ticks} ]; do {step} \
+         kill -0 {pid} 2>/dev/null || exit 0; done; exit {alive}",
+        failed = STOP_SIGNAL_FAILED_EXIT,
+        step = SH_HALF_SECOND_STEP,
+        alive = STOP_STILL_ALIVE_EXIT,
     )
 }
 
@@ -1496,18 +1619,44 @@ async fn start_remote(host: &str, home: RemoteHome) -> anyhow::Result<Manifest> 
         ),
     )
     .await?;
-    for _ in 0..15 {
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        if let Some(m) = remote_manifest(host, home).await? {
-            if remote_alive(host, m.pid).await? {
-                return Ok(m);
-            }
+    // Wait for the manifest AND a live pid in ONE remote loop instead of up
+    // to 15 × 2 client-side execs (each a channel-open RTT + remote fork):
+    // 30 × 0.5 s steps = the same 15 s deadline. The manifest is written
+    // atomically (tmp + rename), so a readable file is a complete one. The
+    // loop prints the manifest and exits 0 the moment the daemon is up, 1
+    // after the deadline. Wrapped `sh -c` (see `sh_wrap`) so a tcsh/fish
+    // login shell defers to a POSIX sh — the start line above predates that
+    // and still assumes a POSIX login shell.
+    let wait = sh_wrap(&start_wait_script(&home.manifest_path(), START_WAIT_TICKS));
+    let output = output_bounded(ssh_cmd(host).arg(wait), SSH_ONESHOT_SECS, "ssh").await?;
+    if output.status.success() {
+        let text = String::from_utf8_lossy(&output.stdout);
+        if let Ok(m) = serde_json::from_str::<Manifest>(text.trim()) {
+            return Ok(m);
         }
     }
     bail!(
         "daemon on {host} did not start within 15s (check {} there)",
         home.log_path()
     );
+}
+
+/// How many half-second ticks [`start_remote`] waits for the manifest (15 s).
+const START_WAIT_TICKS: u32 = 30;
+
+/// The POSIX-sh script [`start_remote`] runs after the start line: up to
+/// `ticks` half-second waits for a readable manifest at `manifest_path`
+/// whose pid answers `kill -0`, then print it and exit 0; exit 1 at the
+/// deadline. Pure so tests can run it under a real `sh`.
+fn start_wait_script(manifest_path: &str, ticks: u32) -> String {
+    format!(
+        "f={manifest_path}; i=0; while [ $i -lt {ticks} ]; do \
+         if [ -r \"$f\" ]; then p=$({pid}); \
+         if [ -n \"$p\" ] && kill -0 \"$p\" 2>/dev/null; then cat \"$f\"; exit 0; fi; fi; \
+         {step} done; exit 1",
+        pid = SH_MANIFEST_PID,
+        step = SH_HALF_SECOND_STEP,
+    )
 }
 
 /// Choose the local tunnel port: explicit flag, else the remote port if
@@ -2174,6 +2323,275 @@ pub async fn compute_cancel(host: &str, manifest: &Manifest, job_id: &str) -> an
 mod tests {
     use super::*;
 
+    /// `remote_probe` folds manifest + liveness into one exec; its stdout is
+    /// `<manifest json>\n<separator>\n<alive|dead>`. No separator = nothing
+    /// running; a corrupt manifest is "none" (a fresh start), never an error.
+    #[test]
+    fn probe_output_parses_manifest_and_alive_flag() {
+        let manifest = serde_json::to_string_pretty(&fake_manifest(Some("b.1"), 42)).unwrap();
+        let (m, alive) = parse_probe_output(&format!("{manifest}\n{PROBE_SEPARATOR}\nalive\n"))
+            .expect("manifest + flag");
+        assert_eq!(m.pid, 42);
+        assert!(alive);
+        let (_, alive) = parse_probe_output(&format!("{manifest}\n{PROBE_SEPARATOR}\ndead\n"))
+            .expect("manifest + flag");
+        assert!(!alive);
+        assert!(parse_probe_output("").is_none(), "no manifest printed");
+        assert!(
+            parse_probe_output(&format!("{{not json\n{PROBE_SEPARATOR}\nalive\n")).is_none(),
+            "a corrupt manifest is a fresh start, as remote_manifest treats it"
+        );
+    }
+
+    /// The remote pid extraction is a `sed` over the manifest; pin its
+    /// pattern against serde's real pretty AND compact renderings with the
+    /// host's own sed (BSD on macOS, GNU on Linux — both POSIX), so a
+    /// renderer change can never silently make every daemon look dead.
+    #[cfg(unix)]
+    #[test]
+    fn manifest_pid_sed_matches_serde_pretty_and_compact() {
+        let dir =
+            std::env::temp_dir().join(format!("chimaera-remote-pid-sed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest = fake_manifest(Some("b.1"), 4242);
+        // The pattern takes the FIRST "pid" line: the real Manifest must stay
+        // flat, or a nested pid would be picked instead of the daemon's.
+        let pretty = serde_json::to_string_pretty(&manifest).unwrap();
+        assert_eq!(
+            pretty.lines().filter(|l| l.contains("\"pid\"")).count(),
+            1,
+            "Manifest must stay flat — a nested pid would be picked first:\n{pretty}"
+        );
+        for (name, text) in [
+            (
+                "pretty.json",
+                serde_json::to_string_pretty(&manifest).unwrap(),
+            ),
+            ("compact.json", serde_json::to_string(&manifest).unwrap()),
+        ] {
+            let path = dir.join(name);
+            std::fs::write(&path, text).unwrap();
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("f={}; {SH_MANIFEST_PID}", path.display()))
+                .output()
+                .expect("run sh");
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout).trim(),
+                "4242",
+                "{name}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The LOGIN shells the wrapped remote commands get run through here —
+    /// sshd hands `ssh host <cmd>` to `$SHELL -c`, so the tests do the same.
+    /// The POSIX ones (`sh`: bash-in-POSIX-mode on macOS, dash on Debian CI;
+    /// `dash` itself, the strictest), `bash`/`zsh`, and the hostile ones —
+    /// `tcsh` (ships with macOS) and `fish` when installed — which read none
+    /// of the script's syntax and reach it only through `sh_wrap`. Absent
+    /// shells skip.
+    #[cfg(unix)]
+    fn login_shells() -> Vec<&'static str> {
+        ["sh", "dash", "bash", "zsh", "tcsh", "fish"]
+            .into_iter()
+            .filter(|shell| {
+                std::process::Command::new(shell)
+                    .args(["-c", "true"])
+                    .output()
+                    .is_ok_and(|out| out.status.success())
+            })
+            .collect()
+    }
+
+    /// Run `script` exactly as a remote would: wrapped by `sh_wrap`, handed
+    /// to `shell -c` the way sshd hands a command to the login shell.
+    #[cfg(unix)]
+    fn run_script(shell: &str, script: &str) -> std::process::Output {
+        std::process::Command::new(shell)
+            .args(["-c", &sh_wrap(script)])
+            .output()
+            .expect("spawn shell")
+    }
+
+    /// `sh_wrap`'s quoting is the one form every login shell reads the same:
+    /// a script full of single quotes, double quotes, `$(…)`, `$((…))`, and
+    /// backslashes must reach `sh` byte-for-byte through each of them — tcsh
+    /// and fish included. And none of the real scripts may contain `!` (csh
+    /// history expansion fires even inside single quotes).
+    #[cfg(unix)]
+    #[test]
+    fn sh_wrap_survives_every_login_shell() {
+        let script = r#"printf '%s\n' "a'b" 'c"d' $((1+2)) "$(printf '%s' '\(x\)')" '\1'"#;
+        let shells = login_shells();
+        // macOS ships tcsh: the hostile-login-shell case must really run here,
+        // not silently skip.
+        #[cfg(target_os = "macos")]
+        assert!(shells.contains(&"tcsh"), "{shells:?}");
+        for shell in shells {
+            let out = run_script(shell, script);
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout),
+                "a'b\nc\"d\n3\n\\(x\\)\n\\1\n",
+                "{shell}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        for script in [
+            probe_script("$HOME/m.json"),
+            start_wait_script("$HOME/m.json", 30),
+            stop_script(1, 20),
+        ] {
+            assert!(!script.contains('!'), "csh history expansion: {script}");
+        }
+    }
+
+    /// A pid that is certainly not alive: a child already reaped.
+    #[cfg(unix)]
+    fn dead_pid() -> u32 {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
+    }
+
+    /// Spawn `cmd` detached from this process (backgrounded by a throwaway
+    /// shell that exits at once), returning its pid. The stop script's
+    /// `kill -0` must see the process VANISH after SIGTERM, which a direct
+    /// child of the test process never does — it lingers as a zombie until
+    /// reaped. Orphaning it to init mirrors the daemon's setsid'd lifetime.
+    #[cfg(unix)]
+    fn spawn_orphan(cmd: &str) -> u32 {
+        // The orphan must not inherit the pipe `output()` waits on, or the
+        // throwaway shell's exit is invisible until the orphan itself ends.
+        let out = std::process::Command::new("sh")
+            .args(["-c", &format!("{cmd} >/dev/null 2>&1 </dev/null & echo $!")])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .expect("pid")
+    }
+
+    #[cfg(unix)]
+    fn write_manifest(path: &Path, pid: u32) {
+        let json = serde_json::to_vec_pretty(&fake_manifest(Some("b.1"), pid)).unwrap();
+        std::fs::write(path, json).unwrap();
+    }
+
+    /// The one-exec probe command through every login shell, against real
+    /// files and pids: alive (this test process), dead (a reaped child), and
+    /// absent (no manifest → nothing printed, exit 0).
+    #[cfg(unix)]
+    #[test]
+    fn probe_script_runs_under_every_login_shell() {
+        let dir =
+            std::env::temp_dir().join(format!("chimaera-probe-script-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("manifest.json");
+        let script = probe_script(&path.display().to_string());
+        for shell in login_shells() {
+            write_manifest(&path, std::process::id());
+            let out = run_script(shell, &script);
+            assert!(
+                out.status.success(),
+                "{shell}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let (m, alive) =
+                parse_probe_output(&String::from_utf8_lossy(&out.stdout)).expect("manifest");
+            assert_eq!(m.pid, std::process::id());
+            assert!(alive, "{shell}: this process is alive");
+
+            write_manifest(&path, dead_pid());
+            let out = run_script(shell, &script);
+            let (_, alive) =
+                parse_probe_output(&String::from_utf8_lossy(&out.stdout)).expect("manifest");
+            assert!(!alive, "{shell}: a reaped pid is dead");
+
+            std::fs::remove_file(&path).unwrap();
+            let out = run_script(shell, &script);
+            assert!(out.status.success(), "{shell}: absent manifest exits 0");
+            assert!(parse_probe_output(&String::from_utf8_lossy(&out.stdout)).is_none());
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The start-wait command through every login shell: prints the manifest
+    /// as soon as one appears with a live pid (written mid-loop here, so the
+    /// sleep path is exercised) and exits non-zero at the deadline otherwise.
+    #[cfg(unix)]
+    #[test]
+    fn start_wait_script_runs_under_every_login_shell() {
+        let dir =
+            std::env::temp_dir().join(format!("chimaera-start-script-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("manifest.json");
+        for shell in login_shells() {
+            std::fs::remove_file(&path).ok();
+            let child = std::process::Command::new(shell)
+                .args([
+                    "-c",
+                    &sh_wrap(&start_wait_script(&path.display().to_string(), 6)),
+                ])
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(700));
+            write_manifest(&path, std::process::id());
+            let out = child.wait_with_output().unwrap();
+            assert!(out.status.success(), "{shell}: manifest appeared in time");
+            let m: Manifest =
+                serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+            assert_eq!(m.pid, std::process::id());
+
+            // A manifest whose pid is dead never satisfies the loop.
+            write_manifest(&path, dead_pid());
+            let out = run_script(shell, &start_wait_script(&path.display().to_string(), 2));
+            assert!(!out.status.success(), "{shell}: a dead pid must time out");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The stop command through every login shell: SIGTERM ends a cooperative
+    /// process (exit 0); one that ignores SIGTERM reaches the deadline and
+    /// reports the distinct still-alive code — never SIGKILL; a dead pid
+    /// reports the signal failure.
+    #[cfg(unix)]
+    #[test]
+    fn stop_script_runs_under_every_login_shell() {
+        for shell in login_shells() {
+            let victim = spawn_orphan("sleep 30");
+            let out = run_script(shell, &stop_script(victim, 6));
+            assert!(
+                out.status.success(),
+                "{shell}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+
+            // `exec` keeps the pid: the ignored disposition survives into sleep.
+            let stubborn = spawn_orphan("sh -c 'trap \"\" TERM; exec sleep 30'");
+            std::thread::sleep(Duration::from_millis(200));
+            let out = run_script(shell, &stop_script(stubborn, 2));
+            assert_eq!(
+                out.status.code(),
+                Some(STOP_STILL_ALIVE_EXIT),
+                "{shell}: still alive after the deadline"
+            );
+            let _ = run_script("sh", &format!("kill -9 {stubborn}"));
+
+            let out = run_script(shell, &stop_script(dead_pid(), 2));
+            assert_eq!(
+                out.status.code(),
+                Some(STOP_SIGNAL_FAILED_EXIT),
+                "{shell}: SIGTERM to a dead pid fails"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn child_stream_reader_fails_at_byte_cap() {
         let err = read_bounded(tokio::io::repeat(b'x'), 32, "test")
@@ -2646,8 +3064,7 @@ mod tests {
     /// One recorded [`RemoteOps`] call, in order.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum Call {
-        RemoteManifest,
-        RemoteAlive,
+        RemoteProbe,
         RemoteSessionsCount,
         ResolveLocalBinary,
         StopRemote,
@@ -2674,13 +3091,9 @@ mod tests {
     }
 
     impl RemoteOps for FakeOps {
-        async fn remote_manifest(&self, _host: &str) -> anyhow::Result<Option<Manifest>> {
-            self.log(Call::RemoteManifest);
-            Ok(self.probe_manifest.clone())
-        }
-        async fn remote_alive(&self, _host: &str, _pid: u32) -> anyhow::Result<bool> {
-            self.log(Call::RemoteAlive);
-            Ok(self.alive)
+        async fn remote_probe(&self, _host: &str) -> anyhow::Result<Option<(Manifest, bool)>> {
+            self.log(Call::RemoteProbe);
+            Ok(self.probe_manifest.clone().map(|m| (m, self.alive)))
         }
         async fn remote_sessions_count(
             &self,
@@ -2784,10 +3197,7 @@ mod tests {
         assert_eq!(manifest.pid, 42, "returns the probed daemon");
         assert!(!outdated);
         assert_eq!(live, None);
-        assert_eq!(
-            *fake.calls.borrow(),
-            vec![Call::RemoteManifest, Call::RemoteAlive]
-        );
+        assert_eq!(*fake.calls.borrow(), vec![Call::RemoteProbe]);
         assert_eq!(phases, vec!["probing"]);
     }
 
@@ -2813,8 +3223,7 @@ mod tests {
         assert_eq!(
             *fake.calls.borrow(),
             vec![
-                Call::RemoteManifest,
-                Call::RemoteAlive,
+                Call::RemoteProbe,
                 Call::RemoteSessionsCount,
                 Call::ResolveLocalBinary,
                 Call::StopRemote,
@@ -2845,8 +3254,7 @@ mod tests {
         assert_eq!(
             *fake.calls.borrow(),
             vec![
-                Call::RemoteManifest,
-                Call::RemoteAlive,
+                Call::RemoteProbe,
                 Call::RemoteSessionsCount,
                 Call::ResolveLocalBinary,
                 Call::StopRemote,
@@ -2876,17 +3284,13 @@ mod tests {
         assert_eq!(live, Some(2));
         assert_eq!(
             *fake.calls.borrow(),
-            vec![
-                Call::RemoteManifest,
-                Call::RemoteAlive,
-                Call::RemoteSessionsCount
-            ]
+            vec![Call::RemoteProbe, Call::RemoteSessionsCount]
         );
         assert_eq!(phases, vec!["probing"]);
     }
 
-    /// Fresh start (no manifest): ensure-binary then start a new daemon; the
-    /// liveness probe is skipped (there is no pid to check).
+    /// Fresh start (no manifest): the one-exec probe reports nothing running,
+    /// then ensure-binary and start a new daemon.
     #[tokio::test]
     async fn resolve_daemon_fresh_start_when_no_manifest() {
         let fake = FakeOps {
@@ -2904,7 +3308,7 @@ mod tests {
         assert_eq!(
             *fake.calls.borrow(),
             vec![
-                Call::RemoteManifest,
+                Call::RemoteProbe,
                 Call::EnsureRemoteBinary,
                 Call::StartRemote
             ]
@@ -2912,9 +3316,8 @@ mod tests {
         assert_eq!(phases, vec!["probing", "starting"]);
     }
 
-    /// Fresh start (stale manifest, dead pid): a manifest whose daemon is not
-    /// alive falls through to the same fresh-start path — after the liveness
-    /// probe that reveals the pid is gone.
+    /// Fresh start (stale manifest, dead pid): the probe returns a manifest
+    /// whose pid is dead, which falls through to the same fresh-start path.
     #[tokio::test]
     async fn resolve_daemon_fresh_start_when_manifest_pid_dead() {
         let fake = FakeOps {
@@ -2930,8 +3333,7 @@ mod tests {
         assert_eq!(
             *fake.calls.borrow(),
             vec![
-                Call::RemoteManifest,
-                Call::RemoteAlive,
+                Call::RemoteProbe,
                 Call::EnsureRemoteBinary,
                 Call::StartRemote,
             ]

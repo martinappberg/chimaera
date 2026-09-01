@@ -26,8 +26,11 @@ a `RemoteOps` trait. See also [native-app.md](native-app.md) for the windows/hos
   `deploy_binary`, `start_remote`, `fetch_release_binary`, `spawn_tunnel`), `hosts.rs`
   (`HostsStore`, `normalize_alias`).
 - **The steps.** (1) **Normalize** the alias (strip a typed `ssh ` prefix, reject flags/whitespace).
-  (2) **Probe** (`resolve_daemon`): `cat ~/.chimaera/manifest.json` + `kill -0 pid` over ssh →
-  *Reuse* if a matching-build daemon runs; if builds differ, count live sessions and *Update* if
+  (2) **Probe** (`resolve_daemon` → `remote_probe`): ONE ssh exec runs a POSIX-sh script — sent as
+  `sh -c '…'`, because sshd hands the command to the user's *login* shell, which may be tcsh or fish
+  — that prints `~/.chimaera/manifest.json` plus a `kill -0` verdict on the pid it records (every separate exec
+  through the ControlMaster costs a channel-open RTT and a remote fork — ~300-500 ms on a loaded login
+  node) → *Reuse* if a matching-build daemon runs; if builds differ, count live sessions and *Update* if
   provably idle (or `--update-daemon`), else *ConnectOutdated*; no daemon → *fresh start*.
   (3) **Resolve the binary** to deploy — explicit `--binary`, else auto-fetch the matching
   musl/darwin release build (sha256-verified); the `~/.chimaera/dist/` stash feeds **dev connects
@@ -36,8 +39,9 @@ a `RemoteOps` trait. See also [native-app.md](native-app.md) for the windows/hos
   stopping any running daemon (a failed fetch must never strand a host with no daemon). (4) **Deploy**
   via `scp` (staged `.new` + `mv -f`), **start** (`chimaera serve --daemonize`, which forks +
   `setsid(2)`s in-process so it needs no util-linux `setsid`/`nohup` and works on any POSIX remote —
-  Linux, macOS, BSD; falls back to `setsid nohup … & disown` for a pre-flag remote binary; poll the
-  manifest ≤15s). (5) **Tunnel** (`ssh -N -L` with `ExitOnForwardFailure`), wait for the local
+  Linux, macOS, BSD; falls back to `setsid nohup … & disown` for a pre-flag remote binary; then ONE
+  more exec runs a remote POSIX-sh loop that waits ≤15 s for the manifest + a live pid and prints it —
+  not 15 client-side polls). (5) **Tunnel** (`ssh -N -L` with `ExitOnForwardFailure`), wait for the local
   listener, then require a bearer-authenticated health 200 through that exact forward before
   publishing `connected` and opening
   `http://127.0.0.1:{port}/#token={token}&host={alias}`. A listener that merely accepts is not ready.
@@ -95,7 +99,9 @@ a `RemoteOps` trait. See also [native-app.md](native-app.md) for the windows/hos
   instead of reused, because started it would relocate to `~/.chimaera-dev` and the manifest poll
   would time out forever.
 - **Never force-kill a remote daemon.** `stop_remote` is SIGTERM-only (a daemon that won't die may
-  hold sessions that mustn't be torn out — it errors honestly). `TunnelPhaseError` is
+  hold sessions that mustn't be torn out — it errors honestly). SIGTERM and the ≤10 s wait for exit
+  are one remote POSIX-sh exec whose exit code is the wire (0 = gone, a distinct code = still alive),
+  not 20 client-side `kill -0` polls. `TunnelPhaseError` is
   downcast-distinguished so the app retries *only* tunnel-phase failures on a fresh port (re-running
   connect on an auth failure would re-prompt 2FA). Child control-plane output is collected
   concurrently under 8 MiB stdout / 1 MiB stderr and wall-clock limits; overflow or timeout kills
