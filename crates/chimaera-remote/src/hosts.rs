@@ -74,6 +74,11 @@ pub struct HostEntry {
 pub struct HostsStore {
     path: PathBuf,
     items: Vec<HostEntry>,
+    /// The file existed but could not be read or parsed. The store still
+    /// serves (an empty list beats a dead home screen), but it refuses to
+    /// save: one transient NFS read error on a connect must not rewrite the
+    /// user's whole host list as the single alias that connect added.
+    unreadable: bool,
 }
 
 impl HostsStore {
@@ -88,17 +93,20 @@ impl HostsStore {
     /// load; ones that stay invalid are kept as-is so the user still sees
     /// (and can delete) them — connect explains what's wrong.
     pub fn load(path: PathBuf) -> Self {
+        let mut unreadable = false;
         let mut items: Vec<HostEntry> = match std::fs::read_to_string(&path) {
             Ok(contents) => match serde_json::from_str(&contents) {
                 Ok(items) => items,
                 Err(err) => {
-                    tracing::warn!(path = %path.display(), %err, "corrupt hosts.json; starting with an empty host list");
+                    tracing::warn!(path = %path.display(), %err, "corrupt hosts.json; serving an empty host list and refusing to overwrite it");
+                    unreadable = true;
                     Vec::new()
                 }
             },
             Err(err) if err.kind() == ErrorKind::NotFound => Vec::new(),
             Err(err) => {
-                tracing::warn!(path = %path.display(), %err, "failed to read hosts.json; starting with an empty host list");
+                tracing::warn!(path = %path.display(), %err, "failed to read hosts.json; serving an empty host list and refusing to overwrite it");
+                unreadable = true;
                 Vec::new()
             }
         };
@@ -115,7 +123,11 @@ impl HostsStore {
         // duplicates at any position; `list()` re-sorts by recency anyway.
         let mut seen = std::collections::HashSet::new();
         items.retain(|entry| seen.insert(entry.alias.clone()));
-        HostsStore { path, items }
+        HostsStore {
+            path,
+            items,
+            unreadable,
+        }
     }
 
     /// All hosts, most recently connected first (never-connected last, by
@@ -169,33 +181,61 @@ impl HostsStore {
         Ok(removed)
     }
 
-    /// Stamp a successful connection to `alias`, adding it if unknown.
-    pub fn record_connected(&mut self, alias: &str) -> anyhow::Result<()> {
-        match self.items.iter_mut().find(|h| h.alias == alias) {
-            Some(entry) => entry.last_connected_at = Some(unix_now()),
+    /// Stamp a successful connection to `alias`, adding it if unknown, and
+    /// return the stamped entry (so callers publish it without a reload).
+    pub fn record_connected(&mut self, alias: &str) -> anyhow::Result<HostEntry> {
+        let entry = match self.items.iter_mut().find(|h| h.alias == alias) {
+            Some(entry) => {
+                entry.last_connected_at = Some(unix_now());
+                entry.clone()
+            }
             None => {
-                self.items.push(HostEntry {
+                let entry = HostEntry {
                     alias: alias.to_string(),
                     binary: None,
                     added_at: unix_now(),
                     last_connected_at: Some(unix_now()),
-                });
+                };
+                self.items.push(entry.clone());
+                entry
             }
-        }
-        self.save()
+        };
+        self.save()?;
+        Ok(entry)
     }
 
-    /// Atomically persist the list (tmp file + rename).
+    /// Atomically persist the list (tmp file + rename). The tmp name is
+    /// unique per writer: the app's concurrent connect flights and a CLI
+    /// `connect` in another process all write this file, and a shared
+    /// `hosts.json.tmp` interleaved between two of them renames a torn file
+    /// into place — which `load` then reads as corrupt: an EMPTY host list.
     fn save(&self) -> anyhow::Result<()> {
+        if self.unreadable {
+            anyhow::bail!(
+                "refusing to overwrite {} — it could not be read on load, and saving now would replace every saved host with this session's",
+                self.path.display()
+            );
+        }
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
-        let tmp = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(&self.items)?)
-            .with_context(|| format!("failed to write {}", tmp.display()))?;
-        std::fs::rename(&tmp, &self.path)
-            .with_context(|| format!("failed to rename into {}", self.path.display()))?;
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let tmp = self
+            .path
+            .with_extension(format!("json.{}.{nanos}.tmp", std::process::id()));
+        if let Err(err) = std::fs::write(&tmp, serde_json::to_vec_pretty(&self.items)?) {
+            std::fs::remove_file(&tmp).ok();
+            return Err(err).with_context(|| format!("failed to write {}", tmp.display()));
+        }
+        if let Err(err) = std::fs::rename(&tmp, &self.path) {
+            std::fs::remove_file(&tmp).ok();
+            return Err(err)
+                .with_context(|| format!("failed to rename into {}", self.path.display()));
+        }
         Ok(())
     }
 }
@@ -241,6 +281,27 @@ mod tests {
         assert!(!reloaded.remove("cluster").unwrap());
         assert_eq!(reloaded.list().len(), 1);
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A hosts.json that exists but cannot be parsed serves an empty list —
+    /// and refuses to save, so the connect that follows a transient read
+    /// failure cannot rewrite the user's whole host list as one alias. The
+    /// file on disk stays byte-for-byte what it was.
+    #[test]
+    fn unreadable_file_serves_empty_and_refuses_to_save() {
+        let (_, dir) = tmp_store("unreadable");
+        let path = dir.join("hosts.json");
+        std::fs::write(&path, b"{ not json").unwrap();
+        let mut store = HostsStore::load(path.clone());
+        assert!(store.list().is_empty());
+        let err = store.record_connected("cluster").unwrap_err();
+        assert!(err.to_string().contains("refusing to overwrite"), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"{ not json");
+        assert!(
+            std::fs::read_dir(&dir).unwrap().count() == 1,
+            "no tmp file left beside it"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -20,14 +20,13 @@ fn local() -> anyhow::Result<()> {
 }
 
 async fn remote(host: &str, home: RemoteHome) -> anyhow::Result<()> {
-    let Some(manifest) = chimaera_remote::remote_manifest(host, home).await? else {
-        println!("not running");
-        return Ok(());
-    };
-    if chimaera_remote::remote_alive(host, manifest.pid).await? {
-        report_running(&manifest);
-    } else {
-        report_stale(&manifest);
+    // The same one-exec probe `connect` uses: manifest + liveness in a
+    // single ssh round trip, sent through `sh -c` so a tcsh/fish login
+    // shell on the host reads it.
+    match chimaera_remote::remote_probe(host, home).await? {
+        None => println!("not running"),
+        Some((manifest, true)) => report_running(&manifest),
+        Some((manifest, false)) => report_stale(&manifest),
     }
     Ok(())
 }
