@@ -151,6 +151,7 @@
   const mountedTabs = $derived(
     node.tabs.filter((t) => t === activeTab || (retainView(t) && liveKeys.includes(tabKey(t)))),
   );
+  const mountedKeys = $derived(new Set(mountedTabs.map(tabKey)));
 
   // Every workbench surface is a feature boundary. Loading only the kinds in
   // this pane's bounded live set keeps home/workspace startup lean; once a
@@ -411,11 +412,22 @@
     <!-- Retained file/workbench/chat views stay mounted with the active one
          visible. PTY components remount against termPool, so inactive xterm
          elements park without making long chat transcripts reconstruct. -->
-    {#each mountedTabs as tab (tabKey(tab))}
+    <!-- One layer per TAB (not per mounted view): a switch must never insert
+         or remove a sibling here. WebKit answers a sibling insertion under a
+         parent that any positional selector ever matched (:last-child, +, ~)
+         by invalidating the style of the whole subtree of the following
+         siblings — every node of every parked document, on every terminal
+         switch. Non-live tabs keep an empty layer. -->
+    {#each node.tabs as tab (tabKey(tab))}
       {@const active = tab === activeTab}
+      <!-- The stops bound WebKit's selection walks (see .sel-stop). -->
+      <span class="sel-stop" aria-hidden="true">&ZeroWidthSpace;</span>
       <div class="layer" class:active inert={!active}>
-        {@render surface(tab, active)}
+        {#if mountedKeys.has(tabKey(tab))}
+          {@render surface(tab, active)}
+        {/if}
       </div>
+      <span class="sel-stop" aria-hidden="true">&ZeroWidthSpace;</span>
     {/each}
     {#if activeTab === null}
       {#if names.size === 0}
@@ -564,18 +576,53 @@
     min-width: 0;
   }
 
-  /* Keep-alive layers: every mounted tab fills the content box; only the active
-     one is visible. visibility:hidden (not display:none) leaves inactive views
-     laid out at full size, so xterm/CodeMirror stay correctly measured and a
-     switch-back needs no reflow — the DOM, scroll, and image decode are intact.
-     inert keeps hidden inputs/editors out of the focus + tab order. */
+  /* Keep-alive layers: every tab has a layer filling the content box; only
+     the active one is visible. Inactive layers hide with opacity — not
+     display:none (unmeasures xterm/CodeMirror), not visibility:hidden (it
+     INHERITS, so a switch re-resolved the style of every node in both layers
+     and WebKit then rebuilt their inline layout, re-shaping every text run:
+     over a second per switch behind a rendered document), and not
+     content-visibility:hidden (measured: the reveal relayout and the
+     activate-class flip both cost more than they save). opacity is not
+     inherited and is compositor-only; layout, scroll, and image decode stay
+     intact, so a switch-back needs no reflow. z-index keeps the active layer
+     on top so the opaque parked ones never take a click; inert keeps them out
+     of the focus + tab order, hit-testing, and the AX tree. pointer-events is
+     inherited too, so it is deliberately NOT toggled here. */
   .layer {
     position: absolute;
     inset: 0;
   }
 
+  .layer.active {
+    z-index: 1;
+  }
+
   .layer:not(.active) {
-    visibility: hidden;
+    opacity: 0;
+  }
+
+  /* Selection-walk stops. macOS WebKit recomputes its editor state on every
+     rendering commit while the caret sits in an editable (the focused
+     terminal's helper textarea, a composer) and, for QuickType, walks the DOM
+     from the caret in both directions until it finds a visible, selectable
+     position. Everything inside a terminal is user-select:none and every
+     inactive layer is inert (unselectable), so without a stop the walk
+     crosses every parked layer node by node — seconds per commit behind a
+     transcript. A zero-width, clipped but visible and selectable character
+     before and after every layer ends that walk at the layer edge. */
+  .sel-stop {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+    pointer-events: none;
+    user-select: text;
+    -webkit-user-select: text;
   }
 
   .hint {

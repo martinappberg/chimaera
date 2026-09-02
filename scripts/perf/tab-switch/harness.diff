@@ -1,0 +1,145 @@
+diff --git a/web-ui/src/App.svelte b/web-ui/src/App.svelte
+index f33f39c..836f7f0 100644
+--- a/web-ui/src/App.svelte
++++ b/web-ui/src/App.svelte
+@@ -2038,6 +2038,128 @@
+     layoutReady = true;
+     pruneAndAutoOpen();
+     pruneDeadFiles();
++    // STALLDRIVE (temporary repro harness, not for commit): #stalldrive=<sess,..>|<file,..>|<logpath>
++    if (new URLSearchParams(String((window as unknown as { __bootHash?: string }).__bootHash ?? "").slice(1)).has("stalldrive")) void stallDrive();
++  }
++
++  async function stallDrive(): Promise<void> {
++    const params = new URLSearchParams(String((window as unknown as { __bootHash?: string }).__bootHash ?? "").slice(1));
++    const [sessPart = "", filePart = "", logPath = ""] = (params.get("stalldrive") ?? "").split("|");
++    const token = params.get("token") ?? "";
++    const lines: string[] = [];
++    const write = (): Promise<unknown> =>
++      fetch(`/api/v1/fs/file?path=${encodeURIComponent(logPath)}`, {
++        method: "PUT",
++        headers: { Authorization: `Bearer ${token}` },
++        body: lines.join("\n") + "\n",
++      }).catch(() => undefined);
++    const frame = (): Promise<void> =>
++      new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => r())));
++    const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
++    await sleep(1500);
++    const paneId = layout.focusedPaneId;
++    for (const id of sessPart.split(",").filter(Boolean)) layout = openSession(layout, id);
++    for (const f of filePart.split(",").filter(Boolean)) layout = openFile(layout, f, false);
++    await tick();
++    const pane = findPane(layout.root, paneId);
++    if (pane === null) return;
++    const kinds = pane.tabs.map((t) => t.surface);
++    lines.push(`${new Date().toISOString()} tabs=${kinds.join(",")} pane=${paneId}`);
++    const termIdx = kinds.map((k, i) => (k === "terminal" ? i : -1)).filter((i) => i >= 0);
++    const fileIdx = kinds.map((k, i) => (k === "file" ? i : -1)).filter((i) => i >= 0);
++    // Let the previews render, then park them behind the first terminal.
++    const scroller = (): HTMLElement | null => {
++      const layer = document.querySelector(".layer.active");
++      if (layer === null) return null;
++      for (const el of layer.querySelectorAll<HTMLElement>("*")) {
++        if (el.scrollHeight > el.clientHeight + 50 && getComputedStyle(el).overflowY !== "visible") return el;
++      }
++      return null;
++    };
++    for (const i of fileIdx) {
++      layout = activateTab(layout, paneId, i);
++      await tick();
++      await sleep(2500);
++      const sc = scroller();
++      if (sc !== null) { sc.scrollTop = 5000; await frame(); lines.push(`park file ${i} scroller=${sc.className.slice(0, 30)} scrollTop=${sc.scrollTop}`); }
++    }
++    const order = termIdx.length >= 2 ? [termIdx[0], termIdx[1]] : termIdx;
++    // Isolation probes: which single mutation costs a whole-document restyle?
++    const force = (): number => document.body.offsetHeight + getComputedStyle(document.body).color.length;
++    const probe = (label: string, fn: () => void): void => {
++      force();
++      const t = performance.now();
++      fn();
++      force();
++      lines.push(`probe ${label} ${(performance.now() - t).toFixed(1)}ms`);
++    };
++    layout = activateTab(layout, paneId, order[0]);
++    await tick();
++    await frame();
++    await sleep(500);
++    const activeLayer = document.querySelector<HTMLElement>(".layer.active");
++    const ta = document.activeElement instanceof HTMLElement ? document.activeElement : null;
++    probe("noop", () => {});
++    probe("focus-blur+focus", () => { ta?.blur(); force(); ta?.focus(); });
++    probe("inert-on+off(active layer)", () => { activeLayer?.setAttribute("inert", ""); force(); activeLayer?.removeAttribute("inert"); });
++    probe("class-active-off+on", () => { activeLayer?.classList.remove("active"); force(); activeLayer?.classList.add("active"); });
++    probe("body-custom-prop", () => { document.body.style.setProperty("--zz-probe", "1"); force(); document.body.style.removeProperty("--zz-probe"); });
++    probe("body-class", () => { document.body.classList.add("zz-probe"); force(); document.body.classList.remove("zz-probe"); });
++    probe("style-el-insert+remove", () => { const st = document.createElement("style"); st.textContent = ".zz-probe-none{color:red}"; document.head.appendChild(st); force(); st.remove(); });
++    probe("sibling-span-insert+remove", () => { const sp = document.createElement("span"); activeLayer?.parentElement?.appendChild(sp); force(); sp.remove(); });
++    probe("term-textarea-blur+focus x3", () => { for (let k = 0; k < 3; k++) { ta?.blur(); force(); ta?.focus(); force(); } });
++    lines.push(`styles=${document.styleSheets.length} styleEls=${document.querySelectorAll("style").length}`);
++    await write();
++    for (let i = 0; i < 24; i++) {
++      const idx = order[i % order.length];
++      const t0 = performance.now();
++      layout = activateTab(layout, paneId, idx);
++      await tick();
++      await frame();
++      const dt = performance.now() - t0;
++      // The engine's own caret walk from the focused editable: Selection.modify
++      // runs the same next/previous visually-distinct-candidate search WebKit's
++      // editor-state (QuickType) update runs on every rendering commit.
++      const sel = document.getSelection();
++      const ae = document.activeElement;
++      // Caret at the LAST text node of the active layer (light DOM, like a
++      // CodeMirror caret would be), then the engine's own forward/backward
++      // visually-distinct-candidate search.
++      const layer = document.querySelector(".layer.active");
++      let lastText: Text | null = null;
++      if (layer !== null) {
++        const tw = document.createTreeWalker(layer, NodeFilter.SHOW_TEXT);
++        while (tw.nextNode()) lastText = tw.currentNode as Text;
++      }
++      let wf = -1;
++      let wb = -1;
++      if (sel !== null && lastText !== null) {
++        const w0 = performance.now();
++        sel.collapse(lastText, lastText.length);
++        sel.modify("move", "forward", "character");
++        wf = performance.now() - w0;
++        const w1 = performance.now();
++        sel.collapse(lastText, 0);
++        sel.modify("move", "backward", "character");
++        wb = performance.now() - w1;
++      }
++      if (ae instanceof HTMLElement) ae.focus();
++      lines.push(`${new Date().toISOString()} switch->${idx} ${dt.toFixed(1)}ms walk fwd ${wf.toFixed(1)}ms back ${wb.toFixed(1)}ms active=${ae?.tagName}.${(ae as HTMLElement)?.className ?? ""}`);
++      if (i % 4 === 3) void write();
++      await sleep(3000);
++    }
++    // Back into the first parked document: is its scroll position intact, and
++    // what does the reveal cost?
++    if (fileIdx.length > 0) {
++      const t0 = performance.now();
++      layout = activateTab(layout, paneId, fileIdx[0]);
++      await tick();
++      await frame();
++      const sc = scroller();
++      lines.push(`reveal file ${fileIdx[0]} ${(performance.now() - t0).toFixed(1)}ms scrollTop=${sc?.scrollTop ?? "n/a"}`);
++    }
++    lines.push("done");
++    await write();
+   }
+ 
+   /** Drop restored file tabs whose files are definitively gone (400/404);
+diff --git a/web-ui/index.html b/web-ui/index.html
+index 8a69d9b..8aff491 100644
+--- a/web-ui/index.html
++++ b/web-ui/index.html
+@@ -24,6 +24,7 @@
+         background: var(--chimaera-bootstrap-bg);
+       }
+     </style>
++    <script>window.__bootHash = location.hash;</script>
+     <script>
+       (() => {
+         const root = document.documentElement;

@@ -361,6 +361,7 @@ function createEntry(id: string, parent: HTMLElement, fontOverride: number | und
   const fit = new FitAddon();
   term.loadAddon(fit);
   term.open(el);
+  hoistStyles(el);
 
   registerTerminalClipboard(term);
 
@@ -534,6 +535,22 @@ function evictLru(): void {
   }
 }
 
+/**
+ * Move any `<style>` xterm planted inside the terminal element up to
+ * `<head>`. xterm 6 keeps its scrollbar theme sheet in `.xterm-screen` (and
+ * the DOM renderer, when WebGL is unavailable, its theme + dimension sheets),
+ * so re-parenting the element between a pane and the stash removed and
+ * re-inserted a stylesheet on every tab switch. WebKit answers a stylesheet
+ * change by rebuilding the document's style resolver and re-resolving EVERY
+ * element — a quarter-second per move behind a long transcript, twice per
+ * switch, and a multi-second freeze in a busy workspace. The node itself
+ * moves (xterm keeps its reference: theme updates and dispose still reach
+ * it); its selectors were document-global already.
+ */
+function hoistStyles(el: HTMLElement): void {
+  for (const st of Array.from(el.getElementsByTagName("style"))) document.head.appendChild(st);
+}
+
 function attach(id: string, host: HTMLElement, fontOverride: number | undefined): void {
   ensureStash();
   let entry = pool.get(id);
@@ -541,6 +558,7 @@ function attach(id: string, host: HTMLElement, fontOverride: number | undefined)
     entry = createEntry(id, host, fontOverride);
   } else {
     if (entry.el.parentElement !== host) {
+      hoistStyles(entry.el);
       host.appendChild(entry.el);
     }
     // Now visible: replay what parking deferred (or resync after a discard)
@@ -640,6 +658,7 @@ export function release(id: string, host: HTMLElement): void {
     // the difference between local and tunneled remotes. An old server
     // ignores the frame; the ParkedBuffer above still absorbs its stream.
     entry.socket.sendPark();
+    hoistStyles(entry.el);
     ensureStash().appendChild(entry.el);
   }
 }
