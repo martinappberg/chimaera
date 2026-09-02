@@ -198,9 +198,10 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   preserving its socket and scrollback. A shared, LRU-capped content store
   (`previews/fileStore.svelte.ts`, keyed by path) additionally caches the *bytes* so re-opening a
   view the live-set evicted re-renders warm rather than re-fetching.
-- **Where it lives.** `layout/Pane.svelte` (the live-set — renders active + recently-visited tabs,
-  inactive ones `opacity:0` + `pointer-events:none` + `inert`, each layer bracketed by a zero-width
-  selectable "selection stop" — see *Why opacity* below); `previews/fileStore.svelte.ts` (`FileEntry`,
+- **Where it lives.** `layout/Pane.svelte` (one persistent layer per tab; the live-set decides which
+  hold a mounted view; parked layers are `opacity:0` + `inert`, dormant — `visibility:hidden` — after
+  30 s, and each layer starts and ends with a selectable 1px image, the "selection stop");
+  `previews/fileStore.svelte.ts` (`FileEntry`,
   `retain`/`release`/`noteWrite`); every `*View.svelte`. The store subscribes to
   `workspace/fsEvents.ts` (`fsEpoch`/`lastFsMutation`) + `workspace/git.ts` (`gitStatus`) +
   `workspace/diskWatch.ts`; the daemon half is `chimaera-server/src/fs_watch.rs` on `/ws/events`.
@@ -211,28 +212,23 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   WebGL renderers attached. Inactive chat tabs freeze their bounded transcript snapshot while the
   pooled reducer/socket continues; historical artifact previews load only near the viewport, and
   initial journal hydration mounts from the newest end once instead of painting oldest-to-newest.
-- **Why opacity, not visibility — and the stops, and the hoisted xterm sheet.** A tab switch behind a
-  few parked documents took 1.3–2 s in WebKit (Safari harness: two terminals plus three parked
-  rendered documents of ~235k inline elements each; 30–50 ms with nothing parked). Three causes,
-  each fixed in the pane/pool code: (1) parked layers hid with `visibility:hidden`, which inherits —
-  every switch re-resolved the style of every node in both layers and WebKit rebuilt their inline
-  layout, re-shaping every text run; `opacity` is not inherited (a switch restyles two elements),
-  the active layer stacks on top with `z-index`, and `inert` still handles focus, hit-testing, and
-  AX. `content-visibility:hidden` was measured and rejected (the reveal relayout and the
-  activate-class flip both cost more than it saved). (2) xterm 6 keeps a `<style>` inside each
-  terminal's screen element, so re-parenting a terminal between a pane and the warm stash removed
-  and re-inserted a stylesheet — WebKit answers that by rebuilding its style resolver and
-  re-resolving the whole document, twice per switch; `termPoolRuntime` now hoists those nodes into
-  `<head>` (xterm keeps its reference, so theme updates still reach them). (3) macOS WebKit
-  recomputes its editor state on every rendering commit while a caret sits in an editable and, for
-  QuickType, walks the DOM from the caret in both directions to the nearest visible *selectable*
-  position; terminals are `user-select:none` and parked layers are inert, so that walk crossed every
-  parked node one by one (a 2.9 s `Position::next` loop in a live sample). The `.sel-stop` spans — a
-  clipped, zero-width, selectable character before and after every layer — end it at the layer
-  edge (the engine's own forward walk: 720–855 ms → 0–1 ms). Layers are also one per TAB, not per
-  mounted view, so a switch never inserts a sibling (WebKit invalidates following siblings' whole
-  subtrees for positional selectors). After all three: 23–37 ms per switch, scroll position and
-  editor state intact. The harness lives in `scripts/perf/tab-switch/`.
+- **Parking is opacity + inert, one layer per tab, fenced by selection stops.** Parked layers
+  never hide with `visibility:hidden`, `display:none`, `pointer-events`, `user-select` or a
+  `z-index` on the shown one — every one of those inherits (WebKit re-resolves and re-shapes the
+  whole parked subtree per switch) or traps a view's `position:fixed` overlay; a switch never
+  inserts a sibling into the pane (positional selectors would re-resolve every parked document);
+  a layer that parks releases DOM focus and selection (a caret left in an inert subtree is
+  re-canonicalized through the whole parked document on every rendering commit); the selectable
+  1px image at each end of a layer is where WebKit's editor-state caret walk ends instead of
+  crossing every parked node (its empty alt keeps it out of copied text; parked text is inert,
+  hence unselectable and never copied); and a layer parked for 30 s goes dormant
+  (`visibility:hidden`, from idle time), which returns the backing stores WebKit keeps for a
+  transparent scroller — the reveal of a dormant layer pays that subtree's restyle once, a quick
+  switch-back never does. `inert` inherits too: a switch restyles the two switched layers' subtrees,
+  never a bystander's. The terminal pool keeps xterm's `<style>` sheets out of
+  the re-parented element for the same reason (see [terminals](terminals.md)). The measurements
+  and the harness: [field notes](../history/field-notes.md#the-tab-switch-stall-reproduced-and-fixed-without-screen-control-2026-09-02-safari-harness),
+  `scripts/perf/tab-switch/`.
   `chatPool` keeps the reducer/socket and view cursor warm if a view is eventually evicted or moved.
   Live-on-disk update is **mounted-path-scoped**, not Git-gated:
   each events

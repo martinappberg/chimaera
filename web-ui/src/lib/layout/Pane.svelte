@@ -135,6 +135,69 @@
     });
   });
 
+  /** A 1×1 transparent GIF: the selection stops (see `.sel-stop`). */
+  const STOP_SRC = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
+
+  // Parked long enough, a layer goes dormant: visibility:hidden, which drops
+  // the backing stores WebKit keeps for a merely transparent scroller. It is
+  // an inherited toggle (a restyle + relayout of that whole subtree), so it
+  // runs off the switch path, from idle time, and only after a pause — a
+  // quick switch-back stays a two-element restyle.
+  const DORMANT_AFTER_MS = 30_000;
+  let dormant = $state<Set<string>>(new Set());
+  const dormantTimers = new Map<string, number>();
+  function scheduleDormant(key: string): void {
+    if (dormantTimers.has(key)) return;
+    dormantTimers.set(
+      key,
+      window.setTimeout(() => {
+        dormantTimers.delete(key);
+        if (parkedKey === key || !node.tabs.some((t) => tabKey(t) === key)) return;
+        dormant = new Set(dormant).add(key);
+      }, DORMANT_AFTER_MS),
+    );
+  }
+  function wake(key: string): void {
+    const timer = dormantTimers.get(key);
+    if (timer !== undefined) {
+      window.clearTimeout(timer);
+      dormantTimers.delete(key);
+    }
+    if (dormant.has(key)) {
+      const next = new Set(dormant);
+      next.delete(key);
+      dormant = next;
+    }
+  }
+  $effect(() => () => {
+    for (const timer of dormantTimers.values()) window.clearTimeout(timer);
+  });
+
+  // A parked layer must not keep the DOM selection or focus: a caret left in
+  // an inert (unselectable) subtree makes WebKit re-canonicalize it through
+  // the whole parked document on every rendering commit. Runs before the DOM
+  // flips, so `.layer.active` is still the departing layer; the incoming
+  // layer wakes in the same batch as its `active` flip.
+  let parkedKey: string | null = null;
+  $effect.pre(() => {
+    const key = activeTab === null ? null : tabKey(activeTab);
+    const previous = parkedKey;
+    parkedKey = key;
+    untrack(() => {
+      if (key !== null) wake(key);
+      if (previous === null || previous === key) return;
+      scheduleDormant(previous);
+      const departing = contentEl?.querySelector(".layer.active");
+      if (!departing) return;
+      const focused = document.activeElement;
+      if (focused instanceof HTMLElement && departing.contains(focused)) focused.blur();
+      const sel = document.getSelection();
+      if (sel !== null && sel.anchorNode !== null && departing.contains(sel.anchorNode)) {
+        sel.removeAllRanges();
+      }
+    });
+  });
+
   // Drop live keys whose tab has closed (or moved to another pane), so the cap
   // counts only retained views this pane still holds.
   $effect(() => {
@@ -151,7 +214,6 @@
   const mountedTabs = $derived(
     node.tabs.filter((t) => t === activeTab || (retainView(t) && liveKeys.includes(tabKey(t)))),
   );
-  const mountedKeys = $derived(new Set(mountedTabs.map(tabKey)));
 
   // Every workbench surface is a feature boundary. Loading only the kinds in
   // this pane's bounded live set keeps home/workspace startup lean; once a
@@ -412,22 +474,19 @@
     <!-- Retained file/workbench/chat views stay mounted with the active one
          visible. PTY components remount against termPool, so inactive xterm
          elements park without making long chat transcripts reconstruct. -->
-    <!-- One layer per TAB (not per mounted view): a switch must never insert
-         or remove a sibling here. WebKit answers a sibling insertion under a
-         parent that any positional selector ever matched (:last-child, +, ~)
-         by invalidating the style of the whole subtree of the following
-         siblings — every node of every parked document, on every terminal
-         switch. Non-live tabs keep an empty layer. -->
+    <!-- One layer per TAB, not per mounted view: a switch must never insert
+         a sibling here (WebKit invalidates the following siblings' whole
+         subtrees for positional selectors). The stops fence the caret walk
+         (see .sel-stop). -->
     {#each node.tabs as tab (tabKey(tab))}
       {@const active = tab === activeTab}
-      <!-- The stops bound WebKit's selection walks (see .sel-stop). -->
-      <span class="sel-stop" aria-hidden="true">&ZeroWidthSpace;</span>
-      <div class="layer" class:active inert={!active}>
-        {#if mountedKeys.has(tabKey(tab))}
+      <div class="layer" class:active class:dormant={dormant.has(tabKey(tab))} inert={!active}>
+        <img class="sel-stop" src={STOP_SRC} alt="" aria-hidden="true" />
+        {#if mountedTabs.includes(tab)}
           {@render surface(tab, active)}
         {/if}
+        <img class="sel-stop" src={STOP_SRC} alt="" aria-hidden="true" />
       </div>
-      <span class="sel-stop" aria-hidden="true">&ZeroWidthSpace;</span>
     {/each}
     {#if activeTab === null}
       {#if names.size === 0}
@@ -576,50 +635,43 @@
     min-width: 0;
   }
 
-  /* Keep-alive layers: every tab has a layer filling the content box; only
-     the active one is visible. Inactive layers hide with opacity — not
-     display:none (unmeasures xterm/CodeMirror), not visibility:hidden (it
-     INHERITS, so a switch re-resolved the style of every node in both layers
-     and WebKit then rebuilt their inline layout, re-shaping every text run:
-     over a second per switch behind a rendered document), and not
-     content-visibility:hidden (measured: the reveal relayout and the
-     activate-class flip both cost more than they save). opacity is not
-     inherited and is compositor-only; layout, scroll, and image decode stay
-     intact, so a switch-back needs no reflow. z-index keeps the active layer
-     on top so the opaque parked ones never take a click; inert keeps them out
-     of the focus + tab order, hit-testing, and the AX tree. pointer-events is
-     inherited too, so it is deliberately NOT toggled here. */
+  /* Keep-alive layers: one per tab, only the active one visible. Parked
+     layers hide with opacity — never display:none (unmeasures
+     xterm/CodeMirror) and, on the switch path, never visibility:hidden: it
+     inherits, so WebKit re-resolves and re-shapes the whole parked subtree.
+     inert (also inherited — its toggle restyles the two switched layers, and
+     only those) keeps parked layers out of focus, hit-testing, and the AX
+     tree. Nothing else toggles here: pointer-events and user-select inherit
+     too, and a z-index would trap the views' position:fixed overlays inside
+     the layer. Layout, scroll, and decode stay intact. */
   .layer {
     position: absolute;
     inset: 0;
-  }
-
-  .layer.active {
-    z-index: 1;
   }
 
   .layer:not(.active) {
     opacity: 0;
   }
 
-  /* Selection-walk stops. macOS WebKit recomputes its editor state on every
-     rendering commit while the caret sits in an editable (the focused
-     terminal's helper textarea, a composer) and, for QuickType, walks the DOM
-     from the caret in both directions until it finds a visible, selectable
-     position. Everything inside a terminal is user-select:none and every
-     inactive layer is inert (unselectable), so without a stop the walk
-     crosses every parked layer node by node — seconds per commit behind a
-     transcript. A zero-width, clipped but visible and selectable character
-     before and after every layer ends that walk at the layer edge. */
+  /* Dormant (parked for a while, applied from idle time): the inherited
+     toggle is paid off the switch path, and the reveal pays it once. */
+  .layer.dormant {
+    visibility: hidden;
+  }
+
+  /* Selection stops. macOS WebKit re-derives its editor state on every
+     rendering commit while a caret sits in an editable, walking the DOM from
+     the caret to the nearest visible selectable position; terminals are
+     user-select:none and parked layers inert, so that walk crossed every
+     parked node. A selectable 1px image at each end of a layer is the nearest
+     such position (an empty block is not one; text would be copied). Its
+     empty alt keeps it out of copied text. */
   .sel-stop {
     position: absolute;
     top: 0;
     left: 0;
     width: 1px;
     height: 1px;
-    overflow: hidden;
-    clip-path: inset(50%);
-    white-space: nowrap;
     pointer-events: none;
     user-select: text;
     -webkit-user-select: text;

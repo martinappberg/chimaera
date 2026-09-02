@@ -65,8 +65,17 @@ pipe), `POST /api/v1/sessions` (spawn), `POST /api/v1/sessions/{id}/exec`,
   rebuilding the terminal buffer (the newly attached pane may still need a fit).
 - **Where it lives.** `web-ui/src/lib/terminal/termPool.ts` (lazy facade) and
   `termPoolRuntime.ts` (`pool`, `attach`/`show`/`release`, hidden `stash`, `POOL_CAP = 12`,
-  `evictLru`), plus `Terminal.svelte` and `layout/Pane.svelte` (only an active PTY component stays
-  mounted, so inactive instances actually park; structured-chat tabs retain their separate DOM).
+  `evictLru`, `hoistStyles`), plus `Terminal.svelte` and `layout/Pane.svelte` (only an active PTY
+  component stays mounted, so inactive instances actually park; structured-chat tabs retain their
+  separate DOM).
+- **A terminal element never carries a `<style>`.** xterm 6 plants its scrollbar theme sheet inside
+  `.xterm-screen` (the DOM renderer, when WebGL is unavailable, two more); an element re-parented
+  with a stylesheet inside is a stylesheet removal + insertion, which WebKit answers by rebuilding
+  its style resolver and re-resolving the whole document — twice per tab switch. The pool moves the
+  sheets to `<head>` after `open()` and, through a per-entry observer on `.xterm-screen`, the moment
+  a later one lands; xterm keeps its reference, so theme updates and dispose still reach them. A
+  theme is handed to xterm only when its tokens changed (xterm compares by identity, and a theme
+  it takes rewrites that sheet).
 - **Key behaviors.** Parking is a **wire state**, not just a client one: `release()` sends a
   `park` frame (the server stops forwarding output — the session's bounded broadcast ring is
   the catch-up buffer) and adopt sends `unpark` (ring replay for small backlogs; a repaint —

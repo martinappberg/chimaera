@@ -110,6 +110,8 @@ interface PoolEntry {
   socket: SessionSocket;
   el: HTMLDivElement;
   ro: ResizeObserver;
+  /** Hoists any `<style>` xterm adds after open (see hoistStyles). */
+  styleObserver: MutationObserver;
   lastUsed: number;
   fitTimer: ReturnType<typeof setTimeout> | null;
   pendingFit: boolean;
@@ -362,6 +364,15 @@ function createEntry(id: string, parent: HTMLElement, fontOverride: number | und
   term.loadAddon(fit);
   term.open(el);
   hoistStyles(el);
+  // xterm only ever appends its sheets to `.xterm-screen`; watch that one
+  // element, non-recursively (the DOM renderer repaints rows every frame).
+  const styleObserver = new MutationObserver((records) => {
+    for (const r of records) {
+      for (const n of r.addedNodes) if (n instanceof HTMLStyleElement) document.head.appendChild(n);
+    }
+  });
+  const screen = el.querySelector(".xterm-screen");
+  styleObserver.observe(screen ?? el, { childList: true, subtree: screen === null });
 
   registerTerminalClipboard(term);
 
@@ -373,6 +384,7 @@ function createEntry(id: string, parent: HTMLElement, fontOverride: number | und
     socket: null as unknown as SessionSocket,
     el,
     ro: null as unknown as ResizeObserver,
+    styleObserver,
     lastUsed: ++clock,
     fitTimer: null,
     pendingFit: false,
@@ -517,6 +529,7 @@ function disposeEntry(entry: PoolEntry): void {
   entry.disposeLinks();
   entry.socket.close();
   entry.ro.disconnect();
+  entry.styleObserver.disconnect();
   entry.term.dispose();
   entry.el.remove();
 }
@@ -536,16 +549,16 @@ function evictLru(): void {
 }
 
 /**
- * Move any `<style>` xterm planted inside the terminal element up to
- * `<head>`. xterm 6 keeps its scrollbar theme sheet in `.xterm-screen` (and
- * the DOM renderer, when WebGL is unavailable, its theme + dimension sheets),
- * so re-parenting the element between a pane and the stash removed and
- * re-inserted a stylesheet on every tab switch. WebKit answers a stylesheet
- * change by rebuilding the document's style resolver and re-resolving EVERY
- * element — a quarter-second per move behind a long transcript, twice per
- * switch, and a multi-second freeze in a busy workspace. The node itself
- * moves (xterm keeps its reference: theme updates and dispose still reach
- * it); its selectors were document-global already.
+ * xterm 6 plants `<style>` sheets inside the terminal element (its scrollbar
+ * theme sheet in `.xterm-screen`; the DOM renderer, when WebGL is
+ * unavailable, two more). A terminal element that carries a stylesheet
+ * across a re-parent — pane ↔ stash, a tab reorder moving its layer — is a
+ * stylesheet removal + insertion, which WebKit answers by rebuilding the
+ * document's style resolver and re-resolving every element. So a terminal
+ * element never holds one: the sheets move to `<head>` (xterm keeps its
+ * reference, so theme updates and dispose still reach them; the selectors
+ * were document-global already), once after open and, via the entry's
+ * observer, the moment a later one lands.
  */
 function hoistStyles(el: HTMLElement): void {
   for (const st of Array.from(el.getElementsByTagName("style"))) document.head.appendChild(st);
@@ -558,7 +571,6 @@ function attach(id: string, host: HTMLElement, fontOverride: number | undefined)
     entry = createEntry(id, host, fontOverride);
   } else {
     if (entry.el.parentElement !== host) {
-      hoistStyles(entry.el);
       host.appendChild(entry.el);
     }
     // Now visible: replay what parking deferred (or resync after a discard)
@@ -602,11 +614,23 @@ export function initPool(h: PoolHandlers): void {
   unsubscribeSettings = onSettingsChange(applySettingsToPool);
 }
 
+// xterm compares option values by identity, and a theme it takes rewrites
+// every terminal's scrollbar sheet — a document-wide restyle — so a theme is
+// only handed over when its tokens actually changed.
+let lastThemeJson = "";
+let lastTheme: ReturnType<typeof themeFromTokens> | null = null;
+
 function applySettingsToPool(): void {
   const opts = settingsOptions();
   const theme = themeFromTokens();
+  const themeJson = JSON.stringify(theme);
+  if (themeJson !== lastThemeJson || lastTheme === null) {
+    lastThemeJson = themeJson;
+    lastTheme = theme;
+  }
   for (const e of pool.values()) {
-    Object.assign(e.term.options, opts, { theme });
+    Object.assign(e.term.options, opts);
+    if (e.term.options.theme !== lastTheme) e.term.options.theme = lastTheme;
     // Panes without a per-pane override follow the default size live.
     const size = e.fontOverride ?? baseFontSize();
     if (e.term.options.fontSize !== size) e.term.options.fontSize = size;
@@ -658,7 +682,6 @@ export function release(id: string, host: HTMLElement): void {
     // the difference between local and tunneled remotes. An old server
     // ignores the frame; the ParkedBuffer above still absorbs its stream.
     entry.socket.sendPark();
-    hoistStyles(entry.el);
     ensureStash().appendChild(entry.el);
   }
 }
