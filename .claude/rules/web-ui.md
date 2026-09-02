@@ -52,3 +52,12 @@ domain surfaces + their stores: files tree, git, sessions, launcher, home) · **
   `net/reconnect.ts`; and infinite animations pause under the `html.app-hidden`
   root class, enumerated per component (see app.css). A deliberate exemption
   (e.g. a keep-alive that must outlive hiding) says so in a comment.
+- **Hide with opacity + inert, and never churn siblings on a hot path.** A
+  keep-alive surface (pane layers, the rail splitter) hides with `opacity:0` +
+  `inert` and keeps one element per item mounted. `visibility`,
+  `pointer-events`, `user-select` — and `inert`'s own flag — inherit, so WebKit
+  re-resolves the whole subtree on every toggle; a `z-index` on the shown item
+  traps views' `position:fixed` overlays; inserting or removing a sibling ahead
+  of large parked content re-resolves all of it (positional selectors). Move a
+  `<style>` out of any element that gets re-parented (xterm plants one;
+  `termPoolRuntime.hoistStyles`). Measured in `scripts/perf/tab-switch/`.

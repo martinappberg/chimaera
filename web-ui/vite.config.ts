@@ -57,6 +57,9 @@ function entryBundleBudget(): Plugin {
 
 export default defineConfig({
   plugins: [svelte(), devManifest(), entryBundleBudget()],
+  // The tab-switch perf harness (src/lib/perf) compiles in only on request;
+  // every other build tree-shakes it out.
+  define: { __CHIMAERA_PERF__: JSON.stringify(process.env.CHIMAERA_PERF === "1") },
   build: {
     outDir: "dist",
   },

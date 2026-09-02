@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount, tick, untrack } from "svelte";
+  import { runStallDrive, stallDriveSpec } from "./lib/perf/tabSwitchDrive";
   import {
     ApiError,
     getActiveWorkspaceId,
@@ -2038,6 +2039,20 @@
     layoutReady = true;
     pruneAndAutoOpen();
     pruneDeadFiles();
+    if (__CHIMAERA_PERF__) {
+      const spec = stallDriveSpec();
+      if (spec !== null) {
+        void runStallDrive(
+          {
+            get: () => layout,
+            set: (next) => {
+              layout = next;
+            },
+          },
+          spec,
+        );
+      }
+    }
   }
 
   /** Drop restored file tabs whose files are definitively gone (400/404);
@@ -4622,19 +4637,20 @@
       </div>
     </aside>
 
-    {#if !layout.focusMode}
-      <!-- Sidebar width handle: a quiet vertical splitter on the rail's edge. -->
-      <div
-        class="rail-resize"
-        class:active={railDividerActive}
-        role="separator"
-        aria-orientation="vertical"
-        aria-label="resize sidebar"
-        title="drag to resize · double-click to reset"
-        onpointerdown={onRailResizeDown}
-        ondblclick={resetRailWidth}
-      ></div>
-    {/if}
+    <!-- Sidebar width handle: a quiet vertical splitter on the rail's edge.
+         Hidden, not unmounted, in focus mode: inserting a sibling ahead of
+         the stage makes WebKit re-resolve every parked document in it. -->
+    <div
+      class="rail-resize"
+      class:active={railDividerActive}
+      hidden={layout.focusMode}
+      role="separator"
+      aria-orientation="vertical"
+      aria-label="resize sidebar"
+      title="drag to resize · double-click to reset"
+      onpointerdown={onRailResizeDown}
+      ondblclick={resetRailWidth}
+    ></div>
 
     <main class="stage" bind:this={stageEl}>
       {#if layoutReady}

@@ -198,8 +198,10 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   preserving its socket and scrollback. A shared, LRU-capped content store
   (`previews/fileStore.svelte.ts`, keyed by path) additionally caches the *bytes* so re-opening a
   view the live-set evicted re-renders warm rather than re-fetching.
-- **Where it lives.** `layout/Pane.svelte` (the live-set — renders active + recently-visited tabs,
-  inactive ones `visibility:hidden` + `inert`); `previews/fileStore.svelte.ts` (`FileEntry`,
+- **Where it lives.** `layout/Pane.svelte` (one persistent layer per tab; the live-set decides which
+  hold a mounted view; parked layers are `opacity:0` + `inert`, dormant — `visibility:hidden` — after
+  30 s, and each layer starts and ends with a selectable 1px image, the "selection stop");
+  `previews/fileStore.svelte.ts` (`FileEntry`,
   `retain`/`release`/`noteWrite`); every `*View.svelte`. The store subscribes to
   `workspace/fsEvents.ts` (`fsEpoch`/`lastFsMutation`) + `workspace/git.ts` (`gitStatus`) +
   `workspace/diskWatch.ts`; the daemon half is `chimaera-server/src/fs_watch.rs` on `/ws/events`.
@@ -210,6 +212,23 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   WebGL renderers attached. Inactive chat tabs freeze their bounded transcript snapshot while the
   pooled reducer/socket continues; historical artifact previews load only near the viewport, and
   initial journal hydration mounts from the newest end once instead of painting oldest-to-newest.
+- **Parking is opacity + inert, one layer per tab, fenced by selection stops.** Parked layers
+  never hide with `visibility:hidden`, `display:none`, `pointer-events`, `user-select` or a
+  `z-index` on the shown one — every one of those inherits (WebKit re-resolves and re-shapes the
+  whole parked subtree per switch) or traps a view's `position:fixed` overlay; a switch never
+  inserts a sibling into the pane (positional selectors would re-resolve every parked document);
+  a layer that parks releases DOM focus and selection (a caret left in an inert subtree is
+  re-canonicalized through the whole parked document on every rendering commit); the selectable
+  1px image at each end of a layer is where WebKit's editor-state caret walk ends instead of
+  crossing every parked node (its empty alt keeps it out of copied text; parked text is inert,
+  hence unselectable and never copied); and a layer parked for 30 s goes dormant
+  (`visibility:hidden`, from idle time), which returns the backing stores WebKit keeps for a
+  transparent scroller — the reveal of a dormant layer pays that subtree's restyle once, a quick
+  switch-back never does. `inert` inherits too: a switch restyles the two switched layers' subtrees,
+  never a bystander's. The terminal pool keeps xterm's `<style>` sheets out of
+  the re-parented element for the same reason (see [terminals](terminals.md)). The measurements
+  and the harness: [field notes](../history/field-notes.md#the-tab-switch-stall-reproduced-and-fixed-without-screen-control-2026-09-02-safari-harness),
+  `scripts/perf/tab-switch/`.
   `chatPool` keeps the reducer/socket and view cursor warm if a view is eventually evicted or moved.
   Live-on-disk update is **mounted-path-scoped**, not Git-gated:
   each events
