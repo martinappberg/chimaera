@@ -126,16 +126,20 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
     line the selection doesn't touch, images/task-checkboxes/rules rendered as widgets
     (clicking a checkbox edits the source), blockquotes drawn as the shared quote card, and
     a small always-visible copy affordance on each fence line and quote card. **Equations**
-    — `$…$` and `$$…$$`, Obsidian's dollar dialect (GitHub's `` $`…`$ `` / ```` ```math ````
-    forms and Codex's `\(`/`\[` are not recognized in files) — typeset as KaTeX widgets, a
-    `$$` block spanning lines as one widget; click one, or move the cursor onto its lines,
-    and the LaTeX shows as mono source. A line opening with `$$` starts a **block** whose
-    lines are raw until one ends in `$$` (so a continuation line like `+ \left(1-w\right)`
-    can't become a bullet list, and an unclosed block runs to the end like a fence); the
-    server mirrors that by promoting such blocks to comrak's ```` ```math ```` fence
-    (`fs.rs` `promote_math_blocks`). `mdMath.ts` is the parser extension; its delimiter
-    rules mirror comrak's `math_dollars` so live and reading agree on what is math (`$5 and
-    $10` stays currency, while `$HOME/$USER` in prose becomes math — as on GitHub).
+    — `$…$` and `$$…$$`, Obsidian's dollar dialect, plus GitHub's ```` ```math ```` fence
+    (the same block under another name; `` $`…`$ `` and Codex's `\(`/`\[` are not recognized
+    in files) — typeset as KaTeX widgets; click one, or move the cursor onto its lines, and
+    the LaTeX shows as mono source. A line opening with `$$` starts a **block** whose lines
+    are raw until the first later line containing `$$` (so a continuation line like
+    `+ \left(1-w\right)` can't become a bullet list), but only when that closer is in sight
+    before the next blank line: prose that merely starts with `$$` stays prose, and a slip
+    costs at most a paragraph. The server mirrors the block rule by promoting such blocks to
+    comrak's math fence before parsing (`fs.rs` `promote_math_blocks`) and hands every
+    equation over as the same `span`; being a line pass, it reads a block inside a list item
+    indented four columns or more as code, where the editor still renders it. `mdMath.ts` is
+    the parser extension; its delimiter rules mirror comrak's `math_dollars` so live and
+    reading agree on what is math (`$5 and $10` stays currency, while `$HOME/$USER` in prose
+    becomes math — as on GitHub).
     Tables/raw HTML/frontmatter stay as mono source (the full render lives in reading, which
     is also where table-cell math typesets), and so does any construct the decorator can't
     render faithfully (reference links, multi-line image syntax). Mod+click follows links;

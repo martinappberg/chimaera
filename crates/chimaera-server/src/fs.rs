@@ -782,138 +782,323 @@ fn render_markdown(raw: &str) -> anyhow::Result<String> {
     Ok(sanitize_markdown(&markdown_to_html(&text)))
 }
 
-/// Promote `$$` BLOCKS — a line whose content opens with `$$` (not `$$$`,
-/// no closing `$$` later on it; indent ≤ 3, optional `>` quote prefix),
-/// closed by the first later line ENDING in `$$` — to comrak's ```math fence
-/// before parsing. comrak's dollar math is inline-only: it pairs within one
-/// paragraph, so an equation wrapped as `+ \left(1-w\right)…` on its second
-/// line is cut by the bullet list that line starts. The fence keeps the
-/// interior raw, exactly what the live editor's block parser does
-/// (`previews/mdMath.ts` — keep the two in lockstep: single-line `$$…$$`
-/// stays inline, list items are left alone, fenced code passes through, an
-/// unterminated block runs to the end like a fence).
+/// Promote `$$` BLOCKS to comrak's ```math fence before parsing. comrak's
+/// dollar math is inline-only — it pairs within one paragraph — so an
+/// equation wrapped as `+ \left(1-w\right)…` on its second line is cut by
+/// the bullet list that line starts. The fence keeps the interior raw,
+/// exactly what the live editor's block parser does (`previews/mdMath.ts`
+/// owns the grammar — keep this pass in lockstep with it):
+///
+/// - a line whose content (after ≤ 3 spaces and any `>` quote prefix) opens
+///   with `$$` — not `$$$`, no closing `$$` later on it — opens a block only
+///   when a CLOSER IS IN SIGHT: a later line containing `$$`, before the next
+///   blank line, at the same quote depth. Prose that merely begins with `$$`
+///   stays prose, and a slip costs at most a paragraph, never the document;
+/// - the first such line closes it; text after its `$$` becomes the next
+///   line of prose;
+/// - the block keeps the opener's quote prefix and indentation, so one
+///   inside a list item stays inside the item;
+/// - fenced code, raw-HTML blocks (to their next blank line) and a leading
+///   YAML frontmatter block pass through untouched;
+/// - a lone `$$` line closing display math opened earlier in its paragraph
+///   (an odd `$$` count so far) is left to inline pairing.
+///
+/// A line pass has no container model: a `$$` block in a list item whose
+/// content column is 4+ (`10. `, nested lists) reads as indented code here
+/// while the editor, which knows the column, still renders it.
 fn promote_math_blocks(text: &str) -> Cow<'_, str> {
     if !text.contains("$$") {
         return Cow::Borrowed(text);
     }
-    /// Leading `(\s{0,3}>\s?)*` — the blockquote prefix a block keeps.
-    fn quote_prefix(line: &str) -> usize {
-        let b = line.as_bytes();
-        let mut i = 0;
+    fn body(line: &str) -> &str {
+        line.trim_end_matches('\n').trim_end_matches('\r')
+    }
+    /// The blockquote prefix `( {0,3}> ?)*`: its depth and byte length.
+    fn quote_prefix(s: &str) -> (usize, usize) {
+        let b = s.as_bytes();
+        let (mut depth, mut i) = (0, 0);
         loop {
             let mut j = i;
-            let mut spaces = 0;
-            while j < b.len() && b[j] == b' ' && spaces < 3 {
+            while j < b.len() && b[j] == b' ' && j - i < 3 {
                 j += 1;
-                spaces += 1;
             }
             if j < b.len() && b[j] == b'>' {
                 j += 1;
-                if j < b.len() && b[j] == b' ' {
+                if j < b.len() && (b[j] == b' ' || b[j] == b'\t') {
                     j += 1;
                 }
+                depth += 1;
                 i = j;
             } else {
-                return i;
+                return (depth, i);
             }
         }
     }
-    /// A fence opener (```/~~~ after ≤ 3 spaces): its char and length.
+    /// A fence opener (```/~~~): its char and length.
     fn fence(content: &str) -> Option<(u8, usize)> {
-        let t = content.trim_start_matches(' ');
-        if content.len() - t.len() > 3 {
-            return None;
-        }
-        let ch = *t.as_bytes().first()?;
+        let ch = *content.as_bytes().first()?;
         if ch != b'`' && ch != b'~' {
             return None;
         }
-        let len = t.bytes().take_while(|&c| c == ch).count();
+        let len = content.bytes().take_while(|&c| c == ch).count();
         (len >= 3).then_some((ch, len))
     }
-    /// The text after `$$` when the line opens a block.
+    fn closes_fence(content: &str, ch: u8, len: usize) -> bool {
+        let run = content.bytes().take_while(|&c| c == ch).count();
+        run >= len && content[run..].trim().is_empty()
+    }
+    /// The text after `$$` when the line's content opens a block.
     fn opener(content: &str) -> Option<&str> {
-        let t = content.trim_start_matches(' ');
-        if content.len() - t.len() > 3 {
-            return None;
+        let rest = content.strip_prefix("$$")?;
+        (!rest.starts_with('$') && !rest.contains("$$")).then_some(rest)
+    }
+    fn starts_html_block(content: &str) -> bool {
+        content.starts_with('<')
+            && content[1..]
+                .bytes()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == b'/' || c == b'!' || c == b'?')
+    }
+    /// A list marker (`- `, `+ `, `* `, `1. `, `1) `): its byte length and
+    /// the item's text after it.
+    fn after_list_marker(content: &str) -> Option<(usize, &str)> {
+        let b = content.as_bytes();
+        let n = match b.first()? {
+            b'-' | b'*' | b'+' => 1,
+            c if c.is_ascii_digit() => {
+                let n = b.iter().take_while(|c| c.is_ascii_digit()).count();
+                if !matches!(b.get(n), Some(b'.' | b')')) {
+                    return None;
+                }
+                n + 1
+            }
+            _ => return None,
+        };
+        (b.get(n) == Some(&b' ')).then(|| (n + 1, &content[n + 1..]))
+    }
+    /// A heading, thematic break or table row: a block of its own, ending
+    /// any paragraph without contributing to one.
+    fn ends_paragraph(content: &str) -> bool {
+        let b = content.as_bytes();
+        match b.first() {
+            Some(b'#') => b.get(1).is_none_or(|&c| c == b' ' || c == b'#'),
+            Some(b'|') => true,
+            Some(&c @ (b'-' | b'*' | b'_')) => {
+                content.bytes().filter(|&x| x != b' ').all(|x| x == c)
+                    && content.bytes().filter(|&x| x == c).count() >= 3
+            }
+            _ => false,
         }
-        let rest = t.strip_prefix("$$")?;
-        if rest.starts_with('$') || rest.contains("$$") {
-            return None;
+    }
+    /// `$$` delimiters in a line: pairs not part of a longer run (`$$$` is
+    /// text) and outside backtick code spans — the editor's `countDollarPairs`.
+    fn dollar_pairs(content: &str) -> usize {
+        let mut n = 0;
+        let mut in_code = false;
+        let b = content.as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            match b[i] {
+                b'`' => in_code = !in_code,
+                b'$' if !in_code => {
+                    let run = b[i..].iter().take_while(|&&c| c == b'$').count();
+                    if run == 2 {
+                        n += 1;
+                    }
+                    i += run;
+                    continue;
+                }
+                _ => {}
+            }
+            i += 1;
         }
-        Some(rest)
+        n
     }
 
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
     let mut out = String::with_capacity(text.len() + 32);
-    let mut in_fence: Option<(u8, usize)> = None;
-    let mut in_math: Option<&str> = None; // the opener's quote prefix
-                                          // `$$` tokens seen in the current paragraph: an odd count means inline
-                                          // display math is open, and a lone `$$` line then CLOSES it (`so $$\n
-                                          // x\n$$` is one display equation) rather than opening a block.
-    let mut para_dollars = 0usize;
-    for line in text.split_inclusive('\n') {
-        let body = line.trim_end_matches('\n').trim_end_matches('\r');
-        let (prefix, content) = body.split_at(quote_prefix(body));
-        if let Some(p) = in_math {
-            let trimmed = content.trim_end();
-            if let Some(before) = trimmed.strip_suffix("$$") {
-                if !before.trim().is_empty() {
-                    out.push_str(prefix);
-                    out.push_str(before);
-                    out.push('\n');
-                }
-                out.push_str(p);
-                out.push_str("```\n");
-                in_math = None;
-            } else {
-                out.push_str(line);
-            }
-            continue;
+    let mut i = 0;
+    // A leading `---` frontmatter block is metadata, never math (the editor
+    // gates on the same shape).
+    if lines.first().is_some_and(|l| body(l) == "---") {
+        if let Some(close) = lines
+            .iter()
+            .skip(1)
+            .take(200)
+            .position(|l| body(l) == "---")
+        {
+            i = close + 2;
+            out.extend(lines[..i].iter().copied());
         }
+    }
+    let mut in_fence: Option<(u8, usize)> = None;
+    let mut in_html = false;
+    let mut para_dollars = 0usize;
+    let mut para_depth = 0usize;
+    while i < lines.len() {
+        let line = lines[i];
+        let b = body(line);
+        let (depth, pe) = quote_prefix(b);
+        let after_quote = &b[pe..];
+        let content = after_quote.trim_start_matches([' ', '\t']);
+        // Columns, the way CommonMark counts them: a tab is four.
+        let indent = after_quote[..after_quote.len() - content.len()]
+            .bytes()
+            .map(|c| if c == b'\t' { 4 } else { 1 })
+            .sum::<usize>();
         if let Some((ch, len)) = in_fence {
-            let t = content.trim_start_matches(' ');
-            let run = t.bytes().take_while(|&c| c == ch).count();
-            if run >= len && t[run..].trim().is_empty() {
+            if indent <= 3 && closes_fence(content, ch, len) {
                 in_fence = None;
             }
             out.push_str(line);
+            i += 1;
             continue;
         }
         if content.trim().is_empty() {
+            in_html = false;
             para_dollars = 0;
             out.push_str(line);
+            i += 1;
             continue;
         }
-        if let Some(f) = fence(content) {
-            in_fence = Some(f);
-            para_dollars = 0;
+        if in_html {
             out.push_str(line);
+            i += 1;
             continue;
         }
-        if para_dollars % 2 == 0 {
-            if let Some(rest) = opener(content) {
-                out.push_str(prefix);
-                out.push_str("```math\n");
-                if !rest.trim().is_empty() {
-                    out.push_str(prefix);
-                    out.push_str(rest);
-                    out.push('\n');
-                }
-                in_math = Some(prefix);
+        if indent <= 3 {
+            // A fence may sit on a list item's marker line (`- ```` … `  ````).
+            if let Some(f) = fence(after_list_marker(content).map_or(content, |(_, rest)| rest)) {
+                in_fence = Some(f);
+                para_dollars = 0;
+                out.push_str(line);
+                i += 1;
+                continue;
+            }
+            if starts_html_block(content) {
+                in_html = true;
+                para_dollars = 0;
+                out.push_str(line);
+                i += 1;
                 continue;
             }
         }
-        para_dollars += content.matches("$$").count();
+        if depth != para_depth {
+            para_dollars = 0;
+            para_depth = depth;
+        }
+        if indent <= 3 && ends_paragraph(content) {
+            para_dollars = 0;
+            out.push_str(line);
+            i += 1;
+            continue;
+        }
+        // A list item's paragraph starts after its marker; a block opened on
+        // the marker line keeps the marker and indents its body to the item.
+        let (text, open_prefix, body_prefix) =
+            match (indent <= 3).then(|| after_list_marker(content)).flatten() {
+                Some((m, rest)) => {
+                    para_dollars = 0;
+                    (
+                        rest,
+                        b[..pe + indent + m].to_string(),
+                        format!("{}{}", &b[..pe + indent], " ".repeat(m)),
+                    )
+                }
+                None => (
+                    content,
+                    b[..pe + indent].to_string(),
+                    b[..pe + indent].to_string(),
+                ),
+            };
+        if indent <= 3 && para_dollars % 2 == 0 {
+            if let Some(rest) = opener(text) {
+                // The closer in sight: before the next blank line, at this depth.
+                let mut closer = None;
+                for (j, l) in lines.iter().enumerate().skip(i + 1) {
+                    let bj = body(l);
+                    let (dj, pj) = quote_prefix(bj);
+                    if bj[pj..].trim().is_empty() || dj < depth {
+                        break;
+                    }
+                    if let Some(k) = bj[pj..].find("$$") {
+                        closer = Some((j, pj + k));
+                        break;
+                    }
+                }
+                if let Some((j, k)) = closer {
+                    out.push_str(&open_prefix);
+                    out.push_str("```math\n");
+                    if !rest.trim().is_empty() {
+                        out.push_str(&body_prefix);
+                        out.push_str(rest);
+                        out.push('\n');
+                    }
+                    out.extend(lines[i + 1..j].iter().copied());
+                    let bj = body(lines[j]);
+                    let (before, after) = (&bj[..k], &bj[k + 2..]);
+                    if !before[quote_prefix(before).1..].trim().is_empty() {
+                        out.push_str(before);
+                        out.push('\n');
+                    }
+                    out.push_str(&body_prefix);
+                    out.push_str("```\n");
+                    if !after.trim().is_empty() {
+                        out.push_str(&bj[..quote_prefix(bj).1]);
+                        out.push_str(after.trim_start());
+                        out.push('\n');
+                    }
+                    i = j + 1;
+                    para_dollars = 0;
+                    continue;
+                }
+            }
+        }
+        para_dollars += dollar_pairs(text);
         out.push_str(line);
+        i += 1;
     }
     Cow::Owned(out)
 }
 
+/// comrak renders a ```math fence — every promoted `$$` block, and a
+/// hand-written GitHub one — as `<pre><code class="language-math"
+/// data-math-style="display">`. The client keys on the SAME `<span
+/// data-math-style>` shape for every equation, so the fence chrome is
+/// rewritten to it here; the literal inside is already HTML-escaped, so the
+/// closing tags cannot occur within it.
+fn math_fences_to_spans(html: &str) -> Cow<'_, str> {
+    const OPEN: &str = "<pre><code class=\"language-math\" data-math-style=\"display\">";
+    const CLOSE: &str = "</code></pre>";
+    if !html.contains(OPEN) {
+        return Cow::Borrowed(html);
+    }
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    while let Some(i) = rest.find(OPEN) {
+        out.push_str(&rest[..i]);
+        rest = &rest[i + OPEN.len()..];
+        out.push_str("<p><span data-math-style=\"display\">");
+        match rest.find(CLOSE) {
+            Some(j) => {
+                out.push_str(&rest[..j]);
+                out.push_str("</span></p>");
+                rest = &rest[j + CLOSE.len()..];
+            }
+            None => {
+                out.push_str(rest);
+                rest = "";
+            }
+        }
+    }
+    out.push_str(rest);
+    Cow::Owned(out)
+}
+
 /// comrak with the GFM extensions the reading view promises, plus `$…$` /
-/// `$$…$$` math emitted as `<span data-math-style>` LaTeX literals and `$$`
-/// blocks (promoted to ```math fences) as `<pre><code data-math-style>` —
-/// never typeset here; the client owns KaTeX. Raw HTML passes through for
-/// ammonia to judge.
+/// `$$…$$` math — inline, promoted `$$` blocks and ```math fences alike —
+/// emitted as `<span data-math-style>` LaTeX literals, never typeset here;
+/// the client owns KaTeX. Raw HTML passes through for ammonia to judge.
 fn markdown_to_html(text: &str) -> String {
     let text = promote_math_blocks(text);
     let mut options = comrak::Options::default();
@@ -925,19 +1110,17 @@ fn markdown_to_html(text: &str) -> String {
     options.extension.math_dollars = true;
     // Let raw HTML through comrak; ammonia strips anything dangerous.
     options.render.r#unsafe = true;
-    comrak::markdown_to_html(&text, &options)
+    math_fences_to_spans(&comrak::markdown_to_html(&text, &options)).into_owned()
 }
 
 /// ammonia's defaults, widened by exactly one attribute: `data-math-style` on
-/// `span` (inline math) and `code` (a promoted `$$` block's fence), the
-/// marker the client's typesetter keys on. Its value is inert (a style name)
-/// and the element's text is LaTeX the client renders with KaTeX trust off,
-/// so a hand-written `<span data-math-style>` in a document can do no more
-/// than `$$` can.
+/// `span`, the marker the client's typesetter keys on. Its value is inert (a
+/// style name) and the span's text is LaTeX the client renders with KaTeX
+/// trust off, so a hand-written `<span data-math-style>` in a document can do
+/// no more than `$$` can.
 fn sanitize_markdown(html: &str) -> String {
     ammonia::Builder::default()
         .add_tag_attributes("span", &["data-math-style"])
-        .add_tag_attributes("code", &["data-math-style"])
         .clean(html)
         .to_string()
 }
@@ -947,7 +1130,7 @@ mod markdown_tests {
     use super::*;
 
     #[test]
-    fn dollar_block_with_a_list_like_line_survives_as_a_math_fence() {
+    fn dollar_block_with_a_list_like_line_renders_as_one_equation() {
         // The reported case: `+ \left(…` starts a bullet list, cutting the
         // paragraph comrak's inline `$$` would have paired within.
         let src = "Then\n\n$$ E = \\frac{a}{b}\n+ \\left(1-w\\right) . $$\n\nafter\n";
@@ -957,42 +1140,63 @@ mod markdown_tests {
         );
         let html = sanitize_markdown(&markdown_to_html(src));
         assert!(
-            html.contains("<code data-math-style=\"display\"> E = \\frac{a}{b}\n+ \\left(1-w\\right) . \n</code>"),
+            html.contains(
+                "<p><span data-math-style=\"display\"> E = \\frac{a}{b}\n+ \\left(1-w\\right) . \n</span></p>"
+            ),
             "{html}"
         );
-        assert!(!html.contains("<li>"), "{html}");
+        assert!(!html.contains("<li>") && !html.contains("<pre>"), "{html}");
+        // GitHub's ```math fence is the same block under another name.
+        let html = sanitize_markdown(&markdown_to_html("```math\nx^2\n```\n"));
+        assert!(
+            html.contains("<p><span data-math-style=\"display\">x^2\n</span></p>"),
+            "{html}"
+        );
     }
 
     #[test]
     fn dollar_block_rules_mirror_the_live_parser() {
-        // Single-line display stays inline; `$$$` is text; list items are
-        // left alone; fenced code passes through; a quote keeps its prefix;
-        // an unterminated block runs to the end.
-        assert_eq!(promote_math_blocks("$$x$$\n"), "$$x$$\n");
-        assert_eq!(promote_math_blocks("$$$\nx\n$$$\n"), "$$$\nx\n$$$\n");
-        assert_eq!(
-            promote_math_blocks("- $$\n  x\n  $$\n"),
-            "- $$\n  x\n  $$\n"
+        // One case per rule in mdMath.ts's block grammar (and its tests).
+        let same = |s: &str| assert_eq!(promote_math_blocks(s), s, "{s:?}");
+        same("$$x$$\n"); // single-line display stays inline
+        same("$$$\nx\n$$$\n"); // three dollars are text
+        same("```\n$$\nx\n$$\n```\n"); // fenced code passes through
+        same("- ```\n  $$\n  x\n  $$\n  ```\n"); // …also on a list-marker line
+        same("<div>\n$$\nx\n$$\n</div>\n"); // raw HTML passes through
+        same("$$ is the shell's PID\n\nnext\n"); // no closer in sight: prose
+        same("$$\nx\n\ny\n"); // …a blank line ends the search
+        same("> $$\nx\n$$\n"); // a lazy quote is left to inline pairing
+        same("so $$\nx\n$$\n"); // a lone `$$` closes display math opened mid-line
+        same("so $$\nx\n$$\nthen $$y$$\n");
+        let promoted = |s: &str, want: &str| assert_eq!(promote_math_blocks(s), want, "{s:?}");
+        promoted(
+            "prose\n$$\nx\n$$\nafter\n",
+            "prose\n```math\nx\n```\nafter\n",
         );
-        assert_eq!(
-            promote_math_blocks("```\n$$\nx\n$$\n```\n"),
-            "```\n$$\nx\n$$\n```\n"
+        promoted("$$\nx\n$$ so on.\n", "```math\nx\n```\nso on.\n"); // trailing text stays prose
+        promoted("$$\nx\n$$.\n", "```math\nx\n```\n.\n");
+        promoted("> $$\n> x\n> $$\n", "> ```math\n> x\n> ```\n");
+        promoted(
+            ">\t$$ a\n>\t+ b $$\n",
+            ">\t```math\n>\t a\n>\t+ b \n>\t```\n",
+        ); // tab after `>`
+        promoted(
+            "- item\n\n  $$\n  x\n  $$\n- next\n",
+            "- item\n\n  ```math\n  x\n  ```\n- next\n",
+        ); // indentation kept: the block stays in its item
+        promoted(
+            "1. First\n   $$\n   x\n   $$\n2. Second\n",
+            "1. First\n   ```math\n   x\n   ```\n2. Second\n",
         );
-        assert_eq!(
-            promote_math_blocks("> $$\n> x\n> $$\n"),
-            "> ```math\n> x\n> ```\n"
-        );
-        assert_eq!(promote_math_blocks("$$\nx\n\ny"), "```math\nx\n\ny");
-        // A lone `$$` line closing display math opened mid-line stays inline.
-        assert_eq!(promote_math_blocks("so $$\nx\n$$\n"), "so $$\nx\n$$\n");
-        assert_eq!(
-            promote_math_blocks("so $$x$$ then\n$$\ny\n$$\n"),
-            "so $$x$$ then\n```math\ny\n```\n"
-        );
-        assert_eq!(
-            promote_math_blocks("prose\n$$\nx\n$$\nafter\n"),
-            "prose\n```math\nx\n```\nafter\n"
-        );
+        promoted(
+            "Use `$$` for math:\n$$\nx\n$$\n",
+            "Use `$$` for math:\n```math\nx\n```\n",
+        ); // a code span's `$$` is not an opener
+        promoted("## Using $$\n$$\nx\n$$\n", "## Using $$\n```math\nx\n```\n"); // a heading's `$$` does not leak into the next paragraph
+        promoted(
+            "---\ntitle: $$\n---\n$$\nx\n$$\n",
+            "---\ntitle: $$\n---\n```math\nx\n```\n",
+        ); // frontmatter is metadata
     }
 
     #[test]
@@ -1004,9 +1208,10 @@ mod markdown_tests {
             html.contains(r#"<span data-math-style="inline">a&lt;b</span>"#),
             "{html}"
         );
-        // A `$$` block is promoted to a math fence: <pre><code>, not a span.
+        // A `$$` block is promoted to a math fence, then handed over as the
+        // same span every equation uses.
         assert!(
-            html.contains("<code data-math-style=\"display\">x^2\n</code>"),
+            html.contains("<p><span data-math-style=\"display\">x^2\n</span></p>"),
             "{html}"
         );
         assert!(!html.contains("<script"), "{html}");

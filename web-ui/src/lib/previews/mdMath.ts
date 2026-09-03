@@ -17,15 +17,29 @@
  *
  * BLOCK (Obsidian's / GitHub's `$$` block, which the server promotes to a
  * ```math fence before comrak — `fs.rs::promote_math_blocks`, keep the two
- * in lockstep): a line whose content starts with `$$` (not `$$$`) and has no
- * closing `$$` later on it opens a block; the first later line ENDING in
- * `$$` closes it; the interior is raw. Without this, an equation wrapped as
- * `+ \left(…\right)` on its second line would be cut by the bullet list that
- * line starts. Blocks open inside blockquotes but not list items (the
- * server's line pass can't see list nesting), and an unterminated block
- * runs to the end of the document, as a fence does.
+ * in lockstep): a line whose content starts with `$$` (not `$$$`) with no
+ * closing `$$` later on it opens a block, PROVIDED a closer is in sight — a
+ * later line containing `$$` before the next blank line. The first such
+ * line closes it (text after the closer stays outside); the interior is
+ * raw. Without this, an equation wrapped as `+ \left(…\right)` on its
+ * second line would be cut by the bullet list that line starts. Requiring
+ * the closer keeps a slip cheap: prose that merely begins with `$$` (`$$ is
+ * the shell's PID`) stays prose, and a block can never swallow more than
+ * the paragraph it sits in. A lone `$$` line never interrupts a paragraph
+ * whose display math is still open (an odd `$$` count), so `so $$` ⏎ `x`
+ * ⏎ `$$` is one inline display equation. GitHub's ```math fence is the
+ * same thing under another name and typesets too (mdLive treats it as a
+ * block; the server already renders it as one).
  */
-import type { BlockContext, InlineContext, Line, MarkdownConfig } from "@lezer/markdown";
+import type { Input } from "@lezer/common";
+import type {
+  BlockContext,
+  InlineContext,
+  LeafBlock,
+  LeafBlockParser,
+  Line,
+  MarkdownConfig,
+} from "@lezer/markdown";
 
 const DOLLAR = 36; // "$"
 const BACKSLASH = 92; // "\"
@@ -83,13 +97,84 @@ function opensMathBlock(line: Line): boolean {
 
 /** `Line.depth` — how many enclosing containers the line still sits in — is
  *  what lezer's own fenced-code parser stops on when a block leaves its
- *  blockquote, but its typings leave it out. */
+ *  blockquote, but its typings leave it out. Likewise `input`: the raw
+ *  document, which the look-ahead below reads without consuming lines. */
 function lineDepth(line: Line): number {
   return (line as unknown as { depth: number }).depth;
 }
 
-function inListItem(cx: BlockContext): boolean {
-  return cx.parentType().name === "ListItem";
+function rawInput(cx: BlockContext): Input {
+  return (cx as unknown as { input: Input }).input;
+}
+
+const LOOKAHEAD = 1 << 16;
+
+/** Whether a closer is in sight: a later line containing `$$` before the
+ *  next blank line. Reads the raw input (quote markers stripped loosely), so
+ *  it can disagree with the consuming loop's exact container rules — only
+ *  ever toward a block that ends unclosed at that blank line, which then
+ *  shows as source. Never toward swallowing the document. */
+function closerAhead(cx: BlockContext, line: Line): boolean {
+  const input = rawInput(cx);
+  const from = cx.lineStart + line.text.length + 1;
+  if (from >= input.length) return false;
+  const text = input.read(from, Math.min(input.length, from + LOOKAHEAD));
+  // Lines that leave the enclosing blockquote(s) end the block, as a fence's
+  // do — a lazily continued quote is left to inline pairing (the reading
+  // render's comrak does the same). The depth comes from the context: the
+  // opener's own `>` is a node, not one of `line.markers`.
+  let quoteDepth = 0;
+  for (let d = 0; d < cx.depth; d++) if (cx.parentType(d).name === "Blockquote") quoteDepth++;
+  for (const raw of text.split("\n")) {
+    const stripped = raw.replace(/^(?: {0,3}>[ \t]?)*/, "");
+    const depth = (raw.length - stripped.length && raw.slice(0, raw.length - stripped.length).split(">").length - 1) || 0;
+    const t = stripped.trim();
+    if (t.length === 0 || depth < quoteDepth) return false;
+    if (t.includes("$$")) return true;
+  }
+  return false;
+}
+
+/** `$$` delimiters in a run of text: pairs not part of a longer dollar run
+ *  (`$$$` is text) and not inside a backtick code span (backticks win). The
+ *  parity of this count says whether display math is open. */
+export function countDollarPairs(text: string): number {
+  let n = 0;
+  const bare = text.replace(/`+[^`]*`+/g, "");
+  for (let i = bare.indexOf("$$"); i >= 0; i = bare.indexOf("$$", i + 2)) {
+    if (bare[i - 1] === "$" || bare[i + 2] === "$") {
+      // a longer run: skip the whole run
+      let j = i;
+      while (bare[j] === "$") j++;
+      i = j - 2;
+      continue;
+    }
+    n++;
+  }
+  return n;
+}
+
+/** Tracks, per line as the paragraph grows, whether its display math is
+ *  open — so `endLeaf` reads one flag instead of re-scanning the whole
+ *  paragraph on every `$$` line (a paragraph of thousands of `$$` lines
+ *  would otherwise go quadratic inside one parse step). */
+class DollarParity implements LeafBlockParser {
+  odd: boolean;
+  constructor(firstLine: string) {
+    this.odd = countDollarPairs(firstLine) % 2 === 1;
+  }
+  nextLine(_cx: BlockContext, line: Line): boolean {
+    if (countDollarPairs(line.text.slice(line.pos)) % 2 === 1) this.odd = !this.odd;
+    return false;
+  }
+  finish(): boolean {
+    return false;
+  }
+}
+
+function displayMathOpen(leaf: LeafBlock): boolean {
+  const p = leaf.parsers.find((x) => x instanceof DollarParity);
+  return p instanceof DollarParity && p.odd;
 }
 
 /** Syntax-tree math: `InlineMath` (`$…$`), `DisplayMath` (`$$…$$` within a
@@ -110,19 +195,24 @@ export const mathExtension: MarkdownConfig = {
     {
       name: "MathBlock",
       parse(cx, line) {
-        if (!opensMathBlock(line) || inListItem(cx)) return false;
+        if (!opensMathBlock(line) || !closerAhead(cx, line)) return false;
         const from = cx.lineStart + line.pos;
         const marks = [cx.elt("MathMark", from, from + 2)];
+        let end = -1;
         while (cx.nextLine() && lineDepth(line) >= cx.depth) {
+          // A blank line means the look-ahead and the container rules
+          // disagreed: end here, unclosed (shown as source), never beyond.
+          if (line.pos === line.text.length) break;
           for (const m of line.markers) marks.push(m);
-          const end = line.text.trimEnd().length;
-          if (end - 2 >= line.pos && line.text.startsWith("$$", end - 2)) {
-            marks.push(cx.elt("MathMark", cx.lineStart + end - 2, cx.lineStart + end));
+          const i = line.text.indexOf("$$", line.pos);
+          if (i >= 0) {
+            marks.push(cx.elt("MathMark", cx.lineStart + i, cx.lineStart + i + 2));
+            end = cx.lineStart + i + 2;
             cx.nextLine();
             break;
           }
         }
-        cx.addElement(cx.elt("MathBlock", from, cx.prevLineEnd(), marks));
+        cx.addElement(cx.elt("MathBlock", from, end >= 0 ? end : cx.prevLineEnd(), marks));
         return true;
       },
       // A `$$` line interrupts a paragraph (a fence does too), so
@@ -130,8 +220,10 @@ export const mathExtension: MarkdownConfig = {
       // the paragraph has display math OPEN (an odd count of `$$`): then the
       // lone `$$` closes it, and `so $$\nx\n$$` is one display equation.
       endLeaf(cx, line, leaf) {
-        if (!opensMathBlock(line) || inListItem(cx)) return false;
-        return (leaf.content.match(/\$\$/g) ?? []).length % 2 === 0;
+        return opensMathBlock(line) && !displayMathOpen(leaf) && closerAhead(cx, line);
+      },
+      leaf(_cx, leaf) {
+        return new DollarParity(leaf.content);
       },
     },
   ],
