@@ -1,6 +1,5 @@
 <script lang="ts">
-  import DOMPurify from "dompurify";
-  import { renderMath } from "./math";
+  import { safeMathHtml } from "./math";
 
   interface Props {
     source: string;
@@ -10,12 +9,7 @@
   let { source, display = false }: Props = $props();
   // User text is local input, but replayed transcript content still crosses a
   // wire/storage boundary. Keep it under the same sanitizer as agent math.
-  const html = $derived(
-    DOMPurify.sanitize(renderMath(source, display), {
-      FORBID_TAGS: ["style"],
-      FORBID_ATTR: ["style"],
-    }),
-  );
+  const html = $derived(safeMathHtml(source, display));
 </script>
 
 <span class="math-text" class:display>{@html html}</span>

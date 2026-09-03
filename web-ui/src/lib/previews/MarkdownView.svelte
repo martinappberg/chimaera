@@ -4,9 +4,10 @@
    *
    * LIVE (the default) is an editable reading view — the shared CodeMirror
    * editor with the mdLive decoration set rendering formatting inline (marks
-   * hidden off the selection's lines, images/checkboxes/rules as widgets).
-   * READING is the complete, non-editable render — the authoritative
-   * server-side comrak GFM (sanitized), which refreshes from disk on save or
+   * hidden off the selection's lines, images/checkboxes/rules/equations as
+   * widgets). READING is the complete, non-editable render — the
+   * authoritative server-side comrak GFM (sanitized; `$`/`$$` math arrives as
+   * LaTeX literals this view typesets), which refreshes from disk on save or
    * an agent write. SOURCE is the same editor as plain raw markdown. Live and
    * source share ONE editor instance (an extension swap, never a remount), and
    * the editor mounts once and survives every toggle, so flipping modes never
@@ -34,6 +35,7 @@
   import Spinner from "./Spinner.svelte";
   import { activateUrl, hasUrlScheme, isWebUrl, urlMenuEntries } from "../shared/urlOpen";
   import { contextMenu } from "../shared/contextMenu.svelte";
+  import { safeMathHtml } from "../chat/math";
 
   interface Props {
     path: string;
@@ -232,7 +234,27 @@
     if (content === null) return;
     decorateCopyTargets(content);
     stampImages(content);
+    typesetMath(content);
   });
+
+  /** Equations in a rendered document. comrak (`math_dollars`) emits each
+   *  `$…$`/`$$…$$` as an escaped LaTeX literal in `span[data-math-style]` —
+   *  the one non-default attribute the server sanitizer keeps — and the
+   *  client typesets it here: KaTeX MathML with trust off, through DOMPurify,
+   *  the chat transcript's exact policy. A typeset span is stamped so the
+   *  pass is idempotent across reading re-entries; a fresh server render
+   *  brings fresh spans. */
+  function typesetMath(root: HTMLElement): void {
+    for (const span of root.querySelectorAll<HTMLElement>("span[data-math-style]")) {
+      if (span.dataset.mdMath === "1") continue;
+      const display = span.dataset.mathStyle === "display";
+      const source = span.textContent ?? "";
+      span.dataset.mdMath = "1";
+      span.classList.add("md-math");
+      if (display) span.classList.add("md-math-display");
+      span.innerHTML = safeMathHtml(source, display);
+    }
+  }
 
   /** `![](figs/plot.png)` in a document: the rendered src is relative, which
    *  the browser would resolve against the APP origin (a guaranteed 404).
@@ -705,6 +727,34 @@
 
   .md-body :global(.md-copy.copied .ic-check) {
     display: block;
+  }
+
+  /* Equations (typeset client-side into comrak's math spans): native MathML
+     in the prose color; display math scrolls within the reading column
+     instead of widening the workbench — the chat transcript's treatment. */
+  .md-body :global(.md-math) {
+    color: inherit;
+  }
+
+  .md-body :global(.md-math .katex) {
+    color: inherit;
+    font-size: 1.02em;
+  }
+
+  .md-body :global(.md-math-display) {
+    display: block;
+    max-width: 100%;
+    overflow-x: auto;
+    overflow-y: hidden;
+    margin: 0.55em 0;
+    padding: 0.1em 0;
+  }
+
+  .md-body :global(.md-math-display .katex-display) {
+    display: block;
+    width: max-content;
+    min-width: 100%;
+    margin: 0;
   }
 
   .md-body :global(ul),

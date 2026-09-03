@@ -1,3 +1,4 @@
+import DOMPurify from "dompurify";
 import katex from "katex";
 import type { MarkedExtension } from "marked";
 
@@ -15,6 +16,18 @@ export const mathOptions = {
 
 export function renderMath(source: string, displayMode: boolean): string {
   return katex.renderToString(source, { ...mathOptions, displayMode });
+}
+
+/** One equation as sanitized KaTeX MathML: the policy above, then DOMPurify
+ * with `<style>`/`style=` forbidden (KaTeX's trust is off, but every fragment
+ * that reaches innerHTML passes the sanitizer regardless). Every surface that
+ * typesets LaTeX outside the chat parser — user bubbles, the markdown file
+ * previews — renders through this one call. */
+export function safeMathHtml(source: string, displayMode: boolean): string {
+  return DOMPurify.sanitize(renderMath(source, displayMode), {
+    FORBID_TAGS: ["style"],
+    FORBID_ATTR: ["style"],
+  });
 }
 
 const INLINE_DOLLAR =
