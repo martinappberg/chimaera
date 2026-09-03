@@ -220,9 +220,12 @@ class MathWidget extends WidgetType {
     return el;
   }
   override ignoreEvent(e: Event): boolean {
-    if (!this.display || e.type !== "mousedown") return false;
-    const el = e.currentTarget instanceof HTMLElement ? e.currentTarget : (e.target as HTMLElement);
-    if (el.scrollWidth <= el.clientWidth) return false;
+    if (!this.display || e.type !== "mousedown" || !(e.target instanceof Element)) return false;
+    // CodeMirror dispatches from contentDOM, so currentTarget is never the
+    // widget: find the scroller from the press target (a press on its own
+    // bar targets the scroller element itself).
+    const el = e.target.closest<HTMLElement>(".lp-math-display");
+    if (el === null || el.scrollWidth <= el.clientWidth) return false;
     // Classic scrollbars have a measurable band; overlay scrollbars (the
     // macOS/WKWebView default) report none, so a bottom strip stands in.
     const band = Math.max(el.offsetHeight - el.clientHeight, 12);
@@ -840,16 +843,28 @@ function topLevelSpan(tree: Tree, from: number, to: number): [number, number] {
 /** After an edit: equations outside the touched top-level blocks only move
  *  (positions mapped through the change) and keep their source; the touched
  *  blocks are re-walked. Per-keystroke work is O(the edited block), not the
- *  document — the plugin's own walk is viewport-bounded for the same reason. */
+ *  document — the plugin's own walk is viewport-bounded for the same reason.
+ *  "Touched" is judged in BOTH trees: closing a fence or HTML block above a
+ *  `$$` paragraph exposes equations that were never known and lie outside
+ *  the new tree's block at the edit — only the old container's extent,
+ *  mapped forward, says where to look (and the reverse edit, which swallows
+ *  blocks into a new container, is covered by the new tree's extent). */
 function recollectAround(prev: MathBlock[], tr: Transaction, fmEnd: number): MathBlock[] {
   const state = tr.state;
   let lo = state.doc.length;
   let hi = 0;
-  tr.changes.iterChangedRanges((_fromA, _toA, fromB, toB) => {
+  let loA = tr.startState.doc.length;
+  let hiA = 0;
+  tr.changes.iterChangedRanges((fromA, toA, fromB, toB) => {
     lo = Math.min(lo, fromB);
     hi = Math.max(hi, toB);
+    loA = Math.min(loA, fromA);
+    hiA = Math.max(hiA, toA);
   });
-  const [from, to] = topLevelSpan(syntaxTree(state), lo, hi);
+  const [newFrom, newTo] = topLevelSpan(syntaxTree(state), lo, hi);
+  const [oldFrom, oldTo] = topLevelSpan(syntaxTree(tr.startState), loA, hiA);
+  const from = Math.min(newFrom, tr.changes.mapPos(oldFrom, -1));
+  const to = Math.max(newTo, tr.changes.mapPos(oldTo, 1));
   const out: MathBlock[] = [];
   let walked = false;
   for (const b of prev) {
