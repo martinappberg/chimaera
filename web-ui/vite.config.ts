@@ -62,6 +62,20 @@ export default defineConfig({
   define: { __CHIMAERA_PERF__: JSON.stringify(process.env.CHIMAERA_PERF === "1") },
   build: {
     outDir: "dist",
+    rollupOptions: {
+      output: {
+        // KaTeX + DOMPurify + the math policy (shared/math.ts) ride ONE chunk:
+        // chat imports it statically (loaded with chat, as before) and the
+        // markdown previews import it on demand at the first equation. Without
+        // the pin Rollup folds a module into its static importer's chunk, and
+        // the previews' dynamic import would drag the whole chat bundle in.
+        manualChunks(id) {
+          if (/[\\/]node_modules[\\/](katex|dompurify)[\\/]/.test(id)) return "math";
+          if (/[\\/]lib[\\/]shared[\\/]math\.ts$/.test(id)) return "math";
+          return undefined;
+        },
+      },
+    },
   },
   server: {
     proxy: {

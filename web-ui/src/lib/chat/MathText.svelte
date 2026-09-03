@@ -15,6 +15,8 @@
 <span class="math-text" class:display>{@html html}</span>
 
 <style>
+  /* Equation typography (.katex) is global — app.css. Display math scrolls
+     within the bubble instead of widening it. */
   .math-text {
     color: inherit;
   }
@@ -25,15 +27,5 @@
     overflow-y: hidden;
     margin: 0.45em 0;
     padding: 0.08em 0;
-  }
-  .math-text :global(.katex) {
-    color: inherit;
-    font-size: 1.02em;
-  }
-  .math-text.display :global(.katex-display) {
-    display: block;
-    width: max-content;
-    min-width: 100%;
-    margin: 0;
   }
 </style>

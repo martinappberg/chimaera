@@ -126,6 +126,17 @@
   box-sizing: border-box;
 }
 
+/* Equations (shared/math.ts → KaTeX MathML, every surface: chat prose and
+   bubbles, the markdown previews' live widgets and reading view). Inherit the
+   prose color; a hair larger than the text so math never reads as small
+   print. MathML output has no .katex-display wrapper — display math is
+   `<math display="block">` inside the same span — so this is the whole
+   recipe; each surface owns only its scroller box. */
+.katex {
+  color: inherit;
+  font-size: 1.02em;
+}
+
 /* --- Chat surface shared chrome --------------------------------------------
    Buttons, popovers, and the entrance animation shared by the structured-chat
    cards/dialogs (web-ui/src/lib/chat). Factored here so the recipes can't

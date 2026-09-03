@@ -786,25 +786,8 @@
   .md :global(p) {
     margin: 0.35em 0;
   }
-  /* Math is rendered as native MathML inside a KaTeX wrapper. Display math
-     scrolls within the reading column instead of widening the workbench. */
-  .md :global(.katex) {
-    color: inherit;
-    font-size: 1.02em;
-  }
-  .md :global(.katex-display) {
-    display: block;
-    max-width: 100%;
-    overflow-x: auto;
-    overflow-y: hidden;
-    margin: 0.55em 0;
-    padding: 0.1em 0;
-  }
-  .md :global(.katex-display > .katex) {
-    display: block;
-    width: max-content;
-    min-width: 100%;
-  }
+  /* Equation typography (.katex) is global — app.css; MathML output has no
+     .katex-display wrapper, display math is `<math display="block">`. */
   /* Heading ladder: real hierarchy (agents lean on markdown constantly), with
      a hairline under the top two ranks — quiet document structure, not chrome. */
   .md :global(h1),

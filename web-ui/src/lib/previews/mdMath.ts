@@ -15,11 +15,12 @@
  * a code span never reaches this parser.
  */
 import type { InlineContext, MarkdownConfig } from "@lezer/markdown";
-import { tags as t } from "@lezer/highlight";
 
 const DOLLAR = 36; // "$"
 const BACKSLASH = 92; // "\"
 
+/** cmark's `isspace` (space, \t \n \v \f \r) — comrak's rule, deliberately
+ *  wider than lezer's own space set. */
 function isSpace(ch: number): boolean {
   return ch === 32 || (ch >= 9 && ch <= 13);
 }
@@ -60,13 +61,13 @@ function scanDisplay(cx: InlineContext, pos: number): number {
 }
 
 /** Syntax-tree math: `InlineMath` (`$…$`), `DisplayMath` (`$$…$$`), each
- *  with two `MathMark` delimiter children and nothing else parsed inside. */
+ *  with two `MathMark` delimiter children and nothing else parsed inside.
+ *  No highlight tags: the live decorator styles them, and source mode keeps
+ *  an equation in the prose color (the editor's highlight style has no rule
+ *  the marks could usefully carry). Also deliberately NOT the chat dialect
+ *  (`chat/math.ts`, which mirrors what agents emit) — see the module header. */
 export const mathExtension: MarkdownConfig = {
-  defineNodes: [
-    { name: "InlineMath" },
-    { name: "DisplayMath" },
-    { name: "MathMark", style: t.processingInstruction },
-  ],
+  defineNodes: [{ name: "InlineMath" }, { name: "DisplayMath" }, { name: "MathMark" }],
   parseInline: [
     {
       name: "DollarMath",

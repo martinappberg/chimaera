@@ -16,7 +16,8 @@ tree + view-state) · **`previews/`** (the file-preview surfaces + their loaders
 **`terminal/`** (the PTY stack: xterm, pool, socket, links) · **`browser/`** (the
 reverse-proxied web-app pane + its proxy client) · **`workspace/`** (workbench
 domain surfaces + their stores: files tree, git, sessions, launcher, home) · **`shared/`**
-(cross-cutting leaf primitives: icons + glyphs, keys/keybindings, reference/provenance). The
+(cross-cutting leaf primitives: icons + glyphs, keys/keybindings, reference/provenance, the
+KaTeX math policy). The
 `chat/`, `settings/`, and `dashboard/` subsystems keep their own folders (+ maps).
 `App.svelte` stays at `src/`.
 

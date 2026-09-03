@@ -35,7 +35,7 @@
   import Spinner from "./Spinner.svelte";
   import { activateUrl, hasUrlScheme, isWebUrl, urlMenuEntries } from "../shared/urlOpen";
   import { contextMenu } from "../shared/contextMenu.svelte";
-  import { safeMathHtml } from "../chat/math";
+  import { loadMath, mathNow } from "./mathLoad";
 
   interface Props {
     path: string;
@@ -235,25 +235,76 @@
     decorateCopyTargets(content);
     stampImages(content);
     typesetMath(content);
+    return cancelTypeset;
   });
 
   /** Equations in a rendered document. comrak (`math_dollars`) emits each
    *  `$…$`/`$$…$$` as an escaped LaTeX literal in `span[data-math-style]` —
    *  the one non-default attribute the server sanitizer keeps — and the
-   *  client typesets it here: KaTeX MathML with trust off, through DOMPurify,
-   *  the chat transcript's exact policy. A typeset span is stamped so the
-   *  pass is idempotent across reading re-entries; a fresh server render
-   *  brings fresh spans. */
-  function typesetMath(root: HTMLElement): void {
-    for (const span of root.querySelectorAll<HTMLElement>("span[data-math-style]")) {
-      if (span.dataset.mdMath === "1") continue;
-      const display = span.dataset.mathStyle === "display";
-      const source = span.textContent ?? "";
-      span.dataset.mdMath = "1";
-      span.classList.add("md-math");
-      if (display) span.classList.add("md-math-display");
-      span.innerHTML = safeMathHtml(source, display);
+   *  client typesets it under the shared KaTeX policy (`shared/math`,
+   *  loaded on demand at the first equation, memoized). The pass is
+   *  idempotent (a typeset span carries `.md-math`; a fresh server render
+   *  brings fresh spans) and time-sliced: lecture notes with thousands of
+   *  equations typeset their first screen synchronously and the rest at
+   *  idle, so a refresh mid agent-rewrite can't stall the workbench. */
+  type MathModule = typeof import("../shared/math");
+  let typesetJob: { cancelled: boolean; handle: number | null; idle: boolean } | null = null;
+
+  function cancelTypeset(): void {
+    const job = typesetJob;
+    if (job === null) return;
+    job.cancelled = true;
+    if (job.handle !== null) {
+      if (job.idle) cancelIdleCallback(job.handle);
+      else clearTimeout(job.handle);
     }
+    typesetJob = null;
+  }
+
+  function typesetSpan(span: HTMLElement, math: MathModule): void {
+    if (!span.isConnected || span.classList.contains("md-math")) return;
+    const display = span.dataset.mathStyle === "display";
+    const source = span.textContent ?? "";
+    span.classList.add("md-math");
+    if (source.trim().length === 0) return; // `$$ $$`: nothing to typeset, as in live
+    if (display) span.classList.add("md-math-display");
+    span.innerHTML = math.safeMathHtml(source, display);
+  }
+
+  function typesetMath(root: HTMLElement): void {
+    cancelTypeset();
+    const spans = Array.from(
+      root.querySelectorAll<HTMLElement>("span[data-math-style]:not(.md-math)"),
+    );
+    if (spans.length === 0) return;
+    const job = { cancelled: false, handle: null as number | null, idle: false };
+    typesetJob = job;
+    let i = 0;
+    const slice = (math: MathModule): void => {
+      if (job.cancelled) return;
+      job.handle = null;
+      const deadline = performance.now() + 8;
+      while (i < spans.length && performance.now() < deadline) typesetSpan(spans[i++], math);
+      if (i >= spans.length) {
+        typesetJob = null;
+        return;
+      }
+      // WKWebView (the native app) has no requestIdleCallback: a short
+      // timeout stands in — the chat's path-stamping fallback.
+      if (typeof requestIdleCallback === "function") {
+        job.idle = true;
+        job.handle = requestIdleCallback(() => slice(math), { timeout: 500 });
+      } else {
+        job.idle = false;
+        job.handle = window.setTimeout(() => slice(math), 16);
+      }
+    };
+    const math = mathNow();
+    if (math !== null) slice(math);
+    else
+      void loadMath().then(slice, () => {
+        // KaTeX failed to load: the LaTeX literals stay readable as text.
+      });
   }
 
   /** `![](figs/plot.png)` in a document: the rendered src is relative, which
@@ -729,16 +780,11 @@
     display: block;
   }
 
-  /* Equations (typeset client-side into comrak's math spans): native MathML
-     in the prose color; display math scrolls within the reading column
-     instead of widening the workbench — the chat transcript's treatment. */
+  /* Equations (typeset client-side into comrak's math spans; typography is
+     the global .katex rule in app.css): display math scrolls within the
+     reading column instead of widening the workbench — the chat's treatment. */
   .md-body :global(.md-math) {
     color: inherit;
-  }
-
-  .md-body :global(.md-math .katex) {
-    color: inherit;
-    font-size: 1.02em;
   }
 
   .md-body :global(.md-math-display) {
@@ -748,13 +794,6 @@
     overflow-y: hidden;
     margin: 0.55em 0;
     padding: 0.1em 0;
-  }
-
-  .md-body :global(.md-math-display .katex-display) {
-    display: block;
-    width: max-content;
-    min-width: 100%;
-    margin: 0;
   }
 
   .md-body :global(ul),

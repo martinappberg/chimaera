@@ -126,21 +126,22 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
     line the selection doesn't touch, images/task-checkboxes/rules rendered as widgets
     (clicking a checkbox edits the source), blockquotes drawn as the shared quote card, and
     a small always-visible copy affordance on each fence line and quote card. **Equations**
-    — `$…$` and `$$…$$` — typeset as KaTeX widgets (`mdMath.ts` is the lezer parser
-    extension; its delimiter rules mirror comrak's `math_dollars`, so live and reading
-    agree on what is math and `$5 and $10` stays currency); a `$$` block spanning lines is
-    one widget, replaced from a state field because a plugin replace can't cross a line
-    break. Click an equation, or move the cursor onto its lines, and the LaTeX shows as
-    mono source. Tables/raw HTML/frontmatter stay as mono source (the full render lives in
-    reading), and so does any construct the decorator can't render faithfully (reference
-    links, multi-line image syntax). Mod+click follows links; right-click gives the same
-    URL menu as reading.
+    — `$…$` and `$$…$$`, Obsidian's dollar dialect (GitHub's `` $`…`$ `` / ```` ```math ````
+    forms and Codex's `\(`/`\[` are not recognized in files) — typeset as KaTeX widgets, a
+    `$$` block spanning lines as one widget; click one, or move the cursor onto its lines,
+    and the LaTeX shows as mono source. `mdMath.ts` is the parser extension; its delimiter
+    rules mirror comrak's `math_dollars` so live and reading agree on what is math (`$5 and
+    $10` stays currency, while `$HOME/$USER` in prose becomes math — as on GitHub).
+    Tables/raw HTML/frontmatter stay as mono source (the full render lives in reading, which
+    is also where table-cell math typesets), and so does any construct the decorator can't
+    render faithfully (reference links, multi-line image syntax). Mod+click follows links;
+    right-click gives the same URL menu as reading.
   - **reading** is the complete non-editable render: `GET /api/v1/fs/markdown?path=` →
     server-side comrak GFM (+ `math_dollars`) → **ammonia-sanitized** HTML (its defaults
-    plus `data-math-style` on `span` — the marker comrak leaves on each LaTeX literal; source
+    plus `data-math-style` on `span`, the marker comrak leaves on each LaTeX literal; source
     cap 4 MB), fetched on first entry and refreshed in place on saves/agent writes. The
-    client typesets those spans (`chat/math.ts` `safeMathHtml`: KaTeX MathML, trust off,
-    through DOMPurify — the chat transcript's policy).
+    client typesets those spans under the one KaTeX policy every surface shares
+    (`shared/math.ts`, loaded on demand at the first equation, memoized, time-sliced).
   - **source** is the same editor as plain raw markdown (an extension swap in CodeView's
     `extra` compartment — never a remount, so the buffer, undo history, and dirty state
     survive every toggle; the file is only written on Cmd/Ctrl+S).
