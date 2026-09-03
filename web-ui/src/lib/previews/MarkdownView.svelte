@@ -238,9 +238,11 @@
     return cancelTypeset;
   });
 
-  /** Equations in a rendered document. comrak (`math_dollars`) emits each
-   *  `$…$`/`$$…$$` as an escaped LaTeX literal in `span[data-math-style]` —
-   *  the one non-default attribute the server sanitizer keeps — and the
+  /** Equations in a rendered document. The server emits each one — inline
+   *  `$…$`/`$$…$$`, a `$$` block, a ```math fence — as an escaped LaTeX
+   *  literal in `span[data-math-style]` (the one non-default attribute the
+   *  sanitizer keeps; blocks are promoted to comrak's math fence and its
+   *  `<pre><code>` rewritten to the same span, so this is the ONE seam) and the
    *  client typesets it under the shared KaTeX policy (`shared/math`,
    *  loaded on demand at the first equation, memoized). The pass is
    *  idempotent (a typeset span carries `.md-math`; a fresh server render
@@ -261,12 +263,19 @@
     typesetJob = null;
   }
 
+  /** Past this, a "source" is not an equation but a document — an unclosed
+   *  ```math fence runs to the end of the file by CommonMark's rules — and
+   *  one KaTeX job over it would stall the workbench for seconds. It stays
+   *  readable text (live shows the same shape as mono source). */
+  const MAX_MATH_SOURCE = 16 * 1024;
+
   function typesetSpan(span: HTMLElement, math: MathModule): void {
     if (!span.isConnected || span.classList.contains("md-math")) return;
     const display = span.dataset.mathStyle === "display";
     const source = span.textContent ?? "";
     span.classList.add("md-math");
-    if (source.trim().length === 0) return; // `$$ $$`: nothing to typeset, as in live
+    // `$$ $$` has nothing to typeset, as in live.
+    if (source.trim().length === 0 || source.length > MAX_MATH_SOURCE) return;
     if (display) span.classList.add("md-math-display");
     span.innerHTML = math.safeMathHtml(source, display);
   }

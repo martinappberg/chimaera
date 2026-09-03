@@ -1,21 +1,21 @@
 import { describe, expect, it } from "vitest";
 import { markdownLanguage } from "@codemirror/lang-markdown";
 import type { MarkdownParser } from "@lezer/markdown";
-import { mathExtension } from "./mdMath";
+import { countDollarPairs, mathExtension } from "./mdMath";
 
 // The APP's parser configuration (GFM + sub/superscript + emoji), not bare
 // CommonMark: extension ORDER is part of what these pins protect.
 const mathParser = (markdownLanguage.parser as MarkdownParser).configure(mathExtension);
 
-/** Every math node as `Name:source`, plus any Escape or Emphasis the parser
- *  produced — inside an equation there must be none. */
+/** Every math node as `Name:source`, plus any Escape, Emphasis, or list the
+ *  parser produced — inside an equation there must be none. */
 function math(src: string): string[] {
   const out: string[] = [];
   mathParser.parse(src).iterate({
     enter(n) {
-      if (n.name === "InlineMath" || n.name === "DisplayMath")
+      if (n.name === "InlineMath" || n.name === "DisplayMath" || n.name === "MathBlock")
         out.push(`${n.name}:${src.slice(n.from, n.to)}`);
-      else if (n.name === "Escape" || n.name === "Emphasis")
+      else if (n.name === "Escape" || n.name === "Emphasis" || n.name === "BulletList")
         out.push(`${n.name}:${src.slice(n.from, n.to)}`);
     },
   });
@@ -29,9 +29,13 @@ describe("dollar math (mirrors comrak's math_dollars)", () => {
     expect(math("$$x = y$$")).toEqual(["DisplayMath:$$x = y$$"]);
   });
 
-  it("lets a $$ block span the lines of its paragraph", () => {
-    const src = "$$\np(\\theta \\mid y) \\;=\\; \\frac{a}{b},\n\\qquad\nx\n$$";
-    expect(math(src)).toEqual([`DisplayMath:${src}`]);
+  it("lets $$ display math span the lines of its paragraph", () => {
+    // Opened mid-line it is inline display math across the paragraph…
+    const src = "so $$\np(\\theta \\mid y) \\;=\\; \\frac{a}{b},\n\\qquad\nx\n$$";
+    expect(math(src)).toEqual([`DisplayMath:${src.slice(3)}`]);
+    // …and opened at a line start it is a block (see below).
+    const block = "$$\np(\\theta \\mid y) \\;=\\; \\frac{a}{b},\n\\qquad\nx\n$$";
+    expect(math(block)).toEqual([`MathBlock:${block}`]);
   });
 
   it("lets inline math cross a soft line break, like comrak", () => {
@@ -40,9 +44,9 @@ describe("dollar math (mirrors comrak's math_dollars)", () => {
 
   it("never parses escapes or emphasis inside an equation", () => {
     expect(math("$\\;a_b\\,$")).toEqual(["InlineMath:$\\;a_b\\,$"]);
-    expect(math("$*x*$ and $$\n\\;x\\,\n$$")).toEqual([
+    expect(math("$*x*$ and\n\n$$\n\\;x\\,\n$$")).toEqual([
       "InlineMath:$*x*$",
-      "DisplayMath:$$\n\\;x\\,\n$$",
+      "MathBlock:$$\n\\;x\\,\n$$",
     ]);
     // Control: the same constructs outside math do parse.
     expect(math("\\; and *x*")).toEqual(["Escape:\\;", "Emphasis:*x*"]);
@@ -78,8 +82,60 @@ describe("dollar math (mirrors comrak's math_dollars)", () => {
     expect(math("`$x$` and `$$y$$`")).toEqual([]);
   });
 
-  it("leaves an unterminated $$ as text without swallowing later math", () => {
-    expect(math("$$ open, then $x$")).toEqual(["InlineMath:$x$"]);
+  it("leaves an unterminated inline $$ as text without swallowing later math", () => {
+    expect(math("an $$ open, then $x$")).toEqual(["InlineMath:$x$"]);
+  });
+
+  it("parses a $$ block whose continuation line would start a list", () => {
+    // The reported case: `+ \left(…` is a bullet to markdown, so inline `$$`
+    // pairing across the paragraph fails; the block form keeps it raw.
+    const src = "$$ E = \\frac{a}{b}\n+ \\left(1-w\\right) . $$";
+    expect(math(src)).toEqual([`MathBlock:${src}`]);
+    expect(math("$$\nx\n$$")).toEqual(["MathBlock:$$\nx\n$$"]);
+  });
+
+  it("closes on the first later line containing $$ (text after it stays outside)", () => {
+    expect(math("$$\nx\n$$.")).toEqual(["MathBlock:$$\nx\n$$"]);
+    expect(math("$$\nx\n$$ so on.\n\nnext $y$")).toEqual(["MathBlock:$$\nx\n$$", "InlineMath:$y$"]);
+  });
+
+  it("opens a block only with a closer in sight, so a stray $$ costs nothing", () => {
+    expect(math("$$ is the shell's PID\n\nnext $x$")).toEqual(["InlineMath:$x$"]);
+    expect(math("$$\nx\n\ny $z$")).toEqual(["InlineMath:$z$"]);
+  });
+
+  it("keeps a single-line $$…$$ inline and $$$ as text", () => {
+    expect(math("$$x$$")).toEqual(["DisplayMath:$$x$$"]);
+    expect(math("$$$\nx\n$$$")).toEqual([]);
+  });
+
+  it("opens blocks inside list items and blockquotes, and after prose", () => {
+    const list = "- item\n\n  $$\n  x\n  $$\n- next";
+    expect(math(list)).toEqual([`BulletList:${list}`, "MathBlock:$$\n  x\n  $$"]);
+    expect(math("> $$\n> x\n> $$")).toEqual(["MathBlock:$$\n> x\n> $$"]);
+    expect(math("prose\n$$\nx\n$$\nafter")).toEqual(["MathBlock:$$\nx\n$$"]);
+    expect(math("Use `$$` for math:\n$$\nx\n$$")).toEqual(["MathBlock:$$\nx\n$$"]);
+  });
+
+  it("leaves a lazily continued quote to inline pairing, like comrak", () => {
+    expect(math("> $$\nx\n$$")).toEqual(["DisplayMath:$$\nx\n$$"]);
+  });
+
+  it("lets a lone $$ line close display math opened earlier in its paragraph", () => {
+    expect(math("so $$\nx\n$$")).toEqual(["DisplayMath:$$\nx\n$$"]);
+    expect(math("so $$\nx\n$$\nthen $$y$$")).toEqual(["DisplayMath:$$\nx\n$$", "DisplayMath:$$y$$"]);
+  });
+
+  it("leaves fenced code and HTML blocks alone", () => {
+    expect(math("```\n$$\nx\n$$\n```")).toEqual([]);
+    expect(math("<div>\n$$\nx\n$$\n</div>")).toEqual([]);
+  });
+
+  it("counts $$ pairs the way the reading render does", () => {
+    expect(countDollarPairs("a $$ b")).toBe(1);
+    expect(countDollarPairs("$$x$$")).toBe(2);
+    expect(countDollarPairs("$$$ and $$$$")).toBe(0);
+    expect(countDollarPairs("`$$` then $$")).toBe(1);
   });
 
   // Known live/reading divergences, pinned so a change is deliberate: lezer's

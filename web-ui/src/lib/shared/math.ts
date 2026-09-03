@@ -34,6 +34,10 @@ export function renderMath(source: string, displayMode: boolean): string {
 // refresh (an agent rewriting the file ticks at ~4 Hz) — so the sanitized
 // markup is memoized. Bounded: insertion order is eviction order.
 const CACHE_MAX = 512;
+// A source longer than this is not an equation anyone re-requests verbatim
+// (a document mid-rewrite, an unclosed block): rendered, never remembered,
+// so the memo's bound stays a bound in bytes too.
+const CACHE_MAX_SOURCE = 4096;
 const cache = new Map<string, string>();
 
 /** One equation as sanitized KaTeX MathML, memoized. */
@@ -45,6 +49,7 @@ export function safeMathHtml(source: string, displayMode: boolean): string {
     FORBID_TAGS: ["style"],
     FORBID_ATTR: ["style"],
   });
+  if (source.length > CACHE_MAX_SOURCE) return html;
   if (cache.size >= CACHE_MAX) {
     const oldest = cache.keys().next().value;
     if (oldest !== undefined) cache.delete(oldest);

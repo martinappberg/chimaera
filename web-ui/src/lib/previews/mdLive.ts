@@ -257,6 +257,25 @@ function mathSource(node: SyntaxNode, doc: Text): string | null {
   return src.trim().length === 0 ? null : src;
 }
 
+/** A ```math fence — GitHub's block form, which the server renders exactly
+ *  like a `$$` block — is an equation here too. */
+function isMathFence(node: SyntaxNode, doc: Text): boolean {
+  const info = node.getChild("CodeInfo");
+  return info !== null && doc.sliceString(info.from, info.to).trim() === "math";
+}
+
+/** The LaTeX of a CLOSED ```math fence (an unclosed one runs to the end of
+ *  the document by CommonMark's rules and stays a visible fence). One
+ *  CodeText per line inside a blockquote, so they are joined. */
+function fenceMathSource(node: SyntaxNode, doc: Text): string | null {
+  if (node.getChildren("CodeMark").length < 2) return null;
+  const src = node
+    .getChildren("CodeText")
+    .map((c) => doc.sliceString(c.from, c.to))
+    .join("");
+  return src.trim().length === 0 ? null : src;
+}
+
 /** Restore a copy button's idle state after the shared 1400ms flash. */
 function flashCopied(btn: HTMLElement, idleLabel: string): void {
   btn.classList.add("copied");
@@ -562,6 +581,10 @@ function buildDecorations(
       return;
     }
     if (name === "FencedCode" || name === "CodeBlock") {
+      // A closed ```math fence is an equation: inactive, the mathBlocks field
+      // replaces it whole and it gets no fence chrome; revealed, it is a fence.
+      if (name === "FencedCode" && isMathFence(node.node, doc) && !active(node.from, node.to))
+        return false;
       const firstLine = doc.lineAt(node.from);
       const lastFrom = doc.lineAt(node.to).from;
       eachVisibleLine(node.from, node.to, (l) => {
@@ -687,7 +710,7 @@ function buildDecorations(
         hide(node.from, node.to);
       return;
     }
-    if (name === "InlineMath" || name === "DisplayMath") {
+    if (name === "InlineMath" || name === "DisplayMath" || name === "MathBlock") {
       // The walk always descends: the MathMark delimiters mute below and
       // nested QuoteMarks stay theirs — whether the equation is revealed,
       // replaced (marks inside a replace are simply not drawn), or has
@@ -698,8 +721,14 @@ function buildDecorations(
         return;
       }
       // A block spanning lines is replaced whole by the mathBlocks state
-      // field — a plugin replace may not cross a line break.
-      if (doc.lineAt(node.from).to < node.to) return;
+      // field — a plugin replace may not cross a line break. An UNCLOSED
+      // `$$` block (mid-typing; it runs to the document end like a fence)
+      // has nothing to typeset and stays visible mono source.
+      if (doc.lineAt(node.from).to < node.to) {
+        if (name === "MathBlock" && node.node.getChildren("MathMark").length < 2)
+          deco.push(markMathSrc.range(node.from, node.to));
+        return;
+      }
       const src = mathSource(node.node, doc);
       if (src === null || !once(`math:${node.from}`)) return;
       deco.push(
@@ -805,14 +834,20 @@ function collectMathBlocks(
     to,
     enter: (n) => {
       if (doc.lineAt(n.from).to >= n.to) return false;
-      if (n.name === "InlineMath" || n.name === "DisplayMath") {
+      if (n.name === "InlineMath" || n.name === "DisplayMath" || n.name === "MathBlock") {
         const source = n.from < fmEnd ? null : mathSource(n.node, doc);
         if (source !== null)
-          out.push({ from: n.from, to: n.to, source, display: n.name === "DisplayMath" });
+          out.push({ from: n.from, to: n.to, source, display: n.name !== "InlineMath" });
+        return false;
+      }
+      if (n.name === "FencedCode") {
+        if (n.from >= fmEnd && isMathFence(n.node, doc)) {
+          const source = fenceMathSource(n.node, doc);
+          if (source !== null) out.push({ from: n.from, to: n.to, source, display: true });
+        }
         return false;
       }
       if (
-        n.name === "FencedCode" ||
         n.name === "CodeBlock" ||
         n.name === "HTMLBlock" ||
         n.name === "CommentBlock" ||
