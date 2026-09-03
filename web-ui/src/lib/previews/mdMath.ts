@@ -16,22 +16,23 @@
  * never reaches this parser.
  *
  * BLOCK (Obsidian's / GitHub's `$$` block, which the server promotes to a
- * ```math fence before comrak — `fs.rs::promote_math_blocks`, keep the two
- * in lockstep): a line whose content starts with `$$` (not `$$$`) with no
- * closing `$$` later on it opens a block, PROVIDED a closer is in sight — a
- * later line containing `$$` before the next blank line. The first such
- * line closes it (text after the closer stays outside); the interior is
- * raw. Without this, an equation wrapped as `+ \left(…\right)` on its
- * second line would be cut by the bullet list that line starts. Requiring
- * the closer keeps a slip cheap: prose that merely begins with `$$` (`$$ is
- * the shell's PID`) stays prose, and a block can never swallow more than
- * the paragraph it sits in. A lone `$$` line never interrupts a paragraph
- * whose display math is still open (an odd `$$` count), so `so $$` ⏎ `x`
- * ⏎ `$$` is one inline display equation. GitHub's ```math fence is the
- * same thing under another name and typesets too (mdLive treats it as a
- * block; the server already renders it as one).
+ * ```math fence before comrak — `fs.rs::promote_math_blocks`; ONE case
+ * list, `mathBlocks.fixture.json`, pins the two in lockstep, so add a case
+ * there and both test suites run it): a line whose content starts with
+ * `$$` (not `$$$`) with no closing `$$` later on it opens a block, PROVIDED
+ * a closer is in sight — a later line containing `$$` before the next blank
+ * line. The first such line closes it (text after the closer stays
+ * outside); the interior is raw. Without this, an equation wrapped as
+ * `+ \left(…\right)` on its second line would be cut by the bullet list
+ * that line starts. Requiring the closer keeps a slip cheap: prose that
+ * merely begins with `$$` (`$$ is the shell's PID`) stays prose, and a
+ * block can never swallow more than the paragraph it sits in. A lone `$$`
+ * line never interrupts a paragraph whose display math is still open (an
+ * odd `$$` count), so `so $$` ⏎ `x` ⏎ `$$` is one inline display equation.
+ * GitHub's ```math fence is the same thing under another name and typesets
+ * too (mdLive treats it as a block; the server already renders it as one).
  */
-import type { Input } from "@lezer/common";
+import { NodeProp, type Input, type NodeType } from "@lezer/common";
 import type {
   BlockContext,
   InlineContext,
@@ -177,6 +178,27 @@ function displayMathOpen(leaf: LeafBlock): boolean {
   return p instanceof DollarParity && p.odd;
 }
 
+/** The groups (`NodeType.is`) the math nodes join, the one place their
+ *  names are spelled: `Math` is every equation node, `MathDisplay` the ones
+ *  typeset display-style. Appended to the groups lezer already gave the
+ *  node (`MathBlock` is a `Block`/`LeafBlock` like any block node) — a plain
+ *  `group.add({…})` would replace them. */
+const MATH_GROUPS = new Map<string, readonly string[]>([
+  ["InlineMath", ["Math"]],
+  ["DisplayMath", ["Math", "MathDisplay"]],
+  ["MathBlock", ["Math", "MathDisplay"]],
+]);
+
+/** Whether the node is an equation: `InlineMath`, `DisplayMath` or `MathBlock`. */
+export function isMath(type: NodeType): boolean {
+  return type.is("Math");
+}
+
+/** Whether the equation is typeset display-style (`DisplayMath`, `MathBlock`). */
+export function isDisplayMath(type: NodeType): boolean {
+  return type.is("MathDisplay");
+}
+
 /** Syntax-tree math: `InlineMath` (`$…$`), `DisplayMath` (`$$…$$` within a
  *  paragraph) and `MathBlock` (`$$` block lines), each with `MathMark`
  *  delimiter children — two when closed — and nothing else parsed inside
@@ -190,6 +212,12 @@ export const mathExtension: MarkdownConfig = {
     { name: "DisplayMath" },
     { name: "MathBlock", block: true },
     { name: "MathMark" },
+  ],
+  props: [
+    NodeProp.group.add((type) => {
+      const groups = MATH_GROUPS.get(type.name);
+      return groups && [...(type.prop(NodeProp.group) ?? []), ...groups];
+    }),
   ],
   parseBlock: [
     {

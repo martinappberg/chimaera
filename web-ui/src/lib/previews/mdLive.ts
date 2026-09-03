@@ -51,7 +51,7 @@ import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
 import { languages } from "@codemirror/language-data";
 import type { SyntaxNode, SyntaxNodeRef, Tree } from "@lezer/common";
 import { rawTicketUrl, resolveDocPath, safeDecodeUri } from "./files";
-import { mathExtension } from "./mdMath";
+import { isDisplayMath, isMath, mathExtension } from "./mdMath";
 import { loadMath, mathNow } from "./mathLoad";
 import { copyText } from "../shared/clipboard";
 import { makeCopyButton } from "../shared/copyDecor";
@@ -710,7 +710,7 @@ function buildDecorations(
         hide(node.from, node.to);
       return;
     }
-    if (name === "InlineMath" || name === "DisplayMath" || name === "MathBlock") {
+    if (isMath(node.type)) {
       // The walk always descends: the MathMark delimiters mute below and
       // nested QuoteMarks stay theirs — whether the equation is revealed,
       // replaced (marks inside a replace are simply not drawn), or has
@@ -732,7 +732,7 @@ function buildDecorations(
       const src = mathSource(node.node, doc);
       if (src === null || !once(`math:${node.from}`)) return;
       deco.push(
-        Decoration.replace({ widget: new MathWidget(src, name === "DisplayMath") }).range(
+        Decoration.replace({ widget: new MathWidget(src, isDisplayMath(node.type)) }).range(
           node.from,
           node.to,
         ),
@@ -834,10 +834,10 @@ function collectMathBlocks(
     to,
     enter: (n) => {
       if (doc.lineAt(n.from).to >= n.to) return false;
-      if (n.name === "InlineMath" || n.name === "DisplayMath" || n.name === "MathBlock") {
+      if (isMath(n.type)) {
         const source = n.from < fmEnd ? null : mathSource(n.node, doc);
         if (source !== null)
-          out.push({ from: n.from, to: n.to, source, display: n.name !== "InlineMath" });
+          out.push({ from: n.from, to: n.to, source, display: isDisplayMath(n.type) });
         return false;
       }
       if (n.name === "FencedCode") {
