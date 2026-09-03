@@ -163,7 +163,11 @@ a `RemoteOps` trait. See also [native-app.md](native-app.md) for the windows/hos
   also carry the build as a second guard for same-origin transitions, while the entry document
   carries its own build stamp so the first asynchronous health poll cannot race the handoff. A
   window with unsaved edits or memory-only chat input holds the navigation behind one visible
-  notice instead of looping reload prompts or silently discarding local state.
+  notice instead of looping reload prompts or silently discarding local state. The navigation is
+  issued **once** and, if the document is still alive after a 5s→30s backoff, tried again — never
+  re-issued per tick: navigation is asynchronous, and WebKit (the native shell) cancels the
+  in-flight load for every re-issue, which once left remote windows stuck on "reloading…" after a
+  daemon update.
 
 ## Dev builds — the isolated dev daemon on a host
 

@@ -283,6 +283,7 @@
   import ReauthOverlay from "./lib/workspace/ReauthOverlay.svelte";
   import AssetTransitionNotice from "./lib/layout/AssetTransitionNotice.svelte";
   import {
+    assetNavigationRetryMs,
     assetTransition,
     BUILD_META_NAME,
     buildSource,
@@ -1140,6 +1141,8 @@
   // state survives navigation. A blocked transition stays visible instead of
   // looping beforeunload prompts or silently dropping a memory-only draft.
   let handledAssetRevision = 0;
+  let unforcedAssetAttempts = 0;
+  let assetRearmTimer: ReturnType<typeof setTimeout> | null = null;
   $effect(() => {
     const transition = $assetTransition;
     if (transition === null || !transition.requested) return;
@@ -1157,12 +1160,30 @@
         history.replaceState(history.state, "", navigation.target);
         location.reload();
       }
-      // This callback can run only if the document survived the navigation
-      // call (normally because the user chose Stay in beforeunload). Re-arm
-      // with `forced` cleared: dirty state holds the next attempt, and saving
-      // it lets the existing effect retry once without a prompt loop.
-      setTimeout(() => rearmAssetNavigation(transition.revision), 0);
+      // Navigation is asynchronous: this document — timers included — keeps
+      // running until the new one commits, so returning from the call proves
+      // nothing. A zero-delay re-arm here re-issued the navigation every few
+      // milliseconds, and WebKit (the native shell) cancels the in-flight load
+      // for each re-issue: a remote entry document slower than one timer tick
+      // never landed and the notice sat on "reloading…" forever.
+      // A forced attempt hands control straight back to the safety gate — the
+      // beforeunload prompt either kept the document (Stay) or is letting it
+      // go, and dirty state must hold any next attempt either way. Nothing can
+      // cancel an unforced attempt, so a document still alive after the retry
+      // delay means the load failed (WebKit keeps the old page when, say, the
+      // new tunnel port is not accepting yet): try again, backing off.
+      const delay = transition.forced
+        ? 0
+        : assetNavigationRetryMs(++unforcedAssetAttempts);
+      if (assetRearmTimer !== null) clearTimeout(assetRearmTimer);
+      assetRearmTimer = setTimeout(() => {
+        assetRearmTimer = null;
+        rearmAssetNavigation(transition.revision);
+      }, delay);
     });
+  });
+  $effect(() => () => {
+    if (assetRearmTimer !== null) clearTimeout(assetRearmTimer);
   });
 
   // Slurm strip: one probe at boot; the store keeps its own 60s poll gated on

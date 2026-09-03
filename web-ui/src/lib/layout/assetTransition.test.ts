@@ -1,6 +1,9 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { get } from "svelte/store";
 import {
+  ASSET_RETRY_BASE_MS,
+  ASSET_RETRY_MAX_MS,
+  assetNavigationRetryMs,
   assetTransition,
   BUILD_META_PLACEHOLDER,
   buildSource,
@@ -80,5 +83,37 @@ describe("asset transition identity", () => {
     // A stale callback cannot perturb a newer transition.
     rearmAssetNavigation(attempted!.revision);
     expect(get(assetTransition)?.revision).toBe(attempted!.revision + 1);
+  });
+
+  it("retries an unforced navigation whose document is still alive", () => {
+    requireAssetNavigation("build", "http://127.0.0.1:9801/#token=fresh");
+    const attempted = get(assetTransition)!;
+    expect(attempted.forced).toBe(false);
+
+    // The load failed (or was cancelled) and the old page is still showing:
+    // the same target is attempted again under a fresh revision.
+    rearmAssetNavigation(attempted.revision);
+    expect(get(assetTransition)).toMatchObject({
+      reason: "build",
+      target: "http://127.0.0.1:9801/#token=fresh",
+      requested: true,
+      forced: false,
+      revision: attempted.revision + 1,
+    });
+    // Repeated health polls reporting the same build do not mint revisions,
+    // so a slow reload is never re-issued underneath itself.
+    requireAssetNavigation("build", null);
+    expect(get(assetTransition)?.revision).toBe(attempted.revision + 1);
+  });
+
+  it("backs off retries from five seconds to a thirty-second ceiling", () => {
+    expect(assetNavigationRetryMs(1)).toBe(ASSET_RETRY_BASE_MS);
+    expect(assetNavigationRetryMs(2)).toBe(ASSET_RETRY_BASE_MS * 2);
+    expect(assetNavigationRetryMs(3)).toBe(ASSET_RETRY_BASE_MS * 4);
+    expect(assetNavigationRetryMs(4)).toBe(ASSET_RETRY_MAX_MS);
+    expect(assetNavigationRetryMs(40)).toBe(ASSET_RETRY_MAX_MS);
+    // A retry must never race a remote round trip: the first delay alone
+    // exceeds any sane entry-document fetch.
+    expect(ASSET_RETRY_BASE_MS).toBeGreaterThanOrEqual(5_000);
   });
 });

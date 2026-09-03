@@ -132,15 +132,32 @@ export function requestAssetReload(force = false): void {
   }));
 }
 
-/** A navigation call returned and this document is still alive, which means
- *  beforeunload was cancelled. Drop the one-shot force and mint a revision so
- *  the normal safety gate waits for dirty state to clear before trying again. */
-export function rearmAssetNavigation(cancelledRevision: number): void {
+/** Delay before an unforced navigation attempt that left this document alive
+ *  is tried again. Navigation is asynchronous, so the document outliving the
+ *  call proves nothing by itself; only after this long is the attempt treated
+ *  as failed. It must comfortably exceed a remote entry-document round trip:
+ *  WebKit cancels the in-flight load for every re-issued request, and a
+ *  zero-delay re-arm once starved a remote window forever. */
+export const ASSET_RETRY_BASE_MS = 5_000;
+export const ASSET_RETRY_MAX_MS = 30_000;
+
+/** Backoff for the n-th (1-based) unforced attempt: 5s, 10s, 20s, then 30s. */
+export function assetNavigationRetryMs(attempt: number): number {
+  const doubled = ASSET_RETRY_BASE_MS * 2 ** Math.max(0, attempt - 1);
+  return Math.min(doubled, ASSET_RETRY_MAX_MS);
+}
+
+/** This document outlived a navigation attempt at `attemptedRevision`: a
+ *  forced attempt met the beforeunload prompt (Stay keeps the document; Leave
+ *  lets it go regardless), or an unforced load failed and the browser kept the
+ *  old page. Drop the one-shot force and mint a revision so the safety gate
+ *  re-evaluates — dirty state holds the next attempt, a clear state retries. */
+export function rearmAssetNavigation(attemptedRevision: number): void {
   assetTransition.update((current) => {
     if (
       current === null ||
       !current.requested ||
-      current.revision !== cancelledRevision
+      current.revision !== attemptedRevision
     ) {
       return current;
     }
