@@ -16,6 +16,10 @@ export interface AssetTransition {
   forced: boolean;
   /** Monotonic request identity; one navigation attempt per revision. */
   revision: number;
+  /** Navigation attempts at this transition that left the document alive —
+   *  the load failed, or the safety gate held. Drives the retry backoff and
+   *  the notice's retry state; a new reason or target starts over. */
+  attempts: number;
 }
 
 export type AssetNavigation =
@@ -24,6 +28,14 @@ export type AssetNavigation =
   | { kind: "replace-and-reload"; target: string };
 
 export const assetTransition = writable<AssetTransition | null>(null);
+
+/** Revisions never repeat within a document, even across a cleared chunk
+ *  failure: App remembers the last revision it navigated for, and a fresh
+ *  transition re-minting that number would be silently swallowed. */
+let lastRevision = 0;
+function nextRevision(): number {
+  return ++lastRevision;
+}
 
 /**
  * Choose a navigation primitive that always replaces the loaded document.
@@ -77,7 +89,10 @@ function rank(reason: AssetTransitionReason): number {
 }
 
 /** Queue a daemon navigation. Build changes outrank connection moves, which
- *  outrank a generic chunk failure; a more precise reason is never hidden. */
+ *  outrank a generic chunk failure; a more precise reason is never hidden.
+ *  Re-reporting the same reason and target (every health poll, every repeated
+ *  "connected" event) mints nothing, so a navigation in flight is never
+ *  re-issued underneath itself. */
 export function requireAssetNavigation(
   reason: Exclude<AssetTransitionReason, "chunk">,
   target: string | null,
@@ -86,20 +101,16 @@ export function requireAssetNavigation(
     const nextReason =
       current !== null && rank(current.reason) > rank(reason) ? current.reason : reason;
     const nextTarget = target ?? current?.target ?? null;
-    if (
-      current !== null &&
-      current.reason === nextReason &&
-      current.target === nextTarget &&
-      current.requested
-    ) {
-      return current;
-    }
+    const sameIdentity =
+      current !== null && current.reason === nextReason && current.target === nextTarget;
+    if (sameIdentity && current.requested) return current;
     return {
       reason: nextReason,
       target: nextTarget,
       requested: true,
       forced: false,
-      revision: (current?.revision ?? 0) + 1,
+      revision: nextRevision(),
+      attempts: sameIdentity ? current.attempts : 0,
     };
   });
 }
@@ -115,39 +126,73 @@ export function noteChunkFailure(): void {
       target: null,
       requested: false,
       forced: false,
-      revision: (current?.revision ?? 0) + 1,
+      revision: nextRevision(),
+      attempts: 0,
     };
   });
 }
 
 /** Request the pending reload. `force` is an explicit user choice to cross a
- *  volatile-state guard; the browser's dirty-file confirmation remains too. */
+ *  volatile-state guard; the browser's dirty-file confirmation remains too.
+ *  A manual re-request keeps the attempt count: it is one more try at the
+ *  same transition, not a fresh one. */
 export function requestAssetReload(force = false): void {
   assetTransition.update((current) => ({
     reason: current?.reason ?? "chunk",
     target: current?.target ?? null,
     requested: true,
     forced: force,
-    revision: (current?.revision ?? 0) + 1,
+    revision: nextRevision(),
+    attempts: current?.attempts ?? 0,
   }));
 }
 
-/** A navigation call returned and this document is still alive, which means
- *  beforeunload was cancelled. Drop the one-shot force and mint a revision so
- *  the normal safety gate waits for dirty state to clear before trying again. */
-export function rearmAssetNavigation(cancelledRevision: number): void {
+/** Retry schedule for an attempt that left the document alive: 10s, 20s,
+ *  then 30s. Navigation is asynchronous — the document, timers included, runs
+ *  on until the new one commits — so a surviving document proves nothing
+ *  until the delay has passed, and every re-issue cancels the load in flight.
+ *  The first step must clear a slow entry document on a loaded login node:
+ *  the target answered the shell's health probe moments before, so an
+ *  outright failed load is the rare case, a slow one is not. */
+const RETRY_BASE_MS = 10_000;
+const RETRY_MAX_MS = 30_000;
+
+/** Delay before the n-th (1-based) retry of a transition. */
+export function assetNavigationRetryMs(attempt: number): number {
+  return Math.min(RETRY_BASE_MS * 2 ** Math.max(0, attempt - 1), RETRY_MAX_MS);
+}
+
+/** When to re-arm after issuing a navigation. `prompted` is a forced attempt
+ *  with dirty files — the only kind that meets a beforeunload prompt. It hands
+ *  back to the safety gate at once: whether the user keeps the document or
+ *  lets it go, dirty state holds any next attempt, so re-arming before the
+ *  prompt is even answered loses nothing. Nothing else can cancel an attempt
+ *  from inside this document; one still here after the backoff has failed. */
+export function assetRearmDelayMs(prompted: boolean, attempts: number): number {
+  return prompted ? 0 : assetNavigationRetryMs(attempts + 1);
+}
+
+/** This document outlived the navigation attempt at `attemptedRevision`.
+ *  Mint a revision so the safety gate re-evaluates — dirty state holds the
+ *  next attempt, a clear state retries — and count the attempt. The one-shot
+ *  force is dropped unless the caller knows no prompt could have consumed it
+ *  (`keepForce`: a forced attempt blocked only by chat drafts), in which case
+ *  the user's acknowledgement carries into the retry. A stale revision is a
+ *  no-op. */
+export function rearmAssetNavigation(attemptedRevision: number, keepForce = false): void {
   assetTransition.update((current) => {
     if (
       current === null ||
       !current.requested ||
-      current.revision !== cancelledRevision
+      current.revision !== attemptedRevision
     ) {
       return current;
     }
     return {
       ...current,
-      forced: false,
-      revision: current.revision + 1,
+      forced: keepForce && current.forced,
+      revision: nextRevision(),
+      attempts: current.attempts + 1,
     };
   });
 }

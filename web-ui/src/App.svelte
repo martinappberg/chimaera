@@ -283,6 +283,7 @@
   import ReauthOverlay from "./lib/workspace/ReauthOverlay.svelte";
   import AssetTransitionNotice from "./lib/layout/AssetTransitionNotice.svelte";
   import {
+    assetRearmDelayMs,
     assetTransition,
     BUILD_META_NAME,
     buildSource,
@@ -1140,6 +1141,10 @@
   // state survives navigation. A blocked transition stays visible instead of
   // looping beforeunload prompts or silently dropping a memory-only draft.
   let handledAssetRevision = 0;
+  let assetRearmTimer: ReturnType<typeof setTimeout> | null = null;
+  /** A retry that came due while nobody could see the window; the return to
+   *  visible is its catch-up. */
+  let deferredAssetRearm: { revision: number; keepForce: boolean } | null = null;
   $effect(() => {
     const transition = $assetTransition;
     if (transition === null || !transition.requested) return;
@@ -1147,6 +1152,9 @@
     if (blocked && !transition.forced) return;
     if (transition.revision === handledAssetRevision) return;
     handledAssetRevision = transition.revision;
+    // Only a forced attempt with dirty files meets the beforeunload prompt
+    // (the guard below exists only then); it hands straight back to the gate.
+    const prompted = transition.forced && $dirtyFiles.size > 0;
     untrack(() => {
       const navigation = planAssetNavigation(location.href, transition.target);
       if (navigation.kind === "reload") {
@@ -1157,12 +1165,35 @@
         history.replaceState(history.state, "", navigation.target);
         location.reload();
       }
-      // This callback can run only if the document survived the navigation
-      // call (normally because the user chose Stay in beforeunload). Re-arm
-      // with `forced` cleared: dirty state holds the next attempt, and saving
-      // it lets the existing effect retry once without a prompt loop.
-      setTimeout(() => rearmAssetNavigation(transition.revision), 0);
+      // Issue once, then wait: the document outliving the call proves nothing
+      // (navigation is asynchronous) and a re-issue cancels the load in flight
+      // (see assetRearmDelayMs). A retry that comes due while hidden holds
+      // until the window is looked at — a window nobody can see must not push
+      // a document load through the tunnel every half minute.
+      if (assetRearmTimer !== null) clearTimeout(assetRearmTimer);
+      assetRearmTimer = setTimeout(() => {
+        assetRearmTimer = null;
+        // Unprompted: no beforeunload could have consumed the force, so it
+        // carries into the retry; a prompted hand-back never waits on visibility.
+        const unprompted = !prompted;
+        if (unprompted && document.visibilityState === "hidden") {
+          deferredAssetRearm = { revision: transition.revision, keepForce: true };
+          return;
+        }
+        rearmAssetNavigation(transition.revision, unprompted);
+      }, assetRearmDelayMs(prompted, transition.attempts));
     });
+  });
+  $effect(() => {
+    if (!$pageVisible || deferredAssetRearm === null) return;
+    const { revision, keepForce } = deferredAssetRearm;
+    deferredAssetRearm = null;
+    rearmAssetNavigation(revision, keepForce);
+  });
+  // Deliberately not the navigation effect's own cleanup: that effect re-runs
+  // on every dirty-state change and would drop the pending retry with it.
+  $effect(() => () => {
+    if (assetRearmTimer !== null) clearTimeout(assetRearmTimer);
   });
 
   // Slurm strip: one probe at boot; the store keeps its own 60s poll gated on
@@ -2367,6 +2398,11 @@
   $effect(() => {
     if ($dirtyFiles.size === 0) return;
     const handler = (e: BeforeUnloadEvent) => {
+      // Sibling effects flush in declaration order: the asset navigation
+      // above can issue its reload in the very flush that cleared the last
+      // dirty file, before this listener is torn down. Decide on the live set
+      // so a clean document never prompts.
+      if (get(dirtyFiles).size === 0) return;
       e.preventDefault();
       e.returnValue = "";
     };
