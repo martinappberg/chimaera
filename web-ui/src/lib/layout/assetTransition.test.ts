@@ -1,9 +1,8 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { get } from "svelte/store";
 import {
-  ASSET_RETRY_BASE_MS,
-  ASSET_RETRY_MAX_MS,
   assetNavigationRetryMs,
+  assetRearmDelayMs,
   assetTransition,
   BUILD_META_PLACEHOLDER,
   buildSource,
@@ -56,6 +55,7 @@ describe("asset transition identity", () => {
       target: "http://127.0.0.1:9800/#token=fresh",
       requested: true,
       forced: false,
+      attempts: 0,
     });
   });
 
@@ -78,11 +78,28 @@ describe("asset transition identity", () => {
     expect(get(assetTransition)).toMatchObject({
       requested: true,
       forced: false,
-      revision: attempted!.revision + 1,
+      attempts: 1,
     });
+    expect(get(assetTransition)!.revision).toBeGreaterThan(attempted!.revision);
     // A stale callback cannot perturb a newer transition.
+    const rearmed = get(assetTransition)!;
     rearmAssetNavigation(attempted!.revision);
-    expect(get(assetTransition)?.revision).toBe(attempted!.revision + 1);
+    expect(get(assetTransition)).toBe(rearmed);
+  });
+
+  it("carries the force into a retry when no prompt could have consumed it", () => {
+    requireAssetNavigation("connection", "http://127.0.0.1:9801/#token=fresh");
+    requestAssetReload(true);
+    const attempted = get(assetTransition)!;
+
+    // Blocked only by chat drafts: no beforeunload handler exists, so a
+    // surviving document means the load failed — the user's acknowledgement
+    // still stands for the retry.
+    rearmAssetNavigation(attempted.revision, true);
+    expect(get(assetTransition)).toMatchObject({ forced: true, attempts: 1 });
+    // A manual "reload now" keeps counting the same transition.
+    requestAssetReload(true);
+    expect(get(assetTransition)).toMatchObject({ forced: true, attempts: 1 });
   });
 
   it("retries an unforced navigation whose document is still alive", () => {
@@ -93,27 +110,44 @@ describe("asset transition identity", () => {
     // The load failed (or was cancelled) and the old page is still showing:
     // the same target is attempted again under a fresh revision.
     rearmAssetNavigation(attempted.revision);
-    expect(get(assetTransition)).toMatchObject({
+    const retried = get(assetTransition)!;
+    expect(retried).toMatchObject({
       reason: "build",
       target: "http://127.0.0.1:9801/#token=fresh",
       requested: true,
       forced: false,
-      revision: attempted.revision + 1,
+      attempts: 1,
     });
-    // Repeated health polls reporting the same build do not mint revisions,
-    // so a slow reload is never re-issued underneath itself.
+    expect(retried.revision).toBeGreaterThan(attempted.revision);
+    // Repeated health polls and "connected" events reporting the same
+    // transition mint nothing, so a slow load is never re-issued underneath
+    // itself.
     requireAssetNavigation("build", null);
-    expect(get(assetTransition)?.revision).toBe(attempted.revision + 1);
+    requireAssetNavigation("build", "http://127.0.0.1:9801/#token=fresh");
+    expect(get(assetTransition)).toBe(retried);
+    // A moved target is a new transition: its backoff starts over.
+    requireAssetNavigation("connection", "http://127.0.0.1:9802/#token=fresh");
+    expect(get(assetTransition)).toMatchObject({ reason: "build", attempts: 0 });
   });
 
-  it("backs off retries from five seconds to a thirty-second ceiling", () => {
-    expect(assetNavigationRetryMs(1)).toBe(ASSET_RETRY_BASE_MS);
-    expect(assetNavigationRetryMs(2)).toBe(ASSET_RETRY_BASE_MS * 2);
-    expect(assetNavigationRetryMs(3)).toBe(ASSET_RETRY_BASE_MS * 4);
-    expect(assetNavigationRetryMs(4)).toBe(ASSET_RETRY_MAX_MS);
-    expect(assetNavigationRetryMs(40)).toBe(ASSET_RETRY_MAX_MS);
-    // A retry must never race a remote round trip: the first delay alone
-    // exceeds any sane entry-document fetch.
-    expect(ASSET_RETRY_BASE_MS).toBeGreaterThanOrEqual(5_000);
+  it("never re-mints a revision, even across a cleared chunk failure", () => {
+    noteChunkFailure();
+    requestAssetReload();
+    const handled = get(assetTransition)!.revision;
+    clearChunkFailure();
+    noteChunkFailure();
+    requestAssetReload();
+    expect(get(assetTransition)!.revision).toBeGreaterThan(handled);
+  });
+
+  it("schedules 10s, 20s, then 30s retries and re-arms a prompted attempt at once", () => {
+    expect([1, 2, 3, 4, 40].map(assetNavigationRetryMs)).toEqual([
+      10_000, 20_000, 30_000, 30_000, 30_000,
+    ]);
+    expect(assetRearmDelayMs(true, 0)).toBe(0);
+    expect(assetRearmDelayMs(true, 7)).toBe(0);
+    expect(assetRearmDelayMs(false, 0)).toBe(10_000);
+    expect(assetRearmDelayMs(false, 1)).toBe(20_000);
+    expect(assetRearmDelayMs(false, 9)).toBe(30_000);
   });
 });

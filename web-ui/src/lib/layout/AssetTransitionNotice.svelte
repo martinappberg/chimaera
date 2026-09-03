@@ -12,6 +12,11 @@
   let { transition, blockedFiles, blockedDrafts, onReload, onDismiss }: Props = $props();
 
   const blocked = $derived(blockedFiles > 0 || blockedDrafts > 0);
+  /** Volatile state holds the navigation and the user has not overridden it. */
+  const held = $derived(blocked && !transition.forced);
+  /** An attempt was issued and the document is still here: the load failed
+   *  (or is being retried); the window keeps trying on its own. */
+  const retrying = $derived(!held && transition.requested && transition.attempts > 0);
   const title = $derived(
     transition.reason === "build"
       ? "this window needs the current interface"
@@ -30,7 +35,10 @@
     return `Send, remove, or copy the unstored ${drafts} before reloading.`;
   });
   const body = $derived.by(() => {
-    if (blocked) return blockedMessage;
+    if (held) return blockedMessage;
+    if (retrying) {
+      return "The new interface has not answered yet. The window keeps trying on its own.";
+    }
     if (transition.reason === "chunk") {
       return "If the affected view offers Retry, try it first. If it still fails, reload this window to obtain the current interface.";
     }
@@ -45,11 +53,14 @@
   </div>
   <p>{body}</p>
   <div class="actions">
-    {#if blocked}
+    {#if held}
       <span class="waiting">waiting for safe reload</span>
       <button class="quiet danger" onclick={() => onReload(true)}>reload anyway</button>
-    {:else if transition.reason === "chunk" || !transition.requested}
+    {:else if !transition.requested}
       <button class="primary" onclick={() => onReload(false)}>reload window</button>
+    {:else if retrying}
+      <span class="waiting">retrying…</span>
+      <button class="quiet" onclick={() => onReload(transition.forced)}>reload now</button>
     {:else}
       <span class="waiting">reloading…</span>
     {/if}
