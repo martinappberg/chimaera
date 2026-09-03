@@ -1011,7 +1011,7 @@ fn promote_math_blocks(text: &str) -> Cow<'_, str> {
                     b[..pe + indent].to_string(),
                 ),
             };
-        if indent <= 3 && para_dollars % 2 == 0 {
+        if indent <= 3 && para_dollars.is_multiple_of(2) {
             if let Some(rest) = opener(text) {
                 // The closer in sight: before the next blank line, at this depth.
                 let mut closer = None;
