@@ -261,21 +261,27 @@
     typesetJob = null;
   }
 
-  function typesetSpan(span: HTMLElement, math: MathModule): void {
-    if (!span.isConnected || span.classList.contains("md-math")) return;
-    const display = span.dataset.mathStyle === "display";
-    const source = span.textContent ?? "";
+  function typesetSpan(el: HTMLElement, math: MathModule): void {
+    if (!el.isConnected || el.classList.contains("md-math")) return;
+    const display = el.dataset.mathStyle === "display";
+    const source = el.textContent ?? "";
+    // A `$$` block reaches comrak as a ```math fence (fs.rs promotes it) and
+    // arrives here as <pre><code data-math-style>: the whole pre becomes the
+    // display span, so the fence chrome never shows around an equation.
+    const pre = el.tagName === "CODE" ? el.closest("pre") : null;
+    const span = pre === null ? el : document.createElement("span");
     span.classList.add("md-math");
-    if (source.trim().length === 0) return; // `$$ $$`: nothing to typeset, as in live
-    if (display) span.classList.add("md-math-display");
-    span.innerHTML = math.safeMathHtml(source, display);
+    if (source.trim().length > 0) {
+      // (`$$ $$` has nothing to typeset, as in live)
+      if (display) span.classList.add("md-math-display");
+      span.innerHTML = math.safeMathHtml(source, display);
+    }
+    if (pre !== null) pre.replaceWith(span);
   }
 
   function typesetMath(root: HTMLElement): void {
     cancelTypeset();
-    const spans = Array.from(
-      root.querySelectorAll<HTMLElement>("span[data-math-style]:not(.md-math)"),
-    );
+    const spans = Array.from(root.querySelectorAll<HTMLElement>("[data-math-style]:not(.md-math)"));
     if (spans.length === 0) return;
     const job = { cancelled: false, handle: null as number | null, idle: false };
     typesetJob = job;

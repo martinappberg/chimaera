@@ -129,7 +129,11 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
     — `$…$` and `$$…$$`, Obsidian's dollar dialect (GitHub's `` $`…`$ `` / ```` ```math ````
     forms and Codex's `\(`/`\[` are not recognized in files) — typeset as KaTeX widgets, a
     `$$` block spanning lines as one widget; click one, or move the cursor onto its lines,
-    and the LaTeX shows as mono source. `mdMath.ts` is the parser extension; its delimiter
+    and the LaTeX shows as mono source. A line opening with `$$` starts a **block** whose
+    lines are raw until one ends in `$$` (so a continuation line like `+ \left(1-w\right)`
+    can't become a bullet list, and an unclosed block runs to the end like a fence); the
+    server mirrors that by promoting such blocks to comrak's ```` ```math ```` fence
+    (`fs.rs` `promote_math_blocks`). `mdMath.ts` is the parser extension; its delimiter
     rules mirror comrak's `math_dollars` so live and reading agree on what is math (`$5 and
     $10` stays currency, while `$HOME/$USER` in prose becomes math — as on GitHub).
     Tables/raw HTML/frontmatter stay as mono source (the full render lives in reading, which

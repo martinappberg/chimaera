@@ -687,7 +687,7 @@ function buildDecorations(
         hide(node.from, node.to);
       return;
     }
-    if (name === "InlineMath" || name === "DisplayMath") {
+    if (name === "InlineMath" || name === "DisplayMath" || name === "MathBlock") {
       // The walk always descends: the MathMark delimiters mute below and
       // nested QuoteMarks stay theirs — whether the equation is revealed,
       // replaced (marks inside a replace are simply not drawn), or has
@@ -698,8 +698,14 @@ function buildDecorations(
         return;
       }
       // A block spanning lines is replaced whole by the mathBlocks state
-      // field — a plugin replace may not cross a line break.
-      if (doc.lineAt(node.from).to < node.to) return;
+      // field — a plugin replace may not cross a line break. An UNCLOSED
+      // `$$` block (mid-typing; it runs to the document end like a fence)
+      // has nothing to typeset and stays visible mono source.
+      if (doc.lineAt(node.from).to < node.to) {
+        if (name === "MathBlock" && node.node.getChildren("MathMark").length < 2)
+          deco.push(markMathSrc.range(node.from, node.to));
+        return;
+      }
       const src = mathSource(node.node, doc);
       if (src === null || !once(`math:${node.from}`)) return;
       deco.push(
@@ -805,10 +811,10 @@ function collectMathBlocks(
     to,
     enter: (n) => {
       if (doc.lineAt(n.from).to >= n.to) return false;
-      if (n.name === "InlineMath" || n.name === "DisplayMath") {
+      if (n.name === "InlineMath" || n.name === "DisplayMath" || n.name === "MathBlock") {
         const source = n.from < fmEnd ? null : mathSource(n.node, doc);
         if (source !== null)
-          out.push({ from: n.from, to: n.to, source, display: n.name === "DisplayMath" });
+          out.push({ from: n.from, to: n.to, source, display: n.name !== "InlineMath" });
         return false;
       }
       if (
