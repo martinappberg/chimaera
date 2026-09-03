@@ -1,23 +1,55 @@
 import { describe, expect, it } from "vitest";
 import { markdownLanguage } from "@codemirror/lang-markdown";
 import type { MarkdownParser } from "@lezer/markdown";
-import { countDollarPairs, mathExtension } from "./mdMath";
+import { countDollarPairs, isMath, mathDelimiters, mathExtension } from "./mdMath";
+import fixture from "./mathBlocks.fixture.json";
 
 // The APP's parser configuration (GFM + sub/superscript + emoji), not bare
 // CommonMark: extension ORDER is part of what these pins protect.
 const mathParser = (markdownLanguage.parser as MarkdownParser).configure(mathExtension);
 
-/** Every math node as `Name:source`, plus any Escape, Emphasis, or list the
- *  parser produced — inside an equation there must be none. */
+/** Every math node as `containers/Name:source` — the enclosing block-context
+ *  nodes first, none at top level; an unclosed block as `MathBlock(unclosed)`
+ *  (the fixture's `editor` shape) — plus any Escape or Emphasis the parser
+ *  produced: inside an equation there must be none. */
 function math(src: string): string[] {
   const out: string[] = [];
   mathParser.parse(src).iterate({
     enter(n) {
-      if (n.name === "InlineMath" || n.name === "DisplayMath" || n.name === "MathBlock")
-        out.push(`${n.name}:${src.slice(n.from, n.to)}`);
-      else if (n.name === "Escape" || n.name === "Emphasis" || n.name === "BulletList")
+      if (isMath(n.type)) {
+        const name = n.name === "MathBlock" && mathDelimiters(n.node) === null ? `${n.name}(unclosed)` : n.name;
+        const path = [name];
+        for (let a = n.node.parent; a !== null && !a.type.isTop; a = a.parent)
+          if (a.type.is("BlockContext")) path.unshift(a.name);
+        out.push(`${path.join("/")}:${src.slice(n.from, n.to)}`);
+      } else if (n.name === "Escape" || n.name === "Emphasis")
         out.push(`${n.name}:${src.slice(n.from, n.to)}`);
     },
+  });
+  return out;
+}
+
+/** 1-based lines none of whose content any leaf-level node covers. A math
+ *  node dump cannot see a parser that consumes a line without giving it a
+ *  node — the one after a block's closer, say — so this backstops every
+ *  case. (A partly covered line passes: a closer's tail has no node.) */
+function uncoveredLines(src: string): number[] {
+  const spans: [number, number][] = [];
+  mathParser.parse(src).iterate({
+    enter(n) {
+      if (n.type.isTop || n.type.is("BlockContext")) return;
+      spans.push([n.from, n.to]);
+      return false; // a node covers its children
+    },
+  });
+  const out: number[] = [];
+  let pos = 0;
+  src.split("\n").forEach((line, i) => {
+    let covered = false;
+    for (let k = 0; k < line.length && !covered; k++)
+      if (!/\s/.test(line[k])) covered = spans.some(([f, t]) => f <= pos + k && pos + k < t);
+    if (!covered && /\S/.test(line)) out.push(i + 1);
+    pos += line.length + 1;
   });
   return out;
 }
@@ -27,15 +59,6 @@ describe("dollar math (mirrors comrak's math_dollars)", () => {
   it("parses inline and display math on one line", () => {
     expect(math("a $x+y$ b")).toEqual(["InlineMath:$x+y$"]);
     expect(math("$$x = y$$")).toEqual(["DisplayMath:$$x = y$$"]);
-  });
-
-  it("lets $$ display math span the lines of its paragraph", () => {
-    // Opened mid-line it is inline display math across the paragraph…
-    const src = "so $$\np(\\theta \\mid y) \\;=\\; \\frac{a}{b},\n\\qquad\nx\n$$";
-    expect(math(src)).toEqual([`DisplayMath:${src.slice(3)}`]);
-    // …and opened at a line start it is a block (see below).
-    const block = "$$\np(\\theta \\mid y) \\;=\\; \\frac{a}{b},\n\\qquad\nx\n$$";
-    expect(math(block)).toEqual([`MathBlock:${block}`]);
   });
 
   it("lets inline math cross a soft line break, like comrak", () => {
@@ -86,64 +109,21 @@ describe("dollar math (mirrors comrak's math_dollars)", () => {
     expect(math("an $$ open, then $x$")).toEqual(["InlineMath:$x$"]);
   });
 
-  it("parses a $$ block whose continuation line would start a list", () => {
-    // The reported case: `+ \left(…` is a bullet to markdown, so inline `$$`
-    // pairing across the paragraph fails; the block form keeps it raw.
-    const src = "$$ E = \\frac{a}{b}\n+ \\left(1-w\\right) . $$";
-    expect(math(src)).toEqual([`MathBlock:${src}`]);
-    expect(math("$$\nx\n$$")).toEqual(["MathBlock:$$\nx\n$$"]);
-  });
-
-  it("closes on the first later line containing $$ (text after it stays outside)", () => {
-    expect(math("$$\nx\n$$.")).toEqual(["MathBlock:$$\nx\n$$"]);
-    expect(math("$$\nx\n$$ so on.\n\nnext $y$")).toEqual(["MathBlock:$$\nx\n$$", "InlineMath:$y$"]);
-  });
-
-  it("opens a block only with a closer in sight, so a stray $$ costs nothing", () => {
-    expect(math("$$ is the shell's PID\n\nnext $x$")).toEqual(["InlineMath:$x$"]);
-    expect(math("$$\nx\n\ny $z$")).toEqual(["InlineMath:$z$"]);
-  });
-
-  it("keeps a single-line $$…$$ inline and $$$ as text", () => {
-    expect(math("$$x$$")).toEqual(["DisplayMath:$$x$$"]);
-    expect(math("$$$\nx\n$$$")).toEqual([]);
-  });
-
-  it("opens blocks inside list items and blockquotes, and after prose", () => {
-    const list = "- item\n\n  $$\n  x\n  $$\n- next";
-    expect(math(list)).toEqual([`BulletList:${list}`, "MathBlock:$$\n  x\n  $$"]);
-    expect(math("> $$\n> x\n> $$")).toEqual(["MathBlock:$$\n> x\n> $$"]);
-    expect(math("prose\n$$\nx\n$$\nafter")).toEqual(["MathBlock:$$\nx\n$$"]);
-    expect(math("Use `$$` for math:\n$$\nx\n$$")).toEqual(["MathBlock:$$\nx\n$$"]);
-  });
-
-  it("leaves a lazily continued quote to inline pairing, like comrak", () => {
-    expect(math("> $$\nx\n$$")).toEqual(["DisplayMath:$$\nx\n$$"]);
-  });
-
-  it("lets a lone $$ line close display math opened earlier in its paragraph", () => {
-    expect(math("so $$\nx\n$$")).toEqual(["DisplayMath:$$\nx\n$$"]);
-    expect(math("so $$\nx\n$$\nthen $$y$$")).toEqual(["DisplayMath:$$\nx\n$$", "DisplayMath:$$y$$"]);
-  });
-
-  it("leaves fenced code and HTML blocks alone", () => {
-    expect(math("```\n$$\nx\n$$\n```")).toEqual([]);
-    expect(math("<div>\n$$\nx\n$$\n</div>")).toEqual([]);
-  });
-
   it("counts $$ pairs the way the reading render does", () => {
     expect(countDollarPairs("a $$ b")).toBe(1);
     expect(countDollarPairs("$$x$$")).toBe(2);
     expect(countDollarPairs("$$$ and $$$$")).toBe(0);
     expect(countDollarPairs("`$$` then $$")).toBe(1);
   });
+});
 
-  // Known live/reading divergences, pinned so a change is deliberate: lezer's
-  // GFM Autolink and superscript runs start BEFORE the `$` and scan past it,
-  // while comrak (no superscript extension) parses the math first.
-  it("loses math swallowed by an earlier autolink or superscript run (documented)", () => {
-    expect(math("see http://x.com/$a$ now")).toEqual([]);
-    expect(math("x^2,$a^b$ done")).toEqual([]);
-    expect(math("x^2 and $a^b$ done")).toEqual(["InlineMath:$a^b$"]);
-  });
+// The editor's half of the shared case list; its `about` documents the fields.
+describe("$$ blocks (mathBlocks.fixture.json, shared with fs.rs)", () => {
+  it("has cases", () => expect(fixture.cases.length).toBeGreaterThan(0));
+  for (const c of fixture.cases) {
+    it(c.note, () => {
+      expect(math(c.input)).toEqual(c.editor);
+      expect(uncoveredLines(c.input)).toEqual([]);
+    });
+  }
 });

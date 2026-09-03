@@ -787,7 +787,7 @@ fn render_markdown(raw: &str) -> anyhow::Result<String> {
 /// equation wrapped as `+ \left(1-w\right)…` on its second line is cut by
 /// the bullet list that line starts. The fence keeps the interior raw,
 /// exactly what the live editor's block parser does (`previews/mdMath.ts`
-/// owns the grammar — keep this pass in lockstep with it):
+/// owns the grammar; its cases live in `previews/mathBlocks.fixture.json`):
 ///
 /// - a line whose content (after ≤ 3 spaces and any `>` quote prefix) opens
 ///   with `$$` — not `$$$`, no closing `$$` later on it — opens a block only
@@ -803,9 +803,13 @@ fn render_markdown(raw: &str) -> anyhow::Result<String> {
 /// - a lone `$$` line closing display math opened earlier in its paragraph
 ///   (an odd `$$` count so far) is left to inline pairing.
 ///
-/// A line pass has no container model: a `$$` block in a list item whose
-/// content column is 4+ (`10. `, nested lists) reads as indented code here
-/// while the editor, which knows the column, still renders it.
+/// A line pass has no container model, and the fixture pins where that
+/// shows: a `$$` block in a list item whose content column is 4+ (`10. `,
+/// nested lists) reads as indented code here while the editor, which knows
+/// the column, still renders it; a block opened on a marker line whose
+/// later lines leave the item is promoted here while the editor ends it
+/// unclosed; a lazy quote line resets the `$$` parity here; and an
+/// unbalanced backtick hides the rest of its line from the parity count.
 fn promote_math_blocks(text: &str) -> Cow<'_, str> {
     if !text.contains("$$") {
         return Cow::Borrowed(text);
@@ -891,7 +895,8 @@ fn promote_math_blocks(text: &str) -> Cow<'_, str> {
         }
     }
     /// `$$` delimiters in a line: pairs not part of a longer run (`$$$` is
-    /// text) and outside backtick code spans — the editor's `countDollarPairs`.
+    /// text) and outside backtick code spans — the editor's `countDollarPairs`,
+    /// except that an unbalanced backtick hides the rest of the line here.
     fn dollar_pairs(content: &str) -> usize {
         let mut n = 0;
         let mut in_code = false;
@@ -1129,74 +1134,83 @@ fn sanitize_markdown(html: &str) -> String {
 mod markdown_tests {
     use super::*;
 
-    #[test]
-    fn dollar_block_with_a_list_like_line_renders_as_one_equation() {
-        // The reported case: `+ \left(…` starts a bullet list, cutting the
-        // paragraph comrak's inline `$$` would have paired within.
-        let src = "Then\n\n$$ E = \\frac{a}{b}\n+ \\left(1-w\\right) . $$\n\nafter\n";
-        assert_eq!(
-            promote_math_blocks(src),
-            "Then\n\n```math\n E = \\frac{a}{b}\n+ \\left(1-w\\right) . \n```\n\nafter\n"
-        );
-        let html = sanitize_markdown(&markdown_to_html(src));
-        assert!(
-            html.contains(
-                "<p><span data-math-style=\"display\"> E = \\frac{a}{b}\n+ \\left(1-w\\right) . \n</span></p>"
-            ),
-            "{html}"
-        );
-        assert!(!html.contains("<li>") && !html.contains("<pre>"), "{html}");
-        // GitHub's ```math fence is the same block under another name.
-        let html = sanitize_markdown(&markdown_to_html("```math\nx^2\n```\n"));
-        assert!(
-            html.contains("<p><span data-math-style=\"display\">x^2\n</span></p>"),
-            "{html}"
-        );
+    /// The shared `$$` block case list — its `about` documents the fields;
+    /// Vitest reads the same file for the editor's half.
+    const MATH_BLOCKS_FIXTURE: &str =
+        include_str!("../../../web-ui/src/lib/previews/mathBlocks.fixture.json");
+
+    /// Strict on purpose: a misspelled key would silently drop its pin.
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct MathBlockCase {
+        note: String,
+        input: String,
+        editor: Vec<String>,
+        server: Option<String>,
+        reading: Vec<String>,
+        diverges: Option<String>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct MathBlocksFixture {
+        about: Vec<String>,
+        cases: Vec<MathBlockCase>,
+    }
+
+    /// `style:literal` for every `<span data-math-style>` in rendered HTML —
+    /// what `MarkdownView` typesets, in document order. The first `>` after
+    /// the attribute ends the tag: html5ever escapes `>` inside values.
+    fn reading_equations(html: &str) -> Vec<String> {
+        const MARK: &str = "data-math-style=\"";
+        let mut out = Vec::new();
+        let mut rest = html;
+        while let Some(i) = rest.find(MARK) {
+            rest = &rest[i + MARK.len()..];
+            let style_end = rest.find('"').expect("a closed attribute");
+            let style = &rest[..style_end];
+            rest = &rest[rest.find('>').expect("a closed tag") + 1..];
+            let end = rest.find("</span>").expect("a closed span");
+            out.push(format!("{style}:{}", &rest[..end]));
+            rest = &rest[end..];
+        }
+        out
     }
 
     #[test]
     fn dollar_block_rules_mirror_the_live_parser() {
-        // One case per rule in mdMath.ts's block grammar (and its tests).
-        let same = |s: &str| assert_eq!(promote_math_blocks(s), s, "{s:?}");
-        same("$$x$$\n"); // single-line display stays inline
-        same("$$$\nx\n$$$\n"); // three dollars are text
-        same("```\n$$\nx\n$$\n```\n"); // fenced code passes through
-        same("- ```\n  $$\n  x\n  $$\n  ```\n"); // …also on a list-marker line
-        same("<div>\n$$\nx\n$$\n</div>\n"); // raw HTML passes through
-        same("$$ is the shell's PID\n\nnext\n"); // no closer in sight: prose
-        same("$$\nx\n\ny\n"); // …a blank line ends the search
-        same("> $$\nx\n$$\n"); // a lazy quote is left to inline pairing
-        same("so $$\nx\n$$\n"); // a lone `$$` closes display math opened mid-line
-        same("so $$\nx\n$$\nthen $$y$$\n");
-        let promoted = |s: &str, want: &str| assert_eq!(promote_math_blocks(s), want, "{s:?}");
-        promoted(
-            "prose\n$$\nx\n$$\nafter\n",
-            "prose\n```math\nx\n```\nafter\n",
-        );
-        promoted("$$\nx\n$$ so on.\n", "```math\nx\n```\nso on.\n"); // trailing text stays prose
-        promoted("$$\nx\n$$.\n", "```math\nx\n```\n.\n");
-        promoted("> $$\n> x\n> $$\n", "> ```math\n> x\n> ```\n");
-        promoted(
-            ">\t$$ a\n>\t+ b $$\n",
-            ">\t```math\n>\t a\n>\t+ b \n>\t```\n",
-        ); // tab after `>`
-        promoted(
-            "- item\n\n  $$\n  x\n  $$\n- next\n",
-            "- item\n\n  ```math\n  x\n  ```\n- next\n",
-        ); // indentation kept: the block stays in its item
-        promoted(
-            "1. First\n   $$\n   x\n   $$\n2. Second\n",
-            "1. First\n   ```math\n   x\n   ```\n2. Second\n",
-        );
-        promoted(
-            "Use `$$` for math:\n$$\nx\n$$\n",
-            "Use `$$` for math:\n```math\nx\n```\n",
-        ); // a code span's `$$` is not an opener
-        promoted("## Using $$\n$$\nx\n$$\n", "## Using $$\n```math\nx\n```\n"); // a heading's `$$` does not leak into the next paragraph
-        promoted(
-            "---\ntitle: $$\n---\n$$\nx\n$$\n",
-            "---\ntitle: $$\n---\n```math\nx\n```\n",
-        ); // frontmatter is metadata
+        let fixture: MathBlocksFixture =
+            serde_json::from_str(MATH_BLOCKS_FIXTURE).expect("the fixture parses");
+        assert!(!fixture.about.is_empty() && !fixture.cases.is_empty());
+        for c in &fixture.cases {
+            let want = c.server.as_deref().unwrap_or(&c.input);
+            assert_eq!(
+                promote_math_blocks(&c.input),
+                want,
+                "{}: {:?}",
+                c.note,
+                c.input
+            );
+            let html = sanitize_markdown(&markdown_to_html(&c.input));
+            assert_eq!(reading_equations(&html), c.reading, "{}: {html}", c.note);
+            if c.diverges.is_none() {
+                // The fixture's own consistency: one CLOSED MathBlock in the
+                // editor per fence this pass adds (an unclosed one is dumped
+                // as `MathBlock(unclosed)` and adds none).
+                let fences = |s: &str| s.matches("```math").count();
+                let blocks = c
+                    .editor
+                    .iter()
+                    .filter(|e| e.starts_with("MathBlock:") || e.contains("/MathBlock:"))
+                    .count();
+                assert_eq!(
+                    blocks,
+                    fences(want) - fences(&c.input),
+                    "{}: one closed MathBlock per promoted fence",
+                    c.note
+                );
+            }
+        }
     }
 
     #[test]
@@ -1204,12 +1218,13 @@ mod markdown_tests {
         let html = sanitize_markdown(&markdown_to_html(
             "Inline $a<b$ here.\n\n$$\nx^2\n$$\n\n<script>alert(1)</script>\n",
         ));
-        assert!(
-            html.contains(r#"<span data-math-style="inline">a&lt;b</span>"#),
+        assert_eq!(
+            reading_equations(&html),
+            ["inline:a&lt;b", "display:x^2\n"],
             "{html}"
         );
-        // A `$$` block is promoted to a math fence, then handed over as the
-        // same span every equation uses.
+        // A promoted `$$` block is handed over in the same `<p><span>` shape
+        // as every other equation.
         assert!(
             html.contains("<p><span data-math-style=\"display\">x^2\n</span></p>"),
             "{html}"

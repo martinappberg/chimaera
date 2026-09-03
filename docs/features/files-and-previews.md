@@ -139,7 +139,9 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
     indented four columns or more as code, where the editor still renders it. `mdMath.ts` is
     the parser extension; its delimiter rules mirror comrak's `math_dollars` so live and
     reading agree on what is math (`$5 and $10` stays currency, while `$HOME/$USER` in prose
-    becomes math — as on GitHub).
+    becomes math — as on GitHub), and one case list, `previews/mathBlocks.fixture.json`, pins
+    the block grammar for both sides: the Vitest and Rust suites each run every case, with
+    the known divergences named in it.
     Tables/raw HTML/frontmatter stay as mono source (the full render lives in reading, which
     is also where table-cell math typesets), and so does any construct the decorator can't
     render faithfully (reference links, multi-line image syntax). Mod+click follows links;

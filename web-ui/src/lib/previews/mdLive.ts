@@ -51,7 +51,7 @@ import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
 import { languages } from "@codemirror/language-data";
 import type { SyntaxNode, SyntaxNodeRef, Tree } from "@lezer/common";
 import { rawTicketUrl, resolveDocPath, safeDecodeUri } from "./files";
-import { mathExtension } from "./mdMath";
+import { MATH_MARK, isDisplayMath, isMath, mathDelimiters, mathExtension } from "./mdMath";
 import { loadMath, mathNow } from "./mathLoad";
 import { copyText } from "../shared/clipboard";
 import { makeCopyButton } from "../shared/copyDecor";
@@ -243,8 +243,8 @@ class MathWidget extends WidgetType {
  *  as comrak does before it emits the literal the reading view typesets —
  *  a `%` comment inside the formula must end at the same place in both. */
 function mathSource(node: SyntaxNode, doc: Text): string | null {
-  const marks = node.getChildren("MathMark");
-  if (marks.length !== 2) return null; // the parser always emits both; defensive
+  const marks = mathDelimiters(node);
+  if (marks === null) return null; // an unclosed `$$` block: nothing to typeset yet
   let src = "";
   let pos = marks[0].to;
   for (const q of node.getChildren("QuoteMark")) {
@@ -710,7 +710,7 @@ function buildDecorations(
         hide(node.from, node.to);
       return;
     }
-    if (name === "InlineMath" || name === "DisplayMath" || name === "MathBlock") {
+    if (isMath(node.type)) {
       // The walk always descends: the MathMark delimiters mute below and
       // nested QuoteMarks stay theirs — whether the equation is revealed,
       // replaced (marks inside a replace are simply not drawn), or has
@@ -722,24 +722,23 @@ function buildDecorations(
       }
       // A block spanning lines is replaced whole by the mathBlocks state
       // field — a plugin replace may not cross a line break. An UNCLOSED
-      // `$$` block (mid-typing; it runs to the document end like a fence)
-      // has nothing to typeset and stays visible mono source.
+      // `$$` block (its lines left their list item before a closer) has
+      // nothing to typeset and stays visible mono source.
       if (doc.lineAt(node.from).to < node.to) {
-        if (name === "MathBlock" && node.node.getChildren("MathMark").length < 2)
-          deco.push(markMathSrc.range(node.from, node.to));
+        if (mathDelimiters(node.node) === null) deco.push(markMathSrc.range(node.from, node.to));
         return;
       }
       const src = mathSource(node.node, doc);
       if (src === null || !once(`math:${node.from}`)) return;
       deco.push(
-        Decoration.replace({ widget: new MathWidget(src, name === "DisplayMath") }).range(
+        Decoration.replace({ widget: new MathWidget(src, isDisplayMath(node.type)) }).range(
           node.from,
           node.to,
         ),
       );
       return;
     }
-    if (name === "MathMark") {
+    if (name === MATH_MARK) {
       deco.push(markMuted.range(node.from, node.to));
       return;
     }
@@ -834,10 +833,10 @@ function collectMathBlocks(
     to,
     enter: (n) => {
       if (doc.lineAt(n.from).to >= n.to) return false;
-      if (n.name === "InlineMath" || n.name === "DisplayMath" || n.name === "MathBlock") {
+      if (isMath(n.type)) {
         const source = n.from < fmEnd ? null : mathSource(n.node, doc);
         if (source !== null)
-          out.push({ from: n.from, to: n.to, source, display: n.name !== "InlineMath" });
+          out.push({ from: n.from, to: n.to, source, display: isDisplayMath(n.type) });
         return false;
       }
       if (n.name === "FencedCode") {
