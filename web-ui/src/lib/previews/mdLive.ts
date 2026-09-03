@@ -16,11 +16,16 @@
  *
  * Replace decorations from a view plugin may not span line breaks (CodeMirror
  * throws and disables the plugin, degrading the whole document): `hide()` and
- * the image widget both enforce single-line ranges.
+ * the image widget both enforce single-line ranges. The one construct that
+ * legitimately spans lines and still renders — a `$$` display-math block —
+ * is replaced from a STATE FIELD (`mathBlocks`), which CodeMirror allows.
  *
  * Sanitization boundary: nothing from the document is ever injected as HTML.
  * Widgets are built via createElement/textContent; the only innerHTML is the
- * shared constant copy-icon SVG. Image widgets pass through only web
+ * shared constant copy-icon SVG and, for equations, KaTeX MathML rendered
+ * with trust off and passed through DOMPurify — the one math policy every
+ * surface shares (`shared/math.ts`, loaded on demand at the first equation
+ * so a document without one never pays for KaTeX). Image widgets pass through only web
  * (http/https) and inline `data:image/` URLs — any other absolute scheme
  * stays visible source — and document-relative paths go through a ticketed
  * /raw/ URL (the server canonicalizes and enforces access).
@@ -34,11 +39,20 @@ import {
   type ViewUpdate,
 } from "@codemirror/view";
 import { syntaxTree } from "@codemirror/language";
-import type { EditorState, Extension, Line } from "@codemirror/state";
+import {
+  StateField,
+  type EditorState,
+  type Extension,
+  type Line,
+  type Text,
+  type Transaction,
+} from "@codemirror/state";
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
 import { languages } from "@codemirror/language-data";
-import type { SyntaxNode, SyntaxNodeRef } from "@lezer/common";
+import type { SyntaxNode, SyntaxNodeRef, Tree } from "@lezer/common";
 import { rawTicketUrl, resolveDocPath, safeDecodeUri } from "./files";
+import { mathExtension } from "./mdMath";
+import { loadMath, mathNow } from "./mathLoad";
 import { copyText } from "../shared/clipboard";
 import { makeCopyButton } from "../shared/copyDecor";
 import { activateUrl, hasUrlScheme, isWebUrl, urlMenuEntries } from "../shared/urlOpen";
@@ -46,14 +60,16 @@ import { contextMenu } from "../shared/contextMenu.svelte";
 
 /**
  * The GFM markdown language (tables, task lists, strikethrough, autolinks;
- * nested fenced-code highlighting via the shared registry). A module
- * SINGLETON: the host keeps it active in both live and source modes, so a
- * mode flip reconfigures around the same Language instance and CodeMirror
- * never reparses the document.
+ * nested fenced-code highlighting via the shared registry) plus `$`/`$$`
+ * math (`mdMath`, whose delimiter rules mirror the reading view's comrak). A
+ * module SINGLETON: the host keeps it active in both live and source modes,
+ * so a mode flip reconfigures around the same Language instance and
+ * CodeMirror never reparses the document.
  */
 export const markdownLanguageExt: Extension = markdown({
   base: markdownLanguage,
   codeLanguages: languages,
+  extensions: [mathExtension],
 });
 
 // --- widgets -----------------------------------------------------------------
@@ -160,6 +176,87 @@ class ImageWidget extends WidgetType {
   }
 }
 
+/** `$…$` / `$$…$$` typeset as KaTeX MathML while its line is inactive. A
+ *  click is handed to the editor (events are NOT ignored), so it lands the
+ *  cursor on the equation and the reveal rule shows its LaTeX — Obsidian's
+ *  gesture. The one exception is a press on a wide display equation's own
+ *  scrollbar band, which must scroll: handing that to the editor would place
+ *  the cursor, reveal the source, and destroy the scroller mid-drag. */
+class MathWidget extends WidgetType {
+  constructor(
+    readonly source: string,
+    readonly display: boolean,
+  ) {
+    super();
+  }
+  override eq(other: MathWidget): boolean {
+    return other.source === this.source && other.display === this.display;
+  }
+  toDOM(view: EditorView): HTMLElement {
+    const el = document.createElement("span");
+    el.className = this.display ? "lp-math lp-math-display" : "lp-math";
+    const math = mathNow();
+    if (math !== null) {
+      el.innerHTML = math.safeMathHtml(this.source, this.display);
+      return el;
+    }
+    // The session's first equation: KaTeX is still on its way. Show the
+    // source meanwhile and typeset in place — the element persists across
+    // rebuilds (eq), so this never races a replacement. A failed load
+    // leaves the source showing, which is honest.
+    el.classList.add("lp-math-src");
+    el.textContent = this.source;
+    void loadMath().then(
+      (m) => {
+        if (!el.isConnected) return;
+        el.innerHTML = m.safeMathHtml(this.source, this.display);
+        el.classList.remove("lp-math-src");
+        view.requestMeasure();
+      },
+      () => {
+        // KaTeX failed to load: the LaTeX source stays visible.
+      },
+    );
+    return el;
+  }
+  override ignoreEvent(e: Event): boolean {
+    if (!this.display || e.type !== "mousedown" || !(e.target instanceof Element)) return false;
+    // CodeMirror dispatches from contentDOM, so currentTarget is never the
+    // widget: find the scroller from the press target (a press on its own
+    // bar targets the scroller element itself).
+    const el = e.target.closest<HTMLElement>(".lp-math-display");
+    if (el === null || el.scrollWidth <= el.clientWidth) return false;
+    // Classic scrollbars have a measurable band; overlay scrollbars (the
+    // macOS/WKWebView default) report none, so a bottom strip stands in.
+    const band = Math.max(el.offsetHeight - el.clientHeight, 12);
+    return (e as MouseEvent).clientY >= el.getBoundingClientRect().bottom - band;
+  }
+  override get estimatedHeight(): number {
+    return this.display ? 56 : -1;
+  }
+}
+
+/** The LaTeX between an equation's delimiters, or null when there is nothing
+ *  to typeset (whitespace only). Quoted math carries its per-line `>` markers
+ *  as QuoteMark children — chrome, not LaTeX, so they are cut out. Inline
+ *  `$…$` that crosses a soft line break gets its newlines folded to spaces,
+ *  as comrak does before it emits the literal the reading view typesets —
+ *  a `%` comment inside the formula must end at the same place in both. */
+function mathSource(node: SyntaxNode, doc: Text): string | null {
+  const marks = node.getChildren("MathMark");
+  if (marks.length !== 2) return null; // the parser always emits both; defensive
+  let src = "";
+  let pos = marks[0].to;
+  for (const q of node.getChildren("QuoteMark")) {
+    if (q.from < pos) continue;
+    src += doc.sliceString(pos, q.from);
+    pos = q.to;
+  }
+  src += doc.sliceString(pos, marks[1].from);
+  if (marks[0].to - marks[0].from === 1) src = src.replace(/\n/g, " ");
+  return src.trim().length === 0 ? null : src;
+}
+
 /** Restore a copy button's idle state after the shared 1400ms flash. */
 function flashCopied(btn: HTMLElement, idleLabel: string): void {
   btn.classList.add("copied");
@@ -242,6 +339,7 @@ const markStrike = Decoration.mark({ class: "lp-strike" });
 const markInlineCode = Decoration.mark({ class: "lp-inline-code" });
 const markFenceChrome = Decoration.mark({ class: "lp-fence-chrome" });
 const markTaskDone = Decoration.mark({ class: "lp-task-done" });
+const markMathSrc = Decoration.mark({ class: "lp-math-src" });
 const replaceBullet = Decoration.replace({ widget: bulletWidget });
 const replaceRule = Decoration.replace({ widget: ruleWidget });
 const replaceChecked = Decoration.replace({ widget: checkedWidget });
@@ -289,6 +387,14 @@ function spansEqual(a: Span[], b: Span[]): boolean {
   return a.length === b.length && a.every((s, i) => s.from === b[i].from && s.to === b[i].to);
 }
 
+/** THE reveal rule, shared by the plugin and the math field: a range is
+ *  active when the selection touches any of its lines. Spans are whole
+ *  lines, so "the range's lines intersect a span" reduces to plain
+ *  containment — no per-node doc.lineAt lookup needed. */
+function touches(sel: Span[], from: number, to: number): boolean {
+  return sel.some((s) => s.from <= to && s.to >= from);
+}
+
 function buildDecorations(
   view: EditorView,
   path: string,
@@ -309,17 +415,37 @@ function buildDecorations(
     return true;
   };
 
-  // Spans are whole lines, so "the position's line intersects a span" reduces
-  // to plain containment — no per-node doc.lineAt lookup needed.
-  const active = (from: number, to: number): boolean =>
-    sel.some((s) => s.from <= to && s.to >= from);
-  const lineActive = (pos: number): boolean => sel.some((s) => s.from <= pos && s.to >= pos);
+  const active = (from: number, to: number): boolean => touches(sel, from, to);
+  const lineActive = (pos: number): boolean => touches(sel, pos, pos);
+
+  // Positions inside a collapsed equation — an inactive multi-line block the
+  // mathBlocks field replaced whole — belong to the ONE line its widget
+  // renders on. A line class or copy button pushed for a later line of the
+  // block would be a point nested inside that replace, which CodeMirror
+  // drops (a quote card ending in a `$$` block lost its bottom corners).
+  const collapsed = state.field(mathBlocks, false)?.deco ?? Decoration.none;
+  const collapsedStart = (pos: number): number | null => {
+    let hit: number | null = null;
+    collapsed.between(pos, pos, (from, to) => {
+      if (from < pos && pos < to) {
+        hit = from;
+        return false;
+      }
+      return;
+    });
+    return hit;
+  };
+  const visibleLineFrom = (lineFrom: number): number => {
+    const c = collapsedStart(lineFrom);
+    return c === null ? lineFrom : doc.lineAt(c).from;
+  };
 
   const addLineClass = (lineFrom: number, cls: string): void => {
-    let set = lineClasses.get(lineFrom);
+    const key = visibleLineFrom(lineFrom);
+    let set = lineClasses.get(key);
     if (set === undefined) {
       set = new Set();
-      lineClasses.set(lineFrom, set);
+      lineClasses.set(key, set);
     }
     set.add(cls);
   };
@@ -462,8 +588,10 @@ function buildDecorations(
         if (outermost && l.from === lastFrom) addLineClass(l.from, "lp-quote-last");
       });
       // The quote card carries the same copy affordance as the reading view.
+      // A quote that OPENS with a collapsed `$$` block gets it just before
+      // the equation instead (the line end sits inside the replace).
       if (outermost && once(`copy:${firstLine.to}`))
-        deco.push(widgetQuoteCopy.range(firstLine.to));
+        deco.push(widgetQuoteCopy.range(collapsedStart(firstLine.to) ?? firstLine.to));
       return;
     }
     if (name === "QuoteMark") {
@@ -559,6 +687,33 @@ function buildDecorations(
         hide(node.from, node.to);
       return;
     }
+    if (name === "InlineMath" || name === "DisplayMath") {
+      // The walk always descends: the MathMark delimiters mute below and
+      // nested QuoteMarks stay theirs — whether the equation is revealed,
+      // replaced (marks inside a replace are simply not drawn), or has
+      // nothing to typeset (`$$ $$`, whose delimiters must still look muted).
+      if (active(node.from, node.to)) {
+        // Being edited: the LaTeX shows as mono source.
+        deco.push(markMathSrc.range(node.from, node.to));
+        return;
+      }
+      // A block spanning lines is replaced whole by the mathBlocks state
+      // field — a plugin replace may not cross a line break.
+      if (doc.lineAt(node.from).to < node.to) return;
+      const src = mathSource(node.node, doc);
+      if (src === null || !once(`math:${node.from}`)) return;
+      deco.push(
+        Decoration.replace({ widget: new MathWidget(src, name === "DisplayMath") }).range(
+          node.from,
+          node.to,
+        ),
+      );
+      return;
+    }
+    if (name === "MathMark") {
+      deco.push(markMuted.range(node.from, node.to));
+      return;
+    }
     if (name === "Table") {
       eachVisibleLine(node.from, node.to, (l) => addLineClass(l.from, "lp-table"));
       hideNestedQuoteMarks(node);
@@ -615,6 +770,173 @@ function livePlugin(path: string): Extension {
     { decorations: (v) => v.decorations },
   );
 }
+
+// --- multi-line math ---------------------------------------------------------
+
+interface MathBlock {
+  from: number;
+  to: number;
+  source: string;
+  display: boolean;
+}
+
+interface MathBlocksState {
+  blocks: MathBlock[];
+  sel: Span[];
+  fmEnd: number;
+  deco: DecorationSet;
+}
+
+/** Every equation within [from, to] whose source spans a line break — the
+ *  whole document by default. The walk prunes any subtree that sits on one
+ *  line (one lineAt per node), so a document of single-line paragraphs costs
+ *  next to nothing; code, HTML and tables can't hold one and are skipped
+ *  outright, and frontmatter is metadata (the plugin's rule), never math. */
+function collectMathBlocks(
+  state: EditorState,
+  fmEnd: number,
+  from = 0,
+  to = state.doc.length,
+): MathBlock[] {
+  const doc = state.doc;
+  const out: MathBlock[] = [];
+  syntaxTree(state).iterate({
+    from,
+    to,
+    enter: (n) => {
+      if (doc.lineAt(n.from).to >= n.to) return false;
+      if (n.name === "InlineMath" || n.name === "DisplayMath") {
+        const source = n.from < fmEnd ? null : mathSource(n.node, doc);
+        if (source !== null)
+          out.push({ from: n.from, to: n.to, source, display: n.name === "DisplayMath" });
+        return false;
+      }
+      if (
+        n.name === "FencedCode" ||
+        n.name === "CodeBlock" ||
+        n.name === "HTMLBlock" ||
+        n.name === "CommentBlock" ||
+        n.name === "Table"
+      )
+        return false;
+      return;
+    },
+  });
+  return out;
+}
+
+/** [from, to] widened to the top-level blocks it touches. An equation never
+ *  crosses a top-level boundary, so an edit can only create or destroy
+ *  equations inside the top-level nodes it touched. A position the (possibly
+ *  still-partial) tree resolves to the Document itself stays as is. */
+function topLevelSpan(tree: Tree, from: number, to: number): [number, number] {
+  const top = (pos: number, side: -1 | 1): SyntaxNode | null => {
+    let n: SyntaxNode | null = tree.resolveInner(pos, side);
+    while (n !== null && n.parent !== null && n.parent.parent !== null) n = n.parent;
+    return n !== null && n.parent !== null ? n : null;
+  };
+  const a = top(from, 1);
+  const b = top(to, -1);
+  return [a === null ? from : Math.min(a.from, from), b === null ? to : Math.max(b.to, to)];
+}
+
+/** After an edit: equations outside the touched top-level blocks only move
+ *  (positions mapped through the change) and keep their source; the touched
+ *  blocks are re-walked. Per-keystroke work is O(the edited block), not the
+ *  document — the plugin's own walk is viewport-bounded for the same reason.
+ *  "Touched" is judged in BOTH trees: closing a fence or HTML block above a
+ *  `$$` paragraph exposes equations that were never known and lie outside
+ *  the new tree's block at the edit — only the old container's extent,
+ *  mapped forward, says where to look (and the reverse edit, which swallows
+ *  blocks into a new container, is covered by the new tree's extent). */
+function recollectAround(prev: MathBlock[], tr: Transaction, fmEnd: number): MathBlock[] {
+  const state = tr.state;
+  let lo = state.doc.length;
+  let hi = 0;
+  let loA = tr.startState.doc.length;
+  let hiA = 0;
+  tr.changes.iterChangedRanges((fromA, toA, fromB, toB) => {
+    lo = Math.min(lo, fromB);
+    hi = Math.max(hi, toB);
+    loA = Math.min(loA, fromA);
+    hiA = Math.max(hiA, toA);
+  });
+  const [newFrom, newTo] = topLevelSpan(syntaxTree(state), lo, hi);
+  const [oldFrom, oldTo] = topLevelSpan(syntaxTree(tr.startState), loA, hiA);
+  const from = Math.min(newFrom, tr.changes.mapPos(oldFrom, -1));
+  const to = Math.max(newTo, tr.changes.mapPos(oldTo, 1));
+  const out: MathBlock[] = [];
+  let walked = false;
+  for (const b of prev) {
+    const f = tr.changes.mapPos(b.from, 1);
+    const t = tr.changes.mapPos(b.to, -1);
+    // STRICTLY outside the span survives; a block merely touching it is
+    // re-walked (the walk visits nodes touching [from, to] too, so an
+    // untouched neighbour is found again). Deleting a closing `$$` maps the
+    // block's end exactly onto the span start — inclusive tests kept that
+    // block alive with its old source.
+    if (t < from) {
+      out.push({ ...b, from: f, to: t });
+    } else if (f > to) {
+      if (!walked) {
+        out.push(...collectMathBlocks(state, fmEnd, from, to));
+        walked = true;
+      }
+      out.push({ ...b, from: f, to: t });
+    }
+  }
+  if (!walked) out.push(...collectMathBlocks(state, fmEnd, from, to));
+  return out;
+}
+
+function mathBlockDecorations(blocks: MathBlock[], sel: Span[]): DecorationSet {
+  const ranges: ReturnType<Decoration["range"]>[] = [];
+  for (const b of blocks) {
+    if (touches(sel, b.from, b.to)) continue; // revealed: the plugin shows source
+    ranges.push(
+      Decoration.replace({ widget: new MathWidget(b.source, b.display) }).range(b.from, b.to),
+    );
+  }
+  return Decoration.set(ranges, true);
+}
+
+/**
+ * Equations spanning lines (`$$` … `$$` on their own lines) rendered as one
+ * widget replacing the whole range. A STATE FIELD, not part of the view
+ * plugin: CodeMirror forbids plugin-provided replace decorations across line
+ * breaks (they change the vertical layout the viewport is computed from).
+ * An edit re-walks only the top-level blocks it touched; a background parse
+ * finishing a region (tree changed, document not) re-walks the document —
+ * a handful of times while a large file loads, never per keystroke; a
+ * selection move just re-applies the reveal rule.
+ */
+const mathBlocks = StateField.define<MathBlocksState>({
+  create(state) {
+    const fmEnd = frontmatterEnd(state);
+    const blocks = collectMathBlocks(state, fmEnd);
+    const sel = selectionSpans(state);
+    return { blocks, sel, fmEnd, deco: mathBlockDecorations(blocks, sel) };
+  },
+  update(v, tr) {
+    const treeChanged = syntaxTree(tr.state) !== syntaxTree(tr.startState);
+    if (!tr.docChanged && !treeChanged && tr.selection === undefined) return v;
+    let fmEnd = v.fmEnd;
+    let blocks = v.blocks;
+    if (tr.docChanged) {
+      fmEnd = frontmatterEnd(tr.state);
+      blocks =
+        fmEnd === v.fmEnd
+          ? recollectAround(v.blocks, tr, fmEnd)
+          : collectMathBlocks(tr.state, fmEnd);
+    } else if (treeChanged) {
+      blocks = collectMathBlocks(tr.state, fmEnd);
+    }
+    const sel = selectionSpans(tr.state);
+    if (blocks === v.blocks && spansEqual(sel, v.sel)) return v;
+    return { blocks, sel, fmEnd, deco: mathBlockDecorations(blocks, sel) };
+  },
+  provide: (f) => EditorView.decorations.from(f, (v) => v.deco),
+});
 
 // --- links -------------------------------------------------------------------
 
@@ -772,11 +1094,25 @@ const liveTheme: Extension = EditorView.theme({
     color: "var(--muted)",
     textDecoration: "line-through",
   },
-  "&.cm-md-live .lp-table, &.cm-md-live .lp-html, &.cm-md-live .lp-frontmatter": {
-    fontFamily: "var(--mono)",
-    fontSize: "0.848em",
-  },
+  "&.cm-md-live .lp-table, &.cm-md-live .lp-html, &.cm-md-live .lp-frontmatter, &.cm-md-live .lp-math-src":
+    {
+      fontFamily: "var(--mono)",
+      fontSize: "0.848em",
+    },
   "&.cm-md-live .lp-frontmatter": { color: "var(--muted)" },
+
+  // Equations (typography is the global .katex rule in app.css): display
+  // math scrolls within the column rather than widening it, as in reading.
+  "&.cm-md-live .lp-math": { color: "inherit" },
+  "&.cm-md-live .lp-math-display": {
+    display: "inline-block",
+    width: "100%",
+    maxWidth: "100%",
+    overflowX: "auto",
+    overflowY: "hidden",
+    margin: "0.35em 0",
+    verticalAlign: "middle",
+  },
 
   "&.cm-md-live .lp-bullet": {
     color: "color-mix(in srgb, var(--accent) 70%, var(--muted))",
@@ -834,6 +1170,7 @@ export function markdownLive(path: string): Extension {
     EditorView.editorAttributes.of({ class: "cm-md-live" }),
     liveTheme,
     livePlugin(path),
+    mathBlocks,
     linkClicks,
   ];
 }

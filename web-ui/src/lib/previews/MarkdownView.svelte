@@ -4,9 +4,10 @@
    *
    * LIVE (the default) is an editable reading view — the shared CodeMirror
    * editor with the mdLive decoration set rendering formatting inline (marks
-   * hidden off the selection's lines, images/checkboxes/rules as widgets).
-   * READING is the complete, non-editable render — the authoritative
-   * server-side comrak GFM (sanitized), which refreshes from disk on save or
+   * hidden off the selection's lines, images/checkboxes/rules/equations as
+   * widgets). READING is the complete, non-editable render — the
+   * authoritative server-side comrak GFM (sanitized; `$`/`$$` math arrives as
+   * LaTeX literals this view typesets), which refreshes from disk on save or
    * an agent write. SOURCE is the same editor as plain raw markdown. Live and
    * source share ONE editor instance (an extension swap, never a remount), and
    * the editor mounts once and survives every toggle, so flipping modes never
@@ -34,6 +35,7 @@
   import Spinner from "./Spinner.svelte";
   import { activateUrl, hasUrlScheme, isWebUrl, urlMenuEntries } from "../shared/urlOpen";
   import { contextMenu } from "../shared/contextMenu.svelte";
+  import { loadMath, mathNow } from "./mathLoad";
 
   interface Props {
     path: string;
@@ -232,7 +234,78 @@
     if (content === null) return;
     decorateCopyTargets(content);
     stampImages(content);
+    typesetMath(content);
+    return cancelTypeset;
   });
+
+  /** Equations in a rendered document. comrak (`math_dollars`) emits each
+   *  `$…$`/`$$…$$` as an escaped LaTeX literal in `span[data-math-style]` —
+   *  the one non-default attribute the server sanitizer keeps — and the
+   *  client typesets it under the shared KaTeX policy (`shared/math`,
+   *  loaded on demand at the first equation, memoized). The pass is
+   *  idempotent (a typeset span carries `.md-math`; a fresh server render
+   *  brings fresh spans) and time-sliced: lecture notes with thousands of
+   *  equations typeset their first screen synchronously and the rest at
+   *  idle, so a refresh mid agent-rewrite can't stall the workbench. */
+  type MathModule = typeof import("../shared/math");
+  let typesetJob: { cancelled: boolean; handle: number | null; idle: boolean } | null = null;
+
+  function cancelTypeset(): void {
+    const job = typesetJob;
+    if (job === null) return;
+    job.cancelled = true;
+    if (job.handle !== null) {
+      if (job.idle) cancelIdleCallback(job.handle);
+      else clearTimeout(job.handle);
+    }
+    typesetJob = null;
+  }
+
+  function typesetSpan(span: HTMLElement, math: MathModule): void {
+    if (!span.isConnected || span.classList.contains("md-math")) return;
+    const display = span.dataset.mathStyle === "display";
+    const source = span.textContent ?? "";
+    span.classList.add("md-math");
+    if (source.trim().length === 0) return; // `$$ $$`: nothing to typeset, as in live
+    if (display) span.classList.add("md-math-display");
+    span.innerHTML = math.safeMathHtml(source, display);
+  }
+
+  function typesetMath(root: HTMLElement): void {
+    cancelTypeset();
+    const spans = Array.from(
+      root.querySelectorAll<HTMLElement>("span[data-math-style]:not(.md-math)"),
+    );
+    if (spans.length === 0) return;
+    const job = { cancelled: false, handle: null as number | null, idle: false };
+    typesetJob = job;
+    let i = 0;
+    const slice = (math: MathModule): void => {
+      if (job.cancelled) return;
+      job.handle = null;
+      const deadline = performance.now() + 8;
+      while (i < spans.length && performance.now() < deadline) typesetSpan(spans[i++], math);
+      if (i >= spans.length) {
+        typesetJob = null;
+        return;
+      }
+      // WKWebView (the native app) has no requestIdleCallback: a short
+      // timeout stands in — the chat's path-stamping fallback.
+      if (typeof requestIdleCallback === "function") {
+        job.idle = true;
+        job.handle = requestIdleCallback(() => slice(math), { timeout: 500 });
+      } else {
+        job.idle = false;
+        job.handle = window.setTimeout(() => slice(math), 16);
+      }
+    };
+    const math = mathNow();
+    if (math !== null) slice(math);
+    else
+      void loadMath().then(slice, () => {
+        // KaTeX failed to load: the LaTeX literals stay readable as text.
+      });
+  }
 
   /** `![](figs/plot.png)` in a document: the rendered src is relative, which
    *  the browser would resolve against the APP origin (a guaranteed 404).
@@ -705,6 +778,22 @@
 
   .md-body :global(.md-copy.copied .ic-check) {
     display: block;
+  }
+
+  /* Equations (typeset client-side into comrak's math spans; typography is
+     the global .katex rule in app.css): display math scrolls within the
+     reading column instead of widening the workbench — the chat's treatment. */
+  .md-body :global(.md-math) {
+    color: inherit;
+  }
+
+  .md-body :global(.md-math-display) {
+    display: block;
+    max-width: 100%;
+    overflow-x: auto;
+    overflow-y: hidden;
+    margin: 0.55em 0;
+    padding: 0.1em 0;
   }
 
   .md-body :global(ul),

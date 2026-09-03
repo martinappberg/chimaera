@@ -761,9 +761,9 @@ pub(crate) async fn markdown(Query(query): Query<MarkdownQuery>) -> Response {
     blocking_json(move || Ok(json!({"html": render_markdown(&query.path)?}))).await
 }
 
-/// Render the markdown file at `raw` with comrak (GFM extensions), then
-/// sanitize with ammonia's defaults so raw HTML in the source cannot inject
-/// scripts. Files over 4MB are rejected.
+/// Render the markdown file at `raw` with comrak (GFM extensions + dollar
+/// math), then sanitize so raw HTML in the source cannot inject scripts.
+/// Files over 4MB are rejected.
 fn render_markdown(raw: &str) -> anyhow::Result<String> {
     let path = canonical_file(raw)?;
     let size = std::fs::metadata(&path)
@@ -778,17 +778,64 @@ fn render_markdown(raw: &str) -> anyhow::Result<String> {
     let bytes =
         std::fs::read(&path).with_context(|| format!("{}: failed to read", path.display()))?;
     let text = String::from_utf8_lossy(&bytes);
+    Ok(sanitize_markdown(&markdown_to_html(&text)))
+}
 
+/// comrak with the GFM extensions the reading view promises, plus `$…$` /
+/// `$$…$$` math emitted as `<span data-math-style>` LaTeX literals — never
+/// typeset here; the client owns KaTeX. Raw HTML passes through for ammonia
+/// to judge.
+fn markdown_to_html(text: &str) -> String {
     let mut options = comrak::Options::default();
     options.extension.strikethrough = true;
     options.extension.table = true;
     options.extension.autolink = true;
     options.extension.tasklist = true;
     options.extension.footnotes = true;
+    options.extension.math_dollars = true;
     // Let raw HTML through comrak; ammonia strips anything dangerous.
     options.render.r#unsafe = true;
-    let html = comrak::markdown_to_html(&text, &options);
-    Ok(ammonia::clean(&html))
+    comrak::markdown_to_html(text, &options)
+}
+
+/// ammonia's defaults, widened by exactly one attribute: `data-math-style` on
+/// `span`, the marker the client's typesetter keys on. Its value is inert (a
+/// style name) and the span's text is LaTeX the client renders with KaTeX
+/// trust off, so a hand-written `<span data-math-style>` in a document can do
+/// no more than `$$` can.
+fn sanitize_markdown(html: &str) -> String {
+    ammonia::Builder::default()
+        .add_tag_attributes("span", &["data-math-style"])
+        .clean(html)
+        .to_string()
+}
+
+#[cfg(test)]
+mod markdown_tests {
+    use super::*;
+
+    #[test]
+    fn dollar_math_survives_sanitization_as_literals_for_the_client() {
+        let html = sanitize_markdown(&markdown_to_html(
+            "Inline $a<b$ here.\n\n$$\nx^2\n$$\n\n<script>alert(1)</script>\n",
+        ));
+        assert!(
+            html.contains(r#"<span data-math-style="inline">a&lt;b</span>"#),
+            "{html}"
+        );
+        assert!(
+            html.contains("<span data-math-style=\"display\">\nx^2\n</span>"),
+            "{html}"
+        );
+        assert!(!html.contains("<script"), "{html}");
+    }
+
+    #[test]
+    fn currency_dollars_stay_text() {
+        let html = markdown_to_html("costs $5 and $10\n");
+        assert!(!html.contains("data-math-style"), "{html}");
+        assert!(html.contains("$5 and $10"), "{html}");
+    }
 }
 
 #[derive(Deserialize)]

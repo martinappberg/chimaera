@@ -1,22 +1,16 @@
-import katex from "katex";
 import type { MarkedExtension } from "marked";
+import { renderMath } from "../shared/math";
 
-/** One bounded, non-trusting KaTeX policy for every chat surface. MathML
- * avoids inline geometry styles (which our sanitizer correctly strips) and
- * stays accessible to screen readers. */
-export const mathOptions = {
-  throwOnError: false,
-  strict: "ignore" as const,
-  trust: false,
-  output: "mathml" as const,
-  maxSize: 20,
-  maxExpand: 1000,
-};
+// The rendering policy (KaTeX trust off → DOMPurify) lives in shared/math so
+// the markdown file previews can load it without the chat subsystem; chat
+// keeps its tokenizers here and re-exports the policy for its own callers.
+export { mathOptions, renderMath, safeMathHtml } from "../shared/math";
 
-export function renderMath(source: string, displayMode: boolean): string {
-  return katex.renderToString(source, { ...mathOptions, displayMode });
-}
-
+// Delimiter rules below are the CHAT dialect — what the agents emit (`$`/`$$`
+// at word boundaries, Codex's `\(`/`\[`). They are deliberately NOT the file
+// previews' rules: `previews/mdMath.ts` mirrors comrak (the reading render)
+// so a document reads the same in every mode there. Don't "harmonize" one
+// into the other; `streamSegments.ts` mirrors BLOCK_DOLLAR exactly.
 const INLINE_DOLLAR =
   /^(\${1,2})(?!\$)((?:\\.|[^\\\n$])+?)\1(?=[\s?!.,:？！。，：]|$)/;
 const BLOCK_DOLLAR = /^(\${1,2})\n((?:\\[^]|[^\\])+?)\n\1(?:\n|$)/;
