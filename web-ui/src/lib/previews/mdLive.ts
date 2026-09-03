@@ -51,7 +51,7 @@ import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
 import { languages } from "@codemirror/language-data";
 import type { SyntaxNode, SyntaxNodeRef, Tree } from "@lezer/common";
 import { rawTicketUrl, resolveDocPath, safeDecodeUri } from "./files";
-import { isDisplayMath, isMath, mathExtension } from "./mdMath";
+import { MATH_MARK, isDisplayMath, isMath, mathDelimiters, mathExtension } from "./mdMath";
 import { loadMath, mathNow } from "./mathLoad";
 import { copyText } from "../shared/clipboard";
 import { makeCopyButton } from "../shared/copyDecor";
@@ -243,8 +243,8 @@ class MathWidget extends WidgetType {
  *  as comrak does before it emits the literal the reading view typesets —
  *  a `%` comment inside the formula must end at the same place in both. */
 function mathSource(node: SyntaxNode, doc: Text): string | null {
-  const marks = node.getChildren("MathMark");
-  if (marks.length !== 2) return null; // the parser always emits both; defensive
+  const marks = mathDelimiters(node);
+  if (marks === null) return null; // an unclosed `$$` block: nothing to typeset yet
   let src = "";
   let pos = marks[0].to;
   for (const q of node.getChildren("QuoteMark")) {
@@ -722,11 +722,10 @@ function buildDecorations(
       }
       // A block spanning lines is replaced whole by the mathBlocks state
       // field — a plugin replace may not cross a line break. An UNCLOSED
-      // `$$` block (mid-typing; it runs to the document end like a fence)
-      // has nothing to typeset and stays visible mono source.
+      // `$$` block (mid-typing, or its lines left their list item) has
+      // nothing to typeset and stays visible mono source.
       if (doc.lineAt(node.from).to < node.to) {
-        if (name === "MathBlock" && node.node.getChildren("MathMark").length < 2)
-          deco.push(markMathSrc.range(node.from, node.to));
+        if (mathDelimiters(node.node) === null) deco.push(markMathSrc.range(node.from, node.to));
         return;
       }
       const src = mathSource(node.node, doc);
@@ -739,7 +738,7 @@ function buildDecorations(
       );
       return;
     }
-    if (name === "MathMark") {
+    if (name === MATH_MARK) {
       deco.push(markMuted.range(node.from, node.to));
       return;
     }

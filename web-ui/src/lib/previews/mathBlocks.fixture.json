@@ -1,90 +1,139 @@
 {
   "about": [
-    "The `$$` block grammar, pinned once for both authorities that implement it: the editor's lezer extension (mdMath.ts, run by mdMath.test.ts) and the server's line pass ahead of comrak (crates/chimaera-server/src/fs.rs promote_math_blocks, whose test include_str!s this file). A case added here runs on both sides.",
-    "input — the document, as a file (trailing newline).",
-    "editor — every math node the live parser yields, in document order, as `containers/Name:source`: Name is InlineMath, DisplayMath (`$$…$$` paired within a paragraph) or MathBlock (a `$$` block); containers are the enclosing Blockquote / list / ListItem nodes, none at top level.",
+    "The `$$` block grammar's case list, one file for both authorities that implement it: the editor's lezer extension (mdMath.ts; mdMath.test.ts asserts `editor`) and the server's line pass ahead of comrak (crates/chimaera-server/src/fs.rs promote_math_blocks; its test include_str!s this file and asserts `server` and `reading`). A case added here runs on both sides.",
+    "input — the document. Most end with a newline, as a file does; a few end at the closer to pin end-of-document handling.",
+    "editor — every math node the live parser yields, in document order, as `containers/Name:source`: Name is InlineMath, DisplayMath (`$$…$$` paired within a paragraph) or MathBlock (a `$$` block; `MathBlock(unclosed)` when its lines ended before a closer); containers are the enclosing block-context nodes (Blockquote, BulletList / OrderedList, ListItem), none at top level. An Escape or Emphasis node would be listed too: no equation may contain one.",
     "server — promote_math_blocks(input), the text comrak then parses; null when the pass leaves the input untouched.",
-    "reading — optional: the equations the reading render hands the client, one `style:literal` per `<span data-math-style>` (HTML-escaped, as carried), in document order.",
-    "diverges — set, with the reason, on a case the two sides are KNOWN to disagree on. Otherwise both suites also require one MathBlock per ```math fence the server adds: the lockstep itself."
+    "reading — the equations the reading render hands the client, one `style:literal` per `<span data-math-style>` (HTML-escaped, as carried), in document order.",
+    "diverges — set, with the reason, on a case the two sides are KNOWN to disagree on. The server test otherwise also requires one closed MathBlock per ```math fence the pass adds: the fixture's own consistency check."
   ],
   "cases": [
     {
       "note": "a single-line $$…$$ is display math within its paragraph, never a block",
       "input": "$$x$$\n",
       "editor": ["DisplayMath:$$x$$"],
-      "server": null
+      "server": null,
+      "reading": ["display:x"]
     },
     {
       "note": "three or more dollars are text",
       "input": "$$$\nx\n$$$\n",
       "editor": [],
-      "server": null
+      "server": null,
+      "reading": []
     },
     {
       "note": "fenced code passes through",
       "input": "```\n$$\nx\n$$\n```\n",
       "editor": [],
-      "server": null
+      "server": null,
+      "reading": []
     },
     {
       "note": "a fence on a list-marker line passes through too",
       "input": "- ```\n  $$\n  x\n  $$\n  ```\n",
       "editor": [],
-      "server": null
+      "server": null,
+      "reading": []
     },
     {
       "note": "a raw-HTML block passes through",
       "input": "<div>\n$$\nx\n$$\n</div>\n",
       "editor": [],
-      "server": null
+      "server": null,
+      "reading": []
     },
     {
       "note": "no closer in sight: prose that merely begins with $$ stays prose",
       "input": "$$ is the shell's PID\n\nnext $x$\n",
       "editor": ["InlineMath:$x$"],
-      "server": null
+      "server": null,
+      "reading": ["inline:x"]
     },
     {
       "note": "the search for a closer ends at the next blank line",
       "input": "$$\nx\n\ny $z$\n",
       "editor": ["InlineMath:$z$"],
-      "server": null
+      "server": null,
+      "reading": ["inline:z"]
     },
     {
-      "note": "a lazily continued quote is left to inline pairing, like comrak",
+      "note": "a lazily continued quote is left to inline pairing, like comrak, as long as no later $$ line follows in the paragraph (next case)",
       "input": "> $$\nx\n$$\n",
       "editor": ["Blockquote/DisplayMath:$$\nx\n$$"],
-      "server": null
+      "server": null,
+      "reading": ["display:\nx\n"]
+    },
+    {
+      "note": "a lazily continued quote whose paragraph goes on to another $$ pair",
+      "input": "> $$\nx\n$$\ny $$ z $$\n",
+      "editor": ["Blockquote/DisplayMath:$$\nx\n$$", "Blockquote/DisplayMath:$$ z $$"],
+      "server": "> $$\nx\n```math\ny \n```\nz $$\n",
+      "reading": ["display:y \n"],
+      "diverges": "server: `depth != para_depth` resets the paragraph's $$ parity on the lazy line, so the closing $$ reads as an opener with `y $$ z $$` in sight; comrak alone pairs like the editor"
     },
     {
       "note": "a lone $$ line closes display math opened earlier in its paragraph",
       "input": "so $$\nx\n$$\n",
       "editor": ["DisplayMath:$$\nx\n$$"],
-      "server": null
+      "server": null,
+      "reading": ["display:\nx\n"]
     },
     {
       "note": "after that closer the paragraph's next $$ pair is display math again",
       "input": "so $$\nx\n$$\nthen $$y$$\n",
       "editor": ["DisplayMath:$$\nx\n$$", "DisplayMath:$$y$$"],
-      "server": null
+      "server": null,
+      "reading": ["display:\nx\n", "display:y"]
+    },
+    {
+      "note": "display math opened mid-line spans several interior lines, backslash-led ones included, with no escapes parsed inside",
+      "input": "so $$\np(\\theta \\mid y) \\;=\\; \\frac{a}{b},\n\\qquad\nx\n$$\n",
+      "editor": ["DisplayMath:$$\np(\\theta \\mid y) \\;=\\; \\frac{a}{b},\n\\qquad\nx\n$$"],
+      "server": null,
+      "reading": ["display:\np(\\theta \\mid y) \\;=\\; \\frac{a}{b},\n\\qquad\nx\n"]
+    },
+    {
+      "note": "a lone $$ closer may end the document",
+      "input": "so $$\nx\n$$",
+      "editor": ["DisplayMath:$$\nx\n$$"],
+      "server": null,
+      "reading": ["display:\nx\n"]
     },
     {
       "note": "a $$ line with a closer in sight is a block, and interrupts a paragraph like a fence",
       "input": "prose\n$$\nx\n$$\nafter\n",
       "editor": ["MathBlock:$$\nx\n$$"],
-      "server": "prose\n```math\nx\n```\nafter\n"
+      "server": "prose\n```math\nx\n```\nafter\n",
+      "reading": ["display:x\n"]
     },
     {
-      "note": "the block closes on the first later line containing $$; text after the closer stays prose",
+      "note": "the same equation opened at a line start is a block whose interior is raw",
+      "input": "$$\np(\\theta \\mid y) \\;=\\; \\frac{a}{b},\n\\qquad\nx\n$$\n",
+      "editor": ["MathBlock:$$\np(\\theta \\mid y) \\;=\\; \\frac{a}{b},\n\\qquad\nx\n$$"],
+      "server": "```math\np(\\theta \\mid y) \\;=\\; \\frac{a}{b},\n\\qquad\nx\n```\n",
+      "reading": ["display:p(\\theta \\mid y) \\;=\\; \\frac{a}{b},\n\\qquad\nx\n"]
+    },
+    {
+      "note": "the block closes on the first later line containing $$; text after the closer stays outside it (prose to the server; the editor gives it no node)",
       "input": "$$\nx\n$$ so on.\n\nnext $y$\n",
       "editor": ["MathBlock:$$\nx\n$$", "InlineMath:$y$"],
-      "server": "```math\nx\n```\nso on.\n\nnext $y$\n"
+      "server": "```math\nx\n```\nso on.\n\nnext $y$\n",
+      "reading": ["display:x\n", "inline:y"]
     },
     {
-      "note": "a bare punctuation tail after the closer is prose too",
+      "note": "a bare punctuation tail after the closer stays outside too",
       "input": "$$\nx\n$$.\n",
       "editor": ["MathBlock:$$\nx\n$$"],
-      "server": "```math\nx\n```\n.\n"
+      "server": "```math\nx\n```\n.\n",
+      "reading": ["display:x\n"]
+    },
+    {
+      "note": "a closer with a tail may end the document",
+      "input": "$$\nx\n$$.",
+      "editor": ["MathBlock:$$\nx\n$$"],
+      "server": "```math\nx\n```\n.\n",
+      "reading": ["display:x\n"]
     },
     {
       "note": "the reported case: a continuation line that would start a bullet list stays inside the equation",
@@ -97,49 +146,81 @@
       "note": "a quoted block keeps its > prefix",
       "input": "> $$\n> x\n> $$\n",
       "editor": ["Blockquote/MathBlock:$$\n> x\n> $$"],
-      "server": "> ```math\n> x\n> ```\n"
+      "server": "> ```math\n> x\n> ```\n",
+      "reading": ["display:x\n"]
     },
     {
       "note": "a tab after > is the quote marker's optional space",
       "input": ">\t$$ a\n>\t+ b $$\n",
       "editor": ["Blockquote/MathBlock:$$ a\n>\t+ b $$"],
-      "server": ">\t```math\n>\t a\n>\t+ b \n>\t```\n"
+      "server": ">\t```math\n>\t a\n>\t+ b \n>\t```\n",
+      "reading": ["display:  a\n + b \n"]
     },
     {
       "note": "a block on a list item's continuation lines keeps its indentation, so it stays in the item",
       "input": "- item\n\n  $$\n  x\n  $$\n- next\n",
       "editor": ["BulletList/ListItem/MathBlock:$$\n  x\n  $$"],
-      "server": "- item\n\n  ```math\n  x\n  ```\n- next\n"
+      "server": "- item\n\n  ```math\n  x\n  ```\n- next\n",
+      "reading": ["display:x\n"]
     },
     {
       "note": "a block on an ordered item's continuation lines (content column 3) stays in the item",
       "input": "1. First\n   $$\n   x\n   $$\n2. Second\n",
       "editor": ["OrderedList/ListItem/MathBlock:$$\n   x\n   $$"],
-      "server": "1. First\n   ```math\n   x\n   ```\n2. Second\n"
+      "server": "1. First\n   ```math\n   x\n   ```\n2. Second\n",
+      "reading": ["display:x\n"]
     },
     {
       "note": "a block opened on the marker line keeps the marker and indents its body to the item",
       "input": "- $$\n  x\n  $$\n",
       "editor": ["BulletList/ListItem/MathBlock:$$\n  x\n  $$"],
-      "server": "- ```math\n  x\n  ```\n"
+      "server": "- ```math\n  x\n  ```\n",
+      "reading": ["display:x\n"]
+    },
+    {
+      "note": "a block opened on a marker line whose closer leaves the item (column 0)",
+      "input": "- $$\n  x\n$$\n",
+      "editor": ["BulletList/ListItem/MathBlock(unclosed):$$\n  x"],
+      "server": "- ```math\n  x\n  ```\n",
+      "reading": ["display:x\n"],
+      "diverges": "editor: closerAhead checks quote depth only, so the block opens, and the consuming loop ends it unclosed where the closer leaves the item — shown as source; the server re-indents the closer into the item and typesets x"
+    },
+    {
+      "note": "a block opened on a marker line whose lines all leave the item (column 0)",
+      "input": "- $$\nx\n$$\n",
+      "editor": ["BulletList/ListItem/MathBlock(unclosed):$$"],
+      "server": "- ```math\nx\n  ```\n",
+      "reading": ["display:"],
+      "diverges": "both: the editor ends the block unclosed as `x` leaves the item; the server copies `x` unindented into a fence whose closer it re-indents, and comrak then renders an empty equation, x as prose, and an empty code block"
     },
     {
       "note": "a code span's $$ is neither an opener nor a pair toward the paragraph's parity",
       "input": "Use `$$` for math:\n$$\nx\n$$\n",
       "editor": ["MathBlock:$$\nx\n$$"],
-      "server": "Use `$$` for math:\n```math\nx\n```\n"
+      "server": "Use `$$` for math:\n```math\nx\n```\n",
+      "reading": ["display:x\n"]
+    },
+    {
+      "note": "an unbalanced backtick before $$: the editor and comrak read it as a literal, the server's parity hides the rest of the line",
+      "input": "`$$ x\n$$\ny\n$$\n",
+      "editor": ["DisplayMath:$$ x\n$$"],
+      "server": "`$$ x\n```math\ny\n```\n",
+      "reading": ["display:y\n"],
+      "diverges": "server: `dollar_pairs` toggles code on every backtick, so the $$ after an unclosed one is not counted; `countDollarPairs` strips only closed spans"
     },
     {
       "note": "a heading's $$ does not leak into the next paragraph's parity",
       "input": "## Using $$\n$$\nx\n$$\n",
       "editor": ["MathBlock:$$\nx\n$$"],
-      "server": "## Using $$\n```math\nx\n```\n"
+      "server": "## Using $$\n```math\nx\n```\n",
+      "reading": ["display:x\n"]
     },
     {
       "note": "a leading YAML frontmatter block is metadata, never math (the editor gates it in mdLive; its parser sees a setext heading, whose $$ does not leak either)",
       "input": "---\ntitle: $$\n---\n$$\nx\n$$\n",
       "editor": ["MathBlock:$$\nx\n$$"],
-      "server": "---\ntitle: $$\n---\n```math\nx\n```\n"
+      "server": "---\ntitle: $$\n---\n```math\nx\n```\n",
+      "reading": ["display:x\n"]
     },
     {
       "note": "GitHub's ```math fence is the same block under another name: nothing to promote, no math node (mdLive typesets the fence itself), one display equation in reading",

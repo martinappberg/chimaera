@@ -787,8 +787,7 @@ fn render_markdown(raw: &str) -> anyhow::Result<String> {
 /// equation wrapped as `+ \left(1-w\right)…` on its second line is cut by
 /// the bullet list that line starts. The fence keeps the interior raw,
 /// exactly what the live editor's block parser does (`previews/mdMath.ts`
-/// owns the grammar; ONE case list, `previews/mathBlocks.fixture.json`, pins
-/// the two in lockstep — add a case there and both test suites run it):
+/// owns the grammar; its cases live in `previews/mathBlocks.fixture.json`):
 ///
 /// - a line whose content (after ≤ 3 spaces and any `>` quote prefix) opens
 ///   with `$$` — not `$$$`, no closing `$$` later on it — opens a block only
@@ -804,9 +803,13 @@ fn render_markdown(raw: &str) -> anyhow::Result<String> {
 /// - a lone `$$` line closing display math opened earlier in its paragraph
 ///   (an odd `$$` count so far) is left to inline pairing.
 ///
-/// A line pass has no container model: a `$$` block in a list item whose
-/// content column is 4+ (`10. `, nested lists) reads as indented code here
-/// while the editor, which knows the column, still renders it.
+/// A line pass has no container model, and the fixture pins where that
+/// shows: a `$$` block in a list item whose content column is 4+ (`10. `,
+/// nested lists) reads as indented code here while the editor, which knows
+/// the column, still renders it; a block opened on a marker line whose
+/// later lines leave the item is promoted here while the editor ends it
+/// unclosed; a lazy quote line resets the `$$` parity here; and an
+/// unbalanced backtick hides the rest of its line from the parity count.
 fn promote_math_blocks(text: &str) -> Cow<'_, str> {
     if !text.contains("$$") {
         return Cow::Borrowed(text);
@@ -892,7 +895,8 @@ fn promote_math_blocks(text: &str) -> Cow<'_, str> {
         }
     }
     /// `$$` delimiters in a line: pairs not part of a longer run (`$$$` is
-    /// text) and outside backtick code spans — the editor's `countDollarPairs`.
+    /// text) and outside backtick code spans — the editor's `countDollarPairs`,
+    /// except that an unbalanced backtick hides the rest of the line here.
     fn dollar_pairs(content: &str) -> usize {
         let mut n = 0;
         let mut in_code = false;
@@ -1130,52 +1134,33 @@ fn sanitize_markdown(html: &str) -> String {
 mod markdown_tests {
     use super::*;
 
-    #[test]
-    fn dollar_block_with_a_list_like_line_renders_as_one_equation() {
-        // The reported case: `+ \left(…` starts a bullet list, cutting the
-        // paragraph comrak's inline `$$` would have paired within.
-        let src = "Then\n\n$$ E = \\frac{a}{b}\n+ \\left(1-w\\right) . $$\n\nafter\n";
-        let html = sanitize_markdown(&markdown_to_html(src));
-        assert!(
-            html.contains(
-                "<p><span data-math-style=\"display\"> E = \\frac{a}{b}\n+ \\left(1-w\\right) . \n</span></p>"
-            ),
-            "{html}"
-        );
-        assert!(!html.contains("<li>") && !html.contains("<pre>"), "{html}");
-    }
-
-    /// The `$$` block grammar's case list, shared with the editor's lezer
-    /// extension (`web-ui/src/lib/previews/mdMath.ts`, whose Vitest suite
-    /// reads the same file): two implementations of one rule set, pinned in
-    /// lockstep by ONE fixture — a case added there runs on both sides. The
-    /// fixture's own `about` says what each field holds.
+    /// The shared `$$` block case list — its `about` documents the fields;
+    /// Vitest reads the same file for the editor's half.
     const MATH_BLOCKS_FIXTURE: &str =
         include_str!("../../../web-ui/src/lib/previews/mathBlocks.fixture.json");
 
+    /// Strict on purpose: a misspelled key would silently drop its pin.
     #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
     struct MathBlockCase {
         note: String,
         input: String,
-        /// The live parser's math nodes — the editor's half, asserted by Vitest.
         editor: Vec<String>,
-        /// `promote_math_blocks(input)`; `None` when the pass leaves it untouched.
         server: Option<String>,
-        /// The equations the reading render hands the client, `style:literal`.
-        #[serde(default)]
-        reading: Option<Vec<String>>,
-        /// Why the two sides are known to disagree here, when they are.
-        #[serde(default)]
+        reading: Vec<String>,
         diverges: Option<String>,
     }
 
     #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
     struct MathBlocksFixture {
+        about: Vec<String>,
         cases: Vec<MathBlockCase>,
     }
 
     /// `style:literal` for every `<span data-math-style>` in rendered HTML —
-    /// what `MarkdownView` typesets, in document order.
+    /// what `MarkdownView` typesets, in document order. The first `>` after
+    /// the attribute ends the tag: html5ever escapes `>` inside values.
     fn reading_equations(html: &str) -> Vec<String> {
         const MARK: &str = "data-math-style=\"";
         let mut out = Vec::new();
@@ -1196,7 +1181,7 @@ mod markdown_tests {
     fn dollar_block_rules_mirror_the_live_parser() {
         let fixture: MathBlocksFixture =
             serde_json::from_str(MATH_BLOCKS_FIXTURE).expect("the fixture parses");
-        assert!(!fixture.cases.is_empty());
+        assert!(!fixture.about.is_empty() && !fixture.cases.is_empty());
         for c in &fixture.cases {
             let want = c.server.as_deref().unwrap_or(&c.input);
             assert_eq!(
@@ -1206,13 +1191,12 @@ mod markdown_tests {
                 c.note,
                 c.input
             );
-            if let Some(reading) = &c.reading {
-                let html = sanitize_markdown(&markdown_to_html(&c.input));
-                assert_eq!(&reading_equations(&html), reading, "{}: {html}", c.note);
-            }
+            let html = sanitize_markdown(&markdown_to_html(&c.input));
+            assert_eq!(reading_equations(&html), c.reading, "{}: {html}", c.note);
             if c.diverges.is_none() {
-                // The lockstep itself: one MathBlock in the editor per fence
-                // this pass adds.
+                // The fixture's own consistency: one CLOSED MathBlock in the
+                // editor per fence this pass adds (an unclosed one is dumped
+                // as `MathBlock(unclosed)` and adds none).
                 let fences = |s: &str| s.matches("```math").count();
                 let blocks = c
                     .editor
@@ -1222,7 +1206,7 @@ mod markdown_tests {
                 assert_eq!(
                     blocks,
                     fences(want) - fences(&c.input),
-                    "{}: one MathBlock per promoted fence",
+                    "{}: one closed MathBlock per promoted fence",
                     c.note
                 );
             }
@@ -1234,12 +1218,13 @@ mod markdown_tests {
         let html = sanitize_markdown(&markdown_to_html(
             "Inline $a<b$ here.\n\n$$\nx^2\n$$\n\n<script>alert(1)</script>\n",
         ));
-        assert!(
-            html.contains(r#"<span data-math-style="inline">a&lt;b</span>"#),
+        assert_eq!(
+            reading_equations(&html),
+            ["inline:a&lt;b", "display:x^2\n"],
             "{html}"
         );
-        // A `$$` block is promoted to a math fence, then handed over as the
-        // same span every equation uses.
+        // A promoted `$$` block is handed over in the same `<p><span>` shape
+        // as every other equation.
         assert!(
             html.contains("<p><span data-math-style=\"display\">x^2\n</span></p>"),
             "{html}"

@@ -16,23 +16,23 @@
  * never reaches this parser.
  *
  * BLOCK (Obsidian's / GitHub's `$$` block, which the server promotes to a
- * ```math fence before comrak — `fs.rs::promote_math_blocks`; ONE case
- * list, `mathBlocks.fixture.json`, pins the two in lockstep, so add a case
- * there and both test suites run it): a line whose content starts with
- * `$$` (not `$$$`) with no closing `$$` later on it opens a block, PROVIDED
- * a closer is in sight — a later line containing `$$` before the next blank
- * line. The first such line closes it (text after the closer stays
- * outside); the interior is raw. Without this, an equation wrapped as
- * `+ \left(…\right)` on its second line would be cut by the bullet list
- * that line starts. Requiring the closer keeps a slip cheap: prose that
- * merely begins with `$$` (`$$ is the shell's PID`) stays prose, and a
- * block can never swallow more than the paragraph it sits in. A lone `$$`
- * line never interrupts a paragraph whose display math is still open (an
- * odd `$$` count), so `so $$` ⏎ `x` ⏎ `$$` is one inline display equation.
- * GitHub's ```math fence is the same thing under another name and typesets
- * too (mdLive treats it as a block; the server already renders it as one).
+ * ```math fence before comrak — `fs.rs::promote_math_blocks`; a case list,
+ * `mathBlocks.fixture.json`, runs on both sides and keeps the two
+ * in lockstep): a line whose content starts with `$$` (not `$$$`) with no
+ * closing `$$` later on it opens a block, PROVIDED a closer is in sight — a
+ * later line containing `$$` before the next blank line. The first such
+ * line closes it (text after the closer stays outside); the interior is
+ * raw. Without this, an equation wrapped as `+ \left(…\right)` on its
+ * second line would be cut by the bullet list that line starts. Requiring
+ * the closer keeps a slip cheap: prose that merely begins with `$$` (`$$ is
+ * the shell's PID`) stays prose, and a block can never swallow more than
+ * the paragraph it sits in. A lone `$$` line never interrupts a paragraph
+ * whose display math is still open (an odd `$$` count), so `so $$` ⏎ `x`
+ * ⏎ `$$` is one inline display equation. GitHub's ```math fence is the
+ * same thing under another name and typesets too (mdLive treats it as a
+ * block; the server already renders it as one).
  */
-import { NodeProp, type Input, type NodeType } from "@lezer/common";
+import { NodeProp, type Input, type NodeType, type SyntaxNode } from "@lezer/common";
 import type {
   BlockContext,
   InlineContext,
@@ -113,7 +113,8 @@ const LOOKAHEAD = 1 << 16;
 /** Whether a closer is in sight: a later line containing `$$` before the
  *  next blank line. Reads the raw input (quote markers stripped loosely), so
  *  it can disagree with the consuming loop's exact container rules — only
- *  ever toward a block that ends unclosed at that blank line, which then
+ *  ever toward a block that ends unclosed, at that blank line or where a
+ *  line leaves the enclosing list item (the fixture pins both), which then
  *  shows as source. Never toward swallowing the document. */
 function closerAhead(cx: BlockContext, line: Line): boolean {
   const input = rawInput(cx);
@@ -178,11 +179,14 @@ function displayMathOpen(leaf: LeafBlock): boolean {
   return p instanceof DollarParity && p.odd;
 }
 
-/** The groups (`NodeType.is`) the math nodes join, the one place their
- *  names are spelled: `Math` is every equation node, `MathDisplay` the ones
- *  typeset display-style. Appended to the groups lezer already gave the
- *  node (`MathBlock` is a `Block`/`LeafBlock` like any block node) — a plain
- *  `group.add({…})` would replace them. */
+/** The delimiter node: the `$` / `$$` on either side of an equation. */
+export const MATH_MARK = "MathMark";
+
+/** The groups (`NodeType.is`) the math nodes join — callers ask `isMath` /
+ *  `isDisplayMath` rather than comparing names: `Math` is every equation
+ *  node, `MathDisplay` the ones typeset display-style. Appended to the
+ *  groups lezer already gave the node (`MathBlock` is a `Block`/`LeafBlock`
+ *  like any block node) — a plain `group.add({…})` would replace them. */
 const MATH_GROUPS = new Map<string, readonly string[]>([
   ["InlineMath", ["Math"]],
   ["DisplayMath", ["Math", "MathDisplay"]],
@@ -199,6 +203,15 @@ export function isDisplayMath(type: NodeType): boolean {
   return type.is("MathDisplay");
 }
 
+/** The opening and closing delimiters of a closed equation, or null while a
+ *  `$$` block is unclosed — its lines ran out (a blank line, or the list
+ *  item they sat in ended) before a closer, and show as source until one is
+ *  typed. Inline math is only ever emitted closed. */
+export function mathDelimiters(node: SyntaxNode): [SyntaxNode, SyntaxNode] | null {
+  const marks = node.getChildren(MATH_MARK);
+  return marks.length === 2 ? [marks[0], marks[1]] : null;
+}
+
 /** Syntax-tree math: `InlineMath` (`$…$`), `DisplayMath` (`$$…$$` within a
  *  paragraph) and `MathBlock` (`$$` block lines), each with `MathMark`
  *  delimiter children — two when closed — and nothing else parsed inside
@@ -211,12 +224,16 @@ export const mathExtension: MarkdownConfig = {
     { name: "InlineMath" },
     { name: "DisplayMath" },
     { name: "MathBlock", block: true },
-    { name: "MathMark" },
+    { name: MATH_MARK },
   ],
   props: [
     NodeProp.group.add((type) => {
       const groups = MATH_GROUPS.get(type.name);
-      return groups && [...(type.prop(NodeProp.group) ?? []), ...groups];
+      // Only `undefined` leaves a node alone: lezer stores any other return,
+      // `[]` included, as the node's group in place of its own. The filter
+      // keeps a second configure from listing the groups twice.
+      if (groups === undefined) return undefined;
+      return [...(type.prop(NodeProp.group) ?? []), ...groups.filter((g) => !type.is(g))];
     }),
   ],
   parseBlock: [
@@ -225,7 +242,7 @@ export const mathExtension: MarkdownConfig = {
       parse(cx, line) {
         if (!opensMathBlock(line) || !closerAhead(cx, line)) return false;
         const from = cx.lineStart + line.pos;
-        const marks = [cx.elt("MathMark", from, from + 2)];
+        const marks = [cx.elt(MATH_MARK, from, from + 2)];
         let end = -1;
         while (cx.nextLine() && lineDepth(line) >= cx.depth) {
           // A blank line means the look-ahead and the container rules
@@ -234,7 +251,7 @@ export const mathExtension: MarkdownConfig = {
           for (const m of line.markers) marks.push(m);
           const i = line.text.indexOf("$$", line.pos);
           if (i >= 0) {
-            marks.push(cx.elt("MathMark", cx.lineStart + i, cx.lineStart + i + 2));
+            marks.push(cx.elt(MATH_MARK, cx.lineStart + i, cx.lineStart + i + 2));
             end = cx.lineStart + i + 2;
             cx.nextLine();
             break;
@@ -269,8 +286,8 @@ export const mathExtension: MarkdownConfig = {
         if (end < 0) return n === 2 ? pos + 2 : -1;
         return cx.addElement(
           cx.elt(n === 2 ? "DisplayMath" : "InlineMath", pos, end, [
-            cx.elt("MathMark", pos, pos + n),
-            cx.elt("MathMark", end - n, end),
+            cx.elt(MATH_MARK, pos, pos + n),
+            cx.elt(MATH_MARK, end - n, end),
           ]),
         );
       },

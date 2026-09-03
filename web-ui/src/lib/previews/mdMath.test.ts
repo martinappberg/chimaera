@@ -1,29 +1,54 @@
 import { describe, expect, it } from "vitest";
 import { markdownLanguage } from "@codemirror/lang-markdown";
 import type { MarkdownParser } from "@lezer/markdown";
-import { countDollarPairs, isMath, mathExtension } from "./mdMath";
+import { countDollarPairs, isMath, mathDelimiters, mathExtension } from "./mdMath";
 import fixture from "./mathBlocks.fixture.json";
 
 // The APP's parser configuration (GFM + sub/superscript + emoji), not bare
 // CommonMark: extension ORDER is part of what these pins protect.
 const mathParser = (markdownLanguage.parser as MarkdownParser).configure(mathExtension);
 
-/** Every math node as `containers/Name:source` — the enclosing quote and
- *  list nodes first, none at top level (the fixture's `editor` shape) —
- *  plus any Escape or Emphasis the parser produced: inside an equation
- *  there must be none. */
+/** Every math node as `containers/Name:source` — the enclosing block-context
+ *  nodes first, none at top level; an unclosed block as `MathBlock(unclosed)`
+ *  (the fixture's `editor` shape) — plus any Escape or Emphasis the parser
+ *  produced: inside an equation there must be none. */
 function math(src: string): string[] {
   const out: string[] = [];
   mathParser.parse(src).iterate({
     enter(n) {
       if (isMath(n.type)) {
-        const path = [n.name];
-        for (let a = n.node.parent; a !== null && a.parent !== null; a = a.parent)
+        const name = n.name === "MathBlock" && mathDelimiters(n.node) === null ? `${n.name}(unclosed)` : n.name;
+        const path = [name];
+        for (let a = n.node.parent; a !== null && !a.type.isTop; a = a.parent)
           if (a.type.is("BlockContext")) path.unshift(a.name);
         out.push(`${path.join("/")}:${src.slice(n.from, n.to)}`);
       } else if (n.name === "Escape" || n.name === "Emphasis")
         out.push(`${n.name}:${src.slice(n.from, n.to)}`);
     },
+  });
+  return out;
+}
+
+/** 1-based lines with content that no leaf-level node covers. A math node
+ *  dump cannot see a parser that consumes a line without giving it a node —
+ *  the one after a block's closer, say — so this backstops every case. */
+function uncoveredLines(src: string): number[] {
+  const spans: [number, number][] = [];
+  mathParser.parse(src).iterate({
+    enter(n) {
+      if (n.type.isTop || n.type.is("BlockContext")) return;
+      spans.push([n.from, n.to]);
+      return false; // a node covers its children
+    },
+  });
+  const out: number[] = [];
+  let pos = 0;
+  src.split("\n").forEach((line, i) => {
+    let covered = false;
+    for (let k = 0; k < line.length && !covered; k++)
+      if (!/\s/.test(line[k])) covered = spans.some(([f, t]) => f <= pos + k && pos + k < t);
+    if (!covered && /\S/.test(line)) out.push(i + 1);
+    pos += line.length + 1;
   });
   return out;
 }
@@ -91,30 +116,13 @@ describe("dollar math (mirrors comrak's math_dollars)", () => {
   });
 });
 
-/** One case list for both implementations of the `$$` block grammar — this
- *  parser and the server's `promote_math_blocks` (fs.rs), whose test reads
- *  the same file. `editor` is asserted here; `server` and `reading` there;
- *  the fixture's own `about` says what each holds. */
-interface MathBlockCase {
-  note: string;
-  input: string;
-  editor: string[];
-  server: string | null;
-  reading?: string[];
-  diverges?: string;
-}
-const cases: MathBlockCase[] = fixture.cases;
-
+// The editor's half of the shared case list; its `about` documents the fields.
 describe("$$ blocks (mathBlocks.fixture.json, shared with fs.rs)", () => {
-  const fences = (s: string) => s.split("```math").length - 1;
-  for (const c of cases) {
+  it("has cases", () => expect(fixture.cases.length).toBeGreaterThan(0));
+  for (const c of fixture.cases) {
     it(c.note, () => {
       expect(math(c.input)).toEqual(c.editor);
-      // The lockstep itself: one MathBlock here per fence the server adds.
-      if (c.diverges === undefined) {
-        const blocks = c.editor.filter((e) => /(^|\/)MathBlock:/.test(e)).length;
-        expect(blocks).toBe(fences(c.server ?? c.input) - fences(c.input));
-      }
+      expect(uncoveredLines(c.input)).toEqual([]);
     });
   }
 });
