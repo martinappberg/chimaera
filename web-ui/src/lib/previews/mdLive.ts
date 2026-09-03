@@ -722,7 +722,7 @@ function buildDecorations(
       }
       // A block spanning lines is replaced whole by the mathBlocks state
       // field — a plugin replace may not cross a line break. An UNCLOSED
-      // `$$` block (mid-typing, or its lines left their list item) has
+      // `$$` block (its lines left their list item before a closer) has
       // nothing to typeset and stays visible mono source.
       if (doc.lineAt(node.from).to < node.to) {
         if (mathDelimiters(node.node) === null) deco.push(markMathSrc.range(node.from, node.to));

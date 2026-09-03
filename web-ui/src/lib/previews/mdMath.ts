@@ -113,9 +113,10 @@ const LOOKAHEAD = 1 << 16;
 /** Whether a closer is in sight: a later line containing `$$` before the
  *  next blank line. Reads the raw input (quote markers stripped loosely), so
  *  it can disagree with the consuming loop's exact container rules — only
- *  ever toward a block that ends unclosed, at that blank line or where a
- *  line leaves the enclosing list item (the fixture pins both), which then
- *  shows as source. Never toward swallowing the document. */
+ *  ever toward a block that ends unclosed where a line leaves the
+ *  enclosing list item (the fixture pins it; a blank line never gets that
+ *  far, since it ends this look-ahead first), which then shows as source.
+ *  Never toward swallowing the document. */
 function closerAhead(cx: BlockContext, line: Line): boolean {
   const input = rawInput(cx);
   const from = cx.lineStart + line.text.length + 1;
@@ -204,9 +205,9 @@ export function isDisplayMath(type: NodeType): boolean {
 }
 
 /** The opening and closing delimiters of a closed equation, or null while a
- *  `$$` block is unclosed — its lines ran out (a blank line, or the list
- *  item they sat in ended) before a closer, and show as source until one is
- *  typed. Inline math is only ever emitted closed. */
+ *  `$$` block is unclosed — the list item its lines sat in ended before a
+ *  closer, and they show as source until one is typed. Inline math is only
+ *  ever emitted closed. */
 export function mathDelimiters(node: SyntaxNode): [SyntaxNode, SyntaxNode] | null {
   const marks = node.getChildren(MATH_MARK);
   return marks.length === 2 ? [marks[0], marks[1]] : null;

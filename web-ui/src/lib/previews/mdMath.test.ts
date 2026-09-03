@@ -29,9 +29,10 @@ function math(src: string): string[] {
   return out;
 }
 
-/** 1-based lines with content that no leaf-level node covers. A math node
- *  dump cannot see a parser that consumes a line without giving it a node —
- *  the one after a block's closer, say — so this backstops every case. */
+/** 1-based lines none of whose content any leaf-level node covers. A math
+ *  node dump cannot see a parser that consumes a line without giving it a
+ *  node — the one after a block's closer, say — so this backstops every
+ *  case. (A partly covered line passes: a closer's tail has no node.) */
 function uncoveredLines(src: string): number[] {
   const spans: [number, number][] = [];
   mathParser.parse(src).iterate({
