@@ -20,13 +20,36 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
 - **What & when.** The rail's FILES section: a lazily-loaded directory tree of the workspace
   root. Browse the project and open files into panes.
 - **How it's used.** Click a directory to expand/collapse; click a file to open it in the focused
-  pane. Start typing (or click the magnifier) to filter the loaded tree; a directory link clicked
+  pane. Start typing (or click the magnifier) to filter the loaded tree; the **collapse folders**
+  button beside it folds every open dir and returns to the top. A directory link clicked
   in a terminal/chat reveals + flashes its row. File rows drag out (drop into a pane/split, or
   onto an agent to reference).
+- **Finding your place in a deep tree.** **Indent guides** — one hairline per depth under each
+  level's chevron; hovering a row draws its parent folder's guide strong, so "which folder am I
+  in" is answered without scrolling up. **Sticky ancestors** — while scrolled inside a folder,
+  the ancestor dir rows of the first visible row pin to the top of the tree as a shelf (nearest
+  three levels); click one to scroll to that folder's real row, click its chevron to collapse it.
+  **Collapse anchoring** — collapsing a folder whose row has scrolled out of view (from its
+  sticky copy, or the keyboard) brings that row back under its ancestors instead of leaving the
+  viewport on unrelated content; a visible row stays put, and expanding never moves the row.
 - **Where it lives.** `FileTree.svelte`; `fsList()` in `files.ts`. Route
   `GET /api/v1/fs/list?path=&hidden=` (server `fs.rs`).
-- **Key behaviors.** Rendered as a flat list of rows (indent = `depth * 13px`), not recursive
-  components. Respects `files.showHidden`. Re-lists **only the dirs whose direct listing could
+- **Key behaviors.** Rendered as a flat list of rows (indent = `depth * 13px`, driven by a
+  per-row `--depth` custom property that also draws the guides as a background gradient — no
+  guide DOM), not recursive components. The tree is **its own scroller** (the rail body around
+  it does not scroll): the sticky shelf is a zero-height `position: sticky` anchor at the
+  scroller's top, recomputed once per frame on scroll or row change by probing
+  `elementsFromPoint` (the inline create/error/listing rows make row arithmetic unreliable),
+  and the scroller opts out of the browser's own scroll anchoring: the component anchors **every**
+  row change itself (a pre-DOM snapshot of the first row under the shelf, restored once the new
+  rows are in — WebKit has no anchoring of its own, so a relist above the viewport would
+  otherwise shift the rows), and a collapse re-anchors on the collapsed row. **OS-desktop drops** (see
+  [drag-drop-and-uploads.md](drag-drop-and-uploads.md)) name their destination: the targeted
+  dir row gets an accent ring + wash and its expanded descendants a light wash (hovering a file
+  targets its parent), the root target keeps the whole-tree frame, and a sticky
+  `upload into <folder>/` label pins to the top of the tree for the length of the drag. App
+  passes the exact folder via `dropDir` (null when no file drag is over the tree).
+  Respects `files.showHidden`. Re-lists **only the dirs whose direct listing could
   have changed** — not the whole tree — when the workspace's git **epoch** bumps (parents of
   paths that entered/left the git dirty set: a symmetric diff, so both a new untracked file and a
   removal are caught), the client **fs epoch** bumps (the exact parent of that
@@ -352,3 +375,14 @@ _Intent pending — drafted from the maintainer's request, 2026-08-27; questionn
 - **Pending.** The mode names (`live`/`reading`/`source`), the default-to-live choice, and
   which constructs the live view renders vs leaves as source have not been confirmed with
   the maintainer — capture via **capture-feature-intent** when available.
+
+### Finding your place in a deep tree — why it exists
+_Intent pending — drafted from the maintainer's request, 2026-09-06; questionnaire not yet run._
+
+- **Problem it solves (from the request).** "If you have a lot of directories it can be hard
+  when they retract etc. — needs just a slight UI polish." Indent guides, sticky ancestor rows,
+  collapse anchoring, and collapse-all answer "which folder am I in" and stop a collapse from
+  throwing the viewport onto unrelated content.
+- **Pending.** The three-level sticky cap, the hover-lit parent guide, and the collapse-all
+  placement beside the filter have not been confirmed with the maintainer — capture via
+  **capture-feature-intent** when available.

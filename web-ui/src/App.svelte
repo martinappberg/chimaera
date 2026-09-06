@@ -29,6 +29,7 @@
     deleteSession,
     deleteWorkspace,
     displayName,
+    sessionLabel,
     dotState,
     dotTitle,
     isBusy,
@@ -190,6 +191,7 @@
     registerLinkRow,
     registerStage,
     sameSpot,
+    sideWord,
     startDrag,
     unregisterLinkRow,
     unregisterStage,
@@ -617,6 +619,60 @@
   // --- the rail's Recents section (ended agent conversations) ---
   let recents = $state<RecentConvo[]>([]);
   let recentsExpanded = $state(false);
+  /** The collapsed section's floor, mirrored by `.recents-list`'s min-height
+   *  (3 rows): below it the sessions column scrolls rather than hiding history. */
+  const RECENTS_MIN_ROWS = 3;
+  /** Recents rows the collapsed section can show without clipping. The
+   *  section fills the height the sessions column has left (`.recents` is
+   *  the column's flex: 1), so a short roster on a tall window shows a long
+   *  history and a full roster falls back to the CSS floor (3 rows) and the
+   *  column scrolls. Measured, never guessed: a ResizeObserver on the list
+   *  reports its box; the first two rows give the row pitch. Only the count
+   *  is state, so a resize that doesn't change it costs nothing. */
+  let recentsFit = $state(RECENTS_MIN_ROWS);
+  let recentsListEl = $state<HTMLElement | null>(null);
+  function measureRecents(): void {
+    const el = recentsListEl;
+    // The expanded list is taller by design (it scrolls); measuring it would
+    // inflate the fit and hide the "show less" toggle.
+    if (el === null || recentsExpanded) return;
+    const first = el.firstElementChild;
+    if (!(first instanceof HTMLElement)) return;
+    const second = first.nextElementSibling;
+    const pitch =
+      second instanceof HTMLElement ? second.offsetTop - first.offsetTop : first.offsetHeight + 1;
+    if (pitch <= 0) return;
+    // The last row needs no trailing gap: a box exactly N rows tall fits N.
+    const gap = pitch - first.offsetHeight;
+    const fit = Math.max(RECENTS_MIN_ROWS, Math.floor((el.clientHeight + gap) / pitch));
+    if (fit !== recentsFit) recentsFit = fit;
+  }
+  $effect(() => {
+    const el = recentsListEl;
+    if (el === null) return;
+    const ro = new ResizeObserver(measureRecents);
+    ro.observe(el);
+    return () => ro.disconnect();
+  });
+
+  /** Expanded, the section wants more height than the column may have left
+   *  (the live roster comes first), so the column scrolls it into view —
+   *  else "show all" can change nothing visible. Collapse scrolls back. */
+  function toggleRecents(): void {
+    recentsExpanded = !recentsExpanded;
+    const section = recentsListEl?.parentElement;
+    const column = section?.parentElement;
+    if (section == null || column == null) return;
+    void tick().then(() => {
+      // Scroll the sessions column itself — never scrollIntoView, which
+      // would also shift the overflow-hidden rail around it.
+      const top = section.getBoundingClientRect().top - column.getBoundingClientRect().top;
+      column.scrollTo({ top: recentsExpanded ? column.scrollTop + top : 0 });
+      // Collapsing back to a box the same size as before fires no resize;
+      // the column may have changed meanwhile, so re-fit explicitly.
+      if (!recentsExpanded) measureRecents();
+    });
+  }
   /** Recents to SHOW: drop any whose conversation is currently LIVE (a live
    *  agent with the same title). A running conversation belongs under AGENTS,
    *  not RECENT — and the server's live-exclusion can briefly miss a fresh
@@ -648,7 +704,9 @@
   let layoutReady = $state(false);
   let gotSessions = $state(false);
   let autoOpened = false;
-  let dropSpot = $state<DropSpot | null>(null);
+  // Raw: a spot is an immutable value replaced wholesale (dnd + the OS-drop
+  // handlers gate rewrites with sameSpot), never mutated in place.
+  let dropSpot = $state.raw<DropSpot | null>(null);
   /** Panes whose bottom band is armed for the CURRENT drag (reference or
    *  link targets) — zone previews stop above the band on these. */
   let bandPanes = $state<ReadonlySet<string>>(new Set());
@@ -1628,23 +1686,36 @@
    *  is over neither. Hit-tests the data attributes those surfaces stamp
    *  (elementFromPoint is valid during an HTML5 drag; there is no in-DOM ghost
    *  to occlude). `paneId` is the Finder pane to wash (null for the rail tree). */
-  function osFolderTargetAt(x: number, y: number): { paneId: string | null; dir: string } | null {
+  function osFolderTargetAt(
+    x: number,
+    y: number,
+  ): { paneId: string | null; dir: string; row: boolean; rowKey?: string } | null {
     const el = document.elementFromPoint(x, y);
     if (!(el instanceof Element)) return null;
-    // A FILES-tree dir row (files target their parent; broken links have none).
+    // A FILES-tree dir row (files target their parent; broken links have
+    // none) — real rows and the sticky ancestor copies alike, so the whole
+    // scroller is one target surface.
     const row = el.closest<HTMLElement>("[data-drop-dir]");
-    if (row?.dataset.dropDir != null && el.closest(".tree") !== null) {
-      return { paneId: null, dir: row.dataset.dropDir };
+    if (row?.dataset.dropDir != null && el.closest(".tree-scroll") !== null) {
+      // The row's position key rides along: the tree highlights by position
+      // (one canonical path can sit under a symlink and its target).
+      return { paneId: null, dir: row.dataset.dropDir, row: false, rowKey: row.dataset.dropKey };
     }
     // The tree background → the workspace root.
     const treeRoot = el.closest<HTMLElement>("[data-tree-root]");
     if (treeRoot?.dataset.treeRoot != null) {
-      return { paneId: null, dir: treeRoot.dataset.treeRoot };
+      return { paneId: null, dir: treeRoot.dataset.treeRoot, row: false };
     }
-    // A Finder column → that column's directory.
+    // A Finder column → that column's directory — unless the pointer is on a
+    // dir ROW it lists, which wins: the row is the exact thing under the
+    // pointer, and `row` lets the Finder light it alone.
     const col = el.closest<HTMLElement>("[data-finder-dir]");
     if (col?.dataset.finderDir != null) {
-      return { paneId: paneIdAt(x, y), dir: col.dataset.finderDir };
+      const paneId = paneIdAt(x, y);
+      if (row?.dataset.dropDir != null && col.contains(row)) {
+        return { paneId, dir: row.dataset.dropDir, row: true };
+      }
+      return { paneId, dir: col.dataset.finderDir, row: false };
     }
     return null;
   }
@@ -1674,9 +1745,19 @@
     // A folder target (Finder column / FILES-tree dir) wins over the session
     // pane it may sit inside — dropping onto the file manager uploads THERE.
     const folder = osFolderTargetAt(e.clientX, e.clientY);
+    // dragover fires continuously (every pointer move, and on a timer while
+    // still): rewrite dropSpot only on a logical change, or every event
+    // re-derives the Finder/tree highlights for nothing.
     if (folder !== null) {
       if (e.dataTransfer !== null) e.dataTransfer.dropEffect = "copy";
-      dropSpot = { kind: "uploadDir", paneId: folder.paneId, dir: folder.dir };
+      const next: DropSpot = {
+        kind: "uploadDir",
+        paneId: folder.paneId,
+        dir: folder.dir,
+        row: folder.row,
+        rowKey: folder.rowKey,
+      };
+      if (!sameSpot(next, dropSpot)) dropSpot = next;
       return;
     }
     const paneId = paneIdAt(e.clientX, e.clientY);
@@ -1684,7 +1765,8 @@
     if (e.dataTransfer !== null) e.dataTransfer.dropEffect = ok ? "copy" : "none";
     // OS drops reuse the dropSpot plumbing: the whole pane is the target
     // (HTML5 dnd has no competing tile gesture to partition against).
-    dropSpot = ok && paneId !== null ? { kind: "upload", paneId } : null;
+    const next: DropSpot | null = ok && paneId !== null ? { kind: "upload", paneId } : null;
+    if (!sameSpot(next, dropSpot)) dropSpot = next;
   }
 
   function onWindowDragLeave(e: DragEvent): void {
@@ -2513,11 +2595,27 @@
    */
   const lastCreatedAt = new Map<string, number>();
 
-  function applySessions(list: Session[]): void {
+  /**
+   * Swap in a sessions list. `snapshot` marks a list that came FROM THE
+   * DAEMON (events frame, poll, refetch) as opposed to a local optimistic
+   * drop (`tombstone`, `onExited`): only a daemon snapshot can confirm a
+   * tombstoned session is gone — a locally filtered list lacks the id by
+   * construction and must not lift its own tombstone.
+   */
+  function applySessions(list: Session[], snapshot = true): void {
     // A session being optimistically killed is tombstoned: never re-add it
-    // from an intervening snapshot (the server hasn't finished the stop yet),
-    // so the row can't flicker back before it's really gone.
-    if (killing.size > 0) list = list.filter((s) => !killing.has(s.id));
+    // from an intervening snapshot (the daemon hasn't reaped it yet), so the
+    // row can't flicker back before it's really gone. A snapshot that no
+    // longer lists the id is the daemon confirming the retire — the tombstone
+    // has done its job and lifts, so a later resume under the same id can't
+    // be filtered away.
+    if (killing.size > 0) {
+      if (snapshot) {
+        const present = new Set(list.map((s) => s.id));
+        for (const id of killing) if (!present.has(id)) killing.delete(id);
+      }
+      if (killing.size > 0) list = list.filter((s) => !killing.has(s.id));
+    }
     for (const s of list) {
       if (s.created_at !== 0) lastCreatedAt.set(s.id, s.created_at);
     }
@@ -2569,9 +2667,42 @@
   const recentlyCreated = new Map<string, number>();
   const RECENT_MS = 10_000;
   /** Sessions being optimistically killed: dropped locally at once, tombstoned
-   *  so an in-flight snapshot can't re-add the dying row before the daemon's
-   *  stop completes. Cleared when the kill request resolves. */
+   *  so a snapshot can't re-add the dying row before the daemon's stop
+   *  completes. A tombstone lifts only when a snapshot arrives WITHOUT the id
+   *  (the daemon has reaped and retired it) — NOT when the DELETE resolves:
+   *  DELETE only signals the process (SIGHUP) and returns while the session
+   *  is still in the roster until its wait thread reaps it, so clearing on
+   *  the response let the row pop back for a beat and vanish again — a
+   *  visible flicker over a remote link, where the round trip and the exit
+   *  both take longer. `KILL_TOMBSTONE_MS` after the request settles a
+   *  lingering tombstone is dropped and the roster refetched, so a kill that
+   *  genuinely failed shows the truth instead of hiding the row forever. */
   const killing = new Set<string>();
+  const KILL_TOMBSTONE_MS = 20_000;
+
+  /** Tombstone `ids` and drop them from the local roster in ONE re-apply
+   *  (a workspace stop kills many at once). */
+  function tombstone(ids: readonly string[]): void {
+    for (const id of ids) killing.add(id);
+    applySessions(
+      sessions.filter((s) => !ids.includes(s.id)),
+      false,
+    );
+  }
+
+  /** The kill requests settled: keep the tombstones until a snapshot
+   *  confirms each session is gone, with one bounded fallback for the batch
+   *  (see `killing`). */
+  function armTombstoneExpiry(ids: readonly string[]): void {
+    window.setTimeout(() => {
+      let lingering = false;
+      for (const id of ids) if (killing.delete(id)) lingering = true;
+      if (!lingering) return;
+      listSessions().then(applySessions, () => {
+        // unreachable daemon: the next snapshot/poll reconciles
+      });
+    }, KILL_TOMBSTONE_MS);
+  }
 
   /**
    * Once both the persisted layout and the first session snapshot are in:
@@ -2646,7 +2777,10 @@
         });
       return;
     }
-    applySessions(sessions.filter((s) => s.id !== id));
+    applySessions(
+      sessions.filter((s) => s.id !== id),
+      false,
+    );
   }
 
   function onSocketError(id: string, message: string): void {
@@ -3050,31 +3184,35 @@
   /** Kill the session's process on the daemon and drop it locally — OPTIMISTIC:
    *  the row/tab vanishes at once and the ChatView tears down immediately,
    *  while the daemon's stop + retire-to-recents runs in the background. The
-   *  tombstone keeps an in-flight snapshot from re-adding the dying row, so
-   *  there's no lingering half-dead state, and the recents entry appears once
-   *  (via the recents epoch) instead of the row "popping up weirdly". */
+   *  tombstone keeps every snapshot until the retire from re-adding the dying
+   *  row, so there's no lingering half-dead state, and the recents entry
+   *  appears once (via the recents epoch) instead of the row "popping up
+   *  weirdly" between the kill and the retire. */
   async function killSession(id: string): Promise<void> {
     confirmKillId = null;
-    killing.add(id);
     chatPool.disposeChat(id); // stop its socket reconnecting right away
-    applySessions(sessions.filter((s) => s.id !== id));
+    tombstone([id]);
     try {
       await deleteSession(id);
     } catch {
       // already gone or unreachable — it's already dropped locally.
     } finally {
-      killing.delete(id);
+      armTombstoneExpiry([id]);
     }
   }
 
   /** End every live session in a workspace — the home-screen "stop". The
-   *  workspace registration itself is untouched; only its running work ends. */
+   *  workspace registration itself is untouched; only its running work ends.
+   *  Same optimistic tombstones as a single kill, so the rollup doesn't
+   *  flicker per session as each one is reaped. */
   async function stopWorkspace(w: Workspace): Promise<void> {
     const live = sessions.filter((s) => s.workspace_id === w.id && s.alive);
     if (live.length === 0) return;
-    await Promise.allSettled(live.map((s) => deleteSession(s.id)));
-    const killed = new Set(live.map((s) => s.id));
-    applySessions(sessions.filter((s) => !killed.has(s.id)));
+    const ids = live.map((s) => s.id);
+    for (const id of ids) chatPool.disposeChat(id);
+    tombstone(ids);
+    await Promise.allSettled(ids.map((id) => deleteSession(id)));
+    armTombstoneExpiry(ids);
   }
 
   /** Inline rename (double-click / F2 on a rail row): chimaera owns the
@@ -3543,6 +3681,25 @@
   }
 
   /**
+   * Words for the drag ghost's hint on the spots dnd.ts can't name itself:
+   * WHICH session a reference band or link target is ("@ reference in
+   * claude-1", "link to codex-2") — the same names the tabs and rail show.
+   * Null for the geometric spots (dnd's generic reading covers them).
+   */
+  function describeSpot(spot: DropSpot): string | null {
+    if (spot.kind === "ref" || spot.kind === "link") {
+      const s = osDropSession(spot.paneId);
+      if (s === null) return null;
+      const name = tabLabel({ surface: "terminal", sessionId: s.id });
+      return spot.kind === "ref" ? `@ reference in ${name}` : `link to ${name}`;
+    }
+    if (spot.kind === "linkpane" || spot.kind === "linktab" || spot.kind === "linkrow") {
+      return `link to ${tabLabel({ surface: "terminal", sessionId: spot.sessionId })}`;
+    }
+    return null;
+  }
+
+  /**
    * Shared drag start for rail rows and pane tabs (any surface). `linkIntent`
    * (set when the drag starts from a pane's link icon) restricts a shell
    * terminal to link-only drops — anywhere but an agent is a no-op, never a
@@ -3652,6 +3809,7 @@
         linkTargets,
         linkSessions,
         linkIntent,
+        describe: describeSpot,
         // Realm-local unsaved state never arms the out spot: the ghost must
         // not advertise "open as new window" for a move the drop refuses.
         allowOut: !linkIntent && canDetachOut() && !guardBlocksTab(tab),
@@ -3721,6 +3879,9 @@
         },
       },
       {
+        // The pane's own zones are refused on drop (onSpot hides their
+        // preview too), so the ghost must not promise "split right" there.
+        describe: (s) => ("paneId" in s && s.paneId === paneId ? "" : describeSpot(s)),
         allowOut: canDetachOut() && !pane.tabs.some(guardBlocksTab),
         trackOut: isNativeShell()
           ? (x, y) => xwin?.track(x, y, dragId) ?? Promise.resolve(false)
@@ -3733,7 +3894,7 @@
   /** A tab's display label (drags, the detached-window title). */
   function tabLabel(tab: Tab): string {
     return tab.surface === "terminal"
-      ? (displayNames.get(tab.sessionId) ?? sessionsById.get(tab.sessionId)?.name ?? tab.sessionId.slice(0, 8))
+      ? sessionLabel(displayNames, sessionsById, tab.sessionId)
       : tab.surface === "file"
         ? (fileTitles.get(tab.path) ?? basename(tab.path))
         : tab.surface === "finder"
@@ -4339,10 +4500,28 @@
              first — the daemon remembers them across restarts. Click resumes
              when a native handle exists, otherwise starts fresh honestly. -->
         {#if visibleRecents.length > 0}
-          <div class="recents">
-            <div class="recents-head">recent</div>
-            <div class="recents-list" class:expanded={recentsExpanded}>
-              {#each recentsExpanded ? visibleRecents : visibleRecents.slice(0, 3) as r (r.resume ?? `${r.kind}:${r.title}`)}
+          <!-- The section fills whatever the sessions column has left and
+               shows as many rows as FIT that space (measured, see
+               recentsFit) — never a fixed three. -->
+          <div class="recents" class:expanded={recentsExpanded}>
+            <div class="recents-head">
+              <span>recent</span>
+              {#if recentsExpanded || visibleRecents.length > recentsFit}
+                <!-- In the header, not below the rows: on a short column the
+                     rows may sit under the fold, the header never does. -->
+                <button
+                  class="recents-more"
+                  title={recentsExpanded
+                    ? "show only what fits"
+                    : `show all ${visibleRecents.length} recent conversations`}
+                  onclick={toggleRecents}
+                >
+                  {recentsExpanded ? "show less" : `all ${visibleRecents.length}`}
+                </button>
+              {/if}
+            </div>
+            <div class="recents-list" class:expanded={recentsExpanded} bind:this={recentsListEl}>
+              {#each recentsExpanded ? visibleRecents : visibleRecents.slice(0, recentsFit) as r (r.resume ?? `${r.kind}:${r.title}`)}
                 <button class="recent-row" title={recentTooltip(r)} onclick={() => openRecent(r)}>
                   <SessionGlyph kind="agent" agentKind={r.kind} size={11} />
                   <span class="recent-title">{r.title}</span>
@@ -4350,14 +4529,6 @@
                 </button>
               {/each}
             </div>
-            {#if visibleRecents.length > 3}
-              <button
-                class="recents-more"
-                onclick={() => (recentsExpanded = !recentsExpanded)}
-              >
-                {recentsExpanded ? "show less" : `all ${visibleRecents.length}`}
-              </button>
-            {/if}
           </div>
         {/if}
       </nav>
@@ -4443,7 +4614,10 @@
                 activePath={focusedFilePath}
                 reveal={treeReveal}
                 createRequest={treeCreate}
-                dropActive={dropSpot?.kind === "uploadDir" && dropSpot.paneId === null}
+                dropDir={dropSpot?.kind === "uploadDir" && dropSpot.paneId === null ? dropSpot.dir : null}
+                dropKey={dropSpot?.kind === "uploadDir" && dropSpot.paneId === null
+                  ? (dropSpot.rowKey ?? null)
+                  : null}
               />
             </div>
           {/if}
@@ -4725,8 +4899,11 @@
           />
         {/if}
         {#if dropSpot?.kind === "edge"}
-          <!-- Window-edge preview: the root split's new pane, full height/width. -->
-          <div class="edge-drop {dropSpot.edge}"></div>
+          <!-- Window-edge preview: the root split's new pane, full height/width,
+               named like the pane zones so it never reads as a bare rectangle. -->
+          <div class="edge-drop {dropSpot.edge}">
+            <span class="drop-chip">split window {sideWord(dropSpot.edge)}</span>
+          </div>
         {/if}
         {#if detachedEmpty && tabCount(layout) === 0}
           <!-- A detached window that emptied but the browser refused
@@ -5583,15 +5760,32 @@
 
   /* --- Recents: ended agent conversations --- */
 
+  /* Fills whatever the sessions column has left. Basis 0 AND min-height 0:
+     with the automatic minimum the rendered rows would feed back into the
+     box the row count is measured from (the section could grow to its
+     high-water mark and never shrink). The list's min-height (3 rows) is
+     the floor, below which the column scrolls. One fixed row height keeps
+     the fit arithmetic exact. */
   .recents {
+    --recent-row-h: 26px;
     margin-top: 0.55rem;
+    flex: 1 1 0;
     min-height: 0;
     display: flex;
     flex-direction: column;
   }
 
+  /* Expanded: at least the old 240px window of scrollable history, even
+     when the live roster leaves the column no slack. */
+  .recents.expanded {
+    min-height: 240px;
+  }
+
   .recents-head {
     flex: none;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
     padding: 4px 8px;
     font-size: var(--text-xs);
     font-weight: 600;
@@ -5602,14 +5796,18 @@
   }
 
   .recents-list {
+    flex: 1;
+    /* The floor: three rows + their gaps. Clip the rest — the rendered
+       count (recentsFit) is what fits, so nothing is ever half-shown. */
+    min-height: calc(var(--recent-row-h) * 3 + 2px);
     display: flex;
     flex-direction: column;
     gap: 1px;
+    overflow: hidden;
   }
 
   /* Expanded: a scrollable window, soft edge fade when it overflows. */
   .recents-list.expanded {
-    max-height: 240px;
     overflow-y: auto;
     scrollbar-width: thin;
     mask-image: linear-gradient(to bottom, black calc(100% - 10px), transparent);
@@ -5623,9 +5821,11 @@
     text-align: left;
     font: inherit;
     display: flex;
+    flex: none;
     align-items: center;
     gap: 8px;
-    padding: 4px 8px;
+    height: var(--recent-row-h);
+    padding: 0 8px;
     border-radius: 5px;
     cursor: pointer;
     user-select: none;
@@ -5665,19 +5865,26 @@
     opacity: 0.8;
   }
 
+  /* The "all N" / "show less" toggle lives in the section header: quiet
+     lowercase text (the header's uppercase tracking is for the label only). */
   .recents-more {
     appearance: none;
     border: none;
     background: none;
-    align-self: flex-start;
-    margin: 1px 0 0;
-    padding: 2px 8px;
+    margin: -2px -4px -2px 0;
+    padding: 1px 4px;
     border-radius: 4px;
     font: inherit;
     font-size: var(--text-xs);
+    font-weight: 500;
+    letter-spacing: 0;
+    text-transform: none;
+    font-variant-numeric: tabular-nums;
     color: var(--muted);
     cursor: pointer;
-    transition: color 0.12s ease;
+    transition:
+      color 0.12s ease,
+      background-color 0.12s ease;
   }
 
   .recents-more:hover {
@@ -5797,7 +6004,9 @@
   .files-body {
     flex: 1;
     min-height: 0;
-    overflow-y: auto;
+    /* The tree is its own scroller (sticky ancestor rows need to live inside
+       the element that scrolls); this box only sizes it. */
+    overflow: hidden;
     /* Column so the tree can grow to fill — a right-click in the empty area
        below the last row then still lands on the tree's context menu. */
     display: flex;
@@ -5991,12 +6200,16 @@
   .edge-drop {
     position: absolute;
     z-index: 30;
+    display: flex;
+    align-items: center;
+    justify-content: center;
     background: color-mix(in srgb, var(--accent) 14%, transparent);
     border: 1px solid color-mix(in srgb, var(--accent) 42%, transparent);
     border-radius: 7px;
     pointer-events: none;
   }
 
+  /* The same label chip as Pane's band-label (one grammar for every preview). */
   .edge-drop.left {
     inset: 8px 50% 8px 8px;
   }

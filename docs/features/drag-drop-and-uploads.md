@@ -27,7 +27,8 @@ selection references (see [terminals.md](terminals.md)).
   from the left file tree — e.g. `@src/lib/` into an agent, or a shell-quoted dir path into a
   terminal.
 - **How it's used.** Drag any tree row over a live-session pane; its lower ~22% grows the
-  **"@ reference"** band; release there to type the path. A sub-threshold release (a plain click)
+  **"@ reference in ⟨session⟩"** band (named, so two session panes side by side read differently)
+  and the drag ghost's hint says the same; release there to type the path. A sub-threshold release (a plain click)
   keeps the tree's own action — open the file, or expand/collapse the folder — so a click never
   also references and a completed drag never also opens.
 - **Where it lives.** `FileTree.svelte` starts a pointer drag for **both** kinds, passing the kind
@@ -60,9 +61,17 @@ selection references (see [terminals.md](terminals.md)).
 - **What & when (session pane).** Drop a file onto a live-session pane. The daemon that
   owns the session receives the bytes and the path is referenced in that session — so an agent (or
   a shell) on a remote host can read a file you dragged from your laptop.
-- **How it's used.** Drag a file over the app; a whole live-session pane lights as the
-  **"@ drop to upload & reference"** target (HTML5 dnd has no competing tile gesture, so the whole
-  pane is the zone, not a bottom band). Release to upload each file and type its returned path. An
+- **How it's used.** Drag a file over the app; the exact destination lights **and is named**, so
+  a drop is never a whole-pane mystery. A live-session pane lights end to end as the
+  **"@ upload & reference in ⟨session⟩"** target (HTML5 dnd has no competing tile gesture, so the
+  whole pane is the zone, not a bottom band). Over the file manager only the target lights: a
+  Finder **column** rings + washes; a Finder **directory row** under the pointer rings *instead*
+  of its column (the row is the target — file rows are not targets themselves, their column is);
+  the FILES tree lights the hovered folder the same way (its pinned ancestor rows are targets
+  too). The Finder pane itself wears a quiet dashed frame ("this pane is receiving") with one
+  `upload into ⟨dir⟩/` chip at its foot — the chip lives on the pane, never inside a column, so
+  hovering can't grow a column's content mid-drag — while the column/row is what says *where*.
+  Release to upload each file and type its returned path. An
   in-flight upload shows byte progress plus a cancel action in a quiet chip bottom-center; failures
   briefly explain what happened. A two-minute no-progress watchdog turns a dead SSH tunnel or stuck
   destination filesystem into an actionable error instead of an endless spinner. Dropping an **image**
@@ -72,7 +81,12 @@ selection references (see [terminals.md](terminals.md)).
   in `onMount` (torn down in the returned cleanup — global listeners must not leak). Every
   `dragover`/`drop` `preventDefault`s **unconditionally** — the browser's default for an unhandled
   file drop is to *navigate away from the app*. `paneIdAt` (`dnd.ts`) hit-tests the drop point
-  against registered pane geometry; `dropFilesOnSession` uploads via
+  against registered pane geometry; `osFolderTargetAt` resolves folder targets from the
+  attributes the surfaces stamp — a `[data-drop-dir]` row inside the tree, the tree root, or a
+  Finder `[data-finder-dir]` column, where a `[data-drop-dir]` **dir row** inside it wins and sets
+  `uploadDir.row` (additive DropSpot field) so `FinderView` (`dropDir` + `dropOnRow` props, passed
+  down by `Pane.svelte`) lights the row alone, never also a column showing the same dir. `dragover`
+  only rewrites `dropSpot` on a logical change (`sameSpot`). `dropFilesOnSession` uploads via
   `uploads.ts::uploadAndInsert` then inserts through `insertUploadedPath`. Daemon route
   `upload::upload` (`router.rs`; a per-route `DefaultBodyLimit` override lifts axum's 2 MB buffered
   default).
@@ -151,3 +165,15 @@ _Captured 2026-07-11 (from the maintainer, confirming a draft read from code + t
   windows land files on the remote host) and the **never-in-RAM** streaming (the daemon lives on
   shared login nodes). Everything else here — caps, limits, the folder follow-up — is an improvable
   addition.
+
+### Named drop destinations — why they exist
+_Intent pending — drafted from the maintainer's request, 2026-09-06; questionnaire not yet run._
+
+- **Problem it solves (from the request).** "When dropping in files you don't really see where in
+  the file manager you are dropping your files. Make sure that all draggable actions are clear
+  about where you should drag them so the UI is intuitive." Every drop target now lights the
+  exact thing that receives the drop (a Finder column or dir row, a tree folder row, a session
+  pane) and names it; pointer-drag ghosts say what releasing will do.
+- **Pending.** The label vocabulary ("split right", "add to this pane", "@ reference in ⟨session⟩",
+  "link to ⟨agent⟩", "upload into ⟨dir⟩/") and the Finder row-beats-column rule have not been
+  confirmed with the maintainer — capture via **capture-feature-intent** when available.

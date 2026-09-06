@@ -6,7 +6,7 @@
    * no recursive components, trivial scrolling.
    */
   import { tick, untrack } from "svelte";
-  import { basename, dirname, fsDownload, fsList, type FsEntry } from "../previews/files";
+  import { basename, dirLabel, dirname, fsDownload, fsList, type FsEntry } from "../previews/files";
   import { getSetting } from "../settings/store.svelte";
   import { gitIndex, gitStatus, type GitEntry } from "./git";
   import { decoFor, dirColor } from "./gitDeco";
@@ -55,8 +55,19 @@
      * workspace root). The nonce distinguishes repeats.
      */
     createRequest?: { kind: "file" | "dir"; nonce: number } | null;
-    /** An OS-desktop file drag is hovering the tree (highlight the drop zone). */
-    dropActive?: boolean;
+    /**
+     * The folder an OS-desktop file drag is hovering: a dir row's path (a
+     * file row targets its parent — App reads the row's `data-drop-dir`), or
+     * the root for the tree background; null while no file drag is over the
+     * tree. The tree lights that exact folder and names it, so the drop
+     * destination is never a guess.
+     */
+    dropDir?: string | null;
+    /** The hovered row's tree-position key for the drop (the row's
+     *  `data-drop-key`, which App forwards): the same canonical path can sit
+     *  under a symlink AND its target, so the highlight resolves by position
+     *  when it can, by path only for the fallbacks. */
+    dropKey?: string | null;
   }
 
   let {
@@ -67,8 +78,15 @@
     activePath,
     reveal = null,
     createRequest = null,
-    dropActive = false,
+    dropDir = null,
+    dropKey = null,
   }: Props = $props();
+
+  /** A row's own left padding (CSS `--row-pad`): the sticky probe lands
+   *  inside it, on the row element itself rather than a glyph. */
+  const ROW_PAD_PX = 8;
+  /** Sticky ancestor cap: a deeper chain shows the nearest three. */
+  const STICKY_MAX = 3;
 
   let expanded = $state<Set<string>>(new Set());
   const diskDirOwner = {};
@@ -91,6 +109,13 @@
      *  the `{#each}` on this (parent-scoped) avoids the duplicate-key breakage
      *  that stranded the "listing…" row and made rows jump. */
     key: string;
+    /** Index of the parent dir row (-1 at the root level) — POSITIONAL, so a
+     *  symlinked dir's children (canonical paths) still resolve to the row
+     *  they sit under. Stamped by the walk; O(1) for every consumer. */
+    parent: number;
+    /** Last row of this row's visible subtree (itself for a file or a
+     *  collapsed dir). */
+    end: number;
   }
 
   // Quiet client-side filter over the LOADED tree: narrows visible entries by
@@ -107,7 +132,7 @@
     const out: Row[] = [];
     // Returns true when this subtree contributed at least one visible row.
     // `keyPrefix` scopes each row's key by its tree position (see Row.key).
-    const walk = (dir: string, depth: number, keyPrefix: string): boolean => {
+    const walk = (dir: string, depth: number, keyPrefix: string, parent: number): boolean => {
       const entries = listings.get(dir);
       if (entries === undefined) return false;
       let any = false;
@@ -118,24 +143,289 @@
           // A filtered dir is shown when it (or a loaded descendant) matches;
           // expand into it while filtering even if collapsed, so matches surface.
           const descend = q !== "" || expanded.has(e.path);
-          const marker: Row = { entry: e, depth, key };
           const before = out.length;
+          const marker: Row = { entry: e, depth, key, parent, end: before };
           out.push(marker);
-          const childMatched = descend ? walk(e.path, depth + 1, key) : false;
+          const childMatched = descend ? walk(e.path, depth + 1, key, before) : false;
           if (q !== "" && !selfMatch && !childMatched) {
             out.length = before; // prune a dir with no matches under it
           } else {
+            marker.end = out.length - 1;
             any = true;
           }
         } else if (selfMatch) {
-          out.push({ entry: e, depth, key });
+          out.push({ entry: e, depth, key, parent, end: out.length });
           any = true;
         }
       }
       return any;
     };
-    walk(root, 0, "");
+    walk(root, 0, "", -1);
     return out;
+  });
+
+  // --- tree-position lookups over the flat `rows` ------------------------------
+  // Parent/subtree are POSITIONAL (stamped by the walk above), never
+  // path-derived: a symlinked dir's children carry canonical paths, so the
+  // path's parent can name a row that is not the one above it.
+
+  /** Index of row `i`'s parent dir row, or -1 at the root level. */
+  function parentIndex(i: number): number {
+    return rows[i]?.parent ?? -1;
+  }
+
+  /** Last row inside dir row `i`'s VISIBLE subtree (`i` itself when none). */
+  function subtreeEnd(i: number): number {
+    return rows[i].end;
+  }
+
+  /** Ancestor dir rows of `i`, root-first. */
+  function ancestorsOf(i: number): number[] {
+    const out: number[] = [];
+    for (let p = parentIndex(i); p >= 0; p = parentIndex(p)) out.unshift(p);
+    return out;
+  }
+
+  // --- hover cue: light the hovered row's parent guide ------------------------
+  // One raw state for the whole tree — a pointer move that stays inside the same
+  // parent costs one comparison, and a change costs each row a range check —
+  // instead of per-row hover tracking. Rows (start, end] carry the parent's
+  // depth as `--hot-level`; the CSS draws that one guide strong.
+  let hot = $state.raw<{ start: number; end: number; depth: number } | null>(null);
+
+  function onTreePointerOver(e: PointerEvent): void {
+    const node = e.target instanceof Element ? e.target.closest<HTMLElement>(".node[data-index]") : null;
+    if (node === null) return; // create/error/listing rows keep the current cue
+    const p = parentIndex(Number(node.dataset.index));
+    if (p < 0) {
+      if (hot !== null) hot = null; // a root-level row is in no folder
+      return;
+    }
+    if (hot?.start === p) return;
+    hot = { start: p, end: subtreeEnd(p), depth: rows[p].depth };
+  }
+
+  // --- sticky ancestors ("you are here") ---------------------------------------
+  // The chain is the ancestors of the first row VISIBLE below the overlay, and
+  // the overlay's height is the chain's own — a fixed point found by probing
+  // the DOM (elementsFromPoint, plural: the overlay itself sits on top and the
+  // inline create/error/listing rows make row math unreliable). It runs once
+  // per frame, on scroll and when `rows` change, and never while hidden — no
+  // scroll events reach an unseen tree.
+  interface StickyRow {
+    index: number;
+    key: string;
+    entry: FsEntry;
+    depth: number;
+  }
+
+  let sticky = $state.raw<StickyRow[]>([]);
+  let scrollEl = $state<HTMLElement | null>(null);
+  let stickyFrame = 0;
+
+  function scheduleSticky(): void {
+    if (stickyFrame === 0) stickyFrame = requestAnimationFrame(computeSticky);
+  }
+
+  /** The tree row element at `y` px below the scroller's top edge (null:
+   *  none). A create/error/listing row resolves to the next real row — it
+   *  shares that neighbour's ancestry. */
+  function rowElementAtY(y: number): HTMLElement | null {
+    const s = scrollEl;
+    if (s === null) return null;
+    const r = s.getBoundingClientRect();
+    if (r.width === 0 || r.height === 0) return null;
+    for (const el of document.elementsFromPoint(r.left + ROW_PAD_PX + 4, r.top + y)) {
+      const node = el.closest<HTMLElement>(".tree .node, .tree .edit-error");
+      if (node === null) continue;
+      let cur: Element | null = node;
+      while (cur !== null && !(cur instanceof HTMLElement && cur.dataset.index !== undefined)) {
+        cur = cur.nextElementSibling;
+      }
+      return cur instanceof HTMLElement ? cur : null;
+    }
+    return null;
+  }
+
+  /** Index of the row at `y` (see rowElementAtY), -1 for none. */
+  function rowIndexAtY(y: number): number {
+    const el = rowElementAtY(y);
+    return el === null ? -1 : Number(el.dataset.index);
+  }
+
+  function rowHeight(): number {
+    return treeEl?.querySelector<HTMLElement>(".node")?.offsetHeight ?? 23;
+  }
+
+  function computeSticky(): void {
+    stickyFrame = 0;
+    const s = scrollEl;
+    if (s === null || rows.length === 0 || s.scrollTop <= 0) {
+      if (sticky.length > 0) sticky = [];
+      return;
+    }
+    const h = rowHeight();
+    // Iterate overlay height → first visible row → its ancestors. A chain
+    // whose bottom row's subtree ends right under the overlay can alternate
+    // between two lengths; the shorter one hides fewer real rows, so it wins.
+    let k = 0;
+    let best: number[] | null = null;
+    for (let iter = 0; iter < 4; iter++) {
+      const i = rowIndexAtY(k * h + 1);
+      const chain = i < 0 ? [] : ancestorsOf(i).slice(-STICKY_MAX);
+      if (chain.length === k) {
+        best = chain;
+        break;
+      }
+      if (best === null || chain.length < best.length) best = chain;
+      k = chain.length;
+    }
+    const next = (best ?? []).map((i) => ({ index: i, key: rows[i].key, entry: rows[i].entry, depth: rows[i].depth }));
+    if (next.length !== sticky.length || next.some((r, j) => r.key !== sticky[j].key)) sticky = next;
+  }
+
+  $effect(() => {
+    const s = scrollEl;
+    if (s === null) return;
+    const onScroll = (): void => scheduleSticky();
+    s.addEventListener("scroll", onScroll, { passive: true });
+    // The shelf is cleared while the tree is unmeasurable (the rail folded
+    // to zero width keeps it mounted); a resize brings it back without
+    // waiting for the next scroll.
+    const ro = new ResizeObserver(scheduleSticky);
+    ro.observe(s);
+    return () => {
+      s.removeEventListener("scroll", onScroll);
+      ro.disconnect();
+      if (stickyFrame !== 0) {
+        cancelAnimationFrame(stickyFrame);
+        stickyFrame = 0;
+      }
+    };
+  });
+
+  // --- scroll anchoring across row changes --------------------------------------
+  // Rows above the viewport come and go (a relist as an agent writes files,
+  // an expand elsewhere); the first visible row must stay where it is.
+  // WebKit has no scroll anchoring of its own and the scroller opts out of
+  // Chromium's/Firefox's (it fights the collapse anchoring), so the component
+  // anchors every row change itself: a pre-DOM snapshot of the first row
+  // under the shelf, restored once the new rows are in.
+  let anchorKey: string | null = null;
+  let anchorTop = 0;
+
+  $effect.pre(() => {
+    void rows;
+    untrack(() => {
+      anchorKey = null;
+      const s = scrollEl;
+      if (s === null || s.scrollTop <= 0) return;
+      const el = rowElementAtY(sticky.length * rowHeight() + 1);
+      if (el === null) return;
+      anchorKey = el.dataset.key ?? null;
+      anchorTop = el.getBoundingClientRect().top;
+    });
+  });
+
+  function restoreAnchor(): void {
+    const key = anchorKey;
+    anchorKey = null;
+    const s = scrollEl;
+    if (key === null || s === null) return;
+    const el = treeEl?.querySelector<HTMLElement>(`.node[data-key="${CSS.escape(key)}"]`);
+    if (el == null) return; // the anchor row itself went (a collapse: anchorRow takes over)
+    const delta = el.getBoundingClientRect().top - anchorTop;
+    if (delta !== 0) s.scrollTop += delta;
+  }
+
+  // Any row change (expand/collapse, relist, filter) shifts what sits under
+  // the overlay and invalidates the hover cue's indices. Reads `rows` only;
+  // the writes go to other state, so this cannot re-trigger itself.
+  $effect(() => {
+    void rows;
+    untrack(() => {
+      if (hot !== null) hot = null;
+      restoreAnchor();
+      scheduleSticky();
+    });
+  });
+
+  /** Scroll so row `el` sits fully in view BELOW its sticky ancestors (which
+   *  would otherwise cover a row scrolled to the very top). */
+  function ensureRowVisible(el: HTMLElement): void {
+    const s = scrollEl;
+    if (s === null) return;
+    const depth = rows[Number(el.dataset.index ?? -1)]?.depth ?? 0;
+    const sr = s.getBoundingClientRect();
+    const er = el.getBoundingClientRect();
+    const lead = Math.min(depth, STICKY_MAX) * er.height;
+    if (er.top < sr.top + lead) {
+      s.scrollTop += er.top - (sr.top + lead);
+      // The shelf rebuilds from whatever now sits at the top; deep rows above
+      // the target can make it taller than the lead, so push once more.
+      computeSticky();
+      const cover = sticky.length * er.height;
+      const top = el.getBoundingClientRect().top;
+      if (top < sr.top + cover) s.scrollTop += top - (sr.top + cover);
+    } else if (er.bottom > sr.bottom) {
+      s.scrollTop += er.bottom - sr.bottom;
+    }
+  }
+
+  function rowElement(index: number, path: string): HTMLElement | null {
+    const byIndex = treeEl?.querySelector<HTMLElement>(`.node[data-index="${index}"]`) ?? null;
+    if (byIndex !== null && byIndex.dataset.path === path) return byIndex;
+    return treeEl?.querySelector<HTMLElement>(`.node[data-path="${CSS.escape(path)}"]`) ?? null;
+  }
+
+  /** A sticky row: its chevron collapses the folder (anchored, see toggle);
+   *  the rest of it scrolls to the folder's real row. */
+  function onStickyClick(e: MouseEvent, s: StickyRow): void {
+    if (e.target instanceof Element && e.target.closest(".chev-hit") !== null) {
+      toggle(s.entry.path);
+      return;
+    }
+    const el = rowElement(s.index, s.entry.path);
+    if (el !== null) ensureRowVisible(el);
+  }
+
+  /** After a collapse removed rows below `path`, keep ITS row in view: a row
+   *  above the viewport (collapsed from its sticky copy, or via the keyboard)
+   *  lands right under its ancestors; a visible one stays where it is — the
+   *  browser only clamps scrollTop, which moves content down, never away. */
+  async function anchorRow(path: string): Promise<void> {
+    await tick();
+    const el = treeEl?.querySelector<HTMLElement>(`.node[data-path="${CSS.escape(path)}"]`);
+    if (el != null) ensureRowVisible(el);
+  }
+
+  function collapseAll(): void {
+    closeFilter(); // a filtered view expands everything it shows
+    expanded = new Set();
+    if (scrollEl !== null) scrollEl.scrollTop = 0;
+  }
+
+  // --- OS-desktop drop target ---------------------------------------------------
+  const rootPath = $derived(root.length > 1 && root.endsWith("/") ? root.slice(0, -1) : root);
+  const dropIsRoot = $derived(dropDir !== null && (dropDir === root || dropDir === rootPath));
+  /** The targeted dir row and its visible subtree (start, end] — the folder's
+   *  extent washes so "into this folder" reads as a region, not a line. */
+  const dropRange = $derived.by(() => {
+    if (dropDir === null || dropIsRoot) return null;
+    // By position when the hovered row named itself, by path otherwise.
+    let i = dropKey === null ? -1 : rows.findIndex((r) => r.key === dropKey);
+    if (i < 0) i = rows.findIndex((r) => r.entry.kind === "dir" && r.entry.path === dropDir);
+    return i < 0 ? null : { start: i, end: subtreeEnd(i), depth: rows[i].depth };
+  });
+  const dropLabel = $derived(dropDir === null ? "" : dirLabel(dropIsRoot ? rootPath : dropDir));
+
+  // A native drag suppresses pointer events, so the hover cue would freeze on
+  // whatever was last hovered; clear it so only the drop highlight shows.
+  $effect(() => {
+    if (dropDir === null) return;
+    untrack(() => {
+      if (hot !== null) hot = null;
+    });
   });
 
   function openFilter(seed = ""): void {
@@ -227,7 +517,7 @@
   }
 
   function addRelistAncestors(dirs: Set<string>, path: string): void {
-    const r = root.length > 1 && root.endsWith("/") ? root.slice(0, -1) : root;
+    const r = rootPath;
     let dir = dirname(path);
     while (true) {
       dirs.add(dir);
@@ -335,7 +625,7 @@
   });
 
   async function doReveal(path: string): Promise<void> {
-    const r = root.endsWith("/") && root.length > 1 ? root.slice(0, -1) : root;
+    const r = rootPath;
     if (path !== r && !path.startsWith(`${r}/`)) return;
     closeFilter();
     const rel = path === r ? "" : path.slice(r.length + 1);
@@ -352,7 +642,7 @@
       await load(d); // fresh listings — the path may have just been created
     }
     const target = chain.at(-1) ?? r;
-    const isDir = listings.get(parentOf(target))?.some((e) => e.path === target && e.kind === "dir");
+    const isDir = listings.get(dirname(target))?.some((e) => e.path === target && e.kind === "dir");
     const next = new Set(expanded);
     for (const d of chain.slice(0, -1)) next.add(d);
     if (isDir === true) {
@@ -364,17 +654,11 @@
     }
     flashPath = path;
     await tick();
-    treeEl
-      ?.querySelector(`[data-path="${CSS.escape(path)}"]`)
-      ?.scrollIntoView({ block: "nearest" });
+    const el = treeEl?.querySelector<HTMLElement>(`.node[data-path="${CSS.escape(path)}"]`);
+    if (el != null) ensureRowVisible(el);
     setTimeout(() => {
       if (flashPath === path) flashPath = null;
     }, 1200);
-  }
-
-  function parentOf(path: string): string {
-    const i = path.lastIndexOf("/");
-    return i > 0 ? path.slice(0, i) : "/";
   }
 
   function toggle(dir: string): void {
@@ -382,6 +666,7 @@
     if (next.has(dir)) {
       next.delete(dir);
       expanded = next;
+      void anchorRow(dir); // the viewport must not jump to unrelated content
     } else {
       next.add(dir);
       expanded = next;
@@ -391,7 +676,7 @@
 
   /** Paste target for an entry: into the dir itself, else its parent. */
   function pasteDirFor(entry: FsEntry): string {
-    return entry.kind === "dir" && !entry.broken ? entry.path : parentOf(entry.path);
+    return entry.kind === "dir" && !entry.broken ? entry.path : dirname(entry.path);
   }
 
   function onRowKey(e: KeyboardEvent, entry: FsEntry): void {
@@ -508,7 +793,7 @@
           cancelEdit();
           return;
         }
-        const parent = parentOf(cur.path);
+        const parent = dirname(cur.path);
         await fsRenameOp(cur.path, `${parent === "/" ? "" : parent}/${name}`);
         cancelEdit(); // the fsEpoch bump re-lists; App rewrites open tabs
       }
@@ -551,7 +836,7 @@
         { label: "Delete…", danger: true, onSelect: () => requestDelete(entry.path, entry.kind) },
       ];
     }
-    const dirTarget = entry.kind === "dir" ? entry.path : parentOf(entry.path);
+    const dirTarget = entry.kind === "dir" ? entry.path : dirname(entry.path);
     return [
       { label: "New File…", onSelect: () => beginCreate("file", dirTarget) },
       { label: "New Folder…", onSelect: () => beginCreate("dir", dirTarget) },
@@ -651,6 +936,24 @@
       />
       <button class="filter-clear" aria-label="clear filter" title="clear filter" onclick={closeFilter}>&times;</button>
     {:else}
+      <button
+        class="filter-toggle"
+        aria-label="collapse folders"
+        title="collapse folders"
+        disabled={expanded.size === 0}
+        onclick={collapseAll}
+      >
+        <svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
+          <path
+            d="M4 7l4-3.5L12 7M4 12.5L8 9l4 3.5"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.4"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          />
+        </svg>
+      </button>
       <button class="filter-toggle" aria-label="filter files" title="filter files" onclick={() => openFilter()}>
         <svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
           <circle cx="7" cy="7" r="4" fill="none" stroke="currentColor" stroke-width="1.4" />
@@ -659,14 +962,68 @@
       </button>
     {/if}
   </div>
+  <!-- The tree is its own scroller so the ancestor overlay can stick to ITS
+       top edge (the rail body around it does not scroll). -->
+  <div class="tree-scroll" bind:this={scrollEl}>
+    <!-- Zero-height sticky anchor: what it holds is painted over the top rows
+         and never moves the content. During an OS file drag it names the drop
+         destination instead of the ancestors — one message at a time. -->
+    <div class="tree-overlay">
+      {#if sticky.length > 0}
+        <div class="sticky-rows">
+          {#each sticky as s (s.key)}
+            <!-- A pinned ancestor is a drop target like its real row
+                 (data-drop-dir; the shelf stays up during a drag). -->
+            <button
+              type="button"
+              class="sticky-node"
+              class:drop-target={dropDir === s.entry.path}
+              tabindex="-1"
+              title={s.entry.path}
+              data-drop-dir={s.entry.path}
+              data-drop-key={s.key}
+              style:--depth={s.depth}
+              onclick={(e) => onStickyClick(e, s)}
+            >
+              <span class="chev-hit" title="collapse">
+                <svg class="chev open" viewBox="0 0 16 16" width="9" height="9" aria-hidden="true">
+                  <path
+                    d="M6 4l4 4-4 4"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.6"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                  />
+                </svg>
+              </span>
+              <span class="row-glyph"><FolderIcon open={true} size={14} link={s.entry.symlink} /></span>
+              <span class="node-name dir" class:symlink={s.entry.symlink}>{s.entry.name}</span>
+            </button>
+          {/each}
+        </div>
+      {/if}
+      {#if dropDir !== null}
+        <!-- Names the destination, pinned just under the shelf so the place
+             and the name read together. -->
+        <div class="drop-chip folder tree-drop-label" style:--shelf-rows={sticky.length} role="status">
+          upload into <b>{dropLabel}</b>
+        </div>
+      {/if}
+    </div>
   <div
     class="tree"
-    class:drop-active={dropActive}
+    class:drop-root={dropIsRoot}
+    style:--shelf-rows={sticky.length}
     role="tree"
     tabindex="-1"
     bind:this={treeEl}
     data-tree-root={root}
     onkeydown={onTreeKeydown}
+    onpointerover={onTreePointerOver}
+    onpointerleave={() => {
+      if (hot !== null) hot = null;
+    }}
     oncontextmenu={(e) =>
       contextMenu.openAt(e, [
         { label: "New File…", onSelect: () => beginCreate("file", root) },
@@ -693,7 +1050,7 @@
   {/if}
   {#snippet createRow(depth: number)}
     {#if edit?.mode === "create"}
-      <div class="node edit-node" style:padding-left={`${8 + depth * 13}px`}>
+      <div class="node edit-node" style:--depth={depth}>
         <span class="chev-spacer" aria-hidden="true"></span>
         <span class="row-glyph">
           {#if edit.kind === "dir"}
@@ -717,30 +1074,51 @@
         />
       </div>
       {#if editError !== null}
-        <div class="edit-error" style:padding-left={`${8 + depth * 13}px`}>{editError}</div>
+        <div class="edit-error" style:--depth={depth}>{editError}</div>
       {/if}
     {/if}
   {/snippet}
   {#if edit?.mode === "create" && createAfterIndex === -1}
     {@render createRow(0)}
   {/if}
-  {#each rows as { entry, depth, key }, i (key)}
+  {#each rows as { entry, depth, key, parent }, i (key)}
     {@const gEntry = entry.kind === "file" ? $gitIndex.files.get(entry.path) : undefined}
     {@const gDeco = gEntry ? decoFor(gEntry) : null}
     {@const gDir = entry.kind === "dir" ? $gitIndex.dirs.get(entry.path) : undefined}
+    {@const inHot = hot !== null && i > hot.start && i <= hot.end}
+    {@const inDrop = dropRange !== null && i > dropRange.start && i <= dropRange.end}
     <div
       class="node"
       class:active={entry.path === activePath}
       class:flash={entry.path === flashPath}
       class:cut={isCutPending(entry.path)}
+      class:guide-hot={inHot}
+      class:drop-target={dropRange?.start === i}
+      class:drop-within={inDrop}
       role="treeitem"
       aria-expanded={entry.kind === "dir" ? expanded.has(entry.path) : undefined}
       aria-selected={entry.path === activePath}
       tabindex="0"
       title={entry.symlink ? `${entry.path} → ${entry.target ?? ""}${entry.broken ? " (missing)" : ""}` : entry.path}
       data-path={entry.path}
-      data-drop-dir={entry.broken ? undefined : entry.kind === "dir" ? entry.path : parentOf(entry.path)}
-      style:padding-left={`${8 + depth * 13}px`}
+      data-index={i}
+      data-key={key}
+      data-drop-dir={entry.broken
+        ? undefined
+        : entry.kind === "dir"
+          ? entry.path
+          : parent < 0
+            ? root
+            : rows[parent].entry.path}
+      data-drop-key={entry.broken
+        ? undefined
+        : entry.kind === "dir"
+          ? key
+          : parent < 0
+            ? undefined
+            : rows[parent].key}
+      style:--depth={depth}
+      style:--hot-level={inDrop ? dropRange?.depth : inHot ? hot?.depth : undefined}
       onpointerdowncapture={(e) => {
         // The rename input stays a plain interactive target (rail-row idiom).
         if (e.target instanceof Element && e.target.closest(".edit-input")) return;
@@ -831,14 +1209,14 @@
            "listing…" row (pure CSS delay, no per-row timer) so a slow remote
            expand shows progress while a fast local one never flickers. A
            re-list of an already-listed dir keeps its stale rows, no spinner. -->
-      <div class="node loading-row" style:padding-left={`${8 + (depth + 1) * 13}px`} role="presentation">
+      <div class="node loading-row" style:--depth={depth + 1} role="presentation">
         <span class="chev-spacer" aria-hidden="true"></span>
         <span class="mini-spinner" aria-hidden="true"></span>
         <span class="loading-label">listing…</span>
       </div>
     {/if}
     {#if edit?.mode === "rename" && edit.path === entry.path && editError !== null}
-      <div class="edit-error" style:padding-left={`${8 + depth * 13}px`}>{editError}</div>
+      <div class="edit-error" style:--depth={depth}>{editError}</div>
     {/if}
     {#if edit?.mode === "create" && createAfterIndex === i}
       {@render createRow(depth + 1)}
@@ -850,6 +1228,7 @@
     </div>
   {/if}
   </div>
+  </div>
 </div>
 
 <style>
@@ -858,6 +1237,112 @@
     flex-direction: column;
     min-height: 0;
     flex: 1; /* fill .files-body so the tree's empty area is right-clickable */
+    /* Row geometry, shared by real rows, the sticky copies and the JS probe
+       (ROW_PAD_PX in the script mirrors --row-pad). */
+    --row-h: calc(var(--text-sm) + 10px);
+    --indent: 13px;
+    --row-pad: 8px;
+    /* Indent guides: one per ancestor level, under that level's chevron
+       column. Quiet by default; the hovered row's parent (or the drop
+       target) draws its guide strong. */
+    --guide: color-mix(in srgb, var(--muted) 28%, transparent);
+    --guide-hot: color-mix(in srgb, var(--muted) 75%, transparent);
+  }
+
+  /* The scroller. overscroll-behavior keeps a wheel that runs out of tree
+     from dragging the rail; the overlay below sticks to this box's top.
+     overflow-anchor: the component anchors collapses itself (anchorRow);
+     Chrome's own scroll anchoring then re-anchors on a removed child row
+     and lands the folder ~4 rows low, and snaps the viewport back on the
+     next expand — measured, deterministic. */
+  .tree-scroll {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    overflow-y: auto;
+    overflow-x: hidden;
+    overscroll-behavior: contain;
+    overflow-anchor: none;
+  }
+
+  .tree-overlay {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    flex: none;
+    height: 0;
+    overflow: visible;
+  }
+
+  .sticky-rows,
+  .tree-drop-label {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+  }
+
+  /* Ancestor rows pinned over the scrolled content: painted like real rows
+     on the rail's ground, with a hairline + soft shade below so they read as
+     a shelf, not as rows that happen to sit at the top. */
+  .sticky-rows {
+    display: flex;
+    flex-direction: column;
+    padding: 0 0.45rem;
+    background: var(--rail-bg);
+    box-shadow:
+      0 1px 0 var(--edge),
+      0 3px 8px -2px color-mix(in srgb, var(--fg) 14%, transparent);
+  }
+
+  /* A <button> so it is clickable without a11y ceremony; strip the UA face
+     (grey background, 1px vertical padding) so it paints exactly like a row. */
+  .sticky-node {
+    appearance: none;
+    border: none;
+    background-color: transparent;
+    padding-top: 0;
+    padding-bottom: 0;
+    width: 100%;
+    font: inherit;
+    text-align: left;
+    color: inherit;
+  }
+
+  /* The sticky chevron is the only part that collapses — give it a real
+     target (the row itself scrolls to the folder). */
+  .chev-hit {
+    flex: none;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 9px;
+    height: 9px;
+    padding: 4px;
+    margin: -4px;
+    box-sizing: content-box;
+    border-radius: 3px;
+  }
+
+  .chev-hit:hover {
+    background: color-mix(in srgb, var(--fg) 10%, transparent);
+  }
+
+  .chev-hit:hover .chev {
+    opacity: 1;
+    color: var(--fg);
+  }
+
+  /* Names the drop destination while an OS file drag is over the tree (the
+     global .drop-chip look): pinned just under the ancestor shelf, so it
+     stays in view when the drag auto-scrolls the tree. */
+  .tree-drop-label {
+    --chip-ground: var(--rail-bg);
+    top: calc(var(--shelf-rows, 0) * var(--row-h) + 2px);
+    margin: 0 0.45rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
   .tree-limit {
@@ -867,19 +1352,21 @@
     padding: 5px 7px;
     border: 1px solid var(--edge);
     border-radius: 5px;
-    background: color-mix(in srgb, var(--bg) 94%, transparent);
+    background: color-mix(in srgb, var(--rail-bg) 88%, transparent);
+    backdrop-filter: blur(6px);
     color: var(--muted);
     font-size: var(--text-xs);
     text-align: center;
   }
 
-  /* Quiet filter affordance: a small magnifier that expands into an input.
-     The collapsed toggle sits flush-right so it never competes with the tree. */
+  /* Quiet tree tools flush-right: collapse-all + the magnifier that expands
+     into the filter input. Neither competes with the tree. */
   .filter-bar {
     flex: none;
     display: flex;
     align-items: center;
     justify-content: flex-end;
+    gap: 2px;
     padding: 0 0.55rem 2px;
     min-height: 20px;
   }
@@ -913,6 +1400,13 @@
     opacity: 1;
     color: var(--fg);
     background: var(--row-hover);
+  }
+
+  .filter-toggle:disabled {
+    opacity: 0.3;
+    color: var(--muted);
+    background: none;
+    cursor: default;
   }
 
   .filter-icon {
@@ -949,15 +1443,17 @@
     flex-direction: column;
     padding: 2px 0.45rem 0.5rem;
     outline: none;
-    /* Fill the FILES area so a right-click BELOW the last row still hits the
-       tree's context menu (Paste into the root) instead of the browser's. */
-    flex: 1;
+    /* At least the scroller's height (a right-click BELOW the last row still
+       hits the tree's context menu — Paste into the root), growing with its
+       rows so the bottom banner has a full-height box to stick within. */
+    flex: 1 0 auto;
     min-height: 0;
   }
 
-  /* An OS-desktop file drag is hovering the tree: a quiet accent frame marks
-     it as a drop zone (dropping uploads into the folder under the pointer). */
-  .tree.drop-active {
+  /* An OS-desktop file drag targets the ROOT (tree background, a root-level
+     file): a quiet accent frame marks the whole tree as the drop zone. A
+     nested folder lights its own row + subtree instead (.drop-target/-within). */
+  .tree.drop-root {
     box-shadow: inset 0 0 0 1.5px color-mix(in srgb, var(--accent) 55%, transparent);
     border-radius: 6px;
     background: color-mix(in srgb, var(--accent) 6%, transparent);
@@ -971,43 +1467,106 @@
     line-height: 1.4;
   }
 
-  .node {
+  .node,
+  .sticky-node {
     display: flex;
     align-items: center;
     gap: 4px;
-    height: calc(var(--text-sm) + 10px);
+    height: var(--row-h);
+    padding-left: calc(var(--row-pad) + var(--depth, 0) * var(--indent));
     padding-right: 0.45rem;
     border-radius: 4px;
     cursor: pointer;
     user-select: none;
     min-width: 0;
     outline: none;
+    /* Indent guides with no extra DOM: a 1px line per 13px tile, the image
+       sized to exactly `depth` tiles so a root row draws none. The line sits
+       at 12–13px of each tile — the centre of that level's 9px chevron
+       (which starts at 8px). Rows paint their state via background-COLOR
+       only, so the guides survive hover/active/flash. */
+    background-image: repeating-linear-gradient(
+      to right,
+      transparent 0 12px,
+      var(--guide) 12px 13px
+    );
+    background-size: calc(var(--depth, 0) * var(--indent)) 100%;
+    background-repeat: no-repeat;
+    background-position: 0 0;
   }
 
-  .node:hover {
-    background: var(--row-hover);
+  /* The hovered row's parent guide (or the drop target's) drawn strong: a
+     second 1px layer at that level, over the quiet set. */
+  .node.guide-hot,
+  .node.drop-within {
+    background-image:
+      linear-gradient(var(--guide-hot), var(--guide-hot)),
+      repeating-linear-gradient(to right, transparent 0 12px, var(--guide) 12px 13px);
+    background-size:
+      1px 100%,
+      calc(var(--depth, 0) * var(--indent)) 100%;
+    background-position:
+      calc(12px + var(--hot-level, 0) * var(--indent)) 0,
+      0 0;
+  }
+
+  /* Keyboard focus and scrollIntoView land BELOW the pinned ancestors
+     (--shelf-rows on .tree), never under them. */
+  .node {
+    scroll-margin-top: calc(var(--shelf-rows, 0) * var(--row-h));
+  }
+
+  .node:hover,
+  .sticky-node:hover {
+    background-color: var(--row-hover);
   }
 
   .node:focus-visible {
-    background: var(--row-hover);
+    background-color: var(--row-hover);
     box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent);
   }
 
   .node.active {
-    background: var(--row-active);
+    background-color: var(--row-active);
   }
 
   /* Reveal flash (terminal dir links): a brief accent wash that fades. */
   .node.flash {
-    background: color-mix(in srgb, var(--accent) 18%, transparent);
+    background-color: color-mix(in srgb, var(--accent) 18%, transparent);
     transition: background-color 0.9s ease;
+  }
+
+  /* OS-desktop drop onto a nested folder: the target row gets a ring + wash,
+     and its expanded descendants a light wash with the guide in accent —
+     the folder's whole extent reads as the destination. */
+  .node.drop-within {
+    --guide-hot: color-mix(in srgb, var(--accent) 80%, transparent);
+    background-color: color-mix(in srgb, var(--accent) 8%, transparent);
+    border-radius: 0;
+  }
+
+  .node.drop-target,
+  .sticky-node.drop-target {
+    background-color: color-mix(in srgb, var(--accent) 20%, transparent);
+    box-shadow: inset 0 0 0 1.5px color-mix(in srgb, var(--accent) 75%, transparent);
+  }
+
+  .node.drop-target .node-name {
+    color: var(--fg);
   }
 
   .chev {
     flex: none;
     color: var(--muted);
-    opacity: 0.8;
-    transition: transform 0.1s ease;
+    opacity: 0.65;
+    transition:
+      transform 0.1s ease,
+      opacity 0.12s ease;
+  }
+
+  .node:hover .chev,
+  .sticky-node .chev {
+    opacity: 1;
   }
 
   .chev.open {
@@ -1099,6 +1658,7 @@
     color: var(--err);
     padding-top: 1px;
     padding-bottom: 2px;
+    padding-left: calc(var(--row-pad) + var(--depth, 0) * var(--indent));
     white-space: normal;
     word-break: break-word;
   }
