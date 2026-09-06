@@ -503,6 +503,24 @@ struct IndexEntry {
     /// not rehydrate the setting, so this small side-index must carry it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     effort: Option<String>,
+    /// The model and permission mode the conversation last ran with, for the
+    /// same reason: a reopen (resume, rewind, fork, post-restart
+    /// resurrection) must come back as it was, and neither agent rehydrates
+    /// them from its own history. Additive: older rows simply lack them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mode: Option<String>,
+}
+
+/// What a native conversation last ran with. A reopened chat starts from
+/// these; the per-agent [`AgentPrefs`] only seed what a chat does not carry
+/// itself (a brand-new one, or a setting recorded before this index knew it).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ConversationSettings {
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub mode: Option<String>,
 }
 
 const INDEX_MAX_ENTRIES: usize = 200;
@@ -522,23 +540,26 @@ impl JournalIndex {
     }
 
     pub fn record(&self, native_id: &str, session_id: &str) {
+        self.upsert(native_id, session_id, |_| {});
+    }
+
+    /// Re-key the conversation's row at the tail (most recent last), carrying
+    /// the settings it already held through `apply`. One atomic rewrite.
+    fn upsert(&self, native_id: &str, session_id: &str, apply: impl FnOnce(&mut IndexEntry)) {
         let _persist = self.persist_lock.lock().expect("index persist lock");
         let mut entries = self.entries.lock().expect("index lock");
-        // Init can race the immediately-following EffortState because both
-        // disk writes run on blocking workers. Preserve an effort upsert that
-        // won that race instead of replacing it with an empty Init record.
-        let effort = entries
-            .iter()
-            .rev()
-            .find(|e| e.native_id == native_id)
-            .and_then(|e| e.effort.clone());
-        entries.retain(|e| e.native_id != native_id);
-        entries.push(IndexEntry {
+        let previous = entries.iter().rev().find(|e| e.native_id == native_id);
+        let mut entry = IndexEntry {
             native_id: native_id.to_string(),
             session_id: session_id.to_string(),
             ts: now_ms(),
-            effort,
-        });
+            effort: previous.and_then(|e| e.effort.clone()),
+            model: previous.and_then(|e| e.model.clone()),
+            mode: previous.and_then(|e| e.mode.clone()),
+        };
+        apply(&mut entry);
+        entries.retain(|e| e.native_id != native_id);
+        entries.push(entry);
         if entries.len() > INDEX_MAX_ENTRIES {
             let excess = entries.len() - INDEX_MAX_ENTRIES;
             entries.drain(..excess);
@@ -548,6 +569,47 @@ impl JournalIndex {
         if let Err(err) = save_atomic(&self.path, &snapshot) {
             tracing::warn!(%err, "failed to save journal index");
         }
+    }
+
+    /// Record what the conversation now runs with. Values are picker ids,
+    /// bounded like every selector on the wire; an over-long one is dropped
+    /// rather than stored. Blocking fs — call from a blocking worker.
+    pub fn record_settings(
+        &self,
+        native_id: &str,
+        session_id: &str,
+        apply: impl FnOnce(&mut ConversationSettings),
+    ) {
+        self.upsert(native_id, session_id, |entry| {
+            let mut settings = ConversationSettings {
+                model: entry.model.take(),
+                effort: entry.effort.take(),
+                mode: entry.mode.take(),
+            };
+            apply(&mut settings);
+            let bounded = |value: Option<String>| {
+                value.filter(|v| !v.is_empty() && v.len() <= crate::model::COMMAND_SELECTOR_MAX)
+            };
+            entry.model = bounded(settings.model);
+            entry.effort = bounded(settings.effort);
+            entry.mode = bounded(settings.mode);
+        });
+    }
+
+    /// The conversation's last known settings (all `None` for an unknown id).
+    pub fn settings(&self, native_id: &str) -> ConversationSettings {
+        self.entries
+            .lock()
+            .expect("index lock")
+            .iter()
+            .rev()
+            .find(|e| e.native_id == native_id)
+            .map(|e| ConversationSettings {
+                model: e.model.clone(),
+                effort: e.effort.clone(),
+                mode: e.mode.clone(),
+            })
+            .unwrap_or_default()
     }
 
     pub fn lookup(&self, native_id: &str) -> Option<String> {
@@ -564,25 +626,7 @@ impl JournalIndex {
     /// Upsert rather than update-only: Init and EffortState are detached onto
     /// blocking workers and may reach this lock in either order.
     pub fn record_effort(&self, native_id: &str, session_id: &str, effort: Option<String>) {
-        let effort = effort.filter(|value| value.len() <= crate::model::COMMAND_SELECTOR_MAX);
-        let _persist = self.persist_lock.lock().expect("index persist lock");
-        let mut entries = self.entries.lock().expect("index lock");
-        entries.retain(|e| e.native_id != native_id);
-        entries.push(IndexEntry {
-            native_id: native_id.to_string(),
-            session_id: session_id.to_string(),
-            ts: now_ms(),
-            effort,
-        });
-        if entries.len() > INDEX_MAX_ENTRIES {
-            let excess = entries.len() - INDEX_MAX_ENTRIES;
-            entries.drain(..excess);
-        }
-        let snapshot = entries.clone();
-        drop(entries);
-        if let Err(err) = save_atomic(&self.path, &snapshot) {
-            tracing::warn!(%err, "failed to save journal index effort");
-        }
+        self.record_settings(native_id, session_id, |s| s.effort = effort);
     }
 
     pub fn effort(&self, native_id: &str) -> Option<String> {
@@ -617,6 +661,111 @@ impl JournalIndex {
         tracing::info!(%native_id, %session_id, %effort, "recovered Codex effort from journal");
         self.record_effort(native_id, &session_id, Some(effort.clone()));
         Some(effort)
+    }
+}
+
+/// The last model / reasoning effort a user chose on an agent kind — what a
+/// NEW chat of that kind starts with (the official TUIs remember the same
+/// pair; chimaera's in-session picks are session-scoped on both wires, so it
+/// has to remember them itself). Keyed by agent kind (`claude` / `codex`),
+/// not by conversation: that is `IndexEntry.effort`'s job.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentPrefs {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// The last permission/approval mode picked (a `ModeInfo.id`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub ts: u64,
+}
+
+/// Durable, tiny (one row per agent kind), atomically rewritten — the same
+/// discipline as [`JournalIndex`], in `prefs.json` beside it.
+#[derive(Default)]
+pub struct AgentPrefsStore {
+    path: PathBuf,
+    prefs: Mutex<std::collections::HashMap<String, AgentPrefs>>,
+    persist_lock: Mutex<()>,
+}
+
+impl AgentPrefsStore {
+    pub fn load(dir: &Path) -> Self {
+        let path = dir.join("prefs.json");
+        let prefs = fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        Self {
+            path,
+            prefs: Mutex::new(prefs),
+            persist_lock: Mutex::new(()),
+        }
+    }
+
+    pub fn get(&self, agent: &str) -> AgentPrefs {
+        self.prefs
+            .lock()
+            .expect("prefs lock")
+            .get(agent)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Remember a user-chosen model (the picker value the agent accepts).
+    /// Blocking fs — call from a blocking worker.
+    pub fn record_model(&self, agent: &str, model: &str) {
+        self.update(agent, |p| p.model = Some(model.to_string()));
+    }
+
+    /// Remember the effort the user picked for the agent kind. Blocking fs.
+    pub fn record_effort(&self, agent: &str, effort: &str) {
+        self.update(agent, |p| p.effort = Some(effort.to_string()));
+    }
+
+    /// Remember the permission/approval mode the user picked. Blocking fs.
+    pub fn record_mode(&self, agent: &str, mode: &str) {
+        self.update(agent, |p| p.mode = Some(mode.to_string()));
+    }
+
+    fn update(&self, agent: &str, apply: impl FnOnce(&mut AgentPrefs)) {
+        // Values are picker ids, bounded like every selector on the wire;
+        // the map itself is bounded by the agent-kind vocabulary.
+        if agent.is_empty() || agent.len() > 32 {
+            return;
+        }
+        let _persist = self.persist_lock.lock().expect("prefs persist lock");
+        let snapshot = {
+            let mut prefs = self.prefs.lock().expect("prefs lock");
+            // Validate on a candidate first: a refused value must leave the
+            // remembered one untouched, in memory and on disk.
+            let mut candidate = prefs.get(agent).cloned().unwrap_or_default();
+            apply(&mut candidate);
+            let valid = |v: &Option<String>| {
+                v.as_deref()
+                    .is_none_or(|s| !s.is_empty() && s.len() <= crate::model::COMMAND_SELECTOR_MAX)
+            };
+            if !valid(&candidate.model) || !valid(&candidate.effort) || !valid(&candidate.mode) {
+                return;
+            }
+            candidate.ts = now_ms();
+            prefs.insert(agent.to_string(), candidate);
+            prefs.clone()
+        };
+        let write = || -> Result<()> {
+            if let Some(dir) = self.path.parent() {
+                fs::create_dir_all(dir)?;
+            }
+            let tmp = self.path.with_extension("json.tmp");
+            fs::write(&tmp, serde_json::to_vec_pretty(&snapshot)?)?;
+            fs::rename(&tmp, &self.path)?;
+            Ok(())
+        };
+        if let Err(err) = write() {
+            tracing::warn!(%err, "failed to save agent prefs");
+        }
     }
 }
 
@@ -957,6 +1106,7 @@ mod tests {
                 attachments: 0,
                 id: None,
                 queued: false,
+                origin: None,
             },
             AgentEvent::TurnStarted {
                 turn_id: "t1".into(),
@@ -1033,6 +1183,40 @@ mod tests {
         assert!(entries.len() <= INDEX_MAX_ENTRIES);
     }
 
+    /// A reopened conversation comes back with its own model/effort/mode: the
+    /// row carries all three, each write keeps the others, the Init re-key
+    /// keeps them too, and an over-long value is dropped rather than stored.
+    #[test]
+    fn index_carries_a_conversations_own_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = JournalIndex::load(dir.path());
+        assert_eq!(index.settings("native-a"), ConversationSettings::default());
+        index.record("native-a", "s-1");
+        index.record_settings("native-a", "s-1", |s| s.model = Some("sonnet".into()));
+        index.record_settings("native-a", "s-1", |s| s.mode = Some("acceptEdits".into()));
+        index.record_effort("native-a", "s-1", Some("high".into()));
+        index.record("native-a", "s-2"); // a resume re-keys the session, not the settings
+        assert_eq!(
+            index.settings("native-a"),
+            ConversationSettings {
+                model: Some("sonnet".into()),
+                effort: Some("high".into()),
+                mode: Some("acceptEdits".into()),
+            }
+        );
+        assert_eq!(index.lookup("native-a").as_deref(), Some("s-2"));
+        let reloaded = JournalIndex::load(dir.path());
+        assert_eq!(reloaded.settings("native-a"), index.settings("native-a"));
+        // Bounded like the wire: a giant id never lands in the row.
+        let giant = "m".repeat(crate::model::COMMAND_SELECTOR_MAX + 1);
+        index.record_settings("native-a", "s-2", |s| s.model = Some(giant));
+        assert_eq!(index.settings("native-a").model, None);
+        assert_eq!(
+            index.settings("native-a").mode.as_deref(),
+            Some("acceptEdits")
+        );
+    }
+
     #[test]
     fn pre_index_effort_recovery_ignores_process_bootstrap_resets() {
         let init = || AgentEvent::Init {
@@ -1043,6 +1227,9 @@ mod tests {
             slash_commands: Vec::new(),
             models: Vec::new(),
             agent_version: None,
+            remote_control_available: false,
+            remote_control_auto_enable: false,
+            remote_control: None,
         };
         let event = |seq, ev| serde_json::to_string(&SeqEvent { seq, ts: seq, ev }).unwrap();
         let content = [
@@ -1052,6 +1239,7 @@ mod tests {
                 AgentEvent::EffortState {
                     effort: Some("low".into()),
                     ultracode: false,
+                    chosen: false,
                 },
             ),
             event(
@@ -1059,6 +1247,7 @@ mod tests {
                 AgentEvent::EffortState {
                     effort: Some("xhigh".into()),
                     ultracode: false,
+                    chosen: false,
                 },
             ),
             event(4, init()),
@@ -1067,6 +1256,7 @@ mod tests {
                 AgentEvent::EffortState {
                     effort: Some("low".into()),
                     ultracode: false,
+                    chosen: false,
                 },
             ),
         ]
@@ -1111,5 +1301,35 @@ mod tests {
 
         prune_dir(dir.path(), u64::MAX, 1).unwrap();
         assert_eq!(fs::read_dir(dir.path()).unwrap().flatten().count(), 1);
+    }
+}
+
+#[cfg(test)]
+mod prefs_tests {
+    use super::*;
+
+    #[test]
+    fn agent_prefs_round_trip_and_bounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = AgentPrefsStore::load(dir.path());
+        assert_eq!(store.get("claude"), AgentPrefs::default());
+        store.record_model("claude", "opus[1m]");
+        store.record_effort("claude", "xhigh");
+        store.record_model("codex", "gpt-6-astra");
+        store.record_mode("codex", "auto-review");
+        // Reload from disk: the file is the truth.
+        let again = AgentPrefsStore::load(dir.path());
+        let claude = again.get("claude");
+        assert_eq!(claude.model.as_deref(), Some("opus[1m]"));
+        assert_eq!(claude.effort.as_deref(), Some("xhigh"));
+        assert!(claude.ts > 0);
+        assert_eq!(again.get("codex").effort, None);
+        assert_eq!(again.get("codex").mode.as_deref(), Some("auto-review"));
+        // An oversized value never lands (selector cap), the prior stays.
+        again.record_model(
+            "claude",
+            &"x".repeat(crate::model::COMMAND_SELECTOR_MAX + 1),
+        );
+        assert_eq!(again.get("claude").model.as_deref(), Some("opus[1m]"));
     }
 }

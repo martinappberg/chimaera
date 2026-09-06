@@ -71,7 +71,15 @@ pub struct SpawnSpec {
     /// every fresh thread), the driver reads Codex's own
     /// `model_reasoning_effort` config before falling back to the model
     /// default. Claude ignores this protocol-side copy.
+    /// (Claude too, since the prefs feature: applied right after the
+    /// handshake via `apply_flag_settings`, session-scoped, skipped when the
+    /// catalog says `initial_model` has no effort knob.)
     pub initial_effort: Option<String>,
+    /// Permission/approval mode to start in (a `ModeInfo.id` of that
+    /// driver's catalog): applied right after the handshake like a header
+    /// pick when it differs from the agent's opening mode. The daemon's
+    /// per-agent prefs feed it; `None` = the agent's own default.
+    pub initial_mode: Option<String>,
     /// The binary's `--version` line as the server probed it (`None` when
     /// the probe failed). Neither wire protocol offers a reliable version
     /// handshake (see PROTOCOL.md), so the server-side probe is the source:
@@ -98,6 +106,18 @@ pub struct SpawnSpec {
     /// PROTOCOL.md Pass 19), so a pre-allow must answer at the prompt.
     /// Claude ignores it (its pre-allows ride the settings file).
     pub mcp_auto_approve: Option<McpAutoApprove>,
+    /// Turn the agent's Remote Control bridge on right after the handshake,
+    /// registered under this display name. The embedder's standing choice (a
+    /// chimaera setting), honored only where the CLI offers the bridge
+    /// (`Init.remote_control_available`) — otherwise a Notice says why not.
+    /// `None` = leave it to the user's in-session toggle.
+    pub remote_control: Option<String>,
+    /// Conversation rewind (codex): the native id of the FIRST dropped turn —
+    /// `thread/revert {beforeTurnId}` excludes it and every later turn. The
+    /// modern path (0.153+: paginated threads refuse the deprecated
+    /// `thread/rollback`); `rollback_turns` stays the fallback count for an
+    /// older app-server without the method.
+    pub revert_before_turn: Option<String>,
     /// Original creation time to stamp on the `ChatInfo` (epoch ms), for a
     /// session being RESURRECTED — so its age survives a daemon restart
     /// instead of resetting to "now". `None` on a fresh spawn (stamped at
@@ -128,11 +148,14 @@ impl SpawnSpec {
             pinned_native_id: None,
             initial_model: None,
             initial_effort: None,
+            initial_mode: None,
             agent_version: None,
             rollback_turns: None,
             fork_at: None,
             portable_context: None,
             mcp_auto_approve: None,
+            remote_control: None,
+            revert_before_turn: None,
             created_at_ms: None,
             handshake_timeout: HANDSHAKE_TIMEOUT,
         }

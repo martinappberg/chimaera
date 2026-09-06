@@ -13,7 +13,8 @@ use chimaera_agent::claude::ClaudeAdapter;
 use chimaera_agent::driver::SpawnSpec;
 use chimaera_agent::journal::SeqEvent;
 use chimaera_agent::model::{
-    AgentCommand, AgentEvent, BackgroundTask, ContentBlock, ToolStatus, UserMessageState,
+    AgentCommand, AgentEvent, BackgroundTask, ContentBlock, RemoteControlState, ToolStatus,
+    UserMessageState,
 };
 use chimaera_agent::{ChatManager, CommandQueueFull, EventHook, ExitHook, RETAINED_SENDS_MAX};
 
@@ -1741,4 +1742,477 @@ async fn stale_attach_reports_the_clamped_replay_cursor() {
     assert!(att.head_seq < u64::MAX);
 
     assert!(fx.manager.kill("s-stale"));
+}
+
+/// Remote Control end to end through the registry: the toggle command rides
+/// the command channel, the fake's live-shaped round-trip (ready → ack →
+/// connected) journals the level-set states, a fresh attach replays them,
+/// and the disable acks Off.
+#[tokio::test]
+async fn remote_control_toggle_journals_state_and_replays() {
+    let fx = fixture();
+    fx.manager
+        .spawn(&ClaudeAdapter, spec("s-rc", &fx.cwd, "normal"))
+        .expect("spawn");
+    let att = fx.manager.attach("s-rc", 0).expect("attach");
+    let mut seen: Vec<Arc<SeqEvent>> = att.replay.clone();
+    let mut rx = att.live;
+    let init = wait_for(&mut rx, &mut seen, "Init", |ev| {
+        matches!(ev, AgentEvent::Init { .. })
+    })
+    .await;
+    match &init.ev {
+        AgentEvent::Init {
+            remote_control_available,
+            current_mode,
+            ..
+        } => {
+            assert!(remote_control_available, "the fake offers the bridge");
+            assert_eq!(
+                current_mode.as_deref(),
+                Some("default"),
+                "seeded at the handshake"
+            );
+        }
+        _ => unreachable!(),
+    }
+
+    fx.manager
+        .command(
+            "s-rc",
+            AgentCommand::SetRemoteControl {
+                enabled: true,
+                name: Some("chimaera test".into()),
+            },
+        )
+        .await
+        .expect("enable");
+    let connected = wait_for(&mut rx, &mut seen, "RemoteControl connected", |ev| {
+        matches!(
+            ev,
+            AgentEvent::RemoteControl {
+                state: RemoteControlState::Connected,
+                ..
+            }
+        )
+    })
+    .await;
+    match &connected.ev {
+        AgentEvent::RemoteControl {
+            session_url, name, ..
+        } => {
+            assert_eq!(
+                session_url.as_deref(),
+                Some("https://claude.ai/code/session_fake01")
+            );
+            assert_eq!(name.as_deref(), Some("chimaera · chimaera test"));
+        }
+        _ => unreachable!(),
+    }
+    // The per-turn system/init (the fake emits one per turn, like the CLI
+    // after the first prompt) must carry the live bridge as a snapshot —
+    // consumers reset on Init, and a repeated Init must not blank it.
+    send_text(&fx, "s-rc", "hello").await;
+    let reinit = wait_for(&mut rx, &mut seen, "Init after enable", |ev| {
+        matches!(
+            ev,
+            AgentEvent::Init {
+                remote_control: Some(_),
+                ..
+            }
+        )
+    })
+    .await;
+    match &reinit.ev {
+        AgentEvent::Init {
+            remote_control: Some(rc),
+            ..
+        } => {
+            assert_eq!(rc.state, RemoteControlState::Connected);
+            assert_eq!(
+                rc.session_url.as_deref(),
+                Some("https://claude.ai/code/session_fake01")
+            );
+        }
+        _ => unreachable!(),
+    }
+    assert_eq!(
+        fx.manager
+            .get("s-rc")
+            .expect("info")
+            .remote_control_url
+            .as_deref(),
+        Some("https://claude.ai/code/session_fake01"),
+        "the rail link survives the repeated Init"
+    );
+    // Let the fake's canned turn (a permission ask) settle so the disable
+    // below lands on an idle driver.
+    let permission = wait_for(&mut rx, &mut seen, "PermissionRequest", |ev| {
+        matches!(ev, AgentEvent::PermissionRequest { .. })
+    })
+    .await;
+    if let AgentEvent::PermissionRequest { request_id, .. } = &permission.ev {
+        fx.manager
+            .command(
+                "s-rc",
+                AgentCommand::Permission {
+                    request_id: request_id.clone(),
+                    option_id: "allow_once".into(),
+                    destination: None,
+                    feedback: None,
+                },
+            )
+            .await
+            .expect("permission");
+    }
+    wait_for(&mut rx, &mut seen, "TurnCompleted", |ev| {
+        matches!(ev, AgentEvent::TurnCompleted { .. })
+    })
+    .await;
+    // The journal carries the whole ladder: Connecting (optimistic), Connecting
+    // + link (ack), Connected (bridge frame).
+    let states: Vec<RemoteControlState> = seen
+        .iter()
+        .filter_map(|e| match &e.ev {
+            AgentEvent::RemoteControl { state, .. } => Some(*state),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        states,
+        [
+            RemoteControlState::Connecting,
+            RemoteControlState::Connecting,
+            RemoteControlState::Connected
+        ]
+    );
+
+    // A late attach replays the same ladder — the state is journal truth.
+    let late = fx.manager.attach("s-rc", 0).expect("attach");
+    let replayed: Vec<RemoteControlState> = late
+        .replay
+        .iter()
+        .filter_map(|e| match &e.ev {
+            AgentEvent::RemoteControl { state, .. } => Some(*state),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(replayed, states);
+
+    fx.manager
+        .command(
+            "s-rc",
+            AgentCommand::SetRemoteControl {
+                enabled: false,
+                name: None,
+            },
+        )
+        .await
+        .expect("disable");
+    wait_for(&mut rx, &mut seen, "RemoteControl off", |ev| {
+        matches!(
+            ev,
+            AgentEvent::RemoteControl {
+                state: RemoteControlState::Off,
+                ..
+            }
+        )
+    })
+    .await;
+    assert!(fx.manager.kill("s-rc"));
+}
+
+/// A refused enable (the fake speaks the CLI's own "claude.ai subscriptions"
+/// sentence) lands as an Error state carrying that sentence — a chip can show
+/// it — and a kill afterwards journals no phantom Off.
+#[tokio::test]
+async fn refused_remote_control_is_an_error_state() {
+    let fx = fixture();
+    fx.manager
+        .spawn(&ClaudeAdapter, spec("s-rcx", &fx.cwd, "rc-refuse"))
+        .expect("spawn");
+    let att = fx.manager.attach("s-rcx", 0).expect("attach");
+    let mut seen: Vec<Arc<SeqEvent>> = att.replay.clone();
+    let mut rx = att.live;
+    fx.manager
+        .command(
+            "s-rcx",
+            AgentCommand::SetRemoteControl {
+                enabled: true,
+                name: None,
+            },
+        )
+        .await
+        .expect("enable");
+    let err = wait_for(&mut rx, &mut seen, "RemoteControl error", |ev| {
+        matches!(
+            ev,
+            AgentEvent::RemoteControl {
+                state: RemoteControlState::Error,
+                ..
+            }
+        )
+    })
+    .await;
+    match &err.ev {
+        AgentEvent::RemoteControl { detail, .. } => {
+            assert!(detail
+                .as_deref()
+                .is_some_and(|d| d.contains("claude.ai subscriptions")));
+        }
+        _ => unreachable!(),
+    }
+    assert!(fx.manager.kill("s-rcx"));
+    wait_for(&mut rx, &mut seen, "Exited", |ev| {
+        matches!(ev, AgentEvent::Exited { .. })
+    })
+    .await;
+    assert!(
+        !seen.iter().any(|e| matches!(
+            &e.ev,
+            AgentEvent::RemoteControl {
+                state: RemoteControlState::Off,
+                ..
+            }
+        )),
+        "nothing was live, so teardown journals no Off"
+    );
+}
+
+/// `SpawnSpec.remote_control` turns the bridge on right after the handshake
+/// (the embedder's standing choice) — and says why not where the CLI does not
+/// offer it.
+#[tokio::test]
+async fn remote_control_at_start_enables_after_the_handshake() {
+    let fx = fixture();
+    let mut s = spec("s-rca", &fx.cwd, "normal");
+    s.remote_control = Some("chimaera at-start".into());
+    fx.manager.spawn(&ClaudeAdapter, s).expect("spawn");
+    let att = fx.manager.attach("s-rca", 0).expect("attach");
+    let mut seen: Vec<Arc<SeqEvent>> = att.replay.clone();
+    let mut rx = att.live;
+    let connected = wait_for(&mut rx, &mut seen, "RemoteControl connected", |ev| {
+        matches!(
+            ev,
+            AgentEvent::RemoteControl {
+                state: RemoteControlState::Connected,
+                ..
+            }
+        )
+    })
+    .await;
+    assert!(matches!(
+        &connected.ev,
+        AgentEvent::RemoteControl { name: Some(n), .. } if n == "chimaera · chimaera at-start"
+    ));
+    assert!(fx.manager.kill("s-rca"));
+
+    let fx2 = fixture();
+    let mut s = spec("s-rcu", &fx2.cwd, "rc-unavailable");
+    s.remote_control = Some("chimaera at-start".into());
+    fx2.manager.spawn(&ClaudeAdapter, s).expect("spawn");
+    let att = fx2.manager.attach("s-rcu", 0).expect("attach");
+    let mut seen: Vec<Arc<SeqEvent>> = att.replay.clone();
+    let mut rx = att.live;
+    wait_for(
+        &mut rx,
+        &mut seen,
+        "not offered notice",
+        |ev| matches!(ev, AgentEvent::Notice { text } if text.contains("not offered")),
+    )
+    .await;
+    assert!(fx2.manager.kill("s-rcu"));
+}
+
+/// A user's model pick is remembered per agent kind (the daemon's prefs) so
+/// the next chat of that kind starts with it; a reroute (reason present) is
+/// not a pick and must not overwrite it. The store is durable: a fresh
+/// manager on the same journal dir reads it back.
+#[tokio::test]
+async fn model_pick_is_remembered_per_agent_kind() {
+    let fx = fixture();
+    fx.manager
+        .spawn(&ClaudeAdapter, spec("s-pref", &fx.cwd, "normal"))
+        .expect("spawn");
+    let att = fx.manager.attach("s-pref", 0).expect("attach");
+    let mut seen: Vec<Arc<SeqEvent>> = att.replay.clone();
+    let mut rx = att.live;
+    assert_eq!(fx.manager.prefs("claude").model, None);
+    fx.manager
+        .command(
+            "s-pref",
+            AgentCommand::SetModel {
+                model_id: "sonnet".into(),
+            },
+        )
+        .await
+        .expect("set_model");
+    wait_for(
+        &mut rx,
+        &mut seen,
+        "ModelSwitched",
+        |ev| matches!(ev, AgentEvent::ModelSwitched { to, .. } if to == "sonnet"),
+    )
+    .await;
+    // The write is detached onto a blocking worker (memory is updated first,
+    // the atomic rename lands a moment later): poll BOTH the live store and
+    // a fresh manager on the same dir — durability across a restart is the
+    // point.
+    let dir = fx.manager.journal_dir().to_path_buf();
+    let reload = || {
+        let (exit_tx, _exits) = mpsc::unbounded_channel::<String>();
+        ChatManager::new(
+            dir.clone(),
+            Box::new(|_, _| {}),
+            Box::new(move |id, exit| {
+                let _ = exit_tx.send(format!("{id}:{exit:?}"));
+            }),
+        )
+    };
+    let deadline = std::time::Instant::now() + WAIT;
+    loop {
+        let live = fx.manager.prefs("claude").model;
+        let durable = reload().prefs("claude").model;
+        if live.as_deref() == Some("sonnet") && durable.as_deref() == Some("sonnet") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "pref never recorded: live={live:?} durable={durable:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(reload().prefs("codex").model, None);
+    // A mode pick is remembered too (its ack carries chosen:true).
+    fx.manager
+        .command(
+            "s-pref",
+            AgentCommand::SetMode {
+                mode_id: "acceptEdits".into(),
+            },
+        )
+        .await
+        .expect("set_mode");
+    wait_for(&mut rx, &mut seen, "ModeChanged", |ev| {
+        matches!(ev, AgentEvent::ModeChanged { mode_id, chosen: true } if mode_id == "acceptEdits")
+    })
+    .await;
+    let deadline = std::time::Instant::now() + WAIT;
+    while reload().prefs("claude").mode.as_deref() != Some("acceptEdits") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "mode pref never recorded"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // The spawn's bootstrap effort read-back is NOT a pick: nothing recorded.
+    assert_eq!(reload().prefs("claude").effort, None);
+    assert!(fx.manager.kill("s-pref"));
+
+    // The next spawn replays the remembered mode through the handshake; that
+    // ModeChanged is not a pick (chosen:false) — it must not re-record.
+    let mut replay = spec("s-pref2", &fx.cwd, "normal");
+    replay.initial_mode = Some("plan".into());
+    fx.manager.spawn(&ClaudeAdapter, replay).expect("spawn");
+    let att = fx.manager.attach("s-pref2", 0).expect("attach");
+    let mut seen: Vec<Arc<SeqEvent>> = att.replay.clone();
+    let mut rx = att.live;
+    wait_for(
+        &mut rx,
+        &mut seen,
+        "replayed ModeChanged",
+        |ev| matches!(ev, AgentEvent::ModeChanged { mode_id, chosen: false } if mode_id == "plan"),
+    )
+    .await;
+    assert!(
+        !seen
+            .iter()
+            .any(|e| matches!(&e.ev, AgentEvent::ModeChanged { chosen: true, .. })),
+        "the handshake replay must not read as a pick"
+    );
+    assert_eq!(
+        reload().prefs("claude").mode.as_deref(),
+        Some("acceptEdits")
+    );
+    assert!(fx.manager.kill("s-pref2"));
+}
+
+/// The journal index carries what each native conversation last ran with —
+/// model and mode from Init, then every change — so a reopen (resume /
+/// rewind / fork / resurrection) can start from it instead of the prefs.
+#[tokio::test]
+async fn conversation_settings_are_indexed_per_native_id() {
+    let fx = fixture();
+    fx.manager
+        .spawn(&ClaudeAdapter, spec("s-own", &fx.cwd, "normal"))
+        .expect("spawn");
+    let att = fx.manager.attach("s-own", 0).expect("attach");
+    let mut seen: Vec<Arc<SeqEvent>> = att.replay.clone();
+    let mut rx = att.live;
+    // The handshake's first snapshot carries no native id yet; the first
+    // turn's system/init re-emits Init with it, and that is the row the
+    // index keys (a resume handle only exists once a conversation does).
+    fx.manager
+        .command(
+            "s-own",
+            AgentCommand::Send {
+                blocks: vec![ContentBlock::Text {
+                    text: "run it".into(),
+                }],
+            },
+        )
+        .await
+        .expect("send");
+    let init = wait_for(&mut rx, &mut seen, "Init with a native id", |ev| {
+        matches!(ev, AgentEvent::Init { native_session_id, .. } if !native_session_id.is_empty())
+    })
+    .await;
+    let AgentEvent::Init {
+        native_session_id,
+        model,
+        current_mode,
+        ..
+    } = &init.ev
+    else {
+        unreachable!()
+    };
+    let native = native_session_id.clone();
+    let deadline = std::time::Instant::now() + WAIT;
+    while fx.manager.index().settings(&native).model != *model
+        || fx.manager.index().settings(&native).mode != *current_mode
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Init settings never indexed: index={:?} init model={model:?} mode={current_mode:?}",
+            fx.manager.index().settings(&native)
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    fx.manager
+        .command(
+            "s-own",
+            AgentCommand::SetMode {
+                mode_id: "plan".into(),
+            },
+        )
+        .await
+        .expect("set_mode");
+    wait_for(
+        &mut rx,
+        &mut seen,
+        "ModeChanged",
+        |ev| matches!(ev, AgentEvent::ModeChanged { mode_id, .. } if mode_id == "plan"),
+    )
+    .await;
+    let deadline = std::time::Instant::now() + WAIT;
+    while fx.manager.index().settings(&native).mode.as_deref() != Some("plan") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "mode change never indexed"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // The other settings survived the mode write.
+    assert_eq!(fx.manager.index().settings(&native).model, *model);
+    assert!(fx.manager.kill("s-own"));
 }

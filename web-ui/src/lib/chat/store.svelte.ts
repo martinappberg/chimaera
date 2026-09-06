@@ -241,6 +241,10 @@ export type ChatBlock = BlockIdentity &
       /** Delivery key (the wire's client-minted uuid); null on old journals,
        *  transcript-seeded messages, and permission-feedback echoes. */
       id: string | null;
+      /** "remote" when a Remote Control client (phone / claude.ai) injected
+       *  the message through the agent's own bridge; null when this
+       *  workbench sent it. */
+      origin: string | null;
       /** Inclusive journal boundary for a portable fork through this row. */
       forkSeq: number;
     }
@@ -364,6 +368,30 @@ export interface WorkflowAgent {
   resultPreview: string | null;
 }
 
+export interface RemoteControlInfo {
+  state: "connecting" | "connected" | "error";
+  /** The session's own page on the vendor's site (claude.ai/code/…). */
+  sessionUrl: string | null;
+  name: string | null;
+  /** The vendor's words on an error (or a bridge detail). */
+  detail: string | null;
+}
+
+/** Fold a wire `remote_control` event or an Init's `remote_control` snapshot
+ *  (same field names) into the store's shape; off/absent = null. */
+function foldRemoteControl(raw: unknown): RemoteControlInfo | null {
+  if (raw === null || typeof raw !== "object") return null;
+  const ev = raw as Record<string, unknown>;
+  const state = ev.state;
+  if (state !== "connecting" && state !== "connected" && state !== "error") return null;
+  return {
+    state,
+    sessionUrl: typeof ev.session_url === "string" ? ev.session_url : null,
+    name: typeof ev.name === "string" ? ev.name : null,
+    detail: typeof ev.detail === "string" ? ev.detail : null,
+  };
+}
+
 export interface ModeInfo {
   id: string;
   label: string;
@@ -441,6 +469,13 @@ export class ChatStore {
   /** CLI-suggested next prompt (claude prompt_suggestion) — composer ghost
    *  chip; cleared when the user sends anything. */
   promptSuggestion = $state<string | null>(null);
+  /** The agent offers Remote Control here (claude `initialize` offer flags;
+   *  codex reports false — its bridge is daemon-level). Init-scoped. */
+  remoteControlAvailable = $state(false);
+  remoteControlAutoEnable = $state(false);
+  /** The live Remote Control bridge (`remote_control` level-set, latest
+   *  wins): null = off. Process-owned — a fresh `init` or `exited` clears it. */
+  remoteControl = $state<RemoteControlInfo | null>(null);
   /** The agent's live background tasks (the `background_tasks` level-set) —
    *  the background tray. Survives turn ends (background work is cross-turn);
    *  dies with the driver process (cleared on init/exited: the tasks are the
@@ -714,6 +749,13 @@ export class ChatStore {
         this.model = typeof ev.model === "string" ? ev.model : null;
         this.currentMode = typeof ev.current_mode === "string" ? ev.current_mode : null;
         this.modes = Array.isArray(ev.modes) ? (ev.modes as ModeInfo[]) : [];
+        // Offer flags are Init-scoped (absent = false on the wire). The bridge
+        // rides Init as a SNAPSHOT: claude re-emits system/init mid-process
+        // (first prompt, background settles), so a live bridge must survive a
+        // repeated Init — and a new process (snapshot absent) starts without.
+        this.remoteControlAvailable = ev.remote_control_available === true;
+        this.remoteControlAutoEnable = ev.remote_control_auto_enable === true;
+        this.remoteControl = foldRemoteControl(ev.remote_control);
         this.slashCommands = Array.isArray(ev.slash_commands)
           ? (ev.slash_commands as SlashCommand[])
           : [];
@@ -733,6 +775,7 @@ export class ChatStore {
         const id = (ev.id as string) ?? null;
         const text = ev.text as string;
         const attachments = (ev.attachments as number) ?? 0;
+        const origin = typeof ev.origin === "string" ? ev.origin : null;
         if (ev.queued === true && id !== null) {
           // Queued: park it in the pending stack, NOT in the transcript at its
           // mid-turn send position (that splice would split the agent's live
@@ -748,12 +791,20 @@ export class ChatStore {
               attachments,
               checkpoint: null,
               id,
+              origin,
               forkSeq: entry.seq,
             }),
           );
           if (id !== null) this.userIndex.set(id, this.blocks.length - 1);
         }
         this.promptSuggestion = null;
+        break;
+      }
+      case "remote_control": {
+        // LEVEL-SET, latest wins; pure state fold. The transcript lines
+        // (connected-with-link, a refusal) are journaled by the driver as
+        // Notice events, so live and replayed transcripts agree.
+        this.remoteControl = foldRemoteControl(ev);
         break;
       }
       case "background_tasks": {
@@ -833,6 +884,7 @@ export class ChatStore {
               kind: "user",
               text: pending.text,
               attachments: pending.attachments,
+              origin: null,
               checkpoint: pending.checkpoint,
               id: pending.id,
               forkSeq: entry.seq,
@@ -1374,8 +1426,10 @@ export class ChatStore {
         this.reconcileOpenTools();
         this.exited = { status: (ev.status as number | null) ?? null };
         // Background tasks are the CLI's children — they died with it (the
-        // CLI SIGTERMs its tracked shells on exit).
+        // CLI SIGTERMs its tracked shells on exit). So did its Remote Control
+        // bridge (the driver journals the Off first; this covers old journals).
         this.backgroundTasks = [];
+        this.remoteControl = null;
         // The reply route for any pending ask died with the process. The
         // driver drains resolutions before Exited, so this is usually a
         // no-op — it covers old journals recorded before that fix.

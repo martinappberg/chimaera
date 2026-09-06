@@ -145,6 +145,17 @@ impl SettingsStore {
             .unwrap_or(true)
     }
 
+    /// Daemon-consumed key: turn Claude's Remote Control on for every new
+    /// structured chat session right after its handshake (see
+    /// `chat::spawn_chat_session`). Default off: enabling registers the
+    /// session with claude.ai, which is the user's call, not the daemon's.
+    pub(crate) fn remote_control_at_start(&mut self) -> bool {
+        self.current()
+            .get("chat.remoteControlAtStart")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    }
+
     /// Daemon-consumed key: periodically check GitHub for newer releases
     /// (see `update`).
     pub(crate) fn update_auto_check(&mut self) -> bool {
