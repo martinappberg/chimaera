@@ -4,7 +4,7 @@
   import { sessionLabel, type Session } from "../workspace/sessions";
   import type { DropSpot, LayoutCtrl } from "./dnd";
   import { registerPane, unregisterPane, zoneWord } from "./dnd";
-  import { basename } from "../previews/files";
+  import { dirLabel } from "../previews/files";
   import { agentHue, type LinkCtrl } from "../workspace/agentLinks";
   import { activeModLabel, keyHint } from "../shared/keybindings";
   import PaneTabs from "./PaneTabs.svelte";
@@ -568,7 +568,7 @@
     <div class="drop-frame">
       <!-- The destination, named once at the pane's foot (never inside the
            column: an in-flow chip would grow the column mid-drag). -->
-      <span class="drop-chip folder">upload into <b>{basename(uploadDir) || "/"}/</b></span>
+      <span class="drop-chip folder">upload into <b>{dirLabel(uploadDir)}</b></span>
     </div>
   {/if}
 </section>

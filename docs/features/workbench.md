@@ -95,7 +95,9 @@ Daemon side: `crates/chimaera-server/src/{workspaces.rs,view_state.rs,quickopen.
   into the pane ground, and a **"N more" control** (chevron + count of tabs out of view) at
   the strip's end opens a menu of **every** tab in order, the active one marked — pick one to
   activate it. The active tab is scrolled into view whenever it changes (click, `Mod+Alt+[`/`]`,
-  an open, a layout restore, a resize). Adjacent tabs are separated by a hairline and the
+  an open, a layout restore) and stays in view across a resize when it was in view before it — a
+  strip the user scrolled away from is not snapped back by an unrelated layout change. Adjacent
+  tabs are separated by a hairline and the
   active tab carries a thin accent underline; a tab drag hovering near either edge of an
   overflowed strip auto-scrolls it.
 - **Preview (italic) tabs.** File opens are **preview** tabs, VS Code-style: the name renders

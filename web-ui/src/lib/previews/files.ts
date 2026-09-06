@@ -454,6 +454,13 @@ export function basename(path: string): string {
   return i >= 0 ? trimmed.slice(i + 1) : trimmed;
 }
 
+/** A directory as a drop-destination label: `src/`, and `/` for the root
+ *  (never `//`). One helper so every "upload into …" chip agrees. */
+export function dirLabel(path: string): string {
+  const name = basename(path);
+  return name === "" ? "/" : `${name}/`;
+}
+
 /**
  * Middle-ellipsis truncation (polish inventory: paths truncate in the
  * middle — the basename is the informative end).

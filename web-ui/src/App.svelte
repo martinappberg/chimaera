@@ -1689,7 +1689,7 @@
   function osFolderTargetAt(
     x: number,
     y: number,
-  ): { paneId: string | null; dir: string; row: boolean } | null {
+  ): { paneId: string | null; dir: string; row: boolean; rowKey?: string } | null {
     const el = document.elementFromPoint(x, y);
     if (!(el instanceof Element)) return null;
     // A FILES-tree dir row (files target their parent; broken links have
@@ -1697,7 +1697,9 @@
     // scroller is one target surface.
     const row = el.closest<HTMLElement>("[data-drop-dir]");
     if (row?.dataset.dropDir != null && el.closest(".tree-scroll") !== null) {
-      return { paneId: null, dir: row.dataset.dropDir, row: false };
+      // The row's position key rides along: the tree highlights by position
+      // (one canonical path can sit under a symlink and its target).
+      return { paneId: null, dir: row.dataset.dropDir, row: false, rowKey: row.dataset.dropKey };
     }
     // The tree background → the workspace root.
     const treeRoot = el.closest<HTMLElement>("[data-tree-root]");
@@ -1753,6 +1755,7 @@
         paneId: folder.paneId,
         dir: folder.dir,
         row: folder.row,
+        rowKey: folder.rowKey,
       };
       if (!sameSpot(next, dropSpot)) dropSpot = next;
       return;
@@ -3876,7 +3879,9 @@
         },
       },
       {
-        describe: describeSpot,
+        // The pane's own zones are refused on drop (onSpot hides their
+        // preview too), so the ghost must not promise "split right" there.
+        describe: (s) => ("paneId" in s && s.paneId === paneId ? "" : describeSpot(s)),
         allowOut: canDetachOut() && !pane.tabs.some(guardBlocksTab),
         trackOut: isNativeShell()
           ? (x, y) => xwin?.track(x, y, dragId) ?? Promise.resolve(false)
@@ -4610,6 +4615,9 @@
                 reveal={treeReveal}
                 createRequest={treeCreate}
                 dropDir={dropSpot?.kind === "uploadDir" && dropSpot.paneId === null ? dropSpot.dir : null}
+                dropKey={dropSpot?.kind === "uploadDir" && dropSpot.paneId === null
+                  ? (dropSpot.rowKey ?? null)
+                  : null}
               />
             </div>
           {/if}

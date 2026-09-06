@@ -47,8 +47,10 @@
       left = Math.max(4, Math.min(px, window.innerWidth - rect.width - 4));
       top = py + rect.height > window.innerHeight - 4 ? Math.max(4, py - rect.height) : py;
       el.focus();
+      // A pick list opens ON its checked row: it is revealed, and the roving
+      // row starts there so the first arrow steps from it, not from the top.
       const checked = contextMenu.items.findIndex((e) => e !== "separator" && e.checked === true);
-      if (checked >= 0) revealRow(checked);
+      if (checked >= 0) activeIndex = checked;
     });
   });
 

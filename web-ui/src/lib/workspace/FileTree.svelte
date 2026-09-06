@@ -6,7 +6,7 @@
    * no recursive components, trivial scrolling.
    */
   import { tick, untrack } from "svelte";
-  import { basename, dirname, fsDownload, fsList, type FsEntry } from "../previews/files";
+  import { basename, dirLabel, dirname, fsDownload, fsList, type FsEntry } from "../previews/files";
   import { getSetting } from "../settings/store.svelte";
   import { gitIndex, gitStatus, type GitEntry } from "./git";
   import { decoFor, dirColor } from "./gitDeco";
@@ -63,6 +63,11 @@
      * destination is never a guess.
      */
     dropDir?: string | null;
+    /** The hovered row's tree-position key for the drop (the row's
+     *  `data-drop-key`, which App forwards): the same canonical path can sit
+     *  under a symlink AND its target, so the highlight resolves by position
+     *  when it can, by path only for the fallbacks. */
+    dropKey?: string | null;
   }
 
   let {
@@ -74,6 +79,7 @@
     reveal = null,
     createRequest = null,
     dropDir = null,
+    dropKey = null,
   }: Props = $props();
 
   /** A row's own left padding (CSS `--row-pad`): the sticky probe lands
@@ -406,10 +412,12 @@
    *  extent washes so "into this folder" reads as a region, not a line. */
   const dropRange = $derived.by(() => {
     if (dropDir === null || dropIsRoot) return null;
-    const i = rows.findIndex((r) => r.entry.kind === "dir" && r.entry.path === dropDir);
+    // By position when the hovered row named itself, by path otherwise.
+    let i = dropKey === null ? -1 : rows.findIndex((r) => r.key === dropKey);
+    if (i < 0) i = rows.findIndex((r) => r.entry.kind === "dir" && r.entry.path === dropDir);
     return i < 0 ? null : { start: i, end: subtreeEnd(i), depth: rows[i].depth };
   });
-  const dropName = $derived(dropDir === null ? "" : basename(dropIsRoot ? rootPath : dropDir));
+  const dropLabel = $derived(dropDir === null ? "" : dirLabel(dropIsRoot ? rootPath : dropDir));
 
   // A native drag suppresses pointer events, so the hover cue would freeze on
   // whatever was last hovered; clear it so only the drop highlight shows.
@@ -973,6 +981,7 @@
               tabindex="-1"
               title={s.entry.path}
               data-drop-dir={s.entry.path}
+              data-drop-key={s.key}
               style:--depth={s.depth}
               onclick={(e) => onStickyClick(e, s)}
             >
@@ -998,13 +1007,14 @@
         <!-- Names the destination, pinned just under the shelf so the place
              and the name read together. -->
         <div class="drop-chip folder tree-drop-label" style:--shelf-rows={sticky.length} role="status">
-          upload into <b>{dropName}/</b>
+          upload into <b>{dropLabel}</b>
         </div>
       {/if}
     </div>
   <div
     class="tree"
     class:drop-root={dropIsRoot}
+    style:--shelf-rows={sticky.length}
     role="tree"
     tabindex="-1"
     bind:this={treeEl}
@@ -1100,6 +1110,13 @@
           : parent < 0
             ? root
             : rows[parent].entry.path}
+      data-drop-key={entry.broken
+        ? undefined
+        : entry.kind === "dir"
+          ? key
+          : parent < 0
+            ? undefined
+            : rows[parent].key}
       style:--depth={depth}
       style:--hot-level={inDrop ? dropRange?.depth : inHot ? hot?.depth : undefined}
       onpointerdowncapture={(e) => {
@@ -1491,6 +1508,12 @@
     background-position:
       calc(12px + var(--hot-level, 0) * var(--indent)) 0,
       0 0;
+  }
+
+  /* Keyboard focus and scrollIntoView land BELOW the pinned ancestors
+     (--shelf-rows on .tree), never under them. */
+  .node {
+    scroll-margin-top: calc(var(--shelf-rows, 0) * var(--row-h));
   }
 
   .node:hover,

@@ -264,12 +264,23 @@
   $effect(() => {
     const strip = tabsEl;
     if (strip === null) return;
+    // Deferred a frame: measure() can flip the "more" control, which resizes
+    // this very element — a synchronous state write inside the observer
+    // callback would loop the observation cycle ("undelivered notifications").
+    let raf = 0;
     const ro = new ResizeObserver(() => {
-      if (activeVisible) revealTab(node.active);
-      measure();
+      if (raf !== 0) return;
+      raf = requestAnimationFrame(() => {
+        raf = 0;
+        if (activeVisible) revealTab(node.active);
+        measure();
+      });
     });
     ro.observe(strip);
-    return () => ro.disconnect();
+    return () => {
+      ro.disconnect();
+      if (raf !== 0) cancelAnimationFrame(raf);
+    };
   });
 
   /** A vertical wheel over the strip scrolls it sideways (the standard tab-bar

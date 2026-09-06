@@ -30,7 +30,16 @@ export type DropSpot =
    *  pointer, so the Finder lights that row alone — never also the column
    *  that may already show the same dir. Produced by App's window drop
    *  handlers, never by spotAt. */
-  | { kind: "uploadDir"; paneId: string | null; dir: string; row: boolean }
+  | {
+      kind: "uploadDir";
+      paneId: string | null;
+      dir: string;
+      row: boolean;
+      /** The FILES-tree row's position key (its `data-drop-key`) when the
+       *  target is a tree row: the same canonical path can appear under a
+       *  symlink and its target, so the tree highlights by position. */
+      rowKey?: string;
+    }
   /** The "link to agent" band over an agent pane's input area — a plain
    *  shell-terminal TAB drag (not link-intent); see startDrag's linkTargets. */
   | { kind: "link"; paneId: string }
@@ -267,7 +276,7 @@ export function sameSpot(a: DropSpot | null, b: DropSpot | null): boolean {
   // rewriting dropSpot (else every event re-derives the Finder/tree lights).
   if (a.kind === "upload" && b.kind === "upload") return a.paneId === b.paneId;
   if (a.kind === "uploadDir" && b.kind === "uploadDir") {
-    return a.paneId === b.paneId && a.dir === b.dir && a.row === b.row;
+    return a.paneId === b.paneId && a.dir === b.dir && a.row === b.row && a.rowKey === b.rowKey;
   }
   // Out is one logical spot regardless of coords (update() refreshes the
   // coords in place so the eventual drop still lands at the release point).
@@ -333,7 +342,10 @@ const SPECIAL_SPOTS: ReadonlySet<DropSpot["kind"]> = new Set([
  */
 function hintFor(spot: DropSpot, opts: DragOptions): string | null {
   const named = opts.describe?.(spot);
-  if (named != null && named.length > 0) return named;
+  // "" is a veto: the caller knows this spot does nothing (a pane hovering
+  // its own zones), so no hint — null/undefined mean "use the generic word".
+  if (named === "") return null;
+  if (named != null) return named;
   switch (spot.kind) {
     case "zone":
       return zoneWord(spot.zone);
@@ -675,7 +687,9 @@ export interface DragOptions {
    * Names the drop for the ghost's hint ("@ reference in claude-1", "link to
    * codex-2"): dnd.ts knows spot geometry, not session names, so the caller
    * supplies the words and the generic reading (hintFor) covers whatever it
-   * returns null for. Called once per logical spot change, never per frame.
+   * returns null for; an empty string VETOES the hint (a spot the caller
+   * will refuse on drop). Called once per logical spot change, never per
+   * frame.
    */
   describe?: (spot: DropSpot) => string | null;
 }
