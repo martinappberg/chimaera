@@ -29,6 +29,7 @@
     deleteSession,
     deleteWorkspace,
     displayName,
+    sessionLabel,
     dotState,
     dotTitle,
     isBusy,
@@ -630,24 +631,26 @@
    *  is state, so a resize that doesn't change it costs nothing. */
   let recentsFit = $state(RECENTS_MIN_ROWS);
   let recentsListEl = $state<HTMLElement | null>(null);
+  function measureRecents(): void {
+    const el = recentsListEl;
+    // The expanded list is taller by design (it scrolls); measuring it would
+    // inflate the fit and hide the "show less" toggle.
+    if (el === null || recentsExpanded) return;
+    const first = el.firstElementChild;
+    if (!(first instanceof HTMLElement)) return;
+    const second = first.nextElementSibling;
+    const pitch =
+      second instanceof HTMLElement ? second.offsetTop - first.offsetTop : first.offsetHeight + 1;
+    if (pitch <= 0) return;
+    // The last row needs no trailing gap: a box exactly N rows tall fits N.
+    const gap = pitch - first.offsetHeight;
+    const fit = Math.max(RECENTS_MIN_ROWS, Math.floor((el.clientHeight + gap) / pitch));
+    if (fit !== recentsFit) recentsFit = fit;
+  }
   $effect(() => {
     const el = recentsListEl;
     if (el === null) return;
-    const measure = (): void => {
-      // The expanded list is taller by design (it scrolls); measuring it
-      // would inflate the fit and hide the "show less" toggle. The collapse
-      // shrinks the box, which re-fires the observer.
-      if (recentsExpanded) return;
-      const first = el.firstElementChild;
-      if (!(first instanceof HTMLElement)) return;
-      const second = first.nextElementSibling;
-      const pitch =
-        second instanceof HTMLElement ? second.offsetTop - first.offsetTop : first.offsetHeight + 1;
-      if (pitch <= 0) return;
-      const fit = Math.max(RECENTS_MIN_ROWS, Math.floor(el.clientHeight / pitch));
-      if (fit !== recentsFit) recentsFit = fit;
-    };
-    const ro = new ResizeObserver(measure);
+    const ro = new ResizeObserver(measureRecents);
     ro.observe(el);
     return () => ro.disconnect();
   });
@@ -657,11 +660,17 @@
    *  else "show all" can change nothing visible. Collapse scrolls back. */
   function toggleRecents(): void {
     recentsExpanded = !recentsExpanded;
-    const el = recentsListEl?.parentElement;
-    if (el === undefined || el === null) return;
+    const section = recentsListEl?.parentElement;
+    const column = section?.parentElement;
+    if (section == null || column == null) return;
     void tick().then(() => {
-      if (recentsExpanded) el.scrollIntoView({ block: "start" });
-      else el.parentElement?.scrollTo({ top: 0 });
+      // Scroll the sessions column itself — never scrollIntoView, which
+      // would also shift the overflow-hidden rail around it.
+      const top = section.getBoundingClientRect().top - column.getBoundingClientRect().top;
+      column.scrollTo({ top: recentsExpanded ? column.scrollTop + top : 0 });
+      // Collapsing back to a box the same size as before fires no resize;
+      // the column may have changed meanwhile, so re-fit explicitly.
+      if (!recentsExpanded) measureRecents();
     });
   }
   /** Recents to SHOW: drop any whose conversation is currently LIVE (a live
@@ -695,7 +704,9 @@
   let layoutReady = $state(false);
   let gotSessions = $state(false);
   let autoOpened = false;
-  let dropSpot = $state<DropSpot | null>(null);
+  // Raw: a spot is an immutable value replaced wholesale (dnd + the OS-drop
+  // handlers gate rewrites with sameSpot), never mutated in place.
+  let dropSpot = $state.raw<DropSpot | null>(null);
   /** Panes whose bottom band is armed for the CURRENT drag (reference or
    *  link targets) — zone previews stop above the band on these. */
   let bandPanes = $state<ReadonlySet<string>>(new Set());
@@ -1678,18 +1689,20 @@
   function osFolderTargetAt(
     x: number,
     y: number,
-  ): { paneId: string | null; dir: string; row?: boolean } | null {
+  ): { paneId: string | null; dir: string; row: boolean } | null {
     const el = document.elementFromPoint(x, y);
     if (!(el instanceof Element)) return null;
-    // A FILES-tree dir row (files target their parent; broken links have none).
+    // A FILES-tree dir row (files target their parent; broken links have
+    // none) — real rows and the sticky ancestor copies alike, so the whole
+    // scroller is one target surface.
     const row = el.closest<HTMLElement>("[data-drop-dir]");
-    if (row?.dataset.dropDir != null && el.closest(".tree") !== null) {
-      return { paneId: null, dir: row.dataset.dropDir };
+    if (row?.dataset.dropDir != null && el.closest(".tree-scroll") !== null) {
+      return { paneId: null, dir: row.dataset.dropDir, row: false };
     }
     // The tree background → the workspace root.
     const treeRoot = el.closest<HTMLElement>("[data-tree-root]");
     if (treeRoot?.dataset.treeRoot != null) {
-      return { paneId: null, dir: treeRoot.dataset.treeRoot };
+      return { paneId: null, dir: treeRoot.dataset.treeRoot, row: false };
     }
     // A Finder column → that column's directory — unless the pointer is on a
     // dir ROW it lists, which wins: the row is the exact thing under the
@@ -1700,7 +1713,7 @@
       if (row?.dataset.dropDir != null && col.contains(row)) {
         return { paneId, dir: row.dataset.dropDir, row: true };
       }
-      return { paneId, dir: col.dataset.finderDir };
+      return { paneId, dir: col.dataset.finderDir, row: false };
     }
     return null;
   }
@@ -1739,7 +1752,7 @@
         kind: "uploadDir",
         paneId: folder.paneId,
         dir: folder.dir,
-        row: folder.row === true,
+        row: folder.row,
       };
       if (!sameSpot(next, dropSpot)) dropSpot = next;
       return;
@@ -2664,21 +2677,24 @@
   const killing = new Set<string>();
   const KILL_TOMBSTONE_MS = 20_000;
 
-  /** Tombstone `id` and drop it from the local roster at once. */
-  function tombstone(id: string): void {
-    killing.add(id);
+  /** Tombstone `ids` and drop them from the local roster in ONE re-apply
+   *  (a workspace stop kills many at once). */
+  function tombstone(ids: readonly string[]): void {
+    for (const id of ids) killing.add(id);
     applySessions(
-      sessions.filter((s) => s.id !== id),
+      sessions.filter((s) => !ids.includes(s.id)),
       false,
     );
   }
 
-  /** The kill request settled: keep the tombstone until a snapshot confirms
-   *  the session is gone, with a bounded fallback (see `killing`). */
-  function armTombstoneExpiry(id: string): void {
+  /** The kill requests settled: keep the tombstones until a snapshot
+   *  confirms each session is gone, with one bounded fallback for the batch
+   *  (see `killing`). */
+  function armTombstoneExpiry(ids: readonly string[]): void {
     window.setTimeout(() => {
-      if (!killing.has(id)) return;
-      killing.delete(id);
+      let lingering = false;
+      for (const id of ids) if (killing.delete(id)) lingering = true;
+      if (!lingering) return;
       listSessions().then(applySessions, () => {
         // unreachable daemon: the next snapshot/poll reconciles
       });
@@ -3172,13 +3188,13 @@
   async function killSession(id: string): Promise<void> {
     confirmKillId = null;
     chatPool.disposeChat(id); // stop its socket reconnecting right away
-    tombstone(id);
+    tombstone([id]);
     try {
       await deleteSession(id);
     } catch {
       // already gone or unreachable — it's already dropped locally.
     } finally {
-      armTombstoneExpiry(id);
+      armTombstoneExpiry([id]);
     }
   }
 
@@ -3189,12 +3205,11 @@
   async function stopWorkspace(w: Workspace): Promise<void> {
     const live = sessions.filter((s) => s.workspace_id === w.id && s.alive);
     if (live.length === 0) return;
-    for (const s of live) {
-      chatPool.disposeChat(s.id);
-      tombstone(s.id);
-    }
-    await Promise.allSettled(live.map((s) => deleteSession(s.id)));
-    for (const s of live) armTombstoneExpiry(s.id);
+    const ids = live.map((s) => s.id);
+    for (const id of ids) chatPool.disposeChat(id);
+    tombstone(ids);
+    await Promise.allSettled(ids.map((id) => deleteSession(id)));
+    armTombstoneExpiry(ids);
   }
 
   /** Inline rename (double-click / F2 on a rail row): chimaera owns the
@@ -3874,7 +3889,7 @@
   /** A tab's display label (drags, the detached-window title). */
   function tabLabel(tab: Tab): string {
     return tab.surface === "terminal"
-      ? (displayNames.get(tab.sessionId) ?? sessionsById.get(tab.sessionId)?.name ?? tab.sessionId.slice(0, 8))
+      ? sessionLabel(displayNames, sessionsById, tab.sessionId)
       : tab.surface === "file"
         ? (fileTitles.get(tab.path) ?? basename(tab.path))
         : tab.surface === "finder"
@@ -4879,7 +4894,7 @@
           <!-- Window-edge preview: the root split's new pane, full height/width,
                named like the pane zones so it never reads as a bare rectangle. -->
           <div class="edge-drop {dropSpot.edge}">
-            <span class="edge-drop-label">split window {sideWord(dropSpot.edge)}</span>
+            <span class="drop-chip">split window {sideWord(dropSpot.edge)}</span>
           </div>
         {/if}
         {#if detachedEmpty && tabCount(layout) === 0}
@@ -5737,14 +5752,17 @@
 
   /* --- Recents: ended agent conversations --- */
 
-  /* Fills whatever the sessions column has left (basis 0 so the rendered
-     row count never feeds back into the box the count is measured from);
-     the list's min-height (3 rows) is the floor, below which the column
-     scrolls. One fixed row height keeps the fit arithmetic exact. */
+  /* Fills whatever the sessions column has left. Basis 0 AND min-height 0:
+     with the automatic minimum the rendered rows would feed back into the
+     box the row count is measured from (the section could grow to its
+     high-water mark and never shrink). The list's min-height (3 rows) is
+     the floor, below which the column scrolls. One fixed row height keeps
+     the fit arithmetic exact. */
   .recents {
     --recent-row-h: 26px;
     margin-top: 0.55rem;
     flex: 1 1 0;
+    min-height: 0;
     display: flex;
     flex-direction: column;
   }
@@ -6184,17 +6202,6 @@
   }
 
   /* The same label chip as Pane's band-label (one grammar for every preview). */
-  .edge-drop-label {
-    font-family: var(--mono);
-    font-size: var(--text-xs);
-    letter-spacing: 0.06em;
-    color: var(--fg);
-    background: color-mix(in srgb, var(--term-bg) 82%, transparent);
-    border-radius: 4px;
-    padding: 2px 8px;
-    user-select: none;
-  }
-
   .edge-drop.left {
     inset: 8px 50% 8px 8px;
   }

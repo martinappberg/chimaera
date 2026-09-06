@@ -14,7 +14,7 @@
    * `onOpenFile` — every file viewer is reused unchanged.
    */
   import { tick, untrack } from "svelte";
-  import { basename, fsDownload, fsList, type FsEntry, humanSize } from "./files";
+  import { basename, dirname, fsDownload, fsList, type FsEntry, humanSize } from "./files";
   import { fsHome } from "../workspace/sessions";
   import { getSetting } from "../settings/store.svelte";
   import { ApiError, isRemoteHost } from "../net/api";
@@ -71,12 +71,6 @@
   }
 
   let { path, wsRoot, onNavigate, onOpenFile, dropDir = null, dropOnRow = false }: Props = $props();
-
-  /** "src/" for the drop label — the root reads as "/" rather than "//". */
-  function dropTargetName(dir: string): string {
-    const name = basename(dir);
-    return name === "" ? "/" : `${name}/`;
-  }
 
   interface Column {
     dir: string;
@@ -501,11 +495,6 @@
     ];
   }
 
-  function parentOf(p: string): string {
-    const i = p.lastIndexOf("/");
-    return i > 0 ? p.slice(0, i) : "/";
-  }
-
   /** Reveal a column by the smallest possible horizontal movement. A blanket
    *  scroll-to-max used to push the selected folder all the way left on every
    *  refresh, even when the user was inspecting an earlier column. */
@@ -589,10 +578,10 @@
       }
       const dirs = new Set<string>();
       if (m?.kind === "rename") {
-        dirs.add(parentOf(m.from));
-        dirs.add(parentOf(m.to));
+        dirs.add(dirname(m.from));
+        dirs.add(dirname(m.to));
       } else if (m !== null && m !== undefined) {
-        dirs.add(parentOf(m.path));
+        dirs.add(dirname(m.path));
       }
       scheduleRefresh(dirs);
     });
@@ -619,8 +608,8 @@
         return;
       }
       const dirs = new Set(change.dirs);
-      for (const file of [...change.files, ...change.removed]) dirs.add(parentOf(file));
-      for (const removed of change.removedDirs) dirs.add(parentOf(removed));
+      for (const file of [...change.files, ...change.removed]) dirs.add(dirname(file));
+      for (const removed of change.removedDirs) dirs.add(dirname(removed));
       scheduleRefresh(dirs);
     });
   });
@@ -707,7 +696,6 @@
            lists (then only the row rings, but this column carries the label —
            the row is too small to hold one). -->
       {@const colTarget = dropDir !== null && !dropOnRow && dropDir === col.dir}
-      {@const rowTargetHere = dropDir !== null && dropOnRow && parentOf(dropDir) === col.dir}
       <div
         class="col"
         class:active={ci === activeCol}
@@ -819,12 +807,6 @@
           <div class="listing-limit" role="status">
             Showing the first {col.entries.length.toLocaleString()} entries
           </div>
-        {/if}
-        {#if (colTarget || rowTargetHere) && dropDir !== null}
-          <!-- Names the destination. Appended AFTER the rows (never inserted
-               ahead of them — positional-selector churn) and sticky at the
-               column's foot, so it shows however far the column is scrolled. -->
-          <div class="drop-label" role="status">upload into <b>{dropTargetName(dropDir)}</b></div>
         {/if}
       </div>
     {/each}
@@ -1044,34 +1026,6 @@
   .row.drop-target {
     background: color-mix(in srgb, var(--accent) 18%, transparent);
     box-shadow: inset 0 0 0 1.5px color-mix(in srgb, var(--accent) 70%, transparent);
-  }
-
-  /* The destination, named, pinned to the column's foot. */
-  .drop-label {
-    position: sticky;
-    bottom: 4px;
-    z-index: 1;
-    width: fit-content;
-    max-width: 100%;
-    margin: 6px auto 0;
-    padding: 2px 8px;
-    font-family: var(--mono);
-    font-size: var(--text-xs);
-    letter-spacing: 0.06em;
-    color: var(--fg);
-    background: color-mix(in srgb, var(--pane-bg, var(--bg)) 90%, transparent);
-    border: 1px solid color-mix(in srgb, var(--accent) 50%, transparent);
-    border-radius: 4px;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    pointer-events: none;
-    user-select: none;
-  }
-
-  .drop-label b {
-    font-weight: 600;
-    color: var(--accent);
   }
 
   .glyph {

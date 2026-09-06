@@ -10,9 +10,16 @@
    * name + close, same drag, same middle-click close, same dblclick zoom.
    * A terminal's glyph carries its session-state color.
    */
+  import { untrack } from "svelte";
   import { tabKey, type PaneNode, type Tab } from "./layout";
   import type { Session } from "../workspace/sessions";
-  import { dotState, dotTitle, renameSession, switchingViews } from "../workspace/sessions";
+  import {
+    dotState,
+    dotTitle,
+    renameSession,
+    sessionLabel as labelSession,
+    switchingViews,
+  } from "../workspace/sessions";
   import SessionGlyph from "../shared/SessionGlyph.svelte";
   import type { DropSpot, LayoutCtrl } from "./dnd";
   import { agentHue, type LinkCtrl } from "../workspace/agentLinks";
@@ -89,7 +96,7 @@
   );
 
   function sessionLabel(id: string): string {
-    return names.get(id) ?? sessions.get(id)?.name ?? id.slice(0, 8);
+    return labelSession(names, sessions, id);
   }
 
   /** Chip dot modifier for a linked terminal: what is that shell doing? */
@@ -175,8 +182,8 @@
    * Strip overflow state, replaced wholesale by measure(): fades per clipped
    * side, whether the strip overflows at all (the "more" control), and how
    * many tabs are out of view. One raw state so a scroll costs one update;
-   * `lastClip` is the plain mirror measure() compares against, so the effects
-   * that call it never read the state they write.
+   * measure() compares against it untracked, so the effects that call it
+   * never read the state they write.
    */
   interface Clip {
     left: boolean;
@@ -184,8 +191,11 @@
     over: boolean;
     hidden: number;
   }
-  let lastClip: Clip = { left: false, right: false, over: false, hidden: 0 };
-  let clip = $state.raw<Clip>(lastClip);
+  let clip = $state.raw<Clip>({ left: false, right: false, over: false, hidden: 0 });
+  /** Whether the active tab was fully in view at the last measure: a strip
+   *  resize re-reveals it only then — a user who scrolled away to read
+   *  hidden tabs is not snapped back by an unrelated layout change. */
+  let activeVisible = true;
 
   /** Fade width; the reveal keeps the active tab this far inside the edge so
    *  the fade never sits on it. */
@@ -199,21 +209,20 @@
     const sl = strip.scrollLeft;
     const cw = strip.clientWidth;
     const sw = strip.scrollWidth;
-    // A lone tab wider than a narrow strip (the bar's controls keep their
-    // room) is just clipped — no list to open, so no control; the fades
-    // still say it runs on.
+    // A tab is capped at the strip's width, so a lone tab can only overflow a
+    // strip narrower than a tab's floor — nothing to list there, no control.
     const over = sw > cw + 1 && node.tabs.length > 1;
     let hidden = 0;
-    if (over) {
-      for (const t of strip.querySelectorAll<HTMLElement>("[data-tab-index]")) {
-        const l = t.offsetLeft;
-        if (l < sl - 2 || l + t.offsetWidth > sl + cw + 2) hidden++;
-      }
+    activeVisible = true;
+    for (const t of strip.querySelectorAll<HTMLElement>("[data-tab-index]")) {
+      const l = t.offsetLeft;
+      const clipped = l < sl - 2 || l + t.offsetWidth > sl + cw + 2;
+      if (clipped && over) hidden++;
+      if (clipped && Number(t.dataset.tabIndex) === node.active) activeVisible = false;
     }
     const next: Clip = { left: sl > 1, right: sl + cw < sw - 1, over, hidden };
-    const p = lastClip;
+    const p = untrack(() => clip);
     if (next.left !== p.left || next.right !== p.right || next.over !== p.over || next.hidden !== p.hidden) {
-      lastClip = next;
       clip = next;
     }
   }
@@ -249,13 +258,14 @@
     measure();
   });
 
-  // Strip resized (split dragged, window resized): keep the active tab in
-  // view and re-measure. Torn down with the element.
+  // Strip resized (split dragged, window resized, a control appeared): keep
+  // the active tab in view when it WAS in view, and re-measure. Torn down
+  // with the element.
   $effect(() => {
     const strip = tabsEl;
     if (strip === null) return;
     const ro = new ResizeObserver(() => {
-      revealTab(node.active);
+      if (activeVisible) revealTab(node.active);
       measure();
     });
     ro.observe(strip);
@@ -269,7 +279,11 @@
     if (strip.scrollWidth <= strip.clientWidth) return;
     if (Math.abs(e.deltaX) >= Math.abs(e.deltaY)) return;
     e.preventDefault();
-    strip.scrollLeft += e.deltaMode === 1 ? e.deltaY * 16 : e.deltaY;
+    // Line and page deltas (some Windows mice / Firefox settings) scale to
+    // pixels; a swallowed page delta must not become a 1px nudge.
+    const px =
+      e.deltaMode === 1 ? e.deltaY * 16 : e.deltaMode === 2 ? e.deltaY * strip.clientWidth : e.deltaY;
+    strip.scrollLeft += px;
   }
 
   /** The "N more" control: every tab in strip order, the active one checked;
@@ -339,9 +353,7 @@
   });
 
   function label(tab: Tab): string {
-    if (tab.surface === "terminal") {
-      return names.get(tab.sessionId) ?? sessions.get(tab.sessionId)?.name ?? tab.sessionId.slice(0, 8);
-    }
+    if (tab.surface === "terminal") return sessionLabel(tab.sessionId);
     if (tab.surface === "settings") return "Settings";
     if (tab.surface === "dashboard") return "Dashboard";
     if (tab.surface === "finder") return basename(tab.path) || "Finder";
@@ -417,15 +429,12 @@
   let renameDraft = $state("");
   let renameError = $state<string | null>(null);
 
-  /** Everything that moves the strip's fold without resizing the strip: the
-   *  tab set, their labels, and an inline rename (a 12ch input replaces the
-   *  name). Re-measured after the DOM settles. */
-  const stripKey = $derived(
-    node.tabs.map((t) => `${tabKey(t)}\t${label(t)}`).join("\n") + `\n${renamingTab ?? ""}`,
-  );
-
+  // Everything that moves the strip's fold without resizing the strip — the
+  // tab set, their labels, an inline rename (a 12ch input replaces the name)
+  // — is read here so the effect re-measures after the DOM settles.
   $effect(() => {
-    void stripKey;
+    for (const t of node.tabs) void label(t);
+    void renamingTab;
     if (tabsEl === null) return;
     measure();
   });
@@ -1245,7 +1254,9 @@
     gap: 7px;
     padding: 0 0.4rem 0 0.55rem;
     min-width: 64px;
-    max-width: 180px;
+    /* Never wider than the strip: a lone long name ellipsizes instead of
+       overflowing under the bar's controls. */
+    max-width: min(180px, 100%);
     font-family: var(--mono);
     font-size: var(--text-xs);
     color: var(--muted);

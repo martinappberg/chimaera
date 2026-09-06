@@ -47,6 +47,8 @@
       left = Math.max(4, Math.min(px, window.innerWidth - rect.width - 4));
       top = py + rect.height > window.innerHeight - 4 ? Math.max(4, py - rect.height) : py;
       el.focus();
+      const checked = contextMenu.items.findIndex((e) => e !== "separator" && e.checked === true);
+      if (checked >= 0) revealRow(checked);
     });
   });
 
@@ -79,6 +81,26 @@
         : (pos + delta + selectable.length) % selectable.length;
     activeIndex = selectable[next];
   }
+
+  /** Scroll row `i` into the menu's own view (the menu scrolls when a pick
+   *  list outgrows the viewport). Own math: the menu is the scroller and
+   *  scrollIntoView would also move whatever sits behind it. */
+  function revealRow(i: number): void {
+    const el = menuEl;
+    const row = el?.querySelector<HTMLElement>(`[data-row="${i}"]`);
+    if (el == null || row == null) return;
+    const top = row.offsetTop;
+    const bottom = top + row.offsetHeight;
+    if (top < el.scrollTop) el.scrollTop = top;
+    else if (bottom > el.scrollTop + el.clientHeight) el.scrollTop = bottom - el.clientHeight;
+  }
+
+  // The roving row follows the keyboard into view; on open, the checked row
+  // of a pick list is shown without a keypress.
+  $effect(() => {
+    const i = activeIndex;
+    if (i >= 0) revealRow(i);
+  });
 
   function onKeydown(e: KeyboardEvent): void {
     if (e.key === "ArrowDown") {
@@ -123,6 +145,7 @@
           class:danger={entry.danger}
           class:active={i === activeIndex}
           role="menuitem"
+          data-row={i}
           disabled={entry.disabled}
           title={entry.disabled === true ? entry.hint : undefined}
           onclick={() => select(entry)}

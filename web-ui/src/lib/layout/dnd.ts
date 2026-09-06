@@ -30,7 +30,7 @@ export type DropSpot =
    *  pointer, so the Finder lights that row alone — never also the column
    *  that may already show the same dir. Produced by App's window drop
    *  handlers, never by spotAt. */
-  | { kind: "uploadDir"; paneId: string | null; dir: string; row?: boolean }
+  | { kind: "uploadDir"; paneId: string | null; dir: string; row: boolean }
   /** The "link to agent" band over an agent pane's input area — a plain
    *  shell-terminal TAB drag (not link-intent); see startDrag's linkTargets. */
   | { kind: "link"; paneId: string }
@@ -267,7 +267,7 @@ export function sameSpot(a: DropSpot | null, b: DropSpot | null): boolean {
   // rewriting dropSpot (else every event re-derives the Finder/tree lights).
   if (a.kind === "upload" && b.kind === "upload") return a.paneId === b.paneId;
   if (a.kind === "uploadDir" && b.kind === "uploadDir") {
-    return a.paneId === b.paneId && a.dir === b.dir && (a.row === true) === (b.row === true);
+    return a.paneId === b.paneId && a.dir === b.dir && a.row === b.row;
   }
   // Out is one logical spot regardless of coords (update() refreshes the
   // coords in place so the eventual drop still lands at the release point).
@@ -283,6 +283,33 @@ export function sameSpot(a: DropSpot | null, b: DropSpot | null): boolean {
  */
 export function sideWord(side: Side): "left" | "right" | "up" | "down" {
   return side === "top" ? "up" : side === "bottom" ? "down" : side;
+}
+
+/**
+ * What releasing on a pane zone does, in words. Shared by the ghost hint and
+ * Pane's zone preview so the two surfaces can never disagree; the center
+ * wording covers one tab and a whole pane's worth alike.
+ */
+export function zoneWord(zone: Zone): string {
+  return zone === "center" ? "add to this pane" : `split ${sideWord(zone)}`;
+}
+
+/**
+ * The tab elements a bar shows RIGHT NOW. The strip scrolls, so a tab that is
+ * scrolled out of view keeps a rect (sitting under the strip's controls) —
+ * it must never become a drop target or an insertion anchor.
+ */
+function visibleTabs(bar: HTMLElement): HTMLElement[] {
+  const strip = bar.querySelector<HTMLElement>(".tabs")?.getBoundingClientRect();
+  const out: HTMLElement[] = [];
+  for (const t of bar.querySelectorAll<HTMLElement>("[data-tab-index]")) {
+    if (strip !== undefined) {
+      const tb = t.getBoundingClientRect();
+      if (tb.right <= strip.left || tb.left >= strip.right) continue;
+    }
+    out.push(t);
+  }
+  return out;
 }
 
 /** Spots whose hint takes the accent: they do something other than a tile
@@ -304,16 +331,15 @@ const SPECIAL_SPOTS: ReadonlySet<DropSpot["kind"]> = new Set([
  * window" / "move into window") is owned by the out/trackOut logic in
  * startDrag's update, which flips it asynchronously.
  */
-function hintFor(spot: DropSpot, payload: DragPayload, opts: DragOptions): string | null {
+function hintFor(spot: DropSpot, opts: DragOptions): string | null {
   const named = opts.describe?.(spot);
   if (named != null && named.length > 0) return named;
   switch (spot.kind) {
     case "zone":
-      if (spot.zone !== "center") return `split ${sideWord(spot.zone)}`;
-      // A whole-pane drag (no tab payload) merges all its tabs into the target.
-      return payload.tab === undefined ? "merge into this pane" : "add as tab";
+      return zoneWord(spot.zone);
     case "tab":
-      return "insert as tab";
+      // The caret in the strip shows WHERE; the words match the center zone.
+      return zoneWord("center");
     case "edge":
       return `split window ${sideWord(spot.edge)}`;
     case "ref":
@@ -406,7 +432,7 @@ function linkSpotAt(
     if (reg.tabbar !== null) {
       const tr = reg.tabbar.getBoundingClientRect();
       if (y >= tr.top && y <= tr.bottom) {
-        for (const t of reg.tabbar.querySelectorAll<HTMLElement>("[data-tab-index]")) {
+        for (const t of visibleTabs(reg.tabbar)) {
           const tb = t.getBoundingClientRect();
           if (x >= tb.left && x <= tb.right) {
             const agentId = t.dataset.linkAgent;
@@ -451,8 +477,12 @@ function spotAt(
     if (reg.tabbar !== null) {
       const tr = reg.tabbar.getBoundingClientRect();
       if (y >= tr.top && y <= tr.bottom) {
-        const tabs = reg.tabbar.querySelectorAll<HTMLElement>("[data-tab-index]");
-        let index = tabs.length;
+        // Only the tabs in view can anchor the caret; past the last of them
+        // the drop lands right after it (a visible caret), never in the
+        // scrolled-away run under the strip's controls.
+        const tabs = visibleTabs(reg.tabbar);
+        const last = tabs.at(-1);
+        let index = last === undefined ? 0 : Number(last.dataset.tabIndex) + 1;
         for (const t of tabs) {
           const tb = t.getBoundingClientRect();
           if (x < tb.left + tb.width / 2) {
@@ -704,7 +734,7 @@ export function startDrag(
   let ghostW = 0;
   const setHint = (s: DropSpot | null) => {
     if (ghost === null || s?.kind === "out") return;
-    const text = s === null ? null : hintFor(s, payload, opts);
+    const text = s === null ? null : hintFor(s, opts);
     if (text === lastHint) return;
     lastHint = text;
     writeHint(text ?? "");
@@ -727,6 +757,12 @@ export function startDrag(
       lastHint = null;
       writeHint(out ? "open as new window" : "");
       ghost?.classList.remove("hinted", "special");
+      // The ghost just changed shape: re-measure so the in-window clamp
+      // below never reserves a stale (hinted) width, and retire any
+      // sibling-window probe still in flight so a late "move into window"
+      // can't land in the now-visible in-window hint.
+      if (ghost !== null) ghostW = ghost.offsetWidth;
+      trackSeq++;
       if (!out) opts.trackEnd?.();
     }
     if (out && opts.trackOut !== undefined) {

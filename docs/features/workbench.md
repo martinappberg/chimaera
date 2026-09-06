@@ -118,12 +118,15 @@ Daemon side: `crates/chimaera-server/src/{workspaces.rs,view_state.rs,quickopen.
   [drag-drop-and-uploads.md](drag-drop-and-uploads.md), which also covers OS-desktop file drops
   and screenshot paste) and a **"link to ⟨agent⟩"** band (a terminal drag leashes it — see
   [linked-terminals.md](linked-terminals.md)). **Every preview says what it does**: zone previews
-  carry a centred label (`split left/right/up/down`, `add as tab`), the window-edge preview says
-  `split window ⟨side⟩`, and the drag ghost's hint names the hovered spot in the same words
-  (`insert as tab`, `@ reference in ⟨session⟩`, `link to ⟨agent⟩`, `merge into this pane` for a
-  pane-grip drag) — quiet for tile moves, accent for reference/link/out. One vocabulary:
-  `sideWord` in `dnd.ts` matches the pane-bar split buttons; `DragOptions.describe` lets App supply
-  session names and `dnd.ts` falls back to generic text, written only on a spot change.
+  carry a centred label (`split left/right/up/down`, `add to this pane`), the window-edge preview
+  says `split window ⟨side⟩`, and the drag ghost's hint names the hovered spot in the same words
+  (`add to this pane` over a tab strip too — the caret says where — plus `@ reference in
+  ⟨session⟩`, `link to ⟨agent⟩`) — quiet for tile moves, accent for reference/link/out. One
+  vocabulary, one source: `zoneWord`/`sideWord` in `dnd.ts` feed both the ghost and the pane
+  previews and match the pane-bar split buttons; `DragOptions.describe` lets App supply session
+  names and `dnd.ts` falls back to generic text, written only on a spot change. A tab-strip drop
+  anchors only to the tabs in view — the scrolled-away run under the strip's controls is never
+  a target — and lands after the last visible tab past them.
 
 ## Detach & cross-window moves
 

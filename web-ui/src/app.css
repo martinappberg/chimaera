@@ -345,6 +345,34 @@ body {
   display: none;
 }
 
+/* The drop chip: ONE label grammar for every drop preview — pane zone and
+   band previews, the window-edge preview, the Finder/tree "upload into"
+   labels. Surfaces only position it; the look lives here so it can't drift
+   between them. */
+.drop-chip {
+  font-family: var(--mono);
+  font-size: var(--text-xs);
+  letter-spacing: 0.06em;
+  color: var(--fg);
+  background: color-mix(in srgb, var(--term-bg) 82%, transparent);
+  border-radius: 4px;
+  padding: 2px 8px;
+  white-space: nowrap;
+  user-select: none;
+  pointer-events: none;
+}
+
+/* Names a FOLDER destination: accent-tinted on the surface's own ground
+   (a surface sets --chip-ground to its background token). */
+.drop-chip.folder {
+  background: color-mix(in srgb, var(--accent) 16%, var(--chip-ground, var(--bg)));
+  border: 1px solid color-mix(in srgb, var(--accent) 50%, transparent);
+}
+
+.drop-chip b {
+  font-weight: 600;
+}
+
 /* In-window hint: what releasing on the hovered spot will do ("split right",
    "@ reference in claude-1"). Quiet (--muted) for tile moves; the special
    spots — reference, link — take the accent, like their dashed bands.

@@ -40,8 +40,10 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   it does not scroll): the sticky shelf is a zero-height `position: sticky` anchor at the
   scroller's top, recomputed once per frame on scroll or row change by probing
   `elementsFromPoint` (the inline create/error/listing rows make row arithmetic unreliable),
-  and the scroller opts out of the browser's own scroll anchoring so the component's collapse
-  anchoring is the only one. **OS-desktop drops** (see
+  and the scroller opts out of the browser's own scroll anchoring: the component anchors **every**
+  row change itself (a pre-DOM snapshot of the first row under the shelf, restored once the new
+  rows are in — WebKit has no anchoring of its own, so a relist above the viewport would
+  otherwise shift the rows), and a collapse re-anchors on the collapsed row. **OS-desktop drops** (see
   [drag-drop-and-uploads.md](drag-drop-and-uploads.md)) name their destination: the targeted
   dir row gets an accent ring + wash and its expanded descendants a light wash (hovering a file
   targets its parent), the root target keeps the whole-tree frame, and a sticky

@@ -65,11 +65,13 @@ selection references (see [terminals.md](terminals.md)).
   a drop is never a whole-pane mystery. A live-session pane lights end to end as the
   **"@ upload & reference in ⟨session⟩"** target (HTML5 dnd has no competing tile gesture, so the
   whole pane is the zone, not a bottom band). Over the file manager only the target lights: a
-  Finder **column** rings + washes with an `upload into ⟨dir⟩/` chip at its foot; a Finder
-  **directory row** under the pointer rings *instead* of its column (the row is the target — file
-  rows are not targets themselves, their column is); the FILES tree lights the hovered folder the
-  same way. The Finder pane itself only wears a quiet dashed frame ("this pane is receiving") —
-  the column/row is what says *where*. Release to upload each file and type its returned path. An
+  Finder **column** rings + washes; a Finder **directory row** under the pointer rings *instead*
+  of its column (the row is the target — file rows are not targets themselves, their column is);
+  the FILES tree lights the hovered folder the same way (its pinned ancestor rows are targets
+  too). The Finder pane itself wears a quiet dashed frame ("this pane is receiving") with one
+  `upload into ⟨dir⟩/` chip at its foot — the chip lives on the pane, never inside a column, so
+  hovering can't grow a column's content mid-drag — while the column/row is what says *where*.
+  Release to upload each file and type its returned path. An
   in-flight upload shows byte progress plus a cancel action in a quiet chip bottom-center; failures
   briefly explain what happened. A two-minute no-progress watchdog turns a dead SSH tunnel or stuck
   destination filesystem into an actionable error instead of an endless spinner. Dropping an **image**
@@ -172,6 +174,6 @@ _Intent pending — drafted from the maintainer's request, 2026-09-06; questionn
   about where you should drag them so the UI is intuitive." Every drop target now lights the
   exact thing that receives the drop (a Finder column or dir row, a tree folder row, a session
   pane) and names it; pointer-drag ghosts say what releasing will do.
-- **Pending.** The label vocabulary ("split right", "add as tab", "@ reference in ⟨session⟩",
+- **Pending.** The label vocabulary ("split right", "add to this pane", "@ reference in ⟨session⟩",
   "link to ⟨agent⟩", "upload into ⟨dir⟩/") and the Finder row-beats-column rule have not been
   confirmed with the maintainer — capture via **capture-feature-intent** when available.

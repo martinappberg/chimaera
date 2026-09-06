@@ -1,9 +1,10 @@
 <script lang="ts">
-  import { keepsPaneViewAlive, tabKey, type PaneNode, type Tab, type Zone } from "./layout";
+  import { keepsPaneViewAlive, tabKey, type PaneNode, type Tab } from "./layout";
   import { untrack, type Component } from "svelte";
-  import type { Session } from "../workspace/sessions";
+  import { sessionLabel, type Session } from "../workspace/sessions";
   import type { DropSpot, LayoutCtrl } from "./dnd";
-  import { registerPane, sideWord, unregisterPane } from "./dnd";
+  import { registerPane, unregisterPane, zoneWord } from "./dnd";
+  import { basename } from "../previews/files";
   import { agentHue, type LinkCtrl } from "../workspace/agentLinks";
   import { activeModLabel, keyHint } from "../shared/keybindings";
   import PaneTabs from "./PaneTabs.svelte";
@@ -79,21 +80,16 @@
    *  exact column or dir row `dir` names (see FinderView's dropDir). */
   const uploadDir = $derived(dropSpot?.kind === "uploadDir" && dropSpot.paneId === node.id ? dropSpot.dir : null);
   const uploadRow = $derived(
-    dropSpot?.kind === "uploadDir" && dropSpot.paneId === node.id && dropSpot.row === true,
+    dropSpot?.kind === "uploadDir" && dropSpot.paneId === node.id && dropSpot.row,
   );
   /** The live session this pane shows, named as its tab is — so a drop band
    *  says WHICH session it targets ("@ reference in claude-1"), not just
    *  "this session"; two session panes side by side must read differently. */
-  const activeSessionName = $derived.by(() => {
-    if (activeTab === null || activeTab.surface !== "terminal") return null;
-    const id = activeTab.sessionId;
-    return names.get(id) ?? sessions.get(id)?.name ?? id.slice(0, 8);
-  });
-  /** Zone-preview words: the split direction as the pane-bar buttons say it;
-   *  the center adopts the payload as a tab. */
-  function zoneLabel(z: Zone): string {
-    return z === "center" ? "add as tab" : `split ${sideWord(z)}`;
-  }
+  const activeSessionName = $derived(
+    activeTab !== null && activeTab.surface === "terminal"
+      ? sessionLabel(names, sessions, activeTab.sessionId)
+      : null,
+  );
   /** This pane's bottom band is reserved for the current drag: the center
    *  (adopt) preview stops above it instead of flashing the full pane. */
   const bandArmed = $derived(bandPanes.has(node.id));
@@ -529,20 +525,20 @@
     <!-- A zone preview always says what it is: the rectangle alone can't tell
          "split right" from "add as tab" at a glance. -->
     <div class="drop drop-{zone}" class:banded={bandArmed}>
-      <span class="band-label">{zoneLabel(zone)}</span>
+      <span class="drop-chip">{zoneWord(zone)}</span>
     </div>
   {:else if linkBand}
     <!-- Distinct from the split/adopt zones: a labeled, dashed band over the
          agent's input area. Dropping links the terminal and types its
          @term: reference into the composer (never submits). -->
     <div class="drop-link" class:hued={ownAgentHue !== null} style:--band-hue={ownAgentHue}>
-      <span class="band-label">link to {activeSessionName ?? "this agent"}</span>
+      <span class="drop-chip">link to {activeSessionName ?? "this agent"}</span>
     </div>
   {:else if linkPane}
     <!-- Link-intent drag: the whole agent view is one target (no aiming for a
          band). Full-pane wash in the agent's hue, centered label. -->
     <div class="drop-linkpane" class:hued={ownAgentHue !== null} style:--band-hue={ownAgentHue}>
-      <span class="band-label">link to {activeSessionName ?? "this agent"}</span>
+      <span class="drop-chip">link to {activeSessionName ?? "this agent"}</span>
     </div>
   {/if}
 
@@ -550,7 +546,7 @@
     <!-- Drag-to-reference: types the path into this session's input, never
          opens a tab, never submits. Visibly distinct from the adopt zone. -->
     <div class="drop-ref">
-      <span class="drop-ref-label"
+      <span class="drop-chip"
         ><span class="drop-ref-at">@</span> reference in {activeSessionName ?? "this session"}</span
       >
     </div>
@@ -560,7 +556,7 @@
     <!-- OS-desktop drop: uploads to the session's host, then types the
          path — same "@ reference" grammar, whole pane as the target. -->
     <div class="drop-upload">
-      <span class="drop-ref-label"
+      <span class="drop-chip"
         ><span class="drop-ref-at">@</span> upload &amp; reference in {activeSessionName ??
           "this session"}</span
       >
@@ -569,7 +565,11 @@
     <!-- OS-desktop drop onto a Finder pane: a quiet frame says this pane is
          receiving; the Finder's own column/row highlight says WHERE (a
          whole-pane wash hid exactly that). -->
-    <div class="drop-frame"></div>
+    <div class="drop-frame">
+      <!-- The destination, named once at the pane's foot (never inside the
+           column: an in-flow chip would grow the column mid-drag). -->
+      <span class="drop-chip folder">upload into <b>{basename(uploadDir) || "/"}/</b></span>
+    </div>
   {/if}
 </section>
 {#if agentExec}
@@ -777,17 +777,6 @@
     pointer-events: none;
   }
 
-  .drop-ref-label {
-    font-family: var(--mono);
-    font-size: var(--text-xs);
-    letter-spacing: 0.06em;
-    color: var(--fg);
-    background: color-mix(in srgb, var(--term-bg) 82%, transparent);
-    border-radius: 4px;
-    padding: 2px 8px;
-    user-select: none;
-  }
-
   .drop-ref-at {
     color: var(--accent);
     font-weight: 600;
@@ -861,6 +850,10 @@
     z-index: 7;
     inset: 0;
     margin: 3px;
+    display: flex;
+    align-items: flex-end;
+    justify-content: center;
+    padding-bottom: 12px;
     border: 1.5px dashed color-mix(in srgb, var(--accent) 45%, transparent);
     border-radius: 8px;
     pointer-events: none;
@@ -883,14 +876,4 @@
     pointer-events: none;
   }
 
-  .band-label {
-    font-family: var(--mono);
-    font-size: var(--text-xs);
-    letter-spacing: 0.06em;
-    color: var(--fg);
-    background: color-mix(in srgb, var(--term-bg) 82%, transparent);
-    border-radius: 4px;
-    padding: 2px 8px;
-    user-select: none;
-  }
 </style>
