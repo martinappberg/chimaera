@@ -69,6 +69,11 @@ pub(crate) struct ChatRecipe {
     /// native id of the first dropped turn. Preferred over the count —
     /// paginated threads refuse the deprecated rollback.
     pub(crate) revert_before_turn: Option<String>,
+    /// This spawn CREATES a conversation's chimaera session (fresh, resumed
+    /// from recents, resurrected) rather than respawning a live one (view
+    /// switch, rewind) — the only spawns where `chat.remoteControlAtStart`
+    /// applies, so a bridge the user turned off stays off across respawns.
+    pub(crate) remote_control_at_start: bool,
     pub(crate) theme: String,
     /// Launch-scope prelude text (see `environment`). Carried on the recipe
     /// so a view-switch/rewind/degrade respawn keeps the launch scope; not
@@ -980,19 +985,29 @@ fn find_fork_cut(content: &str, resume_at: &str) -> Option<ForkCut> {
     // them, and compaction turns alike). Turns run outside this journal
     // (e.g. TUI-interleaved via the view toggle) are invisible here — the
     // rollback count is only as complete as the journal.
-    let dropped_ids: Vec<String> = lines[cut..]
-        .iter()
-        .filter_map(
-            |line| match serde_json::from_str::<SeqEvent>(line).ok()?.ev {
-                AgentEvent::TurnStarted { turn_id } => Some(turn_id),
-                _ => None,
-            },
-        )
-        .collect();
-    let turns = DroppedTurns {
-        count: dropped_ids.len() as u32,
-        first_turn_id: dropped_ids.into_iter().next(),
+    let mut turns = DroppedTurns {
+        count: 0,
+        first_turn_id: None,
     };
+    for line in &lines[cut..] {
+        let Ok(entry) = serde_json::from_str::<SeqEvent>(line) else {
+            continue;
+        };
+        match entry.ev {
+            AgentEvent::TurnStarted { turn_id } => {
+                turns.count += 1;
+                if turns.first_turn_id.is_none() {
+                    turns.first_turn_id = Some(turn_id);
+                }
+            }
+            // A cut BEFORE a portable branch marker would hand the copied
+            // source conversation's turn ids (another vendor's, or another
+            // thread's) to this session's native revert/rollback. Refuse the
+            // anchor: history stays intact, the same outcome as no match.
+            AgentEvent::Forked { native: false, .. } => return None,
+            _ => {}
+        }
+    }
     Some((cut, turns, neutralize))
 }
 
@@ -1283,6 +1298,7 @@ async fn perform_switch(
         fork_at: None,
         rollback_turns: None,
         revert_before_turn: None,
+        remote_control_at_start: false,
         theme,
         prelude: launch_prelude,
         mastermind,
@@ -1437,6 +1453,7 @@ fn control_only_switch_journal(path: &std::path::Path) -> bool {
             | AgentEvent::BackgroundTasks { .. }
             | AgentEvent::PromptSuggestion { .. }
             | AgentEvent::SessionStatus { .. }
+            | AgentEvent::RemoteControl { .. }
             | AgentEvent::Exited { .. } => {}
             _ => return false,
         }
@@ -1667,6 +1684,8 @@ pub(crate) async fn rewind_session(
             } else {
                 None
             },
+            // A rewind respawns a live session: keep the user's bridge choice.
+            remote_control_at_start: false,
             theme,
             prelude: launch_prelude,
             portable_context,
@@ -2748,6 +2767,7 @@ pub(crate) async fn spawn_fresh_chat(
         fork_at: native_fork.as_ref().map(|(_, at)| at.clone()),
         rollback_turns: None,
         revert_before_turn: None,
+        remote_control_at_start: true,
         theme: spec.theme,
         prelude: spec.prelude.filter(|p| !p.trim().is_empty()),
         mastermind,
@@ -2971,18 +2991,43 @@ pub(crate) async fn spawn_chat_session(
         spec.initial_effort = initial_effort;
     }
     // Remote Control at start (claude): the user's standing choice
-    // (`chat.remoteControlAtStart`), registered under a name that reads well
-    // in the claude.ai/code session list. The driver enables it right after
-    // the handshake — or says why not where the CLI doesn't offer the bridge.
-    // Codex's bridge lives on its app-server daemon; nothing to set here.
-    if recipe.kind == AgentKind::Claude && crate::lock(&state.settings).remote_control_at_start() {
-        let workspace = recipe
-            .workspace_root
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .filter(|n| !n.is_empty())
+    // (`chat.remoteControlAtStart`), applied only to spawns that CREATE the
+    // chimaera session (`recipe.remote_control_at_start`) — a view-switch or
+    // rewind respawn keeps a bridge the user turned off, off. The driver
+    // enables it right after the handshake, or says why not where the CLI
+    // doesn't offer the bridge. Codex's bridge lives on its app-server
+    // daemon; nothing to set here.
+    if recipe.kind == AgentKind::Claude
+        && recipe.remote_control_at_start
+        && crate::lock(&state.settings).remote_control_at_start()
+    {
+        // The bare name (the driver spells `chimaera · <name>`): the session's
+        // display name as the rail shows it, or the workspace directory, plus
+        // a short session suffix so concurrent chats in one workspace stay
+        // distinguishable in the claude.ai list. Bounded like the UI path.
+        let display = crate::lock(&state.agents)
+            .get(&id)
+            .map(|a| a.display_name(None))
+            .filter(|n| !n.trim().is_empty())
+            .or_else(|| {
+                recipe
+                    .workspace_root
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+            })
             .unwrap_or_else(|| "workspace".to_string());
-        spec.remote_control = Some(format!("chimaera · {workspace}"));
+        let short: String = id
+            .chars()
+            .rev()
+            .take(4)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        spec.remote_control = Some(format!(
+            "{} ({short})",
+            chimaera_agent::model::truncate_label(display.trim(), 80)
+        ));
     }
     // The binary version the launcher resolved alongside `recipe.bin`: the
     // harness journals it on Init and warns (non-fatally) when it drifts from
@@ -3147,6 +3192,7 @@ pub(crate) async fn resurrect_chat(
         fork_at: None,
         rollback_turns: None,
         revert_before_turn: None,
+        remote_control_at_start: true,
         theme: entry.theme.clone(),
         // The ledger doesn't persist launch text: a resurrected session
         // re-runs the durable scopes (host ⊕ workspace) only.
@@ -3984,6 +4030,7 @@ mod tests {
                         agent_version: None,
                         remote_control_available: false,
                         remote_control_auto_enable: false,
+                        remote_control: None,
                     },
                     AgentEvent::Exited { status: Some(0) },
                 ],
@@ -4003,6 +4050,7 @@ mod tests {
             fork_at: None,
             rollback_turns: None,
             revert_before_turn: None,
+            remote_control_at_start: false,
             theme: "dark".into(),
             prelude: None,
             mastermind: None,

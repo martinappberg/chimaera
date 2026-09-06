@@ -193,9 +193,9 @@ use crate::driver::{
 };
 use crate::model::{
     cap_output, truncate_label, AgentCommand, AgentEvent, ChunkKind, Coalescer, CompactionPhase,
-    ContentBlock, PermissionOption, PermissionOptionKind, RemoteControlState, SlashCommand,
-    ToolContent, ToolKind, ToolStatus, Usage, UserMessageState, SKILL_PATH_MAX, SLASH_COMMANDS_CAP,
-    SLASH_DESCRIPTION_MAX, SLASH_NAME_MAX,
+    ContentBlock, PermissionOption, PermissionOptionKind, RemoteControlSnapshot,
+    RemoteControlState, SlashCommand, ToolContent, ToolKind, ToolStatus, Usage, UserMessageState,
+    SKILL_PATH_MAX, SLASH_COMMANDS_CAP, SLASH_DESCRIPTION_MAX, SLASH_NAME_MAX,
 };
 use crate::ndjson::{JsonlSink, JsonlStream};
 
@@ -253,18 +253,21 @@ impl Driver for CodexDriver {
                 outbound: Vec::new(),
             });
         }
-        Ok(Handshake {
-            mapper: CodexMapper::new(
-                hs.thread_id,
-                hs.catalog,
-                hs.model,
-                hs.effort,
-                spec.agent_version.clone(),
-                spec.mcp_auto_approve.clone(),
-                hs.next_id,
-            ),
-            initial,
-        })
+        let mut mapper = CodexMapper::new(
+            hs.thread_id,
+            hs.catalog,
+            hs.model,
+            hs.effort,
+            spec.agent_version.clone(),
+            spec.mcp_auto_approve.clone(),
+            hs.next_id,
+        );
+        // A status announced during the handshake (a paired daemon that is
+        // already connected) would otherwise never reach the relay.
+        if let Some(frame) = hs.remote_control_status {
+            initial.push(mapper.on_frame(&frame));
+        }
+        Ok(Handshake { mapper, initial })
     }
 }
 
@@ -278,6 +281,9 @@ struct CodexHandshake {
     effort: Option<String>,
     next_id: u64,
     rollback_error: Option<String>,
+    /// The Remote Control status the app-server announced during the
+    /// handshake (see `HandshakeSideband`), replayed through the mapper.
+    remote_control_status: Option<Value>,
 }
 
 #[derive(Default)]
@@ -291,10 +297,11 @@ async fn codex_handshake(
     stream: &mut JsonlStream,
     spec: &SpawnSpec,
 ) -> std::result::Result<CodexHandshake, String> {
+    let mut side = HandshakeSideband::default();
     if sink.send(&initialize_request(0)).await.is_err() {
         return Err("initialize write failed".into());
     }
-    await_rpc_result(stream, 0).await?;
+    await_rpc_result(stream, &mut side, 0).await?;
     if sink
         .send(&json!({ "method": "initialized" }))
         .await
@@ -317,8 +324,11 @@ async fn codex_handshake(
             .await
             .is_ok()
         {
-            match tokio::time::timeout(Duration::from_secs(2), await_rpc_result(stream, config_id))
-                .await
+            match tokio::time::timeout(
+                Duration::from_secs(2),
+                await_rpc_result(stream, &mut side, config_id),
+            )
+            .await
             {
                 Ok(Ok(result)) => configured_effort(&result),
                 _ => None,
@@ -336,7 +346,7 @@ async fn codex_handshake(
     if sink.send(&open).await.is_err() {
         return Err("thread open write failed".into());
     }
-    let result = await_rpc_result(stream, open_id).await?;
+    let result = await_rpc_result(stream, &mut side, open_id).await?;
     let thread_id = result["thread"]["id"]
         .as_str()
         .map(String::from)
@@ -369,30 +379,29 @@ async fn codex_handshake(
         if let Some(before) = spec.revert_before_turn.clone() {
             let id = next_id;
             next_id += 1;
-            if sink
-                .send(&json!({
-                    "id": id, "method": "thread/revert",
-                    "params": { "threadId": thread_id, "beforeTurnId": before },
-                }))
-                .await
-                .is_err()
+            match bounded_rpc(
+                sink,
+                stream,
+                &mut side,
+                id,
+                "thread/revert",
+                json!({ "threadId": thread_id, "beforeTurnId": before }),
+            )
+            .await
             {
-                return Err("thread/revert write failed".into());
-            }
-            // Bounded like model/list: a binary that silently drops the
-            // method must not wedge the handshake until the watchdog fires.
-            match tokio::time::timeout(Duration::from_secs(5), await_rpc_result(stream, id)).await {
-                Ok(Ok(_)) => settled = true,
-                Ok(Err(err)) if error_says_method_unsupported(&err) => {
-                    // Pre-revert binary: try the count below.
-                }
-                Ok(Err(err)) => {
-                    rollback_error = Some(err);
-                    settled = true;
-                }
-                Err(_) => {
-                    rollback_error = Some("no response to thread/revert".into());
-                    settled = true;
+                Ok(_) => settled = true,
+                Err(RpcFailure::Transport(msg)) => return Err(msg),
+                // Anything else — a pre-revert binary (structured method-not-
+                // found), a stale turn id, a timeout — still tries the count
+                // below: the server already truncated the chimaera journal,
+                // so an untruncated agent thread is the worse outcome. The
+                // revert's own error is reported if the count fails too.
+                Err(failure) => {
+                    let unsupported = matches!(&failure, RpcFailure::Error(err)
+                        if is_method_not_found(err, "thread/revert"));
+                    if !unsupported {
+                        rollback_error = Some(failure.describe("thread/revert"));
+                    }
                 }
             }
         }
@@ -400,26 +409,22 @@ async fn codex_handshake(
             if let Some(turns) = spec.rollback_turns.filter(|n| *n > 0) {
                 let id = next_id;
                 next_id += 1;
-                if sink
-                    .send(&json!({
-                        "id": id, "method": "thread/rollback",
-                        "params": { "threadId": thread_id, "numTurns": turns },
-                    }))
-                    .await
-                    .is_err()
-                {
-                    return Err("thread/rollback write failed".into());
-                }
-                rollback_error = match tokio::time::timeout(
-                    Duration::from_secs(5),
-                    await_rpc_result(stream, id),
+                match bounded_rpc(
+                    sink,
+                    stream,
+                    &mut side,
+                    id,
+                    "thread/rollback",
+                    json!({ "threadId": thread_id, "numTurns": turns }),
                 )
                 .await
                 {
-                    Ok(Ok(_)) => None,
-                    Ok(Err(err)) => Some(err),
-                    Err(_) => Some("no response to thread/rollback (unsupported binary?)".into()),
-                };
+                    Ok(_) => rollback_error = None,
+                    Err(RpcFailure::Transport(msg)) => return Err(msg),
+                    Err(failure) => {
+                        rollback_error.get_or_insert_with(|| failure.describe("thread/rollback"));
+                    }
+                }
             }
         }
     }
@@ -440,8 +445,11 @@ async fn codex_handshake(
         // Per-request cap so a binary that silently drops this unknown method
         // can't wedge the whole handshake until the 20s watchdog fires — the
         // model catalog is optional, so a timeout is just an empty catalog.
-        let listed =
-            tokio::time::timeout(Duration::from_secs(2), await_rpc_result(stream, list_id)).await;
+        let listed = tokio::time::timeout(
+            Duration::from_secs(2),
+            await_rpc_result(stream, &mut side, list_id),
+        )
+        .await;
         if let Ok(Ok(list)) = listed {
             for m in list["data"].as_array().unwrap_or(&Vec::new()) {
                 if let Some(id) = m["model"].as_str() {
@@ -494,8 +502,11 @@ async fn codex_handshake(
         .await
         .is_ok()
     {
-        let listed =
-            tokio::time::timeout(Duration::from_secs(2), await_rpc_result(stream, skills_id)).await;
+        let listed = tokio::time::timeout(
+            Duration::from_secs(2),
+            await_rpc_result(stream, &mut side, skills_id),
+        )
+        .await;
         if let Ok(Ok(list)) = listed {
             slash_commands = parse_codex_skills(&list);
         }
@@ -510,6 +521,7 @@ async fn codex_handshake(
         effort,
         next_id,
         rollback_error,
+        remote_control_status: side.remote_control_status,
     })
 }
 
@@ -627,32 +639,104 @@ fn thread_open_request(spec: &SpawnSpec, id: u64, effort: Option<&str>) -> Value
     open
 }
 
-/// An RPC error text that means "this binary has no such method" (JSON-RPC
-/// -32601 / serde's unknown-variant wording), as opposed to a refusal of a
-/// method it does know.
-fn error_says_method_unsupported(err: &str) -> bool {
-    let e = err.to_ascii_lowercase();
-    e.contains("-32601")
-        || e.contains("method not found")
-        || e.contains("unknown method")
-        || e.contains("unknown variant")
+/// Bound on distinct deprecation summaries remembered for dedupe.
+const NOTICED_DEPRECATIONS_CAP: usize = 32;
+
+/// Frames the lock-step handshake would otherwise discard while waiting for
+/// one response id. The app-server announces its Remote Control status right
+/// after `initialize` (live 0.153.0) — i.e. INSIDE the handshake — so the
+/// newest such frame is kept and replayed through the mapper afterwards.
+#[derive(Default)]
+struct HandshakeSideband {
+    remote_control_status: Option<Value>,
 }
 
-async fn await_rpc_result(stream: &mut JsonlStream, id: u64) -> std::result::Result<Value, String> {
+impl HandshakeSideband {
+    fn note(&mut self, frame: &Value) {
+        if frame["method"] == "remoteControl/status/changed" {
+            self.remote_control_status = Some(frame.clone());
+        }
+    }
+}
+
+/// How a bounded handshake RPC ended. The JSON-RPC error object is kept whole
+/// so callers feature-detect with the structured predicate
+/// (`is_method_not_found`) instead of parsing prose.
+enum RpcFailure {
+    Error(Value),
+    Timeout,
+    Transport(String),
+}
+
+impl RpcFailure {
+    fn describe(&self, method: &str) -> String {
+        match self {
+            RpcFailure::Error(err) => format!("{method} failed: {err}"),
+            RpcFailure::Timeout => format!("no response to {method} (unsupported binary?)"),
+            RpcFailure::Transport(msg) => msg.clone(),
+        }
+    }
+}
+
+/// One handshake RPC under the 5 s bound every optional handshake step uses
+/// (a binary that silently drops an unknown method must not wedge the
+/// handshake until the watchdog fires).
+async fn bounded_rpc(
+    sink: &mut JsonlSink,
+    stream: &mut JsonlStream,
+    side: &mut HandshakeSideband,
+    id: u64,
+    method: &str,
+    params: Value,
+) -> std::result::Result<Value, RpcFailure> {
+    if sink
+        .send(&json!({ "id": id, "method": method, "params": params }))
+        .await
+        .is_err()
+    {
+        return Err(RpcFailure::Transport(format!("{method} write failed")));
+    }
+    match tokio::time::timeout(Duration::from_secs(5), await_rpc_raw(stream, side, id)).await {
+        Ok(Ok(frame)) => match frame.get("error") {
+            Some(err) => Err(RpcFailure::Error(err.clone())),
+            None => Ok(frame["result"].clone()),
+        },
+        Ok(Err(msg)) => Err(RpcFailure::Transport(msg)),
+        Err(_) => Err(RpcFailure::Timeout),
+    }
+}
+
+/// The raw response frame for `id`; other frames are dropped except the
+/// sideband ones (see `HandshakeSideband`).
+async fn await_rpc_raw(
+    stream: &mut JsonlStream,
+    side: &mut HandshakeSideband,
+    id: u64,
+) -> std::result::Result<Value, String> {
     loop {
         match stream.next().await {
             Ok(Some(frame)) => {
                 if frame["id"] == json!(id) && frame.get("method").is_none() {
-                    if let Some(err) = frame.get("error") {
-                        return Err(format!("codex request {id} failed: {err}"));
-                    }
-                    return Ok(frame["result"].clone());
+                    return Ok(frame);
                 }
+                side.note(&frame);
             }
             Ok(None) => return Err("codex exited during handshake".into()),
             Err(err) => return Err(format!("{err:#}")),
         }
     }
+}
+
+async fn await_rpc_result(
+    stream: &mut JsonlStream,
+    side: &mut HandshakeSideband,
+    id: u64,
+) -> std::result::Result<Value, String> {
+    let frame = await_rpc_raw(stream, side, id).await?;
+    if let Some(err) = frame.get("error") {
+        return Err(format!("codex request {id} failed: {err}"));
+    }
+    Ok(frame["result"].clone())
 }
 
 /// What an outstanding client→server JSON-RPC id is waiting for.
@@ -874,12 +958,15 @@ struct CodexMapper {
     /// trace ("harness is blocking").
     decline_notified: bool,
     pending_rpcs: HashMap<u64, PendingRpc>,
-    /// `deprecationNotice` summaries already surfaced — the app-server may
-    /// repeat one per request; the transcript says it once.
+    /// `deprecationNotice` summaries already surfaced (truncated keys, capped
+    /// at `NOTICED_DEPRECATIONS_CAP`) — the app-server may repeat one per
+    /// request; the transcript says it once.
     noticed_deprecations: HashSet<String>,
-    /// A non-`disabled` remoteControl status has been seen: from then on
-    /// every status change (including back to disabled) is journaled.
-    remote_control_seen: bool,
+    /// The last relayed Remote Control status + server name (`None` until a
+    /// live one is seen — the daemon-less steady state `disabled` never
+    /// journals). Kept so repeats dedupe, Init snapshots it, and teardown
+    /// journals the Off, as claude does.
+    remote_control: Option<(RemoteControlState, Option<String>)>,
     /// Collab subagents by their thread id, insertion-ordered (see
     /// [`CollabAgent`]). These are process-scoped child threads: they may keep
     /// working after the parent turn completes and remain tracked until their
@@ -964,7 +1051,7 @@ impl CodexMapper {
             decline_notified: false,
             pending_rpcs: HashMap::new(),
             noticed_deprecations: HashSet::new(),
-            remote_control_seen: false,
+            remote_control: None,
             collab_agents: Vec::new(),
             collab_cap_notified: false,
             item_locations: HashMap::new(),
@@ -990,6 +1077,13 @@ impl CodexMapper {
             agent_version: self.agent_version.clone(),
             remote_control_available: false,
             remote_control_auto_enable: false,
+            remote_control: self.remote_control.as_ref().map(|(state, name)| {
+                RemoteControlSnapshot {
+                    state: *state,
+                    session_url: None,
+                    name: name.clone(),
+                }
+            }),
         }
     }
 
@@ -1319,26 +1413,44 @@ impl CodexMapper {
             // client RPC to flip it here — see AgentCommand::SetRemoteControl.
             "remoteControl/status/changed" => {
                 let params = &frame["params"];
-                let state = match params["status"].as_str().unwrap_or_default() {
+                let word = params["status"].as_str().unwrap_or_default();
+                let state = match word {
                     "connected" => RemoteControlState::Connected,
                     "connecting" => RemoteControlState::Connecting,
                     "errored" => RemoteControlState::Error,
-                    _ => RemoteControlState::Off,
+                    "disabled" => RemoteControlState::Off,
+                    // An unmapped word surfaces verbatim (claude symmetry):
+                    // silently folding it to Off would claim a live bridge is
+                    // down with no trace.
+                    other => {
+                        step.events.push(AgentEvent::Notice {
+                            text: format!("Remote Control: {}", truncate_label(other, 40)),
+                        });
+                        return step;
+                    }
                 };
+                let name = params["serverName"]
+                    .as_str()
+                    .filter(|n| !n.is_empty())
+                    .map(|n| truncate_label(n, 120));
                 // "disabled" at connect is the steady state for every session
                 // on a daemon-less app-server: journaling it would stamp a
-                // meaningless Off on every conversation.
-                if state == RemoteControlState::Off && !self.remote_control_seen {
-                    return step;
+                // meaningless Off on every conversation. Once a live state
+                // was seen, every CHANGE is journaled — repeats are not.
+                match &self.remote_control {
+                    None if state == RemoteControlState::Off => return step,
+                    Some((last, _)) if *last == state => return step,
+                    _ => {}
                 }
-                self.remote_control_seen = true;
+                self.remote_control = if state == RemoteControlState::Off {
+                    None
+                } else {
+                    Some((state, name.clone()))
+                };
                 step.events.push(AgentEvent::RemoteControl {
                     state,
                     session_url: None,
-                    name: params["serverName"]
-                        .as_str()
-                        .filter(|n| !n.is_empty())
-                        .map(|n| truncate_label(n, 120)),
+                    name,
                     detail: None,
                 });
             }
@@ -1363,10 +1475,14 @@ impl CodexMapper {
                 if summary.is_empty() {
                     return step;
                 }
-                if method == "deprecationNotice"
-                    && !self.noticed_deprecations.insert(summary.to_string())
-                {
-                    return step;
+                if method == "deprecationNotice" {
+                    let key = truncate_label(summary, 240);
+                    if self.noticed_deprecations.contains(&key) {
+                        return step;
+                    }
+                    if self.noticed_deprecations.len() < NOTICED_DEPRECATIONS_CAP {
+                        self.noticed_deprecations.insert(key);
+                    }
                 }
                 let mut text = format!(
                     "codex {}: {}",
@@ -2229,11 +2345,10 @@ impl CodexMapper {
             Some("imageView") => {
                 // Emitted as a ToolCall on BOTH frames: an instant item can
                 // land as completed only, and clients upsert tool rows by id
-                // (the imageGeneration convention).
-                if !completed {
-                    if let Some(flushed) = self.coalescer.flush() {
-                        step.events.push(flushed);
-                    }
+                // (the imageGeneration convention). Prose flushes first on
+                // either frame — order matters in the transcript.
+                if let Some(flushed) = self.coalescer.flush() {
+                    step.events.push(flushed);
                 }
                 let path = item["path"].as_str().unwrap_or_default().to_string();
                 step.events.push(AgentEvent::ToolCall {
@@ -2271,10 +2386,8 @@ impl CodexMapper {
                     (true, _, _) | (_, Some("completed"), _) => ToolStatus::Completed,
                     _ => ToolStatus::InProgress,
                 };
-                if !completed {
-                    if let Some(flushed) = self.coalescer.flush() {
-                        step.events.push(flushed);
-                    }
+                if let Some(flushed) = self.coalescer.flush() {
+                    step.events.push(flushed);
                 }
                 // Upsert by id on both frames (see imageView).
                 step.events.push(AgentEvent::ToolCall {
@@ -2290,19 +2403,38 @@ impl CodexMapper {
             // `hookPrompt {fragments:[{text, hookRunId}]}`) — the model saw
             // it, so the transcript says so, once, bounded.
             Some("hookPrompt") if completed => {
-                let text: String = item["fragments"]
+                // Capped while accumulating: a hook payload is bounded only
+                // by the stdout line cap, so the peak stays at the cap.
+                const HOOK_TEXT_CAP: usize = 16 * 1024;
+                let mut text = String::new();
+                for fragment in item["fragments"]
                     .as_array()
-                    .map(|frags| {
-                        frags
-                            .iter()
-                            .filter_map(|f| f["text"].as_str())
-                            .map(str::trim)
-                            .filter(|t| !t.is_empty())
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    })
-                    .unwrap_or_default();
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|f| f["text"].as_str())
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                {
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    let room = HOOK_TEXT_CAP.saturating_sub(text.len());
+                    if room == 0 {
+                        text.push('…');
+                        break;
+                    }
+                    let take = fragment
+                        .char_indices()
+                        .take_while(|(i, _)| *i < room)
+                        .last()
+                        .map(|(i, ch)| i + ch.len_utf8())
+                        .unwrap_or(0);
+                    text.push_str(&fragment[..take.min(fragment.len())]);
+                }
                 if !text.is_empty() {
+                    if let Some(flushed) = self.coalescer.flush() {
+                        step.events.push(flushed);
+                    }
                     step.events.push(AgentEvent::Notice {
                         text: format!("hook: {}", cap_output(&text).0),
                     });
@@ -2806,6 +2938,26 @@ impl CodexMapper {
     /// the ask dangling (a replay would strand the card forever — see the
     /// harness's drain call in `run_driver`).
     fn drain_pending(&mut self) -> Vec<AgentEvent> {
+        let mut events: Vec<AgentEvent> = Vec::new();
+        // The daemon's bridge status is connection-scoped: this process is
+        // going, so a live status must not outlive it in the journal (the
+        // claude driver journals the same Off at teardown).
+        if let Some((state, name)) = self.remote_control.take() {
+            if state != RemoteControlState::Off {
+                events.push(AgentEvent::RemoteControl {
+                    state: RemoteControlState::Off,
+                    session_url: None,
+                    name,
+                    detail: Some("the agent process ended".into()),
+                });
+            }
+        }
+        let mut rest = self.drain_pending_inner();
+        events.append(&mut rest);
+        events
+    }
+
+    fn drain_pending_inner(&mut self) -> Vec<AgentEvent> {
         let mut events = Vec::new();
         for request_id in std::mem::take(&mut self.pending_questions).into_keys() {
             events.push(AgentEvent::QuestionResolved {
@@ -3477,11 +3629,16 @@ impl CodexMapper {
                 };
                 // Unknown decision strings silently decline server-side, so
                 // only prebuilt payloads are sent; a miss declines honestly.
+                // A miss declines honestly — in THIS request's own decline
+                // shape (a permissions-profile reply is `{permissions,
+                // scope}`, not a `{decision}`), and the decline is recognized
+                // by the option id, since only one of the two carries it.
+                let declined = option_id == "decline" || !decisions.contains_key(&option_id);
                 let result = decisions
                     .get(&option_id)
+                    .or_else(|| decisions.get("decline"))
                     .cloned()
                     .unwrap_or_else(|| json!({ "decision": "decline" }));
-                let declined = result["decision"] == json!("decline");
                 step.outbound
                     .push(json!({ "id": rpc_id, "result": result }));
                 step.events.push(AgentEvent::PermissionResolved {

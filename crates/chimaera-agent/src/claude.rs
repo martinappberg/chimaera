@@ -31,7 +31,6 @@ use crate::driver::{
     run_driver, AgentAdapter, Driver, DriverExit, DriverIo, DriverStep, Handshake, Mapper,
     SpawnSpec, INTERRUPT_GRACE_TICKS,
 };
-use crate::model::RemoteControlState;
 use crate::model::{
     cap_head_tail, cap_output, truncate_label, AgentCommand, AgentEvent, BackgroundTask,
     BackgroundTaskClose, ChunkKind, Coalescer, CompactionPhase, ContentBlock, ModeInfo,
@@ -41,6 +40,7 @@ use crate::model::{
     PLAN_LABEL_MAX, PLAN_TASKS_CAP, SLASH_COMMANDS_CAP, SLASH_DESCRIPTION_MAX, SLASH_NAME_MAX,
     STATUS_DETAIL_MAX, WF_AGENTS_CAP, WF_AGENTS_SET_BUDGET, WF_AGENT_LABEL_MAX,
 };
+use crate::model::{RemoteControlSnapshot, RemoteControlState};
 use crate::ndjson::{JsonlChild, JsonlSink, JsonlStream};
 
 /// CLI version these frame shapes were verified against (2026-07-18,
@@ -827,6 +827,22 @@ impl ClaudeMapper {
             agent_version: self.agent_version.clone(),
             remote_control_available: self.remote_control_available,
             remote_control_auto_enable: self.remote_control_auto_enable,
+            remote_control: self
+                .remote_control
+                .as_ref()
+                .map(|live| RemoteControlSnapshot {
+                    state: live.state,
+                    session_url: live.session_url.clone(),
+                    name: live.name.clone(),
+                }),
+        }
+    }
+
+    /// Flush buffered prose before an out-of-band row (a notice, an injected
+    /// user message) so the journal keeps wire order — prose before the row.
+    fn flush_prose(&mut self, step: &mut DriverStep) {
+        if let Some(flushed) = self.coalescer.flush() {
+            step.events.push(flushed);
         }
     }
 
@@ -871,6 +887,8 @@ impl ClaudeMapper {
             _ => None,
         };
         let Some(next) = next else {
+            let state = truncate_label(state, 40);
+            self.flush_prose(step);
             step.events.push(AgentEvent::Notice {
                 text: match &detail {
                     Some(d) => format!("Remote Control: {state} — {d}"),
@@ -879,33 +897,53 @@ impl ClaudeMapper {
             });
             return;
         };
-        match next {
-            RemoteControlState::Off | RemoteControlState::Error => {
-                // The link is dead either way — drop the live record so a
-                // later enable starts clean; the event still names the state.
-                let was = self.remote_control.take();
-                if was.is_none() && next == RemoteControlState::Off {
-                    return; // already off — no duplicate journal line
-                }
-                step.events.push(AgentEvent::RemoteControl {
-                    state: next,
-                    session_url: None,
-                    name: was.and_then(|w| w.name),
-                    detail,
-                });
+        // The record OUTLIVES a bridge blip: the CLI reconnects on its own
+        // (`disconnected` → `connected`), and the claude.ai session — its
+        // link and name — is the same one. Only an explicit disable ack or
+        // teardown drops it. A word arriving with nothing live (no enable
+        // was ever acked) is a stray, not a state.
+        if self.remote_control.is_none() {
+            if matches!(next, RemoteControlState::Off | RemoteControlState::Error) {
+                return;
             }
-            _ => {
-                let live = self.remote_control.get_or_insert(RemoteControlLive {
-                    state: next,
-                    session_url: None,
-                    name: None,
-                });
-                if live.state == next && detail.is_none() {
-                    return;
-                }
-                live.state = next;
-                step.events.push(self.remote_control_event(detail));
-            }
+            self.remote_control = Some(RemoteControlLive {
+                state: RemoteControlState::Off,
+                session_url: None,
+                name: None,
+            });
+        }
+        let live = self.remote_control.as_mut().expect("just ensured");
+        if live.state == next && detail.is_none() {
+            return; // same state re-announced — one journal line per change
+        }
+        live.state = next;
+        let url = live.session_url.clone();
+        let name = live.name.clone();
+        step.events.push(AgentEvent::RemoteControl {
+            state: next,
+            // An Off carries no link (the chip has nothing to open); a
+            // reconnect re-emits it from the retained record.
+            session_url: if next == RemoteControlState::Off {
+                None
+            } else {
+                url.clone()
+            },
+            name,
+            detail,
+        });
+        if next == RemoteControlState::Connected {
+            // The one transcript line a user searches for later — journaled
+            // here (not synthesized by a client from a transition) so every
+            // replay and every late attach shows it at the same place.
+            self.flush_prose(step);
+            step.events.push(AgentEvent::Notice {
+                text: match url {
+                    Some(u) => format!(
+                        "Remote Control connected — pick this session up in the Claude app or at {u}"
+                    ),
+                    None => "Remote Control connected".into(),
+                },
+            });
         }
     }
 
@@ -1061,13 +1099,15 @@ impl ClaudeMapper {
                         .take(8)
                         .filter_map(|e| {
                             let name = e["name"].as_str()?;
+                            let name = truncate_label(name, 60);
                             Some(match e["message"].as_str().filter(|m| !m.is_empty()) {
                                 Some(m) => format!("{name} ({})", truncate_label(m, 80)),
-                                None => name.to_string(),
+                                None => name,
                             })
                         })
                         .collect();
                     if !names.is_empty() {
+                        self.flush_prose(step);
                         step.events.push(AgentEvent::Notice {
                             text: format!("MCP server config skipped: {}", names.join(", ")),
                         });
@@ -1085,6 +1125,7 @@ impl ClaudeMapper {
                     return;
                 }
                 if let Some(text) = frame["content"].as_str().filter(|t| !t.trim().is_empty()) {
+                    self.flush_prose(step);
                     step.events.push(AgentEvent::Notice {
                         text: cap_output(text.trim()).0,
                     });
@@ -1097,6 +1138,7 @@ impl ClaudeMapper {
                 if let Some(text) = frame["content"].as_str() {
                     let text = local_command_text(text);
                     if !text.is_empty() {
+                        self.flush_prose(step);
                         step.events.push(AgentEvent::Notice {
                             text: cap_output(&text).0,
                         });
@@ -1809,7 +1851,21 @@ impl ClaudeMapper {
         {
             return;
         }
-        if frame["isReplay"] == json!(true) || !frame["parent_tool_use_id"].is_null() {
+        // Cheap structural gates first: replay echoes, subagent frames, the
+        // CLI's own meta/synthetic turns (`isMeta`, compaction summaries),
+        // tool_result carriers — then the uuid scan.
+        if frame["isReplay"] == json!(true)
+            || frame["isMeta"] == json!(true)
+            || frame["isCompactSummary"] == json!(true)
+            || !frame["parent_tool_use_id"].is_null()
+        {
+            return;
+        }
+        let content = &frame["message"]["content"];
+        if content
+            .as_array()
+            .is_some_and(|blocks| blocks.iter().any(|b| b["type"] == "tool_result"))
+        {
             return;
         }
         if let Some(uuid) = frame["uuid"].as_str() {
@@ -1817,37 +1873,23 @@ impl ClaudeMapper {
                 return;
             }
         }
-        let content = &frame["message"]["content"];
-        let (text, attachments) = match content {
-            Value::String(s) => (s.trim().to_string(), 0u32),
-            Value::Array(blocks) => {
-                if blocks.iter().any(|b| b["type"] == "tool_result") {
-                    return;
-                }
-                let mut text = String::new();
-                let mut attachments = 0u32;
-                for b in blocks {
-                    match b["type"].as_str() {
-                        Some("text") => {
-                            if let Some(t) = b["text"].as_str() {
-                                if !text.is_empty() {
-                                    text.push_str("\n\n");
-                                }
-                                text.push_str(t.trim());
-                            }
-                        }
-                        Some("image") => attachments += 1,
-                        _ => {}
-                    }
-                }
-                (text, attachments)
-            }
-            _ => return,
+        // The transcript importer's own "real prompt" filter: rejects command
+        // invocations, system markup and the injected `Caveat:` preamble —
+        // the CLI-authored user turns that must never wear a phone tag.
+        let attachments = content
+            .as_array()
+            .map(|blocks| blocks.iter().filter(|b| b["type"] == "image").count() as u32)
+            .unwrap_or(0);
+        let text = match crate::transcript::user_prompt_text(content) {
+            Some(t) => t,
+            None if attachments > 0 && !content_has_text(content) => String::new(),
+            None => return,
         };
-        if text.is_empty() && attachments == 0 {
-            return;
+        if text.starts_with('[') {
+            return; // `[Request interrupted by user]`-style markers
         }
         let (text, _) = cap_output(&text);
+        self.flush_prose(step);
         step.events.push(AgentEvent::UserMessage {
             text,
             attachments,
@@ -2378,6 +2420,10 @@ impl ClaudeMapper {
                     .unwrap_or_else(|| "Remote Control request failed".to_string());
                 if enabled {
                     self.remote_control = None;
+                    self.flush_prose(step);
+                    step.events.push(AgentEvent::Notice {
+                        text: format!("Remote Control: {detail}"),
+                    });
                     step.events.push(AgentEvent::RemoteControl {
                         state: RemoteControlState::Error,
                         session_url: None,
@@ -3197,7 +3243,14 @@ impl ClaudeMapper {
             // stays false: the bridge is process-owned, and a claude.ai row
             // that outlives this driver would offer a dead session.
             AgentCommand::SetRemoteControl { enabled, name } => {
-                let name = name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty());
+                // One naming convention, owned here: callers pass the bare
+                // session name (the UI its display name, the daemon the
+                // workspace at start) and the driver spells the claude.ai row
+                // `chimaera · <name>`, bounded.
+                let name = name
+                    .map(|n| n.trim().to_string())
+                    .filter(|n| !n.is_empty())
+                    .map(|n| format!("chimaera · {}", truncate_label(&n, 100)));
                 let id = self.ctl_id();
                 self.pending_controls.insert(
                     id.clone(),
@@ -3830,22 +3883,60 @@ pub(crate) fn tool_kind(name: &str) -> ToolKind {
     }
 }
 
+/// Any non-empty text block in a `user` content array.
+fn content_has_text(content: &Value) -> bool {
+    content.as_array().is_some_and(|blocks| {
+        blocks.iter().any(|b| {
+            b["type"] == "text" && b["text"].as_str().is_some_and(|t| !t.trim().is_empty())
+        })
+    })
+}
+
 /// The `Workflow` tool's title is its script's `meta.name` literal — the
 /// official card's title. Read from the head of the script only (a script can
-/// be large; the meta block is required to be first).
+/// be large; the meta block is required to be first), and only a `name` KEY
+/// counts — at an identifier boundary and followed by `:` — so `filename:`,
+/// `rename:` or a "name" inside a description never become the title.
 fn workflow_name(script: &str) -> Option<String> {
-    let head: String = script.chars().take(2048).collect();
-    let idx = head.find("name")?;
-    let rest = &head[idx + "name".len()..];
-    let rest = rest.trim_start().strip_prefix(':')?.trim_start();
-    let quote = rest
-        .chars()
-        .next()
-        .filter(|c| matches!(c, '\'' | '"' | '`'))?;
-    let body = &rest[quote.len_utf8()..];
-    let end = body.find(quote)?;
-    let name = body[..end].trim();
-    (!name.is_empty()).then(|| name.to_string())
+    let end = script
+        .char_indices()
+        .nth(2048)
+        .map(|(i, _)| i)
+        .unwrap_or(script.len());
+    let head = &script[..end];
+    let region = &head[head.find("meta")?..];
+    let mut from = 0usize;
+    while let Some(rel) = region[from..].find("name") {
+        let idx = from + rel;
+        from = idx + "name".len();
+        let bounded = region[..idx]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !(c.is_alphanumeric() || c == '_' || c == '$'));
+        if !bounded {
+            continue;
+        }
+        let Some(rest) = region[from..].trim_start().strip_prefix(':') else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let Some(quote) = rest
+            .chars()
+            .next()
+            .filter(|c| matches!(c, '\'' | '"' | '`'))
+        else {
+            continue;
+        };
+        let body = &rest[quote.len_utf8()..];
+        let Some(close) = body.find(quote) else {
+            continue;
+        };
+        let name = body[..close].trim();
+        if !name.is_empty() {
+            return Some(name.to_string());
+        }
+    }
+    None
 }
 
 /// `mcp__<server>__<tool>` → `tool (server)`: the CLI's MCP tool naming,
@@ -7364,14 +7455,14 @@ mod tests {
             AgentEvent::RemoteControl {
                 state: RemoteControlState::Connecting,
                 session_url: None,
-                name: Some("chimaera probe".into()),
+                name: Some("chimaera · chimaera probe".into()),
                 detail: None,
             }
         );
         let request = &step.outbound[0]["request"];
         assert_eq!(request["subtype"], "remote_control");
         assert_eq!(request["enabled"], true);
-        assert_eq!(request["name"], "chimaera probe");
+        assert_eq!(request["name"], "chimaera · chimaera probe");
         assert_eq!(request["keep_session_on_exit"], false);
         let ctl_id = step.outbound[0]["request_id"].as_str().unwrap().to_string();
 
@@ -7402,7 +7493,7 @@ mod tests {
             AgentEvent::RemoteControl {
                 state: RemoteControlState::Connecting,
                 session_url: Some("https://claude.ai/code/session_01X".into()),
-                name: Some("chimaera probe".into()),
+                name: Some("chimaera · chimaera probe".into()),
                 detail: None,
             }
         );
@@ -7414,7 +7505,7 @@ mod tests {
             AgentEvent::RemoteControl {
                 state: RemoteControlState::Connected,
                 session_url: Some("https://claude.ai/code/session_01X".into()),
-                name: Some("chimaera probe".into()),
+                name: Some("chimaera · chimaera probe".into()),
                 detail: None,
             }
         );
@@ -7475,8 +7566,14 @@ mod tests {
                 "error": "Remote Control is only available with claude.ai subscriptions.",
             },
         }));
+        // The CLI's sentence is journaled as a Notice (replay-visible), then
+        // the Error state the chip shows.
+        assert!(matches!(
+            &step.events[0],
+            AgentEvent::Notice { text } if text.contains("claude.ai subscriptions")
+        ));
         assert_eq!(
-            step.events[0],
+            step.events[1],
             AgentEvent::RemoteControl {
                 state: RemoteControlState::Error,
                 session_url: None,
@@ -7690,7 +7787,10 @@ mod tests {
             enabled: true,
             name: spec.remote_control.clone(),
         });
-        assert_eq!(step.outbound[0]["request"]["name"], "chimaera dev");
+        assert_eq!(
+            step.outbound[0]["request"]["name"],
+            "chimaera · chimaera dev"
+        );
         // Not offered: the mapper still knows, and the handshake says so.
         let m = ClaudeMapper::new(
             None,

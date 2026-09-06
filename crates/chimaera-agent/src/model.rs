@@ -144,6 +144,14 @@ pub enum AgentEvent {
         /// its own setting asks (see `SpawnSpec.remote_control`).
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         remote_control_auto_enable: bool,
+        /// The bridge as it stands when this Init is emitted. Init is a
+        /// complete process snapshot — and claude re-emits `system/init`
+        /// mid-process (after the first user message, after a background
+        /// task settles), so the snapshot is what lets consumers reset on a
+        /// NEW process without wiping a live bridge on a repeated Init.
+        /// Absent = no bridge (a fresh process, or an older journal).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        remote_control: Option<RemoteControlSnapshot>,
     },
     TurnStarted {
         turn_id: String,
@@ -473,6 +481,16 @@ pub enum AgentEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
     },
+}
+
+/// The live bridge carried on `Init` (see `AgentEvent::Init.remote_control`).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemoteControlSnapshot {
+    pub state: RemoteControlState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 /// Where the Remote Control bridge stands. `Connecting` covers claude's

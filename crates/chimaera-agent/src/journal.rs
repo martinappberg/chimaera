@@ -1046,6 +1046,7 @@ mod tests {
             agent_version: None,
             remote_control_available: false,
             remote_control_auto_enable: false,
+            remote_control: None,
         };
         let event = |seq, ev| serde_json::to_string(&SeqEvent { seq, ts: seq, ev }).unwrap();
         let content = [

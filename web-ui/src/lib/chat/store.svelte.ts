@@ -377,6 +377,21 @@ export interface RemoteControlInfo {
   detail: string | null;
 }
 
+/** Fold a wire `remote_control` event or an Init's `remote_control` snapshot
+ *  (same field names) into the store's shape; off/absent = null. */
+function foldRemoteControl(raw: unknown): RemoteControlInfo | null {
+  if (raw === null || typeof raw !== "object") return null;
+  const ev = raw as Record<string, unknown>;
+  const state = ev.state;
+  if (state !== "connecting" && state !== "connected" && state !== "error") return null;
+  return {
+    state,
+    sessionUrl: typeof ev.session_url === "string" ? ev.session_url : null,
+    name: typeof ev.name === "string" ? ev.name : null,
+    detail: typeof ev.detail === "string" ? ev.detail : null,
+  };
+}
+
 export interface ModeInfo {
   id: string;
   label: string;
@@ -734,12 +749,13 @@ export class ChatStore {
         this.model = typeof ev.model === "string" ? ev.model : null;
         this.currentMode = typeof ev.current_mode === "string" ? ev.current_mode : null;
         this.modes = Array.isArray(ev.modes) ? (ev.modes as ModeInfo[]) : [];
-        // Offer flags are Init-scoped (absent = false on the wire); the
-        // bridge itself is process-owned, so a new process starts without one
-        // — its own remote_control events follow if it was turned on at start.
+        // Offer flags are Init-scoped (absent = false on the wire). The bridge
+        // rides Init as a SNAPSHOT: claude re-emits system/init mid-process
+        // (first prompt, background settles), so a live bridge must survive a
+        // repeated Init — and a new process (snapshot absent) starts without.
         this.remoteControlAvailable = ev.remote_control_available === true;
         this.remoteControlAutoEnable = ev.remote_control_auto_enable === true;
-        this.remoteControl = null;
+        this.remoteControl = foldRemoteControl(ev.remote_control);
         this.slashCommands = Array.isArray(ev.slash_commands)
           ? (ev.slash_commands as SlashCommand[])
           : [];
@@ -785,36 +801,10 @@ export class ChatStore {
         break;
       }
       case "remote_control": {
-        // LEVEL-SET, latest wins. The chip is the surface; the transcript
-        // gets one quiet line per meaningful transition (connected, error) so
-        // the moment is findable later without a wall of bridge chatter.
-        const state = ev.state as string;
-        const previous = this.remoteControl;
-        if (state === "off") {
-          if (previous !== null && typeof ev.detail === "string" && ev.detail.length > 0) {
-            this.notice(`Remote Control off — ${ev.detail}`, "info");
-          }
-          this.remoteControl = null;
-          break;
-        }
-        if (state !== "connecting" && state !== "connected" && state !== "error") break;
-        const next: RemoteControlInfo = {
-          state,
-          sessionUrl: typeof ev.session_url === "string" ? ev.session_url : null,
-          name: typeof ev.name === "string" ? ev.name : null,
-          detail: typeof ev.detail === "string" ? ev.detail : null,
-        };
-        if (state === "connected" && previous?.state !== "connected") {
-          this.notice(
-            next.sessionUrl !== null
-              ? `Remote Control connected — pick this session up in the Claude app or at ${next.sessionUrl}`
-              : "Remote Control connected",
-            "info",
-          );
-        } else if (state === "error") {
-          this.notice(`Remote Control: ${next.detail ?? "could not connect"}`, "error");
-        }
-        this.remoteControl = next;
+        // LEVEL-SET, latest wins; pure state fold. The transcript lines
+        // (connected-with-link, a refusal) are journaled by the driver as
+        // Notice events, so live and replayed transcripts agree.
+        this.remoteControl = foldRemoteControl(ev);
         break;
       }
       case "background_tasks": {

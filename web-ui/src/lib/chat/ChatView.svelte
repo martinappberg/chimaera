@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onDestroy, tick, untrack } from "svelte";
-  import { forkSession, rewindSession, renameSession, type Session } from "../workspace/sessions";
+  import { displayName, forkSession, rewindSession, renameSession, type Session } from "../workspace/sessions";
   import { fsValidate } from "../previews/files";
   import { listAgents } from "../workspace/launcher";
   import SessionGlyph from "../shared/SessionGlyph.svelte";
@@ -137,7 +137,7 @@
   // position instead of snapping to the bottom.
   // svelte-ignore state_referenced_locally
   let atBottom = $state(chatScroll(session.id).atBottom);
-  let menu = $state<"model" | "mode" | "effort" | "mcp" | null>(null);
+  let menu = $state<"model" | "mode" | "effort" | "mcp" | "remote" | null>(null);
 
   // --- bounded transcript DOM ------------------------------------------------
   // The reducer/socket always fold the complete bounded journal so background
@@ -1222,14 +1222,15 @@
     return true;
   }
 
-  /** Remote Control on/off. The name registered on claude.ai is this
-   *  session's display name — what you'd look for in the app's session list. */
+  /** Remote Control on/off. The bare name sent is this session's DISPLAY
+   *  name (what the rail shows — `session.name` is the agent kind for chat
+   *  rows); the driver spells the claude.ai row `chimaera · <name>`. */
   function setRemoteControl(enabled: boolean): boolean {
     return sendCommand(
       {
         type: "set_remote_control",
         enabled,
-        ...(enabled ? { name: `chimaera · ${session.name}` } : {}),
+        ...(enabled ? { name: displayName(session) } : {}),
       },
       "remote control request not sent",
     );

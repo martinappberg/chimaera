@@ -517,17 +517,10 @@ pub(crate) async fn list_agents(
                     .map(|(id, label)| json!({"id": id, "label": label}))
                     .collect()
             } else {
-                live.iter()
-                    .map(|m| {
-                        let mut entry = serde_json::Map::new();
-                        entry.insert("id".into(), json!(m.id));
-                        entry.insert("label".into(), json!(m.label));
-                        if let Some(d) = &m.description {
-                            entry.insert("description".into(), json!(d));
-                        }
-                        serde_json::Value::Object(entry)
-                    })
-                    .collect()
+                // The struct's own serde shape (id/label + the optional
+                // description/resolved/efforts/default_effort) — one source
+                // of truth with the Init event's catalog.
+                live.iter().map(|m| json!(m)).collect()
             };
             row.insert("models".into(), json!(models));
             // Whether this agent can spawn as a structured chat session

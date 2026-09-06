@@ -1431,10 +1431,26 @@ describe("ChatStore remote control", () => {
       name: "chimaera · repo",
       detail: null,
     });
-    // One quiet transcript line for the connect, carrying the link.
-    const notices = store.blocks.filter((b) => b.kind === "notice").map((b) => b.text);
-    expect(notices).toHaveLength(1);
-    expect(notices[0]).toContain("https://claude.ai/code/session_01X");
+    // The transcript line for the connect is the driver's journaled Notice,
+    // never synthesized here (replay must match the live view).
+    expect(store.blocks.filter((b) => b.kind === "notice")).toHaveLength(0);
+  });
+
+  it("survives a repeated init that carries the bridge snapshot", () => {
+    const store = fold([
+      INIT,
+      { type: "remote_control", state: "connected", session_url: "https://claude.ai/code/s" },
+      // claude re-emits system/init after the first prompt: same process,
+      // snapshot present → the chip must NOT flip to off.
+      {
+        type: "init",
+        native_session_id: "n1",
+        remote_control_available: true,
+        remote_control: { state: "connected", session_url: "https://claude.ai/code/s" },
+      },
+    ]);
+    expect(store.remoteControl?.state).toBe("connected");
+    expect(store.remoteControl?.sessionUrl).toBe("https://claude.ai/code/s");
   });
 
   it("clears on off, on a fresh init, and on exit; errors keep the vendor's words", () => {
@@ -1455,9 +1471,6 @@ describe("ChatStore remote control", () => {
     ]);
     expect(errored.remoteControl?.state).toBe("error");
     expect(errored.remoteControl?.detail).toContain("claude.ai subscriptions");
-    expect(errored.blocks.some((b) => b.kind === "notice" && b.text.includes("subscriptions"))).toBe(
-      true,
-    );
 
     const reinit = fold([
       INIT,

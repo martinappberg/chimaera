@@ -1805,10 +1805,70 @@ async fn remote_control_toggle_journals_state_and_replays() {
                 session_url.as_deref(),
                 Some("https://claude.ai/code/session_fake01")
             );
-            assert_eq!(name.as_deref(), Some("chimaera test"));
+            assert_eq!(name.as_deref(), Some("chimaera · chimaera test"));
         }
         _ => unreachable!(),
     }
+    // The per-turn system/init (the fake emits one per turn, like the CLI
+    // after the first prompt) must carry the live bridge as a snapshot —
+    // consumers reset on Init, and a repeated Init must not blank it.
+    send_text(&fx, "s-rc", "hello").await;
+    let reinit = wait_for(&mut rx, &mut seen, "Init after enable", |ev| {
+        matches!(
+            ev,
+            AgentEvent::Init {
+                remote_control: Some(_),
+                ..
+            }
+        )
+    })
+    .await;
+    match &reinit.ev {
+        AgentEvent::Init {
+            remote_control: Some(rc),
+            ..
+        } => {
+            assert_eq!(rc.state, RemoteControlState::Connected);
+            assert_eq!(
+                rc.session_url.as_deref(),
+                Some("https://claude.ai/code/session_fake01")
+            );
+        }
+        _ => unreachable!(),
+    }
+    assert_eq!(
+        fx.manager
+            .get("s-rc")
+            .expect("info")
+            .remote_control_url
+            .as_deref(),
+        Some("https://claude.ai/code/session_fake01"),
+        "the rail link survives the repeated Init"
+    );
+    // Let the fake's canned turn (a permission ask) settle so the disable
+    // below lands on an idle driver.
+    let permission = wait_for(&mut rx, &mut seen, "PermissionRequest", |ev| {
+        matches!(ev, AgentEvent::PermissionRequest { .. })
+    })
+    .await;
+    if let AgentEvent::PermissionRequest { request_id, .. } = &permission.ev {
+        fx.manager
+            .command(
+                "s-rc",
+                AgentCommand::Permission {
+                    request_id: request_id.clone(),
+                    option_id: "allow_once".into(),
+                    destination: None,
+                    feedback: None,
+                },
+            )
+            .await
+            .expect("permission");
+    }
+    wait_for(&mut rx, &mut seen, "TurnCompleted", |ev| {
+        matches!(ev, AgentEvent::TurnCompleted { .. })
+    })
+    .await;
     // The journal carries the whole ladder: Connecting (optimistic), Connecting
     // + link (ack), Connected (bridge frame).
     let states: Vec<RemoteControlState> = seen
@@ -1943,7 +2003,7 @@ async fn remote_control_at_start_enables_after_the_handshake() {
     .await;
     assert!(matches!(
         &connected.ev,
-        AgentEvent::RemoteControl { name: Some(n), .. } if n == "chimaera at-start"
+        AgentEvent::RemoteControl { name: Some(n), .. } if n == "chimaera · chimaera at-start"
     ));
     assert!(fx.manager.kill("s-rca"));
 

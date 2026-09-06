@@ -394,7 +394,12 @@ impl Translator {
 /// string or text blocks; command invocations (`<…>`) and claude's injected
 /// `Caveat:` preamble are not prompts (mirrors the launcher's
 /// `first_prompt_text`). `None` = not a prompt (skip).
-fn user_prompt_text(content: &Value) -> Option<String> {
+/// The user-authored text of a `user` message content (string or text
+/// blocks), or `None` for the CLI's own synthetic user turns — command
+/// invocations and system markup (`<…>`), the injected `Caveat:` preamble.
+/// Shared with the live driver's remote-origin gate (claude.rs), so the two
+/// "is this a real prompt?" filters cannot drift.
+pub(crate) fn user_prompt_text(content: &Value) -> Option<String> {
     let text = match content {
         Value::String(s) => s.clone(),
         Value::Array(blocks) => blocks

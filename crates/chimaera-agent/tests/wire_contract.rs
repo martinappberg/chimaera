@@ -12,7 +12,7 @@
 use chimaera_agent::journal::SeqEvent;
 use chimaera_agent::model::{
     AgentCommand, AgentEvent, CompactionPhase, PermissionOption, PermissionOptionKind, Question,
-    RemoteControlState, ToolKind, ToolStatus, UserMessageState,
+    RemoteControlSnapshot, RemoteControlState, ToolKind, ToolStatus, UserMessageState,
 };
 use serde_json::json;
 
@@ -439,6 +439,7 @@ fn init_agent_version_is_additive_on_the_wire() {
         agent_version: None,
         remote_control_available: false,
         remote_control_auto_enable: false,
+        remote_control: None,
     };
     // No version → the key is omitted (byte-identical to the pre-upgrade wire).
     assert_eq!(
@@ -461,6 +462,7 @@ fn init_agent_version_is_additive_on_the_wire() {
             agent_version: Some("2.1.206 (Claude Code)".into()),
             remote_control_available: false,
             remote_control_auto_enable: false,
+            remote_control: None,
         })
         .unwrap()["agent_version"],
         json!("2.1.206 (Claude Code)")
@@ -484,6 +486,7 @@ fn remote_control_wire_shapes_are_additive() {
             agent_version: None,
             remote_control_available: true,
             remote_control_auto_enable: true,
+            remote_control: None,
         })
         .unwrap(),
         json!({
@@ -513,6 +516,34 @@ fn remote_control_wire_shapes_are_additive() {
         })
         .unwrap(),
         json!({ "type": "remote_control", "state": "off" })
+    );
+    // Init carries the live bridge as a snapshot (same field names as the
+    // event) so a repeated Init never blanks it; absent = no bridge.
+    assert_eq!(
+        serde_json::to_value(AgentEvent::Init {
+            native_session_id: "s1".into(),
+            model: None,
+            modes: vec![],
+            current_mode: None,
+            slash_commands: vec![],
+            models: vec![],
+            agent_version: None,
+            remote_control_available: false,
+            remote_control_auto_enable: false,
+            remote_control: Some(RemoteControlSnapshot {
+                state: RemoteControlState::Connected,
+                session_url: Some("https://claude.ai/code/session_01X".into()),
+                name: None,
+            }),
+        })
+        .unwrap(),
+        json!({
+            "type": "init", "native_session_id": "s1",
+            "remote_control": {
+                "state": "connected",
+                "session_url": "https://claude.ai/code/session_01X",
+            },
+        })
     );
     let cmd: AgentCommand =
         serde_json::from_str(r#"{"type":"set_remote_control","enabled":true,"name":"n"}"#).unwrap();

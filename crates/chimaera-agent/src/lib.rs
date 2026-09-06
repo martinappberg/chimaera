@@ -289,15 +289,22 @@ fn fold_session_metadata(info: &mut ChatInfo, ev: &AgentEvent) {
         AgentEvent::Init {
             model,
             current_mode,
+            remote_control,
             ..
         } => {
+            use crate::model::RemoteControlState as Rc;
             // Init is a complete process snapshot. Clear values that a fresh
             // driver no longer advertises instead of retaining stale state
             // from a resumed/restarted process. The Remote Control bridge is
             // process-owned, so a new process starts with none.
             info.model = model.clone();
             info.current_mode = current_mode.clone();
-            info.remote_control_url = None;
+            // Init is re-emitted mid-process (claude's per-turn system/init),
+            // so the bridge rides the snapshot rather than being cleared.
+            info.remote_control_url = remote_control.as_ref().and_then(|rc| match rc.state {
+                Rc::Connecting | Rc::Connected => rc.session_url.clone(),
+                Rc::Off | Rc::Error => None,
+            });
         }
         AgentEvent::RemoteControl {
             state, session_url, ..
@@ -313,6 +320,11 @@ fn fold_session_metadata(info: &mut ChatInfo, ev: &AgentEvent) {
         }
         AgentEvent::ModeChanged { mode_id } => {
             info.current_mode = Some(mode_id.clone());
+        }
+        // The bridge is process-owned: a dead process has no live link, even
+        // if the driver never got to journal its Off (a hard kill).
+        AgentEvent::Exited { .. } => {
+            info.remote_control_url = None;
         }
         _ => {}
     }
@@ -536,6 +548,7 @@ impl ChatManager {
         // (list() takes info locks under the sessions lock).
         let mut native_to_index: Option<String> = None;
         let mut effort_to_index: Option<(String, Option<String>)> = None;
+        let mut catalog_to_record: Option<String> = None;
         {
             let mut info = session.info.lock().expect("info lock");
             fold_session_metadata(&mut info, &ev);
@@ -551,10 +564,10 @@ impl ChatManager {
                         native_to_index = Some(native_session_id.clone());
                     }
                     if !models.is_empty() {
-                        self.latest_models
-                            .lock()
-                            .expect("latest_models lock")
-                            .insert(info.agent.clone(), models.clone());
+                        // Recorded AFTER the info lock drops (below): the
+                        // catalog clone and the second mutex stay out of the
+                        // registry's critical section.
+                        catalog_to_record = Some(info.agent.clone());
                     }
                 }
                 AgentEvent::EffortState { effort, .. } => {
@@ -598,6 +611,14 @@ impl ChatManager {
                     info.exit_status = *status;
                 }
                 _ => {}
+            }
+        }
+        if let Some(agent) = catalog_to_record {
+            if let AgentEvent::Init { models, .. } = &ev {
+                self.latest_models
+                    .lock()
+                    .expect("latest_models lock")
+                    .insert(agent, models.clone());
             }
         }
         if let Some(native) = native_to_index {
@@ -808,6 +829,7 @@ mod tests {
                 agent_version: None,
                 remote_control_available: false,
                 remote_control_auto_enable: false,
+                remote_control: None,
             },
         );
         assert_eq!(info.model, None, "a complete Init clears stale model state");

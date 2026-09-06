@@ -2253,6 +2253,53 @@ CronList, DesignSync.
   the method is unknown (a pre-revert binary). The live case now pins
   revert on a fresh thread and again after `thread/resume`.
 
+### Review hardening (same day, `/code-review xhigh`)
+
+- **`Init` carries the bridge as a snapshot** (`remote_control: {state,
+  session_url?, name?}`, same field names as the event). Claude re-emits
+  `system/init` mid-process — after the first user message, after a
+  background task settles, after a refusal fallback — and every consumer
+  resets on Init; without the snapshot the chip, rail badge and link went
+  blank on the first prompt while the bridge stayed up (caught in review;
+  the hermetic manager test now sends a turn after enabling). A fresh
+  process journals no snapshot, so a NEW process still starts clean.
+- **A bridge blip keeps the record.** `bridge_state disconnected|error`
+  no longer drops the live record (the CLI reconnects on its own and the
+  claude.ai session is the same one): the state changes, the link/name are
+  retained and re-emitted on `connected`; a stray Off/Error word with
+  nothing live is ignored, repeats dedupe per state. The "Remote Control
+  connected — pick this session up … at <url>" line and a refusal's
+  sentence are journaled by the DRIVER as Notices (not synthesized by the
+  client from a transition), so live and replayed transcripts agree.
+- **One naming convention, owned by the driver:** callers pass the bare
+  session name (the UI its display name — `session.name` on a chat row is
+  the agent kind, which is why the first live check registered as
+  "chimaera · claude"; the daemon "<display name> (<4-char id>)" at start)
+  and the driver spells `chimaera · <name>`, capped. At-start applies only
+  to spawns that CREATE a chimaera session (`ChatRecipe.remote_control_at_
+  start`: fresh, resumed-from-recents, resurrected) — a view-switch or
+  rewind respawn keeps the user's off.
+- **Remote-origin gate hardened:** `isMeta` / `isCompactSummary` frames, the
+  transcript importer's `user_prompt_text` filter (command markup, `Caveat:`
+  preamble) and `[…]` markers are rejected; the row and every new Notice
+  flush buffered prose first (wire order). Still unverified from a phone.
+- **Codex:** the handshake keeps the `remoteControl/status/changed` it
+  would otherwise discard while lock-stepping (`HandshakeSideband`) and
+  replays it through the mapper; unknown status words become a Notice
+  (claude symmetry) instead of a silent Off; repeats dedupe; teardown
+  journals the Off; `thread/revert` failures of ANY kind still try the
+  count-based rollback (structured `is_method_not_found` on the JSON-RPC
+  error object, not string matching), reporting the revert error if both
+  fail; `item/permissions/requestApproval` denies are recognized by option
+  id, so deny-with-feedback steers the reason like every other decline;
+  `deprecationNotice` dedupe keys are truncated and capped at 32.
+- **Server:** `control_only_switch_journal` admits `RemoteControl` lines;
+  a rewind cut that lies BEFORE a portable branch marker is refused (its
+  turn ids belong to the copied source, never to `thread/revert`); the
+  live model catalog is recorded outside the session info lock and served
+  with `ModelInfo`'s full serde shape. `--model default` (and any id) is
+  accepted at spawn — the CLI validates models at the first request.
+
 ### Gate
 
 Hermetic: claude mapper tests for the initialize extras, the RC ladder, the

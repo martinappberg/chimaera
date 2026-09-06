@@ -96,13 +96,28 @@
           : "Remote Control off — take this session with you on your other devices",
   );
   let rcCopied = $state(false);
+  let rcCopiedTimer: ReturnType<typeof setTimeout> | null = null;
   function copyRemoteLink() {
     const url = rc?.sessionUrl;
     if (!url) return;
-    void copyText(url).then(() => {
+    // Same contract as the other copy affordances: "Copied" only when a
+    // write happened, one timer at a time, torn down with the component.
+    void copyText(url).then((ok) => {
+      if (!ok) return;
       rcCopied = true;
-      setTimeout(() => (rcCopied = false), 1400);
+      if (rcCopiedTimer !== null) clearTimeout(rcCopiedTimer);
+      rcCopiedTimer = setTimeout(() => {
+        rcCopied = false;
+        rcCopiedTimer = null;
+      }, 1400);
     });
+  }
+  $effect(() => () => {
+    if (rcCopiedTimer !== null) clearTimeout(rcCopiedTimer);
+  });
+  function openRemote() {
+    const url = rc?.sessionUrl;
+    if (url) openInSystemBrowser(url);
   }
 </script>
 
@@ -278,7 +293,7 @@
             </p>
           {:else if rcState === "connected" || rcState === "connecting"}
             {#if rc?.sessionUrl}
-              <button class="overlay-row menu-row rc-row" role="menuitem" onclick={() => openInSystemBrowser(rc!.sessionUrl!)}>
+              <button class="overlay-row menu-row rc-row" role="menuitem" onclick={openRemote}>
                 Open on claude.ai/code <span class="rc-ext" aria-hidden="true">↗</span>
               </button>
               <button class="overlay-row menu-row rc-row" role="menuitem" onclick={copyRemoteLink}>
@@ -424,20 +439,17 @@
   .chip.rc.busy .rc-dot,
   .rc-dot.busy {
     background: var(--accent);
-    animation: rc-breathe 1.2s ease-in-out infinite;
+    animation: pulse 1.4s ease-in-out infinite; /* shared keyframe in app.css */
   }
   .chip.rc.err .rc-dot,
   .rc-dot.err {
     background: var(--warn);
   }
-  @keyframes rc-breathe {
-    0%,
-    100% {
-      opacity: 0.35;
-    }
-    50% {
-      opacity: 1;
-    }
+  /* Infinite "presence" animations pause while the app is hidden (the
+     html.app-hidden contract; see app.css). */
+  :global(html.app-hidden) .chip.rc.busy .rc-dot,
+  :global(html.app-hidden) .rc-dot.busy {
+    animation-play-state: paused;
   }
   @media (prefers-reduced-motion: reduce) {
     .chip.rc.busy .rc-dot,
