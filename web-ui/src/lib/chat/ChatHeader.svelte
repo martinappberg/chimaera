@@ -446,7 +446,9 @@
       opacity: 0.8;
     }
   }
-  .rc-menu {
+  /* Two classes: the generic .menu rule (declared later) would otherwise
+     win the min-width tie. */
+  .menu.rc-menu {
     min-width: 300px;
     max-width: 340px;
     padding-bottom: 4px;
