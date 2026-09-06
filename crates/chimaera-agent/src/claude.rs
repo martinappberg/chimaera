@@ -447,6 +447,11 @@ impl Driver for ClaudeDriver {
             spec.agent_version.clone(),
             &commands_catalog,
         );
+        // The argv model is the session's model from the first frame on —
+        // `system/init` (which reports the RESOLVED id) only arrives with the
+        // first turn, and the header chip must not claim the catalog default
+        // until then when a remembered `--model` was passed.
+        mapper.model = spec.initial_model.clone();
         let mut initial: Vec<DriverStep> = Vec::new();
         // Seed the effort/ultracode chips with the CLI's applied settings.
         let mut step = DriverStep::default();
