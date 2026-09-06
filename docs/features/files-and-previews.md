@@ -20,13 +20,34 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
 - **What & when.** The rail's FILES section: a lazily-loaded directory tree of the workspace
   root. Browse the project and open files into panes.
 - **How it's used.** Click a directory to expand/collapse; click a file to open it in the focused
-  pane. Start typing (or click the magnifier) to filter the loaded tree; a directory link clicked
+  pane. Start typing (or click the magnifier) to filter the loaded tree; the **collapse folders**
+  button beside it folds every open dir and returns to the top. A directory link clicked
   in a terminal/chat reveals + flashes its row. File rows drag out (drop into a pane/split, or
   onto an agent to reference).
+- **Finding your place in a deep tree.** **Indent guides** — one hairline per depth under each
+  level's chevron; hovering a row draws its parent folder's guide strong, so "which folder am I
+  in" is answered without scrolling up. **Sticky ancestors** — while scrolled inside a folder,
+  the ancestor dir rows of the first visible row pin to the top of the tree as a shelf (nearest
+  three levels); click one to scroll to that folder's real row, click its chevron to collapse it.
+  **Collapse anchoring** — collapsing a folder whose row has scrolled out of view (from its
+  sticky copy, or the keyboard) brings that row back under its ancestors instead of leaving the
+  viewport on unrelated content; a visible row stays put, and expanding never moves the row.
 - **Where it lives.** `FileTree.svelte`; `fsList()` in `files.ts`. Route
   `GET /api/v1/fs/list?path=&hidden=` (server `fs.rs`).
-- **Key behaviors.** Rendered as a flat list of rows (indent = `depth * 13px`), not recursive
-  components. Respects `files.showHidden`. Re-lists **only the dirs whose direct listing could
+- **Key behaviors.** Rendered as a flat list of rows (indent = `depth * 13px`, driven by a
+  per-row `--depth` custom property that also draws the guides as a background gradient — no
+  guide DOM), not recursive components. The tree is **its own scroller** (the rail body around
+  it does not scroll): the sticky shelf is a zero-height `position: sticky` anchor at the
+  scroller's top, recomputed once per frame on scroll or row change by probing
+  `elementsFromPoint` (the inline create/error/listing rows make row arithmetic unreliable),
+  and the scroller opts out of the browser's own scroll anchoring so the component's collapse
+  anchoring is the only one. **OS-desktop drops** (see
+  [drag-drop-and-uploads.md](drag-drop-and-uploads.md)) name their destination: the targeted
+  dir row gets an accent ring + wash and its expanded descendants a light wash (hovering a file
+  targets its parent), the root target keeps the whole-tree frame, and a sticky
+  `upload into <folder>/` label pins to the top of the tree for the length of the drag. App
+  passes the exact folder via `dropDir` (null when no file drag is over the tree).
+  Respects `files.showHidden`. Re-lists **only the dirs whose direct listing could
   have changed** — not the whole tree — when the workspace's git **epoch** bumps (parents of
   paths that entered/left the git dirty set: a symmetric diff, so both a new untracked file and a
   removal are caught), the client **fs epoch** bumps (the exact parent of that
