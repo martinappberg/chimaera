@@ -122,7 +122,11 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   gets the model and effort on `thread/start` (a resumed codex thread keeps its own indexed effort)
   and the mode — Auto review, Read only, Auto, Full access, Plan — as a settings update before the
   first turn. An explicit launch-time model still wins, and a workspace Mastermind keeps its own
-  ask/auto mode. This mirrors the official TUIs, which persist the same choices in their config.
+  ask/auto mode. **A reopened chat is not a new chat:** resuming, rewinding, forking, or a
+  resurrection after a daemon restart brings the conversation back with *its own* last model,
+  effort and mode (the journal index carries them per native conversation, since neither agent
+  rehydrates them from its history); the prefs only fill in what that chat never carried. This
+  mirrors the official TUIs, which persist the same choices in their config.
 - **Remote Control (claude).** The header's **remote** chip turns on Claude Code's own Remote
   Control bridge for this session — the same `remote_control` control the official VS Code and
   Desktop hosts use — so you can pick the conversation up in the Claude mobile app or at

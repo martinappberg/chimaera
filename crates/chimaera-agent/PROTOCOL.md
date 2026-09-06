@@ -2253,6 +2253,18 @@ CronList, DesignSync.
   the method is unknown (a pre-revert binary). The live case now pins
   revert on a fresh thread and again after `thread/resume`.
 
+#### Reopen: `thread/resume` reports the rollout's effort (live, 0.153.0)
+
+- `thread/resume {threadId, cwd, model, effort}` answers with the rollout's own `reasoningEffort`
+  and ignores the `effort` the request carried: a thread that ran `low` (set mid-thread through
+  `thread/settings/update`) came back `xhigh` on reopen. Pass 29's "effort survives reopen" no
+  longer holds on the open request alone. The driver now reconciles right after the handshake —
+  when the conversation's indexed effort differs from the reported one it sends
+  `thread/settings/update {effort}` like a header pick (flagged as the handshake's own, so it is
+  not remembered as a preference) and the `thread/settings/updated` read-back settles the header.
+  The same post-handshake replay carries the conversation's permission mode; `thread/resume` does
+  restore the model (`model` in the result matched the thread's).
+
 ### Review hardening (same day, `/code-review xhigh`)
 
 - **`Init` carries the bridge as a snapshot** (`remote_control: {state,

@@ -278,6 +278,17 @@ impl Driver for CodexDriver {
                 }));
             }
         }
+        // codex 0.153 answers thread/resume with the rollout's own
+        // `reasoningEffort` and ignores the `effort` the open request carried
+        // (live-probed: a thread that ran `low` came back `xhigh`), so the
+        // conversation's remembered effort is re-applied like a header pick.
+        if let Some(effort) = spec.initial_effort.as_deref() {
+            if mapper.pending_effort.as_deref() != Some(effort) {
+                initial.push(mapper.on_command(AgentCommand::SetEffort {
+                    effort_id: effort.to_string(),
+                }));
+            }
+        }
         mapper.bootstrapping = false;
         Ok(Handshake { mapper, initial })
     }
@@ -779,6 +790,9 @@ enum PendingRpc {
     EffortUpdate {
         effort_id: String,
         previous: Option<String>,
+        /// The user's own pick (not the handshake reconciling a reopened
+        /// thread's effort).
+        chosen: bool,
     },
     /// account/read — rate-limit telemetry; `report` also renders /usage.
     AccountRead {
@@ -1881,6 +1895,7 @@ impl CodexMapper {
                 PendingRpc::EffortUpdate {
                     effort_id,
                     previous,
+                    ..
                 },
                 Some(err),
             ) => {
@@ -1934,9 +1949,14 @@ impl CodexMapper {
                     self.apply_mode(mode_id, chosen, step);
                 }
             }
-            (PendingRpc::EffortUpdate { effort_id, .. }, None) => {
+            (
+                PendingRpc::EffortUpdate {
+                    effort_id, chosen, ..
+                },
+                None,
+            ) => {
                 if self.pending_effort.as_deref() == Some(&effort_id) {
-                    self.emit_effort_state_marked(Some(effort_id), true, step);
+                    self.emit_effort_state_marked(Some(effort_id), chosen, step);
                 }
             }
             (PendingRpc::AccountRead { report }, None) => {
@@ -3746,9 +3766,12 @@ impl CodexMapper {
                 // The pick itself is what the prefs remember — even when it
                 // matches the effort already in effect (a bootstrap read-back
                 // is not a pick; re-choosing that value is), so the no-op
-                // branch re-journals the state as chosen.
-                self.chosen_effort = Some(effort_id.clone());
-                if self.pending_effort.as_deref() == Some(&effort_id) {
+                // branch re-journals the state as chosen. The handshake's own
+                // reconcile of a reopened thread's effort is not a pick.
+                if !self.bootstrapping {
+                    self.chosen_effort = Some(effort_id.clone());
+                }
+                if self.pending_effort.as_deref() == Some(&effort_id) && !self.bootstrapping {
                     self.reported_effort = None;
                     self.emit_effort_state_marked(Some(effort_id), true, &mut step);
                 } else {
@@ -3772,6 +3795,7 @@ impl CodexMapper {
                             PendingRpc::EffortUpdate {
                                 effort_id,
                                 previous,
+                                chosen: !self.bootstrapping,
                             },
                         );
                         step.outbound.push(json!({

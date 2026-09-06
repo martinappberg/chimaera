@@ -363,6 +363,16 @@ pub struct ChatAttachment {
     pub head_seq: u64,
 }
 
+/// One conversation-settings write (keyed by the native id) queued by
+/// `absorb` for the blocking lane. `effort: Some(None)` records "no effort".
+#[derive(Default)]
+struct IndexUpdate {
+    native: String,
+    model: Option<String>,
+    effort: Option<Option<String>>,
+    mode: Option<String>,
+}
+
 /// One per-agent preference write queued by `absorb` for the blocking lane.
 #[derive(Default)]
 struct PrefsUpdate {
@@ -570,7 +580,7 @@ impl ChatManager {
         // lock across it would let a slow write freeze the whole manager
         // (list() takes info locks under the sessions lock).
         let mut native_to_index: Option<String> = None;
-        let mut effort_to_index: Option<(String, Option<String>)> = None;
+        let mut index_to_record: Option<IndexUpdate> = None;
         let mut catalog_to_record: Option<String> = None;
         let mut prefs_to_record: Option<PrefsUpdate> = None;
         {
@@ -586,6 +596,15 @@ impl ChatManager {
                     if !native_session_id.is_empty() {
                         info.native_session_id = Some(native_session_id.clone());
                         native_to_index = Some(native_session_id.clone());
+                        // The process's opening model/mode are what a reopen
+                        // of THIS native conversation must come back with
+                        // (fold_session_metadata already copied them in).
+                        index_to_record = Some(IndexUpdate {
+                            native: native_session_id.clone(),
+                            model: info.model.clone(),
+                            mode: info.current_mode.clone(),
+                            ..Default::default()
+                        });
                     }
                     if !models.is_empty() {
                         // Recorded AFTER the info lock drops (below): the
@@ -595,13 +614,16 @@ impl ChatManager {
                     }
                 }
                 AgentEvent::EffortState { effort, chosen, .. } => {
-                    // This index field drives Codex thread-open parameters.
-                    // Claude has its own argv/settings lifecycle and must not
-                    // overwrite the latest Codex choice used for new chats.
-                    if info.agent == "codex" {
-                        if let Some(native) = &info.native_session_id {
-                            effort_to_index = Some((native.clone(), effort.clone()));
-                        }
+                    // The effort in effect is conversation-local (keyed by the
+                    // native id): a reopen of this conversation — codex's
+                    // thread/start effort, claude's post-handshake apply —
+                    // starts from it. `None` records "no effort in effect".
+                    if let Some(native) = &info.native_session_id {
+                        index_to_record = Some(IndexUpdate {
+                            native: native.clone(),
+                            effort: Some(effort.clone()),
+                            ..Default::default()
+                        });
                     }
                     // The user's own effort pick is what the next chat of this
                     // kind starts with (both agents' in-session efforts are
@@ -615,28 +637,43 @@ impl ChatManager {
                         });
                     }
                 }
-                // A user's pick (no reason) is a preference; a safety reroute
-                // or a credits fallback (reason present) is not.
-                AgentEvent::ModelSwitched {
-                    to, reason: None, ..
-                } => {
-                    prefs_to_record = Some(PrefsUpdate {
-                        agent: info.agent.clone(),
-                        model: Some(to.clone()),
-                        ..Default::default()
-                    });
+                // The model in effect is the conversation's own (any reason);
+                // only a user's pick (no reason) is a preference — a safety
+                // reroute or a credits fallback (reason present) is not.
+                AgentEvent::ModelSwitched { to, reason, .. } => {
+                    if let Some(native) = &info.native_session_id {
+                        index_to_record = Some(IndexUpdate {
+                            native: native.clone(),
+                            model: Some(to.clone()),
+                            ..Default::default()
+                        });
+                    }
+                    if reason.is_none() {
+                        prefs_to_record = Some(PrefsUpdate {
+                            agent: info.agent.clone(),
+                            model: Some(to.clone()),
+                            ..Default::default()
+                        });
+                    }
                 }
-                // Likewise the permission/approval mode the user picked (not
-                // one the agent switched on its own, e.g. a plan-mode exit).
-                AgentEvent::ModeChanged {
-                    mode_id,
-                    chosen: true,
-                } => {
-                    prefs_to_record = Some(PrefsUpdate {
-                        agent: info.agent.clone(),
-                        mode: Some(mode_id.clone()),
-                        ..Default::default()
-                    });
+                // Likewise the permission/approval mode: the conversation's
+                // own either way; a preference only when the user picked it
+                // (not one the agent switched on its own, e.g. a plan exit).
+                AgentEvent::ModeChanged { mode_id, chosen } => {
+                    if let Some(native) = &info.native_session_id {
+                        index_to_record = Some(IndexUpdate {
+                            native: native.clone(),
+                            mode: Some(mode_id.clone()),
+                            ..Default::default()
+                        });
+                    }
+                    if *chosen {
+                        prefs_to_record = Some(PrefsUpdate {
+                            agent: info.agent.clone(),
+                            mode: Some(mode_id.clone()),
+                            ..Default::default()
+                        });
+                    }
                 }
                 // "Pending permission" really means "waiting on a human
                 // decision" — structured questions block the turn exactly
@@ -679,16 +716,33 @@ impl ChatManager {
                     .insert(agent, models.clone());
             }
         }
-        if let Some(native) = native_to_index {
+        if native_to_index.is_some() || index_to_record.is_some() {
             let index = Arc::clone(&self.index);
             let session_id = id.to_string();
-            // Fire-and-forget: the native-id index is a side-index consulted
-            // only to seed a resume (`lookup`). Detach the (blocking, possibly
-            // NFS) write so it can NEVER stall the pump — the journal append and
+            // Detached on purpose: the index write can block on NFS, and the
             // event fan-out below must not wait on it. `record` is idempotent,
             // so a detached late write is harmless. Awaiting the JoinHandle here
-            // (the old code) re-coupled the pump to that write.
-            tokio::task::spawn_blocking(move || index.record(&native, &session_id));
+            // (the old code) re-coupled the pump to that write. The mapping and
+            // the settings an Init carries ride one hop so they cannot land
+            // out of order.
+            tokio::task::spawn_blocking(move || {
+                if let Some(native) = native_to_index {
+                    index.record(&native, &session_id);
+                }
+                if let Some(update) = index_to_record {
+                    index.record_settings(&update.native, &session_id, |s| {
+                        if let Some(model) = update.model {
+                            s.model = Some(model);
+                        }
+                        if let Some(effort) = update.effort {
+                            s.effort = effort;
+                        }
+                        if let Some(mode) = update.mode {
+                            s.mode = Some(mode);
+                        }
+                    });
+                }
+            });
         }
         if let Some(update) = prefs_to_record {
             let prefs = Arc::clone(&self.prefs);
@@ -704,14 +758,6 @@ impl ChatManager {
                     prefs.record_mode(&update.agent, &mode);
                 }
             });
-        }
-        if let Some((native, effort)) = effort_to_index {
-            let index = Arc::clone(&self.index);
-            let session_id = id.to_string();
-            // Same NFS rule as the native-id mapping above. This read-back is
-            // infrequent (spawn or a user effort change) and bounded by the
-            // index cap; never park the async pump on its atomic rewrite.
-            tokio::task::spawn_blocking(move || index.record_effort(&native, &session_id, effort));
         }
         let entry = session.journal.append(ev).await;
         let _ = session.events_tx.send(Arc::clone(&entry));

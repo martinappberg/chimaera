@@ -2839,21 +2839,47 @@ async fn codex_initial_effort(state: &Arc<AppState>, recipe: &ChatRecipe) -> Opt
     }
 }
 
+/// Precedence for what a chat starts with: the recipe's explicit model, then
+/// the conversation's own last settings (a reopened chat; `recovered_effort`
+/// is codex's journal-recovered effort for pre-index rows), then the agent
+/// kind's prefs — what the user last picked anywhere.
+fn resolve_start_settings(
+    explicit_model: Option<String>,
+    own: chimaera_agent::journal::ConversationSettings,
+    recovered_effort: Option<String>,
+    prefs: &chimaera_agent::journal::AgentPrefs,
+) -> chimaera_agent::journal::ConversationSettings {
+    chimaera_agent::journal::ConversationSettings {
+        model: explicit_model.or(own.model).or(prefs.model.clone()),
+        effort: recovered_effort.or(own.effort).or(prefs.effort.clone()),
+        mode: own.mode.or(prefs.mode.clone()),
+    }
+}
+
 pub(crate) async fn spawn_chat_session(
     state: &Arc<AppState>,
     id: String,
     recipe: ChatRecipe,
     pinned_override: Option<String>,
 ) -> anyhow::Result<ChatInfo> {
-    let initial_effort = codex_initial_effort(state, &recipe).await;
-    // What the user last chose on this agent kind (the daemon's prefs): the
-    // model when the recipe names none, and the effort for a NEW conversation
-    // (a resumed Codex thread keeps its own indexed effort above). The
-    // official TUIs remember the same pair; chimaera's in-session picks are
-    // session-scoped on both wires, so it remembers them itself.
+    let recovered_effort = codex_initial_effort(state, &recipe).await;
+    // A reopened conversation (resume, rewind, fork, post-restart
+    // resurrection) comes back with its own last model, effort and mode —
+    // the journal index carries them per native id because neither agent
+    // rehydrates the trio from its history. What the user last picked on
+    // this agent kind (the daemon's prefs) seeds only what the chat does not
+    // carry itself: a NEW conversation, or a setting from before the index
+    // knew it. The official TUIs persist the same choices in their config.
+    let own = recipe
+        .resume
+        .as_deref()
+        .map(|native| state.chat.index().settings(native))
+        .unwrap_or_default();
     let prefs = state.chat.prefs(recipe.kind.as_str());
-    let model = recipe.model.clone().or(prefs.model.clone());
-    let initial_effort = initial_effort.or(prefs.effort.clone());
+    let start = resolve_start_settings(recipe.model.clone(), own, recovered_effort, &prefs);
+    let model = start.model;
+    let initial_effort = start.effort;
+    let initial_mode = start.mode;
     // Legacy recovery can yield while a concurrent retire removes the shared
     // identity. From here through ChatManager::spawn there are no awaits, so
     // this closes that race without resurrecting an untracked billing process.
@@ -2994,10 +3020,10 @@ pub(crate) async fn spawn_chat_session(
         spec.initial_model = model.clone();
         spec.initial_effort = initial_effort.clone();
     }
-    // The remembered permission/approval mode, for both agents — except a
-    // Mastermind, whose mode is the workspace's ask/auto decision.
+    // The conversation's own / remembered permission mode, for both agents —
+    // except a Mastermind, whose mode is the workspace's ask/auto decision.
     if recipe.mastermind.is_none() {
-        spec.initial_mode = prefs.mode.clone();
+        spec.initial_mode = initial_mode;
     }
     if recipe.kind == AgentKind::Codex {
         spec.initial_model = model.clone();
@@ -3979,6 +4005,63 @@ mod tests {
         ));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A reopened chat starts from its own last settings; the per-agent prefs
+    /// fill only what it does not carry; an explicit model always wins.
+    #[test]
+    fn start_settings_prefer_the_conversations_own_over_prefs() {
+        use chimaera_agent::journal::{AgentPrefs, ConversationSettings};
+        let prefs = AgentPrefs {
+            model: Some("opus".into()),
+            effort: Some("xhigh".into()),
+            mode: Some("acceptEdits".into()),
+            ts: 0,
+        };
+        // A new chat (nothing of its own) takes the prefs wholesale.
+        assert_eq!(
+            resolve_start_settings(None, ConversationSettings::default(), None, &prefs),
+            ConversationSettings {
+                model: Some("opus".into()),
+                effort: Some("xhigh".into()),
+                mode: Some("acceptEdits".into()),
+            }
+        );
+        // A reopened chat keeps what it ran with, even when the prefs moved on.
+        let own = ConversationSettings {
+            model: Some("sonnet".into()),
+            effort: Some("high".into()),
+            mode: Some("plan".into()),
+        };
+        assert_eq!(resolve_start_settings(None, own.clone(), None, &prefs), own);
+        // Partial knowledge: only the missing setting falls back to the prefs.
+        let partial = ConversationSettings {
+            model: None,
+            effort: Some("medium".into()),
+            mode: None,
+        };
+        assert_eq!(
+            resolve_start_settings(None, partial, None, &prefs),
+            ConversationSettings {
+                model: Some("opus".into()),
+                effort: Some("medium".into()),
+                mode: Some("acceptEdits".into()),
+            }
+        );
+        // The launch-time model and codex's journal-recovered effort win.
+        assert_eq!(
+            resolve_start_settings(
+                Some("haiku".into()),
+                ConversationSettings::default(),
+                Some("low".into()),
+                &prefs
+            ),
+            ConversationSettings {
+                model: Some("haiku".into()),
+                effort: Some("low".into()),
+                mode: Some("acceptEdits".into()),
+            }
+        );
     }
 
     #[tokio::test]

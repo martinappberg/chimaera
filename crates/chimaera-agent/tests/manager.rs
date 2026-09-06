@@ -2136,3 +2136,83 @@ async fn model_pick_is_remembered_per_agent_kind() {
     );
     assert!(fx.manager.kill("s-pref2"));
 }
+
+/// The journal index carries what each native conversation last ran with —
+/// model and mode from Init, then every change — so a reopen (resume /
+/// rewind / fork / resurrection) can start from it instead of the prefs.
+#[tokio::test]
+async fn conversation_settings_are_indexed_per_native_id() {
+    let fx = fixture();
+    fx.manager
+        .spawn(&ClaudeAdapter, spec("s-own", &fx.cwd, "normal"))
+        .expect("spawn");
+    let att = fx.manager.attach("s-own", 0).expect("attach");
+    let mut seen: Vec<Arc<SeqEvent>> = att.replay.clone();
+    let mut rx = att.live;
+    // The handshake's first snapshot carries no native id yet; the first
+    // turn's system/init re-emits Init with it, and that is the row the
+    // index keys (a resume handle only exists once a conversation does).
+    fx.manager
+        .command(
+            "s-own",
+            AgentCommand::Send {
+                blocks: vec![ContentBlock::Text {
+                    text: "run it".into(),
+                }],
+            },
+        )
+        .await
+        .expect("send");
+    let init = wait_for(&mut rx, &mut seen, "Init with a native id", |ev| {
+        matches!(ev, AgentEvent::Init { native_session_id, .. } if !native_session_id.is_empty())
+    })
+    .await;
+    let AgentEvent::Init {
+        native_session_id,
+        model,
+        current_mode,
+        ..
+    } = &init.ev
+    else {
+        unreachable!()
+    };
+    let native = native_session_id.clone();
+    let deadline = std::time::Instant::now() + WAIT;
+    while fx.manager.index().settings(&native).model != *model
+        || fx.manager.index().settings(&native).mode != *current_mode
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Init settings never indexed: index={:?} init model={model:?} mode={current_mode:?}",
+            fx.manager.index().settings(&native)
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    fx.manager
+        .command(
+            "s-own",
+            AgentCommand::SetMode {
+                mode_id: "plan".into(),
+            },
+        )
+        .await
+        .expect("set_mode");
+    wait_for(
+        &mut rx,
+        &mut seen,
+        "ModeChanged",
+        |ev| matches!(ev, AgentEvent::ModeChanged { mode_id, .. } if mode_id == "plan"),
+    )
+    .await;
+    let deadline = std::time::Instant::now() + WAIT;
+    while fx.manager.index().settings(&native).mode.as_deref() != Some("plan") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "mode change never indexed"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // The other settings survived the mode write.
+    assert_eq!(fx.manager.index().settings(&native).model, *model);
+    assert!(fx.manager.kill("s-own"));
+}
