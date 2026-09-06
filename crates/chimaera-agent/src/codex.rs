@@ -238,6 +238,7 @@ impl Driver for CodexDriver {
             events: vec![AgentEvent::EffortState {
                 effort: hs.effort.clone(),
                 ultracode: false,
+                chosen: false,
             }],
             outbound: Vec::new(),
         }];
@@ -267,6 +268,17 @@ impl Driver for CodexDriver {
         if let Some(frame) = hs.remote_control_status {
             initial.push(mapper.on_frame(&frame));
         }
+        // The remembered approval mode (Auto review / Read only / …), applied
+        // like a header pick when it differs from the thread's opening mode.
+        mapper.bootstrapping = true;
+        if let Some(mode) = spec.initial_mode.as_deref() {
+            if mapper.current_mode != mode && codex_modes().iter().any(|m| m.id == mode) {
+                initial.push(mapper.on_command(AgentCommand::SetMode {
+                    mode_id: mode.to_string(),
+                }));
+            }
+        }
+        mapper.bootstrapping = false;
         Ok(Handshake { mapper, initial })
     }
 }
@@ -758,6 +770,8 @@ enum PendingRpc {
     SettingsUpdate {
         mode_id: String,
         per_turn: Value,
+        /// The user's own pick (not the handshake's replay of the prefs).
+        chosen: bool,
     },
     /// Effort is applied eagerly to the thread when supported, with the
     /// guaranteed `turn/start.effort` path retained as the compatibility
@@ -888,6 +902,10 @@ struct CodexMapper {
     /// app-servers persist it through thread/settings/update; older ones use
     /// the guaranteed turn/start override.
     pending_effort: Option<String>,
+    /// The user's own last effort pick. A read-back equal to it is that pick
+    /// (`EffortState.chosen`); the spawn's read or the app-server resetting
+    /// effort on a model switch is not, so the prefs keep the pick.
+    chosen_effort: Option<String>,
     /// Last effort value journaled to the UI. The nested option distinguishes
     /// "no event emitted yet" from an authoritative `None` read-back.
     reported_effort: Option<Option<String>>,
@@ -897,6 +915,10 @@ struct CodexMapper {
     /// Latest mode selection awaiting thread/settings/update. Effort changes
     /// must compose with this selection, not the last acknowledged mode.
     pending_mode: Option<(u64, String)>,
+    /// True only while the handshake replays the spawn's remembered mode
+    /// through the ordinary SetMode arm: its ack must not read as a user
+    /// pick (`ModeChanged.chosen`), or every spawn would re-record the prefs.
+    bootstrapping: bool,
     mode_per_turn: Option<Value>,
     settings_update_unsupported: bool,
     turn_id: String,
@@ -1024,12 +1046,14 @@ impl CodexMapper {
             model,
             pending_model: None,
             pending_effort: effort.clone(),
+            chosen_effort: None,
             // The handshake queues this exact state immediately after Init.
             reported_effort: Some(effort),
             // Chimaera's chat default: the same workspace/on-request tuple,
             // with Codex's reviewer assessing approvals before they surface.
             current_mode: "auto-review".to_string(),
             pending_mode: None,
+            bootstrapping: false,
             mode_per_turn: None,
             settings_update_unsupported: false,
             turn_id: String::new(),
@@ -1088,6 +1112,19 @@ impl CodexMapper {
     }
 
     fn emit_effort_state(&mut self, effort: Option<String>, step: &mut DriverStep) {
+        // A read-back that matches the user's own pending pick is that pick;
+        // a bootstrap read or the agent resetting effort on a model switch
+        // is not (it must not overwrite the remembered effort).
+        let chosen = effort.is_some() && self.chosen_effort == effort;
+        self.emit_effort_state_marked(effort, chosen, step);
+    }
+
+    fn emit_effort_state_marked(
+        &mut self,
+        effort: Option<String>,
+        chosen: bool,
+        step: &mut DriverStep,
+    ) {
         if self.reported_effort.as_ref() == Some(&effort) {
             return;
         }
@@ -1095,6 +1132,7 @@ impl CodexMapper {
         step.events.push(AgentEvent::EffortState {
             effort,
             ultracode: false,
+            chosen,
         });
     }
 
@@ -1804,7 +1842,14 @@ impl CodexMapper {
                     });
                 }
             }
-            (PendingRpc::SettingsUpdate { mode_id, per_turn }, Some(err)) => {
+            (
+                PendingRpc::SettingsUpdate {
+                    mode_id,
+                    per_turn,
+                    chosen,
+                },
+                Some(err),
+            ) => {
                 if is_method_not_found(err, "thread/settings/update") {
                     // Older app-server: the fields ride every turn/start
                     // instead (the extension's own fallback path).
@@ -1816,7 +1861,7 @@ impl CodexMapper {
                     {
                         self.pending_mode = None;
                         self.mode_per_turn = Some(per_turn);
-                        self.apply_mode(mode_id, step);
+                        self.apply_mode(mode_id, chosen, step);
                     }
                 } else {
                     if self
@@ -1870,7 +1915,12 @@ impl CodexMapper {
                     fatal: false,
                 });
             }
-            (PendingRpc::SettingsUpdate { mode_id, .. }, None) => {
+            (
+                PendingRpc::SettingsUpdate {
+                    mode_id, chosen, ..
+                },
+                None,
+            ) => {
                 // A later selection supersedes this response. Applying stale
                 // acknowledgements would make the UI flicker back to an old
                 // mode and break effort composition while the latest request
@@ -1881,12 +1931,12 @@ impl CodexMapper {
                     .is_some_and(|(pending_id, _)| *pending_id == id)
                 {
                     self.pending_mode = None;
-                    self.apply_mode(mode_id, step);
+                    self.apply_mode(mode_id, chosen, step);
                 }
             }
             (PendingRpc::EffortUpdate { effort_id, .. }, None) => {
                 if self.pending_effort.as_deref() == Some(&effort_id) {
-                    self.emit_effort_state(Some(effort_id), step);
+                    self.emit_effort_state_marked(Some(effort_id), true, step);
                 }
             }
             (PendingRpc::AccountRead { report }, None) => {
@@ -2507,11 +2557,14 @@ impl CodexMapper {
     /// `note_auto_decline`. Called from all three mode-application paths (the
     /// live settings/update ack, the -32601 fallback, and the
     /// already-unsupported per-turn path) so they stay consistent.
-    fn apply_mode(&mut self, mode_id: String, step: &mut DriverStep) {
+    fn apply_mode(&mut self, mode_id: String, chosen: bool, step: &mut DriverStep) {
         let entered_full = mode_id == "full-access" && self.current_mode != "full-access";
         let entered_review = mode_id == "auto-review" && self.current_mode != "auto-review";
         self.current_mode = mode_id.clone();
-        step.events.push(AgentEvent::ModeChanged { mode_id });
+        // The app-server never changes the mode unasked, so every change is
+        // ours: the user's pick (fed to the prefs) or the handshake's replay.
+        step.events
+            .push(AgentEvent::ModeChanged { mode_id, chosen });
         if entered_full {
             step.events.push(AgentEvent::Notice {
                 text: "full access on — codex will no longer ask for approval; a \
@@ -3690,8 +3743,14 @@ impl CodexMapper {
                 });
             }
             AgentCommand::SetEffort { effort_id } => {
+                // The pick itself is what the prefs remember — even when it
+                // matches the effort already in effect (a bootstrap read-back
+                // is not a pick; re-choosing that value is), so the no-op
+                // branch re-journals the state as chosen.
+                self.chosen_effort = Some(effort_id.clone());
                 if self.pending_effort.as_deref() == Some(&effort_id) {
-                    self.emit_effort_state(Some(effort_id), &mut step);
+                    self.reported_effort = None;
+                    self.emit_effort_state_marked(Some(effort_id), true, &mut step);
                 } else {
                     let previous = self.pending_effort.replace(effort_id.clone());
                     self.refresh_per_turn_mode_effort();
@@ -3732,7 +3791,8 @@ impl CodexMapper {
                 if self.settings_update_unsupported {
                     self.pending_mode = None;
                     self.mode_per_turn = Some(fields);
-                    self.apply_mode(mode_id, &mut step);
+                    let chosen = !self.bootstrapping;
+                    self.apply_mode(mode_id, chosen, &mut step);
                 } else {
                     // Probe thread/settings/update (applies mid-thread); the
                     // response handler falls back to per-turn on -32601.
@@ -3749,6 +3809,7 @@ impl CodexMapper {
                         PendingRpc::SettingsUpdate {
                             mode_id,
                             per_turn: fields,
+                            chosen: !self.bootstrapping,
                         },
                     );
                     step.outbound.push(json!({
@@ -5169,7 +5230,8 @@ mod tests {
         assert_eq!(
             step.events[0],
             AgentEvent::ModeChanged {
-                mode_id: "read-only".into()
+                mode_id: "read-only".into(),
+                chosen: true
             }
         );
 
@@ -5188,7 +5250,8 @@ mod tests {
         assert_eq!(
             step.events[0],
             AgentEvent::ModeChanged {
-                mode_id: "full-access".into()
+                mode_id: "full-access".into(),
+                chosen: true
             }
         );
     }
@@ -5219,6 +5282,7 @@ mod tests {
             vec![AgentEvent::EffortState {
                 effort: Some("high".into()),
                 ultracode: false,
+                chosen: true,
             }]
         );
         let step = m.on_frame(&json!({ "id": id, "result": {} }));
@@ -5228,6 +5292,66 @@ mod tests {
             blocks: vec![ContentBlock::Text { text: "hi".into() }],
         });
         assert_eq!(step.outbound[0]["params"]["effort"], "high");
+    }
+
+    /// `EffortState.chosen` marks the user's own picks — what the per-agent
+    /// prefs remember — and nothing the app-server did on its own.
+    #[test]
+    fn model_switch_effort_reset_is_not_a_pick() {
+        let mut m = mapper();
+        let read_back = |effort: &str| {
+            json!({
+                "method": "thread/settings/updated",
+                "params": { "threadId": "thr-1", "threadSettings": { "effort": effort } },
+            })
+        };
+        // The spawn's read-back is not a pick.
+        let step = m.on_frame(&read_back("medium"));
+        assert_eq!(
+            step.events,
+            vec![AgentEvent::EffortState {
+                effort: Some("medium".into()),
+                ultracode: false,
+                chosen: false,
+            }]
+        );
+        // The user's pick is (its ack carries the flag).
+        let step = m.on_command(AgentCommand::SetEffort {
+            effort_id: "high".into(),
+        });
+        let id = step.outbound[0]["id"].as_u64().unwrap();
+        let step = m.on_frame(&json!({ "id": id, "result": {} }));
+        assert_eq!(
+            step.events,
+            vec![AgentEvent::EffortState {
+                effort: Some("high".into()),
+                ultracode: false,
+                chosen: true,
+            }]
+        );
+        // The app-server resetting effort on a model switch is not.
+        let step = m.on_frame(&read_back("xhigh"));
+        assert_eq!(
+            step.events,
+            vec![AgentEvent::EffortState {
+                effort: Some("xhigh".into()),
+                ultracode: false,
+                chosen: false,
+            }]
+        );
+        // Re-choosing the effort already in effect still counts as a pick.
+        let step = m.on_command(AgentCommand::SetEffort {
+            effort_id: "xhigh".into(),
+        });
+        assert!(step.outbound.is_empty());
+        assert_eq!(
+            step.events,
+            vec![AgentEvent::EffortState {
+                effort: Some("xhigh".into()),
+                ultracode: false,
+                chosen: true,
+            }]
+        );
     }
 
     #[test]
@@ -5292,6 +5416,7 @@ mod tests {
             step.events,
             vec![AgentEvent::ModeChanged {
                 mode_id: "auto".into(),
+                chosen: true,
             }]
         );
         assert_eq!(m.pending_mode, None);
@@ -5313,6 +5438,7 @@ mod tests {
             vec![AgentEvent::EffortState {
                 effort: Some("xhigh".into()),
                 ultracode: false,
+                chosen: true,
             }]
         );
 

@@ -2083,5 +2083,56 @@ async fn model_pick_is_remembered_per_agent_kind() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert_eq!(reload().prefs("codex").model, None);
+    // A mode pick is remembered too (its ack carries chosen:true).
+    fx.manager
+        .command(
+            "s-pref",
+            AgentCommand::SetMode {
+                mode_id: "acceptEdits".into(),
+            },
+        )
+        .await
+        .expect("set_mode");
+    wait_for(&mut rx, &mut seen, "ModeChanged", |ev| {
+        matches!(ev, AgentEvent::ModeChanged { mode_id, chosen: true } if mode_id == "acceptEdits")
+    })
+    .await;
+    let deadline = std::time::Instant::now() + WAIT;
+    while reload().prefs("claude").mode.as_deref() != Some("acceptEdits") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "mode pref never recorded"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // The spawn's bootstrap effort read-back is NOT a pick: nothing recorded.
+    assert_eq!(reload().prefs("claude").effort, None);
     assert!(fx.manager.kill("s-pref"));
+
+    // The next spawn replays the remembered mode through the handshake; that
+    // ModeChanged is not a pick (chosen:false) — it must not re-record.
+    let mut replay = spec("s-pref2", &fx.cwd, "normal");
+    replay.initial_mode = Some("plan".into());
+    fx.manager.spawn(&ClaudeAdapter, replay).expect("spawn");
+    let att = fx.manager.attach("s-pref2", 0).expect("attach");
+    let mut seen: Vec<Arc<SeqEvent>> = att.replay.clone();
+    let mut rx = att.live;
+    wait_for(
+        &mut rx,
+        &mut seen,
+        "replayed ModeChanged",
+        |ev| matches!(ev, AgentEvent::ModeChanged { mode_id, chosen: false } if mode_id == "plan"),
+    )
+    .await;
+    assert!(
+        !seen
+            .iter()
+            .any(|e| matches!(&e.ev, AgentEvent::ModeChanged { chosen: true, .. })),
+        "the handshake replay must not read as a pick"
+    );
+    assert_eq!(
+        reload().prefs("claude").mode.as_deref(),
+        Some("acceptEdits")
+    );
+    assert!(fx.manager.kill("s-pref2"));
 }

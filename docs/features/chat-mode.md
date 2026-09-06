@@ -111,15 +111,18 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   an explicit choice) and is pushed to the live driver once per driver process, re-synced on each
   respawn (a fresh CLI defaults thinking off) but never re-forced, so a tab remount can't reset it and
   a toggle-off always sticks.
-- **Remembered model and effort.** Both agents' in-session picks are session-scoped on their
-  wires (claude `set_model` / `apply_flag_settings`, codex `thread/settings/update`), so the daemon
-  remembers the last model you picked and the last effort in effect **per agent kind**
-  (`prefs.json` beside the chat journals; a safety reroute or a credits fallback is not a pick) and
-  starts the next chat of that kind with them — claude gets `--model` at spawn and the effort right
-  after the handshake (skipped when the catalog says the model has no effort knob, e.g. haiku);
-  codex gets them on `thread/start`, while a resumed codex thread keeps its own indexed effort. An
-  explicit launch-time model still wins. This mirrors the official TUIs, which persist the same
-  pair in their own config.
+- **Remembered model, effort and mode.** Both agents' in-session picks are session-scoped on
+  their wires (claude `set_model` / `apply_flag_settings` / `set_permission_mode`, codex
+  `thread/settings/update`), so the daemon remembers the last model, effort and permission/approval
+  mode **you picked**, per agent kind (`prefs.json` beside the chat journals), and starts the next
+  chat of that kind with them. Only picks count: a safety reroute, a credits fallback, the spawn's
+  bootstrap read-back, codex resetting effort on a model switch, or claude leaving plan mode on its
+  own are not remembered. Claude gets `--model` at spawn and the effort + mode right after the
+  handshake (effort skipped when the catalog says the model has no effort knob, e.g. haiku); codex
+  gets the model and effort on `thread/start` (a resumed codex thread keeps its own indexed effort)
+  and the mode — Auto review, Read only, Auto, Full access, Plan — as a settings update before the
+  first turn. An explicit launch-time model still wins, and a workspace Mastermind keeps its own
+  ask/auto mode. This mirrors the official TUIs, which persist the same choices in their config.
 - **Remote Control (claude).** The header's **remote** chip turns on Claude Code's own Remote
   Control bridge for this session — the same `remote_control` control the official VS Code and
   Desktop hosts use — so you can pick the conversation up in the Claude mobile app or at

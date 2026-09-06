@@ -460,6 +460,7 @@ impl Driver for ClaudeDriver {
         // The remembered effort (the daemon's per-agent prefs): applied like
         // a header pick, session-scoped, skipped where the catalog says the
         // model has no effort knob (haiku) — the apply would just error.
+        mapper.bootstrapping = true;
         if let Some(effort) = spec.initial_effort.as_deref() {
             if effort_applies(&mapper.models, spec.initial_model.as_deref()) {
                 initial.push(mapper.on_command(AgentCommand::SetEffort {
@@ -467,6 +468,18 @@ impl Driver for ClaudeDriver {
                 }));
             }
         }
+        // The remembered permission mode, applied like a header pick when it
+        // differs from the CLI's current one and is one this surface offers.
+        if let Some(mode) = spec.initial_mode.as_deref() {
+            if mapper.current_mode.as_deref() != Some(mode)
+                && claude_modes().iter().any(|m| m.id == mode)
+            {
+                initial.push(mapper.on_command(AgentCommand::SetMode {
+                    mode_id: mode.to_string(),
+                }));
+            }
+        }
+        mapper.bootstrapping = false;
         // Remote Control at start — the embedder's standing choice, honored
         // only where the CLI offers the bridge. It rides the ordinary command
         // path so the ack + bridge_state frames journal the state exactly as
@@ -557,7 +570,12 @@ struct PendingPermission {
 }
 
 enum PendingControl {
-    SetMode(String),
+    /// set_permission_mode ack → ModeChanged. `chosen` = the user's own
+    /// header pick (fed to the prefs), not the plan-approval follow-up.
+    SetMode {
+        mode: String,
+        chosen: bool,
+    },
     SetModel(String),
     Interrupt,
     SetThinking,
@@ -569,9 +587,17 @@ enum PendingControl {
         dry_run: bool,
     },
     /// get_settings round-trip → EffortState (applied.{effort,ultracode}).
-    Settings,
-    /// apply_flag_settings acknowledged → re-read the truth.
-    ApplyFlags,
+    /// `chosen` = the read follows the user's own apply (a pick), not the
+    /// spawn bootstrap.
+    Settings {
+        chosen: bool,
+    },
+    /// apply_flag_settings acknowledged → re-read the truth. `chosen` = the
+    /// apply was the user's own pick (fed to the prefs), not the handshake
+    /// replaying the spawn's remembered effort.
+    ApplyFlags {
+        chosen: bool,
+    },
     /// mcp_status round-trip (the /mcp panel).
     McpStatus,
     /// mcp_toggle / mcp_reconnect: on success, refresh the panel.
@@ -616,6 +642,11 @@ struct ClaudeMapper {
     agent_version: Option<String>,
     model: Option<String>,
     current_mode: Option<String>,
+    /// True only while the handshake replays the spawn's remembered effort
+    /// and mode through the ordinary command arms: those acks must not read
+    /// as user picks (they would re-record — or, for a recipe's explicit
+    /// effort, overwrite — the prefs).
+    bootstrapping: bool,
     slash_commands: Vec<SlashCommand>,
     /// Account model catalog from the initialize response (value ids the
     /// set_model request accepts, with per-model effort levels).
@@ -812,6 +843,7 @@ impl ClaudeMapper {
             agent_version,
             model: None,
             current_mode,
+            bootstrapping: false,
             slash_commands,
             models,
             coalescer: Coalescer::new(),
@@ -981,9 +1013,13 @@ impl ClaudeMapper {
     /// One get_settings round-trip → EffortState. Issued at spawn and after
     /// every apply_flag_settings, so the chips always show the CLI's truth.
     fn request_settings(&mut self, step: &mut DriverStep) {
+        self.request_settings_after(false, step);
+    }
+
+    fn request_settings_after(&mut self, chosen: bool, step: &mut DriverStep) {
         let id = self.ctl_id();
         self.pending_controls
-            .insert(id.clone(), PendingControl::Settings);
+            .insert(id.clone(), PendingControl::Settings { chosen });
         step.outbound.push(control_request_frame(
             &id,
             json!({ "subtype": "get_settings" }),
@@ -1375,6 +1411,7 @@ impl ClaudeMapper {
                         self.current_mode = Some(mode.to_string());
                         step.events.push(AgentEvent::ModeChanged {
                             mode_id: mode.to_string(),
+                            chosen: false,
                         });
                     }
                 }
@@ -2503,9 +2540,12 @@ impl ClaudeMapper {
                     step.events.push(self.remote_control_event(None));
                 }
             }
-            PendingControl::SetMode(mode) => {
+            PendingControl::SetMode { mode, chosen } => {
                 self.current_mode = Some(mode.clone());
-                step.events.push(AgentEvent::ModeChanged { mode_id: mode });
+                step.events.push(AgentEvent::ModeChanged {
+                    mode_id: mode,
+                    chosen,
+                });
             }
             PendingControl::SetModel(model) => {
                 let from = self.model.replace(model.clone());
@@ -2632,11 +2672,12 @@ impl ClaudeMapper {
                     }
                 }
             }
-            PendingControl::Settings => {
+            PendingControl::Settings { chosen } => {
                 let applied = &payload["applied"];
                 step.events.push(AgentEvent::EffortState {
                     effort: applied["effort"].as_str().map(String::from),
                     ultracode: applied["ultracode"] == json!(true),
+                    chosen,
                 });
             }
             PendingControl::Background => {
@@ -2652,9 +2693,11 @@ impl ClaudeMapper {
                 }
             }
             PendingControl::StopTask => {}
-            PendingControl::ApplyFlags => {
-                // The apply is fire-and-ack; the truth comes from re-reading.
-                self.request_settings(step);
+            PendingControl::ApplyFlags { chosen } => {
+                // The apply is fire-and-ack; the truth comes from re-reading —
+                // and that read is the pick (it feeds the prefs) when the
+                // apply was.
+                self.request_settings_after(chosen, step);
             }
         }
     }
@@ -2983,8 +3026,13 @@ impl ClaudeMapper {
                 // verified control; its ack lands as ModeChanged.
                 if tool == "ExitPlanMode" && option_id == "allow_accept_edits" {
                     let id = self.ctl_id();
-                    self.pending_controls
-                        .insert(id.clone(), PendingControl::SetMode("acceptEdits".into()));
+                    self.pending_controls.insert(
+                        id.clone(),
+                        PendingControl::SetMode {
+                            mode: "acceptEdits".into(),
+                            chosen: false,
+                        },
+                    );
                     step.outbound.push(control_request_frame(
                         &id,
                         json!({ "subtype": "set_permission_mode", "mode": "acceptEdits" }),
@@ -3026,8 +3074,13 @@ impl ClaudeMapper {
             }
             AgentCommand::SetMode { mode_id } => {
                 let id = self.ctl_id();
-                self.pending_controls
-                    .insert(id.clone(), PendingControl::SetMode(mode_id.clone()));
+                self.pending_controls.insert(
+                    id.clone(),
+                    PendingControl::SetMode {
+                        mode: mode_id.clone(),
+                        chosen: !self.bootstrapping,
+                    },
+                );
                 step.outbound.push(control_request_frame(
                     &id,
                     json!({ "subtype": "set_permission_mode", "mode": mode_id }),
@@ -3046,8 +3099,12 @@ impl ClaudeMapper {
             // (apply_flag_settings never persists to settings files here).
             AgentCommand::SetEffort { effort_id } => {
                 let id = self.ctl_id();
-                self.pending_controls
-                    .insert(id.clone(), PendingControl::ApplyFlags);
+                self.pending_controls.insert(
+                    id.clone(),
+                    PendingControl::ApplyFlags {
+                        chosen: !self.bootstrapping,
+                    },
+                );
                 step.outbound.push(control_request_frame(
                     &id,
                     json!({
@@ -3061,8 +3118,12 @@ impl ClaudeMapper {
             // persist it").
             AgentCommand::SetUltracode { enabled } => {
                 let id = self.ctl_id();
-                self.pending_controls
-                    .insert(id.clone(), PendingControl::ApplyFlags);
+                self.pending_controls.insert(
+                    id.clone(),
+                    PendingControl::ApplyFlags {
+                        chosen: !self.bootstrapping,
+                    },
+                );
                 step.outbound.push(control_request_frame(
                     &id,
                     json!({
@@ -5740,7 +5801,9 @@ mod tests {
             &step.events[1],
             AgentEvent::UserMessage { text, .. } if text == "also update the docs"
         ));
-        // The follow-up's ack resolves to ModeChanged(acceptEdits).
+        // The follow-up's ack resolves to ModeChanged(acceptEdits) — not a
+        // pick (`chosen: false`): approving a plan must not become the next
+        // chat's default mode.
         let ctl = step.outbound[1]["request_id"].as_str().unwrap().to_string();
         let step = m.on_frame(&json!({
             "type": "control_response",
@@ -5749,7 +5812,8 @@ mod tests {
         assert_eq!(
             step.events[0],
             AgentEvent::ModeChanged {
-                mode_id: "acceptEdits".into()
+                mode_id: "acceptEdits".into(),
+                chosen: false
             }
         );
     }
@@ -5853,7 +5917,8 @@ mod tests {
         assert_eq!(
             step.events[0],
             AgentEvent::ModeChanged {
-                mode_id: "acceptEdits".into()
+                mode_id: "acceptEdits".into(),
+                chosen: true
             }
         );
     }
@@ -7216,7 +7281,8 @@ mod tests {
         assert_eq!(
             step.events[0],
             AgentEvent::ModeChanged {
-                mode_id: "acceptEdits".into()
+                mode_id: "acceptEdits".into(),
+                chosen: false
             }
         );
         // Unchanged mode re-announcements stay silent.

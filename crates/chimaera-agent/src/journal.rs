@@ -631,6 +631,9 @@ pub struct AgentPrefs {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// The last permission/approval mode picked (a `ModeInfo.id`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
     #[serde(default)]
     pub ts: u64,
 }
@@ -673,9 +676,14 @@ impl AgentPrefsStore {
         self.update(agent, |p| p.model = Some(model.to_string()));
     }
 
-    /// Remember the effort in effect for the agent kind. Blocking fs.
+    /// Remember the effort the user picked for the agent kind. Blocking fs.
     pub fn record_effort(&self, agent: &str, effort: &str) {
         self.update(agent, |p| p.effort = Some(effort.to_string()));
+    }
+
+    /// Remember the permission/approval mode the user picked. Blocking fs.
+    pub fn record_mode(&self, agent: &str, mode: &str) {
+        self.update(agent, |p| p.mode = Some(mode.to_string()));
     }
 
     fn update(&self, agent: &str, apply: impl FnOnce(&mut AgentPrefs)) {
@@ -695,7 +703,7 @@ impl AgentPrefsStore {
                 v.as_deref()
                     .is_none_or(|s| !s.is_empty() && s.len() <= crate::model::COMMAND_SELECTOR_MAX)
             };
-            if !valid(&candidate.model) || !valid(&candidate.effort) {
+            if !valid(&candidate.model) || !valid(&candidate.effort) || !valid(&candidate.mode) {
                 return;
             }
             candidate.ts = now_ms();
@@ -1153,6 +1161,7 @@ mod tests {
                 AgentEvent::EffortState {
                     effort: Some("low".into()),
                     ultracode: false,
+                    chosen: false,
                 },
             ),
             event(
@@ -1160,6 +1169,7 @@ mod tests {
                 AgentEvent::EffortState {
                     effort: Some("xhigh".into()),
                     ultracode: false,
+                    chosen: false,
                 },
             ),
             event(4, init()),
@@ -1168,6 +1178,7 @@ mod tests {
                 AgentEvent::EffortState {
                     effort: Some("low".into()),
                     ultracode: false,
+                    chosen: false,
                 },
             ),
         ]
@@ -1227,6 +1238,7 @@ mod prefs_tests {
         store.record_model("claude", "opus[1m]");
         store.record_effort("claude", "xhigh");
         store.record_model("codex", "gpt-6-astra");
+        store.record_mode("codex", "auto-review");
         // Reload from disk: the file is the truth.
         let again = AgentPrefsStore::load(dir.path());
         let claude = again.get("claude");
@@ -1234,6 +1246,7 @@ mod prefs_tests {
         assert_eq!(claude.effort.as_deref(), Some("xhigh"));
         assert!(claude.ts > 0);
         assert_eq!(again.get("codex").effort, None);
+        assert_eq!(again.get("codex").mode.as_deref(), Some("auto-review"));
         // An oversized value never lands (selector cap), the prior stays.
         again.record_model(
             "claude",

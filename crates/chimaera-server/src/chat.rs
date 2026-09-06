@@ -2994,6 +2994,11 @@ pub(crate) async fn spawn_chat_session(
         spec.initial_model = model.clone();
         spec.initial_effort = initial_effort.clone();
     }
+    // The remembered permission/approval mode, for both agents — except a
+    // Mastermind, whose mode is the workspace's ask/auto decision.
+    if recipe.mastermind.is_none() {
+        spec.initial_mode = prefs.mode.clone();
+    }
     if recipe.kind == AgentKind::Codex {
         spec.initial_model = model.clone();
         // Codex's rollout survives app-server restarts, but its selected

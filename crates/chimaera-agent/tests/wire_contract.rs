@@ -575,3 +575,35 @@ fn remote_control_wire_shapes_are_additive() {
         json!({ "type": "user_message", "text": "from my phone", "origin": "remote" })
     );
 }
+
+/// `mode_changed.chosen` / `effort_state.chosen` are additive: omitted when
+/// false (byte-identical to the pre-upgrade wire), present only for a pick.
+#[test]
+fn mode_and_effort_chosen_flags_are_additive() {
+    assert_eq!(
+        serde_json::to_value(AgentEvent::ModeChanged {
+            mode_id: "plan".into(),
+            chosen: false,
+        })
+        .unwrap(),
+        json!({ "type": "mode_changed", "mode_id": "plan" })
+    );
+    assert_eq!(
+        serde_json::to_value(AgentEvent::ModeChanged {
+            mode_id: "plan".into(),
+            chosen: true,
+        })
+        .unwrap(),
+        json!({ "type": "mode_changed", "mode_id": "plan", "chosen": true })
+    );
+    let old: AgentEvent =
+        serde_json::from_value(json!({ "type": "effort_state", "effort": "high" })).unwrap();
+    assert_eq!(
+        old,
+        AgentEvent::EffortState {
+            effort: Some("high".into()),
+            ultracode: false,
+            chosen: false,
+        }
+    );
+}

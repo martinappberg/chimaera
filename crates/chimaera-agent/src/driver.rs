@@ -75,6 +75,11 @@ pub struct SpawnSpec {
     /// handshake via `apply_flag_settings`, session-scoped, skipped when the
     /// catalog says `initial_model` has no effort knob.)
     pub initial_effort: Option<String>,
+    /// Permission/approval mode to start in (a `ModeInfo.id` of that
+    /// driver's catalog): applied right after the handshake like a header
+    /// pick when it differs from the agent's opening mode. The daemon's
+    /// per-agent prefs feed it; `None` = the agent's own default.
+    pub initial_mode: Option<String>,
     /// The binary's `--version` line as the server probed it (`None` when
     /// the probe failed). Neither wire protocol offers a reliable version
     /// handshake (see PROTOCOL.md), so the server-side probe is the source:
@@ -143,6 +148,7 @@ impl SpawnSpec {
             pinned_native_id: None,
             initial_model: None,
             initial_effort: None,
+            initial_mode: None,
             agent_version: None,
             rollback_turns: None,
             fork_at: None,

@@ -318,7 +318,10 @@ fn fold_session_metadata(info: &mut ChatInfo, ev: &AgentEvent) {
         AgentEvent::ModelSwitched { to, .. } => {
             info.model = Some(to.clone());
         }
-        AgentEvent::ModeChanged { mode_id } => {
+        AgentEvent::ModeChanged {
+            mode_id,
+            chosen: false,
+        } => {
             info.current_mode = Some(mode_id.clone());
         }
         // The bridge is process-owned: a dead process has no live link, even
@@ -358,6 +361,15 @@ pub struct ChatAttachment {
     /// (an empty replay otherwise leaves the stale cursor in force forever).
     pub replay_from: u64,
     pub head_seq: u64,
+}
+
+/// One per-agent preference write queued by `absorb` for the blocking lane.
+#[derive(Default)]
+struct PrefsUpdate {
+    agent: String,
+    model: Option<String>,
+    effort: Option<String>,
+    mode: Option<String>,
 }
 
 pub struct ChatManager {
@@ -560,7 +572,7 @@ impl ChatManager {
         let mut native_to_index: Option<String> = None;
         let mut effort_to_index: Option<(String, Option<String>)> = None;
         let mut catalog_to_record: Option<String> = None;
-        let mut prefs_to_record: Option<(String, Option<String>, Option<String>)> = None;
+        let mut prefs_to_record: Option<PrefsUpdate> = None;
         {
             let mut info = session.info.lock().expect("info lock");
             fold_session_metadata(&mut info, &ev);
@@ -582,7 +594,7 @@ impl ChatManager {
                         catalog_to_record = Some(info.agent.clone());
                     }
                 }
-                AgentEvent::EffortState { effort, .. } => {
+                AgentEvent::EffortState { effort, chosen, .. } => {
                     // This index field drives Codex thread-open parameters.
                     // Claude has its own argv/settings lifecycle and must not
                     // overwrite the latest Codex choice used for new chats.
@@ -591,11 +603,16 @@ impl ChatManager {
                             effort_to_index = Some((native.clone(), effort.clone()));
                         }
                     }
-                    // The effort in effect is what the next chat of this kind
-                    // starts with (both agents' in-session efforts are
-                    // session-scoped, so chimaera remembers them).
-                    if effort.is_some() {
-                        prefs_to_record = Some((info.agent.clone(), None, effort.clone()));
+                    // The user's own effort pick is what the next chat of this
+                    // kind starts with (both agents' in-session efforts are
+                    // session-scoped, so chimaera remembers them). A bootstrap
+                    // read or a model-switch reset (`chosen: false`) is not.
+                    if let (true, Some(effort)) = (*chosen, effort) {
+                        prefs_to_record = Some(PrefsUpdate {
+                            agent: info.agent.clone(),
+                            effort: Some(effort.clone()),
+                            ..Default::default()
+                        });
                     }
                 }
                 // A user's pick (no reason) is a preference; a safety reroute
@@ -603,7 +620,23 @@ impl ChatManager {
                 AgentEvent::ModelSwitched {
                     to, reason: None, ..
                 } => {
-                    prefs_to_record = Some((info.agent.clone(), Some(to.clone()), None));
+                    prefs_to_record = Some(PrefsUpdate {
+                        agent: info.agent.clone(),
+                        model: Some(to.clone()),
+                        ..Default::default()
+                    });
+                }
+                // Likewise the permission/approval mode the user picked (not
+                // one the agent switched on its own, e.g. a plan-mode exit).
+                AgentEvent::ModeChanged {
+                    mode_id,
+                    chosen: true,
+                } => {
+                    prefs_to_record = Some(PrefsUpdate {
+                        agent: info.agent.clone(),
+                        mode: Some(mode_id.clone()),
+                        ..Default::default()
+                    });
                 }
                 // "Pending permission" really means "waiting on a human
                 // decision" — structured questions block the turn exactly
@@ -657,15 +690,18 @@ impl ChatManager {
             // (the old code) re-coupled the pump to that write.
             tokio::task::spawn_blocking(move || index.record(&native, &session_id));
         }
-        if let Some((agent, model, effort)) = prefs_to_record {
+        if let Some(update) = prefs_to_record {
             let prefs = Arc::clone(&self.prefs);
             // Same NFS rule: never park the pump on the atomic rewrite.
             tokio::task::spawn_blocking(move || {
-                if let Some(model) = model {
-                    prefs.record_model(&agent, &model);
+                if let Some(model) = update.model {
+                    prefs.record_model(&update.agent, &model);
                 }
-                if let Some(effort) = effort {
-                    prefs.record_effort(&agent, &effort);
+                if let Some(effort) = update.effort {
+                    prefs.record_effort(&update.agent, &effort);
+                }
+                if let Some(mode) = update.mode {
+                    prefs.record_mode(&update.agent, &mode);
                 }
             });
         }
@@ -890,6 +926,7 @@ mod tests {
             &mut info,
             &AgentEvent::ModeChanged {
                 mode_id: "auto-review".into(),
+                chosen: false,
             },
         );
         assert_eq!(info.current_mode.as_deref(), Some("auto-review"));

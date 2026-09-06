@@ -269,6 +269,12 @@ pub enum AgentEvent {
     },
     ModeChanged {
         mode_id: String,
+        /// The user picked this mode (a SetMode ack), as opposed to the
+        /// agent changing it on its own (claude's plan-mode exit, an applied
+        /// setMode suggestion). Only picks feed the per-agent prefs.
+        /// Additive: absent = false.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        chosen: bool,
     },
     /// Effort/ultracode truth read back from the agent (claude get_settings
     /// applied.{effort,ultracode}; codex thread open/settings read-backs).
@@ -277,6 +283,11 @@ pub enum AgentEvent {
         effort: Option<String>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         ultracode: bool,
+        /// This read-back follows the user's own SetEffort (not a spawn
+        /// bootstrap read or the agent resetting effort on a model switch).
+        /// Only picks feed the per-agent prefs. Additive: absent = false.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        chosen: bool,
     },
     TurnCompleted {
         turn_id: String,
