@@ -193,9 +193,9 @@ use crate::driver::{
 };
 use crate::model::{
     cap_output, truncate_label, AgentCommand, AgentEvent, ChunkKind, Coalescer, CompactionPhase,
-    ContentBlock, PermissionOption, PermissionOptionKind, SlashCommand, ToolContent, ToolKind,
-    ToolStatus, Usage, UserMessageState, SKILL_PATH_MAX, SLASH_COMMANDS_CAP, SLASH_DESCRIPTION_MAX,
-    SLASH_NAME_MAX,
+    ContentBlock, PermissionOption, PermissionOptionKind, RemoteControlState, SlashCommand,
+    ToolContent, ToolKind, ToolStatus, Usage, UserMessageState, SKILL_PATH_MAX, SLASH_COMMANDS_CAP,
+    SLASH_DESCRIPTION_MAX, SLASH_NAME_MAX,
 };
 use crate::ndjson::{JsonlSink, JsonlStream};
 
@@ -828,6 +828,12 @@ struct CodexMapper {
     /// trace ("harness is blocking").
     decline_notified: bool,
     pending_rpcs: HashMap<u64, PendingRpc>,
+    /// `deprecationNotice` summaries already surfaced — the app-server may
+    /// repeat one per request; the transcript says it once.
+    noticed_deprecations: HashSet<String>,
+    /// A non-`disabled` remoteControl status has been seen: from then on
+    /// every status change (including back to disabled) is journaled.
+    remote_control_seen: bool,
     /// Collab subagents by their thread id, insertion-ordered (see
     /// [`CollabAgent`]). These are process-scoped child threads: they may keep
     /// working after the parent turn completes and remain tracked until their
@@ -911,6 +917,8 @@ impl CodexMapper {
             compaction_completed: false,
             decline_notified: false,
             pending_rpcs: HashMap::new(),
+            noticed_deprecations: HashSet::new(),
+            remote_control_seen: false,
             collab_agents: Vec::new(),
             collab_cap_notified: false,
             item_locations: HashMap::new(),
@@ -934,6 +942,8 @@ impl CodexMapper {
             slash_commands: self.catalog.slash_commands.clone(),
             models: self.catalog.models.clone(),
             agent_version: self.agent_version.clone(),
+            remote_control_available: false,
+            remote_control_auto_enable: false,
         }
     }
 
@@ -1256,6 +1266,79 @@ impl CodexMapper {
             }
             "item/autoApprovalReview/completed" => {
                 self.on_auto_review(&frame["params"], true, &mut step)
+            }
+            // Codex's Remote Control lives on its app-server DAEMON, not on
+            // this per-session app-server: the status is relayed (live
+            // 0.153.0: `disabled` right after initialize), and there is no
+            // client RPC to flip it here — see AgentCommand::SetRemoteControl.
+            "remoteControl/status/changed" => {
+                let params = &frame["params"];
+                let state = match params["status"].as_str().unwrap_or_default() {
+                    "connected" => RemoteControlState::Connected,
+                    "connecting" => RemoteControlState::Connecting,
+                    "errored" => RemoteControlState::Error,
+                    _ => RemoteControlState::Off,
+                };
+                // "disabled" at connect is the steady state for every session
+                // on a daemon-less app-server: journaling it would stamp a
+                // meaningless Off on every conversation.
+                if state == RemoteControlState::Off && !self.remote_control_seen {
+                    return step;
+                }
+                self.remote_control_seen = true;
+                step.events.push(AgentEvent::RemoteControl {
+                    state,
+                    session_url: None,
+                    name: params["serverName"]
+                        .as_str()
+                        .filter(|n| !n.is_empty())
+                        .map(|n| truncate_label(n, 120)),
+                    detail: None,
+                });
+            }
+            // Host-facing warnings the app-server routes to clients
+            // (0.153.0 schema: `warning {threadId?, message}`,
+            // `configWarning {summary, details?, path?}`,
+            // `deprecationNotice {summary, details?}`). Bounded notices; a
+            // deprecation is said once per summary.
+            "warning" => {
+                if let Some(message) = frame["params"]["message"]
+                    .as_str()
+                    .filter(|m| !m.trim().is_empty())
+                {
+                    step.events.push(AgentEvent::Notice {
+                        text: format!("codex: {}", truncate_label(message.trim(), 300)),
+                    });
+                }
+            }
+            "configWarning" | "deprecationNotice" => {
+                let params = &frame["params"];
+                let summary = params["summary"].as_str().unwrap_or_default().trim();
+                if summary.is_empty() {
+                    return step;
+                }
+                if method == "deprecationNotice"
+                    && !self.noticed_deprecations.insert(summary.to_string())
+                {
+                    return step;
+                }
+                let mut text = format!(
+                    "codex {}: {}",
+                    if method == "configWarning" {
+                        "config"
+                    } else {
+                        "deprecation"
+                    },
+                    truncate_label(summary, 240)
+                );
+                if let Some(details) = params["details"].as_str().filter(|d| !d.trim().is_empty()) {
+                    text.push_str(" — ");
+                    text.push_str(&truncate_label(details.trim(), 200));
+                }
+                if let Some(path) = params["path"].as_str().filter(|p| !p.is_empty()) {
+                    text.push_str(&format!(" ({})", truncate_label(path, 120)));
+                }
+                step.events.push(AgentEvent::Notice { text });
             }
             "guardianWarning" => {
                 if let Some(message) = frame["params"]["message"].as_str() {
@@ -2095,9 +2178,93 @@ impl CodexMapper {
                     });
                 }
             }
+            // The model looked at an image (0.153.0 `imageView {id, path}`)
+            // — a Read row whose location opens the image in a pane.
+            Some("imageView") => {
+                // Emitted as a ToolCall on BOTH frames: an instant item can
+                // land as completed only, and clients upsert tool rows by id
+                // (the imageGeneration convention).
+                if !completed {
+                    if let Some(flushed) = self.coalescer.flush() {
+                        step.events.push(flushed);
+                    }
+                }
+                let path = item["path"].as_str().unwrap_or_default().to_string();
+                step.events.push(AgentEvent::ToolCall {
+                    id,
+                    kind: ToolKind::Read,
+                    title: format!("View image: {}", truncate_label(&path, 120)),
+                    locations: if path.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![path]
+                    },
+                    status: if completed {
+                        ToolStatus::Completed
+                    } else {
+                        ToolStatus::InProgress
+                    },
+                    cross_turn: false,
+                });
+            }
+            // A client-registered dynamic tool ran (0.153.0). Chimaera
+            // registers none, so this only lands via another client's turn
+            // configuration; a generic bounded row keeps it visible.
+            Some("dynamicToolCall") => {
+                let tool = item["tool"].as_str().unwrap_or("dynamic tool");
+                let title = match item["namespace"].as_str().filter(|n| !n.is_empty()) {
+                    Some(ns) => format!("{}: {}", truncate_label(ns, 40), truncate_label(tool, 80)),
+                    None => truncate_label(tool, 120),
+                };
+                let status = match (
+                    completed,
+                    item["status"].as_str(),
+                    item["success"].as_bool(),
+                ) {
+                    (_, Some("failed"), _) | (true, _, Some(false)) => ToolStatus::Failed,
+                    (true, _, _) | (_, Some("completed"), _) => ToolStatus::Completed,
+                    _ => ToolStatus::InProgress,
+                };
+                if !completed {
+                    if let Some(flushed) = self.coalescer.flush() {
+                        step.events.push(flushed);
+                    }
+                }
+                // Upsert by id on both frames (see imageView).
+                step.events.push(AgentEvent::ToolCall {
+                    id,
+                    kind: ToolKind::Other,
+                    title,
+                    locations: Vec::new(),
+                    status,
+                    cross_turn: false,
+                });
+            }
+            // A hook injected prompt text into the conversation (0.153.0
+            // `hookPrompt {fragments:[{text, hookRunId}]}`) — the model saw
+            // it, so the transcript says so, once, bounded.
+            Some("hookPrompt") if completed => {
+                let text: String = item["fragments"]
+                    .as_array()
+                    .map(|frags| {
+                        frags
+                            .iter()
+                            .filter_map(|f| f["text"].as_str())
+                            .map(str::trim)
+                            .filter(|t| !t.is_empty())
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .unwrap_or_default();
+                if !text.is_empty() {
+                    step.events.push(AgentEvent::Notice {
+                        text: format!("hook: {}", cap_output(&text).0),
+                    });
+                }
+            }
             // enteredReviewMode / exitedReviewMode / sleep / imageGeneration
-            // etc. are tolerated silently (the official client renders
-            // nothing for them either).
+            // / functionCallOutput / plan etc. are tolerated silently (the
+            // official client renders nothing for them either).
             _ => {}
         }
     }
@@ -2415,6 +2582,11 @@ impl CodexMapper {
                         true,
                     ),
                     Some("imageGeneration") => ("generating an image".to_string(), true),
+                    Some("imageView") => ("viewing an image".to_string(), true),
+                    Some("dynamicToolCall") => (
+                        truncate_label(item["tool"].as_str().unwrap_or("dynamic tool"), 80),
+                        true,
+                    ),
                     // A subagent delegating further (nested agents get no
                     // rows of their own; their work reads as this agent's).
                     Some("collabAgentToolCall") => ("delegating".to_string(), true),
@@ -2796,6 +2968,90 @@ impl CodexMapper {
             return;
         }
 
+        // The model asked for EXTRA sandbox permissions (0.153.0
+        // `item/permissions/requestApproval {permissions:{network?,
+        // fileSystem?{read[],write[]}}, reason?, cwd, itemId}`). Its answer is
+        // NOT the `{decision}` union: `{permissions: <granted profile>,
+        // scope: "turn"|"session"}` (schema-pinned). Answering with a
+        // decision fails deserialization server-side and reads as a refusal,
+        // so this arm exists to make Allow actually allow. Deny grants an
+        // empty profile for the turn.
+        if method == "item/permissions/requestApproval" {
+            let requested = &params["permissions"];
+            let mut granted = serde_json::Map::new();
+            let mut asks: Vec<String> = Vec::new();
+            if requested["network"].is_object() {
+                granted.insert("network".into(), requested["network"].clone());
+                if requested["network"]["enabled"] != json!(false) {
+                    asks.push("network access".into());
+                }
+            }
+            if requested["fileSystem"].is_object() {
+                granted.insert("fileSystem".into(), requested["fileSystem"].clone());
+                for (key, verb) in [("read", "read"), ("write", "write to")] {
+                    if let Some(paths) = requested["fileSystem"][key].as_array() {
+                        let n = paths.len();
+                        match paths.first().and_then(|p| p.as_str()) {
+                            Some(first) if n == 1 => {
+                                asks.push(format!("{verb} {}", truncate_label(first, 80)))
+                            }
+                            Some(first) => asks.push(format!(
+                                "{verb} {} (+{} more)",
+                                truncate_label(first, 60),
+                                n - 1
+                            )),
+                            None => {}
+                        }
+                    }
+                }
+            }
+            let title = if asks.is_empty() {
+                "grant extra permissions".to_string()
+            } else {
+                truncate_label(&format!("allow {}", asks.join(", ")), 120)
+            };
+            let granted = Value::Object(granted);
+            opt(
+                &mut options,
+                &mut decisions,
+                "accept",
+                "Allow for this turn".into(),
+                PermissionOptionKind::AllowOnce,
+                json!({ "permissions": granted, "scope": "turn" }),
+            );
+            opt(
+                &mut options,
+                &mut decisions,
+                "acceptForSession",
+                "Allow for this session".into(),
+                PermissionOptionKind::AllowAlways,
+                json!({ "permissions": granted, "scope": "session" }),
+            );
+            opt(
+                &mut options,
+                &mut decisions,
+                "decline",
+                "Deny".into(),
+                PermissionOptionKind::RejectOnce,
+                json!({ "permissions": {}, "scope": "turn" }),
+            );
+            self.pending_approvals
+                .insert(request_id.clone(), (rpc_id, decisions));
+            step.events.push(AgentEvent::PermissionRequest {
+                request_id,
+                tool_call_id: params["itemId"].as_str().map(String::from),
+                title,
+                options,
+                input_preview: crate::model::cap_preview(&json!({
+                    "reason": params["reason"],
+                    "cwd": params["cwd"],
+                    "permissions": requested,
+                })),
+                plan: None,
+            });
+            return;
+        }
+
         let network_host = params["networkApprovalContext"]["host"].as_str();
         let title;
         let input_preview;
@@ -3125,6 +3381,7 @@ impl CodexMapper {
             attachments,
             id: Some(client_msg_id.clone()),
             queued,
+            origin: None,
         });
         if queued {
             self.queued_sends.push_back(QueuedSend {
@@ -3199,6 +3456,7 @@ impl CodexMapper {
                             attachments: 0,
                             id: None,
                             queued: false,
+                            origin: None,
                         });
                         self.dispatch_input(json!([{ "type": "text", "text": fb }]), &mut step);
                     }
@@ -3419,6 +3677,20 @@ impl CodexMapper {
             | AgentCommand::GetMcp
             | AgentCommand::SetMcpEnabled { .. }
             | AgentCommand::ReconnectMcp { .. } => {}
+            // Codex 0.153 has Remote Control, but on its shared app-server
+            // DAEMON (`codex remote-control start` / `codex app-server daemon
+            // enable-remote-control` + `codex remote-control pair`); the
+            // per-session app-server this driver speaks to only relays
+            // status and its client protocol carries no enable RPC. Say so
+            // rather than pretend.
+            AgentCommand::SetRemoteControl { .. } => {
+                step.events.push(AgentEvent::Notice {
+                    text: "Codex Remote Control is managed by its app-server daemon — run \
+                           `codex remote-control start` (then `codex remote-control pair`) on \
+                           this host; this chat only shows its status"
+                        .into(),
+                });
+            }
         }
         step
     }
@@ -4654,6 +4926,7 @@ mod tests {
                 attachments,
                 id,
                 queued,
+                origin: _,
             } => {
                 assert_eq!(text, "see");
                 assert_eq!(*attachments, 1);
@@ -6435,6 +6708,241 @@ mod tests {
                     content: None,
                 },
             ]
+        );
+    }
+
+    // --- 0.153.0 surface: permissions profiles, remote control, warnings --
+
+    /// `item/permissions/requestApproval` is answered with the schema-pinned
+    /// `{permissions, scope}` shape — a `{decision}` reply fails server-side
+    /// deserialization and reads as a refusal.
+    #[test]
+    fn permissions_request_approval_answers_with_profile_shape() {
+        let mut m = mapper();
+        let step = m.on_frame(&json!({
+            "id": 91,
+            "method": "item/permissions/requestApproval",
+            "params": {
+                "threadId": "thr-1", "turnId": "u-1", "itemId": "perm-1",
+                "environmentId": null, "startedAtMs": 1,
+                "cwd": "/repo", "reason": "need to fetch a package",
+                "permissions": {
+                    "network": { "enabled": true },
+                    "fileSystem": { "read": null, "write": ["/repo/out", "/tmp/cache"] },
+                },
+            },
+        }));
+        let request_id = match &step.events[0] {
+            AgentEvent::PermissionRequest {
+                request_id,
+                title,
+                options,
+                tool_call_id,
+                input_preview,
+                ..
+            } => {
+                assert_eq!(title, "allow network access, write to /repo/out (+1 more)");
+                assert_eq!(tool_call_id.as_deref(), Some("perm-1"));
+                assert_eq!(
+                    options.iter().map(|o| o.id.as_str()).collect::<Vec<_>>(),
+                    ["accept", "acceptForSession", "decline"]
+                );
+                assert_eq!(input_preview["reason"], "need to fetch a package");
+                request_id.clone()
+            }
+            other => panic!("expected PermissionRequest, got {other:?}"),
+        };
+        let step = m.on_command(AgentCommand::Permission {
+            request_id: request_id.clone(),
+            option_id: "acceptForSession".into(),
+            destination: None,
+            feedback: None,
+        });
+        assert_eq!(step.outbound[0]["id"], 91);
+        assert_eq!(
+            step.outbound[0]["result"],
+            json!({
+                "permissions": {
+                    "network": { "enabled": true },
+                    "fileSystem": { "read": null, "write": ["/repo/out", "/tmp/cache"] },
+                },
+                "scope": "session",
+            })
+        );
+
+        // Deny grants nothing, for the turn.
+        let step = m.on_frame(&json!({
+            "id": 92,
+            "method": "item/permissions/requestApproval",
+            "params": {
+                "threadId": "thr-1", "turnId": "u-1", "itemId": "perm-2",
+                "startedAtMs": 1, "cwd": "/repo", "reason": null,
+                "permissions": { "network": null, "fileSystem": null },
+            },
+        }));
+        let request_id = match &step.events[0] {
+            AgentEvent::PermissionRequest {
+                request_id, title, ..
+            } => {
+                assert_eq!(title, "grant extra permissions");
+                request_id.clone()
+            }
+            other => panic!("expected PermissionRequest, got {other:?}"),
+        };
+        let step = m.on_command(AgentCommand::Permission {
+            request_id,
+            option_id: "decline".into(),
+            destination: None,
+            feedback: None,
+        });
+        assert_eq!(
+            step.outbound[0]["result"],
+            json!({ "permissions": {}, "scope": "turn" })
+        );
+    }
+
+    /// The daemon-less steady state (`disabled` right after initialize) is
+    /// not journaled; once a live state is seen, every change is.
+    #[test]
+    fn remote_control_status_relays_after_first_live_state() {
+        let mut m = mapper();
+        let status = |s: &str| {
+            json!({
+                "method": "remoteControl/status/changed",
+                "params": {
+                    "status": s, "serverName": "laptop.local",
+                    "installationId": "i-1", "environmentId": null,
+                },
+            })
+        };
+        assert!(m.on_frame(&status("disabled")).events.is_empty());
+        let step = m.on_frame(&status("connecting"));
+        assert_eq!(
+            step.events[0],
+            AgentEvent::RemoteControl {
+                state: RemoteControlState::Connecting,
+                session_url: None,
+                name: Some("laptop.local".into()),
+                detail: None,
+            }
+        );
+        let step = m.on_frame(&status("connected"));
+        assert!(matches!(
+            step.events[0],
+            AgentEvent::RemoteControl {
+                state: RemoteControlState::Connected,
+                ..
+            }
+        ));
+        let step = m.on_frame(&status("disabled"));
+        assert!(matches!(
+            step.events[0],
+            AgentEvent::RemoteControl {
+                state: RemoteControlState::Off,
+                ..
+            }
+        ));
+        // Toggling from this surface is a pointer, not a pretend.
+        let step = m.on_command(AgentCommand::SetRemoteControl {
+            enabled: true,
+            name: None,
+        });
+        assert!(step.outbound.is_empty());
+        assert!(matches!(
+            &step.events[0],
+            AgentEvent::Notice { text } if text.contains("codex remote-control start")
+        ));
+    }
+
+    #[test]
+    fn warnings_and_deprecations_become_bounded_notices_once() {
+        let mut m = mapper();
+        let step = m.on_frame(&json!({
+            "method": "warning",
+            "params": { "threadId": "thr-1", "message": "  skill catalog truncated  " },
+        }));
+        assert_eq!(
+            step.events[0],
+            AgentEvent::Notice {
+                text: "codex: skill catalog truncated".into()
+            }
+        );
+        let dep = json!({
+            "method": "deprecationNotice",
+            "params": { "summary": "thread/rollback is deprecated", "details": "use thread/revert" },
+        });
+        let step = m.on_frame(&dep);
+        assert_eq!(
+            step.events[0],
+            AgentEvent::Notice {
+                text: "codex deprecation: thread/rollback is deprecated — use thread/revert".into()
+            }
+        );
+        assert!(m.on_frame(&dep).events.is_empty(), "one notice per summary");
+        let step = m.on_frame(&json!({
+            "method": "configWarning",
+            "params": { "summary": "unknown key", "details": null, "path": "/home/u/.codex/config.toml" },
+        }));
+        assert_eq!(
+            step.events[0],
+            AgentEvent::Notice {
+                text: "codex config: unknown key (/home/u/.codex/config.toml)".into()
+            }
+        );
+    }
+
+    #[test]
+    fn image_view_and_dynamic_tool_items_become_rows() {
+        let mut m = mapper();
+        m.on_frame(&json!({ "method": "turn/started", "params": { "threadId": "thr-1", "turn": { "id": "u-1" } } }));
+        let step = m.on_frame(&json!({
+            "method": "item/completed",
+            "params": {
+                "threadId": "thr-1", "turnId": "u-1",
+                "item": { "type": "imageView", "id": "iv-1", "path": "/repo/shot.png" },
+            },
+        }));
+        assert_eq!(
+            step.events[0],
+            AgentEvent::ToolCall {
+                id: "iv-1".into(),
+                kind: ToolKind::Read,
+                title: "View image: /repo/shot.png".into(),
+                locations: vec!["/repo/shot.png".into()],
+                status: ToolStatus::Completed,
+                cross_turn: false,
+            }
+        );
+        let step = m.on_frame(&json!({
+            "method": "item/completed",
+            "params": {
+                "threadId": "thr-1", "turnId": "u-1",
+                "item": {
+                    "type": "dynamicToolCall", "id": "dt-1", "namespace": "host",
+                    "tool": "open_pane", "arguments": {}, "status": "completed",
+                    "contentItems": null, "success": false, "durationMs": 3,
+                },
+            },
+        }));
+        assert!(matches!(
+            &step.events[0],
+            AgentEvent::ToolCall { id, title, status: ToolStatus::Failed, .. }
+                if id == "dt-1" && title == "host: open_pane"
+        ));
+        let step = m.on_frame(&json!({
+            "method": "item/completed",
+            "params": {
+                "threadId": "thr-1", "turnId": "u-1",
+                "item": { "type": "hookPrompt", "id": "hp-1", "fragments": [
+                    { "text": "remember the style guide", "hookRunId": "h1" },
+                ]},
+            },
+        }));
+        assert_eq!(
+            step.events[0],
+            AgentEvent::Notice {
+                text: "hook: remember the style guide".into()
+            }
         );
     }
 }

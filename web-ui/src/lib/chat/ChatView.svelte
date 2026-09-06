@@ -966,6 +966,20 @@
         }
         return true;
       }
+      case "remote-control":
+      case "rc": {
+        // Claude's own /remote-control|/rc is a client-side toggle in every
+        // official host; here too. "on"/"off" pin the direction, bare toggles.
+        const live =
+          store.remoteControl !== null && store.remoteControl.state !== "error";
+        const enable = arg === "on" ? true : arg === "off" ? false : !live;
+        if (enable && agentKind === "claude" && !store.remoteControlAvailable) {
+          store.notice("Remote Control is not offered on this deployment", "info");
+          return true;
+        }
+        setRemoteControl(enable);
+        return true;
+      }
       case "usage":
       case "cost":
         // Answered by a usage_report event (plan-limit windows — the honest
@@ -1093,6 +1107,12 @@
       });
     }
     native.push({ name: "usage", description: "plan usage limits — chimaera panel" });
+    if (agentKind === "claude" && store.remoteControlAvailable) {
+      native.push({
+        name: "remote-control",
+        description: "take this session with you — Claude app / claude.ai/code",
+      });
+    }
     if (agentKind === "claude") {
       native.push({ name: "mcp", description: "MCP servers — chimaera panel" });
       native.push({ name: "login", description: "sign in — opens the terminal for Claude's native auth" });
@@ -1200,6 +1220,19 @@
     if (!sendCommand({ type: "set_model", model_id: id }, "model change not sent")) return false;
     menu = null;
     return true;
+  }
+
+  /** Remote Control on/off. The name registered on claude.ai is this
+   *  session's display name — what you'd look for in the app's session list. */
+  function setRemoteControl(enabled: boolean): boolean {
+    return sendCommand(
+      {
+        type: "set_remote_control",
+        enabled,
+        ...(enabled ? { name: `chimaera · ${session.name}` } : {}),
+      },
+      "remote control request not sent",
+    );
   }
 
   function pickMode(id: string): boolean {
@@ -1547,6 +1580,7 @@
     onToggleUltracode={toggleUltracode}
     onToggleThinking={toggleThinking}
     onInterrupt={interrupt}
+    onSetRemoteControl={setRemoteControl}
   />
 
   <!-- Focusable so keyboard scrolling works in WKWebView (Safari never
@@ -1636,8 +1670,15 @@
               />
             </div>
           </div>
-          {#if block.attachments > 0}
-            <span class="attach">{block.attachments} image{block.attachments > 1 ? "s" : ""}</span>
+          {#if block.attachments > 0 || block.origin === "remote"}
+            <span class="bubble-meta">
+              {#if block.origin === "remote"}
+                <span class="origin" title="sent from a Remote Control client (the Claude app or claude.ai/code)">via Remote Control</span>
+              {/if}
+              {#if block.attachments > 0}
+                <span class="attach">{block.attachments} image{block.attachments > 1 ? "s" : ""}</span>
+              {/if}
+            </span>
           {/if}
         </div>
       {:else if item.block.kind === "message"}
@@ -2120,6 +2161,23 @@
     color: var(--muted);
     font-size: var(--text-sm);
     margin-top: 2px;
+  }
+  .bubble-meta {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+  }
+  /* A message that arrived through the agent's Remote Control bridge (phone /
+     claude.ai): a quiet accent tag under the bubble — same pill language as
+     the header chip, so the two read as one feature. */
+  .origin {
+    font-family: var(--mono);
+    font-size: var(--text-xs);
+    color: var(--accent);
+    border: 1px solid color-mix(in srgb, var(--accent) 40%, var(--edge));
+    border-radius: 999px;
+    padding: 0 6px;
+    line-height: 1.5;
   }
   /* Undelivered messages occupy the transcript tail, not fixed composer
      chrome. The transcript's own scrollbar can therefore move a large queue

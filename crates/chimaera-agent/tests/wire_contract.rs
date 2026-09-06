@@ -12,7 +12,7 @@
 use chimaera_agent::journal::SeqEvent;
 use chimaera_agent::model::{
     AgentCommand, AgentEvent, CompactionPhase, PermissionOption, PermissionOptionKind, Question,
-    ToolKind, ToolStatus, UserMessageState,
+    RemoteControlState, ToolKind, ToolStatus, UserMessageState,
 };
 use serde_json::json;
 
@@ -103,6 +103,7 @@ fn user_message_delivery_fields_are_additive() {
             attachments: 0,
             id: None,
             queued: false,
+            origin: None,
         })
         .unwrap(),
         json!({ "type": "user_message", "text": "hi" })
@@ -113,6 +114,7 @@ fn user_message_delivery_fields_are_additive() {
             attachments: 0,
             id: Some("u1".into()),
             queued: true,
+            origin: None,
         })
         .unwrap(),
         json!({ "type": "user_message", "text": "hi", "id": "u1", "queued": true })
@@ -127,6 +129,7 @@ fn user_message_delivery_fields_are_additive() {
             attachments: 0,
             id: None,
             queued: false,
+            origin: None,
         }
     );
     assert_eq!(
@@ -434,6 +437,8 @@ fn init_agent_version_is_additive_on_the_wire() {
         slash_commands: vec![],
         models: vec![],
         agent_version: None,
+        remote_control_available: false,
+        remote_control_auto_enable: false,
     };
     // No version → the key is omitted (byte-identical to the pre-upgrade wire).
     assert_eq!(
@@ -454,8 +459,88 @@ fn init_agent_version_is_additive_on_the_wire() {
             slash_commands: vec![],
             models: vec![],
             agent_version: Some("2.1.206 (Claude Code)".into()),
+            remote_control_available: false,
+            remote_control_auto_enable: false,
         })
         .unwrap()["agent_version"],
         json!("2.1.206 (Claude Code)")
+    );
+}
+
+/// Remote Control rides three additive shapes: the `Init` offer flags (omitted
+/// when false, so the pre-upgrade Init is byte-identical), the level-set
+/// `remote_control` event, the `set_remote_control` command, and the
+/// `user_message.origin` marker for bridge-injected messages.
+#[test]
+fn remote_control_wire_shapes_are_additive() {
+    assert_eq!(
+        serde_json::to_value(AgentEvent::Init {
+            native_session_id: "s1".into(),
+            model: None,
+            modes: vec![],
+            current_mode: None,
+            slash_commands: vec![],
+            models: vec![],
+            agent_version: None,
+            remote_control_available: true,
+            remote_control_auto_enable: true,
+        })
+        .unwrap(),
+        json!({
+            "type": "init", "native_session_id": "s1",
+            "remote_control_available": true, "remote_control_auto_enable": true,
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(AgentEvent::RemoteControl {
+            state: RemoteControlState::Connected,
+            session_url: Some("https://claude.ai/code/session_01X".into()),
+            name: Some("chimaera dev".into()),
+            detail: None,
+        })
+        .unwrap(),
+        json!({
+            "type": "remote_control", "state": "connected",
+            "session_url": "https://claude.ai/code/session_01X", "name": "chimaera dev",
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(AgentEvent::RemoteControl {
+            state: RemoteControlState::Off,
+            session_url: None,
+            name: None,
+            detail: None,
+        })
+        .unwrap(),
+        json!({ "type": "remote_control", "state": "off" })
+    );
+    let cmd: AgentCommand =
+        serde_json::from_str(r#"{"type":"set_remote_control","enabled":true,"name":"n"}"#).unwrap();
+    assert_eq!(
+        cmd,
+        AgentCommand::SetRemoteControl {
+            enabled: true,
+            name: Some("n".into()),
+        }
+    );
+    let cmd: AgentCommand =
+        serde_json::from_str(r#"{"type":"set_remote_control","enabled":false}"#).unwrap();
+    assert_eq!(
+        cmd,
+        AgentCommand::SetRemoteControl {
+            enabled: false,
+            name: None,
+        }
+    );
+    assert_eq!(
+        serde_json::to_value(AgentEvent::UserMessage {
+            text: "from my phone".into(),
+            attachments: 0,
+            id: None,
+            queued: false,
+            origin: Some("remote".into()),
+        })
+        .unwrap(),
+        json!({ "type": "user_message", "text": "from my phone", "origin": "remote" })
     );
 }

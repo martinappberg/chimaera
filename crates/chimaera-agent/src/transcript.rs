@@ -242,6 +242,7 @@ impl Translator {
             attachments,
             id: None,
             queued: false,
+            origin: None,
         });
     }
 
@@ -492,6 +493,7 @@ mod tests {
                 attachments: 0,
                 id: None,
                 queued: false,
+                origin: None,
             }
         );
         assert!(matches!(&events[1], AgentEvent::TurnStarted { turn_id } if turn_id == "t1"));

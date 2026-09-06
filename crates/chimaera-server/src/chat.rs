@@ -726,6 +726,9 @@ pub(crate) fn chat_session_json(
         "status_detail": info.status_detail,
         "status_category": info.status_category,
         "status_needs_action": info.status_needs_action,
+        // The session's Remote Control page while its bridge is up (claude
+        // `session_url`): the rail's "take it with you" badge. Null when off.
+        "remote_control_url": info.remote_control_url,
         "mastermind": if mastermind { json!(true) } else { serde_json::Value::Null },
     })
 }
@@ -1726,6 +1729,7 @@ fn render_fork_context(events: &[AgentEvent]) -> Vec<ForkContextRow> {
                 attachments,
                 id,
                 queued: true,
+                origin: None,
             } => {
                 assistant_turn = None;
                 if let Some(id) = id {
@@ -2936,6 +2940,20 @@ pub(crate) async fn spawn_chat_session(
         // events (foreign auto-review threads are filtered in the driver).
         spec.initial_effort = initial_effort;
     }
+    // Remote Control at start (claude): the user's standing choice
+    // (`chat.remoteControlAtStart`), registered under a name that reads well
+    // in the claude.ai/code session list. The driver enables it right after
+    // the handshake — or says why not where the CLI doesn't offer the bridge.
+    // Codex's bridge lives on its app-server daemon; nothing to set here.
+    if recipe.kind == AgentKind::Claude && crate::lock(&state.settings).remote_control_at_start() {
+        let workspace = recipe
+            .workspace_root
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| "workspace".to_string());
+        spec.remote_control = Some(format!("chimaera · {workspace}"));
+    }
     // The binary version the launcher resolved alongside `recipe.bin`: the
     // harness journals it on Init and warns (non-fatally) when it drifts from
     // the driver's tested pin. `None` when the probe failed — the harness then
@@ -3154,6 +3172,7 @@ mod tests {
             status_detail: None,
             status_category: None,
             status_needs_action: false,
+            remote_control_url: None,
             background_running,
         }
     }
@@ -3168,6 +3187,7 @@ mod tests {
                     attachments: 0,
                     id: Some("u1".into()),
                     queued: false,
+                    origin: None,
                 },
             ),
             seq_event(
@@ -3251,6 +3271,7 @@ mod tests {
                     attachments: 0,
                     id: None,
                     queued: false,
+                    origin: None,
                 },
             ),
             seq_event(
@@ -3279,6 +3300,7 @@ mod tests {
                     attachments: 0,
                     id: Some("u1".into()),
                     queued: false,
+                    origin: None,
                 },
             ),
             seq_event(
@@ -3303,6 +3325,7 @@ mod tests {
                     attachments: 0,
                     id: Some("u2".into()),
                     queued: true,
+                    origin: None,
                 },
             ),
             seq_event(
@@ -3363,6 +3386,7 @@ mod tests {
                 attachments: 0,
                 id: Some("u1".into()),
                 queued: false,
+                origin: None,
             },
             AgentEvent::MessageChunk {
                 turn_id: "t1".into(),
@@ -3412,6 +3436,7 @@ mod tests {
                     attachments: 0,
                     id: Some("u1".into()),
                     queued: false,
+                    origin: None,
                 },
             ),
             seq_event(
@@ -3475,6 +3500,7 @@ mod tests {
                     attachments: 0,
                     id: Some("u2".into()),
                     queued: false,
+                    origin: None,
                 },
             ),
             seq_event(
@@ -3512,6 +3538,7 @@ mod tests {
                     attachments: 0,
                     id: Some("u2".into()),
                     queued: false,
+                    origin: None,
                 },
             ),
             seq_event(
@@ -3586,6 +3613,7 @@ mod tests {
                     attachments: 0,
                     id: Some("u2".into()),
                     queued: false,
+                    origin: None,
                 },
             ),
             seq_event(
@@ -3648,6 +3676,7 @@ mod tests {
                     attachments: 0,
                     id: None,
                     queued: false,
+                    origin: None,
                 },
             ),
             seq_line(
@@ -3677,6 +3706,7 @@ mod tests {
                     attachments: 0,
                     id: None,
                     queued: false,
+                    origin: None,
                 },
             ),
             seq_line(
@@ -3755,6 +3785,7 @@ mod tests {
                     attachments: 0,
                     id: Some("m1".into()),
                     queued: false,
+                    origin: None,
                 },
             ),
             seq_line(
@@ -3777,6 +3808,7 @@ mod tests {
                     attachments: 0,
                     id: Some("q2".into()),
                     queued: true,
+                    origin: None,
                 },
             ),
             seq_line(
@@ -3872,6 +3904,7 @@ mod tests {
                 attachments: 0,
                 id: None,
                 queued: false,
+                origin: None,
             },
             AgentEvent::TurnStarted {
                 turn_id: "turn-1".into(),
@@ -3906,6 +3939,8 @@ mod tests {
                         slash_commands: Vec::new(),
                         models: Vec::new(),
                         agent_version: None,
+                        remote_control_available: false,
+                        remote_control_auto_enable: false,
                     },
                     AgentEvent::Exited { status: Some(0) },
                 ],

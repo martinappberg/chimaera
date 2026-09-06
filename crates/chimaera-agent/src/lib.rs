@@ -35,7 +35,7 @@ use tokio::sync::{broadcast, mpsc, watch};
 
 use driver::{AgentAdapter, DriverExit, DriverIo, SpawnSpec};
 use journal::{Journal, JournalIndex, SeqEvent};
-use model::{AgentCommand, AgentEvent};
+use model::{AgentCommand, AgentEvent, ModelInfo};
 
 /// Called after every journaled event (server: derive AgentState, poke the
 /// event bus). Runs on the pump task — keep it cheap.
@@ -213,6 +213,11 @@ pub struct ChatInfo {
     /// turn starts (the user acted) so it never badges a running session.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub status_needs_action: bool,
+    /// The session's Remote Control page (claude `session_url`) while the
+    /// bridge is connecting/connected — the rail's "take it with you" badge.
+    /// `None` when off, refused, or the process is gone. Additive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_control_url: Option<String>,
     /// How many process-owned jobs are still running outside the parent turn:
     /// backgrounded Bash/workflows plus cross-turn delegated agents.
     ///
@@ -288,9 +293,20 @@ fn fold_session_metadata(info: &mut ChatInfo, ev: &AgentEvent) {
         } => {
             // Init is a complete process snapshot. Clear values that a fresh
             // driver no longer advertises instead of retaining stale state
-            // from a resumed/restarted process.
+            // from a resumed/restarted process. The Remote Control bridge is
+            // process-owned, so a new process starts with none.
             info.model = model.clone();
             info.current_mode = current_mode.clone();
+            info.remote_control_url = None;
+        }
+        AgentEvent::RemoteControl {
+            state, session_url, ..
+        } => {
+            use crate::model::RemoteControlState as Rc;
+            info.remote_control_url = match state {
+                Rc::Connecting | Rc::Connected => session_url.clone(),
+                Rc::Off | Rc::Error => None,
+            };
         }
         AgentEvent::ModelSwitched { to, .. } => {
             info.model = Some(to.clone());
@@ -338,6 +354,13 @@ pub struct ChatManager {
     index: Arc<JournalIndex>,
     on_event: EventHook,
     on_exit: ExitHook,
+    /// The newest model catalog each agent kind advertised on an `Init`
+    /// (claude `initialize.models`, codex `model/list`) — the launcher's
+    /// live source for a launch-time model list, replacing the curated
+    /// fallback once one chat has handshaked. Bounded by construction (the
+    /// drivers cap the catalog); process-lifetime only (the next chat's Init
+    /// refreshes it after a restart).
+    latest_models: Mutex<HashMap<String, Vec<ModelInfo>>>,
 }
 
 impl ChatManager {
@@ -348,7 +371,19 @@ impl ChatManager {
             journal_dir,
             on_event,
             on_exit,
+            latest_models: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// The newest model catalog an agent kind (`"claude"` / `"codex"`)
+    /// advertised on any Init this process saw; empty = none yet.
+    pub fn latest_models(&self, agent: &str) -> Vec<ModelInfo> {
+        self.latest_models
+            .lock()
+            .expect("latest_models lock")
+            .get(agent)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Spawn a structured session. The driver owns the child; the pump owns
@@ -404,6 +439,7 @@ impl ChatManager {
             status_detail: None,
             status_category: None,
             status_needs_action: false,
+            remote_control_url: None,
             background_running: 0,
         };
         let session = Arc::new(ChatSession {
@@ -506,11 +542,19 @@ impl ChatManager {
             info.background_running = background_running;
             match &ev {
                 AgentEvent::Init {
-                    native_session_id, ..
+                    native_session_id,
+                    models,
+                    ..
                 } => {
                     if !native_session_id.is_empty() {
                         info.native_session_id = Some(native_session_id.clone());
                         native_to_index = Some(native_session_id.clone());
+                    }
+                    if !models.is_empty() {
+                        self.latest_models
+                            .lock()
+                            .expect("latest_models lock")
+                            .insert(info.agent.clone(), models.clone());
                     }
                 }
                 AgentEvent::EffortState { effort, .. } => {
@@ -744,6 +788,7 @@ mod tests {
             status_detail: None,
             status_category: None,
             status_needs_action: false,
+            remote_control_url: None,
             background_running: 0,
         }
     }
@@ -761,6 +806,8 @@ mod tests {
                 slash_commands: Vec::new(),
                 models: Vec::new(),
                 agent_version: None,
+                remote_control_available: false,
+                remote_control_auto_enable: false,
             },
         );
         assert_eq!(info.model, None, "a complete Init clears stale model state");
@@ -832,6 +879,7 @@ mod tests {
             attachments: 0,
             id: Some("q1".to_string()),
             queued: true,
+            origin: None,
         });
         assert_eq!(budget.bytes, RETAINED_SEND_BYTES_MAX - 1);
         budget.observe(&AgentEvent::UserMessageUpdate {
@@ -868,6 +916,7 @@ mod tests {
             attachments: 0,
             id: None,
             queued: false,
+            origin: None,
         });
         assert_eq!(budget.bytes, 1024);
         assert_eq!(budget.unassigned.len(), 1);
@@ -877,6 +926,7 @@ mod tests {
             attachments: 0,
             id: Some("q1".to_string()),
             queued: true,
+            origin: None,
         });
         assert!(budget.unassigned.is_empty());
         assert!(budget.queued.contains_key("q1"));

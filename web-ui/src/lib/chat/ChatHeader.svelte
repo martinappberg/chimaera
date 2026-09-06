@@ -7,6 +7,8 @@
    */
   import SessionGlyph from "../shared/SessionGlyph.svelte";
   import EffortPopover from "./EffortPopover.svelte";
+  import { copyText } from "../shared/clipboard";
+  import { openInSystemBrowser } from "../shared/urlOpen";
   import type { ChatStore } from "./store.svelte";
 
   interface ModelChoice {
@@ -22,7 +24,7 @@
     agentName: string;
     /** The one-of-N open overlay; two-way so the host can open /mcp and the
      *  outside-dismiss action can close everything. */
-    menu: "model" | "mode" | "effort" | "mcp" | null;
+    menu: "model" | "mode" | "effort" | "mcp" | "remote" | null;
     modelChoices: ModelChoice[];
     modelLabel: string | null;
     modeLabel: string | null;
@@ -39,6 +41,9 @@
     onToggleUltracode: () => void;
     onToggleThinking: () => void;
     onInterrupt: () => void;
+    /** Turn the agent's Remote Control bridge on/off (claude: the
+     *  `remote_control` control; codex answers with a pointer to its daemon). */
+    onSetRemoteControl: (enabled: boolean) => void;
   }
 
   let {
@@ -62,7 +67,43 @@
     onToggleUltracode,
     onToggleThinking,
     onInterrupt,
+    onSetRemoteControl,
   }: Props = $props();
+
+  // Remote Control: the chip shows where the bridge stands; the popover
+  // carries the one action plus the session link. Offered for claude when
+  // the CLI says so; a codex row appears only once its daemon reports a
+  // live state (its bridge is not switchable from here).
+  const rc = $derived(store.remoteControl);
+  const rcShown = $derived(store.remoteControlAvailable || rc !== null);
+  const rcState = $derived<"off" | "connecting" | "connected" | "error">(rc?.state ?? "off");
+  const rcLabel = $derived(
+    rcState === "connected"
+      ? "remote on"
+      : rcState === "connecting"
+        ? "remote…"
+        : rcState === "error"
+          ? "remote ✕"
+          : "remote off",
+  );
+  const rcTitle = $derived(
+    rcState === "connected"
+      ? `Remote Control on${rc?.name ? ` — ${rc.name}` : ""}: pick this session up in the Claude app or at claude.ai/code`
+      : rcState === "connecting"
+        ? "Remote Control connecting…"
+        : rcState === "error"
+          ? `Remote Control: ${rc?.detail ?? "could not connect"}`
+          : "Remote Control off — take this session with you on your other devices",
+  );
+  let rcCopied = $state(false);
+  function copyRemoteLink() {
+    const url = rc?.sessionUrl;
+    if (!url) return;
+    void copyText(url).then(() => {
+      rcCopied = true;
+      setTimeout(() => (rcCopied = false), 1400);
+    });
+  }
 </script>
 
 {#snippet caret()}
@@ -189,6 +230,74 @@
       thinking{thinking ? " on" : " off"}
     </button>
   {/if}
+  {#if rcShown}
+    <div class="menu-host">
+      <button
+        class="chip pick rc"
+        class:on={rcState === "connected"}
+        class:busy={rcState === "connecting"}
+        class:err={rcState === "error"}
+        title={rcTitle}
+        aria-haspopup="menu"
+        aria-expanded={menu === "remote"}
+        onclick={() => (menu = menu === "remote" ? null : "remote")}
+      >
+        <span class="rc-dot" aria-hidden="true"></span>
+        {rcLabel}
+        {@render caret()}
+      </button>
+      {#if menu === "remote"}
+        <div class="overlay-surface menu rc-menu" role="menu" aria-label="remote control">
+          <div class="rc-head">
+            <span class="rc-dot big" class:on={rcState === "connected"} class:busy={rcState === "connecting"} class:err={rcState === "error"} aria-hidden="true"></span>
+            <span class="rc-title">Remote Control</span>
+            <span class="rc-state">
+              {rcState === "connected"
+                ? "connected"
+                : rcState === "connecting"
+                  ? "connecting…"
+                  : rcState === "error"
+                    ? "failed"
+                    : "off"}
+            </span>
+          </div>
+          <p class="rc-blurb">
+            {#if rcState === "error"}
+              {rc?.detail ?? "The agent could not open its bridge."}
+            {:else if rcState === "off"}
+              The session keeps running here; your phone or claude.ai/code becomes the remote.
+            {:else}
+              Pick this session up in the Claude mobile app, or open it on claude.ai/code.
+              {#if rc?.name}Registered as <b>{rc.name}</b>.{/if}
+            {/if}
+          </p>
+          {#if agentKind === "codex"}
+            <p class="rc-blurb rc-fine">
+              Codex's bridge belongs to its app-server daemon: <code>codex remote-control start</code>, then
+              <code>codex remote-control pair</code> on this host.
+            </p>
+          {:else if rcState === "connected" || rcState === "connecting"}
+            {#if rc?.sessionUrl}
+              <button class="overlay-row menu-row rc-row" role="menuitem" onclick={() => openInSystemBrowser(rc!.sessionUrl!)}>
+                Open on claude.ai/code <span class="rc-ext" aria-hidden="true">↗</span>
+              </button>
+              <button class="overlay-row menu-row rc-row" role="menuitem" onclick={copyRemoteLink}>
+                {rcCopied ? "Copied" : "Copy session link"}
+              </button>
+            {/if}
+            <button class="overlay-row menu-row rc-row rc-off" role="menuitem" onclick={() => { onSetRemoteControl(false); menu = null; }}>
+              Turn off Remote Control
+            </button>
+          {:else}
+            <button class="overlay-row menu-row rc-row rc-on" role="menuitem" onclick={() => { onSetRemoteControl(true); menu = null; }}>
+              {rcState === "error" ? "Try again" : "Turn on Remote Control"}
+            </button>
+            <p class="rc-blurb rc-fine">Opens a secure connection to claude.ai. Also <code>/remote-control</code>.</p>
+          {/if}
+        </div>
+      {/if}
+    </div>
+  {/if}
   <span class="spacer"></span>
   {#if store.running || store.compacting}
     <button class="stop" onclick={onInterrupt} title="interrupt the agent (Esc)">stop</button>
@@ -283,6 +392,111 @@
   }
   .caret {
     display: inline-flex;
+    opacity: 0.7;
+  }
+  /* Remote Control chip: the same pill as its siblings, plus a state dot —
+     muted when off, breathing while connecting, accent when live, warn on a
+     refusal. The dot carries the state at a glance; the label spells it. */
+  .chip.rc {
+    gap: 5px;
+  }
+  .chip.rc.err {
+    color: var(--warn);
+    border-color: color-mix(in srgb, var(--warn) 50%, var(--edge));
+  }
+  .rc-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: color-mix(in srgb, var(--muted) 55%, transparent);
+    flex: none;
+    transition: background-color 0.15s ease;
+  }
+  .rc-dot.big {
+    width: 8px;
+    height: 8px;
+  }
+  .chip.rc.on .rc-dot,
+  .rc-dot.on {
+    background: var(--accent);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent);
+  }
+  .chip.rc.busy .rc-dot,
+  .rc-dot.busy {
+    background: var(--accent);
+    animation: rc-breathe 1.2s ease-in-out infinite;
+  }
+  .chip.rc.err .rc-dot,
+  .rc-dot.err {
+    background: var(--warn);
+  }
+  @keyframes rc-breathe {
+    0%,
+    100% {
+      opacity: 0.35;
+    }
+    50% {
+      opacity: 1;
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .chip.rc.busy .rc-dot,
+    .rc-dot.busy {
+      animation: none;
+      opacity: 0.8;
+    }
+  }
+  .rc-menu {
+    min-width: 260px;
+    max-width: 320px;
+    padding-bottom: 4px;
+  }
+  .rc-head {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    padding: 8px 12px 4px;
+  }
+  .rc-title {
+    color: var(--fg);
+    font-weight: 600;
+  }
+  .rc-state {
+    margin-left: auto;
+    font-family: var(--mono);
+    color: var(--muted);
+  }
+  .rc-blurb {
+    margin: 0;
+    padding: 2px 12px 8px;
+    font-size: var(--text-sm);
+    line-height: 1.4;
+    color: var(--muted);
+  }
+  .rc-blurb b {
+    color: var(--fg);
+    font-weight: 500;
+  }
+  .rc-fine {
+    font-size: var(--text-xs);
+    padding-top: 0;
+  }
+  .rc-fine code {
+    font-family: var(--mono);
+    color: var(--fg);
+  }
+  .rc-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .rc-row.rc-on {
+    color: var(--accent);
+  }
+  .rc-row.rc-off {
+    color: var(--muted);
+  }
+  .rc-ext {
     opacity: 0.7;
   }
   /* Neutral loading placeholder for the model chip: a short muted bar that

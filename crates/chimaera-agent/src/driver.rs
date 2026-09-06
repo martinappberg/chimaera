@@ -98,6 +98,12 @@ pub struct SpawnSpec {
     /// PROTOCOL.md Pass 19), so a pre-allow must answer at the prompt.
     /// Claude ignores it (its pre-allows ride the settings file).
     pub mcp_auto_approve: Option<McpAutoApprove>,
+    /// Turn the agent's Remote Control bridge on right after the handshake,
+    /// registered under this display name. The embedder's standing choice (a
+    /// chimaera setting), honored only where the CLI offers the bridge
+    /// (`Init.remote_control_available`) — otherwise a Notice says why not.
+    /// `None` = leave it to the user's in-session toggle.
+    pub remote_control: Option<String>,
     /// Original creation time to stamp on the `ChatInfo` (epoch ms), for a
     /// session being RESURRECTED — so its age survives a daemon restart
     /// instead of resetting to "now". `None` on a fresh spawn (stamped at
@@ -133,6 +139,7 @@ impl SpawnSpec {
             fork_at: None,
             portable_context: None,
             mcp_auto_approve: None,
+            remote_control: None,
             created_at_ms: None,
             handshake_timeout: HANDSHAKE_TIMEOUT,
         }

@@ -957,6 +957,7 @@ mod tests {
                 attachments: 0,
                 id: None,
                 queued: false,
+                origin: None,
             },
             AgentEvent::TurnStarted {
                 turn_id: "t1".into(),
@@ -1043,6 +1044,8 @@ mod tests {
             slash_commands: Vec::new(),
             models: Vec::new(),
             agent_version: None,
+            remote_control_available: false,
+            remote_control_auto_enable: false,
         };
         let event = |seq, ev| serde_json::to_string(&SeqEvent { seq, ts: seq, ev }).unwrap();
         let content = [

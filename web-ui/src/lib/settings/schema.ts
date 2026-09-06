@@ -118,6 +118,7 @@ export type SettingsMap = {
   "agents.agy.path": string;
   "daemon.scrollbackLines": number;
   "daemon.restoreSessions": boolean;
+  "chat.remoteControlAtStart": boolean;
   "update.autoCheck": boolean;
   "keys.modifier": "auto" | "cmd" | "ctrl-shift" | "alt";
 } & Record<KeyBindingId, string>;
@@ -595,6 +596,15 @@ const DEFS = {
     step: 1000,
     scope: "daemon",
     note: "Applies to sessions started after the change.",
+  },
+  "chat.remoteControlAtStart": {
+    title: "Remote Control at Start (Claude)",
+    category: "Chat",
+    description:
+      "Turn on Claude Code's Remote Control for every new Claude chat session as soon as it starts, so you can pick it up from the Claude mobile app or claude.ai/code. Off: use the header's remote chip (or /remote-control) per session. Registers the session with claude.ai; only offered where your account and organization allow it.",
+    type: "boolean",
+    default: false,
+    scope: "daemon",
   },
   "daemon.restoreSessions": {
     title: "Restore Sessions on Restart",

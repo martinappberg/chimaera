@@ -1397,3 +1397,91 @@ describe("ChatStore live subagents set (activeAgents)", () => {
     expect(fold(events).activeAgents.map((a) => a.id)).toEqual(["a1"]);
   });
 });
+
+describe("ChatStore remote control", () => {
+  const INIT = {
+    type: "init",
+    native_session_id: "n1",
+    remote_control_available: true,
+    remote_control_auto_enable: true,
+  };
+
+  it("folds the offer flags from init and the bridge ladder latest-wins", () => {
+    const store = fold([
+      INIT,
+      { type: "remote_control", state: "connecting", name: "chimaera · repo" },
+      {
+        type: "remote_control",
+        state: "connecting",
+        session_url: "https://claude.ai/code/session_01X",
+        name: "chimaera · repo",
+      },
+      {
+        type: "remote_control",
+        state: "connected",
+        session_url: "https://claude.ai/code/session_01X",
+        name: "chimaera · repo",
+      },
+    ]);
+    expect(store.remoteControlAvailable).toBe(true);
+    expect(store.remoteControlAutoEnable).toBe(true);
+    expect(store.remoteControl).toEqual({
+      state: "connected",
+      sessionUrl: "https://claude.ai/code/session_01X",
+      name: "chimaera · repo",
+      detail: null,
+    });
+    // One quiet transcript line for the connect, carrying the link.
+    const notices = store.blocks.filter((b) => b.kind === "notice").map((b) => b.text);
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toContain("https://claude.ai/code/session_01X");
+  });
+
+  it("clears on off, on a fresh init, and on exit; errors keep the vendor's words", () => {
+    const store = fold([
+      INIT,
+      { type: "remote_control", state: "connected", session_url: "https://claude.ai/code/s" },
+      { type: "remote_control", state: "off" },
+    ]);
+    expect(store.remoteControl).toBeNull();
+
+    const errored = fold([
+      INIT,
+      {
+        type: "remote_control",
+        state: "error",
+        detail: "Remote Control is only available with claude.ai subscriptions.",
+      },
+    ]);
+    expect(errored.remoteControl?.state).toBe("error");
+    expect(errored.remoteControl?.detail).toContain("claude.ai subscriptions");
+    expect(errored.blocks.some((b) => b.kind === "notice" && b.text.includes("subscriptions"))).toBe(
+      true,
+    );
+
+    const reinit = fold([
+      INIT,
+      { type: "remote_control", state: "connected", session_url: "https://claude.ai/code/s" },
+      { type: "init", native_session_id: "n2" },
+    ]);
+    expect(reinit.remoteControl).toBeNull();
+    expect(reinit.remoteControlAvailable).toBe(false);
+
+    const exited = fold([
+      INIT,
+      { type: "remote_control", state: "connected", session_url: "https://claude.ai/code/s" },
+      { type: "exited", status: 0 },
+    ]);
+    expect(exited.remoteControl).toBeNull();
+  });
+
+  it("marks bridge-injected user messages with their origin", () => {
+    const store = fold([
+      INIT,
+      { type: "user_message", text: "from the workbench", id: "u1" },
+      { type: "user_message", text: "from my phone", origin: "remote" },
+    ]);
+    const users = store.blocks.filter((b) => b.kind === "user");
+    expect(users.map((u) => u.origin)).toEqual([null, "remote"]);
+  });
+});

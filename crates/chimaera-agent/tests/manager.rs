@@ -13,7 +13,8 @@ use chimaera_agent::claude::ClaudeAdapter;
 use chimaera_agent::driver::SpawnSpec;
 use chimaera_agent::journal::SeqEvent;
 use chimaera_agent::model::{
-    AgentCommand, AgentEvent, BackgroundTask, ContentBlock, ToolStatus, UserMessageState,
+    AgentCommand, AgentEvent, BackgroundTask, ContentBlock, RemoteControlState, ToolStatus,
+    UserMessageState,
 };
 use chimaera_agent::{ChatManager, CommandQueueFull, EventHook, ExitHook, RETAINED_SENDS_MAX};
 
@@ -1741,4 +1742,224 @@ async fn stale_attach_reports_the_clamped_replay_cursor() {
     assert!(att.head_seq < u64::MAX);
 
     assert!(fx.manager.kill("s-stale"));
+}
+
+/// Remote Control end to end through the registry: the toggle command rides
+/// the command channel, the fake's live-shaped round-trip (ready → ack →
+/// connected) journals the level-set states, a fresh attach replays them,
+/// and the disable acks Off.
+#[tokio::test]
+async fn remote_control_toggle_journals_state_and_replays() {
+    let fx = fixture();
+    fx.manager
+        .spawn(&ClaudeAdapter, spec("s-rc", &fx.cwd, "normal"))
+        .expect("spawn");
+    let att = fx.manager.attach("s-rc", 0).expect("attach");
+    let mut seen: Vec<Arc<SeqEvent>> = att.replay.clone();
+    let mut rx = att.live;
+    let init = wait_for(&mut rx, &mut seen, "Init", |ev| {
+        matches!(ev, AgentEvent::Init { .. })
+    })
+    .await;
+    match &init.ev {
+        AgentEvent::Init {
+            remote_control_available,
+            current_mode,
+            ..
+        } => {
+            assert!(remote_control_available, "the fake offers the bridge");
+            assert_eq!(
+                current_mode.as_deref(),
+                Some("default"),
+                "seeded at the handshake"
+            );
+        }
+        _ => unreachable!(),
+    }
+
+    fx.manager
+        .command(
+            "s-rc",
+            AgentCommand::SetRemoteControl {
+                enabled: true,
+                name: Some("chimaera test".into()),
+            },
+        )
+        .await
+        .expect("enable");
+    let connected = wait_for(&mut rx, &mut seen, "RemoteControl connected", |ev| {
+        matches!(
+            ev,
+            AgentEvent::RemoteControl {
+                state: RemoteControlState::Connected,
+                ..
+            }
+        )
+    })
+    .await;
+    match &connected.ev {
+        AgentEvent::RemoteControl {
+            session_url, name, ..
+        } => {
+            assert_eq!(
+                session_url.as_deref(),
+                Some("https://claude.ai/code/session_fake01")
+            );
+            assert_eq!(name.as_deref(), Some("chimaera test"));
+        }
+        _ => unreachable!(),
+    }
+    // The journal carries the whole ladder: Connecting (optimistic), Connecting
+    // + link (ack), Connected (bridge frame).
+    let states: Vec<RemoteControlState> = seen
+        .iter()
+        .filter_map(|e| match &e.ev {
+            AgentEvent::RemoteControl { state, .. } => Some(*state),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        states,
+        [
+            RemoteControlState::Connecting,
+            RemoteControlState::Connecting,
+            RemoteControlState::Connected
+        ]
+    );
+
+    // A late attach replays the same ladder — the state is journal truth.
+    let late = fx.manager.attach("s-rc", 0).expect("attach");
+    let replayed: Vec<RemoteControlState> = late
+        .replay
+        .iter()
+        .filter_map(|e| match &e.ev {
+            AgentEvent::RemoteControl { state, .. } => Some(*state),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(replayed, states);
+
+    fx.manager
+        .command(
+            "s-rc",
+            AgentCommand::SetRemoteControl {
+                enabled: false,
+                name: None,
+            },
+        )
+        .await
+        .expect("disable");
+    wait_for(&mut rx, &mut seen, "RemoteControl off", |ev| {
+        matches!(
+            ev,
+            AgentEvent::RemoteControl {
+                state: RemoteControlState::Off,
+                ..
+            }
+        )
+    })
+    .await;
+    assert!(fx.manager.kill("s-rc"));
+}
+
+/// A refused enable (the fake speaks the CLI's own "claude.ai subscriptions"
+/// sentence) lands as an Error state carrying that sentence — a chip can show
+/// it — and a kill afterwards journals no phantom Off.
+#[tokio::test]
+async fn refused_remote_control_is_an_error_state() {
+    let fx = fixture();
+    fx.manager
+        .spawn(&ClaudeAdapter, spec("s-rcx", &fx.cwd, "rc-refuse"))
+        .expect("spawn");
+    let att = fx.manager.attach("s-rcx", 0).expect("attach");
+    let mut seen: Vec<Arc<SeqEvent>> = att.replay.clone();
+    let mut rx = att.live;
+    fx.manager
+        .command(
+            "s-rcx",
+            AgentCommand::SetRemoteControl {
+                enabled: true,
+                name: None,
+            },
+        )
+        .await
+        .expect("enable");
+    let err = wait_for(&mut rx, &mut seen, "RemoteControl error", |ev| {
+        matches!(
+            ev,
+            AgentEvent::RemoteControl {
+                state: RemoteControlState::Error,
+                ..
+            }
+        )
+    })
+    .await;
+    match &err.ev {
+        AgentEvent::RemoteControl { detail, .. } => {
+            assert!(detail
+                .as_deref()
+                .is_some_and(|d| d.contains("claude.ai subscriptions")));
+        }
+        _ => unreachable!(),
+    }
+    assert!(fx.manager.kill("s-rcx"));
+    wait_for(&mut rx, &mut seen, "Exited", |ev| {
+        matches!(ev, AgentEvent::Exited { .. })
+    })
+    .await;
+    assert!(
+        !seen.iter().any(|e| matches!(
+            &e.ev,
+            AgentEvent::RemoteControl {
+                state: RemoteControlState::Off,
+                ..
+            }
+        )),
+        "nothing was live, so teardown journals no Off"
+    );
+}
+
+/// `SpawnSpec.remote_control` turns the bridge on right after the handshake
+/// (the embedder's standing choice) — and says why not where the CLI does not
+/// offer it.
+#[tokio::test]
+async fn remote_control_at_start_enables_after_the_handshake() {
+    let fx = fixture();
+    let mut s = spec("s-rca", &fx.cwd, "normal");
+    s.remote_control = Some("chimaera at-start".into());
+    fx.manager.spawn(&ClaudeAdapter, s).expect("spawn");
+    let att = fx.manager.attach("s-rca", 0).expect("attach");
+    let mut seen: Vec<Arc<SeqEvent>> = att.replay.clone();
+    let mut rx = att.live;
+    let connected = wait_for(&mut rx, &mut seen, "RemoteControl connected", |ev| {
+        matches!(
+            ev,
+            AgentEvent::RemoteControl {
+                state: RemoteControlState::Connected,
+                ..
+            }
+        )
+    })
+    .await;
+    assert!(matches!(
+        &connected.ev,
+        AgentEvent::RemoteControl { name: Some(n), .. } if n == "chimaera at-start"
+    ));
+    assert!(fx.manager.kill("s-rca"));
+
+    let fx2 = fixture();
+    let mut s = spec("s-rcu", &fx2.cwd, "rc-unavailable");
+    s.remote_control = Some("chimaera at-start".into());
+    fx2.manager.spawn(&ClaudeAdapter, s).expect("spawn");
+    let att = fx2.manager.attach("s-rcu", 0).expect("attach");
+    let mut seen: Vec<Arc<SeqEvent>> = att.replay.clone();
+    let mut rx = att.live;
+    wait_for(
+        &mut rx,
+        &mut seen,
+        "not offered notice",
+        |ev| matches!(ev, AgentEvent::Notice { text } if text.contains("not offered")),
+    )
+    .await;
+    assert!(fx2.manager.kill("s-rcu"));
 }

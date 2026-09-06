@@ -241,6 +241,10 @@ export type ChatBlock = BlockIdentity &
       /** Delivery key (the wire's client-minted uuid); null on old journals,
        *  transcript-seeded messages, and permission-feedback echoes. */
       id: string | null;
+      /** "remote" when a Remote Control client (phone / claude.ai) injected
+       *  the message through the agent's own bridge; null when this
+       *  workbench sent it. */
+      origin: string | null;
       /** Inclusive journal boundary for a portable fork through this row. */
       forkSeq: number;
     }
@@ -364,6 +368,15 @@ export interface WorkflowAgent {
   resultPreview: string | null;
 }
 
+export interface RemoteControlInfo {
+  state: "connecting" | "connected" | "error";
+  /** The session's own page on the vendor's site (claude.ai/code/…). */
+  sessionUrl: string | null;
+  name: string | null;
+  /** The vendor's words on an error (or a bridge detail). */
+  detail: string | null;
+}
+
 export interface ModeInfo {
   id: string;
   label: string;
@@ -441,6 +454,13 @@ export class ChatStore {
   /** CLI-suggested next prompt (claude prompt_suggestion) — composer ghost
    *  chip; cleared when the user sends anything. */
   promptSuggestion = $state<string | null>(null);
+  /** The agent offers Remote Control here (claude `initialize` offer flags;
+   *  codex reports false — its bridge is daemon-level). Init-scoped. */
+  remoteControlAvailable = $state(false);
+  remoteControlAutoEnable = $state(false);
+  /** The live Remote Control bridge (`remote_control` level-set, latest
+   *  wins): null = off. Process-owned — a fresh `init` or `exited` clears it. */
+  remoteControl = $state<RemoteControlInfo | null>(null);
   /** The agent's live background tasks (the `background_tasks` level-set) —
    *  the background tray. Survives turn ends (background work is cross-turn);
    *  dies with the driver process (cleared on init/exited: the tasks are the
@@ -714,6 +734,12 @@ export class ChatStore {
         this.model = typeof ev.model === "string" ? ev.model : null;
         this.currentMode = typeof ev.current_mode === "string" ? ev.current_mode : null;
         this.modes = Array.isArray(ev.modes) ? (ev.modes as ModeInfo[]) : [];
+        // Offer flags are Init-scoped (absent = false on the wire); the
+        // bridge itself is process-owned, so a new process starts without one
+        // — its own remote_control events follow if it was turned on at start.
+        this.remoteControlAvailable = ev.remote_control_available === true;
+        this.remoteControlAutoEnable = ev.remote_control_auto_enable === true;
+        this.remoteControl = null;
         this.slashCommands = Array.isArray(ev.slash_commands)
           ? (ev.slash_commands as SlashCommand[])
           : [];
@@ -733,6 +759,7 @@ export class ChatStore {
         const id = (ev.id as string) ?? null;
         const text = ev.text as string;
         const attachments = (ev.attachments as number) ?? 0;
+        const origin = typeof ev.origin === "string" ? ev.origin : null;
         if (ev.queued === true && id !== null) {
           // Queued: park it in the pending stack, NOT in the transcript at its
           // mid-turn send position (that splice would split the agent's live
@@ -748,12 +775,46 @@ export class ChatStore {
               attachments,
               checkpoint: null,
               id,
+              origin,
               forkSeq: entry.seq,
             }),
           );
           if (id !== null) this.userIndex.set(id, this.blocks.length - 1);
         }
         this.promptSuggestion = null;
+        break;
+      }
+      case "remote_control": {
+        // LEVEL-SET, latest wins. The chip is the surface; the transcript
+        // gets one quiet line per meaningful transition (connected, error) so
+        // the moment is findable later without a wall of bridge chatter.
+        const state = ev.state as string;
+        const previous = this.remoteControl;
+        if (state === "off") {
+          if (previous !== null && typeof ev.detail === "string" && ev.detail.length > 0) {
+            this.notice(`Remote Control off — ${ev.detail}`, "info");
+          }
+          this.remoteControl = null;
+          break;
+        }
+        if (state !== "connecting" && state !== "connected" && state !== "error") break;
+        const next: RemoteControlInfo = {
+          state,
+          sessionUrl: typeof ev.session_url === "string" ? ev.session_url : null,
+          name: typeof ev.name === "string" ? ev.name : null,
+          detail: typeof ev.detail === "string" ? ev.detail : null,
+        };
+        if (state === "connected" && previous?.state !== "connected") {
+          this.notice(
+            next.sessionUrl !== null
+              ? `Remote Control connected — pick this session up in the Claude app or at ${next.sessionUrl}`
+              : "Remote Control connected",
+            "info",
+          );
+        } else if (state === "error") {
+          this.notice(`Remote Control: ${next.detail ?? "could not connect"}`, "error");
+        }
+        this.remoteControl = next;
         break;
       }
       case "background_tasks": {
@@ -833,6 +894,7 @@ export class ChatStore {
               kind: "user",
               text: pending.text,
               attachments: pending.attachments,
+              origin: null,
               checkpoint: pending.checkpoint,
               id: pending.id,
               forkSeq: entry.seq,
@@ -1374,8 +1436,10 @@ export class ChatStore {
         this.reconcileOpenTools();
         this.exited = { status: (ev.status as number | null) ?? null };
         // Background tasks are the CLI's children — they died with it (the
-        // CLI SIGTERMs its tracked shells on exit).
+        // CLI SIGTERMs its tracked shells on exit). So did its Remote Control
+        // bridge (the driver journals the Off first; this covers old journals).
         this.backgroundTasks = [];
+        this.remoteControl = null;
         // The reply route for any pending ask died with the process. The
         // driver drains resolutions before Exited, so this is usually a
         // no-op — it covers old journals recorded before that fix.

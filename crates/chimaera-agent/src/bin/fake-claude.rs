@@ -72,9 +72,16 @@ fn main() {
                 "response": {
                     "subtype": "success",
                     "request_id": frame["request_id"],
-                    "response": { "commands": [
-                        { "name": "compact", "description": "Compact history" },
-                    ]},
+                    "response": {
+                        "commands": [
+                            { "name": "compact", "description": "Compact history" },
+                        ],
+                        // 2.1.259 initialize extras: the Remote Control offer
+                        // and the seeded permission mode.
+                        "remote_control_available": mode != "rc-unavailable",
+                        "remote_control_auto_enable": false,
+                        "current_permission_mode": "default",
+                    },
                 },
             }));
             // Failure-at-birth: the handshake succeeds, then the "updated"
@@ -187,6 +194,58 @@ fn main() {
                     "is_error": true, "session_id": "fake-native-1",
                     "duration_ms": 7,
                     "usage": { "input_tokens": 10, "output_tokens": 2 },
+                }));
+            }
+        } else if frame["type"] == "control_request"
+            && frame["request"]["subtype"] == "remote_control"
+        {
+            // The live 2.1.259 shape: enable → `bridge_state ready` lands
+            // BEFORE the ack, the ack carries the session link, then
+            // `bridge_state connected`; disable acks with a null response.
+            // Mode "rc-refuse" answers the CLI's own refusal sentence.
+            let request_id = frame["request_id"].clone();
+            if frame["request"]["enabled"] == json!(true) {
+                if mode == "rc-refuse" {
+                    emit(json!({
+                        "type": "control_response",
+                        "response": {
+                            "subtype": "error",
+                            "request_id": request_id,
+                            "error": "Remote Control is only available with claude.ai subscriptions. Please use `/login` to sign in with your claude.ai account.",
+                        },
+                    }));
+                    continue;
+                }
+                emit(json!({
+                    "type": "system", "subtype": "bridge_state", "state": "ready",
+                    "uuid": "bs-1", "session_id": "fake-native-1",
+                }));
+                emit(json!({
+                    "type": "control_response",
+                    "response": {
+                        "subtype": "success",
+                        "request_id": request_id,
+                        "response": {
+                            "session_url": "https://claude.ai/code/session_fake01",
+                            "connect_url": "https://claude.ai/code?environment=",
+                            "environment_id": "",
+                            "bridge_epoch": 1,
+                            "bridge_session_id": "cse_fake01",
+                        },
+                    },
+                }));
+                emit(json!({
+                    "type": "system", "subtype": "bridge_state", "state": "connected",
+                    "bridge_epoch": 1, "uuid": "bs-2", "session_id": "fake-native-1",
+                }));
+            } else {
+                emit(json!({
+                    "type": "control_response",
+                    "response": {
+                        "subtype": "success",
+                        "request_id": request_id,
+                        "response": null,
+                    },
                 }));
             }
         } else if frame["type"] == "control_request" {
