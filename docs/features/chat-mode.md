@@ -622,3 +622,17 @@ _Intent pending — not yet captured from the maintainer (shipped 2026-07-18)._
 - Known-open, not decided: the `@owner` chip is a label, not a control, though `TaskStop` accepts the
   same agent identity — wiring it would cross into the Mastermind story and was left deliberately
   untouched. Run **capture-feature-intent** with the maintainer to replace this stub.
+
+### Remote Control in chat mode — why it exists
+_Intent pending — not yet captured from the maintainer (shipped 2026-09-06, autonomous session)._
+
+- Derived context, not intent: the maintainer asked whether Claude's and Codex's newly shipped
+  Remote Control could be activated from chimaera's chat UI "or whether that is strictly forbidden
+  outside the official harness", and asked for the surface to look integrated. It turned out the
+  official SDK hosts drive it through the same `remote_control` control chimaera speaks, so it was
+  built as a first-class header chip rather than a hidden toggle. Two decisions were made without
+  the maintainer and are open: the daemon setting `chat.remoteControlAtStart` defaults **off** (the
+  official hosts follow the CLI's auto-on verdict; enabling registers the session with claude.ai,
+  which felt like the user's call), and the bridge is registered under `chimaera · <session name>`.
+  Codex's daemon-level Remote Control was deliberately left as status-only. Run
+  **capture-feature-intent** with the maintainer to replace this stub.
