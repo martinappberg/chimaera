@@ -7,7 +7,8 @@ KNOW, how we know it, and what we have not adopted yet. Re-verify with
 
 Sources:
 - **live**: probed against the real CLIs (claude 2.1.206, codex 0.142.5;
-  codex 0.144.2 from Pass 16 on).
+  codex 0.144.2 from Pass 16 on; claude 2.1.259 + codex 0.153.0 from Pass 30
+  on).
 - **official schema/docs**: Codex's upstream `codex-rs/app-server/README.md`
   and the version-specific output of `codex app-server generate-ts` /
   `generate-json-schema` (the preferred shape inventory for the installed
@@ -661,6 +662,9 @@ file list is therefore honest about exactly what will revert.
   xhigh; disabling keeps the elevated effort until reset.
 - **/effort, /ultracode, /workflows, /model, /mcp are NOT in the -p slash
   catalog** (dialog commands) — native UI interception is the only path.
+  **Superseded at 2.1.259 (Pass 30): `/model`, `/effort`, `/mcp`, `/usage`,
+  `/context`, `/fast`, `/compact` ARE in the catalog now** — the composer's
+  native interception still wins for the ones chimaera renders itself.
   The "ultracode" PROMPT KEYWORD still works in chat mode
   (workflowKeywordTriggerEnabled, default true): it opts that turn into
   the Workflow tool, whose runs render as ordinary tool cards. /workflows
@@ -1479,9 +1483,11 @@ Wire facts (live 2026-07-16):
   agents spawning"; completion: "workflow completed: …", both
   `status_category: "review_ready"`). On 2.1.211 it was NOT emitted for
   ANY probed turn — bare echo, Write-tool, background-Bash, or a full
-  Workflow launch+completion (driven live through the daemon). Treat the
-  frame as opportunistic: the mapping is additive and dormant when absent;
-  nothing may depend on it arriving.
+  Workflow launch+completion (driven live through the daemon). On 2.1.259
+  it fired again for a plain one-word echo turn (`status_category:
+  "review_ready"`, `status_detail: "starting task execution"`,
+  `needs_action: ""`). Treat the frame as opportunistic: the mapping is
+  additive and dormant when absent; nothing may depend on it arriving.
 - The vsix routes the subtype but never consumes it — no client-side
   capability gates it, so its 2.1.211 silence looks like a server/CLI-side
   gate, not a missing initialize flag.
@@ -2012,3 +2018,231 @@ migration from that Chimaera journal on a blocking worker: it ignores the
 bootstrap EffortState after every process `Init` and recovers the last later
 settings read-back. Thus an already-recorded explicit `xhigh` outranks the
 erroneous `low` that an old restart appended without blocking Tokio's reactor.
+
+## Pass 30 (2026-09-06 — live probes claude 2.1.259 + codex 0.153.0): Remote Control, the 2.1.259 initialize surface, permission profiles, the new tool family. ADOPTED.
+
+The pins had drifted 47 claude releases (2.1.212 → 2.1.259) and nine codex
+minors (0.144.2 → 0.153.0). Sources for this pass: free control-channel probes
+(claude `initialize`/`set_permission_mode`/`set_model`/`get_settings`; codex
+`initialize`/`model/list`/`thread/start`/`skills/list`/`account/read`/…), ONE
+paid claude turn (haiku, one word) to capture `system/init` and the Remote
+Control enable/disable round-trip end to end, the 0.153.0 generated schema
+(`codex app-server generate-ts`), and JS mined from the 2.1.259 binary and the
+Claude desktop bundle (both readable: the CLI's bridge code and the SDK host's
+`remote_control` request are plain JS chunks).
+
+### Claude: the 2.1.259 `initialize` response
+
+Keys: `commands` (61 here — `/model`, `/effort`, `/mcp`, `/usage`, `/context`,
+`/fast`, `/compact`, `/rename`, `/recap`, `/goal`, `/loop`, `/batch`,
+`/schedule`, `/agents`, `/ultrareview`, `/code-review`… — so the Pass 5 "not
+in the catalog" note is superseded), `models`, `agents`, `account`,
+`output_style`, `available_output_styles`, `pid`, `hooks_applied`,
+`analytics_disabled`, **`current_permission_mode`** (seeds the mode chip at
+the handshake — before this the chip waited for a `system/status`),
+`session_state` (`"idle"`), **`fast_mode_state`** (`off|cooldown|on`) +
+**`fast_mode_disabled_reason`** (`sdk_opt_in_required` here: fast mode needs
+an SDK-side opt-in whose control is unmined — NOT adopted), and the Remote
+Control offer: **`remote_control_available`** ("can be offered at all in this
+deployment: not hard-disabled by managed settings, not nested in a remote
+environment, first-party provider; absent (older CLI) → treat as available"),
+**`remote_control_auto_enable`** (the user's/org's auto-on verdict IDE hosts
+act on), `remote_control_auto_on_by_default`, `ide_rc_auto_enable_gate`.
+
+Model catalog on a Max account: `default` (→ `claude-opus-5[1m]`, "Opus 5
+with 1M context"), `opus[1m]`, `claude-fable-5-1[1m]` ("Fable 5.1"),
+`sonnet` (→ `claude-sonnet-5`), `haiku`; effort levels
+`low|medium|high|xhigh|max`; `supportsFastMode` on the Opus entries only.
+**`set_model` accepts every catalog `value` verbatim, brackets included**
+(`opus[1m]`, `claude-fable-5-1[1m]`, `fable`, `default` all acked; a bogus id
+answers `Model "…" is not a recognized model id`), and `--model 'opus[1m]'`
+spawns — so the server's argv charset guard now admits `[`/`]`.
+`set_permission_mode` accepts `acceptEdits, auto, bypassPermissions, default,
+dontAsk, plan`; `--permission-mode`'s help lists `manual`, which the control
+silently maps to `default` (`{mode:"default"}` came back) — the normalized
+catalog stays `default/acceptEdits/plan/auto/dontAsk`.
+
+### Claude: Remote Control over stream-json — WORKS, ADOPTED
+
+The official SDK hosts (VS Code, Desktop) drive Remote Control through the
+same control channel we speak. Mined request (desktop bundle + CLI, identical):
+
+```json
+{"subtype":"remote_control","enabled":true,"name":"chimaera · repo",
+ "keep_session_on_exit":false}
+```
+(`reattach_session_id` and `work_secret` are the desktop's own re-dispatch
+plumbing — not sent.) Live round-trip on 2.1.259, from a plain `-p
+--input-format stream-json` process 5 s after `initialize`:
+
+1. `system/bridge_state {state:"ready", uuid, session_id}` — BEFORE the ack;
+2. the ack: `{session_url:"https://claude.ai/code/session_01…",
+   connect_url:"https://claude.ai/code?environment=", environment_id:"",
+   bridge_epoch:1, bridge_session_id:"cse_01…"}` — plus a
+   `background_tasks_changed {tasks:[]}` re-announce at the same instant;
+3. `system/bridge_state {state:"connected", bridge_epoch:1}` 0.2 s later;
+4. `{subtype:"remote_control", enabled:false}` acks with `response: null`
+   and emits no bridge frame within 5 s.
+
+The bridge_state word is an open set (`ready`, `connected` seen; the code
+also spells `detail`). Refusals are the CLI's own sentences, worth showing
+verbatim: "Remote Control is only available with claude.ai subscriptions.
+Please use `/login`…", "…disabled by your organization's policy…", "…not
+available inside a cloud session", "…cannot be enabled from inside a remote
+session". `--sdk-url` is reserved for Anthropic's own bridge workers.
+
+Adoption: `AgentCommand::SetRemoteControl {enabled, name?}` → the request
+above; `AgentEvent::RemoteControl {state: off|connecting|connected|error,
+session_url?, name?, detail?}` (latest-wins, like SessionStatus) journals the
+optimistic Connecting, the ack (link), every `bridge_state` transition
+(unknown words become a Notice), the refusal (Error + the sentence), and the
+Off at teardown — the bridge is process-owned. `Init` carries the two offer
+flags; `SpawnSpec.remote_control = Some(name)` (the daemon's
+`chat.remoteControlAtStart` setting) enables it right after the handshake, or
+says "not offered" where the CLI doesn't. `ChatInfo.remote_control_url`
+folds the link for the rail. `keep_session_on_exit` stays false so no
+claude.ai row outlives the driver.
+
+**Bridge-injected messages (UNVERIFIED end to end).** A message typed on a
+phone enters the CLI's own queue (`onInboundMessage` → `bridgeOrigin:true`)
+and never crosses our stdin; the only wire trace can be the CLI's `user`
+frame. With `--replay-user-messages` our OWN sends echo back as `user` frames
+stamped `isReplay:true` (live) — so a text `user` frame that is not a replay,
+carries no tool_result, has no `parent_tool_use_id`, and whose uuid we never
+minted is treated as remote while (and only while) the bridge is Connected:
+`UserMessage {origin:"remote"}`. Whether the CLI emits such a frame for a
+phone-sent message (and whether a synthetic host-injected prompt would also
+match) is not yet probed — nothing was sent from a second device in this
+pass. Chimaera does NOT pass `--replay-user-messages`. Verify from a phone
+before trusting the tag.
+
+### Claude: other 2.1.259 frames (paid probe)
+
+- `system/init` gained `capabilities: ["interrupt_receipt_v1",
+  "interrupt_cancel_queued_v1", "msg_lifecycle_v1"]`, `skills`, `plugins`,
+  `terminal_slash_commands`, `messaging_socket_path`, `memory_paths`,
+  `product_feedback_disabled`, `fast_mode_*`, and (2.1.219+)
+  `mcp_server_errors [{name, type, message}]` — the `--mcp-config` entries
+  it skipped as invalid (ADOPTED as one Notice).
+- **`command_lifecycle`** (a new top-level `type`, gated by
+  `msg_lifecycle_v1`): `{command_uuid, state: queued|started|completed|
+  cancelled|discarded|refused}` — the fate of the inbound message whose uuid
+  we minted. Tolerated (top-level fallthrough); the held-queue design needs
+  no CLI-side lifecycle. `interrupt` now answers `{still_queued[],
+  cancelled[]}` (`interrupt_receipt_v1`) — ignored, same reason.
+- `system/hook_started` / `hook_response {output}` arrive WITHOUT
+  `--include-hook-events` (SessionStart hooks at least). Tolerated.
+- `system/status {status:"requesting"}` at turn start (was unprobed).
+- `system/informational {content, level: info|notice|suggestion|warning,
+  tool_use_id?, prevent_continuation?}` — the CLI's host-facing notices
+  (hook "X says:" lines, pending model switches). ADOPTED as a Notice for
+  every level but `info` (transcript-mode only in the official client).
+- `system/local_command_output {content}` — a local slash command's output
+  wrapped in `<local-command-stdout>`/`<local-command-stderr>`; the
+  official client renders it as assistant-style text. ADOPTED as a Notice
+  with the wrappers stripped.
+- `rate_limit_event` grew `unifiedWindows {five_hour, seven_day}`,
+  `overageStatus`, `overageDisabledReason`, `isUsingOverage`. Existing
+  mapping unchanged.
+- `result.usage.output_tokens_details.thinking_tokens`, `service_tier`,
+  `inference_geo` — not consumed.
+- New CLI→client control subtype `remote_control_work_secret {session_id}`
+  (only after an enable that passed `work_secret`) — never sent by us, so it
+  never fires; the generic unknown-subtype Notice covers it.
+
+### Claude: the tool family the driver now titles
+
+All present in the 2.1.259 binary: `Agent`, `Skill`, `Workflow`,
+`ToolSearch`, `MCPSearch`, `Monitor`, `Sleep`, `ScheduleWakeup`,
+`SendUserMessage`, `SendUserFile`, `SendMessage`, `ListAgents`,
+`ReportFindings`, `Artifact`, `CronCreate/Delete/List`, `EnterWorktree` /
+`ExitWorktree`, `RemoteTrigger`, `PushNotification`, `SuggestSkills`,
+`DesignSync`, `TeamCreate/TeamDelete`, `Config`, `PowerShell`, `LSP`,
+`TaskOutput/TaskStop`, `ReadMcpResourceTool/ReadMcpResourceDirTool/
+ListMcpResourcesTool`, `mcp__<server>__<tool>`. `tool_kind` routes
+PowerShell → Execute, the search/MCP-search tools → Search, the MCP resource
+readers → Read; `tool_title` composes `Skill: /name args`, `Workflow: <meta
+name>` (parsed from the script head), `SendUserFile: a (+N more)`,
+`ScheduleWakeup: in 20m 00s · reason`, `ReportFindings: N findings`,
+`SendMessage → to: text`, `tool (server)` for MCP tools; `tool_locations`
+adds `files[]` (SendUserFile) and `filePath` (LSP) so the card's open/preview
+affordance works for them. Still generic (bare name): ListAgents, ExitWorktree,
+CronList, DesignSync.
+
+### Codex 0.153.0: what the probe and schema say
+
+- `initialize` result: `{userAgent, codexHome, platformFamily, platformOs}`.
+  Immediately after: **`remoteControl/status/changed {status: disabled|
+  connecting|connected|errored, serverName (hostname), installationId,
+  environmentId}`** — Remote Control here is a property of the app-server
+  *process*; on a per-session stdio app-server it reports `disabled`, the
+  client protocol has NO enable RPC (the 0.153.0 `ClientRequest` union has no
+  `remoteControl/*`; `RemoteControlEnableParams {ephemeral?}` exists only
+  for the daemon's own control socket), and the switch is `codex
+  remote-control start` / `codex app-server daemon enable-remote-control` +
+  `codex remote-control pair`. ADOPTED as status relay only: the first
+  non-`disabled` status starts journaling `RemoteControl` events; a
+  `SetRemoteControl` on codex answers with a Notice naming those commands.
+  Full Codex Remote Control would mean attaching chimaera to the shared
+  daemon (`codex app-server proxy` / `--listen unix://`) instead of spawning
+  a per-session app-server — a lifecycle change, not taken here.
+- `model/list` (Pro): `gpt-6-astra` (default; efforts `low|medium|high|
+  xhigh|max|ultra` — ultra = "maximum reasoning with automatic task
+  delegation"; `serviceTiers [{id:"priority", name:"Fast", description:"2x
+  speed, increased usage"}]`, `additionalSpeedTiers ["fast"]`,
+  `multiAgentVersion "v2"`), `gpt-5.6-sol` ("reliable agentic workhorse"),
+  …; new `Model` fields `upgrade`, `availabilityNux`, `modelSpecialty`,
+  `inputModalities`, `supportsPersonality`. The picker passes the effort
+  ladder verbatim (so `max`/`ultra` show); the Fast service tier
+  (`thread/settings/update {serviceTier:"priority"}` / `turn/start
+  .serviceTierForTurn`) is NOT adopted yet.
+- `thread/start` result grew `runtimeWorkspaceRoots`, `instructionSources`,
+  `activePermissionProfile`, `multiAgentMode`; the thread object
+  `historyMode:"paginated"`, `canAcceptDirectInput`, `agentNickname`/
+  `agentRole`, `source:"vscode"`. `config/read` echoes `model`,
+  `model_reasoning_effort`, `service_tier`. `permissionProfile/list` →
+  `:read-only | :workspace | :danger-full-access`. `account/rateLimits/read`
+  is the richer limits read (`rateLimitsByLimitId`, `rateLimitResetCredits`).
+- **`item/permissions/requestApproval`** (server request): `{threadId,
+  turnId, itemId, environmentId, startedAtMs, cwd, reason?, permissions:
+  {network:{enabled}|null, fileSystem:{read[]|null, write[]|null}|null}}`.
+  Its response is **`{permissions: GrantedPermissionProfile, scope:
+  "turn"|"session", strictAutoReview?}`** — NOT the `{decision}` union: the
+  old generic arm's decision reply would fail server-side deserialization and
+  read as a refusal. ADOPTED: allow-for-turn / allow-for-session echo the
+  requested profile back; Deny grants `{}` for the turn. Live emission not
+  yet observed (schema-pinned shape; watch the first real one).
+- `ThreadItem` union: `agentMessage, collabAgentToolCall, commandExecution,
+  contextCompaction, dynamicToolCall, enteredReviewMode, exitedReviewMode,
+  fileChange, functionCallOutput, hookPrompt, imageGeneration, imageView,
+  mcpToolCall, plan, reasoning, sleep, subAgentActivity, userMessage,
+  webSearch`. ADOPTED: `imageView {id, path}` → a Read row whose location
+  opens the image; `dynamicToolCall {namespace?, tool, status, success}` → a
+  generic row; `hookPrompt {fragments[{text, hookRunId}]}` → a "hook: …"
+  Notice. `functionCallOutput`, `plan`, `sleep` stay silent.
+- New notifications: `warning {threadId?, message}`, `configWarning
+  {summary, details?, path?, range?}`, `deprecationNotice {summary,
+  details?}` (ADOPTED as bounded Notices; a deprecation is said once per
+  summary — none fired during the probe), `hook/started|completed {run:
+  HookRunSummary}`, `thread/queue/changed {threadId}` (a server-side queue
+  exists now — `codex queue` — chimaera keeps its client FIFO), `thread/
+  reverted` + `thread/revert {threadId, beforeTurnId}` (alongside
+  `thread/rollback`), `thread/goal/*`, `thread/environment/*`,
+  `thread/realtime/*` (voice), `process/*`, `command/exec/*`, `fs/changed`,
+  `skills/changed`, `app/list/updated`, `autoApprovalReview/
+  strictReviewRequired`, `model/verification`, `windows*` — all tolerated by
+  the existing silent fallthrough. `UserInput` gained `audio`/`localAudio`/
+  `mention` variants; `TurnStartParams` gained `turnTrigger`, `toolOutput`,
+  `serviceTierForTurn`. `InitializeCapabilities` gained `extensions`.
+- `thread/start.approvalsReviewer` etc. unchanged; `MultiAgentMode` is now
+  `{custom: string} | explicitRequestOnly | proactive` (`none` gone).
+
+### Gate
+
+Hermetic: claude mapper tests for the initialize extras, the RC ladder, the
+refusal, teardown Off, remote-origin gating, informational/local-command
+notices, `mcp_server_errors`, the tool titles; codex mapper tests for the
+permissions-profile reply shape, the status relay, warnings/deprecations,
+imageView/dynamicToolCall/hookPrompt; manager tests (`fake-claude` speaks the
+live RC round-trip) for toggle-journals-and-replays, the refusal, and
+Remote-Control-at-start; wire-contract pins for every additive shape.

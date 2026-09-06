@@ -447,8 +447,8 @@
     }
   }
   .rc-menu {
-    min-width: 260px;
-    max-width: 320px;
+    min-width: 300px;
+    max-width: 340px;
     padding-bottom: 4px;
   }
   .rc-head {
@@ -460,6 +460,7 @@
   .rc-title {
     color: var(--fg);
     font-weight: 600;
+    white-space: nowrap;
   }
   .rc-state {
     margin-left: auto;
@@ -489,6 +490,7 @@
     display: flex;
     align-items: center;
     gap: 6px;
+    white-space: nowrap;
   }
   .rc-row.rc-on {
     color: var(--accent);

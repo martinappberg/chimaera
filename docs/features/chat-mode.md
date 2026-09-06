@@ -84,7 +84,11 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
 
 - **Model / effort / mode / thinking / ultracode pickers.** Click a header chip (or `/model`,
   `/effort`, `/mode`) to switch. The agent's *live* catalog (claude `initialize.models` / codex
-  `model/list`) beats the daemon's curated list. Effort is per-model (codex falls back to the
+  `model/list`) beats the daemon's curated list — and once any chat of that agent has handshaked,
+  `GET /api/v1/agents` serves that live catalog for launch-time choices too (fallback: `fable`,
+  `opus`, `sonnet`, `haiku`; `gpt-6-astra`, `gpt-5.6-sol`). Claude's bracketed ids (`opus[1m]`,
+  `claude-fable-5-1[1m]`) are accepted everywhere a model id is. The permission-mode chip is
+  seeded at the handshake from `initialize.current_permission_mode` (2.1.259). Effort is per-model (codex falls back to the
   `minimal…xhigh` ladder; **`xhigh` is never relabeled** — canonical vocabulary is sacred).
   Codex exposes Read only / Auto / Auto review / Full access / Plan; every switch sends a complete
   settings tuple so a prior reviewer, sandbox, approval policy, or collaboration mode cannot stay
@@ -107,11 +111,29 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   an explicit choice) and is pushed to the live driver once per driver process, re-synced on each
   respawn (a fresh CLI defaults thinking off) but never re-forced, so a tab remount can't reset it and
   a toggle-off always sticks.
+- **Remote Control (claude).** The header's **remote** chip turns on Claude Code's own Remote
+  Control bridge for this session — the same `remote_control` control the official VS Code and
+  Desktop hosts use — so you can pick the conversation up in the Claude mobile app or at
+  claude.ai/code while it keeps running on the daemon's host (an HPC login node included). The
+  chip's dot reads off / connecting (breathing) / on (accent) / failed (warn); its popover carries
+  **Open on claude.ai/code**, **Copy session link**, and the on/off action, or the CLI's own
+  refusal sentence (no claude.ai subscription, org policy, nested remote session). `/remote-control`
+  and `/rc` toggle it (`on`/`off` pin a direction). The state is journaled (`remote_control`
+  events, latest-wins), so reconnects and replays agree; the bridge is process-owned — a respawn,
+  view toggle, or exit switches it off and the chip says so. The session rail shows a small
+  **remote** pill while the bridge is up. A message sent from a phone shows a **via Remote
+  Control** tag under its bubble (unverified end to end — see PROTOCOL.md Pass 30). The daemon
+  setting **Remote Control at Start (Claude)** (`chat.remoteControlAtStart`, default off) turns it
+  on for every new Claude chat as soon as it handshakes, registered as `chimaera · <workspace>`.
+  Codex's Remote Control belongs to its shared app-server daemon (`codex remote-control start`
+  / `codex remote-control pair`), not to the per-session app-server chimaera drives, so a Codex chat
+  only relays its status; the popover says how to turn it on.
 - **Live telemetry chips.** A rate-limit chip appears at ≥80% / reached; a context chip shows "42%
   ctx". Subscription usage (`/usage`, `/cost`) shows **percentages, never dollars**.
 - **Where.** `ChatHeader.svelte`, `EffortPopover.svelte`, `UsagePanel.svelte`; store fields fed by
-  `model_switched`/`effort_state`/`mode_changed`/`rate_limit`/`context_usage` events. Commands
-  `set_model`/`set_effort`/`set_mode`/`set_thinking`/`set_ultracode`/`get_usage`.
+  `model_switched`/`effort_state`/`mode_changed`/`rate_limit`/`context_usage`/`remote_control`
+  events. Commands `set_model`/`set_effort`/`set_mode`/`set_thinking`/`set_ultracode`/`get_usage`/
+  `set_remote_control`.
 
 ## The transcript
 
