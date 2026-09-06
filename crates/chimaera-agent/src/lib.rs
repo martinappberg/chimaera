@@ -373,6 +373,10 @@ pub struct ChatManager {
     /// drivers cap the catalog); process-lifetime only (the next chat's Init
     /// refreshes it after a restart).
     latest_models: Mutex<HashMap<String, Vec<ModelInfo>>>,
+    /// Last user-chosen model / effort per agent kind (see
+    /// [`journal::AgentPrefsStore`]) — what a new chat of that kind starts
+    /// with. Fed from user-initiated `ModelSwitched` and `EffortState`.
+    prefs: Arc<journal::AgentPrefsStore>,
 }
 
 impl ChatManager {
@@ -380,11 +384,18 @@ impl ChatManager {
         Self {
             sessions: Mutex::new(HashMap::new()),
             index: Arc::new(JournalIndex::load(&journal_dir)),
+            prefs: Arc::new(journal::AgentPrefsStore::load(&journal_dir)),
             journal_dir,
             on_event,
             on_exit,
             latest_models: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// The last model / effort the user chose on this agent kind (`"claude"`
+    /// / `"codex"`); defaults when none was ever chosen.
+    pub fn prefs(&self, agent: &str) -> journal::AgentPrefs {
+        self.prefs.get(agent)
     }
 
     /// The newest model catalog an agent kind (`"claude"` / `"codex"`)
@@ -549,6 +560,7 @@ impl ChatManager {
         let mut native_to_index: Option<String> = None;
         let mut effort_to_index: Option<(String, Option<String>)> = None;
         let mut catalog_to_record: Option<String> = None;
+        let mut prefs_to_record: Option<(String, Option<String>, Option<String>)> = None;
         {
             let mut info = session.info.lock().expect("info lock");
             fold_session_metadata(&mut info, &ev);
@@ -579,6 +591,19 @@ impl ChatManager {
                             effort_to_index = Some((native.clone(), effort.clone()));
                         }
                     }
+                    // The effort in effect is what the next chat of this kind
+                    // starts with (both agents' in-session efforts are
+                    // session-scoped, so chimaera remembers them).
+                    if effort.is_some() {
+                        prefs_to_record = Some((info.agent.clone(), None, effort.clone()));
+                    }
+                }
+                // A user's pick (no reason) is a preference; a safety reroute
+                // or a credits fallback (reason present) is not.
+                AgentEvent::ModelSwitched {
+                    to, reason: None, ..
+                } => {
+                    prefs_to_record = Some((info.agent.clone(), Some(to.clone()), None));
                 }
                 // "Pending permission" really means "waiting on a human
                 // decision" — structured questions block the turn exactly
@@ -631,6 +656,18 @@ impl ChatManager {
             // so a detached late write is harmless. Awaiting the JoinHandle here
             // (the old code) re-coupled the pump to that write.
             tokio::task::spawn_blocking(move || index.record(&native, &session_id));
+        }
+        if let Some((agent, model, effort)) = prefs_to_record {
+            let prefs = Arc::clone(&self.prefs);
+            // Same NFS rule: never park the pump on the atomic rewrite.
+            tokio::task::spawn_blocking(move || {
+                if let Some(model) = model {
+                    prefs.record_model(&agent, &model);
+                }
+                if let Some(effort) = effort {
+                    prefs.record_effort(&agent, &effort);
+                }
+            });
         }
         if let Some((native, effort)) = effort_to_index {
             let index = Arc::clone(&self.index);

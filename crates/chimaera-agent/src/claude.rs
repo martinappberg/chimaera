@@ -452,6 +452,16 @@ impl Driver for ClaudeDriver {
         let mut step = DriverStep::default();
         mapper.request_settings(&mut step);
         initial.push(step);
+        // The remembered effort (the daemon's per-agent prefs): applied like
+        // a header pick, session-scoped, skipped where the catalog says the
+        // model has no effort knob (haiku) — the apply would just error.
+        if let Some(effort) = spec.initial_effort.as_deref() {
+            if effort_applies(&mapper.models, spec.initial_model.as_deref()) {
+                initial.push(mapper.on_command(AgentCommand::SetEffort {
+                    effort_id: effort.to_string(),
+                }));
+            }
+        }
         // Remote Control at start — the embedder's standing choice, honored
         // only where the CLI offers the bridge. It rides the ordinary command
         // path so the ack + bridge_state frames journal the state exactly as
@@ -493,6 +503,22 @@ impl Driver for ClaudeDriver {
             }
         }
         Ok(Handshake { mapper, initial })
+    }
+}
+
+/// Whether a spawn-time effort should be applied: true when the catalog is
+/// silent (unknown model / older CLI) or the chosen model advertises effort
+/// levels; false only for a catalog entry with none (haiku).
+fn effort_applies(models: &[crate::model::ModelInfo], model: Option<&str>) -> bool {
+    let Some(model) = model else {
+        return true;
+    };
+    match models
+        .iter()
+        .find(|m| m.id == model || m.resolved.as_deref() == Some(model))
+    {
+        Some(entry) => !entry.efforts.is_empty(),
+        None => true,
     }
 }
 
@@ -7798,5 +7824,38 @@ mod tests {
             &json!({ "commands": [], "remote_control_available": false }),
         );
         assert!(!m.remote_control_available);
+    }
+}
+
+#[cfg(test)]
+mod effort_applies_tests {
+    use super::*;
+
+    #[test]
+    fn spawn_effort_skips_only_effortless_catalog_entries() {
+        let models = vec![
+            crate::model::ModelInfo {
+                id: "opus[1m]".into(),
+                label: "Opus".into(),
+                description: None,
+                resolved: Some("claude-opus-5[1m]".into()),
+                efforts: vec!["low".into(), "xhigh".into()],
+                default_effort: None,
+            },
+            crate::model::ModelInfo {
+                id: "haiku".into(),
+                label: "Haiku".into(),
+                description: None,
+                resolved: Some("claude-haiku-4-5-20251001".into()),
+                efforts: Vec::new(),
+                default_effort: None,
+            },
+        ];
+        assert!(effort_applies(&models, None));
+        assert!(effort_applies(&models, Some("opus[1m]")));
+        assert!(effort_applies(&models, Some("claude-opus-5[1m]")));
+        assert!(!effort_applies(&models, Some("haiku")));
+        assert!(effort_applies(&models, Some("something-new")));
+        assert!(effort_applies(&[], Some("haiku")));
     }
 }

@@ -71,6 +71,9 @@ pub struct SpawnSpec {
     /// every fresh thread), the driver reads Codex's own
     /// `model_reasoning_effort` config before falling back to the model
     /// default. Claude ignores this protocol-side copy.
+    /// (Claude too, since the prefs feature: applied right after the
+    /// handshake via `apply_flag_settings`, session-scoped, skipped when the
+    /// catalog says `initial_model` has no effort knob.)
     pub initial_effort: Option<String>,
     /// The binary's `--version` line as the server probed it (`None` when
     /// the probe failed). Neither wire protocol offers a reliable version

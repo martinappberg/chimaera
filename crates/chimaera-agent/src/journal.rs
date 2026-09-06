@@ -620,6 +620,103 @@ impl JournalIndex {
     }
 }
 
+/// The last model / reasoning effort a user chose on an agent kind — what a
+/// NEW chat of that kind starts with (the official TUIs remember the same
+/// pair; chimaera's in-session picks are session-scoped on both wires, so it
+/// has to remember them itself). Keyed by agent kind (`claude` / `codex`),
+/// not by conversation: that is `IndexEntry.effort`'s job.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentPrefs {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    #[serde(default)]
+    pub ts: u64,
+}
+
+/// Durable, tiny (one row per agent kind), atomically rewritten — the same
+/// discipline as [`JournalIndex`], in `prefs.json` beside it.
+#[derive(Default)]
+pub struct AgentPrefsStore {
+    path: PathBuf,
+    prefs: Mutex<std::collections::HashMap<String, AgentPrefs>>,
+    persist_lock: Mutex<()>,
+}
+
+impl AgentPrefsStore {
+    pub fn load(dir: &Path) -> Self {
+        let path = dir.join("prefs.json");
+        let prefs = fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        Self {
+            path,
+            prefs: Mutex::new(prefs),
+            persist_lock: Mutex::new(()),
+        }
+    }
+
+    pub fn get(&self, agent: &str) -> AgentPrefs {
+        self.prefs
+            .lock()
+            .expect("prefs lock")
+            .get(agent)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Remember a user-chosen model (the picker value the agent accepts).
+    /// Blocking fs — call from a blocking worker.
+    pub fn record_model(&self, agent: &str, model: &str) {
+        self.update(agent, |p| p.model = Some(model.to_string()));
+    }
+
+    /// Remember the effort in effect for the agent kind. Blocking fs.
+    pub fn record_effort(&self, agent: &str, effort: &str) {
+        self.update(agent, |p| p.effort = Some(effort.to_string()));
+    }
+
+    fn update(&self, agent: &str, apply: impl FnOnce(&mut AgentPrefs)) {
+        // Values are picker ids, bounded like every selector on the wire;
+        // the map itself is bounded by the agent-kind vocabulary.
+        if agent.is_empty() || agent.len() > 32 {
+            return;
+        }
+        let _persist = self.persist_lock.lock().expect("prefs persist lock");
+        let snapshot = {
+            let mut prefs = self.prefs.lock().expect("prefs lock");
+            // Validate on a candidate first: a refused value must leave the
+            // remembered one untouched, in memory and on disk.
+            let mut candidate = prefs.get(agent).cloned().unwrap_or_default();
+            apply(&mut candidate);
+            let valid = |v: &Option<String>| {
+                v.as_deref()
+                    .is_none_or(|s| !s.is_empty() && s.len() <= crate::model::COMMAND_SELECTOR_MAX)
+            };
+            if !valid(&candidate.model) || !valid(&candidate.effort) {
+                return;
+            }
+            candidate.ts = now_ms();
+            prefs.insert(agent.to_string(), candidate);
+            prefs.clone()
+        };
+        let write = || -> Result<()> {
+            if let Some(dir) = self.path.parent() {
+                fs::create_dir_all(dir)?;
+            }
+            let tmp = self.path.with_extension("json.tmp");
+            fs::write(&tmp, serde_json::to_vec_pretty(&snapshot)?)?;
+            fs::rename(&tmp, &self.path)?;
+            Ok(())
+        };
+        if let Err(err) = write() {
+            tracing::warn!(%err, "failed to save agent prefs");
+        }
+    }
+}
+
 /// Recover the user's last pre-index selection while ignoring each process
 /// handshake's bootstrap read-back. The latter is precisely the bad `low`
 /// event old app-server resumes appended after an `Init`; later EffortState
@@ -1115,5 +1212,33 @@ mod tests {
 
         prune_dir(dir.path(), u64::MAX, 1).unwrap();
         assert_eq!(fs::read_dir(dir.path()).unwrap().flatten().count(), 1);
+    }
+}
+
+#[cfg(test)]
+mod prefs_tests {
+    use super::*;
+
+    #[test]
+    fn agent_prefs_round_trip_and_bounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = AgentPrefsStore::load(dir.path());
+        assert_eq!(store.get("claude"), AgentPrefs::default());
+        store.record_model("claude", "opus[1m]");
+        store.record_effort("claude", "xhigh");
+        store.record_model("codex", "gpt-6-astra");
+        // Reload from disk: the file is the truth.
+        let again = AgentPrefsStore::load(dir.path());
+        let claude = again.get("claude");
+        assert_eq!(claude.model.as_deref(), Some("opus[1m]"));
+        assert_eq!(claude.effort.as_deref(), Some("xhigh"));
+        assert!(claude.ts > 0);
+        assert_eq!(again.get("codex").effort, None);
+        // An oversized value never lands (selector cap), the prior stays.
+        again.record_model(
+            "claude",
+            &"x".repeat(crate::model::COMMAND_SELECTOR_MAX + 1),
+        );
+        assert_eq!(again.get("claude").model.as_deref(), Some("opus[1m]"));
     }
 }

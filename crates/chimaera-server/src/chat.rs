@@ -2846,6 +2846,14 @@ pub(crate) async fn spawn_chat_session(
     pinned_override: Option<String>,
 ) -> anyhow::Result<ChatInfo> {
     let initial_effort = codex_initial_effort(state, &recipe).await;
+    // What the user last chose on this agent kind (the daemon's prefs): the
+    // model when the recipe names none, and the effort for a NEW conversation
+    // (a resumed Codex thread keeps its own indexed effort above). The
+    // official TUIs remember the same pair; chimaera's in-session picks are
+    // session-scoped on both wires, so it remembers them itself.
+    let prefs = state.chat.prefs(recipe.kind.as_str());
+    let model = recipe.model.clone().or(prefs.model.clone());
+    let initial_effort = initial_effort.or(prefs.effort.clone());
     // Legacy recovery can yield while a concurrent retire removes the shared
     // identity. From here through ChatManager::spawn there are no awaits, so
     // this closes that race without resurrecting an untracked billing process.
@@ -2893,7 +2901,7 @@ pub(crate) async fn spawn_chat_session(
                     &recipe.bin,
                     settings,
                     mcp,
-                    recipe.model.as_deref(),
+                    model.as_deref(),
                     recipe.resume.as_deref(),
                     pinned.as_deref(),
                     recipe.fork_at.as_deref(),
@@ -2980,8 +2988,14 @@ pub(crate) async fn spawn_chat_session(
     }
     // Codex selects its create-time model in-protocol at thread open; Claude
     // already received the same recipe value through build_chat_command.
+    // Claude reads the same pair: the model rode argv above; the effort is
+    // applied by its handshake (skipped for an effortless catalog entry).
+    if recipe.kind == AgentKind::Claude {
+        spec.initial_model = model.clone();
+        spec.initial_effort = initial_effort.clone();
+    }
     if recipe.kind == AgentKind::Codex {
-        spec.initial_model = recipe.model.clone();
+        spec.initial_model = model.clone();
         // Codex's rollout survives app-server restarts, but its selected
         // effort does not: thread/resume otherwise falls back to the model's
         // default. Prefer that conversation's value. A brand-new conversation

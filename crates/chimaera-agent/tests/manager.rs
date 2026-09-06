@@ -2023,3 +2023,65 @@ async fn remote_control_at_start_enables_after_the_handshake() {
     .await;
     assert!(fx2.manager.kill("s-rcu"));
 }
+
+/// A user's model pick is remembered per agent kind (the daemon's prefs) so
+/// the next chat of that kind starts with it; a reroute (reason present) is
+/// not a pick and must not overwrite it. The store is durable: a fresh
+/// manager on the same journal dir reads it back.
+#[tokio::test]
+async fn model_pick_is_remembered_per_agent_kind() {
+    let fx = fixture();
+    fx.manager
+        .spawn(&ClaudeAdapter, spec("s-pref", &fx.cwd, "normal"))
+        .expect("spawn");
+    let att = fx.manager.attach("s-pref", 0).expect("attach");
+    let mut seen: Vec<Arc<SeqEvent>> = att.replay.clone();
+    let mut rx = att.live;
+    assert_eq!(fx.manager.prefs("claude").model, None);
+    fx.manager
+        .command(
+            "s-pref",
+            AgentCommand::SetModel {
+                model_id: "sonnet".into(),
+            },
+        )
+        .await
+        .expect("set_model");
+    wait_for(
+        &mut rx,
+        &mut seen,
+        "ModelSwitched",
+        |ev| matches!(ev, AgentEvent::ModelSwitched { to, .. } if to == "sonnet"),
+    )
+    .await;
+    // The write is detached onto a blocking worker (memory is updated first,
+    // the atomic rename lands a moment later): poll BOTH the live store and
+    // a fresh manager on the same dir — durability across a restart is the
+    // point.
+    let dir = fx.manager.journal_dir().to_path_buf();
+    let reload = || {
+        let (exit_tx, _exits) = mpsc::unbounded_channel::<String>();
+        ChatManager::new(
+            dir.clone(),
+            Box::new(|_, _| {}),
+            Box::new(move |id, exit| {
+                let _ = exit_tx.send(format!("{id}:{exit:?}"));
+            }),
+        )
+    };
+    let deadline = std::time::Instant::now() + WAIT;
+    loop {
+        let live = fx.manager.prefs("claude").model;
+        let durable = reload().prefs("claude").model;
+        if live.as_deref() == Some("sonnet") && durable.as_deref() == Some("sonnet") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "pref never recorded: live={live:?} durable={durable:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(reload().prefs("codex").model, None);
+    assert!(fx.manager.kill("s-pref"));
+}
