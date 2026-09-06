@@ -57,9 +57,26 @@
     onNavigate: (path: string) => void;
     /** Open a file in the workbench (newSplit = Cmd/Ctrl held). */
     onOpenFile: (path: string, newSplit: boolean) => void;
+    /**
+     * The folder an OS-desktop file drag hovering this Finder would upload
+     * into (App hit-tests the `data-finder-dir` / `data-drop-dir` attributes
+     * stamped below; Pane passes the spot down). The Finder lights exactly
+     * that target — the column, or with `dropOnRow` the dir row under the
+     * pointer — and names it, so a drop is never a whole-pane mystery.
+     */
+    dropDir?: string | null;
+    /** `dropDir` is a dir ROW under the pointer (not a column): light the row
+     *  alone, never also a column that happens to show the same dir. */
+    dropOnRow?: boolean;
   }
 
-  let { path, wsRoot, onNavigate, onOpenFile }: Props = $props();
+  let { path, wsRoot, onNavigate, onOpenFile, dropDir = null, dropOnRow = false }: Props = $props();
+
+  /** "src/" for the drop label — the root reads as "/" rather than "//". */
+  function dropTargetName(dir: string): string {
+    const name = basename(dir);
+    return name === "" ? "/" : `${name}/`;
+  }
 
   interface Column {
     dir: string;
@@ -686,9 +703,15 @@
       </div>
     {/if}
     {#each columns as col, ci (col.dir)}
+      <!-- OS-drop target resolution: the column itself, or a dir row it
+           lists (then only the row rings, but this column carries the label —
+           the row is too small to hold one). -->
+      {@const colTarget = dropDir !== null && !dropOnRow && dropDir === col.dir}
+      {@const rowTargetHere = dropDir !== null && dropOnRow && parentOf(dropDir) === col.dir}
       <div
         class="col"
         class:active={ci === activeCol}
+        class:drop-target={colTarget}
         role="group"
         aria-label={col.dir}
         data-finder-dir={col.dir}
@@ -752,10 +775,15 @@
               <div class="edit-error">{editError}</div>
             {/if}
           {:else}
+            <!-- Dir rows are OS-drop targets in their own right (data-drop-dir,
+                 read by App's hit-test); file rows are not — for them the
+                 column is the target. -->
             <button
               class="row"
               class:sel={entry.path === col.selected}
               class:cut={isCutPending(entry.path)}
+              class:drop-target={dropOnRow && dropDir === entry.path}
+              data-drop-dir={entry.kind === "dir" && !entry.broken ? entry.path : undefined}
               title={entry.symlink ? `${entry.path} → ${entry.target ?? ""}${entry.broken ? " (missing)" : ""}` : entry.path}
               onclick={(e) => onRowClick(ci, entry, e)}
               oncontextmenu={(e) => contextMenu.openAt(e, menuFor(ci, entry))}
@@ -791,6 +819,12 @@
           <div class="listing-limit" role="status">
             Showing the first {col.entries.length.toLocaleString()} entries
           </div>
+        {/if}
+        {#if (colTarget || rowTargetHere) && dropDir !== null}
+          <!-- Names the destination. Appended AFTER the rows (never inserted
+               ahead of them — positional-selector churn) and sticky at the
+               column's foot, so it shows however far the column is scrolled. -->
+          <div class="drop-label" role="status">upload into <b>{dropTargetName(dropDir)}</b></div>
         {/if}
       </div>
     {/each}
@@ -994,6 +1028,50 @@
 
   .row.sel {
     background: var(--row-active);
+  }
+
+  /* OS-desktop file drag: the column under the pointer rings + washes — the
+     one lit thing says which directory receives the file. An inset ring
+     (no border) keeps the column's geometry, so nothing shifts mid-drag. */
+  .col.drop-target {
+    background: color-mix(in srgb, var(--accent) 9%, transparent);
+    box-shadow: inset 0 0 0 1.5px color-mix(in srgb, var(--accent) 65%, transparent);
+    border-radius: 6px;
+  }
+
+  /* A dir row under the pointer is the target instead: only the row rings
+     (after .sel — a selected row hovered as a target reads as a target). */
+  .row.drop-target {
+    background: color-mix(in srgb, var(--accent) 18%, transparent);
+    box-shadow: inset 0 0 0 1.5px color-mix(in srgb, var(--accent) 70%, transparent);
+  }
+
+  /* The destination, named, pinned to the column's foot. */
+  .drop-label {
+    position: sticky;
+    bottom: 4px;
+    z-index: 1;
+    width: fit-content;
+    max-width: 100%;
+    margin: 6px auto 0;
+    padding: 2px 8px;
+    font-family: var(--mono);
+    font-size: var(--text-xs);
+    letter-spacing: 0.06em;
+    color: var(--fg);
+    background: color-mix(in srgb, var(--pane-bg, var(--bg)) 90%, transparent);
+    border: 1px solid color-mix(in srgb, var(--accent) 50%, transparent);
+    border-radius: 4px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    pointer-events: none;
+    user-select: none;
+  }
+
+  .drop-label b {
+    font-weight: 600;
+    color: var(--accent);
   }
 
   .glyph {

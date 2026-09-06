@@ -341,12 +341,43 @@ body {
   text-overflow: ellipsis;
 }
 
-/* Out-of-window state: the pointer left the viewport on a detach-armed drag.
-   The ghost clamps to the edge (dnd.ts) and grows the hint chip; the accent
-   border says "releasing does something new". */
 .drag-ghost .ghost-hint {
   display: none;
 }
+
+/* In-window hint: what releasing on the hovered spot will do ("split right",
+   "@ reference in claude-1"). Quiet (--muted) for tile moves; the special
+   spots — reference, link — take the accent, like their dashed bands.
+   dnd.ts writes the text only on a logical spot change and measures the
+   ghost once then, so the per-frame edge clamp never forces layout. The
+   hint may truncate here (a long session name) — the out state below keeps
+   its own always-whole rule. */
+.drag-ghost.hinted {
+  max-width: 340px;
+}
+.drag-ghost.hinted .ghost-hint {
+  display: inline;
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin-left: 8px;
+  padding-left: 8px;
+  border-left: 1px solid var(--edge);
+  color: var(--muted);
+  font-family: var(--ui-font);
+}
+.drag-ghost.hinted.special {
+  border-color: color-mix(in srgb, var(--accent) 60%, var(--edge));
+}
+.drag-ghost.hinted.special .ghost-hint {
+  color: var(--accent);
+}
+
+/* Out-of-window state: the pointer left the viewport on a detach-armed drag.
+   The ghost clamps to the edge (dnd.ts) and grows the hint chip; the accent
+   border says "releasing does something new". Declared after .hinted so it
+   wins the shared properties. */
 .drag-ghost.out {
   border-color: var(--accent);
   /* Room for label + the whole hint; dnd's edge clamp reserves this width. */

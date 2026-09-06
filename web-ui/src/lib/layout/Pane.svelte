@@ -1,9 +1,9 @@
 <script lang="ts">
-  import { keepsPaneViewAlive, tabKey, type PaneNode, type Tab } from "./layout";
+  import { keepsPaneViewAlive, tabKey, type PaneNode, type Tab, type Zone } from "./layout";
   import { untrack, type Component } from "svelte";
   import type { Session } from "../workspace/sessions";
   import type { DropSpot, LayoutCtrl } from "./dnd";
-  import { registerPane, unregisterPane } from "./dnd";
+  import { registerPane, sideWord, unregisterPane } from "./dnd";
   import { agentHue, type LinkCtrl } from "../workspace/agentLinks";
   import { activeModLabel, keyHint } from "../shared/keybindings";
   import PaneTabs from "./PaneTabs.svelte";
@@ -75,8 +75,25 @@
    *  partition against). */
   const uploadPane = $derived(dropSpot?.kind === "upload" && dropSpot.paneId === node.id);
   /** An OS-desktop file drag hovering a Finder pane: upload INTO the folder
-   *  under the pointer (the whole Finder pane washes; `dir` names the target). */
+   *  under the pointer. The pane only frames itself — the Finder lights the
+   *  exact column or dir row `dir` names (see FinderView's dropDir). */
   const uploadDir = $derived(dropSpot?.kind === "uploadDir" && dropSpot.paneId === node.id ? dropSpot.dir : null);
+  const uploadRow = $derived(
+    dropSpot?.kind === "uploadDir" && dropSpot.paneId === node.id && dropSpot.row === true,
+  );
+  /** The live session this pane shows, named as its tab is — so a drop band
+   *  says WHICH session it targets ("@ reference in claude-1"), not just
+   *  "this session"; two session panes side by side must read differently. */
+  const activeSessionName = $derived.by(() => {
+    if (activeTab === null || activeTab.surface !== "terminal") return null;
+    const id = activeTab.sessionId;
+    return names.get(id) ?? sessions.get(id)?.name ?? id.slice(0, 8);
+  });
+  /** Zone-preview words: the split direction as the pane-bar buttons say it;
+   *  the center adopts the payload as a tab. */
+  function zoneLabel(z: Zone): string {
+    return z === "center" ? "add as tab" : `split ${sideWord(z)}`;
+  }
   /** This pane's bottom band is reserved for the current drag: the center
    *  (adopt) preview stops above it instead of flashing the full pane. */
   const bandArmed = $derived(bandPanes.has(node.id));
@@ -352,6 +369,8 @@
       <FinderView
         path={tab.path}
         {wsRoot}
+        dropDir={active ? uploadDir : null}
+        dropOnRow={active && uploadRow}
         onOpenFile={(p: string, split: boolean) => ctrl.openFileFrom(node.id, p, split)}
         onNavigate={(p: string) => ctrl.navigateFinder(tab.id, p)}
       />
@@ -507,19 +526,23 @@
   </div>
 
   {#if zone !== null}
-    <div class="drop drop-{zone}" class:banded={bandArmed}></div>
+    <!-- A zone preview always says what it is: the rectangle alone can't tell
+         "split right" from "add as tab" at a glance. -->
+    <div class="drop drop-{zone}" class:banded={bandArmed}>
+      <span class="band-label">{zoneLabel(zone)}</span>
+    </div>
   {:else if linkBand}
     <!-- Distinct from the split/adopt zones: a labeled, dashed band over the
          agent's input area. Dropping links the terminal and types its
          @term: reference into the composer (never submits). -->
     <div class="drop-link" class:hued={ownAgentHue !== null} style:--band-hue={ownAgentHue}>
-      <span class="band-label">link to this agent</span>
+      <span class="band-label">link to {activeSessionName ?? "this agent"}</span>
     </div>
   {:else if linkPane}
     <!-- Link-intent drag: the whole agent view is one target (no aiming for a
          band). Full-pane wash in the agent's hue, centered label. -->
     <div class="drop-linkpane" class:hued={ownAgentHue !== null} style:--band-hue={ownAgentHue}>
-      <span class="band-label">link to this agent</span>
+      <span class="band-label">link to {activeSessionName ?? "this agent"}</span>
     </div>
   {/if}
 
@@ -527,7 +550,9 @@
     <!-- Drag-to-reference: types the path into this session's input, never
          opens a tab, never submits. Visibly distinct from the adopt zone. -->
     <div class="drop-ref">
-      <span class="drop-ref-label"><span class="drop-ref-at">@</span> reference</span>
+      <span class="drop-ref-label"
+        ><span class="drop-ref-at">@</span> reference in {activeSessionName ?? "this session"}</span
+      >
     </div>
   {/if}
 
@@ -536,15 +561,15 @@
          path — same "@ reference" grammar, whole pane as the target. -->
     <div class="drop-upload">
       <span class="drop-ref-label"
-        ><span class="drop-ref-at">@</span> drop to upload &amp; reference</span
+        ><span class="drop-ref-at">@</span> upload &amp; reference in {activeSessionName ??
+          "this session"}</span
       >
     </div>
   {:else if uploadDir !== null}
-    <!-- OS-desktop drop onto a Finder pane: upload INTO the folder under the
-         pointer (no @-reference — this is a file-manager drop). -->
-    <div class="drop-upload">
-      <span class="drop-ref-label">drop to upload here</span>
-    </div>
+    <!-- OS-desktop drop onto a Finder pane: a quiet frame says this pane is
+         receiving; the Finder's own column/row highlight says WHERE (a
+         whole-pane wash hid exactly that). -->
+    <div class="drop-frame"></div>
   {/if}
 </section>
 {#if agentExec}
@@ -716,11 +741,16 @@
     border-color: color-mix(in srgb, var(--accent) 60%, var(--edge));
   }
 
-  /* Translucent drop-zone preview showing exactly where the drop lands. */
+  /* Translucent drop-zone preview showing exactly where the drop lands, with
+     its action named in the middle (the same band-label chip the ref/link
+     bands use — one grammar for every preview). */
   .drop {
     position: absolute;
     z-index: 6;
     margin: 3px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
     background: color-mix(in srgb, var(--accent) 14%, transparent);
     border: 1px solid color-mix(in srgb, var(--accent) 42%, transparent);
     border-radius: 7px;
@@ -821,6 +851,19 @@
   .drop-linkpane.hued {
     background: hsl(var(--band-hue) 55% 55% / 0.14);
     border-color: hsl(var(--band-hue) 55% 55% / 0.6);
+  }
+
+  /* OS-desktop file drop onto a Finder pane: only a dashed frame at the pane
+     edge — no wash, no label — because the Finder column/row under the
+     pointer is what says where the file lands, and a wash would cover it. */
+  .drop-frame {
+    position: absolute;
+    z-index: 7;
+    inset: 0;
+    margin: 3px;
+    border: 1.5px dashed color-mix(in srgb, var(--accent) 45%, transparent);
+    border-radius: 8px;
+    pointer-events: none;
   }
 
   /* OS-desktop file drop: the whole pane is the upload-and-reference target
