@@ -276,3 +276,15 @@ _Captured 2026-07-12 (from the maintainer)._
   workflow, but an **addition**, not a frozen contract.
 - **Do not change (or: open to change):** *"keep a smooth UX for the user"* — the keying mechanics
   are open to improve; only the workspace-first framing (above) is the core bet.
+
+### Fit-width tab strips — why they exist
+_Intent pending — drafted from the maintainer's request, 2026-09-06; questionnaire not yet run._
+
+- **Problem it solves (from the request).** "When you have a lot of tabs open in a pane, they
+  can sometimes switch sizes and it is really hard to see which tab is which, what they are
+  named or how they jump around." Tabs used to shrink toward zero and re-flow on every
+  open/close/activate; now they keep their natural width, the strip scrolls, and an overflow
+  list names every tab.
+- **Pending.** The fit sizing (vs a shrink-then-scroll hybrid), the 180px cap, the overflow
+  count, and the quiet active underline have not been confirmed with the maintainer — capture
+  via **capture-feature-intent** when available.

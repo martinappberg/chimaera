@@ -163,3 +163,15 @@ _Captured 2026-07-11 (from the maintainer, confirming a draft read from code + t
   windows land files on the remote host) and the **never-in-RAM** streaming (the daemon lives on
   shared login nodes). Everything else here — caps, limits, the folder follow-up — is an improvable
   addition.
+
+### Named drop destinations — why they exist
+_Intent pending — drafted from the maintainer's request, 2026-09-06; questionnaire not yet run._
+
+- **Problem it solves (from the request).** "When dropping in files you don't really see where in
+  the file manager you are dropping your files. Make sure that all draggable actions are clear
+  about where you should drag them so the UI is intuitive." Every drop target now lights the
+  exact thing that receives the drop (a Finder column or dir row, a tree folder row, a session
+  pane) and names it; pointer-drag ghosts say what releasing will do.
+- **Pending.** The label vocabulary ("split right", "add as tab", "@ reference in ⟨session⟩",
+  "link to ⟨agent⟩", "upload into ⟨dir⟩/") and the Finder row-beats-column rule have not been
+  confirmed with the maintainer — capture via **capture-feature-intent** when available.

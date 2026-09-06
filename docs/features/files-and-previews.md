@@ -373,3 +373,14 @@ _Intent pending — drafted from the maintainer's request, 2026-08-27; questionn
 - **Pending.** The mode names (`live`/`reading`/`source`), the default-to-live choice, and
   which constructs the live view renders vs leaves as source have not been confirmed with
   the maintainer — capture via **capture-feature-intent** when available.
+
+### Finding your place in a deep tree — why it exists
+_Intent pending — drafted from the maintainer's request, 2026-09-06; questionnaire not yet run._
+
+- **Problem it solves (from the request).** "If you have a lot of directories it can be hard
+  when they retract etc. — needs just a slight UI polish." Indent guides, sticky ancestor rows,
+  collapse anchoring, and collapse-all answer "which folder am I in" and stop a collapse from
+  throwing the viewport onto unrelated content.
+- **Pending.** The three-level sticky cap, the hover-lit parent guide, and the collapse-all
+  placement beside the filter have not been confirmed with the maintainer — capture via
+  **capture-feature-intent** when available.
