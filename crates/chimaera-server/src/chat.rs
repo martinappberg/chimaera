@@ -63,7 +63,12 @@ pub(crate) struct ChatRecipe {
     /// Rewind rollback count: respawn resumes the thread and drops this many
     /// trailing turns via `thread/rollback` (codex only — its thread id
     /// survives, so the conversation truncates in place instead of forking).
+    /// The fallback for app-servers without `thread/revert`.
     pub(crate) rollback_turns: Option<u32>,
+    /// Rewind cut for `thread/revert {beforeTurnId}` (codex 0.153+): the
+    /// native id of the first dropped turn. Preferred over the count —
+    /// paginated threads refuse the deprecated rollback.
+    pub(crate) revert_before_turn: Option<String>,
     pub(crate) theme: String,
     /// Launch-scope prelude text (see `environment`). Carried on the recipe
     /// so a view-switch/rewind/degrade respawn keeps the launch scope; not
@@ -903,7 +908,16 @@ async fn resolve_respawn_inputs(
     Ok((settings, mcp_config, bin, detection.version))
 }
 
-type ForkCut = (usize, u32, Option<(usize, String)>);
+/// What a rewind drops: `TurnStarted` count at/after the cut (codex's legacy
+/// `thread/rollback numTurns`) and the FIRST dropped turn's native id (codex's
+/// `thread/revert beforeTurnId` — the modern path).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DroppedTurns {
+    pub(crate) count: u32,
+    pub(crate) first_turn_id: Option<String>,
+}
+
+type ForkCut = (usize, DroppedTurns, Option<(usize, String)>);
 
 /// Locate the rewind cut for `resume_at` in a journal's content: the line
 /// index where dropped history starts, plus the number of turns
@@ -966,14 +980,19 @@ fn find_fork_cut(content: &str, resume_at: &str) -> Option<ForkCut> {
     // them, and compaction turns alike). Turns run outside this journal
     // (e.g. TUI-interleaved via the view toggle) are invisible here — the
     // rollback count is only as complete as the journal.
-    let turns = lines[cut..]
+    let dropped_ids: Vec<String> = lines[cut..]
         .iter()
-        .filter(|line| {
-            serde_json::from_str::<SeqEvent>(line)
-                .map(|e| matches!(e.ev, AgentEvent::TurnStarted { .. }))
-                .unwrap_or(false)
-        })
-        .count() as u32;
+        .filter_map(
+            |line| match serde_json::from_str::<SeqEvent>(line).ok()?.ev {
+                AgentEvent::TurnStarted { turn_id } => Some(turn_id),
+                _ => None,
+            },
+        )
+        .collect();
+    let turns = DroppedTurns {
+        count: dropped_ids.len() as u32,
+        first_turn_id: dropped_ids.into_iter().next(),
+    };
     Some((cut, turns, neutralize))
 }
 
@@ -994,7 +1013,7 @@ fn find_fork_cut(content: &str, resume_at: &str) -> Option<ForkCut> {
 fn truncate_journal_at_fork(
     path: &std::path::Path,
     resume_at: &str,
-) -> std::io::Result<Option<u32>> {
+) -> std::io::Result<Option<DroppedTurns>> {
     let content = std::fs::read_to_string(path)?;
     let Some((cut, turns, neutralize)) = find_fork_cut(&content, resume_at) else {
         return Ok(None);
@@ -1263,6 +1282,7 @@ async fn perform_switch(
         resume,
         fork_at: None,
         rollback_turns: None,
+        revert_before_turn: None,
         theme,
         prelude: launch_prelude,
         mastermind,
@@ -1566,7 +1586,7 @@ pub(crate) async fn rewind_session(
                 .await
             {
                 Ok(Ok(Some(turns))) => {
-                    tracing::info!(%id, turns, "truncated chat journal at rewind fork point");
+                    tracing::info!(%id, turns = turns.count, first = ?turns.first_turn_id, "truncated chat journal at rewind fork point");
                     Some(turns)
                 }
                 // No anchor match: the file is left whole (no history lost). The
@@ -1637,7 +1657,16 @@ pub(crate) async fn rewind_session(
             model: None,
             resume: Some(native),
             fork_at: (!is_codex).then(|| body.resume_at.clone()),
-            rollback_turns: if is_codex { dropped_turns } else { None },
+            rollback_turns: if is_codex {
+                dropped_turns.as_ref().map(|d| d.count)
+            } else {
+                None
+            },
+            revert_before_turn: if is_codex {
+                dropped_turns.as_ref().and_then(|d| d.first_turn_id.clone())
+            } else {
+                None
+            },
             theme,
             prelude: launch_prelude,
             portable_context,
@@ -2718,6 +2747,7 @@ pub(crate) async fn spawn_fresh_chat(
         resume: native_fork.as_ref().map(|(source, _)| source.clone()),
         fork_at: native_fork.as_ref().map(|(_, at)| at.clone()),
         rollback_turns: None,
+        revert_before_turn: None,
         theme: spec.theme,
         prelude: spec.prelude.filter(|p| !p.trim().is_empty()),
         mastermind,
@@ -2962,6 +2992,7 @@ pub(crate) async fn spawn_chat_session(
     // Conversation rewind (codex): the driver rolls the resumed thread back
     // right after thread/resume. Claude's driver ignores it (fork rides argv).
     spec.rollback_turns = recipe.rollback_turns;
+    spec.revert_before_turn = recipe.revert_before_turn.clone();
     // Same-agent native branch: Claude already receives this through argv;
     // Codex consumes it during the handshake as thread/fork lastTurnId.
     spec.fork_at = recipe.fork_at.clone();
@@ -3115,6 +3146,7 @@ pub(crate) async fn resurrect_chat(
         resume,
         fork_at: None,
         rollback_turns: None,
+        revert_before_turn: None,
         theme: entry.theme.clone(),
         // The ledger doesn't persist launch text: a resurrected session
         // re-runs the durable scopes (host ⊕ workspace) only.
@@ -3745,7 +3777,13 @@ mod tests {
         // message's id ("m1"), whose Checkpoint (seq 6) has preceding_uuid
         // "m1". The second UserMessage (seq 5) onward is dropped — two turns
         // (t2 and t3) started in the dropped region.
-        assert_eq!(truncate_journal_at_fork(&path, "m1").unwrap(), Some(2));
+        assert_eq!(
+            truncate_journal_at_fork(&path, "m1").unwrap(),
+            Some(DroppedTurns {
+                count: 2,
+                first_turn_id: Some("t2".into()),
+            })
+        );
         let kept: Vec<u64> = std::fs::read_to_string(&path)
             .unwrap()
             .lines()
@@ -3848,7 +3886,12 @@ mod tests {
         ];
         std::fs::write(&path, lines.join("\n") + "\n").unwrap();
 
-        assert_eq!(truncate_journal_at_fork(&path, "m1").unwrap(), Some(1));
+        assert_eq!(
+            truncate_journal_at_fork(&path, "m1")
+                .unwrap()
+                .map(|d| d.count),
+            Some(1)
+        );
         let kept: Vec<SeqEvent> = std::fs::read_to_string(&path)
             .unwrap()
             .lines()
@@ -3959,6 +4002,7 @@ mod tests {
             resume: Some(native_id.into()),
             fork_at: None,
             rollback_turns: None,
+            revert_before_turn: None,
             theme: "dark".into(),
             prelude: None,
             mastermind: None,

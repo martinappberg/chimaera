@@ -2236,6 +2236,22 @@ CronList, DesignSync.
   `serviceTierForTurn`. `InitializeCapabilities` gained `extensions`.
 - `thread/start.approvalsReviewer` etc. unchanged; `MultiAgentMode` is now
   `{custom: string} | explicitRequestOnly | proactive` (`none` gone).
+- **Rewind: `thread/rollback` is DEPRECATED and REFUSED on 0.153's default
+  threads** (`historyMode: "paginated"`): `{"code":-32600,"message":
+  "paginated threads do not support thread/rollback"}` — caught by the live
+  suite, which means chimaera's Codex rewind (resume + rollback-by-count at
+  the handshake, Pass 10) was silently broken on 0.153. The replacement is
+  **`thread/revert {threadId, beforeTurnId}`** — "replace a paginated
+  thread's durable history with the prefix before one turn; that turn and
+  every later turn are excluded" (schema; the response's `thread.turns` is
+  always empty, with `turnsBackwardsCursor`/`itemsBackwardsCursor` for
+  `thread/turns|items/list`; a `thread/reverted {threadId}` notification
+  follows). ADOPTED: the server's rewind scan now also records the FIRST
+  dropped turn's native id (`DroppedTurns.first_turn_id` →
+  `SpawnSpec.revert_before_turn`); the handshake sends `thread/revert` with
+  it and falls back to `thread/rollback numTurns` only when the error says
+  the method is unknown (a pre-revert binary). The live case now pins
+  revert on a fresh thread and again after `thread/resume`.
 
 ### Gate
 
@@ -2245,4 +2261,17 @@ notices, `mcp_server_errors`, the tool titles; codex mapper tests for the
 permissions-profile reply shape, the status relay, warnings/deprecations,
 imageView/dynamicToolCall/hookPrompt; manager tests (`fake-claude` speaks the
 live RC round-trip) for toggle-journals-and-replays, the refusal, and
-Remote-Control-at-start; wire-contract pins for every additive shape.
+Remote-Control-at-start; wire-contract pins for every additive shape; the
+server's fork-cut test pins `DroppedTurns.first_turn_id`.
+
+Live: `just chat-smoke` against claude 2.1.259 + codex 0.153.0 — first run
+18/20. The two failures: `codex_fork_rollback_and_compact_surface` was the
+genuine drift above (rollback refused on paginated threads) — the case now
+speaks `thread/revert` and passes; `claude_rewind_title_and_mcp_controls`
+failed its "tool ran" precondition once (the model answered without calling
+`Write` — model variance under the account's default `claude-fable-5-1[1m]`
+at xhigh, not a wire change) and passed on rerun. Pins bumped 2.1.212 →
+2.1.259 and 0.144.2 → 0.153.0. The Remote Control enable/disable round-trip
+was additionally driven through the daemon + web UI in an isolated preview
+(chip → connecting → ack with session link → connected in 0.6 s; off; rail
+badge; `GET /api/v1/sessions` carrying `remote_control_url`).

@@ -104,6 +104,12 @@ pub struct SpawnSpec {
     /// (`Init.remote_control_available`) — otherwise a Notice says why not.
     /// `None` = leave it to the user's in-session toggle.
     pub remote_control: Option<String>,
+    /// Conversation rewind (codex): the native id of the FIRST dropped turn —
+    /// `thread/revert {beforeTurnId}` excludes it and every later turn. The
+    /// modern path (0.153+: paginated threads refuse the deprecated
+    /// `thread/rollback`); `rollback_turns` stays the fallback count for an
+    /// older app-server without the method.
+    pub revert_before_turn: Option<String>,
     /// Original creation time to stamp on the `ChatInfo` (epoch ms), for a
     /// session being RESURRECTED — so its age survives a daemon restart
     /// instead of resetting to "now". `None` on a fresh spawn (stamped at
@@ -140,6 +146,7 @@ impl SpawnSpec {
             portable_context: None,
             mcp_auto_approve: None,
             remote_control: None,
+            revert_before_turn: None,
             created_at_ms: None,
             handshake_timeout: HANDSHAKE_TIMEOUT,
         }

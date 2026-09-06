@@ -29,7 +29,7 @@ use serde_json::{json, Value};
 use crate::ndjson::JsonlChild;
 
 /// CLI version these frame shapes were verified against (2026-07-16).
-pub const TESTED_CODEX_VERSION: &str = "0.144.2";
+pub const TESTED_CODEX_VERSION: &str = "0.153.0";
 
 /// The `initialize` request both the probe client and the driver handshake
 /// send. Declares `experimentalApi` so `thread/settings/update` is available
@@ -355,38 +355,73 @@ async fn codex_handshake(
     let mut next_id = 3u64;
 
     // Conversation rewind: drop the trailing turns right after the resume,
-    // while the exchange is still lock-step (live-verified: thread/rollback
-    // works immediately after thread/resume; an overcount clamps silently,
-    // so the count must be exact — the server derives it from the journal).
+    // while the exchange is still lock-step. The modern RPC is `thread/revert
+    // {beforeTurnId}` — it excludes that turn and every later one (0.153.0
+    // schema; live: the default `historyMode: "paginated"` threads REFUSE the
+    // deprecated `thread/rollback` with -32600 "paginated threads do not
+    // support thread/rollback"). An older app-server without the method
+    // falls back to rollback-by-count (live-verified on 0.144: works right
+    // after thread/resume; an overcount clamps silently, so the count must be
+    // exact — the server derives both from the journal).
     let mut rollback_error = None;
-    if let (Some(_), Some(turns)) = (
-        &spec.pinned_native_id,
-        spec.rollback_turns.filter(|n| *n > 0),
-    ) {
-        let id = next_id;
-        next_id += 1;
-        if sink
-            .send(&json!({
-                "id": id, "method": "thread/rollback",
-                "params": { "threadId": thread_id, "numTurns": turns },
-            }))
-            .await
-            .is_err()
-        {
-            return Err("thread/rollback write failed".into());
+    if spec.pinned_native_id.is_some() {
+        let mut settled = false;
+        if let Some(before) = spec.revert_before_turn.clone() {
+            let id = next_id;
+            next_id += 1;
+            if sink
+                .send(&json!({
+                    "id": id, "method": "thread/revert",
+                    "params": { "threadId": thread_id, "beforeTurnId": before },
+                }))
+                .await
+                .is_err()
+            {
+                return Err("thread/revert write failed".into());
+            }
+            // Bounded like model/list: a binary that silently drops the
+            // method must not wedge the handshake until the watchdog fires.
+            match tokio::time::timeout(Duration::from_secs(5), await_rpc_result(stream, id)).await {
+                Ok(Ok(_)) => settled = true,
+                Ok(Err(err)) if error_says_method_unsupported(&err) => {
+                    // Pre-revert binary: try the count below.
+                }
+                Ok(Err(err)) => {
+                    rollback_error = Some(err);
+                    settled = true;
+                }
+                Err(_) => {
+                    rollback_error = Some("no response to thread/revert".into());
+                    settled = true;
+                }
+            }
         }
-        // Bounded like model/list: a binary that silently drops the method
-        // must not wedge the handshake until the watchdog fires.
-        rollback_error = match tokio::time::timeout(
-            Duration::from_secs(5),
-            await_rpc_result(stream, id),
-        )
-        .await
-        {
-            Ok(Ok(_)) => None,
-            Ok(Err(err)) => Some(err),
-            Err(_) => Some("no response to thread/rollback (unsupported binary?)".into()),
-        };
+        if !settled {
+            if let Some(turns) = spec.rollback_turns.filter(|n| *n > 0) {
+                let id = next_id;
+                next_id += 1;
+                if sink
+                    .send(&json!({
+                        "id": id, "method": "thread/rollback",
+                        "params": { "threadId": thread_id, "numTurns": turns },
+                    }))
+                    .await
+                    .is_err()
+                {
+                    return Err("thread/rollback write failed".into());
+                }
+                rollback_error = match tokio::time::timeout(
+                    Duration::from_secs(5),
+                    await_rpc_result(stream, id),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => None,
+                    Ok(Err(err)) => Some(err),
+                    Err(_) => Some("no response to thread/rollback (unsupported binary?)".into()),
+                };
+            }
+        }
     }
 
     // The agent's own catalog beats any curated list; absence (older
@@ -590,6 +625,17 @@ fn thread_open_request(spec: &SpawnSpec, id: u64, effort: Option<&str>) -> Value
     open["params"]["approvalPolicy"] = json!("on-request");
     open["params"]["approvalsReviewer"] = json!("auto_review");
     open
+}
+
+/// An RPC error text that means "this binary has no such method" (JSON-RPC
+/// -32601 / serde's unknown-variant wording), as opposed to a refusal of a
+/// method it does know.
+fn error_says_method_unsupported(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    e.contains("-32601")
+        || e.contains("method not found")
+        || e.contains("unknown method")
+        || e.contains("unknown variant")
 }
 
 async fn await_rpc_result(stream: &mut JsonlStream, id: u64) -> std::result::Result<Value, String> {
