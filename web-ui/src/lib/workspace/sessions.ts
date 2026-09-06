@@ -165,6 +165,20 @@ export function displayName(s: Session): string {
   return s.display_name ?? s.agent_title ?? s.name;
 }
 
+/**
+ * A session's label on the workbench chrome (tabs, drop bands, ghost hints,
+ * link chips): the user's pin, else the daemon's name, else a short id. One
+ * home for the precedence so every surface names a session the same way.
+ * `names` is the pinned display-name map, `sessions` the roster by id.
+ */
+export function sessionLabel(
+  names: ReadonlyMap<string, string>,
+  sessions: ReadonlyMap<string, Session>,
+  id: string,
+): string {
+  return names.get(id) ?? sessions.get(id)?.name ?? id.slice(0, 8);
+}
+
 /** True when the session is waiting on the user (drives the aggregate count). */
 /**
  * The workspace Mastermind is the observer, not the observed: every roster

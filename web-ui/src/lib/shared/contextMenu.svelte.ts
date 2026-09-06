@@ -9,6 +9,10 @@
 
 export interface ContextMenuItem {
   label: string;
+  /** A pick-list row's state mark: `true` draws a check in the gutter, `false`
+   *  reserves the gutter so labels align. Undefined rows (ordinary actions)
+   *  have no gutter at all — a menu grows one only when some row is checkable. */
+  checked?: boolean;
   /** Err-tinted destructive row (Delete…). */
   danger?: boolean;
   /** Rendered but inert; `hint` says why (shown as the row's title). */
@@ -41,8 +45,14 @@ export const contextMenu = {
   openAt(e: MouseEvent, entries: ContextMenuEntry[]): void {
     e.preventDefault();
     e.stopPropagation();
-    x = e.clientX;
-    y = e.clientY;
+    this.openAtPoint(e.clientX, e.clientY, entries);
+  },
+  /** Open at a viewport point — a control's bottom-left corner, so a menu can
+   *  hang under the button that opened it (keyboard-opened too), without
+   *  fabricating a pointer event. */
+  openAtPoint(px: number, py: number, entries: ContextMenuEntry[]): void {
+    x = px;
+    y = py;
     items = entries;
     open = true;
   },

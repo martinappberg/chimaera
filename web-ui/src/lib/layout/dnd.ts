@@ -25,9 +25,21 @@ export type DropSpot =
   | { kind: "upload"; paneId: string }
   /** An OS-DESKTOP file drag over a FOLDER target — a Finder pane/column or a
    *  FILES-tree dir. `dir` is the destination directory; `paneId` is the
-   *  Finder pane to wash (null for the rail tree, highlighted separately).
-   *  Produced by App's window drop handlers, never by spotAt. */
-  | { kind: "uploadDir"; paneId: string | null; dir: string }
+   *  Finder pane to frame (null for the rail tree, highlighted separately).
+   *  `row` marks a dir ROW inside a Finder column as the thing under the
+   *  pointer, so the Finder lights that row alone — never also the column
+   *  that may already show the same dir. Produced by App's window drop
+   *  handlers, never by spotAt. */
+  | {
+      kind: "uploadDir";
+      paneId: string | null;
+      dir: string;
+      row: boolean;
+      /** The FILES-tree row's position key (its `data-drop-key`) when the
+       *  target is a tree row: the same canonical path can appear under a
+       *  symlink and its target, so the tree highlights by position. */
+      rowKey?: string;
+    }
   /** The "link to agent" band over an agent pane's input area — a plain
    *  shell-terminal TAB drag (not link-intent); see startDrag's linkTargets. */
   | { kind: "link"; paneId: string }
@@ -260,10 +272,100 @@ export function sameSpot(a: DropSpot | null, b: DropSpot | null): boolean {
   if (a.kind === "linktab" && b.kind === "linktab")
     return a.paneId === b.paneId && a.index === b.index;
   if (a.kind === "linkrow" && b.kind === "linkrow") return a.sessionId === b.sessionId;
+  // The OS-drop spots: dragover fires continuously, so App compares before
+  // rewriting dropSpot (else every event re-derives the Finder/tree lights).
+  if (a.kind === "upload" && b.kind === "upload") return a.paneId === b.paneId;
+  if (a.kind === "uploadDir" && b.kind === "uploadDir") {
+    return a.paneId === b.paneId && a.dir === b.dir && a.row === b.row && a.rowKey === b.rowKey;
+  }
   // Out is one logical spot regardless of coords (update() refreshes the
   // coords in place so the eventual drop still lands at the release point).
   if (a.kind === "out" && b.kind === "out") return true;
   return false;
+}
+
+/**
+ * The one vocabulary for a split direction, shared by the ghost hint, the
+ * pane zone labels, and the window-edge preview: it matches the pane-bar
+ * buttons ("split right", "split down"), so a drop preview and the chrome
+ * that does the same thing use the same words.
+ */
+export function sideWord(side: Side): "left" | "right" | "up" | "down" {
+  return side === "top" ? "up" : side === "bottom" ? "down" : side;
+}
+
+/**
+ * What releasing on a pane zone does, in words. Shared by the ghost hint and
+ * Pane's zone preview so the two surfaces can never disagree; the center
+ * wording covers one tab and a whole pane's worth alike.
+ */
+export function zoneWord(zone: Zone): string {
+  return zone === "center" ? "add to this pane" : `split ${sideWord(zone)}`;
+}
+
+/**
+ * The tab elements a bar shows RIGHT NOW. The strip scrolls, so a tab that is
+ * scrolled out of view keeps a rect (sitting under the strip's controls) —
+ * it must never become a drop target or an insertion anchor.
+ */
+function visibleTabs(bar: HTMLElement): HTMLElement[] {
+  const strip = bar.querySelector<HTMLElement>(".tabs")?.getBoundingClientRect();
+  const out: HTMLElement[] = [];
+  for (const t of bar.querySelectorAll<HTMLElement>("[data-tab-index]")) {
+    if (strip !== undefined) {
+      const tb = t.getBoundingClientRect();
+      if (tb.right <= strip.left || tb.left >= strip.right) continue;
+    }
+    out.push(t);
+  }
+  return out;
+}
+
+/** Spots whose hint takes the accent: they do something other than a tile
+ *  move (reference, link, tear out) — the same spots whose previews are
+ *  dashed bands rather than translucent zones. */
+const SPECIAL_SPOTS: ReadonlySet<DropSpot["kind"]> = new Set([
+  "ref",
+  "link",
+  "linkpane",
+  "linktab",
+  "linkrow",
+  "out",
+]);
+
+/**
+ * What releasing on `spot` will do, in words, for the ghost hint. The
+ * caller's `describe` (App knows session names) wins; otherwise a generic
+ * reading of the spot. Null for the out spot — its text ("open as new
+ * window" / "move into window") is owned by the out/trackOut logic in
+ * startDrag's update, which flips it asynchronously.
+ */
+function hintFor(spot: DropSpot, opts: DragOptions): string | null {
+  const named = opts.describe?.(spot);
+  // "" is a veto: the caller knows this spot does nothing (a pane hovering
+  // its own zones), so no hint — null/undefined mean "use the generic word".
+  if (named === "") return null;
+  if (named != null) return named;
+  switch (spot.kind) {
+    case "zone":
+      return zoneWord(spot.zone);
+    case "tab":
+      // The caret in the strip shows WHERE; the words match the center zone.
+      return zoneWord("center");
+    case "edge":
+      return `split window ${sideWord(spot.edge)}`;
+    case "ref":
+      return "@ reference here";
+    case "link":
+    case "linkpane":
+    case "linktab":
+    case "linkrow":
+      return "link to this agent";
+    case "upload":
+    case "uploadDir":
+    case "out":
+      return null; // never pointer-drag spots / owned elsewhere
+  }
 }
 
 /** Hysteresis past the viewport edge before a drag reads as "out the window",
@@ -342,7 +444,7 @@ function linkSpotAt(
     if (reg.tabbar !== null) {
       const tr = reg.tabbar.getBoundingClientRect();
       if (y >= tr.top && y <= tr.bottom) {
-        for (const t of reg.tabbar.querySelectorAll<HTMLElement>("[data-tab-index]")) {
+        for (const t of visibleTabs(reg.tabbar)) {
           const tb = t.getBoundingClientRect();
           if (x >= tb.left && x <= tb.right) {
             const agentId = t.dataset.linkAgent;
@@ -387,8 +489,12 @@ function spotAt(
     if (reg.tabbar !== null) {
       const tr = reg.tabbar.getBoundingClientRect();
       if (y >= tr.top && y <= tr.bottom) {
-        const tabs = reg.tabbar.querySelectorAll<HTMLElement>("[data-tab-index]");
-        let index = tabs.length;
+        // Only the tabs in view can anchor the caret; past the last of them
+        // the drop lands right after it (a visible caret), never in the
+        // scrolled-away run under the strip's controls.
+        const tabs = visibleTabs(reg.tabbar);
+        const last = tabs.at(-1);
+        let index = last === undefined ? 0 : Number(last.dataset.tabIndex) + 1;
         for (const t of tabs) {
           const tb = t.getBoundingClientRect();
           if (x < tb.left + tb.width / 2) {
@@ -445,11 +551,11 @@ function makeGhost(label: string): HTMLDivElement {
   const name = document.createElement("span");
   name.className = "ghost-label";
   name.textContent = label;
-  // The out-of-window hint: hidden by CSS until the ghost wears `.out`
-  // (the pointer left the viewport on a detach-armed drag).
+  // The hint: what releasing here will do. Hidden by CSS until the ghost
+  // wears `.hinted` (over an in-window spot; text set on spot change) or
+  // `.out` (the pointer left the viewport on a detach-armed drag).
   const hint = document.createElement("span");
   hint.className = "ghost-hint";
-  hint.textContent = "open as new window";
   ghost.append(name, hint);
   document.body.appendChild(ghost);
   return ghost;
@@ -577,6 +683,15 @@ export interface DragOptions {
   /** The pointer came back inside the viewport mid-drag: clear any sibling
    *  highlight trackOut lit (the shell's leave event). */
   trackEnd?: () => void;
+  /**
+   * Names the drop for the ghost's hint ("@ reference in claude-1", "link to
+   * codex-2"): dnd.ts knows spot geometry, not session names, so the caller
+   * supplies the words and the generic reading (hintFor) covers whatever it
+   * returns null for; an empty string VETOES the hint (a spot the caller
+   * will refuse on drop). Called once per logical spot change, never per
+   * frame.
+   */
+  describe?: (spot: DropSpot) => string | null;
 }
 
 /**
@@ -621,38 +736,66 @@ export function startDrag(
   // gate; the callback decides per-pane whether a live session sits there).
   const refFor = payload.refPath !== undefined ? (cb.acceptsRef?.bind(cb) ?? null) : null;
 
+  const writeHint = (text: string) => {
+    const hint = ghost?.querySelector<HTMLElement>(".ghost-hint");
+    if (hint != null) hint.textContent = text;
+  };
+
+  // The in-window hint (what releasing here does) is written only when the
+  // logical spot changes — never per frame — and its width is measured then,
+  // once, so the per-frame clamp below never forces layout.
+  let lastHint: string | null = null;
+  let ghostW = 0;
+  const setHint = (s: DropSpot | null) => {
+    if (ghost === null || s?.kind === "out") return;
+    const text = s === null ? null : hintFor(s, opts);
+    if (text === lastHint) return;
+    lastHint = text;
+    writeHint(text ?? "");
+    ghost.classList.toggle("hinted", text !== null);
+    ghost.classList.toggle("special", s !== null && SPECIAL_SPOTS.has(s.kind));
+    ghostW = ghost.offsetWidth;
+  };
+
   const update = () => {
     raf = 0;
     const out = opts.allowOut === true && outOfViewport(lastX, lastY);
     if (out !== wasOut) {
       wasOut = out;
-      if (!out) {
-        // Back inside: whatever sibling window the shell lit up must unlight
-        // — and the hint TEXT resets with the cached state, or the next
-        // out-phase's `over === outTarget` short-circuit would leave a stale
-        // "move into window" showing over bare desktop.
-        outTarget = false;
-        const hint = ghost?.querySelector<HTMLElement>(".ghost-hint");
-        if (hint !== null && hint !== undefined) hint.textContent = "open as new window";
-        opts.trackEnd?.();
-      }
+      // Either way the cached sibling state resets — or the next out-phase's
+      // `over === outTarget` short-circuit would leave a stale "move into
+      // window" showing over bare desktop. Out: the detach hint replaces
+      // whatever in-window hint was showing (trackOut may flip it). In: the
+      // in-window hint re-derives from the fresh spot below.
+      outTarget = false;
+      lastHint = null;
+      writeHint(out ? "open as new window" : "");
+      ghost?.classList.remove("hinted", "special");
+      // The ghost just changed shape: re-measure so the in-window clamp
+      // below never reserves a stale (hinted) width, and retire any
+      // sibling-window probe still in flight so a late "move into window"
+      // can't land in the now-visible in-window hint.
+      if (ghost !== null) ghostW = ghost.offsetWidth;
+      trackSeq++;
+      if (!out) opts.trackEnd?.();
     }
     if (out && opts.trackOut !== undefined) {
       const seq = ++trackSeq;
       void opts.trackOut(lastX, lastY).then((over) => {
         if (seq !== trackSeq || done || over === outTarget) return;
         outTarget = over;
-        const hint = ghost?.querySelector<HTMLElement>(".ghost-hint");
-        if (hint !== null && hint !== undefined) {
-          hint.textContent = over ? "move into window" : "open as new window";
-        }
+        writeHint(over ? "move into window" : "open as new window");
       });
     }
     if (ghost !== null) {
       // Outside the viewport the ghost clamps to the nearest edge (it cannot
       // follow the OS cursor out) and wears the hint. The reserve matches the
-      // .drag-ghost.out max-width so the widened ghost never overhangs.
-      const gx = out ? Math.min(Math.max(lastX + 14, 8), window.innerWidth - 350) : lastX + 14;
+      // .drag-ghost.out max-width so the widened ghost never overhangs. In
+      // the window a hinted ghost clamps by its measured width, so the hint
+      // stays readable against the right edge (where "split right" lives).
+      const gx = out
+        ? Math.min(Math.max(lastX + 14, 8), window.innerWidth - 350)
+        : Math.min(lastX + 14, window.innerWidth - ghostW - 8);
       const gy = out ? Math.min(Math.max(lastY + 10, 8), window.innerHeight - 40) : lastY + 10;
       ghost.style.transform = `translate(${gx}px, ${gy}px)`;
       ghost.classList.toggle("out", out);
@@ -663,6 +806,7 @@ export function startDrag(
     if (!sameSpot(next, spot)) {
       spot = next;
       cb.onSpot(spot);
+      setHint(spot);
     } else if (next !== null && next.kind === "out") {
       // Same logical spot, fresher coords: keep them without re-notifying so
       // the drop lands where the pointer actually released.

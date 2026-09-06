@@ -140,7 +140,12 @@ spawn.rs,recents.rs}`. Wire: `POST/GET/DELETE/PATCH /api/v1/sessions*`, `GET /ap
   driver stays registered (alive:false, errored) until deleted: its row keeps the red glyph, but
   nobody can answer a dead session. Chimaera owns renaming for **all** session kinds (only claude has an
   in-TUI `/rename`); the pin outranks every derived name on every surface. Kill drops the row locally
-  even if the DELETE fails (already-gone/unreachable). Rail rows are drag sources.
+  even if the DELETE fails (already-gone/unreachable), and **tombstones** the id until a daemon
+  snapshot no longer lists it: `DELETE` only signals the process and returns while the session is
+  still in the roster until its wait thread reaps it, so lifting the tombstone on the response let
+  the row pop back for a beat and vanish again — a visible flicker over a remote link. A tombstone
+  that a snapshot never confirms (the kill didn't take) is dropped 20s after the request settles and
+  the roster refetched, so the truth returns. Rail rows are drag sources.
 - **Agent status line (chat sessions).** When claude emits a `post_turn_summary` (its own post-turn
   "where things stand" one-liner, e.g. "workflow launched, 2 agents spawning"), the driver maps it
   to a latest-wins `SessionStatus` event: the chat row's second line shows the line (`status_detail`
@@ -164,7 +169,9 @@ spawn.rs,recents.rs}`. Wire: `POST/GET/DELETE/PATCH /api/v1/sessions*`, `GET /ap
 - **What & when.** Below the rail: the workspace's *ended* agent conversations (any agent, newest
   first), remembered by the daemon across restarts. Pick a finished thread back up.
 - **How it's used.** Click a `recent` row to reopen it (shows agent glyph, title, relative age).
-  Top 3 by default; "all N" expands.
+  The section fills whatever height the sessions column has left and shows **as many rows as fit**
+  (measured by a `ResizeObserver`, fixed 26px rows; a floor of 3 below which the column scrolls);
+  "all N" appears only when more exist and expands into a scrollable list.
 - **Where it lives.** `App.svelte` (`refreshRecents`/`openRecent`), `launcher.ts` (`listRecents`).
   Route `GET /api/v1/recents?workspace_id=` (server `recents.rs`); reopening rides
   `POST /sessions` with `resume` + `title_hint`. History replay: `chimaera-agent/src/transcript.rs`

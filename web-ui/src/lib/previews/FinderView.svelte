@@ -14,7 +14,7 @@
    * `onOpenFile` — every file viewer is reused unchanged.
    */
   import { tick, untrack } from "svelte";
-  import { basename, fsDownload, fsList, type FsEntry, humanSize } from "./files";
+  import { basename, dirname, fsDownload, fsList, type FsEntry, humanSize } from "./files";
   import { fsHome } from "../workspace/sessions";
   import { getSetting } from "../settings/store.svelte";
   import { ApiError, isRemoteHost } from "../net/api";
@@ -57,9 +57,20 @@
     onNavigate: (path: string) => void;
     /** Open a file in the workbench (newSplit = Cmd/Ctrl held). */
     onOpenFile: (path: string, newSplit: boolean) => void;
+    /**
+     * The folder an OS-desktop file drag hovering this Finder would upload
+     * into (App hit-tests the `data-finder-dir` / `data-drop-dir` attributes
+     * stamped below; Pane passes the spot down). The Finder lights exactly
+     * that target — the column, or with `dropOnRow` the dir row under the
+     * pointer — and names it, so a drop is never a whole-pane mystery.
+     */
+    dropDir?: string | null;
+    /** `dropDir` is a dir ROW under the pointer (not a column): light the row
+     *  alone, never also a column that happens to show the same dir. */
+    dropOnRow?: boolean;
   }
 
-  let { path, wsRoot, onNavigate, onOpenFile }: Props = $props();
+  let { path, wsRoot, onNavigate, onOpenFile, dropDir = null, dropOnRow = false }: Props = $props();
 
   interface Column {
     dir: string;
@@ -484,11 +495,6 @@
     ];
   }
 
-  function parentOf(p: string): string {
-    const i = p.lastIndexOf("/");
-    return i > 0 ? p.slice(0, i) : "/";
-  }
-
   /** Reveal a column by the smallest possible horizontal movement. A blanket
    *  scroll-to-max used to push the selected folder all the way left on every
    *  refresh, even when the user was inspecting an earlier column. */
@@ -572,10 +578,10 @@
       }
       const dirs = new Set<string>();
       if (m?.kind === "rename") {
-        dirs.add(parentOf(m.from));
-        dirs.add(parentOf(m.to));
+        dirs.add(dirname(m.from));
+        dirs.add(dirname(m.to));
       } else if (m !== null && m !== undefined) {
-        dirs.add(parentOf(m.path));
+        dirs.add(dirname(m.path));
       }
       scheduleRefresh(dirs);
     });
@@ -602,8 +608,8 @@
         return;
       }
       const dirs = new Set(change.dirs);
-      for (const file of [...change.files, ...change.removed]) dirs.add(parentOf(file));
-      for (const removed of change.removedDirs) dirs.add(parentOf(removed));
+      for (const file of [...change.files, ...change.removed]) dirs.add(dirname(file));
+      for (const removed of change.removedDirs) dirs.add(dirname(removed));
       scheduleRefresh(dirs);
     });
   });
@@ -686,9 +692,14 @@
       </div>
     {/if}
     {#each columns as col, ci (col.dir)}
+      <!-- OS-drop target resolution: the column itself, or a dir row it
+           lists (then only the row rings, but this column carries the label —
+           the row is too small to hold one). -->
+      {@const colTarget = dropDir !== null && !dropOnRow && dropDir === col.dir}
       <div
         class="col"
         class:active={ci === activeCol}
+        class:drop-target={colTarget}
         role="group"
         aria-label={col.dir}
         data-finder-dir={col.dir}
@@ -752,10 +763,15 @@
               <div class="edit-error">{editError}</div>
             {/if}
           {:else}
+            <!-- Dir rows are OS-drop targets in their own right (data-drop-dir,
+                 read by App's hit-test); file rows are not — for them the
+                 column is the target. -->
             <button
               class="row"
               class:sel={entry.path === col.selected}
               class:cut={isCutPending(entry.path)}
+              class:drop-target={dropOnRow && dropDir === entry.path}
+              data-drop-dir={entry.kind === "dir" && !entry.broken ? entry.path : undefined}
               title={entry.symlink ? `${entry.path} → ${entry.target ?? ""}${entry.broken ? " (missing)" : ""}` : entry.path}
               onclick={(e) => onRowClick(ci, entry, e)}
               oncontextmenu={(e) => contextMenu.openAt(e, menuFor(ci, entry))}
@@ -994,6 +1010,22 @@
 
   .row.sel {
     background: var(--row-active);
+  }
+
+  /* OS-desktop file drag: the column under the pointer rings + washes — the
+     one lit thing says which directory receives the file. An inset ring
+     (no border) keeps the column's geometry, so nothing shifts mid-drag. */
+  .col.drop-target {
+    background: color-mix(in srgb, var(--accent) 9%, transparent);
+    box-shadow: inset 0 0 0 1.5px color-mix(in srgb, var(--accent) 65%, transparent);
+    border-radius: 6px;
+  }
+
+  /* A dir row under the pointer is the target instead: only the row rings
+     (after .sel — a selected row hovered as a target reads as a target). */
+  .row.drop-target {
+    background: color-mix(in srgb, var(--accent) 18%, transparent);
+    box-shadow: inset 0 0 0 1.5px color-mix(in srgb, var(--accent) 70%, transparent);
   }
 
   .glyph {
