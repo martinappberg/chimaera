@@ -25,6 +25,12 @@
     }, []),
   );
 
+  /** A pick list (some row carries `checked`) grows a mark gutter on every
+   *  row, so checked and unchecked labels stay aligned. */
+  const hasMarks = $derived(
+    contextMenu.items.some((entry) => entry !== "separator" && entry.checked !== undefined),
+  );
+
   // Land at the pointer immediately (never a flash at the previous spot),
   // then clamp once the size is measurable.
   $effect(() => {
@@ -123,7 +129,7 @@
           onpointerenter={() => {
             if (entry.disabled !== true) activeIndex = i;
           }}
-        >{entry.label}</button>
+        >{#if hasMarks}<span class="ctx-mark" aria-hidden="true">{entry.checked === true ? "✓" : ""}</span>{/if}{entry.label}</button>
       {/if}
     {/each}
   </div>
@@ -135,11 +141,24 @@
     z-index: 90;
     min-width: 172px;
     outline: none;
+    /* A long pick list (every tab of a crowded pane) scrolls inside the
+       viewport instead of running off its bottom edge. */
+    max-height: calc(100vh - 8px);
+    overflow-y: auto;
+    scrollbar-width: thin;
   }
 
   .ctx-row {
     display: block;
     white-space: nowrap;
+  }
+
+  /* The pick-list gutter: a fixed slot so a check never shifts the label. */
+  .ctx-mark {
+    display: inline-block;
+    width: 14px;
+    color: var(--accent);
+    font-weight: 600;
   }
 
   /* The roving active row: keyboard and hover share one highlight. */

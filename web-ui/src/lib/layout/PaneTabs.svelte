@@ -160,6 +160,167 @@
     dropSpot?.kind === "tab" && dropSpot.paneId === node.id ? dropSpot.index : null,
   );
 
+  // --- the tab strip: fit-width tabs on a hidden horizontal scroller -------
+  //
+  // Tabs never shrink (VS Code "fit" sizing): each takes its natural width,
+  // capped, so a name is always readable and a strip of N tabs is a stable
+  // sequence the eye can track. Overflow scrolls (wheel + trackpad), the
+  // active tab is scrolled into view whenever it changes, and the clipped
+  // sides fade + a "N more" control lists every tab.
+
+  /** The scroller (`.tabs`); the dnd hit-tester keeps targeting `el`. */
+  let tabsEl = $state<HTMLElement | null>(null);
+
+  /**
+   * Strip overflow state, replaced wholesale by measure(): fades per clipped
+   * side, whether the strip overflows at all (the "more" control), and how
+   * many tabs are out of view. One raw state so a scroll costs one update;
+   * `lastClip` is the plain mirror measure() compares against, so the effects
+   * that call it never read the state they write.
+   */
+  interface Clip {
+    left: boolean;
+    right: boolean;
+    over: boolean;
+    hidden: number;
+  }
+  let lastClip: Clip = { left: false, right: false, over: false, hidden: 0 };
+  let clip = $state.raw<Clip>(lastClip);
+
+  /** Fade width; the reveal keeps the active tab this far inside the edge so
+   *  the fade never sits on it. */
+  const FADE_PX = 24;
+
+  /** Reads only (scroll metrics + tab offsets), then one state write — no
+   *  interleaved layout so a scroll event never thrashes. */
+  function measure(): void {
+    const strip = tabsEl;
+    if (strip === null) return;
+    const sl = strip.scrollLeft;
+    const cw = strip.clientWidth;
+    const sw = strip.scrollWidth;
+    // A lone tab wider than a narrow strip (the bar's controls keep their
+    // room) is just clipped — no list to open, so no control; the fades
+    // still say it runs on.
+    const over = sw > cw + 1 && node.tabs.length > 1;
+    let hidden = 0;
+    if (over) {
+      for (const t of strip.querySelectorAll<HTMLElement>("[data-tab-index]")) {
+        const l = t.offsetLeft;
+        if (l < sl - 2 || l + t.offsetWidth > sl + cw + 2) hidden++;
+      }
+    }
+    const next: Clip = { left: sl > 1, right: sl + cw < sw - 1, over, hidden };
+    const p = lastClip;
+    if (next.left !== p.left || next.right !== p.right || next.over !== p.over || next.hidden !== p.hidden) {
+      lastClip = next;
+      clip = next;
+    }
+  }
+
+  /** Scroll tab `i` into the strip's view (own scrollLeft math — never
+   *  scrollIntoView, which would also scroll every ancestor). */
+  function revealTab(i: number): void {
+    const strip = tabsEl;
+    if (strip === null) return;
+    const tab = strip.querySelector<HTMLElement>(`[data-tab-index="${i}"]`);
+    if (tab === null) return;
+    // offsetLeft is relative to .tabs (position: relative) and ignores scroll.
+    const left = tab.offsetLeft;
+    const right = left + tab.offsetWidth;
+    const view = strip.clientWidth;
+    if (strip.scrollWidth <= view) return;
+    if (left < strip.scrollLeft + FADE_PX) {
+      strip.scrollLeft = Math.max(0, left - FADE_PX);
+    } else if (right > strip.scrollLeft + view - FADE_PX) {
+      strip.scrollLeft = right - view + FADE_PX;
+    }
+  }
+
+  // Active tab changed (click, Mod+Alt+[/], open, restore, a preview slot
+  // replaced): reveal it. Effects run after the DOM is patched, so a tab
+  // added in the same batch already has its box.
+  $effect(() => {
+    const i = node.active;
+    const t = node.tabs[i];
+    void (t === undefined ? null : tabKey(t));
+    if (tabsEl === null) return;
+    revealTab(i);
+    measure();
+  });
+
+  // Strip resized (split dragged, window resized): keep the active tab in
+  // view and re-measure. Torn down with the element.
+  $effect(() => {
+    const strip = tabsEl;
+    if (strip === null) return;
+    const ro = new ResizeObserver(() => {
+      revealTab(node.active);
+      measure();
+    });
+    ro.observe(strip);
+    return () => ro.disconnect();
+  });
+
+  /** A vertical wheel over the strip scrolls it sideways (the standard tab-bar
+   *  gesture); a trackpad's horizontal delta is left to native scrolling. */
+  function onStripWheel(e: WheelEvent): void {
+    const strip = e.currentTarget as HTMLElement;
+    if (strip.scrollWidth <= strip.clientWidth) return;
+    if (Math.abs(e.deltaX) >= Math.abs(e.deltaY)) return;
+    e.preventDefault();
+    strip.scrollLeft += e.deltaMode === 1 ? e.deltaY * 16 : e.deltaY;
+  }
+
+  /** The "N more" control: every tab in strip order, the active one checked;
+   *  picking one activates it (the reveal effect scrolls it into view). */
+  function tabListMenu(): ContextMenuEntry[] {
+    return node.tabs.map((tab, i) => ({
+      label: label(tab),
+      checked: i === node.active,
+      onSelect: () => ctrl.activateTab(node.id, i),
+    }));
+  }
+
+  /** The list hangs under the control's bottom-left, keyboard-opened too. */
+  function openTabList(btn: HTMLElement): void {
+    const r = btn.getBoundingClientRect();
+    contextMenu.openAtPoint(r.left, r.bottom + 2, tabListMenu());
+  }
+
+  /** A tab drag hovering this strip; drives the edge auto-scroll below. */
+  const dragOverStrip = $derived(insertIndex !== null);
+
+  // Auto-scroll an overflowed strip while a hovering tab drag sits near its
+  // left/right edge (~24px). The rAF loop runs only while the pointer is in
+  // an edge zone and ends with the hover (effect teardown); the dnd layer
+  // re-hit-tests on the next pointer move, so the caret follows the scroll.
+  $effect(() => {
+    if (!dragOverStrip) return;
+    const strip = tabsEl;
+    if (strip === null) return;
+    const SPEED = 6;
+    let dir = 0;
+    let raf = 0;
+    const step = () => {
+      raf = 0;
+      if (dir === 0) return;
+      const before = strip.scrollLeft;
+      strip.scrollLeft = before + dir * SPEED;
+      if (strip.scrollLeft !== before) raf = requestAnimationFrame(step);
+    };
+    const onMove = (e: PointerEvent) => {
+      const r = strip.getBoundingClientRect();
+      dir = e.clientX < r.left + FADE_PX ? -1 : e.clientX > r.right - FADE_PX ? 1 : 0;
+      if (dir !== 0 && raf === 0) raf = requestAnimationFrame(step);
+    };
+    window.addEventListener("pointermove", onMove);
+    return () => {
+      window.removeEventListener("pointermove", onMove);
+      if (raf !== 0) cancelAnimationFrame(raf);
+    };
+  });
+
   /**
    * Context bridge: true when this pane's ACTIVE tab is the terminal that
    * owns the current selection — the bar grows a quiet "reference" action
@@ -255,6 +416,19 @@
   let renamingTab = $state<string | null>(null);
   let renameDraft = $state("");
   let renameError = $state<string | null>(null);
+
+  /** Everything that moves the strip's fold without resizing the strip: the
+   *  tab set, their labels, and an inline rename (a 12ch input replaces the
+   *  name). Re-measured after the DOM settles. */
+  const stripKey = $derived(
+    node.tabs.map((t) => `${tabKey(t)}\t${label(t)}`).join("\n") + `\n${renamingTab ?? ""}`,
+  );
+
+  $effect(() => {
+    void stripKey;
+    if (tabsEl === null) return;
+    measure();
+  });
 
   function beginTabRename(tab: Tab): void {
     renamingTab = tabKey(tab);
@@ -443,182 +617,208 @@
       </svg>
     </button>
   {/if}
-  <div class="tabs" role="tablist">
-    {#each node.tabs as tab, i (tabKey(tab))}
-      {@const sid = tab.surface === "terminal" ? tab.sessionId : null}
-      {@const ts = sid !== null ? (sessions.get(sid) ?? null) : null}
-      {@const fEntry = tab.surface === "file" ? $gitIndex.files.get(tab.path) : undefined}
-      {@const fDeco = fEntry ? decoFor(fEntry) : null}
-      <div
-        class="tab"
-        class:active={i === node.active}
-        class:insert={insertIndex === i}
-        class:link-target={dropSpot?.kind === "linktab" &&
-          dropSpot.paneId === node.id &&
-          dropSpot.index === i}
-        style:--hue={sid !== null && ts?.kind === "agent" ? agentHue(sid) : null}
-        data-link-agent={sid !== null && ts?.kind === "agent" && ts.alive ? sid : undefined}
-        role="tab"
-        aria-selected={i === node.active}
-        tabindex="-1"
-        data-tab-index={i}
-        title={tab.surface === "file" || tab.surface === "finder" || tab.surface === "diff"
-          ? tab.path
-          : tab.surface === "browser" && tab.host !== ""
-            ? `${targetLabel(tab.host, tab.port)}${tab.path}`
-            : label(tab)}
-        onpointerdowncapture={(e) => {
-          // Capture-phase (directly attached, not delegated); ignore presses
-          // on the close button and the rename input so they stay plain
-          // interactive targets.
-          if (e.target instanceof Element && e.target.closest(".tab-close, .tab-rename-input"))
-            return;
-          ctrl.dragTab(e, node.id, i, tab);
-        }}
-        onauxclick={(e) => {
-          // Middle-click closes the tab (detaches the view, never the session).
-          if (renamingTab === tabKey(tab)) return;
-          if (e.button === 1) {
-            e.preventDefault();
-            ctrl.closeTab(node.id, i);
-          }
-        }}
-        ondblclick={() => {
-          if (renamingTab === tabKey(tab)) return;
-          // VS Code: double-clicking a PREVIEW (italic) file tab pins it;
-          // otherwise the pane zooms (the long-standing gesture).
-          if (tab.surface === "file" && tab.preview === true) {
-            ctrl.pinTab(node.id, i);
-          } else {
-            ctrl.zoomPane(node.id);
-          }
-        }}
-        oncontextmenu={(e) => contextMenu.openAt(e, tabMenu(tab, i))}
-      >
-        {#if tab.surface === "terminal"}
-          {@const s = sessions.get(tab.sessionId)}
-          <!-- Session-type glyph (agent_kind-driven) carrying the state color. -->
-          <SessionGlyph
-            kind={s?.kind ?? "shell"}
-            agentKind={s?.agent_kind}
-            state={s ? dotState(s) : ""}
-            size={10}
-            title={s ? dotTitle(s) : "terminal"}
-          />
-        {:else if tab.surface === "settings"}
-          <svg class="glyph" viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
-            <title>settings</title>
-            <circle cx="8" cy="8" r="2.2" fill="none" stroke="currentColor" stroke-width="1.4" />
-            <path
-              d="M8 1.8v2M8 12.2v2M1.8 8h2M12.2 8h2M3.6 3.6l1.4 1.4M11 11l1.4 1.4M12.4 3.6L11 5M5 11l-1.4 1.4"
-              fill="none"
-              stroke="currentColor"
-              stroke-width="1.4"
-              stroke-linecap="round"
-            />
-          </svg>
-        {:else if tab.surface === "finder"}
-          <span class="tab-glyph" class:on={i === node.active}>
-            <FolderIcon size={13} plain={i === node.active} />
-          </span>
-        {:else if tab.surface === "git"}
-          <svg class="glyph" viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
-            <title>source control</title>
-            <path
-              d="M5 4v5.2M11 4v2a2.4 2.4 0 0 1-2.4 2.4H5"
-              fill="none"
-              stroke="currentColor"
-              stroke-width="1.4"
-              stroke-linecap="round"
-            />
-            <circle cx="5" cy="12" r="1.7" fill="none" stroke="currentColor" stroke-width="1.4" />
-            <circle cx="5" cy="2.6" r="1.7" fill="none" stroke="currentColor" stroke-width="1.4" />
-            <circle cx="11" cy="2.6" r="1.7" fill="none" stroke="currentColor" stroke-width="1.4" />
-          </svg>
-        {:else if tab.surface === "diff"}
-          <svg class="glyph" viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
-            <title>diff</title>
-            <path
-              d="M2.5 2.5h4v11h-4zM9.5 2.5h4v11h-4z"
-              fill="none"
-              stroke="currentColor"
-              stroke-width="1.3"
-              stroke-linejoin="round"
-            />
-            <path d="M3.6 6.2h1.8M10.6 6.2h1.8M11.5 5.3v1.8" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
-          </svg>
-        {:else if tab.surface === "changes"}
-          <svg class="glyph" viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
-            <title>changes</title>
-            <path
-              d="M4 2v5m0 0a2 2 0 1 0 0 4m0-4a2 2 0 1 1 0 4m0 0v3M12 14V9m0 0a2 2 0 1 0 0-4m0 4a2 2 0 1 1 0-4m0 0V2"
-              fill="none"
-              stroke="currentColor"
-              stroke-width="1.3"
-              stroke-linecap="round"
-            />
-          </svg>
-        {:else if tab.surface === "dashboard"}
-          <!-- The workspace mark: the brand hexagon, plain stroke. -->
-          <svg class="glyph" viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
-            <title>dashboard</title>
-            <path
-              d="M8 1.8l5.4 3.1v6.2L8 14.2l-5.4-3.1V4.9z"
-              fill="none"
-              stroke="currentColor"
-              stroke-width="1.4"
-              stroke-linejoin="round"
-            />
-          </svg>
-        {:else if tab.surface === "browser"}
-          <svg class="glyph" viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
-            <title>browser</title>
-            <circle cx="8" cy="8" r="5.7" fill="none" stroke="currentColor" stroke-width="1.3" />
-            <ellipse cx="8" cy="8" rx="2.5" ry="5.7" fill="none" stroke="currentColor" stroke-width="1.1" />
-            <path d="M2.6 6h10.8M2.6 10h10.8" fill="none" stroke="currentColor" stroke-width="1.1" />
-          </svg>
-        {:else if $dirtyFiles.has(tab.path)}
-          <!-- Dirty dot replaces the type glyph in its slot (unsaved edits). -->
-          <span class="dirty-dot" title="unsaved changes"></span>
-        {:else}
-          <span class="tab-glyph" class:on={i === node.active}>
-            <FileIcon path={tab.path} size={13} plain={i === node.active} />
-          </span>
-        {/if}
-        {#if renamingTab === tabKey(tab)}
-          <!-- svelte-ignore a11y_autofocus -->
-          <input
-            class="tab-rename-input"
-            class:invalid={renameError !== null}
-            type="text"
-            spellcheck="false"
-            autocomplete="off"
-            aria-label="rename"
-            title={renameError ?? undefined}
-            bind:value={renameDraft}
-            use:renameFocus={tab.surface === "file"}
-            onkeydown={(e) => onRenameKeydown(e, tab)}
-            onblur={() => void commitTabRename(tab, true)}
-          />
-        {:else}
-          <span
-            class="tab-name"
-            class:preview={tab.surface === "file" && tab.preview === true}
-            style:color={fDeco ? fDeco.color : undefined}>{label(tab)}</span
-          >
-        {/if}
-        <button
-          class="tab-close"
-          aria-label="close tab"
-          title="close tab"
-          onclick={(e) => {
-            e.stopPropagation();
-            ctrl.closeTab(node.id, i);
-          }}>&times;</button
+  <!-- .strip owns the edge fades + the "more" control; .tabs is the
+       scroller (hidden scrollbar, wheel → sideways). -->
+  <div class="strip" class:clip-left={clip.left} class:clip-right={clip.right} class:over={clip.over}>
+    <div class="tabs" role="tablist" bind:this={tabsEl} onscroll={measure} onwheel={onStripWheel}>
+      {#each node.tabs as tab, i (tabKey(tab))}
+        {@const sid = tab.surface === "terminal" ? tab.sessionId : null}
+        {@const ts = sid !== null ? (sessions.get(sid) ?? null) : null}
+        {@const fEntry = tab.surface === "file" ? $gitIndex.files.get(tab.path) : undefined}
+        {@const fDeco = fEntry ? decoFor(fEntry) : null}
+        <div
+          class="tab"
+          class:active={i === node.active}
+          class:insert={insertIndex === i}
+          class:link-target={dropSpot?.kind === "linktab" &&
+            dropSpot.paneId === node.id &&
+            dropSpot.index === i}
+          style:--hue={sid !== null && ts?.kind === "agent" ? agentHue(sid) : null}
+          data-link-agent={sid !== null && ts?.kind === "agent" && ts.alive ? sid : undefined}
+          role="tab"
+          aria-selected={i === node.active}
+          tabindex="-1"
+          data-tab-index={i}
+          title={tab.surface === "file" || tab.surface === "finder" || tab.surface === "diff"
+            ? tab.path
+            : tab.surface === "browser" && tab.host !== ""
+              ? `${targetLabel(tab.host, tab.port)}${tab.path}`
+              : label(tab)}
+          onpointerdowncapture={(e) => {
+            // Capture-phase (directly attached, not delegated); ignore presses
+            // on the close button and the rename input so they stay plain
+            // interactive targets.
+            if (e.target instanceof Element && e.target.closest(".tab-close, .tab-rename-input"))
+              return;
+            ctrl.dragTab(e, node.id, i, tab);
+          }}
+          onauxclick={(e) => {
+            // Middle-click closes the tab (detaches the view, never the session).
+            if (renamingTab === tabKey(tab)) return;
+            if (e.button === 1) {
+              e.preventDefault();
+              ctrl.closeTab(node.id, i);
+            }
+          }}
+          ondblclick={() => {
+            if (renamingTab === tabKey(tab)) return;
+            // VS Code: double-clicking a PREVIEW (italic) file tab pins it;
+            // otherwise the pane zooms (the long-standing gesture).
+            if (tab.surface === "file" && tab.preview === true) {
+              ctrl.pinTab(node.id, i);
+            } else {
+              ctrl.zoomPane(node.id);
+            }
+          }}
+          oncontextmenu={(e) => contextMenu.openAt(e, tabMenu(tab, i))}
         >
-      </div>
-    {/each}
-    <div class="tab-tail" class:insert={insertIndex === node.tabs.length}></div>
+          {#if tab.surface === "terminal"}
+            {@const s = sessions.get(tab.sessionId)}
+            <!-- Session-type glyph (agent_kind-driven) carrying the state color. -->
+            <SessionGlyph
+              kind={s?.kind ?? "shell"}
+              agentKind={s?.agent_kind}
+              state={s ? dotState(s) : ""}
+              size={10}
+              title={s ? dotTitle(s) : "terminal"}
+            />
+          {:else if tab.surface === "settings"}
+            <svg class="glyph" viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
+              <title>settings</title>
+              <circle cx="8" cy="8" r="2.2" fill="none" stroke="currentColor" stroke-width="1.4" />
+              <path
+                d="M8 1.8v2M8 12.2v2M1.8 8h2M12.2 8h2M3.6 3.6l1.4 1.4M11 11l1.4 1.4M12.4 3.6L11 5M5 11l-1.4 1.4"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.4"
+                stroke-linecap="round"
+              />
+            </svg>
+          {:else if tab.surface === "finder"}
+            <span class="tab-glyph" class:on={i === node.active}>
+              <FolderIcon size={13} plain={i === node.active} />
+            </span>
+          {:else if tab.surface === "git"}
+            <svg class="glyph" viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
+              <title>source control</title>
+              <path
+                d="M5 4v5.2M11 4v2a2.4 2.4 0 0 1-2.4 2.4H5"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.4"
+                stroke-linecap="round"
+              />
+              <circle cx="5" cy="12" r="1.7" fill="none" stroke="currentColor" stroke-width="1.4" />
+              <circle cx="5" cy="2.6" r="1.7" fill="none" stroke="currentColor" stroke-width="1.4" />
+              <circle cx="11" cy="2.6" r="1.7" fill="none" stroke="currentColor" stroke-width="1.4" />
+            </svg>
+          {:else if tab.surface === "diff"}
+            <svg class="glyph" viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
+              <title>diff</title>
+              <path
+                d="M2.5 2.5h4v11h-4zM9.5 2.5h4v11h-4z"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.3"
+                stroke-linejoin="round"
+              />
+              <path d="M3.6 6.2h1.8M10.6 6.2h1.8M11.5 5.3v1.8" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
+            </svg>
+          {:else if tab.surface === "changes"}
+            <svg class="glyph" viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
+              <title>changes</title>
+              <path
+                d="M4 2v5m0 0a2 2 0 1 0 0 4m0-4a2 2 0 1 1 0 4m0 0v3M12 14V9m0 0a2 2 0 1 0 0-4m0 4a2 2 0 1 1 0-4m0 0V2"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.3"
+                stroke-linecap="round"
+              />
+            </svg>
+          {:else if tab.surface === "dashboard"}
+            <!-- The workspace mark: the brand hexagon, plain stroke. -->
+            <svg class="glyph" viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
+              <title>dashboard</title>
+              <path
+                d="M8 1.8l5.4 3.1v6.2L8 14.2l-5.4-3.1V4.9z"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.4"
+                stroke-linejoin="round"
+              />
+            </svg>
+          {:else if tab.surface === "browser"}
+            <svg class="glyph" viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
+              <title>browser</title>
+              <circle cx="8" cy="8" r="5.7" fill="none" stroke="currentColor" stroke-width="1.3" />
+              <ellipse cx="8" cy="8" rx="2.5" ry="5.7" fill="none" stroke="currentColor" stroke-width="1.1" />
+              <path d="M2.6 6h10.8M2.6 10h10.8" fill="none" stroke="currentColor" stroke-width="1.1" />
+            </svg>
+          {:else if $dirtyFiles.has(tab.path)}
+            <!-- Dirty dot replaces the type glyph in its slot (unsaved edits). -->
+            <span class="dirty-dot" title="unsaved changes"></span>
+          {:else}
+            <span class="tab-glyph" class:on={i === node.active}>
+              <FileIcon path={tab.path} size={13} plain={i === node.active} />
+            </span>
+          {/if}
+          {#if renamingTab === tabKey(tab)}
+            <!-- svelte-ignore a11y_autofocus -->
+            <input
+              class="tab-rename-input"
+              class:invalid={renameError !== null}
+              type="text"
+              spellcheck="false"
+              autocomplete="off"
+              aria-label="rename"
+              title={renameError ?? undefined}
+              bind:value={renameDraft}
+              use:renameFocus={tab.surface === "file"}
+              onkeydown={(e) => onRenameKeydown(e, tab)}
+              onblur={() => void commitTabRename(tab, true)}
+            />
+          {:else}
+            <!-- data-label feeds the ::after bold duplicate that reserves the
+                 active weight's width, so activation never resizes a tab. -->
+            <span
+              class="tab-name"
+              class:preview={tab.surface === "file" && tab.preview === true}
+              data-label={label(tab)}
+              style:color={fDeco ? fDeco.color : undefined}>{label(tab)}</span
+            >
+          {/if}
+          <button
+            class="tab-close"
+            aria-label="close tab"
+            title="close tab"
+            onclick={(e) => {
+              e.stopPropagation();
+              ctrl.closeTab(node.id, i);
+            }}>&times;</button
+          >
+        </div>
+      {/each}
+      <div class="tab-tail" class:insert={insertIndex === node.tabs.length}></div>
+    </div>
+    {#if clip.over}
+      <!-- Overflow control: the count of tabs out of view; opens the full tab
+           list (the app-wide context-menu singleton, anchored under it). -->
+      <button
+        class="tab-more"
+        title="{clip.hidden} tab{clip.hidden === 1 ? '' : 's'} out of view — list all tabs"
+        aria-label="list all tabs"
+        aria-haspopup="menu"
+        onclick={(e) => {
+          e.stopPropagation();
+          openTabList(e.currentTarget);
+        }}
+      >
+        <svg viewBox="0 0 16 16" width="10" height="10" aria-hidden="true">
+          <path d="M3.5 6l4.5 4.5L12.5 6" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
+        </svg>
+        {#if clip.hidden > 0}<span class="tab-more-n">{clip.hidden}</span>{/if}
+      </button>
+    {/if}
   </div>
 
   <!-- Linked-terminal chips: on an agent pane, the complete map of the
@@ -763,7 +963,7 @@
       {/if}
       {#if agentChoices.length > 0}
         <!-- The link icon is a drag handle: drag it onto an agent pane to
-             link this terminal there (drop on the "link to this agent" band).
+             link this terminal there (drop on the "link to ⟨agent⟩" band).
              A plain click (or Enter/Space) opens the picker menu as the
              parity path. -->
         <button
@@ -884,12 +1084,112 @@
     user-select: none;
   }
 
-  .tabs {
+  /* --- the tab strip ------------------------------------------------------
+     .strip is the positioned frame (edge fades, the "more" control); .tabs
+     is the scroller. The scrollbar is hidden: the fades + control ARE the
+     overflow affordance, and a 26px bar has no room for a track. */
+  .strip {
+    position: relative;
     flex: 1;
     min-width: 0;
     display: flex;
     align-items: stretch;
-    overflow: hidden;
+  }
+
+  .tabs {
+    position: relative; /* tabs' offsetLeft resolves against the scroller */
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    align-items: stretch;
+    overflow-x: auto;
+    overflow-y: hidden;
+    overscroll-behavior-x: contain;
+    scrollbar-width: none;
+  }
+
+  .tabs::-webkit-scrollbar {
+    display: none;
+  }
+
+  /* Edge fades: a clipped side dissolves into the pane ground (--term-bg is
+     the pane's background) so cut-off tabs read as "more this way". Opacity
+     toggled, never mounted/unmounted, so a scroll costs no layout. The right
+     fade stops short of the "more" control while it is shown. */
+  .strip::before,
+  .strip::after {
+    content: "";
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 24px;
+    z-index: 2;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 0.12s ease;
+  }
+
+  /* Solid for the first third, then dissolve: a clipped name shows as a
+     hint, not as legible text (dark ground otherwise let it read through). */
+  .strip::before {
+    left: 0;
+    background: linear-gradient(to right, var(--term-bg) 30%, transparent);
+  }
+
+  .strip::after {
+    right: 0;
+    background: linear-gradient(to left, var(--term-bg) 30%, transparent);
+  }
+
+  .strip.over::after {
+    right: 32px;
+  }
+
+  .strip.clip-left::before,
+  .strip.clip-right::after {
+    opacity: 1;
+  }
+
+  /* "N more": chevron + count of tabs out of view; same hover recipe as the
+     right-edge .ctl cluster. Fixed floor width so the right fade's inset
+     (.strip.over::after) stays true for 1–2 digit counts. */
+  .tab-more {
+    appearance: none;
+    border: none;
+    background: none;
+    flex: none;
+    align-self: center;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 2px;
+    min-width: 32px;
+    height: 18px;
+    padding: 0 4px;
+    border-radius: 4px;
+    font: inherit;
+    font-family: var(--mono);
+    font-size: var(--text-xs);
+    font-variant-numeric: tabular-nums;
+    color: var(--muted);
+    cursor: pointer;
+    transition:
+      background-color 0.12s ease,
+      color 0.12s ease;
+  }
+
+  .tab-more:hover {
+    background: var(--row-hover);
+    color: var(--fg);
+  }
+
+  .tab-more:focus-visible {
+    outline: 2px solid var(--focus-ring);
+    outline-offset: 1px;
+  }
+
+  .tab-more-n {
+    line-height: 1;
   }
 
   /* Pane grip: same hover-fade recipe as the right-edge .controls, so the bar
@@ -933,14 +1233,19 @@
     cursor: grabbing;
   }
 
+  /* Fit sizing: a tab is its natural width — never shrunk by its siblings —
+     capped at 180px (long names ellipsize) with a floor that keeps a short
+     name a decent hit target. Widths therefore depend on the tab alone, so
+     opening/closing/activating a neighbour moves nothing. */
   .tab {
     position: relative;
+    flex: none;
     display: flex;
     align-items: center;
     gap: 7px;
     padding: 0 0.4rem 0 0.55rem;
-    max-width: 200px;
-    min-width: 0;
+    min-width: 64px;
+    max-width: 180px;
     font-family: var(--mono);
     font-size: var(--text-xs);
     color: var(--muted);
@@ -953,10 +1258,26 @@
     color: var(--fg);
   }
 
-  /* Active-tab emphasis via weight, not color — the bar stays quiet. */
+  /* Active-tab emphasis via weight, not color — the bar stays quiet; a thin
+     accent underline (inset shadow, above the bar's edge line) confirms it
+     without adding a fill. */
   .tab.active {
     color: var(--fg);
     font-weight: 600;
+    box-shadow: inset 0 -2px 0 color-mix(in srgb, var(--accent) 70%, transparent);
+  }
+
+  /* Hairline between neighbours: absolute, so it costs no width. Vertically
+     inset so it reads as a divider, not a cell border. */
+  .tab + .tab::after {
+    content: "";
+    position: absolute;
+    left: 0;
+    top: 7px;
+    bottom: 7px;
+    width: 1px;
+    pointer-events: none;
+    background: color-mix(in srgb, var(--edge) 85%, transparent);
   }
 
   /* A link-intent drag hovers this agent's tab: light it in the agent's hue
@@ -968,7 +1289,7 @@
     border-radius: 5px;
   }
 
-  /* Drag insertion caret. */
+  /* Drag insertion caret (above the neighbour hairline it overlaps). */
   .tab.insert::before,
   .tab-tail.insert::before {
     content: "";
@@ -977,6 +1298,7 @@
     bottom: 5px;
     left: -1px;
     width: 2px;
+    z-index: 1;
     border-radius: 1px;
     background: var(--accent);
   }
@@ -1013,10 +1335,24 @@
   }
 
   .tab-name {
+    flex: 1 1 auto;
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  /* Width reserve for the active weight: a hidden zero-height bold copy of
+     the label sizes the name at its 600 width in every state, so switching
+     tabs changes nothing but the ink. */
+  .tab-name::after {
+    content: attr(data-label);
+    display: block;
+    height: 0;
+    overflow: hidden;
+    visibility: hidden;
+    font-weight: 600;
+    font-style: normal;
   }
 
   /* A VS Code preview tab: italic until it is pinned (dbl-click / edit). */

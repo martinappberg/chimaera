@@ -86,6 +86,18 @@ Daemon side: `crates/chimaera-server/src/{workspaces.rs,view_state.rs,quickopen.
   split, a window edge re-roots — or drag it past the window edge to tear the whole pane out
   into its own window. It hides only while the pane is zoomed (a single-pane window's grip
   still has somewhere to go: out).
+- **Many tabs: fit sizing + a scrolling strip.** Tabs never shrink to make room (VS Code
+  "fit" sizing): each takes its natural width (glyph + name + close), capped at 180px with a
+  64px floor, and a tab's width depends on itself alone — the active weight is pre-reserved,
+  so activating, opening, or closing a tab moves none of its neighbours. When the strip
+  overflows it **scrolls horizontally** (hidden scrollbar; a vertical mouse wheel over the
+  strip scrolls it sideways, trackpad horizontal scroll is native), the clipped side(s) fade
+  into the pane ground, and a **"N more" control** (chevron + count of tabs out of view) at
+  the strip's end opens a menu of **every** tab in order, the active one marked — pick one to
+  activate it. The active tab is scrolled into view whenever it changes (click, `Mod+Alt+[`/`]`,
+  an open, a layout restore, a resize). Adjacent tabs are separated by a hairline and the
+  active tab carries a thin accent underline; a tab drag hovering near either edge of an
+  overflowed strip auto-scrolls it.
 - **Preview (italic) tabs.** File opens are **preview** tabs, VS Code-style: the name renders
   italic, opening another file **replaces** the one preview slot per pane (so single-clicking
   through files doesn't pile up tabs), and it **pins** (non-italic, permanent) on a
@@ -101,10 +113,17 @@ Daemon side: `crates/chimaera-server/src/{workspaces.rs,view_state.rs,quickopen.
   drags are rAF-throttled and **gate terminal refits** (`pool.setDragging`) to avoid reflow
   jank. The layout tree is pure/immutable with structural sharing. DnD is custom pointer-based
   (HTML5 DnD can't hit 60fps); the source captures the pointer so terminals never see the moves.
-  Two special drop bands over a pane's lower ~22%: an **"@ reference"** band (a file *or folder*
-  drag types its path into a live session — see [drag-drop-and-uploads.md](drag-drop-and-uploads.md),
-  which also covers OS-desktop file drops and screenshot paste) and a **"link to agent"** band (a
-  terminal drag leashes it — see [linked-terminals.md](linked-terminals.md)).
+  Two special drop bands over a pane's lower ~22%: an **"@ reference in ⟨session⟩"** band (a file
+  *or folder* drag types its path into a live session — see
+  [drag-drop-and-uploads.md](drag-drop-and-uploads.md), which also covers OS-desktop file drops
+  and screenshot paste) and a **"link to ⟨agent⟩"** band (a terminal drag leashes it — see
+  [linked-terminals.md](linked-terminals.md)). **Every preview says what it does**: zone previews
+  carry a centred label (`split left/right/up/down`, `add as tab`), the window-edge preview says
+  `split window ⟨side⟩`, and the drag ghost's hint names the hovered spot in the same words
+  (`insert as tab`, `@ reference in ⟨session⟩`, `link to ⟨agent⟩`, `merge into this pane` for a
+  pane-grip drag) — quiet for tile moves, accent for reference/link/out. One vocabulary:
+  `sideWord` in `dnd.ts` matches the pane-bar split buttons; `DragOptions.describe` lets App supply
+  session names and `dnd.ts` falls back to generic text, written only on a spot change.
 
 ## Detach & cross-window moves
 
