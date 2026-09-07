@@ -31,6 +31,7 @@
   import { getSetting } from "../settings/store.svelte";
   import { copyText } from "../shared/clipboard";
   import { copyLabel, copyPayload, decorateCopyTargets } from "../shared/copyDecor";
+  import { markScrollRegion, markScrollRegions, watchScrollRegions } from "../shared/scrollRegion";
   import ReferenceChip from "../shared/ReferenceChip.svelte";
   import Spinner from "./Spinner.svelte";
   import { activateUrl, hasUrlScheme, isWebUrl, urlMenuEntries } from "../shared/urlOpen";
@@ -235,7 +236,24 @@
     decorateCopyTargets(content);
     stampImages(content);
     typesetMath(content);
+    markReadingRegions(content);
     return cancelTypeset;
+  });
+
+  /** Keyboard reach for the reading view's scrollers (shared/scrollRegion.ts):
+   *  every table that overflows sideways — comrak's bare <table> is its own
+   *  display:block scroller, and ammonia strips any tabindex the file might
+   *  carry, so the mark is set here after render — and the reading pane
+   *  itself once the document is taller than it. Re-checked when the pane
+   *  resizes (tables reflow, the vertical overflow changes). */
+  function markReadingRegions(scroll: HTMLElement): void {
+    markScrollRegions(scroll, "table", "x", "scrollable table");
+    markScrollRegion(scroll, "y", "document");
+  }
+  $effect(() => {
+    const scroll = readingEl;
+    if (scroll === null) return;
+    return watchScrollRegions(scroll, "y", () => markReadingRegions(scroll));
   });
 
   /** Equations in a rendered document. The server emits each one — inline
@@ -436,9 +454,17 @@
       clearSelection(selOwner);
       return;
     }
+    // `scroll` doesn't bubble, so the reading pane's own scroll would miss
+    // the inner scrollers (a wide table, a fence, display math): a capturing
+    // listener on the root sees every descendant's scroll and keeps the chip
+    // on the selection as it slides.
+    const root = readingEl;
+    const scrollOpts = { capture: true, passive: true } as const;
     document.addEventListener("selectionchange", syncPreviewSelection);
+    root?.addEventListener("scroll", syncPreviewSelection, scrollOpts);
     return () => {
       document.removeEventListener("selectionchange", syncPreviewSelection);
+      root?.removeEventListener("scroll", syncPreviewSelection, scrollOpts);
       chipPos = null;
       clearSelection(selOwner);
     };
@@ -501,7 +527,6 @@
       class="md-scroll"
       class:hidden={mode !== "reading"}
       bind:this={readingEl}
-      onscroll={syncPreviewSelection}
     >
       {#if error !== null}
         <div class="file-error">{error}</div>

@@ -24,6 +24,7 @@
 <script lang="ts">
   import { copyText } from "../shared/clipboard";
   import { copyLabel, copyPayload, decorateCopyTargets } from "../shared/copyDecor";
+  import { markScrollRegions, watchScrollRegions } from "../shared/scrollRegion";
   import { advanceSegments, type SegmenterState } from "./streamSegments";
   import { RevealLedger } from "./revealLedger";
   import { pathCandidate, trimPathWord, type PathHit, type ResolvePaths } from "./paths";
@@ -558,6 +559,7 @@
     renderFragment(root, source);
     decorateCopyTargets(root);
     classifyLocalAnchors(root);
+    markTableRegions(root);
     if (!reducedMotion) {
       // This segment was the HEAD of the previous open tail — carry the
       // reveal cursor over so already-shown words don't re-hide or re-fade.
@@ -718,6 +720,22 @@
     lastSettledHtml = current;
     decorateCopyTargets(el);
     stampPaths(el);
+    markTableRegions(el);
+  });
+
+  /** A wide table's .md-table host becomes a keyboard-reachable region only
+   *  while it overflows (shared/scrollRegion.ts). Closed segments and the
+   *  settled render are marked as they land; the per-chunk open tail is NOT
+   *  (its read of scrollWidth would force a layout per chunk, and a table is
+   *  reachable soon enough once its segment closes). A width change of the
+   *  transcript re-checks every host. */
+  function markTableRegions(root: ParentNode): void {
+    markScrollRegions(root, ".md-table", "x", "scrollable table");
+  }
+  $effect(() => {
+    const root = el;
+    if (root === null) return;
+    return watchScrollRegions(root, "x", () => markTableRegions(root));
   });
 
   // Stop the ticker, the copied-feedback timer, unwrap timers, and any

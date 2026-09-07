@@ -182,7 +182,11 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
     GFM `:--:` / `--:` alignment is honoured through the `align` attribute comrak emits and the
     sanitizer keeps; numerals are tabular. Unlike chat, headers wrap like any cell, and a
     hand-written `<table>` in the file gets the same scroller (the sanitizer still reshapes it:
-    no `tfoot`, no `width` / `style`).
+    no `tfoot`, no `width` / `style`). Wide tables, and the reading pane once the document is
+    taller than it, are keyboard-reachable: each becomes a focusable, labelled region while it
+    overflows (`shared/scrollRegion.ts`, re-checked on pane resize) — WebKit never makes a
+    scroller focusable on its own. The selection's reference chip follows a table, fence, or
+    equation scrolled sideways, not only the pane's own scroll.
   - **source** is the same editor as plain raw markdown (an extension swap in CodeView's
     `extra` compartment — never a remount, so the buffer, undo history, and dirty state
     survive every toggle; the file is only written on Cmd/Ctrl+S).

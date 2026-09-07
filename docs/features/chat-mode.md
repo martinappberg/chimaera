@@ -191,7 +191,10 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   "Markdown tables"); chat adds only the hosted-cell wrapping reset and the one-line headers.
   Alignment follows the attribute's value on both surfaces: `align="center"` / `"right"` (any
   case) are honoured, anything else — an empty or legacy value in an agent's raw HTML — renders
-  left.
+  left. A table that overflows is keyboard-reachable: its scroll host becomes a focusable,
+  labelled region (Tab to it, arrow keys scroll) for exactly as long as it overflows — a table
+  that fits is no tab stop (`shared/scrollRegion.ts`, re-checked when the transcript's width
+  changes).
 - **Block copy affordances + clean selection copy.** Fenced code blocks and blockquotes carry a
   hover copy button (the shared `shared/copyDecor.ts` decorator, also used by the markdown file
   preview); a blockquote copies its rendered prose whole. Selection-copy of settled prose is
