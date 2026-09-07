@@ -19,10 +19,8 @@ use chimaera_agent::model::{
 use chimaera_agent::{ChatManager, CommandQueueFull, EventHook, ExitHook, RETAINED_SENDS_MAX};
 
 const FAKE: &str = env!("CARGO_BIN_EXE_fake-claude");
-/// Ceiling on any single wait. Every wait in this file is condition-driven
-/// (an event arrives, a hook fires), so this bound only decides how long a
-/// genuinely broken run takes to fail — make it generous enough that a slow,
-/// loaded CI runner running the suite in parallel never trips it.
+/// Ceiling per wait. Every wait here is condition-driven, so this only bounds
+/// how long a broken run takes to fail; generous for a loaded, parallel CI run.
 const WAIT: Duration = Duration::from_secs(20);
 
 struct Fixture {
@@ -77,24 +75,33 @@ async fn wait_for(
     }
 }
 
-/// A turn's surfaced prose so far: every `MessageChunk` of `turn` concatenated
-/// in seq order, deduped by seq (the live tail may overlap the replay
-/// snapshot). HOW MANY chunks the deltas land in is timing-dependent by
-/// design — the harness's ~100ms tick flushes whatever is buffered, so a tick
-/// that fires between two frames splits them — so tests assert on the
-/// concatenation, never on a single chunk's text.
+/// `seen` with the attach overlap removed: `attach` subscribes to `live`
+/// before snapshotting `replay`, so the live tail may re-deliver events the
+/// replay already holds (the documented "dedupe by seq" contract). First
+/// occurrence wins and arrival order is kept, so a genuinely reordered event
+/// survives for the ordering assertions to catch instead of vanishing.
+fn dedup_by_seq(seen: &[Arc<SeqEvent>]) -> Vec<&Arc<SeqEvent>> {
+    let mut taken = std::collections::HashSet::new();
+    seen.iter().filter(|e| taken.insert(e.seq)).collect()
+}
+
+/// A turn's surfaced prose so far: its `MessageChunk`s concatenated in
+/// arrival order. How many chunks the deltas land in is timing-dependent (see
+/// `AgentEvent::MessageChunk`), so tests assert on the concatenation, never on
+/// one chunk's text. Not supersede-aware: it fails loudly rather than gluing
+/// prose across a `MessagesSuperseded` the client would have dropped.
 fn prose(seen: &[Arc<SeqEvent>], turn: &str) -> String {
-    let mut last = 0u64;
     let mut out = String::new();
-    for e in seen {
-        if e.seq <= last {
-            continue;
-        }
-        last = e.seq;
-        if let AgentEvent::MessageChunk { turn_id, text, .. } = &e.ev {
-            if turn_id == turn {
-                out.push_str(text);
+    for e in dedup_by_seq(seen) {
+        match &e.ev {
+            AgentEvent::MessageChunk { turn_id, text } if turn_id == turn => out.push_str(text),
+            AgentEvent::MessagesSuperseded => {
+                panic!(
+                    "prose() is not supersede-aware; MessagesSuperseded at seq {}",
+                    e.seq
+                )
             }
+            _ => {}
         }
     }
     out
@@ -145,20 +152,18 @@ async fn full_turn_with_permission_allow_and_gap_replay() {
         matches!(ev, AgentEvent::TurnStarted { .. })
     })
     .await;
-    let turn = match &started.ev {
-        AgentEvent::TurnStarted { turn_id } => turn_id.clone(),
-        _ => unreachable!(),
+    let AgentEvent::TurnStarted { turn_id: turn } = &started.ev else {
+        unreachable!()
     };
     // Second Init carries the native session id from system/init.
     wait_for(&mut rx, &mut seen, "Init with native id", |ev| {
         matches!(ev, AgentEvent::Init { native_session_id, .. } if native_session_id == "fake-native-1")
     })
     .await;
-    // The streamed deltas ("hel", "lo") coalesce, but whether they surface as
-    // one chunk or two is a race between the second frame and the harness's
-    // ~100ms flush tick (a loaded CI runner split them). What IS pinned is the
-    // order: the driver flushes the turn's prose before it emits the
-    // tool_use's ToolCall, so once the ToolCall is here the prose is complete.
+    // "hel"/"lo" may surface as one chunk or two (see `AgentEvent::MessageChunk`;
+    // a loaded CI runner split them). What IS pinned is the order: the driver
+    // flushes the turn's prose before it emits the tool_use's ToolCall, so once
+    // the ToolCall is here the prose is complete.
     wait_for(
         &mut rx,
         &mut seen,
@@ -167,9 +172,9 @@ async fn full_turn_with_permission_allow_and_gap_replay() {
     )
     .await;
     assert_eq!(
-        prose(&seen, &turn),
+        prose(&seen, turn),
         "hello",
-        "streamed deltas coalesce losslessly ahead of the tool call"
+        "streamed deltas coalesce losslessly ahead of the tool call; saw {seen:#?}"
     );
     let permission = wait_for(&mut rx, &mut seen, "PermissionRequest", |ev| {
         matches!(ev, AgentEvent::PermissionRequest { .. })
@@ -222,25 +227,18 @@ async fn full_turn_with_permission_allow_and_gap_replay() {
     // The assistant frame repeats the streamed text as a `text` block; the
     // driver must not surface it a second time.
     assert_eq!(
-        prose(&seen, &turn),
+        prose(&seen, turn),
         "hello",
-        "a turn's prose surfaces exactly once"
+        "a turn's prose surfaces exactly once; saw {seen:#?}"
     );
 
-    // Attach subscribes to `live` before snapshotting `replay`, so the live
-    // tail may legitimately re-deliver an event already in replay (the
-    // documented "dedupe by seq" contract). Apply that dedupe, then assert the
-    // remaining stream is strictly increasing.
-    let mut ordered: Vec<u64> = Vec::new();
-    let mut max_seq = 0u64;
-    for e in &seen {
-        if e.seq > max_seq {
-            ordered.push(e.seq);
-            max_seq = e.seq;
-        }
-    }
-    for pair in ordered.windows(2) {
-        assert!(pair[1] > pair[0], "non-monotonic: {seen:#?}");
+    // After the attach-overlap dedupe, what a client saw must BE the journal:
+    // contiguous from seq 1 (this attach started at 0), no reorder, no gap.
+    // (A running-max filter would make this vacuous — it hides reorders.)
+    let seqs: Vec<u64> = dedup_by_seq(&seen).iter().map(|e| e.seq).collect();
+    assert_eq!(seqs.first(), Some(&1), "stream starts at seq 1: {seen:#?}");
+    for pair in seqs.windows(2) {
+        assert_eq!(pair[1], pair[0] + 1, "reordered or gapped: {seen:#?}");
     }
 
     // Gap replay: a reconnect with last_seq = permission's seq must get
