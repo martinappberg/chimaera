@@ -175,6 +175,14 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
     cap 4 MB), fetched on first entry and refreshed in place on saves/agent writes. The
     client typesets those spans under the one KaTeX policy every surface shares
     (`shared/math.ts`, loaded on demand at the first equation, memoized, time-sliced).
+    **Tables scroll, never squeeze** — the chat transcript's treatment, without its host
+    wrapper: the `<table>` itself is the horizontal scroller (`display: block`), which on
+    WebKit 26 still exposes table / row / columnheader / cell to VoiceOver (probed through the
+    Web Inspector's node accessibility query), so a table wider than the reading column scrolls
+    in place. GFM `:--:` / `--:` alignment is honoured through the `align` attribute comrak
+    emits (the sanitizer keeps it), numerals are tabular so digit columns line up, and header
+    cells stay on one line. Unlike chat, an author's literal `<table>` HTML gets the same
+    treatment — it's the document's own table, not agent output.
   - **source** is the same editor as plain raw markdown (an extension swap in CodeView's
     `extra` compartment — never a remount, so the buffer, undo history, and dirty state
     survive every toggle; the file is only written on Cmd/Ctrl+S).

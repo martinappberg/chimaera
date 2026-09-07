@@ -829,11 +829,30 @@
     max-width: 100%;
   }
 
+  /* Tables: the <table> is its own horizontal scroller (display:block +
+     overflow-x), so a table wider than the reading column scrolls in place
+     instead of widening it. The block form keeps its semantics: probed on
+     WebKit 26.6 (the native app's engine) through the Web Inspector's node
+     accessibility query, a display:block <table> still reports table / row /
+     columnheader / cell, so the chat transcript's host wrapper isn't needed
+     here — and couldn't be added after render anyway (comrak emits a bare
+     <table>; the {@html} host is append-only, see shared/copyDecor.ts). The
+     scroller otherwise matches the chat host: a thin bar, contained
+     horizontal overscroll (a trackpad swipe at a table edge must not become
+     WebKit's back gesture), and 1px of padding so the outer half of the
+     collapsed border isn't clipped. GFM alignment arrives as the align
+     attribute (ammonia keeps it); the left default is scoped to unaligned
+     cells so the browser's own mapping handles :--: / --: columns. Numerals
+     are tabular so digit columns line up; header cells stay on one line so
+     column names read as labels. */
   .md-body :global(table) {
     border-collapse: collapse;
     margin: 1em 0;
     display: block;
     overflow-x: auto;
+    overscroll-behavior-x: contain;
+    scrollbar-width: thin;
+    padding: 1px;
     font-size: 0.924em;
   }
 
@@ -841,11 +860,17 @@
   .md-body :global(td) {
     border: 1px solid var(--edge);
     padding: 0.35em 0.7em;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .md-body :global(th:not([align])),
+  .md-body :global(td:not([align])) {
     text-align: left;
   }
 
   .md-body :global(th) {
     font-weight: 600;
+    white-space: nowrap;
     background: color-mix(in srgb, var(--fg) 4%, transparent);
   }
 
