@@ -1238,6 +1238,39 @@ mod markdown_tests {
         assert!(!html.contains("data-math-style"), "{html}");
         assert!(html.contains("$5 and $10"), "{html}");
     }
+
+    /// The reading view's alignment CSS keys on the `align` attribute: comrak
+    /// must write GFM `:-:` / `--:` as `align="center|right"` (never a style,
+    /// which the sanitizer would strip), ammonia's defaults must let it
+    /// through, and an unmarked column must carry no attribute at all.
+    #[test]
+    fn gfm_alignment_survives_sanitization_as_align_attributes() {
+        let html = sanitize_markdown(&markdown_to_html(
+            "| a | b | c |\n|:-:|--:|---|\n| 1 | 2 | 3 |\n",
+        ));
+        for cell in [
+            "<th align=\"center\">a</th>",
+            "<th align=\"right\">b</th>",
+            "<th>c</th>",
+            "<td align=\"center\">1</td>",
+            "<td align=\"right\">2</td>",
+            "<td>3</td>",
+        ] {
+            assert!(html.contains(cell), "missing {cell} in {html}");
+        }
+    }
+
+    /// Hand-written HTML reaches the sanitizer too (`render.unsafe`), and the
+    /// reading view matches its `align` case-insensitively — so ammonia must
+    /// pass a raw value through unnormalised, empty ones included.
+    #[test]
+    fn raw_html_alignment_passes_through_unnormalised() {
+        let html = sanitize_markdown(&markdown_to_html(
+            "<table><tr><td align=\"CENTER\">x</td><td align=\"\">y</td></tr></table>\n",
+        ));
+        assert!(html.contains("<td align=\"CENTER\">x</td>"), "{html}");
+        assert!(html.contains("<td align=\"\">y</td>"), "{html}");
+    }
 }
 
 #[derive(Deserialize)]
