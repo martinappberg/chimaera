@@ -56,9 +56,9 @@ no Node needed at run time.
 **One-time build first** (the script fails fast if either is missing):
 
 ```sh
-cargo build -p chimaera                       # builds target/debug/chimaera
 nvm use 22 && npm --prefix web-ui ci \
   && npm --prefix web-ui run build            # Node 22 — the nvm default (16) errors
+cargo build -p chimaera                       # rust-embed requires dist to exist first
 ```
 
 Then `preview_start chimaerad-isolated`, read the printed

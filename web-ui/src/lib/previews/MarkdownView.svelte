@@ -37,6 +37,7 @@
   import { activateUrl, hasUrlScheme, isWebUrl, urlMenuEntries } from "../shared/urlOpen";
   import { contextMenu } from "../shared/contextMenu.svelte";
   import { loadMath, mathNow } from "./mathLoad";
+  import { readingWindow } from "./readingWindow";
 
   interface Props {
     path: string;
@@ -578,7 +579,11 @@
       {#if error !== null}
         <div class="file-error">{error}</div>
       {:else if html !== null}
-        <article class="md-body" style:font-size="{bodyFont}px">
+        <article
+          class="md-body"
+          style:font-size="{bodyFont}px"
+          use:readingWindow={[html, bodyFont, bodyLineHeight]}
+        >
           <!-- eslint-disable-next-line svelte/no-at-html-tags — sanitized server-side -->
           {@html html}
         </article>
