@@ -4373,7 +4373,15 @@
                   title="double-click to rename (F2)"
                   ondblclick={() => startRename(s)}
                 >
-                  <span class="name">{displayNames.get(s.id) ?? displayName(s)}</span>
+                  <span class="name">
+                    {displayNames.get(s.id) ?? displayName(s)}
+                    {#if s.kind === "agent" && s.remote_control_url}
+                      <!-- Remote Control is on: this session is reachable from
+                           the Claude app / claude.ai/code. Quiet accent pill;
+                           the chat header owns the controls. -->
+                      <span class="remote-badge" title="Remote Control on — pick this session up in the Claude app or at claude.ai/code">remote</span>
+                    {/if}
+                  </span>
                   <!-- Second line only when it adds something over the name.
                        Shells never do: the name already resolves to the title
                        (program-set) or the cwd (the shell's "user@host:dir"
@@ -5584,6 +5592,23 @@
   .title {
     font-size: var(--text-xs);
     color: var(--muted);
+  }
+
+  /* Remote Control badge on a rail row: an accent pill inline after the
+     name, the same pill language as the chat header's chips. */
+  .remote-badge {
+    display: inline-block;
+    vertical-align: 1px;
+    margin-left: 5px;
+    padding: 0 5px;
+    font-family: var(--mono);
+    font-size: 9px;
+    line-height: 13px;
+    letter-spacing: 0.02em;
+    color: var(--accent);
+    border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--edge));
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--accent) 9%, transparent);
   }
 
   .close {

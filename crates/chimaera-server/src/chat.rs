@@ -63,7 +63,17 @@ pub(crate) struct ChatRecipe {
     /// Rewind rollback count: respawn resumes the thread and drops this many
     /// trailing turns via `thread/rollback` (codex only — its thread id
     /// survives, so the conversation truncates in place instead of forking).
+    /// The fallback for app-servers without `thread/revert`.
     pub(crate) rollback_turns: Option<u32>,
+    /// Rewind cut for `thread/revert {beforeTurnId}` (codex 0.153+): the
+    /// native id of the first dropped turn. Preferred over the count —
+    /// paginated threads refuse the deprecated rollback.
+    pub(crate) revert_before_turn: Option<String>,
+    /// This spawn CREATES a conversation's chimaera session (fresh, resumed
+    /// from recents, resurrected) rather than respawning a live one (view
+    /// switch, rewind) — the only spawns where `chat.remoteControlAtStart`
+    /// applies, so a bridge the user turned off stays off across respawns.
+    pub(crate) remote_control_at_start: bool,
     pub(crate) theme: String,
     /// Launch-scope prelude text (see `environment`). Carried on the recipe
     /// so a view-switch/rewind/degrade respawn keeps the launch scope; not
@@ -726,6 +736,9 @@ pub(crate) fn chat_session_json(
         "status_detail": info.status_detail,
         "status_category": info.status_category,
         "status_needs_action": info.status_needs_action,
+        // The session's Remote Control page while its bridge is up (claude
+        // `session_url`): the rail's "take it with you" badge. Null when off.
+        "remote_control_url": info.remote_control_url,
         "mastermind": if mastermind { json!(true) } else { serde_json::Value::Null },
     })
 }
@@ -900,7 +913,16 @@ async fn resolve_respawn_inputs(
     Ok((settings, mcp_config, bin, detection.version))
 }
 
-type ForkCut = (usize, u32, Option<(usize, String)>);
+/// What a rewind drops: `TurnStarted` count at/after the cut (codex's legacy
+/// `thread/rollback numTurns`) and the FIRST dropped turn's native id (codex's
+/// `thread/revert beforeTurnId` — the modern path).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DroppedTurns {
+    pub(crate) count: u32,
+    pub(crate) first_turn_id: Option<String>,
+}
+
+type ForkCut = (usize, DroppedTurns, Option<(usize, String)>);
 
 /// Locate the rewind cut for `resume_at` in a journal's content: the line
 /// index where dropped history starts, plus the number of turns
@@ -963,14 +985,29 @@ fn find_fork_cut(content: &str, resume_at: &str) -> Option<ForkCut> {
     // them, and compaction turns alike). Turns run outside this journal
     // (e.g. TUI-interleaved via the view toggle) are invisible here — the
     // rollback count is only as complete as the journal.
-    let turns = lines[cut..]
-        .iter()
-        .filter(|line| {
-            serde_json::from_str::<SeqEvent>(line)
-                .map(|e| matches!(e.ev, AgentEvent::TurnStarted { .. }))
-                .unwrap_or(false)
-        })
-        .count() as u32;
+    let mut turns = DroppedTurns {
+        count: 0,
+        first_turn_id: None,
+    };
+    for line in &lines[cut..] {
+        let Ok(entry) = serde_json::from_str::<SeqEvent>(line) else {
+            continue;
+        };
+        match entry.ev {
+            AgentEvent::TurnStarted { turn_id } => {
+                turns.count += 1;
+                if turns.first_turn_id.is_none() {
+                    turns.first_turn_id = Some(turn_id);
+                }
+            }
+            // A cut BEFORE a portable branch marker would hand the copied
+            // source conversation's turn ids (another vendor's, or another
+            // thread's) to this session's native revert/rollback. Refuse the
+            // anchor: history stays intact, the same outcome as no match.
+            AgentEvent::Forked { native: false, .. } => return None,
+            _ => {}
+        }
+    }
     Some((cut, turns, neutralize))
 }
 
@@ -991,7 +1028,7 @@ fn find_fork_cut(content: &str, resume_at: &str) -> Option<ForkCut> {
 fn truncate_journal_at_fork(
     path: &std::path::Path,
     resume_at: &str,
-) -> std::io::Result<Option<u32>> {
+) -> std::io::Result<Option<DroppedTurns>> {
     let content = std::fs::read_to_string(path)?;
     let Some((cut, turns, neutralize)) = find_fork_cut(&content, resume_at) else {
         return Ok(None);
@@ -1260,6 +1297,8 @@ async fn perform_switch(
         resume,
         fork_at: None,
         rollback_turns: None,
+        revert_before_turn: None,
+        remote_control_at_start: false,
         theme,
         prelude: launch_prelude,
         mastermind,
@@ -1414,6 +1453,7 @@ fn control_only_switch_journal(path: &std::path::Path) -> bool {
             | AgentEvent::BackgroundTasks { .. }
             | AgentEvent::PromptSuggestion { .. }
             | AgentEvent::SessionStatus { .. }
+            | AgentEvent::RemoteControl { .. }
             | AgentEvent::Exited { .. } => {}
             _ => return false,
         }
@@ -1563,7 +1603,7 @@ pub(crate) async fn rewind_session(
                 .await
             {
                 Ok(Ok(Some(turns))) => {
-                    tracing::info!(%id, turns, "truncated chat journal at rewind fork point");
+                    tracing::info!(%id, turns = turns.count, first = ?turns.first_turn_id, "truncated chat journal at rewind fork point");
                     Some(turns)
                 }
                 // No anchor match: the file is left whole (no history lost). The
@@ -1634,7 +1674,18 @@ pub(crate) async fn rewind_session(
             model: None,
             resume: Some(native),
             fork_at: (!is_codex).then(|| body.resume_at.clone()),
-            rollback_turns: if is_codex { dropped_turns } else { None },
+            rollback_turns: if is_codex {
+                dropped_turns.as_ref().map(|d| d.count)
+            } else {
+                None
+            },
+            revert_before_turn: if is_codex {
+                dropped_turns.as_ref().and_then(|d| d.first_turn_id.clone())
+            } else {
+                None
+            },
+            // A rewind respawns a live session: keep the user's bridge choice.
+            remote_control_at_start: false,
             theme,
             prelude: launch_prelude,
             portable_context,
@@ -1726,6 +1777,7 @@ fn render_fork_context(events: &[AgentEvent]) -> Vec<ForkContextRow> {
                 attachments,
                 id,
                 queued: true,
+                origin: None,
             } => {
                 assistant_turn = None;
                 if let Some(id) = id {
@@ -2714,6 +2766,8 @@ pub(crate) async fn spawn_fresh_chat(
         resume: native_fork.as_ref().map(|(source, _)| source.clone()),
         fork_at: native_fork.as_ref().map(|(_, at)| at.clone()),
         rollback_turns: None,
+        revert_before_turn: None,
+        remote_control_at_start: true,
         theme: spec.theme,
         prelude: spec.prelude.filter(|p| !p.trim().is_empty()),
         mastermind,
@@ -2785,13 +2839,47 @@ async fn codex_initial_effort(state: &Arc<AppState>, recipe: &ChatRecipe) -> Opt
     }
 }
 
+/// Precedence for what a chat starts with: the recipe's explicit model, then
+/// the conversation's own last settings (a reopened chat; `recovered_effort`
+/// is codex's journal-recovered effort for pre-index rows), then the agent
+/// kind's prefs — what the user last picked anywhere.
+fn resolve_start_settings(
+    explicit_model: Option<String>,
+    own: chimaera_agent::journal::ConversationSettings,
+    recovered_effort: Option<String>,
+    prefs: &chimaera_agent::journal::AgentPrefs,
+) -> chimaera_agent::journal::ConversationSettings {
+    chimaera_agent::journal::ConversationSettings {
+        model: explicit_model.or(own.model).or(prefs.model.clone()),
+        effort: recovered_effort.or(own.effort).or(prefs.effort.clone()),
+        mode: own.mode.or(prefs.mode.clone()),
+    }
+}
+
 pub(crate) async fn spawn_chat_session(
     state: &Arc<AppState>,
     id: String,
     recipe: ChatRecipe,
     pinned_override: Option<String>,
 ) -> anyhow::Result<ChatInfo> {
-    let initial_effort = codex_initial_effort(state, &recipe).await;
+    let recovered_effort = codex_initial_effort(state, &recipe).await;
+    // A reopened conversation (resume, rewind, fork, post-restart
+    // resurrection) comes back with its own last model, effort and mode —
+    // the journal index carries them per native id because neither agent
+    // rehydrates the trio from its history. What the user last picked on
+    // this agent kind (the daemon's prefs) seeds only what the chat does not
+    // carry itself: a NEW conversation, or a setting from before the index
+    // knew it. The official TUIs persist the same choices in their config.
+    let own = recipe
+        .resume
+        .as_deref()
+        .map(|native| state.chat.index().settings(native))
+        .unwrap_or_default();
+    let prefs = state.chat.prefs(recipe.kind.as_str());
+    let start = resolve_start_settings(recipe.model.clone(), own, recovered_effort, &prefs);
+    let model = start.model;
+    let initial_effort = start.effort;
+    let initial_mode = start.mode;
     // Legacy recovery can yield while a concurrent retire removes the shared
     // identity. From here through ChatManager::spawn there are no awaits, so
     // this closes that race without resurrecting an untracked billing process.
@@ -2839,7 +2927,7 @@ pub(crate) async fn spawn_chat_session(
                     &recipe.bin,
                     settings,
                     mcp,
-                    recipe.model.as_deref(),
+                    model.as_deref(),
                     recipe.resume.as_deref(),
                     pinned.as_deref(),
                     recipe.fork_at.as_deref(),
@@ -2926,8 +3014,19 @@ pub(crate) async fn spawn_chat_session(
     }
     // Codex selects its create-time model in-protocol at thread open; Claude
     // already received the same recipe value through build_chat_command.
+    // Claude reads the same pair: the model rode argv above; the effort is
+    // applied by its handshake (skipped for an effortless catalog entry).
+    if recipe.kind == AgentKind::Claude {
+        spec.initial_model = model.clone();
+        spec.initial_effort = initial_effort.clone();
+    }
+    // The conversation's own / remembered permission mode, for both agents —
+    // except a Mastermind, whose mode is the workspace's ask/auto decision.
+    if recipe.mastermind.is_none() {
+        spec.initial_mode = initial_mode;
+    }
     if recipe.kind == AgentKind::Codex {
-        spec.initial_model = recipe.model.clone();
+        spec.initial_model = model.clone();
         // Codex's rollout survives app-server restarts, but its selected
         // effort does not: thread/resume otherwise falls back to the model's
         // default. Prefer that conversation's value. A brand-new conversation
@@ -2935,6 +3034,45 @@ pub(crate) async fn spawn_chat_session(
         // The index is updated only from authoritative parent EffortState
         // events (foreign auto-review threads are filtered in the driver).
         spec.initial_effort = initial_effort;
+    }
+    // Remote Control at start (claude): the user's standing choice
+    // (`chat.remoteControlAtStart`), applied only to spawns that CREATE the
+    // chimaera session (`recipe.remote_control_at_start`) — a view-switch or
+    // rewind respawn keeps a bridge the user turned off, off. The driver
+    // enables it right after the handshake, or says why not where the CLI
+    // doesn't offer the bridge. Codex's bridge lives on its app-server
+    // daemon; nothing to set here.
+    if recipe.kind == AgentKind::Claude
+        && recipe.remote_control_at_start
+        && crate::lock(&state.settings).remote_control_at_start()
+    {
+        // The bare name (the driver spells `chimaera · <name>`): the session's
+        // display name as the rail shows it, or the workspace directory, plus
+        // a short session suffix so concurrent chats in one workspace stay
+        // distinguishable in the claude.ai list. Bounded like the UI path.
+        let display = crate::lock(&state.agents)
+            .get(&id)
+            .map(|a| a.display_name(None))
+            .filter(|n| !n.trim().is_empty())
+            .or_else(|| {
+                recipe
+                    .workspace_root
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+            })
+            .unwrap_or_else(|| "workspace".to_string());
+        let short: String = id
+            .chars()
+            .rev()
+            .take(4)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        spec.remote_control = Some(format!(
+            "{} ({short})",
+            chimaera_agent::model::truncate_label(display.trim(), 80)
+        ));
     }
     // The binary version the launcher resolved alongside `recipe.bin`: the
     // harness journals it on Init and warns (non-fatally) when it drifts from
@@ -2944,6 +3082,7 @@ pub(crate) async fn spawn_chat_session(
     // Conversation rewind (codex): the driver rolls the resumed thread back
     // right after thread/resume. Claude's driver ignores it (fork rides argv).
     spec.rollback_turns = recipe.rollback_turns;
+    spec.revert_before_turn = recipe.revert_before_turn.clone();
     // Same-agent native branch: Claude already receives this through argv;
     // Codex consumes it during the handshake as thread/fork lastTurnId.
     spec.fork_at = recipe.fork_at.clone();
@@ -3097,6 +3236,8 @@ pub(crate) async fn resurrect_chat(
         resume,
         fork_at: None,
         rollback_turns: None,
+        revert_before_turn: None,
+        remote_control_at_start: true,
         theme: entry.theme.clone(),
         // The ledger doesn't persist launch text: a resurrected session
         // re-runs the durable scopes (host ⊕ workspace) only.
@@ -3154,6 +3295,7 @@ mod tests {
             status_detail: None,
             status_category: None,
             status_needs_action: false,
+            remote_control_url: None,
             background_running,
         }
     }
@@ -3168,6 +3310,7 @@ mod tests {
                     attachments: 0,
                     id: Some("u1".into()),
                     queued: false,
+                    origin: None,
                 },
             ),
             seq_event(
@@ -3251,6 +3394,7 @@ mod tests {
                     attachments: 0,
                     id: None,
                     queued: false,
+                    origin: None,
                 },
             ),
             seq_event(
@@ -3279,6 +3423,7 @@ mod tests {
                     attachments: 0,
                     id: Some("u1".into()),
                     queued: false,
+                    origin: None,
                 },
             ),
             seq_event(
@@ -3303,6 +3448,7 @@ mod tests {
                     attachments: 0,
                     id: Some("u2".into()),
                     queued: true,
+                    origin: None,
                 },
             ),
             seq_event(
@@ -3363,6 +3509,7 @@ mod tests {
                 attachments: 0,
                 id: Some("u1".into()),
                 queued: false,
+                origin: None,
             },
             AgentEvent::MessageChunk {
                 turn_id: "t1".into(),
@@ -3412,6 +3559,7 @@ mod tests {
                     attachments: 0,
                     id: Some("u1".into()),
                     queued: false,
+                    origin: None,
                 },
             ),
             seq_event(
@@ -3475,6 +3623,7 @@ mod tests {
                     attachments: 0,
                     id: Some("u2".into()),
                     queued: false,
+                    origin: None,
                 },
             ),
             seq_event(
@@ -3512,6 +3661,7 @@ mod tests {
                     attachments: 0,
                     id: Some("u2".into()),
                     queued: false,
+                    origin: None,
                 },
             ),
             seq_event(
@@ -3586,6 +3736,7 @@ mod tests {
                     attachments: 0,
                     id: Some("u2".into()),
                     queued: false,
+                    origin: None,
                 },
             ),
             seq_event(
@@ -3648,6 +3799,7 @@ mod tests {
                     attachments: 0,
                     id: None,
                     queued: false,
+                    origin: None,
                 },
             ),
             seq_line(
@@ -3677,6 +3829,7 @@ mod tests {
                     attachments: 0,
                     id: None,
                     queued: false,
+                    origin: None,
                 },
             ),
             seq_line(
@@ -3715,7 +3868,13 @@ mod tests {
         // message's id ("m1"), whose Checkpoint (seq 6) has preceding_uuid
         // "m1". The second UserMessage (seq 5) onward is dropped — two turns
         // (t2 and t3) started in the dropped region.
-        assert_eq!(truncate_journal_at_fork(&path, "m1").unwrap(), Some(2));
+        assert_eq!(
+            truncate_journal_at_fork(&path, "m1").unwrap(),
+            Some(DroppedTurns {
+                count: 2,
+                first_turn_id: Some("t2".into()),
+            })
+        );
         let kept: Vec<u64> = std::fs::read_to_string(&path)
             .unwrap()
             .lines()
@@ -3755,6 +3914,7 @@ mod tests {
                     attachments: 0,
                     id: Some("m1".into()),
                     queued: false,
+                    origin: None,
                 },
             ),
             seq_line(
@@ -3777,6 +3937,7 @@ mod tests {
                     attachments: 0,
                     id: Some("q2".into()),
                     queued: true,
+                    origin: None,
                 },
             ),
             seq_line(
@@ -3816,7 +3977,12 @@ mod tests {
         ];
         std::fs::write(&path, lines.join("\n") + "\n").unwrap();
 
-        assert_eq!(truncate_journal_at_fork(&path, "m1").unwrap(), Some(1));
+        assert_eq!(
+            truncate_journal_at_fork(&path, "m1")
+                .unwrap()
+                .map(|d| d.count),
+            Some(1)
+        );
         let kept: Vec<SeqEvent> = std::fs::read_to_string(&path)
             .unwrap()
             .lines()
@@ -3839,6 +4005,63 @@ mod tests {
         ));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A reopened chat starts from its own last settings; the per-agent prefs
+    /// fill only what it does not carry; an explicit model always wins.
+    #[test]
+    fn start_settings_prefer_the_conversations_own_over_prefs() {
+        use chimaera_agent::journal::{AgentPrefs, ConversationSettings};
+        let prefs = AgentPrefs {
+            model: Some("opus".into()),
+            effort: Some("xhigh".into()),
+            mode: Some("acceptEdits".into()),
+            ts: 0,
+        };
+        // A new chat (nothing of its own) takes the prefs wholesale.
+        assert_eq!(
+            resolve_start_settings(None, ConversationSettings::default(), None, &prefs),
+            ConversationSettings {
+                model: Some("opus".into()),
+                effort: Some("xhigh".into()),
+                mode: Some("acceptEdits".into()),
+            }
+        );
+        // A reopened chat keeps what it ran with, even when the prefs moved on.
+        let own = ConversationSettings {
+            model: Some("sonnet".into()),
+            effort: Some("high".into()),
+            mode: Some("plan".into()),
+        };
+        assert_eq!(resolve_start_settings(None, own.clone(), None, &prefs), own);
+        // Partial knowledge: only the missing setting falls back to the prefs.
+        let partial = ConversationSettings {
+            model: None,
+            effort: Some("medium".into()),
+            mode: None,
+        };
+        assert_eq!(
+            resolve_start_settings(None, partial, None, &prefs),
+            ConversationSettings {
+                model: Some("opus".into()),
+                effort: Some("medium".into()),
+                mode: Some("acceptEdits".into()),
+            }
+        );
+        // The launch-time model and codex's journal-recovered effort win.
+        assert_eq!(
+            resolve_start_settings(
+                Some("haiku".into()),
+                ConversationSettings::default(),
+                Some("low".into()),
+                &prefs
+            ),
+            ConversationSettings {
+                model: Some("haiku".into()),
+                effort: Some("low".into()),
+                mode: Some("acceptEdits".into()),
+            }
+        );
     }
 
     #[tokio::test]
@@ -3872,6 +4095,7 @@ mod tests {
                 attachments: 0,
                 id: None,
                 queued: false,
+                origin: None,
             },
             AgentEvent::TurnStarted {
                 turn_id: "turn-1".into(),
@@ -3906,6 +4130,9 @@ mod tests {
                         slash_commands: Vec::new(),
                         models: Vec::new(),
                         agent_version: None,
+                        remote_control_available: false,
+                        remote_control_auto_enable: false,
+                        remote_control: None,
                     },
                     AgentEvent::Exited { status: Some(0) },
                 ],
@@ -3924,6 +4151,8 @@ mod tests {
             resume: Some(native_id.into()),
             fork_at: None,
             rollback_turns: None,
+            revert_before_turn: None,
+            remote_control_at_start: false,
             theme: "dark".into(),
             prelude: None,
             mastermind: None,

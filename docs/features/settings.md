@@ -22,7 +22,7 @@ a `settings` frame on `/ws/events`. Map: [settings/AGENTS.md](../../web-ui/src/l
   `web-ui/src/lib/settings/schema.ts` (where defaults live).
 - **Key behaviors.** Reads **re-stat the file** so external edits surface without a restart, bumping a
   content generation that `/ws/events` diffs against. Only a handful of keys are daemon-consumed
-  (`git.path`, `agents.*.path`, `daemon.scrollbackLines`, `daemon.restoreSessions`, `update.autoCheck`,
+  (`git.path`, `agents.*.path`, `daemon.scrollbackLines`, `daemon.restoreSessions`, `chat.remoteControlAtStart`, `update.autoCheck`,
   `quickOpen.ignoreDirs`); everything else is opaque and preserved verbatim (forward-compat — a newer
   UI's keys survive an older daemon). A corrupt/oversized/non-object file degrades to an empty map with
   a warning — settings must never brick the daemon. A changed `agents.*.path` triggers shim regeneration

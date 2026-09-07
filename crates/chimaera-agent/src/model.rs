@@ -130,6 +130,28 @@ pub enum AgentEvent {
         /// keys off the same value. Additive: old clients ignore it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent_version: Option<String>,
+        /// The agent offers Remote Control on this deployment (claude
+        /// `initialize.remote_control_available`; absent on older CLIs =
+        /// offered). Codex's Remote Control is a property of its shared
+        /// app-server daemon, not of a per-session app-server, so its driver
+        /// reports false and only relays status. Additive: old clients
+        /// ignore it; old journals replay false.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        remote_control_available: bool,
+        /// The user's/org's own default says "turn Remote Control on at
+        /// start" (claude `initialize.remote_control_auto_enable`) — the
+        /// verdict official IDE hosts act on. Chimaera only acts on it when
+        /// its own setting asks (see `SpawnSpec.remote_control`).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        remote_control_auto_enable: bool,
+        /// The bridge as it stands when this Init is emitted. Init is a
+        /// complete process snapshot — and claude re-emits `system/init`
+        /// mid-process (after the first user message, after a background
+        /// task settles), so the snapshot is what lets consumers reset on a
+        /// NEW process without wiping a live bridge on a repeated Init.
+        /// Absent = no bridge (a fresh process, or an older journal).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        remote_control: Option<RemoteControlSnapshot>,
     },
     TurnStarted {
         turn_id: String,
@@ -166,6 +188,12 @@ pub enum AgentEvent {
         /// Resolved by a `UserMessageUpdate`; default false = delivered.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         queued: bool,
+        /// Where a message the driver did NOT mint came from: `"remote"` =
+        /// a Remote Control client (phone / claude.ai) injected it through
+        /// the agent's own bridge, so it never crossed chimaera's composer.
+        /// Absent = this workbench sent it. Additive.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<String>,
     },
     ToolCall {
         id: String,
@@ -241,6 +269,12 @@ pub enum AgentEvent {
     },
     ModeChanged {
         mode_id: String,
+        /// The user picked this mode (a SetMode ack), as opposed to the
+        /// agent changing it on its own (claude's plan-mode exit, an applied
+        /// setMode suggestion). Only picks feed the per-agent prefs.
+        /// Additive: absent = false.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        chosen: bool,
     },
     /// Effort/ultracode truth read back from the agent (claude get_settings
     /// applied.{effort,ultracode}; codex thread open/settings read-backs).
@@ -249,6 +283,11 @@ pub enum AgentEvent {
         effort: Option<String>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         ultracode: bool,
+        /// This read-back follows the user's own SetEffort (not a spawn
+        /// bootstrap read or the agent resetting effort on a model switch).
+        /// Only picks feed the per-agent prefs. Additive: absent = false.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        chosen: bool,
     },
     TurnCompleted {
         turn_id: String,
@@ -429,6 +468,54 @@ pub enum AgentEvent {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         needs_action: bool,
     },
+    /// Remote Control lifecycle — the agent's own "take this session with
+    /// you" bridge (claude: the `remote_control` control round-trip plus
+    /// `system/bridge_state` frames; codex: `remoteControl/status/changed`).
+    /// LATEST-WINS like `SessionStatus`: a consumer keeps the newest, replay
+    /// converges on the last one, and a fresh `Init` resets it (the bridge is
+    /// process-owned — it dies with the driver process). Strictly additive:
+    /// old journals never carry it, old clients skip the unknown tag.
+    RemoteControl {
+        state: RemoteControlState,
+        /// The session's own page on the vendor's site (claude
+        /// `session_url`, e.g. `https://claude.ai/code/session_…`) — what a
+        /// UI links to. Present from the enable ack on; absent when off or
+        /// when the vendor reports status without a link (codex).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_url: Option<String>,
+        /// The display name the session was registered under (claude
+        /// `name`; codex `serverName`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        /// The vendor's own words when `state` is `error` (or a detail on a
+        /// bridge state change) — capped at construction.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+}
+
+/// The live bridge carried on `Init` (see `AgentEvent::Init.remote_control`).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemoteControlSnapshot {
+    pub state: RemoteControlState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// Where the Remote Control bridge stands. `Connecting` covers claude's
+/// enable-in-flight window and its `ready` bridge state (worker up, backend
+/// not yet attached); `Connected` is the bridge live against the vendor's
+/// backend; `Error` is a refused enable or a bridge failure (`detail` says
+/// why); `Off` is disabled, disconnected for good, or the process gone.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteControlState {
+    Off,
+    Connecting,
+    Connected,
+    Error,
 }
 
 /// One running background task (a `BackgroundTasks` set member).
@@ -631,6 +718,17 @@ pub enum AgentCommand {
     SteerQueued {
         id: String,
     },
+    /// Turn the agent's Remote Control bridge on or off for this session
+    /// (claude: the `remote_control` control request; codex: a Notice — its
+    /// bridge is daemon-level and has no per-session RPC). `name` is the
+    /// display name to register under (claude `name`); the driver picks a
+    /// default when absent. Answered by `RemoteControl` events. APPENDED
+    /// last: additive for pre-upgrade clients.
+    SetRemoteControl {
+        enabled: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
 }
 
 /// A client command exceeded one of the daemon's bounded-ingress budgets.
@@ -779,6 +877,11 @@ impl AgentCommand {
             }
             Self::CancelQueued { id } | Self::SteerQueued { id } => {
                 check_command_len("queued message id", id.len(), COMMAND_ID_MAX)?;
+            }
+            Self::SetRemoteControl { name, .. } => {
+                if let Some(name) = name {
+                    check_command_len("remote control name", name.len(), COMMAND_SELECTOR_MAX)?;
+                }
             }
             Self::Interrupt
             | Self::SetThinking { .. }

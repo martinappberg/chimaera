@@ -1473,23 +1473,24 @@ async fn codex_fork_rollback_and_compact_surface() {
         .expect("fork returns a thread id");
     assert_ne!(forked_id, thread_id, "fork creates a distinct thread");
 
-    // Rollback drops the last turn in place; the result is the thread object.
-    let rollback = chat
+    // Revert drops the named turn and everything after it, in place; the
+    // result is the thread object (turns always empty on 0.153 — hydration
+    // rides thread/turns/list). `thread/rollback` is deprecated and REFUSED
+    // on the default paginated threads ("paginated threads do not support
+    // thread/rollback", live 0.153.0) — the driver's rewind uses revert.
+    let revert = chat
         .request_raw(
-            "thread/rollback",
-            json!({ "threadId": thread_id, "numTurns": 1 }),
+            "thread/revert",
+            json!({ "threadId": thread_id, "beforeTurnId": completed_turns[1] }),
             HANDSHAKE,
         )
         .await
-        .expect("thread/rollback answered");
-    assert!(
-        rollback.get("error").is_none(),
-        "rollback failed: {rollback}"
-    );
+        .expect("thread/revert answered");
+    assert!(revert.get("error").is_none(), "revert failed: {revert}");
     assert_eq!(
-        rollback["result"]["thread"]["id"].as_str(),
+        revert["result"]["thread"]["id"].as_str(),
         Some(thread_id.as_str()),
-        "rollback returns the updated thread: {rollback}"
+        "revert returns the updated thread: {revert}"
     );
 
     // Compact acks empty, then runs as its own turn with a contextCompaction
@@ -1526,8 +1527,8 @@ async fn codex_fork_rollback_and_compact_surface() {
         .await
         .expect("shutdown");
 
-    // The rewind-respawn path: a fresh process resumes the thread and rolls
-    // back immediately, exactly like the driver's handshake does.
+    // The rewind-respawn path: a fresh process resumes the thread and reverts
+    // immediately, exactly like the driver's handshake does.
     let mut resumed = CodexChat::spawn("codex", dir.path()).expect("respawn codex");
     resumed.initialize(HANDSHAKE).await.expect("initialize");
     let resume = resumed
@@ -1543,17 +1544,17 @@ async fn codex_fork_rollback_and_compact_surface() {
         Some(thread_id.as_str()),
         "resume keeps the thread id: {resume}"
     );
-    let rollback = resumed
+    let revert = resumed
         .request_raw(
-            "thread/rollback",
-            json!({ "threadId": thread_id, "numTurns": 1 }),
+            "thread/revert",
+            json!({ "threadId": thread_id, "beforeTurnId": completed_turns[0] }),
             HANDSHAKE,
         )
         .await
-        .expect("post-resume rollback answered");
+        .expect("post-resume revert answered");
     assert!(
-        rollback.get("error").is_none(),
-        "rollback after resume failed: {rollback}"
+        revert.get("error").is_none(),
+        "revert after resume failed: {revert}"
     );
     resumed
         .shutdown(Duration::from_secs(5))

@@ -35,7 +35,7 @@ use tokio::sync::{broadcast, mpsc, watch};
 
 use driver::{AgentAdapter, DriverExit, DriverIo, SpawnSpec};
 use journal::{Journal, JournalIndex, SeqEvent};
-use model::{AgentCommand, AgentEvent};
+use model::{AgentCommand, AgentEvent, ModelInfo};
 
 /// Called after every journaled event (server: derive AgentState, poke the
 /// event bus). Runs on the pump task — keep it cheap.
@@ -213,6 +213,11 @@ pub struct ChatInfo {
     /// turn starts (the user acted) so it never badges a running session.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub status_needs_action: bool,
+    /// The session's Remote Control page (claude `session_url`) while the
+    /// bridge is connecting/connected — the rail's "take it with you" badge.
+    /// `None` when off, refused, or the process is gone. Additive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_control_url: Option<String>,
     /// How many process-owned jobs are still running outside the parent turn:
     /// backgrounded Bash/workflows plus cross-turn delegated agents.
     ///
@@ -284,19 +289,45 @@ fn fold_session_metadata(info: &mut ChatInfo, ev: &AgentEvent) {
         AgentEvent::Init {
             model,
             current_mode,
+            remote_control,
             ..
         } => {
+            use crate::model::RemoteControlState as Rc;
             // Init is a complete process snapshot. Clear values that a fresh
             // driver no longer advertises instead of retaining stale state
-            // from a resumed/restarted process.
+            // from a resumed/restarted process. The Remote Control bridge is
+            // process-owned, so a new process starts with none.
             info.model = model.clone();
             info.current_mode = current_mode.clone();
+            // Init is re-emitted mid-process (claude's per-turn system/init),
+            // so the bridge rides the snapshot rather than being cleared.
+            info.remote_control_url = remote_control.as_ref().and_then(|rc| match rc.state {
+                Rc::Connecting | Rc::Connected => rc.session_url.clone(),
+                Rc::Off | Rc::Error => None,
+            });
+        }
+        AgentEvent::RemoteControl {
+            state, session_url, ..
+        } => {
+            use crate::model::RemoteControlState as Rc;
+            info.remote_control_url = match state {
+                Rc::Connecting | Rc::Connected => session_url.clone(),
+                Rc::Off | Rc::Error => None,
+            };
         }
         AgentEvent::ModelSwitched { to, .. } => {
             info.model = Some(to.clone());
         }
-        AgentEvent::ModeChanged { mode_id } => {
+        AgentEvent::ModeChanged {
+            mode_id,
+            chosen: false,
+        } => {
             info.current_mode = Some(mode_id.clone());
+        }
+        // The bridge is process-owned: a dead process has no live link, even
+        // if the driver never got to journal its Off (a hard kill).
+        AgentEvent::Exited { .. } => {
+            info.remote_control_url = None;
         }
         _ => {}
     }
@@ -332,12 +363,42 @@ pub struct ChatAttachment {
     pub head_seq: u64,
 }
 
+/// One conversation-settings write (keyed by the native id) queued by
+/// `absorb` for the blocking lane. `effort: Some(None)` records "no effort".
+#[derive(Default)]
+struct IndexUpdate {
+    native: String,
+    model: Option<String>,
+    effort: Option<Option<String>>,
+    mode: Option<String>,
+}
+
+/// One per-agent preference write queued by `absorb` for the blocking lane.
+#[derive(Default)]
+struct PrefsUpdate {
+    agent: String,
+    model: Option<String>,
+    effort: Option<String>,
+    mode: Option<String>,
+}
+
 pub struct ChatManager {
     sessions: Mutex<HashMap<String, Arc<ChatSession>>>,
     journal_dir: PathBuf,
     index: Arc<JournalIndex>,
     on_event: EventHook,
     on_exit: ExitHook,
+    /// The newest model catalog each agent kind advertised on an `Init`
+    /// (claude `initialize.models`, codex `model/list`) — the launcher's
+    /// live source for a launch-time model list, replacing the curated
+    /// fallback once one chat has handshaked. Bounded by construction (the
+    /// drivers cap the catalog); process-lifetime only (the next chat's Init
+    /// refreshes it after a restart).
+    latest_models: Mutex<HashMap<String, Vec<ModelInfo>>>,
+    /// Last user-chosen model / effort per agent kind (see
+    /// [`journal::AgentPrefsStore`]) — what a new chat of that kind starts
+    /// with. Fed from user-initiated `ModelSwitched` and `EffortState`.
+    prefs: Arc<journal::AgentPrefsStore>,
 }
 
 impl ChatManager {
@@ -345,10 +406,29 @@ impl ChatManager {
         Self {
             sessions: Mutex::new(HashMap::new()),
             index: Arc::new(JournalIndex::load(&journal_dir)),
+            prefs: Arc::new(journal::AgentPrefsStore::load(&journal_dir)),
             journal_dir,
             on_event,
             on_exit,
+            latest_models: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// The last model / effort the user chose on this agent kind (`"claude"`
+    /// / `"codex"`); defaults when none was ever chosen.
+    pub fn prefs(&self, agent: &str) -> journal::AgentPrefs {
+        self.prefs.get(agent)
+    }
+
+    /// The newest model catalog an agent kind (`"claude"` / `"codex"`)
+    /// advertised on any Init this process saw; empty = none yet.
+    pub fn latest_models(&self, agent: &str) -> Vec<ModelInfo> {
+        self.latest_models
+            .lock()
+            .expect("latest_models lock")
+            .get(agent)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Spawn a structured session. The driver owns the child; the pump owns
@@ -404,6 +484,7 @@ impl ChatManager {
             status_detail: None,
             status_category: None,
             status_needs_action: false,
+            remote_control_url: None,
             background_running: 0,
         };
         let session = Arc::new(ChatSession {
@@ -499,28 +580,99 @@ impl ChatManager {
         // lock across it would let a slow write freeze the whole manager
         // (list() takes info locks under the sessions lock).
         let mut native_to_index: Option<String> = None;
-        let mut effort_to_index: Option<(String, Option<String>)> = None;
+        let mut index_to_record: Option<IndexUpdate> = None;
+        let mut catalog_to_record: Option<String> = None;
+        let mut prefs_to_record: Option<PrefsUpdate> = None;
         {
             let mut info = session.info.lock().expect("info lock");
             fold_session_metadata(&mut info, &ev);
             info.background_running = background_running;
             match &ev {
                 AgentEvent::Init {
-                    native_session_id, ..
+                    native_session_id,
+                    models,
+                    ..
                 } => {
                     if !native_session_id.is_empty() {
                         info.native_session_id = Some(native_session_id.clone());
                         native_to_index = Some(native_session_id.clone());
+                        // The process's opening model/mode are what a reopen
+                        // of THIS native conversation must come back with
+                        // (fold_session_metadata already copied them in).
+                        index_to_record = Some(IndexUpdate {
+                            native: native_session_id.clone(),
+                            model: info.model.clone(),
+                            mode: info.current_mode.clone(),
+                            ..Default::default()
+                        });
+                    }
+                    if !models.is_empty() {
+                        // Recorded AFTER the info lock drops (below): the
+                        // catalog clone and the second mutex stay out of the
+                        // registry's critical section.
+                        catalog_to_record = Some(info.agent.clone());
                     }
                 }
-                AgentEvent::EffortState { effort, .. } => {
-                    // This index field drives Codex thread-open parameters.
-                    // Claude has its own argv/settings lifecycle and must not
-                    // overwrite the latest Codex choice used for new chats.
-                    if info.agent == "codex" {
-                        if let Some(native) = &info.native_session_id {
-                            effort_to_index = Some((native.clone(), effort.clone()));
-                        }
+                AgentEvent::EffortState { effort, chosen, .. } => {
+                    // The effort in effect is conversation-local (keyed by the
+                    // native id): a reopen of this conversation — codex's
+                    // thread/start effort, claude's post-handshake apply —
+                    // starts from it. `None` records "no effort in effect".
+                    if let Some(native) = &info.native_session_id {
+                        index_to_record = Some(IndexUpdate {
+                            native: native.clone(),
+                            effort: Some(effort.clone()),
+                            ..Default::default()
+                        });
+                    }
+                    // The user's own effort pick is what the next chat of this
+                    // kind starts with (both agents' in-session efforts are
+                    // session-scoped, so chimaera remembers them). A bootstrap
+                    // read or a model-switch reset (`chosen: false`) is not.
+                    if let (true, Some(effort)) = (*chosen, effort) {
+                        prefs_to_record = Some(PrefsUpdate {
+                            agent: info.agent.clone(),
+                            effort: Some(effort.clone()),
+                            ..Default::default()
+                        });
+                    }
+                }
+                // The model in effect is the conversation's own (any reason);
+                // only a user's pick (no reason) is a preference — a safety
+                // reroute or a credits fallback (reason present) is not.
+                AgentEvent::ModelSwitched { to, reason, .. } => {
+                    if let Some(native) = &info.native_session_id {
+                        index_to_record = Some(IndexUpdate {
+                            native: native.clone(),
+                            model: Some(to.clone()),
+                            ..Default::default()
+                        });
+                    }
+                    if reason.is_none() {
+                        prefs_to_record = Some(PrefsUpdate {
+                            agent: info.agent.clone(),
+                            model: Some(to.clone()),
+                            ..Default::default()
+                        });
+                    }
+                }
+                // Likewise the permission/approval mode: the conversation's
+                // own either way; a preference only when the user picked it
+                // (not one the agent switched on its own, e.g. a plan exit).
+                AgentEvent::ModeChanged { mode_id, chosen } => {
+                    if let Some(native) = &info.native_session_id {
+                        index_to_record = Some(IndexUpdate {
+                            native: native.clone(),
+                            mode: Some(mode_id.clone()),
+                            ..Default::default()
+                        });
+                    }
+                    if *chosen {
+                        prefs_to_record = Some(PrefsUpdate {
+                            agent: info.agent.clone(),
+                            mode: Some(mode_id.clone()),
+                            ..Default::default()
+                        });
                     }
                 }
                 // "Pending permission" really means "waiting on a human
@@ -556,24 +708,56 @@ impl ChatManager {
                 _ => {}
             }
         }
-        if let Some(native) = native_to_index {
+        if let Some(agent) = catalog_to_record {
+            if let AgentEvent::Init { models, .. } = &ev {
+                self.latest_models
+                    .lock()
+                    .expect("latest_models lock")
+                    .insert(agent, models.clone());
+            }
+        }
+        if native_to_index.is_some() || index_to_record.is_some() {
             let index = Arc::clone(&self.index);
             let session_id = id.to_string();
-            // Fire-and-forget: the native-id index is a side-index consulted
-            // only to seed a resume (`lookup`). Detach the (blocking, possibly
-            // NFS) write so it can NEVER stall the pump — the journal append and
+            // Detached on purpose: the index write can block on NFS, and the
             // event fan-out below must not wait on it. `record` is idempotent,
             // so a detached late write is harmless. Awaiting the JoinHandle here
-            // (the old code) re-coupled the pump to that write.
-            tokio::task::spawn_blocking(move || index.record(&native, &session_id));
+            // (the old code) re-coupled the pump to that write. The mapping and
+            // the settings an Init carries ride one hop so they cannot land
+            // out of order.
+            tokio::task::spawn_blocking(move || {
+                if let Some(native) = native_to_index {
+                    index.record(&native, &session_id);
+                }
+                if let Some(update) = index_to_record {
+                    index.record_settings(&update.native, &session_id, |s| {
+                        if let Some(model) = update.model {
+                            s.model = Some(model);
+                        }
+                        if let Some(effort) = update.effort {
+                            s.effort = effort;
+                        }
+                        if let Some(mode) = update.mode {
+                            s.mode = Some(mode);
+                        }
+                    });
+                }
+            });
         }
-        if let Some((native, effort)) = effort_to_index {
-            let index = Arc::clone(&self.index);
-            let session_id = id.to_string();
-            // Same NFS rule as the native-id mapping above. This read-back is
-            // infrequent (spawn or a user effort change) and bounded by the
-            // index cap; never park the async pump on its atomic rewrite.
-            tokio::task::spawn_blocking(move || index.record_effort(&native, &session_id, effort));
+        if let Some(update) = prefs_to_record {
+            let prefs = Arc::clone(&self.prefs);
+            // Same NFS rule: never park the pump on the atomic rewrite.
+            tokio::task::spawn_blocking(move || {
+                if let Some(model) = update.model {
+                    prefs.record_model(&update.agent, &model);
+                }
+                if let Some(effort) = update.effort {
+                    prefs.record_effort(&update.agent, &effort);
+                }
+                if let Some(mode) = update.mode {
+                    prefs.record_mode(&update.agent, &mode);
+                }
+            });
         }
         let entry = session.journal.append(ev).await;
         let _ = session.events_tx.send(Arc::clone(&entry));
@@ -744,6 +928,7 @@ mod tests {
             status_detail: None,
             status_category: None,
             status_needs_action: false,
+            remote_control_url: None,
             background_running: 0,
         }
     }
@@ -761,6 +946,9 @@ mod tests {
                 slash_commands: Vec::new(),
                 models: Vec::new(),
                 agent_version: None,
+                remote_control_available: false,
+                remote_control_auto_enable: false,
+                remote_control: None,
             },
         );
         assert_eq!(info.model, None, "a complete Init clears stale model state");
@@ -784,6 +972,7 @@ mod tests {
             &mut info,
             &AgentEvent::ModeChanged {
                 mode_id: "auto-review".into(),
+                chosen: false,
             },
         );
         assert_eq!(info.current_mode.as_deref(), Some("auto-review"));
@@ -832,6 +1021,7 @@ mod tests {
             attachments: 0,
             id: Some("q1".to_string()),
             queued: true,
+            origin: None,
         });
         assert_eq!(budget.bytes, RETAINED_SEND_BYTES_MAX - 1);
         budget.observe(&AgentEvent::UserMessageUpdate {
@@ -868,6 +1058,7 @@ mod tests {
             attachments: 0,
             id: None,
             queued: false,
+            origin: None,
         });
         assert_eq!(budget.bytes, 1024);
         assert_eq!(budget.unassigned.len(), 1);
@@ -877,6 +1068,7 @@ mod tests {
             attachments: 0,
             id: Some("q1".to_string()),
             queued: true,
+            origin: None,
         });
         assert!(budget.unassigned.is_empty());
         assert!(budget.queued.contains_key("q1"));

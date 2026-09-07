@@ -40,11 +40,12 @@ use crate::model::{
     PLAN_LABEL_MAX, PLAN_TASKS_CAP, SLASH_COMMANDS_CAP, SLASH_DESCRIPTION_MAX, SLASH_NAME_MAX,
     STATUS_DETAIL_MAX, WF_AGENTS_CAP, WF_AGENTS_SET_BUDGET, WF_AGENT_LABEL_MAX,
 };
+use crate::model::{RemoteControlSnapshot, RemoteControlState};
 use crate::ndjson::{JsonlChild, JsonlSink, JsonlStream};
 
 /// CLI version these frame shapes were verified against (2026-07-18,
 /// full chat-smoke 18/18).
-pub const TESTED_CLAUDE_VERSION: &str = "2.1.212";
+pub const TESTED_CLAUDE_VERSION: &str = "2.1.259";
 
 /// Arguments for a structured chat session, before server-side extras
 /// (`--settings`, `--mcp-config`, `--session-id`) and login-shell wrapping.
@@ -446,11 +447,60 @@ impl Driver for ClaudeDriver {
             spec.agent_version.clone(),
             &commands_catalog,
         );
+        // The argv model is the session's model from the first frame on —
+        // `system/init` (which reports the RESOLVED id) only arrives with the
+        // first turn, and the header chip must not claim the catalog default
+        // until then when a remembered `--model` was passed.
+        mapper.model = spec.initial_model.clone();
         let mut initial: Vec<DriverStep> = Vec::new();
         // Seed the effort/ultracode chips with the CLI's applied settings.
         let mut step = DriverStep::default();
         mapper.request_settings(&mut step);
         initial.push(step);
+        // The remembered effort (the daemon's per-agent prefs): applied like
+        // a header pick, session-scoped, skipped where the catalog says the
+        // model has no effort knob (haiku) — the apply would just error.
+        mapper.bootstrapping = true;
+        if let Some(effort) = spec.initial_effort.as_deref() {
+            if effort_applies(&mapper.models, spec.initial_model.as_deref()) {
+                initial.push(mapper.on_command(AgentCommand::SetEffort {
+                    effort_id: effort.to_string(),
+                }));
+            }
+        }
+        // The remembered permission mode, applied like a header pick when it
+        // differs from the CLI's current one and is one this surface offers.
+        if let Some(mode) = spec.initial_mode.as_deref() {
+            if mapper.current_mode.as_deref() != Some(mode)
+                && claude_modes().iter().any(|m| m.id == mode)
+            {
+                initial.push(mapper.on_command(AgentCommand::SetMode {
+                    mode_id: mode.to_string(),
+                }));
+            }
+        }
+        mapper.bootstrapping = false;
+        // Remote Control at start — the embedder's standing choice, honored
+        // only where the CLI offers the bridge. It rides the ordinary command
+        // path so the ack + bridge_state frames journal the state exactly as
+        // a mid-session toggle would (live 2.1.259: enabling right after
+        // initialize is accepted).
+        if let Some(name) = spec.remote_control.clone() {
+            if mapper.remote_control_available {
+                initial.push(mapper.on_command(AgentCommand::SetRemoteControl {
+                    enabled: true,
+                    name: Some(name),
+                }));
+            } else {
+                let mut step = DriverStep::default();
+                step.events.push(AgentEvent::Notice {
+                    text: "Remote Control is not offered on this deployment, so it was \
+                           not turned on at start"
+                        .into(),
+                });
+                initial.push(step);
+            }
+        }
         // Parked prompts survive client swaps: the initialize response
         // redelivers unanswered permission/dialog requests — replay them
         // through the mapper so a reattach shows the cards, not a wedge.
@@ -471,6 +521,22 @@ impl Driver for ClaudeDriver {
             }
         }
         Ok(Handshake { mapper, initial })
+    }
+}
+
+/// Whether a spawn-time effort should be applied: true when the catalog is
+/// silent (unknown model / older CLI) or the chosen model advertises effort
+/// levels; false only for a catalog entry with none (haiku).
+fn effort_applies(models: &[crate::model::ModelInfo], model: Option<&str>) -> bool {
+    let Some(model) = model else {
+        return true;
+    };
+    match models
+        .iter()
+        .find(|m| m.id == model || m.resolved.as_deref() == Some(model))
+    {
+        Some(entry) => !entry.efforts.is_empty(),
+        None => true,
     }
 }
 
@@ -504,7 +570,12 @@ struct PendingPermission {
 }
 
 enum PendingControl {
-    SetMode(String),
+    /// set_permission_mode ack → ModeChanged. `chosen` = the user's own
+    /// header pick (fed to the prefs), not the plan-approval follow-up.
+    SetMode {
+        mode: String,
+        chosen: bool,
+    },
     SetModel(String),
     Interrupt,
     SetThinking,
@@ -516,9 +587,17 @@ enum PendingControl {
         dry_run: bool,
     },
     /// get_settings round-trip → EffortState (applied.{effort,ultracode}).
-    Settings,
-    /// apply_flag_settings acknowledged → re-read the truth.
-    ApplyFlags,
+    /// `chosen` = the read follows the user's own apply (a pick), not the
+    /// spawn bootstrap.
+    Settings {
+        chosen: bool,
+    },
+    /// apply_flag_settings acknowledged → re-read the truth. `chosen` = the
+    /// apply was the user's own pick (fed to the prefs), not the handshake
+    /// replaying the spawn's remembered effort.
+    ApplyFlags {
+        chosen: bool,
+    },
     /// mcp_status round-trip (the /mcp panel).
     McpStatus,
     /// mcp_toggle / mcp_reconnect: on success, refresh the panel.
@@ -529,7 +608,28 @@ enum PendingControl {
     Background,
     /// stop_task ack (subagent stop).
     StopTask,
+    /// remote_control round-trip: enable answers `{session_url, connect_url,
+    /// bridge_session_id, …}`; disable answers null. Either way the ack is
+    /// what journals the RemoteControl state (the bridge_state frames refine
+    /// it).
+    RemoteControl {
+        enabled: bool,
+        name: Option<String>,
+    },
 }
+
+/// The live Remote Control bridge as this driver knows it (None = off). Kept
+/// so a `bridge_state` frame can re-emit the session link alongside the new
+/// state — the frames themselves carry only the state word.
+struct RemoteControlLive {
+    state: RemoteControlState,
+    session_url: Option<String>,
+    name: Option<String>,
+}
+
+/// Bound on remembered client-minted send uuids (a `user` frame whose uuid we
+/// never minted is a Remote Control injection — see `on_remote_user_text`).
+const MINTED_UUIDS_CAP: usize = 256;
 
 /// Protocol → normalized-model translator. Pure state machine: consumes
 /// frames/commands, yields events + outbound frames; owns no I/O, so it is
@@ -542,6 +642,11 @@ struct ClaudeMapper {
     agent_version: Option<String>,
     model: Option<String>,
     current_mode: Option<String>,
+    /// True only while the handshake replays the spawn's remembered effort
+    /// and mode through the ordinary command arms: those acks must not read
+    /// as user picks (they would re-record — or, for a recipe's explicit
+    /// effort, overwrite — the prefs).
+    bootstrapping: bool,
     slash_commands: Vec<SlashCommand>,
     /// Account model catalog from the initialize response (value ids the
     /// set_model request accepts, with per-model effort levels).
@@ -639,6 +744,18 @@ struct ClaudeMapper {
     /// signals into one normalized start + one terminal event.
     compaction_active: bool,
     compaction_completed: bool,
+    /// Remote Control offer flags from the initialize response (see
+    /// `AgentEvent::Init`): whether the bridge can be offered at all here, and
+    /// whether the user's/org's default says auto-on.
+    remote_control_available: bool,
+    remote_control_auto_enable: bool,
+    /// The live bridge, if any. Process-owned: dies with the driver
+    /// (`drain_pending` journals the Off).
+    remote_control: Option<RemoteControlLive>,
+    /// uuids of the user messages THIS driver minted, FIFO-bounded. A text
+    /// `user` frame carrying a uuid not in here (and not a replay) was
+    /// injected around us — a Remote Control client's message.
+    minted_uuids: VecDeque<String>,
     next_ctl: u64,
 }
 
@@ -705,11 +822,28 @@ impl ClaudeMapper {
                     .collect()
             })
             .unwrap_or_default();
+        // Remote Control offer (2.1.259 initialize response). The CLI's own
+        // docstring: absent `remote_control_available` (older CLI) = treat as
+        // available; absent `remote_control_auto_enable` = no auto-on verdict.
+        let remote_control_available = commands_catalog["remote_control_available"]
+            .as_bool()
+            .unwrap_or(true);
+        let remote_control_auto_enable = commands_catalog["remote_control_auto_enable"]
+            .as_bool()
+            .unwrap_or(false);
+        // `current_permission_mode` (2.1.259) seeds the mode chip at the
+        // handshake — before this the chip stayed blank until the first
+        // system/status frame carried one.
+        let current_mode = commands_catalog["current_permission_mode"]
+            .as_str()
+            .filter(|m| !m.is_empty())
+            .map(String::from);
         Self {
             native_session_id: pinned_native_id,
             agent_version,
             model: None,
-            current_mode: None,
+            current_mode,
+            bootstrapping: false,
             slash_commands,
             models,
             coalescer: Coalescer::new(),
@@ -737,6 +871,10 @@ impl ClaudeMapper {
             thinking_emitted: 0,
             compaction_active: false,
             compaction_completed: false,
+            remote_control_available,
+            remote_control_auto_enable,
+            remote_control: None,
+            minted_uuids: VecDeque::new(),
             next_ctl: 0,
         }
     }
@@ -750,15 +888,138 @@ impl ClaudeMapper {
             slash_commands: self.slash_commands.clone(),
             models: self.models.clone(),
             agent_version: self.agent_version.clone(),
+            remote_control_available: self.remote_control_available,
+            remote_control_auto_enable: self.remote_control_auto_enable,
+            remote_control: self
+                .remote_control
+                .as_ref()
+                .map(|live| RemoteControlSnapshot {
+                    state: live.state,
+                    session_url: live.session_url.clone(),
+                    name: live.name.clone(),
+                }),
+        }
+    }
+
+    /// Flush buffered prose before an out-of-band row (a notice, an injected
+    /// user message) so the journal keeps wire order — prose before the row.
+    fn flush_prose(&mut self, step: &mut DriverStep) {
+        if let Some(flushed) = self.coalescer.flush() {
+            step.events.push(flushed);
+        }
+    }
+
+    /// The current RemoteControl level-set event (latest-wins on the wire).
+    fn remote_control_event(&self, detail: Option<String>) -> AgentEvent {
+        match &self.remote_control {
+            Some(live) => AgentEvent::RemoteControl {
+                state: live.state,
+                session_url: live.session_url.clone(),
+                name: live.name.clone(),
+                detail,
+            },
+            None => AgentEvent::RemoteControl {
+                state: RemoteControlState::Off,
+                session_url: None,
+                name: None,
+                detail,
+            },
+        }
+    }
+
+    /// `system/bridge_state {state, detail?, bridge_epoch}` — the CLI's own
+    /// Remote Control lifecycle (live 2.1.259: `ready` lands right before the
+    /// enable ack, `connected` right after). The state word is an open set;
+    /// the known words map to the normalized states, anything else surfaces
+    /// verbatim as a Notice so a new bridge state is diagnosable, never lost.
+    fn on_bridge_state(&mut self, frame: &Value, step: &mut DriverStep) {
+        let state = frame["state"].as_str().unwrap_or_default();
+        let detail = frame["detail"]
+            .as_str()
+            .filter(|d| !d.is_empty())
+            .map(|d| truncate_label(d, 200));
+        let next = match state {
+            "connected" => Some(RemoteControlState::Connected),
+            "ready" | "connecting" | "reconnecting" | "starting" => {
+                Some(RemoteControlState::Connecting)
+            }
+            "disconnected" | "stopped" | "closed" | "ended" | "disabled" => {
+                Some(RemoteControlState::Off)
+            }
+            "error" | "errored" | "failed" => Some(RemoteControlState::Error),
+            _ => None,
+        };
+        let Some(next) = next else {
+            let state = truncate_label(state, 40);
+            self.flush_prose(step);
+            step.events.push(AgentEvent::Notice {
+                text: match &detail {
+                    Some(d) => format!("Remote Control: {state} — {d}"),
+                    None => format!("Remote Control: {state}"),
+                },
+            });
+            return;
+        };
+        // The record OUTLIVES a bridge blip: the CLI reconnects on its own
+        // (`disconnected` → `connected`), and the claude.ai session — its
+        // link and name — is the same one. Only an explicit disable ack or
+        // teardown drops it. A word arriving with nothing live (no enable
+        // was ever acked) is a stray, not a state.
+        if self.remote_control.is_none() {
+            if matches!(next, RemoteControlState::Off | RemoteControlState::Error) {
+                return;
+            }
+            self.remote_control = Some(RemoteControlLive {
+                state: RemoteControlState::Off,
+                session_url: None,
+                name: None,
+            });
+        }
+        let live = self.remote_control.as_mut().expect("just ensured");
+        if live.state == next && detail.is_none() {
+            return; // same state re-announced — one journal line per change
+        }
+        live.state = next;
+        let url = live.session_url.clone();
+        let name = live.name.clone();
+        step.events.push(AgentEvent::RemoteControl {
+            state: next,
+            // An Off carries no link (the chip has nothing to open); a
+            // reconnect re-emits it from the retained record.
+            session_url: if next == RemoteControlState::Off {
+                None
+            } else {
+                url.clone()
+            },
+            name,
+            detail,
+        });
+        if next == RemoteControlState::Connected {
+            // The one transcript line a user searches for later — journaled
+            // here (not synthesized by a client from a transition) so every
+            // replay and every late attach shows it at the same place.
+            self.flush_prose(step);
+            step.events.push(AgentEvent::Notice {
+                text: match url {
+                    Some(u) => format!(
+                        "Remote Control connected — pick this session up in the Claude app or at {u}"
+                    ),
+                    None => "Remote Control connected".into(),
+                },
+            });
         }
     }
 
     /// One get_settings round-trip → EffortState. Issued at spawn and after
     /// every apply_flag_settings, so the chips always show the CLI's truth.
     fn request_settings(&mut self, step: &mut DriverStep) {
+        self.request_settings_after(false, step);
+    }
+
+    fn request_settings_after(&mut self, chosen: bool, step: &mut DriverStep) {
         let id = self.ctl_id();
         self.pending_controls
-            .insert(id.clone(), PendingControl::Settings);
+            .insert(id.clone(), PendingControl::Settings { chosen });
         step.outbound.push(control_request_frame(
             &id,
             json!({ "subtype": "get_settings" }),
@@ -893,6 +1154,63 @@ impl ClaudeMapper {
                     self.current_mode = Some(mode.to_string());
                 }
                 step.events.push(self.init_event());
+                // 2.1.219+: `--mcp-config` entries the CLI skipped as invalid
+                // (absent from mcp_servers[] without a word otherwise). The
+                // /mcp panel would just not list them — say so once.
+                if let Some(errors) = frame["mcp_server_errors"]
+                    .as_array()
+                    .filter(|a| !a.is_empty())
+                {
+                    let names: Vec<String> = errors
+                        .iter()
+                        .take(8)
+                        .filter_map(|e| {
+                            let name = e["name"].as_str()?;
+                            let name = truncate_label(name, 60);
+                            Some(match e["message"].as_str().filter(|m| !m.is_empty()) {
+                                Some(m) => format!("{name} ({})", truncate_label(m, 80)),
+                                None => name,
+                            })
+                        })
+                        .collect();
+                    if !names.is_empty() {
+                        self.flush_prose(step);
+                        step.events.push(AgentEvent::Notice {
+                            text: format!("MCP server config skipped: {}", names.join(", ")),
+                        });
+                    }
+                }
+            }
+            // Remote Control bridge lifecycle (2.1.259).
+            Some("bridge_state") => self.on_bridge_state(frame, step),
+            // The CLI's own host-facing notices (`level`: info shows only in
+            // transcript mode there; notice/suggestion/warning are visible).
+            // Hook "says:" lines, model-switch notices, … ride this frame.
+            Some("informational") => {
+                let level = frame["level"].as_str().unwrap_or("notice");
+                if level == "info" {
+                    return;
+                }
+                if let Some(text) = frame["content"].as_str().filter(|t| !t.trim().is_empty()) {
+                    self.flush_prose(step);
+                    step.events.push(AgentEvent::Notice {
+                        text: cap_output(text.trim()).0,
+                    });
+                }
+            }
+            // Output of a local slash command (`/context`, `/usage`, …) —
+            // the CLI wraps it in <local-command-stdout>/<…-stderr> tags and
+            // renders it as assistant-style text; here it is a notice.
+            Some("local_command_output") => {
+                if let Some(text) = frame["content"].as_str() {
+                    let text = local_command_text(text);
+                    if !text.is_empty() {
+                        self.flush_prose(step);
+                        step.events.push(AgentEvent::Notice {
+                            text: cap_output(&text).0,
+                        });
+                    }
+                }
             }
             // Subagent status frames — the official surface is the Task tool
             // row ("Agent: …"), never a nested transcript. When the task id
@@ -1093,6 +1411,7 @@ impl ClaudeMapper {
                         self.current_mode = Some(mode.to_string());
                         step.events.push(AgentEvent::ModeChanged {
                             mode_id: mode.to_string(),
+                            chosen: false,
                         });
                     }
                 }
@@ -1580,6 +1899,72 @@ impl ClaudeMapper {
             self.last_msg_uuid = Some(uuid.to_string());
         }
         self.on_tool_results(&frame["message"], step);
+        self.on_remote_user_text(frame, step);
+    }
+
+    /// A text `user` frame we did not write. With the Remote Control bridge
+    /// CONNECTED, a message typed on a phone / claude.ai enters the CLI's
+    /// queue through the bridge and runs as a turn — nothing crossed our
+    /// stdin, so the only trace on this wire is the CLI's own `user` frame.
+    /// Gated hard: bridge connected, not a `--replay-user-messages` echo
+    /// (`isReplay`), not a tool_result carrier, not a subagent frame
+    /// (`parent_tool_use_id`), and a uuid this driver never minted. Outside a
+    /// live bridge nothing changes. The turn itself opens lazily on the first
+    /// response frame (`ensure_turn`), exactly like a queued flush.
+    fn on_remote_user_text(&mut self, frame: &Value, step: &mut DriverStep) {
+        if !self
+            .remote_control
+            .as_ref()
+            .is_some_and(|rc| rc.state == RemoteControlState::Connected)
+        {
+            return;
+        }
+        // Cheap structural gates first: replay echoes, subagent frames, the
+        // CLI's own meta/synthetic turns (`isMeta`, compaction summaries),
+        // tool_result carriers — then the uuid scan.
+        if frame["isReplay"] == json!(true)
+            || frame["isMeta"] == json!(true)
+            || frame["isCompactSummary"] == json!(true)
+            || !frame["parent_tool_use_id"].is_null()
+        {
+            return;
+        }
+        let content = &frame["message"]["content"];
+        if content
+            .as_array()
+            .is_some_and(|blocks| blocks.iter().any(|b| b["type"] == "tool_result"))
+        {
+            return;
+        }
+        if let Some(uuid) = frame["uuid"].as_str() {
+            if self.minted_uuids.iter().any(|u| u == uuid) {
+                return;
+            }
+        }
+        // The transcript importer's own "real prompt" filter: rejects command
+        // invocations, system markup and the injected `Caveat:` preamble —
+        // the CLI-authored user turns that must never wear a phone tag.
+        let attachments = content
+            .as_array()
+            .map(|blocks| blocks.iter().filter(|b| b["type"] == "image").count() as u32)
+            .unwrap_or(0);
+        let text = match crate::transcript::user_prompt_text(content) {
+            Some(t) => t,
+            None if attachments > 0 && !content_has_text(content) => String::new(),
+            None => return,
+        };
+        if text.starts_with('[') {
+            return; // `[Request interrupted by user]`-style markers
+        }
+        let (text, _) = cap_output(&text);
+        self.flush_prose(step);
+        step.events.push(AgentEvent::UserMessage {
+            text,
+            attachments,
+            id: None,
+            queued: false,
+            origin: Some("remote".into()),
+        });
     }
 
     fn on_stream_event(&mut self, event: &Value, step: &mut DriverStep) {
@@ -2092,6 +2477,34 @@ impl ClaudeMapper {
                 });
                 return;
             }
+            // A refused enable is a state, not a stack trace: the CLI's own
+            // sentence ("Remote Control is only available with claude.ai
+            // subscriptions…", org policy, nested remote session) is the
+            // detail the chip shows. A refused disable is just a notice.
+            if let PendingControl::RemoteControl { enabled, .. } = pending {
+                let detail = frame["response"]["error"]
+                    .as_str()
+                    .map(|e| truncate_label(e, 300))
+                    .unwrap_or_else(|| "Remote Control request failed".to_string());
+                if enabled {
+                    self.remote_control = None;
+                    self.flush_prose(step);
+                    step.events.push(AgentEvent::Notice {
+                        text: format!("Remote Control: {detail}"),
+                    });
+                    step.events.push(AgentEvent::RemoteControl {
+                        state: RemoteControlState::Error,
+                        session_url: None,
+                        name: None,
+                        detail: Some(detail),
+                    });
+                } else {
+                    step.events.push(AgentEvent::Notice {
+                        text: format!("could not turn Remote Control off: {detail}"),
+                    });
+                }
+                return;
+            }
             step.events.push(AgentEvent::Error {
                 message: format!("control request failed: {}", frame["response"]),
                 fatal: false,
@@ -2100,9 +2513,39 @@ impl ClaudeMapper {
         }
         let payload = &frame["response"]["response"];
         match pending {
-            PendingControl::SetMode(mode) => {
+            PendingControl::RemoteControl { enabled, name } => {
+                if enabled {
+                    // The ack registers the session (session_url is its page on
+                    // claude.ai/code). A `bridge_state connected` may already
+                    // have landed (live: `ready` precedes the ack, `connected`
+                    // follows it) — keep a Connected we have, else Connecting.
+                    let state = match &self.remote_control {
+                        Some(live) if live.state == RemoteControlState::Connected => {
+                            RemoteControlState::Connected
+                        }
+                        _ => RemoteControlState::Connecting,
+                    };
+                    let session_url = payload["session_url"]
+                        .as_str()
+                        .filter(|u| u.starts_with("https://"))
+                        .map(|u| truncate_label(u, 300));
+                    self.remote_control = Some(RemoteControlLive {
+                        state,
+                        session_url,
+                        name,
+                    });
+                    step.events.push(self.remote_control_event(None));
+                } else {
+                    self.remote_control = None;
+                    step.events.push(self.remote_control_event(None));
+                }
+            }
+            PendingControl::SetMode { mode, chosen } => {
                 self.current_mode = Some(mode.clone());
-                step.events.push(AgentEvent::ModeChanged { mode_id: mode });
+                step.events.push(AgentEvent::ModeChanged {
+                    mode_id: mode,
+                    chosen,
+                });
             }
             PendingControl::SetModel(model) => {
                 let from = self.model.replace(model.clone());
@@ -2229,11 +2672,12 @@ impl ClaudeMapper {
                     }
                 }
             }
-            PendingControl::Settings => {
+            PendingControl::Settings { chosen } => {
                 let applied = &payload["applied"];
                 step.events.push(AgentEvent::EffortState {
                     effort: applied["effort"].as_str().map(String::from),
                     ultracode: applied["ultracode"] == json!(true),
+                    chosen,
                 });
             }
             PendingControl::Background => {
@@ -2249,9 +2693,11 @@ impl ClaudeMapper {
                 }
             }
             PendingControl::StopTask => {}
-            PendingControl::ApplyFlags => {
-                // The apply is fire-and-ack; the truth comes from re-reading.
-                self.request_settings(step);
+            PendingControl::ApplyFlags { chosen } => {
+                // The apply is fire-and-ack; the truth comes from re-reading —
+                // and that read is the pick (it feeds the prefs) when the
+                // apply was.
+                self.request_settings_after(chosen, step);
             }
         }
     }
@@ -2411,11 +2857,16 @@ impl ClaudeMapper {
             .collect();
         let uuid = crate::model::fresh_uuid();
         let preceding = self.last_msg_uuid.replace(uuid.clone());
+        self.minted_uuids.push_back(uuid.clone());
+        if self.minted_uuids.len() > MINTED_UUIDS_CAP {
+            self.minted_uuids.pop_front();
+        }
         step.events.push(AgentEvent::UserMessage {
             text: text.clone(),
             attachments,
             id: Some(uuid.clone()),
             queued: self.turn_active,
+            origin: None,
         });
         step.events.push(AgentEvent::Checkpoint {
             user_message_id: uuid.clone(),
@@ -2575,8 +3026,13 @@ impl ClaudeMapper {
                 // verified control; its ack lands as ModeChanged.
                 if tool == "ExitPlanMode" && option_id == "allow_accept_edits" {
                     let id = self.ctl_id();
-                    self.pending_controls
-                        .insert(id.clone(), PendingControl::SetMode("acceptEdits".into()));
+                    self.pending_controls.insert(
+                        id.clone(),
+                        PendingControl::SetMode {
+                            mode: "acceptEdits".into(),
+                            chosen: false,
+                        },
+                    );
                     step.outbound.push(control_request_frame(
                         &id,
                         json!({ "subtype": "set_permission_mode", "mode": "acceptEdits" }),
@@ -2594,6 +3050,7 @@ impl ClaudeMapper {
                         attachments: 0,
                         id: None,
                         queued: false,
+                        origin: None,
                     });
                 }
             }
@@ -2617,8 +3074,13 @@ impl ClaudeMapper {
             }
             AgentCommand::SetMode { mode_id } => {
                 let id = self.ctl_id();
-                self.pending_controls
-                    .insert(id.clone(), PendingControl::SetMode(mode_id.clone()));
+                self.pending_controls.insert(
+                    id.clone(),
+                    PendingControl::SetMode {
+                        mode: mode_id.clone(),
+                        chosen: !self.bootstrapping,
+                    },
+                );
                 step.outbound.push(control_request_frame(
                     &id,
                     json!({ "subtype": "set_permission_mode", "mode": mode_id }),
@@ -2637,8 +3099,12 @@ impl ClaudeMapper {
             // (apply_flag_settings never persists to settings files here).
             AgentCommand::SetEffort { effort_id } => {
                 let id = self.ctl_id();
-                self.pending_controls
-                    .insert(id.clone(), PendingControl::ApplyFlags);
+                self.pending_controls.insert(
+                    id.clone(),
+                    PendingControl::ApplyFlags {
+                        chosen: !self.bootstrapping,
+                    },
+                );
                 step.outbound.push(control_request_frame(
                     &id,
                     json!({
@@ -2652,8 +3118,12 @@ impl ClaudeMapper {
             // persist it").
             AgentCommand::SetUltracode { enabled } => {
                 let id = self.ctl_id();
-                self.pending_controls
-                    .insert(id.clone(), PendingControl::ApplyFlags);
+                self.pending_controls.insert(
+                    id.clone(),
+                    PendingControl::ApplyFlags {
+                        chosen: !self.bootstrapping,
+                    },
+                );
                 step.outbound.push(control_request_frame(
                     &id,
                     json!({
@@ -2858,6 +3328,46 @@ impl ClaudeMapper {
             // held FIFO has no native way to inject one entry into the open
             // turn, and the chat UI never offers this command for Claude.
             AgentCommand::SteerQueued { .. } => {}
+            // Remote Control: the `remote_control` control request (the
+            // official SDK hosts' exact shape — live 2.1.259). Enable answers
+            // `{session_url, connect_url, environment_id, bridge_epoch,
+            // bridge_session_id}`; disable answers null. `keep_session_on_exit`
+            // stays false: the bridge is process-owned, and a claude.ai row
+            // that outlives this driver would offer a dead session.
+            AgentCommand::SetRemoteControl { enabled, name } => {
+                // One naming convention, owned here: callers pass the bare
+                // session name (the UI its display name, the daemon the
+                // workspace at start) and the driver spells the claude.ai row
+                // `chimaera · <name>`, bounded.
+                let name = name
+                    .map(|n| n.trim().to_string())
+                    .filter(|n| !n.is_empty())
+                    .map(|n| format!("chimaera · {}", truncate_label(&n, 100)));
+                let id = self.ctl_id();
+                self.pending_controls.insert(
+                    id.clone(),
+                    PendingControl::RemoteControl {
+                        enabled,
+                        name: name.clone(),
+                    },
+                );
+                let mut request = json!({ "subtype": "remote_control", "enabled": enabled });
+                if enabled {
+                    if let Some(n) = &name {
+                        request["name"] = json!(n);
+                    }
+                    request["keep_session_on_exit"] = json!(false);
+                    if self.remote_control.is_none() {
+                        self.remote_control = Some(RemoteControlLive {
+                            state: RemoteControlState::Connecting,
+                            session_url: None,
+                            name,
+                        });
+                        step.events.push(self.remote_control_event(None));
+                    }
+                }
+                step.outbound.push(control_request_frame(&id, request));
+            }
         }
         step
     }
@@ -2904,6 +3414,16 @@ impl ClaudeMapper {
             events.push(AgentEvent::UserMessageUpdate {
                 id,
                 state: UserMessageState::Dropped,
+            });
+        }
+        // The Remote Control bridge is the CLI's too — journal the Off so a
+        // replayed transcript never shows a live link to a dead session.
+        if let Some(live) = self.remote_control.take() {
+            events.push(AgentEvent::RemoteControl {
+                state: RemoteControlState::Off,
+                session_url: None,
+                name: live.name,
+                detail: Some("the agent process ended".into()),
             });
         }
         // Background tasks are the CLI's children — they die with it. Journal
@@ -3443,16 +3963,83 @@ fn strip_owner_suffix(line: &str) -> Option<(&str, String)> {
 // stay correct as this mapping evolves.
 pub(crate) fn tool_kind(name: &str) -> ToolKind {
     match name {
-        "Bash" | "BashOutput" | "KillShell" => ToolKind::Execute,
-        "Read" => ToolKind::Read,
+        "Bash" | "BashOutput" | "KillShell" | "PowerShell" => ToolKind::Execute,
+        "Read" | "ReadMcpResourceTool" | "ReadMcpResourceDirTool" => ToolKind::Read,
         "Edit" | "Write" | "MultiEdit" | "NotebookEdit" => ToolKind::Edit,
-        "Grep" | "Glob" => ToolKind::Search,
+        "Grep" | "Glob" | "ToolSearch" | "MCPSearch" | "ListMcpResourcesTool" => ToolKind::Search,
         "WebFetch" | "WebSearch" => ToolKind::Fetch,
         // The subagent tool: "Task" through 2.1.206, renamed "Agent" at
         // 2.1.207 (live-verified — the old name stays for older CLIs).
         "Task" | "Agent" => ToolKind::Agent,
         _ => ToolKind::Other,
     }
+}
+
+/// Any non-empty text block in a `user` content array.
+fn content_has_text(content: &Value) -> bool {
+    content.as_array().is_some_and(|blocks| {
+        blocks.iter().any(|b| {
+            b["type"] == "text" && b["text"].as_str().is_some_and(|t| !t.trim().is_empty())
+        })
+    })
+}
+
+/// The `Workflow` tool's title is its script's `meta.name` literal — the
+/// official card's title. Read from the head of the script only (a script can
+/// be large; the meta block is required to be first), and only a `name` KEY
+/// counts — at an identifier boundary and followed by `:` — so `filename:`,
+/// `rename:` or a "name" inside a description never become the title.
+fn workflow_name(script: &str) -> Option<String> {
+    let end = script
+        .char_indices()
+        .nth(2048)
+        .map(|(i, _)| i)
+        .unwrap_or(script.len());
+    let head = &script[..end];
+    let region = &head[head.find("meta")?..];
+    let mut from = 0usize;
+    while let Some(rel) = region[from..].find("name") {
+        let idx = from + rel;
+        from = idx + "name".len();
+        let bounded = region[..idx]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !(c.is_alphanumeric() || c == '_' || c == '$'));
+        if !bounded {
+            continue;
+        }
+        let Some(rest) = region[from..].trim_start().strip_prefix(':') else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let Some(quote) = rest
+            .chars()
+            .next()
+            .filter(|c| matches!(c, '\'' | '"' | '`'))
+        else {
+            continue;
+        };
+        let body = &rest[quote.len_utf8()..];
+        let Some(close) = body.find(quote) else {
+            continue;
+        };
+        let name = body[..close].trim();
+        if !name.is_empty() {
+            return Some(name.to_string());
+        }
+    }
+    None
+}
+
+/// `mcp__<server>__<tool>` → `tool (server)`: the CLI's MCP tool naming,
+/// spelled for humans.
+fn mcp_tool_label(name: &str) -> Option<String> {
+    let rest = name.strip_prefix("mcp__")?;
+    let (server, tool) = rest.split_once("__")?;
+    if server.is_empty() || tool.is_empty() {
+        return None;
+    }
+    Some(format!("{tool} ({server})"))
 }
 
 /// `93s` → `1m 33s`, `4800s` → `1h 20m 00s`: the one elapsed spelling every
@@ -3470,20 +4057,112 @@ fn fmt_elapsed_secs(s: u64) -> String {
 }
 
 pub(crate) fn tool_title(name: &str, input: &Value) -> String {
+    // Composed titles first (they don't fit the `name: detail` mould).
+    let owned: Option<String> = match name {
+        "Workflow" => input["script"]
+            .as_str()
+            .and_then(workflow_name)
+            .map(|n| format!("Workflow: {n}")),
+        "ReportFindings" => input["findings"].as_array().map(|f| {
+            format!(
+                "ReportFindings: {} finding{}",
+                f.len(),
+                if f.len() == 1 { "" } else { "s" }
+            )
+        }),
+        "SendUserFile" => input["files"].as_array().map(|files| {
+            let first = files.first().and_then(|f| f.as_str()).unwrap_or_default();
+            match files.len() {
+                0 | 1 => format!("SendUserFile: {}", truncate_label(first, 120)),
+                n => format!(
+                    "SendUserFile: {} (+{} more)",
+                    truncate_label(first, 100),
+                    n - 1
+                ),
+            }
+        }),
+        "SendMessage" => match (input["to"].as_str(), input["message"].as_str()) {
+            (Some(to), Some(msg)) => Some(format!(
+                "SendMessage → {}: {}",
+                truncate_label(to, 40),
+                truncate_label(msg, 80)
+            )),
+            (Some(to), None) => Some(format!("SendMessage → {}", truncate_label(to, 60))),
+            _ => None,
+        },
+        "ScheduleWakeup" => Some(
+            match (input["delaySeconds"].as_u64(), input["reason"].as_str()) {
+                (Some(s), Some(r)) => format!(
+                    "ScheduleWakeup: in {} · {}",
+                    fmt_elapsed_secs(s),
+                    truncate_label(r, 90)
+                ),
+                (Some(s), None) => format!("ScheduleWakeup: in {}", fmt_elapsed_secs(s)),
+                (None, Some(r)) => format!("ScheduleWakeup: {}", truncate_label(r, 120)),
+                _ => "ScheduleWakeup".to_string(),
+            },
+        ),
+        "Sleep" => input["seconds"]
+            .as_u64()
+            .or(input["duration"].as_u64())
+            .map(|s| format!("Sleep: {}", fmt_elapsed_secs(s))),
+        "LSP" => match (input["operation"].as_str(), input["filePath"].as_str()) {
+            (Some(op), Some(path)) => Some(format!("LSP: {op} {}", truncate_label(path, 100))),
+            (Some(op), None) => Some(format!("LSP: {op}")),
+            _ => None,
+        },
+        "Skill" => input["skill"]
+            .as_str()
+            .map(|skill| match input["args"].as_str() {
+                Some(args) if !args.trim().is_empty() => {
+                    format!(
+                        "Skill: /{} {}",
+                        truncate_label(skill, 60),
+                        truncate_label(args.trim(), 60)
+                    )
+                }
+                _ => format!("Skill: /{}", truncate_label(skill, 100)),
+            }),
+        "CronCreate" => match (input["cron"].as_str(), input["prompt"].as_str()) {
+            (Some(cron), Some(p)) => {
+                Some(format!("CronCreate: {cron} · {}", truncate_label(p, 80)))
+            }
+            (Some(cron), None) => Some(format!("CronCreate: {cron}")),
+            _ => None,
+        },
+        _ => mcp_tool_label(name),
+    };
+    if let Some(title) = owned {
+        return title;
+    }
     let detail = match name {
-        "Bash" => input["command"].as_str(),
+        "Bash" | "PowerShell" => input["command"].as_str(),
         "Read" | "Edit" | "Write" | "MultiEdit" => input["file_path"].as_str(),
         "NotebookEdit" => input["notebook_path"].as_str(),
         "Grep" | "Glob" => input["pattern"].as_str(),
         "WebFetch" => input["url"].as_str(),
-        "WebSearch" => input["query"].as_str(),
+        "WebSearch" | "ToolSearch" | "MCPSearch" | "SuggestSkills" => input["query"].as_str(),
         "Task" | "Agent" => input["description"].as_str(),
         // BACKGROUND-lane tools, so still real rows — the todo-list `Task*`
         // tools never reach here (intercepted into the plan panel). Both key
         // off `task_id`, NOT the todo list's `taskId`: titling `TaskStop` with
         // the latter surfaced nothing at all.
         "TaskStop" | "TaskOutput" => input["task_id"].as_str(),
-        "Monitor" => input["description"].as_str(),
+        "Monitor" => input["description"].as_str().or(input["command"].as_str()),
+        "SendUserMessage" | "PushNotification" => {
+            input["message"].as_str().or(input["text"].as_str())
+        }
+        "Artifact" => input["title"]
+            .as_str()
+            .or(input["file_path"].as_str())
+            .or(input["action"].as_str()),
+        "EnterWorktree" => input["name"].as_str(),
+        "TeamCreate" | "TeamDelete" => input["team_name"].as_str(),
+        "Config" => input["setting"].as_str(),
+        "CronDelete" => input["id"].as_str(),
+        "RemoteTrigger" => input["prompt"].as_str().or(input["description"].as_str()),
+        "ReadMcpResourceTool" => input["uri"].as_str(),
+        "ListMcpResourcesTool" => input["server"].as_str(),
         _ => None,
     };
     match detail {
@@ -3492,12 +4171,52 @@ pub(crate) fn tool_title(name: &str, input: &Value) -> String {
     }
 }
 
+/// Paths a tool call touches — the card's open-in-a-pane affordance and the
+/// inline preview's source. `files` is the `SendUserFile` list (bounded: a
+/// card links a handful, not a directory listing).
 pub(crate) fn tool_locations(input: &Value) -> Vec<String> {
-    ["file_path", "path", "notebook_path"]
+    let mut out: Vec<String> = ["file_path", "path", "notebook_path", "filePath"]
         .iter()
         .filter_map(|key| input[key].as_str())
         .map(String::from)
-        .collect()
+        .collect();
+    if let Some(files) = input["files"].as_array() {
+        out.extend(
+            files
+                .iter()
+                .filter_map(|f| f.as_str())
+                .filter(|f| !f.is_empty())
+                .take(8)
+                .map(String::from),
+        );
+    }
+    out.dedup();
+    out
+}
+
+/// Strip the CLI's `<local-command-stdout>` / `<local-command-stderr>`
+/// wrappers off a slash command's output (both may be present; stderr is
+/// appended after stdout).
+fn local_command_text(raw: &str) -> String {
+    let mut parts = Vec::new();
+    for tag in ["local-command-stdout", "local-command-stderr"] {
+        let open = format!("<{tag}>");
+        let close = format!("</{tag}>");
+        let mut rest = raw;
+        while let Some(start) = rest.find(&open) {
+            let body = &rest[start + open.len()..];
+            let end = body.find(&close).unwrap_or(body.len());
+            let text = body[..end].trim();
+            if !text.is_empty() {
+                parts.push(text.to_string());
+            }
+            rest = &body[end..];
+        }
+    }
+    if parts.is_empty() && !raw.contains("<local-command-") {
+        return raw.trim().to_string();
+    }
+    parts.join("\n")
 }
 
 /// Edit-family inputs carry the change itself — surface it as diff content
@@ -3657,6 +4376,7 @@ mod tests {
                 attachments,
                 id,
                 queued,
+                origin: _,
             } => {
                 assert_eq!(text, "hello");
                 assert_eq!(*attachments, 0);
@@ -4988,6 +5708,7 @@ mod tests {
                 attachments: 0,
                 id: None,
                 queued: false,
+                origin: None,
             }
         );
 
@@ -5080,7 +5801,9 @@ mod tests {
             &step.events[1],
             AgentEvent::UserMessage { text, .. } if text == "also update the docs"
         ));
-        // The follow-up's ack resolves to ModeChanged(acceptEdits).
+        // The follow-up's ack resolves to ModeChanged(acceptEdits) — not a
+        // pick (`chosen: false`): approving a plan must not become the next
+        // chat's default mode.
         let ctl = step.outbound[1]["request_id"].as_str().unwrap().to_string();
         let step = m.on_frame(&json!({
             "type": "control_response",
@@ -5089,7 +5812,8 @@ mod tests {
         assert_eq!(
             step.events[0],
             AgentEvent::ModeChanged {
-                mode_id: "acceptEdits".into()
+                mode_id: "acceptEdits".into(),
+                chosen: false
             }
         );
     }
@@ -5193,7 +5917,8 @@ mod tests {
         assert_eq!(
             step.events[0],
             AgentEvent::ModeChanged {
-                mode_id: "acceptEdits".into()
+                mode_id: "acceptEdits".into(),
+                chosen: true
             }
         );
     }
@@ -6556,7 +7281,8 @@ mod tests {
         assert_eq!(
             step.events[0],
             AgentEvent::ModeChanged {
-                mode_id: "acceptEdits".into()
+                mode_id: "acceptEdits".into(),
+                chosen: false
             }
         );
         // Unchanged mode re-announcements stay silent.
@@ -6764,5 +7490,443 @@ mod tests {
             "message": { "id": "m9", "content": [{ "type": "text", "text": "sub" }] },
         }));
         assert!(step.events.is_empty());
+    }
+
+    // --- 2.1.259 surface: initialize extras, Remote Control, new frames --
+
+    #[test]
+    fn initialize_extras_seed_mode_and_remote_control_offer() {
+        let m = ClaudeMapper::new(
+            None,
+            None,
+            &json!({
+                "commands": [],
+                "remote_control_available": true,
+                "remote_control_auto_enable": true,
+                "current_permission_mode": "plan",
+            }),
+        );
+        match m.init_event() {
+            AgentEvent::Init {
+                current_mode,
+                remote_control_available,
+                remote_control_auto_enable,
+                ..
+            } => {
+                assert_eq!(current_mode.as_deref(), Some("plan"));
+                assert!(remote_control_available);
+                assert!(remote_control_auto_enable);
+            }
+            other => panic!("expected Init, got {other:?}"),
+        }
+        // Older CLIs: no offer keys → available (the CLI's own docstring),
+        // no auto-on verdict, mode unknown until a status frame.
+        let m = ClaudeMapper::new(None, None, &json!({ "commands": [] }));
+        match m.init_event() {
+            AgentEvent::Init {
+                current_mode,
+                remote_control_available,
+                remote_control_auto_enable,
+                ..
+            } => {
+                assert_eq!(current_mode, None);
+                assert!(remote_control_available);
+                assert!(!remote_control_auto_enable);
+            }
+            other => panic!("expected Init, got {other:?}"),
+        }
+    }
+
+    /// The live 2.1.259 order: enable → `bridge_state ready` (before the ack)
+    /// → the ack with the session link → `bridge_state connected`; disable
+    /// acks null. Every hop journals one RemoteControl level-set.
+    #[test]
+    fn remote_control_roundtrip_tracks_bridge_state() {
+        let mut m = mapper();
+        let step = m.on_command(AgentCommand::SetRemoteControl {
+            enabled: true,
+            name: Some("chimaera probe".into()),
+        });
+        assert_eq!(
+            step.events[0],
+            AgentEvent::RemoteControl {
+                state: RemoteControlState::Connecting,
+                session_url: None,
+                name: Some("chimaera · chimaera probe".into()),
+                detail: None,
+            }
+        );
+        let request = &step.outbound[0]["request"];
+        assert_eq!(request["subtype"], "remote_control");
+        assert_eq!(request["enabled"], true);
+        assert_eq!(request["name"], "chimaera · chimaera probe");
+        assert_eq!(request["keep_session_on_exit"], false);
+        let ctl_id = step.outbound[0]["request_id"].as_str().unwrap().to_string();
+
+        // `ready` re-announces Connecting with nothing new → silent.
+        let step = m.on_frame(&json!({
+            "type": "system", "subtype": "bridge_state", "state": "ready",
+        }));
+        assert!(
+            step.events.is_empty(),
+            "duplicate state, no detail: {:?}",
+            step.events
+        );
+
+        let step = m.on_frame(&json!({
+            "type": "control_response",
+            "response": {
+                "subtype": "success", "request_id": ctl_id,
+                "response": {
+                    "session_url": "https://claude.ai/code/session_01X",
+                    "connect_url": "https://claude.ai/code?environment=",
+                    "environment_id": "", "bridge_epoch": 1,
+                    "bridge_session_id": "cse_01X",
+                },
+            },
+        }));
+        assert_eq!(
+            step.events[0],
+            AgentEvent::RemoteControl {
+                state: RemoteControlState::Connecting,
+                session_url: Some("https://claude.ai/code/session_01X".into()),
+                name: Some("chimaera · chimaera probe".into()),
+                detail: None,
+            }
+        );
+        let step = m.on_frame(&json!({
+            "type": "system", "subtype": "bridge_state", "state": "connected", "bridge_epoch": 1,
+        }));
+        assert_eq!(
+            step.events[0],
+            AgentEvent::RemoteControl {
+                state: RemoteControlState::Connected,
+                session_url: Some("https://claude.ai/code/session_01X".into()),
+                name: Some("chimaera · chimaera probe".into()),
+                detail: None,
+            }
+        );
+        // An unknown bridge word is surfaced verbatim, never swallowed.
+        let step = m.on_frame(&json!({
+            "type": "system", "subtype": "bridge_state", "state": "degraded",
+            "detail": "backend slow",
+        }));
+        assert_eq!(
+            step.events[0],
+            AgentEvent::Notice {
+                text: "Remote Control: degraded — backend slow".into()
+            }
+        );
+
+        let step = m.on_command(AgentCommand::SetRemoteControl {
+            enabled: false,
+            name: None,
+        });
+        assert!(
+            step.events.is_empty(),
+            "disable journals on the ack, not optimistically"
+        );
+        assert_eq!(step.outbound[0]["request"]["enabled"], false);
+        let ctl_id = step.outbound[0]["request_id"].as_str().unwrap().to_string();
+        let step = m.on_frame(&json!({
+            "type": "control_response",
+            "response": { "subtype": "success", "request_id": ctl_id, "response": null },
+        }));
+        assert_eq!(
+            step.events[0],
+            AgentEvent::RemoteControl {
+                state: RemoteControlState::Off,
+                session_url: None,
+                name: None,
+                detail: None,
+            }
+        );
+        // Off twice stays one line.
+        let step = m.on_frame(&json!({
+            "type": "system", "subtype": "bridge_state", "state": "disconnected",
+        }));
+        assert!(step.events.is_empty());
+    }
+
+    #[test]
+    fn refused_remote_control_enable_is_an_error_state_with_the_clis_words() {
+        let mut m = mapper();
+        let step = m.on_command(AgentCommand::SetRemoteControl {
+            enabled: true,
+            name: None,
+        });
+        let ctl_id = step.outbound[0]["request_id"].as_str().unwrap().to_string();
+        let step = m.on_frame(&json!({
+            "type": "control_response",
+            "response": {
+                "subtype": "error", "request_id": ctl_id,
+                "error": "Remote Control is only available with claude.ai subscriptions.",
+            },
+        }));
+        // The CLI's sentence is journaled as a Notice (replay-visible), then
+        // the Error state the chip shows.
+        assert!(matches!(
+            &step.events[0],
+            AgentEvent::Notice { text } if text.contains("claude.ai subscriptions")
+        ));
+        assert_eq!(
+            step.events[1],
+            AgentEvent::RemoteControl {
+                state: RemoteControlState::Error,
+                session_url: None,
+                name: None,
+                detail: Some(
+                    "Remote Control is only available with claude.ai subscriptions.".into()
+                ),
+            }
+        );
+        // Teardown after a refusal has nothing live to switch off.
+        assert!(m
+            .drain_pending()
+            .iter()
+            .all(|e| !matches!(e, AgentEvent::RemoteControl { .. })));
+    }
+
+    #[test]
+    fn live_bridge_is_switched_off_at_teardown() {
+        let mut m = mapper();
+        m.on_command(AgentCommand::SetRemoteControl {
+            enabled: true,
+            name: Some("probe".into()),
+        });
+        m.on_frame(&json!({ "type": "system", "subtype": "bridge_state", "state": "connected" }));
+        let events = m.drain_pending();
+        assert!(events.iter().any(|e| matches!(
+            e,
+            AgentEvent::RemoteControl { state: RemoteControlState::Off, detail: Some(d), .. }
+                if d.contains("process ended")
+        )));
+    }
+
+    /// A text `user` frame we never wrote is a Remote Control injection —
+    /// but ONLY while the bridge is connected, never for replays, tool
+    /// results, subagent frames, or our own uuids.
+    #[test]
+    fn remote_origin_user_frames_render_only_while_connected() {
+        let mut m = mapper();
+        let foreign = |uuid: &str| {
+            json!({
+                "type": "user", "uuid": uuid, "session_id": "native-1",
+                "parent_tool_use_id": null,
+                "message": { "role": "user", "content": [
+                    { "type": "text", "text": "from my phone" },
+                    { "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": "AA==" } },
+                ]},
+            })
+        };
+        // Bridge off: nothing.
+        assert!(m.on_frame(&foreign("u-off")).events.is_empty());
+
+        m.on_command(AgentCommand::SetRemoteControl {
+            enabled: true,
+            name: None,
+        });
+        m.on_frame(&json!({ "type": "system", "subtype": "bridge_state", "state": "connected" }));
+        let step = m.on_frame(&foreign("u-phone"));
+        assert_eq!(
+            step.events[0],
+            AgentEvent::UserMessage {
+                text: "from my phone".into(),
+                attachments: 1,
+                id: None,
+                queued: false,
+                origin: Some("remote".into()),
+            }
+        );
+        // A `--replay-user-messages` echo of a message is not a new one.
+        let mut replay = foreign("u-replay");
+        replay["isReplay"] = json!(true);
+        assert!(m.on_frame(&replay).events.is_empty());
+        // Our own send, echoed back with our uuid: not remote.
+        let step = m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text {
+                text: "mine".into(),
+            }],
+        });
+        let mine = match &step.events[0] {
+            AgentEvent::UserMessage { id: Some(id), .. } => id.clone(),
+            other => panic!("expected UserMessage, got {other:?}"),
+        };
+        assert!(m.on_frame(&foreign(&mine)).events.is_empty());
+        // A subagent-tagged frame is the subagent's transcript, not ours.
+        let mut sub = foreign("u-sub");
+        sub["parent_tool_use_id"] = json!("tu-agent");
+        assert!(m.on_frame(&sub).events.is_empty());
+        // A tool_result carrier renders through on_tool_results only.
+        let step = m.on_frame(&json!({
+            "type": "user", "uuid": "u-tr", "parent_tool_use_id": null,
+            "message": { "role": "user", "content": [
+                { "type": "tool_result", "tool_use_id": "tu-x", "content": "ok" },
+            ]},
+        }));
+        assert!(step
+            .events
+            .iter()
+            .all(|e| !matches!(e, AgentEvent::UserMessage { .. })));
+    }
+
+    #[test]
+    fn informational_and_local_command_output_become_notices() {
+        let mut m = mapper();
+        let step = m.on_frame(&json!({
+            "type": "system", "subtype": "informational",
+            "content": "SessionStart:startup says: hello", "level": "notice",
+        }));
+        assert_eq!(
+            step.events[0],
+            AgentEvent::Notice {
+                text: "SessionStart:startup says: hello".into()
+            }
+        );
+        // `info` is transcript-mode only in the official client.
+        let step = m.on_frame(&json!({
+            "type": "system", "subtype": "informational", "content": "quiet", "level": "info",
+        }));
+        assert!(step.events.is_empty());
+        let step = m.on_frame(&json!({
+            "type": "system", "subtype": "local_command_output",
+            "content": "<local-command-stdout>Context: 12%</local-command-stdout><local-command-stderr>warn</local-command-stderr>",
+        }));
+        assert_eq!(
+            step.events[0],
+            AgentEvent::Notice {
+                text: "Context: 12%\nwarn".into()
+            }
+        );
+    }
+
+    #[test]
+    fn init_frame_mcp_server_errors_surface_once() {
+        let mut m = mapper();
+        let step = m.on_frame(&json!({
+            "type": "system", "subtype": "init", "session_id": "native-9",
+            "model": "claude-opus-5", "permissionMode": "default",
+            "mcp_server_errors": [
+                { "name": "broken", "type": "url_missing_type", "message": "a `url` entry with no `type`" },
+                { "name": "nameless" },
+            ],
+        }));
+        assert!(matches!(&step.events[0], AgentEvent::Init { .. }));
+        assert_eq!(
+            step.events[1],
+            AgentEvent::Notice {
+                text: "MCP server config skipped: broken (a `url` entry with no `type`), nameless"
+                    .into()
+            }
+        );
+    }
+
+    #[test]
+    fn new_tool_family_gets_kinds_titles_and_locations() {
+        assert_eq!(tool_kind("PowerShell"), ToolKind::Execute);
+        assert_eq!(tool_kind("ToolSearch"), ToolKind::Search);
+        assert_eq!(tool_kind("ReadMcpResourceTool"), ToolKind::Read);
+        assert_eq!(tool_kind("SendUserFile"), ToolKind::Other);
+
+        assert_eq!(
+            tool_title("Skill", &json!({ "skill": "chat-mode", "args": "verify" })),
+            "Skill: /chat-mode verify"
+        );
+        assert_eq!(
+            tool_title(
+                "Workflow",
+                &json!({ "script": "export const meta = {\n  name: 'review-changes',\n  description: 'x' }" })
+            ),
+            "Workflow: review-changes"
+        );
+        assert_eq!(
+            tool_title(
+                "ScheduleWakeup",
+                &json!({ "delaySeconds": 1200, "reason": "watching CI" })
+            ),
+            "ScheduleWakeup: in 20m 00s · watching CI"
+        );
+        assert_eq!(
+            tool_title(
+                "SendUserFile",
+                &json!({ "files": ["/tmp/a.png", "/tmp/b.png", "/tmp/c.png"] })
+            ),
+            "SendUserFile: /tmp/a.png (+2 more)"
+        );
+        assert_eq!(
+            tool_title("mcp__goldfish__search_memory", &json!({ "query": "x" })),
+            "search_memory (goldfish)"
+        );
+        assert_eq!(
+            tool_title("ReportFindings", &json!({ "findings": [{}, {}] })),
+            "ReportFindings: 2 findings"
+        );
+        assert_eq!(tool_title("ListAgents", &json!({})), "ListAgents");
+        // SendUserFile's files are the card's open/preview affordance.
+        assert_eq!(
+            tool_locations(&json!({ "files": ["/tmp/a.png", "/tmp/b.pdf"], "caption": "c" })),
+            vec!["/tmp/a.png".to_string(), "/tmp/b.pdf".to_string()]
+        );
+    }
+
+    #[test]
+    fn set_remote_control_at_start_rides_the_handshake_only_when_offered() {
+        let mut spec =
+            crate::driver::SpawnSpec::new("s", vec!["x".into()], std::path::PathBuf::from("/tmp"));
+        spec.remote_control = Some("chimaera dev".into());
+        // Offered: the handshake queues the enable request.
+        let mut m = ClaudeMapper::new(
+            None,
+            None,
+            &json!({ "commands": [], "remote_control_available": true }),
+        );
+        let step = m.on_command(AgentCommand::SetRemoteControl {
+            enabled: true,
+            name: spec.remote_control.clone(),
+        });
+        assert_eq!(
+            step.outbound[0]["request"]["name"],
+            "chimaera · chimaera dev"
+        );
+        // Not offered: the mapper still knows, and the handshake says so.
+        let m = ClaudeMapper::new(
+            None,
+            None,
+            &json!({ "commands": [], "remote_control_available": false }),
+        );
+        assert!(!m.remote_control_available);
+    }
+}
+
+#[cfg(test)]
+mod effort_applies_tests {
+    use super::*;
+
+    #[test]
+    fn spawn_effort_skips_only_effortless_catalog_entries() {
+        let models = vec![
+            crate::model::ModelInfo {
+                id: "opus[1m]".into(),
+                label: "Opus".into(),
+                description: None,
+                resolved: Some("claude-opus-5[1m]".into()),
+                efforts: vec!["low".into(), "xhigh".into()],
+                default_effort: None,
+            },
+            crate::model::ModelInfo {
+                id: "haiku".into(),
+                label: "Haiku".into(),
+                description: None,
+                resolved: Some("claude-haiku-4-5-20251001".into()),
+                efforts: Vec::new(),
+                default_effort: None,
+            },
+        ];
+        assert!(effort_applies(&models, None));
+        assert!(effort_applies(&models, Some("opus[1m]")));
+        assert!(effort_applies(&models, Some("claude-opus-5[1m]")));
+        assert!(!effort_applies(&models, Some("haiku")));
+        assert!(effort_applies(&models, Some("something-new")));
+        assert!(effort_applies(&[], Some("haiku")));
     }
 }

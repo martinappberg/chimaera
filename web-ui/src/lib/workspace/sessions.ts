@@ -140,6 +140,12 @@ export interface Session {
    *  surfaces. Cleared when a new turn starts. */
   status_needs_action?: boolean;
   /**
+   * The session's Remote Control page (claude `session_url`) while its
+   * bridge is connecting/connected — the rail's "take it with you" badge.
+   * Null when off; absent on old daemons and PTY rows.
+   */
+  remote_control_url?: string | null;
+  /**
    * How many process-owned jobs are working outside the current turn:
    * backgrounded Bash/workflows plus cross-turn delegated agents.
    * Chat sessions only; null on PTY rows (a TUI's Ctrl-B raises no hook, so

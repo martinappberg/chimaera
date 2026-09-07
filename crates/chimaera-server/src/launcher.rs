@@ -36,17 +36,29 @@ use crate::agents::AgentKind;
 use crate::AppState;
 
 /// Curated per-agent model list: `(id, label)` pairs, default first. The id
-/// is passed verbatim as `--model <id>` (all three CLIs take the flag).
+/// is passed verbatim as `--model <id>` (all three CLIs take the flag). This
+/// is the FALLBACK: once a chat session of that kind has handshaked, the
+/// catalog the agent itself advertised (`ChatManager::latest_models`) is what
+/// `GET /api/v1/agents` returns — the agent's list is account-specific and
+/// tracks releases without a chimaera change.
 pub(crate) fn models(kind: AgentKind) -> &'static [(&'static str, &'static str)] {
     match kind {
-        // Claude Code resolves the opus/sonnet/haiku aliases to the latest
-        // snapshots itself, so this list never goes stale.
-        AgentKind::Claude => &[("opus", "Opus"), ("sonnet", "Sonnet"), ("haiku", "Haiku")],
-        // Source: the user config codex-cli 0.142.5 writes on this machine
-        // (`model = "gpt-5.5"`). The app-server likely exposes a model list
-        // (the official extension shows one) — adopt it when the codex
-        // driver grows a models probe.
-        AgentKind::Codex => &[("gpt-5.5", "GPT-5.5")],
+        // Claude Code resolves the family aliases to the latest snapshots
+        // itself (`claude --help`: "an alias for the latest model, e.g.
+        // 'fable', 'opus', or 'sonnet'"), so this list never goes stale.
+        AgentKind::Claude => &[
+            ("fable", "Fable"),
+            ("opus", "Opus"),
+            ("sonnet", "Sonnet"),
+            ("haiku", "Haiku"),
+        ],
+        // The 0.153.0 `model/list` on a Pro account (live-probed 2026-09-06):
+        // GPT-6 Astra is the default; GPT-5.6 Sol the workhorse. Both ids are
+        // what `thread/start.model` accepts.
+        AgentKind::Codex => &[
+            ("gpt-6-astra", "GPT-6 Astra"),
+            ("gpt-5.6-sol", "GPT-5.6 Sol"),
+        ],
         // agy picks its own model; no curated list until its integration.
         AgentKind::Antigravity => &[],
         // Static list (gemini is not installed here to probe): the models
@@ -495,10 +507,21 @@ pub(crate) async fn list_agents(
                 "managed_install".into(),
                 json!(crate::runtimes::install_script(kind, &state.managed_root).is_some()),
             );
-            let models: Vec<_> = models(kind)
-                .iter()
-                .map(|(id, label)| json!({"id": id, "label": label}))
-                .collect();
+            // The agent's own catalog (from the newest chat Init of this
+            // kind) beats the curated fallback: it is account-specific and
+            // carries the vendor's descriptions.
+            let live = state.chat.latest_models(kind.as_str());
+            let models: Vec<_> = if live.is_empty() {
+                models(kind)
+                    .iter()
+                    .map(|(id, label)| json!({"id": id, "label": label}))
+                    .collect()
+            } else {
+                // The struct's own serde shape (id/label + the optional
+                // description/resolved/efforts/default_effort) — one source
+                // of truth with the Init event's catalog.
+                live.iter().map(|m| json!(m)).collect()
+            };
             row.insert("models".into(), json!(models));
             // Whether this agent can spawn as a structured chat session
             // (claude stream-json / codex app-server drivers).
@@ -522,12 +545,15 @@ pub(crate) async fn list_agents(
 
 /// Charset guard for model/resume ids that land in argv. Argv cannot
 /// shell-inject, but a flag-shaped value ("--dangerously-…") or control
-/// bytes have no business in either field.
+/// bytes have no business in either field. Square brackets are claude's
+/// own context-window suffix (`opus[1m]`, `claude-fable-5-1[1m]` — the
+/// picker values its initialize catalog advertises; live-verified accepted
+/// by both `--model` and `set_model` on 2.1.259).
 pub(crate) fn safe_arg(s: &str) -> bool {
     !s.is_empty()
         && !s.starts_with('-')
         && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '[' | ']'))
 }
 
 /// Argv for an agent session. Claude gets the hook-injecting `--settings`
@@ -1763,11 +1789,29 @@ mod tests {
         assert!(!is_outdated(AgentKind::Codex, Some("0.52.0")));
         assert!(!is_outdated(AgentKind::Codex, None));
         assert!(!is_outdated(AgentKind::Claude, Some("0.1.99")));
-        // The spec'd claude aliases and labels, exactly.
+        // The curated FALLBACK lists (the live Init catalog wins once seen):
+        // claude's family aliases, which the CLI resolves itself; codex's
+        // 0.153 defaults, whose ids thread/start accepts verbatim.
         assert_eq!(
             models(AgentKind::Claude),
-            [("opus", "Opus"), ("sonnet", "Sonnet"), ("haiku", "Haiku")]
+            [
+                ("fable", "Fable"),
+                ("opus", "Opus"),
+                ("sonnet", "Sonnet"),
+                ("haiku", "Haiku")
+            ]
         );
+        assert_eq!(
+            models(AgentKind::Codex),
+            [
+                ("gpt-6-astra", "GPT-6 Astra"),
+                ("gpt-5.6-sol", "GPT-5.6 Sol")
+            ]
+        );
+        // Claude's context-window suffix is a legal model id in argv.
+        assert!(safe_arg("opus[1m]"));
+        assert!(safe_arg("claude-fable-5-1[1m]"));
+        assert!(!safe_arg("opus[1m];rm"));
         assert!(install_command(AgentKind::Claude).starts_with("curl "));
         assert!(install_command(AgentKind::Codex).contains("npm install -g @openai/codex"));
         assert!(install_command(AgentKind::Gemini).contains("npm install -g @google/gemini-cli"));

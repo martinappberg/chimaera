@@ -44,10 +44,10 @@ gap-replay idea as the PTY transport, realized for structured streams.
 |---|---|---|
 | `lib.rs` | `ChatManager`: the session registry + pump task (`absorb`) + `spawn`/`attach`/`command`/`kill`/`remove`; owns the 32 MiB / 64-message retained-Send budget across its channel and both drivers' pending FIFOs. | adding session lifecycle, changing fan-out, touching `ChatInfo`, or command admission. |
 | `driver.rs` | The `AgentAdapter`/`Mapper` traits, `SpawnSpec` (incl. protocol-side `initial_model`, `agent_version`, `rollback_turns`, native `fork_at`, and quiet `portable_context`), `DriverIo`, `DriverExit`, handshake/kill timeouts; the harness `run_driver` (journals the probed version on `Init` + a non-fatal drift Notice vs `tested_version()`, surfaces startup-failure as a visible event, and drives the `tick`/`drain_pending` mapper hooks). | adding a new agent, changing spawn inputs, exit classification, or the version/startup/teardown harness. |
-| `model.rs` | The normalized `AgentEvent` / `AgentCommand` types (ACP-shaped), including bounded slash catalogs and native skill input blocks; authoritative command-ingress validation, `Usage`, the delta `Coalescer`, and the size caps (`COMMAND_*`, `cap_output`, `cap_head_tail`, `DIFF_*_BUDGET`, `BG_*`). | adding an event/command kind, or a cap. |
-| `claude.rs` | The Claude Code driver: bidirectional `stream-json` + the `control_response` protocol. Pinned to `TESTED_CLAUDE_VERSION`. | claude protocol work. |
-| `codex.rs` | The Codex driver: `codex app-server` JSON-RPC 2.0, thread/turn/steer lifecycle, cwd-scoped `skills/list` + native skill inputs, questions, approvals + default auto-review, model/mode settings. Pinned to `TESTED_CODEX_VERSION`. | codex protocol work. |
-| `journal.rs` | Per-session append-only JSONL + bounded replay ring + the native-id→session index + dir pruning. The gap-replay crown jewel. | anything touching durability, replay, or seq numbering. |
+| `model.rs` | The normalized `AgentEvent` / `AgentCommand` types (ACP-shaped), including bounded slash catalogs, native skill input blocks, the latest-wins `RemoteControl` event + `SetRemoteControl` command, and `UserMessage.origin`; authoritative command-ingress validation, `Usage`, the delta `Coalescer`, and the size caps (`COMMAND_*`, `cap_output`, `cap_head_tail`, `DIFF_*_BUDGET`, `BG_*`). | adding an event/command kind, or a cap. |
+| `claude.rs` | The Claude Code driver: bidirectional `stream-json` + the `control_response` protocol, incl. the Remote Control bridge (`remote_control` control + `system/bridge_state`, `SpawnSpec.remote_control` at-start), the initialize offer flags, and the tool-family titles. Pinned to `TESTED_CLAUDE_VERSION`. | claude protocol work. |
+| `codex.rs` | The Codex driver: `codex app-server` JSON-RPC 2.0, thread/turn/steer lifecycle, cwd-scoped `skills/list` + native skill inputs, questions, approvals (incl. the `{permissions, scope}` profile reply) + default auto-review, model/mode settings, Remote Control status relay. Pinned to `TESTED_CODEX_VERSION`. | codex protocol work. |
+| `journal.rs` | Per-session append-only JSONL + bounded replay ring + the native-id→session index (+ each conversation's own model/effort/mode, so a reopen comes back as it was) + the per-agent-kind `AgentPrefsStore` (last model/effort/mode the user picked, `prefs.json`) + dir pruning. The gap-replay crown jewel. | anything touching durability, replay, seq numbering, or what a new chat starts with. |
 | `ndjson.rs` | Line-oriented JSON transport over child stdio (`JsonlChild` and its split halves), with per-line length caps. Shared by both drivers. | transport/framing, process spawn. |
 | `bin/fake-claude.rs` | A scripted fake that speaks enough of the claude wire to exercise ordinary permission turns plus deterministic `background`, `question`, `plan`, `subagent`, hang, and failure modes. | writing a hermetic driver/registry or live-UI test. |
 | `tests/manager.rs` | Hermetic end-to-end tests via `fake-claude` (no network, no billing). | regression-proofing a change. |
@@ -112,6 +112,10 @@ gap-replay idea as the PTY transport, realized for structured streams.
   tasks that died with the previous daemon process.
 - A `--resume` forks a NEW native session id (claude); never pin `--session-id`
   with `--resume`. Codex resumes in-protocol (the id survives).
+- Remote Control is process-owned on both wires: claude's bridge dies with the
+  driver (teardown journals the Off), codex's lives on its app-server DAEMON
+  (a per-session app-server only reports `disabled`; no enable RPC exists).
+  The `RemoteControl` event is latest-wins and a fresh `Init` resets it.
 - Portable branch context is spawn initialization, never a synthetic `Send`:
   Claude reads the runtime prompt file from argv; Codex carries top-level
   `developerInstructions` on thread open. Opening a branch must stay idle.
