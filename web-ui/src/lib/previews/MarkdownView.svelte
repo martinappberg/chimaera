@@ -649,6 +649,11 @@
        column's min-content and crush numeric cells letter-per-line (chat's
        root does, and needs a per-cell reset; this one doesn't). */
     overflow-wrap: break-word;
+    /* Tables: the shared recipe in app.css ("Markdown tables"), whose default
+       spacing is this surface's; comrak's bare <table> is its own
+       display:block scroller there. Headers wrap like any cell: one-line
+       headers would only turn tables that fit into scrollers, since
+       overflow-wrap above never shrinks a column's min-content. */
   }
 
   .md-body :global(h1),
@@ -833,56 +838,6 @@
 
   .md-body :global(img) {
     max-width: 100%;
-  }
-
-  /* Tables: the <table> is its own horizontal scroller — no chat-style host.
-     The block form keeps its table semantics (probed on WebKit 26.6 via the
-     Web Inspector's node accessibility query and on Chromium 151 via the CDP
-     accessibility tree: table / row / columnheader / cell all survive), and
-     comrak emits a bare <table>, so a host would have to be spliced into the
-     HTML string (the {@html} host is append-only after render, see
-     shared/copyDecor.ts). Contained overscroll: a trackpad swipe at a table
-     edge must not become WebKit's back gesture. The 1px padding keeps the
-     outer half of the collapsed border inside the clip. Alignment: comrak
-     writes GFM :--: / --: as align="center|right" (ammonia keeps it); the
-     explicit value rules honour exactly those, case-insensitively for
-     hand-written HTML, and every other cell stays left — an empty or unknown
-     align never falls back to the browser's centred header default. Headers
-     wrap like any cell: one-line headers would only turn tables that fit into
-     scrollers, since the root's overflow-wrap never shrinks a column's
-     min-content. */
-  .md-body :global(table) {
-    border-collapse: collapse;
-    margin: 1em 0;
-    display: block;
-    overflow-x: auto;
-    overscroll-behavior-x: contain;
-    scrollbar-width: thin;
-    padding: 1px;
-    font-size: 0.924em;
-  }
-
-  .md-body :global(th),
-  .md-body :global(td) {
-    border: 1px solid var(--edge);
-    padding: 0.35em 0.7em;
-    text-align: left;
-    font-variant-numeric: tabular-nums;
-  }
-
-  .md-body :global(th[align="center" i]),
-  .md-body :global(td[align="center" i]) {
-    text-align: center;
-  }
-
-  .md-body :global(th[align="right" i]),
-  .md-body :global(td[align="right" i]) {
-    text-align: right;
-  }
-
-  .md-body :global(th) {
-    font-weight: 600;
-    background: color-mix(in srgb, var(--fg) 4%, transparent);
   }
 
   .md-body :global(input[type="checkbox"]) {

@@ -175,8 +175,9 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
     cap 4 MB), fetched on first entry and refreshed in place on saves/agent writes. The
     client typesets those spans under the one KaTeX policy every surface shares
     (`shared/math.ts`, loaded on demand at the first equation, memoized, time-sliced).
-    **Tables scroll, never squeeze** — the chat transcript's treatment ([chat mode](chat-mode.md))
-    minus its host wrapper: the `<table>` itself is the horizontal scroller, so a table whose
+    **Tables scroll, never squeeze** — one recipe shared with the chat transcript
+    (`web-ui/src/app.css`, "Markdown tables"; [chat mode](chat-mode.md)) minus chat's host
+    wrapper: the `<table>` itself is the horizontal scroller, so a table whose
     columns can't fit the reading column scrolls in place (prose cells still wrap at spaces).
     GFM `:--:` / `--:` alignment is honoured through the `align` attribute comrak emits and the
     sanitizer keeps; numerals are tabular. Unlike chat, headers wrap like any cell, and a

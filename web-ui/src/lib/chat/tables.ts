@@ -15,6 +15,8 @@ import { Renderer, type MarkedExtension, type Tokens } from "marked";
  * and one registered after it replaces the host outright — keep `table`
  * overridden here only (cell/row overrides compose fine). Agent HTML can forge
  * the class; that buys scroll styling around whatever it wraps and nothing more.
+ * The host's styling is the "Markdown tables" recipe in app.css, shared with
+ * the file preview; chat's own deltas sit in Markdown.svelte.
  */
 export const markdownTables: MarkedExtension = {
   renderer: {

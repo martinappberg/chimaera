@@ -1239,8 +1239,9 @@ mod markdown_tests {
         assert!(html.contains("$5 and $10"), "{html}");
     }
 
-    /// The reading view's alignment CSS keys on the `align` attribute: comrak
-    /// must write GFM `:-:` / `--:` as `align="center|right"` (never a style,
+    /// The markdown-table recipe (web-ui app.css, both surfaces) keys on the
+    /// `align` attribute: comrak must write GFM `:-:` / `--:` as
+    /// `align="center|right"` (never a style,
     /// which the sanitizer would strip), ammonia's defaults must let it
     /// through, and an unmarked column must carry no attribute at all.
     #[test]
@@ -1261,7 +1262,7 @@ mod markdown_tests {
     }
 
     /// Hand-written HTML reaches the sanitizer too (`render.unsafe`), and the
-    /// reading view matches its `align` case-insensitively — so ammonia must
+    /// recipe matches its `align` case-insensitively — so ammonia must
     /// pass a raw value through unnormalised, empty ones included.
     #[test]
     fn raw_html_alignment_passes_through_unnormalised() {
