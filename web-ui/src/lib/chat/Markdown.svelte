@@ -1,9 +1,9 @@
 <script module lang="ts">
   import DOMPurify from "dompurify";
   import { marked } from "marked";
-  import { markdownMath } from "./math";
+  import { chatMarkedExtensions } from "./markedExtensions";
 
-  marked.use(markdownMath);
+  marked.use(...chatMarkedExtensions);
 
   // Agent markdown is untrusted model output rendered into the workbench DOM.
   // External links are a phishing / navigate-the-SPA-away vector, so force
@@ -864,6 +864,7 @@
   .md :global(pre code) {
     display: block;
     overflow-x: auto;
+    scrollbar-width: thin;
     background: none;
     padding: 0;
     font-size: var(--text-sm);
@@ -934,20 +935,58 @@
   .md :global(a) {
     color: var(--accent);
   }
+  /* Tables: the emitted .md-table host (tables.ts) is the horizontal
+     scroller — a <table> can't scroll its own content — so a table wider than
+     the transcript scrolls in place instead of squeezing; it chains scroll
+     like the transcript's own bar (thin) and contains horizontal overscroll
+     so a trackpad swipe at a table edge never becomes WebKit's back gesture.
+     The 1px padding keeps the outer half of the collapsed border (which lies
+     outside the table box) inside the host's clip. Hosted cells drop the
+     root's break-anywhere wrapping: under it every column's minimum is ONE
+     character, and the auto layout crushes short numeric columns into a
+     letter-per-line stack ("0." / "39" / "%") while a prose column hogs the
+     width. Prose cells still wrap at spaces and hyphens; unbreakable tokens
+     hold their width, headers stay on one line so column names read as
+     labels, and numerals are tabular so digit columns line up. An agent's
+     literal <table> HTML has NO host (marked passes it through), so it keeps
+     the squeeze-to-fit wrapping — never wider than the transcript — and its
+     own vertical rhythm. GFM alignment arrives as the align attribute (kept
+     by the sanitizer); the author left-default is scoped so the browser's
+     own mapping handles aligned cells. */
+  .md :global(.md-table) {
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+    scrollbar-width: thin;
+    padding: 1px;
+    margin: 0.4em 0;
+  }
   .md :global(table) {
     border-collapse: collapse;
-    margin: 0.4em 0;
     font-size: var(--text-sm);
+  }
+  .md :global(table:not(.md-table > table)) {
+    margin: 0.4em 0;
   }
   .md :global(th),
   .md :global(td) {
     border: 1px solid var(--edge);
     padding: 3px 8px;
+  }
+  .md :global(th:not([align])),
+  .md :global(td:not([align])) {
     text-align: left;
+  }
+  .md :global(.md-table th),
+  .md :global(.md-table td) {
+    word-break: normal;
+    font-variant-numeric: tabular-nums;
   }
   .md :global(th) {
     font-weight: 600;
     background: color-mix(in srgb, var(--fg) 4%, transparent);
+  }
+  .md :global(.md-table th) {
+    white-space: nowrap;
   }
   .md :global(hr) {
     border: none;
