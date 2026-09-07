@@ -50,6 +50,7 @@ function scroller(): HTMLElement | null {
 }
 
 export async function runStallDrive(host: DriveHost, spec: string): Promise<void> {
+  const quick = new URLSearchParams(location.search).has("quickdrive");
   const [sessPart = "", filePart = "", logPath = ""] = spec.split("|");
   const lines: string[] = [];
   const log = (line: string): void => {
@@ -87,10 +88,22 @@ export async function runStallDrive(host: DriveHost, spec: string): Promise<void
     return performance.now() - t0;
   };
 
+  // Warm terminal instances before introducing documents, so creation's
+  // stylesheet/font work is not mislabeled as a warm terminal switch.
+  for (const i of termIdx) {
+    await go(i);
+    await sleep(500);
+  }
+
   // Park every document, scrolled.
   for (const i of fileIdx) {
     await go(i);
-    await sleep(2500);
+    // First-load parsing can exceed a fixed sleep for a dense document.
+    for (let attempt = 0; attempt < 100; attempt++) {
+      if (activeLayer()?.querySelector(".md-body, .cm-editor")) break;
+      await sleep(100);
+    }
+    await sleep(500);
     const sc = scroller();
     if (sc !== null) {
       sc.scrollTop = 5000;
@@ -184,7 +197,7 @@ export async function runStallDrive(host: DriveHost, spec: string): Promise<void
   await write();
 
   const order = termIdx.length >= 2 ? [termIdx[0], termIdx[1]] : termIdx;
-  for (let i = 0; i < 24; i++) {
+  for (let i = 0; i < (quick ? 2 : 24); i++) {
     const idx = order[i % order.length];
     const dt = await go(idx);
     // The engine's own caret walk from a light-DOM caret at each end of the
@@ -215,6 +228,38 @@ export async function runStallDrive(host: DriveHost, spec: string): Promise<void
   if (fileIdx.length > 0) {
     const dt = await go(fileIdx[0]);
     log(`reveal file ${fileIdx[0]} ${dt.toFixed(1)}ms scrollTop=${scroller()?.scrollTop ?? "n/a"}`);
+    // Terminal-only cycles miss the inherited style work on a document's
+    // own layer. Include warm document reveals and departures as well as
+    // the dormant reveal above (the terminal cycles exceed 30 seconds).
+    for (let i = 0; i < 12; i++) {
+      const idx = i % 2 === 0 ? termIdx[0] : fileIdx[Math.floor(i / 2) % fileIdx.length];
+      const dt = await go(idx);
+      log(`mixed->${idx} ${dt.toFixed(1)}ms scrollTop=${scroller()?.scrollTop ?? "n/a"}`);
+      await sleep(500);
+    }
+    const scroll = activeLayer()?.querySelector<HTMLElement>(".md-scroll");
+    const body = scroll?.querySelector<HTMLElement>(".md-body");
+    if (scroll && body) {
+      const inspectedTab = findPane(host.get().root, paneId)!.active;
+      const windowHeight = scroll.scrollHeight;
+      const windowChars = body.textContent?.length ?? 0;
+      scroll.dispatchEvent(new KeyboardEvent("keydown", { key: "a", metaKey: true, bubbles: true }));
+      const sel = document.getSelection();
+      sel?.selectAllChildren(body);
+      await frame();
+      log(`reading select-all chars=${sel?.toString().length} fullHeight=${scroll.scrollHeight} windowHeight=${windowHeight} windowChars=${windowChars}`);
+      sel?.removeAllRanges();
+      await sleep(500);
+      scroll.scrollTop = scroll.scrollHeight;
+      await sleep(300);
+      log(`reading bottom top=${scroll.scrollTop} height=${scroll.scrollHeight} liveChars=${body.textContent?.length}`);
+      scroll.scrollTop = 5000;
+      await sleep(300);
+      const before = scroll.scrollTop;
+      await go(termIdx[0]);
+      await go(inspectedTab);
+      log(`reading restored top=${scroll.scrollTop} expected=${before} liveChars=${body.textContent?.length}`);
+    }
   }
   log("done");
   await write();
