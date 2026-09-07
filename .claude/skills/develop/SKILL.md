@@ -72,7 +72,10 @@ To reset this worktree's isolated daemon state, delete `.chimaera-dev/`.
 ## Running the built daemon (production-like)
 
 The daemon **embeds `web-ui/dist` at compile time** (rust-embed). So a non-dev
-run needs the UI built first — otherwise you serve a stale or empty bundle:
+run needs the UI built first — otherwise you serve a stale or empty bundle.
+In a **fresh worktree with no `web-ui/dist` at all**, `cargo clippy` / `just check`
+don't even compile `chimaera-server` (`Assets::get` not found — the derive over a
+missing folder): build the UI once, or copy a built `dist/` in from another checkout.
 
 ```sh
 just serve         # builds web-ui/dist, then `cargo run -p chimaera -- serve`
