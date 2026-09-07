@@ -2,8 +2,9 @@
   import DOMPurify from "dompurify";
   import { marked } from "marked";
   import { markdownMath } from "./math";
+  import { markdownTables } from "./tables";
 
-  marked.use(markdownMath);
+  marked.use(markdownMath, markdownTables);
 
   // Agent markdown is untrusted model output rendered into the workbench DOM.
   // External links are a phishing / navigate-the-SPA-away vector, so force
@@ -934,20 +935,51 @@
   .md :global(a) {
     color: var(--accent);
   }
+  /* Tables: the emitted .md-table host (tables.ts) is the horizontal
+     scroller — a <table> can't scroll its own content — so a table wider than
+     the transcript scrolls in place instead of squeezing. Cells drop the
+     root's break-anywhere wrapping: under it every column's minimum is ONE
+     character, and the auto layout crushes short numeric columns into a
+     letter-per-line stack ("0." / "39" / "%") while a prose column hogs the
+     width. Prose cells still wrap at spaces; only unbreakable tokens hold
+     their width, and headers stay on one line so column names read as
+     labels. A raw-HTML <table> (no host) keeps its own margins. */
+  .md :global(.md-table) {
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+    margin: 0.4em 0;
+  }
   .md :global(table) {
     border-collapse: collapse;
     margin: 0.4em 0;
     font-size: var(--text-sm);
+  }
+  .md :global(.md-table > table) {
+    margin: 0;
   }
   .md :global(th),
   .md :global(td) {
     border: 1px solid var(--edge);
     padding: 3px 8px;
     text-align: left;
+    word-break: normal;
+    font-variant-numeric: tabular-nums;
   }
   .md :global(th) {
     font-weight: 600;
+    white-space: nowrap;
     background: color-mix(in srgb, var(--fg) 4%, transparent);
+  }
+  /* GFM column alignment arrives as the align attribute (marked emits it,
+     the sanitizer keeps it); a presentational hint loses to the author
+     text-align above, so re-assert the two non-default alignments. */
+  .md :global(th[align="center"]),
+  .md :global(td[align="center"]) {
+    text-align: center;
+  }
+  .md :global(th[align="right"]),
+  .md :global(td[align="right"]) {
+    text-align: right;
   }
   .md :global(hr) {
     border: none;
