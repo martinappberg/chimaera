@@ -156,7 +156,9 @@ pub enum AgentEvent {
     TurnStarted {
         turn_id: String,
     },
-    /// Streamed agent prose (already delta-coalesced by the pump).
+    /// Streamed agent prose, delta-coalesced by the driver's `Coalescer`.
+    /// Chunk boundaries are timing-dependent (the harness's ~100ms tick
+    /// flushes whatever is buffered); only the concatenation is meaningful.
     MessageChunk {
         turn_id: String,
         text: String,

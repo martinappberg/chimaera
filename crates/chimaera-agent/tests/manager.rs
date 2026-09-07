@@ -19,7 +19,11 @@ use chimaera_agent::model::{
 use chimaera_agent::{ChatManager, CommandQueueFull, EventHook, ExitHook, RETAINED_SENDS_MAX};
 
 const FAKE: &str = env!("CARGO_BIN_EXE_fake-claude");
-const WAIT: Duration = Duration::from_secs(5);
+/// Ceiling on any single wait. Every wait in this file is condition-driven
+/// (an event arrives, a hook fires), so this bound only decides how long a
+/// genuinely broken run takes to fail — make it generous enough that a slow,
+/// loaded CI runner running the suite in parallel never trips it.
+const WAIT: Duration = Duration::from_secs(20);
 
 struct Fixture {
     manager: Arc<ChatManager>,
@@ -73,6 +77,29 @@ async fn wait_for(
     }
 }
 
+/// A turn's surfaced prose so far: every `MessageChunk` of `turn` concatenated
+/// in seq order, deduped by seq (the live tail may overlap the replay
+/// snapshot). HOW MANY chunks the deltas land in is timing-dependent by
+/// design — the harness's ~100ms tick flushes whatever is buffered, so a tick
+/// that fires between two frames splits them — so tests assert on the
+/// concatenation, never on a single chunk's text.
+fn prose(seen: &[Arc<SeqEvent>], turn: &str) -> String {
+    let mut last = 0u64;
+    let mut out = String::new();
+    for e in seen {
+        if e.seq <= last {
+            continue;
+        }
+        last = e.seq;
+        if let AgentEvent::MessageChunk { turn_id, text, .. } = &e.ev {
+            if turn_id == turn {
+                out.push_str(text);
+            }
+        }
+    }
+    out
+}
+
 #[tokio::test]
 async fn full_turn_with_permission_allow_and_gap_replay() {
     let fx = fixture();
@@ -114,24 +141,24 @@ async fn full_turn_with_permission_allow_and_gap_replay() {
         |ev| matches!(ev, AgentEvent::UserMessage { text, .. } if text == "run it"),
     )
     .await;
-    wait_for(&mut rx, &mut seen, "TurnStarted", |ev| {
+    let started = wait_for(&mut rx, &mut seen, "TurnStarted", |ev| {
         matches!(ev, AgentEvent::TurnStarted { .. })
     })
     .await;
+    let turn = match &started.ev {
+        AgentEvent::TurnStarted { turn_id } => turn_id.clone(),
+        _ => unreachable!(),
+    };
     // Second Init carries the native session id from system/init.
     wait_for(&mut rx, &mut seen, "Init with native id", |ev| {
         matches!(ev, AgentEvent::Init { native_session_id, .. } if native_session_id == "fake-native-1")
     })
     .await;
-    // Deltas coalesce; the timer flush (100ms) or the tool_use flush must
-    // surface the streamed text exactly once.
-    wait_for(
-        &mut rx,
-        &mut seen,
-        "MessageChunk 'hello'",
-        |ev| matches!(ev, AgentEvent::MessageChunk { text, .. } if text == "hello"),
-    )
-    .await;
+    // The streamed deltas ("hel", "lo") coalesce, but whether they surface as
+    // one chunk or two is a race between the second frame and the harness's
+    // ~100ms flush tick (a loaded CI runner split them). What IS pinned is the
+    // order: the driver flushes the turn's prose before it emits the
+    // tool_use's ToolCall, so once the ToolCall is here the prose is complete.
     wait_for(
         &mut rx,
         &mut seen,
@@ -139,6 +166,11 @@ async fn full_turn_with_permission_allow_and_gap_replay() {
         |ev| matches!(ev, AgentEvent::ToolCall { id, .. } if id == "tu-1"),
     )
     .await;
+    assert_eq!(
+        prose(&seen, &turn),
+        "hello",
+        "streamed deltas coalesce losslessly ahead of the tool call"
+    );
     let permission = wait_for(&mut rx, &mut seen, "PermissionRequest", |ev| {
         matches!(ev, AgentEvent::PermissionRequest { .. })
     })
@@ -187,6 +219,13 @@ async fn full_turn_with_permission_allow_and_gap_replay() {
         _ => unreachable!(),
     }
     assert!(!fx.manager.get("s-1").unwrap().pending_permission);
+    // The assistant frame repeats the streamed text as a `text` block; the
+    // driver must not surface it a second time.
+    assert_eq!(
+        prose(&seen, &turn),
+        "hello",
+        "a turn's prose surfaces exactly once"
+    );
 
     // Attach subscribes to `live` before snapshotting `replay`, so the live
     // tail may legitimately re-deliver an event already in replay (the
