@@ -32,6 +32,7 @@
  * same thing under another name and typesets too (mdLive treats it as a
  * block; the server already renders it as one).
  */
+import type { Text } from "@codemirror/state";
 import { NodeProp, type Input, type NodeType, type SyntaxNode } from "@lezer/common";
 import type {
   BlockContext,
@@ -295,3 +296,24 @@ export const mathExtension: MarkdownConfig = {
     },
   ],
 };
+
+/** The LaTeX between an equation's delimiters, or null when there is nothing
+ *  to typeset (whitespace only). Quoted math carries its per-line `>` markers
+ *  as QuoteMark children — chrome, not LaTeX, so they are cut out. Inline
+ *  `$…$` that crosses a soft line break gets its newlines folded to spaces,
+ *  as comrak does before it emits the literal the reading view typesets —
+ *  a `%` comment inside the formula must end at the same place in both. */
+export function mathSource(node: SyntaxNode, doc: Text): string | null {
+  const marks = mathDelimiters(node);
+  if (marks === null) return null; // an unclosed `$$` block: nothing to typeset yet
+  let src = "";
+  let pos = marks[0].to;
+  for (const q of node.getChildren("QuoteMark")) {
+    if (q.from < pos) continue;
+    src += doc.sliceString(pos, q.from);
+    pos = q.to;
+  }
+  src += doc.sliceString(pos, marks[1].from);
+  if (marks[0].to - marks[0].from === 1) src = src.replace(/\n/g, " ");
+  return src.trim().length === 0 ? null : src;
+}

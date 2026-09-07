@@ -165,10 +165,17 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
     becomes math — as on GitHub), and one case list, `previews/mathBlocks.fixture.json`, pins
     the block grammar for both sides: the Vitest and Rust suites each run every case, with
     the known divergences named in it.
-    Tables/raw HTML/frontmatter stay as mono source (the full render lives in reading, which
-    is also where table-cell math typesets), and so does any construct the decorator can't
-    render faithfully (reference links, multi-line image syntax). Mod+click follows links;
-    right-click gives the same URL menu as reading.
+    **Tables** render as the reading view's grid (the shared "Markdown tables" recipe, so the
+    two views agree cell for cell — alignment, inline formatting, links, `$` math through the
+    same KaTeX policy) while the cursor is outside them; click a cell and the cursor lands in
+    that cell's source, the whole table showing as editable mono text with its pipes aligned
+    (rows stay on one line; a wide one scrolls the editor sideways), and it re-renders the
+    moment the cursor leaves. Like a `$$` block, a table is replaced whole from the
+    `blocks` state field (`mdLive.ts`), built as data from the syntax tree (`mdTable.ts`) and
+    turned into elements without any HTML injection. Raw HTML and frontmatter stay as mono
+    source, and so does any construct the decorator can't render faithfully (reference links,
+    multi-line image syntax). Mod+click follows links; right-click gives the same URL menu as
+    reading.
   - **reading** is the complete non-editable render: `GET /api/v1/fs/markdown?path=` →
     server-side comrak GFM (+ `math_dollars`) → **ammonia-sanitized** HTML (its defaults
     plus `data-math-style` on `span`, the marker comrak leaves on each LaTeX literal; source

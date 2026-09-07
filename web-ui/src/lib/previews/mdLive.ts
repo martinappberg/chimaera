@@ -16,13 +16,15 @@
  *
  * Replace decorations from a view plugin may not span line breaks (CodeMirror
  * throws and disables the plugin, degrading the whole document): `hide()` and
- * the image widget both enforce single-line ranges. The one construct that
- * legitimately spans lines and still renders — a `$$` display-math block —
- * is replaced from a STATE FIELD (`mathBlocks`), which CodeMirror allows.
+ * the image widget both enforce single-line ranges. The two constructs that
+ * legitimately span lines and still render — a `$$` display-math block and
+ * a GFM table — are replaced from a STATE FIELD (`blocks`), which CodeMirror
+ * allows.
  *
  * Sanitization boundary: nothing from the document is ever injected as HTML.
- * Widgets are built via createElement/textContent; the only innerHTML is the
- * shared constant copy-icon SVG and, for equations, KaTeX MathML rendered
+ * Widgets are built via createElement/textContent — a table's grid too, from
+ * its syntax-tree model (mdTable.ts); the only innerHTML is the shared
+ * constant copy-icon SVG and, for equations, KaTeX MathML rendered
  * with trust off and passed through DOMPurify — the one math policy every
  * surface shares (`shared/math.ts`, loaded on demand at the first equation
  * so a document without one never pays for KaTeX). Image widgets pass through only web
@@ -51,7 +53,15 @@ import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
 import { languages } from "@codemirror/language-data";
 import type { SyntaxNode, SyntaxNodeRef, Tree } from "@lezer/common";
 import { rawTicketUrl, resolveDocPath, safeDecodeUri } from "./files";
-import { MATH_MARK, isDisplayMath, isMath, mathDelimiters, mathExtension } from "./mdMath";
+import {
+  MATH_MARK,
+  isDisplayMath,
+  isMath,
+  mathDelimiters,
+  mathExtension,
+  mathSource,
+} from "./mdMath";
+import { tableModel, type CellModel, type Inline, type TableModel } from "./mdTable";
 import { loadMath, mathNow } from "./mathLoad";
 import { copyText } from "../shared/clipboard";
 import { makeCopyButton } from "../shared/copyDecor";
@@ -224,37 +234,162 @@ class MathWidget extends WidgetType {
     // CodeMirror dispatches from contentDOM, so currentTarget is never the
     // widget: find the scroller from the press target (a press on its own
     // bar targets the scroller element itself).
-    const el = e.target.closest<HTMLElement>(".lp-math-display");
-    if (el === null || el.scrollWidth <= el.clientWidth) return false;
-    // Classic scrollbars have a measurable band; overlay scrollbars (the
-    // macOS/WKWebView default) report none, so a bottom strip stands in.
-    const band = Math.max(el.offsetHeight - el.clientHeight, 12);
-    return (e as MouseEvent).clientY >= el.getBoundingClientRect().bottom - band;
+    return onScrollbarBand(e.target.closest<HTMLElement>(".lp-math-display"), e as MouseEvent);
   }
   override get estimatedHeight(): number {
     return this.display ? 56 : -1;
   }
 }
 
-/** The LaTeX between an equation's delimiters, or null when there is nothing
- *  to typeset (whitespace only). Quoted math carries its per-line `>` markers
- *  as QuoteMark children — chrome, not LaTeX, so they are cut out. Inline
- *  `$…$` that crosses a soft line break gets its newlines folded to spaces,
- *  as comrak does before it emits the literal the reading view typesets —
- *  a `%` comment inside the formula must end at the same place in both. */
-function mathSource(node: SyntaxNode, doc: Text): string | null {
-  const marks = mathDelimiters(node);
-  if (marks === null) return null; // an unclosed `$$` block: nothing to typeset yet
-  let src = "";
-  let pos = marks[0].to;
-  for (const q of node.getChildren("QuoteMark")) {
-    if (q.from < pos) continue;
-    src += doc.sliceString(pos, q.from);
-    pos = q.to;
+/** Whether a press sits on a scroller's own bar. Classic scrollbars have a
+ *  measurable band; overlay scrollbars (the macOS/WKWebView default) report
+ *  none, so a bottom strip stands in. */
+function onScrollbarBand(el: HTMLElement | null, e: MouseEvent): boolean {
+  if (el === null || el.scrollWidth <= el.clientWidth) return false;
+  const band = Math.max(el.offsetHeight - el.clientHeight, 12);
+  return e.clientY >= el.getBoundingClientRect().bottom - band;
+}
+
+/** The web URL a rendered link carries, if the press landed on one. */
+function linkUrlIn(target: EventTarget | null): string | null {
+  if (!(target instanceof Element)) return null;
+  const url = target.closest<HTMLElement>("[data-url]")?.dataset.url ?? null;
+  if (url === null) return null;
+  const u = /^www\./i.test(url) ? `http://${url}` : url; // GFM bare autolink
+  return isWebUrl(u) ? u : null;
+}
+
+/** The table whose range holds `pos`, modelled from the CURRENT tree. */
+function tableAt(state: EditorState, pos: number): TableModel | null {
+  for (
+    let n: SyntaxNode | null = syntaxTree(state).resolveInner(pos, 1);
+    n !== null;
+    n = n.parent
+  ) {
+    if (n.name === "Table") return tableModel(n, state.doc);
   }
-  src += doc.sliceString(pos, marks[1].from);
-  if (marks[0].to - marks[0].from === 1) src = src.replace(/\n/g, " ");
-  return src.trim().length === 0 ? null : src;
+  return null;
+}
+
+/** A cell's inline tree as elements: the kinds the decorator styles, an
+ *  equation through the shared KaTeX policy (MathWidget), a link as an
+ *  anchor without href — it opens on Mod+press like every live link. */
+function renderInline(parent: HTMLElement, inline: readonly Inline[], view: EditorView): void {
+  for (const i of inline) {
+    switch (i.kind) {
+      case "text":
+        parent.append(document.createTextNode(i.text));
+        break;
+      case "math":
+        parent.append(new MathWidget(i.source, i.display).toDOM(view));
+        break;
+      case "link": {
+        const a = document.createElement("a");
+        a.className = "lp-link";
+        a.title = i.url;
+        a.dataset.url = i.url;
+        renderInline(a, i.children, view);
+        parent.append(a);
+        break;
+      }
+      default: {
+        const el = document.createElement(i.kind === "strike" ? "s" : i.kind);
+        renderInline(el, i.children, view);
+        parent.append(el);
+      }
+    }
+  }
+}
+
+/** A GFM table rendered as the reading view's grid while its lines are
+ *  inactive — the shared "Markdown tables" recipe (app.css) styles it, so the
+ *  two views agree cell for cell. Built from the collected TableModel
+ *  (mdTable.ts) with createElement only. A press on a cell lands the cursor
+ *  in THAT cell's source — looked up in the tree at press time, since a
+ *  widget kept across rebuilds (eq is the source text) may have moved — and
+ *  the reveal rule then shows the whole table as editable text; a Mod+press
+ *  on a link follows it; a press on the scroller's own bar scrolls (the
+ *  display-math exception, for the same reason). */
+class TableWidget extends WidgetType {
+  constructor(readonly model: TableModel) {
+    super();
+  }
+  override eq(other: TableWidget): boolean {
+    return other.model.source === this.model.source;
+  }
+  toDOM(view: EditorView): HTMLElement {
+    const root = document.createElement("div");
+    root.className = "lp-table-widget";
+    const host = document.createElement("div");
+    host.className = "md-table";
+    const table = document.createElement("table");
+    const thead = document.createElement("thead");
+    const head = document.createElement("tr");
+    this.model.header.forEach((c, col) => head.append(this.cell("th", c, -1, col, view)));
+    thead.append(head);
+    const tbody = document.createElement("tbody");
+    this.model.rows.forEach((cells, row) => {
+      const tr = document.createElement("tr");
+      cells.forEach((c, col) => tr.append(this.cell("td", c, row, col, view)));
+      tbody.append(tr);
+    });
+    table.append(thead, tbody);
+    host.append(table);
+    root.append(host);
+    root.addEventListener("mousedown", (e) => this.press(e, view, root, host));
+    root.addEventListener("contextmenu", (e) => {
+      const url = linkUrlIn(e.target);
+      if (url !== null) contextMenu.openAt(e, urlMenuEntries(url));
+    });
+    return root;
+  }
+  private cell(
+    tag: "th" | "td",
+    model: CellModel,
+    row: number,
+    col: number,
+    view: EditorView,
+  ): HTMLElement {
+    const el = document.createElement(tag);
+    const align = this.model.align[col];
+    if (align !== null) el.setAttribute("align", align);
+    el.dataset.row = String(row);
+    el.dataset.col = String(col);
+    renderInline(el, model.inline, view);
+    return el;
+  }
+  private press(e: MouseEvent, view: EditorView, root: HTMLElement, host: HTMLElement): void {
+    if (e.button !== 0 || onScrollbarBand(host, e)) return; // the bar scrolls
+    const target = e.target instanceof Element ? e.target : null;
+    const url = linkUrlIn(target);
+    e.preventDefault();
+    e.stopPropagation();
+    if (url !== null && (e.metaKey || e.ctrlKey)) {
+      activateUrl(url, false);
+      return;
+    }
+    const pos = view.posAtDOM(root);
+    const live = tableAt(view.state, pos);
+    let anchor = live?.from ?? pos;
+    const td = target?.closest<HTMLElement>("th, td") ?? null;
+    if (live !== null && td !== null) {
+      const row = Number(td.dataset.row);
+      const cells = row < 0 ? live.header : live.rows[row];
+      anchor = cells?.[Number(td.dataset.col)]?.from ?? anchor;
+    }
+    view.dispatch({ selection: { anchor }, scrollIntoView: true });
+    view.focus();
+  }
+  override ignoreEvent(e: Event): boolean {
+    // The widget's own listener consumes presses (and stops them reaching
+    // the editor); only a press on the scroller's bar passes, and that one
+    // must not place the cursor.
+    if (e.type !== "mousedown" || !(e.target instanceof Element)) return false;
+    return onScrollbarBand(e.target.closest<HTMLElement>(".md-table"), e as MouseEvent);
+  }
+  override get estimatedHeight(): number {
+    return 30 * (1 + this.model.rows.length);
+  }
 }
 
 /** A ```math fence — GitHub's block form, which the server renders exactly
@@ -438,11 +573,22 @@ function buildDecorations(
   const lineActive = (pos: number): boolean => touches(sel, pos, pos);
 
   // Positions inside a collapsed equation — an inactive multi-line block the
-  // mathBlocks field replaced whole — belong to the ONE line its widget
+  // blocks field replaced whole — belong to the ONE line its widget
   // renders on. A line class or copy button pushed for a later line of the
   // block would be a point nested inside that replace, which CodeMirror
   // drops (a quote card ending in a `$$` block lost its bottom corners).
-  const collapsed = state.field(mathBlocks, false)?.deco ?? Decoration.none;
+  const collapsed = state.field(blocks, false)?.deco ?? Decoration.none;
+  const replacedWhole = (from: number, to: number): boolean => {
+    let hit = false;
+    collapsed.between(from, to, (f, t) => {
+      if (f === from && t === to) {
+        hit = true;
+        return false;
+      }
+      return;
+    });
+    return hit;
+  };
   const collapsedStart = (pos: number): number | null => {
     let hit: number | null = null;
     collapsed.between(pos, pos, (from, to) => {
@@ -581,7 +727,7 @@ function buildDecorations(
       return;
     }
     if (name === "FencedCode" || name === "CodeBlock") {
-      // A closed ```math fence is an equation: inactive, the mathBlocks field
+      // A closed ```math fence is an equation: inactive, the blocks field
       // replaces it whole and it gets no fence chrome; revealed, it is a fence.
       if (name === "FencedCode" && isMathFence(node.node, doc) && !active(node.from, node.to))
         return false;
@@ -720,7 +866,7 @@ function buildDecorations(
         deco.push(markMathSrc.range(node.from, node.to));
         return;
       }
-      // A block spanning lines is replaced whole by the mathBlocks state
+      // A block spanning lines is replaced whole by the blocks state
       // field — a plugin replace may not cross a line break. An UNCLOSED
       // `$$` block (its lines left their list item before a closer) has
       // nothing to typeset and stays visible mono source.
@@ -743,9 +889,12 @@ function buildDecorations(
       return;
     }
     if (name === "Table") {
+      // Inactive, the blocks field shows the rendered grid; touched by the
+      // selection, the lines show as mono source with their pipes aligned.
+      if (replacedWhole(node.from, node.to)) return false;
       eachVisibleLine(node.from, node.to, (l) => addLineClass(l.from, "lp-table"));
       hideNestedQuoteMarks(node);
-      return false; // pipes align in mono; the full grid lives in reading mode
+      return false;
     }
     if (name === "HTMLBlock" || name === "CommentBlock") {
       eachVisibleLine(node.from, node.to, (l) => addLineClass(l.from, "lp-html"));
@@ -802,32 +951,43 @@ function livePlugin(path: string): Extension {
 // --- multi-line math ---------------------------------------------------------
 
 interface MathBlock {
+  kind: "math";
   from: number;
   to: number;
   source: string;
   display: boolean;
 }
 
-interface MathBlocksState {
-  blocks: MathBlock[];
+interface TableBlock {
+  kind: "table";
+  from: number;
+  to: number;
+  table: TableModel;
+}
+
+type Block = MathBlock | TableBlock;
+
+interface BlocksState {
+  blocks: Block[];
   sel: Span[];
   fmEnd: number;
   deco: DecorationSet;
 }
 
-/** Every equation within [from, to] whose source spans a line break — the
- *  whole document by default. The walk prunes any subtree that sits on one
- *  line (one lineAt per node), so a document of single-line paragraphs costs
- *  next to nothing; code, HTML and tables can't hold one and are skipped
- *  outright, and frontmatter is metadata (the plugin's rule), never math. */
-function collectMathBlocks(
+/** Every equation within [from, to] whose source spans a line break, and
+ *  every GFM table — the whole document by default. The walk prunes any
+ *  subtree that sits on one line (one lineAt per node), so a document of
+ *  single-line paragraphs costs next to nothing; code and HTML can't hold
+ *  one and are skipped outright, a table is a block of its own, and
+ *  frontmatter is metadata (the plugin's rule), never math. */
+function collectBlocks(
   state: EditorState,
   fmEnd: number,
   from = 0,
   to = state.doc.length,
-): MathBlock[] {
+): Block[] {
   const doc = state.doc;
-  const out: MathBlock[] = [];
+  const out: Block[] = [];
   syntaxTree(state).iterate({
     from,
     to,
@@ -836,22 +996,29 @@ function collectMathBlocks(
       if (isMath(n.type)) {
         const source = n.from < fmEnd ? null : mathSource(n.node, doc);
         if (source !== null)
-          out.push({ from: n.from, to: n.to, source, display: isDisplayMath(n.type) });
+          out.push({
+            kind: "math",
+            from: n.from,
+            to: n.to,
+            source,
+            display: isDisplayMath(n.type),
+          });
         return false;
       }
       if (n.name === "FencedCode") {
         if (n.from >= fmEnd && isMathFence(n.node, doc)) {
           const source = fenceMathSource(n.node, doc);
-          if (source !== null) out.push({ from: n.from, to: n.to, source, display: true });
+          if (source !== null)
+            out.push({ kind: "math", from: n.from, to: n.to, source, display: true });
         }
         return false;
       }
-      if (
-        n.name === "CodeBlock" ||
-        n.name === "HTMLBlock" ||
-        n.name === "CommentBlock" ||
-        n.name === "Table"
-      )
+      if (n.name === "Table") {
+        const table = n.from < fmEnd ? null : tableModel(n.node, doc);
+        if (table !== null) out.push({ kind: "table", from: n.from, to: n.to, table });
+        return false;
+      }
+      if (n.name === "CodeBlock" || n.name === "HTMLBlock" || n.name === "CommentBlock")
         return false;
       return;
     },
@@ -883,7 +1050,7 @@ function topLevelSpan(tree: Tree, from: number, to: number): [number, number] {
  *  the new tree's block at the edit — only the old container's extent,
  *  mapped forward, says where to look (and the reverse edit, which swallows
  *  blocks into a new container, is covered by the new tree's extent). */
-function recollectAround(prev: MathBlock[], tr: Transaction, fmEnd: number): MathBlock[] {
+function recollectAround(prev: Block[], tr: Transaction, fmEnd: number): Block[] {
   const state = tr.state;
   let lo = state.doc.length;
   let hi = 0;
@@ -899,7 +1066,7 @@ function recollectAround(prev: MathBlock[], tr: Transaction, fmEnd: number): Mat
   const [oldFrom, oldTo] = topLevelSpan(syntaxTree(tr.startState), loA, hiA);
   const from = Math.min(newFrom, tr.changes.mapPos(oldFrom, -1));
   const to = Math.max(newTo, tr.changes.mapPos(oldTo, 1));
-  const out: MathBlock[] = [];
+  const out: Block[] = [];
   let walked = false;
   for (const b of prev) {
     const f = tr.changes.mapPos(b.from, 1);
@@ -913,30 +1080,30 @@ function recollectAround(prev: MathBlock[], tr: Transaction, fmEnd: number): Mat
       out.push({ ...b, from: f, to: t });
     } else if (f > to) {
       if (!walked) {
-        out.push(...collectMathBlocks(state, fmEnd, from, to));
+        out.push(...collectBlocks(state, fmEnd, from, to));
         walked = true;
       }
       out.push({ ...b, from: f, to: t });
     }
   }
-  if (!walked) out.push(...collectMathBlocks(state, fmEnd, from, to));
+  if (!walked) out.push(...collectBlocks(state, fmEnd, from, to));
   return out;
 }
 
-function mathBlockDecorations(blocks: MathBlock[], sel: Span[]): DecorationSet {
+function blockDecorations(list: Block[], sel: Span[]): DecorationSet {
   const ranges: ReturnType<Decoration["range"]>[] = [];
-  for (const b of blocks) {
+  for (const b of list) {
     if (touches(sel, b.from, b.to)) continue; // revealed: the plugin shows source
-    ranges.push(
-      Decoration.replace({ widget: new MathWidget(b.source, b.display) }).range(b.from, b.to),
-    );
+    const widget =
+      b.kind === "table" ? new TableWidget(b.table) : new MathWidget(b.source, b.display);
+    ranges.push(Decoration.replace({ widget }).range(b.from, b.to));
   }
   return Decoration.set(ranges, true);
 }
 
 /**
- * Equations spanning lines (`$$` … `$$` on their own lines) rendered as one
- * widget replacing the whole range. A STATE FIELD, not part of the view
+ * Equations spanning lines (`$$` … `$$` on their own lines) and GFM tables,
+ * each rendered as one widget replacing the whole range. A STATE FIELD, not part of the view
  * plugin: CodeMirror forbids plugin-provided replace decorations across line
  * breaks (they change the vertical layout the viewport is computed from).
  * An edit re-walks only the top-level blocks it touched; a background parse
@@ -944,30 +1111,28 @@ function mathBlockDecorations(blocks: MathBlock[], sel: Span[]): DecorationSet {
  * a handful of times while a large file loads, never per keystroke; a
  * selection move just re-applies the reveal rule.
  */
-const mathBlocks = StateField.define<MathBlocksState>({
+const blocks = StateField.define<BlocksState>({
   create(state) {
     const fmEnd = frontmatterEnd(state);
-    const blocks = collectMathBlocks(state, fmEnd);
+    const list = collectBlocks(state, fmEnd);
     const sel = selectionSpans(state);
-    return { blocks, sel, fmEnd, deco: mathBlockDecorations(blocks, sel) };
+    return { blocks: list, sel, fmEnd, deco: blockDecorations(list, sel) };
   },
   update(v, tr) {
     const treeChanged = syntaxTree(tr.state) !== syntaxTree(tr.startState);
     if (!tr.docChanged && !treeChanged && tr.selection === undefined) return v;
     let fmEnd = v.fmEnd;
-    let blocks = v.blocks;
+    let list = v.blocks;
     if (tr.docChanged) {
       fmEnd = frontmatterEnd(tr.state);
-      blocks =
-        fmEnd === v.fmEnd
-          ? recollectAround(v.blocks, tr, fmEnd)
-          : collectMathBlocks(tr.state, fmEnd);
+      list =
+        fmEnd === v.fmEnd ? recollectAround(v.blocks, tr, fmEnd) : collectBlocks(tr.state, fmEnd);
     } else if (treeChanged) {
-      blocks = collectMathBlocks(tr.state, fmEnd);
+      list = collectBlocks(tr.state, fmEnd);
     }
     const sel = selectionSpans(tr.state);
-    if (blocks === v.blocks && spansEqual(sel, v.sel)) return v;
-    return { blocks, sel, fmEnd, deco: mathBlockDecorations(blocks, sel) };
+    if (list === v.blocks && spansEqual(sel, v.sel)) return v;
+    return { blocks: list, sel, fmEnd, deco: blockDecorations(list, sel) };
   },
   provide: (f) => EditorView.decorations.from(f, (v) => v.deco),
 });
@@ -1148,6 +1313,27 @@ const liveTheme: Extension = EditorView.theme({
     verticalAlign: "middle",
   },
 
+  // A rendered table (TableWidget): the shared "Markdown tables" recipe in
+  // app.css styles the grid — this root is one of its markdown surfaces,
+  // with the rhythm a widget on its own line needs — and the widget sits
+  // like a display equation, full width on its line. It steps out of the
+  // editor's line-wrapping rules (CodeMirror's `.cm-lineWrapping` sets
+  // break-spaces + word-break/overflow-wrap anywhere on the content): under
+  // them every column's minimum is one character and a wide table crushes
+  // into letter-per-line stacks instead of scrolling in its host. The
+  // source, revealed, keeps each row on one line so the pipes stay aligned;
+  // the editor scrolls sideways for a wide row rather than folding it.
+  "&.cm-md-live": { "--md-table-margin": "0.3em" },
+  "&.cm-md-live .lp-table-widget": {
+    display: "inline-block",
+    width: "100%",
+    verticalAlign: "middle",
+    whiteSpace: "normal",
+    wordBreak: "normal",
+    overflowWrap: "normal",
+  },
+  "&.cm-md-live .lp-table": { whiteSpace: "pre" },
+
   "&.cm-md-live .lp-bullet": {
     color: "color-mix(in srgb, var(--accent) 70%, var(--muted))",
   },
@@ -1204,7 +1390,7 @@ export function markdownLive(path: string): Extension {
     EditorView.editorAttributes.of({ class: "cm-md-live" }),
     liveTheme,
     livePlugin(path),
-    mathBlocks,
+    blocks,
     linkClicks,
   ];
 }
