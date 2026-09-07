@@ -4214,6 +4214,7 @@
       class:collapsed={layout.focusMode}
       class:resizing={railDividerActive}
       style:width={layout.focusMode ? undefined : `${railWidth}px`}
+      style:--rail-w={layout.focusMode ? undefined : `${railWidth}px`}
       bind:this={railEl}
     >
       <div class="workspace">
@@ -4631,6 +4632,11 @@
         <ComputeStrip self={$computeStatus.self} receivedAt={$computeStatus.received_at_ms} />
       {/if}
       <div class="daemon" bind:this={daemonEl}>
+        <!-- Two groups so the bar can WRAP: identity (dot, host, link RTT)
+             and tools (git, slurm, caffeinate, settings). When both don't
+             fit one row the tools drop to a second, instead of the host name
+             being squeezed to nothing behind a branch and a queue count. -->
+        <span class="daemon-id">
         <span
           class="daemon-dot"
           class:ok={eventsUp}
@@ -4657,6 +4663,8 @@
             >{$linkRtt}ms</span
           >
         {/if}
+        </span>
+        <span class="daemon-tools">
         {#if $gitStatus !== null}
           <!-- Always-on orientation: what branch you're on and how dirty the
                tree is; one click opens the source-control panel. -->
@@ -4844,6 +4852,7 @@
             </svg>
           </button>
         {/if}
+        </span>
       </div>
     </aside>
 
@@ -6013,13 +6022,38 @@
     flex-direction: column;
   }
 
+  /* Wraps: the identity group and the tools group each keep their content
+     width, so when the two don't share a row the tools take a second one
+     (flex lines break on content size, before any shrinking). */
   .daemon {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
-    gap: 8px;
+    gap: 4px 8px;
     padding: 12px 16px 0;
     font-size: var(--text-xs);
     color: var(--muted);
+  }
+
+  /* Identity: never grows (the tools sit right after it on a shared row);
+     only an absurd host name ellipsizes, and only when it alone overflows. */
+  .daemon-id {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex: 0 1 auto;
+    min-width: 0;
+    max-width: 100%;
+  }
+
+  /* Tools: take the slack (the gear's auto margin keeps it at the right
+     edge) and, on a row of their own, the whole width. */
+  .daemon-tools {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex: 1 1 auto;
+    min-width: 0;
   }
 
   .daemon-dot {
@@ -6079,16 +6113,18 @@
     white-space: nowrap;
   }
 
-  /* Branch + dirty count: always-on git orientation, quiet until it matters. */
+  /* Branch + dirty count: always-on git orientation, quiet until it matters.
+     Shrinkable (the branch ellipsizes) so on a shared row it yields to the
+     host name; on its own row it gets the width to spell the branch out. */
   .daemon-git {
-    flex: none;
+    flex: 0 1 auto;
+    min-width: 0;
     appearance: none;
     border: none;
     background: none;
     display: flex;
     align-items: center;
     gap: 0.22rem;
-    max-width: 50%;
     height: 20px;
     padding: 0 0.3rem;
     border-radius: 5px;
@@ -6109,12 +6145,18 @@
     color: var(--warn);
   }
 
+  /* The branch's width budget scales with the rail (what the old 50% chip
+     cap gave, minus the host's share) with a 10ch floor. A FIXED budget is
+     what makes the bar's wrap decision honest: flex lines break on content
+     width, so an uncapped branch would push the tools onto a second row for
+     every long branch name, even beside a short "local". */
   .dg-branch {
     font-family: var(--mono);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
     min-width: 0;
+    max-width: max(10ch, calc(var(--rail-w, 230px) * 0.5 - 60px));
   }
 
   .dg-ab,
