@@ -617,6 +617,7 @@
     inset: 0;
     overflow-y: auto;
     overflow-x: hidden;
+    scrollbar-width: thin; /* like the transcript's own bar (chat/ChatView) */
   }
 
   .edit-layer {

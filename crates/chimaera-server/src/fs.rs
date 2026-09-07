@@ -1259,6 +1259,18 @@ mod markdown_tests {
             assert!(html.contains(cell), "missing {cell} in {html}");
         }
     }
+
+    /// Hand-written HTML reaches the sanitizer too (`render.unsafe`), and the
+    /// reading view matches its `align` case-insensitively — so ammonia must
+    /// pass a raw value through unnormalised, empty ones included.
+    #[test]
+    fn raw_html_alignment_passes_through_unnormalised() {
+        let html = sanitize_markdown(&markdown_to_html(
+            "<table><tr><td align=\"CENTER\">x</td><td align=\"\">y</td></tr></table>\n",
+        ));
+        assert!(html.contains("<td align=\"CENTER\">x</td>"), "{html}");
+        assert!(html.contains("<td align=\"\">y</td>"), "{html}");
+    }
 }
 
 #[derive(Deserialize)]
