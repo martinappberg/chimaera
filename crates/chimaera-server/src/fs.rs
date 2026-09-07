@@ -1238,6 +1238,27 @@ mod markdown_tests {
         assert!(!html.contains("data-math-style"), "{html}");
         assert!(html.contains("$5 and $10"), "{html}");
     }
+
+    /// The reading view's alignment CSS keys on the `align` attribute: comrak
+    /// must write GFM `:-:` / `--:` as `align="center|right"` (never a style,
+    /// which the sanitizer would strip), ammonia's defaults must let it
+    /// through, and an unmarked column must carry no attribute at all.
+    #[test]
+    fn gfm_alignment_survives_sanitization_as_align_attributes() {
+        let html = sanitize_markdown(&markdown_to_html(
+            "| a | b | c |\n|:-:|--:|---|\n| 1 | 2 | 3 |\n",
+        ));
+        for cell in [
+            "<th align=\"center\">a</th>",
+            "<th align=\"right\">b</th>",
+            "<th>c</th>",
+            "<td align=\"center\">1</td>",
+            "<td align=\"right\">2</td>",
+            "<td>3</td>",
+        ] {
+            assert!(html.contains(cell), "missing {cell} in {html}");
+        }
+    }
 }
 
 #[derive(Deserialize)]
