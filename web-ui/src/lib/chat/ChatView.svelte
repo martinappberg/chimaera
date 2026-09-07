@@ -2048,6 +2048,12 @@
     display: flex;
     flex-direction: column;
   }
+  /* The pane clips at its padding box and the transcript fills it edge to
+     edge — the global outside ring (app.css) would be cut on three sides, so
+     paint it inside. */
+  .transcript:focus-visible {
+    outline-offset: -2px;
+  }
   /* One real column element, not per-child margin tricks (a block's own
      margin shorthand silently defeated those). It GROWS with content
      (flex-basis auto, no shrink), so children with overflow!=visible

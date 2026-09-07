@@ -1,81 +1,121 @@
 /**
- * Keyboard-reachable scroll hosts: the scrollable-region pattern (tabindex=0 +
- * role=region + a label) applied ONLY while a scroller actually overflows, so
- * a table that fits is never a tab stop. WebKit never makes an overflow
- * container keyboard-focusable on its own (Chromium 130+ and Firefox do, but
- * Chromium withholds it when the scroller holds a focusable child such as a
- * link), so without this a keyboard-only user can't reach a wide table's
- * off-screen columns — WCAG 2.1.1.
+ * Keyboard-reachable horizontal scrollers: `tabindex="0"` (plus, for a host
+ * that wraps a table, a group role and a name) applied ONLY while the box
+ * actually scrolls sideways, so a table that fits is never a tab stop.
+ * WebKit never makes an overflow container keyboard-focusable on its own
+ * (Chromium 130+ and Firefox do, but Chromium withholds it when the scroller
+ * holds a focusable child such as a link), so without this a keyboard-only
+ * user can't reach a wide table's off-screen columns — WCAG 2.1.1.
  *
  * Attributes only: both markdown hosts render via `{@html}` and are
  * append-only after render for STRUCTURAL changes (copyDecor.ts); attribute
- * writes on existing nodes are within that contract. A mark this module set
- * is remembered in `data-scroll-region` so only its own attributes are ever
- * removed — sanitized agent HTML may carry a role of its own.
+ * writes on existing nodes are within that contract. A mark never overwrites
+ * an attribute the content brought along (sanitized agent HTML may carry a
+ * role, a name, even a tabindex of its own) and only ever removes what it
+ * set, remembered per element in a WeakMap — a data attribute would be as
+ * forgeable as the class it keys on. A `<table>` that is its own scroller
+ * gets NO role: an explicit role would replace its native table role and
+ * orphan its rows for a screen reader; the table names itself.
  *
- * One ResizeObserver for the whole app: a host's width changes on pane
- * resizes (no window resize fires), and a per-host observer would mean one
- * per chat message. Width-axis hosts ignore height-only entries, so a
- * streaming message growing line by line re-measures nothing.
+ * Overflow is `scrollWidth > clientWidth`, strict: measured across ~10k
+ * fractional layouts, a fitting box never reads wider, while a 1px tolerance
+ * would hide real 1px overflows fifteen times as often as it removed a
+ * phantom one. Reads layout — mark after render, and read every element
+ * before writing any (a tabindex write invalidates style for the next read).
+ *
+ * One ResizeObserver for the whole app, keyed by element with a set of
+ * callbacks each, so a host and its content can share a watcher and two
+ * watchers on one element never cancel each other. Overflow moves when the
+ * host's width changes (a pane resize — no window resize fires) OR when the
+ * content's width changes (a text-size change, a late image or equation), so
+ * callers watch both: the scroll box and a content proxy — the inner
+ * `<table>` of a host div, or a row group of a self-scrolling table, whose
+ * box is the anonymous table's width. Only width is compared, so a streaming
+ * message growing line by line re-measures nothing.
  */
 
-export type ScrollAxis = "x" | "y";
+/** The role/name pair a host div gets; `null` for an element that already
+ *  carries its own semantics (a `<table>`, a code block, an equation). */
+export type Region = { role: string; label: string } | null;
 
-const MARK = "scrollRegion";
+/** Attribute names this module set on an element — the only ones it removes. */
+const ours = new WeakMap<Element, string[]>();
 
-/** Mark `el` as a focusable region iff it overflows on `axis`; clear a mark
- *  this module set once it no longer does. Reads layout — call after render. */
-export function markScrollRegion(el: HTMLElement, axis: ScrollAxis, label: string): void {
-  const overflows =
-    axis === "x" ? el.scrollWidth > el.clientWidth : el.scrollHeight > el.clientHeight;
+function overflowsX(el: Element): boolean {
+  return el.scrollWidth > el.clientWidth;
+}
+
+function apply(el: HTMLElement, overflows: boolean, region: Region): void {
+  const set = ours.get(el);
   if (overflows) {
-    if (el.getAttribute("tabindex") !== "0") el.setAttribute("tabindex", "0");
-    if (el.getAttribute("role") !== "region") el.setAttribute("role", "region");
-    if (el.getAttribute("aria-label") !== label) el.setAttribute("aria-label", label);
-    el.dataset[MARK] = "1";
-  } else if (el.dataset[MARK] !== undefined) {
-    el.removeAttribute("tabindex");
-    el.removeAttribute("role");
-    el.removeAttribute("aria-label");
-    delete el.dataset[MARK];
+    if (set !== undefined) return;
+    const added: string[] = [];
+    const add = (name: string, value: string) => {
+      if (el.hasAttribute(name)) return;
+      el.setAttribute(name, value);
+      added.push(name);
+    };
+    add("tabindex", "0");
+    if (region !== null) {
+      add("role", region.role);
+      add("aria-label", region.label);
+    }
+    ours.set(el, added);
+  } else if (set !== undefined) {
+    // Dropping tabindex under the focused element would send focus to
+    // <body>; the next re-check clears it once focus has moved on.
+    if (typeof document !== "undefined" && document.activeElement === el) return;
+    for (const name of set) el.removeAttribute(name);
+    ours.delete(el);
   }
 }
 
-/** Mark every `selector` match under `root` (see markScrollRegion). */
-export function markScrollRegions(
-  root: ParentNode,
-  selector: string,
-  axis: ScrollAxis,
-  label: string,
-): void {
-  for (const el of root.querySelectorAll<HTMLElement>(selector)) markScrollRegion(el, axis, label);
+/** Mark or unmark one scroller by its current overflow. */
+export function markScrollRegion(el: HTMLElement, region: Region): void {
+  apply(el, overflowsX(el), region);
 }
 
-type Watched = { size: number; recheck: () => void; axis: ScrollAxis };
-const watched = new WeakMap<Element, Watched>();
+/** Mark every `selector` match under `root` — all reads, then all writes. */
+export function markScrollRegions(root: ParentNode, selector: string, region: Region): void {
+  const els = Array.from(root.querySelectorAll<HTMLElement>(selector));
+  const states = els.map(overflowsX);
+  els.forEach((el, i) => apply(el, states[i], region));
+}
+
+const watchers = new WeakMap<Element, Set<() => void>>();
+const lastWidth = new WeakMap<Element, number>();
 let observer: ResizeObserver | null = null;
 
-/** Re-run `recheck` whenever `host`'s size changes on the axis that matters
- *  (its width for x-scrollers inside it; any dimension for a y-scroller).
- *  The first observation fires with the current size, so a fresh host is
- *  checked once after layout. Returns the teardown. */
-export function watchScrollRegions(host: HTMLElement, axis: ScrollAxis, recheck: () => void): () => void {
+/** Run `recheck` whenever `el`'s content-box width changes; the first
+ *  observation fires with the current width, so a fresh element is checked
+ *  once after layout. Callbacks due in one frame run once each. Returns the
+ *  teardown; the element stays observed while any watcher remains. */
+export function watchWidth(el: Element, recheck: () => void): () => void {
   if (typeof ResizeObserver === "undefined") return () => {};
   observer ??= new ResizeObserver((entries) => {
+    const due = new Set<() => void>();
     for (const entry of entries) {
-      const w = watched.get(entry.target);
-      if (w === undefined) continue;
-      const { width, height } = entry.contentRect;
-      const size = w.axis === "x" ? width : width * 1e6 + height;
-      if (size === w.size) continue;
-      w.size = size;
-      w.recheck();
+      const width = entry.contentRect.width;
+      if (lastWidth.get(entry.target) === width) continue;
+      lastWidth.set(entry.target, width);
+      watchers.get(entry.target)?.forEach((fn) => due.add(fn));
     }
+    due.forEach((fn) => fn());
   });
-  watched.set(host, { size: -1, recheck, axis });
-  observer.observe(host);
+  let set = watchers.get(el);
+  if (set === undefined) {
+    set = new Set();
+    watchers.set(el, set);
+    observer.observe(el);
+  }
+  set.add(recheck);
   return () => {
-    watched.delete(host);
-    observer?.unobserve(host);
+    const s = watchers.get(el);
+    if (s === undefined) return;
+    s.delete(recheck);
+    if (s.size > 0) return;
+    watchers.delete(el);
+    lastWidth.delete(el);
+    observer?.unobserve(el);
   };
 }

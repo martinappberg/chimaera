@@ -24,7 +24,7 @@
 <script lang="ts">
   import { copyText } from "../shared/clipboard";
   import { copyLabel, copyPayload, decorateCopyTargets } from "../shared/copyDecor";
-  import { markScrollRegions, watchScrollRegions } from "../shared/scrollRegion";
+  import { markScrollRegions, watchWidth } from "../shared/scrollRegion";
   import { advanceSegments, type SegmenterState } from "./streamSegments";
   import { RevealLedger } from "./revealLedger";
   import { pathCandidate, trimPathWord, type PathHit, type ResolvePaths } from "./paths";
@@ -559,7 +559,6 @@
     renderFragment(root, source);
     decorateCopyTargets(root);
     classifyLocalAnchors(root);
-    markTableRegions(root);
     if (!reducedMotion) {
       // This segment was the HEAD of the previous open tail — carry the
       // reveal cursor over so already-shown words don't re-hide or re-fade.
@@ -619,7 +618,9 @@
       cancelIdleStamp = null;
       const batch = unstamped.splice(0);
       for (const root of batch) {
-        if (root.isConnected) stampPaths(root);
+        if (!root.isConnected) continue;
+        stampPaths(root);
+        markTableRegions(root); // attached now — a real width to measure
       }
     };
     if (typeof requestIdleCallback === "function") {
@@ -672,6 +673,7 @@
       if (left <= 0) {
         hiddenPerRoot.delete(entry.root);
         scheduleUnwrap(entry.root); // drained: dissolve spans post-fade
+        markTableRegions(entry.root); // every word shown: measure at final width
       } else {
         hiddenPerRoot.set(entry.root, left);
       }
@@ -723,19 +725,32 @@
     markTableRegions(el);
   });
 
-  /** A wide table's .md-table host becomes a keyboard-reachable region only
-   *  while it overflows (shared/scrollRegion.ts). Closed segments and the
-   *  settled render are marked as they land; the per-chunk open tail is NOT
-   *  (its read of scrollWidth would force a layout per chunk, and a table is
-   *  reachable soon enough once its segment closes). A width change of the
-   *  transcript re-checks every host. */
+  /** Keyboard reach for the transcript's horizontal scrollers
+   *  (shared/scrollRegion.ts): a wide table's .md-table host becomes a
+   *  focusable group, a wide fence's code box a plain tab stop, each only
+   *  while it overflows. Marks land where the node is attached and at its
+   *  final width — the idle stamp pass over closed segments, the moment a
+   *  segment's reveal has shown its last word, and the settled render —
+   *  never the per-chunk open tail (its scrollWidth read would force a
+   *  layout per chunk). Overflow moves with the column's width (a pane
+   *  resize) or a table's own (the chat font size), so a settled message
+   *  that holds a scroller watches both; a hidden pane watches nothing and
+   *  catches up when shown. */
   function markTableRegions(root: ParentNode): void {
-    markScrollRegions(root, ".md-table", "x", "scrollable table");
+    markScrollRegions(root, ".md-table", { role: "group", label: "scrollable table" });
+    markScrollRegions(root, "pre > code", null);
   }
   $effect(() => {
+    if (!visible || streaming) return;
+    void html; // dep: a settled render may have changed the scroller set
     const root = el;
-    if (root === null) return;
-    return watchScrollRegions(root, "x", () => markTableRegions(root));
+    if (root === null || root.querySelector(".md-table, pre > code") === null) return;
+    const recheck = () => markTableRegions(root);
+    const stops = [
+      watchWidth(root, recheck),
+      ...Array.from(root.querySelectorAll(".md-table > table"), (t) => watchWidth(t, recheck)),
+    ];
+    return () => stops.forEach((stop) => stop());
   });
 
   // Stop the ticker, the copied-feedback timer, unwrap timers, and any

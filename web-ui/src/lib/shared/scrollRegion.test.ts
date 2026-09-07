@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 
-import { markScrollRegion } from "./scrollRegion";
+import { markScrollRegion, markScrollRegions, type Region } from "./scrollRegion";
+
+const TABLE: Region = { role: "group", label: "scrollable table" };
 
 /** The slice of HTMLElement the marker touches, on a plain object (Vitest
  *  runs in node — no DOM). */
@@ -9,9 +11,7 @@ function fake(scrollWidth: number, clientWidth: number, attrs: Record<string, st
   return {
     scrollWidth,
     clientWidth,
-    scrollHeight: 0,
-    clientHeight: 0,
-    dataset: {} as Record<string, string | undefined>,
+    hasAttribute: (k: string) => k in a,
     getAttribute: (k: string) => a[k] ?? null,
     setAttribute: (k: string, v: string) => {
       a[k] = v;
@@ -22,30 +22,62 @@ function fake(scrollWidth: number, clientWidth: number, attrs: Record<string, st
     attrs: a,
   };
 }
+const el = (f: ReturnType<typeof fake>) => f as unknown as HTMLElement;
 
 describe("markScrollRegion", () => {
-  it("marks an overflowing scroller as a labelled focusable region", () => {
-    const el = fake(900, 500);
-    markScrollRegion(el as unknown as HTMLElement, "x", "scrollable table");
-    expect(el.attrs).toEqual({ tabindex: "0", role: "region", "aria-label": "scrollable table" });
-    expect(el.dataset.scrollRegion).toBe("1");
+  it("marks an overflowing host as a focusable, named group", () => {
+    const host = fake(900, 500);
+    markScrollRegion(el(host), TABLE);
+    expect(host.attrs).toEqual({ tabindex: "0", role: "group", "aria-label": "scrollable table" });
   });
 
-  it("leaves a scroller that fits alone, and clears only its own mark", () => {
+  it("gives a self-scrolling table (or fence) tabindex only — its own role stays", () => {
+    const table = fake(900, 500);
+    markScrollRegion(el(table), null);
+    expect(table.attrs).toEqual({ tabindex: "0" });
+  });
+
+  it("is strict about overflow: a box that fits is no tab stop", () => {
     const fits = fake(500, 500);
-    markScrollRegion(fits as unknown as HTMLElement, "x", "scrollable table");
+    markScrollRegion(el(fits), TABLE);
     expect(fits.attrs).toEqual({});
+    const byOne = fake(501, 500);
+    markScrollRegion(el(byOne), TABLE);
+    expect(byOne.attrs.tabindex).toBe("0");
+  });
 
+  it("clears only what it set, and never overwrites the content's own attributes", () => {
     const was = fake(900, 500);
-    markScrollRegion(was as unknown as HTMLElement, "x", "scrollable table");
+    markScrollRegion(el(was), TABLE);
     was.scrollWidth = 500; // the pane grew: no overflow any more
-    markScrollRegion(was as unknown as HTMLElement, "x", "scrollable table");
+    markScrollRegion(el(was), TABLE);
     expect(was.attrs).toEqual({});
-    expect(was.dataset.scrollRegion).toBeUndefined();
 
-    // A role the content brought along (sanitized agent HTML) is not ours to remove.
-    const foreign = fake(500, 500, { role: "note", tabindex: "-1" });
-    markScrollRegion(foreign as unknown as HTMLElement, "x", "scrollable table");
-    expect(foreign.attrs).toEqual({ role: "note", tabindex: "-1" });
+    // Sanitized agent HTML brought a role and a name: keep them, add reach only.
+    const foreign = fake(900, 500, { role: "note", "aria-label": "caveat" });
+    markScrollRegion(el(foreign), TABLE);
+    expect(foreign.attrs).toEqual({ role: "note", "aria-label": "caveat", tabindex: "0" });
+    foreign.scrollWidth = 500;
+    markScrollRegion(el(foreign), TABLE);
+    expect(foreign.attrs).toEqual({ role: "note", "aria-label": "caveat" });
+
+    // A content tabindex of its own is not ours to touch either way.
+    const inert = fake(900, 500, { tabindex: "-1" });
+    markScrollRegion(el(inert), null);
+    expect(inert.attrs).toEqual({ tabindex: "-1" });
+    inert.scrollWidth = 500;
+    markScrollRegion(el(inert), null);
+    expect(inert.attrs).toEqual({ tabindex: "-1" });
+  });
+});
+
+describe("markScrollRegions", () => {
+  it("marks every match under a root by its own overflow", () => {
+    const wide = fake(900, 500);
+    const narrow = fake(500, 500);
+    const root = { querySelectorAll: () => [wide, narrow] } as unknown as ParentNode;
+    markScrollRegions(root, "table", null);
+    expect(wide.attrs).toEqual({ tabindex: "0" });
+    expect(narrow.attrs).toEqual({});
   });
 });

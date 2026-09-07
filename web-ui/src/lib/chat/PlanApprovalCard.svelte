@@ -64,7 +64,12 @@
     if (e.key === "Enter" && e.target === e.currentTarget && request.options.length > 0) {
       e.preventDefault();
       decide(request.options[0].id);
-    } else if (e.key === "Escape") {
+    } else if (
+      e.key === "Escape" &&
+      // A focused scroller inside the rendered plan (a wide table) is left
+      // with Escape, not answered with it.
+      !(e.target instanceof Element && e.target.closest(".plan-body") !== null)
+    ) {
       const keep = request.options.find((o) => o.kind.startsWith("reject"));
       if (keep) {
         e.preventDefault();
