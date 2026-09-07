@@ -51,7 +51,7 @@
   // the reading body AND the live editor, so the two views read identically.
   const bodyFont = $derived(fontSize ?? getSetting("editor.markdownFontSize"));
   /** The reading pane's accessible name: the file, not a generic word. */
-  const fileLabel = $derived(path.split("/").pop() ?? path);
+  const fileLabel = $derived(path.split("/").filter(Boolean).pop() ?? path);
   const bodyLineHeight = $derived(getSetting("editor.markdownLineHeight"));
 
   type Mode = "live" | "reading" | "source";
@@ -251,14 +251,14 @@
    *  image decoded late), so every table's first row group is watched as its
    *  width proxy alongside the pane. The reading pane itself is a named
    *  region in the markup, always. */
-  const READING_SCROLLERS = "table, pre > code, .md-math-display";
+  const READING_SCROLLERS = [["table, pre > code, .md-math-display", null]] as const;
   $effect(() => {
     void html;
     void bodyFont; // dep: A−/A+ reflows every scroller
     if (mode !== "reading") return;
     const scroll = readingEl;
     if (scroll === null) return;
-    const recheck = () => markScrollRegions(scroll, READING_SCROLLERS, null);
+    const recheck = () => markScrollRegions(scroll, READING_SCROLLERS);
     recheck();
     const stops = [
       watchWidth(scroll, recheck),
@@ -325,6 +325,10 @@
       job.handle = null;
       const deadline = performance.now() + 8;
       while (i < spans.length && performance.now() < deadline) typesetSpan(spans[i++], math);
+      // The equations this slice just laid out: a wide one is a scroller
+      // that didn't exist when the reading view was marked, and no box the
+      // width watcher sees changes when it appears.
+      markScrollRegions(root, [[".md-math-display", null]]);
       if (i >= spans.length) {
         typesetJob = null;
         return;
@@ -451,11 +455,17 @@
       return;
     }
     setSelection(selOwner, { kind: "file", path, startLine: null, endLine: null, text });
+    chipPos = chipPosFor(content, range);
+  }
+
+  /** Where the chip sits for a selection: just past its last rect, clamped
+   *  inside the content box (one rule for placement and re-anchoring). */
+  function chipPosFor(content: HTMLElement, range: Range): { x: number; y: number } {
     const rects = range.getClientRects();
     const last = rects.length > 0 ? rects[rects.length - 1] : range.getBoundingClientRect();
     const rect = content.getBoundingClientRect();
     const clamp = (n: number, lo: number, hi: number) => Math.min(Math.max(n, lo), Math.max(lo, hi));
-    chipPos = {
+    return {
       x: clamp(last.right - rect.left + 4, 4, rect.width - 170),
       y: clamp(last.bottom - rect.top + 6, 4, rect.height - 58),
     };
@@ -467,15 +477,7 @@
     const content = contentEl;
     const s = document.getSelection();
     if (content === null || chipPos === null || s === null || s.rangeCount === 0) return;
-    const range = s.getRangeAt(0);
-    const rects = range.getClientRects();
-    const last = rects.length > 0 ? rects[rects.length - 1] : range.getBoundingClientRect();
-    const rect = content.getBoundingClientRect();
-    const clamp = (n: number, lo: number, hi: number) => Math.min(Math.max(n, lo), Math.max(lo, hi));
-    chipPos = {
-      x: clamp(last.right - rect.left + 4, 4, rect.width - 170),
-      y: clamp(last.bottom - rect.top + 6, 4, rect.height - 58),
-    };
+    chipPos = chipPosFor(content, s.getRangeAt(0));
   }
 
   $effect(() => {

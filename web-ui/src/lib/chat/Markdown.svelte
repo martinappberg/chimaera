@@ -25,6 +25,7 @@
   import { copyText } from "../shared/clipboard";
   import { copyLabel, copyPayload, decorateCopyTargets } from "../shared/copyDecor";
   import { markScrollRegions, watchWidth } from "../shared/scrollRegion";
+  import { getSetting } from "../settings/store.svelte";
   import { advanceSegments, type SegmenterState } from "./streamSegments";
   import { RevealLedger } from "./revealLedger";
   import { pathCandidate, trimPathWord, type PathHit, type ResolvePaths } from "./paths";
@@ -617,11 +618,10 @@
     const run = () => {
       cancelIdleStamp = null;
       const batch = unstamped.splice(0);
-      for (const root of batch) {
-        if (!root.isConnected) continue;
-        stampPaths(root);
-        markTableRegions(root); // attached now — a real width to measure
-      }
+      const attached = batch.filter((root) => root.isConnected);
+      for (const root of attached) stampPaths(root);
+      // After every stamp, so the batch's layout reads flush once.
+      for (const root of attached) markTableRegions(root);
     };
     if (typeof requestIdleCallback === "function") {
       const id = requestIdleCallback(run, { timeout: 500 });
@@ -736,16 +736,27 @@
    *  resize) or a table's own (the chat font size), so a settled message
    *  that holds a scroller watches both; a hidden pane watches nothing and
    *  catches up when shown. */
+  /** A fence's code box scrolls; a bare raw-HTML <pre> (no code child, no
+   *  scroller of its own) scrolls itself — a <pre> that holds one never
+   *  overflows, so listing both marks exactly the box that moves. */
+  const CHAT_SCROLLERS = [
+    [".md-table", { role: "group", label: "scrollable table" }],
+    ["pre > code, pre", null],
+  ] as const;
   function markTableRegions(root: ParentNode): void {
-    markScrollRegions(root, ".md-table", { role: "group", label: "scrollable table" });
-    markScrollRegions(root, "pre > code", null);
+    markScrollRegions(root, CHAT_SCROLLERS);
   }
   $effect(() => {
     if (!visible || streaming) return;
     void html; // dep: a settled render may have changed the scroller set
+    // A fence's content width follows the chat font with no element to
+    // observe (its text is the content), so the font settings are deps too.
+    void getSetting("chat.fontSize");
+    void getSetting("appearance.interfaceFontSize");
     const root = el;
-    if (root === null || root.querySelector(".md-table, pre > code") === null) return;
+    if (root === null || root.querySelector(".md-table, pre") === null) return;
     const recheck = () => markTableRegions(root);
+    recheck();
     const stops = [
       watchWidth(root, recheck),
       ...Array.from(root.querySelectorAll(".md-table > table"), (t) => watchWidth(t, recheck)),

@@ -38,6 +38,9 @@
  *  carries its own semantics (a `<table>`, a code block, an equation). */
 export type Region = { role: string; label: string } | null;
 
+/** What to mark under a root: a selector and the region its matches get. */
+export type Target = readonly [selector: string, region: Region];
+
 /** Attribute names this module set on an element — the only ones it removes. */
 const ours = new WeakMap<Element, string[]>();
 
@@ -63,8 +66,11 @@ function apply(el: HTMLElement, overflows: boolean, region: Region): void {
     ours.set(el, added);
   } else if (set !== undefined) {
     // Dropping tabindex under the focused element would send focus to
-    // <body>; the next re-check clears it once focus has moved on.
-    if (typeof document !== "undefined" && document.activeElement === el) return;
+    // <body>: clear the mark once focus has moved on instead.
+    if (typeof document !== "undefined" && document.activeElement === el) {
+      el.addEventListener("focusout", () => apply(el, overflowsX(el), region), { once: true });
+      return;
+    }
     for (const name of set) el.removeAttribute(name);
     ours.delete(el);
   }
@@ -75,21 +81,27 @@ export function markScrollRegion(el: HTMLElement, region: Region): void {
   apply(el, overflowsX(el), region);
 }
 
-/** Mark every `selector` match under `root` — all reads, then all writes. */
-export function markScrollRegions(root: ParentNode, selector: string, region: Region): void {
-  const els = Array.from(root.querySelectorAll<HTMLElement>(selector));
-  const states = els.map(overflowsX);
-  els.forEach((el, i) => apply(el, states[i], region));
+/** Mark every target's matches under `root` — all reads, then all writes,
+ *  across every target, so a root costs one layout however many kinds of
+ *  scroller it holds. */
+export function markScrollRegions(root: ParentNode, targets: readonly Target[]): void {
+  const found: Array<[HTMLElement, Region]> = [];
+  for (const [selector, region] of targets) {
+    for (const el of root.querySelectorAll<HTMLElement>(selector)) found.push([el, region]);
+  }
+  const states = found.map(([el]) => overflowsX(el));
+  found.forEach(([el, region], i) => apply(el, states[i], region));
 }
 
 const watchers = new WeakMap<Element, Set<() => void>>();
 const lastWidth = new WeakMap<Element, number>();
 let observer: ResizeObserver | null = null;
 
-/** Run `recheck` whenever `el`'s content-box width changes; the first
- *  observation fires with the current width, so a fresh element is checked
- *  once after layout. Callbacks due in one frame run once each. Returns the
- *  teardown; the element stays observed while any watcher remains. */
+/** Run `recheck` whenever `el`'s content-box width changes; every watcher
+ *  gets one check at its current width first (the observer's initial
+ *  delivery for a fresh element, a direct call for one already observed).
+ *  Callbacks due in one frame run once each. Returns the teardown; the
+ *  element stays observed while any watcher remains. */
 export function watchWidth(el: Element, recheck: () => void): () => void {
   if (typeof ResizeObserver === "undefined") return () => {};
   observer ??= new ResizeObserver((entries) => {
@@ -107,6 +119,8 @@ export function watchWidth(el: Element, recheck: () => void): () => void {
     set = new Set();
     watchers.set(el, set);
     observer.observe(el);
+  } else if (lastWidth.has(el)) {
+    recheck();
   }
   set.add(recheck);
   return () => {
