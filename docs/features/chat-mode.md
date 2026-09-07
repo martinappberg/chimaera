@@ -184,9 +184,9 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   devices keep the rail visible; a successful copy briefly swaps its icon to a checkmark.
 - **Tables scroll, never squeeze.** A markdown table renders inside a scroll host (`chat/tables.ts`
   wraps marked's default table markup ahead of sanitization), so a table wider than the transcript
-  scrolls horizontally in place. Cells keep whole tokens — a number, an identifier, or a header label
-  never breaks mid-word into a letter-per-line stack — while prose cells still wrap at spaces, and
-  header cells stay on one line.
+  scrolls horizontally in place. Cells wrap only at spaces and hyphens — a number or identifier is
+  never crushed into a letter-per-line stack — header cells stay on one line, and numerals are tabular.
+  An agent's literal `<table>` HTML gets no host and keeps the old squeeze-to-fit wrapping.
 - **Block copy affordances + clean selection copy.** Fenced code blocks and blockquotes carry a
   hover copy button (the shared `shared/copyDecor.ts` decorator, also used by the markdown file
   preview); a blockquote copies its rendered prose whole. Selection-copy of settled prose is

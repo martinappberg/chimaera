@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { Marked } from "marked";
 
-import { markdownMath } from "./math";
+import { chatMarkedExtensions } from "./markedExtensions";
 import { advanceSegments, BAIL_SEGMENT_CAP, type SegmenterState } from "./streamSegments";
 
 /** Feed `chunks` cumulatively (each entry is the FULL text so far, the way the
@@ -25,10 +25,10 @@ function feed(chunks: string[]) {
   return { closed, open, state: state!, extended };
 }
 
-/** The component's exact marked configuration (math extension + breaks), on a
- *  private instance so these tests can't perturb the global marked. */
+/** The component's exact marked configuration (its extension list + breaks),
+ *  on a private instance so these tests can't perturb the global marked. */
 const md = new Marked();
-md.use(markdownMath);
+md.use(...chatMarkedExtensions);
 const parse = (src: string) => md.parse(src, { async: false, breaks: true }) as string;
 
 /** Render every closed segment + the open tail separately and join — the
