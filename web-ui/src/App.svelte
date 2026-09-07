@@ -6145,11 +6145,20 @@
     color: var(--warn);
   }
 
-  /* The branch's width budget scales with the rail (what the old 50% chip
-     cap gave, minus the host's share) with a 10ch floor. A FIXED budget is
-     what makes the bar's wrap decision honest: flex lines break on content
-     width, so an uncapped branch would push the tools onto a second row for
-     every long branch name, even beside a short "local". */
+  /* A git diagnostic ("git too old", "can’t read repo") is the whole message:
+     never ellipsize it — the bar wraps instead, now that it can. */
+  .daemon-git.bad .dg-branch {
+    max-width: none;
+  }
+
+  /* The branch's width budget scales with the rail (roughly what the old 50%
+     chip cap left for the text after the icon, count and padding) with a
+     10ch floor. The budget is what bounds the bar's wrap decision: flex
+     lines break on content width, so an uncapped branch would put the tools
+     on a second row for every long branch name. It does not prevent the
+     wrap — beside the caffeinate toggle AND the gear (the native macOS app)
+     a long, dirty branch still takes the second row at the default rail
+     width; that row is the point, the host stays readable. */
   .dg-branch {
     font-family: var(--mono);
     overflow: hidden;
@@ -6190,8 +6199,11 @@
     font-variant-numeric: tabular-nums;
   }
 
-  /* Settings gear: the always-there mouse path to ⌘, — quiet until hover. */
+  /* Settings gear: the always-there mouse path to ⌘, — quiet until hover.
+     flex: none so a crowded tools row shrinks the branch label, never the
+     buttons' hit targets. */
   .daemon-settings {
+    flex: none;
     appearance: none;
     border: none;
     background: none;
