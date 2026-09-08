@@ -985,20 +985,13 @@
   .md :global(a) {
     color: var(--accent);
   }
-  /* Chat-only table deltas over the shared recipe (app.css "Markdown
+  /* Chat's one table delta over the shared recipe (app.css "Markdown
      tables"), which styles the .md-table host tables.ts emits and every
-     cell. Hosted cells drop the root's break-anywhere wrapping: under it
-     every column's minimum is ONE character, and the auto layout crushes
-     short numeric columns into a letter-per-line stack ("0." / "39" / "%")
-     while a prose column hogs the width. Prose cells still wrap at spaces and
-     hyphens; unbreakable tokens hold their width; headers stay on one line so
-     column names read as labels. An agent's literal <table> HTML has NO host
-     (marked passes it through), so it keeps this squeeze-to-fit wrapping —
-     never wider than the transcript. */
-  .md :global(.md-table th),
-  .md :global(.md-table td) {
-    word-break: normal;
-  }
+     cell — and resets the root's break-anywhere wrapping on hosted cells
+     (why: there). Headers stay on one line so column names read as labels.
+     An agent's literal <table> HTML has NO host (marked passes it through),
+     so it keeps the root's squeeze-to-fit wrapping — never wider than the
+     transcript. */
   .md :global(.md-table th) {
     white-space: nowrap;
   }

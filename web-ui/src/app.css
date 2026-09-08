@@ -210,6 +210,21 @@
 .md-body table :is(th, td) {
   font-variant-numeric: tabular-nums;
 }
+/* Hosted cells wrap like prose, whatever the surface's root inherits into
+   them: chat's root breaks anywhere so a long token never widens the
+   transcript, and CodeMirror's line wrapping puts break-spaces plus
+   word-break/overflow-wrap anywhere on the live editor's content. Under
+   either, every column's minimum is ONE character and the auto layout
+   crushes a short numeric column into a letter-per-line stack ("0." /
+   "39" / "%") while a prose column hogs the width. Reset, cells wrap at
+   spaces and hyphens, an unbreakable token holds its width, and a table
+   wider than the column scrolls in its host. The reading view's root
+   inherits nothing of the kind. Chat's one-line headers out-specify this. */
+:is(.md, .cm-md-live) .md-table table :is(th, td) {
+  white-space: normal;
+  word-break: normal;
+  overflow-wrap: normal;
+}
 
 /* --- Chat surface shared chrome --------------------------------------------
    Buttons, popovers, and the entrance animation shared by the structured-chat

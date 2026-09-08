@@ -42,6 +42,7 @@ import {
 } from "@codemirror/view";
 import { syntaxTree } from "@codemirror/language";
 import {
+  Facet,
   StateField,
   type EditorState,
   type Extension,
@@ -61,12 +62,25 @@ import {
   mathExtension,
   mathSource,
 } from "./mdMath";
-import { tableModel, type CellModel, type Inline, type TableModel } from "./mdTable";
+import {
+  completeRow,
+  tableModel,
+  type CellModel,
+  type Inline,
+  type RowModel,
+  type TableModel,
+} from "./mdTable";
 import { loadMath, mathNow } from "./mathLoad";
 import { copyText } from "../shared/clipboard";
 import { makeCopyButton } from "../shared/copyDecor";
-import { activateUrl, hasUrlScheme, isWebUrl, urlMenuEntries } from "../shared/urlOpen";
+import { markScrollRegion, watchWidth } from "../shared/scrollRegion";
+import { activateUrl, hasUrlScheme, urlMenuEntries, webUrl } from "../shared/urlOpen";
 import { contextMenu } from "../shared/contextMenu.svelte";
+
+/** The document's path, for widgets that resolve a relative image target
+ *  (the plugin gets it as an argument; a table cell's image is rendered from
+ *  the blocks field, which has only the state). */
+const docPath = Facet.define<string, string>({ combine: (v) => v[0] ?? "" });
 
 /**
  * The GFM markdown language (tables, task lists, strikethrough, autolinks;
@@ -186,12 +200,52 @@ class ImageWidget extends WidgetType {
   }
 }
 
+/** The widget an image reference renders as, or null when it stays visible
+ *  source: only web (http/https) and inline `data:image/` URLs pass through
+ *  as they are — any other absolute scheme (file:, chrome:, …) mirrors what
+ *  the reading view's server-side sanitizer lets through — and a
+ *  document-relative path resolves against the document. */
+function imageWidget(url: string, alt: string, path: string): ImageWidget | null {
+  if (url.length === 0) return null;
+  const remote = hasUrlScheme(url);
+  if (remote && !/^(https?:|data:image\/)/i.test(url)) return null;
+  return new ImageWidget(remote ? url : resolveDocPath(path, safeDecodeUri(url)), alt, remote);
+}
+
+/** An equation as KaTeX MathML — or, at the session's first equation while
+ *  KaTeX is still on its way, its source, typeset in place once loaded. The
+ *  element persists across rebuilds (a widget's eq), so that never races a
+ *  replacement; a failed load leaves the source showing, which is honest. */
+function mathElement(source: string, display: boolean, view: EditorView): HTMLElement {
+  const el = document.createElement("span");
+  el.className = display ? "lp-math lp-math-display" : "lp-math";
+  const math = mathNow();
+  if (math !== null) {
+    el.innerHTML = math.safeMathHtml(source, display);
+    return el;
+  }
+  el.classList.add("lp-math-src");
+  el.textContent = source;
+  void loadMath().then(
+    (m) => {
+      if (!el.isConnected) return;
+      el.innerHTML = m.safeMathHtml(source, display);
+      el.classList.remove("lp-math-src");
+      view.requestMeasure();
+    },
+    () => {
+      // KaTeX failed to load: the LaTeX source stays visible.
+    },
+  );
+  return el;
+}
+
 /** `$…$` / `$$…$$` typeset as KaTeX MathML while its line is inactive. A
  *  click is handed to the editor (events are NOT ignored), so it lands the
  *  cursor on the equation and the reveal rule shows its LaTeX — Obsidian's
  *  gesture. The one exception is a press on a wide display equation's own
- *  scrollbar band, which must scroll: handing that to the editor would place
- *  the cursor, reveal the source, and destroy the scroller mid-drag. */
+ *  scrollbar, which must scroll: handing that to the editor would place the
+ *  cursor, reveal the source, and destroy the scroller mid-drag. */
 class MathWidget extends WidgetType {
   constructor(
     readonly source: string,
@@ -203,60 +257,44 @@ class MathWidget extends WidgetType {
     return other.source === this.source && other.display === this.display;
   }
   toDOM(view: EditorView): HTMLElement {
-    const el = document.createElement("span");
-    el.className = this.display ? "lp-math lp-math-display" : "lp-math";
-    const math = mathNow();
-    if (math !== null) {
-      el.innerHTML = math.safeMathHtml(this.source, this.display);
-      return el;
-    }
-    // The session's first equation: KaTeX is still on its way. Show the
-    // source meanwhile and typeset in place — the element persists across
-    // rebuilds (eq), so this never races a replacement. A failed load
-    // leaves the source showing, which is honest.
-    el.classList.add("lp-math-src");
-    el.textContent = this.source;
-    void loadMath().then(
-      (m) => {
-        if (!el.isConnected) return;
-        el.innerHTML = m.safeMathHtml(this.source, this.display);
-        el.classList.remove("lp-math-src");
-        view.requestMeasure();
-      },
-      () => {
-        // KaTeX failed to load: the LaTeX source stays visible.
-      },
-    );
-    return el;
+    return mathElement(this.source, this.display, view);
   }
   override ignoreEvent(e: Event): boolean {
     if (!this.display || e.type !== "mousedown" || !(e.target instanceof Element)) return false;
     // CodeMirror dispatches from contentDOM, so currentTarget is never the
-    // widget: find the scroller from the press target (a press on its own
-    // bar targets the scroller element itself).
-    return onScrollbarBand(e.target.closest<HTMLElement>(".lp-math-display"), e as MouseEvent);
+    // widget: the scroller is found from the press target.
+    return onScrollbarBand(e.target.closest<HTMLElement>(".lp-math-display"), e);
   }
   override get estimatedHeight(): number {
     return this.display ? 56 : -1;
   }
 }
 
-/** Whether a press sits on a scroller's own bar. Classic scrollbars have a
- *  measurable band; overlay scrollbars (the macOS/WKWebView default) report
- *  none, so a bottom strip stands in. */
-function onScrollbarBand(el: HTMLElement | null, e: MouseEvent): boolean {
-  if (el === null || el.scrollWidth <= el.clientWidth) return false;
-  const band = Math.max(el.offsetHeight - el.clientHeight, 12);
-  return e.clientY >= el.getBoundingClientRect().bottom - band;
+/** Whether a press sits on a scroller's own bar. A bar press targets the
+ *  scroller element itself — its content (cells, KaTeX) covers everything
+ *  else — and an overlay bar (the macOS/WKWebView default) reserves no
+ *  measurable band, so the target answers what geometry cannot; a fitting
+ *  box has no bar to press. */
+function onScrollbarBand(el: HTMLElement | null, e: Event): boolean {
+  return el !== null && e.target === el && el.scrollWidth > el.clientWidth;
 }
 
 /** The web URL a rendered link carries, if the press landed on one. */
 function linkUrlIn(target: EventTarget | null): string | null {
   if (!(target instanceof Element)) return null;
   const url = target.closest<HTMLElement>("[data-url]")?.dataset.url ?? null;
-  if (url === null) return null;
-  const u = /^www\./i.test(url) ? `http://${url}` : url; // GFM bare autolink
-  return isWebUrl(u) ? u : null;
+  return url === null ? null : webUrl(url);
+}
+
+/** An HTML character reference as its character. The token is lezer's
+ *  Entity — `&`, a name or number, `;` by its regex, so it can hold no
+ *  markup — and a textarea's innerHTML is RCDATA: references decode, tags
+ *  cannot form. An unknown name decodes to itself. */
+let entityDecoder: HTMLTextAreaElement | null = null;
+function decodeEntity(source: string): string {
+  entityDecoder ??= document.createElement("textarea");
+  entityDecoder.innerHTML = source;
+  return entityDecoder.value;
 }
 
 /** The table whose range holds `pos`, modelled from the CURRENT tree. */
@@ -271,18 +309,28 @@ function tableAt(state: EditorState, pos: number): TableModel | null {
   return null;
 }
 
-/** A cell's inline tree as elements: the kinds the decorator styles, an
- *  equation through the shared KaTeX policy (MathWidget), a link as an
- *  anchor without href — it opens on Mod+press like every live link. */
+/** A cell's inline tree as elements: the kinds the decorator styles (an
+ *  inline code span in its live class), an equation through the shared
+ *  KaTeX policy, an image under the plugin's URL policy (its source text
+ *  when that refuses), a link as an anchor without href — it opens on
+ *  Mod+press like every live link. */
 function renderInline(parent: HTMLElement, inline: readonly Inline[], view: EditorView): void {
   for (const i of inline) {
     switch (i.kind) {
       case "text":
         parent.append(document.createTextNode(i.text));
         break;
-      case "math":
-        parent.append(new MathWidget(i.source, i.display).toDOM(view));
+      case "entity":
+        parent.append(document.createTextNode(decodeEntity(i.source)));
         break;
+      case "math":
+        parent.append(mathElement(i.source, i.display, view));
+        break;
+      case "image": {
+        const widget = imageWidget(i.url, i.alt, view.state.facet(docPath));
+        parent.append(widget === null ? document.createTextNode(i.source) : widget.toDOM(view));
+        break;
+      }
       case "link": {
         const a = document.createElement("a");
         a.className = "lp-link";
@@ -294,6 +342,7 @@ function renderInline(parent: HTMLElement, inline: readonly Inline[], view: Edit
       }
       default: {
         const el = document.createElement(i.kind === "strike" ? "s" : i.kind);
+        if (i.kind === "code") el.className = "lp-inline-code";
         renderInline(el, i.children, view);
         parent.append(el);
       }
@@ -301,15 +350,26 @@ function renderInline(parent: HTMLElement, inline: readonly Inline[], view: Edit
   }
 }
 
+/** The scroll-region mark a table host earns while it overflows (the
+ *  chat transcript's, so a screen reader hears the same thing). */
+const TABLE_REGION = { role: "group", label: "scrollable table" } as const;
+
+/** Each table widget DOM's width watchers, stopped when CodeMirror drops it. */
+const tableWatchers = new WeakMap<HTMLElement, () => void>();
+
 /** A GFM table rendered as the reading view's grid while its lines are
  *  inactive — the shared "Markdown tables" recipe (app.css) styles it, so the
- *  two views agree cell for cell. Built from the collected TableModel
- *  (mdTable.ts) with createElement only. A press on a cell lands the cursor
- *  in THAT cell's source — looked up in the tree at press time, since a
- *  widget kept across rebuilds (eq is the source text) may have moved — and
- *  the reveal rule then shows the whole table as editable text; a Mod+press
- *  on a link follows it; a press on the scroller's own bar scrolls (the
- *  display-math exception, for the same reason). */
+ *  views agree cell for cell. Built from the block's TableModel (mdTable.ts)
+ *  with createElement only. The widget owns every event inside it (as the
+ *  checkbox does): a press on a cell lands the cursor in THAT cell's source
+ *  — looked up in the tree at press time, since a widget kept across
+ *  rebuilds (eq is the source text) may have moved; a short row is
+ *  completed first so typing lands in the pressed column — and the reveal
+ *  rule then shows the whole table as editable text. A press beside a
+ *  narrow table lands at its end, a Mod+press on a link follows it, a
+ *  right-click on one gives the URL menu (elsewhere the native one), and a
+ *  press on a scroller's own bar scrolls — the host's, or a wide equation's
+ *  inside a cell. Like the chat host, it is a tab stop while it overflows. */
 class TableWidget extends WidgetType {
   constructor(readonly model: TableModel) {
     super();
@@ -325,67 +385,76 @@ class TableWidget extends WidgetType {
     const table = document.createElement("table");
     const thead = document.createElement("thead");
     const head = document.createElement("tr");
-    this.model.header.forEach((c, col) => head.append(this.cell("th", c, -1, col, view)));
+    this.model.header.cells.forEach((c, col) => head.append(this.cell("th", c, col, view)));
     thead.append(head);
     const tbody = document.createElement("tbody");
-    this.model.rows.forEach((cells, row) => {
+    for (const row of this.model.rows) {
       const tr = document.createElement("tr");
-      cells.forEach((c, col) => tr.append(this.cell("td", c, row, col, view)));
+      row.cells.forEach((c, col) => tr.append(this.cell("td", c, col, view)));
       tbody.append(tr);
-    });
+    }
     table.append(thead, tbody);
     host.append(table);
     root.append(host);
-    root.addEventListener("mousedown", (e) => this.press(e, view, root, host));
+    root.addEventListener("mousedown", (e) => this.press(e, view, root));
     root.addEventListener("contextmenu", (e) => {
       const url = linkUrlIn(e.target);
       if (url !== null) contextMenu.openAt(e, urlMenuEntries(url));
     });
+    // Overflow is only known once laid out: the observer's first delivery
+    // marks it, and the host's width (a pane resize) or the table's (the
+    // text size, a late image or equation) re-checks.
+    const recheck = () => markScrollRegion(host, TABLE_REGION);
+    const stops = [watchWidth(host, recheck), watchWidth(table, recheck)];
+    tableWatchers.set(root, () => stops.forEach((stop) => stop()));
     return root;
   }
-  private cell(
-    tag: "th" | "td",
-    model: CellModel,
-    row: number,
-    col: number,
-    view: EditorView,
-  ): HTMLElement {
+  override destroy(dom: HTMLElement): void {
+    tableWatchers.get(dom)?.();
+    tableWatchers.delete(dom);
+  }
+  private cell(tag: "th" | "td", model: CellModel, col: number, view: EditorView): HTMLElement {
     const el = document.createElement(tag);
     const align = this.model.align[col];
     if (align !== null) el.setAttribute("align", align);
-    el.dataset.row = String(row);
-    el.dataset.col = String(col);
     renderInline(el, model.inline, view);
     return el;
   }
-  private press(e: MouseEvent, view: EditorView, root: HTMLElement, host: HTMLElement): void {
-    if (e.button !== 0 || onScrollbarBand(host, e)) return; // the bar scrolls
+  private press(e: MouseEvent, view: EditorView, root: HTMLElement): void {
+    if (e.button !== 0) return;
     const target = e.target instanceof Element ? e.target : null;
-    const url = linkUrlIn(target);
+    const scroller = target?.closest<HTMLElement>(".md-table, .lp-math-display") ?? null;
+    if (onScrollbarBand(scroller, e)) return; // the bar scrolls
     e.preventDefault();
-    e.stopPropagation();
+    const url = linkUrlIn(target);
     if (url !== null && (e.metaKey || e.ctrlKey)) {
       activateUrl(url, false);
       return;
     }
     const pos = view.posAtDOM(root);
     const live = tableAt(view.state, pos);
-    let anchor = live?.from ?? pos;
-    const td = target?.closest<HTMLElement>("th, td") ?? null;
-    if (live !== null && td !== null) {
-      const row = Number(td.dataset.row);
-      const cells = row < 0 ? live.header : live.rows[row];
-      anchor = cells?.[Number(td.dataset.col)]?.from ?? anchor;
+    const td = target?.closest<HTMLTableCellElement>("th, td") ?? null;
+    if (live === null || td === null) {
+      view.dispatch({ selection: { anchor: live?.to ?? pos }, scrollIntoView: true });
+    } else {
+      const tr = td.parentElement as HTMLTableRowElement;
+      const row: RowModel | undefined =
+        tr.parentElement?.tagName === "THEAD" ? live.header : live.rows[tr.sectionRowIndex];
+      const fill =
+        row === undefined || view.state.readOnly
+          ? null
+          : completeRow(row, live.header.cells.length, td.cellIndex);
+      const anchor = fill?.anchor ?? row?.cells[td.cellIndex]?.from ?? live.from;
+      view.dispatch({
+        changes: fill === null ? undefined : { from: fill.from, to: fill.to, insert: fill.insert },
+        selection: { anchor },
+        scrollIntoView: true,
+      });
     }
-    view.dispatch({ selection: { anchor }, scrollIntoView: true });
     view.focus();
   }
-  override ignoreEvent(e: Event): boolean {
-    // The widget's own listener consumes presses (and stops them reaching
-    // the editor); only a press on the scroller's bar passes, and that one
-    // must not place the cursor.
-    if (e.type !== "mousedown" || !(e.target instanceof Element)) return false;
-    return onScrollbarBand(e.target.closest<HTMLElement>(".md-table"), e as MouseEvent);
+  override ignoreEvent(): boolean {
+    return true;
   }
   override get estimatedHeight(): number {
     return 30 * (1 + this.model.rows.length);
@@ -807,23 +876,12 @@ function buildDecorations(
       if (active(line.from, line.to)) return false; // show source while editing it
       const urlNode = node.node.getChild("URL");
       if (urlNode === null) return false; // reference-style: leave as source
-      const url = doc.sliceString(urlNode.from, urlNode.to);
-      if (url.length === 0) return false;
-      const remote = hasUrlScheme(url);
-      // Only web and inline-data images render; any other absolute scheme
-      // (file:, chrome:, …) stays visible source — mirroring what the reading
-      // view's server-side sanitizer lets through.
-      if (remote && !/^(https?:|data:image\/)/i.test(url)) return false;
       const marks = node.node.getChildren("LinkMark");
       const alt = marks.length >= 2 ? doc.sliceString(marks[0].to, marks[1].from) : "";
-      const target = remote ? url : resolveDocPath(path, safeDecodeUri(url));
+      const widget = imageWidget(doc.sliceString(urlNode.from, urlNode.to), alt, path);
+      if (widget === null) return false; // a scheme that stays visible source
       if (once(`img:${node.from}`))
-        deco.push(
-          Decoration.replace({ widget: new ImageWidget(target, alt, remote) }).range(
-            node.from,
-            node.to,
-          ),
-        );
+        deco.push(Decoration.replace({ widget }).range(node.from, node.to));
       return false;
     }
     if (name === "Link") {
@@ -962,7 +1020,13 @@ interface TableBlock {
   kind: "table";
   from: number;
   to: number;
-  table: TableModel;
+  /** The rendered model, built when the table is first decorated and kept
+   *  for as long as the block lives: a block survives edits elsewhere with
+   *  its positions mapped (recollectAround copies it), so a keystroke in
+   *  prose never re-models the document's tables, and a table being edited
+   *  (touched, so shown as source) is never modelled per keystroke. Derived
+   *  data, filled in place. */
+  model: TableModel | null;
 }
 
 type Block = MathBlock | TableBlock;
@@ -1014,8 +1078,7 @@ function collectBlocks(
         return false;
       }
       if (n.name === "Table") {
-        const table = n.from < fmEnd ? null : tableModel(n.node, doc);
-        if (table !== null) out.push({ kind: "table", from: n.from, to: n.to, table });
+        if (n.from >= fmEnd) out.push({ kind: "table", from: n.from, to: n.to, model: null });
         return false;
       }
       if (n.name === "CodeBlock" || n.name === "HTMLBlock" || n.name === "CommentBlock")
@@ -1090,12 +1153,18 @@ function recollectAround(prev: Block[], tr: Transaction, fmEnd: number): Block[]
   return out;
 }
 
-function blockDecorations(list: Block[], sel: Span[]): DecorationSet {
+function blockDecorations(list: Block[], sel: Span[], state: EditorState): DecorationSet {
   const ranges: ReturnType<Decoration["range"]>[] = [];
   for (const b of list) {
     if (touches(sel, b.from, b.to)) continue; // revealed: the plugin shows source
-    const widget =
-      b.kind === "table" ? new TableWidget(b.table) : new MathWidget(b.source, b.display);
+    let widget: WidgetType;
+    if (b.kind === "table") {
+      b.model ??= tableAt(state, b.from);
+      if (b.model === null) continue; // not in the tree yet: source shows
+      widget = new TableWidget(b.model);
+    } else {
+      widget = new MathWidget(b.source, b.display);
+    }
     ranges.push(Decoration.replace({ widget }).range(b.from, b.to));
   }
   return Decoration.set(ranges, true);
@@ -1116,7 +1185,7 @@ const blocks = StateField.define<BlocksState>({
     const fmEnd = frontmatterEnd(state);
     const list = collectBlocks(state, fmEnd);
     const sel = selectionSpans(state);
-    return { blocks: list, sel, fmEnd, deco: blockDecorations(list, sel) };
+    return { blocks: list, sel, fmEnd, deco: blockDecorations(list, sel, state) };
   },
   update(v, tr) {
     const treeChanged = syntaxTree(tr.state) !== syntaxTree(tr.startState);
@@ -1132,7 +1201,7 @@ const blocks = StateField.define<BlocksState>({
     }
     const sel = selectionSpans(tr.state);
     if (list === v.blocks && spansEqual(sel, v.sel)) return v;
-    return { blocks: list, sel, fmEnd, deco: blockDecorations(list, sel) };
+    return { blocks: list, sel, fmEnd, deco: blockDecorations(list, sel, tr.state) };
   },
   provide: (f) => EditorView.decorations.from(f, (v) => v.deco),
 });
@@ -1157,10 +1226,8 @@ function linkUrlAt(state: EditorState, pos: number): string | null {
 function linkUrlAtCoords(view: EditorView, x: number, y: number): string | null {
   const pos = view.posAtCoords({ x, y });
   if (pos === null) return null;
-  let url = linkUrlAt(view.state, pos);
-  if (url === null) return null;
-  if (/^www\./i.test(url)) url = `http://${url}`; // GFM bare autolink
-  return isWebUrl(url) ? url : null;
+  const url = linkUrlAt(view.state, pos);
+  return url === null ? null : webUrl(url);
 }
 
 /** Mod+press follows a link (plain click has to place the cursor — this is an
@@ -1180,9 +1247,10 @@ const linkClicks = EditorView.domEventHandlers({
     activateUrl(url, false);
     return true;
   },
-  // Right-click parity with the reading view's URL menu — the editor renders
-  // no <a> elements for the delegated handler to find. openAt suppresses the
-  // native menu itself.
+  // Right-click parity with the reading view's URL menu — the editor's text
+  // renders no <a> elements for the delegated handler to find (a table
+  // widget's links do, and the widget handles those itself). openAt
+  // suppresses the native menu itself.
   contextmenu: (e, view) => {
     const url = linkUrlAtCoords(view, e.clientX, e.clientY);
     if (url === null) return false;
@@ -1315,22 +1383,17 @@ const liveTheme: Extension = EditorView.theme({
 
   // A rendered table (TableWidget): the shared "Markdown tables" recipe in
   // app.css styles the grid — this root is one of its markdown surfaces,
-  // with the rhythm a widget on its own line needs — and the widget sits
-  // like a display equation, full width on its line. It steps out of the
-  // editor's line-wrapping rules (CodeMirror's `.cm-lineWrapping` sets
-  // break-spaces + word-break/overflow-wrap anywhere on the content): under
-  // them every column's minimum is one character and a wide table crushes
-  // into letter-per-line stacks instead of scrolling in its host. The
-  // source, revealed, keeps each row on one line so the pipes stay aligned;
-  // the editor scrolls sideways for a wide row rather than folding it.
-  "&.cm-md-live": { "--md-table-margin": "0.3em" },
+  // with the rhythm a display equation gets — and the widget sits like one,
+  // full width on its line. The recipe's hosted cells also reset the
+  // editor's line-wrapping rules, which would otherwise crush a wide table
+  // letter-per-line (why: there). The source, revealed, keeps each row on
+  // one line so the pipes stay aligned; the editor scrolls sideways for a
+  // wide row rather than folding it.
+  "&.cm-md-live": { "--md-table-margin": "0.35em" },
   "&.cm-md-live .lp-table-widget": {
     display: "inline-block",
     width: "100%",
     verticalAlign: "middle",
-    whiteSpace: "normal",
-    wordBreak: "normal",
-    overflowWrap: "normal",
   },
   "&.cm-md-live .lp-table": { whiteSpace: "pre" },
 
@@ -1388,6 +1451,7 @@ export function markdownLive(path: string): Extension {
   return [
     EditorView.lineWrapping,
     EditorView.editorAttributes.of({ class: "cm-md-live" }),
+    docPath.of(path),
     liveTheme,
     livePlugin(path),
     blocks,

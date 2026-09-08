@@ -16,7 +16,8 @@ import { Renderer, type MarkedExtension, type Tokens } from "marked";
  * overridden here only (cell/row overrides compose fine). Agent HTML can forge
  * the class; that buys scroll styling around whatever it wraps and nothing more.
  * The host's styling is the "Markdown tables" recipe in app.css, shared with
- * the file preview; chat's own deltas sit in Markdown.svelte. Nothing here
+ * the file preview's reading view and the live editor's table widget (which
+ * builds the same host); chat's own delta sits in Markdown.svelte. Nothing here
  * makes the host focusable: whether it overflows is only known after layout,
  * so Markdown.svelte marks it post-render (shared/scrollRegion.ts).
  */
