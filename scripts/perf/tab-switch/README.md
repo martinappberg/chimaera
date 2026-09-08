@@ -6,6 +6,23 @@ Measures what a tab switch costs in macOS WebKit with documents parked behind it
 
 The driver (`web-ui/src/lib/perf/tabSwitchDrive.ts`, compiled in only with `CHIMAERA_PERF=1`) opens the given sessions and files in the focused pane, parks each document scrolled, leaves a caret in the last document and switches away (the parked-caret case), runs isolation probes (focus flip, `inert` on the active and on a parked layer, the active class, a body custom property, a stylesheet insert — the document-wide restyle reference — a sibling insert, and a select-all to see whether parked text reaches the clipboard), then switches between the two terminals 24 times, logging per switch the commit time and the engine's own caret walk from each end of the active layer (`Selection.modify`, the search WebKit's editor-state update runs on every rendering commit). It ends by revealing the first document (cost + scroll position). Everything is written to `<log-path>` through the daemon.
 
+Terminals are warmed before documents load, and the driver waits for Markdown/editor content
+before scrolling. After the dormant reveal it also measures twelve document↔terminal switches,
+full-document selection, document height with/without the reading window, scrolling to the end,
+and restoring a scrolled tab. Set `CHIMAERA_PERF_QUICK=1` on the runner to reduce terminal cycles
+to two while iterating; use the full run to measure the 30-second dormant case.
+
+The 2026-09-07 reproduction used three 1.37 MB Markdown documents, each containing 1,500 dense
+paragraphs (108,000 inline formatting elements). Warm mixed switches before reading-windowing
+took 180–349 ms (median 262.5 ms); afterward, 32–50 ms (median 45.5 ms). The dormant reveal
+fell from 1,266 ms to 80 ms. These are unsampled Safari timings including two animation frames,
+not hardware-independent budgets. Selection restored over one million characters; measured
+document height was identical (311,298 px), and the 5,000 px scroll position survived a tab round trip.
+A follow-up through a localhost proxy adding 150 ms in each direction measured 27–70 ms
+mixed switches, confirming warm tab selection does not wait for the simulated 300 ms RTT.
+Browser verification also covered a disk refresh while parked, full-text Find after a font
+resize (identical full/windowed height), and an unsaved editor draft surviving a tab round trip.
+
 ## Run
 
 ```sh

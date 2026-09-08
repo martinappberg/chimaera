@@ -270,9 +270,17 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   `retain`/`release`/`noteWrite`); every `*View.svelte`. The store subscribes to
   `workspace/fsEvents.ts` (`fsEpoch`/`lastFsMutation`) + `workspace/git.ts` (`gitStatus`) +
   `workspace/diskWatch.ts`; the daemon half is `chimaera-server/src/fs_watch.rs` on `/ws/events`.
-- **Key behaviors.** Switching pane-tabs (or panes) to a recently-viewed file is **instant with
-  scroll position, image decode, finder columns, and editor state all preserved** — the DOM is
-  never rebuilt, and no route is re-hit (a view only mounts while active, so nothing is measured at
+- **Large reading documents.** `previews/readingWindow.ts` keeps offscreen prose paragraphs
+  in memory behind measured, same-tag placeholders once rendered text exceeds
+  100,000 characters. Only blocks within 1,000 px of the reading viewport stay connected, so a
+  tab's inherited `inert`/dormant flags no longer restyle every inline word in a long document.
+  Heights are measured from the real layout; resizing, font changes, and disk refreshes rebuild
+  the window. Selection, Cmd/Ctrl+F/G, and printing restore the full text. Links, code fences,
+  other keyboard targets, tables, lists, images, math, and Svelte's HTML range boundaries
+  remain connected; editors keep their own viewport handling.
+- **Key behaviors.** Switching pane-tabs (or panes) to a recently-viewed file reuses its view with
+  **scroll position, image decode, finder columns, and editor state preserved** — cached reading
+  blocks are reattached as needed, and no route is re-hit (a view only mounts while active, so nothing is measured at
   a degenerate size). Inactive PTY tabs park in the pool's hidden stash instead of leaving invisible
   WebGL renderers attached. Inactive chat tabs freeze their bounded transcript snapshot while the
   pooled reducer/socket continues; historical artifact previews load only near the viewport, and
@@ -287,7 +295,7 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   1px image at each end of a layer is where WebKit's editor-state caret walk ends instead of
   crossing every parked node (its empty alt keeps it out of copied text; parked text is inert,
   hence unselectable and never copied); and a layer parked for 30 s goes dormant
-  (`visibility:hidden`, from idle time), which returns the backing stores WebKit keeps for a
+  (`visibility:hidden`, from a timer), which returns the backing stores WebKit keeps for a
   transparent scroller — the reveal of a dormant layer pays that subtree's restyle once, a quick
   switch-back never does. `inert` inherits too: a switch restyles the two switched layers' subtrees,
   never a bystander's. The terminal pool keeps xterm's `<style>` sheets out of

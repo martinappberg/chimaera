@@ -156,12 +156,15 @@ pub enum AgentEvent {
     TurnStarted {
         turn_id: String,
     },
-    /// Streamed agent prose (already delta-coalesced by the pump).
+    /// Streamed agent prose. Live drivers merge deltas through [`Coalescer`],
+    /// so chunk boundaries fall wherever it happened to flush (its ~100ms
+    /// tick, the size cap, a block or turn boundary); transcript seeding
+    /// emits one chunk per text block. Only the concatenation is meaningful.
     MessageChunk {
         turn_id: String,
         text: String,
     },
-    /// Streamed reasoning/thinking.
+    /// Streamed reasoning/thinking; the same chunking contract as `MessageChunk`.
     ThoughtChunk {
         turn_id: String,
         text: String,

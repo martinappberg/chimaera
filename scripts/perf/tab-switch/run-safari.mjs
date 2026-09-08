@@ -25,7 +25,8 @@ const secs = Number(secsArg ?? 45);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const spec = encodeURIComponent(`${sessions}|${files}|${logPath}`);
-execFileSync("open", ["-a", "Safari", `${base}/?stalldrive=${spec}#token=${token}&ws=${ws}`]);
+const quick = process.env.CHIMAERA_PERF_QUICK === "1" ? "&quickdrive" : "";
+execFileSync("open", ["-a", "Safari", `${base}/?stalldrive=${spec}${quick}#token=${token}&ws=${ws}`]);
 console.log("opened; waiting for the driver to park the documents");
 await sleep(25_000);
 
