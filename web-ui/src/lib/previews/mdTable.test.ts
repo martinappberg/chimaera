@@ -117,6 +117,7 @@ describe("tableModel", () => {
         "| `a\\|b` | $a \\| b$ |",
         "| &amp; &#x27; <!-- c --> x | <b>raw</b> |",
         "| ![alt](fig.png) | https://example.com www.example.org <https://x.dev> |",
+        "| [sp](<https://e.com/x y>) | ![i](<a b.png>) |",
       ].join("\n"),
     );
     expect(cellsOf(t).slice(1)).toEqual([
@@ -127,6 +128,7 @@ describe("tableModel", () => {
         "![alt](fig.png)",
         "[https://example.com](https://example.com) [www.example.org](www.example.org) [https://x.dev](https://x.dev)",
       ],
+      ["[sp](https://e.com/x y)", "![i](a b.png)"],
     ]);
     expect(t.rows[0].cells[0].inline[0]).toEqual({ kind: "math", source: "E=mc^2", display: false });
     expect(t.rows[2].cells[0].inline[0]).toEqual({ kind: "entity", source: "&amp;" });

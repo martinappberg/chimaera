@@ -64,6 +64,7 @@ import {
 } from "./mdMath";
 import {
   completeRow,
+  linkDestination,
   tableModel,
   type CellModel,
   type Inline,
@@ -263,20 +264,26 @@ class MathWidget extends WidgetType {
     if (!this.display || e.type !== "mousedown" || !(e.target instanceof Element)) return false;
     // CodeMirror dispatches from contentDOM, so currentTarget is never the
     // widget: the scroller is found from the press target.
-    return onScrollbarBand(e.target.closest<HTMLElement>(".lp-math-display"), e);
+    return onScrollbarBand(e.target.closest<HTMLElement>(".lp-math-display"), e as MouseEvent);
   }
   override get estimatedHeight(): number {
     return this.display ? 56 : -1;
   }
 }
 
-/** Whether a press sits on a scroller's own bar. A bar press targets the
- *  scroller element itself — its content (cells, KaTeX) covers everything
- *  else — and an overlay bar (the macOS/WKWebView default) reserves no
- *  measurable band, so the target answers what geometry cannot; a fitting
- *  box has no bar to press. */
-function onScrollbarBand(el: HTMLElement | null, e: Event): boolean {
-  return el !== null && e.target === el && el.scrollWidth > el.clientWidth;
+/** Whether a press sits on a scroller's own bar: it targets the scroller
+ *  element itself AND lies in the bar's band along the bottom edge. A
+ *  classic bar has a measurable band; an overlay bar (the macOS/WKWebView
+ *  default) reserves none, so a 12px strip stands in — which is why the
+ *  target matters too: a table's cells cover its host, so its last row
+ *  never loses its bottom to the strip, while a wide equation's glyphs
+ *  don't cover its scrolled-in overflow (a block `math` box is as wide as
+ *  the scroller, not its content), so a press between symbols there must
+ *  still reach the editor. A fitting box has no bar to press. */
+function onScrollbarBand(el: HTMLElement | null, e: MouseEvent): boolean {
+  if (el === null || e.target !== el || el.scrollWidth <= el.clientWidth) return false;
+  const band = Math.max(el.offsetHeight - el.clientHeight, 12);
+  return e.clientY >= el.getBoundingClientRect().bottom - band;
 }
 
 /** The web URL a rendered link carries, if the press landed on one. */
@@ -878,7 +885,8 @@ function buildDecorations(
       if (urlNode === null) return false; // reference-style: leave as source
       const marks = node.node.getChildren("LinkMark");
       const alt = marks.length >= 2 ? doc.sliceString(marks[0].to, marks[1].from) : "";
-      const widget = imageWidget(doc.sliceString(urlNode.from, urlNode.to), alt, path);
+      const url = linkDestination(doc.sliceString(urlNode.from, urlNode.to));
+      const widget = imageWidget(url, alt, path);
       if (widget === null) return false; // a scheme that stays visible source
       if (once(`img:${node.from}`))
         deco.push(Decoration.replace({ widget }).range(node.from, node.to));
@@ -892,7 +900,7 @@ function buildDecorations(
       // text to stand in for the syntax — leave them fully visible source
       // (hiding their marks rendered `a[ref]` mangles and `[]()` invisible).
       if (urlNode === null || marks.length < 2 || marks[1].from <= marks[0].to) return false;
-      const url = doc.sliceString(urlNode.from, urlNode.to);
+      const url = linkDestination(doc.sliceString(urlNode.from, urlNode.to));
       deco.push(
         Decoration.mark({ class: "lp-link", attributes: { title: url } }).range(
           marks[0].to,
@@ -1214,10 +1222,10 @@ function linkUrlAt(state: EditorState, pos: number): string | null {
     n !== null;
     n = n.parent
   ) {
-    if (n.name === "URL") return state.doc.sliceString(n.from, n.to);
+    if (n.name === "URL") return linkDestination(state.doc.sliceString(n.from, n.to));
     if (n.name === "Link" || n.name === "Autolink") {
       const u = n.getChild("URL");
-      return u === null ? null : state.doc.sliceString(u.from, u.to);
+      return u === null ? null : linkDestination(state.doc.sliceString(u.from, u.to));
     }
   }
   return null;

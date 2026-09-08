@@ -85,6 +85,12 @@ export function alignments(delimiterRow: string): Align[] {
     });
 }
 
+/** A link's destination as written: `[a](<x y>)` wraps a destination that
+ *  holds spaces in angle brackets, which lezer's URL node keeps. */
+export function linkDestination(raw: string): string {
+  return raw.startsWith("<") && raw.endsWith(">") ? raw.slice(1, -1) : raw;
+}
+
 /** comrak's `unescape_pipes`: `\|` is a pipe, and a backslash that is
  *  itself escaped (`\\|`) protects nothing. Applied where lezer leaves the
  *  text raw — a code span, an equation; plain text has the Escape node. */
@@ -138,7 +144,7 @@ function inlineOf(node: SyntaxNode, from: number, to: number, doc: Text): Inline
         text(c.from, c.to); // reference-style or label-less: source
         continue;
       }
-      const href = doc.sliceString(url.from, url.to);
+      const href = linkDestination(doc.sliceString(url.from, url.to));
       if (name === "Image") {
         out.push({
           kind: "image",
