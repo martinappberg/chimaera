@@ -137,13 +137,15 @@
   font-size: 1.02em;
 }
 
-/* --- Markdown tables (both markdown surfaces) ---------------------------
-   One recipe for the chat transcript (.md, chat/Markdown.svelte) and the
+/* --- Markdown tables (every markdown surface) -----------------------------
+   One recipe for the chat transcript (.md, chat/Markdown.svelte), the
    markdown file preview's reading view (.md-body, previews/MarkdownView.svelte)
-   — exactly two markdown roots by design, so the rules key on them; a third
-   surface joins by listing itself here. (Sanitized agent HTML can forge the
-   classes; that buys table styling and nothing more.) The preview's spacing
-   is the default; chat overrides the three tokens on its root.
+   and the live editor's rendered tables (.cm-md-live, previews/mdLive.ts's
+   TableWidget, hosted like chat's) — the markdown roots by design, so the
+   rules key on them; another surface joins by listing itself here.
+   (Sanitized agent HTML can forge the classes; that buys table styling and
+   nothing more.) The preview's spacing is the default; chat overrides the
+   three tokens on its root, the live editor only the margin.
    --md-table-font-size stays a token rather than one shared ratio because
    chat's is absolute (--text-sm carries a legibility floor at the smallest
    pane font) while the preview scales with its per-pane text size.
@@ -172,7 +174,7 @@
    centred block children of a raw-HTML cell, and the non-GFM values middle /
    justify — GFM cells are inline-only and unaffected. Numerals are tabular
    so digit columns line up (in chat, hosted tables only). */
-.md .md-table,
+:is(.md, .cm-md-live) .md-table,
 .md-body table {
   display: block;
   overflow-x: auto;
@@ -180,33 +182,48 @@
   scrollbar-width: thin;
   padding: 1px;
 }
-.md .md-table,
+:is(.md, .cm-md-live) .md-table,
 .md table:not(.md-table > table),
 .md-body table {
   margin: var(--md-table-margin, 1em) 0;
 }
-:is(.md, .md-body) table {
+:is(.md, .md-body, .cm-md-live) table {
   border-collapse: collapse;
   font-size: var(--md-table-font-size, 0.924em);
 }
-:is(.md, .md-body) table :is(th, td) {
+:is(.md, .md-body, .cm-md-live) table :is(th, td) {
   border: 1px solid var(--edge);
   padding: var(--md-table-cell-padding, 0.35em 0.7em);
   text-align: left;
 }
-:is(.md, .md-body) table :is(th, td)[align="center" i] {
+:is(.md, .md-body, .cm-md-live) table :is(th, td)[align="center" i] {
   text-align: center;
 }
-:is(.md, .md-body) table :is(th, td)[align="right" i] {
+:is(.md, .md-body, .cm-md-live) table :is(th, td)[align="right" i] {
   text-align: right;
 }
-:is(.md, .md-body) table th {
+:is(.md, .md-body, .cm-md-live) table th {
   font-weight: 600;
   background: color-mix(in srgb, var(--fg) 4%, transparent);
 }
-.md .md-table table :is(th, td),
+:is(.md, .cm-md-live) .md-table table :is(th, td),
 .md-body table :is(th, td) {
   font-variant-numeric: tabular-nums;
+}
+/* Hosted cells wrap like prose, whatever the surface's root inherits into
+   them: chat's root breaks anywhere so a long token never widens the
+   transcript, and CodeMirror's line wrapping puts break-spaces plus
+   word-break/overflow-wrap anywhere on the live editor's content. Under
+   either, every column's minimum is ONE character and the auto layout
+   crushes a short numeric column into a letter-per-line stack ("0." /
+   "39" / "%") while a prose column hogs the width. Reset, cells wrap at
+   spaces and hyphens, an unbreakable token holds its width, and a table
+   wider than the column scrolls in its host. The reading view's root
+   inherits nothing of the kind. Chat's one-line headers out-specify this. */
+:is(.md, .cm-md-live) .md-table table :is(th, td) {
+  white-space: normal;
+  word-break: normal;
+  overflow-wrap: normal;
 }
 
 /* --- Chat surface shared chrome --------------------------------------------

@@ -165,19 +165,28 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
     becomes math — as on GitHub), and one case list, `previews/mathBlocks.fixture.json`, pins
     the block grammar for both sides: the Vitest and Rust suites each run every case, with
     the known divergences named in it.
-    Tables/raw HTML/frontmatter stay as mono source (the full render lives in reading, which
-    is also where table-cell math typesets), and so does any construct the decorator can't
-    render faithfully (reference links, multi-line image syntax). Mod+click follows links;
-    right-click gives the same URL menu as reading.
+    **Tables** render as the reading view's grid (the shared "Markdown tables" recipe, so the
+    views agree cell for cell — alignment, inline formatting, links, images, `$` math through
+    the same KaTeX policy) while the cursor is outside them. Click a cell, or move the cursor
+    into the table, and the whole table shows as editable mono text with its pipes aligned
+    (rows stay on one line; a wide one scrolls the editor sideways), the cursor in the
+    clicked cell — a row shorter than the header gets its missing pipes written first, so
+    typing lands in the clicked column — and it re-renders the moment the cursor leaves
+    (whole-table reveal, not in-place cell editing). Like a `$$` block, a table is replaced
+    whole from the `blocks` state field (`mdLive.ts`), built as data from the syntax tree
+    (`mdTable.ts`) and turned into elements without any HTML injection; a wide one is a tab
+    stop while it overflows, like chat's. Raw HTML and frontmatter stay as mono source, and so
+    does any construct the decorator can't render faithfully (reference links, multi-line
+    image syntax). Mod+click follows links; right-click gives the same URL menu as reading.
   - **reading** is the complete non-editable render: `GET /api/v1/fs/markdown?path=` →
     server-side comrak GFM (+ `math_dollars`) → **ammonia-sanitized** HTML (its defaults
     plus `data-math-style` on `span`, the marker comrak leaves on each LaTeX literal; source
     cap 4 MB), fetched on first entry and refreshed in place on saves/agent writes. The
     client typesets those spans under the one KaTeX policy every surface shares
     (`shared/math.ts`, loaded on demand at the first equation, memoized, time-sliced).
-    **Tables scroll, never squeeze** — one recipe shared with the chat transcript
-    (`web-ui/src/app.css`, "Markdown tables"; [chat mode](chat-mode.md)) minus chat's host
-    wrapper: the `<table>` itself is the horizontal scroller, so a table whose
+    **Tables scroll, never squeeze** — one recipe shared with the chat transcript and the
+    live mode's table widget (`web-ui/src/app.css`, "Markdown tables"; [chat mode](chat-mode.md))
+    minus their host wrapper: the `<table>` itself is the horizontal scroller, so a table whose
     columns can't fit the reading column scrolls in place (prose cells still wrap at spaces).
     GFM `:--:` / `--:` alignment is honoured through the `align` attribute comrak emits and the
     sanitizer keeps; numerals are tabular. Unlike chat, headers wrap like any cell, and a
@@ -396,6 +405,19 @@ _Intent pending — drafted from the maintainer's request, 2026-08-27; questionn
 - **Pending.** The mode names (`live`/`reading`/`source`), the default-to-live choice, and
   which constructs the live view renders vs leaves as source have not been confirmed with
   the maintainer — capture via **capture-feature-intent** when available.
+
+### Why live mode renders tables as the reading grid
+_Intent pending — drafted from the maintainer's request, 2026-09-07; questionnaire not yet run._
+
+- **Problem it solves (from the request).** "The live view for tables in the .md look quite
+  weird" — live mode showed a table as monospace pipe rows, and since the editor soft-wraps,
+  a wide table folded its rows and the columns fell apart. Offered a small fix (keep rows on
+  one line) or a real table widget, the maintainer picked the widget ("bigger"): a table
+  reads the way the reading view and chat draw it, and turns back into source the moment
+  it is edited.
+- **Pending.** The whole-table reveal (rather than Obsidian 1.5-style in-place cell editing),
+  writing a short row's missing pipes on click, and rendering images inside cells have not
+  been confirmed with the maintainer — capture via **capture-feature-intent** when available.
 
 ### Finding your place in a deep tree — why it exists
 _Intent pending — drafted from the maintainer's request, 2026-09-06; questionnaire not yet run._

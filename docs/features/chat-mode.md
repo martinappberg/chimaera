@@ -187,8 +187,8 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   scrolls horizontally in place. Cells wrap only at spaces and hyphens — a number or identifier is
   never crushed into a letter-per-line stack — header cells stay on one line, and numerals are tabular.
   An agent's literal `<table>` HTML gets no host and keeps the old squeeze-to-fit wrapping. The
-  table styling itself is one recipe shared with the markdown file preview (`web-ui/src/app.css`,
-  "Markdown tables"); chat adds only the hosted-cell wrapping reset and the one-line headers.
+  table styling itself is one recipe shared with the markdown file preview's reading and live
+  modes (`web-ui/src/app.css`, "Markdown tables"); chat adds only the one-line headers.
   Alignment follows the attribute's value on both surfaces: `align="center"` / `"right"` (any
   case) are honoured, anything else — an empty or legacy value in an agent's raw HTML — renders
   left. An overflowing table's scroll host (and a wide fence's code box) is a tab stop — Tab to
