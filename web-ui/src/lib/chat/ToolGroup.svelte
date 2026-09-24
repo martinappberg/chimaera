@@ -1,8 +1,9 @@
 <script lang="ts">
+  import ActivityRows from "./ActivityRows.svelte";
   import ActivitySummary from "./ActivitySummary.svelte";
   import type { ChatBlock } from "./store.svelte";
   import ToolCallCard from "./ToolCallCard.svelte";
-  import { toolGroupTitle, toolRunHealth } from "./toolLabels";
+  import { isLive, toolGroupTitle, toolRunHealth } from "./toolLabels";
 
   /**
    * A run of consecutive tool calls, condensed. Collapsed it is one quiet
@@ -42,9 +43,7 @@
     sourceUid,
   }: Props = $props();
 
-  const running = $derived(
-    tools.some((t) => t.status === "in_progress" || t.status === "pending"),
-  );
+  const running = $derived(tools.some(isLive));
   /** Failed / recovered badge — see toolLabels.ts. */
   const health = $derived(toolRunHealth(tools));
 
@@ -75,7 +74,7 @@
     onToggle={() => (open = !open)}
   />
   {#if open}
-    <div class="rows">
+    <ActivityRows>
       {#each tools as tool (tool.id)}
         <ToolCallCard
           block={tool}
@@ -85,7 +84,7 @@
           onStop={onStopTask !== undefined ? () => onStopTask?.(tool.id) : undefined}
         />
       {/each}
-    </div>
+    </ActivityRows>
   {/if}
 </div>
 
@@ -101,10 +100,5 @@
     .group {
       animation: none;
     }
-  }
-  .rows {
-    margin: 2px 0 6px 2px;
-    padding-left: 10px;
-    border-left: 2px solid color-mix(in srgb, var(--edge) 70%, transparent);
   }
 </style>

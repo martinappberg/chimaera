@@ -1,11 +1,12 @@
 /**
- * Settled activity folds away under the prose it led to. A run of activity
- * lines (thoughts, tool groups, finished work) that a reply has since
- * followed is history: it collapses into one quiet line — "Thought, ran 6
- * commands, read 2 files" — one click from its rows. The trailing run (no
- * reply after it yet) stays open, so live work is always visible.
+ * Settled activity folds away. A run of thought and tool lines that a reply
+ * (or a finished-work line) has since followed is history: it collapses into
+ * one quiet line — "Thought, ran 6 commands, read 2 files" — one click from
+ * its rows. The trailing run (nothing after it yet) stays open, so live work
+ * is always visible; finished-work lines never fold, since they are results
+ * the reader came for (and a woken turn's only stated cause).
  */
-import { countPhrase, type LabelledTool } from "./toolLabels";
+import { capitalize, countPhrase, type LabelledTool } from "./toolLabels";
 
 /** Runs of at least two activity items that a closing item directly
  *  follows, as half-open `[start, end)` spans. A lone line gains nothing
@@ -28,19 +29,14 @@ export function foldSpans<T>(
   return spans;
 }
 
-/** "Thought, ran 6 commands, read 2 files". Finished rows close work a
- *  counted call started, so they name themselves only when nothing else
- *  would. */
-export function foldTitle(thoughts: number, tools: LabelledTool[], finished: number): string {
+/** "Thought, ran 6 commands, read 2 files". Thoughts are counted only when
+ *  they are all there is. */
+export function foldTitle(thoughts: number, tools: LabelledTool[]): string {
   const parts: string[] = [];
   const counted = countPhrase(tools);
   if (thoughts > 0) {
     parts.push(counted === "" && thoughts > 1 ? `thought ${thoughts} times` : "thought");
   }
   if (counted !== "") parts.push(counted);
-  if (parts.length === 0 && finished > 0) {
-    parts.push(finished === 1 ? "work finished" : `${finished} tasks finished`);
-  }
-  const title = parts.join(", ");
-  return title.length > 0 ? title[0].toUpperCase() + title.slice(1) : title;
+  return capitalize(parts.join(", "));
 }

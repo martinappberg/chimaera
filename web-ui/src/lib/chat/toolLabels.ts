@@ -63,7 +63,8 @@ const KINDS: { kind: string; done: Phrase; live: Phrase }[] = [
 
 const KNOWN = new Set(KINDS.map((k) => k.kind).filter((k) => k !== "other"));
 
-function isLive(t: LabelledTool): boolean {
+/** Still running — said in the present tense, and a live dot on its line. */
+export function isLive(t: { status: string }): boolean {
   return t.status === "pending" || t.status === "in_progress";
 }
 
@@ -106,7 +107,7 @@ export function countPhrase(tools: LabelledTool[]): string {
   return parts.join(", ");
 }
 
-function capitalize(s: string): string {
+export function capitalize(s: string): string {
   return s.length > 0 ? s[0].toUpperCase() + s.slice(1) : s;
 }
 

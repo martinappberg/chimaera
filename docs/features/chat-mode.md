@@ -166,10 +166,11 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
     a monitor's end; each links its output file.
   - **Wake markers** — a turn nobody typed (a monitor event, a scheduled wake-up) is marked "Woke
     on a monitor event · “…”" / "Resumed on its own", unless a finished row already shows why.
-  - **Folded runs** — once a reply follows them, two or more activity lines in a row (thoughts,
-    tool groups, finished work) fold into one line above it — "Thought, ran 6 commands, read 2
-    files ›" — that expands to the original rows. The trailing run stays open while the agent
-    works, so live progress is always in view; a hard failure inside shows on the folded line.
+  - **Folded runs** — once a reply (or a finished-work line) follows them, two or more thought and
+    tool lines in a row fold into one line — "Thought, ran 6 commands, read 2 files ›" — that
+    expands to the original rows. The trailing run stays open while the agent works, so live
+    progress is always in view; a hard failure inside shows on the folded line. Finished-work lines
+    never fold: they are the results, and for a woken turn the only stated cause.
 - **Interim prose is prose.** Opus 5.5+ ships the sentences it writes between tool calls as
   server-summarized `thinking` blocks tagged `narration` in their signature; the driver classifies
   each block (the `narration_block_indexes` wrapper, else the decoded signature) and renders

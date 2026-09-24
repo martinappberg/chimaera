@@ -1516,6 +1516,12 @@
         tools: Extract<ChatBlock, { kind: "tool" }>[];
       }
     | { t: "single"; key: string; index: number; block: ChatBlock };
+  /** The rows a fold absorbs. Finished-work lines never fold: they are
+   *  results (and a woken turn's only stated cause), so they stay in view and
+   *  settle the run above them the way a reply does. */
+  type ActivityRow =
+    | Extract<RowItem, { t: "group" }>
+    | { t: "single"; key: string; index: number; block: Extract<ChatBlock, { kind: "thought" }> };
   type RenderItem =
     | RowItem
     | {
@@ -1524,13 +1530,12 @@
         index: number;
         endIndex: number;
         uid: number;
-        items: RowItem[];
+        items: ActivityRow[];
         tools: Extract<ChatBlock, { kind: "tool" }>[];
         thoughts: number;
-        finished: number;
       };
-  const isActivityRow = (item: RowItem) =>
-    item.t === "group" || item.block.kind === "thought" || item.block.kind === "finished";
+  const isActivityRow = (item: RowItem): item is ActivityRow =>
+    item.t === "group" || item.block.kind === "thought";
   const renderItems = $derived.by((): RenderItem[] => {
     const items: RowItem[] = [];
     let group: Extract<RowItem, { t: "group" }> | null = null;
@@ -1564,32 +1569,30 @@
     const spans = foldSpans(
       items,
       isActivityRow,
-      (item) => item.t === "single" && item.block.kind === "message",
+      (item) =>
+        item.t === "single" && (item.block.kind === "message" || item.block.kind === "finished"),
     );
     if (spans.length === 0) return items;
     const folded: RenderItem[] = [];
     let at = 0;
     for (const [start, end] of spans) {
       folded.push(...items.slice(at, start));
-      const run = items.slice(start, end);
+      // Every row in a span is an activity row; the filter only narrows.
+      const run = items.slice(start, end).filter(isActivityRow);
       const first = run[0];
       const last = run[run.length - 1];
       const fold: Extract<RenderItem, { t: "fold" }> = {
         t: "fold",
-        key: `f-${first.key}`,
+        // Keyed by the row that settled it: the run's own first row can
+        // change under a page trim or a history prepend, the closer cannot.
+        key: `f-${items[end].key}`,
         index: first.index,
         endIndex: last.t === "group" ? last.endIndex : last.index,
         uid: first.t === "group" ? first.tools[0].uid : first.block.uid,
         items: run,
-        tools: [],
-        thoughts: 0,
-        finished: 0,
+        tools: run.flatMap((item) => (item.t === "group" ? item.tools : [])),
+        thoughts: run.filter((item) => item.t === "single").length,
       };
-      for (const item of run) {
-        if (item.t === "group") fold.tools.push(...item.tools);
-        else if (item.block.kind === "thought") fold.thoughts++;
-        else fold.finished++;
-      }
       folded.push(fold);
       at = end;
     }
@@ -1725,7 +1728,7 @@
         </button>
       {/if}
     {/if}
-    {#snippet activityRow(item: RowItem)}
+    {#snippet activityRow(item: ActivityRow)}
       {#if item.t === "group"}
         <ToolGroup
           tools={item.tools}
@@ -1737,7 +1740,7 @@
           onBackground={agentKind === "claude" ? backgroundTool : undefined}
           onStopTask={agentKind === "claude" ? stopTask : undefined}
         />
-      {:else if item.block.kind === "thought"}
+      {:else}
         {@const live = store.running && item.block.uid === lastInlineUid}
         <details class="thought activity" data-block-index={item.index} data-block-uid={item.block.uid}>
           <summary title="show the agent's reasoning">
@@ -1747,16 +1750,6 @@
           </summary>
           <div class="thought-body">{item.block.text}</div>
         </details>
-      {:else if item.block.kind === "finished"}
-        <FinishedRow
-          block={item.block}
-          {visible}
-          {onOpenFile}
-          onOpenPath={openProsePath}
-          resolvePaths={resolveProsePaths}
-          sourceIndex={item.index}
-          sourceUid={item.block.uid}
-        />
       {/if}
     {/snippet}
     {#each renderItems as item (item.key)}
@@ -1764,7 +1757,6 @@
         <ActivityFold
           tools={item.tools}
           thoughts={item.thoughts}
-          finished={item.finished}
           steps={item.items.length}
           {visible}
           sourceIndex={item.index}
@@ -1775,8 +1767,7 @@
             {@render activityRow(row)}
           {/each}
         </ActivityFold>
-      {:else if item.t === "group" || item.block.kind === "thought" || item.block.kind === "finished"}
-        <!-- isActivityRow, spelled out so the branches below narrow to a single. -->
+      {:else if isActivityRow(item)}
         {@render activityRow(item)}
       {:else if item.block.kind === "user"}
         {@const block = item.block}
@@ -1868,6 +1859,16 @@
             />
           </div>
         {/if}
+      {:else if item.block.kind === "finished"}
+        <FinishedRow
+          block={item.block}
+          {visible}
+          {onOpenFile}
+          onOpenPath={openProsePath}
+          resolvePaths={resolveProsePaths}
+          sourceIndex={item.index}
+          sourceUid={item.block.uid}
+        />
       {:else if item.block.kind === "wake"}
         <div class="wake activity" data-block-index={item.index} data-block-uid={item.block.uid}>
           <svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true"
