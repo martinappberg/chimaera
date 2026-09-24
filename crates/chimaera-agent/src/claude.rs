@@ -32,11 +32,11 @@ use crate::driver::{
     SpawnSpec, INTERRUPT_GRACE_TICKS,
 };
 use crate::model::{
-    cap_head_tail, cap_output, truncate_label, AgentCommand, AgentEvent, BackgroundTask,
-    BackgroundTaskClose, ChunkKind, Coalescer, CompactionPhase, ContentBlock, ModeInfo,
-    PermissionOption, PermissionOptionKind, PlanEntry, PlanStatus, SlashCommand, ToolContent,
-    ToolKind, ToolStatus, Usage, UsageWindow, UserMessageState, WorkflowAgent, BG_LABEL_MAX,
-    BG_PATH_MAX, BG_TASKS_CAP, COMMAND_ID_MAX, DIFF_FILE_BUDGET, DIFF_TURN_BUDGET,
+    cap_head_tail, cap_output, fmt_elapsed_secs, truncate_label, AgentCommand, AgentEvent,
+    BackgroundTask, BackgroundTaskClose, ChunkKind, Coalescer, CompactionPhase, ContentBlock,
+    ModeInfo, PermissionOption, PermissionOptionKind, PlanEntry, PlanStatus, SlashCommand,
+    ToolContent, ToolKind, ToolStatus, Usage, UsageWindow, UserMessageState, WorkflowAgent,
+    BG_LABEL_MAX, BG_PATH_MAX, BG_TASKS_CAP, COMMAND_ID_MAX, DIFF_FILE_BUDGET, DIFF_TURN_BUDGET,
     PLAN_BLOCKED_CAP, PLAN_DESC_MAX, PLAN_LABEL_MAX, PLAN_TASKS_CAP, SLASH_COMMANDS_CAP,
     SLASH_DESCRIPTION_MAX, SLASH_NAME_MAX, STATUS_DETAIL_MAX, SUBAGENT_RESULT_MAX,
     TOOL_SUMMARY_IDS_CAP, TOOL_SUMMARY_MAX, WF_AGENTS_CAP, WF_AGENTS_SET_BUDGET,
@@ -787,6 +787,12 @@ struct ClaudeMapper {
     /// base the live `TurnTokens` counter adds the thinking estimate to.
     /// Reset per turn like `thinking_emitted`.
     turn_output_tokens: u64,
+    /// The running API call's thinking estimate: blocks already closed in
+    /// this call (`estimated_tokens` restarts per block) plus the open one.
+    call_thinking_base: u64,
+    block_thinking_estimate: u64,
+    /// Last `TurnTokens` journaled (the live counter's throttle).
+    turn_tokens_emitted: u64,
     /// Last `ActivityLine` journaled (repeats of the CLI's line are dropped).
     activity_line: Option<String>,
     /// `system/status` starts/settles compaction while compact_boundary also
@@ -924,6 +930,9 @@ impl ClaudeMapper {
             last_msg_uuid: None,
             thinking_emitted: 0,
             turn_output_tokens: 0,
+            call_thinking_base: 0,
+            block_thinking_estimate: 0,
+            turn_tokens_emitted: 0,
             activity_line: None,
             compaction_active: false,
             compaction_completed: false,
@@ -1505,12 +1514,21 @@ impl ClaudeMapper {
             // so the status row never claims "starting" through a think.
             Some("thinking_tokens") => {
                 let tokens = frame["estimated_tokens"].as_u64().unwrap_or(0);
+                // The estimate is per thinking block: a drop means a new
+                // block in the same call — bank the closed one's total.
+                if tokens < self.block_thinking_estimate {
+                    self.call_thinking_base += self.block_thinking_estimate;
+                    self.thinking_emitted = 0;
+                }
+                self.block_thinking_estimate = tokens;
                 if tokens >= self.thinking_emitted + 256 || self.thinking_emitted == 0 {
                     self.thinking_emitted = tokens.max(1);
                     step.events.push(AgentEvent::ThinkingTokens { tokens });
-                    step.events.push(AgentEvent::TurnTokens {
-                        output: self.turn_output_tokens + tokens,
-                    });
+                }
+                let live = self.turn_output_tokens + self.call_thinking_base + tokens;
+                if live >= self.turn_tokens_emitted + 256 || self.turn_tokens_emitted == 0 {
+                    self.turn_tokens_emitted = live.max(1);
+                    step.events.push(AgentEvent::TurnTokens { output: live });
                 }
             }
             // Post-turn status line `{status_category, status_detail,
@@ -2104,8 +2122,12 @@ impl ClaudeMapper {
                 if let Some(n) = event["usage"]["output_tokens"].as_u64().filter(|n| *n > 0) {
                     self.ensure_turn(step);
                     self.turn_output_tokens = self.turn_output_tokens.saturating_add(n);
-                    // The next thinking block's estimate restarts from zero.
+                    // The call's real count supersedes its thinking estimate;
+                    // the next call's blocks estimate from zero.
                     self.thinking_emitted = 0;
+                    self.call_thinking_base = 0;
+                    self.block_thinking_estimate = 0;
+                    self.turn_tokens_emitted = self.turn_output_tokens;
                     step.events.push(AgentEvent::TurnTokens {
                         output: self.turn_output_tokens,
                     });
@@ -2114,8 +2136,7 @@ impl ClaudeMapper {
             Some("content_block_start") => {
                 // Blocks never interleave: a block still undecided here lost
                 // its signature — it was reasoning as far as anyone can tell.
-                self.release_thinking(ChunkKind::Thought, step);
-                self.thinking_route = None;
+                self.end_thinking_block(step);
                 // A later text/thinking block in a turn owes the paragraph
                 // break its boundary represents. break_paragraph only MARKS —
                 // the coalescer materializes the break with the block's first
@@ -2185,11 +2206,17 @@ impl ClaudeMapper {
                 }
             }
             Some("content_block_stop") => {
-                self.release_thinking(ChunkKind::Thought, step);
-                self.thinking_route = None;
+                self.end_thinking_block(step);
             }
             _ => {}
         }
+    }
+
+    /// Close the open thinking block: an undecided one was reasoning as far
+    /// as anyone can tell, and the next block starts unrouted.
+    fn end_thinking_block(&mut self, step: &mut DriverStep) {
+        self.release_thinking(ChunkKind::Thought, step);
+        self.thinking_route = None;
     }
 
     /// Release the undecided thinking block's held text down `route`, which
@@ -2983,8 +3010,7 @@ impl ClaudeMapper {
     }
 
     fn on_result(&mut self, frame: &Value, step: &mut DriverStep) {
-        self.release_thinking(ChunkKind::Thought, step);
-        self.thinking_route = None;
+        self.end_thinking_block(step);
         if let Some(flushed) = self.coalescer.flush() {
             step.events.push(flushed);
         }
@@ -3021,6 +3047,9 @@ impl ClaudeMapper {
         self.monitor_tools.clear();
         self.thinking_emitted = 0;
         self.turn_output_tokens = 0;
+        self.call_thinking_base = 0;
+        self.block_thinking_estimate = 0;
+        self.turn_tokens_emitted = 0;
         self.activity_line = None;
         // A real result is the turn end — disarm the interrupt watchdog (the
         // interrupt's own is_error result lands here too, so a genuine turn is
@@ -3759,8 +3788,7 @@ impl ClaudeMapper {
             // Interrupt while idle is a CLI no-op — nothing to abort.
             return step;
         }
-        self.release_thinking(ChunkKind::Thought, &mut step);
-        self.thinking_route = None;
+        self.end_thinking_block(&mut step);
         if let Some(flushed) = self.coalescer.flush() {
             step.events.push(flushed);
         }
@@ -3777,6 +3805,9 @@ impl ClaudeMapper {
         self.monitor_tools.clear();
         self.thinking_emitted = 0;
         self.turn_output_tokens = 0;
+        self.call_thinking_base = 0;
+        self.block_thinking_estimate = 0;
+        self.turn_tokens_emitted = 0;
         self.activity_line = None;
         step.events.push(AgentEvent::TurnAborted {
             turn_id,
@@ -4488,16 +4519,6 @@ fn subagent_stats(usage: &Value) -> Option<String> {
     .flatten()
     .collect();
     (!parts.is_empty()).then(|| parts.join(" · "))
-}
-
-fn fmt_elapsed_secs(s: u64) -> String {
-    if s >= 3600 {
-        format!("{}h {:02}m {:02}s", s / 3600, (s % 3600) / 60, s % 60)
-    } else if s >= 60 {
-        format!("{}m {:02}s", s / 60, s % 60)
-    } else {
-        format!("{s}s")
-    }
 }
 
 pub(crate) fn tool_title(name: &str, input: &Value) -> String {
@@ -8608,6 +8629,12 @@ pub(crate) mod tests {
         }));
         assert_eq!(tokens(&thinking), Some(480));
         assert_eq!(tokens(&m.on_frame(&delta(420))), Some(600));
+        // Two thinking blocks in one call: the first block's estimate stays
+        // banked when the second restarts from zero.
+        let est = |n: u64| json!({ "type": "system", "subtype": "thinking_tokens", "estimated_tokens": n });
+        assert_eq!(tokens(&m.on_frame(&est(1000))), Some(1600));
+        assert_eq!(tokens(&m.on_frame(&est(50))), None, "throttled");
+        assert_eq!(tokens(&m.on_frame(&est(400))), Some(2000));
     }
 
     #[test]

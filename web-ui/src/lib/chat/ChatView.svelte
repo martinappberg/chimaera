@@ -23,6 +23,7 @@
   import UserText from "./UserText.svelte";
   import ToolGroup from "./ToolGroup.svelte";
   import FinishedRow from "./FinishedRow.svelte";
+  import { backgroundKind } from "./backgroundKinds";
   import AgentsTray from "./AgentsTray.svelte";
   import BackgroundTray from "./BackgroundTray.svelte";
   import WorkTray from "../shared/WorkTray.svelte";
@@ -1356,9 +1357,15 @@
    *  (commands, monitors, backgrounded agents; housekeeping excluded). A
    *  backgrounded agent's launch row completed at launch, so it is counted
    *  once — by the set. */
-  const runningTasks = $derived(
-    store.activeAgents.length + store.backgroundTasks.filter((t) => !t.ambient).length,
-  );
+  const runningTasks = $derived.by(() => {
+    // A foreground agent moved to the background (Ctrl-B) is still its live
+    // row AND now an agent lane — count it once.
+    const rows = new Set(store.activeAgents.map((a) => a.title.replace(/^(Agent|Task): /, "")));
+    const lanes = store.backgroundTasks.filter(
+      (t) => !t.ambient && !(backgroundKind(t) === "agent" && rows.has(t.description)),
+    );
+    return store.activeAgents.length + lanes.length;
+  });
 
   // Elapsed-turn timer: a quiet counter that surfaces once a turn passes 5s and
   // ticks each second. The START is held in the chat pool (per session), so

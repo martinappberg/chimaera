@@ -207,8 +207,8 @@ use crate::driver::{
     SpawnSpec, IDLE_FLUSH_GRACE_TICKS, INTERRUPT_GRACE_TICKS,
 };
 use crate::model::{
-    cap_output, truncate_label, AgentCommand, AgentEvent, ChunkKind, Coalescer, CompactionPhase,
-    ContentBlock, PermissionOption, PermissionOptionKind, RemoteControlSnapshot,
+    cap_output, fmt_elapsed_secs, truncate_label, AgentCommand, AgentEvent, ChunkKind, Coalescer,
+    CompactionPhase, ContentBlock, PermissionOption, PermissionOptionKind, RemoteControlSnapshot,
     RemoteControlState, SlashCommand, ToolContent, ToolKind, ToolStatus, Usage, UserMessageState,
     BG_LABEL_MAX, SKILL_PATH_MAX, SLASH_COMMANDS_CAP, SLASH_DESCRIPTION_MAX, SLASH_NAME_MAX,
     SUBAGENT_RESULT_MAX,
@@ -4444,18 +4444,6 @@ impl Mapper for CodexMapper {
         step.events.extend(flush.events);
         step.outbound.extend(flush.outbound);
         step
-    }
-}
-
-/// Elapsed seconds in the client's ladder ("45s", "2m 03s", "1h 02m 03s") —
-/// the same spelling claude.rs gives its subagent finish lines.
-fn fmt_elapsed_secs(s: u64) -> String {
-    if s >= 3600 {
-        format!("{}h {:02}m {:02}s", s / 3600, (s % 3600) / 60, s % 60)
-    } else if s >= 60 {
-        format!("{}m {:02}s", s / 60, s % 60)
-    } else {
-        format!("{s}s")
     }
 }
 

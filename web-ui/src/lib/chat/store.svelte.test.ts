@@ -1612,6 +1612,17 @@ describe("ChatStore wake markers (turns nobody typed)", () => {
     expect(store.blocks.some((b) => b.kind === "wake")).toBe(false);
   });
 
+  it("retracts the marker when the message-less turn is a compaction", () => {
+    const store = fold([
+      { type: "user_message", text: "go", attachments: 0 },
+      { type: "turn_started", turn_id: "t1" },
+      { type: "turn_completed", turn_id: "t1", usage: {} },
+      { type: "turn_started", turn_id: "t2" },
+      { type: "context_compaction", phase: "started" },
+    ]);
+    expect(store.blocks.some((b) => b.kind === "wake")).toBe(false);
+  });
+
   it("says 'resumed on its own' when nothing is live", () => {
     const store = fold([
       { type: "user_message", text: "go", attachments: 0 },

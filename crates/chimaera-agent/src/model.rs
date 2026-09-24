@@ -1295,6 +1295,18 @@ pub fn cap_output(text: &str) -> (String, bool) {
 /// One-line label truncation with a plain ellipsis — for tool titles and
 /// command previews, where the head/tail "[N bytes omitted]" marker of
 /// [`cap_head_tail`] would be noise. Respects char boundaries.
+/// Elapsed seconds in the client's ladder ("45s", "2m 03s", "1h 02m 03s") —
+/// one spelling for both drivers' progress and finish lines.
+pub fn fmt_elapsed_secs(s: u64) -> String {
+    if s >= 3600 {
+        format!("{}h {:02}m {:02}s", s / 3600, (s % 3600) / 60, s % 60)
+    } else if s >= 60 {
+        format!("{}m {:02}s", s / 60, s % 60)
+    } else {
+        format!("{s}s")
+    }
+}
+
 pub fn truncate_label(text: &str, max: usize) -> String {
     if text.len() <= max {
         return text.to_string();

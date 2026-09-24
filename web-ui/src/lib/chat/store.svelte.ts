@@ -1312,6 +1312,13 @@ export class ChatStore {
         const phase = ev.phase as string;
         if (phase === "started") {
           this.compacting = true;
+          // A compaction runs as its own message-less turn (codex /compact):
+          // the agent did not wake on its own, so retract the marker its
+          // turn_started just placed.
+          if (this.blocks.at(-1)?.kind === "wake") {
+            this.blocks.pop();
+            this.touchTranscript();
+          }
         } else {
           this.compacting = false;
           if (phase === "completed") {
