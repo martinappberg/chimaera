@@ -525,6 +525,17 @@ fn run_showcase_turn() {
     stream(json!({ "type": "message_delta", "usage": { "output_tokens": 180 } }));
     tool_result("tu-ls", "a.txt\nb.txt");
 
+    // A second reasoning step and call before the narration: the run of
+    // activity lines that the reply after it folds away.
+    stream(json!({ "type": "message_start", "message": { "id": "ms-1b" } }));
+    stream_thinking(
+        "ms-1b",
+        "Both names look like plain text; peeking at one before measuring.",
+        "thinking",
+    );
+    tool_use("ms-1b", "tu-read", "Read", json!({ "file_path": "a.txt" }));
+    tool_result("tu-read", "hello\n");
+
     stream(json!({ "type": "message_start", "message": { "id": "ms-2" } }));
     stream_thinking(
         "ms-2",

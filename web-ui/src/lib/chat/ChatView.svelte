@@ -23,6 +23,8 @@
   import UserText from "./UserText.svelte";
   import ToolGroup from "./ToolGroup.svelte";
   import FinishedRow from "./FinishedRow.svelte";
+  import ActivityFold from "./ActivityFold.svelte";
+  import { foldSpans } from "./activityFold";
   import { backgroundKind } from "./backgroundKinds";
   import AgentsTray from "./AgentsTray.svelte";
   import BackgroundTray from "./BackgroundTray.svelte";
@@ -1501,10 +1503,11 @@
   );
 
   /** Render list for the bounded page: consecutive tool blocks coalesce into
-   *  one ToolGroup. Visible tail rows are live proxies; hidden/history rows
-   *  are inert snapshots. Every item carries its absolute source index for
-   *  scroll anchoring and boundary-sensitive actions. */
-  type RenderItem =
+   *  one ToolGroup, and a settled run of activity rows folds under the reply
+   *  that followed it (activityFold.ts). Visible tail rows are live proxies;
+   *  hidden/history rows are inert snapshots. Every item carries its absolute
+   *  source index for scroll anchoring and boundary-sensitive actions. */
+  type RowItem =
     | {
         t: "group";
         key: string;
@@ -1513,9 +1516,29 @@
         tools: Extract<ChatBlock, { kind: "tool" }>[];
       }
     | { t: "single"; key: string; index: number; block: ChatBlock };
-  const renderItems = $derived.by(() => {
-    const items: RenderItem[] = [];
-    let group: Extract<RenderItem, { t: "group" }> | null = null;
+  /** The rows a fold absorbs. Finished-work lines never fold: they are
+   *  results (and a woken turn's only stated cause), so they stay in view and
+   *  settle the run above them the way a reply does. */
+  type ActivityRow =
+    | Extract<RowItem, { t: "group" }>
+    | { t: "single"; key: string; index: number; block: Extract<ChatBlock, { kind: "thought" }> };
+  type RenderItem =
+    | RowItem
+    | {
+        t: "fold";
+        key: string;
+        index: number;
+        endIndex: number;
+        uid: number;
+        items: ActivityRow[];
+        tools: Extract<ChatBlock, { kind: "tool" }>[];
+        thoughts: number;
+      };
+  const isActivityRow = (item: RowItem): item is ActivityRow =>
+    item.t === "group" || item.block.kind === "thought";
+  const renderItems = $derived.by((): RenderItem[] => {
+    const items: RowItem[] = [];
+    let group: Extract<RowItem, { t: "group" }> | null = null;
     renderBlocks.forEach((block, i) => {
       const originalIndex = renderStart + i;
       // Every user block in `blocks` is delivered — queued/undelivered sends
@@ -1543,7 +1566,38 @@
         items.push({ t: "single", key: `b-${block.uid}`, index: originalIndex, block });
       }
     });
-    return items;
+    const spans = foldSpans(
+      items,
+      isActivityRow,
+      (item) =>
+        item.t === "single" && (item.block.kind === "message" || item.block.kind === "finished"),
+    );
+    if (spans.length === 0) return items;
+    const folded: RenderItem[] = [];
+    let at = 0;
+    for (const [start, end] of spans) {
+      folded.push(...items.slice(at, start));
+      // Every row in a span is an activity row; the filter only narrows.
+      const run = items.slice(start, end).filter(isActivityRow);
+      const first = run[0];
+      const last = run[run.length - 1];
+      const fold: Extract<RenderItem, { t: "fold" }> = {
+        t: "fold",
+        // Keyed by the row that settled it: the run's own first row can
+        // change under a page trim or a history prepend, the closer cannot.
+        key: `f-${items[end].key}`,
+        index: first.index,
+        endIndex: last.t === "group" ? last.endIndex : last.index,
+        uid: first.t === "group" ? first.tools[0].uid : first.block.uid,
+        items: run,
+        tools: run.flatMap((item) => (item.t === "group" ? item.tools : [])),
+        thoughts: run.filter((item) => item.t === "single").length,
+      };
+      folded.push(fold);
+      at = end;
+    }
+    folded.push(...items.slice(at));
+    return folded;
   });
 
   /** A finished turn's duration, kept out of the page (the live elapsed on
@@ -1674,7 +1728,7 @@
         </button>
       {/if}
     {/if}
-    {#each renderItems as item (item.key)}
+    {#snippet activityRow(item: ActivityRow)}
       {#if item.t === "group"}
         <ToolGroup
           tools={item.tools}
@@ -1686,6 +1740,35 @@
           onBackground={agentKind === "claude" ? backgroundTool : undefined}
           onStopTask={agentKind === "claude" ? stopTask : undefined}
         />
+      {:else}
+        {@const live = store.running && item.block.uid === lastInlineUid}
+        <details class="thought activity" data-block-index={item.index} data-block-uid={item.block.uid}>
+          <summary title="show the agent's reasoning">
+            <span class="thought-title" class:live>{live ? "Thinking" : "Thought"}</span>
+            <span class="thought-preview">{thoughtPreview(item.block.text)}</span>
+            <Chevron />
+          </summary>
+          <div class="thought-body">{item.block.text}</div>
+        </details>
+      {/if}
+    {/snippet}
+    {#each renderItems as item (item.key)}
+      {#if item.t === "fold"}
+        <ActivityFold
+          tools={item.tools}
+          thoughts={item.thoughts}
+          steps={item.items.length}
+          {visible}
+          sourceIndex={item.index}
+          sourceEnd={item.endIndex}
+          sourceUid={item.uid}
+        >
+          {#each item.items as row (row.key)}
+            {@render activityRow(row)}
+          {/each}
+        </ActivityFold>
+      {:else if isActivityRow(item)}
+        {@render activityRow(item)}
       {:else if item.block.kind === "user"}
         {@const block = item.block}
         <!-- Only delivered (sent) user messages render inline; queued/dropped
@@ -1763,16 +1846,6 @@
             turnDuration={turnDurations.get(item.block.uid) ?? null}
           />
         </div>
-      {:else if item.block.kind === "thought"}
-        {@const live = store.running && item.block.uid === lastInlineUid}
-        <details class="thought activity" data-block-index={item.index} data-block-uid={item.block.uid}>
-          <summary title="show the agent's reasoning">
-            <span class="thought-title" class:live>{live ? "Thinking" : "Thought"}</span>
-            <span class="thought-preview">{thoughtPreview(item.block.text)}</span>
-            <Chevron />
-          </summary>
-          <div class="thought-body">{item.block.text}</div>
-        </details>
       {:else if item.block.kind === "question"}
         <!-- The transcript's memory of an ask: invisible while the pending
              overlay below is the answerable card, a quiet question+answer

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { toolGroupTitle, type LabelledTool } from "./toolLabels";
+import { toolGroupTitle, toolRunHealth, type HealthTool, type LabelledTool } from "./toolLabels";
 
 function tool(kind: string, over: Partial<LabelledTool> = {}): LabelledTool {
   return { tool: kind, status: "completed", locations: [], summary: null, ...over };
@@ -56,5 +56,39 @@ describe("toolGroupTitle", () => {
         tool("execute", { status: "in_progress" }),
       ]),
     ).toBe("Listed files · running a command");
+  });
+});
+
+describe("toolRunHealth", () => {
+  function call(over: Partial<HealthTool> = {}): HealthTool {
+    return { tool: "edit", title: "Edit a.rs", status: "completed", locations: [], denied: false, ...over };
+  }
+
+  it("is clean when nothing failed", () => {
+    expect(toolRunHealth([call(), call({ status: "in_progress" })])).toBeNull();
+  });
+
+  it("recovers a failure a later same-target call completed", () => {
+    expect(
+      toolRunHealth([
+        call({ status: "failed", locations: ["/a.rs"] }),
+        call({ locations: ["/a.rs"] }),
+      ]),
+    ).toBe("recovered");
+    expect(toolRunHealth([call({ status: "failed" }), call()])).toBe("recovered");
+  });
+
+  it("stays failed when the retry hit another target or came first", () => {
+    expect(
+      toolRunHealth([
+        call({ status: "failed", locations: ["/a.rs"] }),
+        call({ locations: ["/b.rs"] }),
+      ]),
+    ).toBe("failed");
+    expect(toolRunHealth([call(), call({ status: "failed" })])).toBe("failed");
+  });
+
+  it("never recovers a denial", () => {
+    expect(toolRunHealth([call({ denied: true, status: "failed" }), call()])).toBe("failed");
   });
 });

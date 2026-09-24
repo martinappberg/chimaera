@@ -63,7 +63,8 @@ const KINDS: { kind: string; done: Phrase; live: Phrase }[] = [
 
 const KNOWN = new Set(KINDS.map((k) => k.kind).filter((k) => k !== "other"));
 
-function isLive(t: LabelledTool): boolean {
+/** Still running — said in the present tense, and a live dot on its line. */
+export function isLive(t: { status: string }): boolean {
   return t.status === "pending" || t.status === "in_progress";
 }
 
@@ -106,8 +107,36 @@ export function countPhrase(tools: LabelledTool[]): string {
   return parts.join(", ");
 }
 
-function capitalize(s: string): string {
+export function capitalize(s: string): string {
   return s.length > 0 ? s[0].toUpperCase() + s.slice(1) : s;
+}
+
+/** The fields of a tool row its run's health reads. */
+export interface HealthTool {
+  tool: string;
+  title: string;
+  status: string;
+  locations: string[];
+  denied: boolean;
+}
+
+/** A run's failure badge. A failure is RECOVERED when a later call of the
+ *  same tool against the same target completed (the read-before-write dance,
+ *  a retried command) — a net-success run shouldn't wear the hard red badge.
+ *  Presentation only: the failed row inside still shows its own error.
+ *  Denials never recover (the user said no); a failure with no matching
+ *  later success stays hard. */
+export function toolRunHealth(tools: HealthTool[]): "failed" | "recovered" | null {
+  const failed = tools.some((t, i) => {
+    if (t.denied) return true;
+    if (t.status !== "failed") return false;
+    const sameTarget = (s: HealthTool) =>
+      s.tool === t.tool &&
+      (t.locations.length > 0 ? s.locations.some((l) => t.locations.includes(l)) : s.title === t.title);
+    return !tools.some((s, j) => j > i && s.status === "completed" && !s.denied && sameTarget(s));
+  });
+  if (failed) return "failed";
+  return tools.some((t) => t.status === "failed" || t.denied) ? "recovered" : null;
 }
 
 export function toolGroupTitle(tools: LabelledTool[]): string {
