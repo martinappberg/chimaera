@@ -166,6 +166,10 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
     a monitor's end; each links its output file.
   - **Wake markers** — a turn nobody typed (a monitor event, a scheduled wake-up) is marked "Woke
     on a monitor event · “…”" / "Resumed on its own", unless a finished row already shows why.
+  - **Folded runs** — once a reply follows them, two or more activity lines in a row (thoughts,
+    tool groups, finished work) fold into one line above it — "Thought, ran 6 commands, read 2
+    files ›" — that expands to the original rows. The trailing run stays open while the agent
+    works, so live progress is always in view; a hard failure inside shows on the folded line.
 - **Interim prose is prose.** Opus 5.5+ ships the sentences it writes between tool calls as
   server-summarized `thinking` blocks tagged `narration` in their signature; the driver classifies
   each block (the `narration_block_indexes` wrapper, else the decoded signature) and renders
@@ -708,6 +712,6 @@ _Captured 2026-09-23 (from the maintainer, in-session)._
 
 - **Problem it solves:** "The 'interim' messages dont really come through… it is like they are hidden in the thoughts" — Opus 5.5's between-tool prose landed in collapsed thinking. More broadly: "make sure we capture everything that is in their UI properly", including "the small 'highlight' notes and when subagents etc. are finished (for both GPT and Claude)", and "background tasks and monitors, I want those to be nice and accurate so it is clear to see". The live line should say how the turn is going ("something like this that is accurate": elapsed · tokens · running tasks · activity), and a running monitor should read as the session waiting on something, "so it feels more interactive".
 - **How settled it is (intended vs provisional):** an **addition, improvable** — deliberate today, open to change if improved; nothing here is a locked contract.
-- **Deliberate choices voiced while building it:** the new rows must not "take over the actual messages" — prose leads and the activity lines stay quiet (balance is the goal, the exact styling is not). A finished turn's duration was judged unnecessary on the page ("It is just important to know how long the current turn has been going on"), so only the live elapsed shows. The "wakes on each event" hint was dropped as unnecessary.
+- **Deliberate choices voiced while building it:** the new rows must not "take over the actual messages" — prose leads and the activity lines stay quiet (balance is the goal, the exact styling is not). A finished turn's duration was judged unnecessary on the page ("It is just important to know how long the current turn has been going on"), so only the live elapsed shows. The "wakes on each event" hint was dropped as unnecessary. The thought and tool lines above a reply fold into one once the reply has come ("To not clutter, and can be expanded if the user wants to").
 - **Open / known limits:** Claude never puts a monitor event's text on stdout, so a monitor-woken turn names the watch, not the event.
 - **Do not change (or: open to change):** open to change.

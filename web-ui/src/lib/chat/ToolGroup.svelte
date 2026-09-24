@@ -1,8 +1,8 @@
 <script lang="ts">
-  import Chevron from "../shared/Chevron.svelte";
+  import ActivitySummary from "./ActivitySummary.svelte";
   import type { ChatBlock } from "./store.svelte";
   import ToolCallCard from "./ToolCallCard.svelte";
-  import { toolGroupTitle } from "./toolLabels";
+  import { toolGroupTitle, toolRunHealth } from "./toolLabels";
 
   /**
    * A run of consecutive tool calls, condensed. Collapsed it is one quiet
@@ -45,28 +45,8 @@
   const running = $derived(
     tools.some((t) => t.status === "in_progress" || t.status === "pending"),
   );
-  /** A failure is RECOVERED when a later call of the same tool against the
-   *  same target completed (the read-before-write dance, a retried command) —
-   *  a net-success run shouldn't wear the hard red badge. Presentation only:
-   *  the failed row inside still shows its own error. Denials never recover
-   *  (the user said no); a failure with no matching later success stays hard. */
-  const failed = $derived.by(() =>
-    tools.some((t, i) => {
-      if (t.denied) return true;
-      if (t.status !== "failed") return false;
-      const sameTarget = (s: (typeof tools)[number]) =>
-        s.tool === t.tool &&
-        (t.locations.length > 0
-          ? s.locations.some((l) => t.locations.includes(l))
-          : s.title === t.title);
-      return !tools.some(
-        (s, j) => j > i && s.status === "completed" && !s.denied && sameTarget(s),
-      );
-    }),
-  );
-  const recovered = $derived(
-    !failed && tools.some((t) => t.status === "failed" || t.denied),
-  );
+  /** Failed / recovered badge — see toolLabels.ts. */
+  const health = $derived(toolRunHealth(tools));
 
   /** Tool history is opt-in detail. Running and failure state remain visible
    *  in the summary badge, while an explicit user toggle persists as rows
@@ -80,30 +60,20 @@
 
 <div
   class="group activity"
-  class:failed
-  class:running
   class:visible
   data-block-index={sourceIndex}
   data-block-end={sourceEnd}
   data-block-uid={sourceUid}
 >
-  <button
-    class="summary"
-    aria-expanded={open}
-    onclick={() => (open = !open)}
-    title={open ? "hide tool activity" : `show tool activity — ${tools.length} call${tools.length === 1 ? "" : "s"}`}
-  >
-    {#if running}
-      <span class="live-dot" aria-hidden="true"></span>
-    {/if}
-    <span class="label">{title}</span>
-    {#if failed}
-      <span class="badge bad">failed</span>
-    {:else if recovered}
-      <span class="badge soft">recovered</span>
-    {/if}
-    <Chevron {open} />
-  </button>
+  <ActivitySummary
+    label={title}
+    {open}
+    tooltip={open ? "hide tool activity" : `show tool activity — ${tools.length} call${tools.length === 1 ? "" : "s"}`}
+    {running}
+    {health}
+    {visible}
+    onToggle={() => (open = !open)}
+  />
   {#if open}
     <div class="rows">
       {#each tools as tool (tool.id)}
@@ -131,91 +101,6 @@
     .group {
       animation: none;
     }
-  }
-  /* A quiet line, not a card: the Claude/Codex apps render tool runs as a
-     muted sentence with a trailing chevron, so prose stays the page's voice. */
-  .summary {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    max-width: 100%;
-    margin-left: -6px;
-    padding: 2px 6px;
-    background: none;
-    border: none;
-    border-radius: 6px;
-    color: var(--activity-fg, var(--muted));
-    font: inherit;
-    font-size: var(--text-xs);
-    line-height: 1.4;
-    text-align: left;
-    cursor: pointer;
-    transition:
-      background-color 0.12s ease,
-      color 0.12s ease;
-  }
-  .summary:hover,
-  .summary:focus-visible {
-    color: var(--fg);
-    background: color-mix(in srgb, var(--fg) 4%, transparent);
-  }
-  .summary :global(.chev) {
-    opacity: 0.55;
-  }
-  .summary:hover :global(.chev) {
-    opacity: 1;
-  }
-  .label {
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  /* Running: a small breathing dot instead of a badge (the title already
-     says what is running, in the present tense). */
-  .live-dot {
-    flex: none;
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
-    background: var(--accent);
-    animation: live-breathe 1.6s ease-in-out infinite;
-  }
-  @keyframes live-breathe {
-    0%,
-    100% {
-      opacity: 0.35;
-    }
-    50% {
-      opacity: 1;
-    }
-  }
-  :global(html.app-hidden) .live-dot,
-  .group:not(.visible) .live-dot {
-    animation-play-state: paused;
-  }
-  @media (prefers-reduced-motion: reduce) {
-    .live-dot {
-      animation: none;
-    }
-  }
-  .group.failed .summary {
-    color: color-mix(in srgb, var(--err) 80%, var(--muted));
-  }
-  .badge {
-    flex: none;
-    font-size: var(--text-xs);
-    padding: 0 6px;
-    border-radius: 999px;
-  }
-  .badge.bad {
-    color: var(--err);
-    background: color-mix(in srgb, var(--err) 12%, transparent);
-  }
-  /* Recovered: worth a glance, not an alarm. */
-  .badge.soft {
-    color: var(--muted);
-    background: color-mix(in srgb, var(--fg) 7%, transparent);
   }
   .rows {
     margin: 2px 0 6px 2px;
