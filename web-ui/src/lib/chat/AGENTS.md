@@ -224,8 +224,9 @@ per-chunk work proportional to the TRAILING OPEN SEGMENT, not the message:
   loops.
 - **Prose leads; activity lines follow.** Thought, tool-group, finished and wake rows share one
   quieter voice (12px, the column's `--activity-fg`, an `activity` class that ChatView clusters
-  tight) so agent messages stay the page's voice; an interim message floats its hover rail instead
-  of reserving a row. New transcript chrome joins that family rather than adding a new visual
+  tight) so agent messages stay the page's voice. A settled message's hover rail flows inline after
+  its last word (the `.md` shell is `display: contents`, a closing `<p>` goes inline — nothing
+  measures `.md`, keep it that way). New transcript chrome joins that family rather than adding a new visual
   weight. Wake markers are reducer-derived (`markWake`, pure over `blocks` + the live background
   set), so replay rebuilds them; the live status line reads `turnTokens` / `activityLine`.
 - **UI quality is an acceptance criterion.** Use the theme tokens (`--fg`,

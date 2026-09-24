@@ -1734,7 +1734,12 @@
           {/if}
         </div>
       {:else if item.block.kind === "message"}
-        <div class="msg agent" data-block-index={item.index} data-block-uid={item.block.uid}>
+        <div
+          class="msg agent"
+          class:streaming={store.running && item.block.uid === lastInlineUid}
+          data-block-index={item.index}
+          data-block-uid={item.block.uid}
+        >
           <!-- streaming is TURN state (this row is the streaming tail);
                visibility rides separately so hiding a tab mid-stream freezes
                the live segment DOM in place instead of paying a synchronous
@@ -2347,24 +2352,26 @@
     color: var(--err);
   }
   .msg.agent {
-    position: relative;
     padding: 2px 0;
   }
-  /* Interim prose (activity follows it) floats its hover rail over its own
-     bottom-right corner instead of reserving a row under every narration
-     line; the turn's closing message keeps the reserved rail. */
-  .column > .msg.agent:has(+ :global(.activity)) :global(.agent-message-meta) {
-    position: absolute;
-    right: 0;
-    bottom: 2px;
-    padding-left: 18px;
-    background: linear-gradient(to right, transparent, var(--term-bg) 18px);
-    opacity: 0;
-    transition: opacity 0.12s ease;
+  /* A settled message and its hover rail are one inline flow: the rail
+     follows the last word and takes a line of its own only when that line
+     is full — no row reserved under every message. The markdown shell is
+     layout-neutral (its children lay out here; inherited type still
+     applies) and a closing paragraph goes inline; any other closing block
+     (list, table, code) keeps its box, and the rail starts flush below it.
+     While streaming the rail has nothing to act on, so it takes no space. */
+  .msg.agent > :global(.md) {
+    display: contents;
   }
-  .column > .msg.agent:has(+ :global(.activity)):hover :global(.agent-message-meta),
-  .column > .msg.agent:has(+ :global(.activity)) :global(.agent-message-meta:focus-within) {
-    opacity: 1;
+  .msg.agent > :global(.md > p:last-child) {
+    display: inline;
+  }
+  .msg.agent:not(:has(> :global(.md > p:last-child))) :global(.agent-message-meta) {
+    margin-left: 0;
+  }
+  .msg.agent.streaming :global(.agent-message-meta) {
+    display: none;
   }
   /* Reasoning is secondary to prose: one quiet line (label + the first
      line of the thought, faded), the full text a click away — the same

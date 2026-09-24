@@ -547,7 +547,7 @@ async fn showcase_turn_maps_every_transcript_surface() {
         })
         .collect();
     assert!(
-        prose.contains("I'm handing the size check to a helper agent."),
+        prose.contains("I'm handing the size check to a helper agent"),
         "narration is prose: {prose:?}"
     );
     assert!(

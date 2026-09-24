@@ -528,7 +528,7 @@ fn run_showcase_turn() {
     stream(json!({ "type": "message_start", "message": { "id": "ms-2" } }));
     stream_thinking(
         "ms-2",
-        "There are two small text files. I'm handing the size check to a helper agent.",
+        "There are two small text files. I'm handing the size check to a helper agent, so this thread stays free to set up the background work that comes next.",
         "narration",
     );
     tool_use(
@@ -635,7 +635,7 @@ fn run_showcase_turn() {
     stream(json!({ "type": "message_start", "message": { "id": "ms-4" } }));
     stream_text(
         "ms-4",
-        "Both files are 6 bytes. The cache warm-up and the build-log watch keep running in the background.",
+        "Both files are 6 bytes; the cache warm-up and the build-log watch keep running in the background.\n\n- `a.txt` — 6 bytes\n- `b.txt` — 6 bytes",
     );
     stream(json!({ "type": "message_delta", "usage": { "output_tokens": 310 } }));
     emit(json!({ "type": "system", "subtype": "task_summary", "detail": null }));

@@ -198,8 +198,10 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   delimiters.
 - **Assistant message metadata + actions.** Hover an assistant message (or focus one of its actions)
   to reveal a slim rail directly below the prose: the journal-backed send time, copy-full-message,
-  and conversation-fork actions (an interim message — one followed by activity lines — floats the
-  rail over its own last line instead of reserving a row). The timestamp starts at `now`, advances through minute labels and
+  and conversation-fork actions. The rail flows inline right after the message's last word and
+  takes a line of its own only when that line is full (or the message ends in a list, table or
+  code block) — no row is reserved under every message; while a message streams it takes no
+  space at all. The timestamp starts at `now`, advances through minute labels and
   `1h ago`, then switches to the user's local hour cycle and calendar (`today`, `yesterday`, nearby
   weekday, dated time, and a year-bearing date for older calendar years). One view-level timer wakes
   only at the next label boundary rather than leaving an interval on every transcript row. Touch

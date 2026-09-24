@@ -44,7 +44,6 @@
 </script>
 
 <div class="agent-message-meta">
-  <span class="reveal">
   <time datetime={isoTime} title={fullTime}>{timeLabel}</time>
   <span class="actions">
     <button
@@ -105,30 +104,28 @@
       </svg>
     </button>
   </span>
-  </span>
 </div>
 
 <style>
+  /* Inline: the host flows it right after the message's last word, on a
+     new line only when that line is full (ChatView owns that layout). */
   .agent-message-meta {
-    min-height: 20px;
-    display: flex;
+    display: inline-flex;
     align-items: center;
     gap: 5px;
-    width: fit-content;
+    height: 20px;
+    margin-left: 0.6em;
+    vertical-align: middle;
     color: color-mix(in srgb, var(--muted) 78%, transparent);
     font-size: var(--text-xs);
     line-height: 1;
     font-variant-numeric: tabular-nums;
-  }
-  .reveal {
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
+    white-space: nowrap;
     opacity: 0;
     transition: opacity 0.12s ease;
   }
-  :global(.msg.agent:hover) .reveal,
-  .agent-message-meta:focus-within .reveal {
+  :global(.msg.agent:hover) .agent-message-meta,
+  .agent-message-meta:focus-within {
     opacity: 1;
   }
   time {
