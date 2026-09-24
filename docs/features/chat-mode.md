@@ -153,9 +153,30 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
 
 ## The transcript
 
-- **Content.** User bubbles (right), agent prose (left, markdown), collapsible "thinking · N chars"
-  blocks, per-turn duration rulers, plan/todo panel, tool cards, permission/question cards, inline
-  artifacts. A live activity row ("thinking · ~1.2k tokens / writing / <tool>") pulses while running.
+- **Content.** User bubbles (right), agent prose (left, markdown), plan/todo panel, permission/
+  question cards, inline artifacts — and, between the prose, one family of quiet 12px **activity
+  lines** that cluster tight so messages stay the page's voice:
+  - **Thought** — a collapsed reasoning block: "Thought" + a faded first line; click for the text.
+  - **Tool groups** — a run of tool calls as one line, titled by the agent's own past-tense batch
+    label when it offers one (Claude `tool_use_summary`: "Listed files in the workspace"; on by
+    default, `chat.toolSummaries`), else readable counts ("Ran 2 commands, read a file"); calls
+    still running read in the present tense with a breathing dot ("Running agent “…”").
+  - **Finished work** — "Agent “…” finished · 2 tools · 12.3k tokens · 4s" (click for its report),
+    a background command's own close sentence ('Background command "…" completed (exit code 0)'),
+    a monitor's end; each links its output file.
+  - **Wake markers** — a turn nobody typed (a monitor event, a scheduled wake-up) is marked "Woke
+    on a monitor event · “…”" / "Resumed on its own", unless a finished row already shows why.
+- **Interim prose is prose.** Opus 5.5+ ships the sentences it writes between tool calls as
+  server-summarized `thinking` blocks tagged `narration` in their signature; the driver classifies
+  each block (the `narration_block_indexes` wrapper, else the decoded signature) and renders
+  narration as ordinary agent prose — the way the Claude apps do — while real reasoning stays in
+  Thought lines. Codex's commentary messages already arrive as prose; Codex reasoning summaries are
+  now requested (`turn/start.summary: "auto"`, unless the user's config sets its own).
+- **Live status line.** While a turn runs: elapsed · output tokens this turn · running tasks
+  (subagents + background work) · what it is doing — the agent's own phrase when it offers one
+  (Claude `task_summary`, "Measuring file sizes…"), else Thinking / Writing / Running tools.
+  Finished turns keep their duration off the page (it is on the closing message's timestamp
+  tooltip).
 - **Stopping.** Esc (or the header stop chip) interrupts the running turn. A deliberate stop is
   not a failure: the abort event carries a structural `interrupted` flag set by the driver that
   issued the interrupt (claude's result string is free text and never said so), the transcript
@@ -177,7 +198,8 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   delimiters.
 - **Assistant message metadata + actions.** Hover an assistant message (or focus one of its actions)
   to reveal a slim rail directly below the prose: the journal-backed send time, copy-full-message,
-  and conversation-fork actions. The timestamp starts at `now`, advances through minute labels and
+  and conversation-fork actions (an interim message — one followed by activity lines — floats the
+  rail over its own last line instead of reserving a row). The timestamp starts at `now`, advances through minute labels and
   `1h ago`, then switches to the user's local hour cycle and calendar (`today`, `yesterday`, nearby
   weekday, dated time, and a year-bearing date for older calendar years). One view-level timer wakes
   only at the next label boundary rather than leaving an interval on every transcript row. Touch
@@ -266,16 +288,22 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   refusal lands an honest notice), and a running **Agent** (subagent) row offers a ■ stop
   (`stop_task`; the driver resolves the row id to the CLI's opaque task key). Codex has no
   equivalents — the buttons are omitted there.
-- **Background-work tray (claude).** Backgrounded Bash commands and workflows (`run_in_background`,
-  Ctrl-B parity, `/workflows`) get their own pinned monitor strip, sibling to the subagents tray:
-  collapsed to a one-line "N background tasks running" count, expandable to each task's description,
-  live elapsed (anchored on a driver-journaled start stamp, so replay shows honest ages), status,
-  and a ■ stop. Background work is **cross-turn** — the tray persists after the turn that started it
+- **Background-work tray (claude).** Backgrounded Bash commands, **Monitor watches**, backgrounded
+  agents and workflows (`run_in_background`, Ctrl-B parity, `/workflows`) get their own pinned strip,
+  sibling to the subagents tray. Collapsed, its header says exactly what is out — a watch by name,
+  everything else per kind ("Watching “build log” · 1 command in the background") — and doubles as the
+  session's "still waiting on something" signal between turns; expanded, each row shows its kind
+  (command / monitor / agent / workflow; ambient housekeeping dimmed), description, live elapsed
+  (anchored on a driver-journaled start stamp, so replay shows honest ages), status ("watching" for
+  a monitor), and a ■ stop. A Monitor rides the same `local_bash` lane as a backgrounded command;
+  the driver marks it from its launching tool call. Its events wake the agent but never cross the
+  wire (PROTOCOL.md Pass 31), so the transcript marks the unprompted turn instead. Background work is **cross-turn** — the tray persists after the turn that started it
   ends, and dies with the CLI process. Teardown clears its level-set, and every successful driver
   spawn journals the same empty set before its first event so a crash-tailed journal cannot revive
   dead work when the daemon resurrects a session. When a task settles, its verdict folds into the
-  transcript as a quiet notice ("background “…” completed — … (exit code 0)"; failed renders as an
-  error). The driver ingests the CLI's task lanes — `background_tasks_changed` (the authoritative
+  transcript as a finished row titled by the CLI's own sentence ('Background command "…" completed
+  (exit code 0)', 'Monitor "…" stream ended'; failed renders red) with its output file a click
+  away; a subagent's close is its own "Agent “…” finished" row instead, never both. The driver ingests the CLI's task lanes — `background_tasks_changed` (the authoritative
   REPLACE-the-set signal, and the **only** frame that admits a task to the tray) + `task_updated`
   (patch) + `task_started` (non-`local_agent`; enrichment only — it adds the workflow name / card
   binding the set change lacks) + `task_notification` (the only frame carrying the verdict summary)
@@ -307,10 +335,14 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   ordinary permission cards, and a denied agent shows as an error dot.
 - **Live subagents tray + active plan step.** Subagents running *right now* are promoted out of the
   (collapsed) tool groups into a live monitor pinned just above the composer, so parallel work stays
-  glanceable instead of scrolling away — collapsed by default to a one-line "N subagents working"
-  summary, expandable to each agent's progress line (tools · tokens, from `task_progress`) + stop.
-  They keep their in-place "Agent:"/"Task:" row in history; a finished/abandoned run drops from the
-  tray (reconciled shut at turn end; a deliberate Stop settles neutrally, a genuine error fails).
+  glanceable instead of scrolling away — collapsed by default to one line (a lone agent is named
+  with its latest step: "subagent “Measure file sizes” · Running wc -c · 1 tool · 9.1k tokens";
+  several read "N subagents working"), expandable to each agent's progress line (its current
+  activity · tools · tokens · elapsed, from `task_progress`) + stop. They keep their in-place
+  "Agent:"/"Task:" row in history, and every finished subagent — claude foreground or background,
+  codex collab stint — lands one "Agent “…” finished" row with its report (`subagent_finished`); a
+  finished/abandoned run drops from the tray (reconciled shut at turn end; a deliberate Stop settles
+  neutrally, a genuine error fails).
   The plan/todo panel likewise surfaces the current step in its
   summary ("plan · 1/3 · ◐ …"). Both are pure derivations over `blocks`/`plan` — no new events
   (`AgentsTray.svelte`).
@@ -345,8 +377,11 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   delegated threads may keep working after the parent turn, so their cross-turn rows remain in the
   pinned Agents tray and keep the rail/dashboard's off-screen-work cue live until the child's own
   turn ends. A follow-up to a
-  closed agent opens a fresh row (a finished card never walks back to running). The
-  model's `wait` renders as a "waiting for subagents" tool row. No per-agent stop for codex (no
+  closed agent opens a fresh row (a finished card never walks back to running), and the parent's
+  trailing `subAgentActivity {kind:"completed"}` marker never re-opens a closed stint (PROTOCOL.md
+  Pass 31). The model's `wait` renders as a "waiting for subagents" tool row; the v2 collab tools
+  get readable titles ("Message → agent_a", "Interrupt agent_a", "List agents"), and a command whose
+  `commandActions` are all read/list/search renders as a Read/Search row ("Read a.rs, b.rs"). No per-agent stop for codex (no
   such client RPC on the wire) — the tray's ■ stays claude-only. Wire facts: PROTOCOL.md Passes 16
   and 27.
 - **Permission prompts.** A warning card ("<tool> wants to run") with a JSON-input preview and
@@ -665,3 +700,12 @@ _Intent pending — not yet captured from the maintainer (shipped 2026-09-06, au
   which felt like the user's call), and the bridge is registered under `chimaera · <session name>`.
   Codex's daemon-level Remote Control was deliberately left as status-only. Run
   **capture-feature-intent** with the maintainer to replace this stub.
+
+### Transcript fidelity (interim prose, activity lines, live status) — why it exists
+_Captured 2026-09-23 (from the maintainer, in-session)._
+
+- **Problem it solves:** "The 'interim' messages dont really come through… it is like they are hidden in the thoughts" — Opus 5.5's between-tool prose landed in collapsed thinking. More broadly: "make sure we capture everything that is in their UI properly", including "the small 'highlight' notes and when subagents etc. are finished (for both GPT and Claude)", and "background tasks and monitors, I want those to be nice and accurate so it is clear to see". The live line should say how the turn is going ("something like this that is accurate": elapsed · tokens · running tasks · activity), and a running monitor should read as the session waiting on something, "so it feels more interactive".
+- **How settled it is (intended vs provisional):** an **addition, improvable** — deliberate today, open to change if improved; nothing here is a locked contract.
+- **Deliberate choices voiced while building it:** the new rows must not "take over the actual messages" — prose leads and the activity lines stay quiet (balance is the goal, the exact styling is not). A finished turn's duration was judged unnecessary on the page ("It is just important to know how long the current turn has been going on"), so only the live elapsed shows. The "wakes on each event" hint was dropped as unnecessary.
+- **Open / known limits:** Claude never puts a monitor event's text on stdout, so a monitor-woken turn names the watch, not the event.
+- **Do not change (or: open to change):** open to change.

@@ -18,7 +18,10 @@
 //! `question` (the turn asks an
 //! AskUserQuestion instead of running a tool — ask-lifecycle tests), `plan`
 //! (publishes a TodoWrite level-set and parks on ExitPlanMode approval),
-//! `subagent` (parks a turn with one live Task row and progress), `hang`
+//! `subagent` (parks a turn with one live Task row and progress), `showcase`
+//! (one self-ending turn over every 2.1.281 transcript surface: reasoning,
+//! narration, per-batch tool labels, a finished subagent, a background command
+//! and a Monitor whose closes follow after `FAKE_SHOWCASE_SETTLE_MS`), `hang`
 //! (opens a turn, streams content, never ends it, and acks an interrupt with NO
 //! result — the interrupt-watchdog recovery tests), `silent` (never answers —
 //! handshake watchdog tests), `die` (exit 3 immediately — spawn-crash tests),
@@ -102,6 +105,12 @@ fn main() {
                     "question" => run_question_turn(),
                     "plan" => run_plan_turn(),
                     "subagent" => run_subagent_turn(),
+                    // A complete, self-ending turn over every 2.1.281
+                    // transcript surface; its background closes follow.
+                    "showcase" => {
+                        run_showcase_turn();
+                        turn_active = false;
+                    }
                     // Streams content, then never ends — the driver's interrupt
                     // watchdog is the only thing that can recover it.
                     "hang" => run_hang_turn(),
@@ -400,6 +409,293 @@ fn run_background_turn(n: u32) {
         "total_cost_usd": 0.002, "duration_ms": 12,
         "usage": { "input_tokens": 5, "output_tokens": 4 },
     }));
+}
+
+/// A thinking-block signature whose envelope names `kind` the way the server
+/// nests it (base64 → field 2 → field 1 → string field 8) — `narration` or
+/// `thinking`, the tag the driver classifies on (PROTOCOL.md Pass 31).
+fn signature(kind: &str) -> String {
+    fn len_field(tag: u8, body: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag, body.len() as u8];
+        out.extend_from_slice(body);
+        out
+    }
+    let mut header = vec![0x08, 0x12, 0x18, 0x02, 0x38, 0x01];
+    header.extend(len_field(0x42, kind.as_bytes()));
+    let mut envelope = len_field(0x0a, &header);
+    envelope.extend(len_field(0x12, b"fake-nonce"));
+    let mut raw = vec![0x08, 0x04];
+    raw.extend(len_field(0x12, &envelope));
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in raw.chunks(3) {
+        let n =
+            chunk.iter().fold(0u32, |acc, b| (acc << 8) | u32::from(*b)) << (8 * (3 - chunk.len()));
+        for i in 0..=chunk.len() {
+            out.push(ALPHABET[((n >> (18 - 6 * i)) & 63) as usize] as char);
+        }
+    }
+    while !out.len().is_multiple_of(4) {
+        out.push('=');
+    }
+    out
+}
+
+fn stream(event: Value) {
+    emit(json!({ "type": "stream_event", "event": event }));
+}
+
+/// One streamed thinking block: deltas, then the signature that names its
+/// kind, then the per-block assistant frame (2.1.280+ lists narration in
+/// `narration_block_indexes`), then the stop — the live order.
+fn stream_thinking(msg: &str, text: &str, kind: &str) {
+    stream(json!({ "type": "content_block_start",
+                   "content_block": { "type": "thinking", "thinking": "", "signature": "" } }));
+    stream(json!({ "type": "content_block_delta",
+                   "delta": { "type": "thinking_delta", "thinking": text } }));
+    let sig = signature(kind);
+    stream(json!({ "type": "content_block_delta",
+                   "delta": { "type": "signature_delta", "signature": sig } }));
+    let mut frame = json!({
+        "type": "assistant",
+        "message": { "id": msg, "content": [
+            { "type": "thinking", "thinking": text, "signature": sig },
+        ]},
+    });
+    if kind == "narration" {
+        frame["narration_block_indexes"] = json!([0]);
+    }
+    emit(frame);
+    stream(json!({ "type": "content_block_stop" }));
+}
+
+fn stream_text(msg: &str, text: &str) {
+    stream(
+        json!({ "type": "content_block_start", "content_block": { "type": "text", "text": "" } }),
+    );
+    stream(
+        json!({ "type": "content_block_delta", "delta": { "type": "text_delta", "text": text } }),
+    );
+    emit(
+        json!({ "type": "assistant", "message": { "id": msg, "content": [
+            { "type": "text", "text": text },
+        ]}}),
+    );
+    stream(json!({ "type": "content_block_stop" }));
+}
+
+fn tool_use(msg: &str, id: &str, name: &str, input: Value) {
+    emit(
+        json!({ "type": "assistant", "message": { "id": msg, "content": [
+            { "type": "tool_use", "id": id, "name": name, "input": input },
+        ]}}),
+    );
+}
+
+fn tool_result(id: &str, content: &str) {
+    emit(json!({ "type": "user", "message": { "content": [
+        { "type": "tool_result", "tool_use_id": id, "content": content, "is_error": false },
+    ]}}));
+}
+
+/// Every transcript surface the 2.1.281 wire feeds, in one turn: reasoning,
+/// prose, narration (prose shipped as thinking), per-batch tool labels, a
+/// foreground subagent with its hand-back report and close, a backgrounded
+/// command and a Monitor watch — then, after `FAKE_SHOWCASE_SETTLE_MS`, their
+/// closes in the live settle order (set shrink → task_updated → notification).
+fn run_showcase_turn() {
+    emit(json!({
+        "type": "system", "subtype": "init",
+        "session_id": "fake-native-1", "model": "fake-model",
+        "permissionMode": "default", "slash_commands": ["compact"],
+    }));
+    stream(json!({ "type": "message_start", "message": { "id": "ms-1" } }));
+    stream_thinking(
+        "ms-1",
+        "The user wants a quick survey; listing the workspace first.",
+        "thinking",
+    );
+    stream_text("ms-1", "I'll start by looking at what's in the workspace.");
+    tool_use(
+        "ms-1",
+        "tu-ls",
+        "Bash",
+        json!({ "command": "ls", "description": "List files" }),
+    );
+    stream(json!({ "type": "message_delta", "usage": { "output_tokens": 180 } }));
+    tool_result("tu-ls", "a.txt\nb.txt");
+
+    stream(json!({ "type": "message_start", "message": { "id": "ms-2" } }));
+    stream_thinking(
+        "ms-2",
+        "There are two small text files. I'm handing the size check to a helper agent.",
+        "narration",
+    );
+    tool_use(
+        "ms-2",
+        "tu-agent",
+        "Agent",
+        json!({
+            "description": "Measure file sizes", "subagent_type": "general-purpose",
+            "prompt": "Report the byte size of every file here.",
+        }),
+    );
+    emit(
+        json!({ "type": "tool_use_summary", "summary": "Listed files in the workspace",
+                 "preceding_tool_use_ids": ["tu-ls"] }),
+    );
+    emit(
+        json!({ "type": "system", "subtype": "task_started", "task_id": "ta-1",
+                 "tool_use_id": "tu-agent", "description": "Measure file sizes",
+                 "subagent_type": "general-purpose", "is_backgrounded": false,
+                 "task_type": "local_agent" }),
+    );
+    stream(json!({ "type": "message_delta", "usage": { "output_tokens": 1240 } }));
+    emit(json!({ "type": "system", "subtype": "task_summary", "detail": "Measuring file sizes" }));
+    emit(
+        json!({ "type": "system", "subtype": "task_progress", "task_id": "ta-1",
+                 "tool_use_id": "tu-agent", "description": "Running wc -c",
+                 "usage": { "total_tokens": 9100, "tool_uses": 1, "duration_ms": 2100 },
+                 "last_tool_name": "Bash" }),
+    );
+    // A live UI check can hold the turn here — subagent running, status
+    // line populated — before it settles.
+    if let Some(ms) = std::env::var("FAKE_SHOWCASE_PAUSE_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
+    emit(
+        json!({ "type": "system", "subtype": "task_updated", "task_id": "ta-1",
+                 "patch": { "status": "completed", "end_time": 1 } }),
+    );
+    emit(
+        json!({ "type": "system", "subtype": "task_notification", "task_id": "ta-1",
+                 "tool_use_id": "tu-agent", "status": "completed",
+                 "output_file": "/tmp/ta-1.output",
+                 "summary": "Both files are 6 bytes:\n\n| file | bytes |\n|---|---|\n| a.txt | 6 |\n| b.txt | 6 |",
+                 "usage": { "total_tokens": 12345, "tool_uses": 2, "duration_ms": 4200 } }),
+    );
+    tool_result(
+        "tu-agent",
+        "[Subagent hand-back] The text below is the final report of a subagent. The report follows:\n  \
+         Both files are 6 bytes:\n  \n  | file | bytes |\n  |---|---|\n  | a.txt | 6 |\n  | b.txt | 6 |\n\
+         agentId: ta-1 (use SendMessage to continue this agent)\n<usage>subagent_tokens: 12345</usage>",
+    );
+
+    stream(json!({ "type": "message_start", "message": { "id": "ms-3" } }));
+    tool_use(
+        "ms-3",
+        "tu-bg",
+        "Bash",
+        json!({
+            "command": "sleep 30", "description": "Warm the cache", "run_in_background": true,
+        }),
+    );
+    emit(
+        json!({ "type": "system", "subtype": "background_tasks_changed", "tasks": [
+            { "task_id": "bg-1", "task_type": "local_bash", "description": "Warm the cache" },
+        ]}),
+    );
+    emit(
+        json!({ "type": "system", "subtype": "task_started", "task_id": "bg-1",
+                 "tool_use_id": "tu-bg", "description": "Warm the cache",
+                 "is_backgrounded": true, "task_type": "local_bash" }),
+    );
+    tool_result("tu-bg", "Command running in background with ID: bg-1.");
+    tool_use(
+        "ms-3",
+        "tu-mon",
+        "Monitor",
+        json!({
+            "description": "Watch the build log", "command": "tail -f build.log", "timeout_ms": 60000,
+        }),
+    );
+    emit(
+        json!({ "type": "system", "subtype": "background_tasks_changed", "tasks": [
+            { "task_id": "bg-1", "task_type": "local_bash", "description": "Warm the cache" },
+            { "task_id": "mon-1", "task_type": "local_bash", "description": "Watch the build log" },
+        ]}),
+    );
+    emit(
+        json!({ "type": "system", "subtype": "task_started", "task_id": "mon-1",
+                 "tool_use_id": "tu-mon", "description": "Watch the build log",
+                 "is_backgrounded": true, "task_type": "local_bash" }),
+    );
+    tool_result(
+        "tu-mon",
+        "Monitor started (task mon-1). You will be notified on each event.",
+    );
+    emit(
+        json!({ "type": "tool_use_summary", "summary": "Measured file sizes with a helper",
+                 "preceding_tool_use_ids": ["tu-agent"] }),
+    );
+
+    stream(json!({ "type": "message_start", "message": { "id": "ms-4" } }));
+    stream_text(
+        "ms-4",
+        "Both files are 6 bytes. The cache warm-up and the build-log watch keep running in the background.",
+    );
+    stream(json!({ "type": "message_delta", "usage": { "output_tokens": 310 } }));
+    emit(json!({ "type": "system", "subtype": "task_summary", "detail": null }));
+    emit(json!({ "type": "tool_use_summary",
+                 "summary": "Started a cache warm-up and a build-log watch",
+                 "preceding_tool_use_ids": ["tu-bg", "tu-mon"] }));
+    emit(json!({
+        "type": "result", "subtype": "success", "is_error": false,
+        "result": "done", "session_id": "fake-native-1",
+        "total_cost_usd": 0.004, "duration_ms": 5400,
+        "usage": { "input_tokens": 12, "output_tokens": 40 },
+    }));
+
+    let settle_ms: u64 = std::env::var("FAKE_SHOWCASE_SETTLE_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(settle_ms));
+        emit(
+            json!({ "type": "system", "subtype": "background_tasks_changed", "tasks": [
+                { "task_id": "mon-1", "task_type": "local_bash", "description": "Watch the build log" },
+            ]}),
+        );
+        emit(
+            json!({ "type": "system", "subtype": "task_updated", "task_id": "bg-1",
+                     "patch": { "status": "completed", "end_time": 2 } }),
+        );
+        emit(
+            json!({ "type": "system", "subtype": "task_notification", "task_id": "bg-1",
+                     "tool_use_id": "tu-bg", "status": "completed", "output_file": "/tmp/bg-1.output",
+                     "summary": "Background command \"Warm the cache\" completed (exit code 0)" }),
+        );
+        std::thread::sleep(std::time::Duration::from_millis(settle_ms / 2));
+        // A monitor event wakes the agent into a turn nobody typed (the CLI
+        // injects the event into its own queue; nothing of it crosses
+        // stdout) — the reply is all a host sees.
+        stream(json!({ "type": "message_start", "message": { "id": "ms-wake" } }));
+        stream_text(
+            "ms-wake",
+            "The build log shows the first compile step finished.",
+        );
+        emit(json!({
+            "type": "result", "subtype": "success", "is_error": false,
+            "result": "noted", "session_id": "fake-native-1",
+            "total_cost_usd": 0.001, "duration_ms": 900,
+            "usage": { "input_tokens": 4, "output_tokens": 12 },
+        }));
+        std::thread::sleep(std::time::Duration::from_millis(settle_ms / 2));
+        emit(json!({ "type": "system", "subtype": "background_tasks_changed", "tasks": [] }));
+        emit(
+            json!({ "type": "system", "subtype": "task_updated", "task_id": "mon-1",
+                     "patch": { "status": "completed", "end_time": 3 } }),
+        );
+        emit(
+            json!({ "type": "system", "subtype": "task_notification", "task_id": "mon-1",
+                     "tool_use_id": "tu-mon", "status": "completed", "output_file": "/tmp/mon-1.output",
+                     "summary": "Monitor \"Watch the build log\" stream ended" }),
+        );
+    });
 }
 
 /// A turn that parks on an AskUserQuestion (the mined can_use_tool shape) —

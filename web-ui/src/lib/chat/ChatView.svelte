@@ -22,6 +22,7 @@
   import Markdown from "./Markdown.svelte";
   import UserText from "./UserText.svelte";
   import ToolGroup from "./ToolGroup.svelte";
+  import FinishedRow from "./FinishedRow.svelte";
   import AgentsTray from "./AgentsTray.svelte";
   import BackgroundTray from "./BackgroundTray.svelte";
   import WorkTray from "../shared/WorkTray.svelte";
@@ -1316,25 +1317,48 @@
     return match !== null ? `${match[1]} ${match[2]}.${match[3]}` : m;
   });
 
-  /** Live status line under the transcript: what the agent is doing NOW.
-   *  Phases: starting → compacting / thinking / writing / {tool title} → working
-   *  (between tools) → gone. */
+  /** Live status line under the transcript: what the agent is doing NOW —
+   *  the agent's own phrase when it offers one (claude `task_summary`,
+   *  "Counting files"), else the phase: starting → thinking / writing /
+   *  running tools → working (between steps). */
   const agentBusy = $derived(store.running || store.compacting);
   const activityLabel = $derived.by(() => {
-    if (store.compacting) return "compacting context";
+    if (store.compacting) return "Compacting context";
+    if (store.activityLine !== null) return store.activityLine;
     const a = store.activity;
-    if (a === null) return "working";
+    if (a === null) return "Working";
     switch (a.kind) {
       case "thinking":
-        return a.detail.length > 0 ? `thinking · ${a.detail}` : "thinking";
+        return "Thinking";
       case "writing":
-        return "writing";
+        return "Writing";
       case "tool":
-        return a.detail.length > 64 ? `${a.detail.slice(0, 64)}…` : a.detail;
+        return "Running tools";
       default:
-        return a.detail === "starting" ? "starting" : "working";
+        return a.detail === "starting" ? "Starting" : "Working";
     }
   });
+  /** The exact phase detail for the tooltip (a tool title, a thinking-token
+   *  estimate) — the line itself stays short. */
+  const activityDetail = $derived.by(() => {
+    const a = store.activity;
+    if (a === null || a.detail === "" || a.detail === "starting") return undefined;
+    return a.kind === "thinking" ? `thinking · ${a.detail}` : a.detail;
+  });
+  /** Output tokens generated this turn ("12.3k tokens"); hidden until the
+   *  agent reports any. */
+  const turnTokensLabel = $derived.by(() => {
+    const n = store.turnTokens;
+    if (n <= 0) return null;
+    return n >= 1000 ? `${(n / 1000).toFixed(1)}k tokens` : `${n} tokens`;
+  });
+  /** Work running beside the turn: live subagents plus the background set
+   *  (commands, monitors, backgrounded agents; housekeeping excluded). A
+   *  backgrounded agent's launch row completed at launch, so it is counted
+   *  once — by the set. */
+  const runningTasks = $derived(
+    store.activeAgents.length + store.backgroundTasks.filter((t) => !t.ambient).length,
+  );
 
   // Elapsed-turn timer: a quiet counter that surfaces once a turn passes 5s and
   // ticks each second. The START is held in the chat pool (per session), so
@@ -1359,12 +1383,19 @@
     return () => clearInterval(iv);
   });
   /** Upward elapsed for the live status row (shared ladder: "7s", "1m 04s",
-   *  "1h 02m 03s"). Null below 5s so quick turns stay uncluttered. */
+   *  "1h 02m 03s") — how long the running turn has been going, from its
+   *  first second. */
   const turnElapsedLabel = $derived.by(() => {
     const total = Math.floor(turnElapsedMs / 1000);
-    if (total < 5) return null;
+    if (total < 1) return null;
     return formatElapsedSeconds(total);
   });
+  /** First line of a reasoning block, for its collapsed row. */
+  function thoughtPreview(text: string): string {
+    const line = text.trimStart().split("\n", 1)[0] ?? "";
+    return line.length > 160 ? `${line.slice(0, 160)}…` : line;
+  }
+
   /** A completed turn's duration for the turn-end badge. Sub-minute keeps one
    *  decimal ("2.4s"); a minute or more switches to the shared ladder so a
    *  long turn never renders as a raw "2664.6s". */
@@ -1506,6 +1537,19 @@
       }
     });
     return items;
+  });
+
+  /** A finished turn's duration, kept out of the page (the live elapsed on
+   *  the status line is the number that matters while it runs) and offered
+   *  on the closing message's timestamp tooltip instead. Keyed by uid. */
+  const turnDurations = $derived.by(() => {
+    const byMessage = new Map<number, string>();
+    renderBlocks.forEach((block, i) => {
+      if (block.kind !== "turn_end" || block.durationMs < 100 || i === 0) return;
+      const prev = renderBlocks[i - 1];
+      if (prev.kind === "message") byMessage.set(prev.uid, formatDurationMs(block.durationMs));
+    });
+    return byMessage;
   });
 
   /** Identity of the last block (the streaming reveal keys off it). Queued
@@ -1704,11 +1748,17 @@
             sentAtMs={item.block.sentAtMs}
             nowMs={messageTimeNowMs}
             onFork={() => askFork(item.block, item.index)}
+            turnDuration={turnDurations.get(item.block.uid) ?? null}
           />
         </div>
       {:else if item.block.kind === "thought"}
-        <details class="thought" data-block-index={item.index} data-block-uid={item.block.uid}>
-          <summary>thinking · {item.block.text.length} chars</summary>
+        {@const live = store.running && item.block.uid === lastInlineUid}
+        <details class="thought activity" data-block-index={item.index} data-block-uid={item.block.uid}>
+          <summary title="show the agent's reasoning">
+            <span class="thought-title" class:live>{live ? "Thinking" : "Thought"}</span>
+            <span class="thought-preview">{thoughtPreview(item.block.text)}</span>
+            <Chevron />
+          </summary>
           <div class="thought-body">{item.block.text}</div>
         </details>
       {:else if item.block.kind === "question"}
@@ -1724,6 +1774,36 @@
             />
           </div>
         {/if}
+      {:else if item.block.kind === "finished"}
+        <FinishedRow
+          block={item.block}
+          {visible}
+          {onOpenFile}
+          onOpenPath={openProsePath}
+          resolvePaths={resolveProsePaths}
+          sourceIndex={item.index}
+          sourceUid={item.block.uid}
+        />
+      {:else if item.block.kind === "wake"}
+        <div class="wake activity" data-block-index={item.index} data-block-uid={item.block.uid}>
+          <svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true"
+            ><path
+              d="M13 8a5 5 0 1 1-1.5-3.55M13 3v2.5h-2.5"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.4"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            /></svg
+          >
+          <span
+            >{item.block.cause === "monitor"
+              ? `Woke on a monitor event${item.block.label !== null ? ` · “${item.block.label}”` : ""}`
+              : item.block.cause === "background"
+                ? "Woke on background work"
+                : "Resumed on its own"}</span
+          >
+        </div>
       {:else if item.block.kind === "notice"}
         <div
           class="notice"
@@ -1738,13 +1818,7 @@
           {#if block.artifacts.length > 0}
             <ArtifactGallery paths={block.artifacts} onOpen={onOpenFile} />
           {/if}
-          <!-- Instant turns (retractions, empty results) get no strip: a
-               "0.0s" ruler is noise, not information. -->
-          {#if block.durationMs >= 100}
-            <div class="turn-end">
-              <span>{formatDurationMs(block.durationMs)}</span>
-            </div>
-          {/if}
+
         </div>
       {:else if item.block.kind === "usage"}
         <div class="source-block" data-block-index={item.index} data-block-uid={item.block.uid}>
@@ -1794,10 +1868,16 @@
         <span class="status-spark">
           <SessionGlyph kind="agent" {agentKind} size={12} state="alive" />
         </span>
-        <span class="status-label">{activityLabel}</span>
         {#if turnElapsedLabel !== null}
           <span class="status-elapsed">{turnElapsedLabel}</span>
         {/if}
+        {#if turnTokensLabel !== null}
+          <span class="status-part" title="output tokens this turn">{turnTokensLabel}</span>
+        {/if}
+        {#if runningTasks > 0}
+          <span class="status-part">{runningTasks} running task{runningTasks === 1 ? "" : "s"}</span>
+        {/if}
+        <span class="status-label" title={activityDetail}>{activityLabel}</span>
         {#if store.compacting}
           <span class="compaction-progress" role="progressbar" aria-label="Compacting conversation">
             <span></span>
@@ -2069,6 +2149,21 @@
     max-width: var(--chat-measure);
     margin: 0 auto;
   }
+  /* Activity lines (tool runs, thoughts, finished work, wakes) are the
+     margin notes to the prose: one quieter tone, clustered tight, with a
+     little air where prose begins and ends so messages stay the page's
+     voice. */
+  .column {
+    --activity-fg: color-mix(in srgb, var(--muted) 82%, transparent);
+  }
+  .column > :global(.activity + .activity) {
+    margin-top: -2px;
+  }
+  /* Below prose the message's hover rail already holds the space; above
+     it, a cluster ends with a breath. */
+  .column > :global(.activity + .msg.agent) {
+    margin-top: 5px;
+  }
   /* Blocks size to content and never absorb shrink: a tool card
      (overflow:hidden → zero automatic min-size) would otherwise collapse to
      its borders in a tall transcript. Agent prose and cards stretch to the
@@ -2245,26 +2340,99 @@
     color: var(--err);
   }
   .msg.agent {
+    position: relative;
     padding: 2px 0;
   }
-  .thought {
-    margin: 2px 0;
+  /* Interim prose (activity follows it) floats its hover rail over its own
+     bottom-right corner instead of reserving a row under every narration
+     line; the turn's closing message keeps the reserved rail. */
+  .column > .msg.agent:has(+ :global(.activity)) :global(.agent-message-meta) {
+    position: absolute;
+    right: 0;
+    bottom: 2px;
+    padding-left: 18px;
+    background: linear-gradient(to right, transparent, var(--term-bg) 18px);
+    opacity: 0;
+    transition: opacity 0.12s ease;
   }
-  .thought summary {
-    color: var(--muted);
-    font-size: var(--text-sm);
+  .column > .msg.agent:has(+ :global(.activity)):hover :global(.agent-message-meta),
+  .column > .msg.agent:has(+ :global(.activity)) :global(.agent-message-meta:focus-within) {
+    opacity: 1;
+  }
+  /* Reasoning is secondary to prose: one quiet line (label + the first
+     line of the thought, faded), the full text a click away — the same
+     voice as the tool-group and finished rows. */
+  .thought {
+    margin: 1px 0;
+  }
+  .thought > summary {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    width: fit-content;
+    max-width: 100%;
+    margin-left: -6px;
+    padding: 2px 6px;
+    border-radius: 6px;
+    color: var(--activity-fg, var(--muted));
+    font-size: var(--text-xs);
+    line-height: 1.4;
     cursor: pointer;
     user-select: none;
-    list-style-position: inside;
+    list-style: none;
+    transition:
+      background-color 0.12s ease,
+      color 0.12s ease;
+  }
+  .thought > summary::-webkit-details-marker {
+    display: none;
+  }
+  .thought > summary:hover,
+  .thought > summary:focus-visible {
+    color: var(--fg);
+    background: color-mix(in srgb, var(--fg) 4%, transparent);
+  }
+  .thought > summary :global(.chev) {
+    opacity: 0.55;
+  }
+  .thought[open] > summary :global(.chev) {
+    transform: rotate(90deg);
+  }
+  .thought-title {
+    flex: none;
+  }
+  .thought-title.live {
+    animation: label-pulse 1.6s ease-in-out infinite;
+  }
+  :global(html.app-hidden) .thought-title.live {
+    animation-play-state: paused;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .thought-title.live {
+      animation: none;
+    }
+  }
+  .thought-preview {
+    min-width: 0;
+    max-width: 48ch;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: color-mix(in srgb, var(--muted) 60%, transparent);
+    font-style: italic;
+  }
+  .thought[open] .thought-preview {
+    display: none;
   }
   .thought-body {
     color: var(--muted);
     font-size: var(--text-sm);
+    line-height: 1.55;
     white-space: pre-wrap;
     word-break: break-word;
-    border-left: 2px solid var(--edge);
-    padding: 4px 0 4px 10px;
-    margin: 4px 0 4px 4px;
+    border-left: 2px solid color-mix(in srgb, var(--edge) 70%, transparent);
+    padding: 2px 0 2px 12px;
+    margin: 2px 0 8px 2px;
   }
   .notice {
     color: var(--muted);
@@ -2275,31 +2443,46 @@
   .notice.error {
     color: var(--err);
   }
-  .turn-end {
-    display: flex;
-    justify-content: flex-end;
-    gap: 6px;
-    color: color-mix(in srgb, var(--muted) 70%, transparent);
-    font-size: var(--text-xs);
-    font-variant-numeric: tabular-nums;
-    padding: 2px 0 10px;
-    border-bottom: 1px solid color-mix(in srgb, var(--edge) 30%, transparent);
-    margin-bottom: 10px;
-  }
+  /* "✳ 9m 43s · 12.3k tokens · 1 running task · Running tools…" — every
+     part journal-derived (turn start, turn_tokens, the live sets, the phase),
+     separated by quiet middots so the line reads as one sentence. */
   .status-row {
     display: flex;
     align-items: center;
-    gap: 8px;
+    flex-wrap: wrap;
+    gap: 4px 6px;
     padding: 8px 0 2px;
     color: var(--muted);
     font-size: var(--text-sm);
+  }
+  /* A turn the agent started itself: a quiet marker above its reply. */
+  .wake {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 2px 0;
+    color: var(--activity-fg, var(--muted));
+    font-size: var(--text-xs);
+    line-height: 1.4;
+  }
+  .status-part {
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+  .status-row > :is(.status-elapsed, .status-part) + :is(.status-part, .status-label)::before {
+    content: "·";
+    margin-right: 6px;
+    color: color-mix(in srgb, var(--muted) 60%, transparent);
   }
   .status-spark {
     display: inline-flex;
     animation: spark-pulse 1.6s ease-in-out infinite;
   }
   .status-label {
-    font-family: var(--mono, monospace);
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
     animation: label-pulse 1.6s ease-in-out infinite;
   }
   /* Hidden document: nobody sees the shimmer — stop burning frames for the

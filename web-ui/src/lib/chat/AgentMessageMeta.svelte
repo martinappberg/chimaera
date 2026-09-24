@@ -7,12 +7,19 @@
     sentAtMs: number;
     nowMs: number;
     onFork: () => void;
+    /** The turn's duration ("5.4s") when this is the turn's closing message —
+     *  a detail for the timestamp's tooltip, not the page. */
+    turnDuration?: string | null;
   }
 
-  let { text, sentAtMs, nowMs, onFork }: Props = $props();
+  let { text, sentAtMs, nowMs, onFork, turnDuration = null }: Props = $props();
 
   const timeLabel = $derived(formatMessageTimestamp(sentAtMs, nowMs));
-  const fullTime = $derived(formatFullTimestamp(sentAtMs));
+  const fullTime = $derived(
+    turnDuration !== null
+      ? `${formatFullTimestamp(sentAtMs)} · turn took ${turnDuration}`
+      : formatFullTimestamp(sentAtMs),
+  );
   const isoTime = $derived(new Date(sentAtMs).toISOString());
 
   let copied = $state(false);
@@ -37,6 +44,7 @@
 </script>
 
 <div class="agent-message-meta">
+  <span class="reveal">
   <time datetime={isoTime} title={fullTime}>{timeLabel}</time>
   <span class="actions">
     <button
@@ -97,6 +105,7 @@
       </svg>
     </button>
   </span>
+  </span>
 </div>
 
 <style>
@@ -110,11 +119,16 @@
     font-size: var(--text-xs);
     line-height: 1;
     font-variant-numeric: tabular-nums;
+  }
+  .reveal {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
     opacity: 0;
     transition: opacity 0.12s ease;
   }
-  :global(.msg.agent:hover) .agent-message-meta,
-  .agent-message-meta:focus-within {
+  :global(.msg.agent:hover) .reveal,
+  .agent-message-meta:focus-within .reveal {
     opacity: 1;
   }
   time {

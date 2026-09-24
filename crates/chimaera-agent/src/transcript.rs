@@ -269,6 +269,17 @@ impl Translator {
                         }
                     }
                 }
+                // Narration (the prose between tool calls, shipped as a
+                // thinking block) is the assistant talking: prose, like live.
+                Some("thinking") if crate::claude::block_is_narration(block) => {
+                    let text = block["thinking"].as_str().unwrap_or_default();
+                    let sep = if self.msg_seen { "\n\n" } else { "" };
+                    self.msg_seen = true;
+                    out.push(AgentEvent::MessageChunk {
+                        turn_id: turn.clone(),
+                        text: format!("{sep}{text}"),
+                    });
+                }
                 Some("thinking") => {
                     if let Some(text) = block["thinking"].as_str() {
                         if !text.is_empty() {
@@ -371,7 +382,11 @@ impl Translator {
         let content = if matches!(kind, Some(ToolKind::Edit)) && !failed {
             None
         } else {
-            let (text, truncated) = cap_output(&tool_result_text(block));
+            let mut text = tool_result_text(block);
+            if matches!(kind, Some(ToolKind::Agent)) {
+                text = crate::claude::agent_report_text(&text);
+            }
+            let (text, truncated) = cap_output(&text);
             Some(ToolContent::Output { text, truncated })
         };
         out.push(AgentEvent::ToolCallUpdate {
@@ -461,6 +476,28 @@ mod tests {
     /// Imported assistant messages with several text blocks re-render with
     /// their boundary breaks, exactly like the live drivers — otherwise the
     /// same message displays glued after an import but correct live.
+    /// Narration (the prose between tool calls, shipped as a thinking block
+    /// by Opus 5.5+) imports as prose — the same call the live driver makes.
+    #[test]
+    fn imported_narration_is_prose() {
+        let sig = crate::claude::tests::LIVE_NARRATION_SIGNATURE;
+        let line = format!(
+            r#"{{"type":"assistant","uuid":"a1","message":{{"id":"m1","content":[{{"type":"text","text":"Found it."}},{{"type":"thinking","thinking":"Checking the log next.","signature":"{sig}"}},{{"type":"thinking","thinking":"hmm","signature":"x"}}]}}}}"#
+        );
+        let events = import_str(&line);
+        let prose: String = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::MessageChunk { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(prose, "Found it.\n\nChecking the log next.");
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ThoughtChunk { text, .. } if text == "hmm")));
+    }
+
     #[test]
     fn imported_text_blocks_keep_their_paragraph_break() {
         let line = r#####"{"type":"assistant","uuid":"a1","message":{"id":"m1","content":[{"type":"text","text":"prose."},{"type":"text","text":"#### Heading"}]}}"#####;

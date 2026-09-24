@@ -1165,6 +1165,63 @@ async fn codex_echo_turn_deltas_usage_and_completion() {
         .expect("shutdown");
 }
 
+/// Current model catalogs default `default_reasoning_summary` to "none", so
+/// a thread whose summary was never set streams NO reasoning summaries; the
+/// driver sends `turn/start.summary: "auto"` (Codex Desktop's value). Pin
+/// that the app-server applies it to the thread (its settings echo). The
+/// summary text itself is model-dependent (live 0.156.1: 3 of 3 turns), so
+/// it is reported rather than asserted.
+#[tokio::test]
+#[ignore = "live: spawns real codex, needs auth, bills one tiny turn"]
+async fn codex_turn_summary_setting_is_applied() {
+    let dir = tmpdir();
+    let mut chat = CodexChat::spawn("codex", dir.path()).expect("spawn codex");
+    chat.initialize(HANDSHAKE).await.expect("initialize");
+    let thread_id = chat
+        .thread_start(dir.path(), HANDSHAKE)
+        .await
+        .expect("thread/start");
+    chat.turn_start_with(
+        &thread_id,
+        "Without running any commands: how many positive integers below 200 are \
+         divisible by 3 or by 5 but not by 15? Reply with just the number.",
+        json!({ "summary": "auto" }),
+    )
+    .await
+    .expect("turn/start");
+
+    let mut applied = None;
+    let mut summary_deltas = 0u32;
+    loop {
+        let frame = chat
+            .recv(TURN)
+            .await
+            .expect("recv")
+            .expect("codex exited before turn completed");
+        if frame["params"]["threadId"] != thread_id.as_str() {
+            continue;
+        }
+        match frame["method"].as_str() {
+            Some("thread/settings/updated") => {
+                applied = Some(frame["params"]["threadSettings"]["summary"].clone());
+            }
+            Some("item/reasoning/summaryTextDelta") => summary_deltas += 1,
+            Some("turn/completed") => break,
+            _ => {}
+        }
+    }
+    assert_eq!(
+        applied,
+        Some(json!("auto")),
+        "the thread took the turn's reasoning-summary mode"
+    );
+    eprintln!("reasoning summary deltas this turn: {summary_deltas}");
+
+    chat.shutdown(Duration::from_secs(5))
+        .await
+        .expect("shutdown");
+}
+
 /// The multi-agent (collab) wire facts the driver's thread-scoping leans on
 /// (PROTOCOL.md Pass 16): a delegation request produces `subAgentActivity`
 /// markers on the parent thread, and the subagent's OWN thread streams its
@@ -1193,6 +1250,7 @@ async fn codex_collab_subagent_surface() {
     let mut agent_thread = String::new();
     let mut saw_foreign_frame = false;
     let mut saw_foreign_turn_end = false;
+    let mut child_last_phase = Value::Null;
     loop {
         let frame = chat
             .recv(TURN)
@@ -1212,10 +1270,30 @@ async fn codex_collab_subagent_surface() {
                     assert_ne!(agent_thread, thread_id, "a subagent is its own thread");
                     assert!(item["agentPath"].is_string(), "agentPath names the agent");
                 }
+                // The finish marker (0.153+) trails the agent thread's own
+                // turn end — the driver closes the row (and journals its
+                // one SubagentFinished) on that turn end and treats the
+                // marker as a no-op, so the order is load-bearing.
+                if item["kind"] == "completed" {
+                    assert!(
+                        saw_foreign_turn_end,
+                        "the completed marker arrived before the subagent's turn end"
+                    );
+                }
             }
             // The subagent's own transcript multiplexes onto this connection.
             Some("turn/completed") if frame_thread == agent_thread && !agent_thread.is_empty() => {
                 saw_foreign_turn_end = true;
+            }
+            // Its last message is the answer the finish line quotes: phase
+            // `final_answer` (or null on a legacy model), never commentary.
+            Some("item/completed")
+                if !agent_thread.is_empty()
+                    && frame_thread == agent_thread
+                    && item["type"] == "agentMessage" =>
+            {
+                saw_foreign_frame = true;
+                child_last_phase = item["phase"].clone();
             }
             Some(_) if !agent_thread.is_empty() && frame_thread == agent_thread => {
                 saw_foreign_frame = true;
@@ -1240,6 +1318,11 @@ async fn codex_collab_subagent_surface() {
     assert!(
         saw_foreign_turn_end,
         "the subagent's own turn/completed arrived (threadId-scoped)"
+    );
+    assert_ne!(
+        child_last_phase,
+        json!("commentary"),
+        "the subagent's last message is its answer, not interim commentary"
     );
 
     chat.shutdown(Duration::from_secs(5))

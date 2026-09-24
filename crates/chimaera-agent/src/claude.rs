@@ -36,16 +36,18 @@ use crate::model::{
     BackgroundTaskClose, ChunkKind, Coalescer, CompactionPhase, ContentBlock, ModeInfo,
     PermissionOption, PermissionOptionKind, PlanEntry, PlanStatus, SlashCommand, ToolContent,
     ToolKind, ToolStatus, Usage, UsageWindow, UserMessageState, WorkflowAgent, BG_LABEL_MAX,
-    BG_PATH_MAX, BG_TASKS_CAP, DIFF_FILE_BUDGET, DIFF_TURN_BUDGET, PLAN_BLOCKED_CAP, PLAN_DESC_MAX,
-    PLAN_LABEL_MAX, PLAN_TASKS_CAP, SLASH_COMMANDS_CAP, SLASH_DESCRIPTION_MAX, SLASH_NAME_MAX,
-    STATUS_DETAIL_MAX, WF_AGENTS_CAP, WF_AGENTS_SET_BUDGET, WF_AGENT_LABEL_MAX,
+    BG_PATH_MAX, BG_TASKS_CAP, COMMAND_ID_MAX, DIFF_FILE_BUDGET, DIFF_TURN_BUDGET,
+    PLAN_BLOCKED_CAP, PLAN_DESC_MAX, PLAN_LABEL_MAX, PLAN_TASKS_CAP, SLASH_COMMANDS_CAP,
+    SLASH_DESCRIPTION_MAX, SLASH_NAME_MAX, STATUS_DETAIL_MAX, SUBAGENT_RESULT_MAX,
+    TOOL_SUMMARY_IDS_CAP, TOOL_SUMMARY_MAX, WF_AGENTS_CAP, WF_AGENTS_SET_BUDGET,
+    WF_AGENT_LABEL_MAX,
 };
 use crate::model::{RemoteControlSnapshot, RemoteControlState};
 use crate::ndjson::{JsonlChild, JsonlSink, JsonlStream};
 
 /// CLI version these frame shapes were verified against (2026-07-18,
 /// full chat-smoke 18/18).
-pub const TESTED_CLAUDE_VERSION: &str = "2.1.259";
+pub const TESTED_CLAUDE_VERSION: &str = "2.1.281";
 
 /// Arguments for a structured chat session, before server-side extras
 /// (`--settings`, `--mcp-config`, `--session-id`) and login-shell wrapping.
@@ -143,6 +145,8 @@ fn background_task_from_wire(t: &Value, now: u64) -> Option<BackgroundTask> {
         agents: Vec::new(),
         agents_total: 0,
         agents_done: 0,
+        monitor: false,
+        ambient: t["ambient"] == json!(true),
         tool_use_id: wire_tool_use_id(t),
     })
 }
@@ -631,6 +635,26 @@ struct RemoteControlLive {
 /// never minted is a Remote Control injection — see `on_remote_user_text`).
 const MINTED_UUIDS_CAP: usize = 256;
 
+/// Bound on remembered subagent labels per turn (see `task_labels`).
+const TASK_LABELS_CAP: usize = 256;
+
+/// Harness ticks (~100 ms each) an undecided thinking block may hold its text
+/// after the first delta before it streams as thought. Narration lands as one
+/// burst (all deltas, then the signature, within ~10 ms live), so this only
+/// ever delays the head of a genuine reasoning block.
+const THINKING_HOLD_TICKS: u32 = 3;
+
+/// Held-text bound: past it the block is long-form reasoning, not a burst.
+const THINKING_HOLD_MAX: usize = 8 * 1024;
+
+/// An undecided streaming thinking block (see `ClaudeMapper::held_thinking`).
+#[derive(Default)]
+struct HeldThinking {
+    text: String,
+    /// Ticks since the first non-empty delta.
+    ticks: u32,
+}
+
 /// Protocol → normalized-model translator. Pure state machine: consumes
 /// frames/commands, yields events + outbound frames; owns no I/O, so it is
 /// testable without a process. Implements the harness [`Mapper`] trait via a
@@ -658,6 +682,17 @@ struct ClaudeMapper {
     /// `assistant` frames must not be emitted again.
     streamed: HashSet<String>,
     current_stream_msg: Option<String>,
+    /// The streaming `thinking` block whose kind is still unknown — reasoning
+    /// or narration (the prose between tool calls, which Opus 5.5+ ships as a
+    /// thinking block; [`signature_is_narration`]). Its text waits HERE,
+    /// outside the coalescer (the harness flushes that every tick), until the
+    /// block's signature decides the route; a real reasoning block that keeps
+    /// streaming is released as thought after [`THINKING_HOLD_TICKS`]. `None`
+    /// outside an undecided block.
+    held_thinking: Option<HeldThinking>,
+    /// Where the open thinking block's later deltas go once it was released
+    /// (thought after a hold timeout). Reset at every block start/stop.
+    thinking_route: Option<ChunkKind>,
     /// tool_use_id → kind, to choose result rendering; cleared per turn.
     tool_kinds: HashMap<String, ToolKind>,
     /// Outstanding can_use_tool requests, keyed by request_id.
@@ -678,6 +713,14 @@ struct ClaudeMapper {
     task_rows: HashMap<String, String>,
     /// Open Task tool cards: tool_use_id → description, for that correlation.
     agent_tools: HashMap<String, String>,
+    /// Subagent task_id → its description, for the `SubagentFinished` line
+    /// (the close frame carries no description). Same lifetime as
+    /// `task_rows`; bounded by [`TASK_LABELS_CAP`].
+    task_labels: HashMap<String, String>,
+    /// tool_use ids of this turn's `Monitor` calls: the lane their
+    /// task_started announces is a watch, not a job (`BackgroundTask.monitor`).
+    /// Bounded by [`TASK_LABELS_CAP`]; cleared per turn like `agent_tools`.
+    monitor_tools: HashSet<String>,
     /// The agent's todo list, rebuilt from the `Task*` family (see
     /// [`TaskTracker`]). Cross-turn, like the list it mirrors.
     task_list: TaskTracker,
@@ -739,6 +782,13 @@ struct ClaudeMapper {
     /// Last journaled thinking-token estimate (throttles the status frames
     /// to every ~256 tokens; reset per turn).
     thinking_emitted: u64,
+    /// Output tokens of this turn's FINISHED API calls (each `message_delta`
+    /// reports its own call's count; the result's total is their sum) — the
+    /// base the live `TurnTokens` counter adds the thinking estimate to.
+    /// Reset per turn like `thinking_emitted`.
+    turn_output_tokens: u64,
+    /// Last `ActivityLine` journaled (repeats of the CLI's line are dropped).
+    activity_line: Option<String>,
     /// `system/status` starts/settles compaction while compact_boundary also
     /// settles successful runs. These guards turn the overlapping native
     /// signals into one normalized start + one terminal event.
@@ -851,6 +901,8 @@ impl ClaudeMapper {
             turn_active: false,
             streamed: HashSet::new(),
             current_stream_msg: None,
+            held_thinking: None,
+            thinking_route: None,
             tool_kinds: HashMap::new(),
             pending_permissions: HashMap::new(),
             pending_questions: HashMap::new(),
@@ -859,6 +911,8 @@ impl ClaudeMapper {
             noticed_controls: HashSet::new(),
             task_rows: HashMap::new(),
             agent_tools: HashMap::new(),
+            task_labels: HashMap::new(),
+            monitor_tools: HashSet::new(),
             task_list: TaskTracker::default(),
             background_tasks: Vec::new(),
             departed_background: VecDeque::new(),
@@ -869,6 +923,8 @@ impl ClaudeMapper {
             title_requested: false,
             last_msg_uuid: None,
             thinking_emitted: 0,
+            turn_output_tokens: 0,
+            activity_line: None,
             compaction_active: false,
             compaction_completed: false,
             remote_control_available,
@@ -1136,6 +1192,27 @@ impl ClaudeMapper {
                     }
                 }
             }
+            // The past-tense label of one tool batch (the launcher opts in via
+            // CLAUDE_CODE_EMIT_TOOL_USE_SUMMARIES). It lands a model round
+            // after its batch and names it by id, so it never reorders prose.
+            Some("tool_use_summary") => {
+                let summary = frame["summary"].as_str().unwrap_or_default().trim();
+                let tool_ids: Vec<String> = frame["preceding_tool_use_ids"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .filter(|id| !id.is_empty() && id.len() <= COMMAND_ID_MAX)
+                    .take(TOOL_SUMMARY_IDS_CAP)
+                    .map(String::from)
+                    .collect();
+                if !summary.is_empty() && !tool_ids.is_empty() {
+                    step.events.push(AgentEvent::ToolSummary {
+                        summary: truncate_label(summary, TOOL_SUMMARY_MAX),
+                        tool_ids,
+                    });
+                }
+            }
             // keep_alive and other unrecognized top-level frame types are
             // protocol chatter the chat surface skips.
             _ => {}
@@ -1236,6 +1313,10 @@ impl ClaudeMapper {
                     return;
                 }
                 let description = frame["description"].as_str().unwrap_or("subagent");
+                if self.task_labels.len() < TASK_LABELS_CAP {
+                    self.task_labels
+                        .insert(task_id.clone(), truncate_label(description, BG_LABEL_MAX));
+                }
                 // Prefer landing progress on the Task/Agent tool card that
                 // spawned this agent. Newer CLIs name it exactly
                 // (`tool_use_id`) — trust it OUTRIGHT, even before the
@@ -1282,33 +1363,25 @@ impl ClaudeMapper {
                 let Some(row) = self.task_rows.get(task_id).cloned() else {
                     return;
                 };
-                let usage = &frame["usage"];
+                // What it is doing now: the CLI's own summary, else its
+                // activity line (2.1.281 `description`, "Running wc -c"),
+                // else the bare tool name; then the footprint. Driver-built
+                // (not a client timer) so replay reproduces it.
                 let mut line = String::new();
                 if let Some(s) = frame["summary"]
                     .as_str()
+                    .or(frame["description"].as_str())
                     .or(frame["last_tool_name"].as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
                 {
-                    line.push_str(s);
+                    line.push_str(&truncate_label(s, BG_LABEL_MAX));
                 }
-                if let Some(tools) = usage["tool_uses"].as_u64() {
+                if let Some(stats) = subagent_stats(&frame["usage"]) {
                     if !line.is_empty() {
                         line.push_str(" · ");
                     }
-                    line.push_str(&format!("{tools} tools"));
-                }
-                if let Some(tok) = usage["total_tokens"].as_u64() {
-                    if !line.is_empty() {
-                        line.push_str(" · ");
-                    }
-                    line.push_str(&format!("{tok} tokens"));
-                }
-                // Elapsed keeps a minutes-long agent legible at a glance;
-                // driver-built (not a client timer) so replay reproduces it.
-                if let Some(ms) = usage["duration_ms"].as_u64().filter(|ms| *ms >= 1000) {
-                    if !line.is_empty() {
-                        line.push_str(" · ");
-                    }
-                    line.push_str(&fmt_elapsed_secs(ms / 1000));
+                    line.push_str(&stats);
                 }
                 step.events.push(AgentEvent::ToolCallUpdate {
                     id: row,
@@ -1435,6 +1508,9 @@ impl ClaudeMapper {
                 if tokens >= self.thinking_emitted + 256 || self.thinking_emitted == 0 {
                     self.thinking_emitted = tokens.max(1);
                     step.events.push(AgentEvent::ThinkingTokens { tokens });
+                    step.events.push(AgentEvent::TurnTokens {
+                        output: self.turn_output_tokens + tokens,
+                    });
                 }
             }
             // Post-turn status line `{status_category, status_detail,
@@ -1444,6 +1520,20 @@ impl ClaudeMapper {
             // none). Mapped latest-wins; `summarizes_uuid` is dropped
             // (nothing here keys transcript blocks by uuid). A detail-less
             // frame carries nothing a rail could show, so it maps to nothing.
+            // The CLI's own spinner line for what it is doing now ("Counting
+            // files"); `detail: null` clears it (live 2.1.281, emitted after
+            // the result too). Session-level even when a subagent drives it.
+            Some("task_summary") => {
+                let detail = frame["detail"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|d| !d.is_empty())
+                    .map(|d| truncate_label(d, STATUS_DETAIL_MAX));
+                if detail != self.activity_line {
+                    self.activity_line = detail.clone();
+                    step.events.push(AgentEvent::ActivityLine { detail });
+                }
+            }
             Some("post_turn_summary") => {
                 let detail = frame["status_detail"].as_str().unwrap_or_default().trim();
                 if detail.is_empty() {
@@ -1481,7 +1571,7 @@ impl ClaudeMapper {
                 let Some(idx) = self.background_tasks.iter().position(|t| t.id == task_id) else {
                     return;
                 };
-                if matches!(status, "completed" | "failed" | "stopped") {
+                if matches!(status, "completed" | "failed" | "stopped" | "killed") {
                     let task = self.background_tasks.remove(idx);
                     self.park_departed(task);
                     self.emit_background_tasks(Vec::new(), step);
@@ -1524,7 +1614,7 @@ impl ClaudeMapper {
                     if next.iter().any(|b| b.id == id) {
                         continue;
                     }
-                    let task =
+                    let mut task =
                         if let Some(existing) = self.background_tasks.iter().find(|b| b.id == id) {
                             existing.clone()
                         } else if let Some(mut revived) = self.unpark_departed(id) {
@@ -1539,6 +1629,8 @@ impl ClaudeMapper {
                                 None => continue,
                             }
                         };
+                    // The flag can flip on a live entry (the set re-emits).
+                    task.ambient = t["ambient"] == json!(true);
                     next.push(task);
                 }
                 next.reverse();
@@ -1554,9 +1646,13 @@ impl ClaudeMapper {
             }
             Some("task_notification") => {
                 let task_id = frame["task_id"].as_str().unwrap_or_default();
-                // A background task's close: the verdict notice rides THIS
-                // frame only (it carries status + summary + output_file; the
-                // set-removal signals that precede it carry none of that).
+                let status = frame["status"].as_str().unwrap_or("completed");
+                // Every subagent — foreground or backgrounded — closes on this
+                // frame, whose `summary` is its final report (live 2.1.281).
+                // This turn's agents are in task_rows; a backgrounded one that
+                // outlived its turn is a `local_agent` lane in the set.
+                let row = self.task_rows.remove(task_id);
+                let row_label = self.task_labels.remove(task_id);
                 // take_background consumes the ONE residency the id has —
                 // live set (notification first) or departed (set-removal
                 // first, the live-verified settle order) — so the verdict
@@ -1565,8 +1661,13 @@ impl ClaudeMapper {
                 // reports it AND task_rows still maps its Agent row), and
                 // the row close below must also run so a failed/stopped
                 // agent never renders green.
-                if let Some(task) = self.take_background(task_id) {
-                    let status = frame["status"].as_str().unwrap_or("completed");
+                let background = self.take_background(task_id);
+                let is_agent = row.is_some()
+                    || background
+                        .as_ref()
+                        .is_some_and(|t| t.task_type == "local_agent");
+                let mut label = row_label;
+                if let Some(task) = background {
                     // A workflow's launching card gets the run's final line —
                     // the launch text it held was scaffolding; the verdict +
                     // agent count + elapsed is what the transcript should
@@ -1578,14 +1679,26 @@ impl ClaudeMapper {
                     if let Some(ev) = workflow_card_close(&task, status, Some(elapsed_ms)) {
                         step.events.push(ev);
                     }
-                    let summary = frame["summary"]
-                        .as_str()
-                        .filter(|s| !s.is_empty())
-                        .map(|s| truncate_label(s, BG_LABEL_MAX))
-                        // A stop's summary is the description verbatim
-                        // (live-verified) — an echo, not information.
-                        .filter(|s| *s != task.description);
-                    self.emit_background_tasks(
+                    // A subagent's close is its SubagentFinished line below;
+                    // the set just shrinks.
+                    let quiet = task.ambient
+                        || frame["ambient"] == json!(true)
+                        || frame["skip_transcript"] == json!(true);
+                    let closed = if is_agent {
+                        label.get_or_insert(task.description);
+                        Vec::new()
+                    } else if quiet {
+                        // Housekeeping: the set shrinks, the transcript
+                        // stays quiet (the wire asks hosts to hide it).
+                        Vec::new()
+                    } else {
+                        let summary = frame["summary"]
+                            .as_str()
+                            .filter(|s| !s.is_empty())
+                            .map(|s| truncate_label(s, BG_LABEL_MAX))
+                            // A stop's summary is the description verbatim
+                            // (live-verified) — an echo, not information.
+                            .filter(|s| *s != task.description);
                         vec![BackgroundTaskClose {
                             id: task.id,
                             description: task.description,
@@ -1598,19 +1711,17 @@ impl ClaudeMapper {
                                 .as_str()
                                 .filter(|s| s.len() <= BG_PATH_MAX)
                                 .map(String::from),
-                        }],
-                        step,
-                    );
+                            monitor: task.monitor,
+                        }]
+                    };
+                    self.emit_background_tasks(closed, step);
                 }
-                if let Some(row) = self.task_rows.remove(task_id) {
-                    // The close carries a verdict (live-verified 2.1.207:
-                    // status completed|failed|stopped + summary + usage).
-                    // Synthesized rows always close here. A real Task tool
+                if let Some(row) = &row {
+                    // Synthesized rows always close here. A real Agent tool
                     // card gets its authoritative completion from the
                     // tool_result — EXCEPT a failed/stopped verdict, which
                     // must land now so a killed agent never renders green
                     // (the later tool_result, if any, simply re-confirms).
-                    let status = frame["status"].as_str().unwrap_or("completed");
                     let ok = status != "failed";
                     if row.starts_with("task:") || !ok || status == "stopped" {
                         let mut line = String::new();
@@ -1619,23 +1730,15 @@ impl ClaudeMapper {
                         } else if status == "stopped" {
                             line.push_str("stopped");
                         }
-                        let usage = &frame["usage"];
-                        for part in [
-                            usage["tool_uses"].as_u64().map(|n| format!("{n} tools")),
-                            usage["total_tokens"]
-                                .as_u64()
-                                .map(|n| format!("{n} tokens")),
-                        ]
-                        .into_iter()
-                        .flatten()
-                        {
+                        if let Some(stats) = subagent_stats(&frame["usage"]) {
                             if !line.is_empty() {
                                 line.push_str(" · ");
                             }
-                            line.push_str(&part);
+                            line.push_str(&stats);
                         }
+                        let (line, truncated) = cap_output(&line);
                         step.events.push(AgentEvent::ToolCallUpdate {
-                            id: row,
+                            id: row.clone(),
                             status: if ok {
                                 ToolStatus::Completed
                             } else {
@@ -1646,11 +1749,27 @@ impl ClaudeMapper {
                             } else {
                                 Some(ToolContent::Output {
                                     text: line,
-                                    truncated: false,
+                                    truncated,
                                 })
                             },
                         });
                     }
+                }
+                if is_agent {
+                    let label = label.unwrap_or_else(|| "subagent".into());
+                    let result = frame["summary"]
+                        .as_str()
+                        .map(str::trim)
+                        // A stop's summary echoes the description.
+                        .filter(|s| !s.is_empty() && *s != label)
+                        .map(|s| truncate_label(s, SUBAGENT_RESULT_MAX));
+                    step.events.push(AgentEvent::SubagentFinished {
+                        id: row.or_else(|| wire_tool_use_id(frame)),
+                        label: truncate_label(&label, BG_LABEL_MAX),
+                        status: truncate_label(status, BG_LABEL_MAX),
+                        result,
+                        stats: subagent_stats(&frame["usage"]),
+                    });
                 }
             }
             _ => {}
@@ -1691,9 +1810,16 @@ impl ClaudeMapper {
         if let Some(id) = wire_tool_use_id(frame) {
             existing.tool_use_id = Some(id);
         }
+        let monitor = existing
+            .tool_use_id
+            .as_ref()
+            .is_some_and(|id| self.monitor_tools.contains(id));
         let name = wire_workflow_name(frame);
-        if name.is_some() && existing.workflow_name != name {
-            existing.workflow_name = name;
+        if (name.is_some() && existing.workflow_name != name) || monitor != existing.monitor {
+            if name.is_some() {
+                existing.workflow_name = name;
+            }
+            existing.monitor = monitor;
             self.emit_background_tasks(Vec::new(), step);
         }
     }
@@ -1972,30 +2098,81 @@ impl ClaudeMapper {
             Some("message_start") => {
                 self.current_stream_msg = event["message"]["id"].as_str().map(String::from);
             }
+            // An API call's end carries its own output count (thinking
+            // included) — the authoritative step of the turn's counter.
+            Some("message_delta") => {
+                if let Some(n) = event["usage"]["output_tokens"].as_u64().filter(|n| *n > 0) {
+                    self.ensure_turn(step);
+                    self.turn_output_tokens = self.turn_output_tokens.saturating_add(n);
+                    // The next thinking block's estimate restarts from zero.
+                    self.thinking_emitted = 0;
+                    step.events.push(AgentEvent::TurnTokens {
+                        output: self.turn_output_tokens,
+                    });
+                }
+            }
             Some("content_block_start") => {
+                // Blocks never interleave: a block still undecided here lost
+                // its signature — it was reasoning as far as anyone can tell.
+                self.release_thinking(ChunkKind::Thought, step);
+                self.thinking_route = None;
                 // A later text/thinking block in a turn owes the paragraph
                 // break its boundary represents. break_paragraph only MARKS —
                 // the coalescer materializes the break with the block's first
                 // real text, so an empty block, an interrupt, or a turn that
                 // opened out-of-band (idle send, queued flush) never yields a
-                // stray or wrongly-attributed separator.
-                let kind = match event["content_block"]["type"].as_str() {
-                    Some("text") => Some(ChunkKind::Message),
-                    Some("thinking") => Some(ChunkKind::Thought),
-                    _ => None,
-                };
-                if let Some(kind) = kind {
-                    let turn = self.turn_id();
-                    self.coalescer.break_paragraph(&turn, kind);
+                // stray or wrongly-attributed separator. A thinking block's
+                // break is marked when it is released, on the stream its
+                // signature picks.
+                match event["content_block"]["type"].as_str() {
+                    Some("text") => {
+                        let turn = self.turn_id();
+                        self.coalescer.break_paragraph(&turn, ChunkKind::Message);
+                    }
+                    Some("thinking") => self.held_thinking = Some(HeldThinking::default()),
+                    _ => {}
                 }
             }
             Some("content_block_delta") => {
                 self.ensure_turn(step);
                 let turn = self.turn_id();
-                let (kind, text) = match event["delta"]["type"].as_str() {
-                    Some("text_delta") => (ChunkKind::Message, event["delta"]["text"].as_str()),
+                let delta = &event["delta"];
+                let (kind, text) = match delta["type"].as_str() {
+                    Some("text_delta") => (ChunkKind::Message, delta["text"].as_str()),
                     Some("thinking_delta") => {
-                        (ChunkKind::Thought, event["delta"]["thinking"].as_str())
+                        let Some(text) = delta["thinking"].as_str() else {
+                            return;
+                        };
+                        if let Some(id) = &self.current_stream_msg {
+                            self.streamed.insert(id.clone());
+                        }
+                        if let Some(held) = &mut self.held_thinking {
+                            held.text.push_str(text);
+                            if held.text.len() >= THINKING_HOLD_MAX {
+                                self.release_thinking(ChunkKind::Thought, step);
+                            }
+                            return;
+                        }
+                        (
+                            self.thinking_route.unwrap_or(ChunkKind::Thought),
+                            Some(text),
+                        )
+                    }
+                    // The block's last delta before its stop: the signature
+                    // names what the block was.
+                    Some("signature_delta") => {
+                        if self.held_thinking.is_some() {
+                            let narration = delta["signature"]
+                                .as_str()
+                                .is_some_and(signature_is_narration);
+                            let route = if narration {
+                                ChunkKind::Message
+                            } else {
+                                ChunkKind::Thought
+                            };
+                            self.release_thinking(route, step);
+                        }
+                        return;
                     }
                     _ => return,
                 };
@@ -2007,7 +2184,28 @@ impl ClaudeMapper {
                     step.events.push(flushed);
                 }
             }
+            Some("content_block_stop") => {
+                self.release_thinking(ChunkKind::Thought, step);
+                self.thinking_route = None;
+            }
             _ => {}
+        }
+    }
+
+    /// Release the undecided thinking block's held text down `route`, which
+    /// its later deltas then follow too. The block's paragraph break is owed
+    /// by whichever stream it joins — narration continues the prose.
+    fn release_thinking(&mut self, route: ChunkKind, step: &mut DriverStep) {
+        let Some(held) = self.held_thinking.take() else {
+            return;
+        };
+        self.thinking_route = Some(route);
+        let turn = self.turn_id();
+        self.coalescer.break_paragraph(&turn, route);
+        if !held.text.is_empty() {
+            if let Some(flushed) = self.coalescer.push(&turn, route, &held.text) {
+                step.events.push(flushed);
+            }
         }
     }
 
@@ -2051,7 +2249,51 @@ impl ClaudeMapper {
         let Some(blocks) = message["content"].as_array() else {
             return;
         };
-        for block in blocks {
+        // 2.1.280+ names the narration blocks on the wrapper so hosts need
+        // not decode signatures; older CLIs only have the signature.
+        let narration_at: Vec<usize> = frame["narration_block_indexes"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|i| i.as_u64().and_then(|i| usize::try_from(i).ok()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let is_narration = |i: usize, block: &Value| {
+            let text = block["thinking"].as_str().unwrap_or_default();
+            !text.trim().is_empty() && (narration_at.contains(&i) || block_is_narration(block))
+        };
+        if streamed {
+            // The complete frame (it precedes content_block_stop) decides a
+            // block the stream left undecided — and rescues narration that a
+            // hold timeout already let out as thought, as prose too (the
+            // thought copy stays; the prose is what the user must see).
+            if let Some((i, block)) = blocks
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(_, b)| b["type"] == "thinking")
+            {
+                let narration = is_narration(i, block);
+                if self.held_thinking.is_some() {
+                    let route = if narration {
+                        ChunkKind::Message
+                    } else {
+                        ChunkKind::Thought
+                    };
+                    self.release_thinking(route, step);
+                } else if narration && self.thinking_route == Some(ChunkKind::Thought) {
+                    self.thinking_route = Some(ChunkKind::Message);
+                    let turn = self.turn_id();
+                    self.coalescer.break_paragraph(&turn, ChunkKind::Message);
+                    let text = block["thinking"].as_str().unwrap_or_default();
+                    if let Some(flushed) = self.coalescer.push(&turn, ChunkKind::Message, text) {
+                        step.events.push(flushed);
+                    }
+                }
+            }
+        }
+        for (i, block) in blocks.iter().enumerate() {
             match block["type"].as_str() {
                 Some("text") if !streamed => {
                     if let Some(text) = block["text"].as_str().filter(|t| !t.is_empty()) {
@@ -2067,10 +2309,14 @@ impl ClaudeMapper {
                 }
                 Some("thinking") if !streamed => {
                     if let Some(text) = block["thinking"].as_str().filter(|t| !t.is_empty()) {
+                        let kind = if is_narration(i, block) {
+                            ChunkKind::Message
+                        } else {
+                            ChunkKind::Thought
+                        };
                         let turn = self.turn_id();
-                        self.coalescer.break_paragraph(&turn, ChunkKind::Thought);
-                        if let Some(flushed) = self.coalescer.push(&turn, ChunkKind::Thought, text)
-                        {
+                        self.coalescer.break_paragraph(&turn, kind);
+                        if let Some(flushed) = self.coalescer.push(&turn, kind, text) {
                             step.events.push(flushed);
                         }
                     }
@@ -2134,6 +2380,9 @@ impl ClaudeMapper {
 
         let kind = tool_kind(name);
         self.tool_kinds.insert(id.clone(), kind);
+        if name == "Monitor" && self.monitor_tools.len() < TASK_LABELS_CAP {
+            self.monitor_tools.insert(id.clone());
+        }
         // Subagent spawns (Task/Agent) register for task_started correlation.
         if kind == ToolKind::Agent {
             if let Some(desc) = input["description"].as_str() {
@@ -2191,7 +2440,10 @@ impl ClaudeMapper {
             let content = if matches!(kind, Some(ToolKind::Edit)) && !failed {
                 None
             } else {
-                let text = tool_result_text(block);
+                let mut text = tool_result_text(block);
+                if matches!(kind, Some(ToolKind::Agent)) {
+                    text = agent_report_text(&text);
+                }
                 let (text, truncated) = cap_output(&text);
                 Some(ToolContent::Output { text, truncated })
             };
@@ -2708,6 +2960,7 @@ impl ClaudeMapper {
     /// rendering a deliberate Stop as a red "failed" group is the worse lie.
     /// Clears the map it drains.
     fn settle_dangling_tasks(&mut self, interrupted: bool, step: &mut DriverStep) {
+        self.task_labels.clear();
         for row in std::mem::take(&mut self.task_rows).into_values() {
             step.events.push(AgentEvent::ToolCallUpdate {
                 id: row,
@@ -2730,6 +2983,8 @@ impl ClaudeMapper {
     }
 
     fn on_result(&mut self, frame: &Value, step: &mut DriverStep) {
+        self.release_thinking(ChunkKind::Thought, step);
+        self.thinking_route = None;
         if let Some(flushed) = self.coalescer.flush() {
             step.events.push(flushed);
         }
@@ -2760,9 +3015,13 @@ impl ClaudeMapper {
             self.settle_dangling_tasks(interrupted, step);
         } else {
             self.task_rows.clear();
+            self.task_labels.clear();
         }
         self.agent_tools.clear();
+        self.monitor_tools.clear();
         self.thinking_emitted = 0;
+        self.turn_output_tokens = 0;
+        self.activity_line = None;
         // A real result is the turn end — disarm the interrupt watchdog (the
         // interrupt's own is_error result lands here too, so a genuine turn is
         // never double-aborted by the watchdog).
@@ -3382,7 +3641,13 @@ impl ClaudeMapper {
     /// dangling (a replay would strand the card forever — see the harness's
     /// drain call in `run_driver`).
     fn drain_pending(&mut self) -> Vec<AgentEvent> {
-        let mut events = Vec::new();
+        // Text a dying process left undecided is still what it said.
+        let mut released = DriverStep::default();
+        self.release_thinking(ChunkKind::Thought, &mut released);
+        let mut events = released.events;
+        if let Some(flushed) = self.coalescer.flush() {
+            events.push(flushed);
+        }
         for request_id in std::mem::take(&mut self.pending_questions).into_keys() {
             events.push(AgentEvent::QuestionResolved {
                 request_id,
@@ -3457,7 +3722,16 @@ impl ClaudeMapper {
     /// timer — they are held and flushed deterministically on the running turn's
     /// result, so there is no coalesced surplus for a timer to reconcile.
     fn tick(&mut self) -> DriverStep {
-        self.interrupt_watchdog()
+        let mut step = self.interrupt_watchdog();
+        // A thinking block still streaming past the hold is reasoning —
+        // narration arrives whole, signature included, in one burst.
+        if let Some(held) = self.held_thinking.as_mut().filter(|h| !h.text.is_empty()) {
+            held.ticks += 1;
+            if held.ticks >= THINKING_HOLD_TICKS {
+                self.release_thinking(ChunkKind::Thought, &mut step);
+            }
+        }
+        step
     }
 
     /// The interrupt watchdog. Interrupting a claude turn is only observable
@@ -3485,6 +3759,11 @@ impl ClaudeMapper {
             // Interrupt while idle is a CLI no-op — nothing to abort.
             return step;
         }
+        self.release_thinking(ChunkKind::Thought, &mut step);
+        self.thinking_route = None;
+        if let Some(flushed) = self.coalescer.flush() {
+            step.events.push(flushed);
+        }
         let turn_id = self.turn_id();
         self.turn_active = false;
         self.settle_compaction_at_turn_end();
@@ -3495,7 +3774,10 @@ impl ClaudeMapper {
         self.streamed.clear();
         self.settle_dangling_tasks(true, &mut step);
         self.agent_tools.clear();
+        self.monitor_tools.clear();
         self.thinking_emitted = 0;
+        self.turn_output_tokens = 0;
+        self.activity_line = None;
         step.events.push(AgentEvent::TurnAborted {
             turn_id,
             reason: "interrupted".into(),
@@ -3984,6 +4266,110 @@ fn content_has_text(content: &Value) -> bool {
     })
 }
 
+/// Signatures past this are not decoded (live ones are ~1–3 KiB; the cap
+/// bounds the scratch allocation for an untrusted frame).
+const SIGNATURE_DECODE_MAX: usize = 64 * 1024;
+
+/// Whether a `thinking` block is really NARRATION: the server's summary of
+/// the prose the model wrote between tool calls (Opus 5.5+), shipped as a
+/// thinking block. It is the assistant talking to the user, not reasoning —
+/// the official clients render it as prose. The kind is a tag inside the
+/// signature envelope: base64 → protobuf field 2 → field 1 → string field 8
+/// (`"narration"` vs `"thinking"`), decoded exactly as the CLI's own
+/// classifier does (PROTOCOL.md Pass 31). Fail-closed: anything unparseable
+/// is ordinary thinking.
+pub(crate) fn signature_is_narration(signature: &str) -> bool {
+    if signature.is_empty() || signature.len() > SIGNATURE_DECODE_MAX {
+        return false;
+    }
+    let Some(bytes) = base64_decode(signature) else {
+        return false;
+    };
+    proto_bytes_field(&bytes, 2)
+        .and_then(|envelope| proto_bytes_field(envelope, 1))
+        .and_then(|header| proto_bytes_field(header, 8))
+        == Some(b"narration".as_slice())
+}
+
+/// [`signature_is_narration`] for a whole content block (empty narration is
+/// ordinary thinking, like the CLI's own renderer treats it).
+pub(crate) fn block_is_narration(block: &Value) -> bool {
+    block["type"] == "thinking"
+        && block["thinking"]
+            .as_str()
+            .is_some_and(|t| !t.trim().is_empty())
+        && block["signature"]
+            .as_str()
+            .is_some_and(signature_is_narration)
+}
+
+/// Standard-alphabet base64 (padding optional). `None` on any foreign byte.
+fn base64_decode(input: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(input.len() / 4 * 3 + 3);
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for &c in input.trim_end_matches('=').as_bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        };
+        acc = (acc << 6) | u32::from(v);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    Some(out)
+}
+
+/// A protobuf varint at `pos`: `(value, next position)`.
+fn proto_varint(buf: &[u8], mut pos: usize) -> Option<(u64, usize)> {
+    let mut value = 0u64;
+    for shift in (0..64).step_by(7) {
+        let byte = *buf.get(pos)?;
+        pos += 1;
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Some((value, pos));
+        }
+    }
+    None
+}
+
+/// The LAST length-delimited occurrence of `field` in a protobuf message, or
+/// `None` when the message is malformed anywhere (the CLI's walker rejects a
+/// torn envelope outright, so a partial parse never classifies).
+fn proto_bytes_field(buf: &[u8], field: u64) -> Option<&[u8]> {
+    let mut pos = 0;
+    let mut found = None;
+    while pos < buf.len() {
+        let (key, next) = proto_varint(buf, pos)?;
+        pos = next;
+        match key & 7 {
+            0 => pos = proto_varint(buf, pos)?.1,
+            1 => pos = pos.checked_add(8).filter(|&p| p <= buf.len())?,
+            2 => {
+                let (len, start) = proto_varint(buf, pos)?;
+                let end = start
+                    .checked_add(usize::try_from(len).ok()?)
+                    .filter(|&e| e <= buf.len())?;
+                if key >> 3 == field {
+                    found = Some(&buf[start..end]);
+                }
+                pos = end;
+            }
+            5 => pos = pos.checked_add(4).filter(|&p| p <= buf.len())?,
+            _ => return None,
+        }
+    }
+    found
+}
+
 /// The `Workflow` tool's title is its script's `meta.name` literal — the
 /// official card's title. Read from the head of the script only (a script can
 /// be large; the meta block is required to be first), and only a `name` KEY
@@ -4046,6 +4432,64 @@ fn mcp_tool_label(name: &str) -> Option<String> {
 /// driver-built progress and close line shares — the same ladder as the
 /// client tray's `shared/time.ts::formatElapsedSeconds`, so one run never
 /// shows two spellings across the card and the tray.
+/// The subagent's own report out of its Agent tool_result. 2.1.281 wraps it
+/// in model-facing scaffolding — a "[Subagent hand-back] … The report
+/// follows:" preamble, every report line indented two spaces (a column-zero
+/// line ends the report), then `agentId: …` and a `<usage>` block. The row
+/// shows the report itself; any other shape passes through untouched.
+pub(crate) fn agent_report_text(text: &str) -> String {
+    const PREAMBLE: &str = "[Subagent hand-back]";
+    const START: &str = "The report follows:\n";
+    let Some(at) = text
+        .starts_with(PREAMBLE)
+        .then(|| text.find(START))
+        .flatten()
+    else {
+        return text.to_string();
+    };
+    let mut report = String::new();
+    for line in text[at + START.len()..].split('\n') {
+        let line = match line.strip_prefix("  ") {
+            Some(indented) => indented,
+            None if line.trim().is_empty() => "",
+            None => break,
+        };
+        report.push_str(line);
+        report.push('\n');
+    }
+    let report = report.trim_end();
+    if report.is_empty() {
+        text.to_string()
+    } else {
+        report.to_string()
+    }
+}
+
+/// "12 tools · 46.8k tokens · 6s" from a task frame's `usage` — the
+/// subagent's footprint, as the official client's "Done (…)" line counts it.
+fn subagent_stats(usage: &Value) -> Option<String> {
+    let parts: Vec<String> = [
+        usage["tool_uses"]
+            .as_u64()
+            .map(|n| format!("{n} tool{}", if n == 1 { "" } else { "s" })),
+        usage["total_tokens"].as_u64().map(|n| {
+            if n >= 1000 {
+                format!("{:.1}k tokens", n as f64 / 1000.0)
+            } else {
+                format!("{n} tokens")
+            }
+        }),
+        usage["duration_ms"]
+            .as_u64()
+            .filter(|ms| *ms >= 1000)
+            .map(|ms| fmt_elapsed_secs(ms / 1000)),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
 fn fmt_elapsed_secs(s: u64) -> String {
     if s >= 3600 {
         format!("{}h {:02}m {:02}s", s / 3600, (s % 3600) / 60, s % 60)
@@ -4311,7 +4755,7 @@ pub(crate) fn tool_result_text(block: &Value) -> String {
 use crate::model::cap_preview;
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn mapper() -> ClaudeMapper {
@@ -6930,13 +7374,26 @@ mod tests {
         }));
         let (tasks, closed) = background_event(&step);
         assert!(tasks.is_empty());
-        assert_eq!(closed[0].status, "stopped");
+        // A subagent's close is its own finished line, never a generic
+        // "background … stopped" notice as well.
+        assert!(closed.is_empty(), "no background-close notice for an agent");
         assert!(
             step.events
                 .iter()
                 .any(|e| matches!(e, AgentEvent::ToolCallUpdate { .. })),
             "the Agent row still gets its close (the tray must not starve it)"
         );
+        let finished: Vec<_> = step
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::SubagentFinished { label, status, .. } => Some((label, status)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(finished.len(), 1);
+        assert_eq!(finished[0].0, "backgrounded agent");
+        assert_eq!(finished[0].1, "stopped");
     }
 
     #[test]
@@ -7149,11 +7606,26 @@ mod tests {
         let step = m.on_frame(&json!({
             "type": "system", "subtype": "task_notification",
             "task_id": "tk-c", "status": "completed", "summary": "ok",
+            "usage": { "total_tokens": 46787, "tool_uses": 1, "duration_ms": 6875 },
         }));
-        assert!(
-            step.events.is_empty(),
-            "bound completed defers to tool_result"
-        );
+        // The row itself defers to the tool_result; the transcript still
+        // gets the one finished line, with the report and footprint.
+        match step.events.as_slice() {
+            [AgentEvent::SubagentFinished {
+                id,
+                label,
+                status,
+                result,
+                stats,
+            }] => {
+                assert_eq!(id.as_deref(), Some("tu-c"));
+                assert_eq!(label, "bound agent");
+                assert_eq!(status, "completed");
+                assert_eq!(result.as_deref(), Some("ok"));
+                assert_eq!(stats.as_deref(), Some("1 tool · 46.8k tokens · 6s"));
+            }
+            other => panic!("bound completed must only announce the finish: {other:?}"),
+        }
     }
 
     #[test]
@@ -7895,6 +8367,283 @@ mod tests {
             &json!({ "commands": [], "remote_control_available": false }),
         );
         assert!(!m.remote_control_available);
+    }
+
+    // ---- Narration (Pass 31): the prose between tool calls, as thinking ----
+
+    /// A REAL narration signature off the 2.1.280 wire (Opus 5.5 probe,
+    /// 2026-09-24) — pins the envelope layout the classifier walks.
+    pub(crate) const LIVE_NARRATION_SIGNATURE: &str = "CAQS4wYKEQgSGAI4AUIJbmFycmF0aW9uEgzxS+Y41uiR0/KWW6gaDLX+LRq+CxPRkO1/7iIwrKWL2I65YOED5NUZoTqu4NwFcx2lUrfHavcXD9m4zrS5+X9dr/phfmNc16pRKOG6Kv8F5bZJYbyROAftRYgfQMccjCJ1YpzOVYiNMHRIrJ640mp2T5gbDwGKg1lxTbCPATzKLwBJOnwI105XBaRWkaLFPfcx0x7qCUF83DnS4TMd6JtKpaKJO7HW2soyF3TnY5pPbjywS5G9tKvsC3LRzhQmCeMhJrCNA15ZPOFW6eCqeOi7PWzDJxG2DIZnQ9IjahMywJ1N/ubqlVouhanXxbEieENpSwpNyTDuBTIxhXGt9zVy3r3KSelcZHxAEGebKcOqALAR0cvOKiSr9QOFCwilYXj0cM2Yc/t4T20YZwjm5lJZdbEjnuZ8EzgZvrAsvsbq57QY/DlSeD95UPxe+bwi4J2NJT1HWw0ycNq5RjJ7tuQ3zC1Z8Wb9xcxPXf8IF8dNuHH5f1HYwhZd1k1loKwm3sNSHIShPIX4jfMiV8PBGyiDHeRCL1cb8++X7eBvd02gzWxTzMwXROEEJDZZF5cGcFpyZ/eTYFYMZ4OGXP/BMx7eQX50wMhayQWrW/sdVNuojO7Dst7ROEilZ/zgRfcy/prd2vL0K90pdiGI6v/vzc/Q5/tV0C7RvJfhIZ5LZHvbB5ZTijEeb0S7vvOm/4j7ZB89ReUpxYpB90TOuM53L1Sitcyq+kvuuZssRJdA//1yx0r5Zo3JlK3t6QTeTz2Sw40nD8lCK7BpiNm13ulnNjWYOUFkJcgGNtrd5Rfpds407M6/l5GIDte0I+xxusdJl9LszpvaSUPvAcKloCyA0vChD3fxdAipOWz75EOtt4k/UjTUCLPS3EbtQjLsfA+KbXoOUNN1Z4QmhPq/DYZ3SJ6AxId+dNIPLIMw8xqSxsHHQ26lR4eNgBFTON1Brjh20Kqz88iqz7kxAf7gfZJnXOrPMF2NFLx++/KkZQR0U0tc72LEilMBhPN15S8p3KD2NaOoIj9QvPgT+ZPwz1TkTOoCK1XdJ+HdwXSH0QtheK7MAb1WiPd31xbTCVSXQZVh7TrA2f2QBblTLQqzUhNr5i3I8FGkH319wyHFiDv771YYAQ==";
+
+    /// A synthetic signature envelope carrying `kind` at field 2 → 1 → 8, the
+    /// way the server nests it (varint noise around it, like the live one).
+    fn signature_with_kind(kind: &str) -> String {
+        fn len_field(tag: u8, body: &[u8]) -> Vec<u8> {
+            let mut out = vec![tag, body.len() as u8];
+            out.extend_from_slice(body);
+            out
+        }
+        let mut header = vec![0x08, 0x12, 0x18, 0x02, 0x38, 0x01];
+        header.extend(len_field(0x42, kind.as_bytes()));
+        let mut envelope = len_field(0x0a, &header);
+        envelope.extend(len_field(0x12, b"nonce-bytes"));
+        let mut outer = vec![0x08, 0x04];
+        outer.extend(len_field(0x12, &envelope));
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut b64 = String::new();
+        for chunk in outer.chunks(3) {
+            let n = chunk.iter().fold(0u32, |acc, b| (acc << 8) | u32::from(*b))
+                << (8 * (3 - chunk.len()));
+            for i in 0..=chunk.len() {
+                b64.push(ALPHABET[((n >> (18 - 6 * i)) & 63) as usize] as char);
+            }
+        }
+        while !b64.len().is_multiple_of(4) {
+            b64.push('=');
+        }
+        b64
+    }
+
+    #[test]
+    fn signature_classifier_matches_the_cli() {
+        assert!(signature_is_narration(LIVE_NARRATION_SIGNATURE));
+        assert!(signature_is_narration(&signature_with_kind("narration")));
+        assert!(!signature_is_narration(&signature_with_kind("thinking")));
+        // Fail-closed on anything unparseable.
+        assert!(!signature_is_narration(""));
+        assert!(!signature_is_narration("not base64 at all!"));
+        let torn = &LIVE_NARRATION_SIGNATURE[..40];
+        assert!(
+            !signature_is_narration(torn),
+            "a torn envelope never classifies"
+        );
+        // Empty narration is ordinary thinking (the CLI renders it so too).
+        let empty = json!({ "type": "thinking", "thinking": " ",
+                            "signature": LIVE_NARRATION_SIGNATURE });
+        assert!(!block_is_narration(&empty));
+    }
+
+    fn thinking_delta(text: &str) -> Value {
+        json!({ "type": "stream_event",
+                "event": { "type": "content_block_delta",
+                           "delta": { "type": "thinking_delta", "thinking": text } } })
+    }
+
+    fn signature_delta(signature: &str) -> Value {
+        json!({ "type": "stream_event",
+                "event": { "type": "content_block_delta",
+                           "delta": { "type": "signature_delta", "signature": signature } } })
+    }
+
+    fn block_stop() -> Value {
+        json!({ "type": "stream_event", "event": { "type": "content_block_stop" } })
+    }
+
+    fn thought_text(steps: &[DriverStep]) -> String {
+        steps
+            .iter()
+            .flat_map(|s| &s.events)
+            .filter_map(|e| match e {
+                AgentEvent::ThoughtChunk { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The live 2.1.280 shape (Opus 5.5): prose → tool → a narration block
+    /// streamed as thinking (burst + narration signature) → tool. The
+    /// narration must land as PROSE, continuing the message stream with its
+    /// paragraph break — never inside the thought block.
+    #[test]
+    fn streamed_narration_is_prose_and_reasoning_stays_thought() {
+        let mut m = mapper();
+        let mut steps = Vec::new();
+        for frame in [
+            block_start("text"),
+            text_delta("Found two files."),
+            block_stop(),
+            block_start("thinking"),
+            thinking_delta("I should check the sizes"),
+            thinking_delta(" next."),
+            signature_delta(&signature_with_kind("thinking")),
+            block_stop(),
+            block_start("thinking"),
+            thinking_delta("Both files hold one word; "),
+            thinking_delta("I'm counting lines to confirm."),
+            signature_delta(LIVE_NARRATION_SIGNATURE),
+            block_stop(),
+        ] {
+            steps.push(m.on_frame(&frame));
+        }
+        steps.push(DriverStep {
+            events: m.flush().into_iter().collect(),
+            outbound: Vec::new(),
+        });
+        assert_eq!(
+            message_text(&steps, ""),
+            "Found two files.\n\nBoth files hold one word; I'm counting lines to confirm."
+        );
+        assert_eq!(thought_text(&steps), "I should check the sizes next.");
+    }
+
+    /// Genuine reasoning that keeps streaming is not held hostage to its
+    /// signature: after the hold it flows as thought, and later deltas follow.
+    #[test]
+    fn a_long_thinking_block_streams_as_thought_after_the_hold() {
+        let mut m = mapper();
+        m.on_frame(&block_start("thinking"));
+        let mut steps = vec![m.on_frame(&thinking_delta("Considering the options"))];
+        for _ in 0..THINKING_HOLD_TICKS {
+            steps.push(m.tick());
+        }
+        steps.push(m.on_frame(&thinking_delta(" carefully.")));
+        steps.push(DriverStep {
+            events: m.flush().into_iter().collect(),
+            outbound: Vec::new(),
+        });
+        assert_eq!(thought_text(&steps), "Considering the options carefully.");
+        assert!(message_text(&steps, "").is_empty());
+    }
+
+    /// The per-block assistant frame (it precedes content_block_stop) decides
+    /// a block whose signature_delta never came, via narration_block_indexes.
+    #[test]
+    fn the_assistant_frame_decides_an_undecided_block() {
+        let mut m = mapper();
+        m.on_frame(&json!({ "type": "stream_event",
+            "event": { "type": "message_start", "message": { "id": "msg-n" } } }));
+        m.on_frame(&block_start("thinking"));
+        m.on_frame(&thinking_delta("Checking the config next."));
+        let mut steps = vec![m.on_frame(&json!({
+            "type": "assistant", "narration_block_indexes": [0],
+            "message": { "id": "msg-n", "content": [{
+                "type": "thinking", "thinking": "Checking the config next.",
+                "signature": "",
+            }]},
+        }))];
+        steps.push(m.on_frame(&block_stop()));
+        steps.push(DriverStep {
+            events: m.flush().into_iter().collect(),
+            outbound: Vec::new(),
+        });
+        assert_eq!(message_text(&steps, ""), "Checking the config next.");
+        assert!(thought_text(&steps).is_empty());
+    }
+
+    /// Without partial messages (no stream events), the complete frame is the
+    /// only carrier: narration by index or by signature is prose.
+    #[test]
+    fn unstreamed_narration_blocks_are_prose() {
+        let mut m = mapper();
+        let steps = vec![
+            m.on_frame(&json!({
+                "type": "assistant",
+                "message": { "id": "m1", "content": [
+                    { "type": "thinking", "thinking": "private reasoning",
+                      "signature": signature_with_kind("thinking") },
+                    { "type": "thinking", "thinking": "Reading the log now.",
+                      "signature": LIVE_NARRATION_SIGNATURE },
+                ]},
+            })),
+            DriverStep {
+                events: m.flush().into_iter().collect(),
+                outbound: Vec::new(),
+            },
+        ];
+        assert_eq!(message_text(&steps, ""), "Reading the log now.");
+        assert_eq!(thought_text(&steps), "private reasoning");
+    }
+
+    /// A process that dies mid-block still journals what it said.
+    #[test]
+    fn teardown_releases_held_thinking() {
+        let mut m = mapper();
+        m.on_frame(&block_start("thinking"));
+        m.on_frame(&thinking_delta("half a thought"));
+        let events = m.drain_pending();
+        assert!(events.iter().any(
+            |e| matches!(e, AgentEvent::ThoughtChunk { text, .. } if text == "half a thought")
+        ));
+    }
+
+    #[test]
+    fn tool_use_summary_labels_its_batch() {
+        let mut m = mapper();
+        let step = m.on_frame(&json!({
+            "type": "tool_use_summary", "summary": "Listed files in directory",
+            "preceding_tool_use_ids": ["toolu_1", "", "toolu_2"],
+        }));
+        match step.events.as_slice() {
+            [AgentEvent::ToolSummary { summary, tool_ids }] => {
+                assert_eq!(summary, "Listed files in directory");
+                assert_eq!(tool_ids, &["toolu_1", "toolu_2"]);
+            }
+            other => panic!("expected one ToolSummary, got {other:?}"),
+        }
+        // Nothing to label, or no label: nothing to journal.
+        let empty = m.on_frame(&json!({ "type": "tool_use_summary", "summary": "x",
+                                         "preceding_tool_use_ids": [] }));
+        assert!(empty.events.is_empty());
+    }
+
+    /// The status line's counter: each API call reports its OWN output count
+    /// (the result's total is their sum), and a running thinking block adds
+    /// its estimate on top until its call ends.
+    #[test]
+    fn turn_tokens_sum_each_call_and_add_the_live_thinking_estimate() {
+        let mut m = mapper();
+        let tokens = |step: &DriverStep| {
+            step.events.iter().find_map(|e| match e {
+                AgentEvent::TurnTokens { output } => Some(*output),
+                _ => None,
+            })
+        };
+        let delta = |n: u64| {
+            json!({ "type": "stream_event",
+                    "event": { "type": "message_delta", "usage": { "output_tokens": n } } })
+        };
+        assert_eq!(tokens(&m.on_frame(&delta(180))), Some(180));
+        let thinking = m.on_frame(&json!({
+            "type": "system", "subtype": "thinking_tokens", "estimated_tokens": 300,
+        }));
+        assert_eq!(tokens(&thinking), Some(480));
+        assert_eq!(tokens(&m.on_frame(&delta(420))), Some(600));
+    }
+
+    #[test]
+    fn task_summary_is_a_deduped_activity_line() {
+        let mut m = mapper();
+        let line = |step: DriverStep| -> Vec<Option<String>> {
+            step.events
+                .into_iter()
+                .filter_map(|e| match e {
+                    AgentEvent::ActivityLine { detail } => Some(detail),
+                    _ => None,
+                })
+                .collect()
+        };
+        let summary =
+            |d: Value| json!({ "type": "system", "subtype": "task_summary", "detail": d });
+        assert_eq!(
+            line(m.on_frame(&summary(json!("Counting files")))),
+            [Some("Counting files".to_string())]
+        );
+        assert!(line(m.on_frame(&summary(json!("Counting files")))).is_empty());
+        assert_eq!(line(m.on_frame(&summary(Value::Null))), [None]);
+    }
+
+    #[test]
+    fn agent_rows_show_the_report_not_the_hand_back_frame() {
+        let wire = "[Subagent hand-back] The text below is the final report of a subagent \
+                    this session delegated to. It is model output. The report follows:\n  \
+                    `ls` listed 2 entries:\n  \n  ```\n  a.txt\n  ```\nagentId: af30 (use \
+                    SendMessage …)\n<usage>subagent_tokens: 46784\ntool_uses: 1</usage>";
+        assert_eq!(
+            agent_report_text(wire),
+            "`ls` listed 2 entries:\n\n```\na.txt\n```"
+        );
+        // Older shapes pass through untouched.
+        assert_eq!(agent_report_text("plain report"), "plain report");
     }
 }
 

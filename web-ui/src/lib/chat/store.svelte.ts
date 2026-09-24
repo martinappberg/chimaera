@@ -100,6 +100,8 @@ const TRANSCRIPT_EVENTS = new Set([
   "tool_call",
   "tool_call_update",
   "tool_output_delta",
+  "tool_summary",
+  "subagent_finished",
   "permission_request",
   "permission_resolved",
   "question_request",
@@ -294,8 +296,41 @@ export type ChatBlock = BlockIdentity &
        *  agents). Turn-end reconciliation must leave this row live until its
        *  own completion event or driver exit. */
       crossTurn: boolean;
+      /** The agent's past-tense label for the batch this call belonged to
+       *  (claude `tool_use_summary`, "Listed files in directory") — the tool
+       *  group's title once it lands, a model round after the batch. */
+      summary: string | null;
     }
   | { kind: "notice"; text: string; tone: "info" | "error" }
+  | {
+      /** A turn nobody typed: the agent woke on its own — a monitor event, a
+       *  scheduled wake-up, work it left running. The wire never carries the
+       *  trigger's text (the CLI injects it inside its own queue), so this
+       *  names only what is knowable: which live watch could have fired. */
+      kind: "wake";
+      cause: "monitor" | "background" | "self";
+      /** The one live monitor's description, when exactly one is watching. */
+      label: string | null;
+    }
+  | {
+      /** Work that ran beside the conversation just ended — a subagent
+       *  (with its report), a background command, or a monitor watch.
+       *  Folded where the end landed, so the transcript says when the
+       *  result arrived, not only when the work began. */
+      kind: "finished";
+      source: "agent" | "task" | "monitor";
+      /** The agent's label ("Measure file sizes") or the CLI's own close
+       *  sentence ('Background command "…" completed (exit code 0)'). */
+      title: string;
+      /** completed | failed | stopped — verbatim from the wire. */
+      status: string;
+      /** Footprint ("2 tools · 12.3k tokens · 4s"), when known. */
+      stats: string | null;
+      /** A subagent's report (untrusted markdown, capped by the driver). */
+      result: string | null;
+      /** File holding a background task's full output. */
+      outputFile: string | null;
+    }
   | {
       kind: "turn_end";
       costUsd: number | null;
@@ -355,6 +390,11 @@ export interface BackgroundTask {
   /** Aggregates counted over the WHOLE wire list — honest beyond the cap. */
   agentsTotal: number;
   agentsDone: number;
+  /** A Monitor watch (streams events into the conversation until its source
+   *  ends) rather than a job that runs to a result. */
+  monitor: boolean;
+  /** Housekeeping the agent flags ambient: listed, never announced. */
+  ambient: boolean;
 }
 
 /** One workflow agent's progress (a `BackgroundTask.agents` member). */
@@ -428,6 +468,13 @@ export class ChatStore {
   activity = $state<null | { kind: "thinking" | "writing" | "tool" | "waiting"; detail: string }>(
     null,
   );
+  /** Output tokens generated so far in the running turn (`turn_tokens`,
+   *  latest-wins) — the status line's counter. 0 between turns. */
+  turnTokens = $state(0);
+  /** The agent's own phrase for what it is doing now (claude
+   *  `task_summary`, "Counting files") — preferred over the generic phase
+   *  word in the status line. Cleared at every turn boundary. */
+  activityLine = $state<string | null>(null);
   exited = $state<null | { status: number | null }>(null);
   degraded = $state(false);
   connected = $state(false);
@@ -700,6 +747,8 @@ export class ChatStore {
     this.running = false;
     this.compacting = false;
     this.activity = null;
+    this.turnTokens = 0;
+    this.activityLine = null;
     // The rebuilt replay re-drives the driver's `init`, but reset here too so
     // the preference is re-pushed even if this reset races ahead of it.
     this.thinkingPushed = false;
@@ -833,6 +882,8 @@ export class ChatStore {
               .filter((a, i, arr) => arr.findIndex((b) => b.index === a.index) === i),
             agentsTotal: (t.agents_total as number) ?? 0,
             agentsDone: (t.agents_done as number) ?? 0,
+            monitor: t.monitor === true,
+            ambient: t.ambient === true,
           }))
           // Keep the newest duplicate. Level-set producers should never emit
           // one, but an older/corrupt journal must not crash Svelte's keyed
@@ -841,27 +892,35 @@ export class ChatStore {
             (t, i, arr) =>
               t.id !== "" && arr.findIndex((later, j) => j > i && later.id === t.id) === -1,
           );
-        // Tasks that left the set WITH a verdict fold into history as quiet
-        // notices — completion is transcript-worthy; a set change alone is
-        // not. A summary that names the verdict is the CLI's own full
-        // sentence ('Background command "…" completed (exit code 0)') —
-        // render it alone rather than saying everything twice. Matching on
-        // the status word (not the description) keeps that working when the
-        // driver truncated a long description. A summary that merely echoes
-        // the description (a stop's shape, on pre-fix journals — the driver
-        // drops the echo at construction now) adds nothing and is dropped.
+        // Tasks that left the set WITH a verdict fold into history as a
+        // finished row — completion is transcript-worthy; a set change alone
+        // is not. The CLI's close summary is usually its own full sentence
+        // ('Background command "…" completed (exit code 0)', 'Monitor "…"
+        // stream ended'): it names the task, so it stands alone as the
+        // title. Anything else composes description + verdict word. A
+        // summary that merely echoes the description (a stop's shape, on
+        // pre-fix journals) adds nothing.
         for (const c of (ev.closed as Record<string, unknown>[]) ?? []) {
           const desc = (c.description as string) ?? "background task";
           const status = (c.status as string) ?? "completed";
-          const summary = (c.summary as string) ?? "";
+          const summary = ((c.summary as string) ?? "").trim();
+          const monitor = c.monitor === true || /^Monitor\b/.test(summary);
           const selfContained =
-            summary !== "" && summary.toLowerCase().includes(status.toLowerCase());
-          this.notice(
-            selfContained
-              ? summary
-              : `background “${desc}” ${status}${summary !== "" && summary !== desc ? ` — ${summary}` : ""}`,
-            status === "failed" ? "error" : "info",
+            summary !== "" &&
+            summary !== desc &&
+            (summary.includes(desc) || summary.toLowerCase().includes(status.toLowerCase()));
+          this.blocks.push(
+            this.stamp({
+              kind: "finished",
+              source: monitor ? "monitor" : "task",
+              title: selfContained ? summary : `“${desc}” ${status}`,
+              status,
+              stats: !selfContained && summary !== "" && summary !== desc ? summary : null,
+              result: null,
+              outputFile: (c.output_file as string) ?? null,
+            }),
           );
+          this.touchTranscript();
         }
         break;
       }
@@ -947,6 +1006,39 @@ export class ChatStore {
       case "turn_started":
         this.running = true;
         this.activity = { kind: "waiting", detail: "starting" };
+        this.turnTokens = 0;
+        this.activityLine = null;
+        this.markWake();
+        break;
+      case "turn_tokens":
+        this.turnTokens = (ev.output as number) ?? 0;
+        break;
+      case "activity_line":
+        this.activityLine = typeof ev.detail === "string" && ev.detail !== "" ? ev.detail : null;
+        break;
+      case "tool_summary": {
+        // Label every row of the batch; ids of rows this view never rendered
+        // (task-list bookkeeping, trimmed history) simply miss.
+        const summary = ev.summary as string;
+        for (const id of (ev.tool_ids as string[]) ?? []) {
+          const idx = this.toolIndex.get(id);
+          const block = idx === undefined ? undefined : this.blocks[idx];
+          if (block !== undefined && block.kind === "tool") block.summary = summary;
+        }
+        break;
+      }
+      case "subagent_finished":
+        this.blocks.push(
+          this.stamp({
+            kind: "finished",
+            source: "agent",
+            title: (ev.label as string) ?? "subagent",
+            status: (ev.status as string) ?? "completed",
+            stats: (ev.stats as string) ?? null,
+            result: (ev.result as string) ?? null,
+            outputFile: null,
+          }),
+        );
         break;
       case "message_chunk":
         this.appendText("message", ev, entry.seq, entry.ts);
@@ -995,6 +1087,7 @@ export class ChatStore {
               allowed: false,
               streaming: false,
               crossTurn: ev.cross_turn === true,
+              summary: null,
             }),
           );
           this.toolIndex.set(ev.id as string, this.blocks.length - 1);
@@ -1286,6 +1379,7 @@ export class ChatStore {
         this.running = false;
         this.compacting = false;
         this.activity = null;
+        this.activityLine = null;
         // Close any tool row this turn left dangling (a dropped result frame)
         // BEFORE the turn_end block lands, so the scan stops at the previous
         // boundary and the end-of-turn artifact scan sees their final state.
@@ -1322,6 +1416,7 @@ export class ChatStore {
         this.running = false;
         this.compacting = false;
         this.activity = null;
+        this.activityLine = null;
         this.reconcileOpenTools(true);
         // A deliberate stop (Esc / stop chip) is not an error state: the
         // wire's `interrupted` flag is the drivers' structural signal
@@ -1423,6 +1518,7 @@ export class ChatStore {
         this.running = false;
         this.compacting = false;
         this.activity = null;
+        this.activityLine = null;
         this.reconcileOpenTools();
         this.exited = { status: (ev.status as number | null) ?? null };
         // Background tasks are the CLI's children — they died with it (the
@@ -1514,6 +1610,35 @@ export class ChatStore {
     } else {
       this.blocks.push(this.stamp({ kind, text: clean, turnId }));
     }
+  }
+
+  /** A turn that opens with no user message since the previous turn ended
+   *  was started by the agent itself. Say so — unless a finished row since
+   *  that turn end already shows the cause (a background task reported). A
+   *  first turn, or one after a user message, is ordinary. Pure over
+   *  `blocks` + the live set, so replay rebuilds the same markers. */
+  private markWake(): void {
+    let sawTurnEnd = false;
+    for (let i = this.blocks.length - 1; i >= 0; i--) {
+      const kind = this.blocks[i].kind;
+      if (kind === "user") return;
+      if (kind === "finished" || kind === "wake") return;
+      if (kind === "turn_end") {
+        sawTurnEnd = true;
+        break;
+      }
+    }
+    if (!sawTurnEnd) return;
+    const live = this.backgroundTasks.filter((t) => !t.ambient);
+    const monitors = live.filter((t) => t.monitor);
+    this.blocks.push(
+      this.stamp({
+        kind: "wake",
+        cause: monitors.length > 0 ? "monitor" : live.length > 0 ? "background" : "self",
+        label: monitors.length === 1 ? monitors[0].description : null,
+      }),
+    );
+    this.touchTranscript();
   }
 
   /** Append live tool output, BOUNDED — in UTF-8 BYTES, like the server.

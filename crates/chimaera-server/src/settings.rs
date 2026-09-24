@@ -156,6 +156,16 @@ impl SettingsStore {
             .unwrap_or(false)
     }
 
+    /// Daemon-consumed key: ask Claude for its per-batch tool labels (the
+    /// transcript's tool-group titles). Default on: the labels are what the
+    /// official clients show; each costs one small-model call.
+    pub(crate) fn tool_summaries(&mut self) -> bool {
+        self.current()
+            .get("chat.toolSummaries")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true)
+    }
+
     /// Daemon-consumed key: periodically check GitHub for newer releases
     /// (see `update`).
     pub(crate) fn update_auto_check(&mut self) -> bool {
