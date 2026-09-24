@@ -13,8 +13,8 @@ use chimaera_agent::claude::ClaudeAdapter;
 use chimaera_agent::driver::SpawnSpec;
 use chimaera_agent::journal::SeqEvent;
 use chimaera_agent::model::{
-    AgentCommand, AgentEvent, BackgroundTask, ContentBlock, RemoteControlState, ToolStatus,
-    UserMessageState,
+    AgentCommand, AgentEvent, BackgroundTask, ContentBlock, RemoteControlState, ToolContent,
+    ToolStatus, UserMessageState,
 };
 use chimaera_agent::{ChatManager, CommandQueueFull, EventHook, ExitHook, RETAINED_SENDS_MAX};
 
@@ -366,6 +366,8 @@ async fn spawn_neutralizes_stale_background_set_in_reused_journal() {
                     agents: Vec::new(),
                     agents_total: 0,
                     agents_done: 0,
+                    monitor: false,
+                    ambient: false,
                     tool_use_id: None,
                 }],
                 closed: Vec::new(),
@@ -504,6 +506,143 @@ async fn background_tasks_outlive_their_turn_and_accumulate() {
     let info = fx.manager.get("s-bg").expect("info");
     assert_eq!(info.background_running, 0, "an exit clears the count");
     assert!(!info.alive);
+}
+
+/// The 2.1.281 transcript surfaces end to end (fake-claude `showcase`):
+/// narration journals as PROSE, tool batches get their labels, a subagent
+/// closes with exactly one finished line (report + footprint) and a clean
+/// row, a Monitor lane is marked as a watch, and background closes speak the
+/// CLI's own sentences — while an agent's close never doubles as a
+/// background notice.
+#[tokio::test]
+async fn showcase_turn_maps_every_transcript_surface() {
+    let fx = fixture();
+    fx.manager
+        .spawn(&ClaudeAdapter, spec("s-show", &fx.cwd, "showcase"))
+        .expect("spawn");
+    let att = fx.manager.attach("s-show", 0).expect("attach");
+    let mut seen: Vec<Arc<SeqEvent>> = att.replay.clone();
+    let mut rx = att.live;
+    send_text(&fx, "s-show", "survey the workspace").await;
+    // The monitor's close is the last frame the fake emits.
+    wait_for(&mut rx, &mut seen, "the monitor close", |ev| {
+        matches!(ev, AgentEvent::BackgroundTasks { closed, .. }
+            if closed.iter().any(|c| c.id == "mon-1"))
+    })
+    .await;
+    let events: Vec<&AgentEvent> = seen.iter().map(|e| &e.ev).collect();
+
+    let prose: String = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::MessageChunk { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    let thought: String = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ThoughtChunk { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        prose.contains("I'm handing the size check to a helper agent"),
+        "narration is prose: {prose:?}"
+    );
+    assert!(
+        !thought.contains("helper agent"),
+        "…and never thought: {thought:?}"
+    );
+    assert!(
+        thought.contains("listing the workspace first"),
+        "reasoning stays thought"
+    );
+
+    let labels: Vec<(&str, &[String])> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ToolSummary { summary, tool_ids } => {
+                Some((summary.as_str(), tool_ids.as_slice()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(labels.len(), 3, "one label per batch: {labels:?}");
+    assert_eq!(labels[2].1, ["tu-bg".to_string(), "tu-mon".to_string()]);
+
+    let finished: Vec<&AgentEvent> = events
+        .iter()
+        .copied()
+        .filter(|e| matches!(e, AgentEvent::SubagentFinished { .. }))
+        .collect();
+    match finished.as_slice() {
+        [AgentEvent::SubagentFinished {
+            id,
+            label,
+            status,
+            result,
+            stats,
+        }] => {
+            assert_eq!(id.as_deref(), Some("tu-agent"));
+            assert_eq!(label, "Measure file sizes");
+            assert_eq!(status, "completed");
+            assert!(result
+                .as_deref()
+                .is_some_and(|r| r.starts_with("Both files are 6 bytes")));
+            assert_eq!(stats.as_deref(), Some("2 tools · 12.3k tokens · 4s"));
+        }
+        other => panic!("exactly one finished line: {other:#?}"),
+    }
+    let agent_row = events.iter().rev().find_map(|e| match e {
+        AgentEvent::ToolCallUpdate {
+            id,
+            content: Some(ToolContent::Output { text, .. }),
+            ..
+        } if id == "tu-agent" => Some(text.clone()),
+        _ => None,
+    });
+    assert_eq!(
+        agent_row.as_deref(),
+        Some(
+            "Both files are 6 bytes:\n\n| file | bytes |\n|---|---|\n| a.txt | 6 |\n| b.txt | 6 |"
+        ),
+        "the row shows the report, not the hand-back scaffolding"
+    );
+
+    let monitor_marked = events.iter().any(|e| {
+        matches!(e, AgentEvent::BackgroundTasks { tasks, .. }
+            if tasks.iter().any(|t| t.id == "mon-1" && t.monitor)
+                && tasks.iter().any(|t| t.id == "bg-1" && !t.monitor))
+    });
+    assert!(
+        monitor_marked,
+        "the Monitor lane is a watch, the Bash lane a job"
+    );
+    let closes: Vec<(String, Option<String>)> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::BackgroundTasks { closed, .. } => Some(closed),
+            _ => None,
+        })
+        .flatten()
+        .map(|c| (c.id.clone(), c.summary.clone()))
+        .collect();
+    assert_eq!(
+        closes,
+        [
+            (
+                "bg-1".to_string(),
+                Some("Background command \"Warm the cache\" completed (exit code 0)".to_string())
+            ),
+            (
+                "mon-1".to_string(),
+                Some("Monitor \"Watch the build log\" stream ended".to_string())
+            ),
+        ],
+        "background closes only — the agent's close is its finished line"
+    );
+    assert!(fx.manager.kill("s-show"));
 }
 
 #[tokio::test]

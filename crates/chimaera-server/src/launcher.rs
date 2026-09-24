@@ -52,11 +52,14 @@ pub(crate) fn models(kind: AgentKind) -> &'static [(&'static str, &'static str)]
             ("sonnet", "Sonnet"),
             ("haiku", "Haiku"),
         ],
-        // The 0.153.0 `model/list` on a Pro account (live-probed 2026-09-06):
-        // GPT-6 Astra is the default; GPT-5.6 Sol the workhorse. Both ids are
-        // what `thread/start.model` accepts.
+        // The 0.156.1 `model/list` on a Pro account (live-probed 2026-09-23),
+        // default first: GPT-6 Astra (frontier), Sol (workhorse), Luna (fast),
+        // then the previous generation's workhorse. The ids are what
+        // `thread/start.model` accepts.
         AgentKind::Codex => &[
             ("gpt-6-astra", "GPT-6 Astra"),
+            ("gpt-6-sol", "GPT-6 Sol"),
+            ("gpt-6-luna", "GPT-6 Luna"),
             ("gpt-5.6-sol", "GPT-5.6 Sol"),
         ],
         // agy picks its own model; no curated list until its integration.
@@ -1805,6 +1808,8 @@ mod tests {
             models(AgentKind::Codex),
             [
                 ("gpt-6-astra", "GPT-6 Astra"),
+                ("gpt-6-sol", "GPT-6 Sol"),
+                ("gpt-6-luna", "GPT-6 Luna"),
                 ("gpt-5.6-sol", "GPT-5.6 Sol")
             ]
         );

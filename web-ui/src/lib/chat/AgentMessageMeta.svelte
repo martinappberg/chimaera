@@ -7,12 +7,19 @@
     sentAtMs: number;
     nowMs: number;
     onFork: () => void;
+    /** The turn's duration ("5.4s") when this is the turn's closing message —
+     *  a detail for the timestamp's tooltip, not the page. */
+    turnDuration?: string | null;
   }
 
-  let { text, sentAtMs, nowMs, onFork }: Props = $props();
+  let { text, sentAtMs, nowMs, onFork, turnDuration = null }: Props = $props();
 
   const timeLabel = $derived(formatMessageTimestamp(sentAtMs, nowMs));
-  const fullTime = $derived(formatFullTimestamp(sentAtMs));
+  const fullTime = $derived(
+    turnDuration !== null
+      ? `${formatFullTimestamp(sentAtMs)} · turn took ${turnDuration}`
+      : formatFullTimestamp(sentAtMs),
+  );
   const isoTime = $derived(new Date(sentAtMs).toISOString());
 
   let copied = $state(false);
@@ -100,16 +107,20 @@
 </div>
 
 <style>
+  /* Inline: the host flows it right after the message's last word, on a
+     new line only when that line is full (ChatView owns that layout). */
   .agent-message-meta {
-    min-height: 20px;
-    display: flex;
+    display: inline-flex;
     align-items: center;
     gap: 5px;
-    width: fit-content;
+    height: 20px;
+    margin-left: 0.6em;
+    vertical-align: middle;
     color: color-mix(in srgb, var(--muted) 78%, transparent);
     font-size: var(--text-xs);
     line-height: 1;
     font-variant-numeric: tabular-nums;
+    white-space: nowrap;
     opacity: 0;
     transition: opacity 0.12s ease;
   }

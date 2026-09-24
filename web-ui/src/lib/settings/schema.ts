@@ -119,6 +119,7 @@ export type SettingsMap = {
   "daemon.scrollbackLines": number;
   "daemon.restoreSessions": boolean;
   "chat.remoteControlAtStart": boolean;
+  "chat.toolSummaries": boolean;
   "update.autoCheck": boolean;
   "keys.modifier": "auto" | "cmd" | "ctrl-shift" | "alt";
 } & Record<KeyBindingId, string>;
@@ -605,6 +606,16 @@ const DEFS = {
     type: "boolean",
     default: false,
     scope: "daemon",
+  },
+  "chat.toolSummaries": {
+    title: "Tool Activity Labels (Claude)",
+    category: "Chat",
+    description:
+      "Label each run of tool calls in a Claude chat with a short summary of what it did (\"Listed files in directory\"), the way the Claude apps do. Each label is one small, fast model call on your account. Off: tool runs show their counts (\"3 commands\").",
+    type: "boolean",
+    default: true,
+    scope: "daemon",
+    note: "Applies to chat sessions started after the change.",
   },
   "daemon.restoreSessions": {
     title: "Restore Sessions on Restart",

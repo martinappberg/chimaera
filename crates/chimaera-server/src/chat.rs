@@ -2987,6 +2987,15 @@ pub(crate) async fn spawn_chat_session(
                 .push((crate::launcher::CODEX_MCP_KEY_ENV.to_string(), key));
         }
     }
+    // Claude writes a past-tense label per tool batch ("Listed files in
+    // directory" — a small-model call per batch, on the user's account) only
+    // when the host opts in; the transcript's tool groups wear them.
+    if recipe.kind == AgentKind::Claude && crate::lock(&state.settings).tool_summaries() {
+        spec.env.push((
+            "CLAUDE_CODE_EMIT_TOOL_USE_SUMMARIES".to_string(),
+            "1".to_string(),
+        ));
+    }
     // The codex Mastermind's harness gating: its app-server elicits EVERY
     // MCP tool call (approval-mode config is parsed but ignored on that
     // surface — live-probed, PROTOCOL.md Pass 16), so the user's recorded

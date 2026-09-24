@@ -2,13 +2,15 @@
   import Chevron from "../shared/Chevron.svelte";
   import type { ChatBlock } from "./store.svelte";
   import ToolCallCard from "./ToolCallCard.svelte";
+  import { toolGroupTitle } from "./toolLabels";
 
   /**
    * A run of consecutive tool calls, condensed. Collapsed it is one quiet
-   * summary row ("6 commands · 2 files"); expanded it is a light list of
-   * rows, each openable for its output. Groups start collapsed even while
-   * running: the summary badge carries live status without turning the
-   * transcript into a wall of command rows.
+   * line — the agent's own batch label ("Listed files in directory") or a
+   * readable count ("Ran 2 commands, read a file"); expanded it is a light
+   * list of rows, each openable for its output. Groups start collapsed even
+   * while running: a breathing dot and the present-tense title carry live
+   * status without turning the transcript into a wall of command rows.
    */
   interface Props {
     tools: Extract<ChatBlock, { kind: "tool" }>[];
@@ -71,33 +73,13 @@
    *  stream into this keyed group. */
   let open = $state(false);
 
-  /** "6 commands · 2 files · 1 step" — only the non-zero parts, so a pure
-   *  command run reads cleanly. Edits are counted by distinct file. */
-  const summary = $derived.by(() => {
-    let commands = 0;
-    let steps = 0;
-    const files = new Set<string>();
-    for (const t of tools) {
-      if (t.tool === "edit") {
-        if (t.locations.length > 0) for (const l of t.locations) files.add(l);
-        else steps++;
-      } else if (t.tool === "execute") {
-        commands++;
-      } else {
-        steps++;
-      }
-    }
-    const parts: string[] = [];
-    const plural = (n: number, w: string) => `${n} ${w}${n === 1 ? "" : "s"}`;
-    if (commands > 0) parts.push(plural(commands, "command"));
-    if (files.size > 0) parts.push(plural(files.size, "file"));
-    if (steps > 0) parts.push(plural(steps, "step"));
-    return parts.length > 0 ? parts.join(" · ") : plural(tools.length, "tool");
-  });
+  /** The agent's own batch labels, else readable counts ("Ran 2 commands,
+   *  read a file") — see toolLabels.ts. The full list stays in the tooltip. */
+  const title = $derived(toolGroupTitle(tools));
 </script>
 
 <div
-  class="group"
+  class="group activity"
   class:failed
   class:running
   class:visible
@@ -109,17 +91,18 @@
     class="summary"
     aria-expanded={open}
     onclick={() => (open = !open)}
-    title={open ? "collapse tool activity" : "expand tool activity"}
+    title={open ? "hide tool activity" : `show tool activity — ${tools.length} call${tools.length === 1 ? "" : "s"}`}
   >
-    <Chevron {open} />
-    <span class="label">{summary}</span>
+    {#if running}
+      <span class="live-dot" aria-hidden="true"></span>
+    {/if}
+    <span class="label">{title}</span>
     {#if failed}
       <span class="badge bad">failed</span>
-    {:else if running}
-      <span class="badge run">running…</span>
     {:else if recovered}
       <span class="badge soft">recovered</span>
     {/if}
+    <Chevron {open} />
   </button>
   {#if open}
     <div class="rows">
@@ -138,11 +121,7 @@
 
 <style>
   .group {
-    border: 1px solid color-mix(in srgb, var(--edge) 65%, transparent);
-    border-radius: 8px;
-    margin: 4px 0;
-    background: color-mix(in srgb, var(--fg) 2%, transparent);
-    overflow: hidden;
+    margin: 1px 0;
     animation: rise 0.15s ease; /* @keyframes rise lives in app.css */
   }
   .group:not(.visible) {
@@ -153,36 +132,79 @@
       animation: none;
     }
   }
+  /* A quiet line, not a card: the Claude/Codex apps render tool runs as a
+     muted sentence with a trailing chevron, so prose stays the page's voice. */
   .summary {
-    display: flex;
+    display: inline-flex;
     align-items: center;
-    gap: 8px;
-    width: 100%;
-    padding: 5px 10px;
+    gap: 6px;
+    max-width: 100%;
+    margin-left: -6px;
+    padding: 2px 6px;
     background: none;
     border: none;
-    color: var(--muted);
+    border-radius: 6px;
+    color: var(--activity-fg, var(--muted));
     font: inherit;
-    font-size: var(--text-sm);
+    font-size: var(--text-xs);
+    line-height: 1.4;
     text-align: left;
     cursor: pointer;
-    transition: background-color 0.12s ease;
+    transition:
+      background-color 0.12s ease,
+      color 0.12s ease;
   }
-  .summary:hover {
+  .summary:hover,
+  .summary:focus-visible {
+    color: var(--fg);
     background: color-mix(in srgb, var(--fg) 4%, transparent);
   }
+  .summary :global(.chev) {
+    opacity: 0.55;
+  }
+  .summary:hover :global(.chev) {
+    opacity: 1;
+  }
   .label {
-    flex: 1;
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    font-family: var(--mono, monospace);
+  }
+  /* Running: a small breathing dot instead of a badge (the title already
+     says what is running, in the present tense). */
+  .live-dot {
+    flex: none;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--accent);
+    animation: live-breathe 1.6s ease-in-out infinite;
+  }
+  @keyframes live-breathe {
+    0%,
+    100% {
+      opacity: 0.35;
+    }
+    50% {
+      opacity: 1;
+    }
+  }
+  :global(html.app-hidden) .live-dot,
+  .group:not(.visible) .live-dot {
+    animation-play-state: paused;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .live-dot {
+      animation: none;
+    }
+  }
+  .group.failed .summary {
+    color: color-mix(in srgb, var(--err) 80%, var(--muted));
   }
   .badge {
     flex: none;
     font-size: var(--text-xs);
-    font-family: var(--mono, monospace);
     padding: 0 6px;
     border-radius: 999px;
   }
@@ -190,16 +212,14 @@
     color: var(--err);
     background: color-mix(in srgb, var(--err) 12%, transparent);
   }
-  .badge.run {
-    color: var(--accent);
-    background: color-mix(in srgb, var(--accent) 12%, transparent);
-  }
   /* Recovered: worth a glance, not an alarm. */
   .badge.soft {
     color: var(--muted);
     background: color-mix(in srgb, var(--fg) 7%, transparent);
   }
   .rows {
-    border-top: 1px solid color-mix(in srgb, var(--edge) 55%, transparent);
+    margin: 2px 0 6px 2px;
+    padding-left: 10px;
+    border-left: 2px solid color-mix(in srgb, var(--edge) 70%, transparent);
   }
 </style>

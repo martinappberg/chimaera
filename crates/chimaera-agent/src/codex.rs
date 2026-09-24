@@ -17,8 +17,9 @@
 //! - The connection multiplexes EVERY thread: a collab subagent's whole
 //!   transcript streams interleaved with the parent's, distinguished only by
 //!   `params.threadId` (multi-agent, live 0.144.2 — PROTOCOL.md Pass 16).
-//!   Collab items on the parent thread: `subAgentActivity` (spawn/input/close
-//!   markers) and `collabAgentToolCall` (only `wait` seen live).
+//!   Collab items on the parent thread: `subAgentActivity` (spawn/input/
+//!   close/finish markers) and `collabAgentToolCall` (only `wait` seen live
+//!   through 0.156.1).
 
 use std::path::Path;
 use std::time::Duration;
@@ -28,8 +29,8 @@ use serde_json::{json, Value};
 
 use crate::ndjson::JsonlChild;
 
-/// CLI version these frame shapes were verified against (2026-07-16).
-pub const TESTED_CODEX_VERSION: &str = "0.153.0";
+/// CLI version these frame shapes were verified against (2026-09-23).
+pub const TESTED_CODEX_VERSION: &str = "0.156.1";
 
 /// The `initialize` request both the probe client and the driver handshake
 /// send. Declares `experimentalApi` so `thread/settings/update` is available
@@ -92,16 +93,30 @@ impl CodexChat {
 
     /// Kick off a turn; item/turn notifications then flow through `recv`.
     pub async fn turn_start(&mut self, thread_id: &str, text: &str) -> Result<u64> {
+        self.turn_start_with(thread_id, text, json!({})).await
+    }
+
+    /// [`Self::turn_start`] with extra top-level `turn/start` params (e.g.
+    /// `summary`, `effort`) merged in, so probes can pin the per-turn
+    /// settings the driver sends.
+    pub async fn turn_start_with(
+        &mut self,
+        thread_id: &str,
+        text: &str,
+        extra: Value,
+    ) -> Result<u64> {
         let id = self.request_id();
+        let mut params = json!({
+            "threadId": thread_id,
+            "input": [{ "type": "text", "text": text }],
+        });
+        if let Some(fields) = extra.as_object() {
+            for (key, value) in fields {
+                params[key] = value.clone();
+            }
+        }
         self.io
-            .send(&json!({
-                "id": id,
-                "method": "turn/start",
-                "params": {
-                    "threadId": thread_id,
-                    "input": [{ "type": "text", "text": text }],
-                },
-            }))
+            .send(&json!({ "id": id, "method": "turn/start", "params": params }))
             .await?;
         Ok(id)
     }
@@ -192,10 +207,11 @@ use crate::driver::{
     SpawnSpec, IDLE_FLUSH_GRACE_TICKS, INTERRUPT_GRACE_TICKS,
 };
 use crate::model::{
-    cap_output, truncate_label, AgentCommand, AgentEvent, ChunkKind, Coalescer, CompactionPhase,
-    ContentBlock, PermissionOption, PermissionOptionKind, RemoteControlSnapshot,
+    cap_output, fmt_elapsed_secs, truncate_label, AgentCommand, AgentEvent, ChunkKind, Coalescer,
+    CompactionPhase, ContentBlock, PermissionOption, PermissionOptionKind, RemoteControlSnapshot,
     RemoteControlState, SlashCommand, ToolContent, ToolKind, ToolStatus, Usage, UserMessageState,
-    SKILL_PATH_MAX, SLASH_COMMANDS_CAP, SLASH_DESCRIPTION_MAX, SLASH_NAME_MAX,
+    BG_LABEL_MAX, SKILL_PATH_MAX, SLASH_COMMANDS_CAP, SLASH_DESCRIPTION_MAX, SLASH_NAME_MAX,
+    SUBAGENT_RESULT_MAX,
 };
 use crate::ndjson::{JsonlSink, JsonlStream};
 
@@ -263,6 +279,9 @@ impl Driver for CodexDriver {
             spec.mcp_auto_approve.clone(),
             hs.next_id,
         );
+        if hs.summary_configured {
+            mapper.reasoning_summary = None;
+        }
         // A status announced during the handshake (a paired daemon that is
         // already connected) would otherwise never reach the relay.
         if let Some(frame) = hs.remote_control_status {
@@ -307,6 +326,9 @@ struct CodexHandshake {
     /// The Remote Control status the app-server announced during the
     /// handshake (see `HandshakeSideband`), replayed through the mapper.
     remote_control_status: Option<Value>,
+    /// The user's config names a `model_reasoning_summary`, so turns must
+    /// not override it (see `CodexMapper::reasoning_summary`).
+    summary_configured: bool,
 }
 
 #[derive(Default)]
@@ -334,34 +356,36 @@ async fn codex_handshake(
     }
 
     // Match native Codex's new-thread default instead of silently taking the
-    // selected model's catalog default. The config read is optional for older
+    // selected model's catalog default, and learn whether the user chose a
+    // reasoning-summary mode. The config read is optional for older
     // app-server builds; a Chimaera-carried resumed-thread selection wins.
-    let configured_effort = if spec.initial_effort.is_none() {
-        let config_id = 1u64;
-        if sink
-            .send(&json!({
-                "id": config_id,
-                "method": "config/read",
-                "params": { "cwd": spec.cwd, "includeLayers": false },
-            }))
-            .await
-            .is_ok()
+    let config_id = 1u64;
+    let config = if sink
+        .send(&json!({
+            "id": config_id,
+            "method": "config/read",
+            "params": { "cwd": spec.cwd, "includeLayers": false },
+        }))
+        .await
+        .is_ok()
+    {
+        match tokio::time::timeout(
+            Duration::from_secs(2),
+            await_rpc_result(stream, &mut side, config_id),
+        )
+        .await
         {
-            match tokio::time::timeout(
-                Duration::from_secs(2),
-                await_rpc_result(stream, &mut side, config_id),
-            )
-            .await
-            {
-                Ok(Ok(result)) => configured_effort(&result),
-                _ => None,
-            }
-        } else {
-            None
+            Ok(Ok(result)) => Some(result),
+            _ => None,
         }
     } else {
         None
     };
+    let configured_effort = config
+        .as_ref()
+        .filter(|_| spec.initial_effort.is_none())
+        .and_then(configured_effort);
+    let summary_configured = config.as_ref().is_some_and(summary_configured);
     let opening_effort = spec.initial_effort.clone().or(configured_effort);
 
     let open_id = 2u64;
@@ -545,6 +569,7 @@ async fn codex_handshake(
         next_id,
         rollback_error,
         remote_control_status: side.remote_control_status,
+        summary_configured,
     })
 }
 
@@ -608,6 +633,12 @@ fn configured_effort(result: &Value) -> Option<String> {
         .as_str()
         .filter(|effort| effort.len() <= crate::model::COMMAND_SELECTOR_MAX)
         .map(String::from)
+}
+
+/// `config/read` names a reasoning-summary mode (live 0.156.1: `null` when
+/// the user never set `model_reasoning_summary`).
+fn summary_configured(result: &Value) -> bool {
+    result["config"]["model_reasoning_summary"].is_string()
 }
 
 /// Build the thread-open request separately from I/O so the launch recipe's
@@ -839,6 +870,10 @@ const COLLAB_AGENTS_CAP: usize = 32;
 /// thinking ticks, so a chatty subagent can't flood the journal.
 const COLLAB_TOKEN_STEP: u64 = 256;
 
+/// The parent turn's live output counter (`TurnTokens`) journals a new value
+/// only after a move this large — same order as the collab throttle above.
+const TURN_TOKENS_STEP: u64 = 256;
+
 struct CollabAgent {
     /// The subagent's thread id — the key every foreign frame carries.
     thread_id: String,
@@ -865,9 +900,103 @@ struct CollabAgent {
     tokens_emitted: u64,
     /// Latest activity label ("thinking", a command title, "answered", …).
     last: String,
+    /// The agent's thread has a turn running (its own `turn/started` seen,
+    /// no turn end yet). The thread's turn end owns the stint's close; a
+    /// `completed` activity marker only closes a row with no running turn.
+    turn_running: bool,
+    /// When the current stint opened (ms since the epoch) and the tool /
+    /// token totals at that moment — the finish line reports this stint's
+    /// work, not the thread's lifetime.
+    stint_opened_ms: u64,
+    stint_tools: u64,
+    stint_tokens: u64,
+    /// The current stint's latest final answer (an `agentMessage` whose
+    /// phase is `final_answer` or unknown), capped at
+    /// [`SUBAGENT_RESULT_MAX`]; only the last one is kept.
+    answer: Option<String>,
+}
+
+/// How a subagent stint ended — the `SubagentFinished.status` word and the
+/// row's terminal status (a deliberate stop closes quietly, like claude's
+/// stopped verdict; only a failure goes red).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StintEnd {
+    Completed,
+    Failed,
+    Stopped,
+}
+
+impl StintEnd {
+    fn tool_status(self) -> ToolStatus {
+        match self {
+            StintEnd::Failed => ToolStatus::Failed,
+            StintEnd::Completed | StintEnd::Stopped => ToolStatus::Completed,
+        }
+    }
+
+    fn word(self) -> &'static str {
+        match self {
+            StintEnd::Completed => "completed",
+            StintEnd::Failed => "failed",
+            StintEnd::Stopped => "stopped",
+        }
+    }
 }
 
 impl CollabAgent {
+    fn new(thread_id: &str, row_id: String, name: &str, note: &str) -> Self {
+        let mut agent = CollabAgent {
+            thread_id: thread_id.to_string(),
+            row_id,
+            name: name.to_string(),
+            open: true,
+            stint: 1,
+            tools: 0,
+            tokens: 0,
+            tokens_emitted: 0,
+            last: note.to_string(),
+            turn_running: false,
+            stint_opened_ms: 0,
+            stint_tools: 0,
+            stint_tokens: 0,
+            answer: None,
+        };
+        agent.begin_stint();
+        agent
+    }
+
+    /// Reset the per-stint finish bookkeeping as a row (re)opens.
+    fn begin_stint(&mut self) {
+        self.stint_opened_ms = crate::now_ms();
+        self.stint_tools = self.tools;
+        self.stint_tokens = self.tokens;
+        self.answer = None;
+    }
+
+    /// The finish line's stats — claude's `subagent_stats` spelling
+    /// ("12 tools · 34.5k tokens · 2m 03s") over this stint's deltas; a
+    /// part the driver cannot know (or a sub-second run) is omitted.
+    fn stint_stats(&self, now_ms: u64) -> Option<String> {
+        let tools = self.tools.saturating_sub(self.stint_tools);
+        let tokens = self.tokens.saturating_sub(self.stint_tokens);
+        let elapsed_ms = now_ms.saturating_sub(self.stint_opened_ms);
+        let parts: Vec<String> = [
+            (tools > 0).then(|| format!("{tools} tool{}", if tools == 1 { "" } else { "s" })),
+            (tokens > 0).then(|| {
+                if tokens >= 1000 {
+                    format!("{:.1}k tokens", tokens as f64 / 1000.0)
+                } else {
+                    format!("{tokens} tokens")
+                }
+            }),
+            (elapsed_ms >= 1000).then(|| fmt_elapsed_secs(elapsed_ms / 1000)),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        (!parts.is_empty()).then(|| parts.join(" · "))
+    }
+
     /// The row's one-line progress — claude's task_progress format
     /// ("{last} · {n} tools · {tok} tokens"), driver-built so replay
     /// reproduces it byte-identically.
@@ -923,6 +1052,12 @@ struct CodexMapper {
     /// Last effort value journaled to the UI. The nested option distinguishes
     /// "no event emitted yet" from an authoritative `None` read-back.
     reported_effort: Option<Option<String>>,
+    /// `turn/start.summary` for every turn. Current model catalogs default
+    /// `default_reasoning_summary` to "none" (0.156.1 bundled catalog), so a
+    /// thread whose summary was never set streams NO reasoning summaries —
+    /// live: 0 of 3 unset turns vs 3 of 3 with "auto", the value Codex
+    /// Desktop sends. `None` when the user's config names its own mode.
+    reasoning_summary: Option<&'static str>,
     /// Composer agent mode (read-only/auto/full-access/plan): the wire
     /// fields ride each turn/start once settings/update proves unsupported.
     current_mode: String,
@@ -982,6 +1117,17 @@ struct CodexMapper {
     pending_questions: HashMap<String, PendingQuestion>,
     /// One safety-buffering notice per turn (the frame repeats).
     safety_notified: bool,
+    /// A terminal (non-retrying) `error` already put this turn's failure in
+    /// the transcript, so a failed turn end need not repeat the message.
+    turn_error_shown: bool,
+    /// The running parent turn's live output-token counter (`TurnTokens`).
+    /// Base = the thread's cumulative output at the turn's first usage
+    /// update minus that update's own share, so a resumed thread's history
+    /// never counts; `turn_output` is the latest value, `turn_output_emitted`
+    /// the last one journaled (the [`TURN_TOKENS_STEP`] throttle).
+    turn_output_base: Option<u64>,
+    turn_output: u64,
+    turn_output_emitted: u64,
     /// The deprecated thread/compacted notification may overlap the
     /// contextCompaction item pair. Fold both sources to exactly one start
     /// and one completion event per turn.
@@ -1063,6 +1209,7 @@ impl CodexMapper {
             chosen_effort: None,
             // The handshake queues this exact state immediately after Init.
             reported_effort: Some(effort),
+            reasoning_summary: Some("auto"),
             // Chimaera's chat default: the same workspace/on-request tuple,
             // with Codex's reviewer assessing approvals before they surface.
             current_mode: "auto-review".to_string(),
@@ -1084,6 +1231,10 @@ impl CodexMapper {
             pending_approvals: HashMap::new(),
             pending_questions: HashMap::new(),
             safety_notified: false,
+            turn_error_shown: false,
+            turn_output_base: None,
+            turn_output: 0,
+            turn_output_emitted: 0,
             compaction_active: false,
             compaction_completed: false,
             decline_notified: false,
@@ -1406,6 +1557,27 @@ impl CodexMapper {
                     duration_ms: 0,
                     context_window: usage["modelContextWindow"].as_u64(),
                 };
+                // The live turn counter. `outputTokens` already includes
+                // `reasoningOutputTokens` (live 0.156.1: totalTokens =
+                // inputTokens + outputTokens). A late update for a previous
+                // turn (its own turnId) must not seed this turn's base.
+                let this_turn = frame["params"]["turnId"]
+                    .as_str()
+                    .is_none_or(|turn| turn == self.turn_id);
+                if self.turn_active && this_turn {
+                    let total_out = total["outputTokens"].as_u64().unwrap_or(0);
+                    let last_out = usage["last"]["outputTokens"].as_u64().unwrap_or(0);
+                    let base = *self
+                        .turn_output_base
+                        .get_or_insert(total_out.saturating_sub(last_out));
+                    self.turn_output = total_out.saturating_sub(base);
+                    if self.turn_output.abs_diff(self.turn_output_emitted) >= TURN_TOKENS_STEP {
+                        self.turn_output_emitted = self.turn_output;
+                        step.events.push(AgentEvent::TurnTokens {
+                            output: self.turn_output,
+                        });
+                    }
+                }
                 // The context meter reads the LAST request's tokens (what is
                 // actually in the window), not the cumulative total — the
                 // official client's exact math, min'd against the window.
@@ -1616,6 +1788,7 @@ impl CodexMapper {
                         text: format!("{msg} (retrying)"),
                     });
                 } else {
+                    self.turn_error_shown = true;
                     step.events.push(AgentEvent::Error {
                         message: msg.to_string(),
                         fatal: false,
@@ -1632,21 +1805,39 @@ impl CodexMapper {
                 let was_active = self.turn_active;
                 self.turn_active = false;
                 if was_active {
+                    self.emit_final_turn_tokens(&mut step);
                     let turn = &frame["params"]["turn"];
                     let mut usage = self.last_usage.clone();
                     usage.duration_ms = turn["durationMs"].as_u64().unwrap_or(0);
                     let turn_id = turn["id"].as_str().unwrap_or(&self.turn_id).to_string();
-                    if turn["status"] == "interrupted" {
-                        // status "interrupted" only follows a turn/interrupt RPC
-                        // — codex's wire carries the user-stop fact structurally.
-                        step.events.push(AgentEvent::TurnAborted {
+                    match turn["status"].as_str() {
+                        // status "interrupted" only follows a turn/interrupt
+                        // RPC — codex's wire carries the user-stop fact
+                        // structurally.
+                        Some("interrupted") => step.events.push(AgentEvent::TurnAborted {
                             turn_id,
                             reason: "interrupted".into(),
                             interrupted: true,
-                        });
-                    } else {
-                        step.events
-                            .push(AgentEvent::TurnCompleted { turn_id, usage });
+                        }),
+                        // A failed turn is `turn/completed {status: "failed",
+                        // error}` on current app-servers (the 0.153/0.156
+                        // schemas have no `turn/failed`); rendering it
+                        // completed would show a dead turn as a success.
+                        // The terminal `error` notification usually already
+                        // put the message in the transcript; the abort then
+                        // says only "turn failed" instead of repeating it.
+                        Some("failed") => step.events.push(AgentEvent::TurnAborted {
+                            turn_id,
+                            reason: turn["error"]["message"]
+                                .as_str()
+                                .filter(|_| !self.turn_error_shown)
+                                .map(|m| truncate_label(m, 300))
+                                .unwrap_or_else(|| "turn failed".into()),
+                            interrupted: false,
+                        }),
+                        _ => step
+                            .events
+                            .push(AgentEvent::TurnCompleted { turn_id, usage }),
                     }
                     // Refresh rate-limit telemetry once per turn (account/read
                     // is the extension's source; tolerated if absent).
@@ -1676,6 +1867,7 @@ impl CodexMapper {
                 let was_active = self.turn_active;
                 self.turn_active = false;
                 if was_active {
+                    self.emit_final_turn_tokens(&mut step);
                     step.events.push(AgentEvent::TurnAborted {
                         turn_id: self.turn_id.clone(),
                         reason: frame["params"]["error"]["message"]
@@ -1700,6 +1892,17 @@ impl CodexMapper {
         step
     }
 
+    /// The turn's settled output count, if the throttle held it back — so the
+    /// status line ends on the true total, not the last 256-token step.
+    fn emit_final_turn_tokens(&mut self, step: &mut DriverStep) {
+        if self.turn_output != self.turn_output_emitted {
+            self.turn_output_emitted = self.turn_output;
+            step.events.push(AgentEvent::TurnTokens {
+                output: self.turn_output,
+            });
+        }
+    }
+
     /// Clear everything scoped to a single turn. Called at every turn end
     /// (completed OR failed) so nothing leaks across the turn boundary.
     fn reset_turn_state(&mut self) {
@@ -1707,6 +1910,10 @@ impl CodexMapper {
         self.out_streamed.clear();
         self.safety_notified = false;
         self.decline_notified = false;
+        self.turn_error_shown = false;
+        self.turn_output_base = None;
+        self.turn_output = 0;
+        self.turn_output_emitted = 0;
         // A missing terminal item must not strand the UI's compaction lane.
         // Turn end clears it client-side; mark this native lifecycle settled
         // too so a late deprecated thread/compacted notification cannot emit
@@ -2080,11 +2287,13 @@ impl CodexMapper {
                     if let Some(flushed) = self.coalescer.flush() {
                         step.events.push(flushed);
                     }
+                    let (kind, title, locations) = command_exploration(item)
+                        .unwrap_or_else(|| (ToolKind::Execute, command_title(item), Vec::new()));
                     step.events.push(AgentEvent::ToolCall {
                         id,
-                        kind: ToolKind::Execute,
-                        title: command_title(item),
-                        locations: Vec::new(),
+                        kind,
+                        title,
+                        locations,
                         status: ToolStatus::InProgress,
                         cross_turn: false,
                     });
@@ -2310,20 +2519,12 @@ impl CodexMapper {
                     });
                 }
             }
-            // A collab tool call the model made (multi-agent, 0.144.x). Live,
-            // only "wait" surfaces as an item — spawn/input/close appear as
-            // subAgentActivity markers instead — but unseen tools render too.
+            // A collab tool call the model made (multi-agent). Live (0.144.2
+            // through 0.156.1) only "wait" surfaces as an item — spawn/input/
+            // close appear as subAgentActivity markers instead — but every
+            // schema tool (v1 + v2 names) gets a readable title.
             Some("collabAgentToolCall") => {
-                let tool = item["tool"].as_str().unwrap_or("collab");
-                let title = match tool {
-                    "wait" => "waiting for subagents".to_string(),
-                    other => match item["prompt"].as_str() {
-                        Some(p) if !p.is_empty() => {
-                            format!("collab {other}: {}", truncate_label(p, 120))
-                        }
-                        _ => format!("collab {other}"),
-                    },
-                };
+                let title = self.collab_tool_title(item);
                 if let Some(flushed) = self.coalescer.flush() {
                     step.events.push(flushed);
                 }
@@ -2352,9 +2553,11 @@ impl CodexMapper {
                 }
             }
             // A collab tool acted on a subagent: spawn ("started"), follow-up
-            // input ("interacted"), shutdown ("interrupted"). The marker
-            // arrives as item/completed only; item.id is the collab CALL id,
-            // so the subagent's THREAD id is the stable row key.
+            // input ("interacted"), shutdown ("interrupted"), or the agent's
+            // turn finished ("completed"). Acted on at item/completed (0.156.1
+            // also sends an item/started twin for started/completed); item.id
+            // is the collab CALL id (or "subagent-completed-…"), so the
+            // subagent's THREAD id is the stable row key.
             Some("subAgentActivity") if completed => {
                 let thread = item["agentThreadId"]
                     .as_str()
@@ -2378,16 +2581,37 @@ impl CodexMapper {
                     "started" => self.collab_agent_open(&thread, &name, "", step),
                     "interacted" => self.collab_agent_open(&thread, &name, "follow-up input", step),
                     "interrupted" => {
-                        self.collab_agent_close(&thread, ToolStatus::Completed, "closed", step)
+                        self.collab_agent_close(&thread, StintEnd::Stopped, "closed", step)
+                    }
+                    // Trails the agent thread's own turn/completed by ~2 ms
+                    // (live 0.156.1; 0.153 rollouts agree), which already
+                    // closed the stint — so this is a no-op then, and it
+                    // never opens a row (it once re-opened a phantom running
+                    // "Agent" row that only teardown failed). It closes the
+                    // row itself only when no turn of the agent's is known
+                    // to be running (its thread frames never arrived).
+                    "completed" => {
+                        if self
+                            .collab_agent_mut(&thread)
+                            .is_some_and(|agent| agent.open && !agent.turn_running)
+                        {
+                            self.collab_agent_close(&thread, StintEnd::Completed, "answered", step);
+                        }
                     }
                     // Unseen kinds (binary mining also names spawn/compaction
-                    // variants): open-or-note with the agent's own word, so a
-                    // spawn that arrives under an unmined kind still creates
+                    // variants): a spawn under an unmined kind still creates
                     // the row — an invisible subagent is worse than a
-                    // spuriously re-opened one (its turn end closes it).
+                    // spurious one — while a known agent only gets the word
+                    // on its row. A marker never re-opens a closed stint:
+                    // new work on it arrives as the thread's own turn/started,
+                    // which re-opens it.
                     other => {
                         let label = truncate_label(other, 40);
-                        self.collab_agent_open(&thread, &name, &label, step);
+                        if self.collab_agent_mut(&thread).is_some() {
+                            self.collab_agent_note(&thread, &label, step);
+                        } else {
+                            self.collab_agent_open(&thread, &name, &label, step);
+                        }
                     }
                 }
             }
@@ -2618,6 +2842,74 @@ impl CodexMapper {
         });
     }
 
+    /// A readable title for a collab tool call (the `CollabAgentTool` enum,
+    /// v1 + v2 names in the 0.156.1 schema), naming its targets by the
+    /// agents' own names where the thread is tracked. Unmined tools keep the
+    /// generic "collab {tool}" spelling.
+    fn collab_tool_title(&self, item: &Value) -> String {
+        let tool = item["tool"].as_str().unwrap_or("collab");
+        let prompt = item["prompt"]
+            .as_str()
+            .map(str::trim)
+            .filter(|p| !p.is_empty());
+        let targets = self.collab_target_names(item);
+        let with_prompt = |head: String| match prompt {
+            Some(p) => format!("{head}: {}", truncate_label(p, 100)),
+            None => head,
+        };
+        let title = match (tool, targets) {
+            ("wait", _) => "waiting for subagents".to_string(),
+            ("listAgents", _) => "List agents".to_string(),
+            ("spawnAgent", _) => with_prompt("Spawn agent".to_string()),
+            ("sendMessage", Some(t)) => with_prompt(format!("Message → {t}")),
+            ("sendInput", Some(t)) => with_prompt(format!("Input → {t}")),
+            ("followupTask", Some(t)) => with_prompt(format!("Follow-up → {t}")),
+            ("interruptAgent", Some(t)) => format!("Interrupt {t}"),
+            ("resumeAgent", Some(t)) => format!("Resume {t}"),
+            ("closeAgent", Some(t)) => format!("Close {t}"),
+            ("sendMessage", None) => with_prompt("Message an agent".to_string()),
+            ("sendInput", None) => with_prompt("Input to an agent".to_string()),
+            ("followupTask", None) => with_prompt("Follow-up task".to_string()),
+            ("interruptAgent", None) => "Interrupt an agent".to_string(),
+            ("resumeAgent", None) => "Resume an agent".to_string(),
+            ("closeAgent", None) => "Close an agent".to_string(),
+            (other, _) => with_prompt(format!("collab {}", truncate_label(other, 40))),
+        };
+        truncate_label(&title, 160)
+    }
+
+    /// The collab call's `receiverThreadIds` as the agents' own names (the
+    /// tracked row name; an untracked thread shows its id's tail), at most
+    /// three plus a count.
+    fn collab_target_names(&self, item: &Value) -> Option<String> {
+        const SHOWN: usize = 3;
+        let receivers = item["receiverThreadIds"].as_array()?;
+        let mut names: Vec<String> = receivers
+            .iter()
+            .filter_map(Value::as_str)
+            .take(SHOWN)
+            .map(|thread| {
+                self.collab_agents
+                    .iter()
+                    .find(|a| a.thread_id == thread)
+                    .map(|a| a.name.clone())
+                    .unwrap_or_else(|| {
+                        // Thread ids are ASCII UUIDs; a non-boundary cut on
+                        // anything else just drops the tail.
+                        let tail = thread.get(thread.len().saturating_sub(6)..).unwrap_or("");
+                        format!("agent …{tail}")
+                    })
+            })
+            .collect();
+        if names.is_empty() {
+            return None;
+        }
+        if receivers.len() > SHOWN {
+            names.push(format!("+{} more", receivers.len() - SHOWN));
+        }
+        Some(names.join(", "))
+    }
+
     /// The tracked agent for a subagent thread id, if any.
     fn collab_agent_mut(&mut self, thread: &str) -> Option<&mut CollabAgent> {
         self.collab_agents
@@ -2645,6 +2937,7 @@ impl CodexMapper {
                 self.collab_agents[idx].row_id =
                     format!("agent:{thread}#{}", self.collab_agents[idx].stint);
                 self.collab_agents[idx].open = true;
+                self.collab_agents[idx].begin_stint();
                 if let Some(flushed) = self.coalescer.flush() {
                     step.events.push(flushed);
                 }
@@ -2700,17 +2993,7 @@ impl CodexMapper {
             status: ToolStatus::InProgress,
             cross_turn: true,
         });
-        let mut agent = CollabAgent {
-            thread_id: thread.to_string(),
-            row_id,
-            name: name.to_string(),
-            open: true,
-            stint: 1,
-            tools: 0,
-            tokens: 0,
-            tokens_emitted: 0,
-            last: note.to_string(),
-        };
+        let mut agent = CollabAgent::new(thread, row_id, name, note);
         if !note.is_empty() {
             step.events.push(agent.progress_event());
         }
@@ -2721,10 +3004,12 @@ impl CodexMapper {
     /// was shut down ("interrupted" activity), or its turn failed. The entry
     /// stays parked so trailing frames from the closed stint fold into
     /// nothing; new work re-opens as a fresh row (see `collab_agent_open`).
+    /// The open→closed edge is the stint's one `SubagentFinished` line —
+    /// every later close signal for the same stint is a no-op.
     fn collab_agent_close(
         &mut self,
         thread: &str,
-        status: ToolStatus,
+        end: StintEnd,
         note: &str,
         step: &mut DriverStep,
     ) {
@@ -2738,8 +3023,15 @@ impl CodexMapper {
         agent.last = note.to_string();
         step.events.push(AgentEvent::ToolCallUpdate {
             id: agent.row_id.clone(),
-            status,
+            status: end.tool_status(),
             content: agent.progress_content(),
+        });
+        step.events.push(AgentEvent::SubagentFinished {
+            id: Some(agent.row_id.clone()),
+            label: truncate_label(&agent.name, BG_LABEL_MAX),
+            status: end.word().to_string(),
+            result: agent.answer.take(),
+            stats: agent.stint_stats(crate::now_ms()),
         });
     }
 
@@ -2792,7 +3084,12 @@ impl CodexMapper {
                 let item = &frame["params"]["item"];
                 let completed = method == "item/completed";
                 let (label, is_tool): (String, bool) = match item["type"].as_str() {
-                    Some("commandExecution") => (command_title(item), true),
+                    Some("commandExecution") => (
+                        command_exploration(item)
+                            .map(|(_, title, _)| title)
+                            .unwrap_or_else(|| command_title(item)),
+                        true,
+                    ),
                     Some("fileChange") => {
                         // Record the touched paths even for a SUBAGENT's
                         // fileChange: its requestApproval (dispatched before
@@ -2848,6 +3145,22 @@ impl CodexMapper {
                 let Some(agent) = self.collab_agent_mut(thread) else {
                     return;
                 };
+                // The stint's closing words for its finish line: the latest
+                // final answer (commentary is interim narration; a null phase
+                // is a legacy model's unknown, kept as a candidate).
+                if completed
+                    && agent.open
+                    && item["type"] == "agentMessage"
+                    && item["phase"] != "commentary"
+                {
+                    if let Some(text) = item["text"]
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|t| !t.is_empty())
+                    {
+                        agent.answer = Some(truncate_label(text, SUBAGENT_RESULT_MAX));
+                    }
+                }
                 agent.last = label;
                 // One progress emit per item: the started frame carries the
                 // label change; the completed frame only matters when it
@@ -2863,6 +3176,7 @@ impl CodexMapper {
             // working again. A closed agent re-opens as a fresh row (stint).
             "turn/started" => {
                 if let Some(agent) = self.collab_agent_mut(thread) {
+                    agent.turn_running = true;
                     let name = agent.name.clone();
                     self.collab_agent_open(thread, &name, "running", step);
                 }
@@ -2871,25 +3185,39 @@ impl CodexMapper {
             // follow-ups — the row closes; an "interacted" marker re-opens it.
             // A deliberate stop ("interrupted", the close_agent path) closes
             // quietly with the agent's own word — claude renders stopped
-            // subagents the same way (only "failed" verdicts go red).
+            // subagents the same way (only "failed" verdicts go red). Current
+            // app-servers report a failure as `turn/completed {status:
+            // "failed", error}` (no `turn/failed` in the 0.153/0.156 schema).
             "turn/completed" => {
-                let word = if frame["params"]["turn"]["status"] == "interrupted" {
-                    "interrupted"
-                } else {
-                    "answered"
-                };
-                self.collab_agent_close(thread, ToolStatus::Completed, word, step);
+                if let Some(agent) = self.collab_agent_mut(thread) {
+                    agent.turn_running = false;
+                }
+                let turn = &frame["params"]["turn"];
+                match turn["status"].as_str() {
+                    Some("interrupted") => {
+                        self.collab_agent_close(thread, StintEnd::Stopped, "interrupted", step)
+                    }
+                    Some("failed") => {
+                        let reason = turn["error"]["message"].as_str().unwrap_or("turn failed");
+                        let reason = truncate_label(reason, 80);
+                        self.collab_agent_close(thread, StintEnd::Failed, &reason, step);
+                    }
+                    _ => self.collab_agent_close(thread, StintEnd::Completed, "answered", step),
+                }
             }
             "turn/failed" => {
+                if let Some(agent) = self.collab_agent_mut(thread) {
+                    agent.turn_running = false;
+                }
                 let reason = frame["params"]["error"]["message"]
                     .as_str()
                     .unwrap_or("turn failed");
                 let reason = truncate_label(reason, 80);
-                self.collab_agent_close(thread, ToolStatus::Failed, &reason, step);
+                self.collab_agent_close(thread, StintEnd::Failed, &reason, step);
             }
             // A turn-level error on the agent's thread (retryable or not):
             // fold the message into the row so the failure isn't invisible —
-            // the thread's own turn/failed still closes the row if terminal.
+            // the thread's own failed turn end still closes the row.
             "error" => {
                 let msg = frame["params"]["error"]["message"]
                     .as_str()
@@ -3523,6 +3851,9 @@ impl CodexMapper {
         if let Some(effort) = &self.pending_effort {
             params["effort"] = json!(effort);
         }
+        if let Some(summary) = self.reasoning_summary {
+            params["summary"] = json!(summary);
+        }
         // Mode fields ride per-turn only when settings/update proved
         // unsupported (the extension's fallback path).
         if let Some(mode_fields) = &self.mode_per_turn {
@@ -4114,6 +4445,101 @@ impl Mapper for CodexMapper {
         step.outbound.extend(flush.outbound);
         step
     }
+}
+
+/// Parsed actions titled and located per command — beyond this the title is
+/// already past its cap, so later actions only take part in classification.
+const EXPLORATION_ACTIONS_CAP: usize = 16;
+
+/// A command whose every parsed `commandActions` entry reads, lists, or
+/// searches is exploration: it renders like the TUI's "Explored" lines ("Read
+/// a.rs, b.rs", "List src", `Search "q" in src`) as a Read/Search row whose
+/// locations are the read files, so the row opens them. Any `unknown` (or
+/// unmined) action, or none at all, keeps the shell row — a pipeline that
+/// also writes must never masquerade as a read. Read paths arrive absolute
+/// (live 0.156.1); a relative one is resolved against the item's `cwd`.
+fn command_exploration(item: &Value) -> Option<(ToolKind, String, Vec<String>)> {
+    let actions = item["commandActions"]
+        .as_array()
+        .filter(|actions| !actions.is_empty())?;
+    if !actions.iter().all(|action| {
+        matches!(
+            action["type"].as_str(),
+            Some("read") | Some("listFiles") | Some("search")
+        )
+    }) {
+        return None;
+    }
+    let cwd = item["cwd"]
+        .as_str()
+        .map(Path::new)
+        .filter(|c| c.is_absolute());
+    let mut segments: Vec<String> = Vec::new();
+    let mut read_names: Vec<&str> = Vec::new();
+    let mut locations: Vec<String> = Vec::new();
+    let mut searched = false;
+    let flush_reads = |names: &mut Vec<&str>, segments: &mut Vec<String>| {
+        if !names.is_empty() {
+            segments.push(format!("Read {}", names.join(", ")));
+            names.clear();
+        }
+    };
+    for action in actions.iter().take(EXPLORATION_ACTIONS_CAP) {
+        let path = action["path"].as_str().filter(|p| !p.is_empty());
+        match action["type"].as_str() {
+            Some("read") => {
+                let name = action["name"]
+                    .as_str()
+                    .filter(|n| !n.is_empty())
+                    .or_else(|| path.and_then(|p| p.rsplit('/').next()))
+                    .unwrap_or("file");
+                if read_names.last() != Some(&name) {
+                    read_names.push(name);
+                }
+                if let Some(p) = path {
+                    let resolved = if Path::new(p).is_absolute() {
+                        Some(p.to_string())
+                    } else {
+                        cwd.map(|c| c.join(p).to_string_lossy().into_owned())
+                    };
+                    if let Some(resolved) = resolved.filter(|r| !locations.contains(r)) {
+                        locations.push(resolved);
+                    }
+                }
+            }
+            Some("listFiles") => {
+                flush_reads(&mut read_names, &mut segments);
+                searched = true;
+                segments.push(match path.filter(|p| *p != ".") {
+                    Some(p) => format!("List {}", truncate_label(p, 80)),
+                    None => "List files".to_string(),
+                });
+            }
+            _ => {
+                flush_reads(&mut read_names, &mut segments);
+                searched = true;
+                let query = action["query"].as_str().filter(|q| !q.is_empty());
+                let within = path.filter(|p| *p != ".");
+                segments.push(match (query, within) {
+                    (Some(q), Some(p)) => format!(
+                        "Search \"{}\" in {}",
+                        truncate_label(q, 60),
+                        truncate_label(p, 60)
+                    ),
+                    (Some(q), None) => format!("Search \"{}\"", truncate_label(q, 80)),
+                    (None, Some(p)) => format!("Search {}", truncate_label(p, 80)),
+                    (None, None) => "Search files".to_string(),
+                });
+            }
+        }
+    }
+    flush_reads(&mut read_names, &mut segments);
+    let kind = if searched {
+        ToolKind::Search
+    } else {
+        ToolKind::Read
+    };
+    Some((kind, truncate_label(&segments.join(" · "), 120), locations))
 }
 
 /// `commandActions[0].command` is the bare command; the raw `command` field
@@ -7062,6 +7488,560 @@ mod tests {
                 },
             ]
         );
+    }
+
+    // --- 0.156.1 surface: subagent finish, exploration rows, summaries ----
+
+    fn foreign(method: &str, thread: &str, params: Value) -> Value {
+        let mut params = params;
+        params["threadId"] = json!(thread);
+        json!({ "method": method, "params": params })
+    }
+
+    fn finished(events: &[AgentEvent]) -> Vec<&AgentEvent> {
+        events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::SubagentFinished { .. }))
+            .collect()
+    }
+
+    /// The 0.156.1 order: the child's final answer and turn end, THEN the
+    /// parent's `completed` marker ~2 ms later. The marker must be a no-op —
+    /// it used to fall into the open-or-note arm and re-open a phantom
+    /// running "Agent" row that only teardown ever failed.
+    #[test]
+    fn completed_marker_never_reopens_a_closed_agent_row() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        m.on_frame(&sub_agent_activity("started", "sub-1"));
+        m.on_frame(&foreign(
+            "turn/started",
+            "sub-1",
+            json!({ "turn": { "id": "t-s1" } }),
+        ));
+        let mut events = Vec::new();
+        for frame in [
+            foreign(
+                "item/completed",
+                "sub-1",
+                json!({ "item": { "type": "agentMessage", "id": "m0",
+                                  "phase": "commentary", "text": "Working on it." } }),
+            ),
+            foreign(
+                "item/completed",
+                "sub-1",
+                json!({ "item": { "type": "agentMessage", "id": "m1",
+                                  "phase": "final_answer", "text": "  Forty-two\n" } }),
+            ),
+            foreign(
+                "turn/completed",
+                "sub-1",
+                json!({ "turn": { "id": "t-s1", "status": "completed" } }),
+            ),
+        ] {
+            events.extend(m.on_frame(&frame).events);
+        }
+        assert_eq!(
+            finished(&events),
+            vec![&AgentEvent::SubagentFinished {
+                id: Some("agent:sub-1".into()),
+                label: "agent_a".into(),
+                status: "completed".into(),
+                result: Some("Forty-two".into()),
+                stats: None,
+            }],
+            "one finish line, quoting the final answer (not the commentary)"
+        );
+
+        let step = m.on_frame(&sub_agent_activity("completed", "sub-1"));
+        assert_eq!(step.events, vec![], "the trailing marker is a no-op");
+        assert!(!m.collab_agents[0].open, "no phantom re-open");
+        assert_eq!(m.collab_agents[0].stint, 1, "no new stint was minted");
+
+        // An unmined kind for a known, closed agent only notes the word.
+        let step = m.on_frame(&sub_agent_activity("compacted", "sub-1"));
+        assert_eq!(step.events, vec![], "a closed row gets no new card");
+        assert!(!m.collab_agents[0].open);
+    }
+
+    /// The marker still closes a row whose thread never reported a running
+    /// turn (its frames never reached this connection), and is ignored while
+    /// the agent's own turn is known to run.
+    #[test]
+    fn completed_marker_closes_only_a_row_without_a_running_turn() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        m.on_frame(&sub_agent_activity("started", "sub-1"));
+        let step = m.on_frame(&sub_agent_activity("completed", "sub-1"));
+        assert!(
+            step.events.iter().any(|e| matches!(
+                e,
+                AgentEvent::ToolCallUpdate { id, status: ToolStatus::Completed, .. }
+                    if id == "agent:sub-1"
+            )),
+            "an otherwise-silent agent closes on the marker: {:?}",
+            step.events
+        );
+        assert_eq!(finished(&step.events).len(), 1);
+
+        let mut m = mapper();
+        active_turn(&mut m);
+        m.on_frame(&sub_agent_activity("started", "sub-2"));
+        m.on_frame(&foreign(
+            "turn/started",
+            "sub-2",
+            json!({ "turn": { "id": "t-s2" } }),
+        ));
+        let step = m.on_frame(&sub_agent_activity("completed", "sub-2"));
+        assert_eq!(step.events, vec![], "a running turn owns its close");
+        assert!(m.collab_agents[0].open);
+        // A marker for an agent never seen opens nothing.
+        let step = m.on_frame(&sub_agent_activity("completed", "sub-unknown"));
+        assert_eq!(step.events, vec![]);
+        assert_eq!(m.collab_agents.len(), 1);
+    }
+
+    /// Status words, stint-scoped stats, and exactly one finish per stint
+    /// across every close signal (marker + the thread's own turn end).
+    #[test]
+    fn subagent_finished_reports_status_and_stint_stats_once() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        m.on_frame(&sub_agent_activity("started", "sub-1"));
+        m.on_frame(&foreign(
+            "turn/started",
+            "sub-1",
+            json!({ "turn": { "id": "t-s1" } }),
+        ));
+        for n in 0..3 {
+            m.on_frame(&foreign(
+                "item/completed",
+                "sub-1",
+                json!({ "item": { "type": "commandExecution", "id": format!("c{n}"),
+                                  "command": "true" } }),
+            ));
+        }
+        m.on_frame(&foreign(
+            "thread/tokenUsage/updated",
+            "sub-1",
+            json!({ "tokenUsage": { "total": { "totalTokens": 12_345 } } }),
+        ));
+        // Backdate the stint so the elapsed part renders.
+        m.collab_agents[0].stint_opened_ms = crate::now_ms() - 125_000;
+
+        // close_agent: the marker lands first and closes the stint stopped…
+        let step = m.on_frame(&sub_agent_activity("interrupted", "sub-1"));
+        match finished(&step.events).as_slice() {
+            [AgentEvent::SubagentFinished {
+                status,
+                stats: Some(stats),
+                result: None,
+                ..
+            }] => {
+                assert_eq!(status, "stopped");
+                assert_eq!(stats, "3 tools · 12.3k tokens · 2m 05s");
+            }
+            other => panic!("expected one stopped finish, got {other:?}"),
+        }
+        // …and the thread's own interrupted turn end is the same stint.
+        let step = m.on_frame(&foreign(
+            "turn/completed",
+            "sub-1",
+            json!({ "turn": { "id": "t-s1", "status": "interrupted" } }),
+        ));
+        assert_eq!(finished(&step.events).len(), 0, "never twice per stint");
+
+        // A follow-up is a new stint: its stats start from zero and a failed
+        // turn (0.156 spells it turn/completed status "failed") goes red.
+        m.on_frame(&sub_agent_activity("interacted", "sub-1"));
+        m.on_frame(&foreign(
+            "turn/started",
+            "sub-1",
+            json!({ "turn": { "id": "t-s2" } }),
+        ));
+        let step = m.on_frame(&foreign(
+            "turn/completed",
+            "sub-1",
+            json!({ "turn": { "id": "t-s2", "status": "failed",
+                              "error": { "message": "usage limit reached" } } }),
+        ));
+        assert!(
+            step.events.iter().any(|e| matches!(
+                e,
+                AgentEvent::ToolCallUpdate { id, status: ToolStatus::Failed, .. }
+                    if id == "agent:sub-1#2"
+            )),
+            "a failed child turn fails its row: {:?}",
+            step.events
+        );
+        assert_eq!(
+            finished(&step.events),
+            vec![&AgentEvent::SubagentFinished {
+                id: Some("agent:sub-1#2".into()),
+                label: "agent_a".into(),
+                status: "failed".into(),
+                result: None,
+                stats: None,
+            }]
+        );
+        // Teardown after a finish journals no second line (claude symmetry:
+        // a process death is not a subagent's finish).
+        assert!(finished(&m.drain_pending()).is_empty());
+    }
+
+    /// A subagent's closing words are bounded however long its answer is.
+    #[test]
+    fn subagent_answer_is_capped() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        m.on_frame(&sub_agent_activity("started", "sub-1"));
+        let long = "x".repeat(SUBAGENT_RESULT_MAX * 3);
+        m.on_frame(&foreign(
+            "item/completed",
+            "sub-1",
+            json!({ "item": { "type": "agentMessage", "id": "m1", "phase": null,
+                              "text": long } }),
+        ));
+        let step = m.on_frame(&foreign(
+            "turn/completed",
+            "sub-1",
+            json!({ "turn": { "id": "t", "status": "completed" } }),
+        ));
+        match finished(&step.events).as_slice() {
+            [AgentEvent::SubagentFinished {
+                result: Some(result),
+                ..
+            }] => assert!(result.len() <= SUBAGENT_RESULT_MAX + '…'.len_utf8()),
+            other => panic!("expected a capped result, got {other:?}"),
+        }
+    }
+
+    fn command_item(actions: Value) -> Value {
+        json!({
+            "type": "commandExecution", "id": "cmd-1",
+            "command": "/bin/zsh -lc 'x'", "cwd": "/repo",
+            "commandActions": actions,
+        })
+    }
+
+    /// Live 0.156.1 `commandActions` shapes: read paths absolute, search
+    /// path as typed, listFiles path null for a bare `ls`.
+    #[test]
+    fn exploration_commands_render_as_read_and_search_rows() {
+        let row = |actions: Value| {
+            let mut m = mapper();
+            active_turn(&mut m);
+            let step = m.on_frame(&json!({
+                "method": "item/started",
+                "params": { "threadId": "thr-1", "item": command_item(actions) },
+            }));
+            match step.events.into_iter().last() {
+                Some(AgentEvent::ToolCall {
+                    kind,
+                    title,
+                    locations,
+                    ..
+                }) => (kind, title, locations),
+                other => panic!("expected a tool row, got {other:?}"),
+            }
+        };
+        assert_eq!(
+            row(
+                json!([{ "type": "read", "command": "cat notes.txt", "name": "notes.txt",
+                         "path": "/repo/notes.txt" }])
+            ),
+            (
+                ToolKind::Read,
+                "Read notes.txt".to_string(),
+                vec!["/repo/notes.txt".to_string()]
+            )
+        );
+        // Two reads fold into one line; a relative path resolves against cwd.
+        assert_eq!(
+            row(json!([
+                { "type": "read", "command": "sed -n 1,9p a.rs", "name": "a.rs", "path": "src/a.rs" },
+                { "type": "read", "command": "cat b.rs", "name": "b.rs", "path": "/repo/b.rs" },
+            ])),
+            (
+                ToolKind::Read,
+                "Read a.rs, b.rs".to_string(),
+                vec!["/repo/src/a.rs".to_string(), "/repo/b.rs".to_string()]
+            )
+        );
+        assert_eq!(
+            row(json!([{ "type": "listFiles", "command": "ls", "path": null }])),
+            (ToolKind::Search, "List files".to_string(), Vec::new())
+        );
+        assert_eq!(
+            row(json!([
+                { "type": "search", "command": "rg -n apple .", "query": "apple", "path": "." },
+                { "type": "listFiles", "command": "ls src", "path": "src" },
+            ])),
+            (
+                ToolKind::Search,
+                "Search \"apple\" · List src".to_string(),
+                Vec::new()
+            )
+        );
+        assert_eq!(
+            row(
+                json!([{ "type": "search", "command": "rg -n fn src", "query": "fn",
+                         "path": "src" }])
+            ),
+            (
+                ToolKind::Search,
+                "Search \"fn\" in src".to_string(),
+                Vec::new()
+            )
+        );
+        // Anything unknown (a write in the pipeline) keeps the shell row.
+        assert_eq!(
+            row(json!([
+                { "type": "read", "command": "cat a", "name": "a", "path": "/repo/a" },
+                { "type": "unknown", "command": "tee b" },
+            ])),
+            (ToolKind::Execute, "cat a".to_string(), Vec::new())
+        );
+        assert_eq!(
+            row(json!([])),
+            (
+                ToolKind::Execute,
+                "/bin/zsh -lc 'x'".to_string(),
+                Vec::new()
+            )
+        );
+
+        // A subagent's progress line reads the same way.
+        let mut m = mapper();
+        active_turn(&mut m);
+        m.on_frame(&sub_agent_activity("started", "sub-1"));
+        let step = m.on_frame(&foreign(
+            "item/started",
+            "sub-1",
+            json!({ "item": command_item(json!([{ "type": "read", "command": "cat x",
+                                                   "name": "x.rs", "path": "/repo/x.rs" }])) }),
+        ));
+        assert!(
+            step.events.iter().any(|e| matches!(
+                e,
+                AgentEvent::ToolCallUpdate { content: Some(ToolContent::Output { text, .. }), .. }
+                    if text == "Read x.rs"
+            )),
+            "{:?}",
+            step.events
+        );
+    }
+
+    #[test]
+    fn collab_tools_get_readable_titles_naming_their_agents() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        m.on_frame(&sub_agent_activity("started", "sub-1"));
+        let title = |m: &mut CodexMapper, tool: &str, receivers: Value, prompt: Value| {
+            let step = m.on_frame(&json!({
+                "method": "item/started",
+                "params": { "threadId": "thr-1", "item": {
+                    "type": "collabAgentToolCall", "id": format!("call_{tool}"),
+                    "tool": tool, "status": "inProgress", "senderThreadId": "thr-1",
+                    "receiverThreadIds": receivers, "prompt": prompt,
+                    "agentsStates": {},
+                } },
+            }));
+            match step.events.into_iter().last() {
+                Some(AgentEvent::ToolCall { title, .. }) => title,
+                other => panic!("expected a tool row, got {other:?}"),
+            }
+        };
+        assert_eq!(
+            title(
+                &mut m,
+                "sendMessage",
+                json!(["sub-1"]),
+                json!("check the tests")
+            ),
+            "Message → agent_a: check the tests"
+        );
+        assert_eq!(
+            title(&mut m, "followupTask", json!(["sub-1"]), json!(null)),
+            "Follow-up → agent_a"
+        );
+        assert_eq!(
+            title(&mut m, "interruptAgent", json!(["sub-1"]), json!(null)),
+            "Interrupt agent_a"
+        );
+        assert_eq!(
+            title(&mut m, "listAgents", json!([]), json!(null)),
+            "List agents"
+        );
+        // An untracked receiver is named by its thread id's tail.
+        assert_eq!(
+            title(
+                &mut m,
+                "closeAgent",
+                json!(["01a0d191-3347-7ae3-b4c7-e007a082831a"]),
+                json!(null)
+            ),
+            "Close agent …82831a"
+        );
+        assert_eq!(
+            title(
+                &mut m,
+                "sendMessage",
+                json!(["sub-1", "a", "b", "c"]),
+                json!(null)
+            ),
+            "Message → agent_a, agent …a, agent …b, +1 more"
+        );
+        assert_eq!(
+            title(&mut m, "wait", json!([]), json!(null)),
+            "waiting for subagents"
+        );
+        assert_eq!(
+            title(&mut m, "teleport", json!([]), json!("somewhere")),
+            "collab teleport: somewhere"
+        );
+    }
+
+    /// Current catalogs default `default_reasoning_summary` to "none"; an
+    /// unset thread streams no summaries (live: 0/3 unset, 3/3 "auto").
+    #[test]
+    fn turn_start_requests_reasoning_summaries_unless_configured() {
+        let mut m = mapper();
+        let step = m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text { text: "go".into() }],
+        });
+        assert_eq!(step.outbound[0]["method"], "turn/start");
+        assert_eq!(step.outbound[0]["params"]["summary"], "auto");
+
+        // The user's own `model_reasoning_summary` wins: nothing is sent.
+        let mut m = mapper();
+        m.reasoning_summary = None;
+        let step = m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text { text: "go".into() }],
+        });
+        assert!(step.outbound[0]["params"].get("summary").is_none());
+
+        assert!(!summary_configured(
+            &json!({ "config": { "model_reasoning_summary": null } })
+        ));
+        assert!(!summary_configured(&json!({ "config": {} })));
+        assert!(summary_configured(
+            &json!({ "config": { "model_reasoning_summary": "detailed" } })
+        ));
+    }
+
+    /// 0.153/0.156 have no `turn/failed`: a failed turn is `turn/completed
+    /// {status:"failed", error}` and must not render as a success.
+    #[test]
+    fn failed_turn_status_aborts_instead_of_completing() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        let step = m.on_frame(&json!({
+            "method": "turn/completed",
+            "params": { "threadId": "thr-1",
+                        "turn": { "id": "turn-A", "status": "failed",
+                                  "error": { "message": "stream disconnected" } } },
+        }));
+        assert!(
+            step.events.iter().any(|e| matches!(
+                e,
+                AgentEvent::TurnAborted { interrupted: false, reason, .. }
+                    if reason == "stream disconnected"
+            )),
+            "{:?}",
+            step.events
+        );
+        assert!(!step
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TurnCompleted { .. })));
+
+        // After the terminal `error` notification said it, the abort does
+        // not repeat the message.
+        let mut m = mapper();
+        active_turn(&mut m);
+        m.on_frame(&json!({
+            "method": "error",
+            "params": { "threadId": "thr-1", "willRetry": false,
+                        "error": { "message": "stream disconnected" } },
+        }));
+        let step = m.on_frame(&json!({
+            "method": "turn/completed",
+            "params": { "threadId": "thr-1",
+                        "turn": { "id": "turn-A", "status": "failed",
+                                  "error": { "message": "stream disconnected" } } },
+        }));
+        assert!(step.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::TurnAborted { reason, .. } if reason == "turn failed"
+        )));
+    }
+
+    fn usage_frame(thread: &str, turn: &str, total_out: u64, last_out: u64) -> Value {
+        json!({
+            "method": "thread/tokenUsage/updated",
+            "params": { "threadId": thread, "turnId": turn, "tokenUsage": {
+                "total": { "totalTokens": 50_000 + total_out, "inputTokens": 50_000,
+                           "outputTokens": total_out, "reasoningOutputTokens": 0 },
+                "last": { "totalTokens": 1_000 + last_out, "inputTokens": 1_000,
+                          "outputTokens": last_out, "reasoningOutputTokens": 0 },
+                "modelContextWindow": 258_400,
+            } },
+        })
+    }
+
+    fn turn_tokens(events: &[AgentEvent]) -> Vec<u64> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::TurnTokens { output } => Some(*output),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn turn_tokens_count_the_parent_turn_throttled_and_ignore_children() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        // A resumed thread's history (9 000 output tokens) never counts: the
+        // first update seeds the base from total − last.
+        let step = m.on_frame(&usage_frame("thr-1", "turn-A", 9_100, 100));
+        assert_eq!(turn_tokens(&step.events), Vec::<u64>::new(), "<256 held");
+        let step = m.on_frame(&usage_frame("thr-1", "turn-A", 9_500, 400));
+        assert_eq!(turn_tokens(&step.events), vec![500]);
+        let step = m.on_frame(&usage_frame("thr-1", "turn-A", 9_600, 100));
+        assert_eq!(turn_tokens(&step.events), Vec::<u64>::new(), "throttled");
+        // A child thread's usage never feeds the parent counter.
+        let step = m.on_frame(&usage_frame("sub-1", "t-s1", 90_000, 90_000));
+        assert_eq!(turn_tokens(&step.events), Vec::<u64>::new());
+        // The turn end settles the held-back value, before TurnCompleted.
+        let step = m.on_frame(&json!({
+            "method": "turn/completed",
+            "params": { "threadId": "thr-1",
+                        "turn": { "id": "turn-A", "status": "completed" } },
+        }));
+        assert_eq!(turn_tokens(&step.events), vec![600]);
+        let tokens_at = step
+            .events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::TurnTokens { .. }));
+        let completed_at = step
+            .events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::TurnCompleted { .. }));
+        assert!(tokens_at < completed_at, "{:?}", step.events);
+
+        // The next turn starts from zero; a late update for the previous
+        // turn id does not seed it.
+        m.on_frame(&json!({
+            "method": "turn/started",
+            "params": { "threadId": "thr-1", "turn": { "id": "turn-B" } },
+        }));
+        let step = m.on_frame(&usage_frame("thr-1", "turn-A", 9_700, 100));
+        assert_eq!(turn_tokens(&step.events), Vec::<u64>::new());
+        let step = m.on_frame(&usage_frame("thr-1", "turn-B", 10_000, 300));
+        assert_eq!(turn_tokens(&step.events), vec![300]);
     }
 
     // --- 0.153.0 surface: permissions profiles, remote control, warnings --

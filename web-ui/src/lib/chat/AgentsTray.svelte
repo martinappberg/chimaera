@@ -37,13 +37,16 @@
   function progress(b: Extract<ChatBlock, { kind: "tool" }>): string {
     return b.content?.kind === "output" ? (b.content.text ?? "").trim() : "";
   }
+  /** One agent: name it and its latest step, so the collapsed tray alone
+   *  says what is being worked on; several: the count (expand for each). */
+  const label = $derived.by(() => {
+    if (agents.length !== 1) return `${agents.length} subagents working`;
+    const step = progress(agents[0]).split("\n", 1)[0];
+    return `subagent “${name(agents[0].title)}”${step !== "" ? ` · ${step}` : " working"}`;
+  });
 </script>
 
-<WorkTray
-  glyph="✳"
-  {visible}
-  label={agents.length === 1 ? "subagent working" : `${agents.length} subagents working`}
->
+<WorkTray glyph="✳" {visible} {label}>
   {#each agents as agent (agent.id)}
     <WorkTrayRow
       onStop={onStop !== undefined ? () => onStop?.(agent.id) : undefined}
