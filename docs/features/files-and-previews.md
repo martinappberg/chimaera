@@ -129,16 +129,62 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
 ## Raw reads & lightweight editing
 
 - **What & when.** Ranged byte reads back the code viewer, image/PDF/HTML previews, and the small
-  editor.
+  editor (code, markdown live/source, HTML edit/split — all one `CodeView`).
 - **How it's used.** `GET /api/v1/fs/file?path=&offset=&limit=` returns a slice with
-  `X-File-Size`/`X-Truncated`/`X-Mtime` headers; `.gz`/`.bgz` files are decompressed transparently
-  (offsets address decompressed bytes). `PUT /api/v1/fs/file?path=&expect_mtime=` writes atomically.
+  `X-File-Size`/`X-Truncated`/`X-Mtime` headers, plus `X-Content-Hash` (SHA-256) when the body is
+  the whole raw file; `.gz`/`.bgz` files are decompressed transparently (offsets address
+  decompressed bytes). `PUT /api/v1/fs/file?path=&expect_hash=` (or `expect_mtime=` against a
+  daemon that never sent a hash) writes atomically. Cmd/Ctrl+S saves; Mod-f searches (every
+  editor, read-only ones too); the **Autosave** setting (`editor.autosave` off | after a delay,
+  `editor.autosaveDelay`) saves after idle typing and on blur / tab switch.
 - **Where it lives.** `fs.rs` (`file`/`read_file_response`/`read_gz_slice`, `put_file`/
-  `write_file_atomic`); `CodeView.svelte` + `cm.ts` (CodeMirror).
+  `write_file_atomic`); UI `previews/buffers.svelte.ts` (the buffer store), `CodeView.svelte` (a
+  view onto a buffer) + `cm.ts`, `textCodec.ts` (byte fidelity), `merge.ts` (three-way merge over
+  `node-diff3`), `drafts.ts` (the journal), `CompareView.svelte`, `layout/CloseDirtyDialog.svelte`.
+- **Buffers outlive views.** The buffer store owns each open file's `EditorState` (text, undo
+  history, cursor) and what it knows about the disk (base text, content hash, mtime token, line
+  endings/BOM). A `CodeView` attaches to it; unmounting detaches, and a buffer with unsaved edits
+  lives on — closing a pane, the keep-alive cap, split, zoom, a tab drag, a workspace switch and a
+  rename of the file or a parent (the buffer re-keys) all come back to the same text and undo
+  stack. `shared/editing.ts`'s `dirtyFiles` mirrors the store, so the tab dot, beforeunload and
+  the reload gate protect an unmounted dirty buffer too. A clean buffer is forgotten with its last
+  view.
+- **Closing asks.** Every close of a tab whose file is dirty — ×, middle-click, Close / Close
+  Others / Close All, Cmd/Ctrl+W and the close-view chord — opens **Save / Don't save / Cancel**
+  (one dialog for several files). A save that fails keeps its tab open with the reason.
+- **Saves are verified.** A save sends the base's content hash; success (whose reply carries the
+  new hash) marks the buffer clean only if nothing was typed since it was sent (save
+  generations). A save gets a 20 s timeout and one automatic retry once the events link is back
+  (the precondition makes it idempotent: the daemon answers success without writing when the disk
+  already holds the bytes), with a visible "not saved, retrying" / "offline" status. A save is
+  refused — never a silent overwrite — while a conflict is open.
+- **Disk changes merge instead of clobbering.** When the file moves on disk (an agent editing it),
+  the buffer reads it whole and hashes it: a clean buffer reloads in place (cursor kept), a dirty
+  one three-way merges base / mine / disk line-wise. A clean merge applies as minimal edits with
+  a quiet "Merged changes from disk" notice (view diff, undo); overlapping or adjacent edits raise
+  the conflict bar — **compare** (a side-by-side diff), **keep mine** (the disk becomes the base,
+  so the next save deliberately wins), **take disk** (undoable). The disk token is adopted only
+  together with the content it names, and a read that raced a save is discarded, so our own write
+  never reads as a conflict. A 409 on save takes the same path.
+- **Byte fidelity.** Files up to the 1 MB edit cap load in one request. Uniform CRLF or lone-CR
+  line endings, a UTF-8 BOM and the final newline round-trip exactly (the editor holds LF text;
+  the save re-joins with the file's own break). Mixed line endings, text that is not valid UTF-8,
+  compressed files and anything past the cap open **view-only** with a note saying why.
+- **The draft journal.** About a second after typing stops (and on hide/pagehide) dirty text is
+  written to IndexedDB and mirrored to the daemon (`PUT /api/v1/fs/drafts`, ≤ 1 MiB, under
+  `~/.chimaera/drafts`) — a new tunnel port is a new origin with an empty IndexedDB. Opening a
+  file whose draft differs from the disk shows "Recovered unsaved changes from …" with Restore /
+  Discard, never a silent restore; a draft typed against an older disk version restores through
+  the merge. A save of exactly that text, or a discard, clears both copies. A journal that failed
+  everywhere shows "draft not backed up" in the status bar. Older daemons without the routes fall
+  back to IndexedDB only.
+- **Other windows.** Same-origin windows announce dirty paths over a `BroadcastChannel`; a window
+  showing a file another one holds unsaved shows "Unsaved edits in another window".
 - **Key behaviors.** Read chunk cap 2 MB (default 256 KB); PUT body cap 1 MB (editing is for small
-  text files — 413 over) and is mtime-guarded (409 "file changed on disk"). Writes go through a
-  hidden tmp sibling + rename, keep the original mode, and call `git::mark_path_dirty` so the git
-  panel refreshes without polling. Gzip decompress is capped at 64 MB/request (defuses gzip bombs).
+  text files — 413 over). Writes go through a hidden tmp sibling + rename, keep the original
+  mode, and call `git::mark_path_dirty` so the git panel refreshes without polling. Gzip
+  decompress is capped at 64 MB/request (defuses gzip bombs). Open-at-line requests
+  (`shared/reveal.ts`) place the cursor, center the range and flash it.
 
 ## Rendered previews
 
@@ -259,7 +305,8 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
 ## Preview keep-alive & live-update
 
 - **What & when.** A pane keeps recently-viewed rendered views alive (hidden, not destroyed) across
-  a tab switch, bounded by a per-pane LRU (cap 8). This includes structured chat, which retains a
+  a tab switch, bounded by a per-pane LRU (cap 8) that never evicts a file with unsaved edits
+  (its buffer would survive in the store anyway; the view keeps scroll and search state). This includes structured chat, which retains a
   bottom-anchored DOM window (64 blocks initially, 192 maximum) rather than a whole long transcript.
   PTY components remount instead: `termPool` re-parents their xterm element into a hidden stash while
   preserving its socket and scrollback. A shared, LRU-capped content store
@@ -313,9 +360,10 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   an already-dirty file, ignored/non-repo files, and Finder paths outside the workspace; recognized
   agent writes and in-app mutations remain the immediate event-driven fast path. A moved mtime
   refreshes payloads **in place** (never nulling — a null chunk would unmount a live `CodeView`),
-  while PDF/spreadsheet/binary surfaces remount on the new token. An **unsaved** `CodeView` buffer is
-  never clobbered: a disk change while dirty raises the "changed on disk" conflict bar instead of
-  reloading. Chat artifact cards memoize their `/raw` ticket (`rawTicketUrl`) so a cached output
+  while PDF/spreadsheet/binary surfaces remount on the new token. An editor buffer is never
+  clobbered: it retains its path (so a dirty buffer stays watched with no view mounted) and
+  reconciles a moved token by reading the whole file — reload when clean, merge or conflict when
+  dirty (see *Raw reads & lightweight editing* above). Chat artifact cards memoize their `/raw` ticket (`rawTicketUrl`) so a cached output
   image doesn't re-fetch and re-decode (the flash) on re-render.
 
 ## File & folder glyphs
