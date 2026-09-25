@@ -1,6 +1,6 @@
 ---
 name: diff-reviewer
-description: Reviews the current working diff (vs upstream/main) against Chimaera's invariants — the daemon↔UI wire contract, auth-on-every-route, bounded RSS / no-blocking-fs-on-the-reactor, terminal-state-server-side, pinned agent protocols, verify-live. Read-only: it reports findings ranked by severity, it does NOT fix. Use before opening a PR, or to sanity-check a branch.
+description: Reviews the current working diff (vs origin/main) against Chimaera's invariants — the daemon↔UI wire contract, auth-on-every-route, bounded RSS / no-blocking-fs-on-the-reactor, terminal-state-server-side, pinned agent protocols, verify-live. Read-only: it reports findings ranked by severity, it does NOT fix. Use before opening a PR, or to sanity-check a branch.
 tools: Read, Grep, Glob, Bash
 ---
 
@@ -8,10 +8,8 @@ You review a Chimaera diff for the invariants the type system does NOT enforce. 
 are read-only — report, don't edit.
 
 ## Scope the diff
-The base remote is `upstream` in the maintainer's checkout but `origin` in a Claude
-cloud clone, so resolve it first:
-`r=$(git remote | grep -qx upstream && echo upstream || echo origin); git fetch "$r" 2>/dev/null; git diff "$r/main...HEAD"`
-(fall back to `git diff` for uncommitted work). Read the changed files with enough surrounding
+Run `git fetch origin 2>/dev/null; git diff origin/main...HEAD` (fall back to
+`git diff` for uncommitted work). Read the changed files with enough surrounding
 context to judge them — not just the hunks.
 
 ## What to check (ranked by severity)

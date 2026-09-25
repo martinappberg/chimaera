@@ -19,21 +19,40 @@ cmd=$(jq -r '.tool_input.command // empty' 2>/dev/null)
 reason=""
 match() { printf '%s' "$s" | grep -qE "$1"; }
 
+# The canonical repo's history is protected — PR branches included (a stale branch
+# merges main in rather than rebasing). Identify it by URL, not remote name: it's
+# `origin` in the maintainer's checkout and in Claude cloud clones, `upstream` in a
+# fork layout.
+CANON='martinappberg/chimaera'
+# True when a token of the current segment is the canonical repo: a remote whose
+# URL points at it, or that URL written out.
+pushes_canon() {
+  local tok url
+  set -f
+  for tok in $s; do
+    case "$tok" in -*) continue ;; *"$CANON"*) set +f; return 0 ;; esac
+    url=$(git -C "${CLAUDE_PROJECT_DIR:-.}" remote get-url "$tok" 2>/dev/null) || continue
+    case "$url" in *"$CANON"*) set +f; return 0 ;; esac
+  done
+  set +f
+  return 1
+}
+
 while IFS= read -r line; do
   segs=$(printf '%s' "$line" | sed -E 's/&&|\|\||[;|]/\n/g')
   while IFS= read -r seg; do
     s=$(printf '%s' "$seg" | sed -E "s/\"[^\"]*\"//g; s/'[^']*'//g; s/^[[:space:]]+//; s/[[:space:]]+$//; s/^(sudo|env|command|time)[[:space:]]+//")
     [ -n "$s" ] || continue
     if match '^git[[:space:]]+push([[:space:]]|$)' \
-       && match '(--force([^-]|$)|--force-with-lease|[[:space:]]-f([[:space:]]|$))' \
-       && match '[[:space:]]upstream([[:space:]]|$)'; then
-      reason="force-push to 'upstream' is blocked — this repo's history is protected. Push to your fork/branch or open a PR."; break
+       && match '(--force([^-]|$)|--force-with-lease|[[:space:]]-f([[:space:]]|$)|[[:space:]]\+[^[:space:]])' \
+       && pushes_canon; then
+      reason="force-push to ${CANON} is blocked — its history is protected, PR branches included. Bring a stale branch up to date by merging main, not rebasing."; break
     fi
     match '^git[[:space:]]+reset[[:space:]]+--hard' \
       && { reason="'git reset --hard' discards work — use 'git stash' or a soft/mixed reset."; break; }
     match '^git[[:space:]]+branch[[:space:]]+-D[[:space:]]+(main|master)([[:space:]]|$)' \
       && { reason="deleting the main/master branch is blocked."; break; }
-    match '^git[[:space:]]+push[[:space:]].*upstream.*(:|--delete[[:space:]])(main|master)' \
+    match '^git[[:space:]]+push[[:space:]].*(:|--delete[[:space:]])(main|master)' && pushes_canon \
       && { reason="deleting the remote main branch is blocked."; break; }
     # rm, recursive AND force, targeting a BARE root/home/cwd token (not a subpath).
     if match '^rm[[:space:]]' \

@@ -137,8 +137,7 @@ mapping and the no-release path.
   requirement above for agents that do not auto-load them.
 - **Subagents**: Claude definitions live in `.claude/agents/`; Codex definitions
   live in `.codex/agents/`. Both provide `area-implementer` (scoped edits + live
-  verify) and `diff-reviewer` (read-only invariant check vs `upstream/main`, or
-  `origin/main` in a cloud clone).
+  verify) and `diff-reviewer` (read-only invariant check vs `origin/main`).
 - **Claude hooks**: `.claude/settings.json` — fmt-on-save, destructive-command + generated-
   file guards, session orientation, the cloud-only bootstrap, and the doc-drift warn
   (personal hooks go in the gitignored `.claude/settings.local.json`).

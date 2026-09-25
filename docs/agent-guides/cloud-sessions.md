@@ -71,8 +71,7 @@ The repo rule is *verify live, don't just unit-test*. In the cloud:
 
 ## Git and PRs
 
-The clone's remote is **`origin`** (the maintainer's checkout calls it `upstream`;
-the ship-pr skill and diff-reviewer agent handle both). The GitHub proxy lets a
+The clone's remote is **`origin`**, as everywhere else. The GitHub proxy lets a
 session push **only its own working branch**; fetch, `gh`, and PR creation work
 normally. To continue a cloud session on your machine: `claude --teleport`
 (needs a clean tree and the branch pushed).
