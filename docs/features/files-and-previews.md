@@ -3,13 +3,14 @@
 Browsing and managing the workspace's files. The file tree and the Finder browse, open,
 and — via their right-click context menus — create, rename, delete, and download files
 and folders; the preview service streams file bytes and renders them as code, markdown,
-tables, PDFs, images, sandboxed HTML, or a binary info card — plus a light single-file
+tables, PDFs, images, video and audio, sandboxed HTML, or a binary info card — plus a light single-file
 editor. Everything streams (never whole-file loads) to hold the daemon's ~150 MB RSS
 budget on shared login nodes.
 
 **Where it lives (shared):** UI `web-ui/src/lib/previews/` (`files.ts` loaders,
-`fileStore.svelte.ts` the content store, `CodeView`, `MarkdownView`, `TableView`, `PdfView`,
-`ImageView`, `HtmlView`, `BinaryView`, `FinderView`, `cm.ts`) +
+`fileStore.svelte.ts` the content store, `CodeView`, `MarkdownView` + `mdDoc.ts` /
+`docLinks.ts`, `TableView`, `PdfView`, `ImageView`, `MediaView`, `HtmlView`, `BinaryView`,
+`FinderView`, `cm.ts`) +
 `web-ui/src/lib/workspace/FileTree.svelte` + glyphs in `web-ui/src/lib/shared/`
 (`FileIcon`, `FolderIcon`, `icons.ts`). Daemon: **all preview endpoints are in
 `crates/chimaera-server/src/fs.rs`** (there is no separate previews module). The file diff
@@ -142,8 +143,15 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
 
 ## Rendered previews
 
-- **Markdown.** `MarkdownView.svelte`, with Obsidian-style modes **live | reading | source**:
-  - **live** (the default) is an *editable reading view* — the shared CodeMirror editor
+- **Markdown.** `MarkdownView.svelte`, with Obsidian-style modes **live | reading | source**.
+  A file opens in the mode it was last shown in — remembered per file in this browser's
+  `localStorage` (the 300 most recently opened; `mdDoc.ts` `createModeMemory`, every access
+  guarded, so a private window just forgets) — else in the **Markdown Default Mode** setting
+  (`editor.markdownDefaultMode`: reading, live or source; **reading** by default). Opening in
+  reading costs one request, the render: the source is fetched, and the editor mounted, on the
+  first live/source click. Files over the 1 MB edit cap and binary-content files always open
+  in reading and stay there (an editor click on one says why in the mode bar).
+  - **live** is an *editable reading view* — the shared CodeMirror editor
     (`CodeView`) carrying the `mdLive.ts` extension set (`@codemirror/lang-markdown`, GFM
     base): headings sized, emphasis/links/inline code styled, syntax marks hidden on every
     line the selection doesn't touch, images/task-checkboxes/rules rendered as widgets
@@ -177,13 +185,43 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
     (`mdTable.ts`) and turned into elements without any HTML injection; a wide one is a tab
     stop while it overflows, like chat's. Raw HTML and frontmatter stay as mono source, and so
     does any construct the decorator can't render faithfully (reference links, multi-line
-    image syntax). Mod+click follows links; right-click gives the same URL menu as reading.
+    image syntax). **Mod+click follows links** (a plain click places the cursor) through the
+    same routing as reading, below — Mod+Shift+click opens a file link beside, and a
+    same-document `#heading` or `#L12` reveals its line in the editor (a heading is mapped to
+    its line through the daemon's render, so the slug is comrak's). Right-click gives the same
+    URL menu as reading.
   - **reading** is the complete non-editable render: `GET /api/v1/fs/markdown?path=` →
-    server-side comrak GFM (+ `math_dollars`) → **ammonia-sanitized** HTML (its defaults
-    plus `data-math-style` on `span`, the marker comrak leaves on each LaTeX literal; source
-    cap 4 MB), fetched on first entry and refreshed in place on saves/agent writes. The
-    client typesets those spans under the one KaTeX policy every surface shares
-    (`shared/math.ts`, loaded on demand at the first equation, memoized, time-sliced).
+    `{html, frontmatter}` — server-side comrak GFM (+ `math_dollars`) → **ammonia-sanitized**
+    HTML (source cap 4 MB), fetched on first entry and refreshed in place on saves/agent
+    writes. `data-math-style` on `span` marks each LaTeX literal, which the client typesets
+    under the one KaTeX policy every surface shares (`shared/math.ts`, loaded on demand at the
+    first equation, memoized, time-sliced). The render also carries what the reading view
+    builds on (older daemons omit it, and each piece degrades to the old behavior):
+    - **Properties.** A leading `---` YAML block comes back as raw `frontmatter` text instead
+      of rendering as a rule and a heading, and shows as a compact, collapsible key/value
+      panel above the document (collapsed state remembered in this browser). A tiny tolerant
+      reader (`mdDoc.ts` `parseFrontmatter`, no YAML library) handles `key: value`,
+      `key: [a, b]`, `- item` lists, `|`/`>` blocks and true/false (a check box); a nested
+      value shows as its source, and a block it can't read at all shows whole as source.
+      Every value is text, never markup. Live mode keeps frontmatter as muted source.
+    - **Alerts.** GitHub's `> [!NOTE]` / `[!TIP]` / `[!IMPORTANT]` / `[!WARNING]` /
+      `[!CAUTION]` arrive with comrak's `markdown-alert-*` classes and render as a tinted card
+      with a colored rule and a title row led by the type's glyph — semantic theme tokens
+      (`--syn-func`, `--syn-string`, `--rate`, `--warn`, `--err`), so every curated theme
+      restyles them.
+    - **Task boxes.** `- [x]` items arrive as `span.md-task[data-task=done|todo]` (the
+      sanitizer drops `<input>`), drawn as live's check box in place of the bullet; a done
+      item's own text is muted and struck through, as in live.
+    - **Anchors.** Heading and footnote ids carry GitHub's `user-content-` prefix, so a
+      document can't clobber the app's own ids; a `#my-heading` or `#fn-1` link finds
+      `user-content-my-heading` inside *this* document (never a global lookup — every open
+      document shares the page) and scrolls there without touching `location.hash`.
+    - **Line mapping.** Every block carries `data-sourcepos` (lines of the original file,
+      frontmatter included — the properties panel stands in for its lines). A selection's
+      reference chip now names the lines its two ends sit in, and a **reveal** (a `#L12`
+      link, `shared/reveal.ts`) scrolls to the tightest block holding the line and flashes
+      it — only while reading shows; in live/source the editor takes the reveal
+      (`acceptReveal` on `CodeView`).
     **Tables scroll, never squeeze** — one recipe shared with the chat transcript and the
     live mode's table widget (`web-ui/src/app.css`, "Markdown tables"; [chat mode](chat-mode.md))
     minus their host wrapper: the `<table>` itself is the horizontal scroller, so a table whose
@@ -201,6 +239,18 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
     `extra` compartment — never a remount, so the buffer, undo history, and dirty state
     survive every toggle; the file is only written on Cmd/Ctrl+S).
 
+  **Links in documents open** (`previews/docLinks.ts`, both modes). A document-relative path
+  (`other.md`, `../data/run.csv`, `figs/a%20b.png`, a local `file://` URL) resolves against
+  the document's folder, a root-relative `/docs/x.md` also against the workspace root, and
+  the daemon confirms it (`POST /fs/validate`) before anything opens; the file (or folder)
+  then opens through the shared opener (`shared/openPath.ts`, registered by the app) —
+  Cmd/Ctrl+click or a middle-click opens it beside. `#L12` / `#L12-L20` opens the file at
+  those lines (a reveal); `other.md#heading` opens the document and then scrolls to the
+  heading once it has rendered (a small pending-anchor map, keyed by path). A link that
+  resolves to nothing shows a brief inline "not found" hint where it was clicked; web URLs
+  keep their routing (a live local app in a browser pane, anything else in the real
+  browser); mailto:/tel: stay the browser's; any other scheme is dropped.
+
   Rendered documents carry the workbench's reading chrome: fenced code blocks and blockquotes
   get the same hover copy button as the chat transcript (`shared/copyDecor.ts`, one decorator
   for both surfaces), and **document-relative images** (a `figs/plot.png`-style src) resolve
@@ -209,8 +259,7 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   (the server sanitizer already constrains them), while live's image widgets render only
   http(s)/`data:image` URLs and leave other schemes as source. The live mode mirrors all of
   it (quote cards, ticketed image widgets, fence + quote copy) inside the editor; raw HTML
-  in a document is **never rendered** there — it stays visible source. Files over the 1MB
-  edit cap, and binary-content files, open straight into reading and stay there.
+  in a document is **never rendered** there — it stays visible source.
 - **Tables (CSV/TSV, incl. gzip).** `GET /api/v1/fs/table?path=&offset_rows=&limit_rows=&delim=auto`
   returns one page (header row + string cells; rows cap 1000/page; delimiter auto-sniffed; `.gz`/`.bgz`
   transparent). `TableView.svelte`. Bioinformatics reality — big delimited files are the norm.
@@ -229,13 +278,18 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
 - **PDF / image / HTML.** Fetched via a short-lived **ticket**: `POST /api/v1/fs/ticket {path}` →
   `GET /raw/{ticket}` (no bearer header — iframes/`<img>`/pdf.js can't send one; ticket TTL 600s,
   range-aware). HTML is sandboxed (`CSP: sandbox allow-scripts`, no-referrer); SVG is sandboxed too.
-  `PdfView`/`ImageView`/`HtmlView`. `HtmlView` carries a **preview | split | edit** toggle
-  (`SplitEditPreview.svelte` owns the split geometry);
+  `PdfView`/`ImageView`/`HtmlView`. `ImageView` takes png, jpg, gif, webp, svg, bmp, ico and
+  avif (formats every supported webview decodes). `HtmlView` carries a **preview | split | edit** toggle
+  (`SplitEditPreview.svelte` owns the split geometry; a failed source fetch is retried on the
+  next split/edit click);
   its split live-preview is a `sandbox="allow-scripts"` `srcdoc` iframe fed the (debounced) editor
   buffer — same origin-less isolation. **Relative assets load in neither mode today:** `/raw` is
   the single-segment `/raw/{ticket}`, so a page's `app.js` or `figs/a.png` 404s or falls through
   to the app shell; only self-contained HTML (e.g. MultiQC) renders fully. The planned fix is a
   directory-scoped `/raw/{ticket}/{*path}` ([plan](../document-workbench-plan.md#phase-4-embeds-in-documents-and-in-chat)).
+  The PDF toolbar shows **p / N** for the page being read (the one under a line a third of the
+  way down the viewport, computed from the slot sizes, no DOM reads) and takes a page number:
+  type it and press Enter to jump (Escape reverts).
   PDF metadata arrives progressively so the first pages paint before a long document is scanned;
   rasters cap at 12M pixels and inactive canvases use an 8-page LRU. Selectable text is a bounded
   enhancement: a page over 5,000 text items stays canvas-only, and the viewer keeps at most 12,000
@@ -246,6 +300,16 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   evicting a PDF cancels its active pdf.js raster tasks, text reads, text layers, delayed rerenders,
   and restoration frame before destroying the document worker, so invisible work cannot keep a pane
   or webview busy.
+- **Video / audio.** mp4, webm, m4v, ogv and mov play in the native `<video>` player; mp3, wav,
+  m4a, flac, ogg, oga, opus and aac in `<audio>` (`MediaView.svelte`). Bytes come from the same
+  ticketed `/raw/` URL — the daemon serves single byte ranges, so seeking fetches only what it
+  needs and nothing is buffered daemon-side. A player keeps issuing range requests for as long
+  as it plays, past the ticket's 10 minutes: a load that fails on an aged ticket re-mints it
+  and resumes at the same time (as does a re-mint after the file changes on disk). A failure on
+  a fresh ticket is the format — a container is no promise of a codec (HEVC in a `.mov`,
+  Vorbis in WebKit) — and gets a card saying so, with try again and, on a remote host, a
+  download so it can play locally. A parked pane pauses its video (it doesn't resume by
+  itself); audio keeps playing.
 - **Release-safe lazy views.** File and other heavyweight workbench views load from immutable hashed
   chunks. The entry document is never cached and is stamped with the source build that served it,
   so a later health response cannot mistake a replacement daemon for that document's build. Vite's
