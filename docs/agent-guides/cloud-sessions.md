@@ -4,7 +4,7 @@ How Chimaera is set up for Claude Code **cloud sessions** — the Anthropic-host
 behind [claude.ai/code](https://claude.ai/code), the desktop app's *Continue in →
 cloud*, `claude --cloud`, and scheduled routines. Each session is a fresh Ubuntu
 24.04 x86_64 VM (~4 vCPU / 16 GB / 30 GB) holding a fresh clone of this repo.
-Upstream reference: [cloud environments](https://code.claude.com/docs/en/cloud-environments).
+Official docs: [cloud environments](https://code.claude.com/docs/en/cloud-environments).
 
 ## One-time setup (maintainer, on claude.ai)
 
@@ -56,13 +56,18 @@ The repo rule is *verify live, don't just unit-test*. In the cloud:
   ```sh
   cargo build -p chimaera
   PORT=9741 bash .claude/skills/develop/serve-isolated.sh >target/daemon.log 2>&1 &
+  node scripts/smoke-daemon.mjs     # workspace → shell → WS round trip → cleanup
   tok=$(jq -r .token .chimaera-dev/data/manifest.json)
   curl -s -H "Authorization: Bearer $tok" http://127.0.0.1:9741/api/v1/sessions
   ```
 
-  Drive terminal/chat sessions through the session WebSocket with Node 22's
-  built-in `WebSocket` (same recipe as local — see the
-  [verify-app](../../.claude/skills/verify-app/SKILL.md) skill).
+  [`scripts/smoke-daemon.mjs`](../../scripts/smoke-daemon.mjs) is the pattern to
+  extend for a change-specific check: REST calls take the manifest token as a
+  bearer header; the WebSockets (`/ws/sessions/{id}`, `/ws/chat/{id}`,
+  `/ws/events`) take it as the first text frame `{"type":"auth","token":…}`, and on
+  a terminal socket binary frames are PTY bytes both ways (protocol:
+  `crates/chimaera-server/src/ws.rs`). Redirect the daemon's stdio as above — a
+  daemon whose stdout is gone fails every request that logs.
 - **Local-only** (say so in the PR instead of claiming it): visual checks in the
   browser pane (there is none; whether the image carries a headless Chrome is
   unverified), `just chat-smoke` (needs authenticated `claude`/`codex` CLIs and bills

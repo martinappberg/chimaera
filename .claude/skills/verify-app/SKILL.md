@@ -29,6 +29,11 @@ path you changed. Use the `preview_*` tooling to observe: `preview_snapshot`
 for structure/content, `preview_console_logs` + `preview_logs` for errors,
 `preview_network` for API/WS traffic, `preview_screenshot` for proof.
 
+**In a Claude cloud session** (`CLAUDE_CODE_REMOTE=true`) there is no preview
+tooling: run the daemon headless and drive it over HTTP/WS instead, starting from
+`scripts/smoke-daemon.mjs`, and name in the PR what you could not check (see the
+[cloud sessions guide](../../../docs/agent-guides/cloud-sessions.md)).
+
 Match the exercise to what you touched:
 
 - **Terminal / PTY** — spawn a session, type, scroll. Then **kill the socket and
