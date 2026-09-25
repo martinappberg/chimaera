@@ -188,6 +188,62 @@ pub(crate) struct AgentRecord {
     /// Latest statusline-heartbeat telemetry (claude TUIs only), quantized
     /// at ingest.
     pub(crate) usage: Option<AgentUsage>,
+    /// What the session's latest attention edge was about — the opening of
+    /// its final reply, a permission or question title, an error line — for
+    /// the notice feed (`notices`), which consumes it. Never on the wire.
+    pub(crate) notice_note: Option<NoticeNote>,
+    /// The opening of the current turn's latest prose segment (chat only),
+    /// capped at [`NOTICE_TEXT_MAX`] chars. A tool call starts a new segment,
+    /// so at turn end this holds the start of the reply the turn ended on.
+    pub(crate) reply_draft: String,
+}
+
+/// The descriptive half of an attention edge, stashed by whichever surface
+/// saw it (protocol event or hook) for the notice feed to read at the edge.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct NoticeNote {
+    pub(crate) text: String,
+    /// A structured question (claude AskUserQuestion / codex
+    /// requestUserInput) rather than a tool permission — both put the
+    /// session in `NeedsPermission`, but the notification words differ.
+    pub(crate) question: bool,
+}
+
+/// Cap on notice text (a reply opening, a permission line): notifications
+/// show two or three lines at most, and the record must stay small.
+pub(crate) const NOTICE_TEXT_MAX: usize = 240;
+
+/// Collapse `text` to one trimmed line of at most [`NOTICE_TEXT_MAX`] chars
+/// (an ellipsis marks a cut). Markdown emphasis/heading markers are dropped —
+/// an OS notification renders them literally.
+pub(crate) fn notice_line(text: &str) -> String {
+    let mut out = String::new();
+    let mut count = 0;
+    for word in text.split_whitespace() {
+        let word = word
+            .trim_start_matches('#')
+            .replace("**", "")
+            .replace('`', "");
+        if word.is_empty() {
+            continue;
+        }
+        let needed = word.chars().count() + usize::from(!out.is_empty());
+        if count + needed > NOTICE_TEXT_MAX {
+            let room = NOTICE_TEXT_MAX.saturating_sub(count + 1);
+            if !out.is_empty() && room > 0 {
+                out.push(' ');
+            }
+            out.extend(word.chars().take(room));
+            out.push('…');
+            return out;
+        }
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(&word);
+        count += needed;
+    }
+    out
 }
 
 impl AgentRecord {
@@ -206,7 +262,28 @@ impl AgentRecord {
             subagents: Vec::new(),
             now_line: None,
             usage: None,
+            notice_note: None,
+            reply_draft: String::new(),
         }
+    }
+
+    /// Stash the descriptive half of an attention edge (see [`NoticeNote`]).
+    /// Blank text clears it — a note that says nothing must not outlive the
+    /// edge it was meant for.
+    pub(crate) fn set_notice_note(&mut self, text: &str, question: bool) {
+        let text = notice_line(text);
+        self.notice_note = (!text.is_empty()).then_some(NoticeNote { text, question });
+    }
+
+    /// Append streamed prose to the reply draft, keeping only its opening:
+    /// a notification quotes how the reply starts, never the whole thing.
+    pub(crate) fn append_reply(&mut self, chunk: &str) {
+        // Byte-cheap guard first; the char count below is bounded by it.
+        if self.reply_draft.len() >= NOTICE_TEXT_MAX * 4 {
+            return;
+        }
+        let room = (NOTICE_TEXT_MAX + 1).saturating_sub(self.reply_draft.chars().count());
+        self.reply_draft.extend(chunk.chars().take(room));
     }
 
     /// Record a subagent start: an already-known id refreshes its label in

@@ -293,6 +293,84 @@ async fn nudge_paths(state: &Arc<AppState>, paths: &[String]) {
     }
 }
 
+/// Keep the record's notice text current for the notice feed (`notices`):
+/// the reply draft tracks the turn's latest prose segment, and each attention
+/// edge stashes what it was about. The protocol carries the richest words —
+/// a hook's generic Notification message never overwrites these (see
+/// `agents::ingest`).
+fn note_for_notices(record: &mut crate::agent_state::AgentRecord, ev: &AgentEvent) {
+    match ev {
+        AgentEvent::TurnStarted { .. } => {
+            record.reply_draft.clear();
+            record.notice_note = None;
+        }
+        AgentEvent::MessageChunk { text, .. } => record.append_reply(text),
+        // Prose after a tool call is a new segment; the one a turn ENDS on is
+        // its reply.
+        AgentEvent::ToolCall { .. } => record.reply_draft.clear(),
+        AgentEvent::TurnCompleted { .. } => {
+            let reply = std::mem::take(&mut record.reply_draft);
+            record.set_notice_note(&reply, false);
+        }
+        AgentEvent::PermissionRequest {
+            title,
+            input_preview,
+            plan,
+            ..
+        } => {
+            let line = if plan.is_some() {
+                "Plan ready for review".to_string()
+            } else {
+                permission_line(title, input_preview)
+            };
+            record.set_notice_note(&line, false);
+        }
+        AgentEvent::QuestionRequest { questions, .. } => {
+            let text = questions.first().map_or("", |q| q.question.as_str());
+            record.set_notice_note(text, true);
+        }
+        AgentEvent::Error {
+            message,
+            fatal: true,
+        } => record.set_notice_note(message, false),
+        AgentEvent::TurnAborted {
+            reason,
+            interrupted: false,
+            ..
+        } if reason != "interrupted" => record.set_notice_note(reason, false),
+        // The agent's own "where things stand" when it hands back waiting on
+        // the user — better words than the reply opening.
+        AgentEvent::SessionStatus {
+            detail,
+            needs_action: true,
+            ..
+        } if !detail.trim().is_empty() => record.set_notice_note(detail, false),
+        _ => {}
+    }
+}
+
+/// One line naming what a permission request wants: the request's own title
+/// plus the most telling input field (the command, the file), as the chat
+/// card would headline it.
+fn permission_line(title: &str, input: &serde_json::Value) -> String {
+    let detail = [
+        "command",
+        "file_path",
+        "notebook_path",
+        "path",
+        "url",
+        "pattern",
+    ]
+    .iter()
+    .find_map(|key| input.get(key).and_then(|v| v.as_str()))
+    .map(str::trim)
+    .filter(|d| !d.is_empty() && !title.contains(*d));
+    match detail {
+        Some(detail) => format!("{title}: {detail}"),
+        None => title.to_string(),
+    }
+}
+
 /// Fold a protocol event into the AgentRecord state machine.
 ///
 /// In chat mode the protocol is authoritative for the FULL lifecycle, for
@@ -348,6 +426,7 @@ fn apply_chat_event(state: &Arc<AppState>, id: &str, ev: &AgentEvent) {
     if let Some(next) = next {
         record.state = next;
     }
+    note_for_notices(record, ev);
     // Turn end clears the hook-fed activity fields. Tool-adjacent hooks DO
     // fire during claude chat sessions (the files_touched channel) and
     // populate now_line/subagents on the record, but the clearing Stop hook
@@ -3003,23 +3082,26 @@ pub(crate) async fn spawn_chat_session(
     // pre-approves exactly the shared read-tool list (the same one claude's
     // settings pre-allow is generated from — the two vendors' ask modes
     // cannot drift); auto pre-approves the whole chimaera server. Workers
-    // (mastermind: None) keep every prompt.
+    // (mastermind: None) keep every prompt except the prompt-free tools
+    // (`notify`) every session pre-approves.
     if recipe.kind == AgentKind::Codex {
-        spec.mcp_auto_approve =
-            recipe
-                .mastermind
-                .map(|mode| chimaera_agent::driver::McpAutoApprove {
-                    server: "chimaera".to_string(),
-                    tools: match mode {
-                        crate::workspaces::MastermindMode::Ask => Some(
-                            crate::mcp::MASTERMIND_READ_TOOLS
-                                .iter()
-                                .map(|t| t.to_string())
-                                .collect(),
-                        ),
-                        crate::workspaces::MastermindMode::Auto => None,
-                    },
-                });
+        let always = crate::mcp::ALWAYS_ALLOWED_TOOLS
+            .iter()
+            .map(|t| t.to_string());
+        spec.mcp_auto_approve = Some(chimaera_agent::driver::McpAutoApprove {
+            server: "chimaera".to_string(),
+            tools: match recipe.mastermind {
+                Some(crate::workspaces::MastermindMode::Ask) => Some(
+                    crate::mcp::MASTERMIND_READ_TOOLS
+                        .iter()
+                        .map(|t| t.to_string())
+                        .chain(always)
+                        .collect(),
+                ),
+                Some(crate::workspaces::MastermindMode::Auto) => None,
+                None => Some(always.collect()),
+            },
+        });
     }
     // Codex selects its create-time model in-protocol at thread open; Claude
     // already received the same recipe value through build_chat_command.

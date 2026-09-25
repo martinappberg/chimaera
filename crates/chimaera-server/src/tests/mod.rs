@@ -9,6 +9,7 @@ mod ledger;
 mod links;
 mod mastermind;
 mod mcp;
+mod notices;
 mod proxy;
 mod recents;
 mod resumables;
