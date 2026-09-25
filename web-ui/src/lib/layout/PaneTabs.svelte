@@ -563,18 +563,29 @@
     return rows;
   }
 
+  /** Close every tab of this pane except `keep` (or all), from the right so
+   *  the indices still to visit never shift. A file with unsaved edits asks
+   *  first — App gathers them into one "save changes?" dialog. */
+  function closeMany(keep: number | null): void {
+    for (let j = node.tabs.length - 1; j >= 0; j--) {
+      if (j !== keep) ctrl.closeTab(node.id, j);
+    }
+  }
+
   function tabMenu(tab: Tab, i: number): ContextMenuEntry[] {
-    const close: ContextMenuEntry = {
-      label: "Close",
-      onSelect: () => ctrl.closeTab(node.id, i),
-    };
+    const others = node.tabs.length > 1;
+    const close: ContextMenuEntry[] = [
+      { label: "Close", onSelect: () => ctrl.closeTab(node.id, i) },
+      { label: "Close Others", disabled: !others, onSelect: () => closeMany(i) },
+      { label: "Close All", onSelect: () => closeMany(null) },
+    ];
     const move = moveEntries(tab, i);
     if (tab.surface === "terminal") {
       return [
         { label: "Rename…", onSelect: () => beginTabRename(tab) },
         "separator",
         ...move,
-        close,
+        ...close,
       ];
     }
     if (tab.surface === "browser") {
@@ -590,21 +601,17 @@
             ]
           : []),
         ...move,
-        close,
+        ...close,
       ];
     }
     if (tab.surface === "file") {
-      const dirty = $dirtyFiles.has(tab.path);
+      // Renaming a file with unsaved edits is safe: its buffer follows the
+      // rename (previews/buffers re-keys on the fs mutation).
       return [
         ...(tab.preview === true
           ? [{ label: "Keep Open", onSelect: () => ctrl.pinTab(node.id, i) } as ContextMenuEntry, "separator" as const]
           : []),
-        {
-          label: "Rename…",
-          disabled: dirty,
-          hint: dirty ? "save the file first — renaming would drop unsaved edits" : undefined,
-          onSelect: () => beginTabRename(tab),
-        },
+        { label: "Rename…", onSelect: () => beginTabRename(tab) },
         { label: "Reveal in File Tree", onSelect: () => ctrl.revealPathInTree(tab.path) },
         "separator",
         ...(isRemoteHost()
@@ -613,10 +620,10 @@
         { label: "Copy Path", onSelect: () => void copyPath(tab.path) },
         "separator",
         ...move,
-        close,
+        ...close,
       ];
     }
-    return [...move, close];
+    return [...move, ...close];
   }
 </script>
 
