@@ -100,9 +100,10 @@
     for (const s of sessions) {
       const entry = map.get(s.workspace_id) ?? { live: 0, attn: 0 };
       if (s.alive) entry.live += 1;
-      // A crashed chat driver stays registered (alive:false, errored) until
-      // deleted; only a LIVE ask is something the user can act on — the same
-      // gate as App's needsYou and the dashboard lane.
+      // Counts are approvals only (needsApproval — the same predicate as
+      // App's needsYou pill/title and the Dock badge). Alive-gated: a crashed
+      // chat driver stays registered (alive:false) until deleted, and only a
+      // LIVE ask is something the user can act on.
       if (s.alive && needsApproval(s)) entry.attn += 1;
       map.set(s.workspace_id, entry);
     }

@@ -425,11 +425,14 @@ fn classify(prev: AgentState, next: AgentState) -> Edge {
         // minute later — news only while the turn-end notice is pending.
         (Finished, IdlePrompt) => Edge::Upgrade,
         (_, NeedsPermission) => Edge::Notice(NoticeKind::Permission),
+        // Failures come before the "resolved" rule below: a session that
+        // crashes or hits a limit while waiting on the user must still say
+        // so — it is no longer waiting, and nobody acted.
+        (_, Errored) => Edge::Notice(NoticeKind::Error),
+        (_, RateLimited) => Edge::Notice(NoticeKind::RateLimited),
         // A block resolved without the agent resuming (denied, interrupted)
         // — the user acted, so they already know.
         (NeedsPermission, _) => Edge::Cancel,
-        (_, Errored) => Edge::Notice(NoticeKind::Error),
-        (_, RateLimited) => Edge::Notice(NoticeKind::RateLimited),
         _ => Edge::None,
     }
 }
@@ -494,17 +497,25 @@ fn observe(
     seen: &mut HashMap<String, AgentState>,
     pending: &mut HashMap<String, Pending>,
 ) {
-    let agents = crate::lock(&state.agents);
+    let mut agents = crate::lock(&state.agents);
     let now = Instant::now();
-    for (id, record) in agents.iter() {
+    for (id, record) in agents.iter_mut() {
         // First sight (a new session, or every session at boot) is a
         // baseline, not an edge: a resurrected session must not announce
         // the state it was restored into.
-        let Some(prev) = seen.insert(id.clone(), record.state) else {
+        let Some(prev) = seen.get_mut(id) else {
+            seen.insert(id.clone(), record.state);
             continue;
         };
-        if prev == record.state {
+        if *prev == record.state {
             continue;
+        }
+        let prev = std::mem::replace(prev, record.state);
+        // Back to work: whatever the last edge was about (a permission
+        // answered inside the settle, an idle-prompt message) is history,
+        // and must not become the words of the NEXT notice.
+        if record.state == AgentState::Running {
+            record.notice_note = None;
         }
         match classify(prev, record.state) {
             Edge::Notice(kind) => {
@@ -602,41 +613,40 @@ struct Attention {
 }
 
 fn attention(state: &AppState) -> Vec<Attention> {
-    let masterminds = crate::lock(&state.workspaces).mastermind_bindings();
-    let pty_alive: HashMap<String, bool> = state
-        .sessions
-        .list()
-        .into_iter()
-        .map(|s| (s.id, s.alive))
-        .collect();
-    let chat_alive: HashMap<String, bool> = state
-        .chat
-        .list()
-        .into_iter()
-        .map(|c| (c.id, c.alive))
-        .collect();
-    let workspaces = crate::lock(&state.session_workspaces).clone();
-    let agents = crate::lock(&state.agents);
-    let is_mastermind = |id: &str| {
-        workspaces
-            .get(id)
-            .is_some_and(|ws| masterminds.get(ws).is_some_and(|sid| sid == id))
-    };
-    let mut rows: Vec<Attention> = agents
+    // Runs on every long-poll wake (each streamed chat chunk), and the set
+    // is almost always empty: find the few blocked records first, and only
+    // then pay for liveness and workspace lookups — one lock at a time.
+    let mut ids: Vec<String> = crate::lock(&state.agents)
         .iter()
         .filter(|(_, r)| r.state == AgentState::NeedsPermission)
-        .filter(|(id, _)| {
-            pty_alive
-                .get(*id)
-                .or_else(|| chat_alive.get(*id))
-                .copied()
-                .unwrap_or(false)
-        })
-        .filter(|(id, _)| !is_mastermind(id))
-        .map(|(id, r)| Attention {
-            id: id.clone(),
-            workspace_id: workspaces.get(id).cloned(),
-            state: r.state.as_str(),
+        .map(|(id, _)| id.clone())
+        .collect();
+    if ids.is_empty() {
+        return Vec::new();
+    }
+    ids.retain(|id| {
+        state
+            .sessions
+            .get(id)
+            .map(|s| s.alive)
+            .or_else(|| state.chat.get(id).map(|c| c.alive))
+            .unwrap_or(false)
+    });
+    let masterminds = crate::lock(&state.workspaces).mastermind_bindings();
+    let workspaces = crate::lock(&state.session_workspaces);
+    let mut rows: Vec<Attention> = ids
+        .into_iter()
+        .filter_map(|id| {
+            let workspace_id = workspaces.get(&id).cloned();
+            let mastermind = workspace_id
+                .as_ref()
+                .and_then(|ws| masterminds.get(ws))
+                .is_some_and(|sid| *sid == id);
+            (!mastermind).then(|| Attention {
+                id,
+                workspace_id,
+                state: AgentState::NeedsPermission.as_str(),
+            })
         })
         .collect();
     rows.sort_by(|a, b| a.id.cmp(&b.id));
@@ -781,6 +791,15 @@ mod tests {
         );
         // No news: a session settling from its spawn state.
         assert_eq!(classify(Unknown, Finished), Edge::None);
+        // Failing while blocked on the user is news — nobody acted.
+        assert_eq!(
+            classify(NeedsPermission, Errored),
+            Edge::Notice(NoticeKind::Error)
+        );
+        assert_eq!(
+            classify(NeedsPermission, RateLimited),
+            Edge::Notice(NoticeKind::RateLimited)
+        );
     }
 
     #[test]

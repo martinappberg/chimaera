@@ -179,7 +179,6 @@ export function sessionLabel(
   return names.get(id) ?? sessions.get(id)?.name ?? id.slice(0, 8);
 }
 
-/** True when the session is waiting on the user (drives the aggregate count). */
 /**
  * The workspace Mastermind is the observer, not the observed: every roster
  * surface (rail, dashboard roster/lane, home rollups, quick-open) filters
@@ -201,6 +200,11 @@ export function needsApproval(s: Session): boolean {
   return s.agent_state === "needs_permission";
 }
 
+/**
+ * The broader "needs you" set — blocked on approval, waiting for input, or
+ * errored: what the dashboard's attention LANE shows as cards. Never a count
+ * (counts are {@link needsApproval}).
+ */
 export function needsAttention(s: Session): boolean {
   return (
     s.agent_state === "needs_permission" ||

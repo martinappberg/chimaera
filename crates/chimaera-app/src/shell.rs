@@ -536,6 +536,12 @@ pub(crate) fn activate_app(app: &AppHandle, dock_click: bool) {
     if any_on_screen && dock_click {
         return;
     }
+    // A ⌘H-hidden app has no window on screen: unhide it as a whole (the
+    // way the user hid it) before picking a window to restore.
+    #[cfg(target_os = "macos")]
+    if !any_on_screen {
+        let _ = app.show();
+    }
     if windows.is_empty() {
         if app.try_state::<Shell>().is_some() {
             if let Err(e) = show_local_home(app, None) {

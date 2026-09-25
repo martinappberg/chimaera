@@ -1413,6 +1413,8 @@
   }
 
   .tab-close {
+    /* Anchors the unread dot drawn in this slot (see .tab.unread below). */
+    position: relative;
     appearance: none;
     border: none;
     background: none;
@@ -1443,10 +1445,6 @@
   /* Unread's scannable half: an accent dot in the close button's slot that
      turns back into × under the pointer (the editor "dirty dot" gesture,
      here meaning "finished — not looked at yet"). No reflow either way. */
-  .tab-close {
-    position: relative;
-  }
-
   .tab.unread:not(:hover) .tab-close {
     opacity: 1;
     color: transparent;

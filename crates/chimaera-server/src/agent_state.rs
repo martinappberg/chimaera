@@ -220,10 +220,11 @@ pub(crate) fn notice_line(text: &str) -> String {
     let mut out = String::new();
     let mut count = 0;
     for word in text.split_whitespace() {
-        let word = word
-            .trim_start_matches('#')
-            .replace("**", "")
-            .replace('`', "");
+        // A word of only `#`s is a heading marker; "#123" is an issue ref.
+        if word.chars().all(|c| c == '#') {
+            continue;
+        }
+        let word = word.replace("**", "").replace('`', "");
         if word.is_empty() {
             continue;
         }
@@ -613,6 +614,18 @@ pub(crate) fn apply_title_line(line: &str, record: &mut AgentRecord) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn notice_line_drops_markup_but_keeps_issue_refs() {
+        assert_eq!(
+            notice_line("## Done\n\nFixed **#412** and `foo()`"),
+            "Done Fixed #412 and foo()"
+        );
+        let long = "word ".repeat(100);
+        let line = notice_line(&long);
+        assert!(line.ends_with('…'));
+        assert!(line.chars().count() <= NOTICE_TEXT_MAX + 1);
+    }
+
     use super::*;
     use serde_json::json;
 

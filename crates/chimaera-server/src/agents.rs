@@ -29,7 +29,7 @@ use crate::AppState;
 pub(crate) use crate::agent_state::{apply_title_line, truncate_prompt, AgentKind, AgentRecord};
 use crate::agent_state::{
     cleared_by_output, map_event, now_line_update, statusline_usage, subagent_identity,
-    touched_file,
+    touched_file, AgentState,
 };
 
 /// Fresh session id in the same format the PTY engine generates.
@@ -401,6 +401,13 @@ fn note_for_notices(record: &mut AgentRecord, event: &str, payload: &serde_json:
         // A new prompt starts a new story; whatever the last edge was about
         // is history.
         "UserPromptSubmit" => record.notice_note = None,
+        // A permission prompt is the current fact: its message replaces any
+        // older note. Other notifications (the idle "waiting for your input")
+        // only fill a gap — chat sessions also get these hooks, and their
+        // protocol events carry richer words.
+        "Notification" if map_event(event, payload) == Some(AgentState::NeedsPermission) => {
+            record.set_notice_note(text("message"), false);
+        }
         "Notification" if record.notice_note.is_none() => {
             record.set_notice_note(text("message"), false);
         }

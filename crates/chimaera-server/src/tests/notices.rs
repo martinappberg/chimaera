@@ -212,5 +212,18 @@ async fn a_quickly_answered_permission_never_notifies() {
 
     let body = poll(&state, &boot, head).await;
     assert_eq!(body["notices"], serde_json::json!([]), "{body}");
+
+    // The answered prompt's words must not label the turn's end (a Stop
+    // hook without the final message says only "Finished").
+    post_hook(
+        &state,
+        &id,
+        "qk",
+        serde_json::json!({"hook_event_name": "Stop"}),
+    )
+    .await;
+    let notices = wait_notices(&state, &boot, head).await;
+    assert_eq!(notices[0]["kind"], "done");
+    assert_eq!(notices[0]["body"], "", "{notices:?}");
     state.sessions.kill(&id).ok();
 }

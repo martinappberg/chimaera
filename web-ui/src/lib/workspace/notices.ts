@@ -78,8 +78,14 @@ function bus(): BroadcastChannel | null {
   channel.onmessage = (ev: MessageEvent<ChannelMessage>) => {
     const msg = ev.data;
     if (typeof msg?.id !== "number") return;
-    const prev = claims.get(msg.id) ?? { seen: false, focused: false };
-    claims.set(msg.id, { seen: prev.seen || msg.seen, focused: prev.focused || msg.focused });
+    const prev = claims.get(msg.id);
+    claims.set(msg.id, {
+      seen: (prev?.seen ?? false) || msg.seen,
+      focused: (prev?.focused ?? false) || msg.focused,
+    });
+    // A claim only matters during this tab's own wait for the same notice;
+    // one this tab never delivers (it connected later) must not linger.
+    if (prev === undefined) setTimeout(() => claims.delete(msg.id), CLAIM_WAIT_MS * 8);
   };
   return channel;
 }

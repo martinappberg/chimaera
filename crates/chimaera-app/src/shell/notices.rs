@@ -537,8 +537,9 @@ pub(crate) fn route_click(app: &AppHandle, route: Route) {
             return;
         };
         let label = {
-            let windows = lock(&shell.windows);
+            // One lock at a time: every other site takes focus_order alone.
             let order = lock(&shell.focus_order).clone();
+            let windows = lock(&shell.windows);
             let recency = |label: &str| order.iter().position(|l| l == label).unwrap_or(usize::MAX);
             let mut candidates: Vec<(u8, usize, String)> = windows
                 .iter()

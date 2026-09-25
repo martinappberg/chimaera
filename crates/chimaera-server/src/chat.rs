@@ -307,7 +307,11 @@ fn note_for_notices(record: &mut crate::agent_state::AgentRecord, ev: &AgentEven
         AgentEvent::MessageChunk { text, .. } => record.append_reply(text),
         // Prose after a tool call is a new segment; the one a turn ENDS on is
         // its reply.
-        AgentEvent::ToolCall { .. } => record.reply_draft.clear(),
+        // Cross-turn (detached) work can be announced after the reply's prose;
+        // it isn't the turn moving on.
+        AgentEvent::ToolCall {
+            cross_turn: false, ..
+        } => record.reply_draft.clear(),
         AgentEvent::TurnCompleted { .. } => {
             let reply = std::mem::take(&mut record.reply_draft);
             record.set_notice_note(&reply, false);
