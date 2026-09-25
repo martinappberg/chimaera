@@ -12,11 +12,26 @@
 
 import { get, writable } from "svelte/store";
 
-/** A 1-based line range (and optional 1-based column) within a text file. */
+/**
+ * Where to land in a file. `line` (1-based, with optional `endLine`/`col`)
+ * addresses text; the other fields address the non-text viewers, which ignore
+ * `line` (pass 1) when they have their own anchor. Mirrors the locator
+ * fragments in docs/document-workbench-plan.md.
+ */
 export interface Reveal {
   line: number;
   endLine?: number;
   col?: number;
+  /** PDF page, 1-based (`#page=N`). */
+  page?: number;
+  /** Notebook cell, 1-based (`#cell=N`). */
+  cell?: number;
+  /** Slide, 1-based (`#slide=N`). */
+  slide?: number;
+  /** Media time range in seconds (`#t=start,end`). */
+  time?: { start: number; end?: number };
+  /** Pixel region of an image or PDF page (`#xywh=x,y,w,h`). */
+  region?: { x: number; y: number; w: number; h: number };
 }
 
 export interface RevealRequest extends Reveal {
