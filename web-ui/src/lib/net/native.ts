@@ -410,6 +410,70 @@ export async function reportWindowScope(
 }
 
 /**
+ * Tell the shell which sessions this window has on screen (each pane's
+ * active tab). The shell drops a notification about one of them while this
+ * window has focus — the user is already looking — and clears their
+ * delivered alerts. No-op in a browser.
+ */
+export async function reportWindowView(visible: string[]): Promise<void> {
+  await tauri()?.core.invoke<void>("report_window_view", { visible });
+}
+
+/**
+ * A notification was clicked and this window should show `sessionId`.
+ * Window-scoped: the shell emits to the chosen window's label. No-op
+ * unsubscriber in the browser.
+ */
+export function onFocusSession(handler: (sessionId: string) => void): Promise<() => void> {
+  const t = tauri();
+  if (t === null) return Promise.resolve(() => {});
+  return t.webviewWindow
+    .getCurrentWebviewWindow()
+    .listen<string>("focus-session", (e) => handler(e.payload));
+}
+
+/**
+ * The session a notification click opened this window for, if any — asked
+ * once the `focus-session` listener is live, in case the shell's event beat
+ * it. Null in a browser.
+ */
+export async function takePendingFocus(): Promise<string | null> {
+  const t = tauri();
+  if (t === null) return null;
+  return (await t.core.invoke<string | null>("take_pending_focus")) ?? null;
+}
+
+/** OS notification permission as the shell sees it. */
+export type NativeNotificationPermission =
+  | "granted"
+  | "denied"
+  | "not_determined"
+  | "unsupported";
+
+export async function notificationPermission(): Promise<NativeNotificationPermission> {
+  const t = tauri();
+  if (t === null) return "unsupported";
+  return t.core.invoke<NativeNotificationPermission>("notification_permission");
+}
+
+/** Ask the OS for notification permission now (its one-time prompt). */
+export async function requestNotificationPermission(): Promise<NativeNotificationPermission> {
+  const t = tauri();
+  if (t === null) return "unsupported";
+  return t.core.invoke<NativeNotificationPermission>("request_notification_permission");
+}
+
+/** Open the OS's notification settings for Chimaera (macOS System Settings). */
+export async function openNotificationSettings(): Promise<void> {
+  await tauri()?.core.invoke<void>("open_notification_settings");
+}
+
+/** Post a sample notification (the settings page's "Send test"). */
+export async function testNotification(): Promise<void> {
+  await tauri()?.core.invoke<void>("test_notification");
+}
+
+/**
  * An SSH auth prompt ssh raised while connecting (no tty in the app, so it
  * comes to us via SSH_ASKPASS). `prompt` is ssh's own text — a password ask,
  * or a keyboard-interactive challenge like a Duo passcode/option menu.

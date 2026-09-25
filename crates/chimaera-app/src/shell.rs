@@ -24,6 +24,7 @@ use crate::windows::{WindowRecord, WindowRegistry};
 mod commands;
 mod connect;
 mod drag;
+pub(crate) mod notices;
 mod restore;
 
 pub use restore::open_ui_window;
@@ -39,6 +40,13 @@ const DAEMON_UI_CORE_PERMISSIONS: &[&str] = &[
 ];
 
 static DAEMON_CAPABILITY_SEQ: AtomicU64 = AtomicU64::new(0);
+/// Unique ids for test notifications (each must be a new alert, not a
+/// replacement of the last one).
+static TEST_NOTIFICATION_SEQ: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn next_test_notification_id() -> u64 {
+    TEST_NOTIFICATION_SEQ.fetch_add(1, Ordering::Relaxed)
+}
 /// Forces same-origin Home re-homes to be full document navigations instead
 /// of hash-only changes (which do not rerun the SPA's scope bootstrap).
 static HOME_NAV_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -189,6 +197,10 @@ pub struct WindowScope {
     /// creation, the SPA may re-assert it after a restart restore, and
     /// nothing clears it.
     pub detached: bool,
+    /// Session ids on screen in this window (each pane's active tab),
+    /// reported by the page. A notice about one of these is not posted while
+    /// this window has focus — the user is already looking at it.
+    pub(crate) visible: Vec<String>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -226,6 +238,7 @@ impl WindowScope {
             label: String::new(),
             navigation_pending: false,
             detached: false,
+            visible: Vec::new(),
         }
     }
 
@@ -260,6 +273,7 @@ impl WindowScope {
             label: String::new(),
             navigation_pending: false,
             detached: false,
+            visible: Vec::new(),
         }
     }
 
@@ -926,6 +940,11 @@ pub(crate) fn finish_startup(handle: &tauri::AppHandle, local: LocalDaemon) -> t
     } else {
         *lock(&handle.state::<Shell>().local) = local;
     }
+    if fresh {
+        // Before any window opens: the watchers start polling right away,
+        // and a window's first scope report may already owe it a focus.
+        notices::start(handle);
+    }
     // Reopen last session's windows. Restore itself registers a home surface
     // before launching any remote ssh that may need askpass, and also covers
     // the empty/failed local restore case so the app never comes up invisible.
@@ -1015,6 +1034,12 @@ pub fn run() {
             commands::list_askpass,
             commands::cache_appearance,
             commands::report_window_scope,
+            commands::report_window_view,
+            commands::take_pending_focus,
+            commands::notification_permission,
+            commands::request_notification_permission,
+            commands::open_notification_settings,
+            commands::test_notification,
             commands::wsl_status,
             commands::wsl_install,
             commands::wsl_update,
@@ -1052,6 +1077,7 @@ pub fn run() {
                     lock(&shell.transfers)
                         .retain(|_, t| t.source != window.label() && t.target != window.label());
                     lock(&shell.focus_order).retain(|l| l != window.label());
+                    notices::window_gone(window.app_handle(), window.label());
                     let scope = lock(&shell.windows).remove(window.label());
                     if !shell.quitting.load(Ordering::Relaxed) {
                         if let Some(scope) = scope {
@@ -1075,6 +1101,7 @@ pub fn run() {
                         order.insert(0, window.label().to_string());
                     }
                     crate::menu::sync_settings_enabled(window.app_handle());
+                    notices::window_focused(window.app_handle(), window.label());
                 }
                 // Track geometry in memory on every move/resize; a slow tick
                 // (and exit) persists — never a file write per drag event.
@@ -1103,6 +1130,9 @@ pub fn run() {
         })
         .setup(|app| {
             let handle = app.handle().clone();
+            // The notification click delegate must be in place before launch
+            // completes, so a click that launched the app is delivered.
+            crate::notify::init(&handle);
             crate::menu::install(app)?;
             // The menu-bar / system-tray status item. Installed before the
             // daemon is up (its click handlers read Shell.local, populated by

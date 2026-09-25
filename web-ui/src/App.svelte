@@ -161,6 +161,7 @@
     tabCount,
     tabKey,
     toggleZoom,
+    visibleSessionIds,
     type AdoptSpot,
     type FocusDir,
     type Layout,
@@ -228,15 +229,19 @@
     onCaffeinateChanged,
     onHostStatus,
     onLocalDaemonUpdated,
+    onFocusSession,
     onMenu,
     openDetachedPopup,
     openDetachedWindow,
     reportWindowScope,
+    reportWindowView,
     setCaffeinate,
     setNativeWindowTitle,
     shellBuild,
+    takePendingFocus,
     type HostStatusEvent,
   } from "./lib/net/native";
+  import { clearBrowserNotices, deliverBrowserNotices } from "./lib/workspace/notices";
   import UpdateToast from "./lib/workspace/UpdateToast.svelte";
   import { currentOffer, updateState } from "./lib/workspace/update.svelte";
   import * as pool from "./lib/terminal/termPool";
@@ -996,6 +1001,31 @@
   /** terminal session id -> agent session id (one agent per terminal). */
   const linksByTerminal = $derived(new Map(links.map((l) => [l.terminal_id, l.agent_id])));
   const focusedSessionId = $derived(focusedSessionOf(layout));
+  /** Sessions on screen in this window (each pane's active tab). */
+  const visibleSessions = $derived(
+    activeWsId !== null && layoutReady ? visibleSessionIds(layout) : [],
+  );
+  // Tell the notifier what this window shows, so it never alerts about a
+  // session the user is looking at — and clears alerts for ones they now
+  // are. Keyed on the joined ids so a layout write that changes nothing on
+  // screen costs no IPC.
+  const visibleKey = $derived(visibleSessions.join(" "));
+  $effect(() => {
+    const key = visibleKey;
+    const ids = key === "" ? [] : key.split(" ");
+    if (isNativeShell()) {
+      const timer = setTimeout(() => void reportWindowView(ids).catch(() => {}), 120);
+      return () => clearTimeout(timer);
+    }
+    if (document.hasFocus()) clearBrowserNotices(ids);
+  });
+  // Browser: coming back to this tab is looking at what it shows.
+  $effect(() => {
+    if (isNativeShell()) return;
+    const onFocus = (): void => clearBrowserNotices(untrack(() => visibleSessions));
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  });
   const focusedFilePath = $derived(focusedFileOf(layout));
   /** Open file tabs' display titles (basename, disambiguated by parent dir). */
   const fileTitles = $derived(fileTabTitles(allFilePaths(layout)));
@@ -1396,6 +1426,15 @@
         }
       },
       onFs: notifyDiskChange,
+      // The browser's notification source. The native app ignores these: its
+      // shell consumes the same feed per daemon and posts OS notifications.
+      onNotices: (list) => {
+        if (isNativeShell()) return;
+        deliverBrowserNotices(list, {
+          visible: untrack(() => visibleSessions),
+          onClick: focusFromNotification,
+        });
+      },
       onStatus: (up) => {
         // A recovered events socket often means a re-established tunnel — a
         // different link. Drop the RTT window so the rolling minimum can't
@@ -1429,7 +1468,20 @@
     let unlistenHostStatus: (() => void) | null = null;
     let unlistenAppUpdate: (() => void) | null = null;
     let unlistenCaffeinate: (() => void) | null = null;
+    let unlistenFocusSession: (() => void) | null = null;
     if (isNativeShell()) {
+      // A notification was clicked for a session this window should show.
+      // Listen first, then ask for a focus the shell may already owe us (a
+      // click that OPENED this window can beat the listener).
+      const focusListening = onFocusSession(focusFromNotification);
+      unlistenFocusSession = asyncDisposer(focusListening);
+      void focusListening.then(
+        () =>
+          takePendingFocus().then((id) => {
+            if (id !== null) focusFromNotification(id);
+          }),
+        () => {},
+      );
       // Build-skew + app-update signals for the update toast.
       void shellBuild().then((b) => (appBuild = b));
       // Caffeinate state: attach the cross-window broadcast FIRST, then read
@@ -1519,6 +1571,7 @@
       unlistenHostStatus?.();
       unlistenAppUpdate?.();
       unlistenCaffeinate?.();
+      unlistenFocusSession?.();
       document.removeEventListener("copy", onCopy);
       window.removeEventListener("dragenter", onWindowDragEnter);
       window.removeEventListener("dragover", onWindowDragOver);
@@ -2828,6 +2881,35 @@
       pendingReveal = sessionId;
     }
   }
+
+  /**
+   * A notification was clicked for `sessionId`: show it here. Works before
+   * this window knows the session (a window a click just opened) — the id
+   * waits for the roster, then for the layout, like a worktree reveal.
+   */
+  function focusFromNotification(sessionId: string): void {
+    const s = sessionsById.get(sessionId);
+    if (s === undefined) {
+      if (!gotSessions) pendingNoticeFocus = sessionId;
+      return;
+    }
+    if (s.workspace_id !== activeWsId) {
+      void revealWorktreeSession(sessionId, s.workspace_id);
+      return;
+    }
+    if (!layoutReady) {
+      pendingReveal = sessionId;
+      return;
+    }
+    openSess(sessionId);
+  }
+  let pendingNoticeFocus = $state<string | null>(null);
+  $effect(() => {
+    if (!gotSessions || pendingNoticeFocus === null) return;
+    const id = pendingNoticeFocus;
+    pendingNoticeFocus = null;
+    untrack(() => focusFromNotification(id));
+  });
 
   // Focus a pending session once the incoming workspace's layout has booted.
   let pendingReveal: string | null = null;

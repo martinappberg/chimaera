@@ -32,6 +32,7 @@
   import { dirtyFiles } from "../shared/editing";
   import { volatileChatDrafts } from "../chat/drafts";
   import { gitIndex } from "../workspace/git";
+  import { isUnread } from "../workspace/unread.svelte";
   import { decoFor } from "../workspace/gitDeco";
   import { PINNED } from "../shared/keys";
   import { keyHint } from "../shared/keybindings";
@@ -803,6 +804,7 @@
             <span
               class="tab-name"
               class:preview={tab.surface === "file" && tab.preview === true}
+              class:unread={sid !== null && i !== node.active && isUnread(sid)}
               data-label={label(tab)}
               style:color={fDeco ? fDeco.color : undefined}>{label(tab)}</span
             >
@@ -1375,6 +1377,15 @@
     visibility: hidden;
     font-weight: 600;
     font-style: normal;
+  }
+
+  /* Unread: an agent in a background tab finished work you haven't looked
+     at — the rail row's cue (a bolder, full-ink name), so the tab that needs
+     a look reads at a glance. The ::after reserve already sizes the name at
+     this weight, so marking never shifts the strip. */
+  .tab-name.unread {
+    color: var(--fg);
+    font-weight: 600;
   }
 
   /* A VS Code preview tab: italic until it is pinned (dbl-click / edit). */
