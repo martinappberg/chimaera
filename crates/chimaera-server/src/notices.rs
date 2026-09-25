@@ -617,6 +617,11 @@ fn attention(state: &AppState) -> Vec<Attention> {
         .collect();
     let workspaces = crate::lock(&state.session_workspaces).clone();
     let agents = crate::lock(&state.agents);
+    let is_mastermind = |id: &str| {
+        workspaces
+            .get(id)
+            .is_some_and(|ws| masterminds.get(ws).is_some_and(|sid| sid == id))
+    };
     let mut rows: Vec<Attention> = agents
         .iter()
         .filter(|(_, r)| r.state == AgentState::NeedsPermission)
@@ -627,11 +632,7 @@ fn attention(state: &AppState) -> Vec<Attention> {
                 .copied()
                 .unwrap_or(false)
         })
-        .filter(|(id, _)| {
-            !workspaces
-                .get(*id)
-                .is_some_and(|ws| masterminds.get(ws).is_some_and(|sid| sid == *id))
-        })
+        .filter(|(id, _)| !is_mastermind(id))
         .map(|(id, r)| Attention {
             id: id.clone(),
             workspace_id: workspaces.get(id).cloned(),

@@ -55,8 +55,10 @@ app-build` (never the root `cargo`).
   coordinate math in `shell/drag.rs` — logical space on macOS, physical elsewhere).
   Closing a window removes its record (macOS convention) **except during quit** (guarded by an
   `AtomicBool quitting` so teardown doesn't forget every window). Geometry is stored in logical pixels
-  (correct across scale factors) on a slow 2s tick. Closing the final window exits directly; the shell
-  never inserts an extra Home that needs a second close. **Home is the New Window launcher**: File/tray
+  (correct across scale factors) on a slow 2s tick. Closing the final window never inserts an extra
+  Home that needs a second close: on **macOS the app stays alive in the Dock** with no windows (the
+  standard Mac behavior — daemons and the notification watchers keep running; an explicit quit still
+  exits, and a Dock click opens Home), while Linux/Windows exit directly. **Home is the New Window launcher**: File/tray
   New Window creates a Home window when no unused launcher exists, otherwise it raises that singleton
   launcher. Browsing a connected host navigates the launcher to its detail page and Back re-homes it
   onto the local daemon. Selecting a local or remote workspace consumes the launcher and promotes that
@@ -68,9 +70,18 @@ app-build` (never the root `cargo`).
   daemon and tunnel ports (with origin-local storage retained for browser tabs); system light/dark is
   only the first-visit fallback, so new and re-homed webviews do not expose WebKit's unthemed white canvas.
   The shell is process-singleton because its registry, tunnels, and askpass endpoint are process-global;
-  launching the app again raises the complete existing window set rather than starting a competing
-  owner. On macOS, clicking the Dock icon likewise brings every Chimaera window forward while keeping
-  the previously active one frontmost.
+  launching the app again activates the existing instance rather than starting a competing owner.
+  **Activation follows macOS conventions** (`shell::activate_app`): a Dock click with any window on
+  screen leaves the set to AppKit (which raises the visible windows); with every window minimized or
+  hidden it restores ONLY the most recently used one (the rest stay in the Dock); with no window it
+  opens Home. A repeated launch focuses the most recent on-screen window the same way. Minimized
+  windows are never mass-restored.
+
+## Notifications
+
+- Native OS notifications (agent finished / awaiting approval / error / an agent's own `notify`),
+  the Dock badge + bounce, and click-to-session routing live in the shell (`shell/notices.rs` over
+  `notify.rs`) — see [notifications.md](notifications.md) for the whole feature.
 
 ## Signed self-update (app + daemon)
 
@@ -137,15 +148,18 @@ app-build` (never the root `cargo`).
 - **Menu bar** (`menu.rs`): the macOS **Chimaera** submenu (About · **Settings…** ⌘, · Services ·
   Hide/Hide Others/Show All · Quit), **File** (New Window ⇧⌘N · New Terminal ⌘T · New Agent ⇧⌘T ·
   Close View ⌘W · Close Window; +Settings…/Quit on Windows/Linux, which have no app submenu),
-  **Edit**, **View** (fullscreen), **Window**, and **Help** (About, non-macOS only). Items the page
+  **Edit**, **View** (fullscreen), **Window** (Minimize · Zoom · on macOS Bring All to Front, and —
+  registered as the app's Windows menu — AppKit's live list of every window by title, so any one,
+  minimized or not, is a click away), and **Help** (About, non-macOS only). Items the page
   owns — `close-view`/`new-terminal`/`new-agent`/`settings` — are `emit_to`'d as a `menu` event to the
   focused window (`onMenu` in `App.svelte`, via `native.ts`); New Window is handled shell-side.
   **Settings** is daemon-scoped: it opens the settings surface for the focused window's daemon (a
   remote window → the remote daemon's settings), same as the in-UI gear.
 - **System tray / menu-bar status item** (`tray.rs`, `tray-icon` feature): a persistent icon whose
-  menu lists the **open workspace windows** (click one to raise it), then New Window and Quit — the
-  tray stays available while any app window is open, but closing the final window exits the app
-  directly rather than leaving a windowless tray process. The icon is a real **brand-mark template**
+  menu lists the **open workspace windows** (click one to raise it) — each with its count of agents
+  awaiting approval ("crc_finish — 2 awaiting approval"; the tooltip totals them) — then New Window
+  and Quit. On Linux/Windows closing the final window exits the app rather than leaving a windowless
+  tray process; on macOS the app stays in the Dock (see Windows & restore). The icon is a real **brand-mark template**
   (a C-in-hexagon monogram, black on transparent) that macOS tints to the menu-bar theme
   (`icon_as_template`) — not the full app icon, which the template mask would render as a solid blob.
   On macOS the menu also carries the **Keep Awake** check item (see Caffeinate). The menu is rebuilt
