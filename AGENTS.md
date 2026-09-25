@@ -78,6 +78,11 @@ node scripts/check-workflow-security.mjs # immutable Actions pins + explicit per
 disk, so after a UI change just rebuild the UI and reload — no daemon restart. Full
 loop + gotchas: the **[develop](.claude/skills/develop/SKILL.md)** skill.
 
+**Claude Code cloud sessions** (claude.ai/code, `claude --cloud`) have no browser
+pane and no HPC access; a SessionStart hook installs the web-UI deps and builds
+`web-ui/dist` for you. Setup + what "verify live" means there:
+[cloud sessions guide](docs/agent-guides/cloud-sessions.md).
+
 ## Conventions you can't infer from the code
 
 - **Verify live, don't just unit-test.** Terminal state, reconnect, resize, and
@@ -132,7 +137,8 @@ mapping and the no-release path.
   requirement above for agents that do not auto-load them.
 - **Subagents**: Claude definitions live in `.claude/agents/`; Codex definitions
   live in `.codex/agents/`. Both provide `area-implementer` (scoped edits + live
-  verify) and `diff-reviewer` (read-only invariant check vs `upstream/main`).
+  verify) and `diff-reviewer` (read-only invariant check vs `upstream/main`, or
+  `origin/main` in a cloud clone).
 - **Claude hooks**: `.claude/settings.json` — fmt-on-save, destructive-command + generated-
-  file guards, session orientation, and the doc-drift warn (personal hooks go in the
-  gitignored `.claude/settings.local.json`).
+  file guards, session orientation, the cloud-only bootstrap, and the doc-drift warn
+  (personal hooks go in the gitignored `.claude/settings.local.json`).

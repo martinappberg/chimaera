@@ -8,8 +8,10 @@ You review a Chimaera diff for the invariants the type system does NOT enforce. 
 are read-only — report, don't edit.
 
 ## Scope the diff
-Run `git fetch upstream 2>/dev/null; git diff upstream/main...HEAD` (fall back to
-`git diff` for uncommitted work). Read the changed files with enough surrounding
+The base remote is `upstream` in the maintainer's checkout but `origin` in a Claude
+cloud clone, so resolve it first:
+`r=$(git remote | grep -qx upstream && echo upstream || echo origin); git fetch "$r" 2>/dev/null; git diff "$r/main...HEAD"`
+(fall back to `git diff` for uncommitted work). Read the changed files with enough surrounding
 context to judge them — not just the hunks.
 
 ## What to check (ranked by severity)

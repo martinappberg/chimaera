@@ -12,7 +12,8 @@ commit prefix are therefore load-bearing. See [AGENTS.md](../../../AGENTS.md) â†
 
 ## Before opening
 
-1. **Rebase on latest main.** The remote is `upstream`:
+1. **Rebase on latest main.** The remote is `upstream` in the maintainer's checkout
+   (`origin` in a Claude cloud clone â€” substitute it below):
    `git fetch upstream && git rebase upstream/main`.
 2. **Gate is green:** `just check` (fmt + clippy + test). If you touched
    `web-ui/**`, run its `check`, `test`, and `build` scripts. If you touched
@@ -62,7 +63,7 @@ time, verify the type/marker survived into the squash subject.
 ## Open it
 
 ```sh
-git push -u upstream HEAD          # push the branch
+git push -u upstream HEAD          # push the branch (`origin` in a cloud clone)
 gh pr create --title "chore: <what>" --body "<what changed; what you ran/observed>"
 ```
 
