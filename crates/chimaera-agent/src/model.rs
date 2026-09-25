@@ -32,6 +32,13 @@ pub const BG_LABEL_MAX: usize = 200;
 pub const BG_PATH_MAX: usize = 1024;
 /// One-line cap for the `SessionStatus` fields (a status line, not prose).
 pub const STATUS_DETAIL_MAX: usize = 256;
+/// One-line cap for a `ToolSummary` label (live ones are ~30 chars).
+pub const TOOL_SUMMARY_MAX: usize = 200;
+/// Tool ids one `ToolSummary` may name (a batch is a single model reply).
+pub const TOOL_SUMMARY_IDS_CAP: usize = 64;
+/// Head kept of a subagent's closing words on `SubagentFinished` — a preview;
+/// the full answer stays on the agent's own row.
+pub const SUBAGENT_RESULT_MAX: usize = 4 * 1024;
 /// Bound on tracked plan entries. Same reasoning as [`BG_TASKS_CAP`]: the plan
 /// is a glance surface and every `Plan` event carries the whole list, so the
 /// list size IS the event size. Claude's task list is agent-created and
@@ -156,12 +163,15 @@ pub enum AgentEvent {
     TurnStarted {
         turn_id: String,
     },
-    /// Streamed agent prose (already delta-coalesced by the pump).
+    /// Streamed agent prose. Live drivers merge deltas through [`Coalescer`],
+    /// so chunk boundaries fall wherever it happened to flush (its ~100ms
+    /// tick, the size cap, a block or turn boundary); transcript seeding
+    /// emits one chunk per text block. Only the concatenation is meaningful.
     MessageChunk {
         turn_id: String,
         text: String,
     },
-    /// Streamed reasoning/thinking.
+    /// Streamed reasoning/thinking; the same chunking contract as `MessageChunk`.
     ThoughtChunk {
         turn_id: String,
         text: String,
@@ -492,6 +502,55 @@ pub enum AgentEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
     },
+    /// A short past-tense label for one batch of tool calls ("Listed files
+    /// in directory") — claude's `tool_use_summary` frame, written by a small
+    /// model when the host opts in and landing about one model round after
+    /// the batch. Keyed by the batch's tool call ids, so a consumer labels
+    /// whatever group holds them. Strictly additive.
+    ToolSummary {
+        /// Capped at [`TOOL_SUMMARY_MAX`].
+        summary: String,
+        /// Capped at [`TOOL_SUMMARY_IDS_CAP`].
+        tool_ids: Vec<String>,
+    },
+    /// A subagent finished its work — the transcript's "agent finished"
+    /// line. Emitted ONCE per subagent by the driver that knows the real end
+    /// (claude: the `task_notification` verdict — for a backgrounded agent
+    /// that is long after its launch row completed; codex: the child thread's
+    /// turn end). Strictly additive.
+    SubagentFinished {
+        /// The subagent's transcript row (tool call id), when it has one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        /// What the agent was asked to do (description / nickname), capped.
+        label: String,
+        /// `completed` | `failed` | `stopped`.
+        status: String,
+        /// The agent's closing words (its answer or verdict summary): the
+        /// head, capped at [`SUBAGENT_RESULT_MAX`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        result: Option<String>,
+        /// Driver-built stats line ("12 tools · 34k tokens · 2m 03s").
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stats: Option<String>,
+    },
+    /// Output tokens the agent has generated so far in the running turn —
+    /// the live status line's counter (claude: each API call's own
+    /// `message_delta` usage summed across the turn, plus the in-flight
+    /// thinking estimate; codex: the thread's output total minus its value
+    /// at turn start). LATEST-WINS within a turn; a new turn starts at 0.
+    /// Throttled at the driver. Strictly additive.
+    TurnTokens {
+        output: u64,
+    },
+    /// The agent's own one-line phrase for what it is doing right now
+    /// (claude `system/task_summary {detail}`, "Counting files") — the
+    /// status line's activity text. LATEST-WINS; `None` clears it; a turn
+    /// end clears it too. Capped at [`STATUS_DETAIL_MAX`]. Strictly additive.
+    ActivityLine {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
 }
 
 /// The live bridge carried on `Init` (see `AgentEvent::Init.remote_control`).
@@ -550,6 +609,16 @@ pub struct BackgroundTask {
     /// Agents whose wire state is `done`.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub agents_done: u64,
+    /// A watch rather than a job: claude's `Monitor` tool rides the same
+    /// `local_bash` lane as a backgrounded command, but it streams events
+    /// into the conversation (each one wakes the agent) until its source
+    /// ends. Known from the launching tool call. Additive.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub monitor: bool,
+    /// Housekeeping the agent flags `ambient` (claude 2.1.281): the tray may
+    /// list it, the transcript never announces it. Additive.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ambient: bool,
     /// The tool_use that launched this task (claude `task_started
     /// .tool_use_id`) — driver-internal card binding, never on the wire:
     /// it rides the task identity through the live set and the departed
@@ -589,6 +658,10 @@ pub struct BackgroundTaskClose {
     /// File holding the task's full output, when the agent reports one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_file: Option<String>,
+    /// The task was a watch (`BackgroundTask.monitor`) — its end is a watch
+    /// ending, not a job finishing. Additive.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub monitor: bool,
 }
 
 /// Final delivery state of a queued user message.
@@ -1222,6 +1295,18 @@ pub fn cap_output(text: &str) -> (String, bool) {
 /// One-line label truncation with a plain ellipsis — for tool titles and
 /// command previews, where the head/tail "[N bytes omitted]" marker of
 /// [`cap_head_tail`] would be noise. Respects char boundaries.
+/// Elapsed seconds in the client's ladder ("45s", "2m 03s", "1h 02m 03s") —
+/// one spelling for both drivers' progress and finish lines.
+pub fn fmt_elapsed_secs(s: u64) -> String {
+    if s >= 3600 {
+        format!("{}h {:02}m {:02}s", s / 3600, (s % 3600) / 60, s % 60)
+    } else if s >= 60 {
+        format!("{}m {:02}s", s / 60, s % 60)
+    } else {
+        format!("{s}s")
+    }
+}
+
 pub fn truncate_label(text: &str, max: usize) -> String {
     if text.len() <= max {
         return text.to_string();

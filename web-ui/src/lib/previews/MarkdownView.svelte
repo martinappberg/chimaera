@@ -31,11 +31,13 @@
   import { getSetting } from "../settings/store.svelte";
   import { copyText } from "../shared/clipboard";
   import { copyLabel, copyPayload, decorateCopyTargets } from "../shared/copyDecor";
+  import { markScrollRegions, watchWidth } from "../shared/scrollRegion";
   import ReferenceChip from "../shared/ReferenceChip.svelte";
   import Spinner from "./Spinner.svelte";
   import { activateUrl, hasUrlScheme, isWebUrl, urlMenuEntries } from "../shared/urlOpen";
   import { contextMenu } from "../shared/contextMenu.svelte";
   import { loadMath, mathNow } from "./mathLoad";
+  import { readingWindow } from "./readingWindow";
 
   interface Props {
     path: string;
@@ -49,6 +51,8 @@
   // Prose base size: the pane override, else the Markdown preference. Drives
   // the reading body AND the live editor, so the two views read identically.
   const bodyFont = $derived(fontSize ?? getSetting("editor.markdownFontSize"));
+  /** The reading pane's accessible name: the file, not a generic word. */
+  const fileLabel = $derived(path.split("/").filter(Boolean).pop() ?? path);
   const bodyLineHeight = $derived(getSetting("editor.markdownLineHeight"));
 
   type Mode = "live" | "reading" | "source";
@@ -238,6 +242,34 @@
     return cancelTypeset;
   });
 
+  /** Keyboard reach for the reading view's horizontal scrollers
+   *  (shared/scrollRegion.ts): a table — comrak's bare <table> is its own
+   *  display:block scroller, and ammonia strips any tabindex the file might
+   *  carry, so the mark is set here after render, tabindex only so the table
+   *  keeps its own role — a fence's code box, and a display equation, each a
+   *  tab stop while it overflows. Overflow moves with the column's width, the
+   *  pane's text size, and a table's content (an equation typeset at idle, an
+   *  image decoded late), so every table's first row group is watched as its
+   *  width proxy alongside the pane. The reading pane itself is a named
+   *  region in the markup, always. */
+  const READING_SCROLLERS = [["table, pre > code, .md-math-display", null]] as const;
+  $effect(() => {
+    void html;
+    void bodyFont; // dep: A−/A+ reflows every scroller
+    if (mode !== "reading") return;
+    const scroll = readingEl;
+    if (scroll === null) return;
+    const recheck = () => markScrollRegions(scroll, READING_SCROLLERS);
+    recheck();
+    const stops = [
+      watchWidth(scroll, recheck),
+      ...Array.from(scroll.querySelectorAll("table > thead, table > tbody"), (g) =>
+        watchWidth(g, recheck),
+      ),
+    ];
+    return () => stops.forEach((stop) => stop());
+  });
+
   /** Equations in a rendered document. The server emits each one — inline
    *  `$…$`/`$$…$$`, a `$$` block, a ```math fence — as an escaped LaTeX
    *  literal in `span[data-math-style]` (the one non-default attribute the
@@ -294,6 +326,10 @@
       job.handle = null;
       const deadline = performance.now() + 8;
       while (i < spans.length && performance.now() < deadline) typesetSpan(spans[i++], math);
+      // The equations this slice just laid out: a wide one is a scroller
+      // that didn't exist when the reading view was marked, and no box the
+      // width watcher sees changes when it appears.
+      markScrollRegions(root, [[".md-math-display", null]]);
       if (i >= spans.length) {
         typesetJob = null;
         return;
@@ -420,14 +456,29 @@
       return;
     }
     setSelection(selOwner, { kind: "file", path, startLine: null, endLine: null, text });
+    chipPos = chipPosFor(content, range);
+  }
+
+  /** Where the chip sits for a selection: just past its last rect, clamped
+   *  inside the content box (one rule for placement and re-anchoring). */
+  function chipPosFor(content: HTMLElement, range: Range): { x: number; y: number } {
     const rects = range.getClientRects();
     const last = rects.length > 0 ? rects[rects.length - 1] : range.getBoundingClientRect();
     const rect = content.getBoundingClientRect();
     const clamp = (n: number, lo: number, hi: number) => Math.min(Math.max(n, lo), Math.max(lo, hi));
-    chipPos = {
+    return {
       x: clamp(last.right - rect.left + 4, 4, rect.width - 170),
       y: clamp(last.bottom - rect.top + 6, 4, rect.height - 58),
     };
+  }
+
+  /** Geometry only: re-anchor an existing chip to the selection's last rect
+   *  (a scroll moves the selection; it doesn't change what is selected). */
+  function placeChip(): void {
+    const content = contentEl;
+    const s = document.getSelection();
+    if (content === null || chipPos === null || s === null || s.rangeCount === 0) return;
+    chipPos = chipPosFor(content, s.getRangeAt(0));
   }
 
   $effect(() => {
@@ -436,9 +487,26 @@
       clearSelection(selOwner);
       return;
     }
+    // `scroll` doesn't bubble, so the reading pane's own scroll would miss
+    // the inner scrollers (a wide table, a fence, display math): a capturing
+    // listener on the root sees every descendant's scroll and re-anchors the
+    // chip once per frame — geometry only, no selection-store churn.
+    const root = readingEl;
+    const scrollOpts = { capture: true, passive: true } as const;
+    let frame = 0;
+    const onScroll = () => {
+      if (frame !== 0) return;
+      frame = requestAnimationFrame(() => {
+        frame = 0;
+        placeChip();
+      });
+    };
     document.addEventListener("selectionchange", syncPreviewSelection);
+    root?.addEventListener("scroll", onScroll, scrollOpts);
     return () => {
       document.removeEventListener("selectionchange", syncPreviewSelection);
+      root?.removeEventListener("scroll", onScroll, scrollOpts);
+      if (frame !== 0) cancelAnimationFrame(frame);
       chipPos = null;
       clearSelection(selOwner);
     };
@@ -496,17 +564,26 @@
     {/if}
 
     <!-- Authoritative server render (comrak). Shown in reading mode; kept in
-         the DOM (just hidden) so re-entering reading needs no re-render. -->
+         the DOM (just hidden) so re-entering reading needs no re-render.
+         Focusable so keyboard scrolling works in WKWebView (Safari never
+         auto-focuses scrollers), named after the file for the landmark list. -->
+    <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
     <div
       class="md-scroll"
       class:hidden={mode !== "reading"}
+      role="region"
+      aria-label={fileLabel}
+      tabindex="0"
       bind:this={readingEl}
-      onscroll={syncPreviewSelection}
     >
       {#if error !== null}
         <div class="file-error">{error}</div>
       {:else if html !== null}
-        <article class="md-body" style:font-size="{bodyFont}px">
+        <article
+          class="md-body"
+          style:font-size="{bodyFont}px"
+          use:readingWindow={[html, bodyFont, bodyLineHeight]}
+        >
           <!-- eslint-disable-next-line svelte/no-at-html-tags — sanitized server-side -->
           {@html html}
         </article>
@@ -617,6 +694,13 @@
     inset: 0;
     overflow-y: auto;
     overflow-x: hidden;
+    scrollbar-width: thin; /* like the transcript's own bar (chat/ChatView) */
+  }
+  /* The pane clips at its padding box (layout/Pane) and this scroller is
+     inset:0 against it — the global outside ring (app.css) would be cut on
+     three sides, so paint it inside, like GitView's .grow. */
+  .md-scroll:focus-visible {
+    outline-offset: -2px;
   }
 
   .edit-layer {
@@ -644,7 +728,15 @@
     font-size: var(--text-lg);
     line-height: var(--markdown-line-height);
     color: var(--fg);
+    /* overflow-wrap, never word-break / anywhere: those shrink a table
+       column's min-content and crush numeric cells letter-per-line (chat's
+       root does, and needs a per-cell reset; this one doesn't). */
     overflow-wrap: break-word;
+    /* Tables: the shared recipe in app.css ("Markdown tables"), whose default
+       spacing is this surface's; comrak's bare <table> is its own
+       display:block scroller there. Headers wrap like any cell: one-line
+       headers would only turn tables that fit into scrollers, since
+       overflow-wrap above never shrinks a column's min-content. */
   }
 
   .md-body :global(h1),
@@ -718,6 +810,7 @@
   .md-body :global(pre code) {
     display: block;
     overflow-x: auto;
+    scrollbar-width: thin;
     background: none;
     padding: 0;
     font-size: 0.848em;
@@ -801,6 +894,7 @@
     max-width: 100%;
     overflow-x: auto;
     overflow-y: hidden;
+    scrollbar-width: thin;
     margin: 0.55em 0;
     padding: 0.1em 0;
   }
@@ -827,26 +921,6 @@
 
   .md-body :global(img) {
     max-width: 100%;
-  }
-
-  .md-body :global(table) {
-    border-collapse: collapse;
-    margin: 1em 0;
-    display: block;
-    overflow-x: auto;
-    font-size: 0.924em;
-  }
-
-  .md-body :global(th),
-  .md-body :global(td) {
-    border: 1px solid var(--edge);
-    padding: 0.35em 0.7em;
-    text-align: left;
-  }
-
-  .md-body :global(th) {
-    font-weight: 600;
-    background: color-mix(in srgb, var(--fg) 4%, transparent);
   }
 
   .md-body :global(input[type="checkbox"]) {

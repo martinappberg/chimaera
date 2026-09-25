@@ -926,28 +926,7 @@ describe("ChatStore background tasks", () => {
     });
   });
 
-  it("folds a close verdict into history as a notice and empties the set", () => {
-    const store = fold([
-      { type: "background_tasks", tasks: [BG()] },
-      {
-        type: "background_tasks",
-        tasks: [],
-        closed: [{ id: "bg-1", description: "sleep 30", status: "completed", summary: "exit 0" }],
-      },
-    ]);
-    expect(store.backgroundTasks).toHaveLength(0);
-    const notices = store.blocks.filter((b) => b.kind === "notice");
-    expect(notices).toHaveLength(1);
-    expect(notices[0]).toMatchObject({ tone: "info" });
-    expect((notices[0] as { text: string }).text).toContain("sleep 30");
-    expect((notices[0] as { text: string }).text).toContain("completed");
-    expect((notices[0] as { text: string }).text).toContain("exit 0");
-  });
-
-  it("renders a self-contained wire summary alone (no stutter)", () => {
-    // The natural-close summary already names the command AND the verdict
-    // (live shape: 'Background command "…" completed (exit code 0)') —
-    // rendering desc + status + summary would say everything twice.
+  it("folds a close verdict into history as a finished row and empties the set", () => {
     const store = fold([
       { type: "background_tasks", tasks: [BG()] },
       {
@@ -958,18 +937,62 @@ describe("ChatStore background tasks", () => {
             id: "bg-1",
             description: "sleep 30",
             status: "completed",
-            summary: 'Background command "sleep 30" completed (exit code 0)',
+            summary: "exit 0",
+            output_file: "/tmp/bg-1.output",
           },
         ],
       },
     ]);
-    const notices = store.blocks.filter((b) => b.kind === "notice");
-    expect((notices[0] as { text: string }).text).toBe(
-      'Background command "sleep 30" completed (exit code 0)',
-    );
+    expect(store.backgroundTasks).toHaveLength(0);
+    const rows = store.blocks.filter((b) => b.kind === "finished");
+    expect(rows).toHaveLength(1);
+    // A summary that doesn't name the task composes description + verdict,
+    // the summary riding as detail.
+    expect(rows[0]).toMatchObject({
+      source: "task",
+      title: "“sleep 30” completed",
+      status: "completed",
+      stats: "exit 0",
+      outputFile: "/tmp/bg-1.output",
+    });
   });
 
-  it("renders a failed verdict as an error notice", () => {
+  it("uses a self-contained wire sentence as the title (no stutter)", () => {
+    // The natural-close summary already names the command AND the verdict
+    // (live shape: 'Background command "…" completed (exit code 0)'); a
+    // monitor's close names the watch ('Monitor "…" stream ended').
+    const store = fold([
+      { type: "background_tasks", tasks: [BG(), BG({ id: "mon-1", description: "tail log", monitor: true })] },
+      {
+        type: "background_tasks",
+        tasks: [],
+        closed: [
+          {
+            id: "bg-1",
+            description: "sleep 30",
+            status: "completed",
+            summary: 'Background command "sleep 30" completed (exit code 0)',
+          },
+          {
+            id: "mon-1",
+            description: "tail log",
+            status: "completed",
+            summary: 'Monitor "tail log" stream ended',
+            monitor: true,
+          },
+        ],
+      },
+    ]);
+    const rows = store.blocks.filter((b) => b.kind === "finished");
+    expect(rows[0]).toMatchObject({
+      source: "task",
+      title: 'Background command "sleep 30" completed (exit code 0)',
+      stats: null,
+    });
+    expect(rows[1]).toMatchObject({ source: "monitor", title: 'Monitor "tail log" stream ended' });
+  });
+
+  it("keeps a failed verdict's status for the row's tone", () => {
     const store = fold([
       { type: "background_tasks", tasks: [BG()] },
       {
@@ -978,8 +1001,28 @@ describe("ChatStore background tasks", () => {
         closed: [{ id: "bg-1", description: "sleep 30", status: "failed" }],
       },
     ]);
-    const notices = store.blocks.filter((b) => b.kind === "notice");
-    expect(notices[0]).toMatchObject({ tone: "error" });
+    const rows = store.blocks.filter((b) => b.kind === "finished");
+    expect(rows[0]).toMatchObject({ status: "failed", title: "“sleep 30” failed" });
+  });
+
+  it("folds a subagent's end as a finished row with its report", () => {
+    const store = fold([
+      {
+        type: "subagent_finished",
+        id: "tu-1",
+        label: "Measure file sizes",
+        status: "completed",
+        result: "Both files are 6 bytes.",
+        stats: "2 tools · 12.3k tokens · 4s",
+      },
+    ]);
+    expect(store.blocks.at(-1)).toMatchObject({
+      kind: "finished",
+      source: "agent",
+      title: "Measure file sizes",
+      result: "Both files are 6 bytes.",
+      stats: "2 tools · 12.3k tokens · 4s",
+    });
   });
 
   it("survives a turn end and model switch, dies with the process", () => {
@@ -1496,5 +1539,97 @@ describe("ChatStore remote control", () => {
     ]);
     const users = store.blocks.filter((b) => b.kind === "user");
     expect(users.map((u) => u.origin)).toEqual([null, "remote"]);
+  });
+});
+
+describe("ChatStore transcript surfaces (tool labels, turn tokens, activity line)", () => {
+  it("labels every row of a batch; unknown ids simply miss", () => {
+    const store = fold([
+      { type: "turn_started", turn_id: "t1" },
+      { type: "tool_call", id: "a", kind: "execute", title: "ls", status: "in_progress" },
+      { type: "tool_call", id: "b", kind: "read", title: "Read x", status: "in_progress" },
+      { type: "tool_summary", summary: "Listed files", tool_ids: ["a", "b", "gone"] },
+    ]);
+    const tools = store.blocks.filter((b) => b.kind === "tool");
+    expect(tools.map((t) => (t as { summary: string | null }).summary)).toEqual([
+      "Listed files",
+      "Listed files",
+    ]);
+  });
+
+  it("tracks the turn's output tokens and the agent's activity phrase, reset per turn", () => {
+    const store = fold([
+      { type: "turn_started", turn_id: "t1" },
+      { type: "turn_tokens", output: 1200 },
+      { type: "activity_line", detail: "Counting files" },
+    ]);
+    expect(store.turnTokens).toBe(1200);
+    expect(store.activityLine).toBe("Counting files");
+    store.apply({ seq: 4, ts: 4, ev: { type: "activity_line" } } as SeqEvent);
+    expect(store.activityLine).toBeNull();
+    store.apply({ seq: 5, ts: 5, ev: { type: "activity_line", detail: "Reading" } } as SeqEvent);
+    store.apply({
+      seq: 6,
+      ts: 6,
+      ev: { type: "turn_completed", turn_id: "t1", usage: {} },
+    } as SeqEvent);
+    expect(store.activityLine).toBeNull();
+    store.apply({ seq: 7, ts: 7, ev: { type: "turn_started", turn_id: "t2" } } as SeqEvent);
+    expect(store.turnTokens).toBe(0);
+  });
+});
+
+describe("ChatStore wake markers (turns nobody typed)", () => {
+  const MON = { id: "mon-1", task_type: "local_bash", description: "tail log", status: "running", started_at_ms: 1, monitor: true };
+
+  it("marks a turn that opens after a turn end with no user message", () => {
+    const store = fold([
+      { type: "user_message", text: "go", attachments: 0 },
+      { type: "turn_started", turn_id: "t1" },
+      { type: "background_tasks", tasks: [MON] },
+      { type: "turn_completed", turn_id: "t1", usage: { duration_ms: 500 } },
+      { type: "turn_started", turn_id: "t2" },
+    ]);
+    expect(store.blocks.filter((b) => b.kind === "wake")).toEqual([
+      expect.objectContaining({ kind: "wake", cause: "monitor", label: "tail log" }),
+    ]);
+  });
+
+  it("stays quiet for user turns, first turns, and wakes a finished row explains", () => {
+    const store = fold([
+      { type: "turn_started", turn_id: "t1" },
+      { type: "turn_completed", turn_id: "t1", usage: {} },
+      { type: "user_message", text: "again", attachments: 0 },
+      { type: "turn_started", turn_id: "t2" },
+      { type: "turn_completed", turn_id: "t2", usage: {} },
+      {
+        type: "background_tasks",
+        tasks: [],
+        closed: [{ id: "bg-1", description: "build", status: "completed" }],
+      },
+      { type: "turn_started", turn_id: "t3" },
+    ]);
+    expect(store.blocks.some((b) => b.kind === "wake")).toBe(false);
+  });
+
+  it("retracts the marker when the message-less turn is a compaction", () => {
+    const store = fold([
+      { type: "user_message", text: "go", attachments: 0 },
+      { type: "turn_started", turn_id: "t1" },
+      { type: "turn_completed", turn_id: "t1", usage: {} },
+      { type: "turn_started", turn_id: "t2" },
+      { type: "context_compaction", phase: "started" },
+    ]);
+    expect(store.blocks.some((b) => b.kind === "wake")).toBe(false);
+  });
+
+  it("says 'resumed on its own' when nothing is live", () => {
+    const store = fold([
+      { type: "user_message", text: "go", attachments: 0 },
+      { type: "turn_started", turn_id: "t1" },
+      { type: "turn_completed", turn_id: "t1", usage: {} },
+      { type: "turn_started", turn_id: "t2" },
+    ]);
+    expect(store.blocks.find((b) => b.kind === "wake")).toMatchObject({ cause: "self", label: null });
   });
 });

@@ -24,6 +24,8 @@
 <script lang="ts">
   import { copyText } from "../shared/clipboard";
   import { copyLabel, copyPayload, decorateCopyTargets } from "../shared/copyDecor";
+  import { markScrollRegions, watchWidth } from "../shared/scrollRegion";
+  import { getSetting } from "../settings/store.svelte";
   import { advanceSegments, type SegmenterState } from "./streamSegments";
   import { RevealLedger } from "./revealLedger";
   import { pathCandidate, trimPathWord, type PathHit, type ResolvePaths } from "./paths";
@@ -616,9 +618,10 @@
     const run = () => {
       cancelIdleStamp = null;
       const batch = unstamped.splice(0);
-      for (const root of batch) {
-        if (root.isConnected) stampPaths(root);
-      }
+      const attached = batch.filter((root) => root.isConnected);
+      for (const root of attached) stampPaths(root);
+      // After every stamp, so the batch's layout reads flush once.
+      for (const root of attached) markTableRegions(root);
     };
     if (typeof requestIdleCallback === "function") {
       const id = requestIdleCallback(run, { timeout: 500 });
@@ -670,6 +673,7 @@
       if (left <= 0) {
         hiddenPerRoot.delete(entry.root);
         scheduleUnwrap(entry.root); // drained: dissolve spans post-fade
+        markTableRegions(entry.root); // every word shown: measure at final width
       } else {
         hiddenPerRoot.set(entry.root, left);
       }
@@ -718,6 +722,46 @@
     lastSettledHtml = current;
     decorateCopyTargets(el);
     stampPaths(el);
+    markTableRegions(el);
+  });
+
+  /** Keyboard reach for the transcript's horizontal scrollers
+   *  (shared/scrollRegion.ts): a wide table's .md-table host becomes a
+   *  focusable group, a wide fence's code box a plain tab stop, each only
+   *  while it overflows. Marks land where the node is attached and at its
+   *  final width — the idle stamp pass over closed segments, the moment a
+   *  segment's reveal has shown its last word, and the settled render —
+   *  never the per-chunk open tail (its scrollWidth read would force a
+   *  layout per chunk). Overflow moves with the column's width (a pane
+   *  resize) or a table's own (the chat font size), so a settled message
+   *  that holds a scroller watches both; a hidden pane watches nothing and
+   *  catches up when shown. */
+  /** A fence's code box scrolls; a bare raw-HTML <pre> (no code child, no
+   *  scroller of its own) scrolls itself — a <pre> that holds one never
+   *  overflows, so listing both marks exactly the box that moves. */
+  const CHAT_SCROLLERS = [
+    [".md-table", { role: "group", label: "scrollable table" }],
+    ["pre > code, pre", null],
+  ] as const;
+  function markTableRegions(root: ParentNode): void {
+    markScrollRegions(root, CHAT_SCROLLERS);
+  }
+  $effect(() => {
+    if (!visible || streaming) return;
+    void html; // dep: a settled render may have changed the scroller set
+    // A fence's content width follows the chat font with no element to
+    // observe (its text is the content), so the font settings are deps too.
+    void getSetting("chat.fontSize");
+    void getSetting("appearance.interfaceFontSize");
+    const root = el;
+    if (root === null || root.querySelector(".md-table, pre") === null) return;
+    const recheck = () => markTableRegions(root);
+    recheck();
+    const stops = [
+      watchWidth(root, recheck),
+      ...Array.from(root.querySelectorAll(".md-table > table"), (t) => watchWidth(t, recheck)),
+    ];
+    return () => stops.forEach((stop) => stop());
   });
 
   // Stop the ticker, the copied-feedback timer, unwrap timers, and any
@@ -755,6 +799,12 @@
     line-height: var(--chat-line-height, 1.55);
     font-size: var(--text-md);
     word-break: break-word;
+    /* Table spacing over the shared recipe (app.css "Markdown tables"): the
+       transcript's tighter rhythm, and an absolute cell size — --text-sm
+       keeps a legibility floor at the smallest pane font. */
+    --md-table-margin: 0.4em;
+    --md-table-font-size: var(--text-sm);
+    --md-table-cell-padding: 3px 8px;
   }
   /* Streaming containers are layout-neutral: display:contents removes the
      live shell and each segment wrapper from the box tree, so block margins,
@@ -935,56 +985,13 @@
   .md :global(a) {
     color: var(--accent);
   }
-  /* Tables: the emitted .md-table host (tables.ts) is the horizontal
-     scroller — a <table> can't scroll its own content — so a table wider than
-     the transcript scrolls in place instead of squeezing; it chains scroll
-     like the transcript's own bar (thin) and contains horizontal overscroll
-     so a trackpad swipe at a table edge never becomes WebKit's back gesture.
-     The 1px padding keeps the outer half of the collapsed border (which lies
-     outside the table box) inside the host's clip. Hosted cells drop the
-     root's break-anywhere wrapping: under it every column's minimum is ONE
-     character, and the auto layout crushes short numeric columns into a
-     letter-per-line stack ("0." / "39" / "%") while a prose column hogs the
-     width. Prose cells still wrap at spaces and hyphens; unbreakable tokens
-     hold their width, headers stay on one line so column names read as
-     labels, and numerals are tabular so digit columns line up. An agent's
-     literal <table> HTML has NO host (marked passes it through), so it keeps
-     the squeeze-to-fit wrapping — never wider than the transcript — and its
-     own vertical rhythm. GFM alignment arrives as the align attribute (kept
-     by the sanitizer); the author left-default is scoped so the browser's
-     own mapping handles aligned cells. */
-  .md :global(.md-table) {
-    overflow-x: auto;
-    overscroll-behavior-x: contain;
-    scrollbar-width: thin;
-    padding: 1px;
-    margin: 0.4em 0;
-  }
-  .md :global(table) {
-    border-collapse: collapse;
-    font-size: var(--text-sm);
-  }
-  .md :global(table:not(.md-table > table)) {
-    margin: 0.4em 0;
-  }
-  .md :global(th),
-  .md :global(td) {
-    border: 1px solid var(--edge);
-    padding: 3px 8px;
-  }
-  .md :global(th:not([align])),
-  .md :global(td:not([align])) {
-    text-align: left;
-  }
-  .md :global(.md-table th),
-  .md :global(.md-table td) {
-    word-break: normal;
-    font-variant-numeric: tabular-nums;
-  }
-  .md :global(th) {
-    font-weight: 600;
-    background: color-mix(in srgb, var(--fg) 4%, transparent);
-  }
+  /* Chat's one table delta over the shared recipe (app.css "Markdown
+     tables"), which styles the .md-table host tables.ts emits and every
+     cell — and resets the root's break-anywhere wrapping on hosted cells
+     (why: there). Headers stay on one line so column names read as labels.
+     An agent's literal <table> HTML has NO host (marked passes it through),
+     so it keeps the root's squeeze-to-fit wrapping — never wider than the
+     transcript. */
   .md :global(.md-table th) {
     white-space: nowrap;
   }

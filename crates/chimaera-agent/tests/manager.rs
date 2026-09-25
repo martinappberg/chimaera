@@ -13,13 +13,15 @@ use chimaera_agent::claude::ClaudeAdapter;
 use chimaera_agent::driver::SpawnSpec;
 use chimaera_agent::journal::SeqEvent;
 use chimaera_agent::model::{
-    AgentCommand, AgentEvent, BackgroundTask, ContentBlock, RemoteControlState, ToolStatus,
-    UserMessageState,
+    AgentCommand, AgentEvent, BackgroundTask, ContentBlock, RemoteControlState, ToolContent,
+    ToolStatus, UserMessageState,
 };
 use chimaera_agent::{ChatManager, CommandQueueFull, EventHook, ExitHook, RETAINED_SENDS_MAX};
 
 const FAKE: &str = env!("CARGO_BIN_EXE_fake-claude");
-const WAIT: Duration = Duration::from_secs(5);
+/// Ceiling per wait. Every wait here is condition-driven, so this only bounds
+/// how long a broken run takes to fail; generous for a loaded, parallel CI run.
+const WAIT: Duration = Duration::from_secs(20);
 
 struct Fixture {
     manager: Arc<ChatManager>,
@@ -73,6 +75,38 @@ async fn wait_for(
     }
 }
 
+/// `seen` with the attach overlap removed: `attach` subscribes to `live`
+/// before snapshotting `replay`, so the live tail may re-deliver events the
+/// replay already holds (the documented "dedupe by seq" contract). First
+/// occurrence wins and arrival order is kept, so a genuinely reordered event
+/// survives for the ordering assertions to catch instead of vanishing.
+fn dedup_by_seq(seen: &[Arc<SeqEvent>]) -> Vec<&Arc<SeqEvent>> {
+    let mut taken = std::collections::HashSet::new();
+    seen.iter().filter(|e| taken.insert(e.seq)).collect()
+}
+
+/// A turn's surfaced prose so far: its `MessageChunk`s concatenated in
+/// arrival order. How many chunks the deltas land in is timing-dependent (see
+/// `AgentEvent::MessageChunk`), so tests assert on the concatenation, never on
+/// one chunk's text. Not supersede-aware: it fails loudly rather than gluing
+/// prose across a `MessagesSuperseded` the client would have dropped.
+fn prose(seen: &[Arc<SeqEvent>], turn: &str) -> String {
+    let mut out = String::new();
+    for e in dedup_by_seq(seen) {
+        match &e.ev {
+            AgentEvent::MessageChunk { turn_id, text } if turn_id == turn => out.push_str(text),
+            AgentEvent::MessagesSuperseded => {
+                panic!(
+                    "prose() is not supersede-aware; MessagesSuperseded at seq {}",
+                    e.seq
+                )
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 #[tokio::test]
 async fn full_turn_with_permission_allow_and_gap_replay() {
     let fx = fixture();
@@ -114,24 +148,22 @@ async fn full_turn_with_permission_allow_and_gap_replay() {
         |ev| matches!(ev, AgentEvent::UserMessage { text, .. } if text == "run it"),
     )
     .await;
-    wait_for(&mut rx, &mut seen, "TurnStarted", |ev| {
+    let started = wait_for(&mut rx, &mut seen, "TurnStarted", |ev| {
         matches!(ev, AgentEvent::TurnStarted { .. })
     })
     .await;
+    let AgentEvent::TurnStarted { turn_id: turn } = &started.ev else {
+        unreachable!()
+    };
     // Second Init carries the native session id from system/init.
     wait_for(&mut rx, &mut seen, "Init with native id", |ev| {
         matches!(ev, AgentEvent::Init { native_session_id, .. } if native_session_id == "fake-native-1")
     })
     .await;
-    // Deltas coalesce; the timer flush (100ms) or the tool_use flush must
-    // surface the streamed text exactly once.
-    wait_for(
-        &mut rx,
-        &mut seen,
-        "MessageChunk 'hello'",
-        |ev| matches!(ev, AgentEvent::MessageChunk { text, .. } if text == "hello"),
-    )
-    .await;
+    // "hel"/"lo" may surface as one chunk or two (see `AgentEvent::MessageChunk`;
+    // a loaded CI runner split them). What IS pinned is the order: the driver
+    // flushes the turn's prose before it emits the tool_use's ToolCall, so once
+    // the ToolCall is here the prose is complete.
     wait_for(
         &mut rx,
         &mut seen,
@@ -139,6 +171,11 @@ async fn full_turn_with_permission_allow_and_gap_replay() {
         |ev| matches!(ev, AgentEvent::ToolCall { id, .. } if id == "tu-1"),
     )
     .await;
+    assert_eq!(
+        prose(&seen, turn),
+        "hello",
+        "streamed deltas coalesce losslessly ahead of the tool call; saw {seen:#?}"
+    );
     let permission = wait_for(&mut rx, &mut seen, "PermissionRequest", |ev| {
         matches!(ev, AgentEvent::PermissionRequest { .. })
     })
@@ -187,21 +224,21 @@ async fn full_turn_with_permission_allow_and_gap_replay() {
         _ => unreachable!(),
     }
     assert!(!fx.manager.get("s-1").unwrap().pending_permission);
+    // The assistant frame repeats the streamed text as a `text` block; the
+    // driver must not surface it a second time.
+    assert_eq!(
+        prose(&seen, turn),
+        "hello",
+        "a turn's prose surfaces exactly once; saw {seen:#?}"
+    );
 
-    // Attach subscribes to `live` before snapshotting `replay`, so the live
-    // tail may legitimately re-deliver an event already in replay (the
-    // documented "dedupe by seq" contract). Apply that dedupe, then assert the
-    // remaining stream is strictly increasing.
-    let mut ordered: Vec<u64> = Vec::new();
-    let mut max_seq = 0u64;
-    for e in &seen {
-        if e.seq > max_seq {
-            ordered.push(e.seq);
-            max_seq = e.seq;
-        }
-    }
-    for pair in ordered.windows(2) {
-        assert!(pair[1] > pair[0], "non-monotonic: {seen:#?}");
+    // After the attach-overlap dedupe, what a client saw must BE the journal:
+    // contiguous from seq 1 (this attach started at 0), no reorder, no gap.
+    // (A running-max filter would make this vacuous — it hides reorders.)
+    let seqs: Vec<u64> = dedup_by_seq(&seen).iter().map(|e| e.seq).collect();
+    assert_eq!(seqs.first(), Some(&1), "stream starts at seq 1: {seen:#?}");
+    for pair in seqs.windows(2) {
+        assert_eq!(pair[1], pair[0] + 1, "reordered or gapped: {seen:#?}");
     }
 
     // Gap replay: a reconnect with last_seq = permission's seq must get
@@ -329,6 +366,8 @@ async fn spawn_neutralizes_stale_background_set_in_reused_journal() {
                     agents: Vec::new(),
                     agents_total: 0,
                     agents_done: 0,
+                    monitor: false,
+                    ambient: false,
                     tool_use_id: None,
                 }],
                 closed: Vec::new(),
@@ -467,6 +506,143 @@ async fn background_tasks_outlive_their_turn_and_accumulate() {
     let info = fx.manager.get("s-bg").expect("info");
     assert_eq!(info.background_running, 0, "an exit clears the count");
     assert!(!info.alive);
+}
+
+/// The 2.1.281 transcript surfaces end to end (fake-claude `showcase`):
+/// narration journals as PROSE, tool batches get their labels, a subagent
+/// closes with exactly one finished line (report + footprint) and a clean
+/// row, a Monitor lane is marked as a watch, and background closes speak the
+/// CLI's own sentences — while an agent's close never doubles as a
+/// background notice.
+#[tokio::test]
+async fn showcase_turn_maps_every_transcript_surface() {
+    let fx = fixture();
+    fx.manager
+        .spawn(&ClaudeAdapter, spec("s-show", &fx.cwd, "showcase"))
+        .expect("spawn");
+    let att = fx.manager.attach("s-show", 0).expect("attach");
+    let mut seen: Vec<Arc<SeqEvent>> = att.replay.clone();
+    let mut rx = att.live;
+    send_text(&fx, "s-show", "survey the workspace").await;
+    // The monitor's close is the last frame the fake emits.
+    wait_for(&mut rx, &mut seen, "the monitor close", |ev| {
+        matches!(ev, AgentEvent::BackgroundTasks { closed, .. }
+            if closed.iter().any(|c| c.id == "mon-1"))
+    })
+    .await;
+    let events: Vec<&AgentEvent> = seen.iter().map(|e| &e.ev).collect();
+
+    let prose: String = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::MessageChunk { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    let thought: String = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ThoughtChunk { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        prose.contains("I'm handing the size check to a helper agent"),
+        "narration is prose: {prose:?}"
+    );
+    assert!(
+        !thought.contains("helper agent"),
+        "…and never thought: {thought:?}"
+    );
+    assert!(
+        thought.contains("listing the workspace first"),
+        "reasoning stays thought"
+    );
+
+    let labels: Vec<(&str, &[String])> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ToolSummary { summary, tool_ids } => {
+                Some((summary.as_str(), tool_ids.as_slice()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(labels.len(), 3, "one label per batch: {labels:?}");
+    assert_eq!(labels[2].1, ["tu-bg".to_string(), "tu-mon".to_string()]);
+
+    let finished: Vec<&AgentEvent> = events
+        .iter()
+        .copied()
+        .filter(|e| matches!(e, AgentEvent::SubagentFinished { .. }))
+        .collect();
+    match finished.as_slice() {
+        [AgentEvent::SubagentFinished {
+            id,
+            label,
+            status,
+            result,
+            stats,
+        }] => {
+            assert_eq!(id.as_deref(), Some("tu-agent"));
+            assert_eq!(label, "Measure file sizes");
+            assert_eq!(status, "completed");
+            assert!(result
+                .as_deref()
+                .is_some_and(|r| r.starts_with("Both files are 6 bytes")));
+            assert_eq!(stats.as_deref(), Some("2 tools · 12.3k tokens · 4s"));
+        }
+        other => panic!("exactly one finished line: {other:#?}"),
+    }
+    let agent_row = events.iter().rev().find_map(|e| match e {
+        AgentEvent::ToolCallUpdate {
+            id,
+            content: Some(ToolContent::Output { text, .. }),
+            ..
+        } if id == "tu-agent" => Some(text.clone()),
+        _ => None,
+    });
+    assert_eq!(
+        agent_row.as_deref(),
+        Some(
+            "Both files are 6 bytes:\n\n| file | bytes |\n|---|---|\n| a.txt | 6 |\n| b.txt | 6 |"
+        ),
+        "the row shows the report, not the hand-back scaffolding"
+    );
+
+    let monitor_marked = events.iter().any(|e| {
+        matches!(e, AgentEvent::BackgroundTasks { tasks, .. }
+            if tasks.iter().any(|t| t.id == "mon-1" && t.monitor)
+                && tasks.iter().any(|t| t.id == "bg-1" && !t.monitor))
+    });
+    assert!(
+        monitor_marked,
+        "the Monitor lane is a watch, the Bash lane a job"
+    );
+    let closes: Vec<(String, Option<String>)> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::BackgroundTasks { closed, .. } => Some(closed),
+            _ => None,
+        })
+        .flatten()
+        .map(|c| (c.id.clone(), c.summary.clone()))
+        .collect();
+    assert_eq!(
+        closes,
+        [
+            (
+                "bg-1".to_string(),
+                Some("Background command \"Warm the cache\" completed (exit code 0)".to_string())
+            ),
+            (
+                "mon-1".to_string(),
+                Some("Monitor \"Watch the build log\" stream ended".to_string())
+            ),
+        ],
+        "background closes only — the agent's close is its finished line"
+    );
+    assert!(fx.manager.kill("s-show"));
 }
 
 #[tokio::test]

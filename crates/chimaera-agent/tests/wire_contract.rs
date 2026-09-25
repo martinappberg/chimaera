@@ -607,3 +607,80 @@ fn mode_and_effort_chosen_flags_are_additive() {
         }
     );
 }
+
+/// Pass 31 additions — every one strictly additive (old clients skip the
+/// unknown tags; the optional fields vanish when empty).
+#[test]
+fn transcript_surface_wire_shapes_are_additive() {
+    assert_eq!(
+        serde_json::to_value(AgentEvent::ToolSummary {
+            summary: "Listed files in directory".into(),
+            tool_ids: vec!["toolu_1".into()],
+        })
+        .unwrap(),
+        json!({
+            "type": "tool_summary", "summary": "Listed files in directory",
+            "tool_ids": ["toolu_1"],
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(AgentEvent::SubagentFinished {
+            id: Some("toolu_2".into()),
+            label: "Measure file sizes".into(),
+            status: "completed".into(),
+            result: Some("Both files are 6 bytes.".into()),
+            stats: Some("2 tools · 12.3k tokens · 4s".into()),
+        })
+        .unwrap(),
+        json!({
+            "type": "subagent_finished", "id": "toolu_2", "label": "Measure file sizes",
+            "status": "completed", "result": "Both files are 6 bytes.",
+            "stats": "2 tools · 12.3k tokens · 4s",
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(AgentEvent::SubagentFinished {
+            id: None,
+            label: "x".into(),
+            status: "stopped".into(),
+            result: None,
+            stats: None,
+        })
+        .unwrap(),
+        json!({ "type": "subagent_finished", "label": "x", "status": "stopped" })
+    );
+    assert_eq!(
+        serde_json::to_value(AgentEvent::TurnTokens { output: 1240 }).unwrap(),
+        json!({ "type": "turn_tokens", "output": 1240 })
+    );
+    assert_eq!(
+        serde_json::to_value(AgentEvent::ActivityLine {
+            detail: Some("Counting files".into())
+        })
+        .unwrap(),
+        json!({ "type": "activity_line", "detail": "Counting files" })
+    );
+    assert_eq!(
+        serde_json::to_value(AgentEvent::ActivityLine { detail: None }).unwrap(),
+        json!({ "type": "activity_line" })
+    );
+    let task = |monitor, ambient| chimaera_agent::model::BackgroundTask {
+        id: "bg-1".into(),
+        task_type: "local_bash".into(),
+        description: "Watch the build log".into(),
+        status: "running".into(),
+        started_at_ms: 1,
+        workflow_name: None,
+        agents: Vec::new(),
+        agents_total: 0,
+        agents_done: 0,
+        monitor,
+        ambient,
+        tool_use_id: None,
+    };
+    let plain = serde_json::to_value(task(false, false)).unwrap();
+    assert!(plain.get("monitor").is_none() && plain.get("ambient").is_none());
+    let flagged = serde_json::to_value(task(true, true)).unwrap();
+    assert_eq!(flagged["monitor"], json!(true));
+    assert_eq!(flagged["ambient"], json!(true));
+}

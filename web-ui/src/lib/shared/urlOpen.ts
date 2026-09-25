@@ -89,6 +89,13 @@ export function isWebUrl(raw: string): boolean {
   }
 }
 
+/** The web URL a markdown link target names, or null: a GFM bare `www.`
+ *  autolink gets the `http://` GitHub gives it, then the wall above. */
+export function webUrl(raw: string): string | null {
+  const url = /^www\./i.test(raw) ? `http://${raw}` : raw;
+  return isWebUrl(url) ? url : null;
+}
+
 // --- the pane opener (registered by App, which owns the layout) ---------------
 
 type PaneOpener = (target: UrlTarget, newSplit: boolean) => void;
