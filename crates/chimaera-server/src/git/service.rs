@@ -697,6 +697,17 @@ pub(crate) async fn mark_path_dirty(state: &AppState, path: &str) {
             .and_then(Result::ok)
     }
     .unwrap_or_else(|| std::path::PathBuf::from(&expanded));
+    // Tell watching windows first, whether or not a workspace holds the path
+    // (a file opened from outside every workspace still refreshes). Both
+    // spellings go out: a client watches the path it opened, which may be
+    // the symlinked one. No receivers is not an error.
+    let written = std::path::PathBuf::from(&expanded);
+    let touched: crate::fs_watch::Touched = if written == target {
+        Arc::from(vec![target.clone()])
+    } else {
+        Arc::from(vec![written, target.clone()])
+    };
+    let _ = state.fs_touched.send(touched);
     // Snapshot the list and drop the guard before the loop — a `std::sync`
     // guard must never be live across an `.await` (this fn is async now).
     let workspaces = crate::lock(&state.workspaces).list();

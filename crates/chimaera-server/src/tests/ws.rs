@@ -697,6 +697,81 @@ async fn ws_events_pushes_mounted_disk_changes_outside_git() {
     }
 }
 
+/// A write the daemon hears about (`git::mark_path_dirty` — agent hooks,
+/// chat edits, saves) reaches a window watching that exact file right away,
+/// well inside the two-second poll ceiling the registration just started.
+#[tokio::test]
+async fn ws_events_pushes_daemon_observed_writes_without_waiting_for_the_poll() {
+    use futures::SinkExt;
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+    let state = test_state();
+    let root = test_dir("ws-fs-touched");
+    let file = root.join("agent-edited.md");
+    std::fs::write(&file, b"before").unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = app(state.clone());
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    let url = format!("ws://{addr}/ws/events");
+    let (mut socket, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    socket
+        .send(WsMessage::text(
+            serde_json::json!({"type": "auth", "token": "test-token"}).to_string(),
+        ))
+        .await
+        .unwrap();
+    let next_json = |text: &str| serde_json::from_str::<serde_json::Value>(text).unwrap();
+    loop {
+        if let WsMessage::Text(text) = next_ws_frame(&mut socket).await {
+            if next_json(&text)["type"] == "recents" {
+                break;
+            }
+        }
+    }
+    socket
+        .send(WsMessage::text(
+            serde_json::json!({
+                "type": "watch",
+                "workspace_id": null,
+                "files": [file.to_string_lossy()],
+                "dirs": [],
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+    // The registration's baseline frame starts the poll ceiling.
+    loop {
+        if let WsMessage::Text(text) = next_ws_frame(&mut socket).await {
+            if next_json(&text)["type"] == "fs" {
+                break;
+            }
+        }
+    }
+
+    std::fs::write(&file, b"after, from an agent").unwrap();
+    let marked = tokio::time::Instant::now();
+    crate::git::mark_path_dirty(&state, &file.to_string_lossy()).await;
+    let frame = loop {
+        if let WsMessage::Text(text) = next_ws_frame(&mut socket).await {
+            let frame = next_json(&text);
+            if frame["type"] == "fs" {
+                break frame;
+            }
+        }
+    };
+    assert_eq!(frame["files"], serde_json::json!([file]));
+    assert!(
+        marked.elapsed() < std::time::Duration::from_millis(1500),
+        "fs frame took {:?} — the poll, not the fast path",
+        marked.elapsed()
+    );
+}
+
 #[tokio::test]
 async fn ws_events_auth_snapshot_and_change_push() {
     use futures::SinkExt;

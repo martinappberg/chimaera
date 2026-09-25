@@ -164,6 +164,11 @@ pub(crate) struct AppState {
     /// the client so a window on another origin can recover it. Capped and
     /// evicted in `drafts`.
     pub(crate) drafts_root: PathBuf,
+    /// Paths an agent or a save just wrote (`git::mark_path_dirty`). Every
+    /// `/ws/events` client subscribes and re-stats the ones it watches right
+    /// away instead of on its next poll. Bounded; a lagging receiver just
+    /// falls back to that poll. See `fs_watch::TOUCHED_CAPACITY`.
+    pub(crate) fs_touched: tokio::sync::broadcast::Sender<crate::fs_watch::Touched>,
     /// Live install sessions, one per agent (POST /agents/{id}/install
     /// answers 409 while one runs): session id + reservation time. The id
     /// registers in `SessionManager` only after spawn, so a reservation
@@ -245,6 +250,7 @@ impl AppState {
             shims_dir: data_dir.join("shims"),
             uploads_root: data_dir.join("uploads"),
             drafts_root: data_dir.join("drafts"),
+            fs_touched: tokio::sync::broadcast::channel(crate::fs_watch::TOUCHED_CAPACITY).0,
             installs: Mutex::new(HashMap::new()),
             claude_settings_path: home.join(".claude").join("settings.json"),
             codex_config_path: home.join(".codex").join("config.toml"),
