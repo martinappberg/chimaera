@@ -1235,15 +1235,24 @@ pub(crate) struct MarkdownQuery {
     path: String,
 }
 
-/// GET /api/v1/fs/markdown?path= — the file rendered as sanitized GFM HTML.
+/// GET /api/v1/fs/markdown?path= — `{html, frontmatter}`: the file rendered
+/// as sanitized GFM HTML (see [`markdown_to_html`] for what it carries), and
+/// the raw text of a leading YAML frontmatter block (see [`frontmatter`];
+/// delimiter lines excluded) or null.
 pub(crate) async fn markdown(Query(query): Query<MarkdownQuery>) -> Response {
-    blocking_json(move || Ok(json!({"html": render_markdown(&query.path)?}))).await
+    blocking_json(move || {
+        let text = read_markdown(&query.path)?;
+        Ok(json!({
+            "html": sanitize_markdown(&markdown_to_html(&text)),
+            "frontmatter": frontmatter(&text).map(|f| f.inner),
+        }))
+    })
+    .await
 }
 
-/// Render the markdown file at `raw` with comrak (GFM extensions + dollar
-/// math), then sanitize so raw HTML in the source cannot inject scripts.
-/// Files over 4MB are rejected.
-fn render_markdown(raw: &str) -> anyhow::Result<String> {
+/// Read the markdown file at `raw` as (lossy) UTF-8. Files over 4MB are
+/// rejected.
+fn read_markdown(raw: &str) -> anyhow::Result<String> {
     let path = canonical_file(raw)?;
     let size = std::fs::metadata(&path)
         .with_context(|| format!("{}: failed to stat", path.display()))?
@@ -1256,8 +1265,78 @@ fn render_markdown(raw: &str) -> anyhow::Result<String> {
     }
     let bytes =
         std::fs::read(&path).with_context(|| format!("{}: failed to read", path.display()))?;
-    let text = String::from_utf8_lossy(&bytes);
-    Ok(sanitize_markdown(&markdown_to_html(&text)))
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// A leading YAML frontmatter block.
+struct Frontmatter<'a> {
+    /// The text between the delimiter lines, without the line break that
+    /// ends the last one (empty lines inside are kept).
+    inner: &'a str,
+    /// How many lines of the document the block occupies, delimiters
+    /// included.
+    lines: usize,
+}
+
+/// The leading `---` frontmatter block, when there is one. Two rules must
+/// agree for a block to count:
+///
+/// - comrak's front-matter split (`strings::split_off_front_matter`,
+///   reproduced exactly: an optional BOM, `---` alone on line 1, closed by
+///   the first line that is exactly `---` — a `\r\n` closer is searched
+///   first, as comrak does), because comrak is what removes it from the
+///   render;
+/// - the live editor's stricter shape (`mdLive.ts` `frontmatterEnd`): the
+///   closer within the first 200 lines and at least one `key:` line inside,
+///   so a document that merely opens with a thematic break keeps it.
+///
+/// [`markdown_to_html`] enables comrak's extension only for a block that
+/// passes both, and [`promote_math_blocks_mapped`] skips exactly the same
+/// lines.
+fn frontmatter(text: &str) -> Option<Frontmatter<'_>> {
+    const DELIM: &str = "---";
+    const MAX_LINES: usize = 200;
+    let s = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let after_open = s.strip_prefix(DELIM)?;
+    let open_len = DELIM.len()
+        + if after_open.starts_with('\n') {
+            1
+        } else if after_open.starts_with("\r\n") {
+            2
+        } else {
+            return None;
+        };
+    let body = &s[open_len..];
+    let close_nl = body
+        .find("\n---\r\n")
+        .or_else(|| body.find("\n---\n"))
+        .or_else(|| body.find("\n---"))?;
+    let after_close = &body[close_nl + 1 + DELIM.len()..];
+    if !(after_close.is_empty() || after_close.starts_with('\n') || after_close.starts_with("\r\n"))
+    {
+        return None;
+    }
+    let inner = &body[..close_nl];
+    // The opener, at least one inner line (comrak needs the `\n` before the
+    // closer, so `---\n---` is no block), and the closer.
+    let lines = 3 + inner.matches('\n').count();
+    if lines > MAX_LINES {
+        return None;
+    }
+    // The editor's `/^[A-Za-z0-9_-]+\s*:/`.
+    let keyed = inner.lines().any(|line| {
+        line.split_once(':').is_some_and(|(key, _)| {
+            let key = key.trim_end_matches([' ', '\t']);
+            !key.is_empty()
+                && key
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        })
+    });
+    keyed.then(|| Frontmatter {
+        inner: inner.strip_suffix('\r').unwrap_or(inner),
+        lines,
+    })
 }
 
 /// Promote `$$` BLOCKS to comrak's ```math fence before parsing. comrak's
@@ -1288,9 +1367,15 @@ fn render_markdown(raw: &str) -> anyhow::Result<String> {
 /// later lines leave the item is promoted here while the editor ends it
 /// unclosed; a lazy quote line resets the `$$` parity here; and an
 /// unbalanced backtick hides the rest of its line from the parity count.
-fn promote_math_blocks(text: &str) -> Cow<'_, str> {
+///
+/// Promotion can add lines (text after an opening `$$`, or around a closing
+/// one, gets a line of its own), so the pass also returns a [`LineMap`] from
+/// its output's lines back to `text`'s, which keeps comrak's `data-sourcepos`
+/// in the source file's numbering.
+fn promote_math_blocks_mapped(text: &str) -> (Cow<'_, str>, LineMap) {
+    let mut map = LineMap::default();
     if !text.contains("$$") {
-        return Cow::Borrowed(text);
+        return (Cow::Borrowed(text), map);
     }
     fn body(line: &str) -> &str {
         line.trim_end_matches('\n').trim_end_matches('\r')
@@ -1401,18 +1486,14 @@ fn promote_math_blocks(text: &str) -> Cow<'_, str> {
     let lines: Vec<&str> = text.split_inclusive('\n').collect();
     let mut out = String::with_capacity(text.len() + 32);
     let mut i = 0;
-    // A leading `---` frontmatter block is metadata, never math (the editor
-    // gates on the same shape).
-    if lines.first().is_some_and(|l| body(l) == "---") {
-        if let Some(close) = lines
-            .iter()
-            .skip(1)
-            .take(200)
-            .position(|l| body(l) == "---")
-        {
-            i = close + 2;
-            out.extend(lines[..i].iter().copied());
-        }
+    // Output lines before `counted` (a byte offset into `out`) are tallied in
+    // `out_lines`; blocks settle the tally before mapping their own lines.
+    let (mut out_lines, mut counted) = (0u32, 0usize);
+    // A leading frontmatter block is metadata, never math — the same block
+    // comrak and the editor set aside.
+    if let Some(fm) = frontmatter(text) {
+        i = fm.lines.min(lines.len());
+        out.extend(lines[..i].iter().copied());
     }
     let mut in_fence: Option<(u8, usize)> = None;
     let mut in_html = false;
@@ -1510,27 +1591,44 @@ fn promote_math_blocks(text: &str) -> Cow<'_, str> {
                     }
                 }
                 if let Some((j, k)) = closer {
+                    // Every line before the opener was copied whole (with its
+                    // newline), so the tally is exact here.
+                    out_lines +=
+                        u32::try_from(out[counted..].matches('\n').count()).unwrap_or(u32::MAX);
+                    let (open_src, close_src) = (line_no(i), line_no(j));
                     out.push_str(&open_prefix);
                     out.push_str("```math\n");
+                    map.next(&mut out_lines, open_src);
                     if !rest.trim().is_empty() {
                         out.push_str(&body_prefix);
                         out.push_str(rest);
                         out.push('\n');
+                        map.next(&mut out_lines, open_src);
                     }
-                    out.extend(lines[i + 1..j].iter().copied());
+                    if j > i + 1 {
+                        out.extend(lines[i + 1..j].iter().copied());
+                        map.next(&mut out_lines, line_no(i + 1));
+                        out_lines += line_no(j - 1) - line_no(i + 1);
+                    }
                     let bj = body(lines[j]);
                     let (before, after) = (&bj[..k], &bj[k + 2..]);
                     if !before[quote_prefix(before).1..].trim().is_empty() {
                         out.push_str(before);
                         out.push('\n');
+                        map.next(&mut out_lines, close_src);
                     }
                     out.push_str(&body_prefix);
                     out.push_str("```\n");
+                    map.next(&mut out_lines, close_src);
                     if !after.trim().is_empty() {
                         out.push_str(&bj[..quote_prefix(bj).1]);
                         out.push_str(after.trim_start());
                         out.push('\n');
+                        map.next(&mut out_lines, close_src);
                     }
+                    // The next copied line resumes in step with its source.
+                    map.at(out_lines + 1, line_no(j + 1));
+                    counted = out.len();
                     i = j + 1;
                     para_dollars = 0;
                     continue;
@@ -1541,38 +1639,209 @@ fn promote_math_blocks(text: &str) -> Cow<'_, str> {
         out.push_str(line);
         i += 1;
     }
+    (Cow::Owned(out), map)
+}
+
+/// [`promote_math_blocks_mapped`] without the map (the fixture's view).
+#[cfg(test)]
+fn promote_math_blocks(text: &str) -> Cow<'_, str> {
+    promote_math_blocks_mapped(text).0
+}
+
+/// 1-based line number of 0-based line index `i`.
+fn line_no(i: usize) -> u32 {
+    u32::try_from(i + 1).unwrap_or(u32::MAX)
+}
+
+/// Output line -> source line for text rewritten by
+/// [`promote_math_blocks_mapped`]. Stored as the few anchors where the two
+/// stop moving in step (a split-off fence line repeats its source line), so
+/// memory scales with promoted blocks, never with document length. Empty =
+/// identity.
+#[derive(Default)]
+struct LineMap {
+    /// `(output line, source line)`, both 1-based, output ascending.
+    anchors: Vec<(u32, u32)>,
+}
+
+impl LineMap {
+    /// The source line of output line `out` (1-based).
+    fn source_line(&self, out: u32) -> u32 {
+        match self.anchors.partition_point(|&(o, _)| o <= out) {
+            0 => out,
+            n => {
+                let (o, src) = self.anchors[n - 1];
+                src + (out - o)
+            }
+        }
+    }
+
+    /// Record that output line `out` comes from source line `src`, adding an
+    /// anchor only where that breaks step with the lines before it.
+    fn at(&mut self, out: u32, src: u32) {
+        if self.source_line(out) != src {
+            self.anchors.push((out, src));
+        }
+    }
+
+    /// [`Self::at`] for the next output line, advancing the tally.
+    fn next(&mut self, out_lines: &mut u32, src: u32) {
+        *out_lines += 1;
+        self.at(*out_lines, src);
+    }
+
+    fn is_identity(&self) -> bool {
+        self.anchors.is_empty()
+    }
+}
+
+/// Rewrite every `data-sourcepos="l:c-l:c"` in comrak's output from promoted
+/// lines to source lines. Columns inside a promoted block's split-off lines
+/// stay as comrak counted them (approximate there); lines are exact.
+fn remap_sourcepos<'a>(html: &'a str, map: &LineMap) -> Cow<'a, str> {
+    const ATTR: &str = "data-sourcepos=\"";
+    if map.is_identity() || !html.contains(ATTR) {
+        return Cow::Borrowed(html);
+    }
+    // `l:c-l:c` -> the four numbers, or None for anything else.
+    fn parse(value: &str) -> Option<[u32; 4]> {
+        let (start, end) = value.split_once('-')?;
+        let (l1, c1) = start.split_once(':')?;
+        let (l2, c2) = end.split_once(':')?;
+        Some([
+            l1.parse().ok()?,
+            c1.parse().ok()?,
+            l2.parse().ok()?,
+            c2.parse().ok()?,
+        ])
+    }
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    while let Some(i) = rest.find(ATTR) {
+        out.push_str(&rest[..i + ATTR.len()]);
+        rest = &rest[i + ATTR.len()..];
+        let Some(end) = rest.find('"') else { break };
+        match parse(&rest[..end]) {
+            Some([l1, c1, l2, c2]) => {
+                let (l1, l2) = (map.source_line(l1), map.source_line(l2));
+                out.push_str(&format!("{l1}:{c1}-{l2}:{c2}"));
+            }
+            None => out.push_str(&rest[..end]),
+        }
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
     Cow::Owned(out)
 }
 
 /// comrak renders a ```math fence — every promoted `$$` block, and a
-/// hand-written GitHub one — as `<pre><code class="language-math"
-/// data-math-style="display">`. The client keys on the SAME `<span
-/// data-math-style>` shape for every equation, so the fence chrome is
-/// rewritten to it here; the literal inside is already HTML-escaped, so the
-/// closing tags cannot occur within it.
+/// hand-written GitHub one — as `<pre[ data-sourcepos="…"]><code
+/// class="language-math" data-math-style="display">`. The client keys on the
+/// SAME `<span data-math-style>` shape for every equation, so the fence chrome
+/// is rewritten to it here, the source position moving to the `<p>`; the
+/// literal inside is already HTML-escaped, so the closing tags cannot occur
+/// within it.
 fn math_fences_to_spans(html: &str) -> Cow<'_, str> {
-    const OPEN: &str = "<pre><code class=\"language-math\" data-math-style=\"display\">";
+    const PRE: &str = "<pre";
+    const CODE: &str = "<code class=\"language-math\" data-math-style=\"display\">";
     const CLOSE: &str = "</code></pre>";
+    if !html.contains(CODE) {
+        return Cow::Borrowed(html);
+    }
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    while let Some(i) = rest.find(PRE) {
+        let tail = &rest[i + PRE.len()..];
+        let (pos, after_pre) = match tail
+            .strip_prefix(" data-sourcepos=\"")
+            .and_then(|t| t.split_once('"'))
+        {
+            Some((pos, after)) => (Some(pos), after),
+            None => (None, tail),
+        };
+        let Some(body) = after_pre
+            .strip_prefix('>')
+            .and_then(|t| t.strip_prefix(CODE))
+        else {
+            out.push_str(&rest[..i + PRE.len()]);
+            rest = tail;
+            continue;
+        };
+        out.push_str(&rest[..i]);
+        out.push_str("<p");
+        if let Some(pos) = pos {
+            out.push_str(" data-sourcepos=\"");
+            out.push_str(pos);
+            out.push('"');
+        }
+        out.push_str("><span data-math-style=\"display\">");
+        match body.find(CLOSE) {
+            Some(j) => {
+                out.push_str(&body[..j]);
+                out.push_str("</span></p>");
+                rest = &body[j + CLOSE.len()..];
+            }
+            None => {
+                out.push_str(body);
+                rest = "";
+            }
+        }
+    }
+    out.push_str(rest);
+    Cow::Owned(out)
+}
+
+/// comrak renders a task item's box as `<input type="checkbox"[
+/// data-sourcepos][ class][ checked=""] disabled="" />`. The sanitizer never
+/// allows `input` — a form control has no place in a rendered document — so
+/// each checkbox becomes an inert `<span class="md-task" data-task="done|todo">`
+/// first, keeping a `data-sourcepos` comrak put on it (a task in a table
+/// cell). A raw-HTML checkbox in the source becomes the same span, which is
+/// harmless; any other `<input>` is left for the sanitizer to drop.
+fn tasks_to_spans(html: &str) -> Cow<'_, str> {
+    const OPEN: &str = "<input";
     if !html.contains(OPEN) {
         return Cow::Borrowed(html);
+    }
+    /// The double-quoted value of `name` in `tag`, if present.
+    fn attr<'t>(tag: &'t str, name: &str) -> Option<&'t str> {
+        let marker = format!(" {name}=\"");
+        let start = tag.find(&marker)? + marker.len();
+        tag[start..].split_once('"').map(|(value, _)| value)
     }
     let mut out = String::with_capacity(html.len());
     let mut rest = html;
     while let Some(i) = rest.find(OPEN) {
         out.push_str(&rest[..i]);
-        rest = &rest[i + OPEN.len()..];
-        out.push_str("<p><span data-math-style=\"display\">");
-        match rest.find(CLOSE) {
-            Some(j) => {
-                out.push_str(&rest[..j]);
-                out.push_str("</span></p>");
-                rest = &rest[j + CLOSE.len()..];
-            }
-            None => {
-                out.push_str(rest);
-                rest = "";
-            }
+        let from_tag = &rest[i..];
+        let tag = from_tag.find('>').map(|end| &from_tag[..=end]);
+        let is_checkbox = tag.is_some_and(|tag| {
+            matches!(
+                tag.as_bytes().get(OPEN.len()),
+                Some(b' ' | b'\t' | b'\n' | b'\r' | b'/')
+            ) && attr(tag, "type").is_some_and(|t| t.eq_ignore_ascii_case("checkbox"))
+        });
+        let Some(tag) = tag.filter(|_| is_checkbox) else {
+            out.push_str(OPEN);
+            rest = &from_tag[OPEN.len()..];
+            continue;
+        };
+        let done = tag
+            .split(|c: char| c.is_ascii_whitespace() || c == '/' || c == '>')
+            .any(|token| token == "checked" || token.starts_with("checked="));
+        out.push_str("<span class=\"md-task\" data-task=\"");
+        out.push_str(if done { "done" } else { "todo" });
+        out.push('"');
+        if let Some(pos) = attr(tag, "data-sourcepos").filter(|v| {
+            v.bytes()
+                .all(|b| b.is_ascii_digit() || b == b':' || b == b'-')
+        }) {
+            out.push_str(" data-sourcepos=\"");
+            out.push_str(pos);
+            out.push('"');
         }
+        out.push_str("></span>");
+        rest = &from_tag[tag.len()..];
     }
     out.push_str(rest);
     Cow::Owned(out)
@@ -1582,8 +1851,18 @@ fn math_fences_to_spans(html: &str) -> Cow<'_, str> {
 /// `$$…$$` math — inline, promoted `$$` blocks and ```math fences alike —
 /// emitted as `<span data-math-style>` LaTeX literals, never typeset here;
 /// the client owns KaTeX. Raw HTML passes through for ammonia to judge.
+///
+/// Also: a leading [`frontmatter`] block is set aside (never a rule plus a
+/// setext heading); GitHub alerts (`> [!NOTE]` …) render as
+/// `div.markdown-alert.markdown-alert-<type>` with a `p.markdown-alert-title`;
+/// headings get GitHub-slug ids (and an empty `a.anchor` link), which the
+/// sanitizer namespaces as `user-content-<slug>` like footnote ids; task boxes
+/// become [`tasks_to_spans`] spans; and every element carries
+/// `data-sourcepos="line:col-line:col"` in the SOURCE file's numbering
+/// (frontmatter and promoted `$$` blocks included).
 fn markdown_to_html(text: &str) -> String {
-    let text = promote_math_blocks(text);
+    let with_frontmatter = frontmatter(text).is_some();
+    let (promoted, lines) = promote_math_blocks_mapped(text);
     let mut options = comrak::Options::default();
     options.extension.strikethrough = true;
     options.extension.table = true;
@@ -1591,21 +1870,79 @@ fn markdown_to_html(text: &str) -> String {
     options.extension.tasklist = true;
     options.extension.footnotes = true;
     options.extension.math_dollars = true;
+    options.extension.alerts = true;
+    // No prefix here: the sanitizer's `id_prefix` namespaces EVERY id —
+    // headings, footnotes and raw HTML alike — as `user-content-…`, GitHub's
+    // scheme, so a document can never clobber the app's own element ids.
+    options.extension.header_id_prefix = Some(String::new());
+    if with_frontmatter {
+        // Only for a block `frontmatter` accepted, so a document that merely
+        // opens with a thematic break keeps it.
+        options.extension.front_matter_delimiter = Some("---".to_owned());
+    }
     // Let raw HTML through comrak; ammonia strips anything dangerous.
     options.render.r#unsafe = true;
-    math_fences_to_spans(&comrak::markdown_to_html(&text, &options)).into_owned()
+    options.render.sourcepos = true;
+    options.render.tasklist_classes = true;
+    let html = comrak::markdown_to_html(&promoted, &options);
+    let html = remap_sourcepos(&html, &lines);
+    let html = math_fences_to_spans(&html);
+    tasks_to_spans(&html).into_owned()
 }
 
-/// ammonia's defaults, widened by exactly one attribute: `data-math-style` on
-/// `span`, the marker the client's typesetter keys on. Its value is inert (a
-/// style name) and the span's text is LaTeX the client renders with KaTeX
-/// trust off, so a hand-written `<span data-math-style>` in a document can do
-/// no more than `$$` can.
+/// Every class the rendered document may carry: exactly what comrak emits
+/// for the features above, plus the task span. Anything else (a raw-HTML
+/// `class`, a code block's `language-*`) is stripped.
+const MARKDOWN_CLASSES: &[(&str, &[&str])] = &[
+    (
+        "div",
+        &[
+            "markdown-alert",
+            "markdown-alert-note",
+            "markdown-alert-tip",
+            "markdown-alert-important",
+            "markdown-alert-warning",
+            "markdown-alert-caution",
+        ],
+    ),
+    ("p", &["markdown-alert-title"]),
+    ("span", &["md-task"]),
+    ("a", &["anchor", "footnote-backref"]),
+    ("sup", &["footnote-ref"]),
+    ("section", &["footnotes"]),
+    ("ul", &["contains-task-list"]),
+    ("ol", &["contains-task-list"]),
+    ("li", &["task-list-item"]),
+];
+
+/// ammonia's defaults, widened only for what [`markdown_to_html`] emits:
+///
+/// - `data-math-style` on `span`, the marker the client's typesetter keys on.
+///   Its value is inert (a style name) and the span's text is LaTeX the
+///   client renders with KaTeX trust off, so a hand-written `<span
+///   data-math-style>` in a document can do no more than `$$` can;
+/// - `data-task` on `span` (the task marker) and [`MARKDOWN_CLASSES`];
+/// - `data-sourcepos` everywhere (inert coordinates);
+/// - `section` (the footnotes container) and `id` where comrak puts one
+///   (headings, footnote refs and definitions), every id prefixed
+///   `user-content-` — so `href="#fn-1"` pairs with `id="user-content-fn-1"`
+///   and the client maps `#x` to `user-content-x`.
+///
+/// Never `input`: task boxes arrive as spans.
 fn sanitize_markdown(html: &str) -> String {
-    ammonia::Builder::default()
-        .add_tag_attributes("span", &["data-math-style"])
-        .clean(html)
-        .to_string()
+    let mut builder = ammonia::Builder::default();
+    builder
+        .add_tags(&["section"])
+        .add_tag_attributes("span", &["data-math-style", "data-task"])
+        .add_generic_attributes(&["data-sourcepos"])
+        .id_prefix(Some("user-content-"));
+    for tag in ["h1", "h2", "h3", "h4", "h5", "h6", "a", "li"] {
+        builder.add_tag_attributes(tag, &["id"]);
+    }
+    for (tag, classes) in MARKDOWN_CLASSES {
+        builder.add_allowed_classes(*tag, *classes);
+    }
+    builder.clean(html).to_string()
 }
 
 #[cfg(test)]
@@ -1702,9 +2039,11 @@ mod markdown_tests {
             "{html}"
         );
         // A promoted `$$` block is handed over in the same `<p><span>` shape
-        // as every other equation.
+        // as every other equation, its source lines on the `<p>`.
         assert!(
-            html.contains("<p><span data-math-style=\"display\">x^2\n</span></p>"),
+            html.contains(
+                "<p data-sourcepos=\"3:1-5:3\"><span data-math-style=\"display\">x^2\n</span></p>"
+            ),
             "{html}"
         );
         assert!(!html.contains("<script"), "{html}");
@@ -1724,9 +2063,9 @@ mod markdown_tests {
     /// through, and an unmarked column must carry no attribute at all.
     #[test]
     fn gfm_alignment_survives_sanitization_as_align_attributes() {
-        let html = sanitize_markdown(&markdown_to_html(
+        let html = without_sourcepos(&sanitize_markdown(&markdown_to_html(
             "| a | b | c |\n|:-:|--:|---|\n| 1 | 2 | 3 |\n",
-        ));
+        )));
         for cell in [
             "<th align=\"center\">a</th>",
             "<th align=\"right\">b</th>",
@@ -1749,6 +2088,207 @@ mod markdown_tests {
         ));
         assert!(html.contains("<td align=\"CENTER\">x</td>"), "{html}");
         assert!(html.contains("<td align=\"\">y</td>"), "{html}");
+    }
+
+    /// `html` minus every ` data-sourcepos="…"` — for assertions about other
+    /// attributes.
+    fn without_sourcepos(html: &str) -> String {
+        const ATTR: &str = " data-sourcepos=\"";
+        let mut out = String::with_capacity(html.len());
+        let mut rest = html;
+        while let Some(i) = rest.find(ATTR) {
+            out.push_str(&rest[..i]);
+            let after = &rest[i + ATTR.len()..];
+            rest = &after[after.find('"').expect("a closed attribute") + 1..];
+        }
+        out.push_str(rest);
+        out
+    }
+
+    fn render(text: &str) -> String {
+        sanitize_markdown(&markdown_to_html(text))
+    }
+
+    /// A leading frontmatter block is metadata: no rule, no setext heading,
+    /// its text answered raw — and every line after it keeps the SOURCE
+    /// file's number (a heading on line 5 after a 3-line block says `5:1`).
+    #[test]
+    fn frontmatter_is_set_aside_and_later_lines_keep_their_numbers() {
+        let text = "---\ntitle: A $$ title\n---\n\n# Five\n\n$$\nx\n$$\n";
+        let html = render(text);
+        assert!(!html.contains("<hr"), "{html}");
+        assert!(!html.contains("<h2"), "{html}");
+        assert!(!html.contains("title:"), "{html}");
+        assert!(
+            html.contains("<h1 id=\"user-content-five\" data-sourcepos=\"5:1-5:6\">"),
+            "{html}"
+        );
+        // The frontmatter's `$$` is not math; the block after it is, on 7-9
+        // (the end column is the promoted fence's, one past the `$$`).
+        assert!(
+            html.contains("<p data-sourcepos=\"7:1-9:3\"><span data-math-style=\"display\">x\n"),
+            "{html}"
+        );
+        let fm = frontmatter(text).expect("a frontmatter block");
+        assert_eq!(fm.inner, "title: A $$ title");
+        assert_eq!(fm.lines, 3);
+
+        // CRLF and a BOM are comrak's frontmatter too; inner lines keep CRLF.
+        let crlf = "\u{feff}---\r\na: 1\r\nb: 2\r\n---\r\n# Five\r\n";
+        assert_eq!(frontmatter(crlf).map(|f| f.inner), Some("a: 1\r\nb: 2"));
+        let html = render(crlf);
+        assert!(html.contains("data-sourcepos=\"5:1-5:6\""), "{html}");
+        assert!(!html.contains("<hr"), "{html}");
+    }
+
+    /// Only the live editor's shape counts: a document that merely opens with
+    /// a thematic break (no `key:` line), a closer past line 200, or a closer
+    /// that is not exactly `---` keeps rendering as it always did.
+    #[test]
+    fn frontmatter_needs_the_editors_shape() {
+        for text in [
+            "---\n\nintro\n\n---\n# H\n",
+            "---\nnot a key line\n---\n",
+            "---\ntitle: x\n--- \n",
+            "---\ntitle: x\n----\n",
+            "--- \ntitle: x\n---\n",
+        ] {
+            assert!(frontmatter(text).is_none(), "{text:?}");
+            assert!(render(text).contains("<hr"), "{text:?}");
+        }
+        let long = format!("---\ntitle: x\n{}---\n", "k: v\n".repeat(197));
+        assert_eq!(frontmatter(&long).map(|f| f.lines), Some(200));
+        let too_long = format!("---\ntitle: x\n{}---\n", "k: v\n".repeat(198));
+        assert!(frontmatter(&too_long).is_none());
+    }
+
+    /// GitHub alerts: every type, matched case-insensitively, keep exactly
+    /// comrak's classes through the sanitizer; a raw-HTML class is stripped.
+    #[test]
+    fn github_alerts_keep_their_classes() {
+        let html = without_sourcepos(&render(concat!(
+            "> [!NOTE]\n> n\n\n",
+            "> [!tip]\n> t\n\n",
+            "> [!Important]\n> i\n\n",
+            "> [!WARNING]\n> w\n\n",
+            "> [!CAUTION] Mind the gap\n> c\n\n",
+            "<div class=\"evil markdown-alert\" onclick=\"x()\">raw</div>\n",
+        )));
+        for (kind, title) in [
+            ("note", "Note"),
+            ("tip", "Tip"),
+            ("important", "Important"),
+            ("warning", "Warning"),
+            ("caution", "Mind the gap"),
+        ] {
+            let want = format!(
+                "<div class=\"markdown-alert markdown-alert-{kind}\">\n<p class=\"markdown-alert-title\">{title}</p>"
+            );
+            assert!(html.contains(&want), "missing {want} in {html}");
+        }
+        assert!(
+            html.contains("<div class=\"markdown-alert\">raw</div>"),
+            "{html}"
+        );
+        assert!(
+            !html.contains("evil") && !html.contains("onclick"),
+            "{html}"
+        );
+    }
+
+    /// Heading ids are GitHub slugs (deduplicated) under `user-content-`;
+    /// the heading's own anchor link keeps the bare `#slug` the client maps.
+    #[test]
+    fn heading_ids_are_namespaced_github_slugs() {
+        let html = without_sourcepos(&render(
+            "# Hello, World!\n\n# Hello, World!\n\n## Ünï code\n",
+        ));
+        for want in [
+            "<h1 id=\"user-content-hello-world\">Hello, World!<a href=\"#hello-world\" class=\"anchor\" rel=\"noopener noreferrer\"></a></h1>",
+            "<h1 id=\"user-content-hello-world-1\">",
+            "<h2 id=\"user-content-ünï-code\">",
+        ] {
+            assert!(html.contains(want), "missing {want} in {html}");
+        }
+        // Raw HTML ids are namespaced too: a document cannot clobber the app.
+        let html = render("<p id=\"app\">x</p>\n");
+        assert!(!html.contains("id=\"app\""), "{html}");
+    }
+
+    /// A footnote reference `#fn-1` pairs with `id="user-content-fn-1"`, the
+    /// back-reference `#fnref-1` with `id="user-content-fnref-1"`.
+    #[test]
+    fn footnote_ids_pair_with_their_links() {
+        let html = without_sourcepos(&render("Hi[^1].\n\n[^1]: A greeting.\n"));
+        for want in [
+            "<sup class=\"footnote-ref\"><a href=\"#fn-1\" id=\"user-content-fnref-1\"",
+            "<section class=\"footnotes\">",
+            "<li id=\"user-content-fn-1\">",
+            "<a href=\"#fnref-1\" class=\"footnote-backref\"",
+        ] {
+            assert!(html.contains(want), "missing {want} in {html}");
+        }
+    }
+
+    /// Task boxes arrive as inert spans; `input` never survives — neither
+    /// comrak's nor a raw one (a raw checkbox becomes the same span).
+    #[test]
+    fn task_boxes_become_spans_and_inputs_never_survive() {
+        let html = without_sourcepos(&render(concat!(
+            "- [ ] todo\n- [x] done\n\n",
+            "<input type=\"checkbox\" checked onclick=\"x()\">\n\n",
+            "<input type=\"text\" value=\"v\">\n",
+        )));
+        for want in [
+            "<ul class=\"contains-task-list\">",
+            "<li class=\"task-list-item\"><span class=\"md-task\" data-task=\"todo\"></span> todo</li>",
+            "<li class=\"task-list-item\"><span class=\"md-task\" data-task=\"done\"></span> done</li>",
+        ] {
+            assert!(html.contains(want), "missing {want} in {html}");
+        }
+        assert_eq!(html.matches("data-task=\"done\"").count(), 2, "{html}");
+        assert!(!html.contains("<input"), "{html}");
+        assert!(!html.contains("onclick"), "{html}");
+    }
+
+    /// Promotion splits text around `$$` onto lines of its own; positions
+    /// after (and inside) the block still name the source lines.
+    #[test]
+    fn promoted_math_blocks_do_not_shift_source_lines() {
+        let text = concat!(
+            "Intro\n",     // 1
+            "\n",          // 2
+            "$$x^2\n",     // 3: opener with text after it
+            "+ y\n",       // 4
+            "z $$ tail\n", // 5: text before AND after the closer
+            "\n",          // 6
+            "> $$a\n",     // 7: inside a quote
+            "> b $$\n",    // 8
+            "\n",          // 9
+            "# Ten\n",     // 10
+        );
+        let (promoted, map) = promote_math_blocks_mapped(text);
+        assert!(
+            promoted.lines().count() > text.lines().count(),
+            "{promoted}"
+        );
+        let html = render(text);
+        for want in [
+            "<p data-sourcepos=\"1:1-1:5\">Intro</p>",
+            "<p data-sourcepos=\"3:1-5:3\"><span data-math-style=\"display\">",
+            "<p data-sourcepos=\"5:1-5:4\">tail</p>",
+            "<blockquote data-sourcepos=\"7:1-8:",
+            "<h1 id=\"user-content-ten\" data-sourcepos=\"10:1-10:5\">",
+        ] {
+            assert!(html.contains(want), "missing {want} in {html}");
+        }
+        // Every output line maps inside the source.
+        let total = u32::try_from(text.lines().count()).unwrap();
+        for out in 1..=u32::try_from(promoted.lines().count()).unwrap() {
+            assert!((1..=total).contains(&map.source_line(out)), "line {out}");
+        }
+        // No `$$` at all: the identity map, nothing rewritten.
+        assert!(promote_math_blocks_mapped("# a\n\nb\n").1.is_identity());
     }
 }
 

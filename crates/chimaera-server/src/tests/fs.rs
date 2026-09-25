@@ -989,16 +989,25 @@ async fn fs_markdown_renders_gfm_and_sanitizes() {
     let (status, json) = request(&state, Method::GET, &uri, None).await;
     assert_eq!(status, StatusCode::OK);
     let html = json["html"].as_str().unwrap();
+    // No frontmatter block: an explicit null, never absent.
+    assert_eq!(json["frontmatter"], serde_json::Value::Null, "{json}");
 
-    // GFM features render.
-    assert!(html.contains("<h1>Title</h1>"), "no heading in {html}");
+    // GFM features render; every element carries its source lines, headings
+    // a namespaced slug id.
     assert!(
-        html.contains("<del>old</del>"),
+        html.contains("<h1 id=\"user-content-title\" data-sourcepos=\"1:1-1:7\">Title"),
+        "no heading in {html}"
+    );
+    assert!(
+        html.contains("<del data-sourcepos=\"3:1-3:7\">old</del>"),
         "no strikethrough in {html}"
     );
-    assert!(html.contains("<table>"), "no table in {html}");
     assert!(
-        html.contains("<a href=\"https://example.com\""),
+        html.contains("<table data-sourcepos=\"5:1-7:9\">"),
+        "no table in {html}"
+    );
+    assert!(
+        html.contains("<a data-sourcepos=\"3:18-3:36\" href=\"https://example.com\""),
         "no autolink in {html}"
     );
     // Sanitization strips script tags and event handlers but keeps the img.
@@ -1009,6 +1018,56 @@ async fn fs_markdown_renders_gfm_and_sanitizes() {
         html.contains("<img src=\"x.png\""),
         "img stripped in {html}"
     );
+}
+
+/// The reading render's document features over the real route: frontmatter
+/// answered raw beside the HTML (and kept out of it, line numbers intact),
+/// alerts, namespaced heading/footnote ids, task spans.
+#[tokio::test]
+async fn fs_markdown_reports_frontmatter_alerts_ids_and_tasks() {
+    let state = test_state();
+    let root = test_dir("fs-md-features");
+    let path = root.join("doc.md");
+    std::fs::write(
+        &path,
+        concat!(
+            "---\n",            // 1
+            "title: Notes\n",   // 2
+            "tags: [a, b]\n",   // 3
+            "---\n",            // 4
+            "\n",               // 5
+            "# Plan\n",         // 6
+            "\n",               // 7
+            "> [!WARNING]\n",   // 8
+            "> Careful[^1].\n", // 9
+            "\n",               // 10
+            "- [x] shipped\n",  // 11
+            "- [ ] pending\n",  // 12
+            "\n",               // 13
+            "[^1]: Really.\n",  // 14
+        ),
+    )
+    .unwrap();
+
+    let uri = format!("/api/v1/fs/markdown?path={}", path.to_string_lossy());
+    let (status, json) = request(&state, Method::GET, &uri, None).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["frontmatter"], "title: Notes\ntags: [a, b]");
+    let html = json["html"].as_str().unwrap();
+    for want in [
+        "<h1 id=\"user-content-plan\" data-sourcepos=\"6:1-6:6\">",
+        "<div class=\"markdown-alert markdown-alert-warning\" data-sourcepos=\"8:1-9:14\">",
+        "<p class=\"markdown-alert-title\">Warning</p>",
+        "<a href=\"#fn-1\" id=\"user-content-fnref-1\"",
+        "<li data-sourcepos=\"14:1-14:13\" id=\"user-content-fn-1\">",
+        "<span class=\"md-task\" data-task=\"done\"></span> shipped",
+        "<span class=\"md-task\" data-task=\"todo\"></span> pending",
+    ] {
+        assert!(html.contains(want), "missing {want} in {html}");
+    }
+    assert!(!html.contains("title:"), "frontmatter leaked into {html}");
+    assert!(!html.contains("<hr"), "{html}");
+    assert!(!html.contains("<input"), "{html}");
 }
 
 /// `fs/xlsx` parses a spreadsheet into the same paged `TablePage` shape the CSV
