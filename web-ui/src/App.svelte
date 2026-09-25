@@ -171,7 +171,12 @@
   import type { UrlTarget } from "./lib/terminal/urlLinks";
   import { setUrlPaneOpener, urlMenuEntries } from "./lib/shared/urlOpen";
   import { basename, fileTabTitles, fsProbe, viewKindFor } from "./lib/previews/files";
-  import { dirtyFiles } from "./lib/shared/editing";
+  import {
+    dirtyFiles,
+    discardDirtyFile,
+    noteDaemonLink,
+    saveDirtyFile,
+  } from "./lib/shared/editing";
   import {
     activateGitWorkspace,
     gitEnv,
@@ -274,6 +279,7 @@
   import ContextMenuHost from "./lib/shared/ContextMenuHost.svelte";
   import { contextMenu } from "./lib/shared/contextMenu.svelte";
   import ConfirmDialog from "./lib/shared/ConfirmDialog.svelte";
+  import CloseDirtyDialog from "./lib/layout/CloseDirtyDialog.svelte";
   import { fsDeleteOp, lastFsMutation, notifyCreated, pendingDelete } from "./lib/workspace/fsEvents";
   import {
     currentDiskWatches,
@@ -694,6 +700,11 @@
   let treeCreateNonce = 0;
   /** A failed delete's message; keeps the confirm dialog open. */
   let deleteError = $state<string | null>(null);
+  /** File tabs whose close waits on "save changes?" (held by identity — the
+   *  indices shift as other tabs close around them). */
+  let pendingClose = $state<Tab[]>([]);
+  let closeSaving = $state(false);
+  let closeError = $state<string | null>(null);
   /** Element that held focus when the picker opened; restored on close. */
   let pickerRestoreEl: HTMLElement | null = null;
 
@@ -1403,6 +1414,8 @@
         // health sample, which the recovery kick fetches promptly).
         if (up && !eventsUp) resetLinkRtt();
         eventsUp = up;
+        // A save that died with the link retries once it is back.
+        noteDaemonLink(up);
       },
       onFatal: (message) => {
         if (message === "unauthorized") notifyUnauthorized();
@@ -2900,7 +2913,13 @@
   function closeView(paneId: string): void {
     const p = findPane(layout.root, paneId);
     if (p === null) return;
-    layout = p.tabs.length > 0 ? detachTab(layout, paneId, p.active) : closePane(layout, paneId);
+    const active = p.tabs[p.active];
+    if (active !== undefined) {
+      // A dirty file asks first (and keeps its tab until answered).
+      if (!closeTabs([active])) return;
+    } else {
+      layout = closePane(layout, paneId);
+    }
     const sid = focusedSessionOf(layout);
     const focusedId = layout.focusedPaneId;
     // After the flush: closing a pane restructures the tree, which can
@@ -2909,6 +2928,74 @@
       if (sid !== null) pool.focusTerminal(sid);
       else paneRootEl(focusedId)?.focus();
     });
+  }
+
+  /** Detach these tabs wherever they are now (views only; sessions live on). */
+  function detachTabs(tabs: readonly Tab[]): void {
+    let next = layout;
+    for (const t of tabs) {
+      const loc = paneForTab(next.root, t);
+      if (loc !== null) next = detachTab(next, loc.paneId, loc.index);
+    }
+    layout = next;
+  }
+
+  /**
+   * Close tabs by identity. Clean ones go at once; a file with unsaved edits
+   * joins the "save changes?" dialog and keeps its tab until answered — its
+   * buffer would survive a plain close (the buffer store keeps dirty text),
+   * but a close gesture must never leave edits stranded without asking.
+   * True when everything closed right away.
+   */
+  function closeTabs(tabs: readonly Tab[]): boolean {
+    const dirty = get(dirtyFiles);
+    const held = tabs.filter((t) => t.surface === "file" && dirty.has(t.path));
+    detachTabs(tabs.filter((t) => !held.includes(t)));
+    if (held.length === 0) return true;
+    const known = new Set(pendingClose.map(tabKey));
+    pendingClose = [...pendingClose, ...held.filter((t) => !known.has(tabKey(t)))];
+    closeError = null;
+    return false;
+  }
+
+  const pendingClosePaths = $derived(
+    pendingClose.flatMap((t) => (t.surface === "file" ? [t.path] : [])),
+  );
+
+  /** "Save": save each file; close those that saved, keep the rest asking. */
+  async function saveAndClose(): Promise<void> {
+    if (closeSaving) return;
+    closeSaving = true;
+    closeError = null;
+    const batch = pendingClose;
+    const failed: Tab[] = [];
+    for (const t of batch) {
+      if (t.surface !== "file") continue;
+      if (!(await saveDirtyFile(t.path))) failed.push(t);
+      // Saved, but keys landed meanwhile: still dirty, so it keeps asking.
+      else if (get(dirtyFiles).has(t.path)) failed.push(t);
+    }
+    closeSaving = false;
+    detachTabs(batch.filter((t) => !failed.includes(t)));
+    pendingClose = [...failed, ...pendingClose.filter((t) => !batch.includes(t))];
+    if (failed.length > 0) {
+      const names = failed.map((t) => (t.surface === "file" ? `“${basename(t.path)}”` : ""));
+      closeError = `couldn't save ${names.join(", ")} — its editor shows why`;
+    }
+  }
+
+  /** "Don't save": drop the edits (and their drafts), then close. */
+  function discardAndClose(): void {
+    for (const t of pendingClose) if (t.surface === "file") discardDirtyFile(t.path);
+    detachTabs(pendingClose);
+    pendingClose = [];
+    closeError = null;
+  }
+
+  function cancelClose(): void {
+    if (closeSaving) return;
+    pendingClose = [];
+    closeError = null;
   }
 
   /**
@@ -3294,8 +3381,10 @@
       if (sid !== null) pool.focusTerminal(sid);
     },
     closeTab(paneId, index) {
-      // Detaches the view only — the session stays alive in the rail.
-      layout = detachTab(layout, paneId, index);
+      // Detaches the view only — the session stays alive in the rail. A file
+      // with unsaved edits asks first.
+      const tab = findPane(layout.root, paneId)?.tabs[index];
+      if (tab !== undefined) closeTabs([tab]);
     },
     setRatio(splitId, ratio) {
       layout = setRatio(layout, splitId, ratio);
@@ -5112,6 +5201,18 @@
       pendingDelete.set(null);
       deleteError = null;
     }}
+  />
+{/if}
+
+<!-- Closing tabs whose files hold unsaved edits: save / don't save / cancel. -->
+{#if pendingClosePaths.length > 0}
+  <CloseDirtyDialog
+    paths={pendingClosePaths}
+    saving={closeSaving}
+    error={closeError}
+    onSave={() => void saveAndClose()}
+    onDiscard={discardAndClose}
+    onCancel={cancelClose}
   />
 {/if}
 
