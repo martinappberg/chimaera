@@ -13,6 +13,7 @@ mod proxy;
 mod recents;
 mod resumables;
 mod router;
+mod save;
 mod sessions;
 mod settings;
 mod shell;

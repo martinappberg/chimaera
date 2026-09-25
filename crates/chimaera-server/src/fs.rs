@@ -8,8 +8,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
-use std::io::{BufRead, Read, Seek, SeekFrom};
+use std::io::{BufRead, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, UNIX_EPOCH};
@@ -179,25 +178,54 @@ fn gz_mime(path: &Path) -> mime_guess::Mime {
 /// header and PUT `expect_mtime` conflict check. mtime remains the primary
 /// signal, but length plus Unix inode/ctime identity catch a same-size rewrite
 /// whose timestamp was preserved or rounded by a coarse shared filesystem.
+///
+/// Clients hold tokens across daemon restarts and upgrades, so the digest must
+/// be stable across Rust releases: SHA-256 over fixed-width little-endian
+/// fields, never `DefaultHasher` (whose algorithm std may change).
 fn mtime_token(meta: &std::fs::Metadata) -> String {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    meta.modified()
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    let modified = meta
+        .modified()
         .ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map_or(0, |d| d.as_nanos())
-        .hash(&mut hasher);
-    meta.len().hash(&mut hasher);
-    meta.is_file().hash(&mut hasher);
-    meta.is_dir().hash(&mut hasher);
+        .map_or(0, |d| d.as_nanos());
+    hasher.update(modified.to_le_bytes());
+    hasher.update(meta.len().to_le_bytes());
+    hasher.update([u8::from(meta.is_file()), u8::from(meta.is_dir())]);
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        meta.dev().hash(&mut hasher);
-        meta.ino().hash(&mut hasher);
-        meta.ctime().hash(&mut hasher);
-        meta.ctime_nsec().hash(&mut hasher);
+        hasher.update(meta.dev().to_le_bytes());
+        hasher.update(meta.ino().to_le_bytes());
+        hasher.update(meta.ctime().to_le_bytes());
+        hasher.update(meta.ctime_nsec().to_le_bytes());
     }
-    hasher.finish().max(1).to_string()
+    let digest = hasher.finalize();
+    let mut head = [0u8; 8];
+    head.copy_from_slice(&digest[..8]);
+    u64::from_le_bytes(head).max(1).to_string()
+}
+
+/// Lowercase hex SHA-256 of `bytes` — the `X-Content-Hash` / `expect_hash`
+/// version of a file's contents.
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex_lower(&Sha256::digest(bytes))
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
+/// A header value from a token/hash we minted (ASCII digits or hex).
+fn ascii_header(value: &str) -> HeaderValue {
+    HeaderValue::from_str(value).unwrap_or(HeaderValue::from_static("0"))
 }
 
 /// 400 with a JSON error body.
@@ -492,7 +520,10 @@ pub(crate) struct FileQuery {
 /// GET /api/v1/fs/file?path=&offset=0&limit=262144 — raw bytes of a slice of
 /// the file, with `X-File-Size` (total size), `X-Truncated` (whether bytes
 /// remain past this slice), and `X-Mtime` (opaque modification token, echoed
-/// back by PUT's `expect_mtime`) headers. `limit` is capped at 2MB.
+/// back by PUT's `expect_mtime`) headers. `limit` is capped at 2MB. When the
+/// body is the WHOLE raw file (offset 0, nothing left past it, not a gzip
+/// decode) it also carries `X-Content-Hash`: the lowercase hex SHA-256 of
+/// exactly these bytes, echoed back by PUT's `expect_hash`.
 ///
 /// `.gz`/`.bgz` paths are decompressed transparently: `offset`/`limit` then
 /// address DECOMPRESSED bytes (sequential decode, capped), the Content-Type
@@ -509,18 +540,26 @@ pub(crate) async fn file(Query(query): Query<FileQuery>) -> Response {
 /// Build the `fs/file` response for a plain or gzip-compressed file.
 fn read_file_response(raw: &str, offset: u64, limit: u64) -> anyhow::Result<Response> {
     let path = canonical_file(raw)?;
-    let meta =
-        std::fs::metadata(&path).with_context(|| format!("{}: failed to stat", path.display()))?;
-    let mtime = mtime_token(&meta);
 
-    let (mime, total, bytes, truncated) = if is_gzip_path(&path) {
+    let (mime, total, bytes, truncated, mtime, hash) = if is_gzip_path(&path) {
+        let meta = std::fs::metadata(&path)
+            .with_context(|| format!("{}: failed to stat", path.display()))?;
         let (total, bytes, more) = read_gz_slice(&path, offset, limit)?;
-        (gz_mime(&path), total, bytes, more)
+        (gz_mime(&path), total, bytes, more, mtime_token(&meta), None)
     } else {
-        let (total, bytes) = read_file_slice(&path, offset, limit)?;
-        let truncated = offset.saturating_add(bytes.len() as u64) < total;
+        let slice = read_file_slice(&path, offset, limit)?;
+        // Hash only a body that IS the file: a client may echo this as
+        // `expect_hash`, and a slice's hash would never match the disk.
+        let hash = (offset == 0 && slice.eof).then(|| sha256_hex(&slice.bytes));
         let mime = mime_guess::from_path(&path).first_or_octet_stream();
-        (mime, Some(total), bytes, truncated)
+        (
+            mime,
+            Some(slice.total),
+            slice.bytes,
+            !slice.eof,
+            slice.mtime,
+            hash,
+        )
     };
 
     let mut response = (
@@ -535,34 +574,78 @@ fn read_file_response(raw: &str, offset: u64, limit: u64) -> anyhow::Result<Resp
         bytes,
     )
         .into_response();
+    let headers = response.headers_mut();
     if let Some(total) = total {
-        response.headers_mut().insert(
+        headers.insert(
             HeaderName::from_static("x-file-size"),
-            // Always ASCII digits; from_str cannot fail on it.
-            HeaderValue::from_str(&total.to_string()).unwrap_or(HeaderValue::from_static("0")),
+            ascii_header(&total.to_string()),
+        );
+    }
+    if let Some(hash) = hash {
+        headers.insert(
+            HeaderName::from_static("x-content-hash"),
+            ascii_header(&hash),
         );
     }
     Ok(response)
 }
 
+/// One plain-file read: the bytes, whether they reach EOF, the file size, and
+/// the version token of the descriptor they were read from.
+struct FileSlice {
+    bytes: Vec<u8>,
+    /// Nothing remains past this slice (observed by reading, not by `stat`).
+    eof: bool,
+    total: u64,
+    mtime: String,
+}
+
 /// Read up to `limit` bytes of the (canonical) file at `path` starting at
-/// `offset`. Returns the total file size and the bytes.
-fn read_file_slice(path: &Path, offset: u64, limit: u64) -> anyhow::Result<(u64, Vec<u8>)> {
+/// `offset`. EOF is judged by reading one byte past the slice rather than by
+/// the size `fstat` reported, so a file that grows or shrinks between the two
+/// can never earn a whole-file hash for a partial body.
+fn read_file_slice(path: &Path, offset: u64, limit: u64) -> anyhow::Result<FileSlice> {
     let mut file =
         std::fs::File::open(path).with_context(|| format!("{}: failed to open", path.display()))?;
-    let total = file
+    let meta = file
         .metadata()
-        .with_context(|| format!("{}: failed to stat", path.display()))?
-        .len();
-    let mut bytes = Vec::new();
-    if offset < total {
+        .with_context(|| format!("{}: failed to stat", path.display()))?;
+    let stat_len = meta.len();
+    let probe = limit.saturating_add(1);
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(probe.min(stat_len.saturating_sub(offset) + 1)).unwrap_or(0),
+    );
+    // Past the end there is nothing to read (and a huge offset would only
+    // make lseek fail): an empty, non-truncated slice, as always.
+    if offset <= stat_len {
         file.seek(SeekFrom::Start(offset))
             .with_context(|| format!("{}: failed to seek", path.display()))?;
-        file.take(limit)
+        (&mut file)
+            .take(probe)
             .read_to_end(&mut bytes)
             .with_context(|| format!("{}: failed to read", path.display()))?;
     }
-    Ok((total, bytes))
+    let eof = bytes.len() as u64 <= limit;
+    if !eof {
+        bytes.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+    }
+    let read_end = offset.saturating_add(bytes.len() as u64);
+    let total = if eof && !bytes.is_empty() {
+        read_end
+    } else if eof && offset == 0 {
+        0
+    } else if eof {
+        // Past EOF: the read proves only that the file ends at or before `offset`.
+        stat_len.min(offset)
+    } else {
+        stat_len.max(read_end.saturating_add(1))
+    };
+    Ok(FileSlice {
+        bytes,
+        eof,
+        total,
+        mtime: mtime_token(&meta),
+    })
 }
 
 /// Sequentially decode the gzip file at `path`, skipping `offset`
@@ -613,23 +696,59 @@ pub(crate) struct PutFileQuery {
     path: String,
     #[serde(default)]
     expect_mtime: Option<String>,
+    #[serde(default)]
+    expect_hash: Option<String>,
 }
 
-/// Outcome of an attempted atomic write.
+/// Largest file a PUT precondition hashes. A client can only hold the
+/// `X-Content-Hash` of a file it received whole in one `fs/file` read, so a
+/// bigger file can never match `expect_hash`; this also bounds the work a
+/// stale PUT against a huge file can cause.
+const MAX_HASH_BYTES: u64 = MAX_FILE_CHUNK;
+
+/// What the client says it edited. `expect_hash` wins over `expect_mtime`.
+#[derive(Clone, Copy)]
+enum Precondition<'a> {
+    None,
+    Mtime(&'a str),
+    Hash(&'a str),
+}
+
+/// Outcome of an attempted write.
 enum WriteOutcome {
-    /// Written; carries the file's new `X-Mtime` token.
-    Written(String),
-    /// The on-disk mtime no longer matches `expect_mtime`.
-    Conflict,
+    /// The body's bytes are on disk: written by this call (`wrote`), or
+    /// already there (an idempotent retry after a lost reply). Carries the
+    /// file's `X-Mtime` token and `X-Content-Hash`.
+    Written {
+        mtime: String,
+        hash: String,
+        wrote: bool,
+    },
+    /// The precondition failed. Carries the disk's current token and hash
+    /// when they are known (absent for a missing file; no hash past
+    /// [`MAX_HASH_BYTES`]).
+    Conflict {
+        mtime: Option<String>,
+        hash: Option<String>,
+    },
 }
 
-/// PUT /api/v1/fs/file?path=&expect_mtime= — write the raw request body to
-/// the file, atomically (hidden sibling tmp + rename), creating it if its
-/// parent directory exists. 204 on success with the new `X-Mtime` so the
-/// editor can chain saves; 400 for directories/missing parents; 409
-/// `{"error":"file changed on disk"}` when `expect_mtime` (the token from a
-/// previous GET/PUT) no longer matches — the check is skipped when the param
-/// is absent; 413 over 1MB (editing is for small text files).
+/// PUT /api/v1/fs/file?path=&expect_hash=&expect_mtime= — write the raw
+/// request body to the file, creating it if its parent directory exists. 204
+/// on success with the new `X-Mtime` and `X-Content-Hash` (of the bytes now on
+/// disk) so the editor can chain saves; 400 for directories, non-regular
+/// files, dangling symlinks and missing parents; 413 over 1MB (editing is for
+/// small text files); 409 `{"error":"file changed on disk"}` when the
+/// precondition fails, with `X-Mtime`/`X-Content-Hash` describing the current
+/// disk state when known.
+///
+/// Preconditions (neither = unconditional overwrite):
+/// - `expect_hash` (a previous `X-Content-Hash`): the file's CURRENT bytes are
+///   hashed — opening forces fresh attributes on NFS, unlike a cached `stat`.
+///   A mismatch whose disk bytes already equal the body answers success
+///   without writing, so a retry after a lost reply is a no-op, not a 409
+///   against our own write. A missing file is a 409.
+/// - `expect_mtime` (a previous `X-Mtime`): the metadata token must match.
 pub(crate) async fn put_file(
     State(state): State<Arc<AppState>>,
     Query(query): Query<PutFileQuery>,
@@ -649,7 +768,13 @@ pub(crate) async fn put_file(
     }
     let dirty_path = query.path.clone();
     let result = tokio::task::spawn_blocking(move || {
-        write_file_atomic(&query.path, &body, query.expect_mtime.as_deref())
+        let expect_hash = query.expect_hash.map(|h| h.to_ascii_lowercase());
+        let pre = match (expect_hash.as_deref(), query.expect_mtime.as_deref()) {
+            (Some(hash), _) => Precondition::Hash(hash),
+            (None, Some(mtime)) => Precondition::Mtime(mtime),
+            (None, None) => Precondition::None,
+        };
+        write_file(&query.path, &body, pre)
     })
     .await;
     match result {
@@ -658,48 +783,255 @@ pub(crate) async fn put_file(
             Json(json!({"error": format!("file-write task failed: {join}")})),
         )
             .into_response(),
-        Ok(Ok(WriteOutcome::Written(mtime))) => {
-            // A save is a git-relevant change: nudge the workspace(s) holding
-            // this path so the tree/panel refetch without any polling.
-            crate::git::mark_path_dirty(&state, &dirty_path).await;
+        Ok(Ok(WriteOutcome::Written { mtime, hash, wrote })) => {
+            if wrote {
+                // A save is a git-relevant change: nudge the workspace(s)
+                // holding this path so the tree/panel refetch without any
+                // polling (and watching windows re-probe it promptly).
+                crate::git::mark_path_dirty(&state, &dirty_path).await;
+            }
             let mut response = StatusCode::NO_CONTENT.into_response();
-            response.headers_mut().insert(
-                HeaderName::from_static("x-mtime"),
-                // The token is ASCII digits; from_str cannot fail on it.
-                HeaderValue::from_str(&mtime).unwrap_or(HeaderValue::from_static("0")),
+            let headers = response.headers_mut();
+            headers.insert(HeaderName::from_static("x-mtime"), ascii_header(&mtime));
+            headers.insert(
+                HeaderName::from_static("x-content-hash"),
+                ascii_header(&hash),
             );
             response
         }
-        Ok(Ok(WriteOutcome::Conflict)) => (
-            StatusCode::CONFLICT,
-            Json(json!({"error": "file changed on disk"})),
-        )
-            .into_response(),
+        Ok(Ok(WriteOutcome::Conflict { mtime, hash })) => {
+            let mut response = (
+                StatusCode::CONFLICT,
+                Json(json!({"error": "file changed on disk"})),
+            )
+                .into_response();
+            let headers = response.headers_mut();
+            if let Some(mtime) = mtime {
+                headers.insert(HeaderName::from_static("x-mtime"), ascii_header(&mtime));
+            }
+            if let Some(hash) = hash {
+                headers.insert(
+                    HeaderName::from_static("x-content-hash"),
+                    ascii_header(&hash),
+                );
+            }
+            response
+        }
         Ok(Err(err)) => bad_request(&err),
     }
 }
 
-/// Write `bytes` to the file at `raw` atomically: a hidden tmp sibling (never
-/// visible in listings, even transiently) is written, given the original
-/// file's permissions, then renamed over the target. Refuses directories and
-/// paths whose parent directory does not exist.
-fn write_file_atomic(
-    raw: &str,
-    bytes: &[u8],
-    expect_mtime: Option<&str>,
-) -> anyhow::Result<WriteOutcome> {
+/// The disk's current version of an existing file: its token, and its content
+/// hash when it is at most [`MAX_HASH_BYTES`]. Reads through `file`, so the
+/// answer describes that descriptor's inode.
+fn file_version(file: &mut std::fs::File) -> std::io::Result<(String, Option<String>)> {
+    use sha2::{Digest, Sha256};
+    let meta = file.metadata()?;
+    let token = mtime_token(&meta);
+    if meta.len() > MAX_HASH_BYTES {
+        return Ok((token, None));
+    }
+    file.seek(SeekFrom::Start(0))?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    let mut seen = 0u64;
+    loop {
+        let n = match file.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        };
+        seen += n as u64;
+        if seen > MAX_HASH_BYTES {
+            // Grew past the cap mid-read: no hash, same as a big file.
+            return Ok((token, None));
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok((token, Some(hex_lower(&hasher.finalize()))))
+}
+
+/// [`file_version`] by path; `None` when the file does not exist.
+fn path_version(path: &Path) -> anyhow::Result<Option<(String, Option<String>)>> {
+    match std::fs::File::open(path) {
+        Ok(mut file) => Ok(Some(file_version(&mut file).with_context(|| {
+            format!("{}: failed to read current contents", path.display())
+        })?)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => {
+            Err(anyhow::Error::new(err).context(format!("{}: failed to open", path.display())))
+        }
+    }
+}
+
+/// Judge `pre` against the disk's current state (`None` = missing). `Ok(())`
+/// means go ahead and write; `Err(outcome)` is the answer instead — a
+/// conflict, or success without a write when the disk already holds exactly
+/// the body (the idempotent-retry case, `expect_hash` only).
+fn judge(
+    pre: Precondition<'_>,
+    current: Option<(String, Option<String>)>,
+    body_hash: &str,
+) -> Result<(), WriteOutcome> {
+    match pre {
+        Precondition::None => Ok(()),
+        Precondition::Mtime(expect) => match current {
+            Some((mtime, _)) if mtime == expect => Ok(()),
+            Some((mtime, hash)) => Err(WriteOutcome::Conflict {
+                mtime: Some(mtime),
+                hash,
+            }),
+            None => Err(WriteOutcome::Conflict {
+                mtime: None,
+                hash: None,
+            }),
+        },
+        Precondition::Hash(expect) => match current {
+            Some((_, Some(hash))) if hash == expect => Ok(()),
+            Some((mtime, Some(hash))) if hash == body_hash => Err(WriteOutcome::Written {
+                mtime,
+                hash,
+                wrote: false,
+            }),
+            Some((mtime, hash)) => Err(WriteOutcome::Conflict {
+                mtime: Some(mtime),
+                hash,
+            }),
+            None => Err(WriteOutcome::Conflict {
+                mtime: None,
+                hash: None,
+            }),
+        },
+    }
+}
+
+/// The disk version `pre` needs to be judged: a stat for `expect_mtime`, the
+/// full hash only for `expect_hash`, nothing without a precondition.
+fn version_for(
+    pre: Precondition<'_>,
+    path: &Path,
+) -> anyhow::Result<Option<(String, Option<String>)>> {
+    match pre {
+        Precondition::None => Ok(None),
+        Precondition::Mtime(_) => match std::fs::metadata(path) {
+            Ok(meta) => Ok(Some((mtime_token(&meta), None))),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => {
+                Err(anyhow::Error::new(err).context(format!("{}: failed to stat", path.display())))
+            }
+        },
+        Precondition::Hash(_) => path_version(path),
+    }
+}
+
+/// Removes its temp file on drop unless disarmed, so every early return and
+/// `?` after the temp exists cleans up (a full disk must not leave a partial
+/// hidden file behind).
+struct TempFile(Option<PathBuf>);
+
+impl TempFile {
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// Longest file name most filesystems accept (NAME_MAX).
+const MAX_NAME_BYTES: usize = 255;
+
+/// The hidden temp sibling's name: `.{name}.{8 random}.tmp`, with `name`
+/// shortened (at a UTF-8 boundary when it is UTF-8) so the whole stays within
+/// [`MAX_NAME_BYTES`] — a 250-byte file name must still be saveable.
+fn temp_name(name: &std::ffi::OsStr) -> std::ffi::OsString {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    let nonce = &chimaera_core::generate_token()[..8];
+    let budget = MAX_NAME_BYTES - (".".len() + ".".len() + nonce.len() + ".tmp".len());
+    let bytes = name.as_bytes();
+    let mut cut = bytes.len().min(budget);
+    // Never split a multi-byte character: back off past continuation bytes.
+    while cut > 0 && cut < bytes.len() && (bytes[cut] & 0b1100_0000) == 0b1000_0000 {
+        cut -= 1;
+    }
+    let mut out = Vec::with_capacity(cut + 14);
+    out.push(b'.');
+    out.extend_from_slice(&bytes[..cut]);
+    out.push(b'.');
+    out.extend_from_slice(nonce.as_bytes());
+    out.extend_from_slice(b".tmp");
+    std::ffi::OsString::from_vec(out)
+}
+
+/// Give the temp file the target's owner and group where the kernel allows.
+/// A non-root daemon can never give a file away, but may move it to any group
+/// it belongs to — the shared project directory case — so a refused full
+/// `fchown` retries with the group alone. Failures are expected and ignored.
+fn carry_owner(file: &std::fs::File, target: &std::fs::Metadata) {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(now) = file.metadata() else { return };
+    if now.uid() == target.uid() && now.gid() == target.gid() {
+        return;
+    }
+    if std::os::unix::fs::fchown(file, Some(target.uid()), Some(target.gid())).is_err()
+        && now.gid() != target.gid()
+    {
+        let _ = std::os::unix::fs::fchown(file, None, Some(target.gid()));
+    }
+}
+
+/// fsync a directory so a completed rename survives a crash. Best effort:
+/// some filesystems (and FUSE/NFS mounts) refuse to open or sync directories.
+fn sync_dir(dir: &Path) {
+    if let Ok(handle) = std::fs::File::open(dir) {
+        let _ = handle.sync_all();
+    }
+}
+
+/// Write `bytes` to the file at `raw` under `pre`.
+///
+/// Normally atomic: a hidden temp sibling (never visible in listings, even
+/// transiently) is created with the target's permission bits (never more
+/// permissive, even before the exact `fchmod`), given its owner/group where
+/// allowed, written, fsynced, and renamed over the target; then the directory
+/// is fsynced. A live symlink is written THROUGH (its target is replaced; the
+/// link stays). Refuses directories, non-regular files, dangling symlinks
+/// (replacing the link with a regular file would silently detach it) and paths
+/// whose parent directory does not exist.
+///
+/// A target with other hard links is rewritten in place instead (see
+/// [`write_in_place`]).
+fn write_file(raw: &str, bytes: &[u8], pre: Precondition<'_>) -> anyhow::Result<WriteOutcome> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
     let expanded = expand_tilde(raw)?;
+    let body_hash = sha256_hex(bytes);
     let (target, existing) = match std::fs::metadata(&expanded) {
         Ok(meta) if meta.is_dir() => {
             anyhow::bail!("{} is a directory", expanded.display());
+        }
+        Ok(meta) if !meta.is_file() => {
+            anyhow::bail!("{} is not a regular file", expanded.display());
         }
         Ok(meta) => {
             let path =
                 std::fs::canonicalize(&expanded).with_context(|| expanded.display().to_string())?;
             (path, Some(meta))
         }
-        // New file: the parent directory must already exist.
-        Err(_) => {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            if std::fs::symlink_metadata(&expanded).is_ok_and(|m| m.file_type().is_symlink()) {
+                anyhow::bail!(
+                    "{} is a symlink to a missing file; refusing to replace the link with a regular file",
+                    expanded.display()
+                );
+            }
+            // New file: the parent directory must already exist.
             let name = expanded
                 .file_name()
                 .map(|n| n.to_os_string())
@@ -715,41 +1047,172 @@ fn write_file_atomic(
             }
             (parent.join(name), None)
         }
+        Err(err) => {
+            return Err(
+                anyhow::Error::new(err).context(format!("{}: failed to stat", expanded.display()))
+            );
+        }
     };
 
-    if let Some(expect) = expect_mtime {
-        // The client edited some version of the file; if the disk moved on
-        // (or the file vanished) since that version, refuse to clobber it.
-        if existing.as_ref().map(mtime_token).as_deref() != Some(expect) {
-            return Ok(WriteOutcome::Conflict);
-        }
+    // First check: refuse before doing any write work.
+    if let Err(outcome) = judge(pre, version_for(pre, &target)?, &body_hash) {
+        return Ok(outcome);
     }
 
-    let tmp = target.with_file_name(format!(
-        ".{}.{}.tmp",
-        target
-            .file_name()
-            .map(|n| n.to_string_lossy())
-            .unwrap_or_default(),
-        &chimaera_core::generate_token()[..8]
-    ));
-    std::fs::write(&tmp, bytes).with_context(|| format!("failed to write {}", tmp.display()))?;
+    if existing.as_ref().is_some_and(|meta| meta.nlink() > 1) {
+        return write_in_place(&target, bytes, pre, body_hash);
+    }
+
+    let parent = target
+        .parent()
+        .with_context(|| format!("{} has no parent directory", target.display()))?;
+    let name = target
+        .file_name()
+        .with_context(|| format!("{} has no file name", target.display()))?;
+    let tmp = parent.join(temp_name(name));
+    let mode = existing
+        .as_ref()
+        .map_or(0o666, |meta| meta.permissions().mode() & 0o7777);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(&tmp)
+        .with_context(|| format!("failed to create {}", tmp.display()))?;
+    let mut guard = TempFile(Some(tmp.clone()));
     if let Some(meta) = &existing {
-        // Keep the original mode (e.g. an executable script stays executable).
-        // Best-effort: a failure here still leaves a correct write.
-        if let Err(err) = std::fs::set_permissions(&tmp, meta.permissions()) {
+        // Owner first: a successful chown clears setuid/setgid bits, which
+        // the exact chmod below then restores. The open's mode was filtered by
+        // the umask; the chmod restores bits it dropped (e.g. group write on a
+        // shared file). Best-effort: a failure still leaves a correct write.
+        carry_owner(&file, meta);
+        if let Err(err) = file.set_permissions(meta.permissions()) {
             tracing::warn!(path = %tmp.display(), %err, "failed to carry permissions onto tmp file");
         }
     }
-    if let Err(err) = std::fs::rename(&tmp, &target) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(
-            anyhow::Error::new(err).context(format!("failed to rename into {}", target.display()))
-        );
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .with_context(|| format!("failed to write {}", tmp.display()))?;
+    drop(file);
+
+    // Second check, as late as possible: another writer may have landed
+    // while the temp was written and synced. What remains is the gap between
+    // this read and rename(2) itself — POSIX has no compare-and-rename, and
+    // NFS offers no lock every writer honours — so a write landing in those
+    // microseconds is still replaced.
+    if let Err(outcome) = judge(pre, version_for(pre, &target)?, &body_hash) {
+        return Ok(outcome);
     }
+    std::fs::rename(&tmp, &target)
+        .with_context(|| format!("failed to rename into {}", target.display()))?;
+    guard.disarm();
+    sync_dir(parent);
+
     let meta = std::fs::metadata(&target)
         .with_context(|| format!("{}: failed to stat after write", target.display()))?;
-    Ok(WriteOutcome::Written(mtime_token(&meta)))
+    Ok(WriteOutcome::Written {
+        mtime: mtime_token(&meta),
+        hash: body_hash,
+        wrote: true,
+    })
+}
+
+/// Rewrite a hard-linked file in place. Renaming a temp over one name would
+/// split it from its other links (they would keep the old bytes), so the
+/// inode itself is overwritten, which also keeps owner, mode and ACLs. The
+/// cost is atomicity: a reader can see a torn file mid-write, and a crash or
+/// I/O error mid-write leaves one. Bytes are written before the truncate so
+/// the file is never transiently empty. The precondition is judged on the
+/// same descriptor right before writing.
+fn write_in_place(
+    target: &Path,
+    bytes: &[u8],
+    pre: Precondition<'_>,
+    body_hash: String,
+) -> anyhow::Result<WriteOutcome> {
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(target)
+        .with_context(|| format!("{}: failed to open for writing", target.display()))?;
+    let current =
+        match pre {
+            Precondition::None => None,
+            Precondition::Mtime(_) => Some((
+                mtime_token(
+                    &file
+                        .metadata()
+                        .with_context(|| format!("{}: failed to stat", target.display()))?,
+                ),
+                None,
+            )),
+            Precondition::Hash(_) => Some(file_version(&mut file).with_context(|| {
+                format!("{}: failed to read current contents", target.display())
+            })?),
+        };
+    if let Err(outcome) = judge(pre, current, &body_hash) {
+        return Ok(outcome);
+    }
+    let ctx = || format!("failed to write {} in place", target.display());
+    file.seek(SeekFrom::Start(0)).with_context(ctx)?;
+    file.write_all(bytes).with_context(ctx)?;
+    file.set_len(bytes.len() as u64).with_context(ctx)?;
+    file.sync_all().with_context(ctx)?;
+    let meta = file
+        .metadata()
+        .with_context(|| format!("{}: failed to stat after write", target.display()))?;
+    Ok(WriteOutcome::Written {
+        mtime: mtime_token(&meta),
+        hash: body_hash,
+        wrote: true,
+    })
+}
+
+#[cfg(test)]
+mod write_tests {
+    use super::*;
+
+    /// Every exit between creating the temp and renaming it drops the guard
+    /// armed, so no failure after that point can leave a hidden temp behind.
+    #[test]
+    fn temp_guard_removes_unless_disarmed() {
+        let dir = std::env::temp_dir().join(format!(
+            "chimaera-temp-guard-{}-{}",
+            std::process::id(),
+            &chimaera_core::generate_token()[..8]
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dropped = dir.join(".a.tmp");
+        std::fs::write(&dropped, b"x").unwrap();
+        drop(TempFile(Some(dropped.clone())));
+        assert!(!dropped.exists());
+
+        let kept = dir.join(".b.tmp");
+        std::fs::write(&kept, b"x").unwrap();
+        let mut guard = TempFile(Some(kept.clone()));
+        guard.disarm();
+        drop(guard);
+        assert!(kept.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn temp_names_fit_name_max_without_splitting_characters() {
+        use std::os::unix::ffi::OsStrExt;
+        let short = temp_name(std::ffi::OsStr::new("notes.md"));
+        let short = short.to_str().unwrap();
+        assert!(
+            short.starts_with(".notes.md.") && short.ends_with(".tmp"),
+            "{short}"
+        );
+        assert_eq!(short.len(), ".notes.md.".len() + 8 + ".tmp".len());
+
+        // 254 bytes of two-byte characters: cut to fit, on a boundary.
+        let long = "é".repeat(127);
+        let name = temp_name(std::ffi::OsStr::new(&long));
+        assert!(name.as_bytes().len() <= MAX_NAME_BYTES);
+        assert!(name.to_str().is_some(), "split a character: {name:?}");
+    }
 }
 
 #[derive(Deserialize)]
