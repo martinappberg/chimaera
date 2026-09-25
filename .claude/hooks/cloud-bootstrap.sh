@@ -9,14 +9,20 @@
 set -u
 [ "${CLAUDE_CODE_REMOTE:-}" = "true" ] || exit 0
 root="${CLAUDE_PROJECT_DIR:-$(git rev-parse --show-toplevel 2>/dev/null)}"
-cd "$root" 2>/dev/null || exit 0
+# Only ever act inside a Chimaera checkout (`cd ""` would silently stay put).
+[ -n "$root" ] && cd "$root" 2>/dev/null && [ -f web-ui/package.json ] || exit 0
 mkdir -p target # gitignored; holds the log so it never shows up in git status
 log="target/cloud-bootstrap.log"
 notes=""
 note() { notes="${notes}
 - $1"; }
 
-want=$(cat .nvmrc 2>/dev/null)
+warming=0
+pgrep -f 'cargo-warm-chimaera' >/dev/null 2>&1 && warming=1
+# One run's output per log, so "see the log" points at this session's failure.
+[ "$warming" = 1 ] || : >"$log"
+
+want=$(sed 's/^v//; s/\..*//' .nvmrc 2>/dev/null)
 have=$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo none)
 [ "$have" = "$want" ] || note "node is v${have} but .nvmrc pins ${want}; switch before web-ui work."
 
@@ -34,17 +40,19 @@ if [ ! -f web-ui/dist/index.html ]; then
 fi
 
 # A cold workspace compile is the slowest part of a cloud session, so start the
-# gate's builds now, at low priority, while Claude reads code. Cargo's build lock
-# makes a concurrent cargo command wait ("Blocking waiting for file lock") and then
-# reuse this work. Opt out with CHIMAERA_CLOUD_WARM=0 in the environment variables.
+# gate's builds now, at low priority, while Claude reads code. They mirror `just
+# check` exactly (clippy args are part of its fingerprint), and `;` keeps the test
+# build warming even when clippy reports a lint. Cargo's build lock makes a
+# concurrent cargo command wait ("Blocking waiting for file lock") and then reuse
+# this work. Opt out with CHIMAERA_CLOUD_WARM=0 in the environment variables.
 if [ "${CHIMAERA_CLOUD_WARM:-1}" != "0" ] && [ -f web-ui/dist/index.html ] \
-   && ! pgrep -f 'cargo-warm-chimaera' >/dev/null 2>&1; then
+   && [ "$warming" = 0 ]; then
   detach=""
   command -v setsid >/dev/null 2>&1 && detach="setsid"
   $detach nohup nice -n 10 bash -c ': cargo-warm-chimaera;
-    cargo clippy --workspace --all-targets && cargo test --workspace --no-run' \
+    cargo clippy --workspace --all-targets -- -D warnings; cargo test --workspace --no-run' \
     </dev/null >>"$log" 2>&1 &
-  note "warming cargo clippy + test builds in the background (log: $log); a cargo command may wait on its lock."
+  note "warming the \`just check\` builds in the background (log: $log); a cargo command may wait on its lock."
 fi
 
 state="web-ui deps + dist ready."

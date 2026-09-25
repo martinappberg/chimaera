@@ -31,13 +31,23 @@ async function api(method, path, body) {
   return text ? JSON.parse(text) : null;
 }
 
+// Opening a workspace is idempotent (an existing root is returned as-is); note
+// whether this run added it so cleanup doesn't remove one the user already had.
+const known = new Set((await api('GET', '/api/v1/workspaces')).map((w) => w.id));
 const workspace = await api('POST', '/api/v1/workspaces', { root: workspaceRoot });
-const session = await api('POST', '/api/v1/sessions', {
-  workspace_id: workspace.id,
-  kind: 'shell',
-  cols: 100,
-  rows: 30,
-});
+const addedWorkspace = !known.has(workspace.id);
+let session;
+try {
+  session = await api('POST', '/api/v1/sessions', {
+    workspace_id: workspace.id,
+    kind: 'shell',
+    cols: 100,
+    rows: 30,
+  });
+} catch (err) {
+  if (addedWorkspace) await api('DELETE', `/api/v1/workspaces/${workspace.id}`).catch(() => {});
+  throw err;
+}
 console.log(`workspace ${workspace.id} → shell session ${session.id}`);
 
 // The marker is computed by the shell, so seeing it proves a real round trip
@@ -48,10 +58,15 @@ try {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws/sessions/${session.id}`);
     ws.binaryType = 'arraybuffer';
     let seen = '';
-    const timer = setTimeout(() => {
+    let settled = false;
+    const fail = (message) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
       ws.close();
-      reject(new Error(`no "${marker}" within 15s; last output:\n${seen.slice(-500)}`));
-    }, 15000);
+      reject(new Error(`${message}; last output:\n${seen.slice(-500)}`));
+    };
+    const timer = setTimeout(() => fail(`no "${marker}" within 15s`), 15000);
     ws.onopen = () => {
       ws.send(JSON.stringify({ type: 'auth', token }));
       ws.send(new TextEncoder().encode(`echo chimaera-smoke-$((6*7))\r`));
@@ -59,18 +74,19 @@ try {
     ws.onmessage = (ev) => {
       if (typeof ev.data === 'string') return; // JSON control frames
       seen += new TextDecoder().decode(ev.data);
-      if (seen.includes(marker)) {
+      if (seen.includes(marker) && !settled) {
+        settled = true;
         clearTimeout(timer);
         ws.close();
         resolveRun();
       }
     };
-    ws.onerror = () => {
-      clearTimeout(timer);
-      reject(new Error('session websocket error'));
-    };
+    ws.onerror = () => fail('session websocket error');
+    // The server hangs up on a rejected first-frame auth or a vanished session.
+    ws.onclose = (ev) => fail(`session websocket closed (code ${ev.code}) before the marker — stale token?`);
   });
   console.log(`✓ PTY round trip over /ws/sessions/${session.id}`);
 } finally {
   await api('DELETE', `/api/v1/sessions/${session.id}`).catch(() => {});
+  if (addedWorkspace) await api('DELETE', `/api/v1/workspaces/${workspace.id}`).catch(() => {});
 }

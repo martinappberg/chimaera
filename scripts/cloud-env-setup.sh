@@ -25,8 +25,10 @@ TOOLCHAIN=${TOOLCHAIN:-1.96.0}
 
 if ! command -v rustup >/dev/null 2>&1; then
   # sh.rustup.rs is not on the default Trusted allowlist; static.rust-lang.org is.
+  # Set a default toolchain: without one, cargo outside the repo (the `just`
+  # fallback below included) fails with "no default toolchain configured".
   curl -sSf https://static.rust-lang.org/rustup/rustup-init.sh \
-    | sh -s -- -y --profile minimal --default-toolchain none || true
+    | sh -s -- -y --profile minimal --default-toolchain "$TOOLCHAIN" || true
   . "$HOME/.cargo/env" 2>/dev/null || true
 fi
 rustup toolchain install "$TOOLCHAIN" --profile minimal \
