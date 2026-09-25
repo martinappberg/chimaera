@@ -184,6 +184,19 @@ export interface ValidatedPath {
   kind: "file" | "dir";
 }
 
+/** A /fs/validate answer, merged across batches. */
+export interface ValidateResult {
+  /** Candidate (as sent) → its one resolution. */
+  valid: Record<string, ValidatedPath>;
+  /** Candidate → the (at most five) files it could mean, when the
+   *  workspace-index fallback found several. Empty from older daemons. */
+  ambiguous: Record<string, ValidatedPath[]>;
+  /** Candidates that were never answered: past VALIDATE_CAP, or in a batch
+   *  that failed after an earlier one succeeded. Unknown, NOT misses —
+   *  callers must not cache them as such. */
+  unchecked: string[];
+}
+
 /** Server cap on candidates per /fs/validate request. */
 export const VALIDATE_MAX = 50;
 
@@ -192,44 +205,67 @@ export const VALIDATE_MAX = 50;
  *  VALIDATE_MAX requests, currently 4). */
 export const VALIDATE_CAP = 200;
 
+/** Server cap on extra `bases` per request. */
+export const VALIDATE_BASES_MAX = 8;
+
+/** Server cap on one candidate's length, in UTF-8 bytes. */
+const CANDIDATE_MAX_BYTES = 1024;
+
 /**
- * Batch existence check behind the terminal link provider, per the
- * /fs/validate contract: candidates resolve absolutely or against the
- * absolute `base`, `~` expands, and only hits come back (keyed by the
- * candidate as sent). Misses are simply absent — never errors.
+ * Batch existence check behind every path link (terminal, chat, tool
+ * cards), per the /fs/validate contract. Each candidate must be a clean path
+ * (no `:12` suffix, `#L` anchor or wrapper — `shared/fileRef.ts` makes
+ * them). The daemon's ladder: absolute / `~` → `base`, then each of `bases`
+ * in order → the same without a leading `a/` / `b/` diff prefix → with
+ * `workspaceId`, a unique basename or unique path suffix in that
+ * workspace's index (`figs/plot.png` → `results/figs/plot.png`), or up to
+ * five `ambiguous` matches. A miss is simply absent, never an error.
+ * `workspaceId` and `bases` are additive: older daemons ignore them.
  *
- * `workspaceId` (additive — older daemons ignore it) enables the daemon's
- * bare-basename fallback: a slash-less `name.ext` candidate that misses the
- * base also resolves when exactly ONE file in that workspace's index bears
- * the name ("FIGURE_PLAN.md" mentioned bare, living at paper/FIGURE_PLAN.md).
- *
- * The server caps each request at VALIDATE_MAX; callers cache the FULL sent
- * list as resolved, so anything past that cap would otherwise stick as a
- * permanent miss. Loop in VALIDATE_MAX-sized batches (bounded by VALIDATE_CAP)
- * so every candidate is actually validated. Batches run sequentially to keep
- * the daemon's concurrent load low.
+ * The server caps each request at VALIDATE_MAX; loop in VALIDATE_MAX-sized
+ * batches (bounded by VALIDATE_CAP), sequentially to keep the daemon's
+ * concurrent load low. A candidate over the byte cap can never validate
+ * and is dropped (a miss). Throws only when nothing was answered.
  */
 export async function fsValidate(
   candidates: string[],
   base: string,
   workspaceId: string | null = null,
-): Promise<Record<string, ValidatedPath>> {
-  const capped = candidates.slice(0, VALIDATE_CAP);
-  const out: Record<string, ValidatedPath> = {};
+  bases: string[] = [],
+): Promise<ValidateResult> {
+  const out: ValidateResult = { valid: {}, ambiguous: {}, unchecked: [] };
+  const sendable = [...new Set(candidates)].filter(
+    (c) => c.length > 0 && new TextEncoder().encode(c).length <= CANDIDATE_MAX_BYTES,
+  );
+  const capped = sendable.slice(0, VALIDATE_CAP);
+  out.unchecked.push(...sendable.slice(VALIDATE_CAP));
+  const extra = [...new Set(bases)].filter((b) => b !== base).slice(0, VALIDATE_BASES_MAX);
   for (let i = 0; i < capped.length; i += VALIDATE_MAX) {
     const batch = capped.slice(i, i + VALIDATE_MAX);
-    const body = await json<{ valid: Record<string, ValidatedPath> }>(
-      await api("/fs/validate", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          candidates: batch,
-          base,
-          ...(workspaceId !== null ? { workspace_id: workspaceId } : {}),
+    type Body = { valid?: Record<string, ValidatedPath>; ambiguous?: Record<string, ValidatedPath[]> };
+    let body: Body;
+    try {
+      body = await json<Body>(
+        await api("/fs/validate", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            candidates: batch,
+            base,
+            ...(workspaceId !== null ? { workspace_id: workspaceId } : {}),
+            ...(extra.length > 0 ? { bases: extra } : {}),
+          }),
         }),
-      }),
-    );
-    Object.assign(out, body.valid);
+      );
+    } catch (err) {
+      if (i === 0) throw err;
+      out.unchecked.push(...capped.slice(i));
+      break;
+    }
+    Object.assign(out.valid, body.valid ?? {});
+    for (const [cand, matches] of Object.entries(body.ambiguous ?? {})) {
+      if (Array.isArray(matches) && matches.length > 0) out.ambiguous[cand] = matches;
+    }
   }
   return out;
 }
