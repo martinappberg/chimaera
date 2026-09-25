@@ -1484,6 +1484,8 @@ pub(super) fn report_window_scope(
             }
         }
     }
+    // A notification click that opened this window is owed a focus.
+    super::notices::window_scoped(webview.app_handle(), webview.label(), &alias, &ws);
     if (!home_hub || reclaimed_home) && !stable_id.is_empty() {
         let mut registry = lock(&state.registry);
         registry.set_scope(&stable_id, registered_alias, ws);
@@ -1510,6 +1512,74 @@ pub(super) fn report_window_scope(
     // Its workspace also decides whether Settings applies (home screen = no).
     crate::menu::sync_settings_enabled(webview.app_handle());
     Ok(())
+}
+
+/// What this window shows right now: the session in each pane's active tab.
+/// The notifier drops a notice about one of these while the window has
+/// focus, and a focused window's report clears their delivered alerts.
+#[tauri::command]
+pub(super) fn report_window_view(
+    webview: tauri::WebviewWindow,
+    state: State<'_, Shell>,
+    visible: Vec<String>,
+) -> Result<(), String> {
+    // A page shows a handful of panes; anything longer is not a view.
+    const MAX_VISIBLE: usize = 32;
+    let visible: Vec<String> = visible.into_iter().take(MAX_VISIBLE).collect();
+    let alias = {
+        let mut windows = lock(&state.windows);
+        let scope = windows
+            .get_mut(webview.label())
+            .ok_or_else(|| "this window is not registered".to_string())?;
+        scope.visible.clone_from(&visible);
+        scope.alias.clone()
+    };
+    if webview.is_focused().unwrap_or(false) {
+        super::notices::mark_seen(webview.app_handle(), &alias, &visible);
+    }
+    Ok(())
+}
+
+/// The session a notification click opened this window for (see
+/// `notices::take_pending_focus`); `None` once taken or when nothing is owed.
+#[tauri::command]
+pub(super) fn take_pending_focus(webview: tauri::WebviewWindow) -> Option<String> {
+    super::notices::take_pending_focus(webview.app_handle(), webview.label())
+}
+
+/// Whether the OS lets Chimaera post notifications (for the settings page).
+#[tauri::command]
+pub(super) async fn notification_permission() -> crate::notify::Permission {
+    crate::notify::permission().await
+}
+
+/// Ask the OS for notification permission now (the settings page's button;
+/// otherwise the first notification asks).
+#[tauri::command]
+pub(super) async fn request_notification_permission() -> crate::notify::Permission {
+    crate::notify::request_permission().await
+}
+
+/// Post a sample notification (the settings page's "Send test"), so the user
+/// can see what alerts look like — and trigger the OS permission prompt — on
+/// demand. Clicking it just brings the app forward.
+#[tauri::command]
+pub(super) fn test_notification() {
+    crate::notify::post(crate::notify::Toast {
+        id: format!("chimaera-test-{}", super::next_test_notification_id()),
+        thread: "chimaera-test".to_string(),
+        title: "Chimaera".to_string(),
+        subtitle: "Notifications are on".to_string(),
+        body: "You'll hear from agents here when they finish or need you.".to_string(),
+        sound: true,
+    });
+}
+
+/// Open the OS's notification settings for Chimaera (macOS: System Settings
+/// → Notifications → Chimaera) — the only place a denial can be undone.
+#[tauri::command]
+pub(super) fn open_notification_settings() {
+    crate::notify::open_settings();
 }
 
 /// The UI's caffeinate toggle. The real work — and the same `caffeinate-changed`

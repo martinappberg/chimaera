@@ -97,8 +97,12 @@ pub fn install(app: &App) -> tauri::Result<()> {
 
     let window = SubmenuBuilder::new(handle, "Window")
         .item(&PredefinedMenuItem::minimize(handle, None)?)
-        .item(&PredefinedMenuItem::maximize(handle, None)?)
-        .build()?;
+        .item(&PredefinedMenuItem::maximize(handle, None)?);
+    #[cfg(target_os = "macos")]
+    let window = window
+        .separator()
+        .item(&PredefinedMenuItem::bring_all_to_front(handle, None)?);
+    let window = window.build()?;
 
     // macOS carries About in the application submenu; Windows/Linux lost it
     // with that submenu, so give them the conventional Help menu — About is
@@ -115,6 +119,11 @@ pub fn install(app: &App) -> tauri::Result<()> {
     let menu = menu.items(&[&file, &edit, &view, &window, &help]);
     let menu = menu.build()?;
     app.set_menu(menu)?;
+    // AppKit appends the live window list (titles carry the "(N)" needs-you
+    // prefix) to whichever submenu is registered as the app's Windows menu —
+    // the conventional way back to one specific, possibly minimized, window.
+    #[cfg(target_os = "macos")]
+    window.set_as_windows_menu_for_nsapp()?;
     app.manage(MenuState { settings });
 
     app.on_menu_event(|app: &AppHandle, event| {

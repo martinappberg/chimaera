@@ -86,6 +86,12 @@ export type SettingsMap = {
   "agents.defaultView": "chat" | "terminal";
   "dashboard.landing": "auto" | "never";
   "dashboard.cardDensity": "auto" | "comfortable" | "compact";
+  "notifications.turnFinished": boolean;
+  "notifications.needsYou": boolean;
+  "notifications.agentMessages": boolean;
+  "notifications.sound": boolean;
+  "notifications.whileFocused": boolean;
+  "notifications.dockBadge": boolean;
   "chat.fontSize": number;
   "chat.fontFamily": string;
   "chat.lineHeight": number;
@@ -245,6 +251,64 @@ const DEFS = {
       { value: "compact", label: "Compact" },
     ],
     scope: "client",
+  },
+
+  // --- Notifications -----------------------------------------------------------
+  // Daemon-scoped: the daemon decides which notices exist at all (so every
+  // consumer — the native shell, each browser tab — agrees), and hands the
+  // presentation keys to the native shell alongside them.
+  "notifications.turnFinished": {
+    title: "When an Agent Finishes",
+    category: "Notifications",
+    description:
+      "Notify when an agent ends its turn and hands the floor back, quoting how its reply starts. Nothing is sent for the session you're looking at.",
+    type: "boolean",
+    default: true,
+    scope: "daemon",
+  },
+  "notifications.needsYou": {
+    title: "When an Agent Needs You",
+    category: "Notifications",
+    description:
+      "Notify when an agent is blocked on you — a permission to approve, a question to answer, waiting for input — or stops on an error or a usage limit.",
+    type: "boolean",
+    default: true,
+    scope: "daemon",
+  },
+  "notifications.agentMessages": {
+    title: "Messages from Agents",
+    category: "Notifications",
+    description:
+      "Let agents notify you themselves — ask one to \"ping me when the job finishes\" and it can. Agents also see this switch: when it's off, their notify tool tells them so.",
+    type: "boolean",
+    default: true,
+    scope: "daemon",
+  },
+  "notifications.sound": {
+    title: "Play a Sound",
+    category: "Notifications",
+    description: "Notifications play the system notification sound.",
+    type: "boolean",
+    default: true,
+    scope: "daemon",
+  },
+  "notifications.whileFocused": {
+    title: "Notify While Chimaera Is in Front",
+    category: "Notifications",
+    description:
+      "Also show notifications while you're working in Chimaera, for sessions in other tabs or windows. Off: only when Chimaera is in the background.",
+    type: "boolean",
+    default: true,
+    scope: "daemon",
+  },
+  "notifications.dockBadge": {
+    title: "Dock Badge",
+    category: "Notifications",
+    description:
+      "Show how many agents are waiting on you on the app icon, and bounce it once when one gets blocked while Chimaera is in the background (native app).",
+    type: "boolean",
+    default: true,
+    scope: "daemon",
   },
 
   // --- Chat ------------------------------------------------------------------
