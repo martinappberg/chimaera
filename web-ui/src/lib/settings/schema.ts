@@ -107,6 +107,8 @@ export type SettingsMap = {
   "editor.lineNumbers": boolean;
   "editor.wordWrap": boolean;
   "editor.tabSize": number;
+  "editor.autosave": "off" | "afterDelay";
+  "editor.autosaveDelay": number;
   "files.showHidden": boolean;
   "files.tableRowsPerPage": number;
   "quickOpen.maxResults": number;
@@ -473,6 +475,30 @@ const DEFS = {
     min: 1,
     max: 8,
     step: 1,
+    scope: "client",
+  },
+  "editor.autosave": {
+    title: "Autosave",
+    category: "Editor",
+    description:
+      "Save edited files on their own: after a pause in typing, and when the editor loses focus or you switch tabs. Agents only see what is saved to disk. Never saves over a file that changed on disk until you resolve it.",
+    type: "enum",
+    default: "off",
+    options: [
+      { value: "off", label: "Off" },
+      { value: "afterDelay", label: "After a delay" },
+    ],
+    scope: "client",
+  },
+  "editor.autosaveDelay": {
+    title: "Autosave Delay",
+    category: "Editor",
+    description: "Milliseconds of idle typing before an autosave (when Autosave is on).",
+    type: "integer",
+    default: 1000,
+    min: 200,
+    max: 60000,
+    step: 100,
     scope: "client",
   },
 

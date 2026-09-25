@@ -2,6 +2,9 @@
  * Client for the daemon's file service (M3 wave 1):
  *   GET  /fs/list?path=&hidden=      directory listing (dirs first, sorted)
  *   GET  /fs/file?path=&offset=&limit=   raw bytes + X-File-Size/X-Truncated
+ *                                    (+ X-Content-Hash on a complete raw read)
+ *   PUT  /fs/file?path=&expect_hash= content-hash-guarded write
+ *   /fs/drafts, /fs/draft            the unsaved-edit journal mirror
  *   GET  /fs/markdown?path=          server-rendered, sanitized GFM HTML
  *   GET  /fs/table?path=&offset_rows=&limit_rows=   paged CSV/TSV
  *   POST /fs/ticket {path}           short-lived unauthenticated /raw/ URL
@@ -49,6 +52,13 @@ export interface FileChunk {
    * conflict check. Null on an older daemon that omits the header.
    */
   mtime: string | null;
+  /**
+   * SHA-256 (hex) of the whole file (`X-Content-Hash`). The daemon sends it
+   * only when the body IS the complete raw file — offset 0, not truncated, not
+   * a decompressed gzip — so a partial read can never pose as a version. Null
+   * otherwise, and from older daemons (callers fall back to `mtime`).
+   */
+  hash: string | null;
 }
 
 export interface TablePage {
@@ -81,9 +91,14 @@ export async function fsList(path: string, hidden = false): Promise<FsListing> {
   return json(await api(`/fs/list?${q.toString()}`));
 }
 
-export async function fsFile(path: string, offset = 0, limit = FILE_CHUNK): Promise<FileChunk> {
+export async function fsFile(
+  path: string,
+  offset = 0,
+  limit = FILE_CHUNK,
+  signal?: AbortSignal,
+): Promise<FileChunk> {
   const q = new URLSearchParams({ path, offset: String(offset), limit: String(limit) });
-  const res = await api(`/fs/file?${q.toString()}`);
+  const res = await api(`/fs/file?${q.toString()}`, signal !== undefined ? { signal } : {});
   if (!res.ok) {
     let message = `request failed with status ${res.status}`;
     try {
@@ -98,31 +113,59 @@ export async function fsFile(path: string, offset = 0, limit = FILE_CHUNK): Prom
   const size = Number(res.headers.get("X-File-Size") ?? bytes.length);
   const truncated = res.headers.get("X-Truncated") === "true";
   const mtime = res.headers.get("X-Mtime");
-  return { bytes, size: Number.isFinite(size) ? size : bytes.length, truncated, mtime };
+  const hash = res.headers.get("X-Content-Hash");
+  return { bytes, size: Number.isFinite(size) ? size : bytes.length, truncated, mtime, hash };
 }
 
 /** A concurrent-modification conflict raised by PUT /fs/file (HTTP 409). */
 export class FileConflictError extends Error {
-  constructor(message = "file changed on disk") {
+  /** The current disk version, when the daemon reports it (409 headers). */
+  readonly hash: string | null;
+  readonly mtime: string | null;
+  constructor(
+    message = "file changed on disk",
+    hash: string | null = null,
+    mtime: string | null = null,
+  ) {
     super(message);
     this.name = "FileConflictError";
+    this.hash = hash;
+    this.mtime = mtime;
   }
 }
 
+export interface WriteOptions {
+  /** Refuse (409) unless the file on disk hashes to this — the preferred,
+   *  content-verified precondition. */
+  expectHash?: string | null;
+  /** Metadata precondition, for a daemon that never sent a content hash. */
+  expectMtime?: string | null;
+  signal?: AbortSignal;
+}
+
+export interface WriteResult {
+  mtime: string | null;
+  /** SHA-256 of what is now on disk; null from older daemons. */
+  hash: string | null;
+}
+
 /**
- * Write `bytes` to `path` via PUT /fs/file. When `expectMtime` is given the
- * daemon refuses (409 → FileConflictError) if the file changed on disk since
- * that mtime — the caller offers reload/overwrite. Other failures surface as
- * ApiError (400 dir/missing-parent, 413 over the 1MB cap). Resolves to the
- * new mtime (X-Mtime on the 204) so the editor can keep tracking edits.
+ * Write `bytes` to `path` via PUT /fs/file. With a precondition the daemon
+ * refuses (409 → FileConflictError) when the disk moved on. Only one is sent,
+ * the hash when known: a daemon new enough to report hashes checks them, and
+ * one that already holds exactly these bytes answers success without writing,
+ * so a retry after a lost reply is safe. Other failures surface as ApiError
+ * (400 dir/missing-parent, 413 over the 1MB cap); a dead link or an abort
+ * rejects with the fetch's own error.
  */
 export async function fsWrite(
   path: string,
   bytes: Uint8Array,
-  expectMtime: string | null = null,
-): Promise<string | null> {
+  opts: WriteOptions = {},
+): Promise<WriteResult> {
   const q = new URLSearchParams({ path });
-  if (expectMtime !== null) q.set("expect_mtime", expectMtime);
+  if (opts.expectHash != null) q.set("expect_hash", opts.expectHash);
+  else if (opts.expectMtime != null) q.set("expect_mtime", opts.expectMtime);
   // Copy into a fresh ArrayBuffer-backed view so the body is a plain
   // BodyInit (Uint8Array over SharedArrayBuffer is not).
   const body = bytes.slice();
@@ -130,8 +173,15 @@ export async function fsWrite(
     method: "PUT",
     headers: { "Content-Type": "application/octet-stream" },
     body,
+    ...(opts.signal !== undefined ? { signal: opts.signal } : {}),
   });
-  if (res.status === 409) throw new FileConflictError();
+  if (res.status === 409) {
+    throw new FileConflictError(
+      "file changed on disk",
+      res.headers.get("X-Content-Hash"),
+      res.headers.get("X-Mtime"),
+    );
+  }
   if (!res.ok) {
     let message = `save failed with status ${res.status}`;
     try {
@@ -142,7 +192,107 @@ export async function fsWrite(
     }
     throw new ApiError(res.status, message);
   }
-  return res.headers.get("X-Mtime");
+  return { mtime: res.headers.get("X-Mtime"), hash: res.headers.get("X-Content-Hash") };
+}
+
+// --- the unsaved-edit journal's daemon mirror -------------------------------
+// A new tunnel port is a new browser origin with an empty IndexedDB, so dirty
+// text is mirrored to the daemon (~/.chimaera/drafts). Older daemons lack the
+// routes: every helper degrades to "unsupported"/null rather than an error.
+
+export interface DraftBody {
+  path: string;
+  base_hash: string;
+  text: string;
+  updated_ms: number;
+}
+
+export type DraftPutResult = "ok" | "too-large" | "unsupported";
+
+/** Statuses meaning "this daemon has no drafts route". */
+function draftsUnsupported(status: number): boolean {
+  return status === 404 || status === 405 || status === 501;
+}
+
+/** Mirror a draft. `keepalive` lets a small body outlive a closing page. */
+export async function fsDraftPut(
+  path: string,
+  baseHash: string,
+  text: string,
+  keepalive = false,
+): Promise<DraftPutResult> {
+  const res = await api("/fs/drafts", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path, base_hash: baseHash, text }),
+    keepalive,
+    signal: AbortSignal.timeout(15_000),
+  });
+  if (res.ok) return "ok";
+  if (res.status === 413) return "too-large";
+  if (draftsUnsupported(res.status)) return "unsupported";
+  throw new ApiError(res.status, `draft mirror failed with status ${res.status}`);
+}
+
+/** The daemon's draft for `path`, or null (none, or an older daemon). */
+export async function fsDraftGet(path: string): Promise<DraftBody | null> {
+  const q = new URLSearchParams({ path });
+  const res = await api(`/fs/draft?${q.toString()}`, { signal: AbortSignal.timeout(10_000) });
+  if (!res.ok) {
+    if (draftsUnsupported(res.status) || res.status === 400) return null;
+    throw new ApiError(res.status, `draft read failed with status ${res.status}`);
+  }
+  try {
+    const body = (await res.json()) as Partial<DraftBody>;
+    if (typeof body.text !== "string" || typeof body.path !== "string") return null;
+    return {
+      path: body.path,
+      base_hash: typeof body.base_hash === "string" ? body.base_hash : "",
+      text: body.text,
+      updated_ms: typeof body.updated_ms === "number" ? body.updated_ms : 0,
+    };
+  } catch {
+    return null; // not JSON (an older daemon's fallback), so not a draft
+  }
+}
+
+export interface DraftSummary {
+  path: string;
+  base_hash: string;
+  updated_ms: number;
+  bytes: number;
+}
+
+/**
+ * Every mirrored draft (summaries only), or null from a daemon without the
+ * route. Cheaper to consult on open than fetching one draft, which answers a
+ * plain "none" with a 404 the browser logs as a failed resource.
+ */
+export async function fsDraftList(): Promise<DraftSummary[] | null> {
+  const res = await api("/fs/drafts", { signal: AbortSignal.timeout(10_000) });
+  if (!res.ok) {
+    if (draftsUnsupported(res.status)) return null;
+    throw new ApiError(res.status, `draft list failed with status ${res.status}`);
+  }
+  try {
+    const body = (await res.json()) as { drafts?: DraftSummary[] };
+    return Array.isArray(body.drafts) ? body.drafts : null;
+  } catch {
+    return null; // not JSON (an older daemon's fallback)
+  }
+}
+
+/** Drop the daemon's draft for `path` (a no-op on an older daemon). */
+export async function fsDraftDelete(path: string, keepalive = false): Promise<void> {
+  const q = new URLSearchParams({ path });
+  const res = await api(`/fs/draft?${q.toString()}`, {
+    method: "DELETE",
+    keepalive,
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (!res.ok && !draftsUnsupported(res.status)) {
+    throw new ApiError(res.status, `draft delete failed with status ${res.status}`);
+  }
 }
 
 export interface QuickOpenEntry {

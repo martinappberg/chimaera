@@ -14,8 +14,9 @@
  *      store exactly which file metadata moved — including repeated edits to an
  *      already-dirty file, ignored/non-repo files, and paths outside the
  *      workspace. Agent/in-app git nudges remain the zero-latency fast path.
- *      The editor guards its own unsaved buffer (see CodeView); the store carries
- *      last-known-on-disk only.
+ *      Unsaved editor text lives in the buffer store (buffers.svelte.ts), which
+ *      retains its path here so a dirty buffer stays watched with no view
+ *      mounted; this store carries last-known-on-disk only.
  *
  * Memory lives in the browser tab, not the daemon: each entry holds at most the
  * first 256KB chunk (+ small rendered payloads), and the LRU caps the count.
@@ -228,8 +229,8 @@ export class FileEntry {
    * null-then-fetch. A null `chunk` would unmount a CodeView keyed off it (via
    * FileView's probe), and a null anything flashes a spinner over a live view.
    * A failed refetch leaves the last-known value. `chunk` is refreshed so a
-   * later reopen is correct, but a mounted CodeView owns its own buffer and does
-   * not react to it (it live-updates via the mtime watch instead).
+   * later reopen is correct, but an editor buffer never reacts to it (it
+   * reconciles via the mtime watch and a whole-file, hashed read instead).
    */
   private async refreshPayloads(): Promise<void> {
     // Let in-flight first loads land before deciding what is populated: a
