@@ -158,7 +158,13 @@ async fn hook_edges_become_settled_notices() {
     let done = &notices[0];
     assert_eq!(done["kind"], "done");
     assert_eq!(done["body"], "Fixed the flaky test; the suite passes.");
-    assert_eq!(done["title"], "fix it", "named like the rail names it");
+    // Named exactly as the rail names it (which name wins depends on the
+    // shell: a prompt title set by the PTY's shell outranks the first prompt).
+    let row = session_entry(&state, &id).await;
+    assert_eq!(
+        done["title"], row["display_name"],
+        "named like the rail names it"
+    );
     assert!(done["subtitle"].as_str().unwrap().starts_with("Finished"));
     let after = done["id"].as_u64().unwrap();
 
