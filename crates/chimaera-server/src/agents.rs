@@ -558,6 +558,44 @@ pub(crate) async fn ingest(
         state.changes.notify_waiters();
     }
 
+    // The Timeline's hooks tier: claude TUIs only. Claude CHAT sessions fire
+    // the same `--settings` hooks, and the protocol already records their
+    // turns — gate on the PTY registry (and skip a view switch in flight) or
+    // every chat turn lands twice.
+    if state.sessions.get(&id).is_some() && !crate::lock(&state.chat_switching).contains_key(&id) {
+        let now = crate::timeline::now_ms();
+        let draft = {
+            let mut tui = crate::lock(&state.tui_episodes);
+            match event {
+                "UserPromptSubmit" => payload
+                    .get("prompt")
+                    .and_then(|p| p.as_str())
+                    .and_then(|p| tui.prompt(&id, now, p)),
+                "PostToolUse" => {
+                    tui.tool(&id, touched_path.as_deref());
+                    None
+                }
+                // Stop carries the final message (`last_assistant_message`,
+                // present in the claude 2.1.259 Stop hook input); a repeat
+                // Stop with no open turn is dropped.
+                "Stop" => tui.stop(
+                    &id,
+                    now,
+                    "finished",
+                    payload
+                        .get("last_assistant_message")
+                        .and_then(|m| m.as_str()),
+                ),
+                "StopFailure" => tui.stop(&id, now, "errored", None),
+                "SessionEnd" => tui.stop(&id, now, "exited", None),
+                _ => None,
+            }
+        };
+        if let Some(draft) = draft {
+            crate::episodes::record(&state, &id, draft, "hooks").await;
+        }
+    }
+
     // An agent writing a file is the signature git refresh trigger: the hook we
     // already ingest IS the mechanism — no polling, no terminal-text parsing.
     if let Some(path) = touched_path {
@@ -648,6 +686,8 @@ pub(crate) fn spawn_agent_watch(state: Arc<AppState>, session_id: String) {
                 // This loop only retires on PTY absence — a chat driver keeps
                 // the session alive via `session_alive`, and its own exit path
                 // retires first — so the surface here is always the terminal.
+                // A hook turn still open at death never gets its Stop.
+                crate::lock(&state.tui_episodes).forget(&session_id);
                 crate::recents::retire(
                     &state,
                     &session_id,

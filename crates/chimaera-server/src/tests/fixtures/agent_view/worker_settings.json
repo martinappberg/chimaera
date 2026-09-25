@@ -1,0 +1,119 @@
+{
+  "hooks": {
+    "Notification": [
+      {
+        "hooks": [
+          {
+            "timeout": 10,
+            "type": "http",
+            "url": "http://127.0.0.1:4242/api/v1/agent-events/s-agentview?key=KEY"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "timeout": 10,
+            "type": "http",
+            "url": "http://127.0.0.1:4242/api/v1/agent-events/s-agentview?key=KEY"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "timeout": 10,
+            "type": "http",
+            "url": "http://127.0.0.1:4242/api/v1/agent-events/s-agentview?key=KEY"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "timeout": 10,
+            "type": "http",
+            "url": "http://127.0.0.1:4242/api/v1/agent-events/s-agentview?key=KEY"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "timeout": 10,
+            "type": "http",
+            "url": "http://127.0.0.1:4242/api/v1/agent-events/s-agentview?key=KEY"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "timeout": 10,
+            "type": "http",
+            "url": "http://127.0.0.1:4242/api/v1/agent-events/s-agentview?key=KEY"
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "timeout": 10,
+            "type": "http",
+            "url": "http://127.0.0.1:4242/api/v1/agent-events/s-agentview?key=KEY"
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "timeout": 10,
+            "type": "http",
+            "url": "http://127.0.0.1:4242/api/v1/agent-events/s-agentview?key=KEY"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "timeout": 10,
+            "type": "http",
+            "url": "http://127.0.0.1:4242/api/v1/agent-events/s-agentview?key=KEY"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "timeout": 10,
+            "type": "http",
+            "url": "http://127.0.0.1:4242/api/v1/agent-events/s-agentview?key=KEY"
+          }
+        ]
+      }
+    ]
+  },
+  "statusLine": {
+    "command": "'<RUNTIME>/agents/s-agentview-statusline.sh'",
+    "type": "command"
+  },
+  "theme": "dark"
+}

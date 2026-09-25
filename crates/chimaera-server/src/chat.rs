@@ -186,6 +186,9 @@ pub(crate) fn spawn_signal_task(state: Arc<AppState>) {
         // to their completion event (which carries no locations). See
         // `nudge_on_edit`. Owned by this single pump task, so no lock needed.
         let mut pending_edits: HashMap<(String, String), Vec<String>> = HashMap::new();
+        // Per-session turn folds for the Timeline (protocol tier). Owned by
+        // this single task, like `pending_edits`.
+        let mut episodes = crate::episodes::ChatEpisodes::default();
         while let Some(signal) = rx.recv().await {
             match signal {
                 ChatSignal::Event(id, entry) => {
@@ -206,11 +209,26 @@ pub(crate) fn spawn_signal_task(state: Arc<AppState>) {
                     // apply_chat_event: it is async and the std-mutex agents
                     // guard is already dropped.
                     nudge_on_edit(&state, &mut pending_edits, &id, &entry.ev).await;
+                    if let Some(draft) = episodes.observe(&id, entry.ts, &entry.ev) {
+                        crate::episodes::record(&state, &id, draft, "protocol").await;
+                    }
                     state.changes.notify_waiters();
                 }
                 ChatSignal::Exit(id, exit) => {
                     // A dead session's un-completed edits will never land.
                     pending_edits.retain(|(s, _), _| s != &id);
+                    // Record the death BEFORE handle_chat_exit: retiring drops
+                    // the workspace mapping the Timeline entry needs. A
+                    // deliberate view switch is not history.
+                    if crate::lock(&state.chat_switching).contains_key(&id) {
+                        episodes.forget(&id);
+                    } else {
+                        let now = crate::timeline::now_ms();
+                        if let Some(draft) = episodes.flush(&id, now) {
+                            crate::episodes::record(&state, &id, draft, "protocol").await;
+                        }
+                        crate::episodes::record_exit(&state, &id, &exit).await;
+                    }
                     handle_chat_exit(&state, &id, exit).await;
                     state.changes.notify_waiters();
                 }

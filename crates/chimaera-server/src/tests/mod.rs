@@ -1,3 +1,4 @@
+mod agent_view;
 mod agents;
 mod chat;
 mod download;

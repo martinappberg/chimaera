@@ -393,6 +393,10 @@ pub(crate) async fn delete_workspace(
             // the quick-open index, tens of MB nothing could query again.
             state.git.forget_workspace(&id);
             crate::lock(&state.quickopen).forget_workspace(&id);
+            // Its Timeline too (memory now, the directory behind any queued
+            // appends).
+            state.timeline.remove_workspace(&id);
+            crate::lock(&state.plugin_detect).forget_workspace(&id);
             StatusCode::NO_CONTENT.into_response()
         }
         Ok(false) => (

@@ -662,3 +662,24 @@ mod tests {
         );
     }
 }
+
+/// The name the rail shows for any session (PTY or chat), resolved NOW —
+/// the Timeline stamps it on entries so history reads the way the rail did.
+pub(crate) fn display_name_now(state: &AppState, id: &str) -> Option<String> {
+    if let Some(info) = state.sessions.get(id) {
+        if info.renamed {
+            return Some(info.name);
+        }
+        let agent = crate::lock(&state.agents).get(id).cloned();
+        return Some(match agent {
+            Some(agent) => agent.display_name(info.title.as_deref()),
+            None => {
+                let polled = crate::lock(&state.display_names).get(id).cloned();
+                crate::naming::shell_display_name(&info, polled.as_deref())
+            }
+        });
+    }
+    crate::lock(&state.agents)
+        .get(id)
+        .map(|record| record.display_name(None))
+}

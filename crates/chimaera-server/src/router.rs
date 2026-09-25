@@ -7,7 +7,8 @@ use tower_http::trace::TraceLayer;
 use crate::AppState;
 use crate::{
     agents, api, chat, compute, compute_jobs, download, environment, fs, git, launcher, links, mcp,
-    proxy, quickopen, recents, runtimes, settings, update, upload, view_state, ws,
+    plugins, proxy, quickopen, recents, runtimes, settings, timeline, update, upload, view_state,
+    ws,
 };
 
 /// Build the axum router (factored out so tests can drive it with `oneshot`).
@@ -28,6 +29,15 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         .route(
             "/workspaces/{id}/mastermind",
             put(api::put_mastermind).delete(api::delete_mastermind),
+        )
+        .route("/workspaces/{id}/timeline", get(timeline::get_timeline))
+        // Workbench plugins: the catalog, per-workspace status, and the
+        // per-workspace off switch (enabling is the `plugins.enabled` setting).
+        .route("/plugins", get(plugins::list_plugins))
+        .route("/workspaces/{id}/plugins", get(plugins::workspace_plugins))
+        .route(
+            "/workspaces/{id}/plugins/{pid}",
+            put(plugins::put_workspace_plugin),
         )
         .route(
             "/sessions",

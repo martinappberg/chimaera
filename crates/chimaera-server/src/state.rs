@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
 use crate::{
-    agent_updates, agents, chat, compute, environment, fs, git, launcher, ledger, proxy, quickopen,
-    recents, settings, update, view_state, workspaces,
+    agent_updates, agents, chat, compute, environment, episodes, fs, git, launcher, ledger,
+    plugins, proxy, quickopen, recents, settings, timeline, update, view_state, workspaces,
 };
 
 /// Upper bound on how long a sessions snapshot waits for ledger restore.
@@ -172,6 +172,20 @@ pub(crate) struct AppState {
     pub(crate) claude_settings_path: PathBuf,
     /// The user's codex config (`~/.codex/config.toml`); same respect rule.
     pub(crate) codex_config_path: PathBuf,
+    /// The daemon's durable-state root (`~/.chimaera` or
+    /// `$CHIMAERA_HOME/data`); per-workspace stores derive from it, so tests
+    /// and isolated daemons are sandboxed for free.
+    pub(crate) data_dir: PathBuf,
+    /// The per-workspace Timeline (`<data_dir>/workspace/<ws>/timeline.jsonl`):
+    /// what happened, written from signals the daemon already receives. Its
+    /// per-workspace epochs drive the `/ws/events` timeline frame.
+    pub(crate) timeline: timeline::TimelineService,
+    /// Per-workspace plugin footprint detection (see `plugins`): refreshed
+    /// off the reactor, read-only on the MCP hot path.
+    pub(crate) plugin_detect: Mutex<plugins::DetectCache>,
+    /// Hook-driven turns of claude TUIs in flight (the Timeline's hooks
+    /// tier; see `episodes`). Bounded by live sessions.
+    pub(crate) tui_episodes: Mutex<episodes::TuiEpisodes>,
 }
 
 impl AppState {
@@ -243,6 +257,10 @@ impl AppState {
             installs: Mutex::new(HashMap::new()),
             claude_settings_path: home.join(".claude").join("settings.json"),
             codex_config_path: home.join(".codex").join("config.toml"),
+            timeline: timeline::TimelineService::new(data_dir.join("workspace")),
+            plugin_detect: Mutex::new(plugins::DetectCache::default()),
+            tui_episodes: Mutex::new(episodes::TuiEpisodes::default()),
+            data_dir,
         }
     }
 
