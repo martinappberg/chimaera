@@ -12,8 +12,9 @@ commit prefix are therefore load-bearing. See [AGENTS.md](../../../AGENTS.md) â†
 
 ## Before opening
 
-1. **Rebase on latest main.** The remote is `upstream`:
-   `git fetch upstream && git rebase upstream/main`.
+1. **Rebase on latest main.** `git fetch origin && git rebase origin/main`. (Once
+   the branch is pushed, merge `origin/main` in instead â€” the Claude guard hook
+   blocks force-pushes to the canonical repo, PR branches included.)
 2. **Gate is green:** `just check` (fmt + clippy + test). If you touched
    `web-ui/**`, run its `check`, `test`, and `build` scripts. If you touched
    `crates/chimaera-app/**`, run `just app-check`; `app.yml` also builds the
@@ -62,7 +63,7 @@ time, verify the type/marker survived into the squash subject.
 ## Open it
 
 ```sh
-git push -u upstream HEAD          # push the branch
+git push -u origin HEAD            # push the branch
 gh pr create --title "chore: <what>" --body "<what changed; what you ran/observed>"
 ```
 
