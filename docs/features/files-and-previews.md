@@ -3,7 +3,7 @@
 Browsing and managing the workspace's files. The file tree and the Finder browse, open,
 and — via their right-click context menus — create, rename, delete, and download files
 and folders; the preview service streams file bytes and renders them as code, markdown,
-tables, PDFs, images, sandboxed HTML, or a hex/binary summary — plus a light single-file
+tables, PDFs, images, sandboxed HTML, or a binary info card — plus a light single-file
 editor. Everything streams (never whole-file loads) to hold the daemon's ~150 MB RSS
 budget on shared login nodes.
 
@@ -232,8 +232,10 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   `PdfView`/`ImageView`/`HtmlView`. `HtmlView` carries a **preview | split | edit** toggle
   (`SplitEditPreview.svelte` owns the split geometry);
   its split live-preview is a `sandbox="allow-scripts"` `srcdoc` iframe fed the (debounced) editor
-  buffer — same origin-less isolation, but relative assets only load in the authoritative `/raw`
-  preview, so that mode stays the fidelity reference.
+  buffer — same origin-less isolation. **Relative assets load in neither mode today:** `/raw` is
+  the single-segment `/raw/{ticket}`, so a page's `app.js` or `figs/a.png` 404s or falls through
+  to the app shell; only self-contained HTML (e.g. MultiQC) renders fully. The planned fix is a
+  directory-scoped `/raw/{ticket}/{*path}` ([plan](../document-workbench-plan.md#phase-4-embeds-in-documents-and-in-chat)).
   PDF metadata arrives progressively so the first pages paint before a long document is scanned;
   rasters cap at 12M pixels and inactive canvases use an 8-page LRU. Selectable text is a bounded
   enhancement: a page over 5,000 text items stays canvas-only, and the viewer keeps at most 12,000
@@ -251,8 +253,8 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   surfaces. A pane keeps an in-place retry for ordinary tunnel loss; a shared notice offers reload
   when the current asset graph is unavailable. Reload waits behind unsaved file edits and chat
   drafts that exist only in memory, with an explicit reload-anyway escape hatch.
-- **Binary / Finder.** Non-text files get a hex/summary view (`BinaryView`); `FinderView` is a
-  directory browser surface.
+- **Binary / Finder.** Non-text files get an info card (`BinaryView`: name, size, modified time
+  from the parent listing; no hex view yet); `FinderView` is a directory browser surface.
 
 ## Preview keep-alive & live-update
 

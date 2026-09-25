@@ -97,7 +97,9 @@ pipe), `POST /api/v1/sessions` (spawn), `POST /api/v1/sessions/{id}/exec`,
   to open it in a pane, a directory to reveal it in the Finder + file tree.
 - **How it's used.** Hover a path; if the daemon confirms it exists, it underlines. A file opens
   in the **active pane** (reusing an already-open tab); a directory opens/reuses the Finder beside
-  the terminal. Cmd/Ctrl+click forces a new split. A trailing `:42` line suffix is carried.
+  the terminal. Cmd/Ctrl+click forces a new split. A trailing `:42` line suffix is parsed but
+  not yet used: the file opens at the top (tabs have no line field yet; see the
+  [plan](../document-workbench-plan.md#phase-1-links-that-always-open)).
 - **Where it lives.** `web-ui/src/lib/terminal/links.ts` (`PathLinkProvider`), validation via
   `POST /api/v1/fs/validate` (`fsValidate` in `web-ui/src/lib/previews/files.ts`).
 - **Key behaviors.** **Arbitrary web URLs are still deliberately *not* linkified** (no
