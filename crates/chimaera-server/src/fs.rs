@@ -8,8 +8,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
-use std::io::{BufRead, Read, Seek, SeekFrom};
+use std::io::{BufRead, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, UNIX_EPOCH};
@@ -64,6 +63,20 @@ const MAX_XLSX_ENTRIES: usize = 4096;
 /// Hard cap on candidates per `fs/validate` request (the UI batches one
 /// request per visible-viewport scan).
 const MAX_VALIDATE_CANDIDATES: usize = 50;
+/// Longest `fs/validate` candidate considered: longer strings are not paths
+/// an agent wrote, and each one costs a canonicalize per base.
+const MAX_VALIDATE_CANDIDATE_BYTES: usize = 1024;
+/// Most extra `bases` one `fs/validate` request may add after `base`.
+const MAX_VALIDATE_BASES: usize = 8;
+/// Most matches one ambiguous `fs/validate` candidate lists.
+const MAX_AMBIGUOUS: usize = 5;
+/// Most index matches existence-checked per `fs/validate` candidate.
+const MAX_AMBIGUOUS_PROBES: usize = 8;
+/// Wall-clock budget for one `fs/validate` request. With up to nine bases
+/// and a diff-prefix retry, a 50-candidate batch is up to ~900 canonicalize
+/// calls — seconds on a cold NFS mount — and link underlining is not worth
+/// holding a limiter permit longer than this.
+const VALIDATE_BUDGET: Duration = Duration::from_secs(5);
 /// Hard cap on entries returned by a single `fs/dirs` / `fs/list` listing.
 /// The daemon runs on shared login nodes over NFS/Lustre where a scratch dir
 /// can hold hundreds of thousands of entries; without a ceiling a single
@@ -179,25 +192,54 @@ fn gz_mime(path: &Path) -> mime_guess::Mime {
 /// header and PUT `expect_mtime` conflict check. mtime remains the primary
 /// signal, but length plus Unix inode/ctime identity catch a same-size rewrite
 /// whose timestamp was preserved or rounded by a coarse shared filesystem.
+///
+/// Clients hold tokens across daemon restarts and upgrades, so the digest must
+/// be stable across Rust releases: SHA-256 over fixed-width little-endian
+/// fields, never `DefaultHasher` (whose algorithm std may change).
 fn mtime_token(meta: &std::fs::Metadata) -> String {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    meta.modified()
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    let modified = meta
+        .modified()
         .ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map_or(0, |d| d.as_nanos())
-        .hash(&mut hasher);
-    meta.len().hash(&mut hasher);
-    meta.is_file().hash(&mut hasher);
-    meta.is_dir().hash(&mut hasher);
+        .map_or(0, |d| d.as_nanos());
+    hasher.update(modified.to_le_bytes());
+    hasher.update(meta.len().to_le_bytes());
+    hasher.update([u8::from(meta.is_file()), u8::from(meta.is_dir())]);
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        meta.dev().hash(&mut hasher);
-        meta.ino().hash(&mut hasher);
-        meta.ctime().hash(&mut hasher);
-        meta.ctime_nsec().hash(&mut hasher);
+        hasher.update(meta.dev().to_le_bytes());
+        hasher.update(meta.ino().to_le_bytes());
+        hasher.update(meta.ctime().to_le_bytes());
+        hasher.update(meta.ctime_nsec().to_le_bytes());
     }
-    hasher.finish().max(1).to_string()
+    let digest = hasher.finalize();
+    let mut head = [0u8; 8];
+    head.copy_from_slice(&digest[..8]);
+    u64::from_le_bytes(head).max(1).to_string()
+}
+
+/// Lowercase hex SHA-256 of `bytes` — the `X-Content-Hash` / `expect_hash`
+/// version of a file's contents.
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex_lower(&Sha256::digest(bytes))
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
+/// A header value from a token/hash we minted (ASCII digits or hex).
+fn ascii_header(value: &str) -> HeaderValue {
+    HeaderValue::from_str(value).unwrap_or(HeaderValue::from_static("0"))
 }
 
 /// 400 with a JSON error body.
@@ -267,8 +309,9 @@ where
     }
 }
 
-/// Response-shaped companion to [`blocking_json`] for byte-range reads.
-async fn blocking_response<F>(work: F) -> Response
+/// Response-shaped companion to [`blocking_json`] for byte-range reads (and
+/// any other route whose blocking filesystem work must share the limiter).
+pub(crate) async fn blocking_response<F>(work: F) -> Response
 where
     F: FnOnce() -> anyhow::Result<Response> + Send + 'static,
 {
@@ -492,7 +535,10 @@ pub(crate) struct FileQuery {
 /// GET /api/v1/fs/file?path=&offset=0&limit=262144 — raw bytes of a slice of
 /// the file, with `X-File-Size` (total size), `X-Truncated` (whether bytes
 /// remain past this slice), and `X-Mtime` (opaque modification token, echoed
-/// back by PUT's `expect_mtime`) headers. `limit` is capped at 2MB.
+/// back by PUT's `expect_mtime`) headers. `limit` is capped at 2MB. When the
+/// body is the WHOLE raw file (offset 0, nothing left past it, not a gzip
+/// decode) it also carries `X-Content-Hash`: the lowercase hex SHA-256 of
+/// exactly these bytes, echoed back by PUT's `expect_hash`.
 ///
 /// `.gz`/`.bgz` paths are decompressed transparently: `offset`/`limit` then
 /// address DECOMPRESSED bytes (sequential decode, capped), the Content-Type
@@ -509,18 +555,26 @@ pub(crate) async fn file(Query(query): Query<FileQuery>) -> Response {
 /// Build the `fs/file` response for a plain or gzip-compressed file.
 fn read_file_response(raw: &str, offset: u64, limit: u64) -> anyhow::Result<Response> {
     let path = canonical_file(raw)?;
-    let meta =
-        std::fs::metadata(&path).with_context(|| format!("{}: failed to stat", path.display()))?;
-    let mtime = mtime_token(&meta);
 
-    let (mime, total, bytes, truncated) = if is_gzip_path(&path) {
+    let (mime, total, bytes, truncated, mtime, hash) = if is_gzip_path(&path) {
+        let meta = std::fs::metadata(&path)
+            .with_context(|| format!("{}: failed to stat", path.display()))?;
         let (total, bytes, more) = read_gz_slice(&path, offset, limit)?;
-        (gz_mime(&path), total, bytes, more)
+        (gz_mime(&path), total, bytes, more, mtime_token(&meta), None)
     } else {
-        let (total, bytes) = read_file_slice(&path, offset, limit)?;
-        let truncated = offset.saturating_add(bytes.len() as u64) < total;
+        let slice = read_file_slice(&path, offset, limit)?;
+        // Hash only a body that IS the file: a client may echo this as
+        // `expect_hash`, and a slice's hash would never match the disk.
+        let hash = (offset == 0 && slice.eof).then(|| sha256_hex(&slice.bytes));
         let mime = mime_guess::from_path(&path).first_or_octet_stream();
-        (mime, Some(total), bytes, truncated)
+        (
+            mime,
+            Some(slice.total),
+            slice.bytes,
+            !slice.eof,
+            slice.mtime,
+            hash,
+        )
     };
 
     let mut response = (
@@ -535,34 +589,78 @@ fn read_file_response(raw: &str, offset: u64, limit: u64) -> anyhow::Result<Resp
         bytes,
     )
         .into_response();
+    let headers = response.headers_mut();
     if let Some(total) = total {
-        response.headers_mut().insert(
+        headers.insert(
             HeaderName::from_static("x-file-size"),
-            // Always ASCII digits; from_str cannot fail on it.
-            HeaderValue::from_str(&total.to_string()).unwrap_or(HeaderValue::from_static("0")),
+            ascii_header(&total.to_string()),
+        );
+    }
+    if let Some(hash) = hash {
+        headers.insert(
+            HeaderName::from_static("x-content-hash"),
+            ascii_header(&hash),
         );
     }
     Ok(response)
 }
 
+/// One plain-file read: the bytes, whether they reach EOF, the file size, and
+/// the version token of the descriptor they were read from.
+struct FileSlice {
+    bytes: Vec<u8>,
+    /// Nothing remains past this slice (observed by reading, not by `stat`).
+    eof: bool,
+    total: u64,
+    mtime: String,
+}
+
 /// Read up to `limit` bytes of the (canonical) file at `path` starting at
-/// `offset`. Returns the total file size and the bytes.
-fn read_file_slice(path: &Path, offset: u64, limit: u64) -> anyhow::Result<(u64, Vec<u8>)> {
+/// `offset`. EOF is judged by reading one byte past the slice rather than by
+/// the size `fstat` reported, so a file that grows or shrinks between the two
+/// can never earn a whole-file hash for a partial body.
+fn read_file_slice(path: &Path, offset: u64, limit: u64) -> anyhow::Result<FileSlice> {
     let mut file =
         std::fs::File::open(path).with_context(|| format!("{}: failed to open", path.display()))?;
-    let total = file
+    let meta = file
         .metadata()
-        .with_context(|| format!("{}: failed to stat", path.display()))?
-        .len();
-    let mut bytes = Vec::new();
-    if offset < total {
+        .with_context(|| format!("{}: failed to stat", path.display()))?;
+    let stat_len = meta.len();
+    let probe = limit.saturating_add(1);
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(probe.min(stat_len.saturating_sub(offset) + 1)).unwrap_or(0),
+    );
+    // Past the end there is nothing to read (and a huge offset would only
+    // make lseek fail): an empty, non-truncated slice, as always.
+    if offset <= stat_len {
         file.seek(SeekFrom::Start(offset))
             .with_context(|| format!("{}: failed to seek", path.display()))?;
-        file.take(limit)
+        (&mut file)
+            .take(probe)
             .read_to_end(&mut bytes)
             .with_context(|| format!("{}: failed to read", path.display()))?;
     }
-    Ok((total, bytes))
+    let eof = bytes.len() as u64 <= limit;
+    if !eof {
+        bytes.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+    }
+    let read_end = offset.saturating_add(bytes.len() as u64);
+    let total = if eof && !bytes.is_empty() {
+        read_end
+    } else if eof && offset == 0 {
+        0
+    } else if eof {
+        // Past EOF: the read proves only that the file ends at or before `offset`.
+        stat_len.min(offset)
+    } else {
+        stat_len.max(read_end.saturating_add(1))
+    };
+    Ok(FileSlice {
+        bytes,
+        eof,
+        total,
+        mtime: mtime_token(&meta),
+    })
 }
 
 /// Sequentially decode the gzip file at `path`, skipping `offset`
@@ -613,23 +711,59 @@ pub(crate) struct PutFileQuery {
     path: String,
     #[serde(default)]
     expect_mtime: Option<String>,
+    #[serde(default)]
+    expect_hash: Option<String>,
 }
 
-/// Outcome of an attempted atomic write.
+/// Largest file a PUT precondition hashes. A client can only hold the
+/// `X-Content-Hash` of a file it received whole in one `fs/file` read, so a
+/// bigger file can never match `expect_hash`; this also bounds the work a
+/// stale PUT against a huge file can cause.
+const MAX_HASH_BYTES: u64 = MAX_FILE_CHUNK;
+
+/// What the client says it edited. `expect_hash` wins over `expect_mtime`.
+#[derive(Clone, Copy)]
+enum Precondition<'a> {
+    None,
+    Mtime(&'a str),
+    Hash(&'a str),
+}
+
+/// Outcome of an attempted write.
 enum WriteOutcome {
-    /// Written; carries the file's new `X-Mtime` token.
-    Written(String),
-    /// The on-disk mtime no longer matches `expect_mtime`.
-    Conflict,
+    /// The body's bytes are on disk: written by this call (`wrote`), or
+    /// already there (an idempotent retry after a lost reply). Carries the
+    /// file's `X-Mtime` token and `X-Content-Hash`.
+    Written {
+        mtime: String,
+        hash: String,
+        wrote: bool,
+    },
+    /// The precondition failed. Carries the disk's current token and hash
+    /// when they are known (absent for a missing file; no hash past
+    /// [`MAX_HASH_BYTES`]).
+    Conflict {
+        mtime: Option<String>,
+        hash: Option<String>,
+    },
 }
 
-/// PUT /api/v1/fs/file?path=&expect_mtime= — write the raw request body to
-/// the file, atomically (hidden sibling tmp + rename), creating it if its
-/// parent directory exists. 204 on success with the new `X-Mtime` so the
-/// editor can chain saves; 400 for directories/missing parents; 409
-/// `{"error":"file changed on disk"}` when `expect_mtime` (the token from a
-/// previous GET/PUT) no longer matches — the check is skipped when the param
-/// is absent; 413 over 1MB (editing is for small text files).
+/// PUT /api/v1/fs/file?path=&expect_hash=&expect_mtime= — write the raw
+/// request body to the file, creating it if its parent directory exists. 204
+/// on success with the new `X-Mtime` and `X-Content-Hash` (of the bytes now on
+/// disk) so the editor can chain saves; 400 for directories, non-regular
+/// files, dangling symlinks and missing parents; 413 over 1MB (editing is for
+/// small text files); 409 `{"error":"file changed on disk"}` when the
+/// precondition fails, with `X-Mtime`/`X-Content-Hash` describing the current
+/// disk state when known.
+///
+/// Preconditions (neither = unconditional overwrite):
+/// - `expect_hash` (a previous `X-Content-Hash`): the file's CURRENT bytes are
+///   hashed — opening forces fresh attributes on NFS, unlike a cached `stat`.
+///   A mismatch whose disk bytes already equal the body answers success
+///   without writing, so a retry after a lost reply is a no-op, not a 409
+///   against our own write. A missing file is a 409.
+/// - `expect_mtime` (a previous `X-Mtime`): the metadata token must match.
 pub(crate) async fn put_file(
     State(state): State<Arc<AppState>>,
     Query(query): Query<PutFileQuery>,
@@ -649,7 +783,13 @@ pub(crate) async fn put_file(
     }
     let dirty_path = query.path.clone();
     let result = tokio::task::spawn_blocking(move || {
-        write_file_atomic(&query.path, &body, query.expect_mtime.as_deref())
+        let expect_hash = query.expect_hash.map(|h| h.to_ascii_lowercase());
+        let pre = match (expect_hash.as_deref(), query.expect_mtime.as_deref()) {
+            (Some(hash), _) => Precondition::Hash(hash),
+            (None, Some(mtime)) => Precondition::Mtime(mtime),
+            (None, None) => Precondition::None,
+        };
+        write_file(&query.path, &body, pre)
     })
     .await;
     match result {
@@ -658,48 +798,255 @@ pub(crate) async fn put_file(
             Json(json!({"error": format!("file-write task failed: {join}")})),
         )
             .into_response(),
-        Ok(Ok(WriteOutcome::Written(mtime))) => {
-            // A save is a git-relevant change: nudge the workspace(s) holding
-            // this path so the tree/panel refetch without any polling.
-            crate::git::mark_path_dirty(&state, &dirty_path).await;
+        Ok(Ok(WriteOutcome::Written { mtime, hash, wrote })) => {
+            if wrote {
+                // A save is a git-relevant change: nudge the workspace(s)
+                // holding this path so the tree/panel refetch without any
+                // polling (and watching windows re-probe it promptly).
+                crate::git::mark_path_dirty(&state, &dirty_path).await;
+            }
             let mut response = StatusCode::NO_CONTENT.into_response();
-            response.headers_mut().insert(
-                HeaderName::from_static("x-mtime"),
-                // The token is ASCII digits; from_str cannot fail on it.
-                HeaderValue::from_str(&mtime).unwrap_or(HeaderValue::from_static("0")),
+            let headers = response.headers_mut();
+            headers.insert(HeaderName::from_static("x-mtime"), ascii_header(&mtime));
+            headers.insert(
+                HeaderName::from_static("x-content-hash"),
+                ascii_header(&hash),
             );
             response
         }
-        Ok(Ok(WriteOutcome::Conflict)) => (
-            StatusCode::CONFLICT,
-            Json(json!({"error": "file changed on disk"})),
-        )
-            .into_response(),
+        Ok(Ok(WriteOutcome::Conflict { mtime, hash })) => {
+            let mut response = (
+                StatusCode::CONFLICT,
+                Json(json!({"error": "file changed on disk"})),
+            )
+                .into_response();
+            let headers = response.headers_mut();
+            if let Some(mtime) = mtime {
+                headers.insert(HeaderName::from_static("x-mtime"), ascii_header(&mtime));
+            }
+            if let Some(hash) = hash {
+                headers.insert(
+                    HeaderName::from_static("x-content-hash"),
+                    ascii_header(&hash),
+                );
+            }
+            response
+        }
         Ok(Err(err)) => bad_request(&err),
     }
 }
 
-/// Write `bytes` to the file at `raw` atomically: a hidden tmp sibling (never
-/// visible in listings, even transiently) is written, given the original
-/// file's permissions, then renamed over the target. Refuses directories and
-/// paths whose parent directory does not exist.
-fn write_file_atomic(
-    raw: &str,
-    bytes: &[u8],
-    expect_mtime: Option<&str>,
-) -> anyhow::Result<WriteOutcome> {
+/// The disk's current version of an existing file: its token, and its content
+/// hash when it is at most [`MAX_HASH_BYTES`]. Reads through `file`, so the
+/// answer describes that descriptor's inode.
+fn file_version(file: &mut std::fs::File) -> std::io::Result<(String, Option<String>)> {
+    use sha2::{Digest, Sha256};
+    let meta = file.metadata()?;
+    let token = mtime_token(&meta);
+    if meta.len() > MAX_HASH_BYTES {
+        return Ok((token, None));
+    }
+    file.seek(SeekFrom::Start(0))?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    let mut seen = 0u64;
+    loop {
+        let n = match file.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        };
+        seen += n as u64;
+        if seen > MAX_HASH_BYTES {
+            // Grew past the cap mid-read: no hash, same as a big file.
+            return Ok((token, None));
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok((token, Some(hex_lower(&hasher.finalize()))))
+}
+
+/// [`file_version`] by path; `None` when the file does not exist.
+fn path_version(path: &Path) -> anyhow::Result<Option<(String, Option<String>)>> {
+    match std::fs::File::open(path) {
+        Ok(mut file) => Ok(Some(file_version(&mut file).with_context(|| {
+            format!("{}: failed to read current contents", path.display())
+        })?)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => {
+            Err(anyhow::Error::new(err).context(format!("{}: failed to open", path.display())))
+        }
+    }
+}
+
+/// Judge `pre` against the disk's current state (`None` = missing). `Ok(())`
+/// means go ahead and write; `Err(outcome)` is the answer instead — a
+/// conflict, or success without a write when the disk already holds exactly
+/// the body (the idempotent-retry case, `expect_hash` only).
+fn judge(
+    pre: Precondition<'_>,
+    current: Option<(String, Option<String>)>,
+    body_hash: &str,
+) -> Result<(), WriteOutcome> {
+    match pre {
+        Precondition::None => Ok(()),
+        Precondition::Mtime(expect) => match current {
+            Some((mtime, _)) if mtime == expect => Ok(()),
+            Some((mtime, hash)) => Err(WriteOutcome::Conflict {
+                mtime: Some(mtime),
+                hash,
+            }),
+            None => Err(WriteOutcome::Conflict {
+                mtime: None,
+                hash: None,
+            }),
+        },
+        Precondition::Hash(expect) => match current {
+            Some((_, Some(hash))) if hash == expect => Ok(()),
+            Some((mtime, Some(hash))) if hash == body_hash => Err(WriteOutcome::Written {
+                mtime,
+                hash,
+                wrote: false,
+            }),
+            Some((mtime, hash)) => Err(WriteOutcome::Conflict {
+                mtime: Some(mtime),
+                hash,
+            }),
+            None => Err(WriteOutcome::Conflict {
+                mtime: None,
+                hash: None,
+            }),
+        },
+    }
+}
+
+/// The disk version `pre` needs to be judged: a stat for `expect_mtime`, the
+/// full hash only for `expect_hash`, nothing without a precondition.
+fn version_for(
+    pre: Precondition<'_>,
+    path: &Path,
+) -> anyhow::Result<Option<(String, Option<String>)>> {
+    match pre {
+        Precondition::None => Ok(None),
+        Precondition::Mtime(_) => match std::fs::metadata(path) {
+            Ok(meta) => Ok(Some((mtime_token(&meta), None))),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => {
+                Err(anyhow::Error::new(err).context(format!("{}: failed to stat", path.display())))
+            }
+        },
+        Precondition::Hash(_) => path_version(path),
+    }
+}
+
+/// Removes its temp file on drop unless disarmed, so every early return and
+/// `?` after the temp exists cleans up (a full disk must not leave a partial
+/// hidden file behind).
+struct TempFile(Option<PathBuf>);
+
+impl TempFile {
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// Longest file name most filesystems accept (NAME_MAX).
+const MAX_NAME_BYTES: usize = 255;
+
+/// The hidden temp sibling's name: `.{name}.{8 random}.tmp`, with `name`
+/// shortened (at a UTF-8 boundary when it is UTF-8) so the whole stays within
+/// [`MAX_NAME_BYTES`] — a 250-byte file name must still be saveable.
+fn temp_name(name: &std::ffi::OsStr) -> std::ffi::OsString {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    let nonce = &chimaera_core::generate_token()[..8];
+    let budget = MAX_NAME_BYTES - (".".len() + ".".len() + nonce.len() + ".tmp".len());
+    let bytes = name.as_bytes();
+    let mut cut = bytes.len().min(budget);
+    // Never split a multi-byte character: back off past continuation bytes.
+    while cut > 0 && cut < bytes.len() && (bytes[cut] & 0b1100_0000) == 0b1000_0000 {
+        cut -= 1;
+    }
+    let mut out = Vec::with_capacity(cut + 14);
+    out.push(b'.');
+    out.extend_from_slice(&bytes[..cut]);
+    out.push(b'.');
+    out.extend_from_slice(nonce.as_bytes());
+    out.extend_from_slice(b".tmp");
+    std::ffi::OsString::from_vec(out)
+}
+
+/// Give the temp file the target's owner and group where the kernel allows.
+/// A non-root daemon can never give a file away, but may move it to any group
+/// it belongs to — the shared project directory case — so a refused full
+/// `fchown` retries with the group alone. Failures are expected and ignored.
+fn carry_owner(file: &std::fs::File, target: &std::fs::Metadata) {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(now) = file.metadata() else { return };
+    if now.uid() == target.uid() && now.gid() == target.gid() {
+        return;
+    }
+    if std::os::unix::fs::fchown(file, Some(target.uid()), Some(target.gid())).is_err()
+        && now.gid() != target.gid()
+    {
+        let _ = std::os::unix::fs::fchown(file, None, Some(target.gid()));
+    }
+}
+
+/// fsync a directory so a completed rename survives a crash. Best effort:
+/// some filesystems (and FUSE/NFS mounts) refuse to open or sync directories.
+fn sync_dir(dir: &Path) {
+    if let Ok(handle) = std::fs::File::open(dir) {
+        let _ = handle.sync_all();
+    }
+}
+
+/// Write `bytes` to the file at `raw` under `pre`.
+///
+/// Normally atomic: a hidden temp sibling (never visible in listings, even
+/// transiently) is created with the target's permission bits (never more
+/// permissive, even before the exact `fchmod`), given its owner/group where
+/// allowed, written, fsynced, and renamed over the target; then the directory
+/// is fsynced. A live symlink is written THROUGH (its target is replaced; the
+/// link stays). Refuses directories, non-regular files, dangling symlinks
+/// (replacing the link with a regular file would silently detach it) and paths
+/// whose parent directory does not exist.
+///
+/// A target with other hard links is rewritten in place instead (see
+/// [`write_in_place`]).
+fn write_file(raw: &str, bytes: &[u8], pre: Precondition<'_>) -> anyhow::Result<WriteOutcome> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
     let expanded = expand_tilde(raw)?;
+    let body_hash = sha256_hex(bytes);
     let (target, existing) = match std::fs::metadata(&expanded) {
         Ok(meta) if meta.is_dir() => {
             anyhow::bail!("{} is a directory", expanded.display());
+        }
+        Ok(meta) if !meta.is_file() => {
+            anyhow::bail!("{} is not a regular file", expanded.display());
         }
         Ok(meta) => {
             let path =
                 std::fs::canonicalize(&expanded).with_context(|| expanded.display().to_string())?;
             (path, Some(meta))
         }
-        // New file: the parent directory must already exist.
-        Err(_) => {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            if std::fs::symlink_metadata(&expanded).is_ok_and(|m| m.file_type().is_symlink()) {
+                anyhow::bail!(
+                    "{} is a symlink to a missing file; refusing to replace the link with a regular file",
+                    expanded.display()
+                );
+            }
+            // New file: the parent directory must already exist.
             let name = expanded
                 .file_name()
                 .map(|n| n.to_os_string())
@@ -715,41 +1062,172 @@ fn write_file_atomic(
             }
             (parent.join(name), None)
         }
+        Err(err) => {
+            return Err(
+                anyhow::Error::new(err).context(format!("{}: failed to stat", expanded.display()))
+            );
+        }
     };
 
-    if let Some(expect) = expect_mtime {
-        // The client edited some version of the file; if the disk moved on
-        // (or the file vanished) since that version, refuse to clobber it.
-        if existing.as_ref().map(mtime_token).as_deref() != Some(expect) {
-            return Ok(WriteOutcome::Conflict);
-        }
+    // First check: refuse before doing any write work.
+    if let Err(outcome) = judge(pre, version_for(pre, &target)?, &body_hash) {
+        return Ok(outcome);
     }
 
-    let tmp = target.with_file_name(format!(
-        ".{}.{}.tmp",
-        target
-            .file_name()
-            .map(|n| n.to_string_lossy())
-            .unwrap_or_default(),
-        &chimaera_core::generate_token()[..8]
-    ));
-    std::fs::write(&tmp, bytes).with_context(|| format!("failed to write {}", tmp.display()))?;
+    if existing.as_ref().is_some_and(|meta| meta.nlink() > 1) {
+        return write_in_place(&target, bytes, pre, body_hash);
+    }
+
+    let parent = target
+        .parent()
+        .with_context(|| format!("{} has no parent directory", target.display()))?;
+    let name = target
+        .file_name()
+        .with_context(|| format!("{} has no file name", target.display()))?;
+    let tmp = parent.join(temp_name(name));
+    let mode = existing
+        .as_ref()
+        .map_or(0o666, |meta| meta.permissions().mode() & 0o7777);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(&tmp)
+        .with_context(|| format!("failed to create {}", tmp.display()))?;
+    let mut guard = TempFile(Some(tmp.clone()));
     if let Some(meta) = &existing {
-        // Keep the original mode (e.g. an executable script stays executable).
-        // Best-effort: a failure here still leaves a correct write.
-        if let Err(err) = std::fs::set_permissions(&tmp, meta.permissions()) {
+        // Owner first: a successful chown clears setuid/setgid bits, which
+        // the exact chmod below then restores. The open's mode was filtered by
+        // the umask; the chmod restores bits it dropped (e.g. group write on a
+        // shared file). Best-effort: a failure still leaves a correct write.
+        carry_owner(&file, meta);
+        if let Err(err) = file.set_permissions(meta.permissions()) {
             tracing::warn!(path = %tmp.display(), %err, "failed to carry permissions onto tmp file");
         }
     }
-    if let Err(err) = std::fs::rename(&tmp, &target) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(
-            anyhow::Error::new(err).context(format!("failed to rename into {}", target.display()))
-        );
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .with_context(|| format!("failed to write {}", tmp.display()))?;
+    drop(file);
+
+    // Second check, as late as possible: another writer may have landed
+    // while the temp was written and synced. What remains is the gap between
+    // this read and rename(2) itself — POSIX has no compare-and-rename, and
+    // NFS offers no lock every writer honours — so a write landing in those
+    // microseconds is still replaced.
+    if let Err(outcome) = judge(pre, version_for(pre, &target)?, &body_hash) {
+        return Ok(outcome);
     }
+    std::fs::rename(&tmp, &target)
+        .with_context(|| format!("failed to rename into {}", target.display()))?;
+    guard.disarm();
+    sync_dir(parent);
+
     let meta = std::fs::metadata(&target)
         .with_context(|| format!("{}: failed to stat after write", target.display()))?;
-    Ok(WriteOutcome::Written(mtime_token(&meta)))
+    Ok(WriteOutcome::Written {
+        mtime: mtime_token(&meta),
+        hash: body_hash,
+        wrote: true,
+    })
+}
+
+/// Rewrite a hard-linked file in place. Renaming a temp over one name would
+/// split it from its other links (they would keep the old bytes), so the
+/// inode itself is overwritten, which also keeps owner, mode and ACLs. The
+/// cost is atomicity: a reader can see a torn file mid-write, and a crash or
+/// I/O error mid-write leaves one. Bytes are written before the truncate so
+/// the file is never transiently empty. The precondition is judged on the
+/// same descriptor right before writing.
+fn write_in_place(
+    target: &Path,
+    bytes: &[u8],
+    pre: Precondition<'_>,
+    body_hash: String,
+) -> anyhow::Result<WriteOutcome> {
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(target)
+        .with_context(|| format!("{}: failed to open for writing", target.display()))?;
+    let current =
+        match pre {
+            Precondition::None => None,
+            Precondition::Mtime(_) => Some((
+                mtime_token(
+                    &file
+                        .metadata()
+                        .with_context(|| format!("{}: failed to stat", target.display()))?,
+                ),
+                None,
+            )),
+            Precondition::Hash(_) => Some(file_version(&mut file).with_context(|| {
+                format!("{}: failed to read current contents", target.display())
+            })?),
+        };
+    if let Err(outcome) = judge(pre, current, &body_hash) {
+        return Ok(outcome);
+    }
+    let ctx = || format!("failed to write {} in place", target.display());
+    file.seek(SeekFrom::Start(0)).with_context(ctx)?;
+    file.write_all(bytes).with_context(ctx)?;
+    file.set_len(bytes.len() as u64).with_context(ctx)?;
+    file.sync_all().with_context(ctx)?;
+    let meta = file
+        .metadata()
+        .with_context(|| format!("{}: failed to stat after write", target.display()))?;
+    Ok(WriteOutcome::Written {
+        mtime: mtime_token(&meta),
+        hash: body_hash,
+        wrote: true,
+    })
+}
+
+#[cfg(test)]
+mod write_tests {
+    use super::*;
+
+    /// Every exit between creating the temp and renaming it drops the guard
+    /// armed, so no failure after that point can leave a hidden temp behind.
+    #[test]
+    fn temp_guard_removes_unless_disarmed() {
+        let dir = std::env::temp_dir().join(format!(
+            "chimaera-temp-guard-{}-{}",
+            std::process::id(),
+            &chimaera_core::generate_token()[..8]
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dropped = dir.join(".a.tmp");
+        std::fs::write(&dropped, b"x").unwrap();
+        drop(TempFile(Some(dropped.clone())));
+        assert!(!dropped.exists());
+
+        let kept = dir.join(".b.tmp");
+        std::fs::write(&kept, b"x").unwrap();
+        let mut guard = TempFile(Some(kept.clone()));
+        guard.disarm();
+        drop(guard);
+        assert!(kept.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn temp_names_fit_name_max_without_splitting_characters() {
+        use std::os::unix::ffi::OsStrExt;
+        let short = temp_name(std::ffi::OsStr::new("notes.md"));
+        let short = short.to_str().unwrap();
+        assert!(
+            short.starts_with(".notes.md.") && short.ends_with(".tmp"),
+            "{short}"
+        );
+        assert_eq!(short.len(), ".notes.md.".len() + 8 + ".tmp".len());
+
+        // 254 bytes of two-byte characters: cut to fit, on a boundary.
+        let long = "é".repeat(127);
+        let name = temp_name(std::ffi::OsStr::new(&long));
+        assert!(name.as_bytes().len() <= MAX_NAME_BYTES);
+        assert!(name.to_str().is_some(), "split a character: {name:?}");
+    }
 }
 
 #[derive(Deserialize)]
@@ -757,15 +1235,24 @@ pub(crate) struct MarkdownQuery {
     path: String,
 }
 
-/// GET /api/v1/fs/markdown?path= — the file rendered as sanitized GFM HTML.
+/// GET /api/v1/fs/markdown?path= — `{html, frontmatter}`: the file rendered
+/// as sanitized GFM HTML (see [`markdown_to_html`] for what it carries), and
+/// the raw text of a leading YAML frontmatter block (see [`frontmatter`];
+/// delimiter lines excluded) or null.
 pub(crate) async fn markdown(Query(query): Query<MarkdownQuery>) -> Response {
-    blocking_json(move || Ok(json!({"html": render_markdown(&query.path)?}))).await
+    blocking_json(move || {
+        let text = read_markdown(&query.path)?;
+        Ok(json!({
+            "html": sanitize_markdown(&markdown_to_html(&text)),
+            "frontmatter": frontmatter(&text).map(|f| f.inner),
+        }))
+    })
+    .await
 }
 
-/// Render the markdown file at `raw` with comrak (GFM extensions + dollar
-/// math), then sanitize so raw HTML in the source cannot inject scripts.
-/// Files over 4MB are rejected.
-fn render_markdown(raw: &str) -> anyhow::Result<String> {
+/// Read the markdown file at `raw` as (lossy) UTF-8. Files over 4MB are
+/// rejected.
+fn read_markdown(raw: &str) -> anyhow::Result<String> {
     let path = canonical_file(raw)?;
     let size = std::fs::metadata(&path)
         .with_context(|| format!("{}: failed to stat", path.display()))?
@@ -778,8 +1265,78 @@ fn render_markdown(raw: &str) -> anyhow::Result<String> {
     }
     let bytes =
         std::fs::read(&path).with_context(|| format!("{}: failed to read", path.display()))?;
-    let text = String::from_utf8_lossy(&bytes);
-    Ok(sanitize_markdown(&markdown_to_html(&text)))
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// A leading YAML frontmatter block.
+struct Frontmatter<'a> {
+    /// The text between the delimiter lines, without the line break that
+    /// ends the last one (empty lines inside are kept).
+    inner: &'a str,
+    /// How many lines of the document the block occupies, delimiters
+    /// included.
+    lines: usize,
+}
+
+/// The leading `---` frontmatter block, when there is one. Two rules must
+/// agree for a block to count:
+///
+/// - comrak's front-matter split (`strings::split_off_front_matter`,
+///   reproduced exactly: an optional BOM, `---` alone on line 1, closed by
+///   the first line that is exactly `---` — a `\r\n` closer is searched
+///   first, as comrak does), because comrak is what removes it from the
+///   render;
+/// - the live editor's stricter shape (`mdLive.ts` `frontmatterEnd`): the
+///   closer within the first 200 lines and at least one `key:` line inside,
+///   so a document that merely opens with a thematic break keeps it.
+///
+/// [`markdown_to_html`] enables comrak's extension only for a block that
+/// passes both, and [`promote_math_blocks_mapped`] skips exactly the same
+/// lines.
+fn frontmatter(text: &str) -> Option<Frontmatter<'_>> {
+    const DELIM: &str = "---";
+    const MAX_LINES: usize = 200;
+    let s = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let after_open = s.strip_prefix(DELIM)?;
+    let open_len = DELIM.len()
+        + if after_open.starts_with('\n') {
+            1
+        } else if after_open.starts_with("\r\n") {
+            2
+        } else {
+            return None;
+        };
+    let body = &s[open_len..];
+    let close_nl = body
+        .find("\n---\r\n")
+        .or_else(|| body.find("\n---\n"))
+        .or_else(|| body.find("\n---"))?;
+    let after_close = &body[close_nl + 1 + DELIM.len()..];
+    if !(after_close.is_empty() || after_close.starts_with('\n') || after_close.starts_with("\r\n"))
+    {
+        return None;
+    }
+    let inner = &body[..close_nl];
+    // The opener, at least one inner line (comrak needs the `\n` before the
+    // closer, so `---\n---` is no block), and the closer.
+    let lines = 3 + inner.matches('\n').count();
+    if lines > MAX_LINES {
+        return None;
+    }
+    // The editor's `/^[A-Za-z0-9_-]+\s*:/`.
+    let keyed = inner.lines().any(|line| {
+        line.split_once(':').is_some_and(|(key, _)| {
+            let key = key.trim_end_matches([' ', '\t']);
+            !key.is_empty()
+                && key
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        })
+    });
+    keyed.then(|| Frontmatter {
+        inner: inner.strip_suffix('\r').unwrap_or(inner),
+        lines,
+    })
 }
 
 /// Promote `$$` BLOCKS to comrak's ```math fence before parsing. comrak's
@@ -810,9 +1367,15 @@ fn render_markdown(raw: &str) -> anyhow::Result<String> {
 /// later lines leave the item is promoted here while the editor ends it
 /// unclosed; a lazy quote line resets the `$$` parity here; and an
 /// unbalanced backtick hides the rest of its line from the parity count.
-fn promote_math_blocks(text: &str) -> Cow<'_, str> {
+///
+/// Promotion can add lines (text after an opening `$$`, or around a closing
+/// one, gets a line of its own), so the pass also returns a [`LineMap`] from
+/// its output's lines back to `text`'s, which keeps comrak's `data-sourcepos`
+/// in the source file's numbering.
+fn promote_math_blocks_mapped(text: &str) -> (Cow<'_, str>, LineMap) {
+    let mut map = LineMap::default();
     if !text.contains("$$") {
-        return Cow::Borrowed(text);
+        return (Cow::Borrowed(text), map);
     }
     fn body(line: &str) -> &str {
         line.trim_end_matches('\n').trim_end_matches('\r')
@@ -923,18 +1486,14 @@ fn promote_math_blocks(text: &str) -> Cow<'_, str> {
     let lines: Vec<&str> = text.split_inclusive('\n').collect();
     let mut out = String::with_capacity(text.len() + 32);
     let mut i = 0;
-    // A leading `---` frontmatter block is metadata, never math (the editor
-    // gates on the same shape).
-    if lines.first().is_some_and(|l| body(l) == "---") {
-        if let Some(close) = lines
-            .iter()
-            .skip(1)
-            .take(200)
-            .position(|l| body(l) == "---")
-        {
-            i = close + 2;
-            out.extend(lines[..i].iter().copied());
-        }
+    // Output lines before `counted` (a byte offset into `out`) are tallied in
+    // `out_lines`; blocks settle the tally before mapping their own lines.
+    let (mut out_lines, mut counted) = (0u32, 0usize);
+    // A leading frontmatter block is metadata, never math — the same block
+    // comrak and the editor set aside.
+    if let Some(fm) = frontmatter(text) {
+        i = fm.lines.min(lines.len());
+        out.extend(lines[..i].iter().copied());
     }
     let mut in_fence: Option<(u8, usize)> = None;
     let mut in_html = false;
@@ -1032,27 +1591,44 @@ fn promote_math_blocks(text: &str) -> Cow<'_, str> {
                     }
                 }
                 if let Some((j, k)) = closer {
+                    // Every line before the opener was copied whole (with its
+                    // newline), so the tally is exact here.
+                    out_lines +=
+                        u32::try_from(out[counted..].matches('\n').count()).unwrap_or(u32::MAX);
+                    let (open_src, close_src) = (line_no(i), line_no(j));
                     out.push_str(&open_prefix);
                     out.push_str("```math\n");
+                    map.next(&mut out_lines, open_src);
                     if !rest.trim().is_empty() {
                         out.push_str(&body_prefix);
                         out.push_str(rest);
                         out.push('\n');
+                        map.next(&mut out_lines, open_src);
                     }
-                    out.extend(lines[i + 1..j].iter().copied());
+                    if j > i + 1 {
+                        out.extend(lines[i + 1..j].iter().copied());
+                        map.next(&mut out_lines, line_no(i + 1));
+                        out_lines += line_no(j - 1) - line_no(i + 1);
+                    }
                     let bj = body(lines[j]);
                     let (before, after) = (&bj[..k], &bj[k + 2..]);
                     if !before[quote_prefix(before).1..].trim().is_empty() {
                         out.push_str(before);
                         out.push('\n');
+                        map.next(&mut out_lines, close_src);
                     }
                     out.push_str(&body_prefix);
                     out.push_str("```\n");
+                    map.next(&mut out_lines, close_src);
                     if !after.trim().is_empty() {
                         out.push_str(&bj[..quote_prefix(bj).1]);
                         out.push_str(after.trim_start());
                         out.push('\n');
+                        map.next(&mut out_lines, close_src);
                     }
+                    // The next copied line resumes in step with its source.
+                    map.at(out_lines + 1, line_no(j + 1));
+                    counted = out.len();
                     i = j + 1;
                     para_dollars = 0;
                     continue;
@@ -1063,38 +1639,209 @@ fn promote_math_blocks(text: &str) -> Cow<'_, str> {
         out.push_str(line);
         i += 1;
     }
+    (Cow::Owned(out), map)
+}
+
+/// [`promote_math_blocks_mapped`] without the map (the fixture's view).
+#[cfg(test)]
+fn promote_math_blocks(text: &str) -> Cow<'_, str> {
+    promote_math_blocks_mapped(text).0
+}
+
+/// 1-based line number of 0-based line index `i`.
+fn line_no(i: usize) -> u32 {
+    u32::try_from(i + 1).unwrap_or(u32::MAX)
+}
+
+/// Output line -> source line for text rewritten by
+/// [`promote_math_blocks_mapped`]. Stored as the few anchors where the two
+/// stop moving in step (a split-off fence line repeats its source line), so
+/// memory scales with promoted blocks, never with document length. Empty =
+/// identity.
+#[derive(Default)]
+struct LineMap {
+    /// `(output line, source line)`, both 1-based, output ascending.
+    anchors: Vec<(u32, u32)>,
+}
+
+impl LineMap {
+    /// The source line of output line `out` (1-based).
+    fn source_line(&self, out: u32) -> u32 {
+        match self.anchors.partition_point(|&(o, _)| o <= out) {
+            0 => out,
+            n => {
+                let (o, src) = self.anchors[n - 1];
+                src + (out - o)
+            }
+        }
+    }
+
+    /// Record that output line `out` comes from source line `src`, adding an
+    /// anchor only where that breaks step with the lines before it.
+    fn at(&mut self, out: u32, src: u32) {
+        if self.source_line(out) != src {
+            self.anchors.push((out, src));
+        }
+    }
+
+    /// [`Self::at`] for the next output line, advancing the tally.
+    fn next(&mut self, out_lines: &mut u32, src: u32) {
+        *out_lines += 1;
+        self.at(*out_lines, src);
+    }
+
+    fn is_identity(&self) -> bool {
+        self.anchors.is_empty()
+    }
+}
+
+/// Rewrite every `data-sourcepos="l:c-l:c"` in comrak's output from promoted
+/// lines to source lines. Columns inside a promoted block's split-off lines
+/// stay as comrak counted them (approximate there); lines are exact.
+fn remap_sourcepos<'a>(html: &'a str, map: &LineMap) -> Cow<'a, str> {
+    const ATTR: &str = "data-sourcepos=\"";
+    if map.is_identity() || !html.contains(ATTR) {
+        return Cow::Borrowed(html);
+    }
+    // `l:c-l:c` -> the four numbers, or None for anything else.
+    fn parse(value: &str) -> Option<[u32; 4]> {
+        let (start, end) = value.split_once('-')?;
+        let (l1, c1) = start.split_once(':')?;
+        let (l2, c2) = end.split_once(':')?;
+        Some([
+            l1.parse().ok()?,
+            c1.parse().ok()?,
+            l2.parse().ok()?,
+            c2.parse().ok()?,
+        ])
+    }
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    while let Some(i) = rest.find(ATTR) {
+        out.push_str(&rest[..i + ATTR.len()]);
+        rest = &rest[i + ATTR.len()..];
+        let Some(end) = rest.find('"') else { break };
+        match parse(&rest[..end]) {
+            Some([l1, c1, l2, c2]) => {
+                let (l1, l2) = (map.source_line(l1), map.source_line(l2));
+                out.push_str(&format!("{l1}:{c1}-{l2}:{c2}"));
+            }
+            None => out.push_str(&rest[..end]),
+        }
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
     Cow::Owned(out)
 }
 
 /// comrak renders a ```math fence — every promoted `$$` block, and a
-/// hand-written GitHub one — as `<pre><code class="language-math"
-/// data-math-style="display">`. The client keys on the SAME `<span
-/// data-math-style>` shape for every equation, so the fence chrome is
-/// rewritten to it here; the literal inside is already HTML-escaped, so the
-/// closing tags cannot occur within it.
+/// hand-written GitHub one — as `<pre[ data-sourcepos="…"]><code
+/// class="language-math" data-math-style="display">`. The client keys on the
+/// SAME `<span data-math-style>` shape for every equation, so the fence chrome
+/// is rewritten to it here, the source position moving to the `<p>`; the
+/// literal inside is already HTML-escaped, so the closing tags cannot occur
+/// within it.
 fn math_fences_to_spans(html: &str) -> Cow<'_, str> {
-    const OPEN: &str = "<pre><code class=\"language-math\" data-math-style=\"display\">";
+    const PRE: &str = "<pre";
+    const CODE: &str = "<code class=\"language-math\" data-math-style=\"display\">";
     const CLOSE: &str = "</code></pre>";
+    if !html.contains(CODE) {
+        return Cow::Borrowed(html);
+    }
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    while let Some(i) = rest.find(PRE) {
+        let tail = &rest[i + PRE.len()..];
+        let (pos, after_pre) = match tail
+            .strip_prefix(" data-sourcepos=\"")
+            .and_then(|t| t.split_once('"'))
+        {
+            Some((pos, after)) => (Some(pos), after),
+            None => (None, tail),
+        };
+        let Some(body) = after_pre
+            .strip_prefix('>')
+            .and_then(|t| t.strip_prefix(CODE))
+        else {
+            out.push_str(&rest[..i + PRE.len()]);
+            rest = tail;
+            continue;
+        };
+        out.push_str(&rest[..i]);
+        out.push_str("<p");
+        if let Some(pos) = pos {
+            out.push_str(" data-sourcepos=\"");
+            out.push_str(pos);
+            out.push('"');
+        }
+        out.push_str("><span data-math-style=\"display\">");
+        match body.find(CLOSE) {
+            Some(j) => {
+                out.push_str(&body[..j]);
+                out.push_str("</span></p>");
+                rest = &body[j + CLOSE.len()..];
+            }
+            None => {
+                out.push_str(body);
+                rest = "";
+            }
+        }
+    }
+    out.push_str(rest);
+    Cow::Owned(out)
+}
+
+/// comrak renders a task item's box as `<input type="checkbox"[
+/// data-sourcepos][ class][ checked=""] disabled="" />`. The sanitizer never
+/// allows `input` — a form control has no place in a rendered document — so
+/// each checkbox becomes an inert `<span class="md-task" data-task="done|todo">`
+/// first, keeping a `data-sourcepos` comrak put on it (a task in a table
+/// cell). A raw-HTML checkbox in the source becomes the same span, which is
+/// harmless; any other `<input>` is left for the sanitizer to drop.
+fn tasks_to_spans(html: &str) -> Cow<'_, str> {
+    const OPEN: &str = "<input";
     if !html.contains(OPEN) {
         return Cow::Borrowed(html);
+    }
+    /// The double-quoted value of `name` in `tag`, if present.
+    fn attr<'t>(tag: &'t str, name: &str) -> Option<&'t str> {
+        let marker = format!(" {name}=\"");
+        let start = tag.find(&marker)? + marker.len();
+        tag[start..].split_once('"').map(|(value, _)| value)
     }
     let mut out = String::with_capacity(html.len());
     let mut rest = html;
     while let Some(i) = rest.find(OPEN) {
         out.push_str(&rest[..i]);
-        rest = &rest[i + OPEN.len()..];
-        out.push_str("<p><span data-math-style=\"display\">");
-        match rest.find(CLOSE) {
-            Some(j) => {
-                out.push_str(&rest[..j]);
-                out.push_str("</span></p>");
-                rest = &rest[j + CLOSE.len()..];
-            }
-            None => {
-                out.push_str(rest);
-                rest = "";
-            }
+        let from_tag = &rest[i..];
+        let tag = from_tag.find('>').map(|end| &from_tag[..=end]);
+        let is_checkbox = tag.is_some_and(|tag| {
+            matches!(
+                tag.as_bytes().get(OPEN.len()),
+                Some(b' ' | b'\t' | b'\n' | b'\r' | b'/')
+            ) && attr(tag, "type").is_some_and(|t| t.eq_ignore_ascii_case("checkbox"))
+        });
+        let Some(tag) = tag.filter(|_| is_checkbox) else {
+            out.push_str(OPEN);
+            rest = &from_tag[OPEN.len()..];
+            continue;
+        };
+        let done = tag
+            .split(|c: char| c.is_ascii_whitespace() || c == '/' || c == '>')
+            .any(|token| token == "checked" || token.starts_with("checked="));
+        out.push_str("<span class=\"md-task\" data-task=\"");
+        out.push_str(if done { "done" } else { "todo" });
+        out.push('"');
+        if let Some(pos) = attr(tag, "data-sourcepos").filter(|v| {
+            v.bytes()
+                .all(|b| b.is_ascii_digit() || b == b':' || b == b'-')
+        }) {
+            out.push_str(" data-sourcepos=\"");
+            out.push_str(pos);
+            out.push('"');
         }
+        out.push_str("></span>");
+        rest = &from_tag[tag.len()..];
     }
     out.push_str(rest);
     Cow::Owned(out)
@@ -1104,8 +1851,18 @@ fn math_fences_to_spans(html: &str) -> Cow<'_, str> {
 /// `$$…$$` math — inline, promoted `$$` blocks and ```math fences alike —
 /// emitted as `<span data-math-style>` LaTeX literals, never typeset here;
 /// the client owns KaTeX. Raw HTML passes through for ammonia to judge.
+///
+/// Also: a leading [`frontmatter`] block is set aside (never a rule plus a
+/// setext heading); GitHub alerts (`> [!NOTE]` …) render as
+/// `div.markdown-alert.markdown-alert-<type>` with a `p.markdown-alert-title`;
+/// headings get GitHub-slug ids (and an empty `a.anchor` link), which the
+/// sanitizer namespaces as `user-content-<slug>` like footnote ids; task boxes
+/// become [`tasks_to_spans`] spans; and every element carries
+/// `data-sourcepos="line:col-line:col"` in the SOURCE file's numbering
+/// (frontmatter and promoted `$$` blocks included).
 fn markdown_to_html(text: &str) -> String {
-    let text = promote_math_blocks(text);
+    let with_frontmatter = frontmatter(text).is_some();
+    let (promoted, lines) = promote_math_blocks_mapped(text);
     let mut options = comrak::Options::default();
     options.extension.strikethrough = true;
     options.extension.table = true;
@@ -1113,21 +1870,79 @@ fn markdown_to_html(text: &str) -> String {
     options.extension.tasklist = true;
     options.extension.footnotes = true;
     options.extension.math_dollars = true;
+    options.extension.alerts = true;
+    // No prefix here: the sanitizer's `id_prefix` namespaces EVERY id —
+    // headings, footnotes and raw HTML alike — as `user-content-…`, GitHub's
+    // scheme, so a document can never clobber the app's own element ids.
+    options.extension.header_id_prefix = Some(String::new());
+    if with_frontmatter {
+        // Only for a block `frontmatter` accepted, so a document that merely
+        // opens with a thematic break keeps it.
+        options.extension.front_matter_delimiter = Some("---".to_owned());
+    }
     // Let raw HTML through comrak; ammonia strips anything dangerous.
     options.render.r#unsafe = true;
-    math_fences_to_spans(&comrak::markdown_to_html(&text, &options)).into_owned()
+    options.render.sourcepos = true;
+    options.render.tasklist_classes = true;
+    let html = comrak::markdown_to_html(&promoted, &options);
+    let html = remap_sourcepos(&html, &lines);
+    let html = math_fences_to_spans(&html);
+    tasks_to_spans(&html).into_owned()
 }
 
-/// ammonia's defaults, widened by exactly one attribute: `data-math-style` on
-/// `span`, the marker the client's typesetter keys on. Its value is inert (a
-/// style name) and the span's text is LaTeX the client renders with KaTeX
-/// trust off, so a hand-written `<span data-math-style>` in a document can do
-/// no more than `$$` can.
+/// Every class the rendered document may carry: exactly what comrak emits
+/// for the features above, plus the task span. Anything else (a raw-HTML
+/// `class`, a code block's `language-*`) is stripped.
+const MARKDOWN_CLASSES: &[(&str, &[&str])] = &[
+    (
+        "div",
+        &[
+            "markdown-alert",
+            "markdown-alert-note",
+            "markdown-alert-tip",
+            "markdown-alert-important",
+            "markdown-alert-warning",
+            "markdown-alert-caution",
+        ],
+    ),
+    ("p", &["markdown-alert-title"]),
+    ("span", &["md-task"]),
+    ("a", &["anchor", "footnote-backref"]),
+    ("sup", &["footnote-ref"]),
+    ("section", &["footnotes"]),
+    ("ul", &["contains-task-list"]),
+    ("ol", &["contains-task-list"]),
+    ("li", &["task-list-item"]),
+];
+
+/// ammonia's defaults, widened only for what [`markdown_to_html`] emits:
+///
+/// - `data-math-style` on `span`, the marker the client's typesetter keys on.
+///   Its value is inert (a style name) and the span's text is LaTeX the
+///   client renders with KaTeX trust off, so a hand-written `<span
+///   data-math-style>` in a document can do no more than `$$` can;
+/// - `data-task` on `span` (the task marker) and [`MARKDOWN_CLASSES`];
+/// - `data-sourcepos` everywhere (inert coordinates);
+/// - `section` (the footnotes container) and `id` where comrak puts one
+///   (headings, footnote refs and definitions), every id prefixed
+///   `user-content-` — so `href="#fn-1"` pairs with `id="user-content-fn-1"`
+///   and the client maps `#x` to `user-content-x`.
+///
+/// Never `input`: task boxes arrive as spans.
 fn sanitize_markdown(html: &str) -> String {
-    ammonia::Builder::default()
-        .add_tag_attributes("span", &["data-math-style"])
-        .clean(html)
-        .to_string()
+    let mut builder = ammonia::Builder::default();
+    builder
+        .add_tags(&["section"])
+        .add_tag_attributes("span", &["data-math-style", "data-task"])
+        .add_generic_attributes(&["data-sourcepos"])
+        .id_prefix(Some("user-content-"));
+    for tag in ["h1", "h2", "h3", "h4", "h5", "h6", "a", "li"] {
+        builder.add_tag_attributes(tag, &["id"]);
+    }
+    for (tag, classes) in MARKDOWN_CLASSES {
+        builder.add_allowed_classes(*tag, *classes);
+    }
+    builder.clean(html).to_string()
 }
 
 #[cfg(test)]
@@ -1224,9 +2039,11 @@ mod markdown_tests {
             "{html}"
         );
         // A promoted `$$` block is handed over in the same `<p><span>` shape
-        // as every other equation.
+        // as every other equation, its source lines on the `<p>`.
         assert!(
-            html.contains("<p><span data-math-style=\"display\">x^2\n</span></p>"),
+            html.contains(
+                "<p data-sourcepos=\"3:1-5:3\"><span data-math-style=\"display\">x^2\n</span></p>"
+            ),
             "{html}"
         );
         assert!(!html.contains("<script"), "{html}");
@@ -1246,9 +2063,9 @@ mod markdown_tests {
     /// through, and an unmarked column must carry no attribute at all.
     #[test]
     fn gfm_alignment_survives_sanitization_as_align_attributes() {
-        let html = sanitize_markdown(&markdown_to_html(
+        let html = without_sourcepos(&sanitize_markdown(&markdown_to_html(
             "| a | b | c |\n|:-:|--:|---|\n| 1 | 2 | 3 |\n",
-        ));
+        )));
         for cell in [
             "<th align=\"center\">a</th>",
             "<th align=\"right\">b</th>",
@@ -1271,6 +2088,207 @@ mod markdown_tests {
         ));
         assert!(html.contains("<td align=\"CENTER\">x</td>"), "{html}");
         assert!(html.contains("<td align=\"\">y</td>"), "{html}");
+    }
+
+    /// `html` minus every ` data-sourcepos="…"` — for assertions about other
+    /// attributes.
+    fn without_sourcepos(html: &str) -> String {
+        const ATTR: &str = " data-sourcepos=\"";
+        let mut out = String::with_capacity(html.len());
+        let mut rest = html;
+        while let Some(i) = rest.find(ATTR) {
+            out.push_str(&rest[..i]);
+            let after = &rest[i + ATTR.len()..];
+            rest = &after[after.find('"').expect("a closed attribute") + 1..];
+        }
+        out.push_str(rest);
+        out
+    }
+
+    fn render(text: &str) -> String {
+        sanitize_markdown(&markdown_to_html(text))
+    }
+
+    /// A leading frontmatter block is metadata: no rule, no setext heading,
+    /// its text answered raw — and every line after it keeps the SOURCE
+    /// file's number (a heading on line 5 after a 3-line block says `5:1`).
+    #[test]
+    fn frontmatter_is_set_aside_and_later_lines_keep_their_numbers() {
+        let text = "---\ntitle: A $$ title\n---\n\n# Five\n\n$$\nx\n$$\n";
+        let html = render(text);
+        assert!(!html.contains("<hr"), "{html}");
+        assert!(!html.contains("<h2"), "{html}");
+        assert!(!html.contains("title:"), "{html}");
+        assert!(
+            html.contains("<h1 id=\"user-content-five\" data-sourcepos=\"5:1-5:6\">"),
+            "{html}"
+        );
+        // The frontmatter's `$$` is not math; the block after it is, on 7-9
+        // (the end column is the promoted fence's, one past the `$$`).
+        assert!(
+            html.contains("<p data-sourcepos=\"7:1-9:3\"><span data-math-style=\"display\">x\n"),
+            "{html}"
+        );
+        let fm = frontmatter(text).expect("a frontmatter block");
+        assert_eq!(fm.inner, "title: A $$ title");
+        assert_eq!(fm.lines, 3);
+
+        // CRLF and a BOM are comrak's frontmatter too; inner lines keep CRLF.
+        let crlf = "\u{feff}---\r\na: 1\r\nb: 2\r\n---\r\n# Five\r\n";
+        assert_eq!(frontmatter(crlf).map(|f| f.inner), Some("a: 1\r\nb: 2"));
+        let html = render(crlf);
+        assert!(html.contains("data-sourcepos=\"5:1-5:6\""), "{html}");
+        assert!(!html.contains("<hr"), "{html}");
+    }
+
+    /// Only the live editor's shape counts: a document that merely opens with
+    /// a thematic break (no `key:` line), a closer past line 200, or a closer
+    /// that is not exactly `---` keeps rendering as it always did.
+    #[test]
+    fn frontmatter_needs_the_editors_shape() {
+        for text in [
+            "---\n\nintro\n\n---\n# H\n",
+            "---\nnot a key line\n---\n",
+            "---\ntitle: x\n--- \n",
+            "---\ntitle: x\n----\n",
+            "--- \ntitle: x\n---\n",
+        ] {
+            assert!(frontmatter(text).is_none(), "{text:?}");
+            assert!(render(text).contains("<hr"), "{text:?}");
+        }
+        let long = format!("---\ntitle: x\n{}---\n", "k: v\n".repeat(197));
+        assert_eq!(frontmatter(&long).map(|f| f.lines), Some(200));
+        let too_long = format!("---\ntitle: x\n{}---\n", "k: v\n".repeat(198));
+        assert!(frontmatter(&too_long).is_none());
+    }
+
+    /// GitHub alerts: every type, matched case-insensitively, keep exactly
+    /// comrak's classes through the sanitizer; a raw-HTML class is stripped.
+    #[test]
+    fn github_alerts_keep_their_classes() {
+        let html = without_sourcepos(&render(concat!(
+            "> [!NOTE]\n> n\n\n",
+            "> [!tip]\n> t\n\n",
+            "> [!Important]\n> i\n\n",
+            "> [!WARNING]\n> w\n\n",
+            "> [!CAUTION] Mind the gap\n> c\n\n",
+            "<div class=\"evil markdown-alert\" onclick=\"x()\">raw</div>\n",
+        )));
+        for (kind, title) in [
+            ("note", "Note"),
+            ("tip", "Tip"),
+            ("important", "Important"),
+            ("warning", "Warning"),
+            ("caution", "Mind the gap"),
+        ] {
+            let want = format!(
+                "<div class=\"markdown-alert markdown-alert-{kind}\">\n<p class=\"markdown-alert-title\">{title}</p>"
+            );
+            assert!(html.contains(&want), "missing {want} in {html}");
+        }
+        assert!(
+            html.contains("<div class=\"markdown-alert\">raw</div>"),
+            "{html}"
+        );
+        assert!(
+            !html.contains("evil") && !html.contains("onclick"),
+            "{html}"
+        );
+    }
+
+    /// Heading ids are GitHub slugs (deduplicated) under `user-content-`;
+    /// the heading's own anchor link keeps the bare `#slug` the client maps.
+    #[test]
+    fn heading_ids_are_namespaced_github_slugs() {
+        let html = without_sourcepos(&render(
+            "# Hello, World!\n\n# Hello, World!\n\n## Ünï code\n",
+        ));
+        for want in [
+            "<h1 id=\"user-content-hello-world\">Hello, World!<a href=\"#hello-world\" class=\"anchor\" rel=\"noopener noreferrer\"></a></h1>",
+            "<h1 id=\"user-content-hello-world-1\">",
+            "<h2 id=\"user-content-ünï-code\">",
+        ] {
+            assert!(html.contains(want), "missing {want} in {html}");
+        }
+        // Raw HTML ids are namespaced too: a document cannot clobber the app.
+        let html = render("<p id=\"app\">x</p>\n");
+        assert!(!html.contains("id=\"app\""), "{html}");
+    }
+
+    /// A footnote reference `#fn-1` pairs with `id="user-content-fn-1"`, the
+    /// back-reference `#fnref-1` with `id="user-content-fnref-1"`.
+    #[test]
+    fn footnote_ids_pair_with_their_links() {
+        let html = without_sourcepos(&render("Hi[^1].\n\n[^1]: A greeting.\n"));
+        for want in [
+            "<sup class=\"footnote-ref\"><a href=\"#fn-1\" id=\"user-content-fnref-1\"",
+            "<section class=\"footnotes\">",
+            "<li id=\"user-content-fn-1\">",
+            "<a href=\"#fnref-1\" class=\"footnote-backref\"",
+        ] {
+            assert!(html.contains(want), "missing {want} in {html}");
+        }
+    }
+
+    /// Task boxes arrive as inert spans; `input` never survives — neither
+    /// comrak's nor a raw one (a raw checkbox becomes the same span).
+    #[test]
+    fn task_boxes_become_spans_and_inputs_never_survive() {
+        let html = without_sourcepos(&render(concat!(
+            "- [ ] todo\n- [x] done\n\n",
+            "<input type=\"checkbox\" checked onclick=\"x()\">\n\n",
+            "<input type=\"text\" value=\"v\">\n",
+        )));
+        for want in [
+            "<ul class=\"contains-task-list\">",
+            "<li class=\"task-list-item\"><span class=\"md-task\" data-task=\"todo\"></span> todo</li>",
+            "<li class=\"task-list-item\"><span class=\"md-task\" data-task=\"done\"></span> done</li>",
+        ] {
+            assert!(html.contains(want), "missing {want} in {html}");
+        }
+        assert_eq!(html.matches("data-task=\"done\"").count(), 2, "{html}");
+        assert!(!html.contains("<input"), "{html}");
+        assert!(!html.contains("onclick"), "{html}");
+    }
+
+    /// Promotion splits text around `$$` onto lines of its own; positions
+    /// after (and inside) the block still name the source lines.
+    #[test]
+    fn promoted_math_blocks_do_not_shift_source_lines() {
+        let text = concat!(
+            "Intro\n",     // 1
+            "\n",          // 2
+            "$$x^2\n",     // 3: opener with text after it
+            "+ y\n",       // 4
+            "z $$ tail\n", // 5: text before AND after the closer
+            "\n",          // 6
+            "> $$a\n",     // 7: inside a quote
+            "> b $$\n",    // 8
+            "\n",          // 9
+            "# Ten\n",     // 10
+        );
+        let (promoted, map) = promote_math_blocks_mapped(text);
+        assert!(
+            promoted.lines().count() > text.lines().count(),
+            "{promoted}"
+        );
+        let html = render(text);
+        for want in [
+            "<p data-sourcepos=\"1:1-1:5\">Intro</p>",
+            "<p data-sourcepos=\"3:1-5:3\"><span data-math-style=\"display\">",
+            "<p data-sourcepos=\"5:1-5:4\">tail</p>",
+            "<blockquote data-sourcepos=\"7:1-8:",
+            "<h1 id=\"user-content-ten\" data-sourcepos=\"10:1-10:5\">",
+        ] {
+            assert!(html.contains(want), "missing {want} in {html}");
+        }
+        // Every output line maps inside the source.
+        let total = u32::try_from(text.lines().count()).unwrap();
+        for out in 1..=u32::try_from(promoted.lines().count()).unwrap() {
+            assert!((1..=total).contains(&map.source_line(out)), "line {out}");
+        }
+        // No `$$` at all: the identity map, nothing rewritten.
+        assert!(promote_math_blocks_mapped("# a\n\nb\n").1.is_identity());
     }
 }
 
@@ -1613,18 +2631,22 @@ fn sniff_delimiter(path: &Path, gz: bool) -> anyhow::Result<u8> {
 pub(crate) struct ValidateRequest {
     candidates: Vec<String>,
     base: String,
+    /// Additive: more absolute directories to resolve relative candidates
+    /// against, tried in order after `base` (see [`validate`]).
+    #[serde(default)]
+    bases: Option<Vec<String>>,
     /// Additive (older clients omit it, older daemons ignore it): enables the
-    /// bare-basename fallback below, scoped to this workspace's index.
+    /// workspace-index fallbacks below, scoped to this workspace's index.
     #[serde(default)]
     workspace_id: Option<String>,
 }
 
 /// A candidate eligible for the bare-basename fallback: a single path segment
 /// (no `/`), not a dotfile / `~` form / flag-like token, shaped like
-/// `name.ext` with a letter-led extension of at most 8 alphanumerics — the
-/// same shape the terminal client's `BARE_EXT_RE` admits. Prose words
-/// (`docs`, `license`) and version numbers (`1.2.3`) never qualify, so the
-/// fallback cannot widen what the clients already treat as path-like.
+/// `name.ext` with a letter-led extension of at most 16 alphanumerics (long
+/// enough for `.safetensors`) — never wider than what the clients already
+/// treat as path-like. Prose words (`docs`, `license`) and version numbers
+/// (`1.2.3`) never qualify.
 fn bare_basename(candidate: &str) -> bool {
     if candidate.contains('/') {
         return false;
@@ -1636,34 +2658,143 @@ fn bare_basename(candidate: &str) -> bool {
         return false;
     };
     !stem.is_empty()
-        && (1..=8).contains(&ext.len())
+        && (1..=16).contains(&ext.len())
         && ext.starts_with(|c: char| c.is_ascii_alphabetic())
         && ext.chars().all(|c| c.is_ascii_alphanumeric())
 }
 
-/// POST /api/v1/fs/validate {candidates, base, workspace_id?} — batched
-/// existence check behind the terminal and chat link providers: only
-/// path-like strings that resolve to something real get underlined. Each
-/// candidate is resolved (absolute, or relative against the absolute `base`,
-/// `~` expanded) and answered under `valid` as `{path, kind}` — the canonical
-/// absolute path and whether it is a `file` or a `dir`. Misses are simply
-/// absent. Candidates past [`MAX_VALIDATE_CANDIDATES`] are ignored: cheap and
-/// batched by design.
+/// The part of a candidate the path-suffix fallback matches, if eligible: it
+/// contains `/` and is not absolute, `~`-rooted or dot-relative (those name
+/// one place exactly). A trailing `/` (a directory mention) is dropped.
+fn suffix_candidate(candidate: &str) -> Option<&str> {
+    if !candidate.contains('/') || candidate.starts_with(['/', '~', '.']) {
+        return None;
+    }
+    let trimmed = candidate.trim_end_matches('/');
+    (!trimmed.is_empty()).then_some(trimmed)
+}
+
+/// Canonicalize (resolving symlinks and `..`, and proving existence) and
+/// classify; anything unresolvable is `None`, never an error.
+fn resolve_entry(path: &Path) -> Option<(PathBuf, &'static str)> {
+    let resolved = std::fs::canonicalize(path).ok()?;
+    let kind = if resolved.is_dir() { "dir" } else { "file" };
+    Some((resolved, kind))
+}
+
+fn entry_json(path: &Path, kind: &str) -> serde_json::Value {
+    json!({"path": path.to_string_lossy(), "kind": kind})
+}
+
+/// The direct rungs of the ladder: an absolute or `~` candidate as-is; else
+/// joined onto each base in order; else, for a git diff prefix (`a/`, `b/`),
+/// the remainder joined onto each base. First hit wins.
+fn resolve_direct(candidate: &str, bases: &[PathBuf]) -> Option<(PathBuf, &'static str)> {
+    let expanded = expand_tilde(candidate).ok()?;
+    if expanded.is_absolute() {
+        return resolve_entry(&expanded);
+    }
+    if let Some(hit) = bases
+        .iter()
+        .find_map(|base| resolve_entry(&base.join(&expanded)))
+    {
+        return Some(hit);
+    }
+    let rest = candidate
+        .strip_prefix("a/")
+        .or_else(|| candidate.strip_prefix("b/"))
+        .filter(|rest| !rest.is_empty())?;
+    bases
+        .iter()
+        .find_map(|base| resolve_entry(&base.join(rest)))
+}
+
+/// What the workspace index says about one candidate.
+enum IndexAnswer {
+    Unique(serde_json::Value),
+    Ambiguous(Vec<serde_json::Value>),
+    Miss,
+}
+
+/// Judge index matches: sort shortest path first then lexicographically,
+/// re-canonicalize (the index is served stale, so only entries that exist
+/// RIGHT NOW count, answered canonically like the direct rungs) until
+/// [`MAX_AMBIGUOUS`] are confirmed, probing at most [`MAX_AMBIGUOUS_PROBES`].
+/// One confirmed match among all probed is unique; one with matches left
+/// unprobed is a miss (uniqueness unproven — the false-positive defense).
+fn judge_index_matches(
+    mut matches: Vec<&crate::quickopen::IndexedFile>,
+    files_only: bool,
+) -> IndexAnswer {
+    matches.sort_by(|a, b| {
+        a.path
+            .len()
+            .cmp(&b.path.len())
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    let mut found: Vec<(PathBuf, &'static str)> = Vec::new();
+    for entry in matches.iter().take(MAX_AMBIGUOUS_PROBES) {
+        let Some((resolved, kind)) = resolve_entry(Path::new(&entry.path)) else {
+            continue;
+        };
+        if files_only && kind != "file" {
+            continue;
+        }
+        if found.iter().any(|(path, _)| *path == resolved) {
+            continue;
+        }
+        found.push((resolved, kind));
+        if found.len() == MAX_AMBIGUOUS {
+            break;
+        }
+    }
+    match found.as_slice() {
+        [] => IndexAnswer::Miss,
+        [(path, kind)] if matches.len() <= MAX_AMBIGUOUS_PROBES => {
+            IndexAnswer::Unique(entry_json(path, kind))
+        }
+        [_] => IndexAnswer::Miss,
+        several => IndexAnswer::Ambiguous(
+            several
+                .iter()
+                .map(|(path, kind)| entry_json(path, kind))
+                .collect(),
+        ),
+    }
+}
+
+/// POST /api/v1/fs/validate {candidates, base, bases?, workspace_id?} —
+/// batched existence check behind the terminal, chat and document link
+/// providers: only path-like strings that resolve to something real get
+/// underlined. Answers `{valid: {[cand]: {path, kind}}, ambiguous: {[cand]:
+/// [{path, kind}]}}`: `path` is canonical and absolute, `kind` is `file` or
+/// `dir`; misses are simply absent. Candidates past
+/// [`MAX_VALIDATE_CANDIDATES`] or longer than
+/// [`MAX_VALIDATE_CANDIDATE_BYTES`] are ignored: cheap and batched by design.
 ///
-/// Bare-basename fallback: an agent often mentions a file by basename alone
-/// ("FIGURE_PLAN.md") when it lives in a subdirectory (`paper/FIGURE_PLAN.md`),
-/// so direct-child resolution can never confirm it. When `workspace_id` is
-/// given and a [`bare_basename`]-shaped candidate misses, the workspace's
-/// quickopen index is consulted and the candidate resolves IFF exactly one
-/// indexed file has that exact name — ambiguity (three `main.rs`) refuses,
-/// and the hit is re-canonicalized so a file deleted since the walk stays a
-/// miss (existence-verified links only, same as the direct path). Bounds: the
-/// index is the quickopen walk — entry/depth/time-capped, ignore-respecting,
-/// served stale-while-revalidating per workspace (up to two minutes plus one
-/// walk behind the disk on a slow tree, so a file created after the last
-/// walk may take that long to earn a bare-basename link) — fetched at most
-/// once per request and only when a fallback-eligible candidate actually
-/// missed.
+/// The ladder, per candidate, first hit wins:
+/// 1. absolute or `~` → as-is;
+/// 2. joined onto `base` (required, absolute), then onto each of `bases`
+///    (absolute dirs only, deduped, at most [`MAX_VALIDATE_BASES`]) in order
+///    — the cwd when the text was written, the document's folder, …;
+/// 3. a git diff prefix (`a/`, `b/`) stripped, the rest joined onto each base;
+/// 4. with `workspace_id`, the workspace's quickopen index: a
+///    [`bare_basename`] matches files with exactly that name; a partial path
+///    ([`suffix_candidate`]) matches entries whose workspace-relative path
+///    equals it or ends with `/` + it (`figs/plot.png` for
+///    `results/figs/plot.png`). One match → `valid`; several → `ambiguous`
+///    (at most [`MAX_AMBIGUOUS`], shortest path first) for the client to
+///    offer a choice, never an arbitrary pick.
+///
+/// Bounds: the index is the quickopen walk — entry/depth/time-capped,
+/// ignore-respecting (so `target/`, `work/` and symlinked trees are
+/// invisible to rung 4), served stale-while-revalidating per workspace (up to
+/// two minutes plus one walk behind the disk on a slow tree), fetched at most
+/// once per request, only when a rung-4-eligible candidate reached it, and
+/// never waited on (a cold index answers nothing this round). The whole
+/// request runs under the shared filesystem limiter with a
+/// [`VALIDATE_BUDGET`] wall-clock budget; candidates not reached in time are
+/// misses this round (clients retry misses).
 pub(crate) async fn validate(
     State(state): State<Arc<AppState>>,
     Json(body): Json<ValidateRequest>,
@@ -1676,39 +2807,49 @@ pub(crate) async fn validate(
     }
     // Every resolution stats the disk and a fallback may walk a (bounded)
     // tree — NFS-slow work that must stay off the async reactor.
-    let work = move || {
-        let base = Path::new(&body.base);
+    blocking_json(move || {
+        let deadline = Instant::now() + VALIDATE_BUDGET;
+        let mut bases = vec![PathBuf::from(&body.base)];
+        for extra in body.bases.iter().flatten() {
+            if bases.len() > MAX_VALIDATE_BASES {
+                break;
+            }
+            let extra = Path::new(extra);
+            if extra.is_absolute() && !bases.iter().any(|b| b == extra) {
+                bases.push(extra.to_path_buf());
+            }
+        }
         let mut valid = serde_json::Map::new();
+        let mut ambiguous = serde_json::Map::new();
         // Lazily fetched, at most once per request; inner None = unknown
-        // workspace (fallback silently off — degrade, don't error).
+        // workspace or an index still being built (fallback off this round —
+        // degrade, don't error).
         let mut index: Option<Option<Arc<Vec<crate::quickopen::IndexedFile>>>> = None;
         for candidate in body.candidates.iter().take(MAX_VALIDATE_CANDIDATES) {
-            if candidate.is_empty() || valid.contains_key(candidate) {
+            if candidate.is_empty()
+                || candidate.len() > MAX_VALIDATE_CANDIDATE_BYTES
+                || valid.contains_key(candidate)
+                || ambiguous.contains_key(candidate)
+            {
                 continue;
             }
-            let Ok(expanded) = expand_tilde(candidate) else {
-                continue;
-            };
-            let joined = if expanded.is_absolute() {
-                expanded
-            } else {
-                base.join(expanded)
-            };
-            // canonicalize both resolves (symlinks, `..`) and checks existence;
-            // anything unresolvable is a miss, never an error.
-            if let Ok(resolved) = std::fs::canonicalize(&joined) {
-                let kind = if resolved.is_dir() { "dir" } else { "file" };
-                valid.insert(
-                    candidate.clone(),
-                    json!({"path": resolved.to_string_lossy(), "kind": kind}),
-                );
+            if Instant::now() >= deadline {
+                break;
+            }
+            if let Some((path, kind)) = resolve_direct(candidate, &bases) {
+                valid.insert(candidate.clone(), entry_json(&path, kind));
                 continue;
             }
-            // Direct resolution missed — try the unique-basename fallback.
             let Some(workspace_id) = body.workspace_id.as_deref() else {
                 continue;
             };
-            if !bare_basename(candidate) {
+            let basename = bare_basename(candidate);
+            let suffix = if basename {
+                None
+            } else {
+                suffix_candidate(candidate)
+            };
+            if !basename && suffix.is_none() {
                 continue;
             }
             let files = index.get_or_insert_with(|| {
@@ -1717,34 +2858,25 @@ pub(crate) async fn validate(
             let Some(files) = files.as_deref() else {
                 continue;
             };
-            let Some(path) = crate::quickopen::unique_file_named(files, candidate) else {
-                continue;
+            let answer = match suffix {
+                None => judge_index_matches(crate::quickopen::files_named(files, candidate), true),
+                Some(suffix) => {
+                    judge_index_matches(crate::quickopen::entries_with_suffix(files, suffix), false)
+                }
             };
-            // The index is served stale (up to its freshness window plus a
-            // walk): re-canonicalize so only a file that exists RIGHT NOW
-            // links (and the answer is canonical, matching the direct path's
-            // contract).
-            let Ok(resolved) = std::fs::canonicalize(path) else {
-                continue;
-            };
-            if !resolved.is_file() {
-                continue;
+            match answer {
+                IndexAnswer::Unique(hit) => {
+                    valid.insert(candidate.clone(), hit);
+                }
+                IndexAnswer::Ambiguous(hits) => {
+                    ambiguous.insert(candidate.clone(), serde_json::Value::Array(hits));
+                }
+                IndexAnswer::Miss => {}
             }
-            valid.insert(
-                candidate.clone(),
-                json!({"path": resolved.to_string_lossy(), "kind": "file"}),
-            );
         }
-        json!({"valid": valid})
-    };
-    match tokio::task::spawn_blocking(work).await {
-        Ok(body) => Json(body).into_response(),
-        Err(join) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("validate task failed: {join}")})),
-        )
-            .into_response(),
-    }
+        Ok(json!({"valid": valid, "ambiguous": ambiguous}))
+    })
+    .await
 }
 
 #[derive(Deserialize)]

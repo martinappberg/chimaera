@@ -26,6 +26,9 @@ chimaera-core.workspace = true
 chimaera-pty.workspace = true
 futures.workspace = true
 bytes.workspace = true
+# Content hashes for file versions (`X-Content-Hash`, PUT `expect_hash`), the
+# stable `X-Mtime` token, and draft-mirror file names.
+sha2.workspace = true
 comrak = { version = "0.54.0", default-features = false }
 ammonia = "4.1.3"
 csv = "1.4.0"

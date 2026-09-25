@@ -6,8 +6,8 @@ use tower_http::trace::TraceLayer;
 
 use crate::AppState;
 use crate::{
-    agents, api, chat, compute, compute_jobs, download, environment, fs, git, launcher, links, mcp,
-    proxy, quickopen, recents, runtimes, settings, update, upload, view_state, ws,
+    agents, api, chat, compute, compute_jobs, download, drafts, environment, fs, git, launcher,
+    links, mcp, proxy, quickopen, recents, runtimes, settings, update, upload, view_state, ws,
 };
 
 /// Build the axum router (factored out so tests can drive it with `oneshot`).
@@ -89,6 +89,19 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         .route("/fs/xlsx", get(fs::xlsx))
         .route("/fs/quickopen", get(quickopen::quickopen))
         .route("/fs/validate", post(fs::validate))
+        // The draft mirror (unsaved editor text; see `drafts`). The body
+        // limit only makes room for JSON escaping — the 1 MiB text cap is
+        // judged on the decoded text.
+        .route(
+            "/fs/drafts",
+            get(drafts::list_drafts).put(drafts::put_draft).layer(
+                axum::extract::DefaultBodyLimit::max(drafts::MAX_DRAFT_BODY_BYTES),
+            ),
+        )
+        .route(
+            "/fs/draft",
+            get(drafts::get_draft).delete(drafts::delete_draft),
+        )
         .route("/fs/mkdir", post(fs::mkdir))
         .route("/fs/create", post(fs::create))
         .route("/fs/rename", post(fs::rename))

@@ -7,6 +7,7 @@ mod chat;
 mod compute;
 mod compute_jobs;
 mod download;
+mod drafts;
 mod environment;
 mod exec;
 mod fs;
