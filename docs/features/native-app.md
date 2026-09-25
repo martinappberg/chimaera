@@ -55,10 +55,9 @@ app-build` (never the root `cargo`).
   coordinate math in `shell/drag.rs` — logical space on macOS, physical elsewhere).
   Closing a window removes its record (macOS convention) **except during quit** (guarded by an
   `AtomicBool quitting` so teardown doesn't forget every window). Geometry is stored in logical pixels
-  (correct across scale factors) on a slow 2s tick. Closing the final window never inserts an extra
-  Home that needs a second close: on **macOS the app stays alive in the Dock** with no windows (the
-  standard Mac behavior — daemons and the notification watchers keep running; an explicit quit still
-  exits, and a Dock click opens Home), while Linux/Windows exit directly. **Home is the New Window launcher**: File/tray
+  (correct across scale factors) on a slow 2s tick. Closing the final window exits the app directly
+  (on every platform — the maintainer's call, 2026-09-25, over the Mac convention of staying alive in
+  the Dock); the shell never inserts an extra Home that needs a second close. **Home is the New Window launcher**: File/tray
   New Window creates a Home window when no unused launcher exists, otherwise it raises that singleton
   launcher. Browsing a connected host navigates the launcher to its detail page and Back re-homes it
   onto the local daemon. Selecting a local or remote workspace consumes the launcher and promotes that
@@ -73,8 +72,8 @@ app-build` (never the root `cargo`).
   launching the app again activates the existing instance rather than starting a competing owner.
   **Activation follows macOS conventions** (`shell::activate_app`): a Dock click with any window on
   screen leaves the set to AppKit (which raises the visible windows); with every window minimized or
-  hidden it restores ONLY the most recently used one (the rest stay in the Dock); with no window it
-  opens Home. A repeated launch focuses the most recent on-screen window the same way. Minimized
+  hidden it restores ONLY the most recently used one (the rest stay in the Dock); with no window (only
+  during startup) it opens Home. A repeated launch focuses the most recent on-screen window the same way. Minimized
   windows are never mass-restored.
 
 ## Notifications
@@ -158,8 +157,7 @@ app-build` (never the root `cargo`).
 - **System tray / menu-bar status item** (`tray.rs`, `tray-icon` feature): a persistent icon whose
   menu lists the **open workspace windows** (click one to raise it) — each with its count of agents
   awaiting approval ("crc_finish — 2 awaiting approval"; the tooltip totals them) — then New Window
-  and Quit. On Linux/Windows closing the final window exits the app rather than leaving a windowless
-  tray process; on macOS the app stays in the Dock (see Windows & restore). The icon is a real **brand-mark template**
+  and Quit. Closing the final window exits the app rather than leaving a windowless tray process. The icon is a real **brand-mark template**
   (a C-in-hexagon monogram, black on transparent) that macOS tints to the menu-bar theme
   (`icon_as_template`) — not the full app icon, which the template mask would render as a solid blob.
   On macOS the menu also carries the **Keep Awake** check item (see Caffeinate). The menu is rebuilt
@@ -211,6 +209,16 @@ _Captured 2026-07-09 — drafted from DESIGN.md + code, confirmed live with the 
   itself and its teardown UX are additions that can be improved.
 - **Do not change:** the disconnect vs end-sessions vs shut-down distinction; detached daemon
   outlives the app; human host labels.
+
+### Dock activation and closing the last window
+_Captured 2026-09-25 (from the maintainer)._
+
+- **Dock / relaunch behavior** should follow macOS conventions — the maintainer found "clicking the
+  icon opens all windows" weird and asked for standard behavior (restore only what's needed,
+  never mass-un-minimize). An addition: improvable.
+- **Closing the last window exits the app** — offered the Mac convention (stay alive in the Dock,
+  keep notifying), the maintainer chose to keep exiting ("I think exit on last close"). Consequence
+  accepted: notifications stop once no window is open. Open to revisiting; not a core bet.
 
 ### Linux + Windows(WSL2) apps — why they exist
 _Captured 2026-07-11 (from the maintainer, confirming a draft read from the #44 commit body + code)._

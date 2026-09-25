@@ -8,8 +8,8 @@
 //!   removal of stale alerts). It raises an Objective-C exception when the
 //!   process isn't running from an `.app` bundle, so an unbundled `cargo run`
 //!   degrades to no notifications instead of crashing (see [`available`]).
-//!   The Dock badge/bounce go straight to `NSApp`'s dock tile, which needs no
-//!   window — the app stays alive windowless on macOS.
+//!   The Dock badge/bounce go straight to `NSApp`'s dock tile rather than
+//!   through a window, so they don't depend on which windows exist.
 //! - **Linux / Windows** — `notify-rust` (freedesktop D-Bus / WinRT toasts);
 //!   a bounded number of shown notifications wait for their click.
 //!

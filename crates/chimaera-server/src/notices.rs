@@ -2,9 +2,9 @@
 //! an agent finished its turn, needs a permission or an answer, stopped on an
 //! error or a usage limit, or explicitly asked to notify the user (the MCP
 //! `notify` tool). Consumers turn them into OS notifications: the native
-//! shell long-polls [`get_notices`] once per daemon it has open (so it keeps
-//! notifying with every window closed), and browser tabs receive `notices`
-//! frames on `/ws/events`.
+//! shell long-polls [`get_notices`] once per daemon it has open (one alert
+//! per notice however many windows it has, covering workspaces with no
+//! window open), and browser tabs receive `notices` frames on `/ws/events`.
 //!
 //! **One detector, every surface.** Agent state is written from three places
 //! (claude hooks, chat protocol events, the transcript watcher — claude chats

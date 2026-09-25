@@ -4,7 +4,7 @@ How Chimaera tells you something happened while you were looking elsewhere: an a
 **finished** its turn, is **blocked on your approval** (a permission, a plan, a question),
 stopped on an **error** or a **usage limit**, or **sent you a message** itself through its
 `notify` tool. The daemon decides *what happened*; the native app turns it into real OS
-notifications (with the app in the background, or with every window closed), a browser tab
+notifications (with the app in the background, for every workspace on every open daemon), a browser tab
 into Web Notifications; and inside the workbench the same facts show as the approval count
 and the unread mark.
 
@@ -80,8 +80,8 @@ and in `App.svelte` the view reporting + `focusFromNotification`.
 ## Native notifications (the app)
 
 - **What & when.** Real OS notifications from the shell, posted once however many windows
-  are open, and still arriving with every window closed (on macOS the app stays alive in the
-  Dock).
+  are open, for every workspace on every daemon the app has open — including workspaces with
+  no window. (Closing the last window quits the app, so notifications stop with it.)
 - **How it's used.** Automatic. Clicking one raises the window already showing that session
   (else a window on its workspace, else opens one) and focuses its tab. Settings →
   Notifications shows whether the OS allows them, with **Allow notifications** (asks now),
@@ -113,8 +113,8 @@ and in `App.svelte` the view reporting + `focusFromNotification`.
     click is owed its focus until the page asks (`take_pending_focus`), so the event can't
     race the page's listener.
   - **Dock**: the badge counts sessions awaiting approval across every daemon; a new
-    approval bounces the icon once while Chimaera is in the background. Both work
-    windowless (they talk to `NSApp`'s dock tile directly).
+    approval bounces the icon once while Chimaera is in the background. Both talk to
+    `NSApp`'s dock tile directly, independent of which windows exist.
   - **macOS needs a real bundle.** `UNUserNotificationCenter` throws outside an `.app` and
     silently refuses a bundle whose signature doesn't bind its `Info.plist` — a bare
     `cargo run` has no notifications (logged once), and the isolated dev app ad-hoc signs its
@@ -173,10 +173,23 @@ remote host's alerts follow that host's settings.
 > this line is derived and may be regenerated; everything below is deliberate and must not
 > be "helpfully" changed without asking.
 
-### Notifications — _Intent pending_
+### Notifications — why they exist
+_Captured 2026-09-25 (from the maintainer, answering the intent questionnaire in the building session)._
 
-Directional notes from the maintainer (2026-09-25), pending a full capture: notifications for
-turn-finished and needs-your-action are expected of the native app, as is a way for agents to
-send one on request, like the Claude apps do. A number (badge / pill / title count) must mean
-something really requires approval — never unread news — and unread needs to be clearer than a
-bold name alone, without getting loud.
+- **Problem it solves:** "Just nice, so you know when things happen" — while agents run, you find
+  out when one finishes or needs you without watching every tab.
+- **How settled it is (intended vs provisional):** having notifications is intended ("we want
+  notification"); every mechanism behind them "can change". Nothing here — the kinds, the settle
+  window, one-alert-per-session, alerting while Chimaera is in front, the pre-approved `notify`
+  tool — is a locked contract.
+- **What shaped it / left open:** interactivity is the point — "good to have it interactive": a
+  notification should take you somewhere (click → the session's window and tab), not just inform.
+  Richer interaction (e.g. answering from the banner) is open for later.
+- **Do not change (or: open to change):** **open to change**, with one standing aim: keep a
+  **basic observability/notification framework that can be extended** — one feed of
+  "something happened" events that new sources (other agents, terminals, jobs) and new
+  consumers can plug into, rather than one-off alerts wired per surface. Grade: an addition to
+  the core, not a core bet.
+- **Earlier direction (same day, while building):** a number (Dock badge, rail pill, window-title
+  count) should mean something really requires approval — never unread news — and unread needed
+  a clearer cue than a bold name alone, without getting loud. Also an addition: improvable.

@@ -2,8 +2,8 @@
 //! one, each live tunnel, each compute-job tunnel). The shell — not the
 //! windows — consumes the daemons' notice feeds (`GET /api/v1/notices`, a
 //! long-poll per daemon), so a notification is posted exactly once however
-//! many windows show that daemon, and keeps arriving with every window
-//! closed (macOS keeps the app alive in the Dock).
+//! many windows show that daemon — and covers every workspace on it, not
+//! only the ones with a window open.
 //!
 //! Decisions made here, with the window facts only the shell has:
 //! - **Is the user already looking?** A notice about a session visible in

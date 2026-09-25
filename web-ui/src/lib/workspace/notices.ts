@@ -6,8 +6,8 @@
  *
  * The native app never takes this path: its shell consumes the same feed
  * straight from each daemon (`GET /api/v1/notices`) and posts real OS
- * notifications, so it keeps notifying with every window closed and posts
- * once however many windows are open. A browser has only its tabs, so here
+ * notifications — once however many windows are open, and for workspaces
+ * with no window at all. A browser has only its tabs, so here
  * every tab receives each notice and the tabs settle among themselves who
  * shows it:
  *

@@ -520,8 +520,8 @@ pub(crate) fn request_quit(app: &AppHandle) {
 ///   the most recently used on-screen window.
 /// - every window is minimized or hidden → restore ONLY the most recently
 ///   used one; the rest stay in the Dock where the user put them.
-/// - no window at all (macOS keeps the app alive after its last window
-///   closes) → open Home, like any document app's untitled window.
+/// - no window at all (a repeated launch racing startup; closing the last
+///   window quits the app) → open Home.
 pub(crate) fn activate_app(app: &AppHandle, dock_click: bool) {
     let windows: Vec<_> = app
         .webview_windows()
@@ -1210,20 +1210,6 @@ pub fn run() {
                 if !has_visible_windows {
                     activate_app(app, true);
                 }
-            }
-            // macOS apps outlive their last window: closing it leaves the app
-            // in the Dock (the daemons, and the notification watchers, keep
-            // running), and a Dock click opens Home. `code: None` is exactly
-            // that implicit last-window exit — an explicit quit (menu, tray,
-            // ⌘Q) goes through `request_quit` → `exit(0)` with a code.
-            #[cfg(target_os = "macos")]
-            tauri::RunEvent::ExitRequested {
-                code: None, api, ..
-            } if app
-                .try_state::<Shell>()
-                .is_some_and(|s| !s.quitting.load(Ordering::Relaxed)) =>
-            {
-                api.prevent_exit();
             }
             // Quit teardown destroys every window; flag it FIRST so those
             // Destroyed events keep the registry intact for the next launch.

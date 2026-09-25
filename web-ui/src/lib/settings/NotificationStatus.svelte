@@ -90,12 +90,11 @@
       <span class="line">Notifications are on in {where}.</span>
       <span class="sub">
         {#if native}
-          They arrive even with every window closed. Style and grouping live in {isMac
-            ? "System Settings"
-            : "your desktop's settings"}.
+          They cover every workspace, including ones with no window open. Style and grouping
+          live in {isMac ? "System Settings" : "your desktop's settings"}.
         {:else}
-          Shown while a Chimaera tab is open. The native app notifies even with every window
-          closed.
+          Shown while a Chimaera tab is open. The native app also notifies while it's in the
+          background.
         {/if}
       </span>
     {:else if status === "ask"}
