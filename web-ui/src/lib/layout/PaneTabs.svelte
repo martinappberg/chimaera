@@ -647,9 +647,11 @@
         {@const ts = sid !== null ? (sessions.get(sid) ?? null) : null}
         {@const fEntry = tab.surface === "file" ? $gitIndex.files.get(tab.path) : undefined}
         {@const fDeco = fEntry ? decoFor(fEntry) : null}
+        {@const unread = sid !== null && i !== node.active && isUnread(sid)}
         <div
           class="tab"
           class:active={i === node.active}
+          class:unread
           class:insert={insertIndex === i}
           class:link-target={dropSpot?.kind === "linktab" &&
             dropSpot.paneId === node.id &&
@@ -804,7 +806,7 @@
             <span
               class="tab-name"
               class:preview={tab.surface === "file" && tab.preview === true}
-              class:unread={sid !== null && i !== node.active && isUnread(sid)}
+              class:unread
               data-label={label(tab)}
               style:color={fDeco ? fDeco.color : undefined}>{label(tab)}</span
             >
@@ -1436,6 +1438,30 @@
   .tab-close:hover {
     opacity: 1;
     color: var(--fg);
+  }
+
+  /* Unread's scannable half: an accent dot in the close button's slot that
+     turns back into × under the pointer (the editor "dirty dot" gesture,
+     here meaning "finished — not looked at yet"). No reflow either way. */
+  .tab-close {
+    position: relative;
+  }
+
+  .tab.unread:not(:hover) .tab-close {
+    opacity: 1;
+    color: transparent;
+  }
+
+  .tab.unread:not(:hover) .tab-close::after {
+    content: "";
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: 6px;
+    height: 6px;
+    margin: -3px 0 0 -3px;
+    border-radius: 50%;
+    background: var(--accent);
   }
 
   /* --- linked-terminal chips ------------------------------------------- */

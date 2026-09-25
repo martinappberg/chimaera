@@ -212,8 +212,17 @@ mod platform {
         let Some(center) = center() else {
             return;
         };
-        let block = RcBlock::new(move |granted: Bool, _err: *mut NSError| {
+        let block = RcBlock::new(move |granted: Bool, err: *mut NSError| {
             if !granted.as_bool() {
+                // Once per process: the user said no (or hasn't answered);
+                // the settings page carries the way back.
+                static SAID: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    // SAFETY: null or a valid NSError for the call.
+                    let why = unsafe { err.as_ref() }.map(|e| e.localizedDescription().to_string());
+                    tracing::info!(?why, "notifications are not authorized; dropping alerts");
+                }
                 return;
             }
             let content = UNMutableNotificationContent::new();
@@ -232,7 +241,15 @@ mod platform {
                 None,
             );
             UNUserNotificationCenter::currentNotificationCenter()
-                .addNotificationRequest_withCompletionHandler(&request, None);
+                .addNotificationRequest_withCompletionHandler(
+                    &request,
+                    Some(&RcBlock::new(|err: *mut NSError| {
+                        // SAFETY: null or a valid NSError for the call.
+                        if let Some(err) = unsafe { err.as_ref() } {
+                            tracing::warn!("notification not delivered: {err:?}");
+                        }
+                    })),
+                );
         });
         center.requestAuthorizationWithOptions_completionHandler(options(), &block);
     }

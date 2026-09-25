@@ -113,11 +113,11 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
     let mut wins = crate::shell::tray_windows(app);
     wins.sort_by_key(|(label, _)| seq_of(label));
     for (label, name) in &wins {
-        // Which window needs you: its waiting-agent count rides the entry.
+        // Which window needs you: its count of agents blocked on an
+        // approval rides the entry.
         let text = match crate::shell::notices::window_attention(app, label) {
             0 => name.clone(),
-            1 => format!("{name} — 1 needs you"),
-            n => format!("{name} — {n} need you"),
+            n => format!("{name} — {n} awaiting approval"),
         };
         let item = MenuItemBuilder::with_id(format!("tray-win:{label}"), text).build(app)?;
         b = b.item(&item);
@@ -160,8 +160,8 @@ fn tooltip(armed: bool, waiting: usize) -> String {
     let mut parts = vec!["Chimaera".to_string()];
     match waiting {
         0 => {}
-        1 => parts.push("1 agent needs you".to_string()),
-        n => parts.push(format!("{n} agents need you")),
+        1 => parts.push("1 agent awaiting approval".to_string()),
+        n => parts.push(format!("{n} agents awaiting approval")),
     }
     if armed {
         parts.push("keeping this Mac awake".to_string());

@@ -110,13 +110,12 @@ impl NoticeKind {
         }
     }
 
-    /// Whether this kind blocks the agent on the user (consumers may bounce
-    /// the Dock for these; a finished turn is news, not a blocker).
+    /// Whether the agent is blocked on the user's decision (consumers may
+    /// bounce the Dock for these). A finished turn — even one that ends
+    /// "waiting for your input" — is news, not a blocker: only a permission
+    /// or a question stops the agent until the user answers.
     fn blocking(self) -> bool {
-        matches!(
-            self,
-            NoticeKind::Input | NoticeKind::Permission | NoticeKind::Question
-        )
+        matches!(self, NoticeKind::Permission | NoticeKind::Question)
     }
 }
 
@@ -591,8 +590,10 @@ fn fire_due(state: &AppState, pending: &mut HashMap<String, Pending>) -> bool {
     emitted
 }
 
-/// One row of the attention set: a live session that is waiting on the user
-/// (the same predicate as the UI's needs-you count).
+/// One row of the attention set: a live session blocked on the user's
+/// approval — a permission or a question (the UI's `needsApproval`, the one
+/// state every count shows; finished / waiting-for-input sessions are
+/// unread news, not a number on the Dock).
 #[derive(Serialize, Hash)]
 struct Attention {
     id: String,
@@ -618,12 +619,7 @@ fn attention(state: &AppState) -> Vec<Attention> {
     let agents = crate::lock(&state.agents);
     let mut rows: Vec<Attention> = agents
         .iter()
-        .filter(|(_, r)| {
-            matches!(
-                r.state,
-                AgentState::NeedsPermission | AgentState::IdlePrompt | AgentState::Errored
-            )
-        })
+        .filter(|(_, r)| r.state == AgentState::NeedsPermission)
         .filter(|(id, _)| {
             pty_alive
                 .get(*id)
