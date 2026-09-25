@@ -63,6 +63,20 @@ const MAX_XLSX_ENTRIES: usize = 4096;
 /// Hard cap on candidates per `fs/validate` request (the UI batches one
 /// request per visible-viewport scan).
 const MAX_VALIDATE_CANDIDATES: usize = 50;
+/// Longest `fs/validate` candidate considered: longer strings are not paths
+/// an agent wrote, and each one costs a canonicalize per base.
+const MAX_VALIDATE_CANDIDATE_BYTES: usize = 1024;
+/// Most extra `bases` one `fs/validate` request may add after `base`.
+const MAX_VALIDATE_BASES: usize = 8;
+/// Most matches one ambiguous `fs/validate` candidate lists.
+const MAX_AMBIGUOUS: usize = 5;
+/// Most index matches existence-checked per `fs/validate` candidate.
+const MAX_AMBIGUOUS_PROBES: usize = 8;
+/// Wall-clock budget for one `fs/validate` request. With up to nine bases
+/// and a diff-prefix retry, a 50-candidate batch is up to ~900 canonicalize
+/// calls — seconds on a cold NFS mount — and link underlining is not worth
+/// holding a limiter permit longer than this.
+const VALIDATE_BUDGET: Duration = Duration::from_secs(5);
 /// Hard cap on entries returned by a single `fs/dirs` / `fs/list` listing.
 /// The daemon runs on shared login nodes over NFS/Lustre where a scratch dir
 /// can hold hundreds of thousands of entries; without a ceiling a single
@@ -2077,18 +2091,22 @@ fn sniff_delimiter(path: &Path, gz: bool) -> anyhow::Result<u8> {
 pub(crate) struct ValidateRequest {
     candidates: Vec<String>,
     base: String,
+    /// Additive: more absolute directories to resolve relative candidates
+    /// against, tried in order after `base` (see [`validate`]).
+    #[serde(default)]
+    bases: Option<Vec<String>>,
     /// Additive (older clients omit it, older daemons ignore it): enables the
-    /// bare-basename fallback below, scoped to this workspace's index.
+    /// workspace-index fallbacks below, scoped to this workspace's index.
     #[serde(default)]
     workspace_id: Option<String>,
 }
 
 /// A candidate eligible for the bare-basename fallback: a single path segment
 /// (no `/`), not a dotfile / `~` form / flag-like token, shaped like
-/// `name.ext` with a letter-led extension of at most 8 alphanumerics — the
-/// same shape the terminal client's `BARE_EXT_RE` admits. Prose words
-/// (`docs`, `license`) and version numbers (`1.2.3`) never qualify, so the
-/// fallback cannot widen what the clients already treat as path-like.
+/// `name.ext` with a letter-led extension of at most 16 alphanumerics (long
+/// enough for `.safetensors`) — never wider than what the clients already
+/// treat as path-like. Prose words (`docs`, `license`) and version numbers
+/// (`1.2.3`) never qualify.
 fn bare_basename(candidate: &str) -> bool {
     if candidate.contains('/') {
         return false;
@@ -2100,34 +2118,143 @@ fn bare_basename(candidate: &str) -> bool {
         return false;
     };
     !stem.is_empty()
-        && (1..=8).contains(&ext.len())
+        && (1..=16).contains(&ext.len())
         && ext.starts_with(|c: char| c.is_ascii_alphabetic())
         && ext.chars().all(|c| c.is_ascii_alphanumeric())
 }
 
-/// POST /api/v1/fs/validate {candidates, base, workspace_id?} — batched
-/// existence check behind the terminal and chat link providers: only
-/// path-like strings that resolve to something real get underlined. Each
-/// candidate is resolved (absolute, or relative against the absolute `base`,
-/// `~` expanded) and answered under `valid` as `{path, kind}` — the canonical
-/// absolute path and whether it is a `file` or a `dir`. Misses are simply
-/// absent. Candidates past [`MAX_VALIDATE_CANDIDATES`] are ignored: cheap and
-/// batched by design.
+/// The part of a candidate the path-suffix fallback matches, if eligible: it
+/// contains `/` and is not absolute, `~`-rooted or dot-relative (those name
+/// one place exactly). A trailing `/` (a directory mention) is dropped.
+fn suffix_candidate(candidate: &str) -> Option<&str> {
+    if !candidate.contains('/') || candidate.starts_with(['/', '~', '.']) {
+        return None;
+    }
+    let trimmed = candidate.trim_end_matches('/');
+    (!trimmed.is_empty()).then_some(trimmed)
+}
+
+/// Canonicalize (resolving symlinks and `..`, and proving existence) and
+/// classify; anything unresolvable is `None`, never an error.
+fn resolve_entry(path: &Path) -> Option<(PathBuf, &'static str)> {
+    let resolved = std::fs::canonicalize(path).ok()?;
+    let kind = if resolved.is_dir() { "dir" } else { "file" };
+    Some((resolved, kind))
+}
+
+fn entry_json(path: &Path, kind: &str) -> serde_json::Value {
+    json!({"path": path.to_string_lossy(), "kind": kind})
+}
+
+/// The direct rungs of the ladder: an absolute or `~` candidate as-is; else
+/// joined onto each base in order; else, for a git diff prefix (`a/`, `b/`),
+/// the remainder joined onto each base. First hit wins.
+fn resolve_direct(candidate: &str, bases: &[PathBuf]) -> Option<(PathBuf, &'static str)> {
+    let expanded = expand_tilde(candidate).ok()?;
+    if expanded.is_absolute() {
+        return resolve_entry(&expanded);
+    }
+    if let Some(hit) = bases
+        .iter()
+        .find_map(|base| resolve_entry(&base.join(&expanded)))
+    {
+        return Some(hit);
+    }
+    let rest = candidate
+        .strip_prefix("a/")
+        .or_else(|| candidate.strip_prefix("b/"))
+        .filter(|rest| !rest.is_empty())?;
+    bases
+        .iter()
+        .find_map(|base| resolve_entry(&base.join(rest)))
+}
+
+/// What the workspace index says about one candidate.
+enum IndexAnswer {
+    Unique(serde_json::Value),
+    Ambiguous(Vec<serde_json::Value>),
+    Miss,
+}
+
+/// Judge index matches: sort shortest path first then lexicographically,
+/// re-canonicalize (the index is served stale, so only entries that exist
+/// RIGHT NOW count, answered canonically like the direct rungs) until
+/// [`MAX_AMBIGUOUS`] are confirmed, probing at most [`MAX_AMBIGUOUS_PROBES`].
+/// One confirmed match among all probed is unique; one with matches left
+/// unprobed is a miss (uniqueness unproven — the false-positive defense).
+fn judge_index_matches(
+    mut matches: Vec<&crate::quickopen::IndexedFile>,
+    files_only: bool,
+) -> IndexAnswer {
+    matches.sort_by(|a, b| {
+        a.path
+            .len()
+            .cmp(&b.path.len())
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    let mut found: Vec<(PathBuf, &'static str)> = Vec::new();
+    for entry in matches.iter().take(MAX_AMBIGUOUS_PROBES) {
+        let Some((resolved, kind)) = resolve_entry(Path::new(&entry.path)) else {
+            continue;
+        };
+        if files_only && kind != "file" {
+            continue;
+        }
+        if found.iter().any(|(path, _)| *path == resolved) {
+            continue;
+        }
+        found.push((resolved, kind));
+        if found.len() == MAX_AMBIGUOUS {
+            break;
+        }
+    }
+    match found.as_slice() {
+        [] => IndexAnswer::Miss,
+        [(path, kind)] if matches.len() <= MAX_AMBIGUOUS_PROBES => {
+            IndexAnswer::Unique(entry_json(path, kind))
+        }
+        [_] => IndexAnswer::Miss,
+        several => IndexAnswer::Ambiguous(
+            several
+                .iter()
+                .map(|(path, kind)| entry_json(path, kind))
+                .collect(),
+        ),
+    }
+}
+
+/// POST /api/v1/fs/validate {candidates, base, bases?, workspace_id?} —
+/// batched existence check behind the terminal, chat and document link
+/// providers: only path-like strings that resolve to something real get
+/// underlined. Answers `{valid: {[cand]: {path, kind}}, ambiguous: {[cand]:
+/// [{path, kind}]}}`: `path` is canonical and absolute, `kind` is `file` or
+/// `dir`; misses are simply absent. Candidates past
+/// [`MAX_VALIDATE_CANDIDATES`] or longer than
+/// [`MAX_VALIDATE_CANDIDATE_BYTES`] are ignored: cheap and batched by design.
 ///
-/// Bare-basename fallback: an agent often mentions a file by basename alone
-/// ("FIGURE_PLAN.md") when it lives in a subdirectory (`paper/FIGURE_PLAN.md`),
-/// so direct-child resolution can never confirm it. When `workspace_id` is
-/// given and a [`bare_basename`]-shaped candidate misses, the workspace's
-/// quickopen index is consulted and the candidate resolves IFF exactly one
-/// indexed file has that exact name — ambiguity (three `main.rs`) refuses,
-/// and the hit is re-canonicalized so a file deleted since the walk stays a
-/// miss (existence-verified links only, same as the direct path). Bounds: the
-/// index is the quickopen walk — entry/depth/time-capped, ignore-respecting,
-/// served stale-while-revalidating per workspace (up to two minutes plus one
-/// walk behind the disk on a slow tree, so a file created after the last
-/// walk may take that long to earn a bare-basename link) — fetched at most
-/// once per request and only when a fallback-eligible candidate actually
-/// missed.
+/// The ladder, per candidate, first hit wins:
+/// 1. absolute or `~` → as-is;
+/// 2. joined onto `base` (required, absolute), then onto each of `bases`
+///    (absolute dirs only, deduped, at most [`MAX_VALIDATE_BASES`]) in order
+///    — the cwd when the text was written, the document's folder, …;
+/// 3. a git diff prefix (`a/`, `b/`) stripped, the rest joined onto each base;
+/// 4. with `workspace_id`, the workspace's quickopen index: a
+///    [`bare_basename`] matches files with exactly that name; a partial path
+///    ([`suffix_candidate`]) matches entries whose workspace-relative path
+///    equals it or ends with `/` + it (`figs/plot.png` for
+///    `results/figs/plot.png`). One match → `valid`; several → `ambiguous`
+///    (at most [`MAX_AMBIGUOUS`], shortest path first) for the client to
+///    offer a choice, never an arbitrary pick.
+///
+/// Bounds: the index is the quickopen walk — entry/depth/time-capped,
+/// ignore-respecting (so `target/`, `work/` and symlinked trees are
+/// invisible to rung 4), served stale-while-revalidating per workspace (up to
+/// two minutes plus one walk behind the disk on a slow tree), fetched at most
+/// once per request, only when a rung-4-eligible candidate reached it, and
+/// never waited on (a cold index answers nothing this round). The whole
+/// request runs under the shared filesystem limiter with a
+/// [`VALIDATE_BUDGET`] wall-clock budget; candidates not reached in time are
+/// misses this round (clients retry misses).
 pub(crate) async fn validate(
     State(state): State<Arc<AppState>>,
     Json(body): Json<ValidateRequest>,
@@ -2140,39 +2267,49 @@ pub(crate) async fn validate(
     }
     // Every resolution stats the disk and a fallback may walk a (bounded)
     // tree — NFS-slow work that must stay off the async reactor.
-    let work = move || {
-        let base = Path::new(&body.base);
+    blocking_json(move || {
+        let deadline = Instant::now() + VALIDATE_BUDGET;
+        let mut bases = vec![PathBuf::from(&body.base)];
+        for extra in body.bases.iter().flatten() {
+            if bases.len() > MAX_VALIDATE_BASES {
+                break;
+            }
+            let extra = Path::new(extra);
+            if extra.is_absolute() && !bases.iter().any(|b| b == extra) {
+                bases.push(extra.to_path_buf());
+            }
+        }
         let mut valid = serde_json::Map::new();
+        let mut ambiguous = serde_json::Map::new();
         // Lazily fetched, at most once per request; inner None = unknown
-        // workspace (fallback silently off — degrade, don't error).
+        // workspace or an index still being built (fallback off this round —
+        // degrade, don't error).
         let mut index: Option<Option<Arc<Vec<crate::quickopen::IndexedFile>>>> = None;
         for candidate in body.candidates.iter().take(MAX_VALIDATE_CANDIDATES) {
-            if candidate.is_empty() || valid.contains_key(candidate) {
+            if candidate.is_empty()
+                || candidate.len() > MAX_VALIDATE_CANDIDATE_BYTES
+                || valid.contains_key(candidate)
+                || ambiguous.contains_key(candidate)
+            {
                 continue;
             }
-            let Ok(expanded) = expand_tilde(candidate) else {
-                continue;
-            };
-            let joined = if expanded.is_absolute() {
-                expanded
-            } else {
-                base.join(expanded)
-            };
-            // canonicalize both resolves (symlinks, `..`) and checks existence;
-            // anything unresolvable is a miss, never an error.
-            if let Ok(resolved) = std::fs::canonicalize(&joined) {
-                let kind = if resolved.is_dir() { "dir" } else { "file" };
-                valid.insert(
-                    candidate.clone(),
-                    json!({"path": resolved.to_string_lossy(), "kind": kind}),
-                );
+            if Instant::now() >= deadline {
+                break;
+            }
+            if let Some((path, kind)) = resolve_direct(candidate, &bases) {
+                valid.insert(candidate.clone(), entry_json(&path, kind));
                 continue;
             }
-            // Direct resolution missed — try the unique-basename fallback.
             let Some(workspace_id) = body.workspace_id.as_deref() else {
                 continue;
             };
-            if !bare_basename(candidate) {
+            let basename = bare_basename(candidate);
+            let suffix = if basename {
+                None
+            } else {
+                suffix_candidate(candidate)
+            };
+            if !basename && suffix.is_none() {
                 continue;
             }
             let files = index.get_or_insert_with(|| {
@@ -2181,34 +2318,25 @@ pub(crate) async fn validate(
             let Some(files) = files.as_deref() else {
                 continue;
             };
-            let Some(path) = crate::quickopen::unique_file_named(files, candidate) else {
-                continue;
+            let answer = match suffix {
+                None => judge_index_matches(crate::quickopen::files_named(files, candidate), true),
+                Some(suffix) => {
+                    judge_index_matches(crate::quickopen::entries_with_suffix(files, suffix), false)
+                }
             };
-            // The index is served stale (up to its freshness window plus a
-            // walk): re-canonicalize so only a file that exists RIGHT NOW
-            // links (and the answer is canonical, matching the direct path's
-            // contract).
-            let Ok(resolved) = std::fs::canonicalize(path) else {
-                continue;
-            };
-            if !resolved.is_file() {
-                continue;
+            match answer {
+                IndexAnswer::Unique(hit) => {
+                    valid.insert(candidate.clone(), hit);
+                }
+                IndexAnswer::Ambiguous(hits) => {
+                    ambiguous.insert(candidate.clone(), serde_json::Value::Array(hits));
+                }
+                IndexAnswer::Miss => {}
             }
-            valid.insert(
-                candidate.clone(),
-                json!({"path": resolved.to_string_lossy(), "kind": "file"}),
-            );
         }
-        json!({"valid": valid})
-    };
-    match tokio::task::spawn_blocking(work).await {
-        Ok(body) => Json(body).into_response(),
-        Err(join) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("validate task failed: {join}")})),
-        )
-            .into_response(),
-    }
+        Ok(json!({"valid": valid, "ambiguous": ambiguous}))
+    })
+    .await
 }
 
 #[derive(Deserialize)]
