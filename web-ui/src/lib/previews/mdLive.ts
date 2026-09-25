@@ -75,13 +75,29 @@ import { loadMath, mathNow } from "./mathLoad";
 import { copyText } from "../shared/clipboard";
 import { makeCopyButton } from "../shared/copyDecor";
 import { markScrollRegion, watchWidth } from "../shared/scrollRegion";
-import { activateUrl, hasUrlScheme, urlMenuEntries, webUrl } from "../shared/urlOpen";
+import { hasUrlScheme, urlMenuEntries, webUrl } from "../shared/urlOpen";
 import { contextMenu } from "../shared/contextMenu.svelte";
+import { requestReveal } from "../shared/reveal";
+import {
+  followDocHref,
+  isFollowable,
+  revealAnchorInSource,
+  showLinkHint,
+  type DocLinkHost,
+  type LinkContext,
+} from "./docLinks";
 
 /** The document's path, for widgets that resolve a relative image target
  *  (the plugin gets it as an argument; a table cell's image is rendered from
  *  the blocks field, which has only the state). */
 const docPath = Facet.define<string, string>({ combine: (v) => v[0] ?? "" });
+
+const noLinkContext = (): LinkContext => ({ wsRoot: null, workspaceId: null });
+/** The host's link context, read at click time (a getter, so the extension
+ *  set stays stable while the workspace it resolves against can move). */
+const linkContext = Facet.define<() => LinkContext, () => LinkContext>({
+  combine: (v) => v[0] ?? noLinkContext,
+});
 
 /**
  * The GFM markdown language (tables, task lists, strikethrough, autolinks;
@@ -286,10 +302,16 @@ function onScrollbarBand(el: HTMLElement | null, e: MouseEvent): boolean {
   return e.clientY >= el.getBoundingClientRect().bottom - band;
 }
 
+/** The destination a rendered link carries, as written, if the press
+ *  landed on one. */
+function linkTargetIn(target: EventTarget | null): string | null {
+  if (!(target instanceof Element)) return null;
+  return target.closest<HTMLElement>("[data-url]")?.dataset.url ?? null;
+}
+
 /** The web URL a rendered link carries, if the press landed on one. */
 function linkUrlIn(target: EventTarget | null): string | null {
-  if (!(target instanceof Element)) return null;
-  const url = target.closest<HTMLElement>("[data-url]")?.dataset.url ?? null;
+  const url = linkTargetIn(target);
   return url === null ? null : webUrl(url);
 }
 
@@ -433,9 +455,9 @@ class TableWidget extends WidgetType {
     const scroller = target?.closest<HTMLElement>(".md-table, .lp-math-display") ?? null;
     if (onScrollbarBand(scroller, e)) return; // the bar scrolls
     e.preventDefault();
-    const url = linkUrlIn(target);
-    if (url !== null && (e.metaKey || e.ctrlKey)) {
-      activateUrl(url, false);
+    const link = linkTargetIn(target);
+    if (link !== null && (e.metaKey || e.ctrlKey) && isFollowable(link)) {
+      followLiveLink(view, link, e);
       return;
     }
     const pos = view.posAtDOM(root);
@@ -1231,17 +1253,40 @@ function linkUrlAt(state: EditorState, pos: number): string | null {
   return null;
 }
 
-function linkUrlAtCoords(view: EditorView, x: number, y: number): string | null {
+/** The link destination under the pointer, as written. */
+function linkTargetAtCoords(view: EditorView, x: number, y: number): string | null {
   const pos = view.posAtCoords({ x, y });
-  if (pos === null) return null;
-  const url = linkUrlAt(view.state, pos);
+  return pos === null ? null : linkUrlAt(view.state, pos);
+}
+
+function linkUrlAtCoords(view: EditorView, x: number, y: number): string | null {
+  const url = linkTargetAtCoords(view, x, y);
   return url === null ? null : webUrl(url);
 }
 
+/** Follow a link out of the live document exactly as the reading view does
+ *  (docLinks.ts): a web URL opens as there, a file link opens in the
+ *  workbench — Shift beside, since Mod is the follow gesture here — and a
+ *  same-document anchor or `#L` fragment reveals its line in this editor. */
+function followLiveLink(view: EditorView, href: string, e: MouseEvent): void {
+  const doc = view.state.facet(docPath);
+  const ctx = view.state.facet(linkContext)();
+  const box = view.dom.closest<HTMLElement>(".md-content") ?? view.dom;
+  const host: DocLinkHost = {
+    docPath: doc,
+    wsRoot: ctx.wsRoot,
+    workspaceId: ctx.workspaceId,
+    toAnchor: (anchor) => revealAnchorInSource(doc, anchor),
+    toLines: (r) => requestReveal(doc, r),
+    hint: (text) => showLinkHint(box, e.clientX, e.clientY, text),
+  };
+  // A web URL keeps live mode's routing (pane or browser, never forced
+  // into a split by the Shift a file link reads).
+  void followDocHref(href, webUrl(href) === null && e.shiftKey, host);
+}
+
 /** Mod+press follows a link (plain click has to place the cursor — this is an
- *  editor). Routed like the reading view: a live local app opens in a browser
- *  pane, anything else in the user's real browser; relative/in-repo hrefs are
- *  swallowed rather than navigating the workbench to a 404. */
+ *  editor), through the same routing as the reading view. */
 const linkClicks = EditorView.domEventHandlers({
   // MOUSEDOWN, not click: CodeMirror places the cursor on mousedown, which
   // reveals the line's hidden marks and shifts the layout — a click-time
@@ -1249,10 +1294,10 @@ const linkClicks = EditorView.domEventHandlers({
   // Consuming the mousedown also keeps the mod-press from moving the cursor.
   mousedown: (e, view) => {
     if (e.button !== 0 || (!e.metaKey && !e.ctrlKey)) return false;
-    const url = linkUrlAtCoords(view, e.clientX, e.clientY);
-    if (url === null) return false;
+    const href = linkTargetAtCoords(view, e.clientX, e.clientY);
+    if (href === null || !isFollowable(href)) return false;
     e.preventDefault();
-    activateUrl(url, false);
+    followLiveLink(view, href, e);
     return true;
   },
   // Right-click parity with the reading view's URL menu — the editor's text
@@ -1450,16 +1495,18 @@ const liveTheme: Extension = EditorView.theme({
 
 /**
  * The live-preview behavior set (decorations, link handling, wrapping, the
- * static prose theme) for CodeView's `extra` slot. Keyed only on the document
- * path so the host can memoize it; the prose size arrives via the host-set
+ * static prose theme) for CodeView's `extra` slot. Keyed on the document path
+ * and a stable link-context getter (the workspace root a `/docs/x.md` link
+ * resolves against) so the host can memoize it; the prose size arrives via the host-set
  * `--lp-font-size`/`--lp-line-height` CSS variables, so an A−/A+ resize never
  * reconfigures the editor. Pair with the module's `markdownLanguageExt`.
  */
-export function markdownLive(path: string): Extension {
+export function markdownLive(path: string, links: () => LinkContext = noLinkContext): Extension {
   return [
     EditorView.lineWrapping,
     EditorView.editorAttributes.of({ class: "cm-md-live" }),
     docPath.of(path),
+    linkContext.of(links),
     liveTheme,
     livePlugin(path),
     blocks,

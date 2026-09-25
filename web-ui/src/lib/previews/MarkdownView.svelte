@@ -1,22 +1,44 @@
+<script module lang="ts">
+  import { createModeMemory } from "./mdDoc";
+
+  /** The mode each file was last shown in: a per-viewer convenience in this
+   *  browser's storage (never shared, never read back by the daemon). */
+  const modeMemory = createModeMemory(() => localStorage);
+  const PROPS_KEY = "chimaera.markdownPropsCollapsed";
+  function readPropsCollapsed(): boolean {
+    try {
+      return localStorage.getItem(PROPS_KEY) === "1";
+    } catch {
+      return false;
+    }
+  }
+</script>
+
 <script lang="ts">
   /**
    * Markdown with Obsidian-style modes: live | reading | source.
    *
-   * LIVE (the default) is an editable reading view — the shared CodeMirror
-   * editor with the mdLive decoration set rendering formatting inline (marks
-   * hidden off the selection's lines, images/checkboxes/rules/equations as
-   * widgets). READING is the complete, non-editable render — the
-   * authoritative server-side comrak GFM (sanitized; `$`/`$$` math arrives as
-   * LaTeX literals this view typesets), which refreshes from disk on save or
-   * an agent write. SOURCE is the same editor as plain raw markdown. Live and
-   * source share ONE editor instance (an extension swap, never a remount), and
-   * the editor mounts once and survives every toggle, so flipping modes never
-   * drops an unsaved buffer or its undo history. Saves, the dirty dot, and
-   * conflict handling all come from CodeView (Cmd/Ctrl+S).
-   * Editing is offered only for files under the 1MB cap; larger markdown
-   * opens straight into reading and stays there.
+   * READING is the complete, non-editable render — the authoritative
+   * server-side comrak GFM (sanitized; `$`/`$$` math arrives as LaTeX
+   * literals this view typesets), which refreshes from disk on save or an
+   * agent write. Its frontmatter shows as a properties panel, its links open
+   * in the workbench (docLinks.ts), and every block carries its source lines
+   * (`data-sourcepos`), so a selection references real line numbers and a
+   * reveal lands on the right block. LIVE is an editable reading view — the
+   * shared CodeMirror editor with the mdLive decoration set rendering
+   * formatting inline (marks hidden off the selection's lines,
+   * images/checkboxes/rules/equations as widgets). SOURCE is the same editor
+   * as plain raw markdown. Live and source share ONE editor instance (an
+   * extension swap, never a remount), and the editor mounts once and survives
+   * every toggle, so flipping modes never drops an unsaved buffer or its undo
+   * history. Saves, the dirty dot, and conflict handling all come from
+   * CodeView (Cmd/Ctrl+S).
+   * A file opens in the mode it was last shown in, else the
+   * `editor.markdownDefaultMode` setting (reading by default). Editing is
+   * offered only for files under the 1MB cap; larger markdown opens in
+   * reading and stays there.
   */
-  import type { Component } from "svelte";
+  import { untrack, type Component } from "svelte";
   import type { Extension } from "@codemirror/state";
   import {
     EDIT_MAX_BYTES,
@@ -33,20 +55,49 @@
   import { copyLabel, copyPayload, decorateCopyTargets } from "../shared/copyDecor";
   import { markScrollRegions, watchWidth } from "../shared/scrollRegion";
   import ReferenceChip from "../shared/ReferenceChip.svelte";
+  import Chevron from "../shared/Chevron.svelte";
   import Spinner from "./Spinner.svelte";
-  import { activateUrl, hasUrlScheme, isWebUrl, urlMenuEntries } from "../shared/urlOpen";
+  import { hasUrlScheme, isWebUrl, urlMenuEntries } from "../shared/urlOpen";
   import { contextMenu } from "../shared/contextMenu.svelte";
+  import { revealRequest, takeReveal, type Reveal } from "../shared/reveal";
   import { loadMath, mathNow } from "./mathLoad";
   import { readingWindow } from "./readingWindow";
+  import {
+    frontmatterLineSpan,
+    isMdMode,
+    parseFrontmatter,
+    parseSourcepos,
+    revealIndex,
+    spanLines,
+    stripFences,
+    type MdMode,
+    type SourceRange,
+  } from "./mdDoc";
+  import {
+    anchorRequests,
+    findAnchor,
+    followDocHref,
+    revealAnchorInSource,
+    showLinkHint,
+    takeAnchor,
+    type LinkContext,
+  } from "./docLinks";
 
   interface Props {
     path: string;
     /** Per-pane text-size override (px); the preview body scales to it. The
      *  A−/A+ pane controls and the Cmd/Ctrl +/− chords both drive this. */
     fontSize?: number;
+    /** Active workspace root: a root-relative `/docs/x.md` link resolves
+     *  against it when it names no absolute path. */
+    wsRoot?: string | null;
   }
 
-  let { path, fontSize = undefined }: Props = $props();
+  let { path, fontSize = undefined, wsRoot = null }: Props = $props();
+
+  /** Read at click time, so the memoized live extension set never has to
+   *  change when the workspace does. */
+  const linkContext = (): LinkContext => ({ wsRoot, workspaceId: null });
 
   // Prose base size: the pane override, else the Markdown preference. Drives
   // the reading body AND the live editor, so the two views read identically.
@@ -55,10 +106,13 @@
   const fileLabel = $derived(path.split("/").filter(Boolean).pop() ?? path);
   const bodyLineHeight = $derived(getSetting("editor.markdownLineHeight"));
 
-  type Mode = "live" | "reading" | "source";
-  let mode = $state<Mode>("live");
+  type Mode = MdMode;
+  let mode = $state<Mode>("reading");
   let chunk = $state<FileChunk | null>(null);
   let chunkError = $state<string | null>(null);
+  /** Why an editor mode just refused (the file turned out over the cap or
+   *  binary) — the buttons disable too, but a click deserves an answer. */
+  let barNote = $state<string | null>(null);
   /** Size + binary sniff of the source, once probed (null = not yet known). */
   let srcSize = $state<number | null>(null);
   let srcBinary = $state(false);
@@ -76,12 +130,20 @@
    *  still the latest, so a pending fetch can't override a later click. */
   let modeReq = 0;
   let CodeView = $state<
-    Component<{ path: string; first: FileChunk; extra?: Extension; autoLanguage?: boolean }> | null
+    Component<{
+      path: string;
+      first: FileChunk;
+      extra?: Extension;
+      autoLanguage?: boolean;
+      /** Whether the editor takes reveal requests for its path. The hidden
+       *  editor behind reading must not: reading maps the line itself. */
+      acceptReveal?: boolean;
+    }> | null
   >(null);
   let liveMod = $state<typeof import("./mdLive") | null>(null);
   let codeLoadError = $state<string | null>(null);
-  // Loaded eagerly on mount (not gated on entering an editor mode) so the
-  // default live open doesn't serialize the bundle import behind the chunk
+  // Loaded eagerly on mount (not gated on entering an editor mode) so a
+  // live/source open doesn't serialize the bundle import behind the chunk
   // fetch; both are cached after the first markdown file.
   $effect(() => {
     if (CodeView !== null) return;
@@ -99,7 +161,9 @@
   // source flip never reparses) and the live set is per-path. Entering
   // reading changes nothing — the hidden editor keeps its current set.
   const liveSet = $derived(
-    liveMod === null ? null : [liveMod.markdownLanguageExt, liveMod.markdownLive(path)],
+    liveMod === null
+      ? null
+      : [liveMod.markdownLanguageExt, liveMod.markdownLive(path, linkContext)],
   );
   const sourceSet = $derived(liveMod === null ? null : [liveMod.markdownLanguageExt]);
   let editorMode = $state<"live" | "source">("live");
@@ -111,34 +175,58 @@
   // switches, and re-rendered in place when the file changes on disk — a save
   // in the editor, or an agent write, both flow through the store).
   let entry = $state<FileEntry | null>(null);
-  const html = $derived(entry?.markdown ?? null);
+  const html = $derived(entry?.markdown?.html ?? null);
   const error = $derived(entry?.markdownError ?? null);
+  /** The leading YAML block, lifted out of the render by the daemon (null on
+   *  a document without one, and on an older daemon that renders it inline). */
+  const frontmatter = $derived(entry?.markdown?.frontmatter ?? null);
+  const fmEntries = $derived(frontmatter === null ? null : parseFrontmatter(frontmatter));
+  /** The panel stands in for the block's lines, fences included. */
+  const fmSourcepos = $derived(
+    frontmatter === null ? null : `1:1-${frontmatterLineSpan(frontmatter)}:3`,
+  );
+  let propsCollapsed = $state(readPropsCollapsed());
+  function toggleProps(): void {
+    propsCollapsed = !propsCollapsed;
+    try {
+      localStorage.setItem(PROPS_KEY, propsCollapsed ? "1" : "0");
+    } catch {
+      // storage unavailable: the choice lasts for this view
+    }
+  }
 
   // Reset per path — BEFORE the retain effect in source order, so a path swap
-  // resets the view before the new entry is opened.
+  // resets the view before the new entry is opened. The opening mode is the
+  // one this file was last shown in, else the setting — read untracked, so a
+  // settings change never resets an open document.
   $effect(() => {
     void path;
-    mode = "live";
-    editorMode = "live";
+    const initial = untrack(() => {
+      const setting = getSetting("editor.markdownDefaultMode");
+      return modeMemory.get(path) ?? (isMdMode(setting) ? setting : "reading");
+    });
+    mode = initial;
+    editorMode = initial === "source" ? "source" : "live";
     modeReq++;
     chunk = null;
     chunkError = null;
+    barNote = null;
     srcSize = null;
     srcBinary = false;
     entered = false;
     codeLoadError = null;
   });
 
-  // Retain + open the default mode: live when the source is editable (text
-  // under the cap), reading otherwise. `path` is the only tracked dependency
-  // — the store's retain()/ensure* guards are untracked by design, so an
-  // in-place payload refresh (a save, an agent write) can never re-run this
+  // Retain + open the chosen mode. `path` is the only tracked dependency —
+  // the store's retain()/ensure* guards are untracked by design (and
+  // openDefault's read of `mode` is untracked here), so an in-place payload
+  // refresh (a save, an agent write) or a mode click can never re-run this
   // effect and remount the editor over a dirty buffer.
   $effect(() => {
     void path;
     const e = retain(path);
     entry = e;
-    void openDefault(e);
+    untrack(() => void openDefault(e));
     return () => release(path);
   });
 
@@ -159,6 +247,9 @@
   }
 
   async function openDefault(e: FileEntry): Promise<void> {
+    // Reading needs no source: the chunk is fetched (and the editor mounted)
+    // on the first live/source click, so a plain read costs one request.
+    if (mode === "reading") return;
     const req = modeReq;
     await e.ensureChunk();
     if (entry !== e || chunk !== null) return; // path changed, or a toggle won
@@ -176,8 +267,8 @@
   }
 
   // The server render is fetched on the first reading entry (not eagerly —
-  // the default live mode only needs the raw source). Once populated, the
-  // store refreshes it in place on every disk change or in-app save.
+  // the editor modes only need the raw source). Once populated, the store
+  // refreshes it in place on every disk change or in-app save.
   $effect(() => {
     if (mode !== "reading") return;
     void entry?.ensureMarkdown();
@@ -197,49 +288,211 @@
         chunkError = e.chunkError ?? "failed to load source";
         return;
       }
-      if (r === "unusable") return; // binary / too large; stay in reading
+      if (r === "unusable") {
+        // binary / too large; stay in reading
+        barNote = disabledReason;
+        return;
+      }
     }
     entered = true;
     mode = target;
     editorMode = target;
+    modeMemory.set(path, target);
   }
 
   function setMode(m: Mode): void {
     modeReq++;
-    if (m === "reading") mode = "reading";
-    else void enterEditor(m);
+    barNote = null;
+    if (m === "reading") {
+      mode = "reading";
+      modeMemory.set(path, "reading");
+    } else {
+      void enterEditor(m);
+    }
   }
 
   // --- context bridge: selection in the RENDERED reading view ---------------
-  // No line mapping exists for rendered markdown, so the reference carries
-  // the path + quoted excerpt only (live/source go through CodeView, which
-  // has real line numbers).
+  // Every block of the render carries its source lines (`data-sourcepos`),
+  // so a reference names the lines the selection's two ends sit in; a
+  // render without them (an older daemon) sends the quoted excerpt alone.
   const selOwner = {};
   let contentEl = $state<HTMLDivElement | null>(null);
 
-  /**
-   * Links in a rendered document. Nothing set a `target` here, so a click was
-   * a TOP-LEVEL navigation: in a browser that replaces the whole workbench,
-   * and in the native app the shell's navigation guard swallows it. Route it
-   * instead — a live local app (loopback / explicit port) opens in a browser
-   * pane, anything else in the user's real browser. Delegated on `.md-content`
-   * so it covers the reading render (the editor consumes its own clicks).
-   */
   // Copy chrome on fenced blocks + blockquotes (the same affordance as the
-  // chat transcript, via the shared decorator), plus document-relative image
-  // resolution. Scoped to the reading scroll (never the editor subtree) and
-  // gated on reading being shown — a hidden render pane skips the DOM walk
-  // and catches up when reading is next entered (mode is a dependency).
+  // chat transcript, via the shared decorator), document-relative image
+  // resolution, and task-item marks. Scoped to the rendered article (never
+  // the editor subtree, nor the Svelte-owned properties panel) and gated on
+  // reading being shown — a hidden render pane skips the DOM walk and
+  // catches up when reading is next entered (mode is a dependency).
   let readingEl = $state<HTMLDivElement | null>(null);
+  let articleEl = $state<HTMLElement | null>(null);
   $effect(() => {
     void html;
     if (mode !== "reading") return;
-    const content = readingEl;
+    const content = articleEl;
     if (content === null) return;
     decorateCopyTargets(content);
     stampImages(content);
+    markTasks(content);
     typesetMath(content);
     return cancelTypeset;
+  });
+
+  /** Task items (`- [x]`) arrive as `span.md-task[data-task]` at the head of
+   *  their item. The item drops its bullet (the box stands in for it, as in
+   *  live), and a done item's own text — up to its first nested block, so a
+   *  sub-list keeps its ink — is wrapped to read muted and struck through,
+   *  matching live's `lp-task-done`. A CSS `:has()` would do the first half,
+   *  but its invalidation cost on a long document in WebKit is exactly the
+   *  restyle churn the pane parking fights; a class set once is free.
+   *  Idempotent: a fresh server render brings fresh spans. */
+  const BLOCK_TAGS = new Set(["UL", "OL", "P", "DIV", "PRE", "BLOCKQUOTE", "TABLE"]);
+  function markTasks(root: HTMLElement): void {
+    for (const box of root.querySelectorAll<HTMLElement>("span.md-task[data-task]")) {
+      const item = box.closest("li");
+      if (item !== null && !item.classList.contains("md-task-item")) {
+        item.classList.add("md-task-item");
+      }
+      if (box.dataset.task !== "done") continue;
+      if (box.nextElementSibling?.classList.contains("md-task-text")) continue;
+      const wrap = document.createElement("span");
+      wrap.className = "md-task-text";
+      let n = box.nextSibling;
+      while (n !== null && !(n instanceof HTMLElement && BLOCK_TAGS.has(n.tagName))) {
+        const next = n.nextSibling;
+        wrap.append(n);
+        n = next;
+      }
+      // The space after the box stays outside, or the strike starts on it.
+      const head = wrap.firstChild;
+      const lead = head instanceof Text ? /^\s+/.exec(head.data) : null;
+      if (head instanceof Text && lead !== null) head.data = head.data.slice(lead[0].length);
+      box.after(wrap);
+      if (lead !== null) box.after(document.createTextNode(lead[0]));
+    }
+  }
+
+  // --- place: anchors, line reveals ------------------------------------------
+
+  /** Block elements a line reveal can land on (inline marks may carry
+   *  sourcepos too; a flash on a word reads as noise). */
+  const REVEAL_TAGS = new Set([
+    "P", "H1", "H2", "H3", "H4", "H5", "H6", "LI", "UL", "OL", "BLOCKQUOTE", "PRE",
+    "TABLE", "TR", "HR", "DIV", "DL", "DT", "DD", "SECTION", "DETAILS", "FIGURE",
+  ]);
+
+  /** Scroll the reading pane (only — never its ancestors, which
+   *  scrollIntoView would drag along) so `el` sits near the top. */
+  function scrollToEl(root: HTMLElement, el: Element): void {
+    const top = el.getBoundingClientRect().top - root.getBoundingClientRect().top + root.scrollTop;
+    root.scrollTop = Math.max(0, top - Math.min(72, root.clientHeight / 4));
+  }
+
+  const FLASH_MS = 1600;
+  /** Mark where a jump landed. A readingWindow placeholder (inert, aria-
+   *  hidden, same tag and sourcepos) is swapped for its block once scrolled
+   *  into view, so the flash waits a few frames for the real one. */
+  function flash(el: HTMLElement, tries = 4): void {
+    const pos = el.getAttribute("data-sourcepos");
+    if (el.inert && pos !== null && tries > 0) {
+      requestAnimationFrame(() => {
+        const real = readingEl?.querySelector<HTMLElement>(
+          `[data-sourcepos="${CSS.escape(pos)}"]:not([inert])`,
+        );
+        flash(real ?? el, real === null || real === undefined ? tries - 1 : 0);
+      });
+      return;
+    }
+    el.classList.remove("md-flash");
+    void el.offsetWidth; // restart the animation on a repeat jump
+    el.classList.add("md-flash");
+    setTimeout(() => el.classList.remove("md-flash"), FLASH_MS);
+  }
+
+  function toAnchorInReading(anchor: string): boolean {
+    const root = readingEl;
+    if (root === null) return false;
+    const el = findAnchor(root, anchor);
+    if (el === null) return false;
+    scrollToEl(root, el);
+    // A heading's id sits on an empty anchor inside it; flash the block.
+    const block = el.closest<HTMLElement>("[data-sourcepos], h1, h2, h3, h4, h5, h6, li, p");
+    flash(block !== null && root.contains(block) ? block : el);
+    return true;
+  }
+
+  function revealInReading(r: Reveal): void {
+    const root = readingEl;
+    if (root === null) return;
+    const els = Array.from(root.querySelectorAll<HTMLElement>("[data-sourcepos]")).filter((el) =>
+      REVEAL_TAGS.has(el.tagName),
+    );
+    const ranges = els.map((el) => parseSourcepos(el.getAttribute("data-sourcepos")));
+    const i = revealIndex(ranges, r.line);
+    if (i < 0) return;
+    scrollToEl(root, els[i]);
+    const end = r.endLine ?? r.line;
+    if (end <= r.line) {
+      flash(els[i]);
+      return;
+    }
+    // A range: flash the innermost blocks it touches (bounded — a reveal of
+    // a whole long file flashes its first screenfuls, not every block).
+    const hits = els.filter((_, j) => {
+      const g = ranges[j];
+      return g !== null && g.start <= end && g.end >= r.line;
+    });
+    const leaves = hits.length > 200 ? hits.slice(0, 200) : hits;
+    for (const el of leaves) {
+      if (!leaves.some((o) => o !== el && el.contains(o))) flash(el);
+    }
+  }
+
+  /** One frame after the render lays out, jumps run — queued, not tied to
+   *  an effect's teardown: taking a reveal clears the store the effect
+   *  reads, and a teardown-cancelled frame would drop the very jump that
+   *  re-ran it. */
+  let layoutJobs: (() => void)[] = [];
+  let layoutFrame = 0;
+  function afterLayout(job: () => void): void {
+    layoutJobs.push(job);
+    if (layoutFrame !== 0) return;
+    layoutFrame = requestAnimationFrame(() => {
+      layoutFrame = 0;
+      const jobs = layoutJobs;
+      layoutJobs = [];
+      for (const j of jobs) j();
+    });
+  }
+  $effect(() => () => {
+    if (layoutFrame !== 0) cancelAnimationFrame(layoutFrame);
+    layoutFrame = 0;
+    layoutJobs = [];
+  });
+
+  // A reveal (a `#L12` link, an agent's "look here") is this view's to take
+  // only while reading shows; in live/source the editor takes it
+  // (acceptReveal). On render, too: the request may predate the fetch.
+  $effect(() => {
+    void $revealRequest;
+    if (mode !== "reading" || html === null || readingEl === null) return;
+    const req = takeReveal(path);
+    if (req !== null) afterLayout(() => revealInReading(req));
+  });
+
+  // A link from another document (`this.md#heading`) left its anchor
+  // pending for this path. Reading scrolls to the element; the editor
+  // modes map it to a line through the render and reveal that.
+  $effect(() => {
+    void $anchorRequests;
+    if (mode === "reading") {
+      if (html === null || readingEl === null) return;
+      const anchor = takeAnchor(path);
+      if (anchor !== null) afterLayout(() => void toAnchorInReading(anchor));
+    } else {
+      const anchor = takeAnchor(path);
+      if (anchor !== null) void revealAnchorInSource(path, anchor);
+    }
   });
 
   /** Keyboard reach for the reading view's horizontal scrollers
@@ -411,19 +664,46 @@
       }
       return;
     }
+    followLink(e, e.metaKey || e.ctrlKey);
+  }
+
+  /** A middle-click would open the raw href in a new BROWSER tab — for a
+   *  document-relative path, the app origin's 404. A file link opens beside
+   *  instead; a web link keeps the browser's own new-tab behavior. */
+  function onLinkAuxClick(e: MouseEvent): void {
+    if (e.button !== 1) return;
+    const href = (e.target as Element | null)?.closest?.("a[href]")?.getAttribute("href") ?? "";
+    if (isWebUrl(href)) return;
+    followLink(e, true);
+  }
+
+  function followLink(e: MouseEvent, split: boolean): void {
     const anchor = (e.target as Element | null)?.closest?.("a[href]");
-    const href = anchor?.getAttribute("href") ?? "";
-    if (anchor === null || anchor === undefined) return;
-    // Same-document anchors (a heading TOC) keep their native behavior.
-    if (href.startsWith("#")) return;
+    if (anchor === null || anchor === undefined || readingEl?.contains(anchor) !== true) return;
+    const href = anchor.getAttribute("href") ?? "";
     // `mailto:`/`tel:` are the browser's to handle — the OS knows what to do
     // with them and swallowing the click would just make the link look dead.
     // They cannot navigate the workbench away, so letting them through is safe.
     if (/^(mailto|tel):/i.test(href)) return;
+    // Everything else is routed, never a native navigation: nothing sets a
+    // `target` here, so a click would be a TOP-LEVEL navigation — in a
+    // browser that replaces the whole workbench, and in the native app the
+    // shell's guard swallows it. A web URL opens in a browser pane (a live
+    // local app) or the real browser; a file link opens in the workbench,
+    // Cmd/Ctrl beside; `#anchor` / `#L12` scroll this document without
+    // touching location.hash; any other scheme is dropped.
     e.preventDefault();
-    if (isWebUrl(href)) activateUrl(href, e.metaKey || e.ctrlKey);
-    // A relative/in-repo href resolves against no meaningful base here, so it
-    // is swallowed rather than allowed to navigate the workbench to a 404.
+    const x = e.clientX;
+    const y = e.clientY;
+    void followDocHref(href, split, {
+      docPath: path,
+      ...linkContext(),
+      toAnchor: toAnchorInReading,
+      toLines: revealInReading,
+      hint: (text) => {
+        if (contentEl !== null) showLinkHint(contentEl, x, y, text);
+      },
+    });
   }
 
   function onLinkContextMenu(e: MouseEvent): void {
@@ -455,8 +735,31 @@
       clearSelection(selOwner);
       return;
     }
-    setSelection(selOwner, { kind: "file", path, startLine: null, endLine: null, text });
+    const lines = spanLines(
+      linesAt(range.startContainer, range.startOffset),
+      linesAt(range.endContainer, Math.max(range.endOffset - 1, 0)),
+    );
+    setSelection(selOwner, {
+      kind: "file",
+      path,
+      startLine: lines?.start ?? null,
+      endLine: lines?.end ?? null,
+      text,
+    });
     chipPos = chipPosFor(content, range);
+  }
+
+  /** The source lines of the innermost mapped block holding a selection
+   *  boundary (an element boundary names the child at its offset). */
+  function linesAt(node: Node, offset: number): SourceRange | null {
+    let n: Node = node;
+    if (n instanceof Element && n.childNodes.length > 0) {
+      n = n.childNodes[Math.min(offset, n.childNodes.length - 1)];
+    }
+    const el = n instanceof Element ? n : n.parentElement;
+    const block = el?.closest<HTMLElement>("[data-sourcepos]") ?? null;
+    if (block === null || readingEl?.contains(block) !== true) return null;
+    return parseSourcepos(block.getAttribute("data-sourcepos"));
   }
 
   /** Where the chip sits for a selection: just past its last rect, clamped
@@ -544,7 +847,11 @@
         onclick={() => setMode("source")}>source</button
       >
     </div>
-    {#if chunkError !== null}<span class="md-bar-err">{chunkError}</span>{/if}
+    {#if chunkError !== null}
+      <span class="md-bar-err">{chunkError}</span>
+    {:else if barNote !== null}
+      <span class="md-bar-note">{barNote}</span>
+    {/if}
   </div>
 
   <!-- Delegated link handling: the interactive targets are the rendered
@@ -557,6 +864,7 @@
     class="md-content"
     bind:this={contentEl}
     onclick={onLinkClick}
+    onauxclick={onLinkAuxClick}
     oncontextmenu={onLinkContextMenu}
   >
     {#if mode === "reading" && chipPos !== null}
@@ -579,9 +887,68 @@
       {#if error !== null}
         <div class="file-error">{error}</div>
       {:else if html !== null}
+        {#if frontmatter !== null}
+          <!-- The frontmatter as properties: a sibling of the article, never
+               inside it (the raw-HTML range owns the article's first and
+               last nodes — readingWindow's boundary rule). Every value is
+               text-interpolated; the file's YAML is never markup. -->
+          <section
+            class="md-props"
+            class:collapsed={propsCollapsed}
+            style:font-size="{bodyFont}px"
+            data-sourcepos={fmSourcepos}
+            aria-label="properties"
+          >
+            <button
+              type="button"
+              class="md-props-head"
+              aria-expanded={!propsCollapsed}
+              onclick={toggleProps}
+            >
+              <Chevron open={!propsCollapsed} size={10} />
+              <span>properties</span>
+              {#if fmEntries !== null}<span class="md-props-count">{fmEntries.length}</span>{/if}
+            </button>
+            {#if !propsCollapsed}
+              {#if fmEntries !== null && fmEntries.length > 0}
+                <dl class="md-props-list">
+                  {#each fmEntries as prop, i (i)}
+                    <dt>{prop.key}</dt>
+                    <dd>
+                      {#if prop.value.kind === "list"}
+                        {#each prop.value.items as item, j (j)}
+                          <span class="md-prop-chip">{item}</span>
+                        {:else}
+                          <span class="md-prop-empty">—</span>
+                        {/each}
+                      {:else if prop.value.kind === "bool"}
+                        <span
+                          class="md-task"
+                          data-task={prop.value.value ? "done" : "todo"}
+                          role="img"
+                          aria-label={prop.value.value ? "true" : "false"}
+                        ></span>
+                      {:else if prop.value.kind === "raw"}
+                        <pre class="md-prop-raw">{prop.value.text}</pre>
+                      {:else if prop.value.text === ""}
+                        <span class="md-prop-empty">—</span>
+                      {:else}
+                        <span class="md-prop-text">{prop.value.text}</span>
+                      {/if}
+                    </dd>
+                  {/each}
+                </dl>
+              {:else}
+                <pre class="md-props-raw">{stripFences(frontmatter)}</pre>
+              {/if}
+            {/if}
+          </section>
+        {/if}
         <article
           class="md-body"
+          class:after-props={frontmatter !== null}
           style:font-size="{bodyFont}px"
+          bind:this={articleEl}
           use:readingWindow={[html, bodyFont, bodyLineHeight]}
         >
           <!-- eslint-disable-next-line svelte/no-at-html-tags — sanitized server-side -->
@@ -606,7 +973,13 @@
         style:--lp-line-height={bodyLineHeight}
       >
         {#if CodeView !== null}
-          <CodeView {path} {first} {extra} autoLanguage={false} />
+          <CodeView
+            {path}
+            {first}
+            {extra}
+            autoLanguage={false}
+            acceptReveal={mode !== "reading"}
+          />
         {:else if codeLoadError !== null}
           <div class="file-error">{codeLoadError}</div>
         {:else}
@@ -683,6 +1056,11 @@
     color: var(--err);
   }
 
+  .md-bar-note {
+    font-size: var(--text-xs);
+    color: var(--muted);
+  }
+
   .md-content {
     flex: 1;
     position: relative;
@@ -737,6 +1115,296 @@
        display:block scroller there. Headers wrap like any cell: one-line
        headers would only turn tables that fit into scrollers, since
        overflow-wrap above never shrinks a column's min-content. */
+  }
+
+  .md-body.after-props {
+    padding-top: 1.1rem;
+  }
+
+  /* Properties (the frontmatter): a quiet key/value card on the reading
+     column, sized in em off the same per-pane text size as the body. */
+  /* Same box as .md-body (border-box via app.css), so the card lines up
+     with the column under it. */
+  .md-props {
+    max-width: 70ch;
+    margin: 1.6rem auto 0;
+    padding: 0 2rem;
+    line-height: 1.45;
+  }
+
+  .md-props-head {
+    appearance: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.45em;
+    border: none;
+    background: none;
+    padding: 0.15em 0.3em 0.15em 0;
+    font: inherit;
+    font-size: 0.78em;
+    letter-spacing: 0.04em;
+    color: var(--muted);
+    cursor: pointer;
+    border-radius: 4px;
+  }
+
+  .md-props-head:hover {
+    color: var(--fg);
+  }
+
+  .md-props-count {
+    font-variant-numeric: tabular-nums;
+    opacity: 0.7;
+  }
+
+  .md-props-list {
+    display: grid;
+    grid-template-columns: minmax(6em, max-content) 1fr;
+    gap: 0.3em 1.2em;
+    margin: 0.45em 0 0;
+    padding: 0.65em 0.9em;
+    border: 1px solid var(--edge);
+    border-radius: 8px;
+    background: color-mix(in srgb, var(--fg) 2.5%, transparent);
+    font-size: 0.86em;
+  }
+
+  .md-props-list dt {
+    color: var(--muted);
+    overflow-wrap: anywhere;
+  }
+
+  .md-props-list dd {
+    margin: 0;
+    min-width: 0;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 0.3em;
+    overflow-wrap: anywhere;
+  }
+
+  .md-prop-text {
+    white-space: pre-wrap;
+  }
+
+  /* An empty box has no baseline of its own to align by. */
+  .md-props-list dd > :global(.md-task) {
+    align-self: center;
+  }
+
+  .md-prop-chip {
+    padding: 0 0.5em;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+    border: 1px solid color-mix(in srgb, var(--accent) 28%, var(--edge));
+    font-size: 0.94em;
+    line-height: 1.5;
+  }
+
+  .md-prop-empty {
+    color: var(--muted);
+    opacity: 0.6;
+  }
+
+  .md-prop-raw,
+  .md-props-raw {
+    margin: 0;
+    font-family: var(--mono);
+    font-size: 0.9em;
+    white-space: pre-wrap;
+    color: var(--muted);
+  }
+
+  .md-props-raw {
+    margin-top: 0.45em;
+    padding: 0.65em 0.9em;
+    border: 1px solid var(--edge);
+    border-radius: 8px;
+    font-size: 0.78em;
+  }
+
+  /* A task box (the reading render's `span.md-task`, and a boolean
+     property): drawn to match live mode's native checkbox — an edge-toned
+     box, an accent fill with a knocked-out check when done. */
+  .md-view :global(.md-task) {
+    display: inline-block;
+    position: relative;
+    flex: none;
+    width: 0.92em;
+    height: 0.92em;
+    margin: 0 0.45em 0 0;
+    vertical-align: -0.12em;
+    box-sizing: border-box;
+    border: 1.5px solid color-mix(in srgb, var(--fg) 38%, transparent);
+    border-radius: 3px;
+    background: var(--term-bg);
+  }
+
+  .md-view :global(.md-task[data-task="done"]) {
+    background: var(--accent);
+    border-color: var(--accent);
+  }
+
+  .md-view :global(.md-task[data-task="done"]::after) {
+    content: "";
+    position: absolute;
+    left: 30%;
+    top: 8%;
+    width: 28%;
+    height: 58%;
+    border: solid var(--term-bg);
+    border-width: 0 0.13em 0.13em 0;
+    transform: rotate(45deg);
+  }
+
+  /* The box stands in for a bullet, hanging in the marker's place; an
+     ordered task keeps its number (live does the same). */
+  .md-body :global(ul > li.md-task-item) {
+    list-style: none;
+  }
+
+  .md-body :global(ul > li.md-task-item > .md-task:first-child),
+  .md-body :global(ul > li.md-task-item > p:first-child > .md-task:first-child) {
+    margin-left: -1.35em;
+    margin-right: 0.43em;
+  }
+
+  .md-body :global(.md-task-text) {
+    color: var(--muted);
+    text-decoration: line-through;
+    text-decoration-color: color-mix(in srgb, var(--muted) 70%, transparent);
+  }
+
+  /* GitHub alerts (comrak's classes): a tinted card with a colored rule and
+     a title row led by the type's glyph. Colors are semantic theme tokens,
+     so every curated theme restyles them; the glyph is a mask painted in
+     the title's own color. */
+  .md-body :global(.markdown-alert) {
+    --md-alert: var(--syn-func);
+    margin: 0.9em 0;
+    padding: 0.55em 1em 0.6em;
+    border-left: 3px solid color-mix(in srgb, var(--md-alert) 75%, transparent);
+    border-radius: 0 8px 8px 0;
+    background: color-mix(in srgb, var(--md-alert) 7%, transparent);
+  }
+
+  .md-body :global(.markdown-alert-note) {
+    --md-alert: var(--syn-func);
+    --md-alert-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='12' cy='12' r='9'/%3E%3Cpath d='M12 8h.01M11 12h1v4h1'/%3E%3C/svg%3E");
+  }
+
+  .md-body :global(.markdown-alert-tip) {
+    --md-alert: var(--syn-string);
+    --md-alert-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3 12h1m8-9v1m8 8h1M5.6 5.6l.7.7m12.1-.7-.7.7M9 16a5 5 0 1 1 6 0a3.5 3.5 0 0 0-1 3a2 2 0 0 1-4 0a3.5 3.5 0 0 0-1-3M9.7 17h4.6'/%3E%3C/svg%3E");
+  }
+
+  .md-body :global(.markdown-alert-important) {
+    --md-alert: var(--rate);
+    --md-alert-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M18 4a3 3 0 0 1 3 3v8a3 3 0 0 1-3 3h-5l-5 3v-3H6a3 3 0 0 1-3-3V7a3 3 0 0 1 3-3zM12 8v3M12 14v.01'/%3E%3C/svg%3E");
+  }
+
+  .md-body :global(.markdown-alert-warning) {
+    --md-alert: var(--warn);
+    --md-alert-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12 9v4M10.4 3.6L2.3 17.1a1.9 1.9 0 0 0 1.6 2.9h16.2a1.9 1.9 0 0 0 1.6-2.9L13.6 3.6a1.9 1.9 0 0 0-3.2 0zM12 16h.01'/%3E%3C/svg%3E");
+  }
+
+  .md-body :global(.markdown-alert-caution) {
+    --md-alert: var(--err);
+    --md-alert-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12.8 2.6l8.6 8.6a1.1 1.1 0 0 1 0 1.6l-8.6 8.6a1.1 1.1 0 0 1-1.6 0l-8.6-8.6a1.1 1.1 0 0 1 0-1.6l8.6-8.6a1.1 1.1 0 0 1 1.6 0zM12 8v4M12 16h.01'/%3E%3C/svg%3E");
+  }
+
+  .md-body :global(.markdown-alert-title) {
+    display: flex;
+    align-items: center;
+    gap: 0.45em;
+    margin: 0 0 0.25em;
+    font-weight: 600;
+    font-size: 0.94em;
+    color: var(--md-alert);
+  }
+
+  .md-body :global(.markdown-alert-title::before) {
+    content: "";
+    flex: none;
+    width: 1.05em;
+    height: 1.05em;
+    background: currentColor;
+    -webkit-mask: var(--md-alert-icon) center / contain no-repeat;
+    mask: var(--md-alert-icon) center / contain no-repeat;
+  }
+
+  .md-body :global(.markdown-alert > :last-child) {
+    margin-bottom: 0;
+  }
+
+  .md-body :global(.markdown-alert > .markdown-alert-title + *) {
+    margin-top: 0;
+  }
+
+  /* Footnotes: comrak's section, quieter than the prose it annotates. */
+  .md-body :global(section.footnotes) {
+    margin-top: 2.2em;
+    padding-top: 0.6em;
+    border-top: 1px solid var(--edge);
+    font-size: 0.88em;
+    color: color-mix(in srgb, var(--fg) 75%, var(--muted));
+  }
+
+  .md-body :global(.footnote-ref a),
+  .md-body :global(a.footnote-backref) {
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* Where a jump landed: a brief accent wash that fades out. */
+  .md-scroll :global(.md-flash) {
+    animation: md-flash 1.5s ease-out;
+    border-radius: 4px;
+  }
+
+  @keyframes md-flash {
+    0%,
+    20% {
+      background-color: color-mix(in srgb, var(--accent) 22%, transparent);
+    }
+    100% {
+      background-color: transparent;
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .md-scroll :global(.md-flash) {
+      animation: none;
+      outline: 2px solid color-mix(in srgb, var(--accent) 45%, transparent);
+      outline-offset: 2px;
+    }
+  }
+
+  /* A followed link that goes nowhere says so where the click was (both
+     modes: the live editor mounts inside .md-content too). */
+  .md-content :global(.md-link-hint) {
+    position: absolute;
+    z-index: 5;
+    max-width: min(26rem, calc(100% - 16px));
+    padding: 0.3rem 0.6rem;
+    border: 1px solid var(--edge);
+    border-radius: 6px;
+    background: var(--overlay-bg);
+    box-shadow: 0 4px 14px color-mix(in srgb, var(--fg) 12%, transparent);
+    color: var(--muted);
+    font-size: var(--text-xs);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    pointer-events: none;
+    animation: md-hint-in 0.12s ease-out;
+  }
+
+  @keyframes md-hint-in {
+    from {
+      opacity: 0;
+      transform: translateY(-3px);
+    }
   }
 
   .md-body :global(h1),

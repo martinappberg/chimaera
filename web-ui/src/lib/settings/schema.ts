@@ -104,6 +104,7 @@ export type SettingsMap = {
   "editor.lineHeight": number;
   "editor.markdownFontSize": number;
   "editor.markdownLineHeight": number;
+  "editor.markdownDefaultMode": "reading" | "live" | "source";
   "editor.lineNumbers": boolean;
   "editor.wordWrap": boolean;
   "editor.tabSize": number;
@@ -446,6 +447,21 @@ const DEFS = {
     min: 1.2,
     max: 2.4,
     step: 0.05,
+    scope: "client",
+  },
+  "editor.markdownDefaultMode": {
+    title: "Markdown Default Mode",
+    category: "Editor",
+    description:
+      "How a Markdown file opens the first time: the rendered reading view, the editable live preview, or raw source. After that, each file reopens in the mode you last picked.",
+    type: "enum",
+    default: "reading",
+    options: [
+      { value: "reading", label: "Reading" },
+      { value: "live", label: "Live" },
+      { value: "source", label: "Source" },
+    ],
+    note: "Files over 1 MB and binary content always open in reading.",
     scope: "client",
   },
   "editor.lineNumbers": {

@@ -234,10 +234,24 @@ export async function fsValidate(
   return out;
 }
 
-export async function fsMarkdown(path: string): Promise<string> {
+/** A server-rendered markdown document (GET /fs/markdown). */
+export interface MarkdownDoc {
+  /** Sanitized comrak HTML; block elements carry `data-sourcepos`. */
+  html: string;
+  /** Raw YAML text of a leading `---` block (no longer part of `html`), or
+   *  null. Older daemons omit the field and render the block into `html`. */
+  frontmatter: string | null;
+}
+
+export async function fsMarkdown(path: string): Promise<MarkdownDoc> {
   const q = new URLSearchParams({ path });
-  const body = await json<{ html: string }>(await api(`/fs/markdown?${q.toString()}`));
-  return body.html;
+  const body = await json<{ html: string; frontmatter?: string | null }>(
+    await api(`/fs/markdown?${q.toString()}`),
+  );
+  return {
+    html: body.html,
+    frontmatter: typeof body.frontmatter === "string" ? body.frontmatter : null,
+  };
 }
 
 export async function fsTable(path: string, offsetRows = 0, limitRows = 200): Promise<TablePage> {

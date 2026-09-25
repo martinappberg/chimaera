@@ -39,7 +39,11 @@
   // CodeMirror is by far the heaviest dependency in the app; load it only
   // when a text file is actually opened so the terminal-only path stays lean.
   let CodeView = $state<Component<{ path: string; first: FileChunk }> | null>(null);
-  let MarkdownView = $state<Component<{ path: string; fontSize?: number }> | null>(null);
+  let MarkdownView = $state<Component<{
+    path: string;
+    fontSize?: number;
+    wsRoot?: string | null;
+  }> | null>(null);
   let HtmlView = $state<Component<{ path: string }> | null>(null);
   let XlsxView = $state<Component<{ path: string }> | null>(null);
   let PdfView = $state<Component<{ path: string }> | null>(null);
@@ -141,7 +145,7 @@
         <ImageView {path} />
       {:else if kind === "markdown"}
         {#if MarkdownView !== null}
-          <MarkdownView {path} {fontSize} />
+          <MarkdownView {path} {fontSize} {wsRoot} />
         {:else if lazyError !== null}
           <div class="file-error">{lazyError}</div>
         {:else}
