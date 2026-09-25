@@ -1,6 +1,7 @@
 mod agents;
 mod chat;
 mod download;
+mod drafts;
 mod environment;
 mod exec;
 mod fs;

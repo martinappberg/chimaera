@@ -160,6 +160,10 @@ pub(crate) struct AppState {
     /// night-scrubbed on HPC. Size-capped per file and per session (`upload`),
     /// pruned when the session ends and at boot.
     pub(crate) uploads_root: PathBuf,
+    /// Draft mirror (`~/.chimaera/drafts/`): unsaved editor text mirrored by
+    /// the client so a window on another origin can recover it. Capped and
+    /// evicted in `drafts`.
+    pub(crate) drafts_root: PathBuf,
     /// Live install sessions, one per agent (POST /agents/{id}/install
     /// answers 409 while one runs): session id + reservation time. The id
     /// registers in `SessionManager` only after spawn, so a reservation
@@ -240,6 +244,7 @@ impl AppState {
             worktrees_root: data_dir.join("worktrees"),
             shims_dir: data_dir.join("shims"),
             uploads_root: data_dir.join("uploads"),
+            drafts_root: data_dir.join("drafts"),
             installs: Mutex::new(HashMap::new()),
             claude_settings_path: home.join(".claude").join("settings.json"),
             codex_config_path: home.join(".codex").join("config.toml"),

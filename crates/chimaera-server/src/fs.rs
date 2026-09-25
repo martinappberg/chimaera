@@ -295,8 +295,9 @@ where
     }
 }
 
-/// Response-shaped companion to [`blocking_json`] for byte-range reads.
-async fn blocking_response<F>(work: F) -> Response
+/// Response-shaped companion to [`blocking_json`] for byte-range reads (and
+/// any other route whose blocking filesystem work must share the limiter).
+pub(crate) async fn blocking_response<F>(work: F) -> Response
 where
     F: FnOnce() -> anyhow::Result<Response> + Send + 'static,
 {
