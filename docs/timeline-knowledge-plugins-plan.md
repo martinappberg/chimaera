@@ -361,8 +361,8 @@ From the Knowledge card, the Mastermind dock, or the plugin card: **Use
 mycelium for Knowledge →** one sheet, three live-checked steps:
 
 1. **Installed for your agents** — claude ✓ / codex ✗ [install] (a visible
-   terminal running the CLI's documented commands); codex adds a plain
-   instruction for `/hooks` trust (redo after upgrades — its hook paths move).
+   terminal running the CLI's documented commands), then codex's hook trust
+   right in the sheet (§6.6) — no trip to `/hooks`.
 2. **Set up in this workspace** — [Set up] sends *"Set up mycelium"* to a
    new agent session of the user's choosing (their click, their billing);
    mycelium's own init writes `.living/`, `MYCELIUM.md`, the adapters.
@@ -408,6 +408,12 @@ exist on 2.1.259; behaviour unverified).
 - `.mycelium/run/<host>/<session-id>/` is keyed by the agent's own session
   id, so a Timeline episode can link to that session's mycelium log without
   writing anything.
+- Codex install (verified 2026-09-25, codex 0.153.0): `codex plugin
+  marketplace add <local path | owner/repo>` + `codex plugin add
+  mycelium@mycelium`; the app-server's `skills/list` then reports the ten
+  `mycelium:*` skills (scope `user`, `pluginId: mycelium@mycelium`) and
+  `hooks/list` its five hooks as `untrusted`. The pre-0.6 installer's copies
+  in `~/.codex/skills/mycelium-*` duplicate them and must be moved aside.
 
 ### 6.4 The Skills view — "what can my agents do here?"
 
@@ -466,6 +472,28 @@ have configured**, plus Chimaera's own workbench plugins:
 - The security record stands (Loadout §9: ToxicSkills, DeepJack): full
   scrollable manifests, "flags, not clearance", no LLM audit badge.
 
+### 6.6 Hook trust — approve in Chimaera, never silently
+
+Codex runs no plugin or project hook until the user trusts it — a real
+security boundary (hooks run shell on every session), so Chimaera never
+auto-approves. What it removes is the *trip*: the approval happens where the
+user already is, with more context than `/hooks` gives.
+
+- **Read:** app-server `hooks/list {cwds}` → per hook `key`, `eventName`,
+  `matcher`, `source` (`plugin`/`project`/…), `pluginId`, `sourcePath`,
+  `currentHash`, `trustStatus` (`managed|untrusted|trusted|modified`).
+- **Show:** in the attach sheet and on the plugin card — each hook in plain
+  words (when it fires, what it runs), with behavioural notes where they
+  matter ("can keep a turn going until `.living/` is updated").
+- **Write, on the user's click:** the same record `/hooks` writes —
+  `[hooks.state."<key>"] trusted_hash = "<currentHash>"` in
+  `~/.codex/config.toml` — through the app-server's own `config/batchWrite`,
+  never by editing the file. Hash-pinned, so an upgrade that changes a hook
+  comes back as `modified` with a diff to re-approve.
+- **Verify live before building:** that a `config/batchWrite` of that key is
+  honoured exactly as a `/hooks` approval on the pinned codex, and that the
+  hash format round-trips.
+
 ## 7. Agents talking — the *Agent notes* workbench plugin
 
 Off by default; turning it on is the opt-in (no separate switch). Its card:
@@ -510,7 +538,56 @@ Off by default; turning it on is the opt-in (no separate switch). Its card:
   sessions and time. Suggested prompts in the empty dock: "Brief me",
   "What should I do next?", "Anything conflicting?".
 
-## 9. Leaving today's experience alone
+## 9. The experience bar — everything earns its keep
+
+**The rule:** every element answers a question the user has at a specific
+moment, and nothing else on screen answers it. If it can't name its
+question, it's cut; if its question has no answer right now, it collapses to
+one honest line (or to nothing). A clickable mockup of these screens —
+dashboard, Knowledge with mycelium attached, Plugins · Installed and Skills,
+the attach-and-trust sheet — lives on the maintainer's design canvas.
+
+| Element | The question it answers | Shows when | Otherwise |
+|---|---|---|---|
+| Needs you | "Is anything waiting on me?" | non-empty | nothing |
+| Since you left | "What happened while I was away?" | entries since this viewer's last look | "Nothing new since 14:02" |
+| Where things stand | "Where is the project?" | a structured provider has content | the attach line |
+| Now | "Who's running?" | always — one line; the rail has the detail | — |
+| Brief me | "What should I do?" (judgment, not state) | a Mastermind is bound | the setup card |
+| Where we left off | "Where did we stop, what's next, what's blocked?" | a handoff exists | latest episodes |
+| Findings | "What do we know — and how sure?" | findings exist | — |
+| What we decided | "Why did we do X?" | decisions exist | — |
+| Watch out for | "What will bite me?" | learnings exist | — |
+| Open | "What's left?" | todos / open questions exist | — |
+| Guidance & memory | "What are the agents told?" | always, as one row of links | — |
+| A plugin's "Adds" line | "What changes if I turn this on — and what does it cost?" | every card | — |
+| Per-agent skill chips | "Will codex see this too?" | every skill row | — |
+
+**Visual language** (Chimaera's own — the `app.css` tokens, curated light
+and dark, never inverted):
+
+- **Bad news leads.** Within *Since you left*, failures and contradicted
+  findings sort ahead of good news; a contradiction is the most valuable
+  line a scientist can be shown.
+- **The user's words are the headline** (an episode is the prompt that
+  started it); the agent's first real sentence is the result; ids and
+  metadata step back into muted mono.
+- **Mono for identities** — session names, `F-003`, commands, paths,
+  versions — the terminal's typographic DNA; prose in the UI face.
+- **Confidence you can read at a glance:** mycelium's own ladder (●○○
+  preliminary · ●●○ supported · ●●● robust · ✕ contradicted), explained
+  once by a legend beside the list, plus an **evidence strip** — one mark
+  per ledger row (filled supports, half refines, ring contradicts) — so "how
+  much evidence, and does it agree" needs no reading.
+- **Colour is never alone:** one accent for good/current, err for
+  contradicted/failed, warn for waiting/blocked — each always paired with a
+  word; body text holds 4.5:1 in both themes.
+- **Cards only for units** (a finding, a learning, a plugin); everything
+  else is hairline rows under small-caps section labels.
+- **Empty never shows chrome.** An empty section doesn't render; an empty
+  surface says one honest line and offers the single action that fills it.
+
+## 10. Leaving today's experience alone
 
 **Core never changes what agents see; plugins always say what they change.**
 
@@ -526,7 +603,7 @@ Off by default; turning it on is the opt-in (no separate switch). Its card:
   JSONL, mtime-cached capped reads off the reactor, short-lived single-flight
   codex probes, no SQLite, no LLM in the daemon.
 
-## 10. Phasing — two tracks, joined at Knowledge
+## 11. Phasing — two tracks, joined at Knowledge
 
 | Track A — history & knowledge | Track B — plugins & skills |
 |---|---|
@@ -539,7 +616,7 @@ Off by default; turning it on is the opt-in (no separate switch). Its card:
 Each slice is independently shippable and verified live (`verify-app`). LaTeX
 proceeds on B1 in parallel with everything else.
 
-## 11. Open questions [decide]
+## 12. Open questions [decide]
 
 1. **Knowledge without mycelium** = Guidance & memory + the attach card. Is
    that enough, or should Chimaera ever grow its own structured provider?
