@@ -174,14 +174,14 @@ async function followPath(
   if (rel.startsWith("/") && host.wsRoot !== null && host.wsRoot !== "/") {
     candidates.push(`${host.wsRoot.replace(/\/+$/, "")}${rel}`);
   }
-  let valid: Awaited<ReturnType<typeof fsValidate>>;
+  let res: Awaited<ReturnType<typeof fsValidate>>;
   try {
-    valid = await fsValidate(candidates, dirname(docPath), host.workspaceId);
+    res = await fsValidate(candidates, dirname(docPath), host.workspaceId);
   } catch {
     host.hint("couldn't check this link — daemon unreachable");
     return;
   }
-  const hit = candidates.map((c) => valid[c]).find((v) => v !== undefined);
+  const hit = candidates.map((c) => res.valid[c]).find((v) => v !== undefined);
   if (hit === undefined) {
     host.hint(`not found: ${rel}`);
     return;
