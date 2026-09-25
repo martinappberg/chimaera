@@ -555,10 +555,18 @@ export type FileViewKind =
   | "table"
   | "xlsx"
   | "pdf"
+  | "video"
+  | "audio"
   | "binary"
   | "text";
 
-const IMAGE_EXTS = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg"]);
+/** Formats every supported webview decodes natively (WebKit included). */
+const IMAGE_EXTS = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "ico", "avif"]);
+/** Played by the native <video>/<audio> element over ranged /raw reads. The
+ *  container is no promise of a codec (an HEVC .mov, a Vorbis .ogg on
+ *  WebKit): MediaView owns the "can't play this here" fallback. */
+const VIDEO_EXTS = new Set(["mp4", "webm", "m4v", "ogv", "mov"]);
+const AUDIO_EXTS = new Set(["mp3", "wav", "m4a", "flac", "ogg", "oga", "opus", "aac"]);
 
 /** Whether a path renders as an image (chat cards inline-preview these). */
 export function isImagePath(path: string): boolean {
@@ -580,9 +588,9 @@ const BINARY_EXTS = new Set([
   "zip", "tar", "7z", "rar", "xz", "zst", "bz2",
   "exe", "dll", "so", "dylib", "o", "a", "class", "jar", "pyc", "wasm",
   "iso", "dmg",
-  "mp3", "mp4", "m4a", "wav", "flac", "ogg", "mov", "avi", "mkv", "webm",
+  "avi", "mkv",
   "woff", "woff2", "ttf", "otf", "eot",
-  "ico", "bmp", "tif", "tiff", "heic", "psd",
+  "tif", "tiff", "heic", "psd",
   "sqlite", "db", "parquet", "feather", "h5", "hdf5",
   "docx", "doc", "pptx", "ppt",
   "bam", "bai", "cram", "crai", "bcf", "csi", "tbi", "bigwig", "bw", "bigbed", "bb",
@@ -607,6 +615,8 @@ export function viewKindFor(path: string): FileViewKind {
   if (TABLE_EXTS.has(ext)) return "table";
   if (SPREADSHEET_EXTS.has(ext)) return "xlsx";
   if (ext === "pdf") return "pdf";
+  if (VIDEO_EXTS.has(ext)) return "video";
+  if (AUDIO_EXTS.has(ext)) return "audio";
   if (BINARY_EXTS.has(ext)) return "binary";
   return "text";
 }

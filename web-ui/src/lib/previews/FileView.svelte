@@ -1,7 +1,8 @@
 <script lang="ts">
   /**
    * Dispatch a file tab to its preview by extension: image / markdown /
-   * sandboxed html / paged table / read-only code / binary info card.
+   * sandboxed html / paged table / PDF / video + audio / read-only code /
+   * binary info card.
    * The "text" path fetches the first 256KB here and sniffs it — anything
    * with NUL bytes falls through to the info card, so extensionless
    * binaries and .gz never render as garbage.
@@ -10,6 +11,7 @@
   import { looksBinary, midTruncate, viewKindFor, type FileChunk } from "./files";
   import { retain, release, type FileEntry } from "./fileStore.svelte";
   import ImageView from "./ImageView.svelte";
+  import MediaView from "./MediaView.svelte";
   import TableView from "./TableView.svelte";
   import BinaryView from "./BinaryView.svelte";
   import Spinner from "./Spinner.svelte";
@@ -175,6 +177,10 @@
         {:else}
           <Spinner />
         {/if}
+      {:else if kind === "video" || kind === "audio"}
+        <!-- Not keyed on mtime like the other ticketed views: MediaView
+             swaps a re-minted URL in place and keeps the playhead. -->
+        <MediaView {path} {kind} />
       {:else if kind === "binary"}
         {#key entry?.mtime ?? path}
           <BinaryView {path} />
