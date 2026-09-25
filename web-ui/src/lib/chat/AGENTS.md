@@ -57,7 +57,7 @@ hard-resets and rebuilds.
 | `McpPanel.svelte` / `UsagePanel.svelte` | The `/mcp` linked-server panel and the token-usage panel. |
 | `InlinePreview` / `ArtifactGallery` | Inline file/image previews inside the transcript; expensive tickets/table reads/image/PDF loads are intersection-gated near the viewport. |
 | `UserText.svelte` | User-message bubble: plain text (never Markdown), validated path/mention affordances, recognized LaTeX spans delegated to `MathText`. |
-| `paths.ts` | Path-candidate detection + validation types (shared with Markdown's stamping). |
+| `paths.ts` | The chat half of path links: which candidates a code span / link target offers (parsing is `../shared/fileRef.ts`, shared with the terminal), and `PathResolver` — one per ChatView, batching every renderer's candidates into `fsValidate` calls grouped by base ladder (live cwd, spawn cwd, workspace root from App's `setChatLinkContext`), caching hits/ambiguous/misses (misses expire after 15 s and at every turn end; failures are never cached). Opening goes through `../shared/openPath.ts` (reveal at the line, Cmd/Ctrl split); ambiguous names open a context-menu pick list. Own vitest suite (`paths.test.ts`). |
 | `composerBus.ts` | Cross-component channel to insert text/attachments into the active composer (e.g. `@term:` grants, references, dropped-file paths). |
 | `composerHeight.ts` | Pure height policy for content-fit growth plus manual resize baselines; covered by `composerHeight.test.ts`. |
 | `drafts.ts` | Per-session composer draft persistence (survives the per-session ChatView remount + a page reload) — text layers into sessionStorage, images stay in-memory; both bounded. It also publishes which drafts remain memory-only so an interface-build transition cannot silently reload over them. |
@@ -127,9 +127,13 @@ per-chunk work proportional to the TRAILING OPEN SEGMENT, not the message:
   intact (catch-up segments append; the already-read prefix never
   re-animates). The swap to the canonical parse happens only when the row
   genuinely stops streaming.
-- **Deferred decorations**: `stampPaths` (TreeWalker + per-word path regex)
+- **Deferred decorations**: `stampPaths` (TreeWalker + `shared/fileRef.ts`)
   runs at idle on closed segments — never on the per-chunk hot path — and its
-  async resolve callback re-stamps only the affected root, again at idle. On
+  async resolve callback re-stamps only the affected root, again at idle (or
+  the settled root, when the stream settled while the batch was in flight —
+  the canonical swap disconnected the segment it walked). What a stamped
+  element opens lives in a component `WeakMap`, never in DOM attributes
+  (sanitized agent HTML can forge classes and `data-*`). On
   WKWebView (the native app) `requestIdleCallback` is absent and the fallback
   is a short fixed delay. The open tail is stamped when its segment closes or
   at settle — but its schemeless anchors get the `md-local` class
