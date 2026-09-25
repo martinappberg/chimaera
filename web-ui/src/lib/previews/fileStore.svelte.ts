@@ -25,7 +25,15 @@
 
 import { untrack } from "svelte";
 import { get } from "svelte/store";
-import { fsFile, fsMarkdown, fsRawUrl, fsTable, type FileChunk, type TablePage } from "./files";
+import {
+  fsFile,
+  fsMarkdown,
+  fsRawUrl,
+  fsTable,
+  type FileChunk,
+  type MarkdownDoc,
+  type TablePage,
+} from "./files";
 import { fsEpoch, lastFsMutation, type FsMutation } from "../workspace/fsEvents";
 import {
   lastDiskChange,
@@ -57,7 +65,7 @@ export class FileEntry {
   chunk = $state<FileChunk | null>(null);
   chunkError = $state<string | null>(null);
 
-  markdown = $state<string | null>(null);
+  markdown = $state<MarkdownDoc | null>(null);
   markdownError = $state<string | null>(null);
 
   table = $state<TablePage | null>(null);

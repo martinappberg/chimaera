@@ -15,7 +15,8 @@
    * PDF preview via pdf.js (worker bundled locally — no CDN, air-gapped rule).
    * Pages render lazily as they scroll into view; fit-width by default with
    * fit/100%/± zoom controls, ctrl/⌘-wheel zoom anchored at the cursor, a
-   * selectable text layer over each page, and per-tab scroll+zoom memory.
+   * selectable text layer over each page, per-tab scroll+zoom memory, and a
+   * "p / N" indicator that follows the scroll and takes a page to jump to.
    * Bytes come through the ticketed /raw/ URL (range requests supported
    * server-side), so the bearer token never lands in a fetchable URL.
    */
@@ -46,6 +47,12 @@
 
   let scroller = $state<HTMLDivElement | null>(null);
   let containerWidth = $state(0);
+  let containerHeight = $state(0);
+  /** Mirrors the scroller's scrollTop for the page indicator. */
+  let scrollY = $state(0);
+  /** The page field's text while the user is typing in it (null = follow
+   *  the scroll). */
+  let pageDraft = $state<string | null>(null);
   let pages = $state<PageInfo[]>([]);
   let numPages = $state(0);
   let error = $state<string | null>(null);
@@ -97,6 +104,55 @@
     return Math.max((containerWidth - 32) / widest, 0.1);
   });
   const scale = $derived(zoom === "fit" ? fitScale : zoom);
+
+  /** Layout of the page column, from the slot sizes alone (no DOM reads):
+   *  it mirrors .pdf-scroll's padding and gap below. */
+  const SCROLL_PAD = 14;
+  const PAGE_GAP = 12;
+  const pageTops = $derived.by(() => {
+    const tops: number[] = [];
+    let y = SCROLL_PAD;
+    for (const p of pages) {
+      tops.push(y);
+      y += p.h * scale + PAGE_GAP;
+    }
+    return tops;
+  });
+  /** The page under a reading line a third of the way down the viewport —
+   *  the one being read, not the sliver of the next one at the bottom. */
+  const currentPage = $derived.by(() => {
+    const tops = pageTops;
+    if (tops.length === 0) return 0;
+    const y = scrollY + containerHeight / 3;
+    let lo = 0;
+    let hi = tops.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1;
+      if (tops[mid] <= y) lo = mid;
+      else hi = mid - 1;
+    }
+    return lo + 1;
+  });
+
+  function jumpToPage(n: number): void {
+    const el = scroller;
+    if (el === null || pageTops.length === 0 || !Number.isFinite(n)) return;
+    const i = Math.min(Math.max(Math.round(n), 1), pageTops.length) - 1;
+    el.scrollTop = pageTops[i] - SCROLL_PAD / 2;
+  }
+
+  function onPageKey(e: KeyboardEvent): void {
+    const input = e.currentTarget as HTMLInputElement;
+    if (e.key === "Enter") {
+      e.preventDefault();
+      jumpToPage(Number.parseInt(input.value, 10));
+      pageDraft = null;
+      input.select();
+    } else if (e.key === "Escape") {
+      pageDraft = null;
+      input.blur();
+    }
+  }
 
   onMount(() => {
     disposed = false;
@@ -201,10 +257,14 @@
     const el = scroller;
     if (el === null) return;
     const ro = new ResizeObserver((entries) => {
-      for (const e of entries) containerWidth = e.contentRect.width;
+      for (const e of entries) {
+        containerWidth = e.contentRect.width;
+        containerHeight = e.contentRect.height;
+      }
     });
     ro.observe(el);
     containerWidth = el.clientWidth;
+    containerHeight = el.clientHeight;
     return () => ro.disconnect();
   });
 
@@ -484,6 +544,7 @@
   // (the bound `scroller` ref can already be null by cleanup time).
   function onScroll(): void {
     saveMemory();
+    if (scroller !== null) scrollY = scroller.scrollTop;
   }
 
   const zoomPct = $derived(Math.round(scale * 100));
@@ -497,9 +558,26 @@
 
 <div class="pdf-view">
   <div class="pdf-bar">
-    <span class="pages" class:dim={numPages === 0}>
-      {#if numPages > 0}{numPages} page{numPages === 1 ? "" : "s"}{:else}—{/if}
-    </span>
+    {#if numPages > 0 && pages.length > 0}
+      <span class="pages">
+        <input
+          class="page-input"
+          type="text"
+          inputmode="numeric"
+          aria-label="page (enter a number to jump)"
+          title="page — type a number and press Enter to jump"
+          size={Math.max(String(numPages).length, 1)}
+          value={pageDraft ?? String(currentPage)}
+          onfocus={(e) => (e.currentTarget as HTMLInputElement).select()}
+          oninput={(e) => (pageDraft = (e.currentTarget as HTMLInputElement).value)}
+          onkeydown={onPageKey}
+          onblur={() => (pageDraft = null)}
+        />
+        <span class="page-total">/ {numPages}</span>
+      </span>
+    {:else}
+      <span class="pages dim">—</span>
+    {/if}
     {#if selectionLimited}
       <span
         class="selection-note"
@@ -556,7 +634,34 @@
   }
 
   .pages {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3em;
     font-variant-numeric: tabular-nums;
+  }
+
+  .page-input {
+    appearance: none;
+    box-sizing: content-box;
+    min-width: 1.4ch;
+    padding: 0 0.3em;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    background: none;
+    font: inherit;
+    font-variant-numeric: tabular-nums;
+    color: var(--fg);
+    text-align: right;
+  }
+
+  .page-input:hover {
+    border-color: var(--edge);
+  }
+
+  .page-input:focus {
+    outline: none;
+    border-color: color-mix(in srgb, var(--accent) 55%, var(--edge));
+    background: var(--term-bg);
   }
 
   .pages.dim {

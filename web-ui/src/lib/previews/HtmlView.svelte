@@ -89,15 +89,19 @@
     // CodeView handles the rest (background fill + save/dirty/conflict flow).
     const e = entry;
     if (e === null) return;
-    if (chunk === null && chunkError === null) {
+    // A failed fetch is retried on the next click (the store refetches a
+    // missing chunk): gating on the old error left `entered` set with no
+    // chunk, so the edit layer stayed blank for the life of the tab.
+    if (chunk === null) {
+      chunkError = null;
       await e.ensureChunk();
-      if (e.chunk !== null) {
-        chunk = e.chunk;
-        editable = e.chunk.size <= EDIT_MAX_BYTES;
-      } else {
+      if (entry !== e) return; // path changed while fetching
+      if (e.chunk === null) {
         chunkError = e.chunkError ?? "failed to load source";
         return;
       }
+      chunk = e.chunk;
+      editable = e.chunk.size <= EDIT_MAX_BYTES;
     }
     if (editable === false) return; // too large; stay in preview
     entered = true;
