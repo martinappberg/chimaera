@@ -18,6 +18,19 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
     // must not block startup. Best-effort (not a lock) — it closes the retry
     // pile-up, not a deliberate simultaneous double-start race.
     if let Ok(Some(m)) = chimaera_core::Manifest::load() {
+        // On a home shared across nodes the record may be another node's,
+        // whose pid and port can't be checked from here. Not refused: a
+        // renamed host (a laptop's DHCP-assigned name) looks the same and must
+        // still start. `chimaera connect` only lands here after proving that
+        // node's daemon gone — by probing it there, or because the node's
+        // name no longer resolves on this one.
+        if !m.written_here() {
+            tracing::warn!(
+                node = %m.hostname,
+                pid = m.pid,
+                "the manifest was written on another node; this daemon takes over the registry — a daemon still running there is no longer reachable through it"
+            );
+        }
         if m.is_alive() && port_answers_http(m.port).await {
             anyhow::bail!(
                 "a chimaera daemon for {} is already running (pid {}, \
@@ -172,7 +185,15 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
         tracing::warn!(%err, "failed to write restart handoff");
     }
 
-    chimaera_core::Manifest::remove().context("failed to remove manifest")?;
+    // Only our own record: on a home shared across nodes a daemon on another
+    // node may own the file by now, and unlinking it would hide that live
+    // daemon from every client.
+    if !manifest
+        .remove_if_owned()
+        .context("failed to remove manifest")?
+    {
+        tracing::warn!("the manifest now belongs to another daemon; left in place");
+    }
     tracing::info!("chimaera daemon stopped");
     Ok(())
 }
