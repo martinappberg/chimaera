@@ -80,7 +80,9 @@ pub(crate) struct ResolveTargetsRequest {
 /// A target is written as a document writes it: `figs/plot.png`,
 /// `../data.csv#row=1-20`, `my%20plot.png`, `/docs/x.md`, `file:///abs`.
 /// The fragment and any query never take part in resolution, and escapes are
-/// decoded. Resolution is strict, exactly like document links
+/// decoded — so a caller holding a real filesystem path (`/scratch/run#2/…`,
+/// `/data/50%/…`) percent-escapes `%`, `#`, `?` and whitespace first (the
+/// UI's `pathTarget`). Resolution is strict, exactly like document links
 /// (`fs/validate` with `strict`): the exact join onto `base` then each of
 /// `bases`; an absolute (or `~`) target as-is, and a root-relative `/x` that
 /// misses also onto the workspace root (GitHub's reading). No diff-prefix

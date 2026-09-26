@@ -747,7 +747,10 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   decoded; JPEG EXIF rotation honored), and a `/raw` ticket for the kinds loaded through one —
   `{missing: true}` otherwise. Strict like document links (exact join onto `base`, then `bases`; an
   absolute path as-is, a root-relative `/x` also under the workspace root); fragments are ignored
-  for resolution. ≤200 targets, 5 s budget, shared filesystem limiter. A card loads only near its
+  for resolution. A target is read as a link (cut at `#`/`?`, `%XX` decoded), so a card resolving
+  a real filesystem path escapes what that reading would take (`pathTarget`: `%`, `#`, `?`,
+  whitespace, `<>`) — `/scratch/run#2/plot.png` stays that file. ≤200 targets, 5 s budget,
+  shared filesystem limiter. A card loads only near its
   scroller's viewport, reserves its box from the answer's dimensions (nothing jumps), and while on
   screen watches its file (inside the 64-path disk-monitor cap): an overwrite re-resolves it and
   the new version's new ticket reloads the bytes; an unchanged file keeps its cached copy.

@@ -595,3 +595,63 @@ async fn raw_assets_revalidate_every_load() {
     assert!(header_str(&headers, "cache-control").starts_with("private, max-age="));
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// A filesystem path handed over as a target (an embed card resolving a
+/// tool's location) arrives percent-escaped wherever the daemon would read
+/// URL syntax (the UI's `pathTarget`), and names the same file: `#`, `?`
+/// and `%` in a real path are part of its name, not a fragment, a query or
+/// an escape. Sent raw, the same path is read as a link — and misses.
+#[tokio::test]
+async fn escaped_filesystem_paths_resolve_to_the_file_they_name() {
+    let state = test_state();
+    let root = test_dir("embed-raw-paths");
+    for dir in ["run#2", "50%", "50%25", "why?", "sp ace "] {
+        std::fs::create_dir_all(root.join(dir)).unwrap();
+        std::fs::write(root.join(dir).join("plot.png"), png(2, 2)).unwrap();
+    }
+    let base = canon(&root);
+    let escape = |p: &str| {
+        let mut out = String::new();
+        for c in p.chars() {
+            match c {
+                '%' => out.push_str("%25"),
+                '#' => out.push_str("%23"),
+                '?' => out.push_str("%3F"),
+                ' ' => out.push_str("%20"),
+                c => out.push(c),
+            }
+        }
+        out
+    };
+    let paths: Vec<String> = ["run#2", "50%", "50%25", "why?", "sp ace "]
+        .iter()
+        .map(|dir| format!("{base}/{dir}/plot.png"))
+        .collect();
+    let targets: Vec<String> = paths.iter().map(|p| escape(p)).collect();
+    let results = resolve(
+        &state,
+        serde_json::json!({"base": "/", "targets": targets.clone()}),
+    )
+    .await;
+    for (path, target) in paths.iter().zip(&targets) {
+        assert_eq!(results[target]["path"], *path, "{target}");
+        assert_eq!(results[target]["kind"], "file");
+    }
+
+    // Unescaped, a real path is read as a link target: `#2/plot.png` is a
+    // fragment, `50%25` decodes to `50%`, `why?` starts a query.
+    let raw = resolve(
+        &state,
+        serde_json::json!({"base": "/", "targets": [
+            format!("{base}/run#2/plot.png"),
+            format!("{base}/50%25/plot.png"),
+        ]}),
+    )
+    .await;
+    assert_eq!(raw[&format!("{base}/run#2/plot.png")]["missing"], true);
+    assert_eq!(
+        raw[&format!("{base}/50%25/plot.png")]["path"],
+        format!("{base}/50%/plot.png")
+    );
+    std::fs::remove_dir_all(&root).ok();
+}

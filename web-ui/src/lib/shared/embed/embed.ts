@@ -125,6 +125,17 @@ let flushTimer: ReturnType<typeof setTimeout> | null = null;
  *  mounts dozens at once), short enough not to be seen. */
 const COALESCE_MS = 16;
 
+/**
+ * A filesystem path as a `resolve_targets` target. The daemon reads a
+ * target the way a document writes a link — it cuts at `#` and `?`, decodes
+ * `%XX`, trims whitespace, unwraps `<…>` and refuses a `//host` — so every
+ * character it would interpret is percent-escaped, and the path names the
+ * same file after its decode: `/scratch/run#2/plot.png`, `/data/50%/x.png`.
+ */
+export function pathTarget(path: string): string {
+  return path.replace(/[%#?<>\s]/gu, (c) => encodeURIComponent(c)).replace(/^\/\//, "/%2F");
+}
+
 async function flush(): Promise<void> {
   flushTimer = null;
   const batch = [...waiting.keys()].filter((p) => !inflight.has(p)).slice(0, RESOLVE_MAX);
@@ -132,7 +143,7 @@ async function flush(): Promise<void> {
   for (const path of batch) inflight.add(path);
   let results: Record<string, TargetResult> | null;
   try {
-    results = await resolveTargets(batch, "/");
+    results = await resolveTargets(batch.map(pathTarget), "/");
   } catch {
     results = null;
   }
@@ -140,15 +151,17 @@ async function flush(): Promise<void> {
     inflight.delete(path);
     const ws = waiting.get(path);
     waiting.delete(path);
-    for (const w of ws ?? []) w(results?.[path] ?? null);
+    for (const w of ws ?? []) w(results?.[pathTarget(path)] ?? null);
   }
   if (waiting.size > 0 && flushTimer === null) flushTimer = setTimeout(() => void flush(), 0);
 }
 
 /**
- * Resolve one ABSOLUTE path (a tool location, a card's refresh after a
- * disk change). Coalesced with every other card asking in the same frame.
- * Null when the daemon could not answer (unreachable): unknown, not missing.
+ * Resolve one ABSOLUTE filesystem path (a tool location, a card's refresh
+ * after a disk change) — a real path, never a link target: `#`, `?` and `%`
+ * are part of the name (`pathTarget`). Coalesced with every other card
+ * asking in the same frame. Null when the daemon could not answer
+ * (unreachable): unknown, not missing.
  */
 export function resolveFile(path: string): Promise<TargetResult | null> {
   return new Promise((resolve) => {
