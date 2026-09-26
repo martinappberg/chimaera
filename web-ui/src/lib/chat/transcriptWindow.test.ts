@@ -3,9 +3,13 @@ import {
   advanceTailWindow,
   autoPageEarlier,
   pageEarlier,
+  pageAround,
   pageLater,
+  prefetchPage,
   restoreVirtualWindow,
   restoreWindow,
+  spacerNeedsRebalance,
+  spacerTarget,
   tailWindow,
   toArrayCoords,
   TRANSCRIPT_PAGE,
@@ -147,5 +151,54 @@ describe("trim shift for a mounted window", () => {
   it("signals a fully-trimmed window — the caller falls back to the tail", () => {
     expect(trimShift({ start: 0, end: 192 }, 192)).toBeNull();
     expect(trimShift({ start: 0, end: 192 }, 500)).toBeNull();
+  });
+});
+
+describe("scroll prefetch", () => {
+  const history = { start: 300, end: 492 };
+  const edges = (above: number, below: number) => ({ above, below, viewport: 700 });
+
+  it("mounts the earlier page before a reader scrolling up reaches the edge", () => {
+    expect(prefetchPage(edges(1300, 9000), history, 2000, -1)).toBe("earlier");
+    expect(prefetchPage(edges(1500, 9000), history, 2000, -1)).toBeNull();
+    // Inside the spacer: the rendered rows start below the viewport top.
+    expect(prefetchPage(edges(-400, 9000), history, 2000, -1)).toBe("earlier");
+  });
+
+  it("mounts the later page for a reader scrolling back down", () => {
+    expect(prefetchPage(edges(9000, 1000), history, 2000, 1)).toBe("later");
+    expect(prefetchPage(edges(9000, 1000), { start: 1808, end: 2000 }, 2000, 1)).toBeNull();
+  });
+
+  it("only prefetches in the direction of travel, so a short window cannot ping-pong", () => {
+    expect(prefetchPage(edges(100, 100), history, 2000, -1)).toBe("earlier");
+    expect(prefetchPage(edges(100, 100), history, 2000, 1)).toBe("later");
+    expect(prefetchPage(edges(100, 100), { start: 0, end: 192 }, 2000, -1)).toBeNull();
+  });
+});
+
+describe("history spacer", () => {
+  it("stands in for the modelled earlier history, none once it is all mounted", () => {
+    expect(spacerTarget(0, 20)).toBe(0);
+    expect(spacerTarget(500, 0)).toBe(0);
+    expect(spacerTarget(500, 20)).toBe(10000);
+    expect(spacerTarget(1e9, 40)).toBe(4_000_000);
+  });
+
+  it("mounts one page around a far jump's target, clamped to the transcript", () => {
+    expect(pageAround(500, 2000)).toEqual({ start: 484, end: 548 });
+    expect(pageAround(3, 2000)).toEqual({ start: 0, end: 64 });
+    expect(pageAround(1990, 2000)).toEqual({ start: 1936, end: 2000 });
+    expect(pageAround(10, 30)).toEqual({ start: 0, end: 30 });
+  });
+
+  it("re-sizes only when blank, overdrawn, starved, or bloated", () => {
+    expect(spacerNeedsRebalance(0, 0)).toBe(false);
+    expect(spacerNeedsRebalance(40, 0)).toBe(true);
+    expect(spacerNeedsRebalance(-300, 0)).toBe(true);
+    expect(spacerNeedsRebalance(-300, 9000)).toBe(true);
+    expect(spacerNeedsRebalance(10000, 10000)).toBe(false);
+    expect(spacerNeedsRebalance(7000, 10000)).toBe(true);
+    expect(spacerNeedsRebalance(16000, 10000)).toBe(true);
   });
 });

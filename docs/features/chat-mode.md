@@ -235,18 +235,25 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
 - **Hydration + history window.** A fresh attach folds replay into the reducer behind one quiet
   "loading recent conversation" state until the advertised journal `head` arrives; it then mounts
   the newest 64 blocks bottom-anchored in one paint, rather than visibly growing from the oldest
-  message. Approaching the top automatically pages 64 earlier blocks while preserving the paragraph
-  under the reader; a manual earlier control appears only as a compatibility fallback when automatic
-  observation is unavailable. Paging back toward newer history remains explicit, and the middle of a
-  long conversation is never skipped just because the bounded page no longer contains the live edge.
-  The DOM window stays capped at 192 blocks and a clear jump returns directly to the live tail.
+  message. Scrolling pages automatically in both directions: the next 64 blocks mount about two
+  viewports ahead of the reader in whichever direction they are travelling (one page per frame), so
+  a flick through history never stops dead at the rendered edge, and scrolling back down continues
+  contiguously — the middle of a long conversation is never skipped. Manual earlier/later controls
+  appear only as a compatibility fallback when automatic observation is unavailable. The DOM window
+  stays capped at 192 blocks and a clear jump returns directly to the live tail. A spacer above the
+  window stands in for the unmounted earlier history (sized from the blocks' content), so the
+  scrollbar reflects everything above the reader and dragging it up lands on the matching page.
   Historical artifact tickets, table queries, image decodes, and PDF embeds wait until their
   preview approaches the viewport. This is client-side rendering pagination, not lossy history: the
   reducer still holds the capped 2000-block transcript and the daemon journal remains authoritative.
   Replay/live/control frames are reduced through one order-preserving cooperative queue, yielding
   between bounded slices so a large remote journal cannot monopolize navigation clicks.
 - **Scroll ownership.** Stream events, Markdown reveals, and late artifact sizing all request
-  bottom-follow through one frame-coalesced scroll writer. Paging explicitly into older history
+  bottom-follow through one frame-coalesced scroll writer. A reader scrolled up into history keeps
+  the paragraph under them fixed through every change above it — a page mounting or dropping, a
+  preview decoding, activity lines folding — on every engine: the history spacer absorbs the shift
+  instead of the scroll position being rewritten mid-gesture, which the native app's WebKit (no
+  scroll anchoring, a scrolling thread that owns flings) would snap back for a frame. Paging explicitly into older history
   keeps that historical page stable until the reader returns to newest; merely scrolling within the
   live tail does not freeze it. Visible tail rows point directly at the reducer's reactive blocks, so a
   streamed delta updates its own row instead of cloning/repainting the whole window. The tail keeps
