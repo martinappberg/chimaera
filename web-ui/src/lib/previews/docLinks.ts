@@ -15,6 +15,7 @@ import { dirname, fsMarkdown, fsValidate, resolveDocPath, viewKindFor } from "./
 import { openPath } from "../shared/openPath";
 import { requestReveal, type Reveal } from "../shared/reveal";
 import { activateUrl, webUrl } from "../shared/urlOpen";
+import { anchorSourceLine } from "./doc/render";
 import {
   anchorIds,
   classifyHref,
@@ -75,20 +76,29 @@ export function anchorLine(html: string, anchor: string): number | null {
 }
 
 /**
- * The editor modes have no rendered ids: map the anchor to its line through
- * the daemon's render (heading slugs and footnote ids are comrak's, so they
- * match what the reading view and GitHub produce) and hand the editor a
- * reveal. The render is of the file on disk — an unsaved edit above the
- * heading can shift the line, which the flash makes visible.
+ * The editor modes have no rendered ids: map the anchor to its line and
+ * hand the editor a reveal. With the document's current text (the editor's
+ * buffer, unsaved edits included) the client renderer's ids answer — the
+ * same slugs the reading view and GitHub produce; without it, the daemon's
+ * render of the file on disk does.
  */
-export async function revealAnchorInSource(path: string, anchor: string): Promise<boolean> {
-  let html: string;
-  try {
-    html = (await fsMarkdown(path)).html;
-  } catch {
-    return false;
+export async function revealAnchorInSource(
+  path: string,
+  anchor: string,
+  text: string | null = null,
+): Promise<boolean> {
+  let line: number | null;
+  if (text !== null) {
+    line = anchorSourceLine(text, anchor);
+  } else {
+    let html: string;
+    try {
+      html = (await fsMarkdown(path)).html;
+    } catch {
+      return false;
+    }
+    line = anchorLine(html, anchor);
   }
-  const line = anchorLine(html, anchor);
   if (line === null) return false;
   requestReveal(path, { line });
   return true;
@@ -124,7 +134,12 @@ export function isFollowable(href: string): boolean {
 }
 
 /** Follow `href` from `host`'s document. `split` opens beside it. */
-export async function followDocHref(href: string, split: boolean, host: DocLinkHost): Promise<void> {
+export async function followDocHref(
+  href: string,
+  split: boolean,
+  host: DocLinkHost,
+  opts: FollowOptions = {},
+): Promise<void> {
   const t = classifyHref(href);
   switch (t.kind) {
     case "web": {
@@ -139,11 +154,17 @@ export async function followDocHref(href: string, split: boolean, host: DocLinkH
       host.toLines(t.reveal);
       return;
     case "path":
-      await followPath(t.path, t.fragment, split, host);
+      await followPath(t.path, t.fragment, split, host, opts.byName === true);
       return;
     default:
       return;
   }
+}
+
+export interface FollowOptions {
+  /** A wikilink names a note, not a path: when it isn't beside the
+   *  document it resolves by name in the workspace, as Obsidian does. */
+  byName?: boolean;
 }
 
 async function sameDocument(fragment: string | null, host: DocLinkHost): Promise<void> {
@@ -162,6 +183,7 @@ async function followPath(
   fragment: string | null,
   split: boolean,
   host: DocLinkHost,
+  byName = false,
 ): Promise<void> {
   const { docPath } = host;
   if (resolveDocPath(docPath, rel) === docPath) {
@@ -171,21 +193,23 @@ async function followPath(
   // As written first (the daemon joins it to the document's folder and
   // canonicalizes); a root-relative `/docs/x.md` — GitHub's reading — also
   // against the workspace root. Strict: a document's link names exactly one
-  // file, so no diff-prefix strip or index guess may rescue a broken one.
+  // file, so no diff-prefix strip or index guess may rescue a broken one —
+  // unless it is a wikilink, whose name is the whole point.
   const candidates = [rel];
   if (rel.startsWith("/") && host.wsRoot !== null && host.wsRoot !== "/") {
     candidates.push(`${host.wsRoot.replace(/\/+$/, "")}${rel}`);
   }
   let res: Awaited<ReturnType<typeof fsValidate>>;
   try {
-    res = await fsValidate(candidates, dirname(docPath), host.workspaceId, [], { strict: true });
+    res = await fsValidate(candidates, dirname(docPath), host.workspaceId, [], { strict: !byName });
   } catch {
     host.hint("couldn't check this link — daemon unreachable");
     return;
   }
   const hit = candidates.map((c) => res.valid[c]).find((v) => v !== undefined);
   if (hit === undefined) {
-    host.hint(`not found: ${rel}`);
+    const many = byName ? (res.ambiguous[rel]?.length ?? 0) : 0;
+    host.hint(many > 1 ? `${many} files are named ${rel}` : `not found: ${rel}`);
     return;
   }
   if (hit.path === docPath) {
