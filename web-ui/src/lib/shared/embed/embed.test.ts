@@ -76,17 +76,17 @@ describe("targets and hints", () => {
 
 describe("cropLayout / frameWidth", () => {
   it("positions the whole picture inside a region frame", () => {
-    const c = cropLayout({ w: 1000, h: 500 }, { x: 250, y: 100, w: 500, h: 250, unit: "pixel" });
+    const c = cropLayout({ w: 1000, h: 500 }, { x: 250, y: 100, w: 500, h: 250 });
     expect(c).toEqual({ aspect: 2, width: 200, height: 200, left: -50, top: -40 });
   });
 
   it("takes percent regions and clamps to the picture", () => {
-    const c = cropLayout({ w: 200, h: 100 }, { x: 50, y: 0, w: 50, h: 100, unit: "percent" });
+    const c = cropLayout({ w: 200, h: 100 }, { x: 50, y: 0, w: 50, h: 100, percent: true });
     expect(c).toEqual({ aspect: 1, width: 200, height: 100, left: -100, top: -0 });
-    const clamped = cropLayout({ w: 100, h: 100 }, { x: 80, y: 80, w: 50, h: 50, unit: "pixel" });
+    const clamped = cropLayout({ w: 100, h: 100 }, { x: 80, y: 80, w: 50, h: 50 });
     expect(clamped?.aspect).toBe(1);
     expect(clamped?.width).toBe(500);
-    expect(cropLayout({ w: 100, h: 100 }, { x: 200, y: 0, w: 10, h: 10, unit: "pixel" })).toBeNull();
+    expect(cropLayout({ w: 100, h: 100 }, { x: 200, y: 0, w: 10, h: 10 })).toBeNull();
   });
 
   it("reserves the final width before a byte loads", () => {

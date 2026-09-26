@@ -7,12 +7,12 @@
    * decode says so, with a download on a remote host.
    */
   import { mediaUrl } from "./embed";
-  import type { EmbedFragment } from "./fragment";
+  import type { Locator } from "../reveal";
 
   interface Props {
     url: string | null;
     kind: "video" | "audio";
-    time: EmbedFragment["time"];
+    time: Locator["time"];
     compact: boolean;
     active: boolean;
     onDownload?: () => void;

@@ -621,9 +621,11 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
 - **Bodies by kind.** Image (a `#xywh=x,y,w,h` region — pixels or `percent:` — drawn cropped);
   PDF page (`#page=N`, one pdf.js page at the card's width, legacy build, ranged reads, a
   `#page=N&xywh=` region in PDF points); code lines (`#L10-L30`, highlighted like notebook cells,
-  line numbers; a whole file shows its first lines); a table slice (`#row=a-b`, RFC 7111 — row 1 is
-  the header line when the file has one; `#sheet=S&range=A1:F20` for spreadsheets; else the first
-  rows); an HTML report (the sandboxed frame on the folder-scoped raw URL, fixed height, expand);
+  line numbers; a whole file shows its first lines); a table slice (`#row=a-b`, `#col=`, `#cell=`,
+  RFC 7111 — row 1 is the header line when the file has one; `#sheet=S&range=A1:F20` for
+  spreadsheets, A1 counted from the sheet's corner and placed on the grid through `fs/xlsx`'s
+  used-range `origin`, a range wholly outside the sheet's data saying so; else the first rows);
+  an HTML report (the sandboxed frame on the folder-scoped raw URL, fixed height, expand);
   video/audio (`#t=start,end`, the browser seeks natively); a notebook cell (`#cell=N`, else the
   first cell that drew a figure); a Marp slide (`#slide=N`); a markdown excerpt (`#heading`, else
   the opening, clipped with a fade and **more**); a plain file or folder card for everything else.
@@ -641,8 +643,12 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   the new version's new ticket reloads the bytes; an unchanged file keeps its cached copy.
 - **Where.** `web-ui/src/lib/shared/embed/` — `EmbedCard.svelte` + one `*Body.svelte` per kind,
   `embed.ts` (the resolve client, a per-frame batcher for absolute paths, kinds, raw URLs, crops),
-  `fragment.ts` (the fragment grammar), `mount.svelte.ts` (`mountEmbed(el, props) → {update,
-  destroy}` for renderers that own raw DOM); `crates/chimaera-server/src/embed.rs`.
+  `fragment.ts` (a card's reading of a fragment: the one grammar of `shared/locator.ts` plus
+  `fileRef.ts`'s line ranges, and only what a card adds — heading anchors, `row=5-*`'s open end,
+  the header label, the rows a table slice fetches), `mount.svelte.ts` (`mountEmbed(el, props) →
+  {update, destroy}` for renderers that own raw DOM); `crates/chimaera-server/src/embed.rs`.
+  **Open in a pane** lands where a reference to the same fragment would: the same `Reveal`
+  (table rows as RFC 7111 rows, a `percent:` region, a sheet and A1 range, a notebook cell).
 
 ## Pointing at part of a file
 
