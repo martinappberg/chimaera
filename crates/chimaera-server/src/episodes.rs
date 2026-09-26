@@ -346,7 +346,8 @@ pub(crate) async fn record(state: &Arc<AppState>, sid: &str, draft: Draft, tier:
         tools: draft.tools,
         recorded: None,
     };
-    evidence.recorded = crate::knowledge::recorded_since_last_check(state, &ws, sid).await;
+    evidence.recorded =
+        crate::knowledge::recorded_since_last_check(state, &ws, sid, entry.start_ts).await;
     entry.evidence = Some(evidence);
     state.timeline.append(&ws, entry).await;
     state.changes.notify_waiters();
@@ -491,17 +492,11 @@ pub(crate) fn redact_command(text: &str) -> String {
             }
         }
         let word = bare(tok);
+        out.push(tok.to_string());
         if word.starts_with("authorization") {
-            out.push(tok.to_string());
             mask = Mask::AfterAuth;
-        } else if word == "bearer" {
-            out.push(tok.to_string());
+        } else if word == "bearer" || (tok.starts_with('-') && (sensitive(tok) || tok == "-p")) {
             mask = Mask::Next;
-        } else if tok.starts_with('-') && (sensitive(tok) || tok == "-p") {
-            out.push(tok.to_string());
-            mask = Mask::Next;
-        } else {
-            out.push(tok.to_string());
         }
     }
     out.join(" ")

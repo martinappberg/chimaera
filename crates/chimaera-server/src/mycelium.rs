@@ -24,13 +24,6 @@
 //!   `spawn_blocking`, never on the reactor. [`stamp`] is the metadata-only
 //!   check that lets a caller skip a re-parse when nothing changed.
 
-// The Knowledge route (plan §5) is the consumer; until it lands only the tests
-// call in. `expect` (not `allow`) so wiring it up flags this line for removal.
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "consumed by the Knowledge route, not yet wired")
-)]
-
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{File, Metadata};
@@ -236,15 +229,21 @@ pub(crate) struct Stamp {
     refused: Vec<String>,
 }
 
+impl Stamp {
+    /// mtime (ms) of one stamped file, by workspace-relative path — the
+    /// Timeline attributes a new entry to a turn only when its file changed
+    /// after that turn started.
+    pub(crate) fn mtime_of(&self, rel: &str) -> Option<u64> {
+        self.files
+            .iter()
+            .find(|(path, _, _)| path == rel)
+            .map(|(_, mtime, _)| *mtime)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Entry points
 // ---------------------------------------------------------------------------
-
-/// True for a mycelium workspace: a real `.living/` directory (a symlinked one
-/// never counts — it is not followed) or a `MYCELIUM.md`.
-pub(crate) fn detect(root: &Path) -> bool {
-    is_real_dir(&root.join(LIVING)) || is_regular_file(&root.join(PROTOCOL_FILE))
-}
 
 /// Metadata of every file [`read`] would open — no contents read.
 pub(crate) fn stamp(root: &Path) -> Stamp {
@@ -611,10 +610,6 @@ fn is_run_component(name: &str) -> bool {
         && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
-}
-
-fn is_real_dir(path: &Path) -> bool {
-    std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
 }
 
 fn is_regular_file(path: &Path) -> bool {
@@ -2864,7 +2859,6 @@ SESSION RESUME — Last session (2026-09-15 17:40):
     #[test]
     fn a_realistic_project_reads_every_section() {
         let fx = project();
-        assert!(detect(fx.root()));
         let k = read(fx.root());
         assert!(k.warnings.is_empty(), "{:?}", k.warnings);
 
@@ -3277,7 +3271,6 @@ SESSION RESUME — Last session (2026-09-15 17:40):
         let fx = Fixture::new("none");
         // A stray registry is not knowledge without `.living` / MYCELIUM.md.
         fx.write("todo/TODO_REGISTRY.md", TODO_REGISTRY);
-        assert!(!detect(fx.root()));
         let k = read(fx.root());
         assert!(k.left_off.is_none());
         assert!(k.topics.is_empty() && k.decisions.is_empty() && k.learnings.is_empty());
@@ -3296,7 +3289,6 @@ SESSION RESUME — Last session (2026-09-15 17:40):
         let fx = Fixture::new("symlinked");
         symlink(outside.root().join(".living"), fx.root().join(".living")).unwrap();
 
-        assert!(!detect(fx.root()));
         let k = read(fx.root());
         assert!(k.decisions.is_empty());
         assert_eq!(k.warnings.len(), 1);
@@ -3305,7 +3297,6 @@ SESSION RESUME — Last session (2026-09-15 17:40):
         // With MYCELIUM.md it is a mycelium workspace — the link still isn't
         // followed, and neither is a linked topic file inside a real .living.
         fx.write("MYCELIUM.md", "# Mycelium\n");
-        assert!(detect(fx.root()));
         assert!(read(fx.root()).decisions.is_empty());
 
         let real = Fixture::new("real-with-link");

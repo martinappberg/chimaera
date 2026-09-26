@@ -397,6 +397,7 @@ pub(crate) async fn delete_workspace(
             // appends).
             state.timeline.remove_workspace(&id);
             crate::lock(&state.plugin_detect).forget_workspace(&id);
+            crate::lock(&state.knowledge).forget_workspace(&id);
             StatusCode::NO_CONTENT.into_response()
         }
         Ok(false) => (

@@ -716,6 +716,7 @@ pub(crate) fn spawn_agent_watch(state: Arc<AppState>, session_id: String) {
                 // retires first — so the surface here is always the terminal.
                 // A hook turn still open at death never gets its Stop.
                 crate::lock(&state.tui_episodes).forget(&session_id);
+                crate::lock(&state.notes).forget_session(&session_id);
                 crate::recents::retire(
                     &state,
                     &session_id,

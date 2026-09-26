@@ -249,6 +249,7 @@ pub(crate) fn spawn_signal_task(state: Arc<AppState>) {
                     // A dead session's un-completed edits will never land.
                     pending_edits.retain(|(s, _), _| s != &id);
                     crate::lock(&state.chat_catalogs).remove(&id);
+                    crate::lock(&state.notes).forget_session(&id);
                     // Record the death BEFORE handle_chat_exit: retiring drops
                     // the workspace mapping the Timeline entry needs. A
                     // deliberate view switch is not history.

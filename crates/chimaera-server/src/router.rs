@@ -65,6 +65,10 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         )
         .route("/workspaces/{id}/skills", get(agent_probe::skills))
         .route(
+            "/workspaces/{id}/knowledge",
+            get(crate::knowledge::get_knowledge),
+        )
+        .route(
             "/sessions",
             get(api::list_sessions)
                 .post(api::create_session)

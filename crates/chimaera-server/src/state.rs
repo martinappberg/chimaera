@@ -4,9 +4,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
 use crate::{
-    agent_probe, agent_updates, agents, chat, compute, environment, episodes, fs, git, launcher,
-    ledger, notes, plugins, proxy, quickopen, recents, settings, timeline, update, view_state,
-    workspaces,
+    agent_probe, agent_updates, agents, chat, compute, environment, episodes, fs, git, knowledge,
+    launcher, ledger, notes, plugins, proxy, quickopen, recents, settings, timeline, update,
+    view_state, workspaces,
 };
 
 /// Upper bound on how long a sessions snapshot waits for ledger restore.
@@ -173,10 +173,6 @@ pub(crate) struct AppState {
     pub(crate) claude_settings_path: PathBuf,
     /// The user's codex config (`~/.codex/config.toml`); same respect rule.
     pub(crate) codex_config_path: PathBuf,
-    /// The daemon's durable-state root (`~/.chimaera` or
-    /// `$CHIMAERA_HOME/data`); per-workspace stores derive from it, so tests
-    /// and isolated daemons are sandboxed for free.
-    pub(crate) data_dir: PathBuf,
     /// The per-workspace Timeline (`<data_dir>/workspace/<ws>/timeline.jsonl`):
     /// what happened, written from signals the daemon already receives. Its
     /// per-workspace epochs drive the `/ws/events` timeline frame.
@@ -200,6 +196,9 @@ pub(crate) struct AppState {
     /// Agent-notes plugin state: per-session post rate windows and read
     /// cursors (in memory; notes themselves live on the Timeline).
     pub(crate) notes: Mutex<notes::NotesState>,
+    /// Knowledge-provider cache, the Timeline's diff baseline, and who
+    /// recorded what (see `knowledge`). Hot state; rebuilt from the files.
+    pub(crate) knowledge: Mutex<knowledge::KnowledgeState>,
 }
 
 impl AppState {
@@ -278,7 +277,7 @@ impl AppState {
             probes: agent_probe::ProbeState::default(),
             chat_catalogs: Mutex::new(HashMap::new()),
             notes: Mutex::new(notes::NotesState::default()),
-            data_dir,
+            knowledge: Mutex::new(knowledge::KnowledgeState::default()),
         }
     }
 
