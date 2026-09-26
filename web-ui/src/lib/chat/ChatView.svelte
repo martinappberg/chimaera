@@ -4,7 +4,7 @@
   import { fsValidate } from "../previews/files";
   import { listAgents } from "../workspace/launcher";
   import SessionGlyph from "../shared/SessionGlyph.svelte";
-  import { insertIntoComposer } from "./composerBus";
+  import { insertIntoComposer, registerFollow } from "./composerBus";
   import {
     acquireChat,
     releaseChat,
@@ -172,8 +172,8 @@
   let renderEnd = $state(0);
   let renderReady = $state(false);
   let renderedVersion = $state(-1);
-  // Plain (non-reactive) bookkeeping, like tracksTail/rendersLive: only ever
-  // read inside the windowing effect's untracked body or handlers.
+  // Plain (non-reactive) bookkeeping, like rendersLive: only ever read
+  // inside the windowing effect's untracked body or handlers.
   /** store.structuralVersion at the last range write. "Did the row set
    *  change" keys on this, never on lengths: at cap append+trim nets the
    *  length out, and a retracted-then-reappended tail nets even the virtual
@@ -196,13 +196,19 @@
   /** A non-empty draft pauses bottom-following, never transcript rendering. */
   let composerEngaged = $state(false);
   /** An explicit history page is stable. Ordinary scrolling inside a tail page
-   *  keeps streaming until retaining the reader would exceed the DOM cap. */
-  let tracksTail = false;
+   *  keeps streaming until retaining the reader would exceed the DOM cap.
+   *  Reactive for the template only (the windowing effect reads it
+   *  untracked): a row appended to a tail window lags renderEnd by one flush,
+   *  and reading that lag as "newer rows omitted" tore the live chrome out
+   *  and back in — a layout forced in between shrank the transcript under a
+   *  pinned reader, and WebKit's scrollTop clamp there read as scrolling up. */
+  let tracksTail = $state(false);
+  const atLiveEdge = $derived(tracksTail || renderEnd >= store.blocks.length);
   let rendersLive = false;
   let wasVisible = false;
   let pagingTranscript = false;
   const hasDeferredActivity = $derived(
-    followedVersion !== store.transcriptVersion || renderEnd < store.blocks.length,
+    followedVersion !== store.transcriptVersion || !atLiveEdge,
   );
 
   function markFollowed(version = store.transcriptVersion): void {
@@ -744,13 +750,48 @@
     getSetting("chat.fontFamily").trim() || "var(--ui-font)",
   );
 
+  /** When the reader last did something that scrolls. WebKit dispatches the
+   *  wheel (momentum included), pointer (the scrollbar too), touch, or key
+   *  input ahead of the scroll it causes; a scroll chained to one stays the
+   *  reader's, so a track-click animation or fling tail outlives the input. */
+  let scrollIntentAt = -Infinity;
+  const SCROLL_INTENT_MS = 300;
+  function noteScrollIntent(): void {
+    scrollIntentAt = performance.now();
+  }
+  // Passive by hand: Svelte attaches `onwheel` non-passive, which would pull
+  // WebKit's wheel scrolling off its scrolling thread.
+  $effect(() => {
+    const el = transcriptEl;
+    if (el === null) return;
+    el.addEventListener("wheel", noteScrollIntent, { passive: true });
+    return () => el.removeEventListener("wheel", noteScrollIntent);
+  });
+
   function onScroll() {
     const el = transcriptEl;
     if (el === null) return;
     const top = el.scrollTop;
-    if (top !== lastScrollTop) scrollDirection = top < lastScrollTop ? -1 : 1;
+    const moved = top !== lastScrollTop;
+    const up = top < lastScrollTop;
+    if (moved) scrollDirection = up ? -1 : 1;
     lastScrollTop = top;
-    atBottom = renderEnd >= store.blocks.length && el.scrollHeight - top - el.clientHeight < 40;
+    const now = performance.now();
+    const byReader = now - scrollIntentAt < SCROLL_INTENT_MS;
+    // Only a real move carries the reader's gesture on: the follow writer's
+    // own (non-moving) echoes must not keep a stale intent alive all stream.
+    if (byReader && moved) scrollIntentAt = now;
+    const nearEnd = el.scrollHeight - top - el.clientHeight < 40;
+    // A pinned follower leaves the live edge only by its own hand. WebKit
+    // dispatches the follow writer's scroll event a frame late, after rows
+    // that landed in between already grew the transcript (a follower who
+    // never moved), and it clamps scrollTop wherever a streamed re-render
+    // momentarily shrinks the content under the reader (an up-move nobody
+    // made). Idle, geometry alone decides, so a find or focus scroll holds.
+    const held =
+      atBottom && !nearEnd && (!moved || (up && !byReader && store.running));
+    atBottom = renderEnd >= store.blocks.length && (nearEnd || held);
+    if (held && atBottom) queueBottomScroll();
     if (atBottom) {
       // Reaching the actual live edge is an explicit resume signal even after
       // paging history: keep the current range, rebind its live proxies, and
@@ -913,7 +954,7 @@
   // ends inside the viewport produces no scroll event to drive it. Re-created
   // per page (it reads renderEnd), so a sentinel still in view keeps paging;
   // `hasLaterRows` is derived so a live turn's appends don't rebuild it.
-  const hasLaterRows = $derived(renderEnd < store.blocks.length);
+  const hasLaterRows = $derived(!atLiveEdge);
   $effect(() => {
     const root = transcriptEl;
     const sentinel = laterSentinelEl;
@@ -1101,6 +1142,15 @@
     }
     return socket.send({ type: "send", blocks });
   }
+
+  // A send made outside the composer (the Mastermind panel's one-click
+  // prompts) follows exactly like onSubmit below.
+  $effect(() =>
+    registerFollow(session.id, () => {
+      atBottom = true;
+      queueBottomScroll(true);
+    }),
+  );
 
   function onSubmit(text: string, images: ImageAttachment[]): boolean {
     // The daemon owns delivery semantics so reconnect/replay stay exact:
@@ -1947,8 +1997,9 @@
   />
 
   <!-- Focusable so keyboard scrolling works in WKWebView (Safari never
-       auto-focuses scrollers); role="log" announces new agent output. -->
-  <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+       auto-focuses scrollers); role="log" announces new agent output. The
+       input listeners only note that the reader is scrolling (onScroll). -->
+  <!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_no_noninteractive_element_interactions -->
   <div
     class="transcript"
     role="log"
@@ -1956,6 +2007,9 @@
     tabindex="0"
     bind:this={transcriptEl}
     onscroll={onScroll}
+    ontouchmove={noteScrollIntent}
+    onpointerdown={noteScrollIntent}
+    onkeydown={noteScrollIntent}
   >
     <!-- Room for earlier history ahead of the rendered window: it absorbs
          every height change above a scrolled-up reader (see "reading
@@ -2066,12 +2120,14 @@
               />
             </div>
           </div>
-          {#if block.attachments > 0 || block.origin === "remote" || block.origin === "restart"}
+          {#if block.attachments > 0 || block.origin === "remote" || block.origin === "restart" || block.origin === "worker"}
             <span class="bubble-meta">
               {#if block.origin === "remote"}
                 <span class="origin" title="sent from a Remote Control client (the Claude app or claude.ai/code)">via Remote Control</span>
               {:else if block.origin === "restart"}
                 <span class="origin auto" title="chimaera sent this itself: the daemon restarted while this chat had work running, so it asked the resumed agent to pick that work back up (setting: Pick Up Interrupted Work After a Restart)">sent by chimaera after a restart</span>
+              {:else if block.origin === "worker"}
+                <span class="origin auto" title="a worker in this workspace sent this with tell_mastermind; chimaera delivered it because the Mastermind acts on its own (auto)">from a worker</span>
               {/if}
               {#if block.attachments > 0}
                 <span class="attach">{block.attachments} image{block.attachments > 1 ? "s" : ""}</span>
@@ -2175,7 +2231,7 @@
       {/if}
     {/each}
 
-    {#if renderEnd < store.blocks.length}
+    {#if !atLiveEdge}
       {#if canAutoLoadHistory}
         <span class="history-sentinel" bind:this={laterSentinelEl} aria-hidden="true"></span>
       {:else}
@@ -2192,7 +2248,7 @@
     <!-- Live-tail chrome must never be spliced directly after a historical
          page with newer transcript rows omitted in between. Page forward or
          jump first, so chronology remains visually honest. -->
-    {#if !visible || renderEnd >= store.blocks.length}
+    {#if !visible || atLiveEdge}
     {#each pinnedPermissions as request (request.requestId)}
       {#if request.plan !== null}
         <PlanApprovalCard

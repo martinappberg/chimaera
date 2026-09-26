@@ -776,6 +776,45 @@ pub(crate) fn build_chat_command(
 /// 0600 --mcp-config file, so only the codex path needs this.
 pub(crate) const CODEX_MCP_KEY_ENV: &str = "CHIMAERA_MCP_KEY";
 
+/// The `-c` pair wiring a codex spawn to its session's chimaera endpoint:
+/// the secret-free URL in TOML quotes, the key via [`CODEX_MCP_KEY_ENV`].
+fn codex_mcp_overrides(url: &str) -> [String; 4] {
+    [
+        "-c".to_string(),
+        format!("mcp_servers.chimaera.url=\"{url}\""),
+        "-c".to_string(),
+        format!("mcp_servers.chimaera.bearer_token_env_var=\"{CODEX_MCP_KEY_ENV}\""),
+    ]
+}
+
+/// Argv tail giving a codex TUI the chimaera endpoint while plugin tools are
+/// active in its workspace or a Mastermind is appointed (the caller passes
+/// none otherwise, so a codex TUI spawn with neither stays byte-identical). `approve` — the active
+/// plugins' tools plus `notify`, the list claude's `permissions.allow` carries —
+/// ride per-tool `approval_mode = "approve"` so the user's opt-in isn't
+/// re-asked on every call (the app-server ignores that key, Pass 19; the TUI
+/// is where it applies). Linked-terminal tools keep codex's default prompt.
+/// Names outside `[a-z0-9_]` can't be a bare dotted-key segment and are
+/// skipped. Live (codex 0.153.0, PROTOCOL.md Pass 35): a pre-approved tool runs with no
+/// prompt, while a linked-terminal tool still asks.
+pub(crate) fn codex_tui_mcp_args(url: &str, approve: &[String]) -> Vec<String> {
+    let mut args = codex_mcp_overrides(url).to_vec();
+    for tool in approve {
+        if tool.is_empty()
+            || !tool
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+        {
+            continue;
+        }
+        args.push("-c".to_string());
+        args.push(format!(
+            "mcp_servers.chimaera.tools.{tool}.approval_mode=\"approve\""
+        ));
+    }
+    args
+}
+
 pub(crate) fn build_codex_chat_command(
     bin: &Path,
     mcp_url: Option<&str>,
@@ -783,12 +822,7 @@ pub(crate) fn build_codex_chat_command(
 ) -> Vec<String> {
     let mut cmd = vec![bin.to_string_lossy().into_owned(), "app-server".to_string()];
     if let Some(url) = mcp_url {
-        cmd.push("-c".to_string());
-        cmd.push(format!("mcp_servers.chimaera.url=\"{url}\""));
-        cmd.push("-c".to_string());
-        cmd.push(format!(
-            "mcp_servers.chimaera.bearer_token_env_var=\"{CODEX_MCP_KEY_ENV}\""
-        ));
+        cmd.extend(codex_mcp_overrides(url));
     }
     if mastermind.is_some() {
         cmd.push("-c".to_string());
@@ -1484,6 +1518,29 @@ mod tests {
                 "mcp_servers.chimaera.url=\"http://127.0.0.1:4200/api/v1/mcp/s-1a2b3c4d\"",
                 "-c",
                 "mcp_servers.chimaera.bearer_token_env_var=\"CHIMAERA_MCP_KEY\"",
+            ]
+        );
+    }
+
+    /// Codex TUI plugin injection: endpoint + key-by-env, and a per-tool
+    /// approve for exactly the plugin tools; a name that can't be a bare
+    /// dotted-key segment is dropped rather than mangled into the config.
+    #[test]
+    fn codex_tui_mcp_args_pre_approve_only_plugin_tools() {
+        let url = "http://127.0.0.1:4200/api/v1/mcp/s-1a2b3c4d";
+        let args = codex_tui_mcp_args(
+            url,
+            &["knowledge_search".to_string(), "bad.name\"x".to_string()],
+        );
+        assert_eq!(
+            args,
+            [
+                "-c",
+                "mcp_servers.chimaera.url=\"http://127.0.0.1:4200/api/v1/mcp/s-1a2b3c4d\"",
+                "-c",
+                "mcp_servers.chimaera.bearer_token_env_var=\"CHIMAERA_MCP_KEY\"",
+                "-c",
+                "mcp_servers.chimaera.tools.knowledge_search.approval_mode=\"approve\"",
             ]
         );
     }

@@ -1,0 +1,89 @@
+{
+  "tools": [
+    {
+      "description": "List the terminal sessions linked to this agent: name, id, working directory, shell state (ready/running), and the most recent command. Linked terminals are the only ones reachable.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      },
+      "name": "list_terminals"
+    },
+    {
+      "description": "Type a command into a linked terminal's live shell and wait for it to finish; returns its output and exit code. The shell's state (cwd, env, modules, remote ssh) applies and persists. If a command is already running, this queues until the prompt returns (bounded by queue_timeout_ms).",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "command": {
+            "description": "Single-line shell command (join steps with ';' or '&&')",
+            "type": "string"
+          },
+          "queue_timeout_ms": {
+            "description": "Max wait for the shell's prompt before typing (default 15000, cap 600000; 0 = only if free now)",
+            "type": "integer"
+          },
+          "terminal": {
+            "description": "Linked terminal: session id or display name (as in @term:NAME)",
+            "type": "string"
+          },
+          "timeout_ms": {
+            "description": "Max runtime once typed (default 30000, cap 3600000). On timeout the command keeps running and partial output is returned.",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "terminal",
+          "command"
+        ],
+        "type": "object"
+      },
+      "name": "run_in_terminal"
+    },
+    {
+      "description": "Read a linked terminal's recent activity: the command journal (commands, outputs, exit codes) by default, or the visible screen text with screen=true (for TUIs, boot output, or shells without integration marks).",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "commands": {
+            "description": "How many recent journal entries (default 5, cap 50)",
+            "type": "integer"
+          },
+          "screen": {
+            "description": "Return the visible screen text instead of the journal",
+            "type": "boolean"
+          },
+          "terminal": {
+            "description": "Linked terminal: session id or display name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "terminal"
+        ],
+        "type": "object"
+      },
+      "name": "read_terminal"
+    },
+    {
+      "description": "Show the user a Chimaera desktop notification (it reaches them even when Chimaera is in the background). Use it when the user asked to be told about something (\"ping me when the build is done\", \"let me know if the job fails\"), or when long-running work you were watching finishes or fails mid-turn. The user is already notified automatically when your turn ends or you need permission/input, so do not use it for routine progress. Rate-limited per session.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "message": {
+            "description": "The notification text: one or two short sentences with the outcome.",
+            "type": "string"
+          },
+          "title": {
+            "description": "Optional short headline (defaults to this session's name).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "message"
+        ],
+        "type": "object"
+      },
+      "name": "notify"
+    }
+  ]
+}

@@ -78,12 +78,13 @@ describe("foldUnread", () => {
     expect(isUnread("a")).toBe(false);
   });
 
-  it("never marks the workspace Mastermind", () => {
+  it("marks the workspace Mastermind like any agent (the panel icon's dot)", () => {
     fold(
       [agent("a", { agent_state: "running", mastermind: true })],
       [agent("a", { agent_state: "finished", mastermind: true })],
     );
-    expect(isUnread("a")).toBe(false);
+    expect(isUnread("a")).toBe(true);
+    markSeen("a");
   });
 
   it("clears on markSeen and prunes ids gone from the snapshot", () => {

@@ -21,17 +21,39 @@
     return i > 0 ? rel.slice(0, i) : "";
   }
 
+  /** A workspace surface with no file or session to match on (Timeline,
+   *  Knowledge, Plugins): reachable from the palette by name. */
+  interface QuickOpenCommand {
+    id: string;
+    label: string;
+    /** The quiet trailing hint ("what happened"). */
+    hint?: string;
+    run: () => void;
+  }
+
   interface Props {
     workspaceId: string;
     sessions: Session[];
     /** Display names keyed by session id (naming rule zero). */
     sessionNames: Map<string, string>;
+    /** Surfaces reachable by name; listed after sessions, before files, and
+     *  only while the query matches (an empty query keeps the palette about
+     *  files and sessions). */
+    commands?: QuickOpenCommand[];
     onOpenFile: (path: string, split: boolean) => void;
     onOpenSession: (id: string, split: boolean) => void;
     onClose: () => void;
   }
 
-  let { workspaceId, sessions, sessionNames, onOpenFile, onOpenSession, onClose }: Props = $props();
+  let {
+    workspaceId,
+    sessions,
+    sessionNames,
+    commands = [],
+    onOpenFile,
+    onOpenSession,
+    onClose,
+  }: Props = $props();
 
   let input = $state("");
   let entries = $state<QuickOpenEntry[]>([]);
@@ -64,13 +86,21 @@
     sessions.filter((s) => subseq(input.trim(), sessionLabel(s))),
   );
 
+  /** Commands match only a NON-empty query (they'd otherwise crowd the
+   *  file-first empty palette). Same fuzzy rule as sessions. */
+  const matchedCommands = $derived(
+    input.trim() === "" ? [] : commands.filter((c) => subseq(input.trim(), c.label)),
+  );
+
   type Row =
     | { kind: "session"; session: Session }
+    | { kind: "command"; command: QuickOpenCommand }
     | { kind: "file"; entry: QuickOpenEntry };
 
   const rows = $derived.by((): Row[] => {
     const out: Row[] = [];
     for (const s of matchedSessions) out.push({ kind: "session", session: s });
+    for (const c of matchedCommands) out.push({ kind: "command", command: c });
     for (const e of entries) out.push({ kind: "file", entry: e });
     return out;
   });
@@ -119,8 +149,15 @@
   function activate(row: Row | undefined, split: boolean): void {
     if (row === undefined) return;
     if (row.kind === "session") onOpenSession(row.session.id, split);
+    else if (row.kind === "command") row.command.run();
     else onOpenFile(row.entry.path, split);
     onClose();
+  }
+
+  function rowKey(row: Row): string {
+    if (row.kind === "session") return `s:${row.session.id}`;
+    if (row.kind === "command") return `c:${row.command.id}`;
+    return `f:${row.entry.path}`;
   }
 
   function onKeydown(e: KeyboardEvent): void {
@@ -176,7 +213,7 @@
       {#if rows.length === 0 && error === null}
         <div class="empty">no matches</div>
       {/if}
-      {#each rows as row, i (row.kind === "session" ? `s:${row.session.id}` : `f:${row.entry.path}`)}
+      {#each rows as row, i (rowKey(row))}
         <div
           class="rowwrap"
           role="presentation"
@@ -187,11 +224,20 @@
           <button
             class="row"
             tabindex="-1"
-            title={row.kind === "session" ? sessionLabel(row.session) : row.entry.rel}
+            title={row.kind === "session"
+              ? sessionLabel(row.session)
+              : row.kind === "command"
+                ? row.command.label
+                : row.entry.rel}
             onmousedown={(e) => e.preventDefault()}
             onclick={(e) => activate(row, e.metaKey || e.ctrlKey)}
           >
-            {#if row.kind === "session"}
+            {#if row.kind === "command"}
+              {@const c = row.command}
+              <span class="glyph-slot cmd-glyph" aria-hidden="true">›</span>
+              <span class="name">{c.label}</span>
+              {#if c.hint}<span class="meta">{c.hint}</span>{/if}
+            {:else if row.kind === "session"}
               {@const s = row.session}
               <span class="glyph-slot">
                 <!-- Session-type glyph (agent_kind-driven), state-colored. -->
@@ -337,6 +383,10 @@
   }
 
   /* Session glyphs (and their state palette) live in SessionGlyph. */
+  .cmd-glyph {
+    font-family: var(--mono);
+    color: var(--muted);
+  }
 
   .name {
     flex: none;

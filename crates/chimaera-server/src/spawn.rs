@@ -143,8 +143,9 @@ pub(crate) async fn spawn_session(
                 )
                 .await;
                 let settings_theme = (!theme_set).then_some(spec.theme.as_str());
-                // PTY TUI spawns are never the Mastermind (a chat-only role),
-                // so no permissions block rides these settings.
+                let plugin_tools = crate::plugins::spawn_allow(state, &workspace.id).await;
+                // PTY TUI spawns are never the Mastermind (a chat-only role);
+                // only active plugins' tools may ride a permissions block.
                 match crate::agents::write_settings(
                     &id,
                     &key,
@@ -152,6 +153,7 @@ pub(crate) async fn spawn_session(
                     settings_theme,
                     user_statusline.as_ref(),
                     None,
+                    &plugin_tools,
                 ) {
                     Ok(path) => Some(path),
                     Err(err) => {
@@ -181,6 +183,15 @@ pub(crate) async fn spawn_session(
             } else {
                 None
             };
+            // Codex TUIs reach the chimaera endpoint only while a plugin with
+            // tools is active here or a Mastermind is appointed (opt-ins the
+            // user made — `spawn_allow`); with neither, the argv and env stay
+            // exactly what they were.
+            let codex_plugin_tools = if agent_kind == AgentKind::Codex {
+                crate::plugins::spawn_allow(state, &workspace.id).await
+            } else {
+                Vec::new()
+            };
             // Codex resume is a subcommand (`codex resume <thread>`), not a
             // flag. Fresh Codex and every Claude/Gemini spawn keep the normal
             // builder; the dedicated resume builder pins Codex's argv order.
@@ -209,6 +220,24 @@ pub(crate) async fn spawn_session(
             if let Some(mcp) = &mcp_config {
                 argv.push("--mcp-config".to_string());
                 argv.push(mcp.to_string_lossy().into_owned());
+            }
+            if !codex_plugin_tools.is_empty() {
+                // Pre-approved: the prompt-free tools every session gets
+                // (`notify`) plus the active plugins' own.
+                let approve: Vec<String> = crate::mcp::ALWAYS_ALLOWED_TOOLS
+                    .iter()
+                    .map(|t| t.to_string())
+                    .chain(codex_plugin_tools)
+                    .collect();
+                // `-c` trails `resume <thread>` too, like the theme override.
+                argv.extend(crate::launcher::codex_tui_mcp_args(
+                    &crate::agents::mcp_url_bare(&id, state.port),
+                    &approve,
+                ));
+                // The key rides the env, never world-readable argv; env is
+                // applied after env_remove, so nothing strips it.
+                opts.env
+                    .push((crate::launcher::CODEX_MCP_KEY_ENV.to_string(), key.clone()));
             }
             // Login-shell wrap: agents must see the user's terminal environment
             // (exported API keys, nvm PATHs) — the daemon's own env never

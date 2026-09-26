@@ -56,6 +56,99 @@ pub(crate) struct Job {
     /// what it holds. "" when the wire lacked them.
     pub(crate) cpus: String,
     pub(crate) mem: String,
+    /// Elapsed run time (`%M`) and working directory (`%Z`) — the Timeline
+    /// names a finished job's runtime and attributes it to the workspace
+    /// whose root contains the workdir. Additive on the /compute wire;
+    /// omitted when squeue gave nothing.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) elapsed: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) workdir: String,
+}
+
+/// A job that left the queue (or reached a terminal state) since the last
+/// good snapshot — drained by the Timeline's job task.
+#[derive(Clone, Debug)]
+pub(crate) struct JobEnd {
+    pub(crate) job: Job,
+    /// The terminal state when squeue showed one, else "ENDED" (squeue
+    /// forgets finished jobs; we never guess success).
+    pub(crate) state: String,
+}
+
+/// Terminal squeue states — a job seen in one of these has ended.
+const TERMINAL_STATES: [&str; 9] = [
+    "COMPLETED",
+    "FAILED",
+    "CANCELLED",
+    "TIMEOUT",
+    "OUT_OF_MEMORY",
+    "NODE_FAIL",
+    "PREEMPTED",
+    "BOOT_FAIL",
+    "DEADLINE",
+];
+/// Ended-job reports buffered for the Timeline, and ids already reported
+/// (a job seen COMPLETING, then gone, must yield one entry, not two).
+const ENDED_QUEUE_MAX: usize = 64;
+const ENDED_SEEN_MAX: usize = 256;
+
+/// Still queued or running (not yet ended).
+pub(crate) fn is_live_state(state: &str) -> bool {
+    terminal_state(state).is_none()
+}
+
+fn terminal_state(state: &str) -> Option<&'static str> {
+    TERMINAL_STATES
+        .iter()
+        .find(|t| state.starts_with(**t))
+        .copied()
+}
+
+#[derive(Default)]
+struct EndedJobs {
+    queue: std::collections::VecDeque<JobEnd>,
+    reported: std::collections::VecDeque<String>,
+}
+
+impl EndedJobs {
+    fn report(&mut self, job: &Job, state: &str) {
+        if self.reported.iter().any(|id| id == &job.id) {
+            return;
+        }
+        if self.reported.len() >= ENDED_SEEN_MAX {
+            self.reported.pop_front();
+        }
+        self.reported.push_back(job.id.clone());
+        if self.queue.len() >= ENDED_QUEUE_MAX {
+            self.queue.pop_front();
+        }
+        self.queue.push_back(JobEnd {
+            job: job.clone(),
+            state: state.to_string(),
+        });
+    }
+}
+
+/// Diff two GOOD snapshots: jobs that vanished, and jobs that newly show a
+/// terminal state. A vanish only means "ended" when `next` lists the whole
+/// queue — past the `MAX_JOBS` cap a still-running job (a big array's
+/// reshuffle) can simply fall off the page, and the Timeline can't retract.
+fn note_transitions(ended: &mut EndedJobs, prev: &[Job], next: &[Job], next_complete: bool) {
+    for old in prev {
+        match next.iter().find(|j| j.id == old.id) {
+            None if !next_complete => {}
+            None => {
+                let state = terminal_state(&old.state).unwrap_or("ENDED");
+                ended.report(old, state);
+            }
+            Some(now) => {
+                if let Some(state) = terminal_state(&now.state) {
+                    ended.report(now, state);
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -151,6 +244,9 @@ pub(crate) struct ComputeService {
     /// compute-node daemon): `SLURM_JOB_ID` at construction. Drives the
     /// snapshot's `self` block.
     self_job: Option<String>,
+    /// Jobs that ended between good snapshots, for the Timeline (std lock:
+    /// never held across an await).
+    ended: std::sync::Mutex<EndedJobs>,
 }
 
 #[derive(Default)]
@@ -168,6 +264,7 @@ impl ComputeService {
             inner: tokio::sync::Mutex::new(Inner::default()),
             bindir: std::env::var_os("CHIMAERA_SLURM_BINDIR").map(PathBuf::from),
             self_job: std::env::var("SLURM_JOB_ID").ok().filter(|s| !s.is_empty()),
+            ended: std::sync::Mutex::new(EndedJobs::default()),
         }
     }
 
@@ -177,6 +274,7 @@ impl ComputeService {
             inner: tokio::sync::Mutex::new(Inner::default()),
             bindir: Some(dir),
             self_job: None,
+            ended: std::sync::Mutex::new(EndedJobs::default()),
         }
     }
 
@@ -186,6 +284,7 @@ impl ComputeService {
             inner: tokio::sync::Mutex::new(Inner::default()),
             bindir: Some(dir),
             self_job: Some(job.to_string()),
+            ended: std::sync::Mutex::new(EndedJobs::default()),
         }
     }
 
@@ -230,6 +329,20 @@ impl ComputeService {
         // Holding the lock across the fetch IS the single-flight: concurrent
         // requests queue here briefly instead of stampeding the controller.
         let mut snap = fetch_snapshot(&squeue, &sinfo, self.self_job.as_deref()).await;
+        // Only two GOOD reads say a job ended: a failed squeue carries the
+        // old jobs forward and must never read as "everything finished".
+        if !snap.degraded {
+            if let Some((_, prev)) = &inner.cache {
+                if !prev.degraded {
+                    note_transitions(
+                        &mut crate::lock(&self.ended),
+                        &prev.jobs,
+                        &snap.jobs,
+                        !snap.truncated,
+                    );
+                }
+            }
+        }
         if snap.degraded {
             // squeue failed this round: carry the previous jobs forward
             // (tagged) rather than serving a false "queue is empty".
@@ -239,6 +352,19 @@ impl ComputeService {
         }
         inner.cache = Some((Instant::now(), snap.clone()));
         snap
+    }
+
+    /// Jobs that ended since the last drain (the Timeline's job task).
+    pub(crate) fn drain_ended(&self) -> Vec<JobEnd> {
+        crate::lock(&self.ended).queue.drain(..).collect()
+    }
+
+    /// The cached snapshot WITHOUT waiting: a refresh in flight holds the
+    /// lock across a squeue (up to its deadline), and a status answer must
+    /// not stall behind it — None means "refreshing or never fetched".
+    pub(crate) fn peek(&self) -> Option<(Instant, ComputeSnapshot)> {
+        let inner = self.inner.try_lock().ok()?;
+        inner.cache.clone()
     }
 
     /// The context block a compute-node daemon injects into its agent
@@ -396,7 +522,7 @@ async fn fetch_snapshot(
                         user,
                         "--noheader".into(),
                         "-o".into(),
-                        "%i|%P|%T|%L|%N|%C|%m|%j".into(),
+                        "%i|%P|%T|%L|%N|%C|%m|%M|%Z|%j".into(),
                     ],
                 )
                 .await
@@ -568,7 +694,7 @@ fn parse_squeue(out: &str) -> (Vec<Job>, bool) {
     let mut jobs = Vec::new();
     let mut truncated = false;
     for line in out.lines().map(str::trim).filter(|l| !l.is_empty()) {
-        let mut f = line.splitn(8, '|').map(str::trim);
+        let mut f = line.splitn(10, '|').map(str::trim);
         let (Some(id), Some(partition), Some(state), Some(time_left)) =
             (f.next(), f.next(), f.next(), f.next())
         else {
@@ -585,6 +711,13 @@ fn parse_squeue(out: &str) -> (Vec<Job>, bool) {
         let nodes = f.next().unwrap_or("").to_string();
         let cpus = f.next().unwrap_or("").to_string();
         let mem = f.next().unwrap_or("").to_string();
+        let elapsed = f.next().unwrap_or("").to_string();
+        // %Z prints "(null)"/"n/a" on some builds when unknown.
+        let workdir = f
+            .next()
+            .filter(|w| w.starts_with('/'))
+            .unwrap_or("")
+            .to_string();
         jobs.push(Job {
             id: id.to_string(),
             name: f.next().unwrap_or("").to_string(),
@@ -594,6 +727,8 @@ fn parse_squeue(out: &str) -> (Vec<Job>, bool) {
             nodes,
             cpus,
             mem,
+            elapsed,
+            workdir,
         });
     }
     (jobs, truncated)
@@ -783,9 +918,11 @@ mod tests {
         // Shapes measured on Sherlock 2026-07-14, %C|%m resource tail
         // 2026-07-16, %j moved LAST 2026-07-16 (user-controlled names may
         // contain the `|` delimiter — the final field absorbs them).
-        let out = "34022541|normal|RUNNING|9:54|sh02-01n58|4|16G|chimaera-test\n\
-                   34022542|owners|PENDING|8:00:00||||align.sh\n\
-                   34022543|owners|RUNNING|1:00|n1|2|4G|my|weird|name\n\
+        // %M|%Z (elapsed, workdir) joined before %j 2026-09-25.
+        let out =
+            "34022541|normal|RUNNING|9:54|sh02-01n58|4|16G|1:02:03|/home/u/proj|chimaera-test\n\
+                   34022542|owners|PENDING|8:00:00||||0:00|(null)|align.sh\n\
+                   34022543|owners|RUNNING|1:00|n1|2|4G|5:00|/scratch/x|my|weird|name\n\
                    slurm_load_jobs: Warning: something\n";
         let (jobs, truncated) = parse_squeue(out);
         assert!(!truncated);
@@ -797,6 +934,9 @@ mod tests {
         assert_eq!(jobs[0].nodes, "sh02-01n58");
         assert_eq!(jobs[0].cpus, "4");
         assert_eq!(jobs[0].mem, "16G");
+        assert_eq!(jobs[0].elapsed, "1:02:03");
+        assert_eq!(jobs[0].workdir, "/home/u/proj");
+        assert_eq!(jobs[1].workdir, "", "(null) is not a path");
         assert_eq!(jobs[1].nodes, "", "pending job has no nodes yet");
         assert_eq!(jobs[1].cpus, "", "pending rows degrade to empty resources");
         assert_eq!(jobs[1].name, "align.sh");
@@ -807,11 +947,58 @@ mod tests {
         assert_eq!(jobs[2].state, "RUNNING");
 
         let many: String = (0..60)
-            .map(|i| format!("{i}|p|RUNNING|1:00|n{i}|1|1G|j{i}\n"))
+            .map(|i| format!("{i}|p|RUNNING|1:00|n{i}|1|1G|0:10|/w|j{i}\n"))
             .collect();
         let (jobs, truncated) = parse_squeue(&many);
         assert_eq!(jobs.len(), MAX_JOBS);
         assert!(truncated);
+    }
+
+    #[test]
+    fn ended_jobs_are_reported_once_and_only_from_good_reads() {
+        let job = |id: &str, state: &str| Job {
+            id: id.into(),
+            name: format!("job{id}"),
+            partition: "p".into(),
+            state: state.into(),
+            time_left: String::new(),
+            nodes: String::new(),
+            cpus: String::new(),
+            mem: String::new(),
+            elapsed: "1:00".into(),
+            workdir: "/w".into(),
+        };
+        let mut ended = EndedJobs::default();
+        let a = vec![
+            job("1", "RUNNING"),
+            job("2", "RUNNING"),
+            job("3", "PENDING"),
+        ];
+        let b = vec![job("2", "COMPLETING"), job("3", "FAILED")];
+        note_transitions(&mut ended, &a, &b, true);
+        let states: Vec<(String, String)> = ended
+            .queue
+            .iter()
+            .map(|e| (e.job.id.clone(), e.state.clone()))
+            .collect();
+        assert_eq!(
+            states,
+            vec![("1".into(), "ENDED".into()), ("3".into(), "FAILED".into())]
+        );
+        // 3 vanishing next time must not report twice; 2 finishing does.
+        let c: Vec<Job> = Vec::new();
+        note_transitions(&mut ended, &b, &c, true);
+        assert_eq!(ended.queue.len(), 3);
+        assert_eq!(ended.queue[2].job.id, "2");
+        // A truncated read (past MAX_JOBS) proves nothing about the jobs it
+        // no longer lists — only a reported terminal state still counts.
+        let mut ended = EndedJobs::default();
+        let d = vec![job("7", "RUNNING"), job("8", "RUNNING")];
+        note_transitions(&mut ended, &a, &d, false);
+        assert!(ended.queue.is_empty());
+        note_transitions(&mut ended, &d, &[job("8", "TIMEOUT")], false);
+        assert_eq!(ended.queue.len(), 1);
+        assert_eq!(ended.queue[0].job.id, "8");
     }
 
     #[test]
@@ -996,7 +1183,7 @@ mod tests {
             ("scancel", "#!/bin/sh\nexit 0\n"),
             (
                 "squeue",
-                "#!/bin/sh\nif [ \"$1\" = \"-j\" ]; then echo \"$2|gpu|RUNNING|3:59:00|node7\"; else echo '1|normal|RUNNING|59:00|node1|4|8G|myjob'; fi\n",
+                "#!/bin/sh\nif [ \"$1\" = \"-j\" ]; then echo \"$2|gpu|RUNNING|3:59:00|node7\"; else echo '1|normal|RUNNING|59:00|node1|4|8G|0:30|/home/u|myjob'; fi\n",
             ),
             ("sinfo", "#!/bin/sh\necho 'normal*|up|10'\n"),
         ] {
