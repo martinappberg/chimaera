@@ -3,7 +3,7 @@
  *   GET  /fs/list?path=&hidden=      directory listing (dirs first, sorted)
  *   GET  /fs/file?path=&offset=&limit=   raw bytes + X-File-Size/X-Truncated
  *   GET  /fs/markdown?path=          server-rendered, sanitized GFM HTML
- *   GET  /fs/table?path=&offset_rows=&limit_rows=   paged CSV/TSV
+ *   GET  /fs/table?path=&offset_rows=&limit_rows=   paged CSV/TSV/VCF/BED/GFF/SAM
  *   POST /fs/ticket {path}           short-lived unauthenticated /raw/ URL
  * plus the pure helpers that decide how a path is displayed (extension →
  * view kind, basename/parent, human sizes). Bearer auth rides on api().
@@ -56,6 +56,16 @@ export interface TablePage {
   rows: string[][];
   offset: number;
   truncated: boolean;
+  /** Exact data-row count, once the daemon has read to the end (fs/table;
+   *  absent from older daemons and from fs/xlsx). */
+  total_rows?: number | null;
+  /** A byte-rate row estimate while the total is unknown (plain files). */
+  est_rows?: number | null;
+  /** The daemon's per-request scan budget ran out before `offset`: the page
+   *  is empty and asking again resumes from `scanned_to`. */
+  scan_limited?: boolean;
+  /** The data-row number the daemon's scan stopped at. */
+  scanned_to?: number;
 }
 
 /** Server cap for one /fs/file read; also the code view's chunk size. */
@@ -290,13 +300,94 @@ export async function fsMarkdown(path: string): Promise<MarkdownDoc> {
   };
 }
 
-export async function fsTable(path: string, offsetRows = 0, limitRows = 200): Promise<TablePage> {
+/**
+ * How fs/table reads a bioinformatics text format: which lines are comments,
+ * whether a header row exists (else the format's standard column names), and
+ * that fields are never quoted (a SAM quality or VCF text may open with `"`).
+ */
+export interface TablePreset {
+  /** Line prefixes the daemon skips wherever they appear. */
+  comment: string[];
+  /** The file carries its own header row (after the comments). */
+  header: boolean;
+  /** Column names for a header-less file; further fields are `colN`. */
+  names?: string[];
+  /** Strip a leading `#` from the first header cell (VCF's `#CHROM`). */
+  stripHash?: boolean;
+}
+
+const BED_NAMES = ["chrom", "chromStart", "chromEnd", "name", "score", "strand"];
+const PEAK_NAMES = [...BED_NAMES, "signalValue", "pValue", "qValue"];
+const BED_COMMENTS = ["#", "track", "browser"];
+const GFF: TablePreset = {
+  comment: ["#"],
+  header: false,
+  names: ["seqid", "source", "type", "start", "end", "score", "strand", "phase", "attributes"],
+};
+
+const TABLE_PRESETS: Record<string, TablePreset> = {
+  vcf: { comment: ["##"], header: true, stripHash: true },
+  bed: {
+    comment: BED_COMMENTS,
+    header: false,
+    names: [...BED_NAMES, "thickStart", "thickEnd", "itemRgb", "blockCount", "blockSizes", "blockStarts"],
+  },
+  bedgraph: { comment: BED_COMMENTS, header: false, names: ["chrom", "chromStart", "chromEnd", "dataValue"] },
+  narrowpeak: { comment: BED_COMMENTS, header: false, names: [...PEAK_NAMES, "peak"] },
+  broadpeak: { comment: BED_COMMENTS, header: false, names: PEAK_NAMES },
+  gff: GFF,
+  gff3: GFF,
+  gtf: {
+    comment: ["#"],
+    header: false,
+    names: ["seqname", "source", "feature", "start", "end", "score", "strand", "frame", "attribute"],
+  },
+  sam: {
+    comment: ["@"],
+    header: false,
+    names: ["QNAME", "FLAG", "RNAME", "POS", "MAPQ", "CIGAR", "RNEXT", "PNEXT", "TLEN", "SEQ", "QUAL"],
+  },
+};
+
+/** The bioinformatics preset for `path` (gzip wrappers by their inner
+ *  extension), or null for plain CSV/TSV. */
+export function tablePreset(path: string): TablePreset | null {
+  return TABLE_PRESETS[innerExtension(path)] ?? null;
+}
+
+/** The fs/table query for one page of `path`, preset options included. */
+export function tableQuery(path: string, offsetRows: number, limitRows: number): URLSearchParams {
   const q = new URLSearchParams({
     path,
     offset_rows: String(offsetRows),
     limit_rows: String(limitRows),
   });
-  return json(await api(`/fs/table?${q.toString()}`));
+  const preset = tablePreset(path);
+  if (preset !== null) {
+    // Every preset format is tab-separated; the daemon's name sniff knows
+    // only .csv/.tsv.
+    q.set("delim", "tab");
+    q.set("quote", "false");
+    q.set("comment", preset.comment.join(","));
+    if (!preset.header) {
+      q.set("header", "false");
+      if (preset.names !== undefined) q.set("names", preset.names.join(","));
+    }
+  }
+  return q;
+}
+
+/** A page's column names as the grid shows them (VCF's `#CHROM` → `CHROM`). */
+export function presetColumns(path: string, columns: string[]): string[] {
+  if (tablePreset(path)?.stripHash !== true || !columns[0]?.startsWith("#")) return columns;
+  return [columns[0].slice(1), ...columns.slice(1)];
+}
+
+export async function fsTable(path: string, offsetRows = 0, limitRows = 200): Promise<TablePage> {
+  const page = await json<TablePage>(
+    await api(`/fs/table?${tableQuery(path, offsetRows, limitRows).toString()}`),
+  );
+  return { ...page, columns: presetColumns(path, page.columns) };
 }
 
 /** One page of a spreadsheet sheet: the CSV `TablePage` shape plus the
@@ -624,7 +715,12 @@ export function isImagePath(path: string): boolean {
 }
 const MARKDOWN_EXTS = new Set(["md", "markdown"]);
 const HTML_EXTS = new Set(["html", "htm"]);
-const TABLE_EXTS = new Set(["csv", "tsv"]);
+/** Paged by fs/table: delimited text, including the bioinformatics formats
+ *  `tablePreset` knows how to read. */
+const TABLE_EXTS = new Set([
+  "csv", "tsv",
+  "vcf", "bed", "bedgraph", "narrowpeak", "broadpeak", "gff", "gff3", "gtf", "sam",
+]);
 /** Spreadsheets parsed server-side (calamine) into the same paged table grid. */
 const SPREADSHEET_EXTS = new Set(["xlsx", "xls", "xlsm", "ods"]);
 /**
