@@ -279,10 +279,7 @@ pub(crate) async fn run(state: Arc<AppState>) {
     // Boot data must be read (and acted on) before the reconcile loop's
     // first write replaces it with the current — initially empty — truth.
     let boot = crate::lock(&state.ledger).load_boot();
-    restore(&state, boot).await;
-    // Serving started concurrently; sessions snapshots held back by
-    // `wait_restored` may flow now that the roster is whole.
-    state.restored.send_replace(true);
+    consume_boot(&state, boot).await;
     loop {
         tokio::select! {
             _ = state.changes.notified() => {}
@@ -420,6 +417,18 @@ pub(crate) fn snapshot(state: &AppState) -> (Vec<LedgerEntry>, HashMap<String, S
         .map(|(t, a)| (t.clone(), a.clone()))
         .collect();
     (entries, links)
+}
+
+/// Restore the boot ledger, then release what waited on it: the held-back
+/// sessions snapshots, and the chat-journal budget, which cannot run earlier —
+/// until a ledgered chat respawns it is live nowhere, yet its journal is what
+/// it resumes from.
+pub(crate) async fn consume_boot(state: &Arc<AppState>, boot: BootLedger) {
+    restore(state, boot).await;
+    // Serving started concurrently; sessions snapshots held back by
+    // `wait_restored` may flow now that the roster is whole.
+    state.restored.send_replace(true);
+    crate::chat::prune_journals(state, None).await;
 }
 
 /// Act on what the previous daemon left: resurrect what can come back
