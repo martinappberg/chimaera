@@ -15,7 +15,7 @@
 //! order. No fs work ever runs on the reactor: loads and paging reads go
 //! through `spawn_blocking`, writes through the writer thread.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
@@ -209,7 +209,13 @@ enum WriteOp {
 pub(crate) struct TimelineService {
     root: PathBuf,
     inner: Mutex<HashMap<String, WsTimeline>>,
+    /// Per workspace: the head seq at the last append. Durable (seq survives
+    /// a restart), so a client comparing epochs for equality can't alias a
+    /// pre-restart value the way a boot-scoped counter would.
     epochs: Mutex<HashMap<String, u64>>,
+    /// Deleted workspaces (ids are never reused): an append racing the
+    /// delete must not re-create the ring or the directory.
+    removed: Mutex<HashSet<String>>,
     writer: Mutex<Option<mpsc::Sender<WriteOp>>>,
 }
 
@@ -219,6 +225,7 @@ impl TimelineService {
             root,
             inner: Mutex::new(HashMap::new()),
             epochs: Mutex::new(HashMap::new()),
+            removed: Mutex::new(HashSet::new()),
             writer: Mutex::new(None),
         }
     }
@@ -234,7 +241,7 @@ impl TimelineService {
     /// Load a workspace's tail from disk once (off the reactor). Concurrent
     /// first touches may both load; the first insert wins.
     async fn ensure_loaded(&self, ws: &str) {
-        if crate::lock(&self.inner).contains_key(ws) {
+        if crate::lock(&self.inner).contains_key(ws) || crate::lock(&self.removed).contains(ws) {
             return;
         }
         let path = self.path(ws);
@@ -254,13 +261,20 @@ impl TimelineService {
     /// The caller wakes `/ws/events` (`state.changes.notify_waiters()`), so
     /// several appends from one event batch into one wake.
     pub(crate) async fn append(&self, ws: &str, mut entry: Entry) -> Arc<Entry> {
-        self.ensure_loaded(ws).await;
         if entry.ts == 0 {
             entry.ts = now_ms();
         }
+        if crate::lock(&self.removed).contains(ws) {
+            return Arc::new(entry);
+        }
+        self.ensure_loaded(ws).await;
         let path = self.path(ws);
         let arc = {
             let mut inner = crate::lock(&self.inner);
+            // Re-checked under the lock `remove_workspace` takes first.
+            if crate::lock(&self.removed).contains(ws) {
+                return Arc::new(entry);
+            }
             let tl = inner.entry(ws.to_string()).or_insert(WsTimeline {
                 seq: 0,
                 ring: VecDeque::new(),
@@ -282,7 +296,7 @@ impl TimelineService {
             }
             arc
         };
-        *crate::lock(&self.epochs).entry(ws.to_string()).or_insert(0) += 1;
+        crate::lock(&self.epochs).insert(ws.to_string(), arc.seq);
         arc
     }
 
@@ -351,6 +365,16 @@ impl TimelineService {
         self.page(ws, None, None, limit).await.0
     }
 
+    /// The in-memory ring only, newest first — never the file (a hot path
+    /// that re-reads on every call must not parse up to `FILE_MAX`).
+    pub(crate) async fn in_memory(&self, ws: &str) -> Vec<Arc<Entry>> {
+        self.ensure_loaded(ws).await;
+        crate::lock(&self.inner)
+            .get(ws)
+            .map(|tl| tl.ring.iter().rev().cloned().collect())
+            .unwrap_or_default()
+    }
+
     pub(crate) fn epoch(&self, ws: &str) -> u64 {
         crate::lock(&self.epochs).get(ws).copied().unwrap_or(0)
     }
@@ -363,7 +387,10 @@ impl TimelineService {
     /// Forget a deleted workspace: memory now, its directory via the writer
     /// (queued behind any pending appends, so nothing resurrects it).
     pub(crate) fn remove_workspace(&self, ws: &str) {
-        crate::lock(&self.inner).remove(ws);
+        let mut inner = crate::lock(&self.inner);
+        crate::lock(&self.removed).insert(ws.to_string());
+        inner.remove(ws);
+        drop(inner);
         crate::lock(&self.epochs).remove(ws);
         self.send(WriteOp::Remove { dir: self.dir(ws) });
     }
@@ -771,6 +798,28 @@ mod tests {
         assert_eq!(seqs, vec![5, 4, 3]);
         let next = again.append("ws1", episode("after reload")).await;
         assert_eq!(next.seq, 6, "seq resumes from the file");
+        assert_eq!(
+            again.epoch("ws1"),
+            6,
+            "the epoch is the durable seq, never a boot-scoped counter"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn an_append_after_delete_resurrects_nothing() {
+        let root = temp_root("removed");
+        let svc = TimelineService::new(root.clone());
+        svc.append("gone", episode("before")).await;
+        settle(&svc, "gone", 1).await;
+        svc.remove_workspace("gone");
+        svc.append("gone", episode("racing the delete")).await;
+        assert!(svc.in_memory("gone").await.is_empty());
+        // The writer drains in order: a later append elsewhere proves the
+        // Remove ran and nothing re-created the deleted directory.
+        svc.append("kept", episode("elsewhere")).await;
+        settle(&svc, "kept", 1).await;
+        assert!(!svc.dir("gone").exists());
         let _ = std::fs::remove_dir_all(root);
     }
 

@@ -81,7 +81,7 @@ pub(crate) fn defs(plugin: &str) -> Vec<Value> {
                     "type": "object",
                     "required": ["text"],
                     "properties": {
-                        "text": {"type": "string", "description": "The note (≤ 2000 chars)"},
+                        "text": {"type": "string", "description": "The note (under 2 KB)"},
                         "to": {"type": "string", "description": "Session id or \"mastermind\""},
                     },
                     "additionalProperties": false,

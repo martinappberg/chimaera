@@ -432,7 +432,13 @@ pub(crate) async fn install_requirement(
         name: Some(format!("install {} for {agent}", m.id)),
         cols: 100,
         rows: 24,
-        command: Some(vec!["/bin/bash".to_string(), "-c".to_string(), script]),
+        // Login-shell wrap, like every agent spawn and the probes that found
+        // this CLI: an npm-installed agent (`#!/usr/bin/env node`) needs the
+        // user's PATH, which an app-launched daemon's own env lacks.
+        command: Some(crate::launcher::wrap_login_shell(
+            &crate::launcher::login_shell(),
+            vec!["/bin/bash".to_string(), "-c".to_string(), script],
+        )),
         id: Some(session_id.clone()),
         env,
         env_remove,

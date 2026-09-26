@@ -17,6 +17,7 @@
 import { derived, writable, type Readable } from "svelte/store";
 
 import { api, ApiError } from "../net/api";
+import { refreshKnowledge } from "../workspace/knowledge";
 
 export type AgentId = "claude" | "codex";
 
@@ -312,6 +313,9 @@ export async function setWorkspacePluginOn(pluginId: string, on: boolean): Promi
   if (currentWs === null) return;
   await putWorkspacePlugin(currentWs, pluginId, on);
   await refresh(currentWs);
+  // A knowledge provider switched on/off changes what Knowledge (and the
+  // dashboard's Where things stand) holds — don't wait for a Timeline nudge.
+  refreshKnowledge();
 }
 
 // ---- the attach sheet request ------------------------------------------------

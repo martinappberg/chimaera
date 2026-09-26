@@ -135,7 +135,9 @@ pub(crate) async fn post(state: &Arc<AppState>, sid: &str, args: &Value) -> Valu
     ))
 }
 
-/// Unread notes for `sid` (newest last), without moving its cursor.
+/// Unread notes for `sid`, oldest first, at most `READ_MAX` (the rest wait
+/// for the next read — the returned cursor only covers what is returned),
+/// without moving its cursor. Looks at the newest `PAGE_MAX` entries.
 async fn unread(state: &Arc<AppState>, sid: &str, all: bool) -> (Vec<Arc<Entry>>, u64) {
     let Some(ws) = crate::plugins::workspace_of_session(state, sid) else {
         return (Vec::new(), 0);
@@ -159,10 +161,8 @@ async fn unread(state: &Arc<AppState>, sid: &str, all: bool) -> (Vec<Arc<Entry>>
         .filter(|e| e.note.as_ref().is_some_and(|n| is_for(n, sid, is_mm)))
         .collect();
     notes.reverse();
+    notes.truncate(READ_MAX);
     let newest = notes.last().map(|e| e.seq).unwrap_or(cursor);
-    if notes.len() > READ_MAX {
-        notes.drain(..notes.len() - READ_MAX);
-    }
     (notes, newest)
 }
 

@@ -181,7 +181,10 @@ class TimelineStore {
 
 export const timelineStore = new TimelineStore();
 
-let refreshSeq = 0;
+/** Separate counters: a load-older must never discard a nudge pull (whose
+ *  epoch would then go unrecorded) or the other way round. */
+let pullSeq = 0;
+let olderSeq = 0;
 const lastEpoch = new Map<string, number>();
 /** A nudge arrived while the document was hidden: refetch on return. */
 let staleWhileHidden = false;
@@ -238,31 +241,33 @@ function merge(held: TimelineEntry[], incoming: TimelineEntry[]): TimelineEntry[
 }
 
 /** Pull the newest entries: everything past `head` when we hold some, else
- *  the newest page. A `since=` pull that returns a full page means the gap
- *  outgrew one page — take it and mark `more` so the view can keep paging. */
+ *  the newest page. A `since=` pull that returns `more` means the gap
+ *  outgrew one page: the held list would then have a hole below that page,
+ *  which load-older (paging from the oldest HELD entry) could never fill —
+ *  so start over from that newest page and page back contiguously. */
 async function pull(wsId: string): Promise<void> {
-  const seq = ++refreshSeq;
+  const seq = ++pullSeq;
   const since = timelineStore.head > 0 ? timelineStore.head : undefined;
   timelineStore.loading = true;
   try {
     const page = await fetchTimeline(wsId, since !== undefined ? { since, limit: PAGE } : { limit: PAGE });
-    if (timelineStore.wsId !== wsId || seq !== refreshSeq) return;
+    if (timelineStore.wsId !== wsId || seq !== pullSeq) return;
     lastEpoch.set(wsId, page.epoch);
     timelineStore.available = true;
     timelineStore.error = null;
     const wasEmpty = timelineStore.entries.length === 0;
+    const overflowed = since !== undefined && page.more;
     if (page.entries.length > 0) {
-      const merged = merge(timelineStore.entries, page.entries);
+      const merged = overflowed ? merge([], page.entries) : merge(timelineStore.entries, page.entries);
       timelineStore.entries = merged;
       timelineStore.head = merged[0]?.seq ?? 0;
     }
-    if (wasEmpty || since === undefined) timelineStore.more = page.more;
-    else if (page.more) timelineStore.more = true;
+    if (wasEmpty || since === undefined || overflowed) timelineStore.more = page.more;
     // A journal reset (data dir wiped) shows as a head BELOW what a viewer
     // remembers — lastSeen() clamps against `head`, so nothing to do here.
     notify();
   } catch (e) {
-    if (timelineStore.wsId !== wsId || seq !== refreshSeq) return;
+    if (timelineStore.wsId !== wsId || seq !== pullSeq) return;
     if (e instanceof ApiError && e.status === 404) {
       timelineStore.available = false;
       timelineStore.error = null;
@@ -270,7 +275,7 @@ async function pull(wsId: string): Promise<void> {
       timelineStore.error = e instanceof Error ? e.message : String(e);
     }
   } finally {
-    if (timelineStore.wsId === wsId && seq === refreshSeq) timelineStore.loading = false;
+    if (timelineStore.wsId === wsId && seq === pullSeq) timelineStore.loading = false;
   }
 }
 
@@ -302,19 +307,19 @@ export async function loadOlderTimeline(): Promise<void> {
   if (ws === null || timelineStore.loading || !timelineStore.more) return;
   const oldest = timelineStore.entries[timelineStore.entries.length - 1];
   if (oldest === undefined) return;
-  const seq = ++refreshSeq;
+  const seq = ++olderSeq;
   timelineStore.loading = true;
   try {
     const page = await fetchTimeline(ws, { before: oldest.seq, limit: PAGE });
-    if (timelineStore.wsId !== ws || seq !== refreshSeq) return;
+    if (timelineStore.wsId !== ws || seq !== olderSeq) return;
     timelineStore.entries = merge(timelineStore.entries, page.entries);
     timelineStore.more = page.more;
     timelineStore.error = null;
   } catch (e) {
-    if (timelineStore.wsId !== ws || seq !== refreshSeq) return;
+    if (timelineStore.wsId !== ws || seq !== olderSeq) return;
     timelineStore.error = e instanceof Error ? e.message : String(e);
   } finally {
-    if (timelineStore.wsId === ws && seq === refreshSeq) timelineStore.loading = false;
+    if (timelineStore.wsId === ws && seq === olderSeq) timelineStore.loading = false;
   }
 }
 

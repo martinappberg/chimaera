@@ -105,14 +105,24 @@ async fn run_bounded(argv: &[String], cwd: Option<&Path>) -> Result<String, Stri
     let mut stdout = child.stdout.take().ok_or("no stdout")?;
     let mut stderr = child.stderr.take().ok_or("no stderr")?;
     let work = async {
+        // Both pipes at once: a CLI that fills stderr before closing stdout
+        // would otherwise block on its write while we wait for stdout's EOF.
+        // Past the cap stderr is drained unkept, so it can never block.
         let mut out = Vec::new();
-        let mut limited = (&mut stdout).take(CLI_OUTPUT_CAP as u64 + 1);
-        limited
-            .read_to_end(&mut out)
-            .await
-            .map_err(|e| e.to_string())?;
         let mut err = Vec::new();
-        let _ = (&mut stderr).take(8 * 1024).read_to_end(&mut err).await;
+        let read_out = async {
+            (&mut stdout)
+                .take(CLI_OUTPUT_CAP as u64 + 1)
+                .read_to_end(&mut out)
+                .await
+                .map_err(|e| e.to_string())
+        };
+        let read_err = async {
+            let _ = (&mut stderr).take(8 * 1024).read_to_end(&mut err).await;
+            let _ = tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await;
+        };
+        let (read, ()) = tokio::join!(read_out, read_err);
+        read?;
         let status = child.wait().await.map_err(|e| e.to_string())?;
         Ok::<_, String>((out, err, status))
     };

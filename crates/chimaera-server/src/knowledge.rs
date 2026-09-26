@@ -146,10 +146,12 @@ fn claim_of(k: &Knowledge, id: &str) -> String {
 
 /// Whether another agent in the workspace may have written during this turn
 /// (`start_ts`..now) — then crediting this one would be a guess. It may if it
-/// is not settled now (mid-turn, awaiting permission, or untracked: a
-/// hook-less TUI whose turns we never see), or if it finished a turn since
-/// `start_ts` (its episode is on the Timeline). A human editing the files by
-/// hand stays invisible; the mtime gate is all that bounds that.
+/// is mid-turn now (running, awaiting permission, rate-limited) or untracked
+/// (a hook-less TUI — codex/gemini terminals — whose turns we never see), or
+/// if it finished a turn since `start_ts` (its episode is on the Timeline).
+/// `Unknown` on a chat session or a claude TUI only means "no turn yet". A
+/// human editing the files by hand stays invisible; the mtime gate is all
+/// that bounds that.
 async fn another_agent_active_since(
     state: &AppState,
     ws: &str,
@@ -162,14 +164,19 @@ async fn another_agent_active_since(
         .filter(|(s, w)| w.as_str() == ws && s.as_str() != sid)
         .map(|(s, _)| s.clone())
         .collect();
+    let chats: HashSet<&String> = in_ws
+        .iter()
+        .filter(|s| state.chat.get(s).is_some())
+        .collect();
     let unsettled = {
         let agents = crate::lock(&state.agents);
         in_ws.iter().any(|s| {
-            agents.get(s).is_some_and(|r| {
-                !matches!(
-                    r.state,
-                    AgentState::Finished | AgentState::IdlePrompt | AgentState::Errored
-                )
+            agents.get(s).is_some_and(|r| match r.state {
+                AgentState::Running | AgentState::NeedsPermission | AgentState::RateLimited => true,
+                AgentState::Unknown => {
+                    !chats.contains(s) && r.kind != crate::agents::AgentKind::Claude
+                }
+                AgentState::Finished | AgentState::IdlePrompt | AgentState::Errored => false,
             })
         })
     };
@@ -197,34 +204,22 @@ const RECENT_EPISODES: usize = 100;
 
 /// Entry id (F-003 or a fingerprint) → who recorded it (sid, name), read
 /// back from the episodes' own evidence on the Timeline — durable, so the
-/// credits survive a restart — over the newest `RING_CAP` entries (the
-/// newest credit wins).
+/// credits survive a restart — over the in-memory ring (`RING_CAP` newest
+/// entries; the newest credit wins). Never the file: the Knowledge view
+/// refetches on every Timeline change.
 async fn recorded_by(state: &AppState, ws: &str) -> HashMap<String, (String, String)> {
     let mut by = HashMap::new();
-    let mut before = None;
-    let mut seen = 0;
-    while seen < timeline::RING_CAP {
-        let (page, more) = state
-            .timeline
-            .page(ws, before, None, timeline::PAGE_MAX)
-            .await;
-        for e in &page {
-            let (Some(sid), Some(rec)) = (
-                e.sid.as_ref(),
-                e.evidence.as_ref().and_then(|ev| ev.recorded.as_ref()),
-            ) else {
-                continue;
-            };
-            let name = e.name.clone().unwrap_or_else(|| sid.clone());
-            for fp in &rec.fps {
-                by.entry(fp.clone())
-                    .or_insert_with(|| (sid.clone(), name.clone()));
-            }
-        }
-        seen += page.len();
-        match page.last() {
-            Some(last) if more => before = Some(last.seq),
-            _ => break,
+    for e in state.timeline.in_memory(ws).await {
+        let (Some(sid), Some(rec)) = (
+            e.sid.as_ref(),
+            e.evidence.as_ref().and_then(|ev| ev.recorded.as_ref()),
+        ) else {
+            continue;
+        };
+        let name = e.name.clone().unwrap_or_else(|| sid.clone());
+        for fp in &rec.fps {
+            by.entry(fp.clone())
+                .or_insert_with(|| (sid.clone(), name.clone()));
         }
     }
     by
@@ -309,8 +304,11 @@ pub(crate) async fn recorded_since_last_check(
             unattributed_findings.push(id.clone());
         }
     }
-    // Confidence moves: their own Timeline entries (never via `unknown`).
-    for (id, to) in &statuses {
+    // Confidence moves: their own Timeline entries (never via `unknown`), in
+    // id order so one check's moves always land in the same sequence.
+    let mut moves: Vec<(&String, &String)> = statuses.iter().collect();
+    moves.sort();
+    for (id, to) in moves {
         let Some(from) = previous.statuses.get(id) else {
             continue;
         };
@@ -362,18 +360,29 @@ fn guidance(root: &Path) -> Vec<Value> {
         ("CLAUDE.md", "CLAUDE.md", "What claude is told"),
     ] {
         let path = root.join(file);
-        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+        // Follow a symlink only when it stays inside the project (the common
+        // CLAUDE.md → AGENTS.md); one pointing elsewhere is not listed.
+        let inside = std::fs::canonicalize(&path)
+            .ok()
+            .zip(std::fs::canonicalize(root).ok())
+            .is_some_and(|(target, root)| target.starts_with(root));
+        let Ok(meta) = std::fs::metadata(&path) else {
             continue;
         };
-        if !meta.is_file() || meta.len() > 1024 * 1024 {
+        if !inside || !meta.is_file() || meta.len() > 1024 * 1024 {
             continue;
         }
-        // A thin adapter (mycelium's, or a one-line @-include) says where
-        // it points rather than pretending to be the guidance itself.
+        // A thin adapter (mycelium's, a one-line @-include, or a symlink)
+        // says where it points rather than pretending to be the guidance.
+        let link = std::fs::read_link(&path)
+            .ok()
+            .and_then(|t| t.file_name().map(|n| n.to_string_lossy().into_owned()));
         let head = std::fs::read_to_string(&path)
             .map(|t| t.chars().take(4096).collect::<String>())
             .unwrap_or_default();
-        let description = if head.contains("MYCELIUM:BEGIN") && file != "MYCELIUM.md" {
+        let description = if let Some(target) = link.filter(|t| t != file) {
+            format!("{fallback} → {target}")
+        } else if head.contains("MYCELIUM:BEGIN") && file != "MYCELIUM.md" {
             format!("{fallback} → MYCELIUM.md")
         } else if head.trim().lines().any(|l| l.trim() == "@AGENTS.md") {
             format!("{fallback} → AGENTS.md")
