@@ -538,6 +538,12 @@ export function tablePreset(path: string): TablePreset | null {
   return TABLE_PRESETS[innerExtension(path)] ?? null;
 }
 
+/** Whether `path`'s first line is a header the grid does not number (CSV,
+ *  spreadsheets and most presets; not BED). */
+export function tableHeaderRow(path: string): boolean {
+  return tablePreset(path)?.header ?? true;
+}
+
 /** The fs/table query for one page of `path`, preset options included. */
 export function tableQuery(path: string, offsetRows: number, limitRows: number): URLSearchParams {
   const q = new URLSearchParams({

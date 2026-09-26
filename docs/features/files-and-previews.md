@@ -841,7 +841,9 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   PDF page (`#page=N`, one pdf.js page at the card's width, legacy build, ranged reads, a
   `#page=N&xywh=` region in PDF points); code lines (`#L10-L30`, highlighted like notebook cells,
   line numbers; a whole file shows its first lines); a table slice (`#row=a-b`, `#col=`, `#cell=`,
-  RFC 7111 — row 1 is the header line when the file has one; `#sheet=S&range=A1:F20` for
+  RFC 7111 — row 1 is the header line when the file has one, while the card's row numbers and its
+  header's words count data rows as the full grid does, so `#row=2-6` shows rows 1–5;
+  `#sheet=S&range=A1:F20` for
   spreadsheets, A1 counted from the sheet's corner and placed on the grid through `fs/xlsx`'s
   used-range `origin`, a range wholly outside the sheet's data saying so; else the first rows);
   an HTML report (the sandboxed frame on the folder-scoped raw URL, fixed height, expand);

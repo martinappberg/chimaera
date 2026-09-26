@@ -8,7 +8,7 @@
    * first rows. One request for exactly the rows shown (two when a range's
    * sheet does not start at A1); the full grid is one click away.
    */
-  import { fsTable, fsXlsx, tablePreset, type TablePage, type XlsxPage } from "../../previews/files";
+  import { fsTable, fsXlsx, tableHeaderRow, type TablePage, type XlsxPage } from "../../previews/files";
   import { a1Column } from "../locator";
   import { rangeLabel, rangeOutside, tableSlice, tableWindow, type EmbedFragment } from "./fragment";
 
@@ -32,7 +32,7 @@
   let page = $state<TablePage | null>(null);
   let error = $state<string | null>(null);
 
-  const hasHeader = $derived(kind === "xlsx" || (tablePreset(path)?.header ?? true));
+  const hasHeader = $derived(kind === "xlsx" || tableHeaderRow(path));
   const peek = $derived(compact ? TILE_ROWS : PEEK);
   const range = $derived(frag.at?.range);
   const sheet = $derived(frag.at?.sheet ?? null);
@@ -98,9 +98,13 @@
     return all.slice(0, MAX_COLS);
   });
   const elided = $derived(page !== null && slice?.col === undefined && page.columns.length > MAX_COLS);
-  /** The first row number shown, as the fragment counts rows: RFC 7111's
-   *  for `row=`, the sheet's own for an A1 range. */
-  const firstNumber = $derived(offset + (hasHeader ? 2 : 1) + (range !== undefined ? (origin?.[0] ?? 0) : 0));
+  /** The first row number shown: the full grid's own for `row=`/`cell=`
+   *  (data rows from 1, so the card and the table it opens agree; the
+   *  header's words say the same), the sheet's own for an A1 range, as a
+   *  spreadsheet names it. */
+  const firstNumber = $derived(
+    range !== undefined ? offset + (hasHeader ? 2 : 1) + (origin?.[0] ?? 0) : offset + 1,
+  );
   const numbered = $derived(slice?.row !== undefined);
   const outsideNote = $derived(
     outside && range !== undefined && origin !== null

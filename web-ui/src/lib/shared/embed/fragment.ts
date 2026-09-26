@@ -103,10 +103,15 @@ export function rangeLabel(r: NonNullable<Locator["range"]>): string {
   return a === b ? a : `${a}:${b}`;
 }
 
-/** A table block in the fragment's own numbers (RFC 7111 rows). */
-function tableLabel(t: NonNullable<Locator["table"]>, toEnd: boolean): string {
-  const { row, col } = t;
-  const endRow = t.endRow ?? row;
+/** A table block in the grid's row numbers, which the card's own row numbers
+ *  and the full table view use: RFC 7111 counts a header line as row 1, the
+ *  grid counts data rows, so with a header every row is one less (row 1, the
+ *  header itself, shows as the first data row, as the slice does). */
+function tableLabel(t: NonNullable<Locator["table"]>, toEnd: boolean, headerRow: boolean): string {
+  const grid = (r: number | undefined) => (r === undefined || !headerRow ? r : Math.max(1, r - 1));
+  const row = grid(t.row);
+  const col = t.col;
+  const endRow = grid(t.endRow) ?? row;
   const endCol = t.endCol ?? col;
   if (row !== undefined && col !== undefined) {
     return row === endRow && col === endCol ? `cell ${row},${col}` : `cells ${row},${col}–${endRow},${endCol}`;
@@ -120,8 +125,11 @@ function tableLabel(t: NonNullable<Locator["table"]>, toEnd: boolean): string {
 }
 
 /** The card header's short name for the piece shown ("lines 10–30",
- *  "page 3", "rows 5–9", "S!B2:F9", "0:30–0:45"); empty for a whole file. */
-export function fragmentLabel(f: EmbedFragment): string {
+ *  "page 3", "rows 5–9", "S!B2:F9", "0:30–0:45"); empty for a whole file.
+ *  `headerRow`: the table's first line is a header (`tableHeaderRow`), so
+ *  `row=`/`cell=` rows are named as the grid numbers them. An A1 range keeps
+ *  the sheet's own numbers, as a spreadsheet names it. */
+export function fragmentLabel(f: EmbedFragment, headerRow = true): string {
   const parts: string[] = [];
   if (f.lines !== undefined) {
     parts.push(
@@ -132,7 +140,7 @@ export function fragmentLabel(f: EmbedFragment): string {
   if (at.page !== undefined) parts.push(`page ${at.page}`);
   if (at.slide !== undefined) parts.push(`slide ${at.slide}`);
   if (at.cell !== undefined) parts.push(`cell ${at.cell}`);
-  if (at.table !== undefined) parts.push(tableLabel(at.table, f.rowsToEnd === true));
+  if (at.table !== undefined) parts.push(tableLabel(at.table, f.rowsToEnd === true, headerRow));
   if (at.sheet !== undefined || at.range !== undefined) {
     const range = at.range !== undefined ? rangeLabel(at.range) : "";
     parts.push(at.sheet !== undefined ? (range !== "" ? `${at.sheet}!${range}` : at.sheet) : range);

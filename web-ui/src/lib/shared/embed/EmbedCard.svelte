@@ -18,7 +18,7 @@
    */
   import FileIcon from "../FileIcon.svelte";
   import FolderIcon from "../FolderIcon.svelte";
-  import { basename, formatMtime, fsDownload, humanSize } from "../../previews/files";
+  import { basename, formatMtime, fsDownload, humanSize, tableHeaderRow } from "../../previews/files";
   import { isRemoteHost } from "../../net/api";
   import { openPath } from "../openPath";
   import type { Reveal } from "../reveal";
@@ -91,7 +91,7 @@
   /** The piece to show, read as links and references read it (`cell=`
    *  depends on the file's extension). */
   const frag = $derived(parseEmbedFragment(fragment, hit?.path ?? path));
-  const label = $derived(fragmentLabel(frag));
+  const label = $derived(fragmentLabel(frag, tableHeaderRow(hit?.path ?? path)));
 
   let card = $state<HTMLElement | null>(null);
   /** Near the scroller's viewport: load (one-way — a loaded body stays). */

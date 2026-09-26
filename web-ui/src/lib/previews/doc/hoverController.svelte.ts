@@ -22,7 +22,7 @@ import { flushSync, mount, unmount } from "svelte";
 import type { EditorView } from "@codemirror/view";
 import { syntaxTree } from "@codemirror/language";
 import type { SyntaxNode } from "@lezer/common";
-import { basename, fsFile } from "../files";
+import { basename, fsFile, tableHeaderRow } from "../files";
 import { isMac } from "../../shared/keys";
 import { mountEmbed, type EmbedHandle } from "../../shared/embed/mount.svelte";
 import { embedKind, isMissing, type TargetInfo } from "../../shared/embed/embed";
@@ -501,7 +501,7 @@ export class HoverPreviews {
     state.kind = "card";
     state.path = a.path;
     state.name = basename(a.path);
-    state.label = fragmentLabel(parseEmbedFragment(fragment, a.path));
+    state.label = fragmentLabel(parseEmbedFragment(fragment, a.path), tableHeaderRow(a.path));
     state.status = "ready";
     state.message = "";
     state.content.replaceChildren(slot);

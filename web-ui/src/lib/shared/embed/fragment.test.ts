@@ -96,11 +96,15 @@ describe("fragmentLabel", () => {
     expect(label("L10-L30")).toBe("lines 10–30");
     expect(label("L7")).toBe("line 7");
     expect(label("page=3&xywh=1,2,3,4")).toBe("page 3 · region");
-    expect(label("row=2-*", "d.csv")).toBe("rows 2–end");
-    expect(label("row=5-9", "d.csv")).toBe("rows 5–9");
-    expect(label("row=4", "d.csv")).toBe("row 4");
-    expect(label("cell=5,2", "d.csv")).toBe("cell 5,2");
-    expect(label("cell=5,2-9,4", "d.csv")).toBe("cells 5,2–9,4");
+    // Rows as the grid numbers them: RFC 7111's header line is row 1, so
+    // with a header every row is one less.
+    expect(label("row=2-*", "d.csv")).toBe("rows 1–end");
+    expect(label("row=5-9", "d.csv")).toBe("rows 4–8");
+    expect(label("row=4", "d.csv")).toBe("row 3");
+    expect(label("row=1-6", "d.csv")).toBe("rows 1–5");
+    expect(label("row=1", "d.csv")).toBe("row 1");
+    expect(label("cell=5,2", "d.csv")).toBe("cell 4,2");
+    expect(label("cell=5,2-9,4", "d.csv")).toBe("cells 4,2–8,4");
     expect(label("col=3", "d.csv")).toBe("column 3");
     expect(label("col=2-4", "d.csv")).toBe("columns 2–4");
     expect(label("sheet=S&range=A1:F20", "b.xlsx")).toBe("S!A1:F20");
@@ -113,6 +117,12 @@ describe("fragmentLabel", () => {
     expect(label("slide=3", "deck.md")).toBe("slide 3");
     expect(label("Results")).toBe("# Results");
     expect(fragmentLabel({})).toBe("");
+  });
+
+  it("keeps the fragment's rows when the table has no header line", () => {
+    const label = (f: string) => fragmentLabel(parseEmbedFragment(f, "peaks.bed"), false);
+    expect(label("row=5-9")).toBe("rows 5–9");
+    expect(label("cell=5,2")).toBe("cell 5,2");
   });
 });
 

@@ -22,7 +22,7 @@ import { LanguageDescription } from "@codemirror/language";
 import { languages } from "@codemirror/language-data";
 import { highlightCode } from "@lezer/highlight";
 import { codeHighlight } from "../cm";
-import { basename, dirname, humanSize, safeDecodeUri } from "../files";
+import { basename, dirname, humanSize, safeDecodeUri, tableHeaderRow } from "../files";
 import { fetchRawBytes, saveBlob, TooLargeError } from "../rawBytes";
 import { loadMath } from "../mathLoad";
 import { renderMermaid } from "../../shared/mermaid";
@@ -242,7 +242,7 @@ function fillCard(a: HTMLAnchorElement, spec: EmbedSpec, answer: TargetResult | 
   name.className = "md-file-name";
   name.textContent = basename(named) || named;
   a.append(fileGlyph(), name);
-  const label = fragmentLabel(parseEmbedFragment(fragment, named));
+  const label = fragmentLabel(parseEmbedFragment(fragment, named), tableHeaderRow(named));
   if (label !== "") {
     const f = document.createElement("span");
     f.className = "md-file-frag";
