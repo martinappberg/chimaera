@@ -608,6 +608,14 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
 > this line is derived and may be regenerated; everything below is deliberate and must not
 > be "helpfully" changed without asking.
 
+### The turn-end block — "Written this turn" / "Also written" — why it exists
+_Captured 2026-09-26 from the maintainer's own words in the session that shipped it (PR #171); the settled/open questions are still pending._
+
+- **Why (maintainer, verbatim):** "'Made this turn · 3 files' — is this really even only when just files have been changed? Should this really be expanded? I know when agents want to show images figures etc. that is good, but just like this? I feel maybe collapsed by default or something, and in a better way." Later: "when the agent links to files here there is a lot of information on what was written that turn? like is that how we want it. Can we think about this so it becomes optimal experience for the user. And also think about the wording. If a file is only changed, is it really made that turn?" And: "can we make the tiles etc. prettier? so that it actually looks nice for the user? Still with our own touch but so that one actually wants to use this app."
+- **Decisions the maintainer took in that session:** no hover-peek on chips ("too cluttered"); one heading, not two; chips must know their file's state; same-named files must be told apart; billed CLI runs are fine for verifying this.
+- **What this fixed in the design:** the block now adds what the prose did not already show (an embedded figure is not tiled again, a linked document is not chipped again), the heading is precise ("Written", never "made", for an edited document; "Also written" when the prose showed a share), figures are a strip of captioned tiles, documents one line of chips.
+- _Settled vs. free-to-change, and what must not be "fixed": pending — not yet asked._
+
 ### Conversation branching — why it exists
 _Captured 2026-07-19 (from the maintainer, in-session)._
 
