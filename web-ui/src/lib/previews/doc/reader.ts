@@ -386,12 +386,20 @@ export class DocReader {
       const key = `${run.map((n) => n.name).join(",")}\u0000${src}\u0000${deps(from, to, src)}`;
       place(key, line, (into) => renderRun(into, run, env));
     }
+    // The footnote section: one unit, drawn from definitions that may sit
+    // anywhere in the document — so it keys on each one's line too (a shift
+    // between two of them can't be applied to the unit as a whole).
     const notes = footnotesOf(cx);
     if (notes.length > 0) {
       const key =
-        "\u0001footnotes\u0000" +
-        notes.map((f) => `${f.label}\u0000${f.n}\u0000${f.refs}\u0000${text.slice(f.from, f.to)}`).join("\u0001") +
-        deps(notes[0].from, text.length, "[");
+        "\u0001footnotes" +
+        notes
+          .map((f) => {
+            const src = text.slice(f.from, f.to);
+            const at = cx.lines.lineOf(f.from);
+            return `\u0000${f.label}\u0000${f.n}\u0000${f.refs}\u0000${at}\u0000${src}\u0000${deps(f.from, f.to, src)}`;
+          })
+          .join("\u0001");
       place(key, cx.lines.lineOf(notes[0].from), (into) => renderFootnotes(into, notes, env));
     }
 
@@ -436,10 +444,9 @@ export class DocReader {
   }
 
   /**
-   * What a top-level block's rendering reads beyond its own text: the ids
-   * of the headings in it, the numbers of the footnote references in it,
-   * and — when it could hold a reference link — every definition. Offsets
-   * arrive in document order, so each list is walked once per update.
+   * What a stretch of the document's rendering reads beyond its own text:
+   * the ids of the headings in it, the numbers of the footnote references
+   * in it, and — when it could hold a reference link — every definition.
    */
   private depsFor(cx: DocContext): (from: number, to: number, src: string) => string {
     const headings = [...cx.headingIds.entries()].sort((a, b) => a[0] - b[0]);
@@ -448,14 +455,22 @@ export class DocReader {
       cx.refs.size === 0
         ? ""
         : [...cx.refs.entries()].map(([k, d]) => `${k}\u0000${d.url}\u0000${d.title ?? ""}`).join("\u0001");
-    let h = 0;
-    let r = 0;
+    /** The first entry at or after `pos`. */
+    const lowerBound = (list: readonly [number, unknown][], pos: number): number => {
+      let lo = 0;
+      let hi = list.length;
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (list[mid][0] < pos) lo = mid + 1;
+        else hi = mid;
+      }
+      return lo;
+    };
     return (from, to, src) => {
       let out = "";
-      while (h < headings.length && headings[h][0] < from) h++;
-      for (let k = h; k < headings.length && headings[k][0] < to; k++) out += `#${headings[k][1]}`;
-      while (r < refs.length && refs[r][0] < from) r++;
-      for (let k = r; k < refs.length && refs[k][0] < to; k++) {
+      for (let k = lowerBound(headings, from); k < headings.length && headings[k][0] < to; k++)
+        out += `#${headings[k][1]}`;
+      for (let k = lowerBound(refs, from); k < refs.length && refs[k][0] < to; k++) {
         const f = refs[k][1];
         out += `^${f.label}:${f.n}:${f.nth}`;
       }

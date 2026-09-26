@@ -35,11 +35,11 @@ const ENTITIES: Record<string, string> = {
   gt: ">",
   quot: '"',
   apos: "'",
-  nbsp: " ",
-  copy: "©",
-  hellip: "…",
-  mdash: "—",
-  ndash: "–",
+  nbsp: "\u00a0",
+  copy: "\u00a9",
+  hellip: "\u2026",
+  mdash: "\u2014",
+  ndash: "\u2013",
 };
 
 function decodeEntities(s: string): string {
@@ -165,7 +165,7 @@ describe("the corpus normalization", () => {
       normalizeHtml(
         '<P data-sourcepos="1:1-1:3" CLASS=" a  b ">x\n  y</P>\n<!-- c --><br />\nz &amp; &lt;&#65;&copy;',
       ),
-    ).toBe('<p class="a b">x y</p><br>z &amp; &lt;A©');
+    ).toBe('<p class="a b">x y</p><br>z &amp; &lt;A\u00a9');
     expect(
       normalizeHtml('<a title="t" href="/x?a=1&amp;b=2" rel="noopener">l</a> <em>e</em>'),
     ).toBe('<a href="/x?a=1&amp;b=2">l</a> <em>e</em>');

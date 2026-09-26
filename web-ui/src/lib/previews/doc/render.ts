@@ -91,7 +91,7 @@ export function escapeHref(url: string): string {
       const cp = url.codePointAt(i) ?? 0;
       const s = String.fromCodePoint(cp);
       if (s.length === 2) i++;
-      for (const b of utf8.encode(cp === 0 ? "�" : s)) out += `%${b.toString(16).toUpperCase().padStart(2, "0")}`;
+      for (const b of utf8.encode(cp === 0 ? "\ufffd" : s)) out += `%${b.toString(16).toUpperCase().padStart(2, "0")}`;
     }
   }
   return out;
@@ -392,7 +392,7 @@ export function renderFootnotes<N>(parent: N, notes: readonly Footnote[], env: E
           class: "footnote-backref",
           "aria-label": `back to reference ${f.n}${k > 1 ? `-${k}` : ""}`,
         });
-        t.add(a, t.text("↩"));
+        t.add(a, t.text("\u21a9"));
         if (k > 1) {
           const sup = t.el("sup", { class: "footnote-ref" });
           t.add(sup, t.text(String(k)));
