@@ -234,6 +234,22 @@ export function allSessionIds(l: Layout): string[] {
   return out;
 }
 
+/**
+ * Sessions actually on screen: each pane's ACTIVE terminal tab — only the
+ * zoomed pane's while one is zoomed. What the native notifier treats as
+ * "the user is already looking at it" for this window.
+ */
+export function visibleSessionIds(l: Layout): string[] {
+  const zoomed = l.zoomedPaneId !== null ? findPane(l.root, l.zoomedPaneId) : null;
+  const shown = zoomed !== null ? [zoomed] : panes(l.root);
+  const out: string[] = [];
+  for (const p of shown) {
+    const t = p.tabs[p.active];
+    if (t !== undefined && t.surface === "terminal") out.push(t.sessionId);
+  }
+  return out;
+}
+
 /** Every file path shown anywhere in the tree. */
 export function allFilePaths(l: Layout): string[] {
   const out: string[] = [];

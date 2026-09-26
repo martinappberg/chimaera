@@ -39,9 +39,12 @@ leash-drawing in `web-ui/src/App.svelte`; the drag band that arms a link is in
   `POST /api/v1/mcp/{agent_id}?key={secret}` (JSON-RPC over MCP streamable-HTTP, stateless). Tools:
   `list_terminals` (the agent's granted terminals), `run_in_terminal` (type a command, await the
   outcome — the same [exec engine](terminals.md#the-exec-engine-and-command-journal)), `read_terminal`
-  (the command journal).
+  (the command journal). The same server also carries `notify` (every session, pre-approved) — see
+  [notifications.md](notifications.md).
 - **Where it lives.** `mcp.rs` (`mcp`, `tool_defs`, `list_terminals`/`run_in_terminal`/`read_terminal`,
-  `autolink_mentions`, `resolve_terminal`).
+  `autolink_mentions`, `resolve_terminal`). The same server gives every session the document
+  tools `document_guide` and `check_document`; see
+  [agents.md](agents.md#documents-the-portable-dialect-check_document-and-the-issues-chip).
 - **Key behaviors.** `/mcp/{id}` is **not** behind the bearer layer — it's authorized by the random
   per-session `key` in the URL (the agent's MCP client can't know the daemon token), re-checked
   against the `AgentRecord`. The links are the agent's **whole access scope** — it can't reach a

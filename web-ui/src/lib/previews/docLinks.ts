@@ -109,7 +109,8 @@ export async function revealAnchorInSource(
 /** Where the workspace-relative fallback for a `/docs/x.md` link comes from. */
 export interface LinkContext {
   wsRoot: string | null;
-  /** Enables the daemon's unique-basename fallback; null when unknown. */
+  /** The workspace, when known. Document links validate strictly, so the
+   *  daemon's index fallbacks never apply to them. */
   workspaceId: string | null;
 }
 
@@ -133,7 +134,12 @@ export function isFollowable(href: string): boolean {
 }
 
 /** Follow `href` from `host`'s document. `split` opens beside it. */
-export async function followDocHref(href: string, split: boolean, host: DocLinkHost): Promise<void> {
+export async function followDocHref(
+  href: string,
+  split: boolean,
+  host: DocLinkHost,
+  opts: FollowOptions = {},
+): Promise<void> {
   const t = classifyHref(href);
   switch (t.kind) {
     case "web": {
@@ -148,11 +154,17 @@ export async function followDocHref(href: string, split: boolean, host: DocLinkH
       host.toLines(t.reveal);
       return;
     case "path":
-      await followPath(t.path, t.fragment, split, host);
+      await followPath(t.path, t.fragment, split, host, opts.byName === true);
       return;
     default:
       return;
   }
+}
+
+export interface FollowOptions {
+  /** A wikilink names a note, not a path: when it isn't beside the
+   *  document it resolves by name in the workspace, as Obsidian does. */
+  byName?: boolean;
 }
 
 async function sameDocument(fragment: string | null, host: DocLinkHost): Promise<void> {
@@ -171,6 +183,7 @@ async function followPath(
   fragment: string | null,
   split: boolean,
   host: DocLinkHost,
+  byName = false,
 ): Promise<void> {
   const { docPath } = host;
   if (resolveDocPath(docPath, rel) === docPath) {
@@ -179,21 +192,24 @@ async function followPath(
   }
   // As written first (the daemon joins it to the document's folder and
   // canonicalizes); a root-relative `/docs/x.md` — GitHub's reading — also
-  // against the workspace root.
+  // against the workspace root. Strict: a document's link names exactly one
+  // file, so no diff-prefix strip or index guess may rescue a broken one —
+  // unless it is a wikilink, whose name is the whole point.
   const candidates = [rel];
   if (rel.startsWith("/") && host.wsRoot !== null && host.wsRoot !== "/") {
     candidates.push(`${host.wsRoot.replace(/\/+$/, "")}${rel}`);
   }
   let res: Awaited<ReturnType<typeof fsValidate>>;
   try {
-    res = await fsValidate(candidates, dirname(docPath), host.workspaceId);
+    res = await fsValidate(candidates, dirname(docPath), host.workspaceId, [], { strict: !byName });
   } catch {
     host.hint("couldn't check this link — daemon unreachable");
     return;
   }
   const hit = candidates.map((c) => res.valid[c]).find((v) => v !== undefined);
   if (hit === undefined) {
-    host.hint(`not found: ${rel}`);
+    const many = byName ? (res.ambiguous[rel]?.length ?? 0) : 0;
+    host.hint(many > 1 ? `${many} files are named ${rel}` : `not found: ${rel}`);
     return;
   }
   if (hit.path === docPath) {

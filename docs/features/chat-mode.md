@@ -186,9 +186,12 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   then the workspace index (unique basename or path suffix). Click opens the file at the line;
   Cmd/Ctrl+click opens it in a split; a directory opens in the Finder; a name several files
   answer to (dashed underline) asks which in the context menu. Every renderer in a chat shares one
-  batched, cached resolver (`paths.ts` `PathResolver`): a miss is asked again after 15 s, after
-  every turn end (files the agent mentioned may exist now), when the pointer comes back to the
-  message, and on a click of a local link; a daemon error is never cached as a miss. Stamping
+  batched, cached resolver (`paths.ts` `PathResolver`), its answers keyed by the candidate AND the
+  base ladder + workspace it resolved against: a miss is asked again after 15 s, after every turn
+  end (files the agent mentioned may exist now), when the pointer comes back to the message, and
+  on a click of a local link; a hit stands for 60 s; a daemon error is never cached as a miss. A
+  click on a linked reference asks again before opening, so a file moved or deleted since opens
+  nothing (and loses its underline); an unanswered re-check falls back to the link. Stamping
   stays off the streaming hot path (idle, per closed segment, the open tail at settle), and a
   batch that lands after the stream settled re-stamps the settled message. Only elements the
   renderer stamped open anything: agent HTML that forges the classes opens nothing.
@@ -503,7 +506,7 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   in chat”; a terminal resurrected after daemon restart uses its durable resume handle even before a
   fresh transcript hook arrives. A busy `Running` agent needs `force` (409). **Billing note:**
   the TUI side bills like an interactive session; the chat side drives the structured protocol. This
-  is also the **`/login` recovery** path (see [Composing & sending](#composing-sending)): an
+  is also the **`/login` recovery** path (see [Composing & sending](#composing--sending)): an
   expired-auth session flips to its TUI so claude's native auth flow can run.
 - **Branch at any message, without stopping the source.** Hover an assistant response and choose its
   fork action to create a new idle chat immediately after that response. The composer is empty and no

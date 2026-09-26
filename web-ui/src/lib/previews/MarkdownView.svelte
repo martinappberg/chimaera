@@ -78,6 +78,7 @@
   import ReferenceChip from "../shared/ReferenceChip.svelte";
   import Chevron from "../shared/Chevron.svelte";
   import Spinner from "./Spinner.svelte";
+  import DocIssues from "./DocIssues.svelte";
   import { hasUrlScheme, isWebUrl, urlMenuEntries } from "../shared/urlOpen";
   import { contextMenu } from "../shared/contextMenu.svelte";
   import { revealRequest, takeReveal, type Reveal } from "../shared/reveal";
@@ -821,15 +822,20 @@
     e.preventDefault();
     const x = e.clientX;
     const y = e.clientY;
-    void followDocHref(href, split, {
-      docPath: path,
-      ...linkContext(),
-      toAnchor: toAnchorInReading,
-      toLines: revealInReading,
-      hint: (text) => {
-        if (contentEl !== null) showLinkHint(contentEl, x, y, text);
+    void followDocHref(
+      href,
+      split,
+      {
+        docPath: path,
+        ...linkContext(),
+        toAnchor: toAnchorInReading,
+        toLines: revealInReading,
+        hint: (text) => {
+          if (contentEl !== null) showLinkHint(contentEl, x, y, text);
+        },
       },
-    });
+      { byName: anchor.hasAttribute("data-wikilink") },
+    );
   }
 
   function onLinkContextMenu(e: MouseEvent): void {
@@ -1192,6 +1198,7 @@
       <span class="md-bar-note">{barNote}</span>
     {/if}
     <span class="md-bar-fill"></span>
+    <DocIssues {path} {wsRoot} mtime={entry?.mtime ?? null} />
     <button
       class="seg"
       class:on={outlineOpen}

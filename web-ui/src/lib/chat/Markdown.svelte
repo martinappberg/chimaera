@@ -34,6 +34,7 @@
     MISS_TTL_MS,
     menuPoint,
     openResolution,
+    reopenResolution,
     type OpenPathFn,
     type PathResolver,
     type Resolution,
@@ -140,6 +141,15 @@
           : `open ${label}${at} in a pane`,
     );
     stamps.set(node, { ref, res });
+  }
+
+  /** Undo `markPath`: the reference no longer resolves. */
+  function unmarkPath(node: Element) {
+    stamps.delete(node);
+    node.classList.remove("md-path", "md-ambiguous");
+    node.removeAttribute("role");
+    node.removeAttribute("title");
+    if (node.tagName !== "A") node.removeAttribute("tabindex");
   }
 
   /** Wrap each found reference in a text node with its affordance. Right to
@@ -330,15 +340,21 @@
 
   /** Open what a stamped affordance names: a file at its line (Cmd/Ctrl:
    *  in a split), a directory in the Finder, an ambiguous name via a menu
-   *  of its matches. */
+   *  of its matches — as the daemon answers NOW (the stamp may predate a
+   *  move or a delete). A reference that is gone loses its affordance. */
   function activatePath(node: Element, e: MouseEvent | KeyboardEvent) {
     const stamp = stamps.get(node);
     if (stamp === undefined || onOpenPath === undefined) return;
-    openResolution(stamp.res, onOpenPath, {
+    const opts = {
       split: e.metaKey || e.ctrlKey,
       reveal: revealOf(stamp.ref),
       at: menuPoint(e, node),
-      label: (p) => resolvePaths?.label(p) ?? p,
+      label: (p: string) => resolvePaths?.label(p) ?? p,
+    };
+    void reopenResolution(resolvePaths, stamp.ref.path, stamp.res, onOpenPath, opts).then((res) => {
+      if (!node.isConnected || stamps.get(node) !== stamp) return;
+      if (res.state === "miss") unmarkPath(node);
+      else if (res !== stamp.res) markPath(node, node.textContent ?? stamp.ref.path, stamp.ref, res);
     });
   }
 
