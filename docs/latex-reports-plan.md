@@ -671,7 +671,7 @@ paragraph, and every tier has `document_guide` (the portable markdown dialect) a
 `check_document`. It is the one channel that reaches every agent without touching
 the repository. This plan adds to it only where a build plugin is on
 ([what "on" means](#what-on-means-for-a-build-plugin)), through the plugin seam
-(`plugins/tools.rs`: `instructions`, `defs`, `call`).
+(the plugin's `instructions` and `tools` exports, served by `plugins/tools.rs`).
 
 ### A short paragraph in the MCP instructions
 
@@ -874,9 +874,9 @@ plain wall-clock limit where it does not.
 
 | File | What |
 |---|---|
-| `plugins/manifests/latex.toml`, `typst.toml` | the two manifests, registered in `MANIFESTS`; `md-pdf.toml` (Phase E) and `docx.toml` (Phase G) later |
+| `plugins/latex/`, `plugins/typst/` | the two plugin crates (Rust, built to WASM by `scripts/build-plugins.sh`), each with its `plugin.toml`, embedded from `plugins/dist`; the markdown-to-PDF (Phase E) and Word (Phase G) plugins later |
 | `plugins/mod.rs` | the `[build]` section of `Manifest` (`deny_unknown_fields`), the `recommends` block, the lookups the build module and the UI use |
-| `plugins/tools.rs` | `compile_document` and the guide paragraph, served where a build plugin is active |
+| `plugins/tools.rs` | nothing new: `compile_document` and the guide paragraph are the plugins' own `tools` and `instructions` exports, served through this generic seam where a build plugin is active |
 | `build/mod.rs` | routes, the events frame, the module's map line in the server `AGENTS.md` |
 | `build/engines.rs` | prelude environment capture, PATH walk, versions, the ladder from the manifest's engine list |
 | `build/job.rs` | queue, coalescing, single-flight, limits, process groups, build folders and eviction |
@@ -1141,7 +1141,11 @@ makes a third-party plugin safe to switch on.
   `provides.mcp_tools`; `views`, `settings` and `commands` are specified only.
   `agent_probe.rs` reads each installed claude plugin's `installPath` (`:310`,
   `:794`). The UI renders any manifest generically
-  (`web-ui/src/lib/plugins/InstalledView.svelte`).
+  (`web-ui/src/lib/plugins/InstalledView.svelte`). (That was the tree at
+  `6ae68b9`. Since then the plugin system has replaced `MANIFESTS` and the
+  named built-ins with WASM components embedded from `plugins/dist` or
+  installed, and `plugins/tools.rs` is generic:
+  [plugin-system-plan.md](plugin-system-plan.md#status-2026-09-26).)
 - **Quick-open index.** `quickopen.rs` keeps a bounded, cached file index per
   workspace, served stale and refreshed behind, with `workspace_index_if_free` for
   callers that must never start a walk.

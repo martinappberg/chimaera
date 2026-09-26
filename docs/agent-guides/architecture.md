@@ -847,6 +847,29 @@ environment"); for remote shells the journal enables **setup replay** — it kno
 `module load`, `conda activate`, `cd` sequence, so cloning becomes replaying the reviewed
 setup into a new session. Distinctive, deferred.
 
+### Workbench plugins: WASM on a small host
+
+*Added 2026-09-26. Plan: [plugin-system-plan.md](../plugin-system-plan.md); what users see:
+[features/plugins.md](../features/plugins.md); authoring: [plugins.md](plugins.md).*
+
+Opt-in capabilities beyond the core (Mycelium's Knowledge reader, Agent notes, later LaTeX and
+Typst) are **workbench plugins**, and none of their behaviour is daemon code. A plugin is a
+Rust crate compiled to one portable WebAssembly component (`plugin.wasm`, `wasm32-wasip2`)
+beside a `plugin.toml` manifest; the same file runs on a laptop, an x86 login node and an ARM
+box, so the one-static-binary model survives (first-party plugins are embedded in the binary
+from `plugins/dist`, like `web-ui/dist`; third-party ones install under
+`~/.chimaera/plugins/<id>/<version>/` from a checksum-verified release, only on the user's
+click). The daemon's host (`crates/chimaera-server/src/plugins/`) runs each under wasmtime
+through a pinned WIT world, `chimaera:plugin` (`crates/chimaera-plugin-api`) — the third
+public interface Chimaera pins, beside the daemon↔UI wire and the agent protocols. The sandbox
+is the trust model: a plugin reaches nothing but bounded host functions (workspace-relative
+reads with symlinks refused, 64 KiB of state, note-only Timeline appends under a rate cap),
+each call has a deadline and a 64 MiB memory cap, WASI grants nothing, and a trap costs the
+plugin its instance, never the daemon. Login-node discipline holds by construction: nothing
+compiles until a plugin is first used (the release daemon measured 5.8 MB idle, 28.8 MB after
+the first plugin call), and with no plugin active an agent's view is byte-identical to a
+plugin-free daemon's.
+
 ### Git + Slurm
 
 - **Git** (design pass 2026-07-07 — read-only inspection first, worktree-aware). Shell out to

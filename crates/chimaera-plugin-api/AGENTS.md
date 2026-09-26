@@ -4,7 +4,8 @@ The third public interface Chimaera pins (beside the daemon↔UI wire and the
 agent protocols): the `chimaera:plugin` WIT world and the Rust bindings a
 plugin author uses. A plain rlib in the root workspace (it compiles natively);
 plugins depend on it from their own workspace ([plugins/](../../plugins/AGENTS.md)).
-Design and phases: [docs/plugin-system-plan.md](../../docs/plugin-system-plan.md).
+Design and phases: [docs/plugin-system-plan.md](../../docs/plugin-system-plan.md);
+writing a plugin against it: [docs/agent-guides/plugins.md](../../docs/agent-guides/plugins.md).
 The host that serves it: `crates/chimaera-server/src/plugins/`
 ([server map](../chimaera-server/AGENTS.md)).
 

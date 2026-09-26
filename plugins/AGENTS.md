@@ -8,6 +8,7 @@ daemon's lockfile stays free of the guest-side tooling. Later each plugin moves
 to its own repository; the build script then downloads a pinned artifact.
 Design: [docs/plugin-system-plan.md](../docs/plugin-system-plan.md). The API
 they build on: [chimaera-plugin-api](../crates/chimaera-plugin-api/AGENTS.md).
+Writing one: [docs/agent-guides/plugins.md](../docs/agent-guides/plugins.md).
 
 ## Map
 

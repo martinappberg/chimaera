@@ -44,7 +44,7 @@ core; an addition can change when there's a clear improvement. Don't be too stri
 | [workbench.md](workbench.md) | Workspaces, home screen, the pane/tab/split workbench, drag-and-drop, zoom, focus mode, quick-open, folder picker, layout persistence, keybindings |
 | [dashboard.md](dashboard.md) | The workspace dashboard (landing surface), re-centred on questions: the attention lane with inline permission answering, Since you left, Where things stand, the one-line Now (or density-adaptive agent cards with provenance tiers), and the Mastermind dock with Brief me |
 | [timeline-and-knowledge.md](timeline-and-knowledge.md) | The per-workspace Timeline the daemon writes (agent turns, notable commands, ended Slurm jobs, crashes, knowledge changes, agent notes) and the read-only Knowledge view over what agents recorded (mycelium's `.living/`, guidance files, claude memory) |
-| [plugins.md](plugins.md) | The Plugins tab: opt-in workbench plugins (manifests, per-workspace switch, install/setup, plugin MCP tools), agent plugins + the Skills view (asked of claude/codex themselves), in-app codex hook trust, the Agent notes plugin |
+| [plugins.md](plugins.md) | The Plugins tab: opt-in workbench plugins as sandboxed WASM components (manifests, per-workspace switch, install/setup, plugin MCP tools, the plugin host and its limits), plugin versions, installs, updates and rollback (`chimaera plugin`), agent plugins + the Skills view (asked of claude/codex themselves), in-app codex hook trust, the Agent notes plugin |
 | [terminals.md](terminals.md) | Persistent daemon-owned terminals, reconnect/resize/resync, clickable path links, clipboard & provenance, live theming, the exec engine, the command journal |
 | [agents.md](agents.md) | Launching coding agents (real TUI + structured chat), the launcher, managed install/update, agent detection, the session rail & attention state, rename/kill, recents & resume |
 | [chat-mode.md](chat-mode.md) | Structured chat mode (Tier B): the composer, model/effort/mode/thinking/ultracode controls, tool cards, permission & question prompts, rewind, MCP panel, usage, inline artifacts, the seq journal & gap-replay, view-switch |
@@ -60,7 +60,7 @@ core; an addition can change when there's a clear improvement. Don't be too stri
 | [environment.md](environment.md) | Environment preludes — per-host/workspace/launch startup commands (`module load`, `conda activate`) run once per session before the shell or agent |
 | [compute.md](compute.md) | Slurm awareness — daemon-side scheduler detection, the user's queue snapshot, the rail compute chip + popover (hidden off-cluster) |
 | [settings.md](settings.md) | The dotted-key `settings.json` model (hand-edit-aware), the settings UI, theme palettes |
-| [cli.md](cli.md) | The `chimaera` binary: `serve`, `connect`, `status`, `kill`, `doctor`, `shell-integration` |
+| [cli.md](cli.md) | The `chimaera` binary: `serve`, `connect`, `status`, `kill`, `doctor`, `shell-integration`, `plugin` |
 
 ## Not in this catalog (on purpose)
 

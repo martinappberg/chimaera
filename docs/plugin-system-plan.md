@@ -9,6 +9,83 @@ named first-party code) is in [timeline-knowledge-plugins-plan.md §6](timeline-
 this plan replaces its "named built-in" column. The LaTeX and Typst plugins are
 the first new plugins on it ([latex-reports-plan.md](latex-reports-plan.md)).
 
+## Status (2026-09-26)
+
+P1 to P3 are built and P4's live proof passed. The feature page
+([plugins](features/plugins.md)), the authoring guide
+([agent-guides/plugins.md](agent-guides/plugins.md)) and the maps
+(`crates/chimaera-plugin-api/AGENTS.md`, `plugins/AGENTS.md`, the server map)
+describe what shipped; the phases below remain the design record.
+
+- **Shipped:**
+  - P1 (`e2873f4`): `chimaera-plugin-api` (the WIT world `chimaera:plugin@0.1.0`
+    and the Rust bindings), the wasmtime host (`plugins/runtime.rs`,
+    `plugins/hostfns.rs`), `scripts/build-plugins.sh` and the CI step, and
+    Agent notes as the first WASM plugin, with `notes.rs` reduced to core.
+  - P2 (`79d2e35`): Mycelium as a WASM plugin; `mycelium.rs` deleted;
+    `knowledge.rs` asks the provider through its `knowledge` export.
+  - P3 (`55acf73`): `version`, `api`, `requires.chimaera`, `[release]` and
+    `provides.events` in the manifest; the catalog with the precedence rule
+    and the gates; the installed directory with `current` and `previous`
+    links; install, update, Use previous and Remove with checksum-verified
+    downloads; the release checker and Check now;
+    `chimaera plugin list|add|update|remove`; the card. Also
+    `macos_use_mach_ports(false)` (the P0 facts below say why).
+  - P4: the maps, the feature page, the authoring guide and this plan; the
+    live proof.
+- **Proven live** on the isolated debug daemon, with a fake claude binary
+  standing in for the agent so nothing was billed:
+  - Agent notes: the catalog listed both plugins from `plugins/dist`; a
+    session spawned with the plugin on had `mcp__chimaera__post_note` and
+    `read_notes` pre-allowed in its generated settings, and its `initialize`
+    instructions carried the byte-identical Agent notes paragraph (2,130
+    characters with the plugin on, 1,739 off). `post_note` from session A and
+    `read_notes` from session B returned the note quoted; a second read said
+    "No new notes for you."; B posted to A by session id; a target in another
+    workspace was refused with the old wording; both notes reached the
+    Timeline attributed to their sessions; the `UserPromptSubmit` hook
+    answered "1 unread note from other sessions in this workspace —
+    read_notes shows it.". Switching the plugin off removed both tools and the
+    paragraph, a `post_note` call answered -32602 "isn't switched on" and the
+    hook answer became `{}`; switching it on again kept the read cursor.
+  - Mycelium: a workspace holding a copy of the test fixture's `.living/`
+    answered `provider: null` before the switch and `"mycelium"` after, with
+    counts findings 4 · decisions 4 · learnings 4 · open 6, the four
+    confidence levels, the handoff and the legacy-heading warning; a
+    session's `tools/list` carried `knowledge_search` and `knowledge_get`,
+    both returned the pinned text, and the instructions carried the Mycelium
+    paragraph.
+  - Versions and updates, against a local static server standing in for
+    GitHub (`CHIMAERA_PLUGIN_RELEASES_API`) that published the test fixture
+    as `acme/fixture`: `chimaera plugin add acme/fixture` installed 0.1.0 and
+    printed both sha256s, laid out as `<data>/plugins/test-fixture/0.1.0/` with
+    `current -> 0.1.0`, listed as installed beside the two embedded plugins; a
+    session with it on listed its 8 tools. With v0.2.0 published, Check now
+    offered it, Update reported 0.2.0 (previous 0.1.0) with the verified
+    sha256, the links moved, and the **same** session's next `tools/list`
+    carried 9 tools, the new `version` tool answering 0.2.0. Use previous
+    went back to 0.1.0 (8 tools again). `chimaera plugin remove agent-notes`
+    was refused ("ships with chimaera and has no installed copy to remove");
+    removing the fixture deleted its directory and the session's plugin tools.
+  - Not run live: the fault path (a panicking plugin), which
+    `src/tests/plugin_host.rs` covers.
+- **Measured:** the release binary 38.4 MB against 26.8 MB before (Cranelift);
+  Agent notes' `plugin.wasm` 135 KB, a release-grade compile of it 55 to
+  82 ms; Mycelium's 305 KB, its first `knowledge` ask 202 to 209 ms in a
+  release test build, and 6.7 s on the debug daemon (debug Cranelift) with the
+  next ask there 10 ms; a warm tool call through the MCP endpoint 1 to 2 ms
+  (P1) and under 10 ms in the live proof. Release daemon RSS: 5.8 MB idle,
+  10.2 MB with a workspace and a session, 28.8 MB after the first plugin call
+  (compile + instantiate, 70 ms end to end), 28.9 MB after 50 more calls. The
+  debug daemon stayed at 29 to 64 MB through the P3 run.
+- **Later (P5):** the Browse view; `plugins.lock` and the first-party plugins
+  moving to their own repositories; `exec` and `watch` (WIT 0.2) and the LaTeX
+  plan's `build` point on them; the UI-facing `query` route; delivering
+  `switched-on` / `switched-off`; a card for adding a third-party plugin (the
+  CLI and the route only, today); a UI that reads `emit` frames; and, only if
+  cold compile or binary size hurts on a real login node (not yet measured on
+  one), an on-disk `.cwasm` cache or the runtime-only host.
+
 ## Decisions (maintainer, 2026-09-26)
 
 1. **Plugins are Rust, compiled to WASM, in their own repositories.** Not scripts
@@ -71,15 +148,18 @@ Built with `cargo build --target wasm32-wasip2 --release`, the crate yields a
 component. `scripts/build-plugins.sh` (also `just plugins`) builds every
 first-party plugin and lays out `plugins/dist/<id>/{plugin.wasm,plugin.toml}`,
 which the daemon embeds with rust-embed exactly as it embeds `web-ui/dist` (a
-debug daemon reads the folder from disk per load, so a rebuilt plugin needs no
-daemon restart). `plugins/dist/` is gitignored and built in CI before `cargo
-build`, like the UI.
+debug daemon reads the folder from disk once, when its catalog first loads, so
+a rebuilt plugin needs a daemon restart but no cargo rebuild). `plugins/dist/`
+is gitignored and built in CI before `cargo build`, like the UI.
 
-The manifest is unchanged in format (`plugins/mod.rs` parses it with
-`deny_unknown_fields`) and gains one field, `api = "0.1"`, the WIT version the
-component targets. The host refuses a component whose `provides.mcp_tools` does
-not match the names its `tools()` export returns: the card's Adds line and the
-tool gate come from the manifest, so the two must agree.
+The manifest keeps its format (`plugins/mod.rs` parses it with
+`deny_unknown_fields`) and gains `api = "0.1"`, the WIT version the component
+targets, plus the fields of [Versions and updates](#versions-and-updates):
+`version` (required, like `api`), `requires.chimaera`, `[release] github`,
+and `provides.events` (the `on-event` variants the host delivers to it; none
+by default). The host refuses a component whose `provides.mcp_tools` does not
+match the names its `tools()` export returns: the card's Adds line and the tool
+gate come from the manifest, so the two must agree.
 
 ## The interface (WIT)
 
@@ -194,6 +274,10 @@ world chimaera-plugin {
 }
 ```
 
+Two WIT spellings to know: `%list` escapes a keyword (the function is
+`list`), and a type and a function may not share a name inside one interface,
+hence `stat as file-stat` in `host`.
+
 What is deliberately not in 0.1: **`exec`** (a bounded child process on the
 host, the heart of the LaTeX plan's `build` point) and **`watch`** (ask the host
 to report file changes). Both are additive: a host may offer more imports than a
@@ -229,8 +313,9 @@ chimaera_plugin_api::export!(AgentNotes);
 
 Host calls look like `host::read(&cx, ".living/INDEX.md", 256 * 1024)?` and
 return `Result`. The crate compiles natively too, with every host import a stub
-that panics, so a plugin's pure logic (parsers, addressing rules) is unit-tested
-with plain `cargo test` and only the integration runs in the daemon's tests.
+that aborts the test binary, so a plugin's pure logic (parsers, addressing
+rules) is unit-tested with plain `cargo test`, never reaching a host call, and
+only the integration runs in the daemon's tests.
 
 ## The host
 
@@ -238,23 +323,27 @@ with plain `cargo test` and only the integration runs in the daemon's tests.
 
 | File | What |
 |---|---|
-| `mod.rs` | the manifest (unchanged), the catalog now loaded from `plugins/dist` (embedded) and `~/.chimaera/plugins/` (installed), per-workspace on/off, detect, routes: as today |
-| `runtime.rs` | one `wasmtime::Engine` (Cranelift, async, epoch interruption, compile cache); per-(plugin, workspace) instances created on first use, dropped after 10 min idle or on switch-off; one call at a time per instance; per-call deadlines; the fault counter |
+| `mod.rs` | the manifest, the catalog loaded from `plugins/dist` (embedded) and `~/.chimaera/plugins/` (installed) with the precedence rule and the gates, per-workspace on/off, detect, routes |
+| `runtime.rs` | one `wasmtime::Engine` (Cranelift, async, epoch interruption); each build compiled once and kept in memory (the last two per plugin, by SHA-256); per-(plugin, workspace) instances created on first use, dropped after 10 min idle or when the switch flips; one call at a time per instance; per-call deadlines; the fault counter; events delivered only to plugins that declare them |
 | `hostfns.rs` | the `host` interface: bounded fs behind `fs::FILESYSTEM_WORK` on a blocking thread, state (capped), sessions, Timeline append (allowed kinds, rate cap) and recent, emit, log |
-| `tools.rs` | generic: `owner(tool)` from the manifests as today; `defs` / `instructions` / `call` go to the plugin's exports through the runtime |
+| `tools.rs` | generic: `owner(tool)` from the manifests as before; `offered` and `call` go to the plugin's exports through the runtime |
+| `installed.rs` | the installed directory, its `current` and `previous` links, and the install, update, rollback and remove routes (P3) |
+| `releases.rs` | the release checker and Check now (P3) |
 
 Limits, all in the host:
 
 | Limit | Value | How |
 |---|---|---|
-| Time per call | 5 s for tools, queries and events; 30 s for knowledge | epoch interruption: a 100 ms ticker, a wall-clock deadline checked on each tick, then a trap |
+| Time per call | 5 s for tools, queries and events; 30 s for knowledge | epoch interruption: a 100 ms ticker, a wall-clock deadline checked on each tick, then a trap; an outer tokio timeout (2 s past the budget) abandons a call stuck in a host function on a slow filesystem |
 | Memory per instance | 64 MiB linear memory | `StoreLimits` |
-| Compiled code | once per daemon lifetime, in memory (25 to 50 ms for a small component) | `runtime.rs`; an on-disk `.cwasm` (`Component::serialize`) is P4 if a login node's cold compile hurts; wasmtime's own `cache` feature stays out |
+| Compiled code | once per build per daemon lifetime, in memory, the last two builds per plugin (25 to 50 ms for the spike's 58 KB guest; 55 to 82 ms for Agent notes and about 200 ms for Mycelium, release) | `runtime.rs`; an on-disk `.cwasm` (`Component::serialize`) is later (P5) if a login node's cold compile hurts; wasmtime's own `cache` feature stays out |
 | Virtual memory | 64 MiB reserved per instance, not wasmtime's 4 GiB default | `memory_reservation`, `memory_guard_size`, `memory_reservation_for_growth` |
 | WASI | nothing granted: no files, no env, no args, no network; the guest's stderr captured (4 KiB) and logged on a trap | `WasiCtxBuilder::new()` |
 | Reads | `cap` bytes per read, 8 MiB ceiling; 4,096 entries per list | `hostfns.rs` |
 | State | 64 KiB per plugin per workspace | `hostfns.rs` |
-| Timeline appends | 10 per session per minute; `note` entries only; text ≤ 2 KiB | `hostfns.rs` |
+| Timeline appends | 10 per session per minute (the window `tell_mastermind` shares); `note` entries only; text ≤ 2 KiB | `hostfns.rs` |
+| What a plugin returns | a tool result 256 KiB, the instruction paragraph 8 KiB, a hook line 1 KiB (cut past that) | `runtime.rs` |
+| `emit`, `log` | one JSON object ≤ 16 KiB a frame, 64 frames kept; 64 log lines a call, 2 KiB each | `hostfns.rs`, `runtime.rs` |
 | Faults | a trap drops the instance; 5 traps in a minute mark the plugin faulted for the workspace (card shows why) until switched off and on | `runtime.rs` |
 | Instances | at most 64 live instances daemon-wide; least recently used dropped | `runtime.rs` |
 
@@ -270,9 +359,11 @@ plugin on never instantiates one.
 hook hint move to `plugins/agent-notes`. Cursors are host state; the post rate
 cap is the host's Timeline cap. What stays in core is what is core: `deliver`
 (the user sending a note as a real message: a route over Timeline entries),
-`tell_mastermind` (a Mastermind feature with its wake caps) and the `age`
-helper, in `notes.rs` reduced to those. The hint in `agents.rs::ingest` becomes
-one `on-event(hook)` call for each active plugin.
+`tell_mastermind` (a Mastermind feature with its wake caps), the per-session
+post window both it and the host's Timeline appends use (`take_post_slot`) and
+the `age` helper, in `notes.rs` reduced to those. The hint in
+`agents.rs::ingest` becomes one `on-event(hook)` call for each active plugin
+that declares the `hook` event.
 
 **Mycelium.** The reader (`mycelium.rs`: plan, parse, stamp, fingerprint), the
 snapshot types and the two tools move to `plugins/mycelium`. The snapshot JSON
@@ -281,13 +372,16 @@ daemon↔UI wire, so the Knowledge view does not change. `knowledge.rs` keeps th
 core: guidance files, the Timeline diff that attributes recorded entries to
 turns, the route that merges provider and guidance. It asks the active provider
 plugin for `knowledge(cx, known_stamp)` instead of calling `mycelium::read`,
-caches by stamp as today, and attributes changes by stat-ing the paths the
-snapshot names. The stamp JSON carries the same `(path, mtime, len)` triples.
+caches by stamp as today, and attributes changes from the stamp's mtimes. The
+stamp JSON carries the same `(path, mtime, len)` triples.
 
 **The catalog.** `MANIFESTS` (two `include_str!`s) becomes a load of
-`plugins/dist/*/plugin.toml` plus, when present, `~/.chimaera/plugins/*/plugin.toml`,
-each paired with its `plugin.wasm`. The UI is untouched: cards, switches, Adds
-lines and the attach sheet read the same routes.
+`plugins/dist/*/plugin.toml` plus, when present, the installed
+`~/.chimaera/plugins/<id>/current/plugin.toml`, each paired with its
+`plugin.wasm`, sorted by id (the Plugins page's order, and the order active
+plugins' tools and paragraphs reach an agent in). The UI is untouched by the
+port: cards, switches, Adds lines and the attach sheet read the same routes;
+P3 adds the version line and its actions.
 
 ## Packaging and third parties
 
@@ -305,8 +399,9 @@ lines and the attach sheet read the same routes.
   as the authoring guide requires) plus the crate and its `plugin.toml`, and a
   release that publishes `plugin.wasm`.
 - **Installed plugins:** `~/.chimaera/plugins/<id>/<version>/{plugin.toml,plugin.wasm}`
-  behind a `current` link, written by a visible install from a plugin
-  repository's release with the checksum shown, or by `chimaera plugin add`.
+  behind `current` and `previous` links, written by a visible install from a
+  plugin repository's release with the checksum shown, or by `chimaera plugin
+  add`.
   Same host, same limits; the card names the source and the version. Versions,
   precedence between an embedded and an installed copy, compatibility gates and
   updates are their own section: [Versions and updates](#versions-and-updates).
@@ -323,23 +418,28 @@ rules the daemon already applies to agent CLIs: never guess that an update
 exists, and never install or update anything without the user's click and a
 visible, checksum-verified download.
 
-- **Every manifest carries `version`** (the plugin's own, semver) and **`api`**
+- **Every manifest carries `version`** (the plugin's own, plain
+  `MAJOR.MINOR.PATCH` with no pre-release part) and **`api`**
   (the WIT version it targets), and may carry **`requires.chimaera`** (a semver
   requirement on the daemon, for a plugin that needs a host import that arrived
   in a later daemon). The manifest is the one source of truth: the build script
   refuses a first-party plugin whose `plugin.toml` version differs from its
-  crate's `Cargo.toml` version, rather than injecting one.
+  crate's `Cargo.toml` version (or whose `api` differs from the WIT package's
+  MAJOR.MINOR), rather than injecting one.
 - **The wire says what is running.** `GET /plugins` and `GET /workspaces/{id}/plugins`
-  gain `version`, `api`, `source` (`embedded` | `installed`), the installed copy's
-  path, and `update` (`{version, url, checked_ms}`, present only when a check found
-  a newer compatible release). The card shows `name · version` with a source chip
-  ("ships with chimaera 0.4.1" or "installed"), an **Update** chip when one is
-  available, and **Remove** / **Use previous** for installed copies. Nothing
-  else on the wire changes.
+  gain `version`, `api`, `source` (`embedded` | `installed`) and `stale`, and,
+  only when set, the installed copy's `path`, `embedded_version`,
+  `installed_version`, `previous`, `update` (`{version, url, checked_ms}`,
+  present only when a check found a newer compatible release) and `fault` (a
+  failed gate, or the fault counter's reason). The card shows `name · version`
+  with a source chip ("ships with chimaera 0.4.1" or "installed"), an
+  **Update** chip when one is available, and **Use previous** / **Check now** /
+  **Remove** for installed copies. Nothing else on the wire changes.
 - **Layout:** `~/.chimaera/plugins/<id>/<version>/{plugin.toml,plugin.wasm}`
   with an atomic `current` symlink swap (rename over the old link, the managed
   agent runtimes' idiom in `runtimes.rs`). An update never touches the version
-  in use, the previous version stays for a one-click rollback, and moving
+  in use, the previous version stays behind a `previous` link for a one-click,
+  reversible rollback (at most two versions on disk), and moving
   `current` drops the plugin's instances: a running session sees the new tools
   on its next `tools/list` and the new paragraph at its next `initialize`.
 - **Precedence, never silent:** the same id embedded and installed → the higher
@@ -348,9 +448,11 @@ visible, checksum-verified download.
   the embedded one is shown as stale with **Remove**.
 - **Compatibility gates, before a component loads:** `api` must be a WIT version
   this host serves (0.1 now; a host may serve two worlds during a major
-  transition), and `requires.chimaera` must match `chimaera_core::VERSION`. A
-  mismatch renders "needs chimaera ≥ x" or "needs a newer plugin" on the card
-  and the plugin stays off. Because a component is portable across wasmtime
+  transition), and `requires.chimaera` must match `chimaera_core::VERSION` (a
+  dev build, the `0.0.1` sentinel, matches every requirement). A mismatch
+  renders "needs chimaera ≥ x (this is y)", "needs a newer chimaera" (a newer
+  `api`) or "needs a newer plugin" (an older one) on the card, and the plugin
+  stays off with its switch kept. Because a component is portable across wasmtime
   versions (only a precompiled `.cwasm` binds to one), a daemon update never
   invalidates an installed plugin, and an additive WIT bump keeps every older
   plugin loading.
@@ -362,12 +464,17 @@ visible, checksum-verified download.
   own `update.rs`, compares semver, and only reports a release whose `api` and
   `requires.chimaera` this daemon satisfies. It never downloads on its own.
 - **Update and install are one path:** `POST /plugins/{pid}/update` and
-  `POST /plugins/install {github, version?}` download `plugin.wasm` and
-  `plugin.toml` into `<id>/<version>/`, verify the sha256 against `SHA256SUMS`,
-  check the new manifest's gates, then swap `current`; any failure leaves the
-  old version current and says why. `chimaera plugin add|update|remove` are the
-  same routes from the CLI. Embedded plugins update with the daemon through the
-  existing update flow, and their card says so.
+  `POST /plugins/install {github, version?}` fetch `SHA256SUMS` and
+  `plugin.toml` first (small, into memory), verify the manifest's sha256 and
+  check its id, the tag's version and its gates, then stream `plugin.wasm`
+  (16 MiB cap) into a temp dir under `<id>/`, verify it, rename the dir to
+  `<version>/` and swap `current` (the replaced version becomes `previous`);
+  any failure leaves the old version current and says why.
+  `POST /plugins/{pid}/rollback` (Use previous) swaps the two links and
+  `DELETE /plugins/{pid}` removes the id's directory. `chimaera plugin
+  list|add|update|remove` are the same routes from the CLI. Embedded plugins
+  update with the daemon through the existing update flow, and their card says
+  so.
 - **State across versions:** the host's per-(plugin, workspace) state and the
   per-workspace switch follow the plugin id, not the version. A new version must
   tolerate what an older one stored (the API guide says so; Agent notes'
@@ -424,10 +531,16 @@ deadline; `wasmtime_wasi::p2::add_to_linker_async` (the wasip2 std imports
 `wasi:io` and `wasi:cli` at 0.2.6; wasmtime-wasi 49 serves them by semver; no
 files, clocks, random or sockets are imported by a guest that does not use
 them); `WasiCtxBuilder::new()` with nothing granted and the guest's stderr
-captured, capped, and logged on a trap. Components are compiled once per daemon
-lifetime and kept in memory; an on-disk `.cwasm` cache is P4 if a login node's
-cold compile hurts. No Cargo dependency needs pinning between wit-bindgen and
-wasmtime-wasi.
+captured, capped, and logged on a trap; `macos_use_mach_ports(false)`, so
+traps ride ordinary Unix signal handlers on macOS too: wasmtime's default
+Mach-port handler thread aborts the whole process when a caught signal
+interrupts its `mach_msg`, and the daemon catches one all the time (tokio's
+SIGCHLD reaper, firing as PTY shells end). That was the intermittent SIGABRT of
+the server's test binary from P1 until P3 found it, and a shipped daemon on a
+Mac was exposed the same way; the flag is a no-op off macOS. Components are
+compiled once per daemon lifetime and kept in memory; an on-disk `.cwasm` cache
+is later (P5) if a login node's cold compile hurts. No Cargo dependency needs
+pinning between wit-bindgen and wasmtime-wasi.
 
 **One decision for the maintainer.** Cranelift in the daemon costs 9 to 13 MiB
 of binary and about 10 MB of resident memory after a plugin is compiled, and lets
@@ -436,8 +549,8 @@ any `plugin.wasm` load, including a third party's. A runtime-only daemon costs
 target and wasmtime version, so every plugin (first-party in CI, third-party by a
 `chimaera plugin build` step somewhere with Cranelift) ships per-target
 artifacts. The PoC builds the JIT host, since it is the one that keeps the
-third-party story simple; P4 measures the runtime-only build on a real login node
-if the size matters.
+third-party story simple; measuring the runtime-only build on a real login node,
+if the size matters, is later (P5).
 
 **A packaging fact the spike settled.** A plugin crate (a `cdylib`) does not link
 for the native target on macOS: its export names contain `#`, which Apple's
@@ -465,6 +578,15 @@ symlinked path refused, state capped. A fixture plugin under
 `plugins/test-fixture` (loop, allocate, panic, echo) is built by the same script
 for those tests.
 
+**Built** (2026-09-26, `e2873f4`): as above, plus the manifest/tools mismatch
+refusal, emit frames, the fault counter, and a test that the fixture never
+reaches a production catalog (`src/tests/plugin_host.rs`); `plugins/` is its own
+cargo workspace; CI, the release workflow, the Tauri `beforeBuildCommand`, the
+cloud bootstrap and the isolated-daemon script build the plugins first.
+Measured: the release daemon 38.4 MB against 26.8 MB before (+9.8 MiB,
+Cranelift); Agent notes' `plugin.wasm` 135 KB; a release-grade compile of it 55
+to 82 ms; a warm tool call through the MCP endpoint 1 to 2 ms.
+
 ### P2: Mycelium as WASM
 
 `plugins/mycelium` with the reader and the two tools; `mycelium.rs` deleted;
@@ -472,6 +594,13 @@ for those tests.
 fixtures is byte-identical before and after (a snapshot test), the Timeline
 attribution tests pass, and the reader's own unit tests run natively in the
 plugin crate.
+
+**Built** (2026-09-26, `79d2e35`): the reader, the caps, the warning texts and
+the `Serialize` shapes moved unchanged behind a small `Fs` trait (the host's
+functions in the component, `std::fs` only for the 27 moved unit tests); the
+`knowledge(cx, known)` export answers "unchanged" for its own stamp and keeps
+the last snapshot for the two tools; the Knowledge route's bytes and both
+tools' text match the fixtures pinned before the move, with no re-bless.
 
 Measured (2026-09-26, macOS arm64, the daemon's tests in release,
 `--test-threads=1`, the `tests/fixtures/living` workspace):
@@ -500,10 +629,10 @@ isolated daemon's home, sees it on the card, bumps the fake release, sees
 **Update**, updates, and watches a session's next `tools/list` carry the new
 version's tools.
 
-**Built** (2026-09-26): the manifest's `version`, `api`, `requires.chimaera`,
-`[release] github` and `[provides] events` (a hook reaches only plugins that
-declare `hook`: Agent notes does, Mycelium doesn't), and the build script's
-version and API checks; the catalog on `AppState`, reloaded after each
+**Built** (2026-09-26, `55acf73`): the manifest's `version`, `api`,
+`requires.chimaera`, `[release] github` and `[provides] events` (a hook
+reaches only plugins that declare `hook`: Agent notes does, Mycelium doesn't),
+and the build script's version and API checks; the catalog on `AppState`, reloaded after each
 change, with the precedence rule and the gates (`plugins/mod.rs`); the
 installed directory with `current` and `previous` links, and the install,
 update, Use previous and Remove routes (`plugins/installed.rs`); the checker
@@ -516,8 +645,8 @@ release. The live pass (an isolated daemon, a static fake release): add from
 the CLI, the card, a published 0.2.0 offered by Check now and by the boot
 check, Update from the card (the verified checksum shown), Use previous and
 back, Remove through its dialog, a planted `api = "0.2"` copy listed off with
-its reason; a session's `tools/list` after an update is covered by the tests,
-not yet by a live agent (P4).
+its reason. P4's live proof added the rest: a session's `tools/list` after an
+update and after Use previous ([Status](#status-2026-09-26)).
 
 ### P4: docs and the live proof
 
@@ -528,6 +657,10 @@ watch a session's `tools/list` gain `post_note` and `read_notes` and lose them
 when switched off; post and read through the MCP endpoint; the hook hint; a
 workspace with `.living/` showing Knowledge through the WASM reader; the fault
 path (a plugin built to panic) leaving the daemon up; RSS before and after.
+
+**Done** (2026-09-26): the maps, the feature page, the authoring guide and this
+plan, and the live proof in [Status](#status-2026-09-26), except the fault path,
+which stays with the host tests.
 
 ### P5: after the proof
 
@@ -540,18 +673,27 @@ precompiled first-party components if cold compile is slow on a login node.
 - **wasmtime on musl: answered.** Both musl targets cross-build with
   `cargo zigbuild`, static and stripped, with or without the cache feature.
 - **Binary size: measured, under the line.** 9.4 MiB (arm64) to 13.2 MiB
-  (x86_64) with Cranelift; 2.5 MiB runtime-only. The JIT host is the PoC; the
-  runtime-only trade is the maintainer's call in P4.
-- **Cold compile on a login node: small so far.** 25 to 50 ms for a 58 KB
-  component on a laptop; the mycelium reader will be larger and P2 measures it.
-  Once per daemon lifetime; an on-disk `.cwasm` is the fallback.
+  (x86_64) with Cranelift in the spike; the real daemon went from 26.8 to
+  38.4 MB (P1). 2.5 MiB runtime-only. The JIT host shipped; the runtime-only
+  trade is still the maintainer's call.
+- **Cold compile on a login node: small on a laptop, unmeasured on a login
+  node.** 25 to 50 ms for the spike's 58 KB component, 55 to 82 ms for Agent
+  notes, about 200 ms for the 305 KB Mycelium reader (release; a debug build
+  takes seconds). Once per daemon lifetime; an on-disk `.cwasm` is the
+  fallback (P5).
 - **Native compile of plugin crates: answered by moving them.** The plugin
   workspace is separate; the daemon never compiles a cdylib.
 - **A plugin's memory is the daemon's RSS.** About 10 MB stays resident after a
   compile, plus each instance's linear memory (a few MiB typical, 64 MiB cap).
-  64 instances is a 4 GiB worst case on paper; idle eviction and the live proof's
-  RSS reading (P3) keep it honest. Virtual memory per instance is 69 MiB with the
-  reservation set, not 4 GiB, which matters under `ulimit -v`.
+  64 instances is a 4 GiB worst case on paper; idle eviction keeps it honest.
+  Measured in P4 on a release daemon: 5.8 MB idle, 28.8 MB after the first
+  plugin call, 28.9 MB after 50 more. Virtual memory per instance is 69 MiB with
+  the reservation set, not 4 GiB, which matters under `ulimit -v`.
+- **wasmtime's Mach-port trap handler on macOS: answered.** It aborted the
+  whole process when tokio's SIGCHLD handler interrupted its `mach_msg` (the
+  intermittent test-binary SIGABRT from P1 to P3). `macos_use_mach_ports(false)`
+  moves traps to Unix signal handlers; every trap test still passes, and a
+  full-suite run under SIGCHLD load no longer aborts.
 - **A trapped instance is dead**, by design: every trap costs the plugin its
   instance and a 20 µs re-creation, never the daemon.
 

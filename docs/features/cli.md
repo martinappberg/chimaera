@@ -4,7 +4,7 @@ The `chimaera` executable is a thin clap dispatch that delegates to the sibling 
 same static binary is the daemon, the remote-connect client, and the operator's control surface.
 
 **Where it lives:** `crates/chimaera/src/` (`main.rs` clap defs + dispatch, `connect.rs`,
-`status.rs`, `kill.rs`, `doctor.rs`); shell-integration snippet in `chimaera-core/shellint`. Map:
+`status.rs`, `kill.rs`, `doctor.rs`, `plugin.rs`); shell-integration snippet in `chimaera-core/shellint`. Map:
 [chimaera/AGENTS.md](../../crates/chimaera/AGENTS.md). Rules:
 [rules/daemon.md](../../.claude/rules/daemon.md).
 
@@ -18,6 +18,7 @@ same static binary is the daemon, the remote-connect client, and the operator's 
 | `connect` | `chimaera connect <host> [--local-port N] [--binary PATH] [--no-open] [--update-daemon]` | Stand up + tunnel to a remote daemon — see [remote-connect.md](remote-connect.md). A dev build always targets the isolated `~/.chimaera-dev` daemon (deploying your `just dist` build, never a release download). |
 | `doctor` | `chimaera doctor` | Probe write access to the data/runtime dirs and whether `ssh` / `claude` are on PATH. |
 | `shell-integration` | `chimaera shell-integration` | Print the shell-integration snippet (for a remote host's rc file). |
+| `plugin` | `chimaera plugin list` · `add <owner/repo> [--version x]` · `update <id>` · `remove <id>` | Workbench plugins on the daemon running on this node: list them (version, source, any update), install one from its GitHub release, update or remove an installed one — the daemon's own routes, with the token and body on `curl`'s stdin, never argv; prints the checksums the daemon verified. See [plugins.md](plugins.md#versions-installs--updates). |
 
 ## Key behaviors
 
