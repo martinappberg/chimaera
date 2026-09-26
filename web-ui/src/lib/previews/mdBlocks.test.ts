@@ -86,16 +86,27 @@ const DOC = [
   "",
 ].join("\n");
 
+/** Frontmatter whose YAML opens a fence the editor's markdown parse runs
+ *  to the end of the document. */
+const FENCED_FM = "---\ntitle: x\nexample: |\n  ```\n---\n\n";
+
 const INSERTS = ["x", " ", "\n", "\n\n", "- ", "```", "# ", "## ", "> ", "|", "**", "[", "---\n", "1. ", "[^1]", "<div>", "$$"];
 
 describe("the live field's incremental update", () => {
   it("matches a full recomputation after every edit", () => {
     let treeDiffs = 0;
     let steps = 0;
-    for (const [seed, focused] of [[7, true], [11, false], [23, true], [42, true]] as const) {
+    const runs = [
+      [7, true, DOC],
+      [11, false, DOC],
+      [23, true, DOC],
+      [42, true, DOC],
+      [5, true, FENCED_FM + DOC],
+    ] as const;
+    for (const [seed, focused, text] of runs) {
       const next = rng(seed);
       let focus: boolean = focused;
-      let state = fresh(DOC, 30, focus);
+      let state = fresh(text, 30, focus);
       for (let step = 0; step < 400; step++) {
         steps++;
         const len = state.doc.length;
@@ -141,6 +152,31 @@ describe("the live field's incremental update", () => {
     }
     // Nearly every step compares.
     expect(treeDiffs).toBeLessThan(steps / 10);
+  });
+
+  it("draws the body from its own parse when a fence opened in the frontmatter runs on", () => {
+    const text = `${FENCED_FM}# Body\n\npara one\n\n- item\n`;
+    let state = fresh(text, text.indexOf("para"), false);
+    const kinds = (s: EditorState) => s.field(liveField).segs.map((g) => `${g.kind}:${g.names}`);
+    const want = ["front:Frontmatter", "block:ATXHeading1", "block:Paragraph", "block:BulletList"];
+    expect(kinds(state)).toEqual(want);
+    // The properties panel covers the frontmatter's lines and no more.
+    const panel = (s: EditorState): number => {
+      let to = -1;
+      s.field(liveField).deco.between(0, s.doc.length, (from, end, value) => {
+        const w = value.spec.widget as (WidgetType & { id?: string }) | undefined;
+        if (w?.id?.startsWith("P\u0000") === true && from === 0) to = end;
+      });
+      return to;
+    };
+    expect(panel(state)).toBeLessThan(text.indexOf("# Body"));
+    // Typing in the body: still drawn from the body's own parse.
+    const at = state.doc.toString().indexOf("one");
+    state = state.update({ selection: { anchor: at }, effects: liveFocus(true) }).state;
+    state = state.update({ changes: { from: at, insert: "and " }, selection: { anchor: at + 4 } }).state;
+    expect(kinds(state)).toEqual(want);
+    expect(state.field(liveField).revealed).toEqual([false, false, true, false]);
+    expect(panel(state)).toBeLessThan(state.doc.toString().indexOf("# Body"));
   });
 
   it("keeps a revealed figure drawn as entered until the cursor leaves", () => {

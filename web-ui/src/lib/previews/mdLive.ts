@@ -88,7 +88,7 @@ import {
   tableAt,
   type LiveHost,
 } from "./mdBlocks";
-import { isFigureLine } from "./doc/live";
+import { bodyTree, isFigureLine } from "./doc/live";
 
 export { setLivePropsCollapsed, setLiveTheme } from "./mdBlocks";
 
@@ -1497,12 +1497,14 @@ export function editorIn(host: HTMLElement): EditorView | null {
 }
 
 /** The document's headings from the editor's own syntax tree, with the
- *  anchors the reading view gives them (frontmatter skipped). A tree the
+ *  anchors the reading view gives them (frontmatter skipped; the body parsed
+ *  on its own when a node opened there swallowed body lines). A tree the
  *  background parser hasn't finished is completed within a short budget. */
 export function editorOutline(view: EditorView): OutlineEntry[] {
   const state = view.state;
   const tree = ensureSyntaxTree(state, state.doc.length, 30) ?? syntaxTree(state);
-  return outlineOf(tree, state.doc, frontmatterEnd(state));
+  const fmEnd = frontmatterEnd(state);
+  return outlineOf(bodyTree(tree, state.doc, fmEnd) ?? tree, state.doc, fmEnd);
 }
 
 /** Where `scrollEditorTo` lands a line: this far below the visible top. */

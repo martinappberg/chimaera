@@ -62,7 +62,7 @@ import {
   type Extension,
   type Text as CmText,
 } from "@codemirror/state";
-import type { SyntaxNode } from "@lezer/common";
+import { TreeFragment, type ChangedRange, type SyntaxNode, type Tree } from "@lezer/common";
 import {
   contextOf,
   depsOf,
@@ -79,6 +79,8 @@ import type { DocEmbeds } from "./doc/embeds";
 import {
   HeightCache,
   SILENT,
+  bodyTree,
+  crossesFrontmatter,
   hashString,
   isFigureLine,
   nodesIn,
@@ -158,9 +160,10 @@ export function onScrollbarBand(el: Element | null, e: MouseEvent): boolean {
   return e.clientY >= el.getBoundingClientRect().bottom - band;
 }
 
-/** The table whose range holds `pos`, modelled from the CURRENT tree. */
-export function tableAt(state: EditorState, pos: number): TableModel | null {
-  for (let n: SyntaxNode | null = syntaxTree(state).resolveInner(pos, 1); n !== null; n = n.parent) {
+/** The table whose range holds `pos`, modelled from the CURRENT tree (or
+ *  `tree`, the one rendered blocks were drawn from). */
+export function tableAt(state: EditorState, pos: number, tree: Tree = syntaxTree(state)): TableModel | null {
+  for (let n: SyntaxNode | null = tree.resolveInner(pos, 1); n !== null; n = n.parent) {
     if (n.name === "Table") return tableModel(n, state.doc);
   }
   return null;
@@ -228,6 +231,10 @@ interface LiveState {
   notes: string;
   /** Every link reference definition, as block identities read them. */
   defs: string;
+  /** The body parsed on its own, when a node the editor opened in the
+   *  frontmatter swallowed body lines (`bodyTree`): segments, rendering and
+   *  presses read it instead of the editor's tree. */
+  body: Tree | null;
   /** Document-wide facts for rendering (heading ids, footnotes, refs),
    *  made when a block is first drawn for this document: an edit inside
    *  one block never needs them. */
@@ -286,17 +293,17 @@ function holdFigures(
   return same ? prev : out;
 }
 
-type Structure = Pick<LiveState, "segs" | "keys" | "edges" | "fmEnd" | "notes" | "defs" | "cx">;
+type Structure = Pick<LiveState, "segs" | "keys" | "edges" | "fmEnd" | "notes" | "defs" | "cx" | "body">;
 
 /** Heights measured in this session (every live view shares them). */
 const heights = new HeightCache();
 /** A block's edges by its identity (they read only its text). */
 const edgeCache = new Map<string, Edges>();
 
-function edgesFor(key: string, state: EditorState, seg: Segment): Edges {
+function edgesFor(key: string, tree: Tree, doc: CmText, seg: Segment): Edges {
   let e = edgeCache.get(key);
   if (e === undefined) {
-    e = runEdges(nodesIn(syntaxTree(state), seg.blockFrom, seg.blockTo), state.doc);
+    e = runEdges(nodesIn(tree, seg.blockFrom, seg.blockTo), doc);
     if (edgeCache.size > 4000) edgeCache.clear();
     edgeCache.set(key, e);
   }
@@ -322,29 +329,60 @@ function writeCollapsed(on: boolean): void {
   }
 }
 
-function identity(state: EditorState, s: Segment, deps: (from: number, to: number, src: string) => string): [string, Edges] {
-  const doc = state.doc;
+function identity(
+  doc: CmText,
+  tree: Tree,
+  s: Segment,
+  deps: (from: number, to: number, src: string) => string,
+): [string, Edges] {
   if (s.kind === "block") {
     const src = doc.sliceString(s.blockFrom, s.blockTo);
     const key = `${s.names}\u0000${src}\u0000${deps(s.blockFrom, s.blockTo, src)}`;
-    return [key, edgesFor(key, state, s)];
+    return [key, edgesFor(key, tree, doc, s)];
   }
   if (s.kind === "front") return [`front\u0000${doc.sliceString(0, s.blockTo)}`, { head: [], tail: PROPS_TAIL }];
   return ["", { head: [], tail: [] }];
 }
 
+/** The last body parse (`LiveState.body`) and the edit since. */
+interface PrevBody {
+  body: Tree | null;
+  fmEnd: number;
+  changes: ChangeDesc | null;
+}
+
+/** What of the last body parse a new one reuses: nothing when the
+ *  frontmatter's end moved otherwise than the edit moved it (its lines
+ *  would blank differently). */
+function bodyFragments(prev: PrevBody | null, fmEnd: number): readonly TreeFragment[] | undefined {
+  if (prev === null || prev.body === null) return undefined;
+  if ((prev.changes === null ? prev.fmEnd : prev.changes.mapPos(prev.fmEnd)) !== fmEnd) return undefined;
+  const frags = TreeFragment.addTree(prev.body);
+  if (prev.changes === null) return frags;
+  const ranges: ChangedRange[] = [];
+  prev.changes.iterChangedRanges((fromA, toA, fromB, toB) => void ranges.push({ fromA, toA, fromB, toB }));
+  return TreeFragment.applyChanges(frags, ranges);
+}
+
+/** The tree rendered blocks are drawn from, and presses on them map
+ *  through: the editor's, or the body's own (`LiveState.body`). */
+function treeOf(state: EditorState): Tree {
+  return state.field(liveField, false)?.body ?? syntaxTree(state);
+}
+
 /** Segments, identities and edges of the document as it stands. */
-function structure(state: EditorState): Structure {
+function structure(state: EditorState, prev: PrevBody | null = null): Structure {
   const doc = state.doc;
-  const tree = syntaxTree(state);
   const fmEnd = frontmatterEnd(state);
+  const body = bodyTree(syntaxTree(state), doc, fmEnd, bodyFragments(prev, fmEnd));
+  const tree = body ?? syntaxTree(state);
   const segs = segmentsOf(tree, doc, fmEnd);
   const cx = contextOf(doc, tree, new TextLines(doc), fmEnd);
   const deps = depsOf(cx);
   const keys: string[] = [];
   const edges: Edges[] = [];
   for (const s of segs) {
-    const [key, e] = identity(state, s, deps);
+    const [key, e] = identity(doc, tree, s, deps);
     keys.push(key);
     edges.push(e);
   }
@@ -359,7 +397,7 @@ function structure(state: EditorState): Structure {
         })
         .join("\u0001");
   }
-  return { segs, keys, edges, fmEnd, notes, defs: refsKey(cx), cx };
+  return { segs, keys, edges, fmEnd, notes, defs: refsKey(cx), cx, body };
 }
 
 /** Nodes other blocks' rendering reads (heading ids, reference
@@ -398,7 +436,7 @@ function restructure(v: LiveState, tr: Transaction): (Structure & { i0: number; 
   const segs = v.segs;
   const n = segs.length;
   if (n === 0 || tree.length < doc.length || segs[n - 1].kind === "raw") return null;
-  if (frontmatterEnd(state) !== v.fmEnd) return null;
+  if (frontmatterEnd(state) !== v.fmEnd || v.body !== null || crossesFrontmatter(tree, v.fmEnd)) return null;
   let a0 = -1;
   let a1 = -1;
   tr.changes.iterChangedRanges((fromA, toA) => {
@@ -489,7 +527,7 @@ function restructure(v: LiveState, tr: Transaction): (Structure & { i0: number; 
       edges.push(v.edges[i]);
       continue;
     }
-    const [key, e] = identity(state, s, deps);
+    const [key, e] = identity(doc, tree, s, deps);
     keys.push(key);
     edges.push(e);
   }
@@ -509,6 +547,7 @@ function restructure(v: LiveState, tr: Transaction): (Structure & { i0: number; 
     notes: v.notes,
     defs,
     cx: null,
+    body: null,
     i0,
     i1,
     j1: i0 + region.length - 1,
@@ -519,7 +558,7 @@ function restructure(v: LiveState, tr: Transaction): (Structure & { i0: number; 
 function contextFor(state: EditorState): DocContext {
   const st = state.field(liveField);
   // A memo on the state's own value: made once per document version.
-  st.cx ??= contextOf(state.doc, syntaxTree(state), new TextLines(state.doc), st.fmEnd);
+  st.cx ??= contextOf(state.doc, st.body ?? syntaxTree(state), new TextLines(state.doc), st.fmEnd);
   return st.cx;
 }
 
@@ -768,7 +807,9 @@ export const liveField = StateField.define<LiveState>({
       return { ...st, deco };
     }
     const structural = tr.docChanged || treeChanged;
-    const base = structural ? structure(tr.state) : v;
+    const base = structural
+      ? structure(tr.state, { body: v.body, fmEnd: v.fmEnd, changes: tr.docChanged ? tr.changes : null })
+      : v;
     let revealed: readonly boolean[] = revealedOf(base.segs, ranges);
     if (!structural && sameFlags(revealed, v.revealed)) revealed = v.revealed;
     const held =
@@ -989,7 +1030,7 @@ abstract class LiveWidget extends WidgetType {
 /** Draw the document nodes of `seg` into `root` as the reader does. */
 function drawRun(view: EditorView, root: HTMLElement, seg: Segment): void {
   const h = hydratorFor(view);
-  renderRun(root, nodesIn(syntaxTree(view.state), seg.blockFrom, seg.blockTo), { t: h.target, cx: contextFor(view.state) });
+  renderRun(root, nodesIn(treeOf(view.state), seg.blockFrom, seg.blockTo), { t: h.target, cx: contextFor(view.state) });
 }
 
 /** What every rendered widget does once drawn: the reader's decorations,
@@ -1349,12 +1390,12 @@ function pressPos(view: EditorView, hit: { root: HTMLElement; seg: number }, e: 
   const to = doc.line(last).to;
   if (slot !== null) return to;
   if (caret === null || block === null) return from;
-  return sourceOffset(syntaxTree(state), doc, from, to, renderedPrefix(block, caret));
+  return sourceOffset(treeOf(state), doc, from, to, renderedPrefix(block, caret));
 }
 
 /** A press in a rendered table cell: that cell's text, at the character. */
 function cellPos(state: EditorState, seg: Segment, cell: HTMLTableCellElement, caret: Caret | null): number | null {
-  const table = tableAt(state, seg.blockFrom);
+  const table = tableAt(state, seg.blockFrom, treeOf(state));
   const tr = cell.parentElement as HTMLTableRowElement | null;
   if (table === null || tr === null) return null;
   const row: RowModel | undefined =
@@ -1364,7 +1405,7 @@ function cellPos(state: EditorState, seg: Segment, cell: HTMLTableCellElement, c
   const next = row.cells[cell.cellIndex + 1];
   const end = next === undefined ? row.end : Math.max(c.from, next.from - 1);
   if (caret === null || cell.cellIndex >= row.present) return c.from;
-  return sourceOffset(syntaxTree(state), state.doc, c.from, end, renderedPrefix(cell, caret));
+  return sourceOffset(treeOf(state), state.doc, c.from, end, renderedPrefix(cell, caret));
 }
 
 /** A press on a property: after its key on its line. */
@@ -1462,7 +1503,7 @@ function toggleTask(view: EditorView, hit: { root: HTMLElement; seg: number }, b
   if (n < 1 || n > state.doc.lines) return;
   const line = state.doc.line(n);
   let marker: { from: number; to: number } | null = null;
-  syntaxTree(state).iterate({
+  treeOf(state).iterate({
     from: line.from,
     to: line.to,
     enter: (node) => {
