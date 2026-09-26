@@ -388,15 +388,28 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
 - **PDF / image / HTML.** Fetched via a short-lived **ticket**: `POST /api/v1/fs/ticket {path}` →
   `GET /raw/{ticket}` (no bearer header — iframes/`<img>`/pdf.js can't send one; ticket TTL 600s,
   range-aware). HTML is sandboxed (`CSP: sandbox allow-scripts`, no-referrer); SVG is sandboxed too.
+  **Caching over a tunnel:** a ticket is minted with the file's version token, and minting again
+  for the same path + version while it lives answers the *same* ticket (its expiry renewed) — so
+  the URL is stable for as long as the file is unchanged, and a re-render, a tab switch or a reload
+  reuses the browser's copy instead of re-downloading. `/raw` responses carry a strong `ETag`
+  (version + size), `Last-Modified` and `Cache-Control: private, max-age=<the ticket's remaining
+  life>`; after that the browser revalidates and `If-None-Match` answers **304**. A changed file
+  gets a new version, so a new ticket and a new URL: a cached copy never stands for new bytes.
   `PdfView`/`ImageView`/`HtmlView`. `ImageView` takes png, jpg, gif, webp, svg, bmp, ico and
   avif (formats every supported webview decodes). `HtmlView` carries a **preview | split | edit** toggle
   (`SplitEditPreview.svelte` owns the split geometry; a failed source fetch is retried on the
   next split/edit click);
   its split live-preview is a `sandbox="allow-scripts"` `srcdoc` iframe fed the (debounced) editor
-  buffer — same origin-less isolation. **Relative assets load in neither mode today:** `/raw` is
-  the single-segment `/raw/{ticket}`, so a page's `app.js` or `figs/a.png` 404s or falls through
-  to the app shell; only self-contained HTML (e.g. MultiQC) renders fully. The planned fix is a
-  directory-scoped `/raw/{ticket}/{*path}` ([plan](../document-workbench-plan.md#phase-4-embeds-in-documents-and-in-chat)).
+  buffer — same origin-less isolation. **Relative assets load in preview mode:** the frame loads
+  the page by its own name under its ticket (`/raw/{ticket}/report.html`), so a relative `app.js`
+  or `figs/a.png` lands on `GET /raw/{ticket}/{*rest}`, which serves files beside an HTML ticket's
+  page — downward only (plain visible components: no `..`, no absolute path, no `.hidden` name),
+  every component opened `O_NOFOLLOW` beneath the folder's descriptor (a symlink never leads out),
+  with the same sandbox CSP and cache rules. Only an HTML ticket opens its folder. No CORS header is
+  sent on purpose: the origin-less frame can *load* its neighbors (script, style, image, media
+  tags) but never *read* them with `fetch`/XHR, so a report cannot read out the files around it —
+  a report that fetches its data as JSON still needs it inline. The split live preview (`srcdoc`)
+  has no URL, so its relative assets still do not load.
   **PDF** runs on pdf.js's **legacy** build: the modern build calls `Map.prototype.getOrInsertComputed`
   on every render and range read, which WebKit (the macOS app) and Chromium before 145 lack, so its
   pages stayed blank. pdf.js's standard fonts, CMaps, wasm decoders and ICC profiles ship with our
@@ -523,6 +536,39 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   to 4 MB, *file info* to go back — and, on a remote host (the `host=` window rule the
   downloads share), a **download** button; `FinderView` is a directory browser surface.
 
+## Embed cards
+
+- **What & when.** One card shows any file inside something else — agent prose in chat, a turn's
+  "made this turn" gallery, and (once the document renderer mounts them) markdown documents: a thin
+  header (file icon, name, the piece shown, **open in a pane** at that spot, **download** on a
+  remote host) over the file's own viewer in a compact mode. The target is standard markdown,
+  `![caption](path#fragment)`, with Obsidian's size hint (`![caption|400](plot.png)`).
+- **Bodies by kind.** Image (a `#xywh=x,y,w,h` region — pixels or `percent:` — drawn cropped);
+  PDF page (`#page=N`, one pdf.js page at the card's width, legacy build, ranged reads, a
+  `#page=N&xywh=` region in PDF points); code lines (`#L10-L30`, highlighted like notebook cells,
+  line numbers; a whole file shows its first lines); a table slice (`#row=a-b`, RFC 7111 — row 1 is
+  the header line when the file has one; `#sheet=S&range=A1:F20` for spreadsheets; else the first
+  rows); an HTML report (the sandboxed frame on the folder-scoped raw URL, fixed height, expand);
+  video/audio (`#t=start,end`, the browser seeks natively); a notebook cell (`#cell=N`, else the
+  first cell that drew a figure); a Marp slide (`#slide=N`); a markdown excerpt (`#heading`, else
+  the opening, clipped with a fade and **more**); a plain file or folder card for everything else.
+  Missing files show a dashed card that says so (and looks again when it comes back on screen);
+  failed loads say why, with **try again** — never a blank box.
+- **Remote budget.** `POST /api/v1/fs/resolve_targets {base, bases?, workspace_id?, targets}`
+  answers every target of a document in one round trip: canonical path, kind, size, version (the
+  `X-Mtime` token), `mtime_ms`, mime, image `width`/`height` read from ≤64 KB of header bytes (never
+  decoded; JPEG EXIF rotation honored), and a `/raw` ticket for the kinds loaded through one —
+  `{missing: true}` otherwise. Strict like document links (exact join onto `base`, then `bases`; an
+  absolute path as-is, a root-relative `/x` also under the workspace root); fragments are ignored
+  for resolution. ≤200 targets, 5 s budget, shared filesystem limiter. A card loads only near its
+  scroller's viewport, reserves its box from the answer's dimensions (nothing jumps), and while on
+  screen watches its file (inside the 64-path disk-monitor cap): an overwrite re-resolves it and
+  the new version's new ticket reloads the bytes; an unchanged file keeps its cached copy.
+- **Where.** `web-ui/src/lib/shared/embed/` — `EmbedCard.svelte` + one `*Body.svelte` per kind,
+  `embed.ts` (the resolve client, a per-frame batcher for absolute paths, kinds, raw URLs, crops),
+  `fragment.ts` (the fragment grammar), `mount.svelte.ts` (`mountEmbed(el, props) → {update,
+  destroy}` for renderers that own raw DOM); `crates/chimaera-server/src/embed.rs`.
+
 ## Preview keep-alive & live-update
 
 - **What & when.** A pane keeps recently-viewed rendered views alive (hidden, not destroyed) across
@@ -584,8 +630,9 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   while PDF/spreadsheet/binary surfaces remount on the new token. An editor buffer is never
   clobbered: it retains its path (so a dirty buffer stays watched with no view mounted) and
   reconciles a moved token by reading the whole file — reload when clean, merge or conflict when
-  dirty (see *Raw reads & lightweight editing* above). Chat artifact cards memoize their `/raw` ticket (`rawTicketUrl`) so a cached output
-  image doesn't re-fetch and re-decode (the flash) on re-render.
+  dirty (see *Raw reads & lightweight editing* above). Embed cards (below) keep a cached output
+  image from re-fetching and re-decoding (the flash) on re-render: the daemon hands back the same
+  `/raw` ticket for an unchanged file, so the `<img>` URL is stable and the browser's copy answers.
 
 ## File & folder glyphs
 
