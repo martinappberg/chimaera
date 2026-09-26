@@ -2,7 +2,8 @@
   /**
    * HTML file view with a preview | split | edit toggle. Preview is the
    * sandboxed iframe the daemon serves under CSP
-   * "sandbox allow-scripts" (relative assets resolve through the /raw ticket).
+   * "sandbox allow-scripts" (relative assets resolve through the ticket's
+   * folder-confined `/raw/{ticket}/{path}` route).
    * Edit is the shared CodeMirror editor in HTML mode (Cmd/Ctrl+S saves; dirty
    * dot + conflict handling come from CodeView). SPLIT puts the editor beside a
    * live preview of the editor's buffer (a sandboxed `srcdoc` iframe, same
@@ -15,7 +16,7 @@
    * cap.
   */
   import type { Component } from "svelte";
-  import { EDIT_MAX_BYTES, type FileChunk } from "./files";
+  import { basename, EDIT_MAX_BYTES, type FileChunk } from "./files";
   import { retain, release, type FileEntry } from "./fileStore.svelte";
   import SplitEditPreview from "./SplitEditPreview.svelte";
   import Spinner from "./Spinner.svelte";
@@ -68,7 +69,12 @@
     void e.ensureRawUrl();
     return () => release(path);
   });
-  const url = $derived(entry?.rawUrl ?? null);
+  // The frame loads the page by its own name UNDER the ticket
+  // (`/raw/{ticket}/report.html`), so its relative `app.js` / `figs/a.png`
+  // resolve to `/raw/{ticket}/app.js` — the daemon's folder-confined route.
+  const url = $derived(
+    entry?.rawUrl != null ? `${entry.rawUrl}/${encodeURIComponent(basename(path))}` : null,
+  );
   const error = $derived(entry?.rawError ?? null);
 
   // Reset per path.

@@ -67,19 +67,28 @@ in the workbench at that spot. A markdown link works too:
 
 ## Fragments you may receive from the user
 
-The user can point you at part of any file. References look like
-`@path#fragment "quoted text"`:
+The user can point you at part of any file. A reference is one line,
+`@path#fragment (context) "quoted text"`; everything after the path is optional:
 
 | Fragment | Meaning |
 |---|---|
 | `#L12-L20` | lines 12 to 20 |
-| `#page=4` | PDF page 4 |
-| `#xywh=160,120,320,240` | a pixel region (x, y, width, height) of an image, or of a PDF page with `#page=N&xywh=...` |
-| `#t=12.5,20` | seconds 12.5 to 20 of a video or audio file |
-| `#row=5-9`, `#col=2`, `#cell=5,2-9,4` | rows, a column, or a cell range of a CSV/TSV (RFC 7111, 1-based) |
-| `#sheet=Summary&range=B2:F9` | a spreadsheet range |
-| `#/path/to/key` | a JSON or YAML value (JSON Pointer) |
-| `#cell=7`, `#slide=3` | a notebook cell, a slide |
+| `#page=4` | PDF page 4 (the quote is text the user selected on it) |
+| `#xywh=160,120,320,240` | a region (x, y, width, height from the top-left) of an image, in its pixels |
+| `#page=4&xywh=72,90,200,120` | a region of PDF page 4, in PDF points (1/72 inch) from the page's top-left |
+| `#t=12.5`, `#t=12.5,20` | a moment, or seconds 12.5 to 20, of a video or audio file |
+| `#row=5-9`, `#cell=5,2-9,4` | rows, or a cell range (row,column), of a CSV/TSV (RFC 7111, 1-based: the header line is row 1) |
+| `#sheet=Summary&range=B2:F9` | a spreadsheet range in A1 notation (the sheet name URL-encoded) |
+| `#cell=7`, `#slide=3` | a notebook cell, a slide (1-based) |
+
+- `(§ Results)` after the fragment is the heading a markdown selection sits under.
+- A table's quote is TSV on one line: the header first, `\t` between cells, `\n`
+  between rows. It stops at 50 rows, 20 columns or 8 KB, and `…` marks a cut:
+  read the file for the rest.
+- `(region image: /path/ref-1.png)` at the end is a PNG of the region the user
+  drew. Open it to see what they see.
+- These fragments work in your own links too, and open at that spot:
+  `[Fig. 2](paper.pdf#page=3&xywh=72,272,320,220)`, `results/de.tsv#row=5-9`.
 
 ## Slides
 

@@ -7,6 +7,7 @@ interface Expected {
   line?: number;
   col?: number;
   endLine?: number;
+  at?: FileRef["at"];
 }
 
 /** The parse, as the fixture spells it (absent fields omitted). */
@@ -15,6 +16,7 @@ function shape(ref: FileRef): Expected {
   if (ref.line !== undefined) out.line = ref.line;
   if (ref.col !== undefined) out.col = ref.col;
   if (ref.endLine !== undefined) out.endLine = ref.endLine;
+  if (ref.at !== undefined) out.at = ref.at;
   return out;
 }
 

@@ -162,9 +162,10 @@ pub(crate) struct AgentRecord {
     /// First prompt seen in a `UserPromptSubmit` hook payload; provisional
     /// display name until a real title exists.
     pub(crate) first_prompt: Option<String>,
-    /// Native conversation id this session resumed, when it did. Claude forks
-    /// a NEW session id on resume, while Codex continues the same thread id;
-    /// Recents needs the ancestor to recognize the live continuation.
+    /// Native conversation id this session resumed, when it did. Older Claude
+    /// CLIs forked a NEW session id on resume (2.1.283 keeps it), while Codex
+    /// continues the same thread id; Recents needs the ancestor to recognize
+    /// the live continuation.
     pub(crate) resumed_from: Option<String>,
     /// Files this session has written (PostToolUse hooks for file-writing
     /// tools): ordered, de-duplicated, most recently touched last, capped at

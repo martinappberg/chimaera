@@ -30,9 +30,25 @@ export interface Reveal {
   slide?: number;
   /** Media time range in seconds (`#t=start,end`). */
   time?: { start: number; end?: number };
-  /** Pixel region of an image or PDF page (`#xywh=x,y,w,h`). */
-  region?: { x: number; y: number; w: number; h: number };
+  /** Region of an image (natural pixels) or a PDF page (PDF points at 100%,
+   *  from the page's top-left): `#xywh=x,y,w,h`. `percent` (`#xywh=percent:…`)
+   *  means the four numbers are percentages of the image or page. */
+  region?: { x: number; y: number; w: number; h: number; percent?: boolean };
+  /** A block of a table (`#row=5-9`, `#col=2`, `#cell=5,2-9,4`): RFC 7111
+   *  rows, so the header line is row 1 when the file has one (the grid's
+   *  data row N is row N + 1 there; the viewer converts), and 1-based
+   *  columns. An absent side spans everything; an end is only present when
+   *  it differs from the start. */
+  table?: { row?: number; endRow?: number; col?: number; endCol?: number };
+  /** A spreadsheet sheet (`#sheet=Summary`). */
+  sheet?: string;
+  /** A spreadsheet A1 range (`#range=B2:F9`), 1-based SHEET coordinates
+   *  (row 1 is the sheet's first row, whatever the viewer shows as header). */
+  range?: { row?: number; col?: number; endRow?: number; endCol?: number };
 }
+
+/** The non-text part of a reveal: what a `#fragment` other than `#L…` names. */
+export type Locator = Omit<Reveal, "line" | "endLine" | "col">;
 
 export interface RevealRequest extends Reveal {
   /** Absolute path the reveal targets. */

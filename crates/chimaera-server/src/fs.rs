@@ -105,7 +105,7 @@ fn home_dir() -> anyhow::Result<PathBuf> {
 }
 
 /// Expand a leading `~` to the user's home directory; other paths pass through.
-fn expand_tilde(raw: &str) -> anyhow::Result<PathBuf> {
+pub(crate) fn expand_tilde(raw: &str) -> anyhow::Result<PathBuf> {
     if raw == "~" {
         return home_dir();
     }
@@ -198,7 +198,7 @@ fn gz_mime(path: &Path) -> mime_guess::Mime {
 /// Clients hold tokens across daemon restarts and upgrades, so the digest must
 /// be stable across Rust releases: SHA-256 over fixed-width little-endian
 /// fields, never `DefaultHasher` (whose algorithm std may change).
-fn mtime_token(meta: &std::fs::Metadata) -> String {
+pub(crate) fn mtime_token(meta: &std::fs::Metadata) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     let modified = meta
@@ -245,7 +245,7 @@ fn ascii_header(value: &str) -> HeaderValue {
 }
 
 /// 400 with a JSON error body.
-fn bad_request(err: &anyhow::Error) -> Response {
+pub(crate) fn bad_request(err: &anyhow::Error) -> Response {
     (
         StatusCode::BAD_REQUEST,
         Json(json!({"error": format!("{err:#}")})),
@@ -287,7 +287,7 @@ pub(crate) async fn dirs(Query(query): Query<DirsQuery>) -> Response {
 /// Run JSON-producing filesystem/preview work on a blocking thread. NFS and
 /// Lustre can stall even a metadata lookup, while gzip/markdown parsing is
 /// CPU-heavy; neither belongs on a Tokio worker.
-async fn blocking_json<F>(work: F) -> Response
+pub(crate) async fn blocking_json<F>(work: F) -> Response
 where
     F: FnOnce() -> anyhow::Result<serde_json::Value> + Send + 'static,
 {
@@ -3421,6 +3421,10 @@ fn read_xlsx(
     Ok(json!({
         "sheets": sheets,
         "sheet": sheet_name,
+        // The used range's first cell (0-based row, column): the header row
+        // need not be row 1, and the UI writes A1 references for the user's
+        // selections from it.
+        "origin": range.start().map(|(row, col)| [row, col]),
         "columns": columns,
         "rows": rows,
         "offset": offset_rows,
@@ -4271,20 +4275,46 @@ pub(crate) async fn move_(
 /// In-memory store of short-lived raw-access tickets. A ticket is bound to
 /// one canonical file path and expires after [`TICKET_TTL`]; expired entries
 /// are purged on every create/lookup.
+///
+/// A ticket minted with a version (the `X-Mtime` token of the file when it
+/// was minted) is shared: minting again for the same path AND version while
+/// that ticket is alive answers the same ticket, its expiry pushed out a full
+/// TTL. The URL therefore stays stable for as long as the file does and
+/// someone keeps asking, which is what lets the browser cache (and the
+/// `ETag` revalidation behind it) work across re-renders and tab switches;
+/// a new version gets a new ticket, so a cached copy can never stand for a
+/// file that changed. A renewal is a bearer-authed request for a capability
+/// the caller could mint fresh anyway.
 #[derive(Default)]
 pub(crate) struct TicketStore {
     tickets: HashMap<String, Ticket>,
+    /// (path, version) -> the live ticket minted for it.
+    by_version: HashMap<(PathBuf, String), String>,
 }
 
 struct Ticket {
     path: PathBuf,
+    version: Option<String>,
     expires: Instant,
 }
 
 impl TicketStore {
-    /// Mint a ticket for `path`, valid for `ttl`.
-    fn create(&mut self, path: PathBuf, ttl: Duration) -> String {
+    /// Mint (or renew) a ticket for `path` at `version`, valid for
+    /// [`TICKET_TTL`]. `None` (the version could not be read) always mints.
+    pub(crate) fn mint(&mut self, path: PathBuf, version: Option<String>) -> String {
+        self.create(path, version, TICKET_TTL)
+    }
+
+    fn create(&mut self, path: PathBuf, version: Option<String>, ttl: Duration) -> String {
         self.purge();
+        if let Some(version) = &version {
+            if let Some(existing) = self.by_version.get(&(path.clone(), version.clone())) {
+                if let Some(ticket) = self.tickets.get_mut(existing) {
+                    ticket.expires = Instant::now() + ttl;
+                    return existing.clone();
+                }
+            }
+        }
         if self.tickets.len() >= MAX_TICKETS {
             // Expiries preserve creation order for a common TTL. Evicting the
             // soonest-to-expire capability keeps the store bounded while
@@ -4295,14 +4325,23 @@ impl TicketStore {
                 .min_by_key(|(_, ticket)| ticket.expires)
                 .map(|(key, _)| key.clone())
             {
-                self.tickets.remove(&oldest);
+                if let Some(evicted) = self.tickets.remove(&oldest) {
+                    if let Some(version) = evicted.version {
+                        self.by_version.remove(&(evicted.path, version));
+                    }
+                }
             }
         }
         let ticket = format!("t-{}", &chimaera_core::generate_token()[..32]);
+        if let Some(version) = &version {
+            self.by_version
+                .insert((path.clone(), version.clone()), ticket.clone());
+        }
         self.tickets.insert(
             ticket.clone(),
             Ticket {
                 path,
+                version,
                 expires: Instant::now() + ttl,
             },
         );
@@ -4312,13 +4351,24 @@ impl TicketStore {
     /// The path bound to `ticket`, if it exists and has not expired.
     /// Shared with the download module — same store, same capability model.
     pub(crate) fn lookup(&mut self, ticket: &str) -> Option<PathBuf> {
+        self.lookup_ttl(ticket).map(|(path, _)| path)
+    }
+
+    /// [`Self::lookup`] plus how long the ticket has left — the `max-age`
+    /// a `/raw` response may be cached for.
+    pub(crate) fn lookup_ttl(&mut self, ticket: &str) -> Option<(PathBuf, Duration)> {
         self.purge();
-        self.tickets.get(ticket).map(|t| t.path.clone())
+        let now = Instant::now();
+        self.tickets
+            .get(ticket)
+            .map(|t| (t.path.clone(), t.expires.saturating_duration_since(now)))
     }
 
     fn purge(&mut self) {
         let now = Instant::now();
         self.tickets.retain(|_, t| t.expires > now);
+        let tickets = &self.tickets;
+        self.by_version.retain(|_, id| tickets.contains_key(id));
     }
 
     /// Force a ticket to be already expired (test hook for the expiry path).
@@ -4337,15 +4387,41 @@ mod ticket_store_tests {
     #[test]
     fn ticket_store_evicts_oldest_at_hard_cap() {
         let mut store = TicketStore::default();
-        let first = store.create(PathBuf::from("/first"), TICKET_TTL);
+        let first = store.create(PathBuf::from("/first"), Some("v".into()), TICKET_TTL);
         for n in 1..=MAX_TICKETS {
-            store.create(PathBuf::from(format!("/{n}")), TICKET_TTL);
+            store.create(PathBuf::from(format!("/{n}")), None, TICKET_TTL);
         }
         assert_eq!(store.tickets.len(), MAX_TICKETS);
         assert!(
             store.lookup(&first).is_none(),
             "oldest ticket was not evicted"
         );
+        // Its version entry went with it: the next mint is a new ticket.
+        assert!(store.by_version.is_empty());
+        let again = store.create(PathBuf::from("/first"), Some("v".into()), TICKET_TTL);
+        assert_ne!(again, first);
+    }
+
+    #[test]
+    fn same_version_shares_a_ticket_and_a_new_version_does_not() {
+        let mut store = TicketStore::default();
+        let path = PathBuf::from("/plot.png");
+        let a = store.create(path.clone(), Some("1".into()), Duration::from_secs(5));
+        let b = store.create(path.clone(), Some("1".into()), TICKET_TTL);
+        assert_eq!(a, b, "an unchanged file keeps its URL");
+        // The renewal pushed the expiry out a full TTL.
+        let (_, left) = store.lookup_ttl(&a).unwrap();
+        assert!(left > Duration::from_secs(60), "{left:?}");
+        let c = store.create(path.clone(), Some("2".into()), TICKET_TTL);
+        assert_ne!(a, c, "a new version is a new URL");
+        // Unversioned mints never share.
+        let d = store.create(path.clone(), None, TICKET_TTL);
+        let e = store.create(path, None, TICKET_TTL);
+        assert_ne!(d, e);
+        // An expired ticket is never renewed.
+        store.expire(&c);
+        let f = store.create(PathBuf::from("/plot.png"), Some("2".into()), TICKET_TTL);
+        assert_ne!(c, f);
     }
 }
 
@@ -4359,13 +4435,20 @@ pub(crate) struct TicketRequest {
 /// (none of which can send Authorization headers) can fetch it via GET
 /// /raw/{ticket} (files only) or GET /download/{ticket}. The bearer token
 /// never appears in a URL. A ticket is a per-path snapshot: renaming the
-/// path afterwards makes the fetch 404, deliberately.
+/// path afterwards makes the fetch 404, deliberately. Minting again for an
+/// unchanged file answers the same ticket (see [`TicketStore`]).
 pub(crate) async fn create_ticket(
     State(state): State<Arc<AppState>>,
     Json(body): Json<TicketRequest>,
 ) -> Response {
-    let path = match tokio::task::spawn_blocking(move || canonical(&body.path)).await {
-        Ok(Ok(path)) => path,
+    let minted = tokio::task::spawn_blocking(move || {
+        let path = canonical(&body.path)?;
+        let version = std::fs::metadata(&path).ok().map(|m| mtime_token(&m));
+        anyhow::Ok((path, version))
+    })
+    .await;
+    let (path, version) = match minted {
+        Ok(Ok(minted)) => minted,
         Ok(Err(err)) => return bad_request(&err),
         Err(join) => {
             return (
@@ -4375,7 +4458,7 @@ pub(crate) async fn create_ticket(
                 .into_response();
         }
     };
-    let ticket = crate::lock(&state.tickets).create(path, TICKET_TTL);
+    let ticket = crate::lock(&state.tickets).mint(path, version);
     Json(json!({"ticket": ticket})).into_response()
 }
 
@@ -4418,32 +4501,205 @@ fn parse_byte_range(value: &str, total: u64) -> Option<Result<(u64, u64), ()>> {
 /// direct navigation should not run them either). Single byte ranges are
 /// honored (206/416; pdf.js fetches pages lazily this way). 404 on unknown
 /// or expired tickets, and on files that vanished since the ticket was minted.
+/// Cacheable for the ticket's remaining life, revalidated by `ETag` (see
+/// [`serve_raw`]).
 pub(crate) async fn raw(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(ticket): axum::extract::Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    let not_found = || (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response();
-    let Some(path) = crate::lock(&state.tickets).lookup(&ticket) else {
-        return not_found();
+    let Some((path, fresh_for)) = crate::lock(&state.tickets).lookup_ttl(&ticket) else {
+        return raw_not_found();
     };
-    let mut file = match tokio::fs::File::open(&path).await {
+    let file = match tokio::fs::File::open(&path).await {
         Ok(file) => file,
         Err(err) => {
             tracing::warn!(path = %path.display(), %err, "ticketed file unreadable");
-            return not_found();
+            return raw_not_found();
         }
     };
-    let total = match file.metadata().await {
+    let meta = match file.metadata().await {
         // Tickets may now name directories (folder downloads); /raw itself
         // stays file-only — a dir ticket here is a 404, not a listing.
-        Ok(meta) if meta.is_file() => meta.len(),
-        Ok(_) => return not_found(),
+        Ok(meta) if meta.is_file() => meta,
+        Ok(_) => return raw_not_found(),
         Err(err) => {
             tracing::warn!(path = %path.display(), %err, "ticketed file unstattable");
-            return not_found();
+            return raw_not_found();
         }
     };
+    serve_raw(file, &meta, &path, &headers, fresh_for).await
+}
+
+/// GET /raw/{ticket}/{*rest} — a file beside an HTML report, so the report's
+/// relative `app.js`, `style.css` or `figs/a.png` load inside its frame (the
+/// previews point the frame at `/raw/{ticket}/{its own name}`, which makes
+/// every relative URL land here). Only a ticket naming an HTML document
+/// opens its folder, and only downward: `rest` must be plain components (no
+/// `..`, no absolute path, no hidden `.name` anywhere), and every component
+/// is opened `O_NOFOLLOW` beneath the folder's descriptor
+/// ([`crate::download::open_beneath`]), so a symlink can never lead out of
+/// the subtree. Same sandbox CSP, range and cache rules as [`raw`]. The
+/// frame has no origin, so its scripts can LOAD these files (script, style,
+/// image, media tags) but never READ them with fetch/XHR — no CORS header is
+/// sent on purpose: a report must not be able to read out its neighbors.
+pub(crate) async fn raw_asset(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path((ticket, rest)): axum::extract::Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    let Some((path, fresh_for)) = crate::lock(&state.tickets).lookup_ttl(&ticket) else {
+        return raw_not_found();
+    };
+    if !opens_its_folder(&path) {
+        return raw_not_found();
+    }
+    let (Some(relative), Some(dir)) = (asset_relative(&rest), path.parent()) else {
+        return raw_not_found();
+    };
+    let dir = dir.to_path_buf();
+    let permit = FILESYSTEM_WORK
+        .acquire()
+        .await
+        .expect("filesystem work semaphore is never closed");
+    let target = relative.clone();
+    let opened = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        open_asset(&dir, &target)
+    })
+    .await;
+    let (file, meta) = match opened {
+        Ok(Ok(opened)) => opened,
+        _ => return raw_not_found(),
+    };
+    serve_raw(
+        tokio::fs::File::from_std(file),
+        &meta,
+        &relative,
+        &headers,
+        fresh_for,
+    )
+    .await
+}
+
+fn raw_not_found() -> Response {
+    (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response()
+}
+
+/// Whether a ticket's file opens its folder to [`raw_asset`]: HTML documents
+/// only (a report's page is what references neighbors by relative URL).
+fn opens_its_folder(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            ["html", "htm", "xhtml"]
+                .iter()
+                .any(|html| ext.eq_ignore_ascii_case(html))
+        })
+}
+
+/// `rest` as a relative path of plain, visible components, or `None`.
+/// Axum has already percent-decoded it, so `%2e%2e` arrives as `..` here.
+fn asset_relative(rest: &str) -> Option<PathBuf> {
+    if rest.is_empty() || rest.starts_with('/') || rest.contains('\0') {
+        return None;
+    }
+    let mut out = PathBuf::new();
+    for part in rest.split('/') {
+        // Empty (`a//b`), `.`, `..` and hidden names are all refused: a
+        // report has no business reaching `.git/` or `.env`.
+        if part.is_empty() || part.starts_with('.') {
+            return None;
+        }
+        out.push(part);
+    }
+    Some(out)
+}
+
+/// Open `relative` beneath `dir` without following any symlink, as a
+/// regular file (O_NONBLOCK: a planted FIFO must not park the worker).
+fn open_asset(dir: &Path, relative: &Path) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
+    let root = std::fs::File::from(rustix::fs::open(
+        dir,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )?);
+    let file = crate::download::open_beneath(
+        &root,
+        relative,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC
+            | rustix::fs::OFlags::NONBLOCK,
+    )?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    Ok((file, meta))
+}
+
+/// The strong `ETag` of a `/raw` response: the file's version token (the
+/// `X-Mtime` fingerprint) and its size.
+fn raw_etag(meta: &std::fs::Metadata) -> String {
+    format!("\"{}-{}\"", mtime_token(meta), meta.len())
+}
+
+/// `If-None-Match` names `etag` (weak comparison, as RFC 9110 asks for
+/// this header) or is `*`.
+fn etag_matches(headers: &HeaderMap, etag: &str) -> bool {
+    let Some(value) = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return false;
+    };
+    let bare = |tag: &str| tag.trim().trim_start_matches("W/").to_string();
+    let want = bare(etag);
+    value
+        .split(',')
+        .any(|tag| tag.trim() == "*" || bare(tag) == want)
+}
+
+/// Stream an opened regular file as a `/raw` response. Caching: a strong
+/// `ETag` (version token + size), `Last-Modified`, and `Cache-Control:
+/// private, max-age=` the ticket's remaining life — the URL is stable per
+/// file version (see [`TicketStore`]), so within that window the browser
+/// reuses its copy outright and afterwards revalidates to a 304 instead of
+/// re-downloading over the tunnel. `name` decides the content type.
+async fn serve_raw(
+    mut file: tokio::fs::File,
+    meta: &std::fs::Metadata,
+    name: &Path,
+    headers: &HeaderMap,
+    fresh_for: Duration,
+) -> Response {
+    let total = meta.len();
+    let etag = raw_etag(meta);
+    let mut validators: Vec<(HeaderName, HeaderValue)> = vec![
+        (header::ETAG, ascii_header(&etag)),
+        (
+            header::CACHE_CONTROL,
+            ascii_header(&format!("private, max-age={}", fresh_for.as_secs())),
+        ),
+    ];
+    if let Ok(modified) = meta.modified() {
+        validators.push((
+            header::LAST_MODIFIED,
+            ascii_header(&httpdate::fmt_http_date(modified)),
+        ));
+    }
+    if etag_matches(headers, &etag) {
+        let mut response = StatusCode::NOT_MODIFIED.into_response();
+        response.headers_mut().extend(validators);
+        return response;
+    }
 
     let range = headers
         .get(header::RANGE)
@@ -4469,11 +4725,11 @@ pub(crate) async fn raw(
     let len = if total == 0 { 0 } else { end - start + 1 };
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
     if let Err(err) = file.seek(SeekFrom::Start(start)).await {
-        tracing::warn!(path = %path.display(), %err, "ticketed file read failed");
-        return not_found();
+        tracing::warn!(path = %name.display(), %err, "ticketed file read failed");
+        return raw_not_found();
     }
 
-    let mime = mime_guess::from_path(&path).first_or_octet_stream();
+    let mime = mime_guess::from_path(name).first_or_octet_stream();
     // Stream the selected span. The previous `vec![0; len]` loaded an
     // un-ranged file (or attacker-chosen large range) wholly into daemon RSS.
     let body = Body::from_stream(tokio_util::io::ReaderStream::new(file.take(len)));
@@ -4487,13 +4743,16 @@ pub(crate) async fn raw(
         body,
     )
         .into_response();
+    response.headers_mut().extend(validators);
     if status == StatusCode::PARTIAL_CONTENT {
         if let Ok(value) = HeaderValue::from_str(&format!("bytes {start}-{end}/{total}")) {
             response.headers_mut().insert(header::CONTENT_RANGE, value);
         }
     }
     let sandbox = match mime.essence_str() {
-        "text/html" => Some(HeaderValue::from_static("sandbox allow-scripts")),
+        "text/html" | "application/xhtml+xml" => {
+            Some(HeaderValue::from_static("sandbox allow-scripts"))
+        }
         "image/svg+xml" => Some(HeaderValue::from_static("sandbox")),
         _ => None,
     };

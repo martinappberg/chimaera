@@ -141,6 +141,9 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   Control** tag under its bubble (unverified end to end — see PROTOCOL.md Pass 30). The daemon
   setting **Remote Control at Start (Claude)** (`chat.remoteControlAtStart`, default off) turns it
   on for every new Claude chat as soon as it handshakes, registered as `chimaera · <workspace>`.
+  A daemon restart brings the bridge back as it was — on if it was on, off if you had turned it
+  off — whatever that setting says (see the restart carryover in
+  [lifecycle-and-persistence.md](lifecycle-and-persistence.md)).
   Codex's Remote Control belongs to its shared app-server daemon (`codex remote-control start`
   / `codex remote-control pair`), not to the per-session app-server chimaera drives, so a Codex chat
   only relays its status; the popover says how to turn it on.
@@ -183,7 +186,8 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   confirms it. The parser is the terminal's (`shared/fileRef.ts`: `:12`, `:12:3`, `#L12-L20`,
   `@mentions`, `a/`/`b/` diff sides, `…/` tails, `file://`, wrappers and punctuation, Unicode), and
   the candidates resolve against the session's live cwd, its spawn cwd and the workspace root,
-  then the workspace index (unique basename or path suffix). Click opens the file at the line;
+  then the workspace index (unique basename or path suffix). Click opens the file at the line, or
+  at a locator's spot (`paper.pdf#page=3&xywh=…`, `de.tsv#row=5-9`, `demo.mp4#t=30`);
   Cmd/Ctrl+click opens it in a split; a directory opens in the Finder; a name several files
   answer to (dashed underline) asks which in the context menu. Every renderer in a chat shares one
   batched, cached resolver (`paths.ts` `PathResolver`), its answers keyed by the candidate AND the
@@ -253,18 +257,25 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
 - **Hydration + history window.** A fresh attach folds replay into the reducer behind one quiet
   "loading recent conversation" state until the advertised journal `head` arrives; it then mounts
   the newest 64 blocks bottom-anchored in one paint, rather than visibly growing from the oldest
-  message. Approaching the top automatically pages 64 earlier blocks while preserving the paragraph
-  under the reader; a manual earlier control appears only as a compatibility fallback when automatic
-  observation is unavailable. Paging back toward newer history remains explicit, and the middle of a
-  long conversation is never skipped just because the bounded page no longer contains the live edge.
-  The DOM window stays capped at 192 blocks and a clear jump returns directly to the live tail.
+  message. Scrolling pages automatically in both directions: the next 64 blocks mount about two
+  viewports ahead of the reader in whichever direction they are travelling (one page per frame), so
+  a flick through history never stops dead at the rendered edge, and scrolling back down continues
+  contiguously — the middle of a long conversation is never skipped. Manual earlier/later controls
+  appear only as a compatibility fallback when automatic observation is unavailable. The DOM window
+  stays capped at 192 blocks and a clear jump returns directly to the live tail. A spacer above the
+  window stands in for the unmounted earlier history (sized from the blocks' content), so the
+  scrollbar reflects everything above the reader and dragging it up lands on the matching page.
   Historical artifact tickets, table queries, image decodes, and PDF embeds wait until their
   preview approaches the viewport. This is client-side rendering pagination, not lossy history: the
   reducer still holds the capped 2000-block transcript and the daemon journal remains authoritative.
   Replay/live/control frames are reduced through one order-preserving cooperative queue, yielding
   between bounded slices so a large remote journal cannot monopolize navigation clicks.
 - **Scroll ownership.** Stream events, Markdown reveals, and late artifact sizing all request
-  bottom-follow through one frame-coalesced scroll writer. Paging explicitly into older history
+  bottom-follow through one frame-coalesced scroll writer. A reader scrolled up into history keeps
+  the paragraph under them fixed through every change above it — a page mounting or dropping, a
+  preview decoding, activity lines folding — on every engine: the history spacer absorbs the shift
+  instead of the scroll position being rewritten mid-gesture, which the native app's WebKit (no
+  scroll anchoring, a scrolling thread that owns flings) would snap back for a frame. Paging explicitly into older history
   keeps that historical page stable until the reader returns to newest; merely scrolling within the
   live tail does not freeze it. Visible tail rows point directly at the reducer's reactive blocks, so a
   streamed delta updates its own row instead of cloning/repainting the whole window. The tail keeps
@@ -456,13 +467,34 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
 
 ## Inline artifacts
 
-- **What & when.** The output *is* the point of many jobs — after a turn's closing prose, a gallery
-  previews the previewable files that turn produced (image thumbnail, CSV/TSV first-rows peek,
-  embedded PDF). Click a tile to open the full viewer in a pane.
-- **Where.** `ArtifactGallery.svelte`, `InlinePreview.svelte`; `turn_end.artifacts` collected by
-  scanning back to the turn boundary (only *written* previewable files + touched images; a merely
-  *read* CSV isn't an artifact; capped at 8). Uses `POST /api/v1/fs/ticket` → `GET /raw/{ticket}` and
-  `GET /api/v1/fs/table`.
+- **What & when.** The output *is* the point of many jobs. Files show in the transcript as **embed
+  cards** — the same cards documents use ([files & previews](files-and-previews.md#embed-cards)):
+  a figure, a PDF page, a table slice, a sandboxed HTML report with its assets, a notebook cell, a
+  slide, a player, a document excerpt, a file card. Click a card's name (or ↗) to open the full
+  viewer in a pane at the same spot.
+- **Images in agent prose.** `![alt](figs/plot.png)` renders the file (it used to be a broken
+  image): the target resolves against the session's live directory, then where it started, then
+  the workspace root — strictly, an embed names one file — and any fragment picks the piece
+  (`paper.pdf#page=3`, `run.py#L10-L30`, `data.csv#row=2-9`). A file the agent announces before
+  writing shows as "not found" and turns into its card when it appears.
+- **Made this turn.** After a turn's closing prose, a gallery of compact tiles shows what the turn
+  made — including files written by **shell commands** (a plot saved by a script, a rendered
+  report), not only by edit tools. HTML reports, markdown, PDFs, tables and spreadsheets,
+  notebooks, slides and media; never source code (its diff is in the tool card). A stopped or
+  failed turn keeps its gallery. Tiles stay fresh when a file is overwritten, and say so when one
+  is gone.
+- **How the gallery finds shell-written files.** No structured event names them, so the reducer
+  lists the artifact-shaped paths the turn's commands, command outputs and prose *mention*
+  (`artifacts.ts`), and the gallery keeps those the daemon confirms exist and were **modified
+  inside the turn** — between its journal-stamped start and end (daemon clock on both sides, a few
+  seconds' slack). A file merely `cat`-ed, or rewritten by a later turn, stays out. One
+  `resolve_targets` round trip per gallery, when it nears the viewport; replay rebuilds the same
+  `turn_end` from the journal.
+- **Where.** `Markdown.svelte` (the sanitizer moves a local `<img>` src out of reach; cards mount
+  beside the placeholder on settled content and closed stream segments, and are destroyed with
+  it), `ArtifactGallery.svelte`, `artifacts.ts`, `embeds.ts` (`EmbedResolver`),
+  `store.svelte.ts` (`turn_end.artifacts` / `mentioned` / `startedAtMs` / `endedAtMs` /
+  `aborted`), `shared/embed/`. Uses `POST /api/v1/fs/resolve_targets` and `GET /raw/{ticket}`.
 
 ## Reconnect & gap-replay
 
@@ -536,7 +568,9 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
 ## Status: partial
 
 - Chat sessions survive a *disconnect* **and a daemon restart** — the ledger resurrects them live
-  (resuming the native conversation, carrying the pinned title). A normally finished Codex chat
+  (resuming the native conversation, carrying the pinned title, the Remote Control bridge and
+  ultracode; a turn or background work the restart cut off is handed back to the agent in one
+  message tagged **sent by chimaera after a restart**, setting `chat.resumeAfterRestart`). A normally finished Codex chat
   preserves its native thread id in Recents, whose click starts `thread/resume` under a new Chimaera
   session id (see [lifecycle-and-persistence.md](lifecycle-and-persistence.md)).
 - Codex rewind's rollback count only sees turns the chat journal saw (TUI-interleaved turns
