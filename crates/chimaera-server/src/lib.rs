@@ -20,6 +20,7 @@ mod ledger;
 mod lifecycle;
 mod links;
 mod mcp;
+mod mycelium;
 mod naming;
 mod notes;
 mod persist;
