@@ -116,6 +116,11 @@
 
   let { path, fontSize = undefined, wsRoot = null }: Props = $props();
 
+  /** The path as a value: the host can hand this view its props anew with
+   *  nothing changed (it does when the buffer turns dirty), and a per-path
+   *  reset on that would remount the editor under the first keystroke. */
+  const filePath = $derived(path);
+
   /** Read at click time, so the memoized live extension set never has to
    *  change when the workspace does. The window's workspace enables the
    *  daemon's by-name fallback (a wikilink, a moved file). */
@@ -196,7 +201,7 @@
   const liveSet = $derived(
     liveMod === null
       ? null
-      : [liveMod.markdownLanguageExt, liveMod.markdownLive(path, linkContext)],
+      : [liveMod.markdownLanguageExt, liveMod.markdownLive(filePath, linkContext)],
   );
   const sourceSet = $derived(liveMod === null ? null : [liveMod.markdownLanguageExt]);
   let editorMode = $state<"live" | "source">("live");
@@ -268,10 +273,10 @@
   // one this file was last shown in, else the setting — read untracked, so a
   // settings change never resets an open document.
   $effect(() => {
-    void path;
+    const p = filePath;
     const initial = untrack(() => {
       const setting = getSetting("editor.markdownDefaultMode");
-      return modeMemory.get(path) ?? (isMdMode(setting) ? setting : "reading");
+      return modeMemory.get(p) ?? (isMdMode(setting) ? setting : "reading");
     });
     mode = initial;
     editorMode = initial === "source" ? "source" : "live";
@@ -293,17 +298,17 @@
     currentHeading = -1;
   });
 
-  // Retain + open the chosen mode. `path` is the only tracked dependency —
+  // Retain + open the chosen mode. The path is the only tracked dependency —
   // the store's retain()/ensure* guards are untracked by design (and
   // openDefault's read of `mode` is untracked here), so an in-place payload
   // refresh (a save, an agent write) or a mode click can never re-run this
   // effect and remount the editor over a dirty buffer.
   $effect(() => {
-    void path;
-    const e = retain(path);
+    const p = filePath;
+    const e = retain(p);
     entry = e;
     untrack(() => void openDefault(e));
-    return () => release(path);
+    return () => release(p);
   });
 
   /** Adopt the fetched source into local state. Oversized/binary chunks are
@@ -405,7 +410,7 @@
 
   $effect(() => {
     const el = clientArticle;
-    const docPath = path;
+    const docPath = filePath;
     if (el === null) return;
     const win = createReadingWindow(el);
     const r = new DocReader(el, {
