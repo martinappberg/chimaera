@@ -7,12 +7,13 @@ use super::support::*;
 use crate::*;
 
 /// Every session's MCP tools (the linked-terminal and document tools).
-const BASE_TOOLS: [&str; 5] = [
+const BASE_TOOLS: [&str; 6] = [
     "list_terminals",
     "run_in_terminal",
     "read_terminal",
     "document_guide",
     "check_document",
+    "notify",
 ];
 
 /// PUT the mastermind and return (status, body).

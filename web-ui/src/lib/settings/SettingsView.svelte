@@ -13,6 +13,7 @@
   import AgentsSettings from "./AgentsSettings.svelte";
   import EnvironmentSettings from "./EnvironmentSettings.svelte";
   import DocumentsSettings from "./DocumentsSettings.svelte";
+  import NotificationStatus from "./NotificationStatus.svelte";
   import { APP_MENU, PINNED } from "../shared/keys";
   import { activeModLabel } from "../shared/keybindings";
 
@@ -224,6 +225,16 @@
                  /api/v1/agent-docs. It renders its own <h2>. -->
             <section data-section={group.category}>
               <DocumentsSettings />
+            </section>
+          {:else if group.category === "Notifications"}
+            <!-- Generic rows plus a status line: whether the OS/browser will
+                 show the alerts at all, with the action that changes it. -->
+            <section data-section={group.category}>
+              <h2 class="cat">{group.category}</h2>
+              <NotificationStatus />
+              {#each group.defs as def (def.id)}
+                <SettingRow {def} />
+              {/each}
             </section>
           {:else}
             <section data-section={group.category}>

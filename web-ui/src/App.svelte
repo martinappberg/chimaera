@@ -36,7 +36,7 @@
     listSessions,
     listWorkspaces,
     renameSession,
-    needsAttention,
+    needsApproval,
     pollSessions,
     switchingViews,
     switchSessionView,
@@ -161,6 +161,7 @@
     tabCount,
     tabKey,
     toggleZoom,
+    visibleSessionIds,
     type AdoptSpot,
     type FocusDir,
     type Layout,
@@ -237,15 +238,19 @@
     onCaffeinateChanged,
     onHostStatus,
     onLocalDaemonUpdated,
+    onFocusSession,
     onMenu,
     openDetachedPopup,
     openDetachedWindow,
     reportWindowScope,
+    reportWindowView,
     setCaffeinate,
     setNativeWindowTitle,
     shellBuild,
+    takePendingFocus,
     type HostStatusEvent,
   } from "./lib/net/native";
+  import { clearBrowserNotices, deliverBrowserNotices } from "./lib/workspace/notices";
   import UpdateToast from "./lib/workspace/UpdateToast.svelte";
   import { currentOffer, updateState } from "./lib/workspace/update.svelte";
   import * as pool from "./lib/terminal/termPool";
@@ -1013,6 +1018,31 @@
   /** terminal session id -> agent session id (one agent per terminal). */
   const linksByTerminal = $derived(new Map(links.map((l) => [l.terminal_id, l.agent_id])));
   const focusedSessionId = $derived(focusedSessionOf(layout));
+  /** Sessions on screen in this window (each pane's active tab). */
+  const visibleSessions = $derived(
+    activeWsId !== null && layoutReady ? visibleSessionIds(layout) : [],
+  );
+  // Tell the notifier what this window shows, so it never alerts about a
+  // session the user is looking at — and clears alerts for ones they now
+  // are. Keyed on the joined ids so a layout write that changes nothing on
+  // screen costs no IPC.
+  const visibleKey = $derived(visibleSessions.join(" "));
+  $effect(() => {
+    const key = visibleKey;
+    const ids = key === "" ? [] : key.split(" ");
+    if (isNativeShell()) {
+      const timer = setTimeout(() => void reportWindowView(ids).catch(() => {}), 120);
+      return () => clearTimeout(timer);
+    }
+    if (document.hasFocus()) clearBrowserNotices(ids);
+  });
+  // Browser: coming back to this tab is looking at what it shows.
+  $effect(() => {
+    if (isNativeShell()) return;
+    const onFocus = (): void => clearBrowserNotices(untrack(() => visibleSessions));
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  });
   const focusedFilePath = $derived(focusedFileOf(layout));
   /** Open file tabs' display titles (basename, disambiguated by parent dir). */
   const fileTitles = $derived(fileTabTitles(allFilePaths(layout)));
@@ -1020,7 +1050,7 @@
     layout.zoomedPaneId !== null ? findPane(layout.root, layout.zoomedPaneId) : null,
   );
 
-  /** Sessions in the active workspace waiting on the user. */
+  /** Sessions in the active workspace blocked on the user's approval. */
   // A detached solo window badges only ITS OWN sessions: workspace-wide
   // attention is the main window's wayfinding, and a torn-off pane wearing
   // the whole roster's badge reads as a false alarm (found live).
@@ -1030,9 +1060,9 @@
   // session, and a pill/title saying 1 while the dashboard says 0 is exactly
   // the stale state this count exists to prevent.
   const needsYou = $derived.by(() => {
-    if (!detachedWindow) return wsSessions.filter((s) => s.alive && needsAttention(s)).length;
+    if (!detachedWindow) return wsSessions.filter((s) => s.alive && needsApproval(s)).length;
     const mine = new Set(allSessionIds(layout));
-    return wsSessions.filter((s) => s.alive && mine.has(s.id) && needsAttention(s)).length;
+    return wsSessions.filter((s) => s.alive && mine.has(s.id) && needsApproval(s)).length;
   });
 
   /** The focused pane is showing the dashboard (its rail row highlights). */
@@ -1419,6 +1449,15 @@
         }
       },
       onFs: notifyDiskChange,
+      // The browser's notification source. The native app ignores these: its
+      // shell consumes the same feed per daemon and posts OS notifications.
+      onNotices: (list) => {
+        if (isNativeShell()) return;
+        deliverBrowserNotices(list, {
+          visible: untrack(() => visibleSessions),
+          onClick: focusFromNotification,
+        });
+      },
       onStatus: (up) => {
         // A recovered events socket often means a re-established tunnel — a
         // different link. Drop the RTT window so the rolling minimum can't
@@ -1454,7 +1493,20 @@
     let unlistenHostStatus: (() => void) | null = null;
     let unlistenAppUpdate: (() => void) | null = null;
     let unlistenCaffeinate: (() => void) | null = null;
+    let unlistenFocusSession: (() => void) | null = null;
     if (isNativeShell()) {
+      // A notification was clicked for a session this window should show.
+      // Listen first, then ask for a focus the shell may already owe us (a
+      // click that OPENED this window can beat the listener).
+      const focusListening = onFocusSession(focusFromNotification);
+      unlistenFocusSession = asyncDisposer(focusListening);
+      void focusListening.then(
+        () =>
+          takePendingFocus().then((id) => {
+            if (id !== null) focusFromNotification(id);
+          }),
+        () => {},
+      );
       // Build-skew + app-update signals for the update toast.
       void shellBuild().then((b) => (appBuild = b));
       // Caffeinate state: attach the cross-window broadcast FIRST, then read
@@ -1544,6 +1596,7 @@
       unlistenHostStatus?.();
       unlistenAppUpdate?.();
       unlistenCaffeinate?.();
+      unlistenFocusSession?.();
       document.removeEventListener("copy", onCopy);
       window.removeEventListener("dragenter", onWindowDragEnter);
       window.removeEventListener("dragover", onWindowDragOver);
@@ -2871,6 +2924,35 @@
       pendingReveal = sessionId;
     }
   }
+
+  /**
+   * A notification was clicked for `sessionId`: show it here. Works before
+   * this window knows the session (a window a click just opened) — the id
+   * waits for the roster, then for the layout, like a worktree reveal.
+   */
+  function focusFromNotification(sessionId: string): void {
+    const s = sessionsById.get(sessionId);
+    if (s === undefined) {
+      if (!gotSessions) pendingNoticeFocus = sessionId;
+      return;
+    }
+    if (s.workspace_id !== activeWsId) {
+      void revealWorktreeSession(sessionId, s.workspace_id);
+      return;
+    }
+    if (!layoutReady) {
+      pendingReveal = sessionId;
+      return;
+    }
+    openSess(sessionId);
+  }
+  let pendingNoticeFocus = $state<string | null>(null);
+  $effect(() => {
+    if (!gotSessions || pendingNoticeFocus === null) return;
+    const id = pendingNoticeFocus;
+    pendingNoticeFocus = null;
+    untrack(() => focusFromNotification(id));
+  });
 
   // Focus a pending session once the incoming workspace's layout has booted.
   let pendingReveal: string | null = null;
@@ -4363,7 +4445,10 @@
           </svg>
         </button>
         {#if needsYou > 0}
-          <span class="needs" title="{needsYou} need{needsYou === 1 ? 's' : ''} you">
+          <span
+            class="needs"
+            title="{needsYou} waiting for your approval — a permission or a question"
+          >
             {needsYou}
           </span>
         {/if}
@@ -4524,6 +4609,10 @@
                 <!-- Which-key discovery: the ⌘1–9 digit for this row, faded in
                      while the modifier is held. Pure teaching chrome. -->
                 <span class="kbd-badge" aria-hidden="true">{chordDigits.get(s.id)}</span>
+              {:else if renamingId !== s.id && isUnread(s.id)}
+                <!-- Unread: the scannable half of the cue (the bold name is
+                     the readable half). Yields to the close button on hover. -->
+                <span class="unread-dot" aria-hidden="true"></span>
               {/if}
               <button
                 class="close"
@@ -5138,6 +5227,9 @@
                 backgrounded={backgrounded(s)}
               />
               <span class="chip-name">{displayNames.get(s.id) ?? displayName(s)}</span>
+              {#if isUnread(s.id)}
+                <span class="chip-unread" aria-hidden="true"></span>
+              {/if}
               {#if hintsActive() && chordDigits.has(s.id)}
                 <span class="chip-badge" aria-hidden="true">{chordDigits.get(s.id)}</span>
               {/if}
@@ -5155,7 +5247,9 @@
         <!-- Scoped upstream: in a detached window this counts only the
              sessions THIS window shows, so it never false-alarms for the
              rest of the workspace. -->
-        <span class="strip-needs">{needsYou} need{needsYou === 1 ? "s" : ""} you</span>
+        <span class="strip-needs" title="a permission or a question is waiting on you"
+          >{needsYou} awaiting approval</span
+        >
       {/if}
       {#if detachedWindow && detachOrigin !== null}
         <!-- Send everything in this solo window back where it came from; the
@@ -5808,15 +5902,57 @@
     }
   }
 
-  /* Unread output: finished with output you haven't looked at. The quietest
-     cue that still reads — a bolder name (the unread-mail convention), no bar
-     or wash in the dense rail so it never looks like a hover/active state.
-     The dashboard card wears the same bold name over a faint wash. A focused
-     row is never unread, so this never fights the active state. */
+  /* Unread output: an agent finished (or handed back, waiting for input)
+     and you haven't looked yet. Two halves, the unread-mail convention: a
+     bolder full-ink name you READ, and a small accent dot you SCAN for down
+     the rail. Still no bar or wash in the dense rail — those read as hover /
+     active. The same pair marks pane tabs, strip chips, and dashboard cards.
+     A focused row is never unread, so this never fights the active state.
+     Counts are reserved for approvals (see needsApproval): unread never adds
+     a number anywhere. */
   .row.unread .name,
   .chip.unread .chip-name {
     color: var(--fg);
     font-weight: 600;
+  }
+
+  /* Sits in the close button's slot (right edge, like the ⌘-digit badge),
+     so marking never reflows the label; hover hands the slot back to ×. */
+  .unread-dot {
+    position: absolute;
+    right: 11px;
+    top: 50%;
+    width: 6px;
+    height: 6px;
+    margin-top: -3px;
+    border-radius: 50%;
+    background: var(--accent);
+    pointer-events: none;
+    transition: opacity 0.12s ease;
+    animation: unread-in 0.28s ease-out;
+  }
+
+  .row:hover .unread-dot,
+  .row:focus-within .unread-dot {
+    opacity: 0;
+  }
+
+  .chip-unread {
+    flex: none;
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    background: var(--accent);
+    animation: unread-in 0.28s ease-out;
+  }
+
+  /* One-shot arrival (not an infinite presence animation — nothing to pause
+     while hidden). */
+  @keyframes unread-in {
+    from {
+      opacity: 0;
+      transform: scale(0.3);
+    }
   }
 
   .row.new {

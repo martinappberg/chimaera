@@ -36,6 +36,7 @@ owns the text; the confirm dialog shows it verbatim before anything is written.
 | `environment.ts` | Wire types + `getEnvironment`/`putEnvironment` for the prelude map. |
 | `DocumentsSettings.svelte` | The Documents panel: the opt-in AGENTS.md / Claude skill installs (see the exception above). |
 | `agentDocs.ts` | Wire types + `getAgentDocs`/`installAgentDocs` for `/api/v1/agent-docs`. |
+| `NotificationStatus.svelte` | The Notifications section's status line: whether the OS (native) or browser will show alerts, with Allow / Open System Settings / Send test. The switches below it are ordinary schema rows. |
 | `SettingRow.svelte` | One schema-driven control. |
 | `SettingsJson.svelte` | The raw-JSON editor (validates against the schema). |
 

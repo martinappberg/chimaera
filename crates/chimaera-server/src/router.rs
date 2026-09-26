@@ -7,7 +7,8 @@ use tower_http::trace::TraceLayer;
 use crate::AppState;
 use crate::{
     agents, api, chat, compute, compute_jobs, download, drafts, environment, fs, git, launcher,
-    links, mcp, proxy, quickopen, recents, runtimes, settings, update, upload, view_state, ws,
+    links, mcp, notices, proxy, quickopen, recents, runtimes, settings, update, upload, view_state,
+    ws,
 };
 
 /// Build the axum router (factored out so tests can drive it with `oneshot`).
@@ -68,6 +69,8 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         .route("/agents/claude/sessions", get(launcher::claude_resumables))
         .route("/recents", get(recents::list_recents))
         .route("/update", get(update::get_update))
+        // The native shell's notice long-poll (agent finished / needs you).
+        .route("/notices", get(notices::get_notices))
         .route(
             "/view-state/{key}",
             get(view_state::get_view_state).put(view_state::put_view_state),

@@ -21,6 +21,7 @@ mod lifecycle;
 mod links;
 mod mcp;
 mod naming;
+mod notices;
 mod persist;
 mod proxy;
 mod quickopen;
