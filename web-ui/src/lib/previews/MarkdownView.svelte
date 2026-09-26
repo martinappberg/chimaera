@@ -189,7 +189,7 @@
    *  Width) — a document is never wider than a transcript. The column
    *  itself is 48em of the document font (`.md-body`), so it keeps its
    *  characters per line through A−/A+. */
-  const measure = $derived(getSetting("chat.contentWidth"));
+  const columnCap = $derived(getSetting("chat.contentWidth"));
   let chunk = $state<FileChunk | null>(null);
   let chunkError = $state<string | null>(null);
   /** Why an editor mode just refused (the file turned out over the cap or
@@ -575,6 +575,9 @@
     const t = e.target;
     if (!(t instanceof Element)) return;
     if (t.closest("a[href], button, input, select, textarea, summary, video, audio, iframe, .md-task") !== null) return;
+    // A double-tap on a wide table's or fence's own scrollbar is scrolling.
+    const scroller = t.closest("table, pre > code, .md-math-display, .md-mermaid-svg");
+    if (liveMod?.onScrollbarBand(scroller, e) === true) return;
     // The word the double-click selected would otherwise linger under the
     // editor's own cursor.
     document.getSelection()?.removeAllRanges();
@@ -589,6 +592,8 @@
    *  preview did (it stops the key on the window, capturing). */
   function onEditorKey(e: KeyboardEvent): void {
     if (e.key !== "Escape" || e.defaultPrevented || e.isComposing || mode !== "live" || !editing) return;
+    // The editor's own key, not an overlay's inside the layer.
+    if (!(e.target instanceof Element) || e.target.closest(".cm-editor") === null) return;
     e.preventDefault();
     leaveEditing();
   }
@@ -694,12 +699,16 @@
     req: number,
     point: { x: number; y: number } | null = null,
   ): Promise<void> {
+    if (place === null && point === null) return;
     await tick();
     for (let tries = 0; tries < 60; tries++) {
       if (req !== modeReq) return;
       const view = editorView();
       if (view !== null && view.scrollDOM.clientHeight > 0) {
         if (place !== null) await liveMod?.restoreEditorPlace(view, place.line, place.offset, place.height);
+        // No place to settle to: still give a fresh mount its first frames,
+        // so the blocks under the point are drawn before it is read.
+        else await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
         if (point === null || req !== modeReq) return;
         // Re-found: the editor may have remounted while the place settled.
         const now = editorView();
@@ -1447,7 +1456,7 @@
   </section>
 {/snippet}
 
-<div class="md-view" style:--markdown-line-height={bodyLineHeight} style:--doc-measure="{measure}px">
+<div class="md-view" style:--markdown-line-height={bodyLineHeight} style:--doc-measure="{columnCap}px">
   <div class="md-bar">
     <div class="toggle" role="tablist" aria-label="markdown mode">
       <button
@@ -1805,7 +1814,7 @@
        was ~460px of text: cramped on a desktop pane. Plus this box's side
        padding. The properties card and the live editor's column match
        (below; mdLive). */
-    max-width: calc(min(48em, var(--doc-measure)) + 4rem);
+    max-width: calc(min(48em, var(--doc-measure, 52rem)) + 4rem);
     margin: 0 auto;
     padding: 2.2rem 2rem 3.5rem;
     font-size: var(--text-lg);
@@ -1831,7 +1840,7 @@
   /* Same box as .md-body (border-box via app.css), so the card lines up
      with the column under it. */
   .md-view :global(.md-props) {
-    max-width: calc(min(48em, var(--doc-measure)) + 4rem);
+    max-width: calc(min(48em, var(--doc-measure, 52rem)) + 4rem);
     margin: 1.6rem auto 0;
     padding: 0 2rem;
     line-height: 1.45;

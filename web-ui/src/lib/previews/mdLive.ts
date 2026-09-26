@@ -91,7 +91,7 @@ import {
 } from "./mdBlocks";
 import { bodyTree, isFigureLine } from "./doc/live";
 
-export { enterAtPoint, setLivePropsCollapsed, setLiveTheme } from "./mdBlocks";
+export { enterAtPoint, onScrollbarBand, setLivePropsCollapsed, setLiveTheme } from "./mdBlocks";
 
 /**
  * The GFM markdown language with the shared document extensions — `$`/`$$`
