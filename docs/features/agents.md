@@ -225,7 +225,8 @@ spawn.rs,recents.rs}`. Wire: `POST/GET/DELETE/PATCH /api/v1/sessions*`, `GET /ap
 - **Key behaviors.** The checker parses the document exactly as the reading view does (the same
   comrak extensions, frontmatter rule and `$$` promotion; lines stay in source numbering), then
   scans the lines outside code. **Errors:** broken relative links and embeds (with a case-mismatch
-  or root-relative fix when one exists), `#heading` fragments missing from a target `.md` (GitHub
+  or root-relative fix when one exists; a link that differs from the file on disk only in case is
+  broken even where the filesystem ignores case, since the Linux hosts and GitHub do not), `#heading` fragments missing from a target `.md` (GitHub
   slug rule, the nearest slug suggested), `#L` ranges past a file's end, same-document anchors
   with no heading or footnote, dangling footnote references and unused definitions.
   **Warnings:** absolute local paths (`/home/`, `/Users/`, `/scratch/`, `/tmp/`, `~`, `file://`,

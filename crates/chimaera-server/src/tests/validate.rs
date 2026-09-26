@@ -278,27 +278,44 @@ async fn fs_validate_lists_ambiguous_basenames() {
     );
 }
 
-/// Candidates longer than 1024 bytes are skipped even when they exist.
+/// Candidates longer than 1024 bytes are skipped even when they exist. The
+/// candidates are long, the files are not: `./` hops keep the paths on disk
+/// short. The cap is on the string an agent wrote, and macOS refuses any
+/// path argument of 1024 bytes or more (its PATH_MAX; Linux's is 4096)
+/// before a resolver sees it, so long real paths cannot even be created.
 #[tokio::test]
 async fn fs_validate_skips_candidates_over_1024_bytes() {
     let state = test_state();
     let base = test_dir("v-long");
-    let segment = "d".repeat(200);
-    let dir = (0..5).fold(base.clone(), |p, _| p.join(&segment));
-    std::fs::create_dir_all(&dir).unwrap();
-    // 5 × 201 bytes of directories + the file name.
-    let at_cap = format!("{}{}", format!("{segment}/").repeat(5), "f".repeat(19));
-    let over_cap = format!("{}{}", format!("{segment}/").repeat(5), "g".repeat(20));
+    // 1000 bytes that resolve to `base` itself.
+    let hops = "./".repeat(500);
+    let at_cap = format!("{hops}{}", "f".repeat(24));
+    let over_cap = format!("{hops}{}", "g".repeat(25));
     assert_eq!((at_cap.len(), over_cap.len()), (1024, 1025));
-    std::fs::write(base.join(&at_cap), "x").unwrap();
-    std::fs::write(base.join(&over_cap), "x").unwrap();
+    std::fs::write(base.join("f".repeat(24)), "x").unwrap();
+    std::fs::write(base.join("g".repeat(25)), "x").unwrap();
+    // A shorter hop-built candidate proves the fixture resolves, so the
+    // over-cap miss below is the cap's doing.
+    let long = format!("{}{}", "./".repeat(100), "f".repeat(24));
+    // The boundary itself is provable only where the OS takes
+    // `base/<1024 bytes>` as a syscall argument: Linux (CI) does; macOS
+    // answers ENAMETOOLONG whatever the path resolves to.
+    let boundary_provable = match std::fs::metadata(base.join(&at_cap)) {
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidFilename => false,
+        Err(e) => panic!("{e}"),
+    };
 
     let answer = validate(
         &state,
-        serde_json::json!({"candidates": [at_cap, over_cap], "base": base.to_string_lossy()}),
+        serde_json::json!({
+            "candidates": [long.clone(), at_cap.clone(), over_cap.clone()],
+            "base": base.to_string_lossy(),
+        }),
     )
     .await;
     let valid = answer["valid"].as_object().unwrap();
-    assert!(valid.contains_key(&at_cap));
+    assert!(valid.contains_key(&long));
+    assert_eq!(valid.contains_key(&at_cap), boundary_provable);
     assert!(!valid.contains_key(&over_cap));
 }
