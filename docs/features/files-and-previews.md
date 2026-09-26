@@ -240,7 +240,9 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
     render itself (same DOM, same manners: a click selects, a link opens, a rest previews, a
     drag references) until you **double-click** a block — then the editor takes the render's
     place with that block where it was and the cursor on the character under the pointer
-    (`MarkdownView` `editing`; mdBlocks `enterAtPoint`, the press mapping below) — and
+    (`MarkdownView` `editing`; mdBlocks `enterAtPoint`, the press mapping below); **Enter**
+    with the pane focused is the keyboard's way in, the cursor at the top block's first
+    line, scrolled into view — and
     **Esc**, or the live tab again, returns to the render with your place kept (the mode bar
     names both gestures). A document is read far more than it is edited, so live never
     turns a click into a cursor. In the editor, Typora's model: every top-level block

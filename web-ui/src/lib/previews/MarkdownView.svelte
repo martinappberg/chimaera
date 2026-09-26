@@ -520,6 +520,7 @@
     target: "live" | "source",
     place: Place | null = null,
     point: { x: number; y: number } | null = null,
+    keyboard = false,
   ): Promise<void> {
     const e = entry;
     if (e === null || editable === false) return;
@@ -550,7 +551,7 @@
     editing = target === "live";
     editorMode = target;
     modeMemory.set(path, target);
-    void placeEditor(place, req, point);
+    void placeEditor(place, req, point, keyboard);
   }
 
   /** Live's editor gives the render back its place (Esc, the live tab). */
@@ -585,6 +586,19 @@
     modeReq++;
     barNote = null;
     void enterEditor("live", place, { x: e.clientX, y: e.clientY });
+  }
+
+  /** Enter on the focused reading pane (the keyboard's double-click): edit
+   *  from the block at the top of the view. Only the pane itself — a link or
+   *  a button inside it keeps its own Enter. */
+  function onRenderKey(e: KeyboardEvent): void {
+    if (e.key !== "Enter" || e.target !== readingEl || !render || mode !== "live" || editable !== true) return;
+    if (e.metaKey || e.ctrlKey || e.altKey || e.shiftKey || e.isComposing) return;
+    e.preventDefault();
+    const place = capturePlace();
+    modeReq++;
+    barNote = null;
+    void enterEditor("live", place, null, true);
   }
 
   /** Esc in live's editor returns to the render — unless the editor took
@@ -698,8 +712,9 @@
     place: Place | null,
     req: number,
     point: { x: number; y: number } | null = null,
+    keyboard = false,
   ): Promise<void> {
-    if (place === null && point === null) return;
+    if (place === null && point === null && !keyboard) return;
     await tick();
     for (let tries = 0; tries < 60; tries++) {
       if (req !== modeReq) return;
@@ -709,10 +724,25 @@
         // No place to settle to: still give a fresh mount its first frames,
         // so the blocks under the point are drawn before it is read.
         else await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
-        if (point === null || req !== modeReq) return;
+        if (req !== modeReq) return;
         // Re-found: the editor may have remounted while the place settled.
         const now = editorView();
         if (now === null || liveMod === null) return;
+        if (point === null) {
+          // The keyboard's entry: the cursor at the top block's first line
+          // (where the reader was), brought into view — a block scrolled
+          // partly past the top starts above it — and the editor takes the
+          // keys.
+          if (keyboard) {
+            if (place !== null) {
+              const doc = now.state.doc;
+              const anchor = doc.line(Math.min(Math.max(1, place.line), doc.lines)).from;
+              now.dispatch({ selection: { anchor }, scrollIntoView: true });
+            }
+            now.focus();
+          }
+          return;
+        }
         if (liveMod.enterAtPoint(now, point.x, point.y)) return;
         const pos = now.posAtCoords(point, false);
         now.dispatch({ selection: { anchor: pos } });
@@ -1464,7 +1494,7 @@
         class:on={mode === "live"}
         role="tab"
         aria-selected={mode === "live"}
-        title={editable === false ? disabledReason : "the rendered document — double-click to edit in place, Esc to finish"}
+        title={editable === false ? disabledReason : "the rendered document — double-click (or Enter with the page focused) to edit in place, Esc to finish"}
         disabled={editable === false}
         onclick={() => setMode("live")}>live</button
       >
@@ -1530,7 +1560,9 @@
            Focusable so keyboard scrolling works in WKWebView (Safari never
            auto-focuses scrollers), named after the file for the landmark
            list. -->
-      <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+      <!-- The region's own keys (Enter edits, in live) and double-click: the
+           pane is the document, not a control inside it. -->
+      <!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_no_noninteractive_element_interactions -->
       <div
         class="md-scroll"
         class:hidden={!render}
@@ -1539,6 +1571,7 @@
         tabindex="0"
         bind:this={readingEl}
         ondblclick={onRenderDblclick}
+        onkeydown={onRenderKey}
       >
         {#if clientRender === true}
           {#if frontmatter !== null}{@render properties(frontmatter)}{/if}
