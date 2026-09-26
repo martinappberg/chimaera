@@ -2,7 +2,7 @@
   import { extractFileRefs, revealOf, type FileRef } from "../shared/fileRef";
   import MathText from "./MathText.svelte";
   import { splitUserMath } from "./math";
-  import { menuPoint, reopenResolution, type OpenPathFn, type PathResolver, type Resolution } from "./paths";
+  import { menuPoint, reopenResolution, uploadName, type OpenPathFn, type PathResolver, type Resolution } from "./paths";
 
   /**
    * The user's own message text: plain (never markdown — prompts are not
@@ -87,6 +87,14 @@
     return res?.state === "miss" ? undefined : res;
   }
 
+  /** What a linked reference reads as: its text, except that a mention of
+   *  an uploaded file reads as the file's name (`uploadName`). */
+  function label(t: Token): string {
+    if (!t.mention || t.ref === null) return t.text;
+    const name = uploadName(t.ref.path);
+    return name === null ? t.text : `@${name}`;
+  }
+
   function titleFor(t: Token, res: Resolution): string {
     if (res.state === "ambiguous") return `${t.text} matches ${res.matches.length} files — choose one`;
     if (res.state === "hit" && res.hit.kind === "dir") return `browse ${t.text} in the finder`;
@@ -119,7 +127,7 @@
         class:mention={t.mention}
         class:ambiguous={res.state === "ambiguous"}
         title={titleFor(t, res)}
-        onclick={(e) => activate(e, t, res)}>{t.text}</button>{:else}{t.text}{/if}{/each}</span
+        onclick={(e) => activate(e, t, res)}>{label(t)}</button>{:else}{t.text}{/if}{/each}</span
 >
 
 <style>

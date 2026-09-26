@@ -63,6 +63,16 @@ export function chatLinkContext(sessionId: string): LinkContext | null {
 
 // --- candidates a rendered element offers ------------------------------------------
 
+/** A file the daemon's upload landing pad holds (`<uploads>/<session-id>/<name>`
+ *  — OS drops, reference crops): its name, else null. The path is machine-made
+ *  and ~100 characters of noise in a message, so a mention of one reads as
+ *  its name; the whole path stays in the text the agent got and in the
+ *  tooltip. */
+export function uploadName(path: string): string | null {
+  const m = /\/uploads\/s-[0-9a-f]{8}\/([^/]+)$/.exec(path);
+  return m === null ? null : m[1];
+}
+
 /**
  * An inline code span's references: the whole span when it is one
  * (`src/x.rs:12`, `Screenshot (1).png`) and, when it holds several words

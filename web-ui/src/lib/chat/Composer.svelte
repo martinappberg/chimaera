@@ -7,8 +7,11 @@
     composerHeightForContent,
     type ManualComposerHeight,
   } from "./composerHeight";
+  import AttachmentStrip from "./AttachmentStrip.svelte";
+  import ImagePreview from "./ImagePreview.svelte";
   import { registerComposer, registerComposerAttach } from "./composerBus";
   import {
+    attachmentSrc,
     imageToAttachment,
     IMAGE_MAX_ATTACHMENTS,
     type ImageAttachment,
@@ -83,6 +86,20 @@
   let draft = $state(savedDraft.text);
   let images = $state<ImageAttachment[]>(savedDraft.images.slice(0, IMAGE_MAX_ATTACHMENTS));
   let attachmentError = $state<string | null>(null);
+
+  /** The attachment shown large (ImagePreview), by index. */
+  let previewing = $state<number | null>(null);
+
+  function removeImage(index: number): void {
+    images = images.filter((_, j) => j !== index);
+    attachmentError = null;
+  }
+
+  /** Back to typing where the preview was opened from. */
+  function closePreview(): void {
+    previewing = null;
+    el?.focus();
+  }
 
   function addImage(image: ImageAttachment): boolean {
     if (images.length >= IMAGE_MAX_ATTACHMENTS) {
@@ -626,20 +643,22 @@
 
   {#if images.length > 0}
     <div class="attachments">
-      {#each images as img, i (i)}
-        <span class="attachment">
-          {img.label}
-          <button
-            class="attachment-x"
-            aria-label="remove attachment"
-            onclick={() => {
-              images = images.filter((_, j) => j !== i);
-              attachmentError = null;
-            }}>×</button
-          >
-        </span>
-      {/each}
+      <AttachmentStrip drafts={images} onRemove={removeImage} onPreview={(i) => (previewing = i)} />
     </div>
+  {/if}
+  {#if previewing !== null && images[previewing] !== undefined}
+    {@const shown = images[previewing]}
+    {@const index = previewing}
+    <ImagePreview
+      src={attachmentSrc(shown)}
+      label={shown.label}
+      {visible}
+      onClose={closePreview}
+      onRemove={() => {
+        removeImage(index);
+        closePreview();
+      }}
+    />
   {/if}
   {#if attachmentError !== null}
     <div class="attachment-error" role="status">{attachmentError}</div>
@@ -765,37 +784,12 @@
     white-space: nowrap;
   }
   .attachments {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 6px;
-    padding-bottom: 6px;
+    padding-bottom: 8px;
   }
   .attachment-error {
     color: var(--warn);
     font-size: var(--text-xs);
     margin: 0 4px 4px;
-  }
-  .attachment {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    border: 1px solid var(--edge);
-    border-radius: 999px;
-    padding: 1px 8px;
-    font-size: var(--text-sm);
-    color: var(--muted);
-  }
-  .attachment-x {
-    background: none;
-    border: none;
-    color: var(--muted);
-    cursor: pointer;
-    padding: 0;
-    font-size: var(--text-md);
-    transition: color 0.12s ease;
-  }
-  .attachment-x:hover {
-    color: var(--err);
   }
   /* flex: kills the inline-block baseline gap under the textarea, so the
      bottom-anchored action button measures from the real input edge. */

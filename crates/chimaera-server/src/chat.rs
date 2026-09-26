@@ -1972,6 +1972,7 @@ fn render_fork_context(events: &[AgentEvent]) -> Vec<ForkContextRow> {
             AgentEvent::UserMessage {
                 text,
                 attachments,
+                attachment_paths: _,
                 id,
                 queued: true,
                 origin: None,
@@ -3745,6 +3746,7 @@ mod tests {
                 AgentEvent::UserMessage {
                     text: "question".into(),
                     attachments: 0,
+                    attachment_paths: Vec::new(),
                     id: Some("u1".into()),
                     queued: false,
                     origin: None,
@@ -3829,6 +3831,7 @@ mod tests {
                 AgentEvent::UserMessage {
                     text: "old prompt".into(),
                     attachments: 0,
+                    attachment_paths: Vec::new(),
                     id: None,
                     queued: false,
                     origin: None,
@@ -3858,6 +3861,7 @@ mod tests {
                 AgentEvent::UserMessage {
                     text: "first prompt".into(),
                     attachments: 0,
+                    attachment_paths: Vec::new(),
                     id: Some("u1".into()),
                     queued: false,
                     origin: None,
@@ -3883,6 +3887,7 @@ mod tests {
                 AgentEvent::UserMessage {
                     text: "edit me".into(),
                     attachments: 0,
+                    attachment_paths: Vec::new(),
                     id: Some("u2".into()),
                     queued: true,
                     origin: None,
@@ -3944,6 +3949,7 @@ mod tests {
             AgentEvent::UserMessage {
                 text: "real request".into(),
                 attachments: 0,
+                attachment_paths: Vec::new(),
                 id: Some("u1".into()),
                 queued: false,
                 origin: None,
@@ -3994,6 +4000,7 @@ mod tests {
                 AgentEvent::UserMessage {
                     text: "question".into(),
                     attachments: 0,
+                    attachment_paths: Vec::new(),
                     id: Some("u1".into()),
                     queued: false,
                     origin: None,
@@ -4058,6 +4065,7 @@ mod tests {
                 AgentEvent::UserMessage {
                     text: "edit this".into(),
                     attachments: 0,
+                    attachment_paths: Vec::new(),
                     id: Some("u2".into()),
                     queued: false,
                     origin: None,
@@ -4096,6 +4104,7 @@ mod tests {
                 AgentEvent::UserMessage {
                     text: "edit this too".into(),
                     attachments: 0,
+                    attachment_paths: Vec::new(),
                     id: Some("u2".into()),
                     queued: false,
                     origin: None,
@@ -4171,6 +4180,7 @@ mod tests {
                 AgentEvent::UserMessage {
                     text: "new target turn".into(),
                     attachments: 0,
+                    attachment_paths: Vec::new(),
                     id: Some("u2".into()),
                     queued: false,
                     origin: None,
@@ -4234,6 +4244,7 @@ mod tests {
                 AgentEvent::UserMessage {
                     text: "first".into(),
                     attachments: 0,
+                    attachment_paths: Vec::new(),
                     id: None,
                     queued: false,
                     origin: None,
@@ -4264,6 +4275,7 @@ mod tests {
                 AgentEvent::UserMessage {
                     text: "second".into(),
                     attachments: 0,
+                    attachment_paths: Vec::new(),
                     id: None,
                     queued: false,
                     origin: None,
@@ -4349,6 +4361,7 @@ mod tests {
                 AgentEvent::UserMessage {
                     text: "first".into(),
                     attachments: 0,
+                    attachment_paths: Vec::new(),
                     id: Some("m1".into()),
                     queued: false,
                     origin: None,
@@ -4372,6 +4385,7 @@ mod tests {
                 AgentEvent::UserMessage {
                     text: "next".into(),
                     attachments: 0,
+                    attachment_paths: Vec::new(),
                     id: Some("q2".into()),
                     queued: true,
                     origin: None,
@@ -4530,6 +4544,7 @@ mod tests {
             AgentEvent::UserMessage {
                 text: "preserved question".into(),
                 attachments: 0,
+                attachment_paths: Vec::new(),
                 id: None,
                 queued: false,
                 origin: None,

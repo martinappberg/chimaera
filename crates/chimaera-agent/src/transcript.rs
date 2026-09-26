@@ -240,6 +240,7 @@ impl Translator {
         out.push(AgentEvent::UserMessage {
             text,
             attachments,
+            attachment_paths: Vec::new(),
             id: None,
             queued: false,
             origin: None,
@@ -534,6 +535,7 @@ mod tests {
             AgentEvent::UserMessage {
                 text: "fix the bug".into(),
                 attachments: 0,
+                attachment_paths: Vec::new(),
                 id: None,
                 queued: false,
                 origin: None,

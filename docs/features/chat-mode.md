@@ -38,13 +38,24 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   back a queued item or dismisses a dropped one. This is driven by the single `pendingSends` reducer
   and journaled via `user_message` `id`/`queued` + `user_message_update`, so replay rebuilds the same
   order and delivery truth (see PROTOCOL.md passes 8 and 21).
-- **Image paste.** Paste an image → a removable chip; sent as base64 blocks. Downscaled to
-  1568px max dim, 2 MiB post-encode cap, at most four images (8 MiB total); oversized images
-  are silently dropped. The daemon independently enforces those image budgets plus 256 KiB of
-  text, a 10 MiB pre-deserialization WebSocket envelope, and a per-session 32 MiB / 64-message
-  aggregate across the manager channel and driver-held send queue. A refused command raises a
-  visible, nonfatal notice; the socket stays healthy. The journal stores a placeholder, never the
-  bytes.
+- **Image attachments.** Paste (or drop) an image → a picture tile above the composer
+  (`AttachmentStrip`): one 56px row, each tile as wide as its picture's aspect ratio, a small
+  always-visible ✕, and a click that shows it large (`ImagePreview`: Esc / backdrop / ✕ close,
+  "remove" drops it). Sent as base64 blocks. Downscaled to 1568px max dim, 2 MiB post-encode cap,
+  at most four images (8 MiB total); oversized images are silently dropped. The daemon
+  independently enforces those image budgets plus 256 KiB of text, a 10 MiB pre-deserialization
+  WebSocket envelope, and a per-session 32 MiB / 64-message aggregate across the manager channel
+  and driver-held send queue. A refused command raises a visible, nonfatal notice; the socket stays
+  healthy.
+- **Your pictures stay in your message.** At WebSocket ingress the daemon saves each sent image
+  into the session's upload landing pad (`upload::save_send_images`: same per-session caps as OS
+  drops, a client-supplied `path` is always discarded, a failed save never refuses the send) and
+  the `user_message` echo carries their paths as `attachment_paths` (PROTOCOL.md Pass 37) — both
+  drivers, Claude and Codex. The sent (or queued) bubble shows them as the same tiles, a 112px row
+  above the text on the user's side; a click opens the picture in a pane, as an agent's figure
+  does. So reloads, other windows and replay show the pictures too. The journal still never holds
+  the bytes. Old journals, Remote Control messages and seeded history carry only a count and keep
+  the "N images" line; a copy gone with its session's uploads shows a dashed empty tile.
 - **Long drafts.** The composer grows upward with wrapped text to a pane-conscious cap, then scrolls
   internally. Its subtle top-edge grip can expand or contract it manually (drag for a precise size;
   click to toggle expanded/content-fit; Up/Down resize from the keyboard and Home returns to

@@ -320,6 +320,23 @@ describe("ChatStore pending-send ordering", () => {
     expect(store.blocks[2]).toMatchObject({ kind: "user", id: "q1" });
   });
 
+  it("image attachments keep their saved copies from the queue into the transcript", () => {
+    const shot = "/home/u/.chimaera/uploads/s-1/image-ab12cd34.png";
+    const store = fold([
+      // A turn-opening send whose second image failed to save: one path, two images.
+      { type: "user_message", text: "look", attachments: 2, attachment_paths: [shot], id: "u1" },
+      { type: "turn_started", turn_id: "t1" },
+      { type: "user_message", text: "", attachments: 1, attachment_paths: [shot], id: "q1", queued: true },
+    ]);
+    expect(store.blocks[0]).toMatchObject({ kind: "user", attachments: 2, attachmentPaths: [shot] });
+    expect(store.pendingSends[0]).toMatchObject({ id: "q1", attachmentPaths: [shot] });
+    store.apply({ seq: 4, ts: 4, ev: { type: "user_message_update", id: "q1", state: "sent" } } as SeqEvent);
+    expect(store.blocks.at(-1)).toMatchObject({ kind: "user", id: "q1", attachmentPaths: [shot] });
+    // An old journal (count only) carries no paths.
+    const old = fold([{ type: "user_message", text: "old", attachments: 1 }]);
+    expect(old.blocks[0]).toMatchObject({ attachments: 1, attachmentPaths: [] });
+  });
+
   it("the ✕ tombstone dismisses a dropped bubble and no-ops for a delivered one", () => {
     // Dismiss: dropped → cancelled removes it from the stack (replay-stable).
     const dismissed = fold([

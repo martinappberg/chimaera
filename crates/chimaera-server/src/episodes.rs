@@ -691,6 +691,7 @@ mod tests {
         AgentEvent::UserMessage {
             text: text.into(),
             attachments: 0,
+            attachment_paths: Vec::new(),
             id: id.map(Into::into),
             queued,
             origin: None,
