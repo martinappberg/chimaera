@@ -89,6 +89,12 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         .route("/fs/xlsx", get(fs::xlsx))
         .route("/fs/quickopen", get(quickopen::quickopen))
         .route("/fs/validate", post(fs::validate))
+        // The portable-dialect checker (the reading view's issues chip; the
+        // MCP `check_document` tool runs the same code) and the opt-in
+        // "teach agents" installs behind Settings.
+        .route("/fs/check_document", get(crate::doc_check::check_document))
+        .route("/agent-docs", get(crate::agent_docs::status))
+        .route("/agent-docs/install", post(crate::agent_docs::install))
         // The draft mirror (unsaved editor text; see `drafts`). The body
         // limit only makes room for JSON escaping — the 1 MiB text cap is
         // judged on the decoded text.

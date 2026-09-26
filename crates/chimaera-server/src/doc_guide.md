@@ -10,7 +10,8 @@ GitHub and in Obsidian, so a document you write here is ready to publish.
 - CommonMark + GitHub Flavored Markdown: headings, lists, tables, task lists
   (`- [ ]`, `- [x]`), footnotes (`[^1]`), strikethrough, fenced code with a
   language (```` ```python ````).
-- Alerts (GitHub syntax), one per blockquote:
+- Alerts (GitHub syntax), one per blockquote, the marker alone on its first
+  line (a title after it turns the alert back into a plain quote on GitHub):
   ```
   > [!NOTE]
   > Useful context the reader should not miss.
@@ -89,5 +90,7 @@ HTML or PDF. Keep one idea per slide and put figures in with image syntax.
 ## Before you hand a document over
 
 Run the `check_document` tool on it. It reports broken links and embeds,
-unsupported syntax, missing alt text, absolute local paths and oversized images,
-each with a fix. Fix what it finds, then tell the user the document's path.
+heading and line fragments that point nowhere, dangling footnotes, absolute
+local paths, missing alt text, oversized images and syntax GitHub shows as
+literal text, each with its line and a fix. Fix what it finds, then tell the
+user the document's path.
