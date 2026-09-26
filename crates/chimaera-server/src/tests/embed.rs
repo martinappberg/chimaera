@@ -666,15 +666,15 @@ async fn raw_never_blocks_on_a_fifo_at_the_ticketed_path() {
     std::fs::write(&target, png(2, 2)).unwrap();
     let ticket = ticket_for(&state, &target).await;
     std::fs::remove_file(&target).unwrap();
-    // mkfifo(1), not rustix: rustix has no `mkfifoat` on Apple targets (and no
-    // plain `mkfifo` at all), and `just check` must compile on a Mac too.
+    // The coreutils command: rustix has no `mkfifoat` on Apple targets, and
+    // the test must run where the daemon is developed as well as where CI is.
     let made = std::process::Command::new("mkfifo")
         .arg("-m")
         .arg("600")
         .arg(&target)
         .status()
-        .expect("mkfifo(1) on PATH");
-    assert!(made.success(), "mkfifo failed: {made}");
+        .unwrap();
+    assert!(made.success(), "mkfifo {}", target.display());
 
     let uri = format!("/raw/{ticket}");
     let answer = tokio::time::timeout(
