@@ -5,16 +5,22 @@
 //! with an empty store. So the client also mirrors each dirty buffer here,
 //! and a window on any origin can offer to recover it.
 //!
-//! Storage is one small JSON file per draft under `<data dir>/drafts/`, named
-//! by the first 32 hex chars of SHA-256(path): an update rewrites one file
-//! atomically instead of appending to a shared log. Every dimension is
-//! capped (text per draft, draft count, total bytes) with
-//! least-recently-updated eviction, and a corrupt file is skipped, never
-//! fatal. Drafts hold unsaved user text, so the directory is 0700 and each
-//! file 0600 from creation — `~/.chimaera` may sit on a shared login node.
-//! All filesystem work runs off the reactor under the shared filesystem
-//! limiter.
+//! Storage is two small JSON files per draft under `<data dir>/drafts/`,
+//! named by the first 32 hex chars of SHA-256(path): `<id>.json` holds the
+//! draft (text included) and `<id>.meta.json` its listing metadata, so a
+//! listing — which the client asks for on every editable file open — reads a
+//! few hundred bytes per draft instead of up to 1 MiB. An update rewrites
+//! both atomically (draft first, so a sidecar never advertises text that is
+//! not there) instead of appending to a shared log; a delete removes both
+//! (sidecar first). Every dimension is capped (text per draft, draft count,
+//! total bytes of both files) with least-recently-updated eviction of the
+//! pair, and a missing or corrupt file is skipped, never fatal. Drafts hold
+//! unsaved user text, so the directory is 0700 and each file 0600 from
+//! creation — `~/.chimaera` may sit on a shared login node. All filesystem
+//! work runs off the reactor under the shared filesystem limiter.
 
+use std::collections::HashMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -46,24 +52,27 @@ pub(crate) const MAX_DRAFT_BODY_BYTES: usize = 7 * 1024 * 1024;
 /// A temp file left by a crash mid-write is swept once it is this old (a
 /// live write finishes in well under a second).
 const STALE_TEMP_AGE: Duration = Duration::from_secs(600);
+/// Largest sidecar a listing reads: a real one is under 4.5 KiB (the path
+/// and hash caps), so anything bigger is not ours.
+const MAX_META_FILE_BYTES: u64 = 16 * 1024;
 
 /// Serializes draft mutations (write + eviction, delete). Reads need no lock:
 /// every write lands by atomic rename.
 static DRAFTS_WRITE: Mutex<()> = Mutex::new(());
 
-/// One draft file.
+/// One draft file (`<id>.json`), self-contained for `GET /fs/draft`.
 #[derive(Serialize, Deserialize)]
 struct StoredDraft {
     path: String,
     base_hash: Option<String>,
     updated_ms: u64,
-    /// UTF-8 length of `text`, stored so a listing never decodes the text.
+    /// UTF-8 length of `text`.
     bytes: u64,
     text: String,
 }
 
-/// A draft file minus its text: serde skips the unknown `text` field without
-/// allocating it, so listing 64 drafts never materializes 16 MiB.
+/// A draft's listing sidecar (`<id>.meta.json`): what `GET /fs/drafts`
+/// answers per draft, without the text.
 #[derive(Serialize, Deserialize)]
 struct DraftMeta {
     path: String,
@@ -78,17 +87,43 @@ fn now_ms() -> u64 {
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
-/// `<root>/<first 32 hex of SHA-256(path)>.json`.
-fn draft_file(root: &Path, path: &str) -> PathBuf {
-    let digest = crate::fs::sha256_hex(path.as_bytes());
-    root.join(format!("{}.json", &digest[..32]))
+/// The first 32 hex chars of SHA-256(path): both files' shared stem.
+fn draft_id(path: &str) -> String {
+    let mut digest = crate::fs::sha256_hex(path.as_bytes());
+    digest.truncate(32);
+    digest
 }
 
-/// A file name this module wrote as a draft (never a temp or a stray).
-fn is_draft_name(name: &str) -> bool {
-    name.strip_suffix(".json").is_some_and(|stem| {
-        stem.len() == 32 && stem.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-    })
+/// `<root>/<id>.json`: the draft, text included.
+fn draft_file(root: &Path, id: &str) -> PathBuf {
+    root.join(format!("{id}.json"))
+}
+
+/// `<root>/<id>.meta.json`: the draft's listing sidecar.
+fn meta_file(root: &Path, id: &str) -> PathBuf {
+    root.join(format!("{id}.meta.json"))
+}
+
+/// The draft id of a file name this module wrote, and whether it is the
+/// sidecar; `None` for temps and strays.
+fn parse_draft_name(name: &str) -> Option<(&str, bool)> {
+    let (stem, is_meta) = match name.strip_suffix(".meta.json") {
+        Some(stem) => (stem, true),
+        None => (name.strip_suffix(".json")?, false),
+    };
+    let ours = stem.len() == 32 && stem.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    ours.then_some((stem, is_meta))
+}
+
+/// Remove `file`; already gone is fine.
+fn remove_if_present(file: &Path) -> anyhow::Result<()> {
+    match std::fs::remove_file(file) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => {
+            Err(anyhow::Error::new(err).context(format!("failed to delete {}", file.display())))
+        }
+    }
 }
 
 fn json_error(status: StatusCode, message: impl Into<String>) -> Response {
@@ -141,25 +176,48 @@ fn write_private(dest: &Path, contents: &[u8]) -> anyhow::Result<()> {
     result.with_context(|| format!("failed to write {}", dest.display()))
 }
 
-/// Enforce the count and byte caps, newest kept, `keep` (the draft just
-/// written) never evicted. Recency is the file's mtime — the time of its last
-/// atomic replace — so enforcement needs one stat per draft, never a parse.
-/// Also sweeps temp files a crash left behind.
-fn evict(root: &Path, keep: &Path) {
+/// One draft's files on disk, as eviction sees them.
+#[derive(Default)]
+struct DraftFiles {
+    /// The draft file's mtime (its last atomic replace); a lone sidecar's
+    /// stands in for a draft file a crash lost.
+    modified: Option<SystemTime>,
+    /// Both files together.
+    len: u64,
+    draft: Option<PathBuf>,
+    meta: Option<PathBuf>,
+}
+
+/// Enforce the count and byte caps over draft + sidecar pairs, newest kept,
+/// `keep` (the id just written) never evicted. Recency is the draft file's
+/// mtime, so enforcement needs one stat per file, never a parse. An evicted
+/// pair goes sidecar first. Also sweeps temp files a crash left behind.
+fn evict(root: &Path, keep: &str) {
     let Ok(read) = std::fs::read_dir(root) else {
         return;
     };
     let now = SystemTime::now();
-    let mut drafts: Vec<(SystemTime, u64, PathBuf)> = Vec::new();
+    let mut kept_len = 0u64;
+    let mut drafts: HashMap<String, DraftFiles> = HashMap::new();
     for entry in read.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
         let Ok(meta) = entry.metadata() else { continue };
         let modified = meta.modified().unwrap_or(UNIX_EPOCH);
         let path = entry.path();
-        if is_draft_name(name) {
-            if path != keep {
-                drafts.push((modified, meta.len(), path));
+        if let Some((id, is_meta)) = parse_draft_name(name) {
+            if id == keep {
+                kept_len += meta.len();
+                continue;
+            }
+            let files = drafts.entry(id.to_owned()).or_default();
+            files.len += meta.len();
+            if is_meta {
+                files.meta = Some(path);
+                files.modified.get_or_insert(modified);
+            } else {
+                files.draft = Some(path);
+                files.modified = Some(modified);
             }
         } else if name.starts_with('.')
             && name.ends_with(".tmp")
@@ -170,15 +228,18 @@ fn evict(root: &Path, keep: &Path) {
             let _ = std::fs::remove_file(&path);
         }
     }
-    drafts.sort_by_key(|draft| std::cmp::Reverse(draft.0));
+    let mut drafts: Vec<DraftFiles> = drafts.into_values().collect();
+    drafts.sort_by_key(|files| std::cmp::Reverse(files.modified));
     let mut count = 1usize;
-    let mut total = std::fs::metadata(keep).map_or(0, |m| m.len());
-    for (_, len, path) in drafts {
-        if count < MAX_DRAFTS && total.saturating_add(len) <= MAX_DRAFTS_TOTAL_BYTES {
+    let mut total = kept_len;
+    for files in drafts {
+        if count < MAX_DRAFTS && total.saturating_add(files.len) <= MAX_DRAFTS_TOTAL_BYTES {
             count += 1;
-            total += len;
+            total += files.len;
         } else {
-            let _ = std::fs::remove_file(&path);
+            for file in [files.meta, files.draft].into_iter().flatten() {
+                let _ = std::fs::remove_file(&file);
+            }
         }
     }
 }
@@ -192,9 +253,10 @@ pub(crate) struct PutDraftRequest {
 }
 
 /// PUT /api/v1/fs/drafts {path, base_hash: string|null, text} — store (or
-/// replace) the draft for `path`. 204; 413 when `text` is over 1 MiB (UTF-8
-/// bytes); 400 for an empty or overlong `path` / `base_hash`. Beyond 64
-/// drafts or 16 MiB in total the least recently updated drafts are evicted.
+/// replace) the draft for `path` and its listing sidecar. 204; 413 when
+/// `text` is over 1 MiB (UTF-8 bytes); 400 for an empty or overlong `path` /
+/// `base_hash`. Beyond 64 drafts or 16 MiB in total (both files counted) the
+/// least recently updated drafts are evicted.
 pub(crate) async fn put_draft(
     State(state): State<Arc<AppState>>,
     Json(body): Json<PutDraftRequest>,
@@ -228,18 +290,49 @@ pub(crate) async fn put_draft(
             text: body.text,
         };
         let contents = serde_json::to_vec(&stored).context("failed to encode draft")?;
-        let dest = draft_file(&root, &stored.path);
+        let meta = serde_json::to_vec(&DraftMeta {
+            path: stored.path.clone(),
+            base_hash: stored.base_hash.clone(),
+            updated_ms: stored.updated_ms,
+            bytes: stored.bytes,
+        })
+        .context("failed to encode draft metadata")?;
+        let id = draft_id(&stored.path);
         let _writing = crate::lock(&DRAFTS_WRITE);
         ensure_root(&root)?;
-        write_private(&dest, &contents)?;
-        evict(&root, &dest);
+        // The draft first: a sidecar must never advertise text that isn't there.
+        write_private(&draft_file(&root, &id), &contents)?;
+        write_private(&meta_file(&root, &id), &meta)?;
+        evict(&root, &id);
         Ok(StatusCode::NO_CONTENT.into_response())
     })
     .await
 }
 
+/// Read one sidecar, bounded; `None` (logged) when it is unreadable, corrupt,
+/// oversized, or names a path whose id is not `id`.
+fn read_meta(file: &Path, id: &str) -> Option<DraftMeta> {
+    let read = || -> anyhow::Result<DraftMeta> {
+        let mut bytes = Vec::new();
+        std::fs::File::open(file)?
+            .take(MAX_META_FILE_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        anyhow::ensure!(
+            bytes.len() as u64 <= MAX_META_FILE_BYTES,
+            "sidecar too large"
+        );
+        let meta: DraftMeta = serde_json::from_slice(&bytes)?;
+        anyhow::ensure!(draft_id(&meta.path) == id, "sidecar names another path");
+        Ok(meta)
+    };
+    read()
+        .map_err(|err| tracing::debug!(path = %file.display(), %err, "skipping draft sidecar"))
+        .ok()
+}
+
 /// GET /api/v1/fs/drafts — `{drafts: [{path, base_hash, updated_ms, bytes}]}`
-/// newest first, without text. Unreadable or corrupt draft files are skipped.
+/// newest first, without text. Reads only the sidecars; a draft whose
+/// sidecar is missing or corrupt is skipped.
 pub(crate) async fn list_drafts(State(state): State<Arc<AppState>>) -> Response {
     let root = state.drafts_root.clone();
     crate::fs::blocking_response(move || {
@@ -255,18 +348,11 @@ pub(crate) async fn list_drafts(State(state): State<Arc<AppState>>) -> Response 
         };
         for entry in read.into_iter().flatten().flatten() {
             let name = entry.file_name();
-            if !name.to_str().is_some_and(is_draft_name) {
+            let Some((id, true)) = name.to_str().and_then(parse_draft_name) else {
                 continue;
-            }
-            let path = entry.path();
-            match std::fs::read(&path)
-                .map_err(anyhow::Error::from)
-                .and_then(|bytes| Ok(serde_json::from_slice::<DraftMeta>(&bytes)?))
-            {
-                Ok(meta) => drafts.push(meta),
-                Err(err) => {
-                    tracing::debug!(path = %path.display(), %err, "skipping unreadable draft");
-                }
+            };
+            if let Some(meta) = read_meta(&entry.path(), id) {
+                drafts.push(meta);
             }
         }
         drafts.sort_by(|a, b| {
@@ -292,7 +378,7 @@ pub(crate) async fn get_draft(
 ) -> Response {
     let root = state.drafts_root.clone();
     crate::fs::blocking_response(move || {
-        let file = draft_file(&root, &query.path);
+        let file = draft_file(&root, &draft_id(&query.path));
         let stored = match std::fs::read(&file) {
             Ok(bytes) => serde_json::from_slice::<StoredDraft>(&bytes).ok(),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
@@ -318,25 +404,18 @@ pub(crate) async fn get_draft(
     .await
 }
 
-/// DELETE /api/v1/fs/draft?path= — drop the draft for `path`. 204 whether or
-/// not one existed.
+/// DELETE /api/v1/fs/draft?path= — drop the draft for `path` and its
+/// sidecar (sidecar first). 204 whether or not one existed.
 pub(crate) async fn delete_draft(
     State(state): State<Arc<AppState>>,
     Query(query): Query<DraftQuery>,
 ) -> Response {
     let root = state.drafts_root.clone();
     crate::fs::blocking_response(move || {
-        let file = draft_file(&root, &query.path);
+        let id = draft_id(&query.path);
         let _writing = crate::lock(&DRAFTS_WRITE);
-        match std::fs::remove_file(&file) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => {
-                return Err(
-                    anyhow::Error::new(err).context(format!("failed to delete {}", file.display()))
-                );
-            }
-        }
+        remove_if_present(&meta_file(&root, &id))?;
+        remove_if_present(&draft_file(&root, &id))?;
         Ok(StatusCode::NO_CONTENT.into_response())
     })
     .await

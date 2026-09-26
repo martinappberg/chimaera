@@ -132,16 +132,70 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
 ## Raw reads & lightweight editing
 
 - **What & when.** Ranged byte reads back the code viewer, image/PDF/HTML previews, and the small
-  editor.
+  editor (code, markdown live/source, HTML edit/split — all one `CodeView`).
 - **How it's used.** `GET /api/v1/fs/file?path=&offset=&limit=` returns a slice with
-  `X-File-Size`/`X-Truncated`/`X-Mtime` headers; `.gz`/`.bgz` files are decompressed transparently
-  (offsets address decompressed bytes). `PUT /api/v1/fs/file?path=&expect_mtime=` writes atomically.
+  `X-File-Size`/`X-Truncated`/`X-Mtime` headers, plus `X-Content-Hash` (SHA-256) when the body is
+  the whole raw file; `.gz`/`.bgz` files are decompressed transparently (offsets address
+  decompressed bytes). `PUT /api/v1/fs/file?path=&expect_hash=` (or `expect_mtime=` against a
+  daemon that never sent a hash) writes atomically. Cmd/Ctrl+S saves; Mod-f searches (every
+  editor, read-only ones too); the **Autosave** setting (`editor.autosave` off | after a delay,
+  `editor.autosaveDelay`) saves after idle typing and on blur / tab switch.
 - **Where it lives.** `fs.rs` (`file`/`read_file_response`/`read_gz_slice`, `put_file`/
-  `write_file_atomic`); `CodeView.svelte` + `cm.ts` (CodeMirror).
+  `write_file_atomic`); UI `previews/buffers.svelte.ts` (the buffer store), `CodeView.svelte` (a
+  view onto a buffer) + `cm.ts`, `textCodec.ts` (byte fidelity), `merge.ts` (three-way merge over
+  `node-diff3`), `drafts.ts` (the journal), `CompareView.svelte`, `layout/CloseDirtyDialog.svelte`.
+- **Buffers outlive views.** The buffer store owns each open file's `EditorState` (text, undo
+  history, cursor) and what it knows about the disk (base text, content hash, mtime token, line
+  endings/BOM). A `CodeView` attaches to it; unmounting detaches, and a buffer with unsaved edits
+  lives on — closing a pane, the keep-alive cap, split, zoom, a tab drag, a workspace switch and a
+  rename of the file or a parent (the buffer re-keys) all come back to the same text and undo
+  stack. `shared/editing.ts`'s `dirtyFiles` mirrors the store, so the tab dot, beforeunload and
+  the reload gate protect an unmounted dirty buffer too. A clean buffer is forgotten with its last
+  view.
+- **Closing asks.** Every close of a tab whose file is dirty — ×, middle-click, Close / Close
+  Others / Close All, Cmd/Ctrl+W and the close-view chord — opens **Save / Don't save / Cancel**
+  (one dialog for several files). A save that fails keeps its tab open with the reason. Save
+  waits at most 15 s (a dead link): past that it reports "not saved" and hands control back
+  while the save carries on in the background. Cancel and Escape stay live while saving and
+  only keep the tabs open.
+- **Saves are verified.** A save sends the base's content hash; success (whose reply carries the
+  new hash) marks the buffer clean only if nothing was typed since it was sent (save
+  generations). A save gets a 20 s timeout and one automatic retry once the events link is back
+  (the precondition makes it idempotent: the daemon answers success without writing when the disk
+  already holds the bytes), with a visible "not saved, retrying" / "offline" status. A save is
+  refused — never a silent overwrite — while a conflict is open.
+- **Disk changes merge instead of clobbering.** When the file moves on disk (an agent editing it),
+  the buffer reads it whole and hashes it: a clean buffer reloads in place (cursor kept), a dirty
+  one three-way merges base / mine / disk line-wise. A clean merge applies as minimal edits with
+  a quiet "Merged changes from disk" notice (view diff, undo); overlapping or adjacent edits raise
+  the conflict bar — **compare** (a side-by-side diff), **keep mine** (the disk becomes the base,
+  so the next save deliberately wins), **take disk** (undoable). The disk token is adopted only
+  together with the content it names, and a read that raced a save is discarded, so our own write
+  never reads as a conflict. A 409 on save takes the same path.
+- **Byte fidelity.** Files up to the 1 MB edit cap load in one request. Uniform CRLF or lone-CR
+  line endings, a UTF-8 BOM and the final newline round-trip exactly (the editor holds LF text;
+  the save re-joins with the file's own break). Mixed line endings, text that is not valid UTF-8,
+  compressed files and anything past the cap open **view-only** with a note saying why.
+- **The draft journal.** About a second after typing stops (and on hide/pagehide) dirty text is
+  written to IndexedDB and mirrored to the daemon (`PUT /api/v1/fs/drafts`, ≤ 1 MiB, under
+  `~/.chimaera/drafts`; a listing reads only each draft's small metadata sidecar, and the client
+  reuses one for 3 s across opens) — a new tunnel port is a new origin with an empty IndexedDB.
+  Opening a file whose draft differs from the disk shows "Recovered unsaved changes from …" with Restore /
+  Discard, never a silent restore; a draft typed against an older disk version restores through
+  the merge. A save of exactly that text, or a discard, clears both copies; mirror writes for a
+  path land in issue order, so a late journal write never re-creates a cleared draft. A
+  hide/pagehide flush sends drafts as keepalive requests only within a shared 56 KiB budget of
+  encoded body bytes (the browser's keepalive quota); the rest go as normal requests, with the
+  IndexedDB copy regardless. A journal that failed
+  everywhere shows "draft not backed up" in the status bar. Older daemons without the routes fall
+  back to IndexedDB only.
+- **Other windows.** Same-origin windows announce dirty paths over a `BroadcastChannel`; a window
+  showing a file another one holds unsaved shows "Unsaved edits in another window".
 - **Key behaviors.** Read chunk cap 2 MB (default 256 KB); PUT body cap 1 MB (editing is for small
-  text files — 413 over) and is mtime-guarded (409 "file changed on disk"). Writes go through a
-  hidden tmp sibling + rename, keep the original mode, and call `git::mark_path_dirty` so the git
-  panel refreshes without polling. Gzip decompress is capped at 64 MB/request (defuses gzip bombs).
+  text files — 413 over). Writes go through a hidden tmp sibling + rename, keep the original
+  mode, and call `git::mark_path_dirty` so the git panel refreshes without polling. Gzip
+  decompress is capped at 64 MB/request (defuses gzip bombs). Open-at-line requests
+  (`shared/reveal.ts`) place the cursor, center the range and flash it.
 
 ## Rendered previews
 
@@ -244,7 +298,8 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   **Links in documents open** (`previews/docLinks.ts`, both modes). A document-relative path
   (`other.md`, `../data/run.csv`, `figs/a%20b.png`, a local `file://` URL) resolves against
   the document's folder, a root-relative `/docs/x.md` also against the workspace root, and
-  the daemon confirms it (`POST /fs/validate`) before anything opens; the file (or folder)
+  the daemon confirms it (`POST /fs/validate`, `strict`: only the exact join, so a broken
+  `b/spec.md` never opens `spec.md`) before anything opens; the file (or folder)
   then opens through the shared opener (`shared/openPath.ts`, registered by the app) —
   Cmd/Ctrl+click or a middle-click opens it beside. `#L12` / `#L12-L20` opens the file at
   those lines (a reveal); `other.md#heading` opens the document and then scrolls to the
@@ -262,13 +317,51 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   http(s)/`data:image` URLs and leave other schemes as source. The live mode mirrors all of
   it (quote cards, ticketed image widgets, fence + quote copy) inside the editor; raw HTML
   in a document is **never rendered** there — it stays visible source.
-- **Tables (CSV/TSV, incl. gzip).** `GET /api/v1/fs/table?path=&offset_rows=&limit_rows=&delim=auto`
-  returns one page (header row + string cells; rows cap 1000/page; delimiter auto-sniffed; `.gz`/`.bgz`
-  transparent). `TableView.svelte`. Bioinformatics reality — big delimited files are the norm.
+
+  The toolbar carries a quiet **"N issues"** chip (`previews/DocIssues.svelte`) when the
+  daemon's portable-dialect check (`GET /api/v1/fs/check_document`) finds errors or warnings:
+  broken links and embeds, missing anchors, absolute paths, missing alt text, syntax GitHub
+  shows as literal text. Clicking an issue reveals its line; it re-checks after disk changes,
+  only while visible. Details:
+  [agents.md](agents.md#documents-the-portable-dialect-check_document-and-the-issues-chip).
+- **Tables (CSV/TSV and bioinformatics text, incl. gzip).**
+  `GET /api/v1/fs/table?path=&offset_rows=&limit_rows=&delim=auto` returns one page (header row +
+  string cells; rows cap 1000/page; delimiter from the name, else sniffed from the first line that is
+  not a comment; `.gz`/`.bgz` transparent). Bioinformatics reality — big delimited files are the
+  norm. Additive options read the genomics formats: `comment=` (comma-separated line prefixes,
+  skipped wherever they appear), `header=false` (every line is data; the columns are `names=` then
+  `colN`), and `quote=false` (a SAM quality or VCF text may open a field with `"`). `files.ts`
+  (`tablePreset`, `tableQuery`) routes them to the table view and sets the options: **VCF** (`##`
+  lines skipped; the `#CHROM` line is the header, shown as `CHROM`; `.vcf.gz` too), **BED /
+  bedGraph / narrowPeak / broadPeak** (`#`, `track` and `browser` lines skipped; the standard BED
+  column names), **GFF / GFF3 / GTF** (`#` skipped; the nine standard names) and **SAM** (`@`
+  header lines skipped; the eleven mandatory names, then `colN` for optional tags). Every answer
+  carries `total_rows` once a scan has reached the end, else `est_rows` (a byte-rate estimate from
+  the rows walked plus two sampled windows of the rest).
+  **Deep pages seek.** A plain file keeps a sparse row-offset index in the daemon
+  (`fs/row_index.rs`): a byte offset per 1,000 data rows, keyed by path + parse options and
+  dropped when the file's version token changes; at most 16,384 offsets per file (past that the
+  stride doubles) and 32 files (LRU) — ~4 MB at worst. A request seeks to the nearest checkpoint
+  and walks at most 64 MB; one that runs out before its offset answers `scan_limited` with
+  `scanned_to`, and asking again resumes where it stopped. Gzip cannot seek, so `.gz` still
+  decodes from the start under its 64 MB decompression cap.
+  **The grid** (`TableView.svelte`; its arithmetic in `tableGrid.ts`) keeps only the rows in view
+  plus overscan in the DOM, between two spacer rows. The loaded window pages in both directions as
+  you scroll, capped at 20,000 rows (paging past that drops the far end). Columns start at widths
+  counted from the first page in the mono font's advance — a fixed layout, so nothing shifts while
+  scrolling — widen as longer cells page in, and can be dragged or double-click auto-fit. The
+  footer says what is loaded (`row 1,499,998 · 600 loaded rows of ~2M`, or `of 5,000` once all
+  of it is), and its row field jumps: a loaded row scrolls into view; any other row fetches a
+  window around it (asking again while the daemon reports `scan_limited`, with `indexing… row N`
+  in the footer) and flashes. Measured live: row 1,500,000 of a 2M-row, 100 MB TSV in ~0.8 s cold
+  (two budgeted scans) and ~50 ms once indexed. Double-click a cell to read all of it in a popover
+  (column, row, length, copy; Escape or a click outside closes it). Drag or shift-click selects
+  cells, the gutter selects rows, and ⌘/Ctrl+C copies them as TSV.
 - **Spreadsheets (xlsx/xls/xlsm/ods).** `GET /api/v1/fs/xlsx?path=&sheet=&offset_rows=&limit_rows=`
   parses the workbook server-side (**calamine**) into the same paged `TablePage` (first row = header),
   plus the workbook's `sheets` list. `XlsxView.svelte` renders a sheet picker over the shared
-  `TableView` grid — so selection/resize/paging come for free. calamine loads a whole sheet into
+  `TableView` grid — so selection, resizing, paging, virtualization, jump to row and cell expand
+  come for free. calamine loads a whole sheet into
   memory, so the SOURCE file is size-capped (`MAX_XLSX_BYTES`, 8 MB) before parsing, and ZIP-backed
   workbooks are preflighted at 64 MiB expanded / 4096 entries before calamine runs off the reactor
   (`spawn_blocking`); over-cap files get an honest "too large" message. A disk change remounts the
@@ -289,11 +382,39 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   the single-segment `/raw/{ticket}`, so a page's `app.js` or `figs/a.png` 404s or falls through
   to the app shell; only self-contained HTML (e.g. MultiQC) renders fully. The planned fix is a
   directory-scoped `/raw/{ticket}/{*path}` ([plan](../document-workbench-plan.md#phase-4-embeds-in-documents-and-in-chat)).
-  The PDF toolbar shows **p / N** for the page being read (the one under a line a third of the
-  way down the viewport, computed from the slot sizes, no DOM reads) and takes a page number:
-  type it and press Enter to jump (Escape reverts).
-  PDF metadata arrives progressively so the first pages paint before a long document is scanned;
-  rasters cap at 12M pixels and inactive canvases use an 8-page LRU. Selectable text is a bounded
+  **PDF** runs on pdf.js's **legacy** build: the modern build calls `Map.prototype.getOrInsertComputed`
+  on every render and range read, which WebKit (the macOS app) and Chromium before 145 lack, so its
+  pages stayed blank. pdf.js's standard fonts, CMaps, wasm decoders and ICC profiles ship with our
+  own build under `assets/pdfjs-<version>/` (the `pdfjsAssets` plugin in `vite.config.ts` copies
+  them from `pdfjs-dist`; never a CDN), so a PDF that names Helvetica without embedding it paints
+  its text. Bytes load lazily — `disableAutoFetch` + `disableStream` over the ranged `/raw` ticket,
+  so a remote tunnel carries only the 64 KB chunks the visible pages need. Every page gets a
+  placeholder sized like page 1 at once (the scrollbar, jumps and reveals work immediately) and a
+  background walk corrects odd-sized pages in batches. The toolbar shows **p / N** for the page
+  being read (the one under a line a third of the way down the viewport, computed from the slot
+  sizes, no DOM reads) and takes a page number: type it and press Enter to jump (Escape reverts).
+  - **Outline** — a toolbar button (only when the document has bookmarks) opens them as a sidebar,
+    first level expanded and deeper levels on demand; a click resolves the destination (named or
+    explicit; `XYZ`, `FitH` and `FitR` land on their point) and scrolls there. Open or closed is
+    remembered per tab.
+  - **Links** — pdf.js's `AnnotationLayer`, given only the page's link annotations (no forms, no
+    scripting) and a small link service: internal destinations navigate in place; http(s) URLs go
+    through `activateUrl` (a live local app opens in a pane, anything else in the real browser);
+    any other scheme is inert.
+  - **Find** — ⌘/Ctrl+F anywhere in the view (or the magnifier) opens a find bar. It walks every
+    page's text starting at the page being read, one page per task so the UI stays responsive,
+    and counts as it goes (`2 / 3`); Enter and Shift+Enter step, scrolling to matches on pages not
+    rendered yet too. Matching is case-insensitive, lets words run together or break across lines,
+    and knows the ﬁ/ﬂ/ﬀ ligatures (`pdfFind.ts`); matches are highlighted on the text layer, the
+    current one stronger. Pages over the 5,000-item text ceiling are not searched, and the bar
+    says how many; the count stops at 5,000 matches.
+  - **Reveals** — a reveal carrying `page` (`#page=N`) jumps there, and a `region` (`#xywh=`, in
+    PDF points from the page's top-left at 100%) is outlined on that page and scrolled into view;
+    a reveal wins over the remembered scroll position.
+
+  The text layer uses pdf.js's own sizing (font size and scale from `--total-scale-factor` on the
+  page), so selection and highlights sit on the glyphs and follow a zoom at once. Rasters cap at
+  12M pixels and inactive canvases use an 8-page LRU. Selectable text is a bounded
   enhancement: a page over 5,000 text items stays canvas-only, and the viewer keeps at most 12,000
   text items across retained pages; the toolbar says `selection limited` when either ceiling is hit.
   This protects highly-compressed vector plots whose small PDF stream expands into tens of thousands
@@ -302,6 +423,10 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   evicting a PDF cancels its active pdf.js raster tasks, text reads, text layers, delayed rerenders,
   and restoration frame before destroying the document worker, so invisible work cannot keep a pane
   or webview busy.
+  **Image region reveals** — a reveal carrying a `region` (`#xywh=`, in image pixels) is clipped
+  to the image, outlined with an accent frame (a veil over the rest fades out), and framed so it
+  fills about half the view (never below fit, never past 400%) (`imageRegion.ts`); the toolbar
+  shows its coordinates with frame-again and clear buttons.
 - **Video / audio.** mp4, webm, m4v, ogv and mov play in the native `<video>` player; mp3, wav,
   m4a, flac, ogg, oga, opus and aac in `<audio>` (`MediaView.svelte`). Bytes come from the same
   ticketed `/raw/` URL — the daemon serves single byte ranges, so seeking fetches only what it
@@ -385,7 +510,8 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
 ## Preview keep-alive & live-update
 
 - **What & when.** A pane keeps recently-viewed rendered views alive (hidden, not destroyed) across
-  a tab switch, bounded by a per-pane LRU (cap 8). This includes structured chat, which retains a
+  a tab switch, bounded by a per-pane LRU (cap 8) that never evicts a file with unsaved edits
+  (its buffer would survive in the store anyway; the view keeps scroll and search state). This includes structured chat, which retains a
   bottom-anchored DOM window (64 blocks initially, 192 maximum) rather than a whole long transcript.
   PTY components remount instead: `termPool` re-parents their xterm element into a hidden stash while
   preserving its socket and scrollback. A shared, LRU-capped content store
@@ -439,9 +565,10 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   an already-dirty file, ignored/non-repo files, and Finder paths outside the workspace; recognized
   agent writes and in-app mutations remain the immediate event-driven fast path. A moved mtime
   refreshes payloads **in place** (never nulling — a null chunk would unmount a live `CodeView`),
-  while PDF/spreadsheet/binary surfaces remount on the new token. An **unsaved** `CodeView` buffer is
-  never clobbered: a disk change while dirty raises the "changed on disk" conflict bar instead of
-  reloading. Chat artifact cards memoize their `/raw` ticket (`rawTicketUrl`) so a cached output
+  while PDF/spreadsheet/binary surfaces remount on the new token. An editor buffer is never
+  clobbered: it retains its path (so a dirty buffer stays watched with no view mounted) and
+  reconciles a moved token by reading the whole file — reload when clean, merge or conflict when
+  dirty (see *Raw reads & lightweight editing* above). Chat artifact cards memoize their `/raw` ticket (`rawTicketUrl`) so a cached output
   image doesn't re-fetch and re-decode (the flash) on re-render.
 
 ## File & folder glyphs

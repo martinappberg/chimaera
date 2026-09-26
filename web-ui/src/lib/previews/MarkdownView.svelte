@@ -57,6 +57,7 @@
   import ReferenceChip from "../shared/ReferenceChip.svelte";
   import Chevron from "../shared/Chevron.svelte";
   import Spinner from "./Spinner.svelte";
+  import DocIssues from "./DocIssues.svelte";
   import { hasUrlScheme, isWebUrl, urlMenuEntries } from "../shared/urlOpen";
   import { contextMenu } from "../shared/contextMenu.svelte";
   import { revealRequest, takeReveal, type Reveal } from "../shared/reveal";
@@ -852,6 +853,7 @@
     {:else if barNote !== null}
       <span class="md-bar-note">{barNote}</span>
     {/if}
+    <DocIssues {path} {wsRoot} mtime={entry?.mtime ?? null} />
   </div>
 
   <!-- Delegated link handling: the interactive targets are the rendered

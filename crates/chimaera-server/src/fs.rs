@@ -25,6 +25,8 @@ use serde_json::json;
 
 use crate::AppState;
 
+mod row_index;
+
 /// Hard cap on a single `fs/file` read.
 const MAX_FILE_CHUNK: u64 = 2 * 1024 * 1024;
 /// Default `fs/file` read size (256KB).
@@ -37,9 +39,9 @@ const MAX_WRITE_BYTES: usize = 1024 * 1024;
 /// bounds that work (and defuses gzip bombs) at the cost of an honest
 /// "truncated" answer for very deep reads.
 const MAX_GZ_DECOMPRESS: u64 = 64 * 1024 * 1024;
-/// Maximum bytes a paged table request scans from the start of a plain file.
-/// CSV has no row index, so a hostile giant `offset_rows` would otherwise tie
-/// up one blocking worker walking an arbitrarily large dataset.
+/// Maximum bytes one paged table request walks in a plain file (from the
+/// nearest row-index checkpoint), so a hostile giant `offset_rows` cannot tie
+/// up a blocking worker walking an arbitrarily large dataset in one go.
 const MAX_TABLE_SCAN_BYTES: u64 = 64 * 1024 * 1024;
 /// Largest markdown source `fs/markdown` will render.
 const MAX_MARKDOWN_BYTES: u64 = 4 * 1024 * 1024;
@@ -92,7 +94,7 @@ const MAX_TICKETS: usize = 4096;
 /// blocking pool can grow very large under a request burst; on NFS/Lustre that
 /// turns one stalled mount into host-wide thread and syscall pressure. Queued
 /// requests remain asynchronous, so terminals/chat/health stay responsive.
-static FILESYSTEM_WORK: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8);
+pub(crate) static FILESYSTEM_WORK: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8);
 
 /// The daemon user's home directory (`$HOME`).
 fn home_dir() -> anyhow::Result<PathBuf> {
@@ -537,7 +539,8 @@ pub(crate) struct FileQuery {
 /// remain past this slice), and `X-Mtime` (opaque modification token, echoed
 /// back by PUT's `expect_mtime`) headers. `limit` is capped at 2MB. When the
 /// body is the WHOLE raw file (offset 0, nothing left past it, not a gzip
-/// decode) it also carries `X-Content-Hash`: the lowercase hex SHA-256 of
+/// decode) and no write raced the read (the token re-checked after it, one
+/// retry) it also carries `X-Content-Hash`: the lowercase hex SHA-256 of
 /// exactly these bytes, echoed back by PUT's `expect_hash`.
 ///
 /// `.gz`/`.bgz` paths are decompressed transparently: `offset`/`limit` then
@@ -563,9 +566,7 @@ fn read_file_response(raw: &str, offset: u64, limit: u64) -> anyhow::Result<Resp
         (gz_mime(&path), total, bytes, more, mtime_token(&meta), None)
     } else {
         let slice = read_file_slice(&path, offset, limit)?;
-        // Hash only a body that IS the file: a client may echo this as
-        // `expect_hash`, and a slice's hash would never match the disk.
-        let hash = (offset == 0 && slice.eof).then(|| sha256_hex(&slice.bytes));
+        let hash = slice.whole_file_hash(offset);
         let mime = mime_guess::from_path(&path).first_or_octet_stream();
         (
             mime,
@@ -612,19 +613,64 @@ struct FileSlice {
     /// Nothing remains past this slice (observed by reading, not by `stat`).
     eof: bool,
     total: u64,
+    /// The token from BEFORE the read: if a write raced it, the client's
+    /// watch sees the file move past this and reads again.
     mtime: String,
+    /// The token was the same after the read: `bytes` are exactly the
+    /// version `mtime` names.
+    stable: bool,
+}
+
+impl FileSlice {
+    /// `X-Content-Hash`, only for a body that IS the file (a client echoes it
+    /// as `expect_hash`, and a slice's hash would never match the disk) and
+    /// only when no write raced the read (a hash of one version must never
+    /// travel with the token of another). Otherwise the client falls back to
+    /// the token.
+    fn whole_file_hash(&self, offset: u64) -> Option<String> {
+        (offset == 0 && self.eof && self.stable).then(|| sha256_hex(&self.bytes))
+    }
 }
 
 /// Read up to `limit` bytes of the (canonical) file at `path` starting at
 /// `offset`. EOF is judged by reading one byte past the slice rather than by
 /// the size `fstat` reported, so a file that grows or shrinks between the two
-/// can never earn a whole-file hash for a partial body.
+/// can never earn a whole-file hash for a partial body. The token comes from
+/// an fstat before the read, so a second fstat after it checks that no write
+/// landed in between; on a change the read is retried once (reopened: a
+/// rename-replace is a new inode), and a second change leaves the slice
+/// unstable (no content hash).
 fn read_file_slice(path: &Path, offset: u64, limit: u64) -> anyhow::Result<FileSlice> {
+    read_file_slice_racing(path, offset, limit, &mut || {})
+}
+
+/// [`read_file_slice`] with `racer` run between each attempt's first fstat
+/// and its read — the window a concurrent writer can hit (tests use it).
+fn read_file_slice_racing(
+    path: &Path,
+    offset: u64,
+    limit: u64,
+    racer: &mut dyn FnMut(),
+) -> anyhow::Result<FileSlice> {
+    let slice = read_file_slice_once(path, offset, limit, racer)?;
+    if slice.stable {
+        return Ok(slice);
+    }
+    read_file_slice_once(path, offset, limit, racer)
+}
+
+fn read_file_slice_once(
+    path: &Path,
+    offset: u64,
+    limit: u64,
+    racer: &mut dyn FnMut(),
+) -> anyhow::Result<FileSlice> {
     let mut file =
         std::fs::File::open(path).with_context(|| format!("{}: failed to open", path.display()))?;
     let meta = file
         .metadata()
         .with_context(|| format!("{}: failed to stat", path.display()))?;
+    racer();
     let stat_len = meta.len();
     let probe = limit.saturating_add(1);
     let mut bytes = Vec::with_capacity(
@@ -655,11 +701,16 @@ fn read_file_slice(path: &Path, offset: u64, limit: u64) -> anyhow::Result<FileS
     } else {
         stat_len.max(read_end.saturating_add(1))
     };
+    let mtime = mtime_token(&meta);
+    let after = file
+        .metadata()
+        .with_context(|| format!("{}: failed to stat", path.display()))?;
     Ok(FileSlice {
         bytes,
         eof,
         total,
-        mtime: mtime_token(&meta),
+        stable: mtime_token(&after) == mtime,
+        mtime,
     })
 }
 
@@ -1184,6 +1235,76 @@ fn write_in_place(
 }
 
 #[cfg(test)]
+mod slice_tests {
+    use super::*;
+
+    fn temp_file(tag: &str, contents: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "chimaera-slice-{tag}-{}-{}",
+            std::process::id(),
+            &chimaera_core::generate_token()[..8]
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("f.txt");
+        std::fs::write(&file, contents).unwrap();
+        file
+    }
+
+    /// A write landing between the token's fstat and the read is caught by
+    /// the fstat after it; one retry reads a consistent version, whose hash
+    /// and token then travel together.
+    #[test]
+    fn a_raced_read_retries_once_and_pairs_hash_with_token() {
+        let file = temp_file("retry", "one\n");
+        let mut calls = 0;
+        let slice = read_file_slice_racing(&file, 0, 1024, &mut || {
+            calls += 1;
+            if calls == 1 {
+                std::fs::write(&file, "two, longer\n").unwrap();
+            }
+        })
+        .unwrap();
+        assert_eq!(calls, 2);
+        assert!(slice.stable);
+        assert_eq!(slice.bytes, b"two, longer\n");
+        assert_eq!(slice.mtime, mtime_token(&std::fs::metadata(&file).unwrap()));
+        assert_eq!(slice.whole_file_hash(0), Some(sha256_hex(b"two, longer\n")));
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    /// Raced on the retry too: the slice keeps the pre-read token (so the
+    /// client's watch re-reads) and carries no content hash at all.
+    #[test]
+    fn a_read_raced_twice_omits_the_content_hash() {
+        let file = temp_file("twice", "v0\n");
+        let mut calls = 0;
+        let slice = read_file_slice_racing(&file, 0, 1024, &mut || {
+            calls += 1;
+            std::fs::write(&file, "v".repeat(calls + 3)).unwrap();
+        })
+        .unwrap();
+        assert_eq!(calls, 2);
+        assert!(!slice.stable);
+        assert_eq!(slice.whole_file_hash(0), None);
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    #[test]
+    fn an_undisturbed_whole_read_is_hashed_once() {
+        let file = temp_file("calm", "calm\n");
+        let mut calls = 0;
+        let slice = read_file_slice_racing(&file, 0, 1024, &mut || calls += 1).unwrap();
+        assert_eq!(calls, 1);
+        assert!(slice.stable && slice.eof);
+        assert_eq!(slice.whole_file_hash(0), Some(sha256_hex(b"calm\n")));
+        // A partial body is never hashed as the file.
+        let part = read_file_slice(&file, 0, 2).unwrap();
+        assert_eq!(part.whole_file_hash(0), None);
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+}
+
+#[cfg(test)]
 mod write_tests {
     use super::*;
 
@@ -1692,6 +1813,33 @@ impl LineMap {
 
     fn is_identity(&self) -> bool {
         self.anchors.is_empty()
+    }
+}
+
+/// What [`markdown_to_html`] hands comrak, for `doc_check`'s AST walk (the
+/// checker must parse a document exactly as the reading view does): the
+/// `$$`-promoted text, how many leading lines an accepted [`frontmatter`]
+/// block spans (None = no block, so no front-matter option), and the line map.
+pub(crate) struct MarkdownParseInput<'t> {
+    pub(crate) text: Cow<'t, str>,
+    pub(crate) frontmatter_lines: Option<usize>,
+    lines: LineMap,
+}
+
+impl MarkdownParseInput<'_> {
+    /// The source line of line `line` (1-based) of [`Self::text`].
+    pub(crate) fn source_line(&self, line: usize) -> usize {
+        self.lines.source_line(line as u32) as usize
+    }
+}
+
+pub(crate) fn markdown_parse_input(text: &str) -> MarkdownParseInput<'_> {
+    let frontmatter_lines = frontmatter(text).map(|f| f.lines);
+    let (text, lines) = promote_math_blocks_mapped(text);
+    MarkdownParseInput {
+        text,
+        frontmatter_lines,
+        lines,
     }
 }
 
@@ -2301,6 +2449,98 @@ pub(crate) struct TableQuery {
     limit_rows: Option<usize>,
     #[serde(default)]
     delim: Option<String>,
+    /// Comma-separated line prefixes skipped wherever they appear: `##` for
+    /// VCF meta lines, `@` for SAM headers, `#,track,browser` for BED.
+    #[serde(default)]
+    comment: Option<String>,
+    /// `false`: there is no header row — every line is data, and the columns
+    /// are `names` followed by `colN` for any further field.
+    #[serde(default)]
+    header: Option<bool>,
+    /// Comma-separated column names for a header-less file.
+    #[serde(default)]
+    names: Option<String>,
+    /// `false`: fields are never quoted. SAM qualities and VCF text can open a
+    /// field with `"`, which CSV quoting would read as a quote that swallows
+    /// lines until the next one.
+    #[serde(default)]
+    quote: Option<bool>,
+}
+
+const MAX_COMMENT_PREFIXES: usize = 4;
+const MAX_COMMENT_PREFIX_BYTES: usize = 16;
+const MAX_TABLE_NAMES: usize = 256;
+const MAX_TABLE_NAME_BYTES: usize = 256;
+
+/// The parse options of one `fs/table` read beyond paging.
+struct TableOpts {
+    delim: String,
+    comments: Vec<Vec<u8>>,
+    header: bool,
+    names: Vec<String>,
+    quoting: bool,
+}
+
+impl TableOpts {
+    fn from_query(q: &TableQuery) -> anyhow::Result<Self> {
+        let comments: Vec<Vec<u8>> = q
+            .comment
+            .as_deref()
+            .unwrap_or("")
+            .split(',')
+            .filter(|p| !p.is_empty())
+            .map(|p| p.as_bytes().to_vec())
+            .collect();
+        if comments.len() > MAX_COMMENT_PREFIXES
+            || comments.iter().any(|p| p.len() > MAX_COMMENT_PREFIX_BYTES)
+        {
+            anyhow::bail!(
+                "comment takes at most {MAX_COMMENT_PREFIXES} prefixes of \
+                 {MAX_COMMENT_PREFIX_BYTES} bytes"
+            );
+        }
+        let names: Vec<String> = q
+            .names
+            .as_deref()
+            .filter(|n| !n.is_empty())
+            .map(|n| n.split(',').map(str::to_owned).collect())
+            .unwrap_or_default();
+        if names.len() > MAX_TABLE_NAMES || names.iter().any(|n| n.len() > MAX_TABLE_NAME_BYTES) {
+            anyhow::bail!(
+                "names takes at most {MAX_TABLE_NAMES} names of {MAX_TABLE_NAME_BYTES} bytes"
+            );
+        }
+        Ok(TableOpts {
+            delim: q.delim.clone().unwrap_or_else(|| "auto".into()),
+            comments,
+            header: q.header.unwrap_or(true),
+            names,
+            quoting: q.quote.unwrap_or(true),
+        })
+    }
+
+    fn is_comment(&self, record: &csv::ByteRecord) -> bool {
+        !self.comments.is_empty()
+            && record
+                .get(0)
+                .is_some_and(|first| self.comments.iter().any(|p| first.starts_with(p)))
+    }
+
+    /// Everything that changes which byte a row number lands on — the row
+    /// index is only reusable under the same answer.
+    fn index_key(&self, delimiter: u8) -> String {
+        let comments: Vec<String> = self
+            .comments
+            .iter()
+            .map(|p| String::from_utf8_lossy(p).into_owned())
+            .collect();
+        format!(
+            "{delimiter}|{}|{}|{}",
+            self.quoting,
+            self.header,
+            comments.join("\u{1f}")
+        )
+    }
 }
 
 /// GET /api/v1/fs/table?path=&offset_rows=0&limit_rows=200&delim=auto — a
@@ -2308,24 +2548,183 @@ pub(crate) struct TableQuery {
 /// rows starting at `offset_rows`. All cells are strings. `.gz`/`.bgz` files
 /// (bioinformatics reality: `.tsv.gz` everywhere) page identically via
 /// sequential decode, capped at [`MAX_GZ_DECOMPRESS`] decompressed bytes.
+///
+/// Additive options: `comment` (skipped line prefixes), `header=false` with
+/// optional `names`, and `quote=false` — together they read VCF, BED, GFF and
+/// SAM. Plain files keep a sparse row index ([`row_index`]), so a deep page
+/// seeks instead of re-parsing from byte 0; each request still walks at most
+/// [`MAX_TABLE_SCAN_BYTES`], and one that runs out before `offset_rows`
+/// answers `scan_limited` with how far it got (`scanned_to`) — asking again
+/// resumes from there. The response also carries `total_rows` once a scan has
+/// reached the end, else `est_rows` (a byte-rate estimate, plain files only).
 pub(crate) async fn table(Query(query): Query<TableQuery>) -> Response {
     let limit = query.limit_rows.unwrap_or(200).min(MAX_TABLE_ROWS);
-    let delim = query.delim.as_deref().unwrap_or("auto");
-    let delim = delim.to_string();
-    blocking_json(move || read_table(&query.path, query.offset_rows, limit, &delim)).await
+    let opts = match TableOpts::from_query(&query) {
+        Ok(opts) => opts,
+        Err(err) => return bad_request(&err),
+    };
+    blocking_json(move || {
+        read_table(
+            &query.path,
+            query.offset_rows,
+            limit,
+            &opts,
+            MAX_TABLE_SCAN_BYTES,
+        )
+    })
+    .await
 }
 
-/// Parse one page of the delimited (possibly gzip-compressed) file at `raw`.
+/// One page's scan: the rows, and where the walk stopped.
+struct TableScan {
+    rows: Vec<Vec<String>>,
+    /// More rows remain past the page (or may: a budget or cap stopped us).
+    truncated: bool,
+    eof: bool,
+    /// The scan budget ran out before reaching `offset_rows`.
+    scan_limited: bool,
+    /// The data-row number the walk stopped at.
+    end_row: usize,
+    /// Rows and bytes this request walked (for the row estimate).
+    walked_rows: usize,
+    walked_bytes: u64,
+}
+
+fn lossy_cells(record: &csv::ByteRecord) -> Vec<String> {
+    record
+        .iter()
+        .map(|cell| String::from_utf8_lossy(cell).into_owned())
+        .collect()
+}
+
+/// Read up to the header row: leading comment lines are skipped, and the
+/// first other record is the header — unless the file has none.
+fn read_header<R: Read>(
+    reader: &mut csv::Reader<R>,
+    opts: &TableOpts,
+    path: &Path,
+) -> anyhow::Result<Option<Vec<String>>> {
+    if !opts.header {
+        return Ok(None);
+    }
+    let mut record = csv::ByteRecord::new();
+    loop {
+        let more = reader
+            .read_byte_record(&mut record)
+            .with_context(|| format!("{}: failed to parse header row", path.display()))?;
+        if !more {
+            return Ok(Some(Vec::new()));
+        }
+        if !opts.is_comment(&record) {
+            return Ok(Some(lossy_cells(&record)));
+        }
+    }
+}
+
+/// Where one page walk starts and what bounds it.
+struct Walk<'a> {
+    /// The data-row number the reader is positioned at.
+    first_row: usize,
+    offset_rows: usize,
+    limit_rows: usize,
+    /// Most bytes to walk; `None` when the reader carries its own cap.
+    budget: Option<u64>,
+    /// Learns every checkpoint the walk passes.
+    index: Option<&'a mut row_index::RowIndex>,
+}
+
+/// Walk data rows, collecting `limit_rows` of them from `offset_rows`.
+fn scan_page<R: Read>(
+    reader: &mut csv::Reader<R>,
+    opts: &TableOpts,
+    walk: Walk<'_>,
+    path: &Path,
+) -> anyhow::Result<TableScan> {
+    let Walk {
+        first_row,
+        offset_rows,
+        limit_rows,
+        budget,
+        mut index,
+    } = walk;
+    let mut record = csv::ByteRecord::new();
+    let mut rows = Vec::with_capacity(limit_rows.min(256));
+    let start = reader.position().byte();
+    let mut row = first_row;
+    let mut truncated = false;
+    let mut eof = false;
+    let mut scan_limited = false;
+    loop {
+        let at = reader.position().byte();
+        if budget.is_some_and(|b| at - start > b) {
+            truncated = true;
+            scan_limited = row < offset_rows;
+            break;
+        }
+        let more = reader
+            .read_byte_record(&mut record)
+            .with_context(|| format!("{}: failed to parse row", path.display()))?;
+        if !more {
+            eof = true;
+            break;
+        }
+        if opts.is_comment(&record) {
+            continue;
+        }
+        if let Some(index) = index.as_deref_mut() {
+            index.observe(row, at);
+        }
+        if row >= offset_rows {
+            if rows.len() == limit_rows {
+                truncated = true;
+                break;
+            }
+            rows.push(lossy_cells(&record));
+        }
+        row += 1;
+    }
+    Ok(TableScan {
+        rows,
+        truncated,
+        eof,
+        scan_limited,
+        end_row: row,
+        walked_rows: row - first_row,
+        walked_bytes: reader.position().byte() - start,
+    })
+}
+
+/// Bytes per line in a 32 KB window ending at or after `at` (clamped to the
+/// file), counting only the whole lines inside it; None when it holds none.
+fn window_line_rate(file: &mut std::fs::File, at: u64, len: u64) -> Option<f64> {
+    const WINDOW: u64 = 32 * 1024;
+    let start = at.min(len.saturating_sub(WINDOW));
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut buf = Vec::with_capacity(WINDOW as usize);
+    file.take(WINDOW).read_to_end(&mut buf).ok()?;
+    // The window opens mid-line: measure from the first line break to the last.
+    let first = buf.iter().position(|&b| b == b'\n')?;
+    let last = buf.iter().rposition(|&b| b == b'\n')?;
+    let lines = buf[first + 1..=last]
+        .iter()
+        .filter(|&&b| b == b'\n')
+        .count();
+    (lines > 0).then(|| (last - first) as f64 / lines as f64)
+}
+
+/// Parse one page of the delimited (possibly gzip-compressed) file at `raw`,
+/// walking at most `budget` bytes of a plain file.
 fn read_table(
     raw: &str,
     offset_rows: usize,
     limit_rows: usize,
-    delim: &str,
+    opts: &TableOpts,
+    budget: u64,
 ) -> anyhow::Result<serde_json::Value> {
     let path = canonical_file(raw)?;
     let gz = is_gzip_path(&path);
-    let delimiter = match delim {
-        "auto" => sniff_delimiter(&path, gz)?,
+    let delimiter = match opts.delim.as_str() {
+        "auto" => sniff_delimiter(&path, gz, &opts.comments)?,
         "," | "comma" => b',',
         "\t" | "tab" => b'\t',
         other => anyhow::bail!("unsupported delimiter {other:?} (want auto, comma, or tab)"),
@@ -2333,91 +2732,217 @@ fn read_table(
 
     let file = std::fs::File::open(&path)
         .with_context(|| format!("{}: failed to open", path.display()))?;
-    let (columns, rows, truncated) = if gz {
+    let mut builder = csv::ReaderBuilder::new();
+    // Headers are read by hand (comment lines may precede them), so the csv
+    // reader treats every record as data.
+    builder
+        .delimiter(delimiter)
+        .has_headers(false)
+        .flexible(true)
+        .quoting(opts.quoting);
+
+    let (header, scan, total_rows, est_rows) = if gz {
         // Take caps the decode work so a gzip bomb cannot spin the daemon;
-        // flate2's read decoders buffer their input internally.
-        let decoder = MultiGzDecoder::new(file).take(MAX_GZ_DECOMPRESS);
-        let (columns, rows, mut truncated, rest) =
-            page_records(decoder, delimiter, offset_rows, limit_rows, &path)?;
-        if rest.limit() == 0 {
-            // Cap reached: rows past it are unreachable by sequential decode,
-            // so the page is honestly "truncated" even though we saw EOF.
-            truncated = true;
-        }
-        (columns, rows, truncated)
-    } else {
-        let (columns, rows, mut truncated, rest) = page_records(
-            std::io::BufReader::new(file).take(MAX_TABLE_SCAN_BYTES),
-            delimiter,
+        // flate2's read decoders buffer their input internally. A gzip
+        // stream cannot seek, so there is no index: every read decodes from
+        // the start.
+        let mut reader = builder.from_reader(MultiGzDecoder::new(file).take(MAX_GZ_DECOMPRESS));
+        let header = read_header(&mut reader, opts, &path)?;
+        let walk = Walk {
+            first_row: 0,
             offset_rows,
             limit_rows,
-            &path,
-        )?;
-        if rest.limit() == 0 {
-            truncated = true;
+            budget: None,
+            index: None,
+        };
+        let mut scan = scan_page(&mut reader, opts, walk, &path)?;
+        if reader.get_ref().limit() == 0 {
+            // Cap reached: rows past it are unreachable by sequential decode,
+            // so the page is honestly "truncated" even though we saw EOF.
+            scan.truncated = true;
+            scan.eof = false;
         }
-        (columns, rows, truncated)
+        let total = scan.eof.then_some(scan.end_row);
+        (header, scan, total, None)
+    } else {
+        let meta = file
+            .metadata()
+            .with_context(|| format!("{}: failed to stat", path.display()))?;
+        let key = row_index::IndexKey {
+            path: path.clone(),
+            opts: opts.index_key(delimiter),
+        };
+        let version = mtime_token(&meta);
+        let mut reader = builder.from_reader(std::io::BufReader::new(file));
+        let header = read_header(&mut reader, opts, &path)?;
+        let mut index = row_index::lookup(&key, &version)
+            .unwrap_or_else(|| row_index::RowIndex::new(version, reader.position().byte()));
+        let (start_row, start_byte) = index.seek_point(offset_rows);
+        let mut pos = csv::Position::new();
+        pos.set_byte(start_byte);
+        reader
+            .seek(pos)
+            .with_context(|| format!("{}: failed to seek", path.display()))?;
+        let walk = Walk {
+            first_row: start_row,
+            offset_rows,
+            limit_rows,
+            budget: Some(budget),
+            index: Some(&mut index),
+        };
+        let scan = scan_page(&mut reader, opts, walk, &path)?;
+        if scan.eof {
+            index.total = Some(scan.end_row);
+        }
+        let total = index.total;
+        row_index::store(key, index);
+        let est = match total {
+            Some(_) => None,
+            None if scan.walked_rows > 0 && scan.walked_bytes > 0 => {
+                // Rows often grow down a file (ids get longer), so the walked
+                // rate alone overshoots from the top: average it with the
+                // line rate at the middle and the end of what remains.
+                let walked_to = start_byte + scan.walked_bytes;
+                let mut file = reader.into_inner().into_inner();
+                let rest = meta.len().saturating_sub(walked_to);
+                let rates: Vec<f64> = [
+                    Some(scan.walked_bytes as f64 / scan.walked_rows as f64),
+                    window_line_rate(&mut file, walked_to + rest / 2, meta.len()),
+                    window_line_rate(&mut file, meta.len(), meta.len()),
+                ]
+                .into_iter()
+                .flatten()
+                .collect();
+                let per_row = rates.iter().sum::<f64>() / rates.len() as f64;
+                Some(scan.end_row + (rest as f64 / per_row).round() as usize)
+            }
+            None => None,
+        };
+        (header, scan, total, est)
+    };
+
+    let columns = match header {
+        Some(columns) => columns,
+        None => {
+            // Header-less: as wide as the widest row on the page, named from
+            // `names` where given.
+            let width = scan
+                .rows
+                .iter()
+                .map(Vec::len)
+                .max()
+                .unwrap_or(opts.names.len());
+            (0..width)
+                .map(|i| {
+                    opts.names
+                        .get(i)
+                        .cloned()
+                        .unwrap_or_else(|| format!("col{}", i + 1))
+                })
+                .collect()
+        }
     };
 
     Ok(json!({
         "columns": columns,
-        "rows": rows,
+        "rows": scan.rows,
         "offset": offset_rows,
-        "truncated": truncated,
+        "truncated": scan.truncated,
+        "total_rows": total_rows,
+        "est_rows": est_rows,
+        "scan_limited": scan.scan_limited,
+        "scanned_to": scan.end_row,
     }))
 }
+#[cfg(test)]
+mod table_tests {
+    use super::*;
 
-/// One paged table read: header row, data rows, more-rows-remain, and the
-/// reader handed back (gz callers inspect its remaining `Take` budget to
-/// detect the decode cap).
-type PagedRecords<R> = (Vec<String>, Vec<Vec<String>>, bool, R);
-
-/// Page `limit_rows` records (after skipping `offset_rows`) out of a
-/// delimited byte stream: header row first, then the page. Returns the
-/// exhausted reader so gz callers can check whether the decode cap was hit.
-fn page_records<R: Read>(
-    input: R,
-    delimiter: u8,
-    offset_rows: usize,
-    limit_rows: usize,
-    path: &Path,
-) -> anyhow::Result<PagedRecords<R>> {
-    let mut reader = csv::ReaderBuilder::new()
-        .delimiter(delimiter)
-        .has_headers(true)
-        .flexible(true)
-        .from_reader(input);
-
-    let lossy_cells = |record: &csv::ByteRecord| -> Vec<String> {
-        record
-            .iter()
-            .map(|cell| String::from_utf8_lossy(cell).into_owned())
-            .collect()
-    };
-
-    let columns = lossy_cells(
-        reader
-            .byte_headers()
-            .with_context(|| format!("{}: failed to parse header row", path.display()))?,
-    );
-
-    let mut rows = Vec::with_capacity(limit_rows.min(256));
-    let mut truncated = false;
-    for (index, record) in reader.byte_records().enumerate() {
-        let record = record.with_context(|| format!("{}: failed to parse row", path.display()))?;
-        if index < offset_rows {
-            continue;
+    fn opts(delim: &str) -> TableOpts {
+        TableOpts {
+            delim: delim.into(),
+            comments: Vec::new(),
+            header: true,
+            names: Vec::new(),
+            quoting: true,
         }
-        if rows.len() == limit_rows {
-            truncated = true;
-            break;
-        }
-        rows.push(lossy_cells(&record));
     }
 
-    Ok((columns, rows, truncated, reader.into_inner()))
-}
+    /// A walk that runs out of budget before its target answers
+    /// `scan_limited` with its progress, and the next ask resumes from the
+    /// checkpoints the first one left instead of starting over.
+    #[test]
+    fn scan_budget_resumes_from_the_row_index() {
+        let dir = std::env::temp_dir().join(format!(
+            "chimaera-table-budget-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rows.tsv");
+        let mut text = String::from("n\tsquare\n");
+        for i in 0..20_000 {
+            text.push_str(&format!("{i}\t{}\n", i * i));
+        }
+        std::fs::write(&path, &text).unwrap();
+        let raw = path.to_string_lossy().into_owned();
+        let o = opts("tab");
 
+        // ~16 bytes a row: a 64 KB budget walks ~4k rows per ask.
+        let budget = 64 * 1024;
+        let first = read_table(&raw, 15_000, 5, &o, budget).unwrap();
+        assert_eq!(first["scan_limited"], true);
+        assert_eq!(first["truncated"], true);
+        assert!(first["rows"].as_array().unwrap().is_empty());
+        let mut reached = first["scanned_to"].as_u64().unwrap();
+        assert!(reached > 3_000 && reached < 15_000, "{reached}");
+        assert!(first["est_rows"].as_u64().unwrap() > 15_000);
+
+        let mut page = first;
+        for _ in 0..8 {
+            page = read_table(&raw, 15_000, 5, &o, budget).unwrap();
+            if page["scan_limited"] == false {
+                break;
+            }
+            let next = page["scanned_to"].as_u64().unwrap();
+            assert!(next > reached, "no progress: {next} <= {reached}");
+            reached = next;
+        }
+        assert_eq!(page["scan_limited"], false);
+        assert_eq!(page["rows"][0], serde_json::json!(["15000", "225000000"]));
+        assert_eq!(page["rows"].as_array().unwrap().len(), 5);
+
+        // Once indexed, a deep page is one short seek within the budget.
+        let again = read_table(&raw, 14_990, 3, &o, budget).unwrap();
+        assert_eq!(again["scan_limited"], false);
+        assert_eq!(again["rows"][0][0], "14990");
+
+        // Reading to the end records the total for every later page.
+        let mut end = read_table(&raw, 19_998, 5, &o, budget).unwrap();
+        for _ in 0..8 {
+            if end["scan_limited"] == false {
+                break;
+            }
+            end = read_table(&raw, 19_998, 5, &o, budget).unwrap();
+        }
+        assert_eq!(end["truncated"], false);
+        assert_eq!(end["total_rows"], 20_000);
+        let top = read_table(&raw, 0, 2, &o, budget).unwrap();
+        assert_eq!(top["total_rows"], 20_000);
+        assert!(top["est_rows"].is_null());
+
+        // A rewrite changes the version: the old offsets are not trusted.
+        let mut shorter = String::from("n\tsquare\n");
+        for i in 0..100 {
+            shorter.push_str(&format!("{i}\t-\n"));
+        }
+        std::fs::write(&path, shorter).unwrap();
+        let fresh = read_table(&raw, 98, 5, &o, budget).unwrap();
+        assert_eq!(fresh["rows"][0], serde_json::json!(["98", "-"]));
+        assert_eq!(fresh["total_rows"], 100);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
 #[derive(Deserialize)]
 pub(crate) struct XlsxQuery {
     path: String,
@@ -2588,8 +3113,8 @@ fn delimiter_from_name(name: &str) -> Option<u8> {
 /// Pick the delimiter: the effective file name decides by extension (for gz
 /// that is the path minus its .gz/.bgz suffix — `foo.tsv.gz` -> tsv — then
 /// the gzip member's stored FNAME); with no telling name, sniff the first
-/// (decoded) line: any tab means tab, otherwise comma.
-fn sniff_delimiter(path: &Path, gz: bool) -> anyhow::Result<u8> {
+/// (decoded) line that is not a comment: any tab means tab, otherwise comma.
+fn sniff_delimiter(path: &Path, gz: bool, comments: &[Vec<u8>]) -> anyhow::Result<u8> {
     let effective = if gz {
         gz_inner_from_path(path)
     } else {
@@ -2608,23 +3133,24 @@ fn sniff_delimiter(path: &Path, gz: bool) -> anyhow::Result<u8> {
     }
     let file =
         std::fs::File::open(path).with_context(|| format!("{}: failed to open", path.display()))?;
-    let mut first_line = Vec::new();
-    if gz {
-        std::io::BufReader::new(MultiGzDecoder::new(file))
-            .take(64 * 1024)
-            .read_until(b'\n', &mut first_line)
-            .with_context(|| format!("{}: failed to decompress", path.display()))?;
+    let input: Box<dyn Read> = if gz {
+        Box::new(MultiGzDecoder::new(file))
     } else {
-        std::io::BufReader::new(file)
-            .take(64 * 1024)
-            .read_until(b'\n', &mut first_line)
+        Box::new(file)
+    };
+    // One 64 KB window for the whole sniff, comment lines included.
+    let mut window = std::io::BufReader::new(input).take(64 * 1024);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let n = window
+            .read_until(b'\n', &mut line)
             .with_context(|| format!("{}: failed to read", path.display()))?;
+        if n == 0 || !comments.iter().any(|p| line.starts_with(p)) {
+            break;
+        }
     }
-    Ok(if first_line.contains(&b'\t') {
-        b'\t'
-    } else {
-        b','
-    })
+    Ok(if line.contains(&b'\t') { b'\t' } else { b',' })
 }
 
 #[derive(Deserialize)]
@@ -2639,6 +3165,11 @@ pub(crate) struct ValidateRequest {
     /// workspace-index fallbacks below, scoped to this workspace's index.
     #[serde(default)]
     workspace_id: Option<String>,
+    /// Additive: only the exact join onto each base — no diff-prefix strip,
+    /// no workspace-index fallback. A document's own link names one file; a
+    /// broken `b/spec.md` must stay broken rather than open `spec.md`.
+    #[serde(default)]
+    strict: bool,
 }
 
 /// A candidate eligible for the bare-basename fallback: a single path segment
@@ -2687,9 +3218,13 @@ fn entry_json(path: &Path, kind: &str) -> serde_json::Value {
 }
 
 /// The direct rungs of the ladder: an absolute or `~` candidate as-is; else
-/// joined onto each base in order; else, for a git diff prefix (`a/`, `b/`),
-/// the remainder joined onto each base. First hit wins.
-fn resolve_direct(candidate: &str, bases: &[PathBuf]) -> Option<(PathBuf, &'static str)> {
+/// joined onto each base in order; else (unless `strict`), for a git diff
+/// prefix (`a/`, `b/`), the remainder joined onto each base. First hit wins.
+fn resolve_direct(
+    candidate: &str,
+    bases: &[PathBuf],
+    strict: bool,
+) -> Option<(PathBuf, &'static str)> {
     let expanded = expand_tilde(candidate).ok()?;
     if expanded.is_absolute() {
         return resolve_entry(&expanded);
@@ -2699,6 +3234,9 @@ fn resolve_direct(candidate: &str, bases: &[PathBuf]) -> Option<(PathBuf, &'stat
         .find_map(|base| resolve_entry(&base.join(&expanded)))
     {
         return Some(hit);
+    }
+    if strict {
+        return None;
     }
     let rest = candidate
         .strip_prefix("a/")
@@ -2763,7 +3301,7 @@ fn judge_index_matches(
     }
 }
 
-/// POST /api/v1/fs/validate {candidates, base, bases?, workspace_id?} —
+/// POST /api/v1/fs/validate {candidates, base, bases?, workspace_id?, strict?} —
 /// batched existence check behind the terminal, chat and document link
 /// providers: only path-like strings that resolve to something real get
 /// underlined. Answers `{valid: {[cand]: {path, kind}}, ambiguous: {[cand]:
@@ -2785,6 +3323,9 @@ fn judge_index_matches(
 ///    `results/figs/plot.png`). One match → `valid`; several → `ambiguous`
 ///    (at most [`MAX_AMBIGUOUS`], shortest path first) for the client to
 ///    offer a choice, never an arbitrary pick.
+///
+/// `strict` (document links) stops after rung 2: a link a document spells
+/// out must name exactly that file. Chat and terminal text stay lenient.
 ///
 /// Bounds: the index is the quickopen walk — entry/depth/time-capped,
 /// ignore-respecting (so `target/`, `work/` and symlinked trees are
@@ -2836,8 +3377,11 @@ pub(crate) async fn validate(
             if Instant::now() >= deadline {
                 break;
             }
-            if let Some((path, kind)) = resolve_direct(candidate, &bases) {
+            if let Some((path, kind)) = resolve_direct(candidate, &bases, body.strict) {
                 valid.insert(candidate.clone(), entry_json(&path, kind));
+                continue;
+            }
+            if body.strict {
                 continue;
             }
             let Some(workspace_id) = body.workspace_id.as_deref() else {

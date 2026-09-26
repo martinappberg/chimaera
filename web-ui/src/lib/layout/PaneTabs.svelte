@@ -32,6 +32,7 @@
   import { dirtyFiles } from "../shared/editing";
   import { volatileChatDrafts } from "../chat/drafts";
   import { gitIndex } from "../workspace/git";
+  import { isUnread } from "../workspace/unread.svelte";
   import { decoFor } from "../workspace/gitDeco";
   import { PINNED } from "../shared/keys";
   import { keyHint } from "../shared/keybindings";
@@ -563,18 +564,29 @@
     return rows;
   }
 
+  /** Close every tab of this pane except `keep` (or all), from the right so
+   *  the indices still to visit never shift. A file with unsaved edits asks
+   *  first — App gathers them into one "save changes?" dialog. */
+  function closeMany(keep: number | null): void {
+    for (let j = node.tabs.length - 1; j >= 0; j--) {
+      if (j !== keep) ctrl.closeTab(node.id, j);
+    }
+  }
+
   function tabMenu(tab: Tab, i: number): ContextMenuEntry[] {
-    const close: ContextMenuEntry = {
-      label: "Close",
-      onSelect: () => ctrl.closeTab(node.id, i),
-    };
+    const others = node.tabs.length > 1;
+    const close: ContextMenuEntry[] = [
+      { label: "Close", onSelect: () => ctrl.closeTab(node.id, i) },
+      { label: "Close Others", disabled: !others, onSelect: () => closeMany(i) },
+      { label: "Close All", onSelect: () => closeMany(null) },
+    ];
     const move = moveEntries(tab, i);
     if (tab.surface === "terminal") {
       return [
         { label: "Rename…", onSelect: () => beginTabRename(tab) },
         "separator",
         ...move,
-        close,
+        ...close,
       ];
     }
     if (tab.surface === "browser") {
@@ -590,21 +602,17 @@
             ]
           : []),
         ...move,
-        close,
+        ...close,
       ];
     }
     if (tab.surface === "file") {
-      const dirty = $dirtyFiles.has(tab.path);
+      // Renaming a file with unsaved edits is safe: its buffer follows the
+      // rename (previews/buffers re-keys on the fs mutation).
       return [
         ...(tab.preview === true
           ? [{ label: "Keep Open", onSelect: () => ctrl.pinTab(node.id, i) } as ContextMenuEntry, "separator" as const]
           : []),
-        {
-          label: "Rename…",
-          disabled: dirty,
-          hint: dirty ? "save the file first — renaming would drop unsaved edits" : undefined,
-          onSelect: () => beginTabRename(tab),
-        },
+        { label: "Rename…", onSelect: () => beginTabRename(tab) },
         { label: "Reveal in File Tree", onSelect: () => ctrl.revealPathInTree(tab.path) },
         "separator",
         ...(isRemoteHost()
@@ -613,10 +621,10 @@
         { label: "Copy Path", onSelect: () => void copyPath(tab.path) },
         "separator",
         ...move,
-        close,
+        ...close,
       ];
     }
-    return [...move, close];
+    return [...move, ...close];
   }
 </script>
 
@@ -646,9 +654,11 @@
         {@const ts = sid !== null ? (sessions.get(sid) ?? null) : null}
         {@const fEntry = tab.surface === "file" ? $gitIndex.files.get(tab.path) : undefined}
         {@const fDeco = fEntry ? decoFor(fEntry) : null}
+        {@const unread = sid !== null && i !== node.active && isUnread(sid)}
         <div
           class="tab"
           class:active={i === node.active}
+          class:unread
           class:insert={insertIndex === i}
           class:link-target={dropSpot?.kind === "linktab" &&
             dropSpot.paneId === node.id &&
@@ -803,6 +813,7 @@
             <span
               class="tab-name"
               class:preview={tab.surface === "file" && tab.preview === true}
+              class:unread
               data-label={label(tab)}
               style:color={fDeco ? fDeco.color : undefined}>{label(tab)}</span
             >
@@ -1377,6 +1388,15 @@
     font-style: normal;
   }
 
+  /* Unread: an agent in a background tab finished work you haven't looked
+     at — the rail row's cue (a bolder, full-ink name), so the tab that needs
+     a look reads at a glance. The ::after reserve already sizes the name at
+     this weight, so marking never shifts the strip. */
+  .tab-name.unread {
+    color: var(--fg);
+    font-weight: 600;
+  }
+
   /* A VS Code preview tab: italic until it is pinned (dbl-click / edit). */
   .tab-name.preview {
     font-style: italic;
@@ -1400,6 +1420,8 @@
   }
 
   .tab-close {
+    /* Anchors the unread dot drawn in this slot (see .tab.unread below). */
+    position: relative;
     appearance: none;
     border: none;
     background: none;
@@ -1425,6 +1447,26 @@
   .tab-close:hover {
     opacity: 1;
     color: var(--fg);
+  }
+
+  /* Unread's scannable half: an accent dot in the close button's slot that
+     turns back into × under the pointer (the editor "dirty dot" gesture,
+     here meaning "finished — not looked at yet"). No reflow either way. */
+  .tab.unread:not(:hover) .tab-close {
+    opacity: 1;
+    color: transparent;
+  }
+
+  .tab.unread:not(:hover) .tab-close::after {
+    content: "";
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: 6px;
+    height: 6px;
+    margin: -3px 0 0 -3px;
+    border-radius: 50%;
+    background: var(--accent);
   }
 
   /* --- linked-terminal chips ------------------------------------------- */

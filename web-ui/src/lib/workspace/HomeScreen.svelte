@@ -3,7 +3,7 @@
   import BrandMark from "../shared/BrandMark.svelte";
   import ComputeLaunchDialog from "./ComputeLaunchDialog.svelte";
   import { keyHint } from "../shared/keybindings";
-  import { isBusy, needsAttention, type Session, type Workspace } from "./sessions";
+  import { isBusy, needsApproval, type Session, type Workspace } from "./sessions";
   import {
     addHost,
     beginUpdate,
@@ -100,10 +100,11 @@
     for (const s of sessions) {
       const entry = map.get(s.workspace_id) ?? { live: 0, attn: 0 };
       if (s.alive) entry.live += 1;
-      // A crashed chat driver stays registered (alive:false, errored) until
-      // deleted; only a LIVE ask is something the user can act on — the same
-      // gate as App's needsYou and the dashboard lane.
-      if (s.alive && needsAttention(s)) entry.attn += 1;
+      // Counts are approvals only (needsApproval — the same predicate as
+      // App's needsYou pill/title and the Dock badge). Alive-gated: a crashed
+      // chat driver stays registered (alive:false) until deleted, and only a
+      // LIVE ask is something the user can act on.
+      if (s.alive && needsApproval(s)) entry.attn += 1;
       map.set(s.workspace_id, entry);
     }
     return map;
@@ -921,7 +922,7 @@
                   <span
                     class="dot {wsState}"
                     title={wsState === "attn"
-                      ? `${live?.attn} need${live?.attn === 1 ? "s" : ""} you`
+                      ? `${live?.attn} awaiting approval`
                       : wsState === "alive"
                         ? `${live?.live} live session${live?.live === 1 ? "" : "s"}`
                         : "no live sessions"}
@@ -929,7 +930,7 @@
                   <span class="name">{w.name}</span>
                   <span class="path">{tildify(w.root)}</span>
                   {#if live !== undefined && live.attn > 0}
-                    <span class="badge attn" title="{live.attn} need{live.attn === 1 ? 's' : ''} you">
+                    <span class="badge attn" title="{live.attn} awaiting approval">
                       <span class="dot attn"></span>{live.attn}
                     </span>
                   {/if}

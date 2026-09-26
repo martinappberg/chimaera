@@ -1,9 +1,27 @@
 <script lang="ts">
+  /**
+   * The paged table grid shared by delimited text (CSV/TSV and the
+   * bioinformatics presets in `files.ts`) and spreadsheets (`XlsxView`).
+   * The DOM holds only the rows in view plus overscan (`tableGrid.ts`); the
+   * loaded window pages in both directions as you scroll and is capped, so a
+   * deep jump or a long scroll never grows without bound. Jump to any row
+   * from the footer field (the daemon's row index makes that a seek);
+   * double-click a cell to read and copy all of it.
+   */
+  import { tick, untrack } from "svelte";
   import { fsTable, type TablePage } from "./files";
   import { retain, release, type FileEntry } from "./fileStore.svelte";
   import { getSetting } from "../settings/store.svelte";
   import { copyText } from "../shared/clipboard";
   import Spinner from "./Spinner.svelte";
+  import {
+    autoColumnWidths,
+    formatRowCount,
+    jumpOffset,
+    parseRowNumber,
+    rowAt,
+    virtualWindow,
+  } from "./tableGrid";
 
   interface Props {
     path: string;
@@ -20,26 +38,52 @@
 
   /** Rows per fetched page (settings ground truth, read per request). */
   const pageRows = () => getSetting("files.tableRowsPerPage");
-  /** Start fetching the next page when the scroll gets this close to the end. */
-  const PREFETCH_PX = 600;
+  /** Fetch the next (or previous) page when the rendered rows come this close
+   *  to the loaded window's edge. */
+  const PREFETCH_ROWS = 150;
+  const OVERSCAN = 12;
+  /** The loaded window's ceiling; paging past it drops rows off the far end. */
+  const MAX_LOADED_ROWS = 20_000;
+  /** A deep jump may need several budgeted daemon scans while the row index
+   *  is built; each one must make progress, and this bounds the whole walk. */
+  const MAX_SCAN_ROUNDS = 64;
   const MIN_COL_PX = 48;
-  const MAX_AUTOFIT_PX = 480;
+  const CELL_PAD_PX = 24;
+  const AUTO_MAX_CHARS = 40;
+  const AUTOFIT_MAX_CHARS = 80;
+  const FLASH_MS = 1400;
+  /** Until the grid font is measured: close to every mono face at 12-13px. */
+  const FALLBACK_CHAR_W = 7.5;
 
-  let columns = $state<string[]>([]);
-  let rows = $state<string[][]>([]);
-  let total = $state<number | null>(null); // null = unknown / more beyond
-  let loadedOffset = $state(0); // rows before our first loaded row (always 0 here)
+  let columns = $state.raw<string[]>([]);
+  let rows = $state.raw<string[][]>([]);
+  /** Row number of `rows[0]` in the file (0-based). */
+  let loadedOffset = $state(0);
+  /** Exact data-row count once known; else the daemon's estimate. */
+  let total = $state<number | null>(null);
+  let estimate = $state<number | null>(null);
+  let atEnd = $state(false);
   let error = $state<string | null>(null);
   let loading = $state(false);
-  let atEnd = $state(false);
+  /** A jump in progress: what it is doing ("indexing… row 400,000"). */
+  let seeking = $state<string | null>(null);
   let scroller = $state<HTMLDivElement | null>(null);
+  let head = $state<HTMLTableSectionElement | null>(null);
+  let scrollTop = $state(0);
+  let viewportH = $state(0);
+  let rowH = $state(24);
+  /** Monospace advance of the grid font (0 = not measured yet); column
+   *  widths are counted in it. */
+  let charW = $state(0);
 
-  /** Explicit per-column widths (px); unset = auto (content-driven). */
-  let widths = $state<Record<number, number>>({});
+  /** Column widths (px); auto-sized from the first page, then the user's. */
+  let widths = $state.raw<number[]>([]);
+  const userSized = new Set<number>();
   /** Columns detected as numeric get right-aligned tabular figures. */
   let numericCols = $state<Set<number>>(new Set());
 
-  /** Selection: a rectangular block of cells, or whole rows via the gutter. */
+  /** Selection: a rectangular block of cells, or whole rows via the gutter.
+   *  Rows are file row numbers, so paging the window keeps it anchored. */
   interface Sel {
     r0: number;
     c0: number;
@@ -50,9 +94,38 @@
   let anchor: { r: number; c: number } | null = null;
   let selecting = false;
 
+  let flashRow = $state<number | null>(null);
+  let flashTimer: ReturnType<typeof setTimeout> | null = null;
+  let jumpGen = 0;
+  /** The footer row field's text while typing (null = follow the scroll). */
+  let rowDraft = $state<string | null>(null);
+
+  /** The cell open in the expand popover. */
+  interface Expanded {
+    r: number;
+    c: number;
+    column: string;
+    text: string;
+    left: number;
+    top: number;
+  }
+  let expanded = $state<Expanded | null>(null);
+  let copied = $state(false);
+  let root = $state<HTMLDivElement | null>(null);
+
+  const win = $derived(virtualWindow(scrollTop, viewportH, rowH, rows.length, OVERSCAN));
+  const visibleRows = $derived(rows.slice(win.start, win.end));
+  const topRow = $derived(loadedOffset + rowAt(scrollTop, rowH, rows.length) + 1);
+  const gutterW = $derived(
+    Math.ceil(
+      Math.max(5, (loadedOffset + rows.length).toLocaleString("en-US").length + 1) * (charW || FALLBACK_CHAR_W),
+    ) + CELL_PAD_PX,
+  );
+  const tableW = $derived(gutterW + widths.reduce((a, b) => a + b, 0));
+
   // The shared store entry holds the FIRST page (cached across tab switches,
-  // re-fetched in place when the file changes on disk). Subsequent pages load
-  // on scroll via loadMore and are not cached.
+  // re-fetched in place when the file changes on disk). Further pages load
+  // as the window scrolls and are not cached.
   let entry = $state<FileEntry | null>(null);
   $effect(() => {
     const p = path;
@@ -60,14 +133,19 @@
     columns = [];
     rows = [];
     total = null;
+    estimate = null;
     loadedOffset = 0;
     error = null;
     atEnd = false;
-    widths = {};
+    widths = [];
+    userSized.clear();
     numericCols = new Set();
     sel = null;
     anchor = null;
+    expanded = null;
     loading = true;
+    jumpGen += 1;
+    seeking = null;
     if (fetchPage !== undefined) {
       // Store-bypass source (xlsx): no shared store entry (so no instant cache /
       // live-on-disk refresh) — the caller remounts us per sheet, which resets
@@ -78,7 +156,7 @@
         try {
           const page = await fp(0, pageRows());
           if (p !== path) return;
-          apply(page, true);
+          apply(page, "replace");
         } catch (e) {
           if (p !== path) return;
           error = e instanceof Error ? e.message : "failed to load the sheet";
@@ -96,26 +174,108 @@
 
   // Apply the store's first page whenever it (re)loads — initial fetch, an
   // instant cache hit on return, or a live refresh after a disk change (which
-  // resets to the fresh first page, dropping any scrolled-in extra pages).
+  // resets to the fresh first page, dropping any paged-in window). Only the
+  // entry's payload is a dependency: `apply` reads the grid's own state.
   $effect(() => {
     const e = entry;
     if (e === null) return;
     const page = e.table;
-    if (page !== null) {
-      apply(page, true);
-      loading = false;
-      scroller?.scrollTo({ top: 0 });
-    } else if (e.tableError !== null) {
-      error = e.tableError;
-      loading = false;
-    }
+    const failure = e.tableError;
+    untrack(() => {
+      if (page !== null) {
+        apply(page, "replace");
+        loading = false;
+        if (scroller !== null) scroller.scrollTop = 0;
+        scrollTop = 0;
+      } else if (failure !== null) {
+        error = failure;
+        loading = false;
+      }
+    });
   });
+
+  // Viewport height and the row height (the latter follows the text-size
+  // setting, which resizes the header row).
+  $effect(() => {
+    const el = scroller;
+    const th = head;
+    if (el === null) return;
+    const ro = new ResizeObserver(() => {
+      viewportH = el.clientHeight;
+      measure();
+    });
+    ro.observe(el);
+    if (th !== null) ro.observe(th);
+    viewportH = el.clientHeight;
+    return () => ro.disconnect();
+  });
+
+  // Measure once the first rows render (the grid mounts with the data).
+  $effect(() => {
+    if (scroller === null || rows.length === 0) return;
+    void tick().then(measure);
+  });
+
+  $effect(
+    () => () => {
+      if (flashTimer !== null) clearTimeout(flashTimer);
+    },
+  );
+
+  /** Read the real row height and font advance from the rendered grid. */
+  function measure(): void {
+    const el = scroller;
+    if (el === null) return;
+    const tr = el.querySelector<HTMLElement>("tbody tr.row");
+    if (tr !== null) {
+      const h = tr.getBoundingClientRect().height;
+      if (h > 0 && Math.abs(h - rowH) > 0.25) rowH = h;
+    }
+    const probe = el.querySelector<HTMLElement>(".char-probe");
+    const chars = probe?.textContent?.length ?? 0;
+    if (probe !== null && chars > 0) {
+      const w = probe.getBoundingClientRect().width / chars;
+      if (w > 0 && Math.abs(w - charW) > 0.05) {
+        charW = w;
+        // The measured font (or a new text size) re-derives every column the
+        // user has not sized.
+        resizeAutoColumns();
+      }
+    }
+  }
+
+  function resizeAutoColumns(): void {
+    const auto = autoColumnWidths(columns, rows.slice(0, 200), charW || FALLBACK_CHAR_W, {
+      pad: CELL_PAD_PX,
+      min: MIN_COL_PX,
+      maxChars: AUTO_MAX_CHARS,
+    });
+    widths = auto.map((w, c) => (userSized.has(c) && widths[c] !== undefined ? widths[c] : w));
+  }
+
+  /** Widen (never narrow — no jitter while scrolling) the columns the user
+   *  has not sized so a newly loaded page's cells fit: ids deep in a file
+   *  are longer than the first page's. Also adds columns for wider rows. */
+  function growAutoColumns(sample: string[][]): void {
+    const fit = autoColumnWidths(columns, sample.slice(0, 200), charW || FALLBACK_CHAR_W, {
+      pad: CELL_PAD_PX,
+      min: MIN_COL_PX,
+      maxChars: AUTO_MAX_CHARS,
+    });
+    if (fit.length <= widths.length && fit.every((w, c) => userSized.has(c) || w <= widths[c])) return;
+    widths = fit.map((w, c) => {
+      const held = widths[c];
+      if (held === undefined) return w;
+      return userSized.has(c) ? held : Math.max(held, w);
+    });
+  }
 
   const NUMERIC_RE = /^-?(?:\d[\d,]*)(?:\.\d+)?(?:[eE][-+]?\d+)?%?$/;
 
   function detectNumeric(cols: string[], sample: string[][]): Set<number> {
     const out = new Set<number>();
-    for (let c = 0; c < cols.length; c++) {
+    const width = Math.max(cols.length, ...sample.map((r) => r.length));
+    for (let c = 0; c < width; c++) {
       let seen = 0;
       let numeric = 0;
       for (const row of sample) {
@@ -129,79 +289,222 @@
     return out;
   }
 
-  /** Append the next page without disturbing the current scroll position. */
+  /** One page from the source, riding out budget-limited daemon scans (each
+   *  must get further than the last). */
+  async function fetchAt(
+    offset: number,
+    limit: number,
+    progress?: (reached: number) => void,
+  ): Promise<TablePage> {
+    let reached = -1;
+    let page: TablePage | null = null;
+    for (let round = 0; round < MAX_SCAN_ROUNDS; round++) {
+      page = fetchPage !== undefined ? await fetchPage(offset, limit) : await fsTable(path, offset, limit);
+      if (page.scan_limited !== true) return page;
+      const next = page.scanned_to ?? 0;
+      if (next <= reached) break;
+      reached = next;
+      progress?.(next);
+    }
+    if (page === null) throw new Error("failed to load rows");
+    throw new Error(`gave up scanning at row ${(page.scanned_to ?? 0).toLocaleString("en-US")}`);
+  }
+
+  function noteCounts(page: TablePage): void {
+    if (typeof page.total_rows === "number") total = page.total_rows;
+    if (typeof page.est_rows === "number") estimate = page.est_rows;
+  }
+
+  /**
+   * Fold a page into the window. "replace" starts a new window at the page
+   * (first load, refresh, jump); "append"/"prepend" extend the current one
+   * and trim the far end past MAX_LOADED_ROWS, keeping the view still.
+   */
+  function apply(page: TablePage, how: "replace" | "append" | "prepend"): void {
+    noteCounts(page);
+    if (how === "replace") {
+      const fresh = columns.length !== page.columns.length || columns.some((c, i) => c !== page.columns[i]);
+      columns = page.columns;
+      rows = page.rows;
+      loadedOffset = page.offset;
+      if (fresh || widths.length === 0) {
+        numericCols = detectNumeric(page.columns, page.rows.slice(0, 50));
+        userSized.clear();
+        widths = [];
+        resizeAutoColumns();
+      }
+      atEnd = !page.truncated;
+      error = null;
+      sel = null;
+      expanded = null;
+    } else if (how === "append") {
+      let next = rows.concat(page.rows);
+      atEnd = !page.truncated;
+      if (next.length > MAX_LOADED_ROWS) {
+        const drop = next.length - MAX_LOADED_ROWS;
+        next = next.slice(drop);
+        loadedOffset += drop;
+        shiftScroll(-drop);
+      }
+      rows = next;
+    } else {
+      let next = page.rows.concat(rows);
+      loadedOffset = page.offset;
+      shiftScroll(page.rows.length);
+      if (next.length > MAX_LOADED_ROWS) {
+        next = next.slice(0, MAX_LOADED_ROWS);
+        atEnd = false;
+      }
+      rows = next;
+    }
+    if (atEnd) total = loadedOffset + rows.length;
+    growAutoColumns(page.rows);
+  }
+
+  /** Keep the same rows on screen after `delta` rows were added (+) above
+   *  or removed (−) from above the view. */
+  function shiftScroll(delta: number): void {
+    const next = Math.max(0, scrollTop + delta * rowH);
+    scrollTop = next;
+    void tick().then(() => {
+      if (scroller !== null) scroller.scrollTop = next;
+    });
+  }
+
   async function loadMore(): Promise<void> {
-    if (loading || atEnd || error !== null) return;
+    if (loading || atEnd || error !== null || seeking !== null) return;
     loading = true;
     const p = path;
-    const off = loadedOffset + rows.length;
+    const gen = jumpGen;
     try {
-      const page = fetchPage !== undefined ? await fetchPage(off, pageRows()) : await fsTable(p, off, pageRows());
-      if (p !== path) return;
-      apply(page, false);
+      const page = await fetchAt(loadedOffset + rows.length, pageRows());
+      if (p !== path || gen !== jumpGen) return;
+      apply(page, "append");
     } catch (e) {
       if (p !== path) return;
       error = e instanceof Error ? e.message : "failed to load more rows";
     } finally {
       if (p === path) loading = false;
     }
+    void tick().then(maybePrefetch);
   }
 
-  function apply(page: TablePage, first: boolean): void {
-    if (first) {
-      columns = page.columns;
-      rows = page.rows;
-      loadedOffset = page.offset;
-      numericCols = detectNumeric(page.columns, page.rows.slice(0, 50));
-      // A fresh first page also RESETS pagination — this runs not only on the
-      // initial load but on a live refresh after a disk change, where atEnd /
-      // total / error may carry over from the previous (fully-loaded) content
-      // and would otherwise strand the grown file at its first page.
-      atEnd = false;
-      total = null;
-      error = null;
-    } else {
-      rows = rows.concat(page.rows);
+  async function loadPrev(): Promise<void> {
+    if (loading || loadedOffset === 0 || error !== null || seeking !== null) return;
+    loading = true;
+    const p = path;
+    const gen = jumpGen;
+    const offset = Math.max(0, loadedOffset - pageRows());
+    try {
+      const page = await fetchAt(offset, loadedOffset - offset);
+      if (p !== path || gen !== jumpGen) return;
+      apply(page, "prepend");
+    } catch (e) {
+      if (p !== path) return;
+      error = e instanceof Error ? e.message : "failed to load rows";
+    } finally {
+      if (p === path) loading = false;
     }
-    if (!page.truncated) {
-      atEnd = true;
-      total = loadedOffset + rows.length;
-    }
+  }
+
+  function maybePrefetch(): void {
+    if (rows.length === 0) return;
+    if (win.end >= rows.length - PREFETCH_ROWS && !atEnd) void loadMore();
+    else if (win.start <= PREFETCH_ROWS && loadedOffset > 0) void loadPrev();
   }
 
   function onScroll(): void {
     const el = scroller;
-    if (el === null || atEnd || loading) return;
-    if (el.scrollTop + el.clientHeight >= el.scrollHeight - PREFETCH_PX) {
-      void loadMore();
+    if (el === null) return;
+    scrollTop = el.scrollTop;
+    expanded = null;
+    maybePrefetch();
+  }
+
+  // --- jump to row -------------------------------------------------------------
+
+  function scrollToRow(r: number): void {
+    const el = scroller;
+    if (el === null) return;
+    const i = r - loadedOffset;
+    // Two rows of context above the target.
+    const top = Math.max(0, (i - 2) * rowH);
+    el.scrollTop = top;
+    scrollTop = el.scrollTop;
+    flashRow = r;
+    if (flashTimer !== null) clearTimeout(flashTimer);
+    flashTimer = setTimeout(() => {
+      flashTimer = null;
+      flashRow = null;
+    }, FLASH_MS);
+  }
+
+  /** Show 1-based row `n`: a scroll when it is loaded, else a new window
+   *  fetched around it (the daemon seeks via its row index). */
+  async function jumpTo(n: number): Promise<void> {
+    let target = n - 1;
+    if (total !== null && total > 0) target = Math.min(target, total - 1);
+    if (target >= loadedOffset && target < loadedOffset + rows.length) {
+      scrollToRow(target);
+      return;
+    }
+    const gen = ++jumpGen;
+    const p = path;
+    seeking = `seeking row ${(target + 1).toLocaleString("en-US")}…`;
+    try {
+      let page = await fetchAt(jumpOffset(target + 1), pageRows(), (reached) => {
+        if (gen === jumpGen) seeking = `indexing… row ${reached.toLocaleString("en-US")}`;
+      });
+      if (gen !== jumpGen || p !== path) return;
+      noteCounts(page);
+      if (page.rows.length === 0 && total !== null && total > 0) {
+        // Past the end: land on the last row instead.
+        target = total - 1;
+        page = await fetchAt(jumpOffset(total), pageRows());
+        if (gen !== jumpGen || p !== path) return;
+      }
+      if (page.rows.length === 0) {
+        error = `row ${(n).toLocaleString("en-US")} is past the end`;
+        return;
+      }
+      apply(page, "replace");
+      target = Math.min(target, page.offset + page.rows.length - 1);
+      await tick();
+      scrollToRow(target);
+      void tick().then(maybePrefetch);
+    } catch (e) {
+      if (gen === jumpGen && p === path) error = e instanceof Error ? e.message : "jump failed";
+    } finally {
+      if (gen === jumpGen) seeking = null;
     }
   }
 
-  // The row currently at the top of the viewport — "position always visible".
-  let topRow = $state(1);
-  function updateTopRow(): void {
-    const el = scroller;
-    if (el === null || rows.length === 0) return;
-    const body = el.querySelector<HTMLElement>("tbody");
-    if (body === null) return;
-    const rowH = body.offsetHeight / rows.length;
-    if (rowH <= 0) return;
-    // Header is sticky, so scrollTop 0 sits at the first body row.
-    const idx = Math.floor(el.scrollTop / rowH);
-    topRow = Math.min(rows.length, Math.max(1, idx + 1));
+  function onRowKey(e: KeyboardEvent): void {
+    const input = e.currentTarget as HTMLInputElement;
+    if (e.key === "Enter") {
+      e.preventDefault();
+      const n = parseRowNumber(input.value);
+      rowDraft = null;
+      if (n !== null) {
+        error = null;
+        void jumpTo(n);
+      }
+      input.select();
+    } else if (e.key === "Escape") {
+      rowDraft = null;
+      input.blur();
+    }
   }
 
-  function onScrollAll(): void {
-    onScroll();
-    updateTopRow();
-  }
-
-  const positionLabel = $derived.by(() => {
-    if (rows.length === 0) return "no rows";
-    const shown = rows.length.toLocaleString();
-    const totalStr = total !== null ? total.toLocaleString() : `${shown}+`;
-    const first = (loadedOffset + topRow).toLocaleString();
-    return `row ${first} · ${shown} of ${totalStr} loaded`;
+  /** Honest about what is loaded: "of 5,000" when it all is, else
+   *  "· 3,000 loaded rows of ~1.2M". */
+  const countLabel = $derived.by(() => {
+    if (rows.length === 0) return "· no rows";
+    if (total !== null && atEnd && loadedOffset === 0) return `of ${formatRowCount(total, true)}`;
+    const loaded = `· ${rows.length.toLocaleString("en-US")} loaded ${rows.length === 1 ? "row" : "rows"}`;
+    if (total !== null) return `${loaded} of ${formatRowCount(total, true)}`;
+    if (estimate !== null) return `${loaded} of ${formatRowCount(estimate, false)}`;
+    return `${loaded} of ${(loadedOffset + rows.length).toLocaleString("en-US")}+`;
   });
 
   // --- column resize / auto-fit ---------------------------------------------
@@ -214,15 +517,16 @@
     e.stopPropagation();
     resizeCol = col;
     resizeStartX = e.clientX;
-    const th = (e.currentTarget as HTMLElement).closest("th");
-    resizeStartW = th?.getBoundingClientRect().width ?? MIN_COL_PX;
+    resizeStartW = widths[col] ?? MIN_COL_PX;
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
   }
 
   function onResizeMove(e: PointerEvent): void {
     if (resizeCol === null) return;
     const next = Math.max(MIN_COL_PX, resizeStartW + (e.clientX - resizeStartX));
-    widths = { ...widths, [resizeCol]: next };
+    const col = resizeCol;
+    userSized.add(col);
+    widths = widths.map((w, c) => (c === col ? next : w));
   }
 
   function onResizeUp(e: PointerEvent): void {
@@ -231,26 +535,16 @@
     (e.currentTarget as HTMLElement).releasePointerCapture?.(e.pointerId);
   }
 
-  /** Double-click a divider: auto-fit the column to its widest visible cell. */
+  /** Double-click a divider: fit the column to its widest loaded cell. */
   function autoFit(col: number): void {
-    const el = scroller;
-    if (el === null) return;
-    const measure = document.createElement("span");
-    measure.style.cssText =
-      "position:absolute;visibility:hidden;white-space:pre;font-family:var(--mono);font-size:var(--text-sm);";
-    el.appendChild(measure);
-    let max = 0;
-    measure.textContent = columns[col] ?? "";
-    max = measure.offsetWidth;
-    // sample up to 300 rows to keep it snappy on big tables
-    const n = Math.min(rows.length, 300);
-    for (let r = 0; r < n; r++) {
-      measure.textContent = rows[r][col] ?? "";
-      if (measure.offsetWidth > max) max = measure.offsetWidth;
-    }
-    measure.remove();
-    const w = Math.min(MAX_AUTOFIT_PX, Math.max(MIN_COL_PX, max + 28));
-    widths = { ...widths, [col]: w };
+    const sample = rows.slice(0, 5_000).map((r) => [r[col] ?? ""]);
+    const [fit] = autoColumnWidths([columns[col] ?? ""], sample, charW || FALLBACK_CHAR_W, {
+      pad: CELL_PAD_PX,
+      min: MIN_COL_PX,
+      maxChars: AUTOFIT_MAX_CHARS,
+    });
+    userSized.add(col);
+    widths = widths.map((w, c) => (c === col ? fit : w));
   }
 
   // --- cell / row selection + copy ------------------------------------------
@@ -263,10 +557,11 @@
     };
   }
 
+  const selN = $derived(sel === null ? null : norm(sel));
+
   function inSel(r: number, c: number): boolean {
-    if (sel === null) return false;
-    const s = norm(sel);
-    return r >= s.r0 && r <= s.r1 && c >= s.c0 && c <= s.c1;
+    const s = selN;
+    return s !== null && r >= s.r0 && r <= s.r1 && c >= s.c0 && c <= s.c1;
   }
 
   function onCellDown(e: PointerEvent, r: number, c: number): void {
@@ -288,7 +583,7 @@
   function onRowGutterDown(e: PointerEvent, r: number): void {
     if (e.button !== 0) return;
     selecting = true;
-    const lastC = columns.length - 1;
+    const lastC = widths.length - 1;
     if (e.shiftKey && anchor !== null) {
       sel = { r0: anchor.r, c0: 0, r1: r, c1: lastC };
     } else {
@@ -299,7 +594,7 @@
 
   function onGutterEnter(r: number): void {
     if (!selecting || anchor === null) return;
-    sel = { r0: anchor.r, c0: 0, r1: r, c1: columns.length - 1 };
+    sel = { r0: anchor.r, c0: 0, r1: r, c1: widths.length - 1 };
   }
 
   function endSelect(): void {
@@ -312,13 +607,17 @@
     resizeCol = null;
   }
 
+  /** The selected block as TSV — only the part still in the loaded window. */
   function selectionText(): string {
-    if (sel === null) return "";
-    const s = norm(sel);
+    if (selN === null) return "";
+    const s = selN;
     const lines: string[] = [];
-    for (let r = s.r0; r <= s.r1 && r < rows.length; r++) {
+    const from = Math.max(s.r0, loadedOffset);
+    const to = Math.min(s.r1, loadedOffset + rows.length - 1);
+    for (let r = from; r <= to; r++) {
+      const row = rows[r - loadedOffset];
       const cells: string[] = [];
-      for (let c = s.c0; c <= s.c1; c++) cells.push(rows[r]?.[c] ?? "");
+      for (let c = s.c0; c <= s.c1; c++) cells.push(row?.[c] ?? "");
       lines.push(cells.join("\t"));
     }
     return lines.join("\n");
@@ -326,6 +625,7 @@
 
   function onKeyDown(e: KeyboardEvent): void {
     if ((e.metaKey || e.ctrlKey) && (e.key === "c" || e.key === "C")) {
+      if (window.getSelection()?.toString()) return; // native text selection wins
       const text = selectionText();
       if (text !== "") {
         void copyText(text);
@@ -333,19 +633,67 @@
       }
     } else if ((e.metaKey || e.ctrlKey) && (e.key === "a" || e.key === "A")) {
       if (rows.length > 0) {
-        anchor = { r: 0, c: 0 };
-        sel = { r0: 0, c0: 0, r1: rows.length - 1, c1: columns.length - 1 };
+        anchor = { r: loadedOffset, c: 0 };
+        sel = { r0: loadedOffset, c0: 0, r1: loadedOffset + rows.length - 1, c1: widths.length - 1 };
         e.preventDefault();
       }
     } else if (e.key === "Escape") {
-      sel = null;
+      if (expanded !== null) expanded = null;
+      else sel = null;
+    }
+  }
+
+  // --- expand a cell -----------------------------------------------------------
+
+  function openCell(e: MouseEvent, r: number, c: number): void {
+    const cell = e.currentTarget as HTMLElement;
+    const host = root;
+    if (host === null) return;
+    window.getSelection()?.removeAllRanges();
+    const box = cell.getBoundingClientRect();
+    const frame = host.getBoundingClientRect();
+    const popW = Math.min(520, frame.width - 16);
+    const left = Math.min(Math.max(8, box.left - frame.left), Math.max(8, frame.width - popW - 8));
+    // Below the cell, or above it when the cell sits in the lower half.
+    const below = box.bottom - frame.top + 4;
+    const top = below < frame.height / 2 ? below : Math.max(8, box.top - frame.top - 4);
+    copied = false;
+    expanded = {
+      r,
+      c,
+      column: columns[c] ?? `col${c + 1}`,
+      text: rows[r - loadedOffset]?.[c] ?? "",
+      left,
+      top,
+    };
+  }
+
+  async function copyExpanded(): Promise<void> {
+    if (expanded === null) return;
+    await copyText(expanded.text);
+    copied = true;
+  }
+
+  /** Close the popover on any press outside it. */
+  function onWindowPointerDown(e: PointerEvent): void {
+    if (expanded === null) return;
+    const target = e.target as Node | null;
+    const pop = root?.querySelector(".cell-pop");
+    if (pop !== null && pop !== undefined && target !== null && pop.contains(target)) return;
+    expanded = null;
+  }
+
+  function onWindowKey(e: KeyboardEvent): void {
+    if (expanded !== null && e.key === "Escape") {
+      expanded = null;
+      scroller?.focus();
     }
   }
 </script>
 
-<svelte:window onpointerup={onWindowPointerUp} />
+<svelte:window onpointerup={onWindowPointerUp} onpointerdown={onWindowPointerDown} onkeydown={onWindowKey} />
 
-<div class="table-view">
+<div class="table-view" bind:this={root}>
   {#if error !== null && rows.length === 0}
     <div class="file-error">{error}</div>
   {:else if loading && rows.length === 0}
@@ -354,24 +702,31 @@
     <div
       class="scroll"
       bind:this={scroller}
-      onscroll={onScrollAll}
+      onscroll={onScroll}
       onpointerup={endSelect}
       onpointerleave={endSelect}
       onkeydown={onKeyDown}
       tabindex="0"
       role="grid"
+      aria-rowcount={total ?? -1}
     >
-      <table style:table-layout={Object.keys(widths).length > 0 ? "fixed" : "auto"}>
-        <thead>
+      <span class="char-probe" aria-hidden="true">0000000000</span>
+      <!-- The last, unsized column takes whatever the pane has left, so the
+           sized ones keep their widths instead of being stretched. -->
+      <table style:width={`max(100%, ${tableW}px)`}>
+        <colgroup>
+          <col style:width={`${gutterW}px`} />
+          {#each widths as w, c (c)}
+            <col style:width={`${w}px`} />
+          {/each}
+          <col />
+        </colgroup>
+        <thead bind:this={head}>
           <tr>
             <th class="ln gut" aria-label="row number"></th>
-            {#each columns as col, c (c)}
-              <th
-                class:num={numericCols.has(c)}
-                style:width={widths[c] !== undefined ? `${widths[c]}px` : undefined}
-                style:min-width={widths[c] !== undefined ? `${widths[c]}px` : undefined}
-              >
-                <span class="th-label">{col}</span>
+            {#each widths as _, c (c)}
+              <th class:num={numericCols.has(c)} title={columns[c] ?? ""}>
+                <span class="th-label">{columns[c] ?? ""}</span>
                 <span
                   class="resizer"
                   role="separator"
@@ -384,45 +739,90 @@
                 ></span>
               </th>
             {/each}
+            <th class="fill" aria-hidden="true"></th>
           </tr>
         </thead>
         <tbody>
-          {#each rows as row, r (r)}
-            <tr>
+          {#if win.padTop > 0}
+            <tr class="spacer" aria-hidden="true"><td colspan={widths.length + 2} style:height={`${win.padTop}px`}></td></tr>
+          {/if}
+          {#each visibleRows as row, i (loadedOffset + win.start + i)}
+            {@const r = loadedOffset + win.start + i}
+            <tr class="row" class:flash={flashRow === r}>
               <td
                 class="ln gut"
                 class:selrow={inSel(r, 0)}
                 onpointerdown={(e) => onRowGutterDown(e, r)}
-                onpointerenter={() => onGutterEnter(r)}>{(loadedOffset + r + 1).toLocaleString()}</td
+                onpointerenter={() => onGutterEnter(r)}>{(r + 1).toLocaleString("en-US")}</td
               >
-              {#each row as cell, c (c)}
+              {#each widths as _, c (c)}
                 <td
                   class:num={numericCols.has(c)}
                   class:sel={inSel(r, c)}
-                  style:width={widths[c] !== undefined ? `${widths[c]}px` : undefined}
-                  style:max-width={widths[c] !== undefined ? `${widths[c]}px` : undefined}
                   onpointerdown={(e) => onCellDown(e, r, c)}
-                  onpointerenter={() => onCellEnter(r, c)}>{cell}</td
+                  onpointerenter={() => onCellEnter(r, c)}
+                  ondblclick={(e) => openCell(e, r, c)}>{row[c] ?? ""}</td
                 >
               {/each}
+              <td class="fill"></td>
             </tr>
           {/each}
+          {#if win.padBottom > 0}
+            <tr class="spacer" aria-hidden="true"
+              ><td colspan={widths.length + 2} style:height={`${win.padBottom}px`}></td></tr
+            >
+          {/if}
         </tbody>
       </table>
-      {#if loading && rows.length > 0}
+      {#if loading && rows.length > 0 && !atEnd}
         <div class="more">loading more…</div>
       {/if}
     </div>
     <footer class="pager">
-      <span class="range">{positionLabel}</span>
+      <span class="pos">
+        <span class="pos-label">row</span>
+        <input
+          class="row-input"
+          type="text"
+          inputmode="numeric"
+          aria-label="row (enter a number to jump)"
+          title="row — type a number and press Enter to jump"
+          size={Math.max(String(total ?? estimate ?? loadedOffset + rows.length).length + 2, 4)}
+          value={rowDraft ?? topRow.toLocaleString("en-US")}
+          onfocus={(e) => (e.currentTarget as HTMLInputElement).select()}
+          oninput={(e) => (rowDraft = (e.currentTarget as HTMLInputElement).value)}
+          onkeydown={onRowKey}
+          onblur={() => (rowDraft = null)}
+        />
+        <span class="count">{countLabel}</span>
+      </span>
       <span class="spacer"></span>
-      {#if sel !== null}
-        <span class="selnote">selection copied with ⌘/Ctrl+C</span>
-      {/if}
-      {#if error !== null}
+      {#if seeking !== null}
+        <span class="seeking">{seeking}</span>
+      {:else if error !== null}
         <span class="err">{error}</span>
+      {:else if sel !== null}
+        <span class="selnote">⌘/Ctrl+C copies the selection · double-click a cell to expand</span>
       {/if}
     </footer>
+    {#if expanded !== null}
+      <div
+        class="cell-pop"
+        role="dialog"
+        aria-label={`${expanded.column}, row ${(expanded.r + 1).toLocaleString("en-US")}`}
+        style:left={`${expanded.left}px`}
+        style:top={`${expanded.top}px`}
+      >
+        <div class="cp-head">
+          <span class="cp-col" title={expanded.column}>{expanded.column}</span>
+          <span class="cp-row">row {(expanded.r + 1).toLocaleString("en-US")} · {expanded.text.length.toLocaleString("en-US")} chars</span>
+          <span class="spacer"></span>
+          <button class="cp-btn" onclick={copyExpanded}>{copied ? "copied" : "copy"}</button>
+          <button class="cp-btn ic" aria-label="close" title="close (Esc)" onclick={() => (expanded = null)}>×</button>
+        </div>
+        <pre class="cp-text">{expanded.text === "" ? "(empty)" : expanded.text}</pre>
+      </div>
+    {/if}
   {/if}
 </div>
 
@@ -435,21 +835,38 @@
   }
 
   .scroll {
+    position: relative;
     flex: 1;
     overflow: auto;
     min-height: 0;
     outline: none;
+    overflow-anchor: none;
     scrollbar-width: thin;
     scrollbar-color: color-mix(in srgb, var(--fg) 22%, transparent) transparent;
   }
 
+  .char-probe {
+    position: absolute;
+    visibility: hidden;
+    white-space: pre;
+    font-family: var(--mono);
+    font-size: var(--text-sm);
+    pointer-events: none;
+  }
+
   table {
+    table-layout: fixed;
     border-collapse: separate;
     border-spacing: 0;
     font-family: var(--mono);
     font-size: var(--text-sm);
     line-height: 1.4;
-    min-width: 100%;
+  }
+
+  td.fill,
+  th.fill {
+    padding: 0;
+    cursor: default;
   }
 
   thead th {
@@ -463,6 +880,7 @@
     padding: 0.45rem 0.9rem 0.4rem 0.6rem;
     border-bottom: 1px solid var(--edge);
     white-space: nowrap;
+    overflow: hidden;
     box-shadow: 0 1px 0 var(--edge);
   }
 
@@ -488,11 +906,9 @@
   }
 
   .th-label {
-    display: inline-block;
+    display: block;
     overflow: hidden;
     text-overflow: ellipsis;
-    max-width: 100%;
-    vertical-align: bottom;
   }
 
   .resizer {
@@ -525,11 +941,15 @@
     padding: 0.22rem 0.9rem 0.22rem 0.6rem;
     color: var(--fg);
     white-space: nowrap;
-    max-width: 40ch;
     overflow: hidden;
     text-overflow: ellipsis;
     border-bottom: 1px solid color-mix(in srgb, var(--edge) 45%, transparent);
     cursor: cell;
+  }
+
+  tr.spacer td {
+    padding: 0;
+    border: none;
   }
 
   td.num {
@@ -545,27 +965,46 @@
 
   .ln {
     color: var(--muted);
-    opacity: 0.65;
     text-align: right;
-    padding-left: 0.9rem;
+    padding-left: 0.6rem;
     user-select: none;
     font-size: var(--text-xs);
+    font-variant-numeric: tabular-nums;
+  }
+
+  td.ln {
+    color: color-mix(in srgb, var(--muted) 70%, transparent);
   }
 
   .ln.selrow {
-    opacity: 1;
     color: var(--fg);
   }
 
-  tbody tr:hover td:not(.sel):not(.selrow) {
+  tr.row:hover td:not(.sel):not(.selrow) {
     background: color-mix(in srgb, var(--fg) 3.5%, transparent);
   }
 
-  tbody tr:hover td.gut {
+  tr.row:hover td.gut {
     background: color-mix(in srgb, var(--fg) 6%, var(--term-bg));
   }
 
+  tr.flash td {
+    animation: row-flash 1.4s ease-out;
+  }
+
+  @keyframes row-flash {
+    0%,
+    35% {
+      background: color-mix(in srgb, var(--accent) 24%, var(--term-bg));
+    }
+    100% {
+      background: transparent;
+    }
+  }
+
   .more {
+    position: sticky;
+    left: 0;
     padding: 0.5rem;
     text-align: center;
     color: var(--muted);
@@ -583,23 +1022,143 @@
     border-top: 1px solid var(--edge);
     font-size: var(--text-xs);
     color: var(--muted);
+    white-space: nowrap;
+    overflow: hidden;
   }
 
-  .range {
+  .pos {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35em;
     font-variant-numeric: tabular-nums;
+    min-width: 0;
   }
 
-  .selnote {
+  .row-input {
+    appearance: none;
+    box-sizing: content-box;
+    padding: 0 0.3em;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    background: none;
+    font: inherit;
+    font-variant-numeric: tabular-nums;
+    color: var(--fg);
+    text-align: right;
+  }
+
+  .row-input:hover {
+    border-color: var(--edge);
+  }
+
+  .row-input:focus {
+    outline: none;
+    border-color: color-mix(in srgb, var(--accent) 55%, var(--edge));
+    background: var(--term-bg);
+  }
+
+  .count {
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .selnote,
+  .seeking {
     color: var(--muted);
-    opacity: 0.85;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .seeking {
+    color: var(--fg);
   }
 
   .err {
     color: var(--danger, #d9534f);
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
   .spacer {
     flex: 1;
+  }
+
+  .cell-pop {
+    position: absolute;
+    z-index: 10;
+    width: min(520px, calc(100% - 16px));
+    max-height: 50%;
+    display: flex;
+    flex-direction: column;
+    background: var(--term-bg);
+    border: 1px solid var(--edge);
+    border-radius: 6px;
+    box-shadow: 0 8px 28px rgba(0, 0, 0, 0.22);
+    overflow: hidden;
+  }
+
+  .cp-head {
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.3rem 0.4rem 0.3rem 0.65rem;
+    border-bottom: 1px solid var(--edge);
+    font-size: var(--text-xs);
+    color: var(--muted);
+    white-space: nowrap;
+  }
+
+  .cp-col {
+    font-family: var(--mono);
+    font-weight: 600;
+    color: var(--fg);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    min-width: 0;
+  }
+
+  .cp-row {
+    font-variant-numeric: tabular-nums;
+  }
+
+  .cp-btn {
+    appearance: none;
+    border: none;
+    background: none;
+    font: inherit;
+    color: var(--muted);
+    cursor: pointer;
+    padding: 0.1rem 0.45rem;
+    border-radius: 4px;
+  }
+
+  .cp-btn:hover {
+    background: var(--row-hover);
+    color: var(--fg);
+  }
+
+  .cp-btn:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+
+  .cp-btn.ic {
+    font-size: var(--text-lg);
+    line-height: 1;
+  }
+
+  .cp-text {
+    margin: 0;
+    padding: 0.55rem 0.7rem;
+    overflow: auto;
+    font-family: var(--mono);
+    font-size: var(--text-sm);
+    line-height: 1.45;
+    color: var(--fg);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    user-select: text;
   }
 
   .file-error {
@@ -608,5 +1167,12 @@
     font-size: var(--text-md);
     padding: 1rem;
     text-align: center;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    tr.flash td {
+      animation: none;
+      background: color-mix(in srgb, var(--accent) 18%, var(--term-bg));
+    }
   }
 </style>

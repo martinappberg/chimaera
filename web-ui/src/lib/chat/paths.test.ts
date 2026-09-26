@@ -3,9 +3,13 @@ import {
   codeSpanRefs,
   groupByBases,
   hrefRef,
+  HIT_TTL_MS,
   MISS_TTL_MS,
   PathResolver,
+  reopenResolution,
+  resolveScope,
   type PathHit,
+  type Resolution,
   type ValidateAnswer,
 } from "./paths";
 
@@ -191,11 +195,124 @@ describe("PathResolver", () => {
     stop();
   });
 
+  it("keys verdicts by scope: an answer for one cwd never stands for another", async () => {
+    let cwd = "/w/one";
+    const calls: string[][] = [];
+    const resolver = new PathResolver(
+      async (c) => {
+        calls.push([...c]);
+        return { valid: { "x.rs": hit(`${cwd}/x.rs`) } };
+      },
+      {
+        now: clock,
+        scope: (c) => resolveScope({ cwd, root: "/w", workspaceId: "ws" }, c),
+      },
+    );
+    void resolver.resolve(["x.rs"]);
+    await vi.advanceTimersByTimeAsync(50);
+    expect(resolver.peek("x.rs")).toEqual({ state: "hit", hit: hit("/w/one/x.rs") });
+    cwd = "/w/two"; // the agent cd'd: the same text now means another file
+    expect(resolver.peek("x.rs")).toBeUndefined();
+    void resolver.resolve(["x.rs"]);
+    await vi.advanceTimersByTimeAsync(50);
+    expect(calls.length).toBe(2);
+    expect(resolver.peek("x.rs")).toEqual({ state: "hit", hit: hit("/w/two/x.rs") });
+    cwd = "/w/one"; // and back: the first answer still stands for its own scope
+    expect(resolver.peek("x.rs")).toEqual({ state: "hit", hit: hit("/w/one/x.rs") });
+  });
+
+  it("lets a hit stand for its TTL, then asks again", async () => {
+    const { resolver, calls } = answering(() => ({ valid: { "a.rs": hit("/w/a.rs") } }));
+    void resolver.resolve(["a.rs"]);
+    await vi.advanceTimersByTimeAsync(50);
+    now += HIT_TTL_MS - 1;
+    expect(resolver.peek("a.rs")?.state).toBe("hit");
+    expect(await resolver.resolve(["a.rs"])).toBe(false); // standing: not re-asked
+    expect(calls.length).toBe(1);
+    now += 1;
+    expect(resolver.peek("a.rs")).toBeUndefined();
+    const again = resolver.resolve(["a.rs"]);
+    await vi.advanceTimersByTimeAsync(50);
+    expect(await again).toBe(true);
+    expect(calls.length).toBe(2);
+  });
+
+  it("re-checks even a fresh hit on a click, and hears that the file is gone", async () => {
+    let exists = true;
+    const { resolver, calls } = answering(() => ({
+      valid: exists ? { "m.rs": hit("/w/m.rs") } : ({} as Record<string, PathHit>),
+    }));
+    void resolver.resolve(["m.rs"]);
+    await vi.advanceTimersByTimeAsync(50);
+    exists = false; // moved or deleted since it was stamped
+    const clicked = resolver.resolveNow("m.rs");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(await clicked).toEqual({ state: "miss" });
+    expect(calls.length).toBe(2);
+    expect(resolver.peek("m.rs")).toEqual({ state: "miss" });
+  });
+
+  it("reports an unanswered click re-check as unknown, not as the stale hit", async () => {
+    let fail = false;
+    const { resolver } = answering(() => {
+      if (fail) throw new Error("daemon unreachable");
+      return { valid: { "u.rs": hit("/w/u.rs") } };
+    });
+    void resolver.resolve(["u.rs"]);
+    await vi.advanceTimersByTimeAsync(50);
+    fail = true;
+    const clicked = resolver.resolveNow("u.rs");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(await clicked).toBeUndefined();
+  });
+
   it("answers every waiter on dispose", async () => {
     const { resolver } = answering(() => new Promise(() => {}));
     const pending = resolver.resolve(["a.rs"]);
     resolver.dispose();
     expect(await pending).toBe(false);
     expect(await resolver.resolve(["b.rs"])).toBe(false);
+  });
+});
+
+describe("reopenResolution (a click on a stamped reference)", () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  const hit = (path: string) => ({ path, kind: "file" as const });
+  const stamped: Resolution = { state: "hit", hit: hit("/w/old/plan.md") };
+  const opts = { at: { x: 0, y: 0 }, label: (p: string) => p };
+
+  function resolverAnswering(answer: () => ValidateAnswer) {
+    return new PathResolver(async () => answer());
+  }
+
+  it("opens what the daemon answers now, not the stamp", async () => {
+    const resolver = resolverAnswering(() => ({ valid: { "plan.md": hit("/w/new/plan.md") } }));
+    const open = vi.fn();
+    const done = reopenResolution(resolver, "plan.md", stamped, open, opts);
+    await vi.advanceTimersByTimeAsync(0);
+    expect((await done).state).toBe("hit");
+    expect(open).toHaveBeenCalledWith("/w/new/plan.md", "file", { split: undefined, reveal: undefined });
+  });
+
+  it("opens nothing when the file is gone", async () => {
+    const resolver = resolverAnswering(() => ({ valid: {} }));
+    const open = vi.fn();
+    const done = reopenResolution(resolver, "plan.md", stamped, open, opts);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(await done).toEqual({ state: "miss" });
+    expect(open).not.toHaveBeenCalled();
+  });
+
+  it("falls back to the stamp when the daemon cannot answer", async () => {
+    const resolver = resolverAnswering(() => {
+      throw new Error("daemon unreachable");
+    });
+    const open = vi.fn();
+    const done = reopenResolution(resolver, "plan.md", stamped, open, opts);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(await done).toBe(stamped);
+    expect(open).toHaveBeenCalledWith("/w/old/plan.md", "file", { split: undefined, reveal: undefined });
   });
 });

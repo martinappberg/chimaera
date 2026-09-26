@@ -7,7 +7,7 @@ use tower_http::trace::TraceLayer;
 use crate::AppState;
 use crate::{
     agents, api, chat, compute, compute_jobs, download, drafts, environment, fs, git, launcher,
-    links, mcp, notebook, proxy, quickopen, recents, runtimes, settings, update, upload,
+    links, mcp, notebook, notices, proxy, quickopen, recents, runtimes, settings, update, upload,
     view_state, ws,
 };
 
@@ -69,6 +69,8 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         .route("/agents/claude/sessions", get(launcher::claude_resumables))
         .route("/recents", get(recents::list_recents))
         .route("/update", get(update::get_update))
+        // The native shell's notice long-poll (agent finished / needs you).
+        .route("/notices", get(notices::get_notices))
         .route(
             "/view-state/{key}",
             get(view_state::get_view_state).put(view_state::put_view_state),
@@ -91,6 +93,12 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         .route("/fs/notebook", get(notebook::notebook))
         .route("/fs/quickopen", get(quickopen::quickopen))
         .route("/fs/validate", post(fs::validate))
+        // The portable-dialect checker (the reading view's issues chip; the
+        // MCP `check_document` tool runs the same code) and the opt-in
+        // "teach agents" installs behind Settings.
+        .route("/fs/check_document", get(crate::doc_check::check_document))
+        .route("/agent-docs", get(crate::agent_docs::status))
+        .route("/agent-docs/install", post(crate::agent_docs::install))
         // The draft mirror (unsaved editor text; see `drafts`). The body
         // limit only makes room for JSON escaping — the 1 MiB text cap is
         // judged on the decoded text.

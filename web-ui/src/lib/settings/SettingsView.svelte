@@ -12,18 +12,21 @@
   import SettingsJson from "./SettingsJson.svelte";
   import AgentsSettings from "./AgentsSettings.svelte";
   import EnvironmentSettings from "./EnvironmentSettings.svelte";
+  import DocumentsSettings from "./DocumentsSettings.svelte";
+  import NotificationStatus from "./NotificationStatus.svelte";
   import { APP_MENU, PINNED } from "../shared/keys";
   import { activeModLabel } from "../shared/keybindings";
 
   /**
    * Nav sections: the schema categories, plus the bespoke Environment section
    * (store-backed via /api/v1/environment — it has no schema rows) slotted
-   * after Agents.
+   * after Agents, and the bespoke Documents section (/api/v1/agent-docs)
+   * after that.
    */
   const sections = (() => {
     const out = [...CATEGORIES];
     const at = out.indexOf("Agents");
-    out.splice(at >= 0 ? at + 1 : out.length, 0, "Environment");
+    out.splice(at >= 0 ? at + 1 : out.length, 0, "Environment", "Documents");
     return out;
   })();
 
@@ -61,6 +64,9 @@
    */
   const ENV_KEYWORDS = ["environment", "prelude", "module", "conda", "micromamba", "startup", "activate", "export"];
   const envVisible = $derived(q === "" || ENV_KEYWORDS.some((k) => k.includes(q)));
+  /** Same idea for the Documents section. */
+  const DOC_KEYWORDS = ["documents", "markdown", "agents.md", "skill", "claude", "teach", "check"];
+  const docsVisible = $derived(q === "" || DOC_KEYWORDS.some((k) => k.includes(q)));
 
   /** Rows grouped by category, registry order, empty groups dropped. */
   const groups = $derived.by(() => {
@@ -68,6 +74,10 @@
     for (const cat of sections) {
       if (cat === "Environment") {
         if (envVisible) out.push({ category: cat, defs: [] });
+        continue;
+      }
+      if (cat === "Documents") {
+        if (docsVisible) out.push({ category: cat, defs: [] });
         continue;
       }
       const defs = visible.filter((d) => d.category === cat);
@@ -209,6 +219,22 @@
                  It renders its own <h2>; there are no generic rows. -->
             <section data-section={group.category}>
               <EnvironmentSettings />
+            </section>
+          {:else if group.category === "Documents"}
+            <!-- Bespoke panel: the opt-in "teach agents" installs over
+                 /api/v1/agent-docs. It renders its own <h2>. -->
+            <section data-section={group.category}>
+              <DocumentsSettings />
+            </section>
+          {:else if group.category === "Notifications"}
+            <!-- Generic rows plus a status line: whether the OS/browser will
+                 show the alerts at all, with the action that changes it. -->
+            <section data-section={group.category}>
+              <h2 class="cat">{group.category}</h2>
+              <NotificationStatus />
+              {#each group.defs as def (def.id)}
+                <SettingRow {def} />
+              {/each}
             </section>
           {:else}
             <section data-section={group.category}>
