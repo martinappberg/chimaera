@@ -291,24 +291,13 @@ fn describe(state: &AppState, path: &Path) -> Option<serde_json::Value> {
     Some(info)
 }
 
-/// Open a regular file for header reads: `O_NONBLOCK`, and re-checked on the
-/// descriptor, so a FIFO or device swapped in after the stat cannot block.
-fn open_regular(path: &Path) -> Option<std::fs::File> {
-    let fd = rustix::fs::open(
-        path,
-        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NONBLOCK,
-        rustix::fs::Mode::empty(),
-    )
-    .ok()?;
-    let file = std::fs::File::from(fd);
-    file.metadata().ok()?.is_file().then_some(file)
-}
-
 /// An image's pixel size from its header, or `None` when the header does not
 /// say (or is not what the extension claims). Raster formats are sniffed by
 /// their magic bytes, so a JPEG saved as `.png` still answers.
 pub(crate) fn image_dimensions(path: &Path, ext: &str) -> Option<(u32, u32)> {
-    let mut file = open_regular(path)?;
+    // `O_NONBLOCK` + an fstat re-check: a FIFO or device swapped in after
+    // the stat cannot block.
+    let (mut file, _) = crate::fs::open_regular(path).ok()?;
     let dims = if ext == "svg" {
         let mut text = Vec::new();
         (&mut file)

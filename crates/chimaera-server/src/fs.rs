@@ -142,12 +142,36 @@ fn canonical_parent_join(raw: &str) -> anyhow::Result<PathBuf> {
 }
 
 /// Canonicalize `raw` and require a regular file (not a directory).
-fn canonical_file(raw: &str) -> anyhow::Result<PathBuf> {
+pub(crate) fn canonical_file(raw: &str) -> anyhow::Result<PathBuf> {
     let path = canonical(raw)?;
     if !path.is_file() {
         anyhow::bail!("{} is not a file", path.display());
     }
     Ok(path)
+}
+
+/// Open `path` for reading, only as a regular file: `O_NONBLOCK`, then an
+/// `fstat` of the descriptor itself. Callers stat (or canonicalize) first,
+/// but a FIFO swapped in after that check would park a plain `open` until a
+/// writer shows up — holding a blocking worker and whatever limiter permit
+/// the caller took — and a device (`/dev/zero`) would stream without end.
+/// `O_NONBLOCK` changes nothing for a regular file's reads.
+pub(crate) fn open_regular(path: &Path) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
+    use rustix::fs::{Mode, OFlags};
+    let fd = rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK,
+        Mode::empty(),
+    )?;
+    let file = std::fs::File::from(fd);
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    Ok((file, meta))
 }
 
 /// True when the path names a gzip stream: `.gz`, or bgzip's `.bgz`. BGZF is

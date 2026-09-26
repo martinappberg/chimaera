@@ -1265,25 +1265,12 @@ impl Checker<'_> {
 
 /// Read `path` when it is a regular file of at most `cap` bytes (`Ok(None)`
 /// past the cap). Callers stat first and open only regular files; the open
-/// is still `O_NONBLOCK` and re-checked by `fstat`, so a FIFO or device
-/// swapped in after that stat can neither block this worker (and its
-/// `FILESYSTEM_WORK` permit) nor stream without end, and `take` bounds a
-/// file that grew.
+/// is still [`crate::fs::open_regular`] (`O_NONBLOCK`, re-checked by
+/// `fstat`), so a FIFO or device swapped in after that stat can neither
+/// block this worker (and its `FILESYSTEM_WORK` permit) nor stream without
+/// end, and `take` bounds a file that grew.
 pub(crate) fn read_regular(path: &Path, cap: u64) -> std::io::Result<Option<Vec<u8>>> {
-    use rustix::fs::{Mode, OFlags};
-    let fd = rustix::fs::open(
-        path,
-        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK,
-        Mode::empty(),
-    )?;
-    let file = std::fs::File::from(fd);
-    let meta = file.metadata()?;
-    if !meta.is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "not a regular file",
-        ));
-    }
+    let (file, meta) = crate::fs::open_regular(path)?;
     let mut bytes = Vec::with_capacity(meta.len().min(cap) as usize);
     file.take(cap + 1).read_to_end(&mut bytes)?;
     Ok((bytes.len() as u64 <= cap).then_some(bytes))
