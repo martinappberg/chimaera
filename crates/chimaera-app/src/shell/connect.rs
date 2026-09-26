@@ -46,12 +46,19 @@ pub struct HostState {
     outdated: bool,
     remote_build: Option<String>,
     live_sessions: Option<usize>,
+    /// The login node the daemon runs on, when the alias names a pool of
+    /// login nodes and the connection is pinned to one other than where a
+    /// new ssh connection lands (`None` = wherever the alias lands).
+    node: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
 struct ConnectProgress {
     alias: String,
     phase: &'static str,
+    /// The login node a `routing` phase is reaching.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    node: Option<String>,
 }
 
 /// Live tunnel liveness, pushed as hosts drop or reconnect (see the health
@@ -116,6 +123,7 @@ pub(super) fn state_for(
         outdated: tunnel.is_some_and(|t| t.outdated),
         remote_build: tunnel.and_then(|t| t.remote_build.clone()),
         live_sessions: tunnel.and_then(|t| t.live_sessions),
+        node: tunnel.and_then(|t| t.route.node().map(str::to_string)),
     }
 }
 
@@ -175,26 +183,33 @@ async fn run_connect(
     let progress_app = app.clone();
     let progress_alias = alias.to_string();
     chimaera_remote::connect(alias, opts, move |phase| {
-        let phase = match phase {
-            Phase::Probing => "probing",
-            Phase::Updating => "updating",
-            Phase::Downloading { .. } => "downloading",
-            Phase::Installing { .. } => "installing",
-            Phase::Starting => "starting",
-            Phase::Tunneling { .. } => "tunneling",
+        let (phase, node) = match phase {
+            Phase::Probing => ("probing", None),
+            // A second authentication prompt may follow — for that node.
+            Phase::Routing { node } => ("routing", Some(node)),
+            Phase::Updating => ("updating", None),
+            Phase::Downloading { .. } => ("downloading", None),
+            Phase::Installing { .. } => ("installing", None),
+            Phase::Starting => ("starting", None),
+            Phase::Tunneling { .. } => ("tunneling", None),
         };
-        emit_progress(&progress_app, &progress_alias, phase);
+        emit_progress_at(&progress_app, &progress_alias, phase, node);
     })
     .await
 }
 
 /// One `connect-progress` event: the phase label a host row shows.
 fn emit_progress(app: &AppHandle, alias: &str, phase: &'static str) {
+    emit_progress_at(app, alias, phase, None);
+}
+
+fn emit_progress_at(app: &AppHandle, alias: &str, phase: &'static str, node: Option<String>) {
     let _ = app.emit(
         "connect-progress",
         ConnectProgress {
             alias: alias.to_string(),
             phase,
+            node,
         },
     );
 }

@@ -10,6 +10,20 @@ pub async fn run() -> anyhow::Result<()> {
         println!("not running");
         return Ok(());
     };
+    // A home shared across nodes (HPC login nodes) shows every node the same
+    // manifest, but its pid names a process on the node that wrote it: here
+    // it is an unrelated process (or none), so neither signal it nor call the
+    // record stale.
+    if !manifest.written_here() {
+        println!(
+            "the daemon is registered on {} (pid {}), not this node — stop it there, \
+             or remove {} if that node is gone for good",
+            manifest.hostname,
+            manifest.pid,
+            Manifest::path().display()
+        );
+        return Ok(());
+    }
     if !manifest.is_alive() {
         Manifest::remove()?;
         println!("stale manifest (pid {} dead), removed", manifest.pid);

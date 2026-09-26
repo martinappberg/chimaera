@@ -66,12 +66,27 @@ export interface HostState {
   remote_build: string | null;
   /** Live sessions counted when the update decision was made. */
   live_sessions: number | null;
+  /**
+   * The login node the daemon runs on when the alias names a pool of login
+   * nodes and the connection is pinned to one other than where a new ssh
+   * connection lands (null = wherever the alias lands).
+   */
+  node: string | null;
 }
 
 /** Progress of an in-flight connect, mirrored from chimaera-remote phases. */
 export interface ConnectProgress {
   alias: string;
-  phase: "probing" | "updating" | "downloading" | "installing" | "starting" | "tunneling";
+  phase:
+    | "probing"
+    | "routing"
+    | "updating"
+    | "downloading"
+    | "installing"
+    | "starting"
+    | "tunneling";
+  /** The login node a `routing` phase is reaching (it may ask to authenticate). */
+  node?: string;
 }
 
 /** Build parity of the local daemon, as decided at app startup. */

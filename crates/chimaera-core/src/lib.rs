@@ -302,13 +302,63 @@ impl Manifest {
         }
     }
 
+    /// Remove the manifest only while it is still `self` — the record this
+    /// daemon wrote (same node, pid, and start time). On a home shared across
+    /// nodes (an HPC cluster's login nodes) another node's daemon may have
+    /// replaced the file since; removing that one would make every client read
+    /// "not running" while it serves. Returns whether the file was removed.
+    /// Best-effort, not a lock: a replacement landing between the read and the
+    /// unlink still loses, the same window the startup guard accepts.
+    pub fn remove_if_owned(&self) -> anyhow::Result<bool> {
+        match Self::load()? {
+            Some(current)
+                if current.pid == self.pid
+                    && current.started_at == self.started_at
+                    && same_node(&current.hostname, &self.hostname) =>
+            {
+                Self::remove()?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// Whether this manifest was written on the machine reading it. A home
+    /// shared across nodes (HPC login nodes behind one round-robin name) shows
+    /// every node the same file, but its pid and loopback port mean something
+    /// only on the node that wrote it — anywhere else `kill -0` answers for an
+    /// unrelated process table. Unknown (the node name can't be read) counts
+    /// as here, the pre-multi-node behavior.
+    pub fn written_here(&self) -> bool {
+        this_node().is_none_or(|node| same_node(&node, &self.hostname))
+    }
+
     /// Whether the recorded pid is alive (signal 0 probe). Unix-only by
     /// design: on Windows the pid in a manifest belongs to a process inside
     /// WSL, so liveness must be probed in the distro, never on the host.
+    /// Meaningless for a manifest another node wrote — check
+    /// [`Manifest::written_here`] first.
     #[cfg(unix)]
     pub fn is_alive(&self) -> bool {
         nix::sys::signal::kill(nix::unistd::Pid::from_raw(self.pid as i32), None).is_ok()
     }
+}
+
+/// This machine's node name — `gethostname(2)`, the value `uname -n` prints
+/// and the daemon records as [`Manifest::hostname`]. `None` if unreadable.
+pub fn this_node() -> Option<String> {
+    let name = hostname::get().ok()?.to_string_lossy().trim().to_string();
+    (!name.is_empty()).then_some(name)
+}
+
+/// Whether two node names denote the same node. Host names are
+/// case-insensitive; nothing else is normalized — a short name and an FQDN
+/// can't be proven to be one machine without asking a resolver, and the two
+/// values compared here (a manifest's recorded name, a node's `uname -n`) come
+/// from the same syscall, so an honest mismatch is a different node or a
+/// renamed one.
+pub fn same_node(a: &str, b: &str) -> bool {
+    a.trim().eq_ignore_ascii_case(b.trim())
 }
 
 /// Carryover from a daemon stopped for a *planned* restart (update/replace):
@@ -526,7 +576,52 @@ mod tests {
         assert!(Manifest::load().unwrap().is_none());
         Manifest::remove().unwrap(); // idempotent
 
+        // Ownership-checked removal: another node's (or a newer local
+        // daemon's) manifest that replaced ours must survive our shutdown.
+        manifest.write().unwrap();
+        let foreign = Manifest {
+            hostname: "other-node".to_string(),
+            ..manifest.clone()
+        };
+        assert!(!foreign.remove_if_owned().unwrap(), "another node's record");
+        let newer = Manifest {
+            started_at: manifest.started_at + 1,
+            ..manifest.clone()
+        };
+        assert!(!newer.remove_if_owned().unwrap(), "a later start's record");
+        assert!(Manifest::load().unwrap().is_some(), "left in place");
+        assert!(manifest.remove_if_owned().unwrap(), "our own record goes");
+        assert!(Manifest::load().unwrap().is_none());
+        assert!(!manifest.remove_if_owned().unwrap(), "absent is not ours");
+
         std::fs::remove_dir_all(&tmp_home).ok();
+    }
+
+    #[test]
+    fn node_identity_is_case_insensitive_and_exact_otherwise() {
+        assert!(same_node(
+            "sh03-ln06.stanford.edu",
+            "SH03-LN06.Stanford.EDU"
+        ));
+        assert!(same_node(" login1\n", "login1"));
+        assert!(!same_node(
+            "sh03-ln06.stanford.edu",
+            "sh04-ln03.stanford.edu"
+        ));
+        // A short name vs an FQDN is not provably the same machine.
+        assert!(!same_node("login1", "login1.cluster.edu"));
+        let here = this_node().expect("the test host has a name");
+        let manifest = |hostname: &str| Manifest {
+            hostname: hostname.to_string(),
+            port: 1,
+            token: String::new(),
+            pid: 1,
+            version: VERSION.to_string(),
+            started_at: 0,
+            build: None,
+        };
+        assert!(manifest(&here).written_here());
+        assert!(!manifest("chimaera-test-other-node.invalid").written_here());
     }
 
     /// Manifests written before build ids existed (no `build` field) must
