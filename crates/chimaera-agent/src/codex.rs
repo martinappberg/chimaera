@@ -288,6 +288,9 @@ impl Driver for CodexDriver {
         if let Some(frame) = hs.remote_control_status {
             initial.push(mapper.on_frame(&frame));
         }
+        for frame in &hs.server_requests {
+            initial.push(mapper.on_frame(frame));
+        }
         // The remembered approval mode (Auto review / Read only / …), applied
         // like a header pick when it differs from the thread's opening mode.
         mapper.bootstrapping = true;
@@ -327,6 +330,9 @@ struct CodexHandshake {
     /// The Remote Control status the app-server announced during the
     /// handshake (see `HandshakeSideband`), replayed through the mapper.
     remote_control_status: Option<Value>,
+    /// Server requests that arrived during the handshake, in order, replayed
+    /// through the mapper so each is answered (see `HandshakeSideband`).
+    server_requests: Vec<Value>,
     /// The user's config names a `model_reasoning_summary`, so turns must
     /// not override it (see `CodexMapper::reasoning_summary`).
     summary_configured: bool,
@@ -570,6 +576,7 @@ async fn codex_handshake(
         next_id,
         rollback_error,
         remote_control_status: side.remote_control_status,
+        server_requests: side.server_requests,
         summary_configured,
     })
 }
@@ -701,15 +708,32 @@ const NOTICED_DEPRECATIONS_CAP: usize = 32;
 /// one response id. The app-server announces its Remote Control status right
 /// after `initialize` (live 0.153.0) — i.e. INSIDE the handshake — so the
 /// newest such frame is kept and replayed through the mapper afterwards.
+/// Server REQUESTS (id + method) are kept too: dropping one would leave the
+/// app-server waiting on a reply that never comes, so each is replayed into
+/// `on_server_request` (a card, an answer, or a refusal) once the mapper
+/// exists.
 #[derive(Default)]
 struct HandshakeSideband {
     remote_control_status: Option<Value>,
+    server_requests: Vec<Value>,
 }
+
+/// Server requests held across the handshake. None is expected there; the
+/// cap only stops a hostile stream from growing the buffer (past it a
+/// request is dropped with a warning, as every one was before).
+const HANDSHAKE_REQUESTS_CAP: usize = 16;
 
 impl HandshakeSideband {
     fn note(&mut self, frame: &Value) {
-        if frame["method"] == "remoteControl/status/changed" {
+        let method = frame["method"].as_str().unwrap_or_default();
+        if method == "remoteControl/status/changed" {
             self.remote_control_status = Some(frame.clone());
+        } else if frame.get("id").is_some() && !method.is_empty() {
+            if self.server_requests.len() < HANDSHAKE_REQUESTS_CAP {
+                self.server_requests.push(frame.clone());
+            } else {
+                tracing::warn!(method = ?method, "codex server request during the handshake dropped (buffer full)");
+            }
         }
     }
 }
@@ -3864,7 +3888,7 @@ impl CodexMapper {
         let fresh = self.noticed_requests.len() < UNHANDLED_REQUESTS_CAP
             && self.noticed_requests.insert(method.clone());
         if fresh {
-            tracing::warn!(%method, "codex sent a server request chimaera does not handle");
+            tracing::warn!(method = ?method, "codex sent a server request chimaera does not handle");
             step.events.push(AgentEvent::Notice {
                 text: format!(
                     "codex sent a request chimaera doesn't handle yet ({method}) — \
@@ -6596,6 +6620,36 @@ mod tests {
             assert_eq!(step.outbound[0]["error"]["code"], -32601, "always refused");
         }
         assert_eq!(m.noticed_requests.len(), UNHANDLED_REQUESTS_CAP);
+    }
+
+    /// A server request that lands while the handshake awaits a response is
+    /// kept (in order, bounded) instead of dropped, and its post-handshake
+    /// replay through the mapper answers it like a live one.
+    #[test]
+    fn handshake_sideband_keeps_server_requests_for_replay() {
+        let mut side = HandshakeSideband::default();
+        side.note(&json!({ "id": 3, "result": {} }));
+        side.note(&json!({ "method": "thread/started", "params": {} }));
+        side.note(&json!({ "method": "remoteControl/status/changed", "params": {} }));
+        side.note(&json!({ "id": 7, "method": "currentTime/read", "params": {} }));
+        side.note(&json!({ "id": 8, "method": "item/tool/call", "params": {} }));
+        assert!(side.remote_control_status.is_some());
+        let ids: Vec<_> = side
+            .server_requests
+            .iter()
+            .map(|f| f["id"].clone())
+            .collect();
+        assert_eq!(ids, [json!(7), json!(8)], "only requests, in arrival order");
+
+        let mut m = mapper();
+        let steps: Vec<_> = side.server_requests.iter().map(|f| m.on_frame(f)).collect();
+        assert!(steps[0].outbound[0]["result"]["currentTimeAt"].is_u64());
+        assert_eq!(steps[1].outbound[0]["error"]["code"], -32601);
+
+        for i in 0..HANDSHAKE_REQUESTS_CAP * 2 {
+            side.note(&json!({ "id": 100 + i, "method": "item/tool/call", "params": {} }));
+        }
+        assert_eq!(side.server_requests.len(), HANDSHAKE_REQUESTS_CAP);
     }
 
     #[test]

@@ -2520,7 +2520,7 @@ impl ClaudeMapper {
             let fresh = self.noticed_controls.len() < UNHANDLED_REQUESTS_CAP
                 && self.noticed_controls.insert(subtype.clone());
             if fresh {
-                tracing::warn!(%subtype, "claude sent a control request chimaera does not handle");
+                tracing::warn!(subtype = ?subtype, "claude sent a control request chimaera does not handle");
                 step.events.push(AgentEvent::Notice {
                     text: format!(
                         "claude sent a request chimaera doesn't handle yet ({subtype}) — \
