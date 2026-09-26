@@ -363,11 +363,14 @@ const DEFS = {
     step: 0.05,
     scope: "client",
   },
+  // Keyed `chat.*` from when only the transcript read it; it now caps every
+  // reading column, so it sits with the window-wide Appearance choices. The
+  // key stays: stored values and the wire never see the category.
   "chat.contentWidth": {
-    title: "Content Width",
-    category: "Chat",
+    title: "Reading Width",
+    category: "Appearance",
     description:
-      "Maximum width in pixels of the transcript, composer, and live work trays. Narrower panes still fit their available space.",
+      "The widest a reading column gets, in pixels: the chat transcript (with its composer and live work trays) and a Markdown document alike. Each column is 48em of its own text — about a hundred characters, so a bigger font keeps its line length — and never wider than this. Narrower panes still fit their available space.",
     type: "integer",
     default: 832,
     min: 480,
@@ -534,7 +537,7 @@ const DEFS = {
     title: "Markdown Default Mode",
     category: "Editor",
     description:
-      "How a Markdown file opens the first time: live (the rendered document you can type in — only the block you are editing shows as source), the read-only reading view, or raw source. After that, each file reopens in the mode you last picked.",
+      "How a Markdown file opens the first time: live (the rendered document; double-click a block to edit it in place — only that block shows as source — and Esc returns to the page), the read-only reading view, or raw source. After that, each file reopens in the mode you last picked.",
     type: "enum",
     default: "live",
     options: [

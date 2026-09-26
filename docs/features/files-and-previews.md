@@ -221,10 +221,11 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   A file opens in the mode it was last shown in — remembered per file in this browser's
   `localStorage` (the 300 most recently opened; `mdDoc.ts` `createModeMemory`, every access
   guarded, so a private window just forgets) — else in the **Markdown Default Mode** setting
-  (`editor.markdownDefaultMode`: live, reading or source; **live** by default — it reads
-  exactly like reading until you type). Opening in reading costs one request, the source
-  (the store's first 256 KB chunk, which the editor modes reuse; a source past it and under
-  the 1 MB edit cap is read whole once): the editor mounts on the first live/source click.
+  (`editor.markdownDefaultMode`: live, reading or source; **live** by default — it IS the
+  reading view until you double-click). Opening in reading or live costs one request, the
+  source (the store's first 256 KB chunk, which the editor modes reuse; a source past it and
+  under the 1 MB edit cap is read whole once): the editor mounts on the first source click or
+  double-click.
   Files over the 1 MB edit cap and binary-content files always open in reading and stay
   there (an editor click on one says why in the mode bar).
   **One parser for every view** (`previews/doc/parser.ts`): lang-markdown's GFM language plus
@@ -235,7 +236,16 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   `[[note|alias]]`, `[[note#heading]]`, `![[embed]]`). Live parses with it through
   lang-markdown, reading through the same configured parser, so the two can't disagree
   about what a line is.
-  - **live** is the reading view you can type into — Typora's model. Every top-level block
+  - **live** is the reading view with editing a double-click away. It shows the reading
+    render itself (same DOM, same manners: a click selects, a link opens, a rest previews, a
+    drag references) until you **double-click** a block — then the editor takes the render's
+    place with that block where it was and the cursor on the character under the pointer
+    (`MarkdownView` `editing`; mdBlocks `enterAtPoint`, the press mapping below); **Enter**
+    with the pane focused is the keyboard's way in, the cursor at the top block's first
+    line, scrolled into view — and
+    **Esc**, or the live tab again, returns to the render with your place kept (the mode bar
+    names both gestures). A document is read far more than it is edited, so live never
+    turns a click into a cursor. In the editor, Typora's model: every top-level block
     the cursor is not in is the reading renderer's own DOM for it (block widgets from a state
     field, `mdBlocks.ts`, drawn by `doc/render.ts` with the same `.md-doc` CSS), so live and
     reading match block for block — same elements, same tops and heights, light and dark;
@@ -293,6 +303,11 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
     offset go from one mode to the next, so the same block sits at the same height; one
     scrolled partly past the top keeps that share of itself past it (a 90 px figure that is
     one line of source keeps that line in view — `mdDoc.ts` `placeOffset`).
+  - **The column** (reading, the properties card and live's editor alike) is 48em of the
+    document font — Claude.ai's reading measure, ~650 px / ~100 characters at the 13.5 px
+    default — so A−/A+ keeps the line length, capped by the **Reading Width** setting
+    (Appearance; the chat transcript's ceiling too, `chat.contentWidth`) so a document is
+    never wider than a transcript; a narrower pane fills what it has.
   - **reading** is the complete non-editable render, drawn **in the browser** by the shared
     renderer (`previews/doc/`) from the document's *current* text: the editor's buffer once
     the editor holds the file (unsaved edits included — a live keystroke shows the next time
@@ -1098,6 +1113,29 @@ _Intent pending — drafted from the maintainer's request, 2026-08-27; questionn
 - **Pending.** The mode names (`live`/`reading`/`source`), the default-to-live choice, and
   which constructs the live view renders vs leaves as source have not been confirmed with
   the maintainer — capture via **capture-feature-intent** when available.
+
+### Why live edits on a double-click, and why documents and chat share one reading width
+_Captured 2026-09-26 (the maintainer)._
+
+- **Problem it solves:** live mode turned every click into a cursor and a revealed line,
+  which made a document harder to move around in than the reading view; and markdown files
+  were "so width compressed for no reason" (the 70ch column, ~460 px of text at the default
+  font) while the chat read comfortably. The ask: live should be "exactly like reading mode"
+  until a double-click, and a document should read like a transcript — but, pressed on it,
+  "not too wide" either, on a desktop view. The maintainer then asked for the same measure
+  in chat once it was framed as the better reading width, rather than two rules.
+- **How settled it is (intended vs provisional):** the maintainer's words — "this should be
+  nice for the user, all open to change." The intent is the reading experience, not any
+  particular gesture or number. Double-click-to-edit with Esc back, the 48em column, and
+  the shared Reading Width ceiling are all **additions**: deliberate today, improvable
+  whenever something reads better.
+- **Deliberately open / where it may go:** the double-click gesture, the Esc/live-tab exit,
+  whether the live tab itself should ever enter the editor, the exact em measure and its
+  default cap, and whether the reading tab still earns its place next to a live tab that
+  reads identically.
+- **Do not change (or: open to change):** open to change, wholesale. The one thing to keep
+  is the direction: reading first, editing on an explicit gesture, and a column sized for
+  reading rather than for the pane.
 
 ### Why live mode renders tables as the reading grid
 _Intent pending — drafted from the maintainer's request, 2026-09-07; questionnaire not yet run._
