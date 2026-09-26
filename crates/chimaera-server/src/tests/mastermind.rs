@@ -709,6 +709,42 @@ async fn workers_tell_the_mastermind_and_ask_mode_keeps_it_in_the_inbox() {
     assert_eq!(note["from_sid"], worker.as_str());
     assert!(note.get("woke").is_none(), "not woken in ask mode: {note}");
 
+    // Auto mode, but the Mastermind has no live chat to wake: the message
+    // still lands in the inbox, and no wake is claimed or reported.
+    lock(&state.workspaces)
+        .set_mastermind(
+            &ws,
+            Some(workspaces::MastermindCfg {
+                session_id: mm.clone(),
+                mode: workspaces::MastermindMode::Auto,
+                agent: "claude".to_string(),
+            }),
+        )
+        .unwrap();
+    let (is_err, text) = mcp_tool_call(
+        &state,
+        &worker,
+        "kw",
+        "tell_mastermind",
+        serde_json::json!({"text": "qc/ is green again"}),
+    )
+    .await;
+    assert!(!is_err, "{text}");
+    assert!(
+        text.contains("hands it over"),
+        "no live Mastermind chat: inbox, never a wake: {text}"
+    );
+    let (_, page) = request(
+        &state,
+        Method::GET,
+        &format!("/api/v1/workspaces/{ws}/timeline"),
+        None,
+    )
+    .await;
+    let note = &page["entries"][0]["note"];
+    assert_eq!(note["text"], "qc/ is green again");
+    assert!(note.get("woke").is_none(), "{note}");
+
     // Named but never offered: the call gate refuses the Mastermind itself.
     let (_, out) = mcp_post(
         &state,

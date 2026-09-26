@@ -1075,9 +1075,18 @@
   let MastermindPanelView = $state<typeof MastermindPanel | null>(null);
   $effect(() => {
     if (!mastermindPanel.open || MastermindPanelView !== null) return;
-    void import("./lib/dashboard/MastermindPanel.svelte").then((m) => {
-      MastermindPanelView = m.default;
-    });
+    import("./lib/dashboard/MastermindPanel.svelte").then(
+      (m) => {
+        MastermindPanelView = m.default;
+      },
+      (err: unknown) => {
+        // A chunk that can't load (stale assets after an update) must not
+        // leave an "open" panel nobody can see: close it so the corner icon
+        // and ⌘J work again.
+        console.error("Mastermind panel failed to load", err);
+        setMastermindPanelOpen(false);
+      },
+    );
   });
   $effect(() => {
     setMastermindChrome({
@@ -1110,7 +1119,9 @@
         return { kind: "file", name: rel(tab.path).split("/").pop() ?? tab.path, ref: rel(tab.path) };
       case "finder": {
         const r = rel(tab.path);
-        return { kind: "folder", name: r.split("/").slice(-2).join("/"), ref: r };
+        // The root is "." — the chip names the workspace instead.
+        const name = r === "." ? (workspace?.name ?? "this workspace") : r.split("/").slice(-2).join("/");
+        return { kind: "folder", name, ref: r };
       }
       case "terminal":
       case "changes": {

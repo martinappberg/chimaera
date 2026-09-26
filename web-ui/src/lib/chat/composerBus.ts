@@ -51,19 +51,31 @@ export function insertIntoComposer(sessionId: string, text: string): boolean {
 // mounted transcript jumps to the bottom exactly as the composer's own submit
 // does. No buffering — a transcript that isn't mounted has nothing to scroll.
 
-const followRegistry = new Map<string, () => void>();
+// A set per session: two mounted views of one chat (the panel and a pane, or
+// a remount overlapping its predecessor) both follow, and either unmounting
+// leaves the other registered.
+const followRegistry = new Map<string, Set<() => void>>();
 
 /** A mounted transcript's "the user just sent" handler. Returns the unregister. */
 export function registerFollow(sessionId: string, follow: () => void): () => void {
-  followRegistry.set(sessionId, follow);
+  let handlers = followRegistry.get(sessionId);
+  if (handlers === undefined) {
+    handlers = new Set();
+    followRegistry.set(sessionId, handlers);
+  }
+  handlers.add(follow);
   return () => {
-    if (followRegistry.get(sessionId) === follow) followRegistry.delete(sessionId);
+    const current = followRegistry.get(sessionId);
+    if (current === undefined) return;
+    current.delete(follow);
+    if (current.size === 0) followRegistry.delete(sessionId);
   };
 }
 
-/** Bring a session's mounted transcript to the bottom and keep it following. */
+/** Bring a session's mounted transcripts to the bottom and keep them following. */
 export function followToBottom(sessionId: string): void {
-  followRegistry.get(sessionId)?.();
+  const handlers = followRegistry.get(sessionId);
+  if (handlers !== undefined) for (const follow of handlers) follow();
 }
 
 // --- image attachments (OS drops onto a chat pane) ---------------------------

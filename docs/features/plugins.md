@@ -140,9 +140,9 @@ tools ride the per-session MCP endpoint ([linked-terminals.md](linked-terminals.
   (a) reads; (b) is a claude session — a one-line "N unread notes … read_notes shows them" hint
   rides the `SessionStart` / `UserPromptSubmit` hook responses claude already fires; (c) the
   user clicks "deliver to <name>" on the Timeline row of a note addressed to one session — a
-  real, attributed, quoted message they chose to send; (d) is the Mastermind — a "N new notes
-  from agents" chip in the Mastermind panel, where one click is one turn asking it to `read_notes`
-  ([dashboard.md](dashboard.md#the-mastermind-panel)).
+  real, attributed, quoted message they chose to send; (d) is the Mastermind — a "N new messages
+  from agents" chip in the Mastermind panel, where one click is one turn that quotes up to 20 of
+  them into the prompt ([dashboard.md](dashboard.md#the-mastermind-panel)).
 - **Coverage.** claude chat / TUI — read, post, hinted, addressable; codex chat — read, post,
   pull-only; codex TUI — read, post, pull-only (it gets the MCP server because this plugin has
   tools); shells — none. Any session in the workspace can be a `to`; **deliver** needs a

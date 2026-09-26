@@ -35,6 +35,9 @@ pub const STATUS_DETAIL_MAX: usize = 256;
 /// `UserMessage.origin` for the message the daemon sends a resurrected
 /// session when a restart cut its work off (see `ChatManager::command_as`).
 pub const ORIGIN_RESTART: &str = "restart";
+/// `UserMessage.origin` for a worker's `tell_mastermind` message the daemon
+/// delivers to an auto-mode Mastermind (a wake the user didn't type).
+pub const ORIGIN_WORKER: &str = "worker";
 /// One-line cap for a `ToolSummary` label (live ones are ~30 chars).
 pub const TOOL_SUMMARY_MAX: usize = 200;
 /// Tool ids one `ToolSummary` may name (a batch is a single model reply).
@@ -205,7 +208,9 @@ pub enum AgentEvent {
         /// `"remote"` = a Remote Control client (phone / claude.ai) injected
         /// it through the agent's own bridge, so it never crossed chimaera's
         /// composer; [`ORIGIN_RESTART`] = the daemon sent it itself after a
-        /// restart cut work off. Absent = this workbench's composer. Additive.
+        /// restart cut work off; [`ORIGIN_WORKER`] = a worker's message the
+        /// daemon delivered to the Mastermind. Absent = this workbench's
+        /// composer. Additive.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin: Option<String>,
     },

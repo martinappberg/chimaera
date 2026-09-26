@@ -64,11 +64,16 @@
     if (p === null) return null;
     return p.endsWith("SKILL.md") ? p : `${p.replace(/\/$/, "")}/SKILL.md`;
   }
+  /** `path` is the skill's own file or dir, or lies inside that dir — a
+   *  sibling that merely shares a prefix ("pdf" vs "pdf-tools") is not. */
+  function within(path: string, skillPath: string): boolean {
+    return path === skillPath || path.startsWith(skillPath.endsWith("/") ? skillPath : `${skillPath}/`);
+  }
   function errorsFor(s: Skill): string[] {
     if (report === null) return [];
     const paths = [s.paths.claude, s.paths.codex].filter((p): p is string => !!p);
     return report.errors
-      .filter((e) => e.path !== undefined && paths.some((p) => e.path === p || e.path!.startsWith(p)))
+      .filter((e) => e.path !== undefined && paths.some((p) => within(e.path!, p)))
       .map((e) => `${e.agent}: ${e.message}`);
   }
   /** Load errors no listed skill claims (a SKILL.md too broken to list). */
@@ -76,7 +81,7 @@
     if (report === null) return [];
     const claimed = all.flatMap((s) => [s.paths.claude, s.paths.codex].filter((p): p is string => !!p));
     return report.errors.filter(
-      (e) => e.path === undefined || !claimed.some((p) => e.path === p || e.path!.startsWith(p)),
+      (e) => e.path === undefined || !claimed.some((p) => within(e.path!, p)),
     );
   });
 

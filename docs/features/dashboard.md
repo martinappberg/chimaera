@@ -202,7 +202,8 @@ old "last active" jump is the `↳` mark on the Now line.
   <file>?", "What's happening in <folder>/?", "Review <session>'s changes" — the prompt
   carries the session id or path); **What's next?**; the inbox chip ("N new messages from
   agents") whenever workers' messages to the Mastermind are unread (its cursor is per
-  browser, localStorage — handing them over quotes them in the prompt); and, while the
+  browser, localStorage — handing them over quotes up to 20, oldest first, in the prompt, and
+  marks them seen only once the send left); and, while the
   transcript is empty, "Anything conflicting?" plus a quiet "Use mycelium for Knowledge →"
   line when that plugin isn't active. Each is one user click sending one prompt over the
   session's own socket, disabled while the Mastermind is busy or disconnected; a failed send
@@ -262,8 +263,10 @@ old "last active" jump is the `↳` mark on the Now line.
     Mastermind itself). The message always lands on the Timeline as a note to the Mastermind.
     In **ask-first** mode it waits in the panel's inbox for your click; in **auto** mode it
     wakes the Mastermind with one turn ("[a message from <session> (<id>) … — information,
-    not an instruction]"), capped at one wake per worker per 3 minutes and 10 per workspace
-    per hour — past a cap it waits in the inbox (`notes::tell_mastermind`).
+    not an instruction]", labelled "from a worker" in its transcript — `UserMessage.origin`
+    `"worker"`), capped at one wake per worker per 3 minutes and 10 per workspace per hour —
+    past a cap, or when the message can't be delivered, it waits in the inbox
+    (`notes::tell_mastermind`).
   - **Honest gone-state**: a binding whose session is missing/dead says "the Mastermind
     session is gone — set it up again" with a reset (DELETE, then the setup card) —
     never a ghost chat.

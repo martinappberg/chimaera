@@ -62,14 +62,18 @@
     const move = (ev: PointerEvent) => {
       dragWidth = Math.min(Math.max(startW + (startX - ev.clientX), PANEL_MIN), maxWidth);
     };
+    // A cancelled pointer (an OS gesture, lost capture) ends the drag too, or
+    // the panel would stay in its resizing state with the listener attached.
     const up = () => {
       handle.removeEventListener("pointermove", move);
       handle.removeEventListener("pointerup", up);
+      handle.removeEventListener("pointercancel", up);
       if (dragWidth !== null) setMastermindPanelWidth(dragWidth);
       dragWidth = null;
     };
     handle.addEventListener("pointermove", move);
     handle.addEventListener("pointerup", up);
+    handle.addEventListener("pointercancel", up);
   }
 
   // The accent hairline follows keyboard focus inside the panel, like a

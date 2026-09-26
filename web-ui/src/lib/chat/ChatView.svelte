@@ -172,8 +172,8 @@
   let renderEnd = $state(0);
   let renderReady = $state(false);
   let renderedVersion = $state(-1);
-  // Plain (non-reactive) bookkeeping, like tracksTail/rendersLive: only ever
-  // read inside the windowing effect's untracked body or handlers.
+  // Plain (non-reactive) bookkeeping, like rendersLive: only ever read
+  // inside the windowing effect's untracked body or handlers.
   /** store.structuralVersion at the last range write. "Did the row set
    *  change" keys on this, never on lengths: at cap append+trim nets the
    *  length out, and a retracted-then-reappended tail nets even the virtual
@@ -196,15 +196,14 @@
   /** A non-empty draft pauses bottom-following, never transcript rendering. */
   let composerEngaged = $state(false);
   /** An explicit history page is stable. Ordinary scrolling inside a tail page
-   *  keeps streaming until retaining the reader would exceed the DOM cap. */
-  let tracksTail = false;
-  /** tracksTail, for the template. A row appended to a tail window lags
-   *  renderEnd by one flush (the windowing effect advances it); reading that
-   *  lag as "newer rows omitted" tore the live chrome out and back in, and a
-   *  layout forced in between shrank the transcript under a pinned reader —
-   *  WebKit clamps scrollTop there, which then reads as scrolling up. */
-  let endsLive = $state(false);
-  const atLiveEdge = $derived(endsLive || renderEnd >= store.blocks.length);
+   *  keeps streaming until retaining the reader would exceed the DOM cap.
+   *  Reactive for the template only (the windowing effect reads it
+   *  untracked): a row appended to a tail window lags renderEnd by one flush,
+   *  and reading that lag as "newer rows omitted" tore the live chrome out
+   *  and back in — a layout forced in between shrank the transcript under a
+   *  pinned reader, and WebKit's scrollTop clamp there read as scrolling up. */
+  let tracksTail = $state(false);
+  const atLiveEdge = $derived(tracksTail || renderEnd >= store.blocks.length);
   let rendersLive = false;
   let wasVisible = false;
   let pagingTranscript = false;
@@ -242,7 +241,6 @@
     renderBlocks = options.live ? source : $state.snapshot(source);
     rendersLive = options.live;
     tracksTail = options.tail;
-    endsLive = options.tail;
     renderedVersion = store.transcriptVersion;
     renderedStructural = store.structuralVersion;
     renderedTrim = store.trimmedCount;
@@ -690,7 +688,6 @@
           // preserve the page and make the deferred gap explicit.
           freezeRenderedRange();
           tracksTail = false;
-          endsLive = false;
           saveWindowVirtual(renderStart, renderEnd, false);
         }
       }
@@ -781,7 +778,9 @@
     lastScrollTop = top;
     const now = performance.now();
     const byReader = now - scrollIntentAt < SCROLL_INTENT_MS;
-    if (byReader) scrollIntentAt = now;
+    // Only a real move carries the reader's gesture on: the follow writer's
+    // own (non-moving) echoes must not keep a stale intent alive all stream.
+    if (byReader && moved) scrollIntentAt = now;
     const nearEnd = el.scrollHeight - top - el.clientHeight < 40;
     // A pinned follower leaves the live edge only by its own hand. WebKit
     // dispatches the follow writer's scroll event a frame late, after rows
@@ -2121,12 +2120,14 @@
               />
             </div>
           </div>
-          {#if block.attachments > 0 || block.origin === "remote" || block.origin === "restart"}
+          {#if block.attachments > 0 || block.origin === "remote" || block.origin === "restart" || block.origin === "worker"}
             <span class="bubble-meta">
               {#if block.origin === "remote"}
                 <span class="origin" title="sent from a Remote Control client (the Claude app or claude.ai/code)">via Remote Control</span>
               {:else if block.origin === "restart"}
                 <span class="origin auto" title="chimaera sent this itself: the daemon restarted while this chat had work running, so it asked the resumed agent to pick that work back up (setting: Pick Up Interrupted Work After a Restart)">sent by chimaera after a restart</span>
+              {:else if block.origin === "worker"}
+                <span class="origin auto" title="a worker in this workspace sent this with tell_mastermind; chimaera delivered it because the Mastermind acts on its own (auto)">from a worker</span>
               {/if}
               {#if block.attachments > 0}
                 <span class="attach">{block.attachments} image{block.attachments > 1 ? "s" : ""}</span>
