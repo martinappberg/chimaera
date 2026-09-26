@@ -127,8 +127,9 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
     }
 
     let new_window = MenuItemBuilder::with_id("tray-new-window", "New Window").build(app)?;
-    // Custom Quit (not predefined) so it flags the quit intent via
-    // `request_quit` — see menu.rs and the CloseRequested handler.
+    // Custom Quit (not predefined) so it goes through `request_quit`, which
+    // asks windows with unsaved edits first and flags the quit intent — see
+    // menu.rs and shell/unsaved.rs.
     let quit = MenuItemBuilder::with_id("quit", "Quit Chimaera").build(app)?;
     b = b.item(&new_window).separator().item(&quit);
     b.build()

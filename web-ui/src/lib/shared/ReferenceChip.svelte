@@ -13,9 +13,11 @@
     /** Position within the nearest positioned ancestor, px. */
     x: number;
     y: number;
+    /** What is pointed at ("p. 3 region", "rows 5–9"), for the tooltip. */
+    label?: string;
   }
 
-  let { x, y }: Props = $props();
+  let { x, y, label }: Props = $props();
 
   const target = $derived($referenceTarget);
 </script>
@@ -27,7 +29,7 @@
   disabled={target === null}
   title={target === null
     ? "no agent session in this workspace — start one to reference"
-    : `reference in ${target.name} (${PINNED.reference})`}
+    : `reference ${label !== undefined ? `${label} ` : ""}in ${target.name} (${PINNED.reference})`}
   onpointerdown={(e) => {
     // Keep the selection alive: the press must never collapse it or start
     // a drag; the click alone acts.

@@ -113,7 +113,9 @@
   },
   "permissions": {
     "allow": [
-      "mcp__chimaera__notify"
+      "mcp__chimaera__notify",
+      "mcp__chimaera__document_guide",
+      "mcp__chimaera__check_document"
     ]
   },
   "statusLine": {

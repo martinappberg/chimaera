@@ -1,6 +1,8 @@
 <script lang="ts">
   /**
-   * Small confirmation modal for destructive actions (file-manager delete).
+   * Small confirmation modal for destructive actions (file-manager delete),
+   * and for writes that must show exactly what they write (`detail`, a
+   * scrollable verbatim block that widens the dialog).
    * Scrim + dialog per the AskpassModal/FolderPicker pattern; focus lands on
    * Cancel (the safe default), Escape cancels, Enter activates the focused
    * button. A failure keeps the dialog open with an inline error, so the
@@ -17,6 +19,8 @@
     danger?: boolean;
     /** Inline failure line; the dialog stays open while set. */
     error?: string | null;
+    /** Verbatim text shown in a scrollable monospace block. */
+    detail?: string | null;
     onConfirm(): void;
     onCancel(): void;
   }
@@ -27,6 +31,7 @@
     confirmLabel,
     danger = false,
     error = null,
+    detail = null,
     onConfirm,
     onCancel,
   }: Props = $props();
@@ -46,6 +51,7 @@
   <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
   <div
     class="dialog"
+    class:wide={detail !== null}
     role="dialog"
     aria-modal="true"
     aria-label={title}
@@ -55,6 +61,9 @@
   >
     <div class="title">{title}</div>
     <div class="body">{body}</div>
+    {#if detail !== null}
+      <pre class="detail">{detail}</pre>
+    {/if}
     {#if error !== null}
       <div class="error">{error}</div>
     {/if}
@@ -87,6 +96,30 @@
     border: 1px solid var(--edge);
     border-radius: 10px;
     box-shadow: 0 16px 48px rgba(0, 0, 0, 0.35);
+  }
+
+  .dialog.wide {
+    width: min(640px, 100%);
+    max-height: calc(100vh - 48px);
+  }
+
+  .detail {
+    margin: 0;
+    min-height: 0;
+    max-height: 50vh;
+    overflow: auto;
+    padding: 10px 12px;
+    font-family: var(--mono);
+    font-size: var(--text-xs);
+    line-height: 1.5;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    /* Verbatim: `<!--` must not ligate into an arrow. */
+    font-variant-ligatures: none;
+    color: var(--fg);
+    background: var(--term-bg);
+    border: 1px solid var(--edge);
+    border-radius: 6px;
   }
 
   .title {

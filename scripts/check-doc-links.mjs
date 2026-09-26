@@ -17,7 +17,7 @@ const files = execSync("git ls-files -co --exclude-standard '*.md'", { cwd: root
 // GitHub-flavored heading slug: lowercase, drop anything but word chars/space/hyphen
 // (backticks and punctuation vanish), spaces -> hyphens.
 const slug = (s) =>
-  s.toLowerCase().replace(/[^\w\s-]/g, '').trim().replace(/\s+/g, '-');
+  s.toLowerCase().replace(/[^\w\s-]/g, '').trim().replace(/\s/g, '-');
 
 const anchorsOf = (absPath) => {
   const set = new Set();
@@ -36,12 +36,34 @@ const getAnchors = (p) => {
 
 // [text](target) — skip images are fine to check too; ignore ![.. the same way.
 const LINK = /\[[^\]]*\]\(([^)]+)\)/g;
+
+// Fenced blocks and inline code spans never render as links, so a doc that shows
+// markdown syntax as an example (`![alt](figs/plot.png)`) must not be held to it.
+// Blanked rather than removed, so nothing else shifts.
+const withoutCode = (text) => {
+  let fence = null; // the opening run (``` / ~~~…) while inside a fenced block
+  return text
+    .split('\n')
+    .map((line) => {
+      const run = /^\s{0,3}(`{3,}|~{3,})/.exec(line)?.[1];
+      if (fence !== null) {
+        if (run && run[0] === fence[0] && run.length >= fence.length) fence = null;
+        return '';
+      }
+      if (run) {
+        fence = run;
+        return '';
+      }
+      return line.replace(/(`+)([\s\S]*?[^`])\1(?!`)/g, '');
+    })
+    .join('\n');
+};
 const problems = [];
 
 for (const rel of files) {
   const abs = join(root, rel);
   const dir = dirname(abs);
-  const text = readFileSync(abs, 'utf8');
+  const text = withoutCode(readFileSync(abs, 'utf8'));
   let m;
   while ((m = LINK.exec(text)) !== null) {
     let target = m[1].trim().split(/\s+/)[0]; // drop optional "title"

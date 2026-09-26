@@ -111,9 +111,12 @@ export type SettingsMap = {
   "editor.lineHeight": number;
   "editor.markdownFontSize": number;
   "editor.markdownLineHeight": number;
+  "editor.markdownDefaultMode": "reading" | "live" | "source";
   "editor.lineNumbers": boolean;
   "editor.wordWrap": boolean;
   "editor.tabSize": number;
+  "editor.autosave": "off" | "afterDelay";
+  "editor.autosaveDelay": number;
   "files.showHidden": boolean;
   "files.tableRowsPerPage": number;
   "quickOpen.maxResults": number;
@@ -527,6 +530,21 @@ const DEFS = {
     step: 0.05,
     scope: "client",
   },
+  "editor.markdownDefaultMode": {
+    title: "Markdown Default Mode",
+    category: "Editor",
+    description:
+      "How a Markdown file opens the first time: live (the rendered document you can type in — only the block you are editing shows as source), the read-only reading view, or raw source. After that, each file reopens in the mode you last picked.",
+    type: "enum",
+    default: "live",
+    options: [
+      { value: "reading", label: "Reading" },
+      { value: "live", label: "Live" },
+      { value: "source", label: "Source" },
+    ],
+    note: "Files over 1 MB and binary content always open in reading.",
+    scope: "client",
+  },
   "editor.lineNumbers": {
     title: "Line Numbers",
     category: "Editor",
@@ -552,6 +570,30 @@ const DEFS = {
     min: 1,
     max: 8,
     step: 1,
+    scope: "client",
+  },
+  "editor.autosave": {
+    title: "Autosave",
+    category: "Editor",
+    description:
+      "Save edited files on their own: after a pause in typing, and when the editor loses focus or you switch tabs. Agents only see what is saved to disk. Never saves over a file that changed on disk until you resolve it.",
+    type: "enum",
+    default: "off",
+    options: [
+      { value: "off", label: "Off" },
+      { value: "afterDelay", label: "After a delay" },
+    ],
+    scope: "client",
+  },
+  "editor.autosaveDelay": {
+    title: "Autosave Delay",
+    category: "Editor",
+    description: "Milliseconds of idle typing before an autosave (when Autosave is on).",
+    type: "integer",
+    default: 1000,
+    min: 200,
+    max: 60000,
+    step: 100,
     scope: "client",
   },
 

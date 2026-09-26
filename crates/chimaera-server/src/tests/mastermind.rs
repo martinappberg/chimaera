@@ -6,6 +6,16 @@
 use super::support::*;
 use crate::*;
 
+/// Every session's MCP tools (the linked-terminal and document tools).
+const BASE_TOOLS: [&str; 6] = [
+    "list_terminals",
+    "run_in_terminal",
+    "read_terminal",
+    "document_guide",
+    "check_document",
+    "notify",
+];
+
 /// PUT the mastermind and return (status, body).
 async fn put_mastermind(
     state: &Arc<AppState>,
@@ -296,15 +306,10 @@ async fn mcp_tier_gates_on_the_binding() {
         assert!(mm_tools.contains(&tool.to_string()), "{mm_tools:?}");
     }
     let worker_tools = tool_names(&state, &worker, "wk").await;
+    let mut expected = BASE_TOOLS.to_vec();
+    expected.push("tell_mastermind");
     assert_eq!(
-        worker_tools,
-        [
-            "list_terminals",
-            "run_in_terminal",
-            "read_terminal",
-            "notify",
-            "tell_mastermind"
-        ],
+        worker_tools, expected,
         "workers get the base tier plus tell_mastermind — never the Mastermind tier"
     );
 
@@ -353,15 +358,7 @@ async fn mcp_tier_gates_on_the_binding() {
     // Unbind (fire the Mastermind): the tier drops on the very next call.
     lock(&state.workspaces).set_mastermind(&ws, None).unwrap();
     let fired = tool_names(&state, &mastermind, "mmk").await;
-    assert_eq!(
-        fired,
-        [
-            "list_terminals",
-            "run_in_terminal",
-            "read_terminal",
-            "notify"
-        ]
-    );
+    assert_eq!(fired, BASE_TOOLS);
 
     state.sessions.kill(&mastermind).ok();
     state.sessions.kill(&worker).ok();

@@ -28,6 +28,8 @@ pub const DAEMON_UI_COMMANDS: &[&str] = &[
     "list_scope_windows",
     "report_window_scope",
     "report_window_view",
+    "report_unsaved",
+    "reply_unsaved",
     "take_pending_focus",
     "notification_permission",
     "request_notification_permission",

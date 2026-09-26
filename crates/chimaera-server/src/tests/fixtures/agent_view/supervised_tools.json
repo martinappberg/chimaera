@@ -65,6 +65,32 @@
       "name": "read_terminal"
     },
     {
+      "description": "The full guide to writing documents the user reads in Chimaera: the portable markdown dialect (it also renders on GitHub and in Obsidian), links and embeds with fragments, frontmatter, and how to reference files in replies. Read it before writing a report, README or notes.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      },
+      "name": "document_guide"
+    },
+    {
+      "description": "Check a markdown document before handing it over: broken relative links and embeds, missing heading anchors and line ranges, dangling footnotes, absolute local paths, images without alt text or over 10 MB, and syntax GitHub shows as literal text (wikilinks, MDX, ::: blocks, MyST directives, unsupported alert types). Returns each issue with its line and a fix.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "description": "The markdown file: relative to this session's working directory (then the workspace root), or absolute",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      },
+      "name": "check_document"
+    },
+    {
       "description": "Show the user a Chimaera desktop notification (it reaches them even when Chimaera is in the background). Use it when the user asked to be told about something (\"ping me when the build is done\", \"let me know if the job fails\"), or when long-running work you were watching finishes or fails mid-turn. The user is already notified automatically when your turn ends or you need permission/input, so do not use it for routine progress. Rate-limited per session.",
       "inputSchema": {
         "additionalProperties": false,

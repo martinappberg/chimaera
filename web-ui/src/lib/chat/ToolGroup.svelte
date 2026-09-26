@@ -1,6 +1,7 @@
 <script lang="ts">
   import ActivityRows from "./ActivityRows.svelte";
   import ActivitySummary from "./ActivitySummary.svelte";
+  import type { OpenPathFn, PathResolver } from "./paths";
   import type { ChatBlock } from "./store.svelte";
   import ToolCallCard from "./ToolCallCard.svelte";
   import { isLive, toolGroupTitle, toolRunHealth } from "./toolLabels";
@@ -15,7 +16,9 @@
    */
   interface Props {
     tools: Extract<ChatBlock, { kind: "tool" }>[];
-    onOpenFile?: (path: string) => void;
+    /** Open a tool's locations (resolved against the session first). */
+    onOpenPath?: OpenPathFn;
+    resolvePaths?: PathResolver;
     /** Background/stop a running row (claude only — the host omits these
      *  for agents without the capability). Called with the tool row id. */
     onBackground?: (id: string) => void;
@@ -34,7 +37,8 @@
 
   let {
     tools,
-    onOpenFile,
+    onOpenPath,
+    resolvePaths,
     onBackground,
     onStopTask,
     visible = true,
@@ -79,7 +83,8 @@
         <ToolCallCard
           block={tool}
           {visible}
-          {onOpenFile}
+          {onOpenPath}
+          {resolvePaths}
           onBackground={onBackground !== undefined ? () => onBackground?.(tool.id) : undefined}
           onStop={onStopTask !== undefined ? () => onStopTask?.(tool.id) : undefined}
         />

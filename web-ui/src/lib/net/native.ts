@@ -438,6 +438,51 @@ export async function reportWindowView(visible: string[]): Promise<void> {
 }
 
 /**
+ * Tell the shell how many files hold unsaved edits in this window, whenever
+ * that changes. The shell decides a window close or the app's quit from this
+ * count without asking the page first, so a window with nothing unsaved
+ * closes with no prompt. No-op in a browser (beforeunload guards there).
+ */
+export async function reportUnsaved(count: number): Promise<void> {
+  await tauri()?.core.invoke<void>("report_unsaved", { count });
+}
+
+/** Why the shell is asking this window about its unsaved edits. */
+export type UnsavedReason = "close" | "quit";
+
+/**
+ * The shell held this window's close, or the app's quit, because this window
+ * reported unsaved edits. `id` is stable across repeated asks of one prompt;
+ * every reply carries it.
+ */
+export interface UnsavedPrompt {
+  id: number;
+  reason: UnsavedReason;
+}
+
+/**
+ * - `shown`: the dialog is up — the page is alive, so the shell waits for the
+ *   user instead of treating the window as hung (it proceeds anyway after a
+ *   few seconds without this).
+ * - `proceed`: every file saved, or Don't save — the close or quit goes ahead.
+ * - `cancel`: keep the window; a quit is abandoned.
+ */
+export type UnsavedReply = "shown" | "proceed" | "cancel";
+
+/** The shell asks about this window's unsaved edits (window-scoped, like onMenu). */
+export function onUnsavedPrompt(handler: (p: UnsavedPrompt) => void): Promise<() => void> {
+  const t = tauri();
+  if (t === null) return Promise.resolve(() => {});
+  return t.webviewWindow
+    .getCurrentWebviewWindow()
+    .listen<UnsavedPrompt>("unsaved-prompt", (e) => handler(e.payload));
+}
+
+export async function replyUnsaved(id: number, reply: UnsavedReply): Promise<void> {
+  await tauri()?.core.invoke<void>("reply_unsaved", { id, reply });
+}
+
+/**
  * A notification was clicked and this window should show `sessionId`.
  * Window-scoped: the shell emits to the chosen window's label. No-op
  * unsubscriber in the browser.

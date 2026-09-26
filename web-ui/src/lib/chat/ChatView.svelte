@@ -2,6 +2,16 @@
   import { onDestroy, tick, untrack } from "svelte";
   import { displayName, forkSession, rewindSession, renameSession, type Session } from "../workspace/sessions";
   import { fsValidate } from "../previews/files";
+  import { openPath, type OpenPathOptions, type PathKind } from "../shared/openPath";
+  import type { LinkContext } from "../shared/fileRef";
+  import {
+    chatLinkContext,
+    groupByBases,
+    PathResolver,
+    resolveAndOpen,
+    resolveScope,
+    type ValidateAnswer,
+  } from "./paths";
   import { listAgents } from "../workspace/launcher";
   import SessionGlyph from "../shared/SessionGlyph.svelte";
   import { insertIntoComposer, registerFollow } from "./composerBus";
@@ -31,6 +41,7 @@
   import WorkTray from "../shared/WorkTray.svelte";
   import Chevron from "../shared/Chevron.svelte";
   import ArtifactGallery from "./ArtifactGallery.svelte";
+  import { EmbedResolver } from "./embeds";
   import PermissionCard from "./PermissionCard.svelte";
   import PlanApprovalCard from "./PlanApprovalCard.svelte";
   import QuestionCard from "./QuestionCard.svelte";
@@ -80,7 +91,9 @@
     terminals?: { id: string; name: string }[];
     /** Open a file path in an adjacent pane (the workbench path-click flow). */
     onOpenFile?: (path: string) => void;
-    /** Kind-aware open: files → viewer pane, dirs → the Finder. */
+    /** Kind-aware open: files → viewer pane, dirs → the Finder. A fallback:
+     *  path links open through the workbench opener (`shared/openPath.ts`)
+     *  whenever App has registered one. */
     onOpenPath?: (path: string, kind: "file" | "dir") => void;
     /** Flip this session to its real TUI (the pane-bar view toggle). Used for
      *  interactive CLI flows the `-p` stream-json mode can't run — `/login`
@@ -116,6 +129,8 @@
     if (prefetchFrame !== null) cancelAnimationFrame(prefetchFrame);
     if (idleTimer !== null) clearTimeout(idleTimer);
   });
+  onDestroy(() => prosePaths.dispose());
+  onDestroy(() => proseEmbeds.dispose());
 
   // Curated model choices for this agent's picker (daemon-cached catalog).
   let models = $state<{ id: string; label: string }[]>([]);
@@ -1351,29 +1366,77 @@
     return setUltracode(!store.ultracode);
   }
 
-  /** Prose path candidates validate against the daemon relative to the
-   *  session cwd (the terminal-link mechanism) — only real paths become
-   *  clickable, and dirs route to the Finder. The workspace id enables the
-   *  daemon's unique-basename fallback, keeping chat links and terminal
-   *  links in parity for a bare "FIGURE_PLAN.md" living in a subdirectory. */
-  async function resolveProsePaths(
-    candidates: string[],
-  ): Promise<Map<string, { path: string; kind: "file" | "dir" }>> {
-    const out = new Map<string, { path: string; kind: "file" | "dir" }>();
-    try {
-      const valid = await fsValidate(candidates, session.cwd, session.workspace_id ?? null);
-      for (const [cand, hit] of Object.entries(valid)) {
-        out.set(cand, { path: hit.path, kind: hit.kind });
+  /** Where this chat's relative references resolve: App's context for the
+   *  session (live cwd, spawn cwd, workspace root — the terminal's answer
+   *  too), else what the session row itself knows. */
+  function linkContext(): LinkContext {
+    return (
+      chatLinkContext(session.id) ?? {
+        cwd: session.cwd_current ?? session.cwd,
+        spawnCwd: session.cwd,
+        root: null,
+        workspaceId: session.workspace_id ?? null,
       }
-    } catch {
-      // Unreachable daemon: nothing becomes clickable this round.
-    }
-    return out;
+    );
   }
 
-  function openProsePath(path: string, kind: "file" | "dir") {
+  /** Every path candidate in this chat (prose, code spans, links, user
+   *  messages, tool locations) resolves through one batched, cached
+   *  resolver: one request per base ladder per batch, the workspace id
+   *  enabling the daemon's unique-basename / path-suffix fallbacks. */
+  async function validateProse(candidates: string[]): Promise<ValidateAnswer> {
+    const ctx = linkContext();
+    const answer: Required<ValidateAnswer> = { valid: {}, ambiguous: {}, unchecked: [] };
+    const groups = groupByBases(candidates, ctx);
+    const results = await Promise.allSettled(
+      groups.map((g) => fsValidate(g.candidates, g.bases[0], ctx.workspaceId, g.bases.slice(1))),
+    );
+    if (results.length > 0 && results.every((r) => r.status === "rejected")) {
+      throw (results[0] as PromiseRejectedResult).reason;
+    }
+    results.forEach((r, i) => {
+      if (r.status === "rejected") {
+        answer.unchecked.push(...groups[i].candidates);
+        return;
+      }
+      Object.assign(answer.valid, r.value.valid);
+      Object.assign(answer.ambiguous, r.value.ambiguous);
+      answer.unchecked.push(...r.value.unchecked);
+    });
+    return answer;
+  }
+  // The scope reads the session and workspace untracked: a template that
+  // peeks must not re-render on every session update, only on answers.
+  const prosePaths = new PathResolver(validateProse, {
+    root: () => linkContext().root,
+    scope: (c) => untrack(() => resolveScope(linkContext(), c)),
+  });
+  /** Files the chat shows as embed cards (prose `![](…)`, the turn
+   *  gallery's shell-written files) resolve against the same directories,
+   *  strictly: an embed names one file. */
+  const proseEmbeds = new EmbedResolver(() => untrack(() => linkContext()));
+
+  // A turn end is when files the agent mentioned have come to exist: drop
+  // the misses so the renderers holding them ask again.
+  let wasRunning = false;
+  $effect(() => {
+    const running = store.running;
+    if (wasRunning && !running) prosePaths.expireMisses();
+    wasRunning = running;
+  });
+
+  /** Open a resolved path through the workbench opener (shared/openPath.ts):
+   *  files at their line, Cmd/Ctrl-click in a split, dirs in the Finder. */
+  function openProsePath(path: string, kind: PathKind, opts: OpenPathOptions = {}) {
+    if (openPath(path, kind, opts)) return;
     if (onOpenPath !== undefined) onOpenPath(path, kind);
     else if (kind === "file") onOpenFile?.(path);
+  }
+
+  /** A path from structured data (a tool location, an artifact tile) that
+   *  may be relative: resolve it against the session first. */
+  function openLocation(path: string) {
+    void resolveAndOpen(prosePaths, path, openProsePath, { at: { x: 0, y: 0 } });
   }
 
   /** The composer's palette: chimaera-native pickers first (they don't
@@ -2051,7 +2114,8 @@
           sourceEnd={item.endIndex}
           sourceUid={item.tools[0]?.uid}
           {visible}
-          {onOpenFile}
+          onOpenPath={openProsePath}
+          resolvePaths={prosePaths}
           onBackground={agentKind === "claude" ? backgroundTool : undefined}
           onStopTask={agentKind === "claude" ? stopTask : undefined}
         />
@@ -2116,7 +2180,7 @@
               <UserText
                 text={block.text}
                 onOpenPath={openProsePath}
-                resolvePaths={resolveProsePaths}
+                resolvePaths={prosePaths}
               />
             </div>
           </div>
@@ -2152,7 +2216,8 @@
             streaming={store.running && item.block.uid === lastInlineUid}
             {visible}
             onOpenPath={openProsePath}
-            resolvePaths={resolveProsePaths}
+            resolvePaths={prosePaths}
+            embeds={proseEmbeds}
             onReveal={() => {
               if (visible && atBottom && !composerEngaged) queueBottomScroll();
             }}
@@ -2182,9 +2247,10 @@
         <FinishedRow
           block={item.block}
           {visible}
-          {onOpenFile}
+          onOpenFile={openLocation}
           onOpenPath={openProsePath}
-          resolvePaths={resolveProsePaths}
+          resolvePaths={prosePaths}
+          embeds={proseEmbeds}
           sourceIndex={item.index}
           sourceUid={item.block.uid}
         />
@@ -2218,9 +2284,16 @@
       {:else if item.block.kind === "turn_end"}
         {@const block = item.block}
         <div class="source-block" data-block-index={item.index} data-block-uid={item.block.uid}>
-          <!-- The turn's artifacts preview here, after the closing prose. -->
-          {#if block.artifacts.length > 0}
-            <ArtifactGallery paths={block.artifacts} onOpen={onOpenFile} />
+          <!-- What the turn made previews here, after the closing prose. -->
+          {#if block.artifacts.length > 0 || block.mentioned.length > 0}
+            <ArtifactGallery
+              paths={block.artifacts}
+              mentioned={block.mentioned}
+              startedAtMs={block.startedAtMs}
+              endedAtMs={block.endedAtMs}
+              resolver={proseEmbeds}
+              onOpenPath={openProsePath}
+            />
           {/if}
 
         </div>
@@ -2256,7 +2329,7 @@
           {visible}
           onDecide={(opt, feedback) => decide(request.requestId, opt, undefined, feedback)}
           onOpenPath={openProsePath}
-          resolvePaths={resolveProsePaths}
+          resolvePaths={prosePaths}
         />
       {:else}
         <PermissionCard
@@ -2322,7 +2395,7 @@
                 <UserText
                   text={send.text}
                   onOpenPath={openProsePath}
-                  resolvePaths={resolveProsePaths}
+                  resolvePaths={prosePaths}
                 />
               </div>
               {#if agentKind === "codex" && send.state === "queued" && store.running}

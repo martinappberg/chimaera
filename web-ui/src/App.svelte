@@ -97,14 +97,16 @@
     uploadAndInsert,
     uploadJobs,
     uploadToDir,
+    uploadToSession,
   } from "./lib/net/uploads";
   import { get } from "svelte/store";
   import {
     activeSelection,
     clearSelection,
     composeAgentPathReference,
-    composeFileReference,
+    composeSelectionReference,
     composeShellPathReference,
+    needsCropUpload,
     composeTerminalReference,
     referenceTarget,
     composeProvenanceSuffix,
@@ -183,11 +185,22 @@
     type SplitDir,
     type Tab,
   } from "./lib/layout/layout";
-  import type { PathKind } from "./lib/terminal/links";
+  import type { LinkContext } from "./lib/shared/fileRef";
+  import { openPath, setPathOpener, type OpenPathOptions, type PathKind } from "./lib/shared/openPath";
+  import type { Reveal } from "./lib/shared/reveal";
+  import { setChatLinkContext } from "./lib/chat/paths";
   import type { UrlTarget } from "./lib/terminal/urlLinks";
   import { setUrlPaneOpener, urlMenuEntries } from "./lib/shared/urlOpen";
   import { basename, fileTabTitles, fsProbe, viewKindFor } from "./lib/previews/files";
-  import { dirtyFiles } from "./lib/shared/editing";
+  import {
+    CLOSE_SAVE_DEADLINE_MS,
+    dirtyFiles,
+    discardDirtyFile,
+    noteDaemonLink,
+    saveDirtyFiles,
+    unsavedCloseError,
+    unsavedDeleteNote,
+  } from "./lib/shared/editing";
   import {
     activateGitWorkspace,
     gitEnv,
@@ -255,8 +268,11 @@
     onLocalDaemonUpdated,
     onFocusSession,
     onMenu,
+    onUnsavedPrompt,
     openDetachedPopup,
     openDetachedWindow,
+    replyUnsaved,
+    reportUnsaved,
     reportWindowScope,
     reportWindowView,
     setCaffeinate,
@@ -303,6 +319,8 @@
   import ContextMenuHost from "./lib/shared/ContextMenuHost.svelte";
   import { contextMenu } from "./lib/shared/contextMenu.svelte";
   import ConfirmDialog from "./lib/shared/ConfirmDialog.svelte";
+  import CloseDirtyDialog from "./lib/layout/CloseDirtyDialog.svelte";
+  import { WindowCloseGuard } from "./lib/layout/windowClose.svelte";
   import { fsDeleteOp, lastFsMutation, notifyCreated, pendingDelete } from "./lib/workspace/fsEvents";
   import {
     currentDiskWatches,
@@ -723,6 +741,15 @@
   let treeCreateNonce = 0;
   /** A failed delete's message; keeps the confirm dialog open. */
   let deleteError = $state<string | null>(null);
+  /** File tabs whose close waits on "save changes?" (held by identity — the
+   *  indices shift as other tabs close around them). */
+  let pendingClose = $state<Tab[]>([]);
+  let closeSaving = $state(false);
+  let closeError = $state<string | null>(null);
+  /** Bumped by Cancel: a "Save" still waiting then touches nothing. */
+  let closeAttempt = 0;
+  /** The native window close / app quit over this window's unsaved files. */
+  const windowClose = new WindowCloseGuard(replyUnsaved);
   /** Element that held focus when the picker opened; restored on close. */
   let pickerRestoreEl: HTMLElement | null = null;
 
@@ -1523,6 +1550,12 @@
     setUrlPaneOpener((target, newSplit) =>
       openBrowserFromPane(layout.focusedPaneId, target, newSplit),
     );
+    // Every path link (terminal, chat prose, tool cards, documents) opens
+    // through one opener, so a line reveal and Cmd/Ctrl-click split work
+    // wherever the link was; chat resolves against the same per-session
+    // context as terminal links.
+    setPathOpener(openPathInLayout);
+    setChatLinkContext(linkContext);
     setReferenceHandler(referenceSelection);
     setUploadPathInserter(insertUploadedPath);
     // OS-desktop file drags: window-level so the navigate-away default is
@@ -1565,6 +1598,8 @@
         // health sample, which the recovery kick fetches promptly).
         if (up && !eventsUp) resetLinkRtt();
         eventsUp = up;
+        // A save that died with the link retries once it is back.
+        noteDaemonLink(up);
       },
       onFatal: (message) => {
         if (message === "unauthorized") notifyUnauthorized();
@@ -1703,6 +1738,8 @@
       stopChordHints();
       setReferenceHandler(null);
       setUploadPathInserter(null);
+      setPathOpener(null);
+      setChatLinkContext(null);
       events.close();
       pool.disposePool();
       chatPool.disposeAllChats();
@@ -1780,28 +1817,51 @@
     const sel = get(activeSelection);
     const target = refTargetSession;
     if (sel === null || target === null) return;
-    let text: string;
-    if (sel.kind === "file") {
-      const root = workspace?.root;
-      const rel = root !== undefined ? workspaceRelative(sel.path, root) : sel.path;
-      text = composeFileReference(rel, sel.startLine, sel.endLine, sel.text);
-    } else {
-      const src = sessionsById.get(sel.sessionId);
-      const name =
-        displayNames.get(sel.sessionId) ?? (src !== undefined ? displayName(src) : "terminal");
-      text = composeTerminalReference(name, sel.text);
-    }
+    const targetId = target.id;
+    const kind = target.ui === "chat" ? "chat" : "terminal";
     // A reference never lands out of sight: surface the target agent first,
     // splitting beside the selection's own pane when it is not open anywhere.
-    if (sessionPaneId(layout, target.id) === null) {
+    if (sessionPaneId(layout, targetId) === null) {
       const beside =
         (sel.kind === "terminal" ? sessionPaneId(layout, sel.sessionId) : null) ??
         layout.focusedPaneId;
       layout = splitPane(layout, beside, "row");
-      layout = openSession(layout, target.id);
+      layout = openSession(layout, targetId);
     }
-    typeIntoSession(target.id, text);
+    if (sel.kind === "terminal") {
+      const src = sessionsById.get(sel.sessionId);
+      const name =
+        displayNames.get(sel.sessionId) ?? (src !== undefined ? displayName(src) : "terminal");
+      typeIntoSession(targetId, composeTerminalReference(name, sel.text));
+      return;
+    }
+    const root = workspace?.root;
+    const rel = root !== undefined ? workspaceRelative(sel.path, root) : sel.path;
+    const crop = sel.crop;
+    if (crop !== undefined && needsCropUpload(sel, kind)) {
+      // Pixels for a terminal agent: a file in the session's landing pad
+      // (bounded, pruned with the session), its path typed after the
+      // locator. A failed upload still sends the locator (its chip says why).
+      const name = `ref-${++refCropSeq}.png`;
+      void trackFileOp("Sending the region image…", (progress) =>
+        uploadToSession(targetId, crop, name, progress),
+      ).then((up) => typeIntoSession(targetId, composeSelectionReference(rel, sel, kind, up?.path ?? null)));
+      return;
+    }
+    if (crop !== undefined && kind === "chat") {
+      // Chat sees the pixels as an attachment, through the same downscale
+      // and payload caps as a pasted screenshot.
+      const label = sel.label;
+      void imageToAttachment(crop).then((image) => {
+        if (image !== null) attachImageToComposer(targetId, label !== undefined ? { ...image, label } : image);
+      });
+    }
+    typeIntoSession(targetId, composeSelectionReference(rel, sel, kind));
   }
+
+  /** Names each region image a terminal agent receives (`ref-1.png`, …);
+   *  the landing pad dedupes a name that is already there. */
+  let refCropSeq = 0;
 
   /**
    * Drag-to-reference drop: type the dropped path (file OR folder) into the
@@ -2043,18 +2103,16 @@
 
   // --- clickable paths: the bridge's return direction ------------------------
 
-  /** Resolution context for a session's terminal link provider. */
-  function linkContext(id: string): {
-    cwd: string | null;
-    root: string | null;
-    workspaceId: string | null;
-  } {
+  /** Resolution context for a session's path links (terminal and chat). */
+  function linkContext(id: string): LinkContext {
     const s = sessionsById.get(id);
     // The session's own workspace, else the active one — the same preference
     // order the root fallback uses, so root and workspaceId stay in step.
     const ws = workspaces.find((w) => w.id === s?.workspace_id) ?? workspace;
     return {
       cwd: s?.cwd_current ?? s?.cwd ?? null,
+      // Scrollback and older messages were written from the spawn directory.
+      spawnCwd: s?.cwd ?? null,
       root: ws?.root ?? null,
       workspaceId: ws?.id ?? null,
     };
@@ -2096,19 +2154,37 @@
     layout = openTab(layout, freshBrowserTab("", 0, "/"));
   }
 
-  /** A confirmed terminal path link was activated. */
-  function onOpenPath(id: string, path: string, kind: PathKind, newSplit: boolean): void {
+  /** A confirmed terminal path link was activated: anchor the open on the
+   *  pane showing that session, not merely the focused one. */
+  function onOpenPath(
+    id: string,
+    path: string,
+    kind: PathKind,
+    opts: { split: boolean; reveal?: Reveal },
+  ): void {
     const loc = paneForTab(layout.root, { surface: "terminal", sessionId: id });
-    const fromPane = loc?.paneId ?? layout.focusedPaneId;
+    openPath(path, kind, { ...opts, fromPane: loc?.paneId });
+  }
+
+  /**
+   * The workbench's path opener (registered with `shared/openPath.ts`; every
+   * link surface calls `openPath`). Directory names open in the Finder
+   * (browsing anywhere, in or out of the workspace); an in-workspace dir is
+   * ALSO revealed in the FILES side-tree (revealInTree is a no-op outside the
+   * root). Files follow `openFileFromPane`; `openPath` has already requested
+   * the line reveal, which the file view takes once it shows the path.
+   */
+  function openPathInLayout(path: string, kind: PathKind, opts: OpenPathOptions): void {
+    const from = opts.fromPane;
+    const fromPane =
+      from !== undefined && findPane(layout.root, from) !== null ? from : layout.focusedPaneId;
+    const split = opts.split === true;
     if (kind === "dir") {
-      // Directory names open in the Finder (browsing anywhere, in or out of the
-      // workspace); an in-workspace dir is ALSO revealed in the FILES side-tree
-      // (revealInTree is a no-op outside the root).
-      openDirInFinder(fromPane, path, newSplit);
+      openDirInFinder(fromPane, path, split);
       revealInTree(path);
       return;
     }
-    openFileFromPane(fromPane, path, newSplit);
+    openFileFromPane(fromPane, path, split);
   }
 
   /**
@@ -2672,6 +2748,20 @@
     return () => window.removeEventListener("beforeunload", handler);
   });
 
+  // The native app's close/quit guard: a webview gets no beforeunload when
+  // its window closes or the app quits, so the shell decides from the
+  // unsaved count this window pushes (no round trip, and no prompt when
+  // nothing is unsaved) and asks here when it holds one.
+  const unsavedCount = $derived($dirtyFiles.size);
+  $effect(() => {
+    if (!isNativeShell()) return;
+    void reportUnsaved(unsavedCount).catch(() => {});
+  });
+  $effect(() => {
+    if (!isNativeShell()) return;
+    return asyncDisposer(onUnsavedPrompt((p) => windowClose.receive(p)));
+  });
+
   // A file that became dirty must never be a PREVIEW tab: an unsaved edit
   // that the next preview open silently replaced would be lost. Promote any
   // dirty preview tab to a permanent one. untrack() so writing `layout` here
@@ -3147,7 +3237,13 @@
   function closeView(paneId: string): void {
     const p = findPane(layout.root, paneId);
     if (p === null) return;
-    layout = p.tabs.length > 0 ? detachTab(layout, paneId, p.active) : closePane(layout, paneId);
+    const active = p.tabs[p.active];
+    if (active !== undefined) {
+      // A dirty file asks first (and keeps its tab until answered).
+      if (!closeTabs([active])) return;
+    } else {
+      layout = closePane(layout, paneId);
+    }
     const sid = focusedSessionOf(layout);
     const focusedId = layout.focusedPaneId;
     // After the flush: closing a pane restructures the tree, which can
@@ -3156,6 +3252,84 @@
       if (sid !== null) pool.focusTerminal(sid);
       else paneRootEl(focusedId)?.focus();
     });
+  }
+
+  /** Detach these tabs wherever they are now (views only; sessions live on). */
+  function detachTabs(tabs: readonly Tab[]): void {
+    let next = layout;
+    for (const t of tabs) {
+      const loc = paneForTab(next.root, t);
+      if (loc !== null) next = detachTab(next, loc.paneId, loc.index);
+    }
+    layout = next;
+  }
+
+  /**
+   * Close tabs by identity. Clean ones go at once; a file with unsaved edits
+   * joins the "save changes?" dialog and keeps its tab until answered — its
+   * buffer would survive a plain close (the buffer store keeps dirty text),
+   * but a close gesture must never leave edits stranded without asking.
+   * True when everything closed right away.
+   */
+  function closeTabs(tabs: readonly Tab[]): boolean {
+    const dirty = get(dirtyFiles);
+    const held = tabs.filter((t) => t.surface === "file" && dirty.has(t.path));
+    detachTabs(tabs.filter((t) => !held.includes(t)));
+    if (held.length === 0) return true;
+    const known = new Set(pendingClose.map(tabKey));
+    pendingClose = [...pendingClose, ...held.filter((t) => !known.has(tabKey(t)))];
+    closeError = null;
+    return false;
+  }
+
+  const pendingClosePaths = $derived(
+    pendingClose.flatMap((t) => (t.surface === "file" ? [t.path] : [])),
+  );
+
+  /**
+   * "Save": save each file; close those that saved, keep the rest asking.
+   * Bounded: past the deadline (a dead link) it reports "not saved" and
+   * hands control back while the save carries on in the background.
+   */
+  async function saveAndClose(): Promise<void> {
+    if (closeSaving) return;
+    closeSaving = true;
+    closeError = null;
+    const attempt = ++closeAttempt;
+    const batch = pendingClose;
+    const r = await saveDirtyFiles(
+      batch.flatMap((t) => (t.surface === "file" ? [t.path] : [])),
+      { deadlineMs: CLOSE_SAVE_DEADLINE_MS, cancelled: () => attempt !== closeAttempt },
+    );
+    // Cancelled while waiting: the tabs stay open, the dialog is already gone.
+    if (r === null) return;
+    closeSaving = false;
+    const failed = batch.filter((t) => t.surface === "file" && r.unsaved.includes(t.path));
+    detachTabs(batch.filter((t) => !failed.includes(t)));
+    pendingClose = [...failed, ...pendingClose.filter((t) => !batch.includes(t))];
+    if (failed.length > 0) {
+      closeError = unsavedCloseError(
+        failed.flatMap((t) => (t.surface === "file" ? [t.path] : [])),
+        r.timedOut,
+      );
+    }
+  }
+
+  /** "Don't save": drop the edits (and their drafts), then close. */
+  function discardAndClose(): void {
+    for (const t of pendingClose) if (t.surface === "file") discardDirtyFile(t.path);
+    detachTabs(pendingClose);
+    pendingClose = [];
+    closeError = null;
+  }
+
+  /** Also while saving: the tabs stay open and dirty, and a save already
+   *  sent may still land in the background. */
+  function cancelClose(): void {
+    closeAttempt++;
+    closeSaving = false;
+    pendingClose = [];
+    closeError = null;
   }
 
   /**
@@ -3541,8 +3715,10 @@
       if (sid !== null) pool.focusTerminal(sid);
     },
     closeTab(paneId, index) {
-      // Detaches the view only — the session stays alive in the rail.
-      layout = detachTab(layout, paneId, index);
+      // Detaches the view only — the session stays alive in the rail. A file
+      // with unsaved edits asks first.
+      const tab = findPane(layout.root, paneId)?.tabs[index];
+      if (tab !== undefined) closeTabs([tab]);
     },
     setRatio(splitId, ratio) {
       layout = setRatio(layout, splitId, ratio);
@@ -3581,12 +3757,7 @@
       openFileFromPane(paneId, path, newSplit);
     },
     openPathFrom(paneId, path, kind, newSplit) {
-      if (kind === "dir") {
-        openDirInFinder(paneId, path, newSplit);
-        revealInTree(path);
-      } else {
-        openFileFromPane(paneId, path, newSplit);
-      }
+      openPath(path, kind, { fromPane: paneId, split: newSplit });
     },
     openChangesFrom(paneId, sessionId, newSplit) {
       openChangesFromPane(paneId, sessionId, newSplit);
@@ -5447,7 +5618,7 @@
     title={$pendingDelete.kind === "dir" ? "Delete folder" : "Delete file"}
     body={`Permanently delete “${basename($pendingDelete.path)}”${
       $pendingDelete.kind === "dir" ? " and everything inside it" : ""
-    }? This cannot be undone.`}
+    }? This cannot be undone.${unsavedDeleteNote($pendingDelete.path, $dirtyFiles)}`}
     confirmLabel="delete"
     danger
     error={deleteError}
@@ -5456,6 +5627,30 @@
       pendingDelete.set(null);
       deleteError = null;
     }}
+  />
+{/if}
+
+<!-- The native window close / app quit over every unsaved file here; it takes
+     precedence over a tab close already asking (whose files it includes). -->
+{#if windowClose.prompt !== null}
+  <CloseDirtyDialog
+    paths={windowClose.prompt.paths}
+    saving={windowClose.saving}
+    error={windowClose.error}
+    action={windowClose.prompt.reason}
+    onSave={() => void windowClose.save()}
+    onDiscard={() => windowClose.discard()}
+    onCancel={() => windowClose.cancel()}
+  />
+<!-- Closing tabs whose files hold unsaved edits: save / don't save / cancel. -->
+{:else if pendingClosePaths.length > 0}
+  <CloseDirtyDialog
+    paths={pendingClosePaths}
+    saving={closeSaving}
+    error={closeError}
+    onSave={() => void saveAndClose()}
+    onDiscard={discardAndClose}
+    onCancel={cancelClose}
   />
 {/if}
 

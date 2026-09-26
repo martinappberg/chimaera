@@ -3187,29 +3187,12 @@ pub(crate) async fn spawn_chat_session(
     // settings pre-allow is generated from — the two vendors' ask modes
     // cannot drift); auto pre-approves the whole chimaera server. Workers
     // (mastermind: None) keep every prompt except the prompt-free tools
-    // (`notify`) every session pre-approves. Active workbench plugins' tools
-    // join the pre-approved set too (the user switched the plugin on; its
-    // card names the tools) — for workers as well.
+    // (`notify`, the read-only document tools) every session pre-approves.
+    // Active workbench plugins' tools join the pre-approved set too (the user
+    // switched the plugin on; its card names the tools) — for workers as well.
     if recipe.kind == AgentKind::Codex {
         let plugin_tools = crate::plugins::spawn_allow(state, &recipe.workspace_id).await;
-        let always = crate::mcp::ALWAYS_ALLOWED_TOOLS
-            .iter()
-            .map(|t| t.to_string());
-        spec.mcp_auto_approve = Some(chimaera_agent::driver::McpAutoApprove {
-            server: "chimaera".to_string(),
-            tools: match recipe.mastermind {
-                Some(crate::workspaces::MastermindMode::Ask) => Some(
-                    crate::mcp::MASTERMIND_READ_TOOLS
-                        .iter()
-                        .map(|t| t.to_string())
-                        .chain(always)
-                        .chain(plugin_tools)
-                        .collect(),
-                ),
-                Some(crate::workspaces::MastermindMode::Auto) => None,
-                None => Some(always.chain(plugin_tools).collect()),
-            },
-        });
+        spec.mcp_auto_approve = Some(codex_mcp_auto_approve(recipe.mastermind, plugin_tools));
     }
     // Codex selects its create-time model in-protocol at thread open; Claude
     // already received the same recipe value through build_chat_command.
@@ -3506,6 +3489,34 @@ pub(crate) async fn resurrect_chat(
     }
 }
 
+/// The codex driver's standing consent to chimaera MCP tool calls (see the
+/// gating note in `spawn_chat_session`): the prompt-free tools and the
+/// workspace's active plugin tools for every session, plus a Mastermind's
+/// tier.
+fn codex_mcp_auto_approve(
+    mastermind: Option<crate::workspaces::MastermindMode>,
+    plugin_tools: Vec<String>,
+) -> chimaera_agent::driver::McpAutoApprove {
+    let always = crate::mcp::ALWAYS_ALLOWED_TOOLS
+        .iter()
+        .map(|t| t.to_string())
+        .chain(plugin_tools);
+    chimaera_agent::driver::McpAutoApprove {
+        server: "chimaera".to_string(),
+        tools: match mastermind {
+            Some(crate::workspaces::MastermindMode::Ask) => Some(
+                crate::mcp::MASTERMIND_READ_TOOLS
+                    .iter()
+                    .map(|t| t.to_string())
+                    .chain(always)
+                    .collect(),
+            ),
+            Some(crate::workspaces::MastermindMode::Auto) => None,
+            None => Some(always.collect()),
+        },
+    }
+}
+
 /// Daemon stop (an update, `chimaera kill`, SIGTERM): end every live chat
 /// driver through the harness's stop — SIGTERM, stdin closed, `KILL_GRACE`,
 /// then SIGKILL — before the process exits, instead of the runtime's
@@ -3639,6 +3650,41 @@ fn restart_message(carry: &chimaera_agent::Carryover) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Codex elicits every MCP call; the driver answers the prompt-free
+    /// tools (notify and the read-only document tools) for every session.
+    #[test]
+    fn codex_pre_approves_the_prompt_free_tools_for_every_session() {
+        use crate::workspaces::MastermindMode;
+        let worker = codex_mcp_auto_approve(None, Vec::new());
+        assert_eq!(worker.server, "chimaera");
+        assert_eq!(
+            worker.tools,
+            Some(vec![
+                "notify".to_string(),
+                "document_guide".to_string(),
+                "check_document".to_string(),
+            ])
+        );
+        let ask = codex_mcp_auto_approve(Some(MastermindMode::Ask), Vec::new())
+            .tools
+            .unwrap();
+        for tool in [
+            "workspace_status",
+            "notify",
+            "document_guide",
+            "check_document",
+        ] {
+            assert!(ask.iter().any(|t| t == tool), "{tool} in {ask:?}");
+        }
+        assert!(!ask
+            .iter()
+            .any(|t| t == "spawn_agent" || t == "run_in_terminal"));
+        assert_eq!(
+            codex_mcp_auto_approve(Some(MastermindMode::Auto), Vec::new()).tools,
+            None
+        );
+    }
 
     fn seq_line(n: u64, ev: AgentEvent) -> String {
         serde_json::to_string(&SeqEvent { seq: n, ts: 0, ev }).unwrap()

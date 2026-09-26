@@ -9,7 +9,7 @@ it talks to is a separate, longer-lived process (see
 
 **Where it lives:** `crates/chimaera-app/src/` — its own **standalone cargo workspace** (Tauri is
 kept out of the daemon workspace so musl/HPC builds stay lean). `main.rs` (three-role argv
-dispatch), `shell.rs` + `shell/{commands,connect,restore}.rs`, `daemon.rs`, `windows.rs`,
+dispatch), `shell.rs` + `shell/{commands,connect,restore,unsaved}.rs`, `daemon.rs`, `windows.rs`,
 `update.rs`, `askpass.rs`, `appearance.rs`, `menu.rs`. UI bridge `web-ui/src/lib/net/native.ts`; toast
 `web-ui/src/lib/workspace/{UpdateToast.svelte,update.svelte.ts}`. Rules:
 [rules/native-app.md](../../.claude/rules/native-app.md); map:
@@ -75,6 +75,36 @@ app-build` (never the root `cargo`).
   hidden it restores ONLY the most recently used one (the rest stay in the Dock); with no window (only
   during startup) it opens Home. A repeated launch focuses the most recent on-screen window the same way. Minimized
   windows are never mass-restored.
+
+## Unsaved edits on close and quit
+
+- **What & when.** A webview gets no `beforeunload` when its native window closes or the app
+  quits, so the shell guards both. Each page pushes its unsaved-file count whenever it changes;
+  a close or quit with nothing unsaved goes through exactly as before — no prompt, no round
+  trip. Closing a window that holds unsaved edits is held, and that window shows the tab
+  close's **Save all / Don't save / Cancel** over every unsaved file in it: Save waits for the
+  saves (the 15 s deadline, then "not saved" and control back), Don't save discards (drafts
+  too), Cancel keeps the window. Quitting — ⌘Q, the menu, the tray, a programmatic exit, and on
+  macOS Dock › Quit or logging out — asks each window with unsaved edits in turn, most recently
+  focused first, raising it; Cancel in any of them abandons the quit, and a quit every one lets
+  go of keeps the window set for the next launch as usual.
+- **Where it lives.** `shell/unsaved.rs` (the pure `Guard` state machine + its glue; commands
+  `report_unsaved(count)` and `reply_unsaved(id, "shown" | "proceed" | "cancel")`, the
+  window-scoped `unsaved-prompt` event `{id, reason: "close" | "quit"}`), `shell.rs`
+  (`CloseRequested`, `ExitRequested`, `request_quit` / `finish_quit`); UI
+  `layout/windowClose.svelte.ts` + `layout/CloseDirtyDialog.svelte`, bridge `net/native.ts`.
+- **Key behaviors.** **Never a trap:** a prompted page must reply `shown` within 4 s or the shell
+  proceeds anyway (a hung webview) — the draft journal still holds the text, and reopening the
+  file offers it back; asking again (another close click or ⌘Q) re-pings a shown prompt, and
+  the third ask of one prompt proceeds outright. The updater's relaunch is a restart Tauri will
+  not let the guard hold, so **update refuses while any window has unsaved edits** (the toast
+  says so). macOS OS-level quits never become Tauri's `ExitRequested`; the shell adds
+  `applicationShouldTerminate:` to tao's app delegate, and a held one answers
+  `NSTerminateCancel` (macOS reports that Chimaera stopped the logout). On Linux and Windows a
+  logout ends the process without asking (tao has no end-session hook there); the journal
+  covers it. Remote-host windows behave the same — the commands are granted per window like
+  every daemon-window command — and a window whose UI predates the guard never reports, so it
+  closes as it always did.
 
 ## Notifications
 
@@ -185,6 +215,9 @@ app-build` (never the root `cargo`).
 - **Windows is beta**: engine + connect transport + askpass relay are implemented and
   CI-smoked; the wizard flow and the interop askpass chain have not yet been hand-driven on
   retail Windows hardware.
+- **The unsaved-edits guard on close and quit** has unit-tested decisions (the shell's `Guard`,
+  the page's dialog controller) and CI's bundle builds, but has not yet been hand-driven in the
+  app; the macOS `applicationShouldTerminate:` hook (Dock › Quit, logout) is compile-checked only.
 
 ---
 

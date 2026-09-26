@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const mocks = vi.hoisted(() => ({
   fsFile: vi.fn(),
   fsMarkdown: vi.fn(),
-  fsRawUrl: vi.fn(),
+  fsRawTicket: vi.fn(),
   fsTable: vi.fn(),
 }));
 
@@ -17,9 +17,9 @@ describe("FileEntry.ensureRawUrl", () => {
   });
 
   it("makes concurrent consumers wait for the same raw ticket", async () => {
-    let resolveTicket!: (url: string) => void;
-    mocks.fsRawUrl.mockReturnValue(
-      new Promise<string>((resolve) => {
+    let resolveTicket!: (t: { url: string; name: string | null }) => void;
+    mocks.fsRawTicket.mockReturnValue(
+      new Promise<{ url: string; name: string | null }>((resolve) => {
         resolveTicket = resolve;
       }),
     );
@@ -35,16 +35,37 @@ describe("FileEntry.ensureRawUrl", () => {
     });
 
     await Promise.resolve();
-    expect(mocks.fsRawUrl).toHaveBeenCalledTimes(1);
+    expect(mocks.fsRawTicket).toHaveBeenCalledTimes(1);
     expect(firstFinished).toBe(false);
     expect(secondFinished).toBe(false);
 
-    resolveTicket("/api/fs/raw/ticket");
+    resolveTicket({ url: "/api/fs/raw/ticket", name: "umap.pdf" });
     await Promise.all([first, second]);
 
     expect(entry.rawUrl).toBe("/api/fs/raw/ticket");
+    expect(entry.rawName).toBe("umap.pdf");
     expect(firstFinished).toBe(true);
     expect(secondFinished).toBe(true);
+  });
+});
+
+describe("FileEntry.isOwnWrite", () => {
+  it("tells this window's own save from a rewrite elsewhere", async () => {
+    const entry = new FileEntry("docs/notes.md");
+    expect(entry.isOwnWrite("m1")).toBe(false);
+    // An in-app save lands: its token is the entry's, and ours.
+    entry.noteWrite("m2");
+    expect(entry.mtime).toBe("m2");
+    expect(entry.isOwnWrite("m2")).toBe(true);
+    // The daemon's watch reports another version: not ours.
+    mocks.fsFile.mockResolvedValue({ bytes: new Uint8Array(0), size: 0, truncated: false, mtime: "m3", hash: null });
+    await entry.revalidate();
+    expect(entry.mtime).toBe("m3");
+    expect(entry.isOwnWrite("m3")).toBe(false);
+    // A save whose reply carried no token claims nothing.
+    entry.noteWrite(null);
+    expect(entry.isOwnWrite(null)).toBe(false);
+    expect(entry.isOwnWrite("m2")).toBe(false);
   });
 });
 
@@ -52,10 +73,6 @@ describe("FileEntry.ensureRawUrl", () => {
 // learning the first mtime must not count (a cold open would mount twice), and
 // a real change must count only after the refreshed ticket is in place.
 describe("FileEntry.changes", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-  });
-
   it("does not count the first mtime it learns", async () => {
     mocks.fsFile.mockResolvedValue({ mtime: "t1" });
     const entry = new FileEntry("data/book.xlsx");
@@ -66,23 +83,23 @@ describe("FileEntry.changes", () => {
 
   it("counts a change on disk once, after the refreshed ticket lands", async () => {
     mocks.fsFile.mockResolvedValue({ mtime: "t1" });
-    mocks.fsRawUrl.mockResolvedValueOnce("/raw/old");
+    mocks.fsRawTicket.mockResolvedValueOnce({ url: "/raw/old", name: "umap.pdf" });
     const entry = new FileEntry("plots/umap.pdf");
     await entry.ensureMtime();
     await entry.ensureRawUrl();
 
-    let resolveTicket!: (url: string) => void;
-    mocks.fsRawUrl.mockReturnValue(
-      new Promise<string>((resolve) => {
+    let resolveTicket!: (t: { url: string; name: string | null }) => void;
+    mocks.fsRawTicket.mockReturnValue(
+      new Promise<{ url: string; name: string | null }>((resolve) => {
         resolveTicket = resolve;
       }),
     );
     mocks.fsFile.mockResolvedValue({ mtime: "t2" });
     const pending = entry.revalidate();
-    await vi.waitFor(() => expect(mocks.fsRawUrl).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(mocks.fsRawTicket).toHaveBeenCalledTimes(2));
     expect(entry.changes).toBe(0);
 
-    resolveTicket("/raw/new");
+    resolveTicket({ url: "/raw/new", name: "umap.pdf" });
     await pending;
     expect(entry.rawUrl).toBe("/raw/new");
     expect(entry.changes).toBe(1);

@@ -180,6 +180,25 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   narration as ordinary agent prose — the way the Claude apps do — while real reasoning stays in
   Thought lines. Codex's commentary messages already arrive as prose; Codex reasoning summaries are
   now requested (`turn/start.summary: "auto"`, unless the user's config sets its own).
+- **File references are links.** A path in agent prose, in inline code (the whole span, or the
+  paths inside a command like `cat results/x.csv`), in a markdown link target
+  (`[x](src/a.rs#L10)`, `%20` escapes), or in your own message becomes a link once the daemon
+  confirms it. The parser is the terminal's (`shared/fileRef.ts`: `:12`, `:12:3`, `#L12-L20`,
+  `@mentions`, `a/`/`b/` diff sides, `…/` tails, `file://`, wrappers and punctuation, Unicode), and
+  the candidates resolve against the session's live cwd, its spawn cwd and the workspace root,
+  then the workspace index (unique basename or path suffix). Click opens the file at the line, or
+  at a locator's spot (`paper.pdf#page=3&xywh=…`, `de.tsv#row=5-9`, `demo.mp4#t=30`);
+  Cmd/Ctrl+click opens it in a split; a directory opens in the Finder; a name several files
+  answer to (dashed underline) asks which in the context menu. Every renderer in a chat shares one
+  batched, cached resolver (`paths.ts` `PathResolver`), its answers keyed by the candidate AND the
+  base ladder + workspace it resolved against: a miss is asked again after 15 s, after every turn
+  end (files the agent mentioned may exist now), when the pointer comes back to the message, and
+  on a click of a local link; a hit stands for 60 s; a daemon error is never cached as a miss. A
+  click on a linked reference asks again before opening, so a file moved or deleted since opens
+  nothing (and loses its underline); an unanswered re-check falls back to the link. Stamping
+  stays off the streaming hot path (idle, per closed segment, the open tail at settle), and a
+  batch that lands after the stream settled re-stamps the settled message. Only elements the
+  renderer stamped open anything: agent HTML that forges the classes opens nothing.
 - **Live status line.** While a turn runs: elapsed · output tokens this turn · running tasks
   (subagents + background work) · what it is doing — the agent's own phrase when it offers one
   (Claude `task_summary`, "Measuring file sizes…"), else Thinking / Writing / Running tools.
@@ -288,8 +307,10 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
 ## Tool cards, permissions & questions
 
 - **Tool cards + grouping.** Each tool call is a collapsible card (title, glyph, status dot,
-  output/diff, a `↗` to open the touched file). Consecutive calls condense into a group ("6 commands
-  · 2 files"). Groups are collapsed by default, including while work is running, and remain
+  output/diff, a `↗` to open what it touched — with a count and a compact list when it touched
+  several; each location resolves against the session first, so a relative Grep/Glob `path` or
+  Codex change opens, and a directory opens in the Finder). Consecutive calls condense into a
+  group ("6 commands · 2 files"). Groups are collapsed by default, including while work is running, and remain
   expandable on demand; the summary badge (`running…` / `failed` / `recovered`) carries the verdict
   without turning live activity or history into a wall of command rows.
   Tool calls upsert by id (a late enriching re-emit never walks a finished tool back to
@@ -446,13 +467,34 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
 
 ## Inline artifacts
 
-- **What & when.** The output *is* the point of many jobs — after a turn's closing prose, a gallery
-  previews the previewable files that turn produced (image thumbnail, CSV/TSV first-rows peek,
-  embedded PDF). Click a tile to open the full viewer in a pane.
-- **Where.** `ArtifactGallery.svelte`, `InlinePreview.svelte`; `turn_end.artifacts` collected by
-  scanning back to the turn boundary (only *written* previewable files + touched images; a merely
-  *read* CSV isn't an artifact; capped at 8). Uses `POST /api/v1/fs/ticket` → `GET /raw/{ticket}` and
-  `GET /api/v1/fs/table`.
+- **What & when.** The output *is* the point of many jobs. Files show in the transcript as **embed
+  cards** — the same cards documents use ([files & previews](files-and-previews.md#embed-cards)):
+  a figure, a PDF page, a table slice, a sandboxed HTML report with its assets, a notebook cell, a
+  slide, a player, a document excerpt, a file card. Click a card's name (or ↗) to open the full
+  viewer in a pane at the same spot.
+- **Images in agent prose.** `![alt](figs/plot.png)` renders the file (it used to be a broken
+  image): the target resolves against the session's live directory, then where it started, then
+  the workspace root — strictly, an embed names one file — and any fragment picks the piece
+  (`paper.pdf#page=3`, `run.py#L10-L30`, `data.csv#row=2-9`). A file the agent announces before
+  writing shows as "not found" and turns into its card when it appears.
+- **Made this turn.** After a turn's closing prose, a gallery of compact tiles shows what the turn
+  made — including files written by **shell commands** (a plot saved by a script, a rendered
+  report), not only by edit tools. HTML reports, markdown, PDFs, tables and spreadsheets,
+  notebooks, slides and media; never source code (its diff is in the tool card). A stopped or
+  failed turn keeps its gallery. Tiles stay fresh when a file is overwritten, and say so when one
+  is gone.
+- **How the gallery finds shell-written files.** No structured event names them, so the reducer
+  lists the artifact-shaped paths the turn's commands, command outputs and prose *mention*
+  (`artifacts.ts`), and the gallery keeps those the daemon confirms exist and were **modified
+  inside the turn** — between its journal-stamped start and end (daemon clock on both sides, a few
+  seconds' slack). A file merely `cat`-ed, or rewritten by a later turn, stays out. One
+  `resolve_targets` round trip per gallery, when it nears the viewport; replay rebuilds the same
+  `turn_end` from the journal.
+- **Where.** `Markdown.svelte` (the sanitizer moves a local `<img>` src out of reach; cards mount
+  beside the placeholder on settled content and closed stream segments, and are destroyed with
+  it), `ArtifactGallery.svelte`, `artifacts.ts`, `embeds.ts` (`EmbedResolver`),
+  `store.svelte.ts` (`turn_end.artifacts` / `mentioned` / `startedAtMs` / `endedAtMs` /
+  `aborted`), `shared/embed/`. Uses `POST /api/v1/fs/resolve_targets` and `GET /raw/{ticket}`.
 
 ## Reconnect & gap-replay
 
@@ -496,7 +538,7 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   in chat”; a terminal resurrected after daemon restart uses its durable resume handle even before a
   fresh transcript hook arrives. A busy `Running` agent needs `force` (409). **Billing note:**
   the TUI side bills like an interactive session; the chat side drives the structured protocol. This
-  is also the **`/login` recovery** path (see [Composing & sending](#composing-sending)): an
+  is also the **`/login` recovery** path (see [Composing & sending](#composing--sending)): an
   expired-auth session flips to its TUI so claude's native auth flow can run.
 - **Branch at any message, without stopping the source.** Hover an assistant response and choose its
   fork action to create a new idle chat immediately after that response. The composer is empty and no

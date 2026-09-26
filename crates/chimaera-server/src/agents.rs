@@ -180,8 +180,8 @@ pub(crate) fn write_settings(
     if let Some(theme) = theme {
         settings["theme"] = json!(theme);
     }
-    // Every session pre-allows the prompt-free tools (`notify`); a
-    // Mastermind adds its tier's gate on top.
+    // Every session pre-allows the prompt-free tools (`notify`, the
+    // read-only document tools); a Mastermind adds its tier's gate on top.
     let mut allow: Vec<String> = crate::mcp::ALWAYS_ALLOWED_TOOLS
         .iter()
         .map(|t| format!("mcp__chimaera__{t}"))
@@ -979,11 +979,16 @@ mod tests {
         // No theme requested: the settings stay hooks-only (a user with an
         // explicit theme choice is never overridden).
         assert!(value.get("theme").is_none());
-        // Not a mastermind: only the prompt-free `notify` is pre-allowed —
-        // every other tool (the terminal tools included) still prompts.
+        // Not a mastermind: only the prompt-free tools (`notify`, the
+        // read-only document tools) are pre-allowed — every other tool (the
+        // terminal tools included) still prompts.
         assert_eq!(
             value["permissions"]["allow"],
-            json!(["mcp__chimaera__notify"])
+            json!([
+                "mcp__chimaera__notify",
+                "mcp__chimaera__document_guide",
+                "mcp__chimaera__check_document",
+            ])
         );
         use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
@@ -1040,6 +1045,8 @@ mod tests {
             value["permissions"]["allow"],
             json!([
                 "mcp__chimaera__notify",
+                "mcp__chimaera__document_guide",
+                "mcp__chimaera__check_document",
                 "mcp__chimaera__workspace_status",
                 "mcp__chimaera__read_session",
                 "mcp__chimaera__list_changed_files",

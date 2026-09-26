@@ -6,9 +6,9 @@ use tower_http::trace::TraceLayer;
 
 use crate::AppState;
 use crate::{
-    agent_probe, agents, api, chat, compute, compute_jobs, download, environment, fs, git,
-    launcher, links, mcp, notices, plugins, proxy, quickopen, recents, runtimes, settings,
-    timeline, update, upload, view_state, ws,
+    agent_probe, agents, api, chat, compute, compute_jobs, download, drafts, environment, fs, git,
+    launcher, links, mcp, notebook, notices, plugins, proxy, quickopen, recents, runtimes,
+    settings, timeline, update, upload, view_state, ws,
 };
 
 /// Build the axum router (factored out so tests can drive it with `oneshot`).
@@ -128,8 +128,29 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         .route("/fs/markdown", get(fs::markdown))
         .route("/fs/table", get(fs::table))
         .route("/fs/xlsx", get(fs::xlsx))
+        .route("/fs/notebook", get(notebook::notebook))
         .route("/fs/quickopen", get(quickopen::quickopen))
         .route("/fs/validate", post(fs::validate))
+        .route("/fs/resolve_targets", post(crate::embed::resolve_targets))
+        // The portable-dialect checker (the reading view's issues chip; the
+        // MCP `check_document` tool runs the same code) and the opt-in
+        // "teach agents" installs behind Settings.
+        .route("/fs/check_document", get(crate::doc_check::check_document))
+        .route("/agent-docs", get(crate::agent_docs::status))
+        .route("/agent-docs/install", post(crate::agent_docs::install))
+        // The draft mirror (unsaved editor text; see `drafts`). The body
+        // limit only makes room for JSON escaping — the 1 MiB text cap is
+        // judged on the decoded text.
+        .route(
+            "/fs/drafts",
+            get(drafts::list_drafts).put(drafts::put_draft).layer(
+                axum::extract::DefaultBodyLimit::max(drafts::MAX_DRAFT_BODY_BYTES),
+            ),
+        )
+        .route(
+            "/fs/draft",
+            get(drafts::get_draft).delete(drafts::delete_draft),
+        )
         .route("/fs/mkdir", post(fs::mkdir))
         .route("/fs/create", post(fs::create))
         .route("/fs/rename", post(fs::rename))
@@ -192,6 +213,8 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         .route("/ws/chat/{id}", get(ws::chat_ws))
         .route("/ws/events", get(ws::events_ws))
         .route("/raw/{ticket}", get(fs::raw))
+        // An HTML report's relative assets, confined to its folder.
+        .route("/raw/{ticket}/{*rest}", get(fs::raw_asset))
         .route("/download/{ticket}", get(download::download))
         // Three spellings because `{*path}` refuses an EMPTY tail: the bare
         // form redirects to the slashed form, the slashed form IS the app's

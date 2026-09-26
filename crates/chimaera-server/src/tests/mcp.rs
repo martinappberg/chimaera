@@ -35,7 +35,8 @@ async fn mcp_handshake_auth_and_tool_listing() {
     .await;
     assert_eq!(status, StatusCode::ACCEPTED);
 
-    // tools/list names the three linked-terminal tools.
+    // tools/list names the three linked-terminal tools and the two
+    // document tools.
     let (status, out) = mcp_post(
         &state,
         &id,
@@ -56,6 +57,8 @@ async fn mcp_handshake_auth_and_tool_listing() {
             "list_terminals",
             "run_in_terminal",
             "read_terminal",
+            "document_guide",
+            "check_document",
             "notify"
         ]
     );

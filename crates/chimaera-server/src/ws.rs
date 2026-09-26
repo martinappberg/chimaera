@@ -952,6 +952,11 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
     // Per-client, bounded mounted-path monitor. Dropping the socket drops every
     // registration, so a closed window costs zero filesystem work.
     let mut fs_watch = crate::fs_watch::FsWatch::new();
+    // Writes the daemon heard about, re-stated at once for watched paths.
+    // Subscribed before the first snapshot so no write between the two is
+    // missed (the poll would still catch it, just later).
+    let mut touched = state.fs_touched.subscribe();
+    let mut touched_open = true;
 
     let mut last_sent: Option<Arc<String>> = None;
     let mut last_settings_gen: Option<u64> = None;
@@ -1017,6 +1022,34 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
         tokio::select! {
             _ = state.changes.notified() => {}
             _ = tokio::time::sleep(EVENTS_TICK) => {}
+            first = touched.recv(), if touched_open => {
+                let mut paths: Vec<std::path::PathBuf> = Vec::new();
+                match first {
+                    Ok(batch) => paths.extend(batch.iter().cloned()),
+                    // Skipped writes are the poll's to find; no fast path now.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        touched_open = false;
+                    }
+                }
+                // Everything queued since coalesces into this one stat pass
+                // (bounded by the channel's capacity).
+                loop {
+                    match touched.try_recv() {
+                        Ok(batch) => paths.extend(batch.iter().cloned()),
+                        Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {}
+                        Err(_) => break,
+                    }
+                }
+                let changes = fs_watch.poll_touched(&paths).await;
+                if send_fs_changes(&mut socket, changes).await.is_err() {
+                    return;
+                }
+                // Fall through to the regular sends: a steady stream of
+                // writes must neither starve them (the tick restarts every
+                // iteration) nor outrun the throttle below, which bounds
+                // these passes to four a second per window.
+            }
             msg = socket.recv() => match msg {
                 // The only client frame on this bus: which workspace this window
                 // shows + the exact mounted paths whose disk state it renders.

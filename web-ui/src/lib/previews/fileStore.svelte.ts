@@ -14,8 +14,9 @@
  *      store exactly which file metadata moved — including repeated edits to an
  *      already-dirty file, ignored/non-repo files, and paths outside the
  *      workspace. Agent/in-app git nudges remain the zero-latency fast path.
- *      The editor guards its own unsaved buffer (see CodeView); the store carries
- *      last-known-on-disk only.
+ *      Unsaved editor text lives in the buffer store (buffers.svelte.ts), which
+ *      retains its path here so a dirty buffer stays watched with no view
+ *      mounted; this store carries last-known-on-disk only.
  *
  * Memory lives in the browser tab, not the daemon: each entry holds at most the
  * first 256KB chunk (+ small rendered payloads), and the LRU caps the count.
@@ -25,7 +26,15 @@
 
 import { untrack } from "svelte";
 import { get } from "svelte/store";
-import { fsFile, fsMarkdown, fsRawUrl, fsTable, type FileChunk, type TablePage } from "./files";
+import {
+  fsFile,
+  fsMarkdown,
+  fsRawTicket,
+  fsTable,
+  type FileChunk,
+  type MarkdownDoc,
+  type TablePage,
+} from "./files";
 import { fsEpoch, lastFsMutation, type FsMutation } from "../workspace/fsEvents";
 import {
   lastDiskChange,
@@ -60,7 +69,7 @@ export class FileEntry {
   chunk = $state<FileChunk | null>(null);
   chunkError = $state<string | null>(null);
 
-  markdown = $state<string | null>(null);
+  markdown = $state<MarkdownDoc | null>(null);
   markdownError = $state<string | null>(null);
 
   table = $state<TablePage | null>(null);
@@ -68,6 +77,9 @@ export class FileEntry {
 
   /** Unauthenticated `/raw` URL for <img>/<iframe>/pdf.js. */
   rawUrl = $state<string | null>(null);
+  /** The canonical file name `rawUrl`'s ticket is bound to (a symlink's
+   *  target's, never the pane path's): what an HTML frame loads its page by. */
+  rawName = $state<string | null>(null);
   rawError = $state<string | null>(null);
 
   /** Whether any payload is cached — i.e. the entry is "warm", not cold. */
@@ -85,6 +97,8 @@ export class FileEntry {
   rawMintedAt = 0;
   /** Last global unknown-change generation this entry has checked against. */
   seenAllStaleEpoch = 0;
+  /** The token this window's last in-app save landed (`noteWrite`). */
+  private writtenMtime: string | null = null;
   /** In-flight guard so concurrent mtime probes don't double-fetch. */
   private loading = { mtime: false };
   /** Raw consumers must await the same ticket mint, not merely suppress duplicates. */
@@ -216,7 +230,9 @@ export class FileEntry {
     const load = (async (): Promise<void> => {
       this.rawError = null;
       try {
-        this.rawUrl = await fsRawUrl(this.path);
+        const t = await fsRawTicket(this.path);
+        this.rawName = t.name;
+        this.rawUrl = t.url;
         this.rawMintedAt = Date.now();
       } catch (e) {
         this.rawError = e instanceof Error ? e.message : "failed to load file";
@@ -235,8 +251,8 @@ export class FileEntry {
    * null-then-fetch. A null `chunk` would unmount a CodeView keyed off it (via
    * FileView's probe), and a null anything flashes a spinner over a live view.
    * A failed refetch leaves the last-known value. `chunk` is refreshed so a
-   * later reopen is correct, but a mounted CodeView owns its own buffer and does
-   * not react to it (it live-updates via the mtime watch instead).
+   * later reopen is correct, but an editor buffer never reacts to it (it
+   * reconciles via the mtime watch and a whole-file, hashed read instead).
    */
   private async refreshPayloads(): Promise<void> {
     // Let in-flight first loads land before deciding what is populated: a
@@ -285,9 +301,10 @@ export class FileEntry {
     }
     if (this.rawUrl !== null) {
       jobs.push(
-        fsRawUrl(this.path)
-          .then((u) => {
-            this.rawUrl = u;
+        fsRawTicket(this.path)
+          .then((t) => {
+            this.rawName = t.name;
+            this.rawUrl = t.url;
             this.rawMintedAt = Date.now();
           })
           .catch(() => {
@@ -329,11 +346,18 @@ export class FileEntry {
     this.missing = false;
     const known = untrack(() => this.mtime);
     if (mtime !== null) this.mtime = mtime;
+    this.writtenMtime = mtime;
     // Count the change only once the saved payloads land, as `revalidate`
     // does, so a remount cannot reuse the old ticket.
     void this.refreshPayloads().then(() => {
       if (mtime !== null && known !== null && mtime !== known) this.changes += 1;
     });
+  }
+
+  /** Whether `mtime` is the version this window's own last save wrote —
+   *  not a change from elsewhere (an agent's rewrite, another window). */
+  isOwnWrite(mtime: string | null): boolean {
+    return mtime !== null && mtime === this.writtenMtime;
   }
 
   /** Preserve a mounted editor entry while recording that its disk path died. */

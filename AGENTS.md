@@ -91,8 +91,9 @@ pane and no HPC access; a SessionStart hook installs the web-UI deps and builds
   skill); the PR says what you ran and observed. The web UI has targeted Vitest
   coverage, but no browser/component tests — the live preview remains its runtime net.
 - **The daemon runs on shared HPC login nodes.** ~150 MB RSS, no unbounded buffers,
-  no busy loops, hard preview ceilings. **No SQLite near NFS/Lustre**; durable state
-  is append-only, size-capped JSONL under `~/.chimaera`; hot state is reconstructible.
+  no busy loops, hard preview ceilings. **No SQLite near NFS/Lustre**; durable logs
+  are append-only, size-capped JSONL under `~/.chimaera` (small whole-file state is
+  capped JSON rewritten atomically); hot state is reconstructible.
 - **The daemon↔UI wire is a stable public interface.** Core structs serialize
   straight to it — don't let its shape drift as a side effect of a refactor.
 - **Agent wire formats are pinned, not trusted** — a driver or agent-CLI change
