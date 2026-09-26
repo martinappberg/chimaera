@@ -2485,7 +2485,6 @@ It is not every resume. A clean resume (the previous process finished its turn a
 ### Gate (Pass 33)
 
 `just chat-smoke` 23/23 as above. No driver mapping changed: the pins moved (`TESTED_CLAUDE_VERSION = "2.1.283"`, `TESTED_CODEX_VERSION = "0.157.1"`), the harness's drift check matches whole version tokens (hermetic `driver::tests::version_pin_matches_whole_tokens_only`, plus the existing `version_drift_is_nonfatal_and_never_reaches_the_stream`), and the resume-id notes were corrected.
-||||||| parent of 7887c14 (fix: codex server requests without a handler get an error, not a bogus approval card)
 
 ## Pass 34 (2026-09-25 — codex 0.157.1 generated schema + binary + one live probe): server requests without a handler. ADOPTED.
 
@@ -2522,3 +2521,25 @@ The binary has `app-server/src/current_time.rs`, `core/src/tools/handlers/curren
 ### Gate (Pass 34)
 
 Hermetic: `current_time_read_is_answered_from_the_clock`; `handshake_sideband_keeps_server_requests_for_replay`; `unhandled_server_requests_are_refused_not_carded` (the four non-approval methods, both v1 approvals, and an unknown method carrying `networkApprovalContext`: each gets exactly one `-32601` reply naming the method, no card, one Notice, and none on a repeat); `unhandled_server_request_notices_are_bounded` and claude's `unknown_control_subtype_notices_are_bounded` (a long name is capped, the set stops at the cap, requests are still refused or parked past it). The existing approval, elicitation, permissions and question tests pin the arms that did not change. Live: `just chat-smoke` 24/24 on claude 2.1.283 + codex 0.157.1, including the new `driver_stack_end_to_end_against_real_codex`. Every other codex case drives the raw `CodexChat` client, so until this case the suite never ran `CodexMapper` against real frames; it pins that an ordinary turn raises no card and no unhandled-request notice, and that Init, the resume index and replay work through the driver.
+
+## Pass 35 (2026-09-25 — live probes codex 0.153.0 + claude 2.1.259): agent-side plugin, skill and hook state for the Plugins tab. ADOPTED (daemon `agent_probe.rs`, not a driver).
+
+These are read by a SHORT-LIVED `codex app-server` the daemon opens for the Plugins tab (initialize → `initialized` → requests; no thread, no model call), and by claude's plugin CLI. No driver changed.
+
+#### Codex
+
+- **`skills/list {cwds:[cwd], forceReload}`** → `{data:[{cwd, skills:[SkillMetadata], errors:[{path, message}]}]}`. `SkillMetadata`: `name`, `description`, `shortDescription?`, `interface?`, `path`, `scope: user|repo|system|admin`, `enabled`, `dependencies?`, **`pluginId?`** (owning plugin id, e.g. `mycelium@mycelium`). Plugin skills are namespaced (`mycelium:core`). After `codex plugin marketplace add <local path|owner/repo>` + `codex plugin add mycelium@mycelium` the ten `mycelium:*` skills list with `scope: "user"`, `enabled: true`, `pluginId: "mycelium@mycelium"`.
+- **`hooks/list {cwds:[cwd]}`** → `{data:[{cwd, hooks:[HookMetadata], warnings:[string], errors:[{path, message}]}]}`. `HookMetadata`: `key` (e.g. `mycelium@mycelium:hooks/hooks.json:post_tool_use:0:1` — `<source>:<event_snake>:<group>:<hook>`), `eventName` (camelCase: `preToolUse`, `postToolUse`, `sessionStart`, `stop`, …), `matcher?`, `source` (`system|user|project|mdm|sessionFlags|plugin|…`), `sourcePath`, `pluginId?`, `currentHash` (`sha256:…`), `trustStatus: managed|untrusted|trusted|modified`, `enabled`, `timeoutSec`, `statusMessage?`, `isManaged`, `displayOrder`. There is NO command field — the daemon reads the command from `sourcePath`'s hooks.json by the key's `<event>:<group>:<hook>` suffix (event → PascalCase section).
+- **Trust is `[hooks.state."<key>"] trusted_hash = "<currentHash>"` in config.toml** (the record `/hooks` writes). **`config/batchWrite {edits:[{keyPath, value, mergeStrategy: replace|upsert}], filePath?, expectedVersion?, reloadUserConfig}`** → `{status:"ok", version, filePath, overriddenMetadata}`. Verified against a throwaway `CODEX_HOME`: `{keyPath:"hooks.state", mergeStrategy:"upsert", value:{"<key>":{"trusted_hash":"<hash>"}}}` MERGES — an unrelated pre-existing `[hooks.state."…"]` record survived — and the next `hooks/list` reports the hooks `trusted`. `replace` would drop every other trust record; never use it there.
+- `plugin/list`, `plugin/installed`, `plugin/install`, `marketplace/*` exist in the 0.153 schema but are NOT used: a plugin's install state is read from `pluginId` on its skills and hooks.
+
+#### Claude
+
+- `claude plugin list --json` → `[{id, version, scope, enabled, installPath, installedAt, lastUpdated}]`; `--available` adds `{installed:[…], available:[{pluginId, name, description, marketplaceName, source}]}` (291 entries on this host). `claude plugin details <id>` is human text (component inventory + "Always-on: ~N tok"); only the totals are read, leniently.
+- The **Stop hook input carries `last_assistant_message`** (2.1.259 binary: `{…, hook_event_name:"Stop", stop_hook_active, last_assistant_message, background_tasks, session_crons}`; SubagentStop adds `agent_id`, `agent_transcript_path`, `agent_type`). ADOPTED as a claude-TUI Timeline episode's result line.
+
+- **Codex TUI takes the chimaera MCP server by `-c` too** (0.153.0, live): a TUI spawned with `-c mcp_servers.chimaera.url="…"`, `-c mcp_servers.chimaera.bearer_token_env_var="CHIMAERA_MCP_KEY"` (key in the PTY env, never argv) and per-tool `-c mcp_servers.chimaera.tools.<t>.approval_mode="approve"` starts cleanly and its `/mcp` lists `chimaera: connected (5 tools)` (3 linked-terminal + 2 notes). ADOPTED for codex TUIs **only while a plugin with tools is active in the workspace** (`launcher::codex_tui_mcp_args`); with none on, the argv is unchanged. Live turn: `read_notes` (pre-approved) ran with no prompt and returned the quoted note, while `list_terminals` (not pre-approved) raised the TUI's `Allow the chimaera MCP server to run tool "list_terminals"?` prompt (Allow / Allow for this session / Always allow / Cancel) — so `approval_mode="approve"` IS honored by the TUI. A codex chat *worker* with Agent notes on called `post_note` with no elicitation surfacing (the driver's `mcp_auto_approve` answered it).
+
+#### Gate (Pass 35)
+
+Hermetic: `agent_probe` tests (details totals, hook command summary, SKILL.md frontmatter), `plugins` route/MCP-gate/notes tests, `codex_tui_mcp_args_pre_approve_only_plugin_tools`, and the `agent_view` fixtures pinning the plugin-free worker view. Live: the throwaway-`CODEX_HOME` trust probe above; the rest in the PR's live verification.

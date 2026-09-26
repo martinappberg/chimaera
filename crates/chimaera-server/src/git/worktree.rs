@@ -361,6 +361,9 @@ pub(crate) async fn remove_worktree(
         // with it (see `delete_workspace` — same eviction).
         state.git.forget_workspace(&id);
         crate::lock(&state.quickopen).forget_workspace(&id);
+        state.timeline.remove_workspace(&id);
+        crate::lock(&state.plugin_detect).forget_workspace(&id);
+        crate::lock(&state.knowledge).forget_workspace(&id);
     }
 
     // Bump + invalidate, same pairing as the add path: the triggered

@@ -1,0 +1,8 @@
+[
+  "/bin/codex",
+  "app-server",
+  "-c",
+  "mcp_servers.chimaera.url=\"http://127.0.0.1:4242/api/v1/mcp/s-agentview\"",
+  "-c",
+  "mcp_servers.chimaera.bearer_token_env_var=\"CHIMAERA_MCP_KEY\""
+]

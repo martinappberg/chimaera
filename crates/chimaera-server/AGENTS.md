@@ -40,6 +40,13 @@ the module you need and read its header doc.
 | `environment.rs` | Environment preludes: the `env-profiles.json` store + `GET/PUT /environment`, per-session prelude materialization (host ⊕ workspace ⊕ launch → `CHIMAERA_PRELUDE`). Injection rides `api::session_env`/`spawn_env_remove` — keep those two lists disjoint (the PTY and chat transports apply env/env_remove in opposite orders). |
 | `compute.rs` | Slurm awareness: login-shell detection (cached; `CHIMAERA_SLURM_BINDIR` test knob) + `GET /compute` — the user's queue + partitions via capped/timeout-fenced `squeue`/`sinfo`, 30s single-flight snapshot cache. Never a 500: a failed `squeue` CALL carries the previous jobs forward tagged `degraded` (distinct from an empty queue); everything else degrades to an empty snapshot. Also `agent_context` — the compute-session context a compute-node daemon (`SLURM_JOB_ID` at boot) injects into its claude sessions via the hook response (`agents::ingest`); baked once per daemon lifetime with an absolute walltime end. |
 | `compute_jobs.rs` | Mode 2 — chimaera daemons AS Slurm jobs: `POST/GET/DELETE /compute/sessions` (DETACHED-srun launch — setsid/nohup, tmux-grade persistence, works on interactive-only partitions; charset-gated argv; job id via queue adoption; refusals surfaced from the srun log tail; stateless squeue⋈manifest⋈record listing + dismissable "ended" tombstones from orphaned records, scancel + record marking). Launch seeds the job home's `workspaces.json` with the host's whole registry over the shared FS. |
+| `mycelium.rs` | Read-only reader for a workspace's mycelium knowledge (`.living/` findings/decisions/learnings, `todo/TODO_REGISTRY.md`, the `.mycelium/last-session.md` handoff) → the `Knowledge` shape for the Knowledge view (plan: `docs/timeline-knowledge-plugins-plan.md` §5/§6.3). Pure blocking fs — callers use `spawn_blocking`; `stamp` (metadata only) gates re-parsing. Never writes, never follows symlinks, fence-aware, capped per file/field/read (constants at the top). Matches mycelium 0.7.2's real writers — e.g. new todo rows land BELOW the "add above this line" marker. Consumed by `knowledge.rs`. |
+| `timeline.rs` | The per-workspace **Timeline** (plan `docs/timeline-knowledge-plugins-plan.md` §4): append-only JSONL under `<data_dir>/workspace/<ws>/timeline.jsonl` (seq-first, ONE writer thread so file order == seq order, torn-tail loader, compaction past 2 MiB), a bounded ring per workspace loaded lazily, `GET /workspaces/{id}/timeline`, the `/ws/events` `timeline` epoch frame. Also the `headline` (result-line) and prompt-title helpers. |
+| `episodes.rs` | What writes the Timeline: chat turns folded from protocol events on the chat signal task (`ChatEpisodes` — queued prompts, feedback, lost TurnStarted, retractions, written-files-only), claude-TUI turns from hooks (`TuiEpisodes`, PTY-only — chat sessions fire the same hooks), notable terminal commands (redacted heads, via `Marks::finished_since` on the shells' 2 s tick), finished Slurm jobs (a 60 s task, idle without a queue), chat crashes. No LLM anywhere. |
+| `knowledge.rs` | `GET /workspaces/{id}/knowledge` (the mycelium provider when its plugin is active, else guidance + claude memory), the `knowledge_search`/`knowledge_get` tools, and Timeline attribution at episode ends (credit only when the entry's file changed after the turn started AND no other agent ran; confidence moves are their own entries). Never writes knowledge. |
+| `plugins/` | Workbench plugins: embedded TOML manifests (`manifests/`), per-workspace switch (`Workspace.plugins_on`), footprint detection off the reactor, the MCP tools a plugin adds (`tools.rs` — offered AND call-gated only where active, pre-allowed at spawn), install (the agent's own plugin manager in a visible terminal) and setup (a chat sent the plugin's own prompt) routes. Recipe: `docs/agent-guides/plugins.md`. |
+| `agent_probe.rs` | Ask the agents themselves: `claude plugin list --json`/`details`, a short-lived `codex app-server` (`skills/list`, `hooks/list`, `config/batchWrite`) — one probe daemon-wide at a time, login-shell wrapped, bounded, cached 60 s; `GET agent-plugins`, `GET skills`, `POST trust-hooks` (re-list; only this plugin's untrusted hooks whose hash still matches; upsert merges — PROTOCOL.md Pass 35). |
+| `notes.rs` | The Agent notes plugin: `post_note`/`read_notes` (in-workspace only, rate-capped, framed as information), the unread hint on claude's existing hook carriers, `POST timeline/{seq}/deliver` (the user's click; chat targets only). A note never starts a turn. |
 | `workspaces` / `links`+`mcp` / `settings` / `quickopen` / `recents` / `naming` / `view_state` | The rest of the workbench: roots, linked terminals, settings, palette, history, per-window view-state. `quickopen` is stale-while-revalidate + single-flight per workspace with a walk-cost-scaled freshness window (its header doc has the rules — a cold NFS crawl must never run twice at once nor on a reactor worker); `view_state` caps keys at 128 by write recency and persists off the reactor. |
 
 ## The status feed (v0.2)
@@ -102,7 +109,10 @@ One privileged chat session per workspace (the dashboard plan §6/§7 —
 - **MCP tiers** (`mcp.rs`) — the tier is `mastermind_of()` (who you are, not
   a grant), computed per call on the stateless endpoint: firing the
   Mastermind drops the tier on the very next call. Observe:
-  `workspace_status` / `read_session` / `list_changed_files` (read-only;
+  `workspace_status` (sessions + terminals' recent commands, links, the
+  cached Slurm snapshot, what the env prelude loads — never exported values
+  — open windows via the view-state `surfaces` key, active plugins) /
+  `read_timeline` (plain, data-framed) / `read_session` / `list_changed_files` (read-only;
   `read_session` may read agent-TUI screens — reading is safe, typing never
   is). Act: `spawn_agent` / `spawn_terminal` (the normal spawn paths, never
   a mastermind) / `message_agent` / `interrupt_agent` (**chat sessions in
@@ -126,17 +136,24 @@ One privileged chat session per workspace (the dashboard plan §6/§7 —
   tools' elicitations itself, everything else surfaces); the role prompt is
   `-c developer_instructions`.
 - **Reactive-only** — the daemon never triggers a Mastermind turn; it speaks
-  only when the user (or nothing) does. No event-nudged turns, no
-  `ask_mastermind` in v1 (decision 9 in the plan).
+  only when the user does (typing, or the dock's user-clicked "Brief me").
+  Workers reach it through the Agent notes plugin (`post_note` to
+  "mastermind") — a note never starts a turn; the dock shows the inbox.
 - **Lifecycle** — resurrection (`resurrect_chat`) re-resolves the mode from
   the binding; view-switch/rewind respawns resolve `ChatRecipe.mastermind`
   from the binding too. A Mastermind that dies on its own clears its binding
   in `recents::retire` (and skips Recents).
 
-Codex chat sessions (workers) get the per-session chimaera MCP injected at
-spawn via `-c mcp_servers.chimaera.url=…` (`launcher::build_codex_chat_command`,
-verified codex 0.144.2) — the same key-in-URL endpoint claude's
-`--mcp-config` points at.
+Codex chat sessions get the per-session chimaera MCP injected at spawn via
+`-c mcp_servers.chimaera.url=…` + `bearer_token_env_var` — the key rides the
+spawn env, never world-readable argv (`launcher::build_codex_chat_command`).
+Codex TUIs get the same injection only while a workbench plugin with tools
+is active in the workspace or a Mastermind is appointed (`plugins::spawn_allow`
+→ `launcher::codex_tui_mcp_args`, `spawn.rs`), with a per-tool
+`approval_mode="approve"` for exactly those tools (plus `tell_mastermind` and
+`notify`); with neither, a codex TUI's argv is unchanged. Workers message the
+Mastermind with `tell_mastermind` (`notes.rs`: inbox in ask-first, a capped
+wake in auto).
 
 ## The chat-mode seam (`chat.rs`) — the part this doc exists for
 

@@ -425,6 +425,33 @@
     {:else}
       <Spinner />
     {/if}
+  {:else if tab.surface === "timeline"}
+    {@const TimelineView = views.timeline}
+    {#if TimelineView !== undefined}
+      <TimelineView {dash} {sessions} {names} {wsId} {wsRoot} paneId={node.id} {ctrl} visible={active} />
+    {:else if viewErrors.timeline}
+      {@render loadFailure("timeline", "timeline")}
+    {:else}
+      <Spinner />
+    {/if}
+  {:else if tab.surface === "knowledge"}
+    {@const KnowledgeView = views.knowledge}
+    {#if KnowledgeView !== undefined}
+      <KnowledgeView {wsId} {wsRoot} paneId={node.id} {ctrl} visible={active} />
+    {:else if viewErrors.knowledge}
+      {@render loadFailure("knowledge", "knowledge")}
+    {:else}
+      <Spinner />
+    {/if}
+  {:else if tab.surface === "plugins"}
+    {@const PluginsView = views.plugins}
+    {#if PluginsView !== undefined}
+      <PluginsView {dash} {wsId} {wsRoot} paneId={node.id} {ctrl} visible={active} />
+    {:else if viewErrors.plugins}
+      {@render loadFailure("plugins", "plugins")}
+    {:else}
+      <Spinner />
+    {/if}
   {:else if tab.surface === "browser"}
     {@const BrowserView = views.browser}
     {#if BrowserView !== undefined}

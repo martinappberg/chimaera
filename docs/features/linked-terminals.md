@@ -34,8 +34,11 @@ leash-drawing in `web-ui/src/App.svelte`; the drag band that arms a link is in
 ## The MCP server
 
 - **What & when.** How a linked agent actually reaches its terminals: the daemon exposes a built-in
-  MCP server per agent, offering three tools.
-- **How it's used.** Wired into claude via the generated `--mcp-config` pointing at
+  MCP server per agent session. Every agent on it gets the three terminal tools below; the same
+  server also carries the Mastermind tier and workbench-plugin tools (see "Beyond the leash").
+- **How it's used.** Wired into claude via the generated `--mcp-config`, and into codex via
+  `-c mcp_servers.chimaera.*` overrides (key in the env, never argv — every codex chat; a codex
+  TUI only while a workbench plugin with tools is active in its workspace), pointing at
   `POST /api/v1/mcp/{agent_id}?key={secret}` (JSON-RPC over MCP streamable-HTTP, stateless). Tools:
   `list_terminals` (the agent's granted terminals), `run_in_terminal` (type a command, await the
   outcome — the same [exec engine](terminals.md#the-exec-engine-and-command-journal)), `read_terminal`
@@ -44,13 +47,24 @@ leash-drawing in `web-ui/src/App.svelte`; the drag band that arms a link is in
 - **Where it lives.** `mcp.rs` (`mcp`, `tool_defs`, `list_terminals`/`run_in_terminal`/`read_terminal`,
   `autolink_mentions`, `resolve_terminal`).
 - **Key behaviors.** `/mcp/{id}` is **not** behind the bearer layer — it's authorized by the random
-  per-session `key` in the URL (the agent's MCP client can't know the daemon token), re-checked
+  per-session `key` in the URL, or as an `Authorization: Bearer` header for codex (whose argv is
+  world-readable on shared hosts) — the agent's MCP client can't know the daemon token — re-checked
   against the `AgentRecord`. The links are the agent's **whole access scope** — it can't reach a
   terminal it wasn't granted. A `@term:NAME` mention resolves across *every* non-agent session (the
   point is granting a not-yet-linked terminal); the mention arriving through the `UserPromptSubmit`
   hook (TUI) or the protocol input (chat) **is** the consent. MCP is stateless streamable-HTTP
   (plain JSON, no SSE). Dead-session edges are pruned at read time so the `/ws/events` snapshot dedup
   doesn't flap.
+- **Beyond the leash.** `tools/list` and the call gate are computed per call. The workspace
+  **Mastermind** additionally gets its tier — reads `workspace_status` / `read_timeline` /
+  `read_session` / `list_changed_files`, acts `spawn_agent` / `spawn_terminal` /
+  `message_agent` / `interrupt_agent` ([dashboard.md](dashboard.md#the-mastermind-panel)) — by
+  who it is, not by a grant. A **worker in a workspace with a Mastermind** also gets
+  `tell_mastermind` (the supervised view). **Workbench plugins** add tools only where they're active —
+  `knowledge_search` / `knowledge_get` (mycelium), `post_note` / `read_notes` (Agent notes) —
+  each with an instruction paragraph at `initialize` ([plugins.md](plugins.md#workbench-plugins)).
+  A plugin-free worker's view (tools, instructions, generated settings, codex argv) is pinned
+  byte-for-byte by `crates/chimaera-server/src/tests/agent_view.rs`.
 
 ---
 

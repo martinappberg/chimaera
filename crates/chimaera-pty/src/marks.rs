@@ -84,6 +84,19 @@ pub struct CommandView {
     pub running: bool,
 }
 
+/// A finished command WITHOUT its output — what a background watcher (the
+/// daemon's Timeline) needs every tick, at a few dozen bytes per record
+/// instead of `CommandView`'s up-to-80 KiB capture clone.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CommandMeta {
+    pub seq: u64,
+    pub command: Option<String>,
+    pub source: CommandSource,
+    pub exit_code: Option<i32>,
+    pub started_at_ms: u64,
+    pub ended_at_ms: u64,
+}
+
 /// Bounded head+tail capture of one command's output.
 #[derive(Debug, Default)]
 struct Capture {
@@ -492,6 +505,38 @@ impl Marks {
             .map(|r| r.view(true))
     }
 
+    /// Finished commands with `seq > after`, oldest first, metadata only
+    /// (no output clone), at most `limit` — the cursor read for a watcher
+    /// that polls. Records evicted from the ring before a poll are simply
+    /// not reported (bounded ring; a watcher that sleeps misses, never grows).
+    pub fn finished_since(&self, after: u64, limit: usize) -> Vec<CommandMeta> {
+        let inner = lock_unpoisoned(&self.inner);
+        inner
+            .done
+            .iter()
+            .filter(|r| r.seq > after)
+            .take(limit)
+            .map(|r| CommandMeta {
+                seq: r.seq,
+                command: r.command.clone(),
+                source: r.source,
+                exit_code: r.exit_code,
+                started_at_ms: r.started_at_ms,
+                ended_at_ms: r.ended_at_ms.unwrap_or(r.started_at_ms),
+            })
+            .collect()
+    }
+
+    /// The newest finished seq (0 when none) — a watcher's starting cursor,
+    /// so history from before it attached is never replayed as news.
+    pub fn last_finished_seq(&self) -> u64 {
+        lock_unpoisoned(&self.inner)
+            .done
+            .back()
+            .map(|r| r.seq)
+            .unwrap_or(0)
+    }
+
     /// Last `limit` journal entries, oldest first; the running command (if
     /// any) is always included last.
     pub fn journal(&self, limit: usize) -> Vec<CommandView> {
@@ -889,6 +934,26 @@ mod tests {
         assert_eq!(journal[2].command.as_deref(), Some("tail -f log"));
         assert!(journal[2].running);
         assert_eq!(journal[2].output, "following...");
+    }
+
+    #[test]
+    fn finished_since_is_a_metadata_cursor() {
+        let marks = Marks::new();
+        assert_eq!(marks.last_finished_seq(), 0);
+        for (i, code) in [0, 2, 0].iter().enumerate() {
+            feed_str(&marks, &format!("\x1b]633;E;cmd{i}\x07"));
+            feed_str(&marks, &format!("\x1b]133;C\x07out\x1b]133;D;{code}\x07"));
+        }
+        feed_str(&marks, "\x1b]633;E;still running\x07\x1b]133;C\x07...");
+        let all = marks.finished_since(0, 10);
+        assert_eq!(all.len(), 3, "the running command is not finished");
+        assert_eq!(all[1].command.as_deref(), Some("cmd1"));
+        assert_eq!(all[1].exit_code, Some(2));
+        assert!(all[1].ended_at_ms >= all[1].started_at_ms);
+        let cursor = marks.last_finished_seq();
+        assert_eq!(cursor, all[2].seq);
+        assert!(marks.finished_since(cursor, 10).is_empty());
+        assert_eq!(marks.finished_since(0, 2).len(), 2, "limit applies");
     }
 
     #[test]

@@ -958,6 +958,7 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
     let mut last_git: Option<String> = None;
     let mut last_update_epoch: Option<u64> = None;
     let mut last_recents_epoch: Option<u64> = None;
+    let mut last_timeline: Option<String> = None;
     // Notices start at the head: a (re)connecting window is told about what
     // happens from now on, never handed old alerts as new.
     let mut last_notice = state.notices.head();
@@ -1000,6 +1001,12 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
         return;
     }
     if send_recents_snapshot(&mut socket, &state, &mut last_recents_epoch)
+        .await
+        .is_err()
+    {
+        return;
+    }
+    if send_timeline_snapshot(&mut socket, &state, &mut last_timeline)
         .await
         .is_err()
     {
@@ -1059,6 +1066,12 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
             return;
         }
         if send_recents_snapshot(&mut socket, &state, &mut last_recents_epoch)
+            .await
+            .is_err()
+        {
+            return;
+        }
+        if send_timeline_snapshot(&mut socket, &state, &mut last_timeline)
             .await
             .is_err()
         {
@@ -1135,6 +1148,26 @@ async fn send_recents_snapshot(
     let frame = json!({"type": "recents", "epoch": epoch}).to_string();
     socket.send(Message::Text(frame.into())).await?;
     *last_epoch = Some(epoch);
+    Ok(())
+}
+
+/// Send a `{"type":"timeline","epochs":{workspace_id:epoch}}` invalidate
+/// frame when any workspace's Timeline grew — the git frame's shape and
+/// dedupe: entries never ride the bus; the client pulls its own workspace's
+/// page (`GET /workspaces/{id}/timeline?since=`).
+async fn send_timeline_snapshot(
+    socket: &mut WebSocket,
+    state: &AppState,
+    last: &mut Option<String>,
+) -> Result<(), axum::Error> {
+    let epochs: std::collections::BTreeMap<String, u64> =
+        state.timeline.epochs_snapshot().into_iter().collect();
+    let frame = json!({"type": "timeline", "epochs": epochs}).to_string();
+    if last.as_deref() == Some(frame.as_str()) {
+        return Ok(());
+    }
+    socket.send(Message::Text(frame.clone().into())).await?;
+    *last = Some(frame);
     Ok(())
 }
 
