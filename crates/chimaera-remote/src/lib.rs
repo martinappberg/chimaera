@@ -1096,8 +1096,22 @@ async fn locate(
                 ops.set_route(host, Route::Alias);
                 return Ok(Some((landed.manifest, landed.alive)));
             }
-            // Gone between the probes — that node's daemon just stopped.
-            Ok(ProbeRun::Ran(None)) => return Ok(None),
+            // No manifest over this route: either that node's daemon just
+            // stopped (a graceful stop removes it), or the dial reached a
+            // machine that doesn't share this home. Only the node we landed
+            // on — which just read the manifest — can tell them apart.
+            Ok(ProbeRun::Ran(None)) => {
+                ops.set_route(host, Route::Alias);
+                match ops.remote_probe(host).await? {
+                    ProbeRun::Ran(None) => return Ok(None),
+                    _ => {
+                        why = format!(
+                            "dialing {node} reached a machine that doesn't see {host}'s manifest"
+                        );
+                        break;
+                    }
+                }
+            }
             Ok(ProbeRun::Ran(Some(p))) => {
                 why = if same_node(&p.node, &node) {
                     format!(
@@ -1131,6 +1145,8 @@ async fn locate(
 /// not reach: what is where, why nothing was started, and the way out.
 fn unreachable_node_error(host: &str, landed: &Probe, why: &str) -> String {
     let m = &landed.manifest;
+    // ssh ends its own complaint with a period.
+    let why = why.trim_end_matches('.');
     format!(
         "{host}'s daemon runs on login node {} (pid {}), but this connection landed on {} and \
          could not reach {}: {why}. Nothing was started: a second daemon would resume the same \
@@ -4520,6 +4536,10 @@ mod tests {
         assert!(err.contains("landed on ln02.cluster.edu"), "{err}");
         assert!(err.contains("Permission denied"), "{err}");
         assert!(err.contains("Nothing was started"), "{err}");
+        assert!(
+            !err.contains(".."),
+            "ssh's own period is not doubled: {err}"
+        );
         assert_eq!(
             fake.routed(),
             vec![
@@ -4580,6 +4600,57 @@ mod tests {
             "alias + both routes, no start"
         );
         assert_eq!(*fake.route.borrow(), Route::Alias);
+    }
+
+    /// A routed probe that finds no manifest is confirmed from the node we
+    /// landed on: really gone → a fresh start there; still there → the dial
+    /// reached a machine that doesn't share this home, and nothing starts.
+    #[tokio::test]
+    async fn a_manifest_missing_over_the_route_is_confirmed_where_we_landed() {
+        let gone = FakeOps {
+            probe: Some(Box::new({
+                let seen = std::cell::Cell::new(0);
+                move |route| {
+                    seen.set(seen.get() + 1);
+                    match (route, seen.get()) {
+                        (Route::Alias, 1) => seen_from(
+                            LN02,
+                            &manifest_on(LN01, Some(chimaera_core::BUILD_ID), 42),
+                            false,
+                            Some(true),
+                        ),
+                        (Route::Node(_), _) | (Route::Alias, _) => Ok(ProbeRun::Ran(None)),
+                        (other, _) => panic!("dialed {other:?}"),
+                    }
+                }
+            })),
+            ..FakeOps::base()
+        };
+        let ((manifest, ..), _) = run_resolve(&gone, false).await;
+        assert_eq!(manifest.pid, 999, "stopped meanwhile: a fresh start");
+        assert_eq!(
+            gone.routed(),
+            vec![
+                (Call::RemoteProbe, Route::Alias),
+                (Call::RemoteProbe, Route::Node(LN01.into())),
+                (Call::RemoteProbe, Route::Alias),
+                (Call::EnsureRemoteBinary, Route::Alias),
+                (Call::StartRemote, Route::Alias),
+            ]
+        );
+
+        let elsewhere = pool(
+            manifest_on(LN01, Some(chimaera_core::BUILD_ID), 42),
+            false,
+            Some(true),
+            |_, _| Ok(ProbeRun::Ran(None)),
+        );
+        let (out, _) = try_resolve(&elsewhere, false).await;
+        assert!(
+            format!("{:#}", out.unwrap_err()).contains("doesn't see host's manifest"),
+            "a machine without the shared home is never where a daemon starts"
+        );
+        assert_eq!(elsewhere.calls(), vec![Call::RemoteProbe; 3]);
     }
 
     /// A bare node name is never dialed from this machine (its search

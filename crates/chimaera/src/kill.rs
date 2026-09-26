@@ -67,13 +67,48 @@ mod tests {
 
     /// A daemon that outlives SIGTERM must keep its manifest — removing it while
     /// the daemon is alive would make every other client read "not running"
-    /// while it still holds its port.
+    /// while it still holds its port. And a manifest another node wrote (a
+    /// home shared across login nodes) is neither signalled nor removed: its
+    /// pid names a process there, not here. One test: both cases relocate
+    /// `CHIMAERA_HOME`, which is process-global.
     #[tokio::test]
     async fn kill_leaves_the_manifest_when_the_daemon_survives() {
         // Isolate all per-user state under a tmp CHIMAERA_HOME.
         let home = std::env::temp_dir().join(format!("chimaera-kill-test-{}", std::process::id()));
         std::fs::create_dir_all(&home).unwrap();
         std::env::set_var("CHIMAERA_HOME", &home);
+        let manifest_for = |pid: u32, hostname: String| Manifest {
+            hostname,
+            port: 59999,
+            token: "t".into(),
+            pid,
+            version: "0.0.0".into(),
+            started_at: 0,
+            build: None,
+        };
+
+        // Another node's record whose pid happens to be a live process here
+        // that SIGTERM would end.
+        let mut bystander = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn sleep");
+        manifest_for(bystander.id(), "chimaera-other-login-node".into())
+            .write()
+            .expect("write manifest");
+        run().await.expect("kill run");
+        // A signal would end it asynchronously: give it time to show.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            bystander.try_wait().unwrap().is_none(),
+            "another node's pid must never be signalled here"
+        );
+        assert!(
+            Manifest::load().unwrap().is_some(),
+            "another node's manifest must never be removed here"
+        );
+        let _ = bystander.kill();
+        let _ = bystander.wait();
 
         // A "daemon" that ignores SIGTERM (trap), so its pid stays alive.
         let mut child = std::process::Command::new("sh")
@@ -81,15 +116,8 @@ mod tests {
             .spawn()
             .expect("spawn sh");
 
-        let manifest = Manifest {
-            hostname: "testhost".into(),
-            port: 59999,
-            token: "t".into(),
-            pid: child.id(),
-            version: "0.0.0".into(),
-            started_at: 0,
-            build: None,
-        };
+        let here = chimaera_core::this_node().expect("the test host has a name");
+        let manifest = manifest_for(child.id(), here);
         manifest.write().expect("write manifest");
         assert!(Manifest::load().unwrap().is_some());
 
