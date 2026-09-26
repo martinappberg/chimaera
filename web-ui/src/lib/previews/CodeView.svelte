@@ -89,8 +89,12 @@
   /** The view exists (reveal and other view-bound effects wait for it). */
   let ready = $state(false);
   /** Another view of this buffer took over (a transient overlap while a tab
-   *  moves between panes): this one must not accept keystrokes. */
+   *  moves between panes): this one must not accept keystrokes. It resumes
+   *  if that view unmounts first. */
   let superseded = $state(false);
+  /** The filename-matched language pack, once loaded (a resumed view's
+   *  fresh state must carry it again). */
+  let langSupport: Extension = [];
   const settingsCompartment = new Compartment();
   const extraCompartment = new Compartment();
   const langCompartment = new Compartment();
@@ -184,7 +188,7 @@
       // Before the filename-matched language pack, so a host language in
       // `extra` (markdown live) wins the language facet.
       extraCompartment.of((lastExtra = extra)),
-      langCompartment.of([]),
+      langCompartment.of(langSupport),
       highlightSpecialChars(),
       drawSelection(),
       bracketMatching(),
@@ -208,10 +212,20 @@
     if (el === null) return () => releaseBuffer(buf);
     const v = new EditorView({ state: buf.stateFor(viewExtensions()), parent: el });
     view = v;
-    buf.attach(v, () => {
+    const onSuperseded = () => {
       superseded = true;
       view = null;
-    });
+    };
+    // The view that superseded this one unmounted first: take over again
+    // from the buffer's current state (its text and undo moved on here).
+    const onResume = () => {
+      v.setState(buf.stateFor(viewExtensions()));
+      view = v;
+      superseded = false;
+      buf.attach(v, onSuperseded, onResume);
+      onDoc?.(v.state.doc.toString());
+    };
+    buf.attach(v, onSuperseded, onResume);
     ready = true;
     // Seed the live-buffer sink with the current text (the split preview shows
     // it before the first keystroke — or a re-attached buffer's unsaved text).
@@ -231,6 +245,7 @@
       void desc
         .load()
         .then((support) => {
+          langSupport = support;
           if (view === v) v.dispatch({ effects: langCompartment.reconfigure(support) });
         })
         .catch(() => {

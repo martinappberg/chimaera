@@ -150,7 +150,9 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   rename of the file or a parent (the buffer re-keys) all come back to the same text and undo
   stack. `shared/editing.ts`'s `dirtyFiles` mirrors the store, so the tab dot, beforeunload and
   the reload gate protect an unmounted dirty buffer too. A clean buffer is forgotten with its last
-  view.
+  view. Two views mounted on one buffer at once (a tab mid-move) never both edit: the newer takes
+  over and the older shows "open in another pane" — and resumes, from the buffer's current state,
+  if the newer one unmounts first.
 - **Closing asks.** Every close of a tab whose file is dirty — ×, middle-click, Close / Close
   Others / Close All, Cmd/Ctrl+W and the close-view chord — opens **Save / Don't save / Cancel**
   (one dialog for several files). A save that fails keeps its tab open with the reason. Save

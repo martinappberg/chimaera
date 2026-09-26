@@ -201,6 +201,10 @@ export class Buffer {
   private st: EditorState;
   private view: EditorView | null = null;
   private onSuperseded: (() => void) | null = null;
+  private onResume: (() => void) | null = null;
+  /** Views a newer one superseded that are still mounted, newest last: when
+   *  the live view goes, the newest of them resumes. */
+  private standby: { view: EditorView; resume: () => void }[] = [];
   /** The last detached view's scroll position, restored on re-attach. */
   private scroll: StateEffect<unknown> | null = null;
   private codec: TextCodec = { bom: false, eol: "\n" };
@@ -268,14 +272,18 @@ export class Buffer {
   }
 
   /** Make `view` the live surface. A previous view is superseded (its host
-   *  hides it; its keystrokes would no longer reach this buffer). */
-  attach(view: EditorView, onSuperseded: () => void): void {
+   *  hides it; its keystrokes would no longer reach this buffer) and, if it
+   *  gave `onResume`, waits to take over again when this one detaches. */
+  attach(view: EditorView, onSuperseded: () => void, onResume?: () => void): void {
+    this.standby = this.standby.filter((s) => s.view !== view);
     if (this.view !== null && this.view !== view) {
       this.st = this.view.state;
       this.onSuperseded?.();
+      if (this.onResume !== null) this.standby.push({ view: this.view, resume: this.onResume });
     }
     this.view = view;
     this.onSuperseded = onSuperseded;
+    this.onResume = onResume ?? null;
     if (this.scroll !== null) {
       view.dispatch({ effects: this.scroll });
       this.scroll = null;
@@ -283,11 +291,20 @@ export class Buffer {
   }
 
   detach(view: EditorView): void {
+    const parked = this.standby.findIndex((s) => s.view === view);
+    if (parked >= 0) {
+      this.standby.splice(parked, 1);
+      return;
+    }
     if (this.view !== view) return;
     this.st = view.state;
     this.scroll = view.scrollSnapshot();
     this.view = null;
     this.onSuperseded = null;
+    this.onResume = null;
+    // A view this one superseded is still mounted (a tab mid-move, a second
+    // host of the path): it takes over, re-attaching with the current state.
+    this.standby.pop()?.resume();
   }
 
   /** Buffer-owned extensions, re-added whenever a view (re)configures. */

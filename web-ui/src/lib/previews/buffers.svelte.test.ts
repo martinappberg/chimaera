@@ -150,6 +150,43 @@ describe("buffer lifetime", () => {
     expect(get(dirtyFiles).has(path)).toBe(false);
   });
 
+  it("hands the buffer back to a superseded view when the live one unmounts first", () => {
+    const path = `/w/standby-${++seq}.md`;
+    const buf = openBuffer(path, chunk("one\n", "h0", "m0"));
+    const older = new FakeView(buf.stateFor([]));
+    const events: string[] = [];
+    const resumeOlder = () => {
+      older.state = buf.stateFor([]);
+      events.push("resumed");
+      buf.attach(older as unknown as EditorView, () => events.push("superseded"), resumeOlder);
+    };
+    buf.attach(older as unknown as EditorView, () => events.push("superseded"), resumeOlder);
+
+    // A second view of the path (a tab mid-move) takes over and is typed in.
+    const newer = new FakeView(openBuffer(path, chunk("one\n", "h0", "m0")).stateFor([]));
+    buf.attach(newer as unknown as EditorView, () => {}, () => {});
+    expect(events).toEqual(["superseded"]);
+    newer.type(0, "zero ");
+
+    // It unmounts first: the older view resumes with the current text and
+    // is live again (its keystrokes reach the buffer).
+    close(buf, newer);
+    expect(events).toEqual(["superseded", "resumed"]);
+    expect(older.text).toBe("zero one\n");
+    older.type(0, "! ");
+    expect(buf.current.doc.toString()).toBe("! zero one\n");
+    expect(buf.dirty).toBe(true);
+
+    // A superseded view that unmounts is simply forgotten.
+    const third = new FakeView(openBuffer(path, chunk("one\n", "h0", "m0")).stateFor([]));
+    buf.attach(third as unknown as EditorView, () => {}, () => {});
+    close(buf, older);
+    close(buf, third);
+    expect(events).toEqual(["superseded", "resumed", "superseded"]);
+    buf.discard();
+    expect(bufferFor(path)).toBeUndefined();
+  });
+
   it("follows a rename of a parent folder", () => {
     const path = `/w/dir-${++seq}/notes.md`;
     const dir = path.slice(0, path.lastIndexOf("/"));
