@@ -93,17 +93,21 @@ outside facts are in [sources](#sources).
 ## The plugin shape
 
 Since martinappberg/chimaera#162 an opt-in capability is a **workbench plugin**
-([plugins](features/plugins.md), [authoring guide](agent-guides/plugins.md)): a TOML
-manifest embedded in the binary, switched on per workspace, saying on its card in
-words what it adds, with its behaviour in first-party code behind capabilities the
-manifest names. With no plugin active, nothing an agent sees changes, pinned by the
-`agent_view` fixtures. The authoring guide named LaTeX the next plugin and sketched
-it on the specified-but-unbuilt `commands` and `settings` points, where a build is a
-visible terminal session. This plan replaces that sketch: compile-on-save cannot be
-a terminal per save (a new rail entry every time an agent writes a chapter, no time
-or memory limit, no build folder), and a terminal cannot hand back diagnostics, an
-output file and sync data. So the plugin's contribution point is a new one, `build`,
-and sections 1 to 7 describe what that point does.
+([plugins](features/plugins.md)): switched on per workspace, saying on its card in
+words what it adds, with nothing changing for an agent where it is off (pinned by
+the `agent_view` fixtures). The [plugin system plan](plugin-system-plan.md)
+(maintainer decisions of 2026-09-26) makes a plugin a Rust crate compiled to one
+portable `plugin.wasm`, run by a small host in the daemon through a pinned WIT
+interface, with first-party plugins embedded in the binary and every host call
+bounded. LaTeX and Typst are the first new plugins on it, after Agent notes and
+Mycelium prove the model. The authoring guide's earlier sketch put LaTeX on
+`commands` and `settings`, where a build is a visible terminal session; this plan
+replaces that: compile-on-save cannot be a terminal per save (a new rail entry every
+time an agent writes a chapter, no time or memory limit, no build folder), and a
+terminal cannot hand back diagnostics, an output file and sync data. So the
+plugin's contribution point is `build`: a manifest section (below) that the host
+reads, plus the LaTeX-specific logic in the plugin's own code, on top of the host's
+`exec` (WIT 0.2). Sections 1 to 7 describe what the point does.
 
 ### One point, four manifests
 
@@ -154,16 +158,18 @@ writes the Typst source the engine then builds. Word export
 `output = "{build_dir}/{stem}.docx"`, `diagnostics = "file-line-col"` and no sync.
 That is the guide's rule of two, met four times over by one point.
 
-| In the manifest (data) | In Chimaera (first-party code, named by the manifest) |
-|---|---|
-| which files, which tools, the command and its environment, the output path, timeouts, debounce, the Adds lines | the queue and every limit (section 7), the prelude environment capture and PATH walk, build folders and eviction, the events frame |
-| the engine ladder as an ordered list | the parsers (`latex-log`, `file-line-col`, `json`), main-file finders (`tex`, `self`), watch-set sources (`fls`, `typst-deps`), sync (`synctex`, `text`), transforms (`md-typst`) |
-| the paragraph `document_guide` adds for this plugin | `DocumentView`, the editor marks, the problems list, **Ask agent**, the PDF swap, `compile_document` |
+| In the manifest (data) | In the plugin (Rust, compiled to WASM) | In the host (first-party, shared by every build plugin) |
+|---|---|---|
+| which files, which tools, the command and its environment, the output path, timeouts, debounce, the Adds lines | the ladder's decisions, the log parser with its fixture corpus, main-file finding, the watch set from `.fls` or Typst's deps, SyncTeX parsing, the guide paragraph, `compile_document` as a tool export | the queue and every limit (section 7), the prelude environment capture and PATH walk, `exec` itself, build folders and eviction, the events frame |
+| the engine ladder as an ordered list | the `md-typst` transform (the markdown-to-PDF plugin) | `DocumentView`, the editor marks, the problems list, **Ask agent**, the PDF swap, the diagnostics and sync JSON shapes |
 
-Placeholders (`{root}`, `{build_dir}`, `{output}`, `{stem}`, `{workspace}`) are
-substituted by the daemon and shell-quoted, so a file name can never change the
-command. A project's own config still wins over the manifest (a `Tectonic.toml`, a
-trusted `latexmkrc`), as the guide requires.
+The names in the manifest (`diagnostics = "latex-log"`, `sync = "synctex"`) are
+what the plugin's code answers to, not built-in capabilities of the host: the host
+knows only the JSON shapes it renders. Placeholders (`{root}`, `{build_dir}`,
+`{output}`, `{stem}`, `{workspace}`) are substituted by the host and shell-quoted,
+so a file name can never change the command. A project's own config still wins
+over the manifest (a `Tectonic.toml`, a trusted `latexmkrc`), as the guide
+requires.
 
 ### What "on" means for a build plugin
 
@@ -194,7 +200,7 @@ Nothing silently, and by default nothing at all:
 
 | Where | What | How |
 |---|---|---|
-| Chimaera | nothing: the runner, parsers, sync and view ship in the binary with the manifests | versions with the daemon |
+| Chimaera | nothing to fetch: the host, `exec`, the build runner and the document view ship in the daemon; the LaTeX logic ships as the plugin's `plugin.wasm`, embedded in the binary for first-party plugins | versions with the daemon; a plugin's own version on its card |
 | the host toolchain | nothing by default; whatever the prelude provides (`module load texlive`, a `typst` in `~/.local/bin`) | detection through the prelude (section 1) |
 | managed tools (Phase F) | `typst`, `tectonic`, later `pandoc`: official release artifacts, checksums where the release publishes them, a visible shell session, never sudo, under `~/.chimaera/tools/<tool>/<version>/` | the `runtimes.rs` pattern; **Install** on the empty PDF state |
 | the agents | nothing required: the MCP tool and guide reach every agent without an install. Optional: a `report-writing` skill pack (the guide's conventions as an Agent Skill, for agents that run outside Chimaera) as a claude and codex plugin, installed through the agents' own plugin managers in a visible terminal | a new `recommends.agent_plugins` block, the shape of `requires`, shown as optional on the card, so the plugin works with zero installs |
@@ -500,6 +506,14 @@ shows a calm empty state instead of an error:
   message and log location are all plain text any agent on the host can use.
 
 ## 3. Source and PDF: SyncTeX
+
+**Under the plugin model** the SyncTeX parser is the plugin's code, on the daemon,
+not a TypeScript worker in the browser: a plugin contributes no UI code, and a
+LaTeX parser in core is what the model avoids. So the first version answers jumps
+through the plugin (`query("sync", …)`, about two tunnel round trips per click) and
+the browser-side parsing below becomes the later optimisation, as a capped, generic
+sync table the plugin emits per build and the browser queries locally. The data,
+units and paths described here are unchanged either way.
 
 ### Where the data comes from
 
@@ -1025,51 +1039,19 @@ point gives PowerPoint the same way, later.
 
 ## Packaging: plugins in their own repositories
 
-Today every manifest is embedded in the binary (`MANIFESTS` in `plugins/mod.rs`),
-and "extensible" means extensible by this repository. The question is whether each
-plugin should be its own repository, found through a marketplace, so that a LaTeX
-plugin, a Word plugin or a Quarto plugin can come from anyone. The answer is yes
-for everything that is data or agent-side, and no for code:
-
-- **No extension host.** Third-party code in the daemon or the UI does not survive
-  the daemon's constraints: a static binary at about 150 MB on a shared login node,
-  bearer auth on every route, no unbounded child processes. An extension host is
-  also what makes an IDE an IDE, and the split above shows it is not needed: the
-  pieces that must be careful (the runner, the parsers, sync, the views) are few,
-  shared by every document plugin, and better written once. Third parties extend
-  Chimaera by writing manifests that name them.
-- **The marketplace exists already.** A claude marketplace is a git repository with
-  `.claude-plugin/marketplace.json`; a codex plugin is the same repository with
-  `.codex-plugin/plugin.json`; mycelium is both at once. A Chimaera plugin
-  repository is that repository plus `.chimaera-plugin/plugin.toml`, the manifest
-  above. Its skills, hooks and MCP servers ride the agents' own plugin managers, as
-  the authoring guide requires; its workbench half is the manifest. The Browse view
-  the plugins plan defers (§6.5) lists the marketplaces the agents already have; a
-  card gains a *workbench* badge when the plugin carries a Chimaera manifest.
-- **Discovery: three sources, one catalog.** Embedded manifests (first-party,
-  versioned with the daemon); manifests inside installed agent plugins
-  (`claude plugin list --json` reports each plugin's `installPath`, which
-  `agent_probe.rs` already reads to scan skills; codex's app-server reports its
-  plugin paths the same way); and `~/.chimaera/plugins/<id>/`, a clone at a pinned
-  commit for a plugin that is not an agent plugin, staged and reviewed the way the
-  skills-manager design stages skill packs. The card shows the source. The same id
-  from two sources is a conflict the card names, never a silent override.
-- **Trust is the manifest, read once.** A third-party manifest is declarative only:
-  it may use `build`, `detect`, `requires`, `recommends`, `setup`, `settings` and
-  `commands`, and name first-party capabilities. Its command templates are shown
-  verbatim when the plugin is first switched on and again whenever the manifest's
-  hash changes, like a project `latexmkrc` and like codex hook trust; the daemon
-  quotes every placeholder. No LLM reviews it and nothing runs before the user has
-  read it. A manifest that names a capability this daemon does not have, or a
-  `requires.chimaera` newer than this build, renders "needs a newer chimaera" and
-  stays off.
-- **Order.** In-tree first: the latex and typst manifests land embedded, because
-  that is the fastest way to prove the `build` point and there is no second home for
-  a manifest yet. The manifest format is designed now so that moving a plugin to its
-  own repository later is a file copy plus the discovery source, not a rewrite. The
-  move earns its keep when a plugin has a life outside this repository: a
-  `chimaera-plugins` repository (or one per plugin) that also ships the skill packs,
-  or the first third-party manifest.
+Decided in the [plugin system plan](plugin-system-plan.md#packaging-and-third-parties):
+a plugin is a Rust crate in its own repository, built to one portable
+`plugin.wasm` beside its `plugin.toml`, with its agent-side pieces (skills, hooks)
+in the same repository's `.claude-plugin/` and `.codex-plugin/` so they install
+through the agents' own plugin managers. First-party plugins are embedded in the
+daemon; third-party plugins install into `~/.chimaera/plugins/` through the same
+host and limits. What that means here: the LaTeX and Typst crates start under
+`plugins/` in this repository (embedded, off by default) and move to their own
+repositories when they have a life outside it, a file copy plus a pinned release
+artifact in the build script. Still no code in the daemon or the UI that is not the
+host's own: a plugin cannot open a file, run a process or reach the network except
+through host calls the host bounds, and the sandbox, not a manifest review, is what
+makes a third-party plugin safe to switch on.
 
 ## Open decisions
 

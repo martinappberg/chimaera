@@ -45,6 +45,12 @@ the unmerged Loadout plan (`docs/skills-manager-plan.md` on branch
 - Workers reach the Mastermind without the Agent notes plugin: `tell_mastermind`
   (maintainer, 2026-09-26) — inbox in ask-first mode, a capped wake in auto mode.
 - The Mastermind lives in a window panel on every view, not in the dashboard.
+- **Superseded (2026-09-26):** the "named built-in" column of §6.1 — plugin
+  behaviour as first-party daemon code named by the manifest — is replaced by
+  the [plugin system plan](plugin-system-plan.md): a plugin is a Rust crate
+  compiled to WASM, run by a small host through a pinned WIT interface, with
+  Mycelium and Agent notes ported first as the proof. Manifests, per-workspace
+  switches, the cards and the agent-side rules stand.
 
 ## Decisions (maintainer, 2026-09-25)
 
