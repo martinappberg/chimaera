@@ -4437,6 +4437,11 @@ pub(crate) struct TicketRequest {
 /// never appears in a URL. A ticket is a per-path snapshot: renaming the
 /// path afterwards makes the fetch 404, deliberately. Minting again for an
 /// unchanged file answers the same ticket (see [`TicketStore`]).
+///
+/// Answers `{ticket, name}`: `name` is the file name of the CANONICAL path
+/// the ticket is bound to, which a symlink (`latest.html -> runs/42/…`) or
+/// `~` can hide from the caller — an HTML frame addresses its page as
+/// `/raw/{ticket}/{name}` (see [`raw_asset`]).
 pub(crate) async fn create_ticket(
     State(state): State<Arc<AppState>>,
     Json(body): Json<TicketRequest>,
@@ -4458,8 +4463,9 @@ pub(crate) async fn create_ticket(
                 .into_response();
         }
     };
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
     let ticket = crate::lock(&state.tickets).mint(path, version);
-    Json(json!({"ticket": ticket})).into_response()
+    Json(json!({"ticket": ticket, "name": name})).into_response()
 }
 
 /// Parse a single `Range: bytes=...` header value against a file of `total`
@@ -4535,10 +4541,12 @@ pub(crate) async fn raw(
 
 /// GET /raw/{ticket}/{*rest} — a file beside an HTML report, so the report's
 /// relative `app.js`, `style.css` or `figs/a.png` load inside its frame (the
-/// previews point the frame at `/raw/{ticket}/{its own name}`, which makes
-/// every relative URL land here). Only a ticket naming an HTML document
-/// opens its folder, and only downward: `rest` must be plain components (no
-/// `..`, no absolute path, no hidden `.name` anywhere), and every component
+/// previews point the frame at `/raw/{ticket}/{its own name}` — the
+/// canonical name the ticket mint answers — which makes every relative URL
+/// land here). The ticket's own file is served by its name even when that
+/// name is hidden (`.summary.html`). Only a ticket naming an HTML document
+/// opens its folder, and only downward: any other `rest` must be plain
+/// components (no `..`, no absolute path, no hidden `.name` anywhere), and every component
 /// is opened `O_NOFOLLOW` beneath the folder's descriptor
 /// ([`crate::download::open_beneath`]), so a symlink can never lead out of
 /// the subtree. Every response here is sandboxed, whatever its type (HTML
@@ -4560,7 +4568,13 @@ pub(crate) async fn raw_asset(
     if !opens_its_folder(&path) {
         return raw_not_found();
     }
-    let (Some(relative), Some(dir)) = (asset_relative(&rest), path.parent()) else {
+    // The page itself, by its canonical name: allowed even when hidden, as
+    // that name is the one the ticket was minted for, not one the page chose.
+    let own = path
+        .file_name()
+        .filter(|name| name.as_encoded_bytes() == rest.as_bytes())
+        .map(PathBuf::from);
+    let (Some(relative), Some(dir)) = (own.or_else(|| asset_relative(&rest)), path.parent()) else {
         return raw_not_found();
     };
     let dir = dir.to_path_buf();

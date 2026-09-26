@@ -481,3 +481,74 @@ async fn raw_sandboxes_markup_and_every_report_asset() {
     assert_eq!(header_str(&headers, "x-content-type-options"), "nosniff");
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// A frame addresses its page by the canonical name the ticket mint answers:
+/// an HTML report opened through a symlink, or under a hidden name, loads
+/// itself and its assets; hidden names stay refused for every OTHER file.
+#[tokio::test]
+async fn raw_asset_serves_the_tickets_own_file_by_its_canonical_name() {
+    use std::os::unix::fs::symlink;
+    let state = test_state();
+    let root = test_dir("embed-own-name");
+    let run = root.join("runs/42");
+    std::fs::create_dir_all(run.join("figs")).unwrap();
+    std::fs::write(run.join("report.html"), "<img src=figs/a.png>").unwrap();
+    std::fs::write(run.join("figs/a.png"), png(3, 3)).unwrap();
+    std::fs::write(run.join(".summary.html"), "<p>summary</p>").unwrap();
+    std::fs::write(run.join(".env"), "SECRET=1").unwrap();
+    symlink(run.join("report.html"), root.join("latest.html")).unwrap();
+
+    let mint = |path: std::path::PathBuf| {
+        let state = state.clone();
+        async move {
+            let (status, json) = request(
+                &state,
+                Method::POST,
+                "/api/v1/fs/ticket",
+                Some(serde_json::json!({"path": path.to_string_lossy()})),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{json}");
+            (
+                json["ticket"].as_str().unwrap().to_string(),
+                json["name"].as_str().unwrap().to_string(),
+            )
+        }
+    };
+
+    // Through a symlink: the ticket (and its name) is the target's.
+    let (ticket, name) = mint(root.join("latest.html")).await;
+    assert_eq!(name, "report.html");
+    let (status, _, body) = get_with(&state, &format!("/raw/{ticket}/{name}"), &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(&body[..], b"<img src=figs/a.png>");
+    let (status, _, _) = get_with(&state, &format!("/raw/{ticket}/figs/a.png"), &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    // The link's own name is not in the target's folder.
+    let (status, _, _) = get_with(&state, &format!("/raw/{ticket}/latest.html"), &[]).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // A hidden page is served by its own name, sandboxed like any report…
+    let (ticket, name) = mint(run.join(".summary.html")).await;
+    assert_eq!(name, ".summary.html");
+    let (status, headers, body) =
+        get_with(&state, &format!("/raw/{ticket}/.summary.html"), &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(&body[..], b"<p>summary</p>");
+    assert_eq!(
+        header_str(&headers, "content-security-policy"),
+        "sandbox allow-scripts"
+    );
+    let (status, _, _) = get_with(&state, &format!("/raw/{ticket}/figs/a.png"), &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    // …but its neighbors' hidden names stay refused,
+    let (status, _, _) = get_with(&state, &format!("/raw/{ticket}/.env"), &[]).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    // and another page's ticket never opens it by name.
+    let (report_ticket, _) = mint(run.join("report.html")).await;
+    for rest in [".summary.html", "%2esummary.html", "figs/../.summary.html"] {
+        let (status, _, _) = get_with(&state, &format!("/raw/{report_ticket}/{rest}"), &[]).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{rest}");
+    }
+    std::fs::remove_dir_all(&root).ok();
+}

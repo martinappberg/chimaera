@@ -607,14 +607,25 @@ export async function fsXlsx(
  * same version (renewing it), and a new one once the file changed.
  */
 export async function fsRawUrl(path: string): Promise<string> {
-  const body = await json<{ ticket: string }>(
+  return (await fsRawTicket(path)).url;
+}
+
+/**
+ * `fsRawUrl` plus the file name of the canonical path the ticket is bound
+ * to (null from a daemon that doesn't say). An HTML frame addresses its page
+ * by that name under the ticket (`/raw/{ticket}/{name}`): the name in the
+ * pane's path is a symlink's (`latest.html -> runs/42/report.html`) or can
+ * be hidden, and the daemon serves the ticket's own file only by its name.
+ */
+export async function fsRawTicket(path: string): Promise<{ url: string; name: string | null }> {
+  const body = await json<{ ticket: string; name?: string | null }>(
     await api("/fs/ticket", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ path }),
     }),
   );
-  return `/raw/${body.ticket}`;
+  return { url: `/raw/${body.ticket}`, name: typeof body.name === "string" ? body.name : null };
 }
 
 /**

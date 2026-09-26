@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const mocks = vi.hoisted(() => ({
   fsFile: vi.fn(),
   fsMarkdown: vi.fn(),
-  fsRawUrl: vi.fn(),
+  fsRawTicket: vi.fn(),
   fsTable: vi.fn(),
 }));
 
@@ -17,9 +17,9 @@ describe("FileEntry.ensureRawUrl", () => {
   });
 
   it("makes concurrent consumers wait for the same raw ticket", async () => {
-    let resolveTicket!: (url: string) => void;
-    mocks.fsRawUrl.mockReturnValue(
-      new Promise<string>((resolve) => {
+    let resolveTicket!: (t: { url: string; name: string | null }) => void;
+    mocks.fsRawTicket.mockReturnValue(
+      new Promise<{ url: string; name: string | null }>((resolve) => {
         resolveTicket = resolve;
       }),
     );
@@ -35,14 +35,15 @@ describe("FileEntry.ensureRawUrl", () => {
     });
 
     await Promise.resolve();
-    expect(mocks.fsRawUrl).toHaveBeenCalledTimes(1);
+    expect(mocks.fsRawTicket).toHaveBeenCalledTimes(1);
     expect(firstFinished).toBe(false);
     expect(secondFinished).toBe(false);
 
-    resolveTicket("/api/fs/raw/ticket");
+    resolveTicket({ url: "/api/fs/raw/ticket", name: "umap.pdf" });
     await Promise.all([first, second]);
 
     expect(entry.rawUrl).toBe("/api/fs/raw/ticket");
+    expect(entry.rawName).toBe("umap.pdf");
     expect(firstFinished).toBe(true);
     expect(secondFinished).toBe(true);
   });

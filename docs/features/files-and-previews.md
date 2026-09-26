@@ -463,7 +463,7 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   components' reactive graphs into a freeze; `TableView` fetches its own plain page via a *stable*
   `fetchPage`.
 - **PDF / image / HTML.** Fetched via a short-lived **ticket**: `POST /api/v1/fs/ticket {path}` →
-  `GET /raw/{ticket}` (no bearer header — iframes/`<img>`/pdf.js can't send one; ticket TTL 600s,
+  `{ticket, name}` (`name`: the canonical file's name) → `GET /raw/{ticket}` (no bearer header — iframes/`<img>`/pdf.js can't send one; ticket TTL 600s,
   range-aware). Every `/raw` response says `X-Content-Type-Options: nosniff`. HTML is sandboxed
   (`CSP: sandbox allow-scripts`, no-referrer); every other type a browser renders as markup (XML,
   XSL, SVG, MathML, any `+xml` — an XML file's XHTML `<script>` would run in the daemon's origin)
@@ -481,9 +481,11 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   next split/edit click);
   its split live-preview is a `sandbox="allow-scripts"` `srcdoc` iframe fed the (debounced) editor
   buffer — same origin-less isolation. **Relative assets load in preview mode:** the frame loads
-  the page by its own name under its ticket (`/raw/{ticket}/report.html`), so a relative `app.js`
-  or `figs/a.png` lands on `GET /raw/{ticket}/{*rest}`, which serves files beside an HTML ticket's
-  page — downward only (plain visible components: no `..`, no absolute path, no `.hidden` name),
+  the page by its canonical name under its ticket (`/raw/{ticket}/report.html` — the name the
+  ticket mint answers, so a page opened through `latest.html -> runs/42/report.html` is framed from
+  runs/42), so a relative `app.js` or `figs/a.png` lands on `GET /raw/{ticket}/{*rest}`, which serves
+  the ticket's own file by that name (even a hidden `.summary.html`) and files beside an HTML
+  ticket's page — downward only (plain visible components: no `..`, no absolute path, no `.hidden` name),
   every component opened `O_NOFOLLOW` beneath the folder's descriptor (a symlink never leads out),
   and every response there is sandboxed whatever its type (HTML with `allow-scripts`, like the
   report; anything else script-less — inert on a script, style or image the page loads). Only an

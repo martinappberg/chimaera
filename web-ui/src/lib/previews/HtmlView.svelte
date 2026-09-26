@@ -72,8 +72,13 @@
   // The frame loads the page by its own name UNDER the ticket
   // (`/raw/{ticket}/report.html`), so its relative `app.js` / `figs/a.png`
   // resolve to `/raw/{ticket}/app.js` — the daemon's folder-confined route.
+  // The name is the ticket's canonical file's, not the pane path's: opened
+  // through `latest.html -> runs/42/report.html` the page and its assets
+  // live in runs/42, and a hidden `.summary.html` is served only by name.
   const url = $derived(
-    entry?.rawUrl != null ? `${entry.rawUrl}/${encodeURIComponent(basename(path))}` : null,
+    entry?.rawUrl != null
+      ? `${entry.rawUrl}/${encodeURIComponent(entry.rawName ?? basename(path))}`
+      : null,
   );
   const error = $derived(entry?.rawError ?? null);
 
