@@ -54,6 +54,11 @@ PTY snapshot-on-attach ([terminals.md](terminals.md)) and the chat seq-journal g
   conversation found"). A client connecting mid-restore waits `wait_restored()` (cap 15s) so it never
   prunes still-respawning tabs. A busy handoff port after ~5s falls back to an OS-assigned port (stay up
   on a fresh port rather than die); a crash leaves no handoff; an explicit conflicting `--port` wins.
+- **Chat journals survive the restart too.** The chat-journal dir budget (100 MiB / 200 files) waits
+  for restore (`ledger::consume_boot` → `chat::prune_journals`): until a ledgered chat respawns it is
+  live nowhere, yet its journal is what it replays and resumes from. After that the budget evicts
+  history oldest-first but never a live session's journal — an idle resurrected chat is routinely the
+  oldest file in the dir.
 
 ## Restart carryover (chat sessions)
 

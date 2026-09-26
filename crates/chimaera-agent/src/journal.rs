@@ -13,7 +13,7 @@
 //! must stall the one agent (async backpressure — [`Journal::append`] yields,
 //! never parks a runtime worker) rather than grow memory or freeze the pump.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -42,7 +42,8 @@ const MAX_ENTRY_BYTES: usize = 256 * 1024;
 /// never has a hole; deep enough to ride out normal fs latency.
 const WRITE_QUEUE_DEPTH: usize = 256;
 
-/// Directory budgets, enforced by [`prune_dir`] at daemon start.
+/// Directory budgets, enforced by [`prune_dir`] once boot restore settles and
+/// again on every chat spawn.
 pub const DIR_MAX_BYTES: u64 = 100 * 1024 * 1024;
 pub const DIR_MAX_FILES: usize = 200;
 
@@ -887,10 +888,19 @@ pub fn seed_journal(dir: &Path, session_id: &str, events: &[AgentEvent]) -> Resu
     Ok(())
 }
 
-/// Enforce the chat-dir budget at daemon start: oldest-mtime journals go
-/// first. No live-session exclusions needed — chat sessions die with the
-/// daemon, so at startup every journal is history.
-pub fn prune_dir(dir: &Path, max_bytes: u64, max_files: usize) -> Result<()> {
+/// Enforce the chat-dir budget: the oldest-mtime journals go first, except
+/// the sessions in `keep`. Chats outlive the daemon (ledger resurrection), so
+/// an idle live session's journal is routinely the oldest file here — and it
+/// is what that session's gap replay and its next resurrection read from.
+/// Kept journals still count toward the budget, so history is evicted to make
+/// room for them; if they alone exceed it, pruning stops short rather than
+/// cut into a journal in use.
+pub fn prune_dir(
+    dir: &Path,
+    max_bytes: u64,
+    max_files: usize,
+    keep: &HashSet<String>,
+) -> Result<()> {
     let mut files: Vec<(PathBuf, u64, SystemTime)> = Vec::new();
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -911,6 +921,13 @@ pub fn prune_dir(dir: &Path, max_bytes: u64, max_files: usize) -> Result<()> {
     for (path, size, _) in &files {
         if total <= max_bytes && count <= max_files {
             break;
+        }
+        let kept = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .is_some_and(|id| keep.contains(id));
+        if kept {
+            continue;
         }
         if fs::remove_file(path).is_ok() {
             total -= size;
@@ -1289,18 +1306,64 @@ mod tests {
                 .unwrap();
         }
 
-        prune_dir(dir.path(), 3500, 100).unwrap();
-        let remaining: Vec<_> = fs::read_dir(dir.path())
-            .unwrap()
-            .flatten()
-            .map(|e| e.file_name().into_string().unwrap())
-            .collect();
+        let none = HashSet::new();
+        prune_dir(dir.path(), 3500, 100, &none).unwrap();
+        let remaining = names(dir.path());
         assert_eq!(remaining.len(), 3);
         assert!(remaining.contains(&"s-5.jsonl".to_string()), "newest kept");
         assert!(!remaining.contains(&"s-0.jsonl".to_string()), "oldest gone");
 
-        prune_dir(dir.path(), u64::MAX, 1).unwrap();
+        prune_dir(dir.path(), u64::MAX, 1, &none).unwrap();
         assert_eq!(fs::read_dir(dir.path()).unwrap().flatten().count(), 1);
+    }
+
+    fn names(dir: &Path) -> Vec<String> {
+        fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().into_string().unwrap())
+            .collect()
+    }
+
+    fn backdated(dir: &Path, name: &str, bytes: usize, secs_ago: u64) {
+        let path = dir.join(name);
+        fs::write(&path, vec![b'x'; bytes]).unwrap();
+        let mtime = SystemTime::now() - std::time::Duration::from_secs(secs_ago);
+        fs::File::open(&path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(mtime))
+            .unwrap();
+    }
+
+    #[test]
+    fn prune_dir_skips_kept_sessions_but_counts_them() {
+        let dir = tempfile::tempdir().unwrap();
+        // The kept journal is the OLDEST and the biggest: an idle live chat.
+        backdated(dir.path(), "live.jsonl", 3000, 900);
+        for i in 0..4 {
+            backdated(dir.path(), &format!("h-{i}.jsonl"), 1000, 600 - i * 60);
+        }
+        let keep: HashSet<String> = ["live".to_string()].into();
+
+        // 7000 bytes over a 5000 budget: history goes oldest-first around the
+        // kept journal, which still counts toward the total.
+        prune_dir(dir.path(), 5000, 100, &keep).unwrap();
+        let remaining = names(dir.path());
+        assert!(
+            remaining.contains(&"live.jsonl".to_string()),
+            "kept survives"
+        );
+        assert!(!remaining.contains(&"h-0.jsonl".to_string()), "oldest gone");
+        assert!(
+            !remaining.contains(&"h-1.jsonl".to_string()),
+            "next oldest gone"
+        );
+        assert_eq!(remaining.len(), 3, "live + the two newest history");
+
+        // A budget the kept journal alone busts: every history journal goes,
+        // the kept one never does.
+        prune_dir(dir.path(), 0, 0, &keep).unwrap();
+        assert_eq!(names(dir.path()), vec!["live.jsonl".to_string()]);
     }
 }
 

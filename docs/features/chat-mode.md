@@ -475,8 +475,12 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   assigned *once* in `Journal::append` — the durable JSONL, the live broadcast, and every client agree.
   `seq` must stay the first serialized key of `SeqEvent` (the write-path scan depends on it). The
   journal repairs a crash-torn tail, compacts at a turn boundary past `FILE_CAP 4 MiB`, and is
-  size-capped per dir (`100 MiB` / `200 files`). Resuming a finished conversation seed-copies the old
-  journal so `attach` replays the whole history (via a native-id → chimaera-session index).
+  size-capped per dir (`100 MiB` / `200 files`): history goes oldest-first, but never a live
+  session's journal or one the boot ledger is about to resurrect — chats outlive the daemon, so an
+  idle one is often the oldest file there (`journal::prune_dir`'s `keep` set; the server's
+  `chat::prune_journals` runs on every spawn and once boot restore settles). Resuming a finished
+  conversation seed-copies the old journal so `attach` replays the whole history (via a native-id →
+  chimaera-session index).
 - **Pinned protocols** (`claude.rs`/`codex.rs`): the `stream-json` and `app-server` wire formats are
   **unversioned and pinned, not trusted** — each driver is verified against its `TESTED_*_VERSION`
   constant (the current pins live at the top of `claude.rs` / `codex.rs`). Touching a driver or

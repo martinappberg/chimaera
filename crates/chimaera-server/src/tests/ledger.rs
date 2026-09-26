@@ -184,3 +184,112 @@ async fn ledger_restore_disabled_still_lands_recents() {
     assert_eq!(recents[0].resume.as_deref(), Some("conv-1"));
     assert_eq!(recents[0].last_active, 1_750_000_000);
 }
+
+/// Chats outlive the daemon, so the journals a boot ledger resurrects are
+/// routinely the OLDEST in the chat dir — and they are what those chats
+/// replay and resume from. The dir budget must spare them at construction
+/// (before restore has run) and across the resurrection spawns themselves
+/// (the first chat's spawn must not evict the second's journal), while
+/// history is still evicted oldest-first once the roster is whole.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn journal_budget_spares_chats_the_ledger_resurrects() {
+    use chimaera_agent::journal::{seed_journal, DIR_MAX_FILES};
+    use chimaera_agent::model::AgentEvent;
+
+    fn backdate(path: &std::path::Path, secs_ago: u64) {
+        let mtime = std::time::SystemTime::now() - std::time::Duration::from_secs(secs_ago);
+        std::fs::File::open(path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(mtime))
+            .unwrap();
+    }
+    fn journals(dir: &std::path::Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().into_string().unwrap())
+            .filter(|n| n.ends_with(".jsonl"))
+            .collect()
+    }
+
+    let data = test_dir("ledger-journal-budget");
+    let chat_dir = data.join("chat");
+    // Two chats the previous daemon was running, idle for a day...
+    for (id, text) in [("s-chat-a", "alpha history"), ("s-chat-b", "beta history")] {
+        seed_journal(
+            &chat_dir,
+            id,
+            &[AgentEvent::MessageChunk {
+                turn_id: "t1".into(),
+                text: text.into(),
+            }],
+        )
+        .unwrap();
+        backdate(&chat_dir.join(format!("{id}.jsonl")), 86_400);
+    }
+    // ...then more (newer) history than the budget holds.
+    for i in 0..DIR_MAX_FILES + 5 {
+        let path = chat_dir.join(format!("h-{i:03}.jsonl"));
+        std::fs::write(&path, b"{\"seq\":1,\"ts\":0}\n").unwrap();
+        backdate(&path, 3_600 - i as u64);
+    }
+
+    let state = test_state_with_data_dir(0, data);
+    assert!(
+        chat_dir.join("s-chat-a.jsonl").exists() && chat_dir.join("s-chat-b.jsonl").exists(),
+        "constructing the daemon must not prune before the ledger is restored"
+    );
+
+    let workspace_id = make_workspace(&state, "ledger-journal-budget-ws").await;
+    let root = lock(&state.workspaces).get(&workspace_id).unwrap().root;
+    preset_agent(
+        &state,
+        agents::AgentKind::Claude,
+        Ok(write_fake_claude("ledger-journal-budget-fake")),
+        Some("9.9.9-fake"),
+    );
+    let chat_entry = |id: &str| ledger::LedgerEntry {
+        id: id.to_string(),
+        workspace_id: workspace_id.clone(),
+        cwd: root.clone(),
+        pinned_name: None,
+        cols: 120,
+        rows: 40,
+        theme: "dark".to_string(),
+        created_at: 0,
+        agent: Some(ledger::LedgerAgent {
+            kind: agents::AgentKind::Claude,
+            resume: None,
+            transcript: None,
+            title: "claude".to_string(),
+            ui: chimaera_agent::model::SessionUi::Chat,
+            model: None,
+            carryover: None,
+        }),
+    };
+    let boot = ledger::BootLedger {
+        sessions: vec![chat_entry("s-chat-a"), chat_entry("s-chat-b")],
+        links: std::collections::HashMap::new(),
+        written_at: 0,
+    };
+    // As `lifecycle::serve` does before the ledger task runs.
+    state.restored.send_replace(false);
+    ledger::consume_boot(&state, boot).await;
+
+    for (id, text) in [("s-chat-a", "alpha history"), ("s-chat-b", "beta history")] {
+        assert!(state.chat.contains(id), "{id} resurrected");
+        let journal = std::fs::read_to_string(chat_dir.join(format!("{id}.jsonl")))
+            .unwrap_or_else(|e| panic!("{id}'s journal was pruned: {e}"));
+        assert!(journal.contains(text), "{id} kept its history");
+    }
+    let remaining = journals(&chat_dir);
+    assert_eq!(remaining.len(), DIR_MAX_FILES, "the budget still holds");
+    assert!(
+        !remaining.contains(&"h-000.jsonl".to_string()),
+        "history is evicted oldest-first"
+    );
+    assert!(remaining.contains(&format!("h-{:03}.jsonl", DIR_MAX_FILES + 4)));
+
+    state.chat.kill("s-chat-a");
+    state.chat.kill("s-chat-b");
+}

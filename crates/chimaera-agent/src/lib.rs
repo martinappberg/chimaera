@@ -1005,14 +1005,21 @@ impl ChatManager {
         &self.index
     }
 
-    /// The chat journal directory. Enforce its byte/file budget with
-    /// [`journal::prune_dir`]; safe to call periodically since dead sessions'
-    /// journals stay on disk to seed resumes.
-    pub fn prune_journal_dir(&self) {
+    /// Enforce the chat journal directory's byte/file budget with
+    /// [`journal::prune_dir`], evicting history (dead sessions' journals,
+    /// kept on disk to seed resumes) oldest-first. Every session in this
+    /// registry is protected; `keep` adds the ids only the caller knows are
+    /// still in use — a session between processes (respawn, view switch,
+    /// resurrection) owns a journal it is about to reopen. Blocking fs: run
+    /// it off the reactor.
+    pub fn prune_journal_dir(&self, keep: &HashSet<String>) {
+        let mut keep = keep.clone();
+        keep.extend(self.sessions.lock().expect("sessions lock").keys().cloned());
         if let Err(err) = journal::prune_dir(
             &self.journal_dir,
             journal::DIR_MAX_BYTES,
             journal::DIR_MAX_FILES,
+            &keep,
         ) {
             tracing::warn!(%err, "chat journal prune failed");
         }
