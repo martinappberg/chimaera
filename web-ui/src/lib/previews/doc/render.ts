@@ -57,6 +57,10 @@ export interface Target<N> {
   /** `src` is already escaped and scheme-checked ("" = none); `wikilink`
    *  names an `![[embed]]`'s target, resolved by name. */
   image(src: string, alt: string, title: string | null, wikilink: string | null): N;
+  /** An image-syntax block — a paragraph that is one `![…](…)` or `![[…]]`
+   *  and nothing else — drawn as an embed card. A target without it (the
+   *  parity corpus) draws the paragraph as the daemon does, `<p><img>`. */
+  embed?(spec: EmbedSpec): N;
 }
 
 // --- URLs ---------------------------------------------------------------------
@@ -118,6 +122,56 @@ export function wikilinkHref(target: string, heading: string | null): string {
 
 export function isImageTarget(target: string): boolean {
   return IMAGE_EXT.test(target);
+}
+
+// --- embeds -----------------------------------------------------------------------
+
+/** A file an image-shaped reference names, as the daemon resolves it
+ *  (`fs/resolve_targets`): the target escaped as an href is (the daemon
+ *  decodes it; the fragment rides along), and whether `![[name]]` rules
+ *  apply — a miss beside the document is then looked up by name. */
+export interface EmbedRef {
+  target: string;
+  byName: boolean;
+}
+
+export interface EmbedSpec extends EmbedRef {
+  /** The alt text (or a wikilink's alias) as written, size hint and all. */
+  alt: string;
+  /** The target names a picture (by its extension): it draws as one. */
+  image: boolean;
+}
+
+const HAS_SCHEME = /^([a-z][a-z0-9+.-]*:|\/\/)/i;
+
+/** The file an image or an `![[embed]]` names, or null when it names none
+ *  on this host (a web or data URL, an in-page anchor, nothing). */
+export function embedSpecOf(i: Inline): EmbedSpec | null {
+  if (i.kind === "image") {
+    const target = hrefFor(i.url);
+    if (target === null || target === "" || target.startsWith("#") || HAS_SCHEME.test(target)) return null;
+    return { target, byName: false, alt: i.alt, image: isImageTarget(target.split(/[?#]/)[0] ?? "") };
+  }
+  if (i.kind !== "wikilink" || !i.embed || i.target === "" || HAS_SCHEME.test(i.target)) return null;
+  // As `wikilinkHref` reads the name (`.md` for an extension-less one), but
+  // the fragment kept as written: it may be a spot (`page=3`), not a heading.
+  const hasExt = /\.[A-Za-z0-9]*[A-Za-z][A-Za-z0-9]*$/.test(i.target.split("/").pop() ?? "");
+  const file = escapeHref(hasExt ? i.target : `${i.target}.md`);
+  const target = i.heading === null ? file : `${file}#${escapeHref(i.heading)}`;
+  return { target, byName: true, alt: i.alias ?? "", image: isImageTarget(file) };
+}
+
+/** The embed a paragraph is when it holds one image reference and nothing
+ *  else (blank text aside). */
+export function soleEmbed(inline: readonly Inline[]): EmbedSpec | null {
+  let found: EmbedSpec | null = null;
+  for (const i of inline) {
+    if (i.kind === "text" && i.text.trim() === "") continue;
+    if (found !== null) return null;
+    found = embedSpecOf(i);
+    if (found === null) return null;
+  }
+  return found;
 }
 
 // --- rendering ------------------------------------------------------------------
@@ -274,12 +328,17 @@ export function renderBlock<N>(parent: N, b: Block, env: Env<N>, tight = false):
   const { t } = env;
   switch (b.kind) {
     case "paragraph": {
+      const embed = t.embed === undefined ? null : soleEmbed(b.inline);
+      const body = (into: N): void => {
+        if (embed !== null && t.embed !== undefined) t.add(into, t.embed(embed));
+        else renderInline(into, b.inline, env);
+      };
       if (tight) {
-        renderInline(parent, b.inline, env);
+        body(parent);
         return;
       }
       const p = t.el("p", pos(env, b.from, b.to));
-      renderInline(p, b.inline, env);
+      body(p);
       t.add(parent, p);
       return;
     }
@@ -547,7 +606,12 @@ export function anchorSourceLine(source: string, anchor: string): number | null 
 /** What only a page can do, supplied by the reader: fetch image bytes,
  *  lay out diagrams, load highlighting grammars. */
 export interface DomHooks {
-  image(img: HTMLImageElement, src: string, wikilink: string | null): void;
+  /** Point an inline `img` at its bytes; a node returned here is drawn in
+   *  its place. */
+  image(img: HTMLImageElement, src: string, wikilink: string | null): Node | void;
+  /** The element an image-syntax block draws as (reading and live both
+   *  render through it). */
+  embed(spec: EmbedSpec): Node;
   code(code: HTMLElement, lang: string, text: string): void;
   mermaid(box: HTMLElement, source: string): void;
 }
@@ -572,8 +636,10 @@ export class DomTarget implements Target<Node> {
     const frag = sanitizeHtml(html);
     // What the island's markdown (a run an HTML block opened) drew as
     // markup gets the same hydration as everywhere else.
-    for (const img of frag.querySelectorAll<HTMLImageElement>("img[data-md-src]"))
-      this.hooks.image(img, img.dataset.mdSrc ?? "", null);
+    for (const img of frag.querySelectorAll<HTMLImageElement>("img[data-md-src]")) {
+      const out = this.hooks.image(img, img.dataset.mdSrc ?? "", null);
+      if (out instanceof Node && out !== img) img.replaceWith(out);
+    }
     for (const code of frag.querySelectorAll<HTMLElement>("pre > code[data-lang]")) {
       const lang = code.dataset.lang ?? "";
       const text = code.textContent ?? "";
@@ -616,8 +682,11 @@ export class DomTarget implements Target<Node> {
     const img = document.createElement("img");
     img.alt = alt;
     if (title !== null) img.title = title;
-    if (src !== "" || wikilink !== null) this.hooks.image(img, src, wikilink);
-    return img;
+    if (src === "" && wikilink === null) return img;
+    return this.hooks.image(img, src, wikilink) ?? img;
+  }
+  embed(spec: EmbedSpec): Node {
+    return this.hooks.embed(spec);
   }
 }
 

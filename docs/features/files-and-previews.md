@@ -10,8 +10,8 @@ budget on shared login nodes.
 
 **Where it lives (shared):** UI `web-ui/src/lib/previews/` (`files.ts` loaders,
 `fileStore.svelte.ts` the content store, `CodeView`, `MarkdownView` + `mdDoc.ts` /
-`docLinks.ts` / `mdLive.ts` and the markdown engine in `doc/` (`parser.ts`, `model.ts`,
-`render.ts`, `reader.ts`), `TableView`, `PdfView`, `ImageView`, `MediaView`, `HtmlView`, `BinaryView`,
+`docLinks.ts` / `mdLive.ts` / `mdBlocks.ts` and the markdown engine in `doc/` (`parser.ts`,
+`model.ts`, `render.ts`, `reader.ts`, `live.ts`, `embeds.ts`), `TableView`, `PdfView`, `ImageView`, `MediaView`, `HtmlView`, `BinaryView`,
 `NotebookView` + `notebook.ts`, `LogView` + `logText.ts`, `SlidesView` + `marp.ts`,
 `MermaidView`, `RawTextView`, `ansi.ts`, `FinderView`, `cm.ts`) +
 `web-ui/src/lib/workspace/FileTree.svelte` + glyphs in `web-ui/src/lib/shared/`
@@ -219,12 +219,12 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   A file opens in the mode it was last shown in — remembered per file in this browser's
   `localStorage` (the 300 most recently opened; `mdDoc.ts` `createModeMemory`, every access
   guarded, so a private window just forgets) — else in the **Markdown Default Mode** setting
-  (`editor.markdownDefaultMode`: reading, live or source; **reading** by default). Opening in
-  reading costs one request, the source (the store's first 256 KB chunk, which the editor
-  modes reuse; a source past it and under the 1 MB edit cap is read whole once): the editor
-  mounts on the first live/source click. Files over the 1 MB edit cap and binary-content
-  files always open in reading and stay there (an editor click on one says why in the mode
-  bar).
+  (`editor.markdownDefaultMode`: live, reading or source; **live** by default — it reads
+  exactly like reading until you type). Opening in reading costs one request, the source
+  (the store's first 256 KB chunk, which the editor modes reuse; a source past it and under
+  the 1 MB edit cap is read whole once): the editor mounts on the first live/source click.
+  Files over the 1 MB edit cap and binary-content files always open in reading and stay
+  there (an editor click on one says why in the mode bar).
   **One parser for every view** (`previews/doc/parser.ts`): lang-markdown's GFM language plus
   the document extensions — `$`/`$$` math (`mdMath.ts`), comrak's single-tilde
   strikethrough (`~x~` strikes like `~~x~~`, flanking by the same rules; three tildes are
@@ -233,16 +233,48 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   `[[note|alias]]`, `[[note#heading]]`, `![[embed]]`). Live parses with it through
   lang-markdown, reading through the same configured parser, so the two can't disagree
   about what a line is.
-  - **live** is an *editable reading view* — the shared CodeMirror editor
-    (`CodeView`) carrying the `mdLive.ts` extension set (the shared parser, above):
-    headings sized, emphasis/links/inline code styled, syntax marks hidden on every
-    line the selection doesn't touch, images/task-checkboxes/rules rendered as widgets
-    (clicking a checkbox edits the source), blockquotes drawn as the shared quote card, and
-    a small always-visible copy affordance on each fence line and quote card. **Equations**
-    — `$…$` and `$$…$$`, Obsidian's dollar dialect, plus GitHub's ```` ```math ```` fence
-    (the same block under another name; `` $`…`$ `` and Codex's `\(`/`\[` are not recognized
-    in files) — typeset as KaTeX widgets; click one, or move the cursor onto its lines, and
-    the LaTeX shows as mono source. A line opening with `$$` starts a **block** whose lines
+  - **live** is the reading view you can type into — Typora's model. Every top-level block
+    the cursor is not in is the reading renderer's own DOM for it (block widgets from a state
+    field, `mdBlocks.ts`, drawn by `doc/render.ts` with the same `.md-doc` CSS), so live and
+    reading match block for block — same elements, same tops and heights, light and dark;
+    only the block being edited shows as source, styled by `mdLive.ts`'s inline decorations
+    (headings sized, marks hidden off the cursor's line, a table's pipes aligned). Nothing
+    reveals while the editor is unfocused, so a document opens looking exactly like reading.
+    Link reference definitions and comments, which render nothing, stay as muted source.
+    - **Entering a block.** A click lands the cursor on the character clicked — mapped
+      through the block's `data-sourcepos` lines, then the rendered text before the pointer
+      aligned against the source minus its syntax (`doc/live.ts` `sourceOffset`); in a table,
+      the clicked cell (a row shorter than the header gets its missing pipes first, so typing
+      lands in that column) — and the clicked text stays where it was on screen. Arrow keys
+      step into the adjacent block at the same column and reveal it; a selection reveals
+      every block it touches; a double-click selects the word. **Mod+click follows** a link or
+      wikilink through the same routing as reading, below (Mod+Shift+click opens a file link
+      beside; a same-document `#heading` or `#L12` reveals its line in the editor, found in
+      the buffer itself with the slugs reading gives it); a plain click edits. Right-click
+      gives the same URL menu as reading. A **task box** toggles its source line (`- [ ]` ↔
+      `- [x]`), a copy button copies, the properties header folds the panel.
+    - **Nothing jumps.** A block's height is known before it paints: a cache of measured
+      heights keyed by what the block renders and the column it rendered at, so a block
+      rendered again (the cursor left it, it scrolled back into view) is exact, and its drawn
+      DOM is kept to come back as it was — highlighted, typeset, loaded. The line being acted
+      on — the clicked text, the block an arrow entered, the line being typed, the cursor's
+      line under an agent's write above it — keeps its place through CodeMirror's scroll
+      anchor. Margins collapse as in reading: each widget is a margin-free `flow-root` box
+      that starts with a zero-height "ghost" of the previous block's trailing edge. An edit
+      patches the block structure around itself instead of rebuilding it (a heading,
+      definition, footnote or raw-HTML change recomputes the whole). A **figure** (a
+      paragraph that is one image reference) stays drawn under its source line while you
+      edit it — as it was when you entered it, so retyping a path redraws only when the
+      cursor leaves — and stepping through a document of figures moves nothing but a line.
+    - **Measured** headless (Chromium) on a 5,000-line document: a keystroke 4–5 ms (p95
+      ~7 ms), typing that splits blocks ~5 ms (p95 ~9 ms), an arrow into the next block
+      3–4 ms (p95 ~10 ms), a click into a rendered block ~6 ms (p95 ~18 ms), a warm open
+      ~50 ms.
+    **Equations** — `$…$` and `$$…$$`, Obsidian's dollar dialect, plus GitHub's
+    ```` ```math ```` fence (the same block under another name; `` $`…`$ `` and Codex's
+    `\(`/`\[` are not recognized in files) — render as reading typesets them; revealed, the
+    LaTeX shows as mono source, with inline equations on the block's other lines typeset. A
+    line opening with `$$` starts a **block** whose lines
     are raw until the first later line containing `$$` (so a continuation line like
     `+ \left(1-w\right)` can't become a bullet list), but only when that closer is in sight
     before the next blank line: prose that merely starts with `$$` stays prose, and a slip
@@ -255,24 +287,10 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
     becomes math — as on GitHub), and one case list, `previews/mathBlocks.fixture.json`, pins
     the block grammar for both sides: the Vitest and Rust suites each run every case, with
     the known divergences named in it.
-    **Tables** render as the reading view's grid (the shared "Markdown tables" recipe, so the
-    views agree cell for cell — alignment, inline formatting, links, images, `$` math through
-    the same KaTeX policy) while the cursor is outside them. Click a cell, or move the cursor
-    into the table, and the whole table shows as editable mono text with its pipes aligned
-    (rows stay on one line; a wide one scrolls the editor sideways), the cursor in the
-    clicked cell — a row shorter than the header gets its missing pipes written first, so
-    typing lands in the clicked column — and it re-renders the moment the cursor leaves
-    (whole-table reveal, not in-place cell editing). Like a `$$` block, a table is replaced
-    whole from the `blocks` state field (`mdLive.ts`), built as data from the syntax tree
-    (`mdTable.ts`) and turned into elements without any HTML injection; a wide one is a tab
-    stop while it overflows, like chat's. Raw HTML and frontmatter stay as mono source, and so
-    does any construct the decorator can't render faithfully (reference links, footnotes,
-    wikilinks, multi-line image syntax). **Mod+click follows links** (a plain click places
-    the cursor) through the same routing as reading, below — Mod+Shift+click opens a file link
-    beside, and a same-document `#heading` or `#L12` reveals its line in the editor (the
-    heading is found in the buffer itself, unsaved edits included, with the slugs reading
-    gives it — `doc/render.ts` `anchorSourceLine`). Right-click gives the same URL menu as
-    reading.
+    **Mode switches keep your place**: the top visible block's first source line and its
+    offset go from one mode to the next, so the same block sits at the same height; one
+    scrolled partly past the top keeps that share of itself past it (a 90 px figure that is
+    one line of source keeps that line in view — `mdDoc.ts` `placeOffset`).
   - **reading** is the complete non-editable render, drawn **in the browser** by the shared
     renderer (`previews/doc/`) from the document's *current* text: the editor's buffer once
     the editor holds the file (unsaved edits included — a live keystroke shows the next time
@@ -319,8 +337,11 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
       by the type's glyph — semantic theme tokens (`--syn-func`, `--syn-string`, `--rate`,
       `--warn`, `--err`), so every curated theme restyles them.
     - **Task boxes.** `- [x]` items render as `span.md-task[data-task=done|todo]` (never an
-      `<input>`; a raw checkbox becomes the same span), drawn as live's check box in place of
-      the bullet; a done item's own text is muted and struck through, as in live.
+      `<input>`; a raw checkbox becomes the same span), drawn as a check box in place of the
+      bullet; a done item's own text is muted and struck through. A click toggles the item's
+      source line in reading too — an edit through the file's one buffer (the editor's, which
+      mounts hidden if it hasn't yet), so the file turns dirty, undo takes it back, autosave
+      applies.
     - **Footnotes.** `[^id]` references number in the order they are first made, as
       `sup.footnote-ref > a[href="#fn-id"]`; the definitions gather at the end in
       `section.footnotes`, each with a back-reference per reference; one nobody references is
@@ -343,8 +364,22 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
     - **Wikilinks** (read for Obsidian vaults; the daemon shows them as text) are links
       carrying `data-wikilink`: `[[note]]` points at `note.md`, `#heading` at its slug, and a
       click resolves it like any document link, by name in the workspace when it isn't beside
-      the document. `![[plot.png]]` embeds the image (found the same way); any other embed is
-      a file link.
+      the document. `![[plot.png]]` on a line of its own is an embed (below), found by name
+      when it isn't beside the document; inline, an image one draws the image and any other
+      is a file link.
+    - **Embeds.** An image-syntax block — a paragraph that is one `![alt](target#fragment)`
+      or `![[name]]` and nothing else — draws as an [embed card](#embed-cards) (a PDF page, a
+      table slice, a code excerpt, a notebook cell, a note's section…), the same in reading
+      and live. A **picture** keeps drawing as a picture — through the card's image body, its
+      frame and header dropped (`MarkdownView` CSS) — with its box reserved from the header
+      dimensions before a byte loads, `|400` size hints, `#xywh=` crops, and a missing file
+      said in place; a click opens it in a pane (in live: Mod+click; a plain click edits its
+      line). Every image-shaped reference in the document, inline ones too, resolves in
+      **one** `fs/resolve_targets` round trip (`doc/embeds.ts` `DocEmbeds`, shared by the two
+      views; asked again when the set changes or the file changes on disk; a `![[name]]` that
+      misses beside the document costs one by-name lookup more). A drawn-again block reuses
+      its answer, so nothing flashes; cards are destroyed with their block. A card's excerpt
+      of another note is the card's own (marked), not a transclusion through this renderer.
     - **Anchors.** Heading and footnote ids carry GitHub's `user-content-` prefix (heading
       slugs GitHub's, `-1`, `-2` on repeats), so a document can't clobber the app's own ids;
       a `#my-heading` or `#fn-1` link finds `user-content-my-heading` inside *this* document
@@ -398,17 +433,14 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
 
   Rendered documents carry the workbench's reading chrome: fenced code blocks and blockquotes
   get the same hover copy button as the chat transcript (`shared/copyDecor.ts`, one decorator
-  for both surfaces), and **document-relative images** (a `figs/plot.png`-style src) resolve
-  against the file's directory through short-lived `/raw/` tickets (`rawTicketUrl`: the daemon
-  keeps a file's ticket while it is unchanged, so a re-rendered block shows the last answer at
-  once and never flashes, and swaps to the new version's URL when the image was overwritten —
-  the client reuses an answer only for a render's burst; a relative src in raw HTML too, never
-  requested from the app's origin first) —
-  http(s) URLs pass through, any scheme the daemon's sanitizer would strip (`data:`,
-  `file:`, `javascript:`) loses its src or href, while live's image widgets render only
-  http(s)/`data:image` URLs and leave other schemes as source. The live mode mirrors all of
-  it (quote cards, ticketed image widgets, fence + quote copy) inside the editor; raw HTML
-  in a document is **never rendered** there — it stays visible source.
+  for both surfaces; never inside an embed card), and **document-relative images** (a
+  `figs/plot.png`-style src, a relative src in raw HTML too — never requested from the app's
+  origin first) resolve against the file's directory from the document's embed answers
+  (above): a ticketed `/raw/` URL the daemon keeps while the file is unchanged, and a new one
+  for a new version — http(s) URLs pass through, any scheme the daemon's sanitizer would
+  strip (`data:`, `file:`, `javascript:`) loses its src or href. Live draws all of it with
+  the reading renderer; raw HTML renders there as in reading once you leave its block. (The
+  daemon-render fallback keeps its own ticketed images, `rawTicketUrl`.)
 
   The toolbar carries a quiet **"N issues"** chip (`previews/DocIssues.svelte`) when the
   daemon's portable-dialect check (`GET /api/v1/fs/check_document`) finds errors or warnings:
@@ -731,7 +763,7 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
 ## Embed cards
 
 - **What & when.** One card shows any file inside something else — agent prose in chat, a turn's
-  "made this turn" gallery, and (once the document renderer mounts them) markdown documents: a thin
+  "made this turn" gallery, and markdown documents (reading and live, `doc/reader.ts` `Hydrator`): a thin
   header (file icon, name, the piece shown, **open in a pane** at that spot, **download** on a
   remote host) over the file's own viewer in a compact mode. The target is standard markdown,
   `![caption](path#fragment)`, with Obsidian's size hint (`![caption|400](plot.png)`).

@@ -244,6 +244,21 @@ export function revealIndex(ranges: readonly (SourceRange | null)[], line: numbe
   return after !== -1 ? after : before;
 }
 
+/**
+ * Where a mode switch puts the top block's text: `offset` below the top
+ * edge in the mode it came from, where the block was `was` tall; `now` is
+ * its height here. A block scrolled partly past the edge keeps the same
+ * share of itself past it — a figure that is one source line keeps that
+ * line in view, and a table half scrolled by is half scrolled by in its
+ * source too; a block wholly in view keeps its offset, and one wholly
+ * past the edge keeps the distance its end was past it.
+ */
+export function placeOffset(offset: number, was: number, now: number): number {
+  if (offset >= 0 || was <= 0 || now <= 0) return offset;
+  if (-offset >= was) return offset - (now - was);
+  return offset * (now / was);
+}
+
 // --- links and fragments -----------------------------------------------------------
 
 /** `decodeURIComponent` that keeps the raw text on a malformed escape. */

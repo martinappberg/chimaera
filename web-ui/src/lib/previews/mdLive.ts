@@ -1,14 +1,16 @@
 /**
- * Obsidian-style LIVE PREVIEW for markdown files: a CodeMirror extension set
- * that renders formatting inline — headings sized, emphasis styled, syntax
- * marks hidden on lines the selection doesn't touch, images/checkboxes/rules
- * as widgets, blockquotes as the shared quote-card treatment — while the
- * document stays plain editable text underneath. The buffer, save, dirty and
- * conflict machinery all stay in CodeView; this module is decoration-only and
- * never mutates the document except for the task-checkbox toggle (a normal
- * dispatched change, so undo/dirty/save all see it).
+ * LIVE mode for markdown files: the reading view you can type in. Every
+ * top-level block the selection does not touch is the reading renderer's
+ * own DOM (`mdBlocks.ts`); the blocks being edited show as source, styled
+ * here — headings sized, emphasis styled, syntax marks hidden on lines the
+ * selection doesn't touch, images/checkboxes/rules as widgets, blockquotes
+ * as the shared quote-card treatment — while the document stays plain
+ * editable text underneath. The buffer, save, dirty and conflict machinery
+ * all stay in CodeView; these modules are decoration-only and never mutate
+ * the document except for a task toggle (a normal dispatched change, so
+ * undo/dirty/save all see it).
  *
- * Reveal rule: marks un-hide per line the selection touches (multi-line
+ * Reveal rule, inside a revealed block: marks un-hide per line the selection touches (multi-line
  * elements like fenced code keep their chrome visible but muted), so the
  * cursor always edits real text and nothing is ever atomic-trapped. A
  * construct the decorator can't render faithfully (a reference link, an image
@@ -42,7 +44,6 @@ import {
 } from "@codemirror/view";
 import { ensureSyntaxTree, syntaxTree } from "@codemirror/language";
 import {
-  Facet,
   StateField,
   type EditorState,
   type Extension,
@@ -54,13 +55,13 @@ import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
 import { languages } from "@codemirror/language-data";
 import type { SyntaxNode, SyntaxNodeRef, Tree } from "@lezer/common";
 import { lastRawTicketUrl, rawTicketUrl, resolveDocPath, safeDecodeUri } from "./files";
+import { placeOffset } from "./mdDoc";
 import { MATH_MARK, isDisplayMath, isMath, mathDelimiters, mathSource } from "./mdMath";
 import { docExtensions } from "./doc/parser";
-import { frontmatterOf, outlineOf, type OutlineEntry } from "./doc/model";
+import { outlineOf, type OutlineEntry } from "./doc/model";
 import {
   completeRow,
   linkDestination,
-  tableModel,
   type CellModel,
   type Inline,
   type RowModel,
@@ -72,27 +73,24 @@ import { makeCopyButton } from "../shared/copyDecor";
 import { markScrollRegion, watchWidth } from "../shared/scrollRegion";
 import { hasUrlScheme, urlMenuEntries, webUrl } from "../shared/urlOpen";
 import { contextMenu } from "../shared/contextMenu.svelte";
-import { requestReveal } from "../shared/reveal";
+import { isFollowable, type LinkContext } from "./docLinks";
 import {
-  followDocHref,
-  isFollowable,
-  revealAnchorInSource,
-  showLinkHint,
-  type DocLinkHost,
-  type LinkContext,
-} from "./docLinks";
+  docPath,
+  followLiveLink,
+  frontmatterEnd,
+  liveField,
+  linkContext,
+  noLinkContext,
+  onScrollbarBand,
+  renderedAt,
+  renderedDocument,
+  sourceRanges,
+  tableAt,
+  type LiveHost,
+} from "./mdBlocks";
+import { isFigureLine } from "./doc/live";
 
-/** The document's path, for widgets that resolve a relative image target
- *  (the plugin gets it as an argument; a table cell's image is rendered from
- *  the blocks field, which has only the state). */
-const docPath = Facet.define<string, string>({ combine: (v) => v[0] ?? "" });
-
-const noLinkContext = (): LinkContext => ({ wsRoot: null, workspaceId: null });
-/** The host's link context, read at click time (a getter, so the extension
- *  set stays stable while the workspace it resolves against can move). */
-const linkContext = Facet.define<() => LinkContext, () => LinkContext>({
-  combine: (v) => v[0] ?? noLinkContext,
-});
+export { setLivePropsCollapsed, setLiveTheme } from "./mdBlocks";
 
 /**
  * The GFM markdown language with the shared document extensions — `$`/`$$`
@@ -226,7 +224,8 @@ function imageWidget(url: string, alt: string, path: string): ImageWidget | null
   if (url.length === 0) return null;
   const remote = hasUrlScheme(url);
   if (remote && !/^(https?:|data:image\/)/i.test(url)) return null;
-  return new ImageWidget(remote ? url : resolveDocPath(path, safeDecodeUri(url)), alt, remote);
+  // A fragment (`#xywh=…`) or query names a spot, not part of the file.
+  return new ImageWidget(remote ? url : resolveDocPath(path, safeDecodeUri(url.split(/[?#]/)[0] ?? "")), alt, remote);
 }
 
 /** An equation as KaTeX MathML — or, at the session's first equation while
@@ -287,21 +286,6 @@ class MathWidget extends WidgetType {
   }
 }
 
-/** Whether a press sits on a scroller's own bar: it targets the scroller
- *  element itself AND lies in the bar's band along the bottom edge. A
- *  classic bar has a measurable band; an overlay bar (the macOS/WKWebView
- *  default) reserves none, so a 12px strip stands in — which is why the
- *  target matters too: a table's cells cover its host, so its last row
- *  never loses its bottom to the strip, while a wide equation's glyphs
- *  don't cover its scrolled-in overflow (a block `math` box is as wide as
- *  the scroller, not its content), so a press between symbols there must
- *  still reach the editor. A fitting box has no bar to press. */
-function onScrollbarBand(el: HTMLElement | null, e: MouseEvent): boolean {
-  if (el === null || e.target !== el || el.scrollWidth <= el.clientWidth) return false;
-  const band = Math.max(el.offsetHeight - el.clientHeight, 12);
-  return e.clientY >= el.getBoundingClientRect().bottom - band;
-}
-
 /** The destination a rendered link carries, as written, if the press
  *  landed on one. */
 function linkTargetIn(target: EventTarget | null): string | null {
@@ -313,18 +297,6 @@ function linkTargetIn(target: EventTarget | null): string | null {
 function linkUrlIn(target: EventTarget | null): string | null {
   const url = linkTargetIn(target);
   return url === null ? null : webUrl(url);
-}
-
-/** The table whose range holds `pos`, modelled from the CURRENT tree. */
-function tableAt(state: EditorState, pos: number): TableModel | null {
-  for (
-    let n: SyntaxNode | null = syntaxTree(state).resolveInner(pos, 1);
-    n !== null;
-    n = n.parent
-  ) {
-    if (n.name === "Table") return tableModel(n, state.doc);
-  }
-  return null;
 }
 
 /** A cell's inline tree as elements: the kinds the decorator styles (an
@@ -595,23 +567,6 @@ const widgetFenceCopy = Decoration.widget({ widget: fenceCopyWidget, side: 1 });
 const widgetQuoteCopy = Decoration.widget({ widget: quoteCopyWidget, side: 1 });
 
 // --- decoration build --------------------------------------------------------
-
-/**
- * End offset of a leading YAML frontmatter block (0 = none). The markdown
- * parser has no frontmatter notion — without this, `---` fences would render
- * as rules and `title:`-then-`---` as a setext heading. The reading view's
- * rule (`doc/model.ts frontmatterOf`, the daemon's): an UNindented `---`
- * first line, a closing line exactly `---` within 200 lines, and at least one
- * `key:` line between — a document that merely opens with a thematic break
- * must not have its head restyled as metadata. Reads only those first 200
- * lines; recomputed only on doc change.
- */
-function frontmatterEnd(state: EditorState): number {
-  const doc = state.doc;
-  if (doc.lines < 2 || doc.line(1).text !== "---") return 0;
-  const head = doc.sliceString(0, doc.line(Math.min(doc.lines, 201)).to);
-  return frontmatterOf(head)?.end ?? 0;
-}
 
 interface Span {
   from: number;
@@ -894,6 +849,7 @@ function buildDecorations(
       const line = doc.lineAt(node.from);
       if (line.to < node.to) return false; // spans lines: replace is illegal from a plugin
       if (active(line.from, line.to)) return false; // show source while editing it
+      if (isFigureLine(line.text)) return false; // its figure is drawn below it (mdBlocks)
       const urlNode = node.node.getChild("URL");
       if (urlNode === null) return false; // reference-style: leave as source
       const marks = node.node.getChildren("LinkMark");
@@ -975,6 +931,11 @@ function buildDecorations(
       hideNestedQuoteMarks(node);
       return false;
     }
+    if (name === "LinkReference") {
+      // Renders nothing in reading: quiet source, never mistaken for prose.
+      eachVisibleLine(node.from, node.to, (l) => addLineClass(l.from, "lp-meta"));
+      return false;
+    }
     if (name === "HTMLBlock" || name === "CommentBlock") {
       eachVisibleLine(node.from, node.to, (l) => addLineClass(l.from, "lp-html"));
       hideNestedQuoteMarks(node);
@@ -982,11 +943,14 @@ function buildDecorations(
     }
   };
 
-  for (const range of view.visibleRanges) {
-    rangeFrom = range.from;
-    rangeTo = range.to;
-    syntaxTree(state).iterate({ from: range.from, to: range.to, enter });
-  }
+  // Only what shows as source: a rendered block is the renderer's DOM, and
+  // decorations inside its replaced range would never be drawn.
+  for (const visible of view.visibleRanges)
+    for (const range of sourceRanges(state, visible.from, visible.to)) {
+      rangeFrom = range.from;
+      rangeTo = range.to;
+      syntaxTree(state).iterate({ from: range.from, to: range.to, enter });
+    }
 
   for (const [pos, cls] of lineClasses)
     deco.push(Decoration.line({ class: [...cls].join(" ") }).range(pos));
@@ -1010,7 +974,12 @@ function livePlugin(path: string): Extension {
         // The tree comparison catches the incremental parser finishing regions
         // after the viewport painted (large documents parse in the background).
         const treeChanged = syntaxTree(u.state) !== syntaxTree(u.startState);
-        if (!u.docChanged && !u.viewportChanged && !treeChanged) {
+        // Which blocks show as source moved (focus, a selection across
+        // blocks, a reveal): the walk covers a different set of lines.
+        const live = u.state.field(liveField, false);
+        const was = u.startState.field(liveField, false);
+        const swapped = live?.revealed !== was?.revealed || live?.segs !== was?.segs;
+        if (!u.docChanged && !u.viewportChanged && !treeChanged && !swapped) {
           if (!u.selectionSet) return;
           // Reveal granularity is whole lines: a cursor move WITHIN the
           // already-selected lines cannot change the output — skip the walk.
@@ -1178,6 +1147,8 @@ function blockDecorations(list: Block[], sel: Span[], state: EditorState): Decor
   const ranges: ReturnType<Decoration["range"]>[] = [];
   for (const b of list) {
     if (touches(sel, b.from, b.to)) continue; // revealed: the plugin shows source
+    // Inside a block the renderer draws whole: nothing of it shows as source.
+    if (renderedAt(state, b.from)) continue;
     let widget: WidgetType;
     if (b.kind === "table") {
       b.model ??= tableAt(state, b.from);
@@ -1210,7 +1181,9 @@ const blocks = StateField.define<BlocksState>({
   },
   update(v, tr) {
     const treeChanged = syntaxTree(tr.state) !== syntaxTree(tr.startState);
-    if (!tr.docChanged && !treeChanged && tr.selection === undefined) return v;
+    const live = tr.state.field(liveField, false);
+    const swapped = live?.revealed !== tr.startState.field(liveField, false)?.revealed;
+    if (!tr.docChanged && !treeChanged && tr.selection === undefined && !swapped) return v;
     let fmEnd = v.fmEnd;
     let list = v.blocks;
     if (tr.docChanged) {
@@ -1221,7 +1194,7 @@ const blocks = StateField.define<BlocksState>({
       list = collectBlocks(tr.state, fmEnd);
     }
     const sel = selectionSpans(tr.state);
-    if (list === v.blocks && spansEqual(sel, v.sel)) return v;
+    if (list === v.blocks && spansEqual(sel, v.sel) && !swapped) return v;
     return { blocks: list, sel, fmEnd, deco: blockDecorations(list, sel, tr.state) };
   },
   provide: (f) => EditorView.decorations.from(f, (v) => v.deco),
@@ -1253,27 +1226,6 @@ function linkTargetAtCoords(view: EditorView, x: number, y: number): string | nu
 function linkUrlAtCoords(view: EditorView, x: number, y: number): string | null {
   const url = linkTargetAtCoords(view, x, y);
   return url === null ? null : webUrl(url);
-}
-
-/** Follow a link out of the live document exactly as the reading view does
- *  (docLinks.ts): a web URL opens as there, a file link opens in the
- *  workbench — Shift beside, since Mod is the follow gesture here — and a
- *  same-document anchor or `#L` fragment reveals its line in this editor. */
-function followLiveLink(view: EditorView, href: string, e: MouseEvent): void {
-  const doc = view.state.facet(docPath);
-  const ctx = view.state.facet(linkContext)();
-  const box = view.dom.closest<HTMLElement>(".md-content") ?? view.dom;
-  const host: DocLinkHost = {
-    docPath: doc,
-    wsRoot: ctx.wsRoot,
-    workspaceId: ctx.workspaceId,
-    toAnchor: (anchor) => revealAnchorInSource(doc, anchor, view.state.doc.toString()),
-    toLines: (r) => requestReveal(doc, r),
-    hint: (text) => showLinkHint(box, e.clientX, e.clientY, text),
-  };
-  // A web URL keeps live mode's routing (pane or browser, never forced
-  // into a split by the Shift a file link reads).
-  void followDocHref(href, webUrl(href) === null && e.shiftKey, host);
 }
 
 /** Mod+press follows a link (plain click has to place the cursor — this is an
@@ -1331,23 +1283,69 @@ const liveTheme: Extension = EditorView.theme({
   "&.cm-md-live .cm-line": { padding: "0" },
   "&.cm-md-live .cm-gutters": { display: "none" },
 
+  // A revealed heading's space above it is the gap widget's (mdBlocks), the
+  // rendered heading's margin: the line itself carries only what the
+  // reading view's heading box does below its text.
   "&.cm-md-live .lp-heading": { lineHeight: "1.25", letterSpacing: "-0.01em" },
   "&.cm-md-live .lp-h1": {
     fontSize: "1.576em",
-    paddingTop: "0.45em",
     paddingBottom: "0.35em",
     borderBottom: "1px solid var(--edge)",
   },
   "&.cm-md-live .lp-h2": {
     fontSize: "1.25em",
-    paddingTop: "0.55em",
     paddingBottom: "0.25em",
     borderBottom: "1px solid var(--edge)",
   },
-  "&.cm-md-live .lp-h3": { fontSize: "1.087em", paddingTop: "0.5em" },
-  "&.cm-md-live .lp-h4, &.cm-md-live .lp-h5, &.cm-md-live .lp-h6": {
-    paddingTop: "0.4em",
+  "&.cm-md-live .lp-h3": { fontSize: "1.087em" },
+
+  // Rendered blocks (mdBlocks): the reading view's DOM and CSS (`.md-doc`,
+  // MarkdownView) in a margin-free box CodeMirror can measure. The box
+  // resets what the editor's content inherits into it (pre-wrap, break-
+  // anywhere, the live table margin), contains its children's margins
+  // (flow-root), and drops the trailing margin chain — the next block's
+  // ghost lends it back, collapsed with that block's own top margin.
+  "&.cm-md-live .lp-block, &.cm-md-live .lp-gap": {
+    display: "flow-root",
+    whiteSpace: "normal",
+    wordBreak: "normal",
+    overflowWrap: "break-word",
+    "--md-table-margin": "initial",
   },
+  "&.cm-md-live .lp-block": { cursor: "text" },
+  "&.cm-md-live .lp-block > :last-child, &.cm-md-live .lp-block > :last-child > :last-child, &.cm-md-live .lp-block > :last-child > :last-child > :last-child, &.cm-md-live .lp-block > :last-child > :last-child > :last-child > :last-child":
+    { marginBottom: "0 !important" },
+  "&.cm-md-live :is(.lp-ghost-tail, .lp-ghost-head), &.cm-md-live :is(.lp-ghost-tail, .lp-ghost-head) *": {
+    display: "block !important",
+    height: "0 !important",
+    minHeight: "0 !important",
+    padding: "0 !important",
+    border: "0 !important",
+    visibility: "hidden",
+  },
+  "&.cm-md-live .lp-ghost-tail, &.cm-md-live .lp-ghost-tail *": { marginTop: "0 !important" },
+  "&.cm-md-live .lp-ghost-head, &.cm-md-live .lp-ghost-head *": { marginBottom: "0 !important" },
+  // Below the properties panel: the reading article's `.after-props` inset.
+  "&.cm-md-live .lp-ghost-tail.lp-props-gap": { height: "1.1rem !important" },
+
+  // The properties panel sits where the reading view's does: the content
+  // box starts at the panel's top margin.
+  "&.cm-md-live .cm-content.lp-has-props": { paddingTop: "1.6rem" },
+  "&.cm-md-live .cm-content .lp-props": {
+    margin: "0",
+    padding: "0",
+    maxWidth: "none",
+    whiteSpace: "normal",
+    cursor: "text",
+  },
+  "&.cm-md-live .cm-content .lp-props .md-props-head": { cursor: "pointer" },
+  "&.cm-md-live .lp-chev": {
+    display: "inline-flex",
+    flex: "none",
+    color: "var(--muted)",
+    transition: "transform 0.14s ease",
+  },
+  "&.cm-md-live .lp-chev.open": { transform: "rotate(90deg)" },
   "&.cm-md-live .lp-mark": {
     color: "var(--muted)",
     opacity: "0.6",
@@ -1411,6 +1409,11 @@ const liveTheme: Extension = EditorView.theme({
       fontSize: "0.848em",
     },
   "&.cm-md-live .lp-frontmatter": { color: "var(--muted)" },
+  "&.cm-md-live .lp-meta": {
+    fontFamily: "var(--mono)",
+    fontSize: "0.82em",
+    color: "var(--muted)",
+  },
 
   // Equations (typography is the global .katex rule in app.css): display
   // math scrolls within the column rather than widening it, as in reading.
@@ -1519,21 +1522,117 @@ export function scrollEditorTo(view: EditorView, pos: number): void {
   view.dispatch({ effects: EditorView.scrollIntoView(pos, { y: "start", yMargin: JUMP_MARGIN }) });
 }
 
+/** The end of the top-level block whose first line starts at `pos`. */
+function blockEnd(view: EditorView, pos: number): number {
+  const n = syntaxTree(view.state).topNode.childBefore(pos + 1);
+  return n !== null && n.to >= pos ? n.to : view.state.doc.lineAt(pos).to;
+}
+
+/** Where the top visible block's text is on screen, for a block from `pos`
+ *  to `end`: a rendered block's first element (below its gap), else its
+ *  source lines. Null while not laid out. */
+function contentBox(view: EditorView, pos: number, end: number): { top: number; height: number } | null {
+  let at: Node | null;
+  try {
+    const d = view.domAtPos(pos, 1);
+    at = d.node instanceof Element ? (d.node.childNodes[d.offset] ?? d.node) : d.node;
+  } catch {
+    return null;
+  }
+  let el: Element | null = at instanceof Element ? at : (at?.parentElement ?? null);
+  while (el !== null && el.parentElement !== view.contentDOM) el = el.parentElement;
+  if (el === null) return null;
+  if (el.classList.contains("lp-gap")) el = el.nextElementSibling;
+  if (el === null) return null;
+  if (el.classList.contains("lp-block") || el.classList.contains("lp-props")) {
+    const first = Array.from(el.children).find((c) => !c.classList.contains("lp-ghost-tail"));
+    const r = (first ?? el).getBoundingClientRect();
+    return { top: r.top, height: r.height };
+  }
+  const top = el.getBoundingClientRect().top;
+  const bottom = view.lineBlockAt(Math.min(end, view.state.doc.length)).bottom + view.documentTop;
+  return { top, height: Math.max(0, bottom - top) };
+}
+
+/** The editor's place: the first line of the block at the top of the
+ *  visible area, how far its text sits below that edge (negative when
+ *  scrolled into it), and its height. Null while hidden. Reading maps it
+ *  through the blocks' source lines, so a mode switch keeps the same block
+ *  on top. */
+export function editorPlace(view: EditorView): { line: number; offset: number; height: number } | null {
+  const rect = view.scrollDOM.getBoundingClientRect();
+  if (rect.height <= 0) return null;
+  const docY = rect.top - view.documentTop;
+  let block = view.lineBlockAtHeight(Math.max(0, docY));
+  if (block.bottom <= docY + 1 && block.to < view.state.doc.length) block = view.lineBlockAt(block.to + 1);
+  // The top-level block that line belongs to — a blank line, to the block
+  // above it, as live's segments have it (source draws a block as its
+  // lines, live as one widget): its first line is the place.
+  let start = block.from;
+  const n = syntaxTree(view.state).topNode.childBefore(block.from + 1);
+  if (n !== null && n.from < start) start = view.state.doc.lineAt(n.from).from;
+  const first = start === block.from ? block : view.lineBlockAt(start);
+  const box = contentBox(view, start, blockEnd(view, start));
+  return {
+    line: view.state.doc.lineAt(start).number,
+    offset: box === null || first.bottom < docY ? first.top - docY : box.top - rect.top,
+    height: box?.height ?? 0,
+  };
+}
+
+/** Put line `line`'s block at `offset` below the visible top (a share of
+ *  it past the edge when it was `height` tall and scrolled into:
+ *  `placeOffset`): scrolled there by the height map first, then corrected
+ *  against the drawn text once it is laid out (a block the map only
+ *  estimated). */
+export function restoreEditorPlace(view: EditorView, line: number, offset: number, height = 0): void {
+  const doc = view.state.doc;
+  const pos = doc.line(Math.min(Math.max(1, line), doc.lines)).from;
+  const end = blockEnd(view, pos);
+  view.dispatch({ effects: EditorView.scrollIntoView(pos, { y: "start", yMargin: offset }) });
+  // Between frames, not inside CodeMirror's measure: a scroll there is
+  // taken as the anchor's own movement and undone. Blocks drawn for the
+  // first time settle over a few frames; stop once the text holds still.
+  let still = 0;
+  const correct = (tries: number): void => {
+    if (!view.dom.isConnected) return;
+    const box = contentBox(view, pos, end);
+    if (box === null) return;
+    const d = box.top - view.scrollDOM.getBoundingClientRect().top - placeOffset(offset, height, box.height);
+    if (Math.abs(d) > 0.5) {
+      view.scrollDOM.scrollTop += d;
+      still = 0;
+    } else if (++still >= 2) {
+      return;
+    }
+    if (tries > 0) requestAnimationFrame(() => correct(tries - 1));
+  };
+  requestAnimationFrame(() => requestAnimationFrame(() => correct(12)));
+}
+
 /**
- * The live-preview behavior set (decorations, link handling, wrapping, the
- * static prose theme) for CodeView's `extra` slot. Keyed on the document path
- * and a stable link-context getter (the workspace root a `/docs/x.md` link
- * resolves against) so the host can memoize it; the prose size arrives via the host-set
- * `--lp-font-size`/`--lp-line-height` CSS variables, so an A−/A+ resize never
- * reconfigures the editor. Pair with the module's `markdownLanguageExt`.
+ * The live-preview behavior set for CodeView's `extra` slot: the reading
+ * renderer's blocks with the one being edited as source (mdBlocks), the
+ * inline decorations of that source, link handling, wrapping, and the
+ * static prose theme. Keyed on the document path, a stable link-context
+ * getter (the workspace root a `/docs/x.md` link resolves against) and a
+ * stable host (the theme) so the host can memoize it; the prose size
+ * arrives via the host-set `--lp-font-size`/`--lp-line-height` CSS
+ * variables, so an A−/A+ resize never reconfigures the editor. Pair with
+ * the module's `markdownLanguageExt`.
  */
-export function markdownLive(path: string, links: () => LinkContext = noLinkContext): Extension {
+export function markdownLive(
+  path: string,
+  links: () => LinkContext = noLinkContext,
+  host: LiveHost = { theme: () => "light" },
+): Extension {
   return [
     EditorView.lineWrapping,
     EditorView.editorAttributes.of({ class: "cm-md-live" }),
     docPath.of(path),
     linkContext.of(links),
     liveTheme,
+    renderedDocument(host),
     livePlugin(path),
     blocks,
     linkClicks,

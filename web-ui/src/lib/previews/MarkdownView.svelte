@@ -39,22 +39,24 @@
    * shows as a properties panel, its links open in the workbench
    * (docLinks.ts), and every block carries its source lines
    * (`data-sourcepos`), so a selection references real line numbers and a
-   * reveal lands on the right block. LIVE is an editable reading view — the
-   * shared CodeMirror editor with the mdLive decoration set rendering
-   * formatting inline (marks hidden off the selection's lines,
-   * images/checkboxes/rules/equations as widgets). SOURCE is the same editor
-   * as plain raw markdown. Live and source share ONE editor instance (an
+   * reveal lands on the right block. LIVE is the reading view you type in —
+   * the shared CodeMirror editor where every block the cursor is not in is
+   * the same renderer's DOM under the same CSS (`.md-doc`, below; mdBlocks),
+   * and only the block being edited shows as source, styled inline (mdLive).
+   * Task boxes toggle the source in both. SOURCE is the same editor as plain
+   * raw markdown. A mode switch keeps the block at the top of the view on
+   * top. Live and source share ONE editor instance (an
    * extension swap, never a remount), and the editor mounts once and survives
    * every toggle, so flipping modes never drops an unsaved buffer or its undo
    * history. Saves, the dirty dot, and conflict handling all come from
    * CodeView (Cmd/Ctrl+S). The OUTLINE panel lists the headings in every
    * mode and follows the scroll.
    * A file opens in the mode it was last shown in, else the
-   * `editor.markdownDefaultMode` setting (reading by default). Editing is
+   * `editor.markdownDefaultMode` setting (live by default). Editing is
    * offered only for files under the 1MB cap; larger markdown opens in
    * reading and stays there.
   */
-  import { untrack, type Component } from "svelte";
+  import { tick, untrack, type Component } from "svelte";
   import type { Extension } from "@codemirror/state";
   import type { EditorView } from "@codemirror/view";
   import {
@@ -68,10 +70,12 @@
     type FileChunk,
   } from "./files";
   import { retain, release, type FileEntry } from "./fileStore.svelte";
+  import { openBuffer, releaseBuffer } from "./buffers.svelte";
   import { clearSelection, setSelection } from "../shared/reference";
   import { activeTheme, getSetting } from "../settings/store.svelte";
   import { getActiveWorkspaceId } from "../net/api";
-  import { DocReader, MathTypesetter, mathSpans } from "./doc/reader";
+  import { DocReader, MathTypesetter, markTasks, mathSpans } from "./doc/reader";
+  import { DocEmbeds } from "./doc/embeds";
   import { createReadingWindow, type ReadingWindow } from "./readingWindow";
   import { copyText } from "../shared/clipboard";
   import { copyLabel, copyPayload, decorateCopyTargets } from "../shared/copyDecor";
@@ -89,6 +93,7 @@
     isMdMode,
     parseFrontmatter,
     parseSourcepos,
+    placeOffset,
     revealIndex,
     spanLines,
     stripFences,
@@ -117,6 +122,11 @@
 
   let { path, fontSize = undefined, wsRoot = null }: Props = $props();
 
+  /** The path as a value: the host can hand this view its props anew with
+   *  nothing changed (it does when the buffer turns dirty), and a per-path
+   *  reset on that would remount the editor under the first keystroke. */
+  const filePath = $derived(path);
+
   /** Read at click time, so the memoized live extension set never has to
    *  change when the workspace does. The window's workspace enables the
    *  daemon's by-name fallback (a wikilink, a moved file). */
@@ -129,6 +139,27 @@
     }
     return { wsRoot, workspaceId };
   };
+  /** The document's embed answers: every image reference it holds, resolved
+   *  in one round trip that both views draw from. Per path; construction
+   *  asks nothing (the first render does). */
+  const docEmbeds = $derived(new DocEmbeds(filePath, linkContext));
+  $effect(() => {
+    const e = docEmbeds;
+    return () => e.dispose();
+  });
+  // The file changed on disk (an agent's rewrite regenerates its figures
+  // too): its references are asked again, and changed files redraw. The
+  // first version seen is the one the first render already asked about.
+  let embedsSeen: { embeds: DocEmbeds; mtime: string | null } | null = null;
+  $effect(() => {
+    const mtime = entry?.mtime ?? null;
+    const embeds = docEmbeds;
+    const seen = embedsSeen;
+    embedsSeen = { embeds, mtime };
+    if (seen !== null && seen.embeds === embeds && seen.mtime !== null && seen.mtime !== mtime) embeds.refresh();
+  });
+  /** What live mode reads at draw time (stable, like the link context). */
+  const liveHost = { theme: (): "light" | "dark" => themeMode, embeds: (): DocEmbeds => docEmbeds };
 
   // Prose base size: the pane override, else the Markdown preference. Drives
   // the reading body AND the live editor, so the two views read identically.
@@ -197,7 +228,7 @@
   const liveSet = $derived(
     liveMod === null
       ? null
-      : [liveMod.markdownLanguageExt, liveMod.markdownLive(path, linkContext)],
+      : [liveMod.markdownLanguageExt, liveMod.markdownLive(filePath, linkContext, liveHost)],
   );
   const sourceSet = $derived(liveMod === null ? null : [liveMod.markdownLanguageExt]);
   let editorMode = $state<"live" | "source">("live");
@@ -258,6 +289,9 @@
   function toggleProps(): void {
     propsCollapsed = !propsCollapsed;
     writeFlag(PROPS_KEY, propsCollapsed);
+    // Live draws the same panel: it folds with this one.
+    const view = editorView();
+    if (view !== null) liveMod?.setLivePropsCollapsed(view, propsCollapsed);
   }
   /** Bumped after every client render: what follows the render (reveals,
    *  anchors, scroll regions, the outline's place) re-checks on it. */
@@ -269,10 +303,10 @@
   // one this file was last shown in, else the setting — read untracked, so a
   // settings change never resets an open document.
   $effect(() => {
-    void path;
+    const p = filePath;
     const initial = untrack(() => {
       const setting = getSetting("editor.markdownDefaultMode");
-      return modeMemory.get(path) ?? (isMdMode(setting) ? setting : "reading");
+      return modeMemory.get(p) ?? (isMdMode(setting) ? setting : "live");
     });
     mode = initial;
     editorMode = initial === "source" ? "source" : "live";
@@ -294,17 +328,17 @@
     currentHeading = -1;
   });
 
-  // Retain + open the chosen mode. `path` is the only tracked dependency —
+  // Retain + open the chosen mode. The path is the only tracked dependency —
   // the store's retain()/ensure* guards are untracked by design (and
   // openDefault's read of `mode` is untracked here), so an in-place payload
   // refresh (a save, an agent write) or a mode click can never re-run this
   // effect and remount the editor over a dirty buffer.
   $effect(() => {
-    void path;
-    const e = retain(path);
+    const p = filePath;
+    const e = retain(p);
     entry = e;
     untrack(() => void openDefault(e));
-    return () => release(path);
+    return () => release(p);
   });
 
   /** Adopt the fetched source into local state. Oversized/binary chunks are
@@ -406,12 +440,13 @@
 
   $effect(() => {
     const el = clientArticle;
-    const docPath = path;
+    const docPath = filePath;
     if (el === null) return;
     const win = createReadingWindow(el);
     const r = new DocReader(el, {
       docPath,
       links: linkContext,
+      embeds: untrack(() => docEmbeds),
       theme: untrack(() => themeMode),
       // A wide equation typeset late is a scroller the last pass missed.
       onLayout: () => {
@@ -429,11 +464,13 @@
     };
   });
 
-  // Diagrams follow the theme.
+  // Diagrams follow the theme, in both views.
   $effect(() => {
     const theme = themeMode;
     void readerTick;
     reader?.setTheme(theme);
+    const view = untrack(editorView);
+    if (view !== null) liveMod?.setLiveTheme(view, theme);
   });
 
   // The render: the current text into the article, incrementally — only
@@ -454,7 +491,7 @@
     untrack(() => renderTick++);
   });
 
-  async function enterEditor(target: "live" | "source"): Promise<void> {
+  async function enterEditor(target: "live" | "source", place: Place | null = null): Promise<void> {
     const e = entry;
     if (e === null || editable === false) return;
     const req = modeReq;
@@ -483,16 +520,143 @@
     mode = target;
     editorMode = target;
     modeMemory.set(path, target);
+    if (place !== null) void placeEditor(place, req);
   }
 
   function setMode(m: Mode): void {
+    if (m === mode) return;
+    const place = capturePlace();
     modeReq++;
     barNote = null;
     if (m === "reading") {
       mode = "reading";
       modeMemory.set(path, "reading");
+      // Live may have folded the panel meanwhile.
+      propsCollapsed = readFlag(PROPS_KEY);
+      if (place !== null) void placeReading(place);
     } else {
-      void enterEditor(m);
+      void enterEditor(m, place);
+    }
+  }
+
+  // --- keeping your place across modes ----------------------------------------
+  // The top visible block's first source line, how far its text sits below
+  // the view's top edge, and its height: every block of every mode knows
+  // its lines, so a switch puts the same block at the same height (one
+  // scrolled partly by keeps that share of itself by: `placeOffset`).
+
+  interface Place {
+    line: number;
+    offset: number;
+    height: number;
+  }
+
+  /** The live/source editor, found from its DOM (null until mounted). */
+  function editorView(): EditorView | null {
+    const layer = editLayerEl;
+    return layer === null || liveMod === null ? null : liveMod.editorIn(layer);
+  }
+
+  /** The top-level blocks of the reading render, in order. */
+  function readingBlocks(): HTMLElement[] {
+    const root = readingEl;
+    const article = clientArticle ?? articleEl;
+    if (root === null || article === null) return [];
+    const out: HTMLElement[] = [];
+    const props = root.querySelector<HTMLElement>(":scope > .md-props");
+    if (props !== null) out.push(props);
+    for (const el of article.children) if (el instanceof HTMLElement) out.push(el);
+    return out;
+  }
+
+  function capturePlace(): Place | null {
+    if (mode !== "reading") {
+      const view = editorView();
+      return view === null || liveMod === null ? null : liveMod.editorPlace(view);
+    }
+    const root = readingEl;
+    if (root === null) return null;
+    const top = root.getBoundingClientRect().top;
+    for (const el of readingBlocks()) {
+      const r = el.getBoundingClientRect();
+      if (r.bottom <= top + 1) continue;
+      const range = parseSourcepos(el.getAttribute("data-sourcepos"));
+      if (range !== null) return { line: range.start, offset: r.top - top, height: r.height };
+    }
+    return null;
+  }
+
+  /** Once reading has rendered and laid out, the block holding the line
+   *  goes back to its height. */
+  async function placeReading(place: Place): Promise<void> {
+    const req = modeReq;
+    await tick();
+    afterLayout(() => {
+      const root = readingEl;
+      if (root === null || req !== modeReq || mode !== "reading") return;
+      const blocks = readingBlocks();
+      const i = revealIndex(
+        blocks.map((el) => parseSourcepos(el.getAttribute("data-sourcepos"))),
+        place.line,
+      );
+      if (i < 0) return;
+      const r = blocks[i].getBoundingClientRect();
+      root.scrollTop += r.top - root.getBoundingClientRect().top - placeOffset(place.offset, place.height, r.height);
+    });
+  }
+
+  /** Once the editor shows (a first entry mounts it), the same. */
+  async function placeEditor(place: Place, req: number): Promise<void> {
+    await tick();
+    for (let tries = 0; tries < 60; tries++) {
+      if (req !== modeReq) return;
+      const view = editorView();
+      if (view !== null && view.scrollDOM.clientHeight > 0) {
+        liveMod?.restoreEditorPlace(view, place.line, place.offset, place.height);
+        return;
+      }
+      await new Promise((r) => requestAnimationFrame(r));
+    }
+  }
+
+  // --- task boxes in reading -----------------------------------------------------
+  /** `- [ ]` at the head of a list item's first line (inside quotes too):
+   *  the text before the box, and its mark. */
+  const TASK_LINE = /^([ \t]*(?:>[ \t]?)*[ \t]*(?:[-+*]|\d{1,9}[.)])[ \t]+)\[([ xX])\]/;
+
+  /**
+   * A box clicked in reading toggles the source, through the file's one
+   * buffer (the editor's, when it holds the file) — an edit like any other:
+   * dirty, undoable, autosaved. The editor mounts (hidden) so the render
+   * follows the buffer from here on.
+   */
+  async function toggleTaskInReading(box: HTMLElement): Promise<void> {
+    const text = docText;
+    const e = entry;
+    const first = e?.chunk ?? chunk;
+    if (clientRender !== true || editable !== true || text === null || first === null) return;
+    const range = parseSourcepos(box.closest("[data-sourcepos]")?.getAttribute("data-sourcepos"));
+    if (range === null) return;
+    const lines = text.split("\n");
+    const lineText = lines[range.start - 1];
+    const m = lineText === undefined ? null : TASK_LINE.exec(lineText);
+    if (m === null) return;
+    const buf = openBuffer(path, first);
+    try {
+      for (let tries = 0; buf.loading && tries < 100; tries++) await new Promise((r) => setTimeout(r, 30));
+      const doc = buf.current.doc;
+      // The buffer must hold the text reading drew (it can differ only when
+      // unsaved edits live in a buffer this view never showed).
+      if (range.start > doc.lines || doc.line(range.start).text !== lineText) {
+        entered = true;
+        return;
+      }
+      const from = doc.line(range.start).from + m[1].length;
+      if (!buf.edit({ changes: { from, to: from + 3, insert: m[2] === " " ? "[x]" : "[ ]" } })) return;
+      if (editorText === null) editorText = buf.current.doc.toString();
+      entered = true;
+    } finally {
+      releaseBuffer(buf);
     }
   }
 
@@ -542,40 +706,6 @@
       });
     }
     return out;
-  }
-
-  /** Task items (`- [x]`) arrive as `span.md-task[data-task]` at the head of
-   *  their item. The item drops its bullet (the box stands in for it, as in
-   *  live), and a done item's own text — up to its first nested block, so a
-   *  sub-list keeps its ink — is wrapped to read muted and struck through,
-   *  matching live's `lp-task-done`. A CSS `:has()` would do the first half,
-   *  but its invalidation cost on a long document in WebKit is exactly the
-   *  restyle churn the pane parking fights; a class set once is free.
-   *  Idempotent: a fresh server render brings fresh spans. */
-  const BLOCK_TAGS = new Set(["UL", "OL", "P", "DIV", "PRE", "BLOCKQUOTE", "TABLE"]);
-  function markTasks(root: HTMLElement): void {
-    for (const box of root.querySelectorAll<HTMLElement>("span.md-task[data-task]")) {
-      const item = box.closest("li");
-      if (item !== null && !item.classList.contains("md-task-item")) {
-        item.classList.add("md-task-item");
-      }
-      if (box.dataset.task !== "done") continue;
-      if (box.nextElementSibling?.classList.contains("md-task-text")) continue;
-      const wrap = document.createElement("span");
-      wrap.className = "md-task-text";
-      let n = box.nextSibling;
-      while (n !== null && !(n instanceof HTMLElement && BLOCK_TAGS.has(n.tagName))) {
-        const next = n.nextSibling;
-        wrap.append(n);
-        n = next;
-      }
-      // The space after the box stays outside, or the strike starts on it.
-      const head = wrap.firstChild;
-      const lead = head instanceof Text ? /^\s+/.exec(head.data) : null;
-      if (head instanceof Text && lead !== null) head.data = head.data.slice(lead[0].length);
-      box.after(wrap);
-      if (lead !== null) box.after(document.createTextNode(lead[0]));
-    }
   }
 
   // --- place: anchors, line reveals ------------------------------------------
@@ -785,7 +915,17 @@
   });
 
   function onLinkClick(e: MouseEvent): void {
-    const copyBtn = (e.target as Element | null)?.closest?.("button.md-copy");
+    // Live mode's rendered blocks handle their own presses (mdBlocks), an
+    // embed card its own.
+    if (!(e.target instanceof Element) || readingEl?.contains(e.target) !== true) return;
+    if (e.target.closest(".embed-card") !== null) return;
+    const box = e.target.closest<HTMLElement>("span.md-task");
+    if (box !== null && box.closest(".md-props") === null) {
+      e.preventDefault();
+      void toggleTaskInReading(box);
+      return;
+    }
+    const copyBtn = e.target.closest("button.md-copy");
     if (copyBtn instanceof HTMLElement) {
       const payload = copyPayload(copyBtn);
       if (payload.length > 0) {
@@ -802,7 +942,7 @@
    *  document-relative path, the app origin's 404. A file link opens beside
    *  instead; a web link keeps the browser's own new-tab behavior. */
   function onLinkAuxClick(e: MouseEvent): void {
-    if (e.button !== 1) return;
+    if (e.button !== 1 || (e.target as Element | null)?.closest?.(".embed-card") != null) return;
     const href = (e.target as Element | null)?.closest?.("a[href]")?.getAttribute("href") ?? "";
     if (isWebUrl(href)) return;
     followLink(e, true);
@@ -843,6 +983,7 @@
   }
 
   function onLinkContextMenu(e: MouseEvent): void {
+    if ((e.target as Element | null)?.closest?.(".embed-card") != null) return;
     const anchor = (e.target as Element | null)?.closest?.("a[href]");
     const href = anchor?.getAttribute("href") ?? "";
     if (anchor === null || anchor === undefined || !isWebUrl(href)) return;
@@ -1266,7 +1407,7 @@
           {#if frontmatter !== null}{@render properties(frontmatter)}{/if}
           <!-- The client render: the reader owns every child. -->
           <article
-            class="md-body"
+            class="md-body md-doc"
             class:after-props={frontmatter !== null}
             style:font-size="{bodyFont}px"
             bind:this={clientArticle}
@@ -1280,7 +1421,7 @@
           {#if frontmatter !== null}{@render properties(frontmatter)}{/if}
           <!-- The daemon's render (the fallback), sanitized server-side. -->
           <article
-            class="md-body"
+            class="md-body md-doc"
             class:after-props={frontmatter !== null}
             style:font-size="{bodyFont}px"
             bind:this={articleEl}
@@ -1551,14 +1692,14 @@
      column, sized in em off the same per-pane text size as the body. */
   /* Same box as .md-body (border-box via app.css), so the card lines up
      with the column under it. */
-  .md-props {
+  .md-view :global(.md-props) {
     max-width: 70ch;
     margin: 1.6rem auto 0;
     padding: 0 2rem;
     line-height: 1.45;
   }
 
-  .md-props-head {
+  .md-view :global(.md-props-head) {
     appearance: none;
     display: inline-flex;
     align-items: center;
@@ -1574,16 +1715,16 @@
     border-radius: 4px;
   }
 
-  .md-props-head:hover {
+  .md-view :global(.md-props-head:hover) {
     color: var(--fg);
   }
 
-  .md-props-count {
+  .md-view :global(.md-props-count) {
     font-variant-numeric: tabular-nums;
     opacity: 0.7;
   }
 
-  .md-props-list {
+  .md-view :global(.md-props-list) {
     display: grid;
     grid-template-columns: minmax(6em, max-content) 1fr;
     gap: 0.3em 1.2em;
@@ -1595,12 +1736,12 @@
     font-size: 0.86em;
   }
 
-  .md-props-list dt {
+  .md-view :global(.md-props-list dt) {
     color: var(--muted);
     overflow-wrap: anywhere;
   }
 
-  .md-props-list dd {
+  .md-view :global(.md-props-list dd) {
     margin: 0;
     min-width: 0;
     display: flex;
@@ -1610,16 +1751,16 @@
     overflow-wrap: anywhere;
   }
 
-  .md-prop-text {
+  .md-view :global(.md-prop-text) {
     white-space: pre-wrap;
   }
 
   /* An empty box has no baseline of its own to align by. */
-  .md-props-list dd > :global(.md-task) {
+  .md-view :global(.md-props-list dd > .md-task) {
     align-self: center;
   }
 
-  .md-prop-chip {
+  .md-view :global(.md-prop-chip) {
     padding: 0 0.5em;
     border-radius: 999px;
     background: color-mix(in srgb, var(--accent) 12%, transparent);
@@ -1628,13 +1769,13 @@
     line-height: 1.5;
   }
 
-  .md-prop-empty {
+  .md-view :global(.md-prop-empty) {
     color: var(--muted);
     opacity: 0.6;
   }
 
-  .md-prop-raw,
-  .md-props-raw {
+  .md-view :global(.md-prop-raw),
+  .md-view :global(.md-props-raw) {
     margin: 0;
     font-family: var(--mono);
     font-size: 0.9em;
@@ -1642,7 +1783,7 @@
     color: var(--muted);
   }
 
-  .md-props-raw {
+  .md-view :global(.md-props-raw) {
     margin-top: 0.45em;
     padding: 0.65em 0.9em;
     border: 1px solid var(--edge);
@@ -1686,17 +1827,17 @@
 
   /* The box stands in for a bullet, hanging in the marker's place; an
      ordered task keeps its number (live does the same). */
-  .md-body :global(ul > li.md-task-item) {
+  .md-view :global(.md-doc ul > li.md-task-item) {
     list-style: none;
   }
 
-  .md-body :global(ul > li.md-task-item > .md-task:first-child),
-  .md-body :global(ul > li.md-task-item > p:first-child > .md-task:first-child) {
+  .md-view :global(.md-doc ul > li.md-task-item > .md-task:first-child),
+  .md-view :global(.md-doc ul > li.md-task-item > p:first-child > .md-task:first-child) {
     margin-left: -1.35em;
     margin-right: 0.43em;
   }
 
-  .md-body :global(.md-task-text) {
+  .md-view :global(.md-doc .md-task-text) {
     color: var(--muted);
     text-decoration: line-through;
     text-decoration-color: color-mix(in srgb, var(--muted) 70%, transparent);
@@ -1706,7 +1847,7 @@
      a title row led by the type's glyph. Colors are semantic theme tokens,
      so every curated theme restyles them; the glyph is a mask painted in
      the title's own color. */
-  .md-body :global(.markdown-alert) {
+  .md-view :global(.md-doc .markdown-alert) {
     --md-alert: var(--syn-func);
     margin: 0.9em 0;
     padding: 0.55em 1em 0.6em;
@@ -1715,32 +1856,32 @@
     background: color-mix(in srgb, var(--md-alert) 7%, transparent);
   }
 
-  .md-body :global(.markdown-alert-note) {
+  .md-view :global(.md-doc .markdown-alert-note) {
     --md-alert: var(--syn-func);
     --md-alert-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='12' cy='12' r='9'/%3E%3Cpath d='M12 8h.01M11 12h1v4h1'/%3E%3C/svg%3E");
   }
 
-  .md-body :global(.markdown-alert-tip) {
+  .md-view :global(.md-doc .markdown-alert-tip) {
     --md-alert: var(--syn-string);
     --md-alert-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3 12h1m8-9v1m8 8h1M5.6 5.6l.7.7m12.1-.7-.7.7M9 16a5 5 0 1 1 6 0a3.5 3.5 0 0 0-1 3a2 2 0 0 1-4 0a3.5 3.5 0 0 0-1-3M9.7 17h4.6'/%3E%3C/svg%3E");
   }
 
-  .md-body :global(.markdown-alert-important) {
+  .md-view :global(.md-doc .markdown-alert-important) {
     --md-alert: var(--rate);
     --md-alert-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M18 4a3 3 0 0 1 3 3v8a3 3 0 0 1-3 3h-5l-5 3v-3H6a3 3 0 0 1-3-3V7a3 3 0 0 1 3-3zM12 8v3M12 14v.01'/%3E%3C/svg%3E");
   }
 
-  .md-body :global(.markdown-alert-warning) {
+  .md-view :global(.md-doc .markdown-alert-warning) {
     --md-alert: var(--warn);
     --md-alert-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12 9v4M10.4 3.6L2.3 17.1a1.9 1.9 0 0 0 1.6 2.9h16.2a1.9 1.9 0 0 0 1.6-2.9L13.6 3.6a1.9 1.9 0 0 0-3.2 0zM12 16h.01'/%3E%3C/svg%3E");
   }
 
-  .md-body :global(.markdown-alert-caution) {
+  .md-view :global(.md-doc .markdown-alert-caution) {
     --md-alert: var(--err);
     --md-alert-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12.8 2.6l8.6 8.6a1.1 1.1 0 0 1 0 1.6l-8.6 8.6a1.1 1.1 0 0 1-1.6 0l-8.6-8.6a1.1 1.1 0 0 1 0-1.6l8.6-8.6a1.1 1.1 0 0 1 1.6 0zM12 8v4M12 16h.01'/%3E%3C/svg%3E");
   }
 
-  .md-body :global(.markdown-alert-title) {
+  .md-view :global(.md-doc .markdown-alert-title) {
     display: flex;
     align-items: center;
     gap: 0.45em;
@@ -1750,7 +1891,7 @@
     color: var(--md-alert);
   }
 
-  .md-body :global(.markdown-alert-title::before) {
+  .md-view :global(.md-doc .markdown-alert-title::before) {
     content: "";
     flex: none;
     width: 1.05em;
@@ -1760,16 +1901,16 @@
     mask: var(--md-alert-icon) center / contain no-repeat;
   }
 
-  .md-body :global(.markdown-alert > :last-child) {
+  .md-view :global(.md-doc .markdown-alert > :last-child) {
     margin-bottom: 0;
   }
 
-  .md-body :global(.markdown-alert > .markdown-alert-title + *) {
+  .md-view :global(.md-doc .markdown-alert > .markdown-alert-title + *) {
     margin-top: 0;
   }
 
   /* Footnotes: comrak's section, quieter than the prose it annotates. */
-  .md-body :global(section.footnotes) {
+  .md-view :global(.md-doc section.footnotes) {
     margin-top: 2.2em;
     padding-top: 0.6em;
     border-top: 1px solid var(--edge);
@@ -1777,13 +1918,13 @@
     color: color-mix(in srgb, var(--fg) 75%, var(--muted));
   }
 
-  .md-body :global(.footnote-ref a),
-  .md-body :global(a.footnote-backref) {
+  .md-view :global(.md-doc .footnote-ref a),
+  .md-view :global(.md-doc a.footnote-backref) {
     font-variant-numeric: tabular-nums;
   }
 
   /* Where a jump landed: a brief accent wash that fades out. */
-  .md-scroll :global(.md-flash) {
+  .md-view :global(.md-flash) {
     animation: md-flash 1.5s ease-out;
     border-radius: 4px;
   }
@@ -1799,7 +1940,7 @@
   }
 
   @media (prefers-reduced-motion: reduce) {
-    .md-scroll :global(.md-flash) {
+    .md-view :global(.md-flash) {
       animation: none;
       outline: 2px solid color-mix(in srgb, var(--accent) 45%, transparent);
       outline-offset: 2px;
@@ -1833,55 +1974,55 @@
     }
   }
 
-  .md-body :global(h1),
-  .md-body :global(h2),
-  .md-body :global(h3),
-  .md-body :global(h4),
-  .md-body :global(h5),
-  .md-body :global(h6) {
+  .md-view :global(.md-doc h1),
+  .md-view :global(.md-doc h2),
+  .md-view :global(.md-doc h3),
+  .md-view :global(.md-doc h4),
+  .md-view :global(.md-doc h5),
+  .md-view :global(.md-doc h6) {
     line-height: 1.25;
     margin: 1.6em 0 0.55em;
     font-weight: 600;
     letter-spacing: -0.01em;
   }
 
-  .md-body :global(h1) {
+  .md-view :global(.md-doc h1) {
     font-size: 1.576em;
     margin-top: 0.2em;
     padding-bottom: 0.35em;
     border-bottom: 1px solid var(--edge);
   }
 
-  .md-body :global(h2) {
+  .md-view :global(.md-doc h2) {
     font-size: 1.25em;
     padding-bottom: 0.25em;
     border-bottom: 1px solid var(--edge);
   }
 
-  .md-body :global(h3) {
+  .md-view :global(.md-doc h3) {
     font-size: 1.087em;
   }
 
-  .md-body :global(h4),
-  .md-body :global(h5),
-  .md-body :global(h6) {
+  .md-view :global(.md-doc h4),
+  .md-view :global(.md-doc h5),
+  .md-view :global(.md-doc h6) {
     font-size: 1em;
   }
 
-  .md-body :global(p) {
+  .md-view :global(.md-doc p) {
     margin: 0.7em 0;
   }
 
-  .md-body :global(a) {
+  .md-view :global(.md-doc a) {
     color: var(--accent);
     text-decoration: none;
   }
 
-  .md-body :global(a:hover) {
+  .md-view :global(.md-doc a:hover) {
     text-decoration: underline;
   }
 
-  .md-body :global(code) {
+  .md-view :global(.md-doc code) {
     font-family: var(--mono);
     font-size: 0.82em;
     background: color-mix(in srgb, var(--fg) 6%, transparent);
@@ -1891,7 +2032,7 @@
 
   /* The CODE child is the horizontal scroller (not the pre), so the pinned
      copy button never rides away with scrolled content. */
-  .md-body :global(pre) {
+  .md-view :global(.md-doc pre) {
     position: relative; /* the copy button's anchor */
     background: color-mix(in srgb, var(--fg) 4.5%, transparent);
     border: 1px solid var(--edge);
@@ -1901,7 +2042,7 @@
     line-height: 1.5;
   }
 
-  .md-body :global(pre code) {
+  .md-view :global(.md-doc pre code) {
     display: block;
     overflow-x: auto;
     scrollbar-width: thin;
@@ -1912,7 +2053,7 @@
 
   /* Quoted material as a quiet card — the same treatment as the chat
      transcript: an accent→neutral wash a half-step off the page. */
-  .md-body :global(blockquote) {
+  .md-view :global(.md-doc blockquote) {
     position: relative; /* the copy button's anchor */
     margin: 0.8em 0;
     padding: 0.55em 1em;
@@ -1926,17 +2067,17 @@
     color: color-mix(in srgb, var(--fg) 45%, var(--muted));
   }
 
-  .md-body :global(blockquote > :first-child) {
+  .md-view :global(.md-doc blockquote > :first-child) {
     margin-top: 0;
   }
 
-  .md-body :global(blockquote > :nth-last-child(1 of :not(.md-copy))) {
+  .md-view :global(.md-doc blockquote > :nth-last-child(1 of :not(.md-copy))) {
     margin-bottom: 0;
   }
 
   /* Hover-reveal copy chrome (shared decorator; the chat transcript's
      language). Token-only scrim so both themes hold. */
-  .md-body :global(.md-copy) {
+  .md-view :global(.md-doc .md-copy) {
     position: absolute;
     top: 6px;
     right: 6px;
@@ -1955,35 +2096,35 @@
       color 0.12s ease;
   }
 
-  .md-body :global(pre:hover .md-copy),
-  .md-body :global(blockquote:hover > .md-copy),
-  .md-body :global(.md-copy:focus-visible),
-  .md-body :global(.md-copy.copied) {
+  .md-view :global(.md-doc pre:hover .md-copy),
+  .md-view :global(.md-doc blockquote:hover > .md-copy),
+  .md-view :global(.md-doc .md-copy:focus-visible),
+  .md-view :global(.md-doc .md-copy.copied) {
     opacity: 1;
   }
 
-  .md-body :global(.md-copy:hover),
-  .md-body :global(.md-copy.copied) {
+  .md-view :global(.md-doc .md-copy:hover),
+  .md-view :global(.md-doc .md-copy.copied) {
     color: var(--accent);
   }
 
-  .md-body :global(.md-copy .ic-check),
-  .md-body :global(.md-copy.copied .ic-copy) {
+  .md-view :global(.md-doc .md-copy .ic-check),
+  .md-view :global(.md-doc .md-copy.copied .ic-copy) {
     display: none;
   }
 
-  .md-body :global(.md-copy.copied .ic-check) {
+  .md-view :global(.md-doc .md-copy.copied .ic-check) {
     display: block;
   }
 
   /* Equations (typeset client-side into comrak's math spans; typography is
      the global .katex rule in app.css): display math scrolls within the
      reading column instead of widening the workbench — the chat's treatment. */
-  .md-body :global(.md-math) {
+  .md-view :global(.md-doc .md-math) {
     color: inherit;
   }
 
-  .md-body :global(.md-math-display) {
+  .md-view :global(.md-doc .md-math-display) {
     display: block;
     max-width: 100%;
     overflow-x: auto;
@@ -1993,33 +2134,72 @@
     padding: 0.1em 0;
   }
 
-  .md-body :global(ul),
-  .md-body :global(ol) {
+  .md-view :global(.md-doc ul),
+  .md-view :global(.md-doc ol) {
     padding-left: 1.6em;
     margin: 0.6em 0;
   }
 
-  .md-body :global(li) {
+  .md-view :global(.md-doc li) {
     margin: 0.2em 0;
   }
 
-  .md-body :global(li)::marker {
+  .md-view :global(.md-doc li)::marker {
     color: color-mix(in srgb, var(--accent) 70%, var(--muted));
   }
 
-  .md-body :global(hr) {
+  .md-view :global(.md-doc hr) {
     border: none;
     border-top: 1px solid var(--edge);
     margin: 1.8em 0;
   }
 
-  .md-body :global(img) {
+  /* The width and height a resolved picture carries reserve its box before
+     a byte loads; the height follows when the column caps the width. An
+     embed card sizes its own. */
+  .md-view :global(.md-doc img:not(.embed-card *)) {
     max-width: 100%;
+    height: auto;
+  }
+
+  /* An image-syntax block: an embed card (shared/embed) inside its
+     paragraph, which keeps the paragraph's spacing (live's ghosts read it
+     so). */
+  .md-view :global(.md-doc .md-embed) {
+    display: block;
+    max-width: 100%;
+  }
+
+  /* A picture reads as a picture: its card drops the frame and header and
+     keeps the image body — the box reserved from the header dimensions, a
+     region crop, the size hint, a click that opens it. Before the
+     document's answers arrive (one round trip) it takes no room rather
+     than a card's loading state; a missing one keeps the card, which says
+     so. */
+  .md-view :global(.md-doc .md-embed-image > .embed-card[data-embed-kind="image"]) {
+    min-width: 0;
+    margin: 0;
+    border: none;
+    border-radius: 0;
+    background: none;
+  }
+
+  .md-view :global(.md-doc .md-embed-image > .embed-card[data-embed-kind="image"] > .head) {
+    display: none;
+  }
+
+  .md-view :global(.md-doc .md-embed-image > .embed-card[data-embed-kind="image"] .image-body) {
+    padding: 0;
+    background: none;
+  }
+
+  .md-view :global(.md-doc .md-embed-image > .embed-card[data-embed-kind="pending"]:not(.missing)) {
+    display: none;
   }
 
   /* A wikilink reads as a link with a quieter, dotted rule: it resolves by
      name (docLinks), so it may land somewhere a path link wouldn't. */
-  .md-body :global(a.wikilink) {
+  .md-view :global(.md-doc a.wikilink) {
     text-decoration: underline dotted color-mix(in srgb, var(--accent) 55%, transparent);
     text-underline-offset: 0.18em;
   }
@@ -2027,16 +2207,16 @@
   /* Mermaid: the laid-out diagram, centered and never wider than the
      column (a wide one scrolls); the source shows while it lays out and,
      with the parser's message, when it can't. */
-  .md-body :global(.md-mermaid) {
+  .md-view :global(.md-doc .md-mermaid) {
     margin: 0.9em 0;
   }
 
-  .md-body :global(.md-mermaid-svg) {
+  .md-view :global(.md-doc .md-mermaid-svg) {
     overflow-x: auto;
     scrollbar-width: thin;
   }
 
-  .md-body :global(.md-mermaid-svg svg) {
+  .md-view :global(.md-doc .md-mermaid-svg svg) {
     display: block;
     max-width: 100%;
     height: auto;
@@ -2045,7 +2225,14 @@
 
   /* The parser's message keeps its lines: its caret points into the one
      above it. */
-  .md-body :global(.md-mermaid-note) {
+  /* The source shown while a diagram lays out (or fails) keeps the box's
+     own margins: a bare `pre`'s would collapse through it, and the box's
+     spacing would change when the diagram arrives. */
+  .md-view :global(.md-doc .md-mermaid > pre) {
+    margin: 0;
+  }
+
+  .md-view :global(.md-doc .md-mermaid-note) {
     margin: 0 0 0.4em;
     font-family: var(--mono);
     font-size: 0.76em;
@@ -2055,7 +2242,7 @@
     color: var(--err);
   }
 
-  .md-body :global(input[type="checkbox"]) {
+  .md-view :global(.md-doc input[type="checkbox"]) {
     accent-color: var(--accent);
     margin-right: 0.4em;
   }

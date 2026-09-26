@@ -78,8 +78,53 @@ export function docText(text: string): DocText {
   return { sliceString: (from, to) => text.slice(from, to) };
 }
 
+/** 1-based lines of a document: what block rendering reads beyond the
+ *  text itself (`data-sourcepos`, a fence's indentation, blank lines). */
+export interface Lines {
+  /** The line holding offset `pos`. */
+  lineOf(pos: number): number;
+  lineStart(line: number): number;
+  lineText(line: number): string;
+  /** comrak's `data-sourcepos`: `startLine:startCol-endLine:endCol`,
+   *  1-based, the end column inclusive. */
+  sourcepos(from: number, to: number): string;
+}
+
+function sourceposOf(lines: Lines, from: number, to: number): string {
+  const l1 = lines.lineOf(from);
+  const end = Math.max(from, to - 1);
+  const l2 = lines.lineOf(end);
+  return `${l1}:${from - lines.lineStart(l1) + 1}-${l2}:${end - lines.lineStart(l2) + 1}`;
+}
+
+/** The slice of CodeMirror's `Text` a `TextLines` reads. */
+export interface LinedText {
+  readonly lines: number;
+  readonly length: number;
+  lineAt(pos: number): { number: number; from: number; to: number; text: string };
+  line(n: number): { from: number; text: string };
+}
+
+/** `Lines` over the editor's own document: no pass over the text (the
+ *  live view renders single blocks of a document that changes per key). */
+export class TextLines implements Lines {
+  constructor(private readonly doc: LinedText) {}
+  lineOf(pos: number): number {
+    return this.doc.lineAt(Math.max(0, Math.min(pos, this.doc.length))).number;
+  }
+  lineStart(line: number): number {
+    return line > this.doc.lines ? this.doc.length : this.doc.line(Math.max(1, line)).from;
+  }
+  lineText(line: number): string {
+    return line < 1 || line > this.doc.lines ? "" : this.doc.line(line).text;
+  }
+  sourcepos(from: number, to: number): string {
+    return sourceposOf(this, from, to);
+  }
+}
+
 /** 1-based line numbers for offsets of one text. */
-export class LineIndex {
+export class LineIndex implements Lines {
   readonly starts: number[] = [0];
   constructor(readonly text: string) {
     for (let i = text.indexOf("\n"); i >= 0; i = text.indexOf("\n", i + 1)) this.starts.push(i + 1);
@@ -104,13 +149,8 @@ export class LineIndex {
     const next = this.starts[line];
     return this.text.slice(from, next === undefined ? this.text.length : next - 1);
   }
-  /** comrak's `data-sourcepos`: `startLine:startCol-endLine:endCol`, 1-based,
-   *  the end column inclusive. */
   sourcepos(from: number, to: number): string {
-    const l1 = this.lineOf(from);
-    const end = Math.max(from, to - 1);
-    const l2 = this.lineOf(end);
-    return `${l1}:${from - this.lineStart(l1) + 1}-${l2}:${end - this.lineStart(l2) + 1}`;
+    return sourceposOf(this, from, to);
   }
 }
 
@@ -176,9 +216,8 @@ const HEADING = /^(ATXHeading[1-6]|SetextHeading[12])$/;
 const CONTAINERS = new Set(["Document", "Blockquote", "BulletList", "OrderedList", "ListItem"]);
 
 export interface DocContext {
-  text: string;
   doc: DocText;
-  lines: LineIndex;
+  lines: Lines;
   tree: Tree;
   refs: Map<string, LinkDef>;
   /** Normalized label → the definition node (the first one wins). */
@@ -234,7 +273,6 @@ export function documentContext(
   text: string,
   prev: { text: string; tree: Tree } | null = null,
 ): DocContext {
-  const doc = docText(text);
   let fragments: readonly TreeFragment[] | undefined;
   if (prev !== null) {
     const a = prev.text;
@@ -251,12 +289,23 @@ export function documentContext(
       { fromA: start, toA: endA, fromB: start, toB: endB },
     ]);
   }
-  const tree = docParser.parse(text, fragments);
+  return contextOf(docText(text), docParser.parse(text, fragments), new LineIndex(text));
+}
+
+/**
+ * The document-wide facts of an already parsed document: its reference
+ * definitions, footnote numbering and heading ids. The live editor hands
+ * its own tree and text (`lines` over its `Text`), whose frontmatter it
+ * parsed as markdown: nothing before `start` counts. A pass over block
+ * containers only — never inline content — so it stays cheap per edit.
+ */
+export function contextOf(doc: DocText, tree: Tree, lines: Lines, start = 0): DocContext {
   const top = tree.topNode;
   const refs = new Map<string, LinkDef>();
   const footnoteDefs = new Map<string, SyntaxNode>();
   const headings: SyntaxNode[] = [];
   eachBlock(top, false, (n) => {
+    if (n.from < start) return;
     if (n.name === "LinkReference") {
       const def = linkReference(n, doc);
       if (def !== null && !refs.has(def[0])) refs.set(def[0], def[1]);
@@ -288,7 +337,7 @@ export function documentContext(
         visitRefs(r);
         continue;
       }
-      const label = normalizeLabel(text.slice(r.from + 2, r.to - 1));
+      const label = normalizeLabel(doc.sliceString(r.from + 2, r.to - 1));
       const node = footnoteDefs.get(label);
       if (node === undefined) continue;
       let f = byLabel.get(label);
@@ -303,7 +352,8 @@ export function documentContext(
   };
   const scanRefs = (scope: SyntaxNode): void => {
     for (let c = scope.firstChild; c !== null; c = c.nextSibling) {
-      if (c.name === "FootnoteDefinition" || !text.slice(c.from, c.to).includes("[^")) continue;
+      if (c.from < start || c.name === "FootnoteDefinition") continue;
+      if (!doc.sliceString(c.from, c.to).includes("[^")) continue;
       visitRefs(c);
     }
   };
@@ -323,18 +373,49 @@ export function documentContext(
       if (HEADING.test(n.name)) headingIds.set(n.from, outlineEntry(n, doc, inline, slugs).id);
     });
 
-  return {
-    text,
-    doc,
-    lines: new LineIndex(text),
-    tree,
-    refs,
-    footnoteDefs,
-    headingIds,
-    outline,
-    footnoteRefs,
-    footnotes,
-    inline,
+  return { doc, lines, tree, refs, footnoteDefs, headingIds, outline, footnoteRefs, footnotes, inline };
+}
+
+/** Every reference definition, as a block that could hold a reference
+ *  link reads them ("" when there are none). */
+export function refsKey(cx: DocContext): string {
+  return cx.refs.size === 0
+    ? ""
+    : [...cx.refs.entries()].map(([k, d]) => `${k}\u0000${d.url}\u0000${d.title ?? ""}`).join("\u0001");
+}
+
+/**
+ * What a stretch of the document's rendering reads beyond its own text:
+ * the ids of the headings in it, the numbers of the footnote references
+ * in it, and — when it could hold a reference link — every definition. A
+ * block's text plus this is its rendering's identity (both views keep a
+ * block's DOM while it holds).
+ */
+export function depsOf(cx: DocContext): (from: number, to: number, src: string) => string {
+  const headings = [...cx.headingIds.entries()].sort((a, b) => a[0] - b[0]);
+  const refs = [...cx.footnoteRefs.entries()].sort((a, b) => a[0] - b[0]);
+  const defs = refsKey(cx);
+  /** The first entry at or after `pos`. */
+  const lowerBound = (list: readonly [number, unknown][], pos: number): number => {
+    let lo = 0;
+    let hi = list.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (list[mid][0] < pos) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo;
+  };
+  return (from, to, src) => {
+    let out = "";
+    for (let k = lowerBound(headings, from); k < headings.length && headings[k][0] < to; k++)
+      out += `#${headings[k][1]}`;
+    for (let k = lowerBound(refs, from); k < refs.length && refs[k][0] < to; k++) {
+      const f = refs[k][1];
+      out += `^${f.label}:${f.n}:${f.nth}`;
+    }
+    if (defs !== "" && src.includes("[")) out += `\u0001${defs}`;
+    return out;
   };
 }
 
@@ -461,7 +542,7 @@ function listOf(node: SyntaxNode, cx: DocContext): Block {
       if (c.name === "Task" && blocks.length === 0) {
         const marker = c.getChild("TaskMarker");
         if (marker !== null) {
-          task = /x/i.test(cx.text.slice(marker.from, marker.to)) ? "done" : "todo";
+          task = /x/i.test(cx.doc.sliceString(marker.from, marker.to)) ? "done" : "todo";
           const inline = inlineOf(c, marker.to, c.to, cx.doc, cx.inline);
           trimEdges(inline);
           blocks.push({ kind: "paragraph", from: c.from, to: c.to, inline });
@@ -470,8 +551,8 @@ function listOf(node: SyntaxNode, cx: DocContext): Block {
       }
       // `- [ ]` with nothing after it: lezer reads a paragraph, comrak (and
       // GitHub) an empty task.
-      if (c.name === "Paragraph" && blocks.length === 0 && /^\[[ xX]\]$/.test(cx.text.slice(c.from, c.to))) {
-        task = /x/i.test(cx.text.slice(c.from, c.to)) ? "done" : "todo";
+      if (c.name === "Paragraph" && blocks.length === 0 && /^\[[ xX]\]$/.test(cx.doc.sliceString(c.from, c.to))) {
+        task = /x/i.test(cx.doc.sliceString(c.from, c.to)) ? "done" : "todo";
         continue;
       }
       const b = blockOf(c, cx);
@@ -483,7 +564,7 @@ function listOf(node: SyntaxNode, cx: DocContext): Block {
   let start = 1;
   if (ordered) {
     const mark = itemNodes[0]?.getChild("ListMark");
-    if (mark !== null && mark !== undefined) start = parseInt(cx.text.slice(mark.from, mark.to), 10) || 0;
+    if (mark !== null && mark !== undefined) start = parseInt(cx.doc.sliceString(mark.from, mark.to), 10) || 0;
   }
   return { kind: "list", from: node.from, to: node.to, ordered, start, tight, items };
 }
@@ -495,7 +576,7 @@ function fenceText(node: SyntaxNode, cx: DocContext): string {
   const texts = node.getChildren("CodeText");
   const marks = node.getChildren("CodeMark");
   const open = marks[0];
-  let text = texts.map((t) => cx.text.slice(t.from, t.to)).join("");
+  let text = texts.map((t) => cx.doc.sliceString(t.from, t.to)).join("");
   if (open !== undefined && texts.length > 0) {
     const col = (pos: number): number => pos - cx.lines.lineStart(cx.lines.lineOf(pos));
     const indent = col(open.from) - col(texts[0].from);
@@ -516,11 +597,11 @@ function htmlSource(node: SyntaxNode, cx: DocContext): string {
   let out = "";
   let pos = node.from;
   for (const q of node.getChildren("QuoteMark")) {
-    out += cx.text.slice(pos, q.from);
+    out += cx.doc.sliceString(pos, q.from);
     pos = q.to;
-    if (cx.text[pos] === " ") pos++;
+    if (cx.doc.sliceString(pos, pos + 1) === " ") pos++;
   }
-  return out + cx.text.slice(pos, node.to);
+  return out + cx.doc.sliceString(pos, node.to);
 }
 
 /** The model of one block node; null for what renders nothing in place
@@ -550,7 +631,7 @@ export function blockOf(node: SyntaxNode, cx: DocContext): Block | null {
       return { kind: "rule", from, to };
     case "Blockquote": {
       const markerLine = cx.lines.lineOf(from);
-      const m = ALERT.exec(cx.text.slice(from, cx.lines.lineStart(markerLine + 1)));
+      const m = ALERT.exec(cx.doc.sliceString(from, cx.lines.lineStart(markerLine + 1)));
       if (m === null) return { kind: "quote", from, to, children: children(node, cx) };
       // The marker line is the alert's; its content starts on the next line
       // (a paragraph lezer began on the marker line keeps only its rest).
@@ -583,7 +664,7 @@ export function blockOf(node: SyntaxNode, cx: DocContext): Block | null {
       return listOf(node, cx);
     case "FencedCode": {
       const info = node.getChild("CodeInfo");
-      const lang = info === null ? "" : decodeEntities(unescapeBackslashes(cx.text.slice(info.from, info.to)));
+      const lang = info === null ? "" : decodeEntities(unescapeBackslashes(cx.doc.sliceString(info.from, info.to)));
       const text = fenceText(node, cx);
       if (lang === "math") return { kind: "math", from, to, source: text };
       return { kind: "code", from, to, lang, text };
@@ -591,7 +672,7 @@ export function blockOf(node: SyntaxNode, cx: DocContext): Block | null {
     case "CodeBlock": {
       const text = node
         .getChildren("CodeText")
-        .map((t) => cx.text.slice(t.from, t.to))
+        .map((t) => cx.doc.sliceString(t.from, t.to))
         .join("");
       return { kind: "code", from, to, lang: "", text: `${text}\n` };
     }
