@@ -1,7 +1,11 @@
 # Timeline, Knowledge & Plugins — design & plan
 
-Status: **design draft, first maintainer pass done** (2026-09-25). Nothing
-here is built. It grows out of a maintainer conversation about three
+Status: **built** on `claude/mastermind-cross-agent-comms-19a84e`
+(2026-09-25): A1–A3 and B1–B4 of §11, verified live against an isolated
+daemon and a mycelium 0.7.2 fixture. **B5 (Browse / marketplace) is later**,
+and the §6 contribution points `views` / `settings` / `commands` are
+specified but not built (see [plugins.md](agent-guides/plugins.md)). The
+§12 questions took their recommended defaults. It grows out of a maintainer conversation about three
 frustrations — the Mastermind "often isn't doing anything", the dashboard
 "doesn't say much and feels redundant", and the wish for agents (claude *and*
 codex, even subagents) to talk to each other and for the workspace to *know*
@@ -516,8 +520,10 @@ Off by default; turning it on is the opt-in (no separate switch). Its card:
   to readers as data; "nobody commands sideways" stands. Rate- and
   size-capped per session.
 - **Coverage, honestly:** claude chat/TUI — read, post, hinted, addressable;
-  codex chat — read, post, pull-only; codex TUI — gets no chimaera MCP today
-  (`-c mcp_servers` injection documented, needs a live check); subagents —
+  codex chat — read, post, pull-only; codex TUI — read, post, pull-only,
+  via a `-c mcp_servers` injection that rides only while a plugin with
+  tools is active (live: `/mcp` lists it; whether the per-tool
+  `approval_mode="approve"` silences the prompt is still unconfirmed); subagents —
   inherit the parent's tools, attributed to the parent, not addressable (no
   vendor exposes a running subagent to outside messages); shells — none.
 
