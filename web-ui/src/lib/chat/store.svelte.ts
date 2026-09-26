@@ -5,7 +5,8 @@
  * construction — there is no separate "catch up" code to get wrong.
  */
 
-import { canInlinePreview, isImagePath } from "../previews/files";
+import { isImagePath } from "../previews/files";
+import { artifactMentions, isArtifactPath } from "./artifacts";
 import type { AgentEvent, ChatSessionInfo, SeqEvent } from "./chatWs";
 
 /** The single leading notice a client-side transcript trim leaves behind. */
@@ -336,9 +337,19 @@ export type ChatBlock = BlockIdentity &
       costUsd: number | null;
       outputTokens: number;
       durationMs: number;
-      /** Previewable files this turn produced (absolute paths) — rendered as
-       *  a small gallery after the closing prose. */
+      /** Files this turn's edit tools wrote (absolute paths, the tools' own
+       *  locations) — the "made this turn" gallery after the closing prose. */
       artifacts: string[];
+      /** Artifact-shaped paths the turn's commands, outputs and prose
+       *  MENTION (as written): candidates for files written by shell
+       *  commands. The gallery keeps those the daemon confirms were modified
+       *  between `startedAtMs` and `endedAtMs` (artifacts.ts). */
+      mentioned: string[];
+      /** Journal timestamps of the turn's start and end (daemon clock). */
+      startedAtMs: number | null;
+      endedAtMs: number | null;
+      /** The turn was stopped or failed; its files still show. */
+      aborted: boolean;
     }
   | { kind: "usage"; windows: UsageWindow[] });
 
@@ -648,6 +659,9 @@ export class ChatStore {
   private userIndex = new Map<string, number>();
   /** question request_id -> index into blocks, for the resolution fold. */
   private questionIndex = new Map<string, number>();
+  /** Journal time of the running turn's `turn_started` — the lower bound of
+   *  the "made this turn" window. */
+  private turnStartedAt: number | null = null;
 
   onReady(session: ChatSessionInfo, _replayFrom: number, head: number | undefined): void {
     this.connected = true;
@@ -718,6 +732,7 @@ export class ChatStore {
     this.userIndex.clear();
     this.questionIndex.clear();
     this.outputClip.clear();
+    this.turnStartedAt = null;
     this.activeAgents = [];
     // Pending asks and sends belong to the journal being rebuilt; the fresh
     // replay re-delivers any that are still live.
@@ -1004,6 +1019,7 @@ export class ChatStore {
         break;
       }
       case "turn_started":
+        this.turnStartedAt = entry.ts;
         this.running = true;
         this.activity = { kind: "waiting", detail: "starting" };
         this.turnTokens = 0;
@@ -1414,9 +1430,13 @@ export class ChatStore {
             costUsd: usage.cost_usd ?? null,
             outputTokens: usage.output_tokens ?? 0,
             durationMs: usage.duration_ms ?? 0,
-            artifacts: this.collectTurnArtifacts(),
+            ...this.collectTurnArtifacts(),
+            startedAtMs: this.turnStartedAt,
+            endedAtMs: entry.ts,
+            aborted: false,
           }),
         );
+        this.turnStartedAt = null;
         break;
       }
       case "turn_aborted": {
@@ -1425,6 +1445,25 @@ export class ChatStore {
         this.activity = null;
         this.activityLine = null;
         this.reconcileOpenTools(true);
+        // A stopped turn keeps what it made: its gallery lands before the
+        // notice, closing the turn like a completed one would. Only when it
+        // has something to show, so a plain stop reads as before.
+        const made = this.collectTurnArtifacts();
+        if (made.artifacts.length > 0 || made.mentioned.length > 0) {
+          this.blocks.push(
+            this.stamp({
+              kind: "turn_end",
+              costUsd: null,
+              outputTokens: 0,
+              durationMs: 0,
+              ...made,
+              startedAtMs: this.turnStartedAt,
+              endedAtMs: entry.ts,
+              aborted: true,
+            }),
+          );
+        }
+        this.turnStartedAt = null;
         // A deliberate stop (Esc / stop chip) is not an error state: the
         // wire's `interrupted` flag is the drivers' structural signal
         // (claude's free-text result string never reliably said so); the
@@ -1801,31 +1840,46 @@ export class ChatStore {
     }
   }
 
-  /** The previewable files THIS turn produced, for the end-of-turn gallery.
-   *  Scans back to the turn boundary (previous user message / turn_end) and
-   *  keeps previewable locations from writes (edit kind) plus any image a
-   *  tool touched — a CSV the agent merely READ is not an artifact. Absolute
-   *  paths from the tool itself, so the gallery is always openable regardless
-   *  of how the prose spelled the name. */
-  private collectTurnArtifacts(): string[] {
+  /** What THIS turn made, for the end-of-turn gallery. Scans back to the
+   *  turn boundary (previous user message / turn_end):
+   *  - `artifacts`: artifact-kind files an edit tool wrote, plus any image a
+   *    tool touched — absolute paths from the tools themselves, so a tile
+   *    always opens whatever the prose called it. A CSV the agent merely
+   *    READ is not an artifact.
+   *  - `mentioned`: artifact-shaped paths the turn's commands, outputs and
+   *    prose name (newest first) — a plot a script saved, a report a shell
+   *    command rendered. The gallery confirms each against the daemon and
+   *    the turn's time window before showing it (artifacts.ts). */
+  private collectTurnArtifacts(): { artifacts: string[]; mentioned: string[] } {
     const out: string[] = [];
     const seen = new Set<string>();
+    const texts: string[] = [];
     for (let i = this.blocks.length - 1; i >= 0; i--) {
       const b = this.blocks[i];
       // Every user block here is delivered (queued sends live in pendingSends),
       // so a user block IS this turn's opening boundary — stop the scan.
       if (b.kind === "user" || b.kind === "turn_end") break;
-      if (b.kind !== "tool" || b.status !== "completed" || b.denied) continue;
+      if (b.kind === "message") {
+        texts.push(b.text);
+        continue;
+      }
+      if (b.kind !== "tool" || b.denied) continue;
+      if (b.tool === "execute" || b.tool === "other") {
+        if (b.content?.text !== undefined) texts.push(b.content.text);
+        texts.push(b.title);
+      }
+      if (b.status !== "completed") continue;
       for (const loc of b.locations) {
-        if (seen.has(loc) || !canInlinePreview(loc)) continue;
-        if (b.tool === "edit" || isImagePath(loc)) {
+        if (seen.has(loc)) continue;
+        if ((b.tool === "edit" && isArtifactPath(loc)) || isImagePath(loc)) {
           seen.add(loc);
           out.push(loc);
         }
       }
     }
     out.reverse(); // chronological
-    return out.slice(0, 8);
+    const mentioned = artifactMentions(texts).filter((m) => !seen.has(m));
+    return { artifacts: out.slice(0, 8), mentioned };
   }
 
   /** Rebuild every id→index map from `blocks` after a non-tail splice

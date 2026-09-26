@@ -41,6 +41,7 @@
   import WorkTray from "../shared/WorkTray.svelte";
   import Chevron from "../shared/Chevron.svelte";
   import ArtifactGallery from "./ArtifactGallery.svelte";
+  import { EmbedResolver } from "./embeds";
   import PermissionCard from "./PermissionCard.svelte";
   import PlanApprovalCard from "./PlanApprovalCard.svelte";
   import QuestionCard from "./QuestionCard.svelte";
@@ -120,6 +121,7 @@
     if (followFrame !== null) cancelAnimationFrame(followFrame);
   });
   onDestroy(() => prosePaths.dispose());
+  onDestroy(() => proseEmbeds.dispose());
 
   // Curated model choices for this agent's picker (daemon-cached catalog).
   let models = $state<{ id: string; label: string }[]>([]);
@@ -1102,6 +1104,10 @@
     root: () => linkContext().root,
     scope: (c) => untrack(() => resolveScope(linkContext(), c)),
   });
+  /** Files the chat shows as embed cards (prose `![](…)`, the turn
+   *  gallery's shell-written files) resolve against the same directories,
+   *  strictly: an embed names one file. */
+  const proseEmbeds = new EmbedResolver(() => untrack(() => linkContext()));
 
   // A turn end is when files the agent mentioned have come to exist: drop
   // the misses so the renderers holding them ask again.
@@ -1892,6 +1898,7 @@
             {visible}
             onOpenPath={openProsePath}
             resolvePaths={prosePaths}
+            embeds={proseEmbeds}
             onReveal={() => {
               if (visible && atBottom && !composerEngaged) queueBottomScroll();
             }}
@@ -1924,6 +1931,7 @@
           onOpenFile={openLocation}
           onOpenPath={openProsePath}
           resolvePaths={prosePaths}
+          embeds={proseEmbeds}
           sourceIndex={item.index}
           sourceUid={item.block.uid}
         />
@@ -1957,9 +1965,16 @@
       {:else if item.block.kind === "turn_end"}
         {@const block = item.block}
         <div class="source-block" data-block-index={item.index} data-block-uid={item.block.uid}>
-          <!-- The turn's artifacts preview here, after the closing prose. -->
-          {#if block.artifacts.length > 0}
-            <ArtifactGallery paths={block.artifacts} onOpen={openLocation} />
+          <!-- What the turn made previews here, after the closing prose. -->
+          {#if block.artifacts.length > 0 || block.mentioned.length > 0}
+            <ArtifactGallery
+              paths={block.artifacts}
+              mentioned={block.mentioned}
+              startedAtMs={block.startedAtMs}
+              endedAtMs={block.endedAtMs}
+              resolver={proseEmbeds}
+              onOpenPath={openProsePath}
+            />
           {/if}
 
         </div>
