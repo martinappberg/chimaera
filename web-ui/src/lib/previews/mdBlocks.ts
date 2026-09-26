@@ -1566,6 +1566,34 @@ function fillCell(view: EditorView, hit: { root: HTMLElement; seg: number }, cel
   return true;
 }
 
+/**
+ * Enter the rendered block under a screen point at its character: the
+ * reading view's double-click, once this editor stands in its place with
+ * the block at the same height (MarkdownView). The same mapping as a press
+ * (`pressPos`), the same anchor — the text under the point stays where it
+ * is while the block reveals — and the editor takes focus. False when no
+ * rendered block sits at the point (a gap, the margin): the caller places
+ * the cursor its own way.
+ */
+export function enterAtPoint(view: EditorView, x: number, y: number): boolean {
+  const target = document.elementFromPoint(x, y);
+  const hit = hitOf(view, target);
+  if (hit === null) return false;
+  const st = view.state.field(liveField);
+  const seg = st.segs[hit.seg];
+  const press = { target, clientX: x, clientY: y } as unknown as MouseEvent;
+  const pos = pressPos(view, hit, press);
+  pendingAnchor.set(
+    view.state,
+    embedIn(hit, target) !== null && seg !== undefined
+      ? { pos: seg.from, top: view.lineBlockAt(seg.from).top, text: false, focus: !st.focused }
+      : { pos, top: caretTop(view, caretAt(x, y), y), text: true, focus: !st.focused },
+  );
+  view.dispatch({ selection: EditorSelection.cursor(pos), userEvent: "select.pointer" });
+  view.focus();
+  return true;
+}
+
 /** Presses on rendered content that are not cursor placement: a task box,
  *  a copy button, the properties fold, Mod+press on a link, a short row's
  *  missing cell, a link's own click (never a navigation), its menu. */

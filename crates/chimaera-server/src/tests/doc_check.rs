@@ -84,18 +84,30 @@ fn broken_links_and_embeds_are_errors_with_fixes() {
     let dir = fixture("dc-broken");
     let issues = check(
         &dir,
-        "[gone](missing.md)\n\n![Case](figs/umap.png)\n\n![Spaces](my%20file.png)\n",
+        "[gone](missing.md)\n\n![Case](figs/umap.png)\n\n![Spaces](my%20file.png)\n\n\
+         ![Dir](Figs/UMAP.png)\n\n![Both](./Figs/../figs/Umap.PNG)\n",
     );
     assert_eq!(
         codes(&issues),
-        [(1, "broken-link"), (3, "broken-embed"), (5, "broken-embed")]
+        [
+            (1, "broken-link"),
+            (3, "broken-embed"),
+            (5, "broken-embed"),
+            (7, "broken-embed"),
+            (9, "broken-embed"),
+        ]
     );
     assert!(issues.iter().all(|i| i.severity == Severity::Error));
     assert!(issues[0]
         .message
         .contains(&dir.join("missing.md").display().to_string()));
-    // A case-only mismatch names the real file.
-    assert!(issues[1].fix.contains("figs/UMAP.png"), "{}", issues[1].fix);
+    // A case-only mismatch names the real file, in the file name, in a
+    // directory, or through `.`/`..` hops — on a case-sensitive filesystem
+    // (where the stat misses) and on a case-insensitive one (where it hits:
+    // the link works here and breaks on a Linux host, so it is still broken).
+    for i in [1, 3, 4] {
+        assert!(issues[i].fix.contains("figs/UMAP.png"), "{}", issues[i].fix);
+    }
     // `%20` decodes before the stat.
     assert!(
         issues[2].message.contains("my file.png"),
