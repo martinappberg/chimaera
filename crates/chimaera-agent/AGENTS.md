@@ -112,12 +112,15 @@ gap-replay idea as the PTY transport, realized for structured streams.
   tasks that died with the previous daemon process.
 - A `--resume` forks a NEW native session id (claude); never pin `--session-id`
   with `--resume`. Codex resumes in-protocol (the id survives).
-- A daemon stop ends drivers through the polite path (stdin closed, grace, then
-  SIGKILL — the server's `stop_all_for_exit`), not the runtime's drop-time
-  SIGKILL: claude's Bash shells are detached, so only its own teardown ends
-  them (PROTOCOL.md Pass 32). What the process held is `Carryover`; the server
-  snapshots it BEFORE the stop, because the teardown journals the bridge off
-  and an empty background set.
+- Every stop we initiate SIGTERMs the child before closing stdin
+  (`ChildGuard::terminate`; then the grace, then SIGKILL), and a daemon stop
+  runs it for every live driver (the server's `stop_all_for_exit`) instead of
+  the runtime's drop-time SIGKILL. Claude's Bash shells and Monitors are
+  detached, so only its SIGTERM handler ends them; a bare stdin close leaves
+  the shell running and wakes a turn when the Monitor stops (PROTOCOL.md
+  Pass 32). What the process held is `Carryover`; the server snapshots it
+  BEFORE the stop, because the teardown journals the bridge off and an empty
+  background set.
 - Remote Control is process-owned on both wires: claude's bridge dies with the
   driver (teardown journals the Off), codex's lives on its app-server DAEMON
   (a per-session app-server only reports `disabled`; no enable RPC exists).

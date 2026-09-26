@@ -3424,16 +3424,16 @@ pub(crate) async fn resurrect_chat(
 }
 
 /// Daemon stop (an update, `chimaera kill`, SIGTERM): end every live chat
-/// driver the polite way — stdin closed, `KILL_GRACE`, then SIGKILL — before
-/// the process exits, instead of the runtime's drop-time SIGKILL. The CLI
-/// then runs its own teardown, and that is what ends its background work:
-/// claude starts its shells detached (their own sessions), so a SIGKILLed
-/// claude leaves them running on the host — a dev server holding its port, a
-/// monitor's tail that never ends — and the resumed agent would start each a
-/// second time. Runs after the ledger's final flush (so the carryover still
-/// says what was running) and with `stopping` set (so these exits retire
-/// nothing). Bounded by the grace plus a margin; stragglers are left to the
-/// runtime's kill.
+/// driver through the harness's stop — SIGTERM, stdin closed, `KILL_GRACE`,
+/// then SIGKILL — before the process exits, instead of the runtime's
+/// drop-time SIGKILL. The CLI's SIGTERM handler is what ends its background
+/// work: claude starts its shells detached (their own sessions), so a
+/// SIGKILLed claude leaves them running on the host — a dev server holding
+/// its port, a monitor's command that never ends — and the resumed agent
+/// would start each a second time (live-probed, PROTOCOL.md Pass 32). Runs
+/// after the ledger's final flush (so the carryover still says what was
+/// running) and with `stopping` set (so these exits retire nothing). Bounded
+/// by the grace plus a margin; stragglers are left to the runtime's kill.
 pub(crate) async fn stop_all_for_exit(state: &Arc<AppState>) {
     let live: Vec<String> = state
         .chat
@@ -3515,16 +3515,18 @@ fn restart_message(carry: &chimaera_agent::Carryover) -> Option<String> {
         let label = label.split_whitespace().collect::<Vec<_>>().join(" ");
         text.push_str(&format!("\n- {kind} \"{label}\" (id {})", task.id));
     }
+    // Restoring is the default: offered a free choice ("whichever you still
+    // need"), a live Haiku just acknowledged and restarted nothing.
     if carry.turn_in_flight {
         text.push_str(
-            "\n\nYour last turn was also cut off before it finished.\n\nRestart whichever \
-             of these you still need, the same way you started them, then continue where \
-             you left off.",
+            "\n\nYour last turn was also cut off before it finished.\n\nRestart each of \
+             these the same way you started it, unless it is clearly no longer needed (say \
+             which you skipped), then continue where you left off.",
         );
     } else {
         text.push_str(
-            "\n\nRestart whichever of these you still need, the same way you started them. \
-             If none are needed any more, just say so.",
+            "\n\nRestart each of these the same way you started it, unless it is clearly no \
+             longer needed (say which you skipped).",
         );
     }
     Some(text)
@@ -4534,7 +4536,8 @@ mod tests {
         ] {
             assert!(text.contains(line), "missing {line:?} in {text}");
         }
-        assert!(text.contains("If none are needed any more"), "{text}");
+        assert!(text.contains("Restart each of these"), "{text}");
+        assert!(text.contains("say which you skipped"), "{text}");
         assert!(!text.contains("last turn"), "{text}");
 
         let both = Carryover {

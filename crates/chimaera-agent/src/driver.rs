@@ -530,6 +530,14 @@ pub async fn run_driver<D: Driver>(driver: D, spec: SpawnSpec, mut io: DriverIo)
             break;
         }
     }
+    // A stop WE initiated (kill, dead receiver, protocol error) SIGTERMs the
+    // child first: claude's handler ends its detached background work, where
+    // a bare stdin close leaves it running (see `ChildGuard::terminate`). A
+    // child that closed its own output is already on its way out and keeps
+    // its own exit status for the at-birth classification below.
+    if !matches!(exit, DriverExit::Clean(_)) {
+        guard.terminate();
+    }
     // Close stdin (the polite shutdown both protocols honor) so a child blocked
     // on read wakes, then reap with a bounded wait. A normally-exiting child
     // returns its real status at once; a lingerer is SIGKILLed after the grace.
