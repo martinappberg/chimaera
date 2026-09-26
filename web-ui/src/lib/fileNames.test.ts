@@ -1,5 +1,3 @@
-import { readdirSync } from "node:fs";
-import { join, relative } from "node:path";
 import { describe, expect, it } from "vitest";
 
 // macOS and Windows file systems ignore case, Linux (and so CI's ui job) does
@@ -7,17 +5,13 @@ import { describe, expect, it } from "vitest";
 // `X.svelte` component there, and the app bundle build fails only on those
 // hosts. Catch any name that differs from another only by case, and the
 // `x.svelte.ts` / `X.svelte` pair in particular, here on every platform.
-const SRC = join(__dirname, "..");
-
-function files(dir: string): string[] {
-  return readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
-    const path = join(dir, entry.name);
-    return entry.isDirectory() ? files(path) : [path];
-  });
-}
+// The glob only lists paths; nothing it matches is imported.
+const all = Object.keys(import.meta.glob("/src/**/*"));
 
 describe("source file names", () => {
-  const all = files(SRC).map((path) => relative(SRC, path));
+  it("are listed", () => {
+    expect(all.length).toBeGreaterThan(100);
+  });
 
   it("never differ from another only by letter case", () => {
     const seen = new Map<string, string>();
