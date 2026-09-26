@@ -39,8 +39,10 @@ const MAX_OUTPUT_TEXT: usize = 200 * 1024;
 const MAX_CELL_SOURCE: usize = 1024 * 1024;
 /// A page stops adding cells past this many payload bytes (it always carries
 /// at least one), so a notebook of large figures pages by size, not count.
-const MAX_NOTEBOOK_PAGE_BYTES: usize = 16 * 1024 * 1024;
-/// One notebook parse at a time: each can transiently hold a page (16 MB)
+/// The response is built and serialized at once, so a page costs a few times
+/// this in transient memory.
+const MAX_NOTEBOOK_PAGE_BYTES: usize = 8 * 1024 * 1024;
+/// One notebook parse at a time: each can transiently hold a page (8 MB)
 /// plus one embedded string (up to the source cap), and the shared limiter
 /// alone would admit eight at once. A parse is sub-second, so the queue is
 /// short.
@@ -66,6 +68,18 @@ fn home() -> anyhow::Result<PathBuf> {
         Some(home) if !home.is_empty() => Ok(PathBuf::from(home)),
         _ => anyhow::bail!("HOME is not set"),
     }
+}
+
+/// A JSON object from owned values. `json!` serializes each value by
+/// reference — a deep copy of every multi-megabyte payload string — so the
+/// page is assembled by moving instead.
+fn object<const N: usize>(fields: [(&str, Value); N]) -> Value {
+    Value::Object(
+        fields
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect(),
+    )
 }
 
 #[derive(Deserialize)]
@@ -138,13 +152,13 @@ fn read_notebook(
     if meta.worksheets {
         anyhow::bail!("nbformat 3 notebooks are not supported — upgrade it with `jupyter nbconvert --to notebook`");
     }
-    Ok(json!({
-        "cells": page.cells,
-        "offset": offset,
-        "total": page.total,
-        "language": meta.language,
-        "nbformat": meta.nbformat,
-    }))
+    Ok(object([
+        ("cells", Value::Array(page.cells)),
+        ("offset", json!(offset)),
+        ("total", json!(page.total)),
+        ("language", meta.language.map_or(Value::Null, Value::String)),
+        ("nbformat", json!(meta.nbformat)),
+    ]))
 }
 
 /// The page being collected while the cell array streams past.
@@ -324,7 +338,7 @@ impl<'de> Visitor<'de> for CellSeed {
                     for (name, bundle) in bundles {
                         let (data, omitted, size) = bundle.into_parts();
                         bytes = bytes.saturating_add(size);
-                        attachments.insert(name, json!({"data": data, "omitted": omitted}));
+                        attachments.insert(name, object([("data", data), ("omitted", omitted)]));
                     }
                 }
                 _ => {
@@ -333,16 +347,17 @@ impl<'de> Visitor<'de> for CellSeed {
             }
         }
         bytes = bytes.saturating_add(source.text.len());
-        let mut json = json!({
-            "index": self.index,
-            "cell_type": cell_type,
-            "source": source.text,
-        });
-        let obj = json.as_object_mut().expect("literal object");
+        let is_code = cell_type == "code";
+        let mut json = object([
+            ("index", json!(self.index)),
+            ("cell_type", Value::String(cell_type)),
+            ("source", Value::String(source.text)),
+        ]);
+        let obj = json.as_object_mut().expect("built as an object");
         if source.truncated {
             obj.insert("truncated".into(), Value::Bool(true));
         }
-        if cell_type == "code" {
+        if is_code {
             obj.insert("execution_count".into(), json!(execution_count));
             let mut list = Vec::with_capacity(outputs.len());
             for (output, size) in outputs {
@@ -687,45 +702,53 @@ impl<'de> Visitor<'de> for OutputSeed {
                 }
             }
         }
-        let (json, bytes) = match output_type.as_str() {
+        let kind = output_type.clone();
+        let (json, bytes) = match kind.as_str() {
             "stream" => {
                 let bytes = text.text.len();
                 (
-                    json!({
-                        "output_type": "stream",
-                        "name": name.unwrap_or_else(|| "stdout".into()),
-                        "text": text.text,
-                        "truncated": text.truncated,
-                    }),
+                    object([
+                        ("output_type", Value::String(output_type)),
+                        (
+                            "name",
+                            Value::String(name.unwrap_or_else(|| "stdout".into())),
+                        ),
+                        ("text", Value::String(text.text)),
+                        ("truncated", Value::Bool(text.truncated)),
+                    ]),
                     bytes,
                 )
             }
             "error" => {
                 let bytes = traceback.text.len() + evalue.text.len();
                 (
-                    json!({
-                        "output_type": "error",
-                        "ename": ename.unwrap_or_default(),
-                        "evalue": evalue.text,
-                        "traceback": traceback.text,
-                        "truncated": traceback.truncated || evalue.truncated,
-                    }),
+                    object([
+                        ("output_type", Value::String(output_type)),
+                        ("ename", Value::String(ename.unwrap_or_default())),
+                        ("evalue", Value::String(evalue.text)),
+                        ("traceback", Value::String(traceback.text)),
+                        (
+                            "truncated",
+                            Value::Bool(traceback.truncated || evalue.truncated),
+                        ),
+                    ]),
                     bytes,
                 )
             }
             "display_data" | "execute_result" | "update_display_data" => {
                 let (data, omitted, bytes) = bundle.unwrap_or_default().into_parts();
-                let mut out = json!({
-                    "output_type": output_type,
-                    "data": data,
-                    "omitted": omitted,
-                });
-                if output_type == "execute_result" {
+                let result = output_type == "execute_result";
+                let mut out = object([
+                    ("output_type", Value::String(output_type)),
+                    ("data", data),
+                    ("omitted", omitted),
+                ]);
+                if result {
                     out["execution_count"] = json!(execution_count);
                 }
                 (out, bytes)
             }
-            _ => (json!({ "output_type": output_type }), 0),
+            _ => (object([("output_type", Value::String(output_type))]), 0),
         };
         Ok((json, bytes))
     }

@@ -183,11 +183,13 @@ async fn fs_notebook_caps_payloads_text_and_page_size() {
         .collect();
     let path = write_notebook(&dir, "figs.ipynb", figs);
     let page = get_notebook(&state, &path, "&limit=5").await;
-    assert_eq!(page["cells"].as_array().unwrap().len(), 3);
-    assert_eq!(page["total"], 5);
-    let page = get_notebook(&state, &path, "&offset=3&limit=5").await;
     assert_eq!(page["cells"].as_array().unwrap().len(), 2);
-    assert_eq!(page["cells"][0]["index"], 3);
+    assert_eq!(page["total"], 5);
+    let page = get_notebook(&state, &path, "&offset=2&limit=5").await;
+    assert_eq!(page["cells"].as_array().unwrap().len(), 2);
+    assert_eq!(page["cells"][0]["index"], 2);
+    let page = get_notebook(&state, &path, "&offset=4&limit=5").await;
+    assert_eq!(page["cells"].as_array().unwrap().len(), 1);
 
     std::fs::remove_dir_all(&dir).ok();
 }
