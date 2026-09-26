@@ -1,27 +1,37 @@
 <script lang="ts">
   /**
-   * What a turn made, after its closing prose. The files its edit tools
-   * wrote (absolute paths from the tools, so a tile opens whatever the prose
-   * called the file), plus the files its shell commands wrote — the paths
-   * its commands, outputs and prose mention that the daemon confirms exist
-   * and were modified during the turn (artifacts.ts).
+   * What a turn wrote that its prose did not already show, after the
+   * closing prose. The files its edit tools wrote (absolute paths from the
+   * tools, so a tile opens whatever the prose called the file), plus the
+   * files its shell commands wrote — the paths its commands and outputs
+   * mention that the daemon confirms exist and were modified during the
+   * turn (artifacts.ts). The reducer leaves out what the prose embedded or
+   * linked, so this block adds and never repeats; its heading says "Also
+   * written" when the prose showed a share. "Written", not "made": a turn
+   * that edits a document wrote it too.
    *
-   * Two shapes, by what a file is for (artifactShape): a *visual* — a
-   * figure, a rendered report, a PDF, a clip — is looked at, so it gets an
-   * embed tile up front; a *document* — a markdown note, a table, a
+   * One header, two shapes by what a file is for (artifactShape): a
+   * *visual* — a figure, a rendered report, a PDF, a clip — is looked at,
+   * so it gets an embed tile; a *document* — a markdown note, a table, a
    * notebook, a deck — is opened, so it gets one chip on a quiet line, and
-   * its tile only when the line is unfolded. A turn that only touched
-   * documents therefore costs one line, not a wall of excerpts. Tiles load
+   * its tile only when the line is unfolded. With no tiles the header sits
+   * on the chip line, so a turn that only touched documents costs one line.
+   *
+   * A chip knows its file: two files sharing a name show their folders; a
+   * file rewritten after the turn says so in its tooltip; a gone file is
+   * struck and not clickable. States come from one resolve when the gallery
+   * nears the viewport and follow the daemon's disk monitor while on screen
+   * (the shown chips only — the watch list is small and shared). Tiles load
    * near the viewport, stay fresh when a file is overwritten, and say so
    * when one is gone.
    */
-  import { basename } from "../previews/files";
   import Chevron from "../shared/Chevron.svelte";
   import FileIcon from "../shared/FileIcon.svelte";
   import EmbedCard from "../shared/embed/EmbedCard.svelte";
-  import { isMissing, type TargetInfo, type TargetResult } from "../shared/embed/embed";
+  import { isMissing, resolveFile, type TargetInfo, type TargetResult } from "../shared/embed/embed";
   import type { OpenPathOptions, PathKind } from "../shared/openPath";
-  import { artifactShape, writtenDuring } from "./artifacts";
+  import { lastDiskChange, releaseDiskFile, retainDiskFile } from "../workspace/diskWatch";
+  import { artifactShape, chipLabels, fileStateAfter, writtenDuring, type FileState } from "./artifacts";
   import type { EmbedResolver } from "./embeds";
 
   interface Props {
@@ -31,6 +41,10 @@
     mentioned?: string[];
     startedAtMs?: number | null;
     endedAtMs?: number | null;
+    /** What the turn wrote that the prose already showed: this block is
+     *  the remainder (it says "also"), and a chip's name widens against
+     *  these too. */
+    covered?: string[];
     /** Resolves mentioned paths against the session's directories. */
     resolver?: EmbedResolver;
     onOpenPath?: (path: string, kind: PathKind, opts?: OpenPathOptions) => void;
@@ -41,40 +55,58 @@
     mentioned = [],
     startedAtMs = null,
     endedAtMs = null,
+    covered = [],
     resolver,
     onOpenPath,
   }: Props = $props();
 
-  /** Tiles per shape: past this the turn made a directory's worth. */
+  /** Precise about what the block is: everything the turn wrote, or what
+   *  is left once the prose has shown its share. */
+  const heading = $derived(covered.length > 0 ? "Also written" : "Written this turn");
+
+  /** Tiles per shape: past this the turn wrote a directory's worth. */
   const MAX_TILES = 8;
-  /** Chips on the files line before the rest fold behind "+n more". */
+  /** Chips on the line before the rest fold behind "+n more". */
   const MAX_CHIPS = 6;
 
   let host = $state<HTMLElement | null>(null);
   let near = $state(false);
+  let onScreen = $state(false);
   /** Mentioned files confirmed written during the turn. */
   let confirmed = $state.raw<TargetInfo[]>([]);
+  /** Each document's state now, by path; absent = not yet known. */
+  let states = $state.raw<Record<string, FileState>>({});
   /** The documents' tiles, unfolded by the reader. */
   let peek = $state(false);
   let allChips = $state(false);
 
   $effect(() => {
     const el = host;
-    if (el === null || near) return;
+    if (el === null) return;
     if (typeof IntersectionObserver === "undefined") {
       near = true;
+      onScreen = true;
       return;
     }
-    const observer = new IntersectionObserver(
+    const root = el.closest(".transcript");
+    const nearing = new IntersectionObserver(
       (entries) => {
         if (!entries.some((e) => e.isIntersecting)) return;
         near = true;
-        observer.disconnect();
+        nearing.disconnect();
       },
-      { root: el.closest(".transcript"), rootMargin: "480px 0px" },
+      { root, rootMargin: "480px 0px" },
     );
-    observer.observe(el);
-    return () => observer.disconnect();
+    const seeing = new IntersectionObserver((entries) => {
+      const last = entries[entries.length - 1];
+      if (last !== undefined) onScreen = last.isIntersecting;
+    }, { root });
+    nearing.observe(el);
+    seeing.observe(el);
+    return () => {
+      nearing.disconnect();
+      seeing.disconnect();
+    };
   });
 
   // One resolve round trip for every mention, once the gallery is near.
@@ -111,12 +143,81 @@
   });
   const visuals = $derived(all.filter((t) => artifactShape(t.path) === "visual").slice(0, MAX_TILES));
   const documents = $derived(all.filter((t) => artifactShape(t.path) === "document").slice(0, MAX_TILES * 3));
+  const chips = $derived(allChips || documents.length <= MAX_CHIPS ? documents : documents.slice(0, MAX_CHIPS));
   /** The fold previews the first tiles' worth; the chips still name them all. */
   const previewed = $derived(documents.slice(0, MAX_TILES));
-  const chips = $derived(allChips || documents.length <= MAX_CHIPS ? documents : documents.slice(0, MAX_CHIPS));
+  /** Names widen against everything the turn wrote, shown here or not:
+   *  `docs/notes.md` must not read "notes.md" beside the prose's link to
+   *  the root one. */
+  const labels = $derived(chipLabels([...documents.map((d) => d.path), ...covered]));
+
+  function setState(path: string, state: FileState): void {
+    if (states[path] === state) return;
+    states = { ...states, [path]: state };
+  }
+
+  // Each document's state, asked once when the gallery is near: a confirmed
+  // mention was resolved just now (present by construction); a tool-written
+  // path gets one coalesced fs/resolve_targets. `asked` is plain, not
+  // reactive — reading `states` here would make this effect its own trigger.
+  const asked = new Set<string>();
+  $effect(() => {
+    if (!near) return;
+    const end = endedAtMs;
+    for (const doc of documents) {
+      if (asked.has(doc.path)) continue;
+      asked.add(doc.path);
+      if (doc.info !== null) {
+        setState(doc.path, fileStateAfter(doc.info, end));
+        continue;
+      }
+      void resolveFile(doc.path).then((r) => {
+        if (r !== null) setState(doc.path, fileStateAfter(r, end));
+      });
+    }
+  });
+
+  // While the line is on screen, the shown chips follow the disk monitor: a
+  // delete strikes the chip, a rewrite re-resolves its mtime.
+  const watched = $derived(chips.map((c) => c.path));
+  $effect(() => {
+    const targets = watched;
+    const end = endedAtMs;
+    if (!onScreen || targets.length === 0) return;
+    for (const t of targets) retainDiskFile(t);
+    let first = true;
+    let seen = 0;
+    const stop = lastDiskChange.subscribe((change) => {
+      if (first) {
+        first = false;
+        seen = change?.seq ?? 0;
+        return;
+      }
+      if (change === null || change.seq === seen) return;
+      seen = change.seq;
+      for (const t of targets) {
+        if (change.removed.includes(t)) setState(t, "gone");
+        else if (change.files.includes(t)) {
+          void resolveFile(t).then((r) => {
+            if (r !== null) setState(t, fileStateAfter(r, end));
+          });
+        }
+      }
+    });
+    return () => {
+      stop();
+      for (const t of targets) releaseDiskFile(t);
+    };
+  });
 
   function open(path: string, kind: "file" | "dir", reveal?: import("../shared/reveal").Reveal): void {
     onOpenPath?.(path, kind, reveal !== undefined ? { reveal } : {});
+  }
+
+  function chipTitle(path: string, state: FileState): string {
+    if (state === "gone") return `${path} · gone`;
+    const verb = onOpenPath !== undefined ? "open " : "";
+    return state === "changed" ? `${verb}${path} · changed after this turn` : `${verb}${path}`;
   }
 </script>
 
@@ -137,23 +238,27 @@
 
 <div class="gallery-host" bind:this={host}>
   {#if visuals.length > 0}
-    <div class="label">Made this turn</div>
-    {@render tiles(visuals, "made this turn")}
+    <div class="label">{heading}</div>
+    {@render tiles(visuals, heading.toLowerCase())}
   {/if}
   {#if documents.length > 0}
     <!-- Documents are opened, not stared at: one chip each, the same quiet
          voice as a folded activity line, and their tiles behind a fold. -->
-    <div class="files" role="group" aria-label="files this turn">
-      <span class="files-label">Files</span>
+    <div class="files" role="group" aria-label="documents written this turn">
+      {#if visuals.length === 0}
+        <span class="files-label">{heading}</span>
+      {/if}
       {#each chips as doc (doc.path)}
+        {@const state = states[doc.path] ?? "present"}
         <button
           class="chip"
-          title={onOpenPath !== undefined ? `open ${doc.path}` : doc.path}
-          disabled={onOpenPath === undefined}
+          class:gone={state === "gone"}
+          title={chipTitle(doc.path, state)}
+          disabled={onOpenPath === undefined || state === "gone"}
           onclick={() => open(doc.path, "file")}
         >
-          <FileIcon path={doc.path} size={13} />
-          <span class="name">{basename(doc.path)}</span>
+          <FileIcon path={doc.path} size={13} broken={state === "gone"} />
+          <span class="name">{labels.get(doc.path) ?? doc.path}</span>
         </button>
       {/each}
       {#if chips.length < documents.length}
@@ -170,7 +275,7 @@
       </button>
     </div>
     {#if peek}
-      {@render tiles(previewed, "files this turn, previewed")}
+      {@render tiles(previewed, "documents written this turn, previewed")}
     {/if}
   {/if}
 </div>
@@ -246,6 +351,15 @@
     text-overflow: ellipsis;
     white-space: nowrap;
     font-family: var(--mono, monospace);
+  }
+  /* Gone: still named (the turn did write it), plainly not there any more. */
+  .chip.gone {
+    color: var(--muted);
+    border-style: dashed;
+    background: none;
+  }
+  .chip.gone .name {
+    text-decoration: line-through;
   }
   /* "+n more" and the preview fold: text-only, no card edge. */
   .more,

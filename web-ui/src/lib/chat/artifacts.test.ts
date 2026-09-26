@@ -2,8 +2,11 @@ import { describe, expect, it } from "vitest";
 import {
   artifactMentions,
   artifactShape,
+  chipLabels,
+  fileStateAfter,
   isArtifactPath,
-  isProseEmbedded,
+  namesFile,
+  proseCovered,
   proseEmbedTargets,
   writtenDuring,
 } from "./artifacts";
@@ -51,18 +54,24 @@ describe("prose embeds", () => {
     ]);
   });
 
-  it("matches a tool's absolute path and a text mention against the embeds", () => {
-    const targets = ["figs/umap.png", "./notes.md", "/home/me/proj/out/report.html"];
-    expect(isProseEmbedded("/home/me/proj/figs/umap.png", targets)).toBe(true);
-    expect(isProseEmbedded("figs/umap.png", targets)).toBe(true);
-    expect(isProseEmbedded("./figs/umap.png", targets)).toBe(true);
-    expect(isProseEmbedded("notes.md", targets)).toBe(true);
-    expect(isProseEmbedded("/home/me/proj/out/report.html", targets)).toBe(true);
-    // A suffix match needs a directory boundary; an absolute embed names one file.
-    expect(isProseEmbedded("/home/me/proj/oldfigs/umap.png", targets)).toBe(false);
-    expect(isProseEmbedded("/home/me/proj/figs/xumap.png", targets)).toBe(false);
-    expect(isProseEmbedded("/tmp/out/report.html", targets)).toBe(false);
-    expect(isProseEmbedded("other.md", targets)).toBe(false);
+  it("tells whether a written name refers to a file", () => {
+    expect(namesFile("figs/umap.png", "/home/me/proj/figs/umap.png")).toBe(true);
+    expect(namesFile("./figs/umap.png", "figs/umap.png")).toBe(true);
+    expect(namesFile("notes.md", "./notes.md")).toBe(true);
+    expect(namesFile("/home/me/proj/out/report.html", "/home/me/proj/out/report.html")).toBe(true);
+    // A suffix match needs a directory boundary; an absolute name is one file.
+    expect(namesFile("figs/umap.png", "/home/me/proj/oldfigs/umap.png")).toBe(false);
+    expect(namesFile("figs/umap.png", "/home/me/proj/figs/xumap.png")).toBe(false);
+    expect(namesFile("/home/me/proj/out/report.html", "/tmp/out/report.html")).toBe(false);
+    expect(namesFile("notes.md", "other.md")).toBe(false);
+  });
+
+  it("a name covers the shallowest file it matches, never a family", () => {
+    const paths = ["/p/docs/notes.md", "/p/notes.md", "/p/out/summary.csv", "/p/figs/umap.png"];
+    expect([...proseCovered(paths, ["notes.md", "summary.csv"])]).toEqual(["/p/notes.md", "/p/out/summary.csv"]);
+    expect([...proseCovered(paths, ["docs/notes.md"])]).toEqual(["/p/docs/notes.md"]);
+    expect([...proseCovered(paths, ["/p/figs/umap.png", "missing.md"])]).toEqual(["/p/figs/umap.png"]);
+    expect(proseCovered(paths, []).size).toBe(0);
   });
 });
 
@@ -108,5 +117,32 @@ describe("writtenDuring", () => {
     expect(writtenDuring(60_000, 9_000, null)).toBe(true);
     expect(writtenDuring(null, 9_000, 20_000)).toBe(false);
     expect(writtenDuring(10_000, null, 20_000)).toBe(false);
+  });
+});
+
+describe("fileStateAfter", () => {
+  const info = (mtime_ms: number | null) =>
+    ({ path: "/p/a.md", kind: "file", size: 1, version: "v", mtime_ms, mime: "text/markdown" }) as const;
+  it("tells present from changed-later from gone", () => {
+    expect(fileStateAfter({ missing: true }, 20_000)).toBe("gone");
+    expect(fileStateAfter(info(19_000), 20_000)).toBe("present");
+    expect(fileStateAfter(info(22_000), 20_000)).toBe("present"); // clock slack
+    expect(fileStateAfter(info(60_000), 20_000)).toBe("changed");
+    expect(fileStateAfter(info(60_000), null)).toBe("present"); // turn still open
+    expect(fileStateAfter(info(null), 20_000)).toBe("present");
+  });
+});
+
+describe("chipLabels", () => {
+  it("names files, widening only where names collide", () => {
+    const labels = chipLabels(["/p/notes.md", "/p/a/README.md", "/p/b/README.md", "/p/out/summary.csv"]);
+    expect([...labels.values()]).toEqual(["notes.md", "a/README.md", "b/README.md", "summary.csv"]);
+  });
+  it("keeps widening until distinct, and stops at the root", () => {
+    const labels = chipLabels(["/x/a/docs/README.md", "/y/a/docs/README.md", "README.md"]);
+    expect(labels.get("/x/a/docs/README.md")).toBe("x/a/docs/README.md");
+    expect(labels.get("/y/a/docs/README.md")).toBe("y/a/docs/README.md");
+    expect(labels.get("README.md")).toBe("README.md");
+    expect(chipLabels([])).toEqual(new Map());
   });
 });

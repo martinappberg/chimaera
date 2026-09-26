@@ -754,6 +754,9 @@ fn run_artifacts_turn(n: u32) {
         std::fs::write(path, body).expect("write");
     };
     let full = n.is_multiple_of(2);
+    // Tool ids are unique per turn, as the real CLI mints them: the store
+    // upserts a repeated id onto the earlier row.
+    let id = |name: &str| format!("tu-{name}-{n}");
     emit(json!({
         "type": "system", "subtype": "init",
         "session_id": "fake-native-1", "model": "fake-model",
@@ -765,21 +768,31 @@ fn run_artifacts_turn(n: u32) {
     write("notes.md", &notes);
     tool_use(
         "ma-1",
-        "tu-w1",
+        &id("w1"),
         "Write",
         json!({ "file_path": abs("notes.md"), "content": notes }),
     );
-    tool_result("tu-w1", "File written");
+    tool_result(&id("w1"), "File written");
     let plan = format!("# Plan\n\n- [x] turn {n}\n- [ ] next: batch effects\n");
     write("plan.md", &plan);
     tool_use(
         "ma-1",
-        "tu-w2",
+        &id("w2"),
         "Write",
         json!({ "file_path": abs("plan.md"), "content": plan }),
     );
-    tool_result("tu-w2", "File written");
+    tool_result(&id("w2"), "File written");
     if full {
+        // A second notes.md in another folder: the gallery must tell them apart.
+        let lab = format!("# Lab notes\n\nTurn {n}: reagent lot changed.\n");
+        write("docs/notes.md", &lab);
+        tool_use(
+            "ma-1",
+            &id("w3"),
+            "Write",
+            json!({ "file_path": abs("docs/notes.md"), "content": lab }),
+        );
+        tool_result(&id("w3"), "File written");
         write(
             "figs/umap.svg",
             "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 160 120'>\
@@ -797,12 +810,12 @@ fn run_artifacts_turn(n: u32) {
         );
         tool_use(
             "ma-1",
-            "tu-b1",
+            &id("b1"),
             "Bash",
             json!({ "command": "python scripts/plot.py --out figs/umap.svg --table out/summary.csv --report report.html" }),
         );
         tool_result(
-            "tu-b1",
+            &id("b1"),
             "wrote figs/umap.svg\nwrote out/summary.csv\nwrote report.html\n",
         );
         stream(json!({ "type": "message_start", "message": { "id": "ma-2" } }));
@@ -815,7 +828,7 @@ fn run_artifacts_turn(n: u32) {
         stream(json!({ "type": "message_start", "message": { "id": "ma-2" } }));
         stream_text(
             "ma-2",
-            "Updated notes.md and plan.md with this turn's findings.",
+            "Updated the notes and the plan with this turn's findings.",
         );
     }
     emit(json!({

@@ -15,7 +15,7 @@
  */
 
 import { viewKindFor } from "../previews/files";
-import { splitTarget } from "../shared/embed/embed";
+import { isMissing, splitTarget, type TargetResult } from "../shared/embed/embed";
 
 /** What a turn's file is FOR, which decides how the gallery shows it:
  *  a `visual` is looked at (a figure, a rendered report, a PDF, a clip) and
@@ -129,22 +129,39 @@ function hopless(path: string): string {
 }
 
 /**
- * Whether `path` (absolute from a tool, or as written in text) names one of
- * the prose's embedded `targets` (as written). A relative target matches an
- * absolute path by suffix on a directory boundary — the same file can be
- * named two ways in one turn, and a stray suffix collision only hides a
- * tile the prose is already showing.
+ * Whether `name`, as the prose wrote it, refers to `path` (absolute from a
+ * tool, or as written elsewhere). A relative name matches by suffix on a
+ * directory boundary — the same file is named two ways in one turn — and
+ * an absolute name matches exactly.
  */
-export function isProseEmbedded(path: string, targets: readonly string[]): boolean {
-  const bare = hopless(path);
-  for (const t of targets) {
-    if (t === path) return true;
-    // An absolute target names exactly one file.
-    if (t.startsWith("/")) continue;
-    const rel = hopless(t);
-    if (rel !== "" && (bare === rel || path.endsWith(`/${rel}`))) return true;
+export function namesFile(name: string, path: string): boolean {
+  if (name === path) return true;
+  if (name.startsWith("/")) return false;
+  const rel = hopless(name);
+  return rel !== "" && (hopless(path) === rel || path.endsWith(`/${rel}`));
+}
+
+/**
+ * The files among `paths` that the prose's `names` refer to. Each name
+ * claims one file, the shallowest match — a bare `notes.md` is the one at
+ * the base, not `docs/notes.md` — so a name covers a file, never a family.
+ */
+export function proseCovered(paths: readonly string[], names: readonly string[]): Set<string> {
+  const out = new Set<string>();
+  for (const name of names) {
+    let best: string | null = null;
+    let bestDepth = Infinity;
+    for (const p of paths) {
+      if (!namesFile(name, p)) continue;
+      const depth = p.split("/").length;
+      if (depth < bestDepth) {
+        best = p;
+        bestDepth = depth;
+      }
+    }
+    if (best !== null) out.add(best);
   }
-  return false;
+  return out;
 }
 
 /** Slack between the journal's clock and a file's mtime (one host, but
@@ -161,4 +178,55 @@ export function writtenDuring(
   if (mtimeMs === null || startedAtMs === null) return false;
   if (mtimeMs < startedAtMs - MTIME_SLACK_MS) return false;
   return endedAtMs === null || mtimeMs <= endedAtMs + MTIME_SLACK_MS;
+}
+
+/** What a chip can say about its file now, against the turn that wrote
+ *  it: still as written, rewritten by a later turn (or by hand), or gone. */
+export type FileState = "present" | "changed" | "gone";
+
+/** The state of a resolved file for a turn that ended at `endedAtMs`. A
+ *  modification after the turn (past the clock slack) is a change the
+ *  reader should know about before opening what this turn wrote. */
+export function fileStateAfter(r: TargetResult, endedAtMs: number | null): FileState {
+  if (isMissing(r)) return "gone";
+  if (endedAtMs !== null && r.mtime_ms !== null && r.mtime_ms > endedAtMs + MTIME_SLACK_MS) {
+    return "changed";
+  }
+  return "present";
+}
+
+/**
+ * Chip labels for a set of paths: each file's name, widened with parent
+ * directories only where two files share one (`a/README.md`, `b/README.md`),
+ * one directory at a time until every label is distinct.
+ */
+export function chipLabels(paths: readonly string[]): Map<string, string> {
+  const segments = new Map(paths.map((p) => [p, p.split("/").filter((s) => s !== "")]));
+  const depth = new Map(paths.map((p) => [p, 1]));
+  for (;;) {
+    const groups = new Map<string, string[]>();
+    for (const p of paths) {
+      const segs = segments.get(p) ?? [p];
+      const label = segs.slice(Math.max(0, segs.length - (depth.get(p) ?? 1))).join("/") || p;
+      const members = groups.get(label);
+      if (members === undefined) groups.set(label, [p]);
+      else members.push(p);
+    }
+    let widened = false;
+    for (const members of groups.values()) {
+      if (members.length < 2) continue;
+      for (const p of members) {
+        const d = depth.get(p) ?? 1;
+        if (d < (segments.get(p)?.length ?? 0)) {
+          depth.set(p, d + 1);
+          widened = true;
+        }
+      }
+    }
+    if (!widened) {
+      const out = new Map<string, string>();
+      for (const [label, members] of groups) for (const p of members) out.set(p, label);
+      return out;
+    }
+  }
 }

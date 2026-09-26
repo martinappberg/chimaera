@@ -477,29 +477,36 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   the workspace root — strictly, an embed names one file — and any fragment picks the piece
   (`paper.pdf#page=3`, `run.py#L10-L30`, `data.csv#row=2-9`). A file the agent announces before
   writing shows as "not found" and turns into its card when it appears.
-- **Made this turn.** After a turn's closing prose, what the turn made — including files written
-  by **shell commands** (a plot saved by a script, a rendered report), not only by edit tools;
-  never source code (its diff is in the tool card). Two shapes, by what a file is *for*: a
+- **Written this turn.** After a turn's closing prose, the files the turn wrote — created or
+  changed, by its edit tools or by **shell commands** (a plot saved by a script, a rendered
+  report); never source code (its diff is in the tool card). The block **adds, never repeats**:
+  the prose is the reader's first view of the turn, so a figure it embeds inline
+  (`![](figs/plot.png)`) is not tiled again and a document it links is not chipped again (a name
+  claims the shallowest match, so `notes.md` covers the one at the base, not `docs/notes.md`); a
+  figure the prose only names still shows, because a link is not a picture. The heading says
+  "Written this turn" when the prose named none of it and "Also written" when it named some; a
+  turn whose prose covers everything ends with no block. Two shapes by what a file is *for*: a
   **visual** (a figure, an HTML report, a PDF, a clip) is something to look at, so it shows as a
-  compact tile up front under "Made this turn"; a **document** (markdown, docx/pptx, tables and
-  spreadsheets, notebooks) is something to open, so it shows as one chip on a quiet "Files" line —
-  click a chip to open the file in a pane, "+n more" past six, and "preview" unfolds the
-  documents' tiles on demand. A turn that only edited docs therefore costs one line, not a wall
-  of excerpts. A file the prose already embeds inline (`![](figs/plot.png)`) is left out — its
-  card is beside the words about it. A stopped or failed turn keeps its gallery. Tiles stay fresh
-  when a file is overwritten, and say so when one is gone.
+  compact tile; a **document** (markdown, docx/pptx, tables and spreadsheets, notebooks) is
+  something to open, so it shows as one chip on a quiet line — click to open in a pane, "+n
+  more" past six, "preview" unfolds the documents' tiles; with no tiles the heading sits on the
+  chip line, so a turn costs one line. Two files sharing a name show their folders (against
+  everything the turn wrote, linked in the prose or not). A chip knows
+  its file: gone (struck, not clickable) or changed after this turn (its tooltip says so), kept
+  current by the disk monitor while on screen. A stopped or failed turn keeps its block. Tiles
+  stay fresh when a file is overwritten, and say so when one is gone.
 - **How the gallery finds shell-written files.** No structured event names them, so the reducer
-  lists the artifact-shaped paths the turn's commands, command outputs and prose *mention*
-  (`artifacts.ts`), and the gallery keeps those the daemon confirms exist and were **modified
-  inside the turn** — between its journal-stamped start and end (daemon clock on both sides, a few
+  lists the artifact-shaped paths the turn's commands and command outputs *mention*, plus figures
+  the prose names without embedding (`artifacts.ts`), and the gallery keeps those the daemon
+  confirms exist and were **modified inside the turn** — between its journal-stamped start and end (daemon clock on both sides, a few
   seconds' slack). A file merely `cat`-ed, or rewritten by a later turn, stays out. One
   `resolve_targets` round trip per gallery, when it nears the viewport; replay rebuilds the same
   `turn_end` from the journal.
 - **Where.** `Markdown.svelte` (the sanitizer moves a local `<img>` src out of reach; cards mount
   beside the placeholder on settled content and closed stream segments, and are destroyed with
   it), `ArtifactGallery.svelte`, `artifacts.ts`, `embeds.ts` (`EmbedResolver`),
-  `store.svelte.ts` (`turn_end.artifacts` / `mentioned` / `startedAtMs` / `endedAtMs` /
-  `aborted`), `shared/embed/`. Uses `POST /api/v1/fs/resolve_targets` and `GET /raw/{ticket}`.
+  `store.svelte.ts` (`turn_end.artifacts` / `mentioned` / `covered` / `startedAtMs` /
+  `endedAtMs` / `aborted`), `shared/embed/`. Uses `POST /api/v1/fs/resolve_targets` and `GET /raw/{ticket}`.
 
 ## Reconnect & gap-replay
 

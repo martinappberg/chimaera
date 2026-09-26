@@ -2289,6 +2289,7 @@
             <ArtifactGallery
               paths={block.artifacts}
               mentioned={block.mentioned}
+              covered={block.covered}
               startedAtMs={block.startedAtMs}
               endedAtMs={block.endedAtMs}
               resolver={proseEmbeds}
