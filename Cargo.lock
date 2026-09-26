@@ -386,6 +386,7 @@ name = "chimaera-agent"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "nix 0.31.3",
  "rand 0.10.2",
  "serde",
  "serde_json",

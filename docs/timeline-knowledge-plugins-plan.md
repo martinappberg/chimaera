@@ -27,7 +27,7 @@ the unmerged Loadout plan (`docs/skills-manager-plan.md` on branch
 - The interactive-program exclusions are a fixed list in `episodes.rs`, not
   a setting.
 - Codex's installed plugins are inferred from the `pluginId` on its skills
-  and hooks (PROTOCOL.md Pass 32), not `plugin/installed`; a codex plugin
+  and hooks (PROTOCOL.md Pass 33), not `plugin/installed`; a codex plugin
   with neither doesn't appear.
 - Claude memory is read from `~/.claude/projects/<encoded cwd>/memory`.
   Without mycelium there is no "latest episodes" fallback for *Where we

@@ -714,6 +714,7 @@ name = "chimaera-agent"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "nix 0.31.3",
  "rand 0.10.2",
  "serde",
  "serde_json",
@@ -824,6 +825,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-util",
+ "toml 0.9.12+spec-1.1.0",
  "tower-http 0.7.0",
  "tracing",
  "zip 8.6.0",

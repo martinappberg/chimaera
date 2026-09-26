@@ -80,6 +80,10 @@ pub struct SpawnSpec {
     /// pick when it differs from the agent's opening mode. The daemon's
     /// per-agent prefs feed it; `None` = the agent's own default.
     pub initial_mode: Option<String>,
+    /// Turn claude's session-scoped ultracode on after the handshake, like a
+    /// header pick but not recorded as one (a resurrected session had it on
+    /// when the daemon restarted). Codex has no ultracode and ignores it.
+    pub initial_ultracode: bool,
     /// The binary's `--version` line as the server probed it (`None` when
     /// the probe failed). Neither wire protocol offers a reliable version
     /// handshake (see PROTOCOL.md), so the server-side probe is the source:
@@ -149,6 +153,7 @@ impl SpawnSpec {
             initial_model: None,
             initial_effort: None,
             initial_mode: None,
+            initial_ultracode: false,
             agent_version: None,
             rollback_turns: None,
             fork_at: None,
@@ -524,6 +529,14 @@ pub async fn run_driver<D: Driver>(driver: D, spec: SpawnSpec, mut io: DriverIo)
         if io.events.send(ev).await.is_err() {
             break;
         }
+    }
+    // A stop WE initiated (kill, dead receiver, protocol error) SIGTERMs the
+    // child first: claude's handler ends its detached background work, where
+    // a bare stdin close leaves it running (see `ChildGuard::terminate`). A
+    // child that closed its own output is already on its way out and keeps
+    // its own exit status for the at-birth classification below.
+    if !matches!(exit, DriverExit::Clean(_)) {
+        guard.terminate();
     }
     // Close stdin (the polite shutdown both protocols honor) so a child blocked
     // on read wakes, then reap with a bounded wait. A normally-exiting child

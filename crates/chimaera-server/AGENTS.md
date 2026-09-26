@@ -16,7 +16,7 @@ the module you need and read its header doc.
 | `state.rs` | `AppState` (every shared handle) + `lock()`. |
 | `router.rs` | `app()` — the axum route table. |
 | `lifecycle.rs` | The daemon `run()` lifecycle (bind/handoff/manifest/serve/graceful-shutdown) + the listener helpers. |
-| `ledger.rs` | The session ledger: snapshot/restore for restart handoff + resurrection. Covers **both** surfaces — PTY sessions and chat sessions (via `state.chat`); a chat resurrects through `chat::resurrect_chat`. |
+| `ledger.rs` | The session ledger: snapshot/restore for restart handoff + resurrection. Covers **both** surfaces — PTY sessions and chat sessions (via `state.chat`); a chat resurrects through `chat::resurrect_chat`, carrying its process `Carryover` (bridge, ultracode, cut-off work). The reconciler stops writing once `stopping` is set — the graceful stop owns the last write. |
 | `api/` | REST, split by resource: `workspaces`/`sessions`/`exec`/`shutdown`/`env` + `mod.rs` (auth+health+re-exports). |
 | `exec.rs` | `run_exec` — the transport-neutral "type a command into a live shell, with sentinel policy" helper, shared by `api::exec_session` (REST) and `mcp::run_in_terminal` (so `mcp` doesn't depend on `api`). |
 | `persist.rs` | `atomic_write_json` — the shared temp-write + rename dance for the small JSON state stores (view-state/ledger/workspaces/recents/settings). |
@@ -45,7 +45,7 @@ the module you need and read its header doc.
 | `episodes.rs` | What writes the Timeline: chat turns folded from protocol events on the chat signal task (`ChatEpisodes` — queued prompts, feedback, lost TurnStarted, retractions, written-files-only), claude-TUI turns from hooks (`TuiEpisodes`, PTY-only — chat sessions fire the same hooks), notable terminal commands (redacted heads, via `Marks::finished_since` on the shells' 2 s tick), finished Slurm jobs (a 60 s task, idle without a queue), chat crashes. No LLM anywhere. |
 | `knowledge.rs` | `GET /workspaces/{id}/knowledge` (the mycelium provider when its plugin is active, else guidance + claude memory), the `knowledge_search`/`knowledge_get` tools, and Timeline attribution at episode ends (credit only when the entry's file changed after the turn started AND no other agent ran; confidence moves are their own entries). Never writes knowledge. |
 | `plugins/` | Workbench plugins: embedded TOML manifests (`manifests/`), per-workspace switch (`Workspace.plugins_on`), footprint detection off the reactor, the MCP tools a plugin adds (`tools.rs` — offered AND call-gated only where active, pre-allowed at spawn), install (the agent's own plugin manager in a visible terminal) and setup (a chat sent the plugin's own prompt) routes. Recipe: `docs/agent-guides/plugins.md`. |
-| `agent_probe.rs` | Ask the agents themselves: `claude plugin list --json`/`details`, a short-lived `codex app-server` (`skills/list`, `hooks/list`, `config/batchWrite`) — one probe daemon-wide at a time, login-shell wrapped, bounded, cached 60 s; `GET agent-plugins`, `GET skills`, `POST trust-hooks` (re-list; only this plugin's untrusted hooks whose hash still matches; upsert merges — PROTOCOL.md Pass 32). |
+| `agent_probe.rs` | Ask the agents themselves: `claude plugin list --json`/`details`, a short-lived `codex app-server` (`skills/list`, `hooks/list`, `config/batchWrite`) — one probe daemon-wide at a time, login-shell wrapped, bounded, cached 60 s; `GET agent-plugins`, `GET skills`, `POST trust-hooks` (re-list; only this plugin's untrusted hooks whose hash still matches; upsert merges — PROTOCOL.md Pass 33). |
 | `notes.rs` | The Agent notes plugin: `post_note`/`read_notes` (in-workspace only, rate-capped, framed as information), the unread hint on claude's existing hook carriers, `POST timeline/{seq}/deliver` (the user's click; chat targets only). A note never starts a turn. |
 | `workspaces` / `links`+`mcp` / `settings` / `quickopen` / `recents` / `naming` / `view_state` | The rest of the workbench: roots, linked terminals, settings, palette, history, per-window view-state. `quickopen` is stale-while-revalidate + single-flight per workspace with a walk-cost-scaled freshness window (its header doc has the rules — a cold NFS crawl must never run twice at once nor on a reactor worker); `view_state` caps keys at 128 by write recency and persists off the reactor. |
 
@@ -221,7 +221,17 @@ the lifecycle, keep them consistent:
   `chat::resurrect_chat` (regenerate settings/mcp, `--resume`/thread, reuse the
   journal) and retires the rest into Recents (`ui=Chat`). The graceful-shutdown
   path must **not** retire chats (that drops their workspace mapping and the
-  reconciler would lose them) — the snapshot carries them.
+  reconciler would lose them) — the snapshot carries them. It does END them
+  (`chat::stop_all_for_exit`, after the final ledger flush and the dead-chat
+  retire loop) so claude's detached background shells die with their agent;
+  with `stopping` set, `handle_chat_exit` and the agent watcher do nothing for
+  those exits. The ledger's per-chat `carryover` brings back the bridge
+  (`ChatRecipe.remote_control` = `RemoteControlAtStart::Yes/No`, over the
+  at-start setting) and ultracode and, when a turn or background work was cut
+  off and the conversation resumed, one `origin: "restart"` message to the
+  agent (`pickup_message`: gated by `chat.resumeAfterRestart`, never to a
+  Mastermind, and withheld within 10 min of the chat's last pick-up so a
+  crash loop can't bill a turn per crash).
 - **`close-all` / `shutdown` must stop chat drivers too** (`kill_all` only
   covers PTYs).
 - **Resource discipline is a review criterion.** ~150 MB RSS, no unbounded

@@ -794,7 +794,7 @@ fn codex_mcp_overrides(url: &str) -> [String; 4] {
 /// re-asked on every call (the app-server ignores that key, Pass 19; the TUI
 /// is where it applies). Linked-terminal tools keep codex's default prompt.
 /// Names outside `[a-z0-9_]` can't be a bare dotted-key segment and are
-/// skipped. Live (codex 0.153.0, Pass 32): a pre-approved tool runs with no
+/// skipped. Live (codex 0.153.0, Pass 33): a pre-approved tool runs with no
 /// prompt, while a linked-terminal tool still asks.
 pub(crate) fn codex_tui_mcp_args(url: &str, approve: &[String]) -> Vec<String> {
     let mut args = codex_mcp_overrides(url).to_vec();

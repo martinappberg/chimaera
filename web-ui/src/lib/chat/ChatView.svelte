@@ -1805,10 +1805,12 @@
               />
             </div>
           </div>
-          {#if block.attachments > 0 || block.origin === "remote"}
+          {#if block.attachments > 0 || block.origin === "remote" || block.origin === "restart"}
             <span class="bubble-meta">
               {#if block.origin === "remote"}
                 <span class="origin" title="sent from a Remote Control client (the Claude app or claude.ai/code)">via Remote Control</span>
+              {:else if block.origin === "restart"}
+                <span class="origin auto" title="chimaera sent this itself: the daemon restarted while this chat had work running, so it asked the resumed agent to pick that work back up (setting: Pick Up Interrupted Work After a Restart)">sent by chimaera after a restart</span>
               {/if}
               {#if block.attachments > 0}
                 <span class="attach">{block.attachments} image{block.attachments > 1 ? "s" : ""}</span>
@@ -2365,6 +2367,12 @@
     border-radius: 999px;
     padding: 0 6px;
     line-height: 1.5;
+  }
+  /* The daemon's own message (a restart pick-up), not a feature: muted, so
+     it reads as provenance rather than as another chip to act on. */
+  .origin.auto {
+    color: var(--muted);
+    border-color: var(--edge);
   }
   /* Undelivered messages occupy the transcript tail, not fixed composer
      chrome. The transcript's own scrollbar can therefore move a large queue

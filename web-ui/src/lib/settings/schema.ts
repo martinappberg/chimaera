@@ -127,6 +127,7 @@ export type SettingsMap = {
   "daemon.restoreSessions": boolean;
   "chat.remoteControlAtStart": boolean;
   "chat.toolSummaries": boolean;
+  "chat.resumeAfterRestart": boolean;
   "update.autoCheck": boolean;
   "keys.modifier": "auto" | "cmd" | "ctrl-shift" | "alt";
 } & Record<KeyBindingId, string>;
@@ -694,6 +695,15 @@ const DEFS = {
     default: true,
     scope: "daemon",
     note: "Applies to chat sessions started after the change.",
+  },
+  "chat.resumeAfterRestart": {
+    title: "Pick Up Interrupted Work After a Restart",
+    category: "Chat",
+    description:
+      "When the daemon restarts (an update, a crash) while a chat was mid-turn or had background commands, monitors or workflows running, send the resumed agent one message listing what stopped, so it restarts what it still needs and finishes its turn. The message shows in the transcript and starts a turn on your account. Off: those chats come back idle. Remote Control, model, effort, mode and ultracode come back either way.",
+    type: "boolean",
+    default: true,
+    scope: "daemon",
   },
   "daemon.restoreSessions": {
     title: "Restore Sessions on Restart",

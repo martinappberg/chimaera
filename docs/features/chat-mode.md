@@ -141,6 +141,9 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   Control** tag under its bubble (unverified end to end — see PROTOCOL.md Pass 30). The daemon
   setting **Remote Control at Start (Claude)** (`chat.remoteControlAtStart`, default off) turns it
   on for every new Claude chat as soon as it handshakes, registered as `chimaera · <workspace>`.
+  A daemon restart brings the bridge back as it was — on if it was on, off if you had turned it
+  off — whatever that setting says (see the restart carryover in
+  [lifecycle-and-persistence.md](lifecycle-and-persistence.md)).
   Codex's Remote Control belongs to its shared app-server daemon (`codex remote-control start`
   / `codex remote-control pair`), not to the per-session app-server chimaera drives, so a Codex chat
   only relays its status; the popover says how to turn it on.
@@ -516,7 +519,9 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
 ## Status: partial
 
 - Chat sessions survive a *disconnect* **and a daemon restart** — the ledger resurrects them live
-  (resuming the native conversation, carrying the pinned title). A normally finished Codex chat
+  (resuming the native conversation, carrying the pinned title, the Remote Control bridge and
+  ultracode; a turn or background work the restart cut off is handed back to the agent in one
+  message tagged **sent by chimaera after a restart**, setting `chat.resumeAfterRestart`). A normally finished Codex chat
   preserves its native thread id in Recents, whose click starts `thread/resume` under a new Chimaera
   session id (see [lifecycle-and-persistence.md](lifecycle-and-persistence.md)).
 - Codex rewind's rollback count only sees turns the chat journal saw (TUI-interleaved turns

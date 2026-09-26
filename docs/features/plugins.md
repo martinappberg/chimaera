@@ -58,7 +58,7 @@ tools ride the per-session MCP endpoint ([linked-terminals.md](linked-terminals.
     `permissions.allow` (chat and TUI); codex chat — the driver's `mcp_auto_approve`; codex
     TUI — `-c mcp_servers.chimaera.url=…` + `bearer_token_env_var="CHIMAERA_MCP_KEY"` (the key
     in the PTY env, never argv) + per-tool `approval_mode="approve"` (live: a pre-approved
-    tool runs with no prompt, a linked-terminal tool still asks — PROTOCOL.md Pass 32). **A codex TUI gets the chimaera MCP server at all only while a
+    tool runs with no prompt, a linked-terminal tool still asks — PROTOCOL.md Pass 33). **A codex TUI gets the chimaera MCP server at all only while a
     plugin with tools is active in its workspace** — with none on, its argv is unchanged.
     Pre-allows are baked at spawn: a claude session or codex chat started before the switch
     sees the tools (tools/list is per call) but its agent asks per call, and a codex TUI
@@ -99,7 +99,7 @@ tools ride the per-session MCP endpoint ([linked-terminals.md](linked-terminals.
   Filter chips (All · claude · codex · only one agent), search, a detail aside.
 - **Where it lives.** `agent_probe.rs` (`claude_state`, `codex_raw` / `codex_state`,
   `CodexRpc`, `agent_plugins`, `skills`, `scan_skills`); UI `SkillsView.svelte`,
-  `skillsModel.ts`. Wire facts: [PROTOCOL.md Pass 32](../../crates/chimaera-agent/PROTOCOL.md).
+  `skillsModel.ts`. Wire facts: [PROTOCOL.md Pass 33](../../crates/chimaera-agent/PROTOCOL.md).
 - **Key behaviors.** Every child is login-shell wrapped, time-boxed (20 s CLI, 15 s per RPC),
   output-capped, `kill_on_drop`; **one probe runs daemon-wide at a time** (a semaphore — three
   windows on the tab never spawn three app-servers); answers are cached 60 s; `?refresh=true`,

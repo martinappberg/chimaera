@@ -32,6 +32,9 @@ pub const BG_LABEL_MAX: usize = 200;
 pub const BG_PATH_MAX: usize = 1024;
 /// One-line cap for the `SessionStatus` fields (a status line, not prose).
 pub const STATUS_DETAIL_MAX: usize = 256;
+/// `UserMessage.origin` for the message the daemon sends a resurrected
+/// session when a restart cut its work off (see `ChatManager::command_as`).
+pub const ORIGIN_RESTART: &str = "restart";
 /// One-line cap for a `ToolSummary` label (live ones are ~30 chars).
 pub const TOOL_SUMMARY_MAX: usize = 200;
 /// Tool ids one `ToolSummary` may name (a batch is a single model reply).
@@ -198,10 +201,11 @@ pub enum AgentEvent {
         /// Resolved by a `UserMessageUpdate`; default false = delivered.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         queued: bool,
-        /// Where a message the driver did NOT mint came from: `"remote"` =
-        /// a Remote Control client (phone / claude.ai) injected it through
-        /// the agent's own bridge, so it never crossed chimaera's composer.
-        /// Absent = this workbench sent it. Additive.
+        /// Where a message the user did NOT type in this workbench came from:
+        /// `"remote"` = a Remote Control client (phone / claude.ai) injected
+        /// it through the agent's own bridge, so it never crossed chimaera's
+        /// composer; [`ORIGIN_RESTART`] = the daemon sent it itself after a
+        /// restart cut work off. Absent = this workbench's composer. Additive.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin: Option<String>,
     },
