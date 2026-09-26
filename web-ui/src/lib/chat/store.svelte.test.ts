@@ -1633,3 +1633,78 @@ describe("ChatStore wake markers (turns nobody typed)", () => {
     expect(store.blocks.find((b) => b.kind === "wake")).toMatchObject({ cause: "self", label: null });
   });
 });
+
+describe("ChatStore turn artifacts (the made-this-turn gallery)", () => {
+  /** Fold with explicit journal timestamps: `[ts, event]`. */
+  function foldAt(events: [number, Record<string, unknown>][]): ChatStore {
+    const store = new ChatStore();
+    events.forEach(([ts, ev], i) => store.apply({ seq: i + 1, ts, ev } as SeqEvent));
+    return store;
+  }
+
+  const TURN: [number, Record<string, unknown>][] = [
+    [1000, { type: "user_message", text: "make me a report", attachments: 0 }],
+    [1010, { type: "turn_started", turn_id: "t1" }],
+    [1020, { type: "tool_call", id: "w1", kind: "edit", title: "Write notes.md", locations: ["/p/notes.md"], status: "in_progress" }],
+    [1030, { type: "tool_call_update", id: "w1", status: "completed" }],
+    [1040, { type: "tool_call", id: "e1", kind: "edit", title: "Edit main.rs", locations: ["/p/src/main.rs"], status: "in_progress" }],
+    [1050, { type: "tool_call_update", id: "e1", status: "completed" }],
+    [1060, { type: "tool_call", id: "b1", kind: "execute", title: "python plot.py --out figs/umap.png", status: "in_progress" }],
+    [1070, { type: "tool_call_update", id: "b1", status: "completed", content: { kind: "output", text: "wrote report/index.html\n" } }],
+    [1080, { type: "message_chunk", turn_id: "t1", text: "Done — see `figs/umap.png` and report/index.html." }],
+    [2000, { type: "turn_completed", turn_id: "t1", usage: {} }],
+  ];
+
+  it("collects written artifacts, shell-mentioned candidates and the turn's window", () => {
+    const store = foldAt(TURN);
+    const end = store.blocks.find((b) => b.kind === "turn_end");
+    expect(end).toMatchObject({
+      kind: "turn_end",
+      // Source code an edit tool touched is not an artifact.
+      artifacts: ["/p/notes.md"],
+      startedAtMs: 1010,
+      endedAtMs: 2000,
+      aborted: false,
+    });
+    expect(end?.kind === "turn_end" ? end.mentioned : []).toEqual(
+      expect.arrayContaining(["figs/umap.png", "report/index.html"]),
+    );
+    // Replay rebuilds the identical blocks (pure over the journal).
+    expect(foldAt(TURN).blocks).toEqual(store.blocks);
+  });
+
+  it("a stopped turn keeps what it made; a plain stop adds nothing", () => {
+    const stopped = foldAt([
+      ...TURN.slice(0, -1),
+      [1500, { type: "turn_aborted", turn_id: "t1", reason: "interrupted", interrupted: true }],
+    ]);
+    const kinds = stopped.blocks.map((b) => b.kind);
+    expect(kinds.slice(-2)).toEqual(["turn_end", "notice"]);
+    expect(stopped.blocks.find((b) => b.kind === "turn_end")).toMatchObject({
+      artifacts: ["/p/notes.md"],
+      startedAtMs: 1010,
+      endedAtMs: 1500,
+      aborted: true,
+    });
+
+    const plain = foldAt([
+      [1, { type: "turn_started", turn_id: "t1" }],
+      [2, { type: "message_chunk", turn_id: "t1", text: "thinking out loud" }],
+      [3, { type: "turn_aborted", turn_id: "t1", reason: "interrupted", interrupted: true }],
+    ]);
+    expect(plain.blocks.map((b) => b.kind)).toEqual(["message", "notice"]);
+  });
+
+  it("each turn scans only itself", () => {
+    const store = foldAt([
+      ...TURN,
+      [3000, { type: "user_message", text: "thanks", attachments: 0 }],
+      [3010, { type: "turn_started", turn_id: "t2" }],
+      [3020, { type: "message_chunk", turn_id: "t2", text: "You're welcome." }],
+      [3030, { type: "turn_completed", turn_id: "t2", usage: {} }],
+    ]);
+    const ends = store.blocks.filter((b) => b.kind === "turn_end");
+    expect(ends).toHaveLength(2);
+    expect(ends[1]).toMatchObject({ artifacts: [], mentioned: [], startedAtMs: 3010, endedAtMs: 3030 });
+  });
+});

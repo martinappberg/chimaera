@@ -52,6 +52,8 @@ async_zip = { version = "0.0.18", default-features = false, features = ["tokio",
 # body stream (GET /download/{ticket}); compat adapts tokio files onto
 # async_zip's futures-flavored entry writer.
 tokio-util = { version = "0.7", features = ["io", "compat"] }
+# `Last-Modified` on `/raw` (already in the tree through hyper).
+httpdate = "1.0"
 
 # macOS-only: foreground-process name/cwd for session display names
 # (proc_pidinfo BSDINFO name / PIDVNODEPATHINFO cwd); Linux reads /proc.

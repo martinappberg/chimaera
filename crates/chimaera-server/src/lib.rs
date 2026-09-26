@@ -10,6 +10,7 @@ mod compute_jobs;
 mod doc_check;
 mod download;
 mod drafts;
+mod embed;
 mod environment;
 mod exec;
 mod fs;

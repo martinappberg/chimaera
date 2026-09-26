@@ -456,6 +456,7 @@ dependencies = [
  "futures",
  "hostname",
  "http-body-util",
+ "httpdate",
  "hyper",
  "hyper-util",
  "libproc",
