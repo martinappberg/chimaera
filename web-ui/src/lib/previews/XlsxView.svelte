@@ -9,12 +9,11 @@
    * Bounded by the server's source-size cap; no in-place editing (a spreadsheet
    * is not a text file).
    */
-  import { untrack } from "svelte";
   import { fsXlsx, type TablePage } from "./files";
   import TableView from "./TableView.svelte";
   import Spinner from "./Spinner.svelte";
   import { a1ToBlock, blockToA1, sheetFragment, type TableBlock } from "../shared/locator";
-  import { requestReveal, revealRequest, takeReveal, type Reveal } from "../shared/reveal";
+  import { revealRequest, takeReveal, type Reveal } from "../shared/reveal";
 
   interface Props {
     path: string;
@@ -114,14 +113,11 @@
     if (table !== undefined) gridReveal = { table, nonce: ++revealNonce };
   });
 
-  // A reveal taken but not yet applied goes back to the store when this view
-  // goes first, for the instance that replaces it: FileView remounts a
-  // spreadsheet once its version token lands ({#key entry.mtime}) — on a
-  // cold open, moments after the open that carried the reveal.
-  $effect(() => () => {
-    const req = untrack(() => pendingReveal);
-    if (req !== null) requestReveal(path, req);
-  });
+  // A reveal is held (pendingReveal) until its sheet has loaded, so this
+  // view must outlive a cold open: FileView keys it on a version token that
+  // moves only when the file CHANGES (versionKey.ts), not when the token
+  // first lands. A reveal still pending when the view goes is dropped — the
+  // one global slot may hold a newer reveal for another file by then.
 </script>
 
 <div class="xlsx-view">

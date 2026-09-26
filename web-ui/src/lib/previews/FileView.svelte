@@ -17,6 +17,7 @@
   import { looksBinary, midTruncate, viewKindFor, type FileChunk } from "./files";
   import { retain, release, type FileEntry } from "./fileStore.svelte";
   import { isMarpFrontmatter, isMarpSource } from "./marp";
+  import { nextVersionKey, VERSION_KEY_START } from "./versionKey";
   import ImageView from "./ImageView.svelte";
   import MediaView from "./MediaView.svelte";
   import TableView from "./TableView.svelte";
@@ -212,6 +213,18 @@
     else void e.ensureMtime();
     return () => release(p);
   });
+  // The views that read their whole file again on a new version remount on
+  // this key: it moves when the version token CHANGES, not when it first
+  // lands on a cold open (see versionKey.ts) — that remount read the file
+  // twice and lost a spreadsheet's range reveal.
+  let version = VERSION_KEY_START;
+  let versionKey = $state(0);
+  $effect(() => {
+    const e = entry;
+    if (e === null) return;
+    version = nextVersionKey(version, e.path, e.mtime);
+    if (version.key !== untrack(() => versionKey)) versionKey = version.key;
+  });
   // "Open as text" on an extension-known binary, or a board's source: its
   // chunk was never read.
   $effect(() => {
@@ -356,7 +369,7 @@
         <TableView {path} />
       {:else if kind === "xlsx"}
         {#if XlsxView !== null}
-          {#key entry?.mtime ?? path}
+          {#key versionKey}
             <XlsxView {path} />
           {/key}
         {:else}
@@ -364,7 +377,7 @@
         {/if}
       {:else if kind === "pdf"}
         {#if PdfView !== null}
-          {#key entry?.mtime ?? path}
+          {#key versionKey}
             <PdfView {path} />
           {/key}
         {:else}
@@ -415,14 +428,14 @@
       {:else if kind === "parquet"}
         {#if ParquetView !== null}
           <!-- Keyed on the version: a rewritten file is a new footer and new offsets. -->
-          {#key entry?.mtime ?? path}
+          {#key versionKey}
             <ParquetView {path} />
           {/key}
         {:else}
           {@render lazyFallback()}
         {/if}
       {:else if kind === "binary" && !asText}
-        {#key entry?.mtime ?? path}
+        {#key versionKey}
           <BinaryView {path} onText={() => (asText = true)} />
         {/key}
       {:else if probe.state === "text" && asText}
@@ -434,7 +447,7 @@
           {@render lazyFallback()}
         {/if}
       {:else if probe.state === "binary"}
-        {#key entry?.mtime ?? path}
+        {#key versionKey}
           <BinaryView {path} knownSize={probe.size} onText={() => (asText = true)} />
         {/key}
       {:else if probe.state === "error"}
