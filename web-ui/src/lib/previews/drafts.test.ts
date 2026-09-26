@@ -45,14 +45,15 @@ const net = vi.hoisted(() => {
   };
 });
 
-vi.mock("./files", () => ({
+vi.mock("./files", async (orig) => ({
+  draftPutBody: (await orig<typeof import("./files")>()).draftPutBody,
   fsDraftPut: net.fsDraftPut,
   fsDraftDelete: net.fsDraftDelete,
   fsDraftList: net.fsDraftList,
   fsDraftGet: net.fsDraftGet,
 }));
 
-import { clear, journal, type DraftRecord } from "./drafts";
+import { clear, journal, KEEPALIVE_BUDGET_BYTES, type DraftRecord } from "./drafts";
 
 const rec = (path: string, text: string): DraftRecord => ({
   path,
@@ -141,5 +142,53 @@ describe("the draft mirror's per-path order", () => {
     deliver(2);
     await Promise.all([older, newer]);
     expect(net.store.get("/w/e.md")).toBe("new");
+  });
+});
+
+describe("the keepalive budget (a pagehide flush sends every dirty buffer at once)", () => {
+  /** What one flush asked for, per path. */
+  const keepalives = () => Object.fromEntries(net.sent.map((r) => [r.path, r.keepalive]));
+
+  it("shares one budget across the flush, counted in encoded bytes", async () => {
+    // 20k "é" is 20k UTF-16 units but 40 KB of UTF-8: two cannot both fit.
+    const wide = "é".repeat(20_000);
+    const flushed = [
+      journal(rec("/w/k1.md", wide), true),
+      journal(rec("/w/k2.md", wide), true),
+      journal(rec("/w/k3.md", "small"), true),
+    ];
+    await flush();
+    expect(keepalives()).toEqual({ "/w/k1.md": true, "/w/k2.md": false, "/w/k3.md": true });
+    net.sent.forEach((r) => r.settle());
+    await Promise.all(flushed);
+    // Everything was still sent: an over-budget body goes as a normal request.
+    expect([...net.store.keys()].sort()).toEqual(["/w/k1.md", "/w/k2.md", "/w/k3.md"]);
+  });
+
+  it("frees the budget as keepalive requests complete", async () => {
+    const big = "x".repeat(KEEPALIVE_BUDGET_BYTES - 200);
+    const first = journal(rec("/w/f1.md", big), true);
+    await flush();
+    const blocked = journal(rec("/w/f2.md", big), true);
+    await flush();
+    expect(keepalives()).toEqual({ "/w/f1.md": true, "/w/f2.md": false });
+    net.sent.forEach((r) => r.settle());
+    await Promise.all([first, blocked]);
+    net.sent.length = 0;
+    const later = journal(rec("/w/f3.md", big), true);
+    await flush();
+    expect(keepalives()).toEqual({ "/w/f3.md": true });
+    net.sent[0].settle();
+    await later;
+  });
+
+  it("never asks for keepalive over the budget, whatever the text length says", async () => {
+    // Under the budget in UTF-16 units, over it once encoded.
+    const text = "€".repeat(Math.floor(KEEPALIVE_BUDGET_BYTES / 2));
+    const put = journal(rec("/w/euro.md", text), true);
+    await flush();
+    expect(keepalives()).toEqual({ "/w/euro.md": false });
+    net.sent[0].settle();
+    await put;
   });
 });

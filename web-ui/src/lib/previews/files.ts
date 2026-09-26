@@ -214,6 +214,12 @@ function draftsUnsupported(status: number): boolean {
   return status === 404 || status === 405 || status === 501;
 }
 
+/** The JSON body of a draft PUT (drafts.ts weighs it against the browser's
+ *  keepalive quota before asking for `keepalive`). */
+export function draftPutBody(path: string, baseHash: string, text: string): string {
+  return JSON.stringify({ path, base_hash: baseHash, text });
+}
+
 /** Mirror a draft. `keepalive` lets a small body outlive a closing page. */
 export async function fsDraftPut(
   path: string,
@@ -224,7 +230,7 @@ export async function fsDraftPut(
   const res = await api("/fs/drafts", {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ path, base_hash: baseHash, text }),
+    body: draftPutBody(path, baseHash, text),
     keepalive,
     signal: AbortSignal.timeout(15_000),
   });

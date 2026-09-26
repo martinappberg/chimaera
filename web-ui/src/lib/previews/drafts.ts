@@ -19,6 +19,7 @@
  */
 
 import {
+  draftPutBody,
   fsDraftDelete,
   fsDraftGet,
   fsDraftList,
@@ -194,16 +195,39 @@ function inLane<T>(path: string, op: (stale: () => boolean) => Promise<T>, now =
   return run;
 }
 
+/**
+ * The browser caps the bodies of ALL in-flight keepalive requests together
+ * (~64 KiB per page) — and the pagehide flush sends every dirty buffer at
+ * once, beside the layout and settings flushes. Drafts use at most this much
+ * of it at a time, counted in encoded body bytes; a body that does not fit
+ * goes as a normal request (it lands if the page lives long enough), with
+ * the IndexedDB copy written regardless.
+ */
+export const KEEPALIVE_BUDGET_BYTES = 56 * 1024;
+let keepaliveInFlight = 0;
+
+/** Reserve keepalive quota for `rec`'s PUT body: its size, or 0 (no fit). */
+function reserveKeepalive(rec: DraftRecord): number {
+  const room = KEEPALIVE_BUDGET_BYTES - keepaliveInFlight;
+  // UTF-8 never has fewer bytes than UTF-16 code units: skip encoding a
+  // body that cannot fit anyway.
+  if (rec.text.length > room) return 0;
+  const bytes = new TextEncoder().encode(draftPutBody(rec.path, rec.baseHash, rec.text)).length;
+  if (bytes > room) return 0;
+  keepaliveInFlight += bytes;
+  return bytes;
+}
+
 async function sendPut(rec: DraftRecord, keepalive: boolean): Promise<JournalResult["remote"]> {
+  const reserved = keepalive ? reserveKeepalive(rec) : 0;
   try {
-    // keepalive bodies are capped (~64 KiB) by the browser; larger ones go
-    // as a normal request and may not outlive a closing page.
-    const small = rec.text.length < 60 * 1024;
-    const r = await fsDraftPut(rec.path, rec.baseHash, rec.text, keepalive && small);
+    const r = await fsDraftPut(rec.path, rec.baseHash, rec.text, reserved > 0);
     if (r === "unsupported") remoteUnsupported = true;
     return r;
   } catch {
     return "failed";
+  } finally {
+    keepaliveInFlight -= reserved;
   }
 }
 
