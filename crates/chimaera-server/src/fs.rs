@@ -4543,20 +4543,22 @@ pub(crate) async fn raw(
     let Some((path, fresh_for)) = crate::lock(&state.tickets).lookup_ttl(&ticket) else {
         return raw_not_found();
     };
-    let file = match tokio::fs::File::open(&path).await {
-        Ok(file) => file,
-        Err(err) => {
+    // `open_regular` (non-blocking open + fstat re-check): a FIFO or device
+    // swapped in at the ticketed path since the mint must never park a
+    // blocking-pool thread in `open`. Tickets may also name directories
+    // (folder downloads); /raw itself stays file-only — a 404, not a listing.
+    let opened = {
+        let path = path.clone();
+        tokio::task::spawn_blocking(move || open_regular(&path)).await
+    };
+    let (file, meta) = match opened {
+        Ok(Ok((file, meta))) => (tokio::fs::File::from_std(file), meta),
+        Ok(Err(err)) => {
             tracing::warn!(path = %path.display(), %err, "ticketed file unreadable");
             return raw_not_found();
         }
-    };
-    let meta = match file.metadata().await {
-        // Tickets may now name directories (folder downloads); /raw itself
-        // stays file-only — a dir ticket here is a 404, not a listing.
-        Ok(meta) if meta.is_file() => meta,
-        Ok(_) => return raw_not_found(),
         Err(err) => {
-            tracing::warn!(path = %path.display(), %err, "ticketed file unstattable");
+            tracing::warn!(path = %path.display(), %err, "ticketed file open panicked");
             return raw_not_found();
         }
     };

@@ -655,3 +655,32 @@ async fn escaped_filesystem_paths_resolve_to_the_file_they_name() {
     );
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// A FIFO swapped in at a ticketed path since the mint must answer 404 at
+/// once, never park a blocking thread in `open` waiting for a writer.
+#[tokio::test]
+async fn raw_never_blocks_on_a_fifo_at_the_ticketed_path() {
+    let state = test_state();
+    let root = test_dir("embed-raw-fifo");
+    let target = root.join("plot.png");
+    std::fs::write(&target, png(2, 2)).unwrap();
+    let ticket = ticket_for(&state, &target).await;
+    std::fs::remove_file(&target).unwrap();
+    rustix::fs::mkfifoat(
+        rustix::fs::CWD,
+        &target,
+        rustix::fs::Mode::from_raw_mode(0o600),
+    )
+    .unwrap();
+
+    let uri = format!("/raw/{ticket}");
+    let answer = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        get_with(&state, &uri, &[]),
+    )
+    .await;
+    let (status, headers, _) = answer.expect("a FIFO at the ticketed path must not block /raw");
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(header_str(&headers, "x-content-type-options"), "nosniff");
+    std::fs::remove_dir_all(&root).ok();
+}
