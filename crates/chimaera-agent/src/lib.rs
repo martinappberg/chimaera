@@ -319,6 +319,15 @@ pub struct Carryover {
     /// ambient tasks. Bounded by the drivers' `BG_TASKS_CAP`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub background: Vec<CarriedTask>,
+    /// When this process was handed the daemon's restart pick-up message
+    /// (epoch ms; 0 = never) — how the next resurrection tells a restart
+    /// LOOP from a series of updates, since each pick-up starts a billed turn.
+    #[serde(default, skip_serializing_if = "is_zero_ms")]
+    pub pickup_at_ms: u64,
+}
+
+fn is_zero_ms(ms: &u64) -> bool {
+    *ms == 0
 }
 
 /// One running background task, as much of it as a successor needs to name
@@ -352,6 +361,10 @@ impl Carryover {
                 self.remote_control = matches!(state, Rc::Connecting | Rc::Connected);
             }
             AgentEvent::EffortState { ultracode, .. } => self.ultracode = *ultracode,
+            AgentEvent::UserMessage {
+                origin: Some(origin),
+                ..
+            } if origin == model::ORIGIN_RESTART => self.pickup_at_ms = now_ms(),
             AgentEvent::TurnStarted { .. } => self.turn_in_flight = true,
             AgentEvent::TurnCompleted { .. } | AgentEvent::TurnAborted { .. } => {
                 self.turn_in_flight = false;
@@ -1349,6 +1362,16 @@ mod tests {
             interrupted: true,
         });
         assert!(!carry.turn_in_flight);
+
+        assert_eq!(carry.pickup_at_ms, 0);
+        carry.observe(&AgentEvent::UserMessage {
+            text: "pick up".into(),
+            attachments: 0,
+            id: Some("m1".into()),
+            queued: false,
+            origin: Some(model::ORIGIN_RESTART.into()),
+        });
+        assert!(carry.pickup_at_ms > 0, "the pick-up is stamped");
 
         carry.observe(&AgentEvent::Exited { status: Some(0) });
         assert_eq!(carry, Carryover::default(), "nothing outlives the process");

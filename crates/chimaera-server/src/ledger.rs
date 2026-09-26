@@ -313,6 +313,14 @@ pub(crate) fn snapshot(state: &AppState) -> (Vec<LedgerEntry>, HashMap<String, S
     // roster above. Snapshot them too — otherwise a restart resurrects terminals
     // but silently drops every chat.
     let chats = state.chat.list();
+    // Each chat's process state, read BEFORE the four state locks below:
+    // `carryover` takes the chat registry's own locks, which have no business
+    // nesting inside ours.
+    let carries: HashMap<String, chimaera_agent::Carryover> = chats
+        .iter()
+        .filter(|c| c.alive)
+        .filter_map(|c| Some((c.id.clone(), state.chat.carryover(&c.id)?)))
+        .collect();
     // Live ids across BOTH surfaces: the theme map is pruned to these, and a
     // session id belongs to at most one surface at a time.
     let live_ids: std::collections::HashSet<String> = infos
@@ -398,7 +406,7 @@ pub(crate) fn snapshot(state: &AppState) -> (Vec<LedgerEntry>, HashMap<String, S
                     title,
                     ui: SessionUi::Chat,
                     model: c.model.clone(),
-                    carryover: state.chat.carryover(&c.id),
+                    carryover: carries.get(&c.id).cloned(),
                 }),
             })
         })
@@ -798,6 +806,7 @@ mod tests {
                 workflow_name: None,
                 monitor: true,
             }],
+            pickup_at_ms: 1_790_000_000_000,
         });
         let entries = vec![
             shell_entry(),

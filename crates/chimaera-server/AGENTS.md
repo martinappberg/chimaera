@@ -211,11 +211,13 @@ the lifecycle, keep them consistent:
   (`chat::stop_all_for_exit`, after the final ledger flush and the dead-chat
   retire loop) so claude's detached background shells die with their agent;
   with `stopping` set, `handle_chat_exit` and the agent watcher do nothing for
-  those exits. The ledger's per-chat `carryover` brings back the bridge and
-  ultracode (`ChatRecipe.carry_*`) and, when a turn or background work was cut
+  those exits. The ledger's per-chat `carryover` brings back the bridge
+  (`ChatRecipe.remote_control` = `RemoteControlAtStart::Yes/No`, over the
+  at-start setting) and ultracode and, when a turn or background work was cut
   off and the conversation resumed, one `origin: "restart"` message to the
-  agent (`restart_message`, gated by `chat.resumeAfterRestart`; never to a
-  Mastermind — the daemon doesn't start its turns).
+  agent (`pickup_message`: gated by `chat.resumeAfterRestart`, never to a
+  Mastermind, and withheld within 10 min of the chat's last pick-up so a
+  crash loop can't bill a turn per crash).
 - **`close-all` / `shutdown` must stop chat drivers too** (`kill_all` only
   covers PTYs).
 - **Resource discipline is a review criterion.** ~150 MB RSS, no unbounded

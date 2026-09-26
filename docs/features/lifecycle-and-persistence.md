@@ -67,14 +67,17 @@ PTY snapshot-on-attach ([terminals.md](terminals.md)) and the chat seq-journal g
 - **How it's used.** Nothing to do. The message appears in the transcript as a user bubble tagged
   **sent by chimaera after a restart** and starts a turn on your account. It is sent only when work
   was actually cut off and the conversation really resumed (a chat that had to boot fresh has no
-  memory of that work), and never to a workspace Mastermind, whose turns the daemon never starts. Setting **Pick Up Interrupted Work After a Restart**
+  memory of that work), never to a workspace Mastermind (the daemon never starts its turns), and not
+  again within 10 minutes of the chat's last one — a daemon crashing in a loop would otherwise start
+  a billed turn on every crash. Setting **Pick Up Interrupted Work After a Restart**
   (`chat.resumeAfterRestart`, default on) turns the message off; the bridge and ultracode come back
   either way. Model, effort and mode already came back through the journal index.
 - **Where it lives.** `chimaera-agent` `lib.rs` (`Carryover` — folded per session from the event
   stream, read by `ChatManager::carryover`; `command_as` stamps a daemon-sent message's
   `UserMessage.origin = "restart"` via the Send↔echo reservation), `ledger.rs`
-  (`LedgerAgent.carryover`), `chat.rs` (`resurrect_chat` → `ChatRecipe.carry_*`,
-  `SpawnSpec.initial_ultracode`, `restart_message`; `stop_all_for_exit`), `lifecycle.rs`.
+  (`LedgerAgent.carryover`), `chat.rs` (`resurrect_chat` → `RemoteControlAtStart` +
+  `SpawnSpec.initial_ultracode`; `pickup_message` / `restart_message`; `stop_all_for_exit`),
+  `lifecycle.rs`.
 - **Key behaviors.** A graceful stop now **ends chat agents cleanly** before the daemon exits
   (SIGTERM, stdin closed, the 3 s kill grace, then SIGKILL) instead of the runtime's drop-time
   SIGKILL. That matters because Claude Code starts its background shells and Monitors detached: a
