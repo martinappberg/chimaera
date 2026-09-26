@@ -405,16 +405,16 @@ fn command_summary(command: &str) -> String {
         .map(|w| w.trim_matches(['"', '\'']))
         .filter(|w| !w.is_empty())
         .collect();
-    if let Some(i) = words
-        .iter()
-        .position(|w| w.ends_with(".sh") || w.ends_with(".py"))
-    {
-        let script = words[i].rsplit('/').next().unwrap_or(words[i]);
+    let is_script = |w: &str| w.ends_with(".sh") || w.ends_with(".py");
+    let base = |w: &'_ str| w.rsplit('/').next().unwrap_or(w).to_string();
+    if let Some(i) = words.iter().position(|w| is_script(w)) {
         return match words.get(i + 1) {
+            // A dispatcher handing off to the real handler: name the handler.
+            Some(next) if is_script(next) => base(next),
             Some(arg) if arg.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') => {
-                format!("{script} {arg}")
+                format!("{} {arg}", base(words[i]))
             }
-            _ => script.to_string(),
+            _ => base(words[i]),
         };
     }
     crate::timeline::cap(command, 80)
@@ -944,6 +944,13 @@ mod tests {
                 r#"if [ -n "${PLUGIN_ROOT:-}" ]; then "$PLUGIN_ROOT/hooks/mycelium-codex-dispatch.sh" health; fi"#
             ),
             "mycelium-codex-dispatch.sh health"
+        );
+        assert_eq!(
+            command_summary(
+                r#"if [ -n "${PLUGIN_ROOT:-}" ]; then "${PLUGIN_ROOT}/hooks/mycelium-codex-dispatch.sh" mycelium-stop-check.sh; fi"#
+            ),
+            "mycelium-stop-check.sh",
+            "a dispatcher names its handler"
         );
         assert_eq!(command_summary("echo hi"), "echo hi");
         assert_eq!(pascal("post_tool_use"), "PostToolUse");
