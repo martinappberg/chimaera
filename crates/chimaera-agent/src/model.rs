@@ -1602,6 +1602,20 @@ mod tests {
     }
 
     #[test]
+    fn clip_command_keeps_head_and_tail_on_char_boundaries() {
+        assert_eq!(clip_command("ls -la"), "ls -la");
+        // A multi-byte char straddles both cut points: neither is split.
+        let long = "é".repeat(COMMAND_CAP);
+        let clipped = clip_command(&long);
+        assert!(clipped.starts_with("éé") && clipped.ends_with("éé"));
+        assert!(clipped.contains("\n…\n"));
+        assert!(clipped.len() <= COMMAND_CAP + "\n…\n".len());
+        let ascii = format!("{}{}", "a".repeat(COMMAND_CAP), "z".repeat(10));
+        let clipped = clip_command(&ascii);
+        assert!(clipped.starts_with("aaaa") && clipped.ends_with("zzzz"));
+    }
+
+    #[test]
     fn event_serde_round_trips_with_stable_tags() {
         let ev = AgentEvent::ToolCall {
             id: "t1".into(),

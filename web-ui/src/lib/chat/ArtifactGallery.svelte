@@ -283,6 +283,7 @@
 <style>
   .gallery-host {
     min-height: 1px;
+    margin-top: 6px;
   }
   .label {
     margin: 8px 0 4px;
@@ -307,20 +308,6 @@
     max-width: 100%;
     height: 230px;
     border-radius: 10px;
-    transition:
-      transform 0.15s ease,
-      box-shadow 0.15s ease;
-  }
-  .tile:hover {
-    transform: translateY(-1px);
-    box-shadow: 0 10px 24px -14px color-mix(in srgb, var(--fg) 45%, transparent);
-  }
-  @media (prefers-reduced-motion: reduce) {
-    .tile,
-    .tile:hover {
-      transform: none;
-      transition: none;
-    }
   }
   /* The shared embed card, worn as a tile: the name becomes a caption
      under the picture, the picture fills the tile to its edges, and the

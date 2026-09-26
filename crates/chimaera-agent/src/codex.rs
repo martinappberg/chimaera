@@ -2322,11 +2322,11 @@ impl CodexMapper {
                     }
                     let (kind, title, locations) = command_exploration(item)
                         .unwrap_or_else(|| (ToolKind::Execute, command_title(item), Vec::new()));
-                    // Only a real execution carries its command: an
-                    // exploration (`cat`, `ls`) is a read, and its row says so.
-                    let command = (kind == ToolKind::Execute)
-                        .then(|| command_text(item).map(clip_command))
-                        .flatten();
+                    // Every command execution carries its command, an
+                    // exploration row included: `cat > out.csv <<EOF` reads
+                    // as a `cat`, and the gallery's mtime check already keeps
+                    // a merely-read file out.
+                    let command = command_text(item).map(clip_command);
                     step.events.push(AgentEvent::ToolCall {
                         id,
                         kind,

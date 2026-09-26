@@ -501,7 +501,7 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   confirms exist and were **modified inside the turn**. A command is scanned whole: an execute
   `tool_call` carries its full text in the additive `command` field (8 KiB head+tail), because
   the ~120-char `title` is spent on claude's `cd "…/absolute/path" && …` prefix before any file
-  name appears; the tool card shows the whole command on hover — between its journal-stamped start and end (daemon clock on both sides, a few
+  name appears — between its journal-stamped start and end (daemon clock on both sides, a few
   seconds' slack). A file merely `cat`-ed, or rewritten by a later turn, stays out. One
   `resolve_targets` round trip per gallery, when it nears the viewport; replay rebuilds the same
   `turn_end` from the journal.

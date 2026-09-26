@@ -2851,7 +2851,14 @@
   .msg.agent > :global(.md > p:last-child) {
     display: inline;
   }
-  .msg.agent:not(:has(> :global(.md > p:last-child))) :global(.agent-message-meta) {
+  /* On a line of its own — after a code block, a table, a figure the prose
+     embeds — the rail sits at the right edge: a signature under the message,
+     not a stray timestamp between a figure and whatever follows the turn. */
+  .msg.agent:not(:has(> :global(.md > p:last-child))) :global(.agent-message-meta),
+  .msg.agent:has(> :global(.md > p:last-child > .md-embed)) :global(.agent-message-meta) {
+    display: flex;
+    justify-content: flex-end;
+    width: 100%;
     margin-left: 0;
   }
   .msg.agent.streaming :global(.agent-message-meta) {
