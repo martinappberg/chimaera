@@ -9,13 +9,13 @@
    * double-click a cell to read and copy all of it.
    */
   import { tick, untrack } from "svelte";
-  import { fsTable, type TablePage } from "./files";
+  import { fsTable, tablePreset, type TablePage } from "./files";
   import { retain, release, type FileEntry } from "./fileStore.svelte";
   import { getSetting } from "../settings/store.svelte";
   import { copyText } from "../shared/clipboard";
   import { activeSelection, clearSelection, setSelection, type FileSelection } from "../shared/reference";
   import { revealRequest, takeReveal, type Reveal } from "../shared/reveal";
-  import { tableFragment, tableLabel, tsvQuote, TSV_LIMITS, type TableBlock } from "../shared/locator";
+  import { rfcToDataRow, tableFragment, tableLabel, tsvQuote, TSV_LIMITS, type TableBlock } from "../shared/locator";
   import ReferenceChip from "../shared/ReferenceChip.svelte";
   import Spinner from "./Spinner.svelte";
   import {
@@ -37,11 +37,11 @@
      *  this component's effect. */
     fetchPage?: (offset: number, limit: number) => Promise<TablePage>;
     /** How a selected block is addressed for an agent: the fragment and
-     *  its words. Default: RFC 7111 syntax on 1-based data rows (CSV/TSV);
+     *  its words. Default: RFC 7111 (the header line is row 1; CSV/TSV);
      *  the xlsx viewer passes its sheet + A1 form. Pass a STABLE reference. */
     locate?: (b: TableBlock) => { fragment: string; label: string };
     /** A block to land on, handed down by a host that takes its reveals
-     *  itself (xlsx: the sheet comes first). 1-based data rows/columns;
+     *  itself (xlsx: the sheet comes first). RFC 7111 rows (header = 1);
      *  `nonce` re-triggers an identical one. Without a host, the grid takes
      *  `#row=`/`#col=`/`#cell=` reveals for `path` from the reveal store. */
     reveal?: { table: NonNullable<Reveal["table"]>; nonce: number } | null;
@@ -735,7 +735,11 @@
   const PROVENANCE_MAX_CELLS = 5_000;
   const CHIP_W = 170;
 
-  const defaultLocate = (b: TableBlock) => ({ fragment: tableFragment(b), label: tableLabel(b) });
+  /** RFC 7111 counts a header line as row 1: every spreadsheet grid and a
+   *  delimited file unless its format has none (BED, SAM, GFF). */
+  const hasHeader = $derived(fetchPage !== undefined || (tablePreset(path)?.header ?? true));
+
+  const defaultLocate = (b: TableBlock) => ({ fragment: tableFragment(b, hasHeader), label: tableLabel(b) });
 
   /** The block, 1-based, as the locator helpers take it. */
   function blockOf(s: Sel): TableBlock {
@@ -824,14 +828,16 @@
 
   let revealGen = 0;
 
-  /** Jump to a revealed block, flash its rows and outline its cells. */
+  /** Jump to a revealed block (RFC 7111 rows), flash its rows and outline
+   *  its cells. */
   async function revealBlock(t: NonNullable<Reveal["table"]>): Promise<void> {
     const gen = ++revealGen;
     const lastC = Math.max(0, widths.length - 1);
     const c0 = Math.min((t.col ?? 1) - 1, lastC);
     const c1 = t.col === undefined ? lastC : Math.min((t.endCol ?? t.col) - 1, lastC);
-    const firstRow = t.row ?? 1;
-    const lastRow = t.row === undefined ? firstRow : (t.endRow ?? t.row);
+    // Data rows, as the grid numbers them.
+    const firstRow = t.row !== undefined ? rfcToDataRow(t.row, hasHeader) : 1;
+    const lastRow = t.row === undefined ? firstRow : rfcToDataRow(t.endRow ?? t.row, hasHeader);
     await jumpTo(firstRow, lastRow);
     if (gen !== revealGen) return;
     const r0 = firstRow - 1;

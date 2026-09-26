@@ -4,7 +4,7 @@
     "refs — one reference: `input` is a token (or, with `delimited: true`, a whole markdown link target or code span, where spaces belong to the path). `expect` is the parse — path plus 1-based line/col/endLine when present — or null when the input is not a path candidate. `bare: true` parses the way the terminal's hover does (single-segment names admitted).",
     "text — a run of prose or a terminal line: `expect` lists every reference found, in order, as `text` (the exact span a link underlines) plus the parse.",
     "The client only proposes candidates: `and/or` or `a/src/x.rs` are candidates because only the daemon knows whether they exist (it strips a diff prefix when the path misses, and suffix-matches an abbreviated tail).",
-    "`at` is a locator fragment's spot (`shared/locator.ts`): PDF page, image or page region, media time, a CSV/TSV block (1-based data rows), a spreadsheet sheet and A1 range, a notebook cell, a slide. Style `chimaera` is what the workbench itself types when the user points at part of a file."
+    "`at` is a locator fragment's spot (`shared/locator.ts`): PDF page, image or page region, media time, a CSV/TSV block (RFC 7111 rows: the header line is row 1), a spreadsheet sheet and A1 range, a notebook cell, a slide. Style `chimaera` is what the workbench itself types when the user points at part of a file."
   ],
   "refs": [
     {

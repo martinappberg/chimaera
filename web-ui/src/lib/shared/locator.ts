@@ -10,7 +10,7 @@
  *   #xywh=160,120,320,240        W3C Media Fragments (pixel: / percent: too);
  *   #page=4&xywh=…               on a PDF page, in PDF points from its top-left
  *   #t=12.5,20                   W3C Media Fragments (npt, hh:mm:ss too)
- *   #row=5-9 #col=2 #cell=5,2-9,4  RFC 7111 syntax, counting DATA rows
+ *   #row=5-9 #col=2 #cell=5,2-9,4  RFC 7111 (the header line is row 1)
  *   #sheet=Summary&range=B2:F9   A1 notation
  *   #cell=7 (.ipynb) #slide=3    Chimaera convention
  *
@@ -281,7 +281,8 @@ export function xywhFragment(r: { x: number; y: number; w: number; h: number }):
   return `xywh=${x},${y},${w},${h}`;
 }
 
-/** A block of a delimited table, 1-based data rows and columns. */
+/** A block of a table grid: 1-based DATA rows (the grid's own row numbers,
+ *  the header not counted) and 1-based columns. */
 export interface TableBlock {
   r0: number;
   r1: number;
@@ -291,14 +292,29 @@ export interface TableBlock {
   wholeRows: boolean;
 }
 
-/** RFC 7111 syntax for a block: `row=5-9`, `cell=5,2`, `cell=5,2-9,4`. */
-export function tableFragment(b: TableBlock): string {
-  if (b.wholeRows) return b.r1 > b.r0 ? `row=${b.r0}-${b.r1}` : `row=${b.r0}`;
-  if (b.r0 === b.r1 && b.c0 === b.c1) return `cell=${b.r0},${b.c0}`;
-  return `cell=${b.r0},${b.c0}-${b.r1},${b.c1}`;
+/**
+ * RFC 7111 for a block: `row=6-10`, `cell=6,2`, `cell=6,2-10,4`. RFC 7111
+ * counts the header line as row 1 when the file has one (`header`), so the
+ * grid's data row N is row N + 1 there; a header-less format (BED, SAM)
+ * counts from its first record. Embed cards read rows the same way.
+ */
+export function tableFragment(b: TableBlock, header: boolean): string {
+  const k = header ? 1 : 0;
+  const r0 = b.r0 + k;
+  const r1 = b.r1 + k;
+  if (b.wholeRows) return r1 > r0 ? `row=${r0}-${r1}` : `row=${r0}`;
+  if (r0 === r1 && b.c0 === b.c1) return `cell=${r0},${b.c0}`;
+  return `cell=${r0},${b.c0}-${r1},${b.c1}`;
 }
 
-/** Words for a table block ("rows 5–9", "cell 5,2"). */
+/** The grid's data row for an RFC 7111 row (the header line clamps to the
+ *  first data row). */
+export function rfcToDataRow(row: number, header: boolean): number {
+  return header ? Math.max(1, row - 1) : row;
+}
+
+/** Words for a table block in the grid's own numbers ("rows 5–9",
+ *  "cell 5,2"), for tooltips. */
 export function tableLabel(b: TableBlock): string {
   if (b.wholeRows) return b.r1 > b.r0 ? `rows ${b.r0}–${b.r1}` : `row ${b.r0}`;
   if (b.r0 === b.r1 && b.c0 === b.c1) return `cell ${b.r0},${b.c0}`;
@@ -321,13 +337,14 @@ export function blockToA1(b: TableBlock, origin: readonly [number, number]): str
   return a1Range(or + 1 + b.r0, oc + b.c0, or + 1 + b.r1, oc + b.c1);
 }
 
-/** …and an A1 range back on the grid (the header row clamps to data row 1). */
+/** …and an A1 range back on the grid, as RFC 7111 rows of it (its header
+ *  row is row 1, like a delimited file's header line). */
 export function a1ToBlock(
   r: NonNullable<Locator["range"]>,
   origin: readonly [number, number],
 ): NonNullable<Locator["table"]> {
   const [or, oc] = origin;
-  const row = (sheetRow: number) => Math.max(1, sheetRow - or - 1);
+  const row = (sheetRow: number) => Math.max(1, sheetRow - or);
   const col = (sheetCol: number) => Math.max(1, sheetCol - oc);
   const t: NonNullable<Locator["table"]> = {};
   if (r.row !== undefined) {

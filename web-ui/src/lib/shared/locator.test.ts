@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   a1ToBlock,
+  rfcToDataRow,
   blockToA1,
   a1Column,
   a1ColumnNumber,
@@ -19,21 +20,30 @@ import {
 } from "./locator";
 
 describe("formatting round-trips through the parser", () => {
-  it("table blocks (RFC 7111 syntax, data rows)", () => {
+  it("table blocks: RFC 7111 rows, the header line being row 1", () => {
+    // The grid's data rows 5–9 of a file with a header are its rows 6–10.
     const cases = [
-      { b: { r0: 5, r1: 9, c0: 1, c1: 4, wholeRows: true }, f: "row=5-9", t: { row: 5, endRow: 9 } },
-      { b: { r0: 5, r1: 5, c0: 1, c1: 4, wholeRows: true }, f: "row=5", t: { row: 5 } },
-      { b: { r0: 5, r1: 5, c0: 2, c1: 2, wholeRows: false }, f: "cell=5,2", t: { row: 5, col: 2 } },
+      { b: { r0: 5, r1: 9, c0: 1, c1: 4, wholeRows: true }, f: "row=6-10", t: { row: 6, endRow: 10 } },
+      { b: { r0: 5, r1: 5, c0: 1, c1: 4, wholeRows: true }, f: "row=6", t: { row: 6 } },
+      { b: { r0: 5, r1: 5, c0: 2, c1: 2, wholeRows: false }, f: "cell=6,2", t: { row: 6, col: 2 } },
       {
         b: { r0: 5, r1: 9, c0: 2, c1: 4, wholeRows: false },
-        f: "cell=5,2-9,4",
-        t: { row: 5, col: 2, endRow: 9, endCol: 4 },
+        f: "cell=6,2-10,4",
+        t: { row: 6, col: 2, endRow: 10, endCol: 4 },
       },
     ];
     for (const c of cases) {
-      expect(tableFragment(c.b)).toBe(c.f);
+      expect(tableFragment(c.b, true)).toBe(c.f);
       expect(parseLocator(c.f, "de.csv")).toEqual({ table: c.t });
+      // …and back to the grid's rows.
+      expect(rfcToDataRow(c.t.row, true)).toBe(c.b.r0);
     }
+    // A header-less format (BED) counts from its first record.
+    expect(tableFragment(cases[0].b, false)).toBe("row=5-9");
+    expect(rfcToDataRow(5, false)).toBe(5);
+    // The header line itself lands on the first data row.
+    expect(rfcToDataRow(1, true)).toBe(1);
+    // Tooltips speak the grid's numbers.
     expect(tableLabel(cases[0].b)).toBe("rows 5–9");
     expect(tableLabel(cases[2].b)).toBe("cell 5,2");
   });
@@ -54,14 +64,16 @@ describe("formatting round-trips through the parser", () => {
   });
   it("grid blocks ⇄ A1, wherever the sheet's used range starts", () => {
     const b = { r0: 1, r1: 8, c0: 2, c1: 6, wholeRows: false };
-    // Used range from A1: the header is row 1, data row 1 is row 2.
+    // Used range from A1: the header is row 1, data row 1 is row 2. Back on
+    // the grid, rows come as RFC 7111 rows (its header row is row 1).
     expect(blockToA1(b, [0, 0])).toBe("B2:F9");
-    expect(a1ToBlock({ row: 2, col: 2, endRow: 9, endCol: 6 }, [0, 0])).toEqual({ row: 1, col: 2, endRow: 8, endCol: 6 });
+    expect(a1ToBlock({ row: 2, col: 2, endRow: 9, endCol: 6 }, [0, 0])).toEqual({ row: 2, col: 2, endRow: 9, endCol: 6 });
     // Used range from C4 (a title block above, a margin column left).
     expect(blockToA1(b, [3, 2])).toBe("D5:H12");
-    expect(a1ToBlock({ row: 5, col: 4, endRow: 12, endCol: 8 }, [3, 2])).toEqual({ row: 1, col: 2, endRow: 8, endCol: 6 });
-    // The header row itself lands on the first data row.
-    expect(a1ToBlock({ row: 1, col: 1 }, [0, 0])).toEqual({ row: 1, col: 1 });
+    expect(a1ToBlock({ row: 5, col: 4, endRow: 12, endCol: 8 }, [3, 2])).toEqual({ row: 2, col: 2, endRow: 9, endCol: 6 });
+    expect(rfcToDataRow(2, true)).toBe(b.r0);
+    // Rows above the used range clamp to its header row.
+    expect(a1ToBlock({ row: 1, col: 1 }, [3, 2])).toEqual({ row: 1, col: 1 });
   });
   it("media moments and ranges", () => {
     expect(timeFragment(12.5)).toBe("t=12.5");

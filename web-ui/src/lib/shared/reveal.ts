@@ -34,10 +34,11 @@ export interface Reveal {
    *  from the page's top-left): `#xywh=x,y,w,h`. `percent` (`#xywh=percent:…`)
    *  means the four numbers are percentages of the image or page. */
   region?: { x: number; y: number; w: number; h: number; percent?: boolean };
-  /** A block of a CSV/TSV (`#row=5-9`, `#col=2`, `#cell=5,2-9,4`, RFC 7111
-   *  syntax): 1-based DATA rows (the header line is not counted, matching
-   *  the grid's row numbers) and 1-based columns. An absent side spans
-   *  everything; an end is only present when it differs from the start. */
+  /** A block of a table (`#row=5-9`, `#col=2`, `#cell=5,2-9,4`): RFC 7111
+   *  rows, so the header line is row 1 when the file has one (the grid's
+   *  data row N is row N + 1 there; the viewer converts), and 1-based
+   *  columns. An absent side spans everything; an end is only present when
+   *  it differs from the start. */
   table?: { row?: number; endRow?: number; col?: number; endCol?: number };
   /** A spreadsheet sheet (`#sheet=Summary`). */
   sheet?: string;
