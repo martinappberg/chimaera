@@ -26,7 +26,11 @@
 //! result — the interrupt-watchdog recovery tests), `silent` (never answers —
 //! handshake watchdog tests), `die` (exit 3 immediately — spawn-crash tests),
 //! `die-after-handshake` (answer initialize, print a diagnostic on stderr, exit
-//! 2 — the post-update failure-at-birth tests).
+//! 2 — the post-update failure-at-birth tests), `artifacts` (self-ending turns
+//! that really write files under the cwd — documents by Write, a figure, a
+//! table and a report "by a shell command", one figure embedded in the prose —
+//! so the made-this-turn gallery can be driven without billing; odd turns
+//! touch documents only).
 
 use std::io::{BufRead, Write};
 
@@ -121,6 +125,11 @@ fn main() {
                     // session settles idle with the task still running.
                     "background" => {
                         run_background_turn(turn_count);
+                        turn_active = false;
+                        turn_count += 1;
+                    }
+                    "artifacts" => {
+                        run_artifacts_turn(turn_count);
                         turn_active = false;
                         turn_count += 1;
                     }
@@ -725,6 +734,96 @@ fn run_showcase_turn() {
                      "summary": "Monitor \"Watch the build log\" stream ended" }),
         );
     });
+}
+
+/// A self-ending turn that makes real files, the way a working agent does:
+/// two markdown documents through Write (their absolute `file_path` is what
+/// the gallery's edit-tool path carries), then "a script" that saves a figure,
+/// a table and an HTML report — named only in the command line, its output
+/// and the closing prose, which also embeds the figure inline. Even turns do
+/// all of it; odd turns only rewrite the documents, the shape of a turn that
+/// edited docs and nothing else.
+fn run_artifacts_turn(n: u32) {
+    let cwd = std::env::current_dir().expect("cwd");
+    let abs = |rel: &str| cwd.join(rel).to_string_lossy().into_owned();
+    let write = |rel: &str, body: &str| {
+        let path = cwd.join(rel);
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).expect("mkdir");
+        }
+        std::fs::write(path, body).expect("write");
+    };
+    let full = n.is_multiple_of(2);
+    emit(json!({
+        "type": "system", "subtype": "init",
+        "session_id": "fake-native-1", "model": "fake-model",
+        "permissionMode": "default", "slash_commands": ["compact"],
+    }));
+    stream(json!({ "type": "message_start", "message": { "id": "ma-1" } }));
+    stream_text("ma-1", "Writing the notes and the plan first.");
+    let notes = format!("# Notes\n\nTurn {n}: the clusters separate on PC1.\n");
+    write("notes.md", &notes);
+    tool_use(
+        "ma-1",
+        "tu-w1",
+        "Write",
+        json!({ "file_path": abs("notes.md"), "content": notes }),
+    );
+    tool_result("tu-w1", "File written");
+    let plan = format!("# Plan\n\n- [x] turn {n}\n- [ ] next: batch effects\n");
+    write("plan.md", &plan);
+    tool_use(
+        "ma-1",
+        "tu-w2",
+        "Write",
+        json!({ "file_path": abs("plan.md"), "content": plan }),
+    );
+    tool_result("tu-w2", "File written");
+    if full {
+        write(
+            "figs/umap.svg",
+            "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 160 120'>\
+             <rect width='160' height='120' fill='#f4f4f8'/>\
+             <circle cx='50' cy='60' r='22' fill='#2e9e6b'/>\
+             <circle cx='110' cy='50' r='18' fill='#4a76c4'/></svg>\n",
+        );
+        write(
+            "out/summary.csv",
+            "cluster,n,marker\nA,412,CD3E\nB,198,MS4A1\n",
+        );
+        write(
+            "report.html",
+            "<!doctype html><title>QC report</title><h1>QC report</h1><p>412 + 198 cells.</p>\n",
+        );
+        tool_use(
+            "ma-1",
+            "tu-b1",
+            "Bash",
+            json!({ "command": "python scripts/plot.py --out figs/umap.svg --table out/summary.csv --report report.html" }),
+        );
+        tool_result(
+            "tu-b1",
+            "wrote figs/umap.svg\nwrote out/summary.csv\nwrote report.html\n",
+        );
+        stream(json!({ "type": "message_start", "message": { "id": "ma-2" } }));
+        stream_text(
+            "ma-2",
+            "Done. The UMAP:\n\n![umap](figs/umap.svg)\n\nNotes are in notes.md, the plan in plan.md, \
+             the counts in out/summary.csv, and the rendered report.html has the QC summary.",
+        );
+    } else {
+        stream(json!({ "type": "message_start", "message": { "id": "ma-2" } }));
+        stream_text(
+            "ma-2",
+            "Updated notes.md and plan.md with this turn's findings.",
+        );
+    }
+    emit(json!({
+        "type": "result", "subtype": "success", "is_error": false,
+        "result": "done", "session_id": "fake-native-1",
+        "total_cost_usd": 0.004, "duration_ms": 30,
+        "usage": { "input_tokens": 12, "output_tokens": 40 },
+    }));
 }
 
 /// A turn that parks on an AskUserQuestion (the mined can_use_tool shape) —

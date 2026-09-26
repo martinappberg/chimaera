@@ -1695,6 +1695,20 @@ describe("ChatStore turn artifacts (the made-this-turn gallery)", () => {
     expect(plain.blocks.map((b) => b.kind)).toEqual(["message", "notice"]);
   });
 
+  it("drops what the prose already embeds inline", () => {
+    const store = foldAt([
+      ...TURN.slice(0, -2),
+      [1080, { type: "message_chunk", turn_id: "t1", text: "Done:\n\n![umap](figs/umap.png)\n\n![notes](/p/notes.md)\n\nAlso report/index.html." }],
+      [2000, { type: "turn_completed", turn_id: "t1", usage: {} }],
+    ]);
+    const end = store.blocks.find((b) => b.kind === "turn_end");
+    expect(end).toMatchObject({ kind: "turn_end", artifacts: [] });
+    const mentioned = end?.kind === "turn_end" ? end.mentioned : [];
+    expect(mentioned).toContain("report/index.html");
+    expect(mentioned).not.toContain("figs/umap.png");
+    expect(mentioned).not.toContain("/p/notes.md");
+  });
+
   it("each turn scans only itself", () => {
     const store = foldAt([
       ...TURN,

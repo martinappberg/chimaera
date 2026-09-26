@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { artifactMentions, isArtifactPath, writtenDuring } from "./artifacts";
+import {
+  artifactMentions,
+  artifactShape,
+  isArtifactPath,
+  isProseEmbedded,
+  proseEmbedTargets,
+  writtenDuring,
+} from "./artifacts";
 
 describe("isArtifactPath", () => {
   it("keeps outputs, not source code", () => {
@@ -9,6 +16,42 @@ describe("isArtifactPath", () => {
     for (const p of ["main.rs", "plot.py", "Makefile", "data.json", "run.log"]) {
       expect(isArtifactPath(p), p).toBe(false);
     }
+  });
+});
+
+describe("artifactShape", () => {
+  it("tells what is looked at from what is opened", () => {
+    for (const p of ["figs/umap.png", "fig.svg", "report.html", "paper.pdf", "clip.mp4", "talk.mp3"]) {
+      expect(artifactShape(p), p).toBe("visual");
+    }
+    for (const p of ["notes.md", "out/summary.csv", "t.tsv.gz", "run.ipynb", "deck.pptx", "calls.vcf"]) {
+      expect(artifactShape(p), p).toBe("document");
+    }
+    expect(artifactShape("main.rs")).toBeNull();
+  });
+});
+
+describe("prose embeds", () => {
+  it("lists the local files the prose embeds, fragments off, URLs skipped", () => {
+    const texts = [
+      "Here it is:\n\n![umap](figs/umap.png)\n\nand page 3: ![p](<paper.pdf#page=3>)",
+      "![again](figs/umap.png) ![web](https://x.test/a.png) ![abs](/home/me/proj/out/report.html)",
+    ];
+    expect(proseEmbedTargets(texts)).toEqual(["figs/umap.png", "paper.pdf", "/home/me/proj/out/report.html"]);
+  });
+
+  it("matches a tool's absolute path and a text mention against the embeds", () => {
+    const targets = ["figs/umap.png", "./notes.md", "/home/me/proj/out/report.html"];
+    expect(isProseEmbedded("/home/me/proj/figs/umap.png", targets)).toBe(true);
+    expect(isProseEmbedded("figs/umap.png", targets)).toBe(true);
+    expect(isProseEmbedded("./figs/umap.png", targets)).toBe(true);
+    expect(isProseEmbedded("notes.md", targets)).toBe(true);
+    expect(isProseEmbedded("/home/me/proj/out/report.html", targets)).toBe(true);
+    // A suffix match needs a directory boundary; an absolute embed names one file.
+    expect(isProseEmbedded("/home/me/proj/oldfigs/umap.png", targets)).toBe(false);
+    expect(isProseEmbedded("/home/me/proj/figs/xumap.png", targets)).toBe(false);
+    expect(isProseEmbedded("/tmp/out/report.html", targets)).toBe(false);
+    expect(isProseEmbedded("other.md", targets)).toBe(false);
   });
 });
 

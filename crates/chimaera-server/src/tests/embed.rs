@@ -666,12 +666,15 @@ async fn raw_never_blocks_on_a_fifo_at_the_ticketed_path() {
     std::fs::write(&target, png(2, 2)).unwrap();
     let ticket = ticket_for(&state, &target).await;
     std::fs::remove_file(&target).unwrap();
-    rustix::fs::mkfifoat(
-        rustix::fs::CWD,
-        &target,
-        rustix::fs::Mode::from_raw_mode(0o600),
-    )
-    .unwrap();
+    // mkfifo(1), not rustix: rustix has no `mkfifoat` on Apple targets (and no
+    // plain `mkfifo` at all), and `just check` must compile on a Mac too.
+    let made = std::process::Command::new("mkfifo")
+        .arg("-m")
+        .arg("600")
+        .arg(&target)
+        .status()
+        .expect("mkfifo(1) on PATH");
+    assert!(made.success(), "mkfifo failed: {made}");
 
     let uri = format!("/raw/{ticket}");
     let answer = tokio::time::timeout(

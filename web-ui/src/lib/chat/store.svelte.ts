@@ -6,7 +6,7 @@
  */
 
 import { isImagePath } from "../previews/files";
-import { artifactMentions, isArtifactPath } from "./artifacts";
+import { artifactMentions, isArtifactPath, isProseEmbedded, proseEmbedTargets } from "./artifacts";
 import type { AgentEvent, ChatSessionInfo, SeqEvent } from "./chatWs";
 
 /** The single leading notice a client-side transcript trim leaves behind. */
@@ -1849,11 +1849,15 @@ export class ChatStore {
    *  - `mentioned`: artifact-shaped paths the turn's commands, outputs and
    *    prose name (newest first) — a plot a script saved, a report a shell
    *    command rendered. The gallery confirms each against the daemon and
-   *    the turn's time window before showing it (artifacts.ts). */
+   *    the turn's time window before showing it (artifacts.ts).
+   *  Either list drops a file the turn's prose embeds inline
+   *  (`![](figs/plot.png)`): that card already sits beside the words about
+   *  it, so the gallery showing it again would be the same picture twice. */
   private collectTurnArtifacts(): { artifacts: string[]; mentioned: string[] } {
     const out: string[] = [];
     const seen = new Set<string>();
     const texts: string[] = [];
+    const prose: string[] = [];
     for (let i = this.blocks.length - 1; i >= 0; i--) {
       const b = this.blocks[i];
       // Every user block here is delivered (queued sends live in pendingSends),
@@ -1861,6 +1865,7 @@ export class ChatStore {
       if (b.kind === "user" || b.kind === "turn_end") break;
       if (b.kind === "message") {
         texts.push(b.text);
+        prose.push(b.text);
         continue;
       }
       if (b.kind !== "tool" || b.denied) continue;
@@ -1878,8 +1883,10 @@ export class ChatStore {
       }
     }
     out.reverse(); // chronological
-    const mentioned = artifactMentions(texts).filter((m) => !seen.has(m));
-    return { artifacts: out.slice(0, 8), mentioned };
+    const embedded = proseEmbedTargets(prose);
+    const artifacts = out.filter((p) => !isProseEmbedded(p, embedded)).slice(0, 8);
+    const mentioned = artifactMentions(texts).filter((m) => !seen.has(m) && !isProseEmbedded(m, embedded));
+    return { artifacts, mentioned };
   }
 
   /** Rebuild every id→index map from `blocks` after a non-tail splice

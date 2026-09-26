@@ -477,12 +477,17 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   the workspace root — strictly, an embed names one file — and any fragment picks the piece
   (`paper.pdf#page=3`, `run.py#L10-L30`, `data.csv#row=2-9`). A file the agent announces before
   writing shows as "not found" and turns into its card when it appears.
-- **Made this turn.** After a turn's closing prose, a gallery of compact tiles shows what the turn
-  made — including files written by **shell commands** (a plot saved by a script, a rendered
-  report), not only by edit tools. HTML reports, markdown, PDFs, tables and spreadsheets,
-  notebooks, slides and media; never source code (its diff is in the tool card). A stopped or
-  failed turn keeps its gallery. Tiles stay fresh when a file is overwritten, and say so when one
-  is gone.
+- **Made this turn.** After a turn's closing prose, what the turn made — including files written
+  by **shell commands** (a plot saved by a script, a rendered report), not only by edit tools;
+  never source code (its diff is in the tool card). Two shapes, by what a file is *for*: a
+  **visual** (a figure, an HTML report, a PDF, a clip) is something to look at, so it shows as a
+  compact tile up front under "Made this turn"; a **document** (markdown, docx/pptx, tables and
+  spreadsheets, notebooks) is something to open, so it shows as one chip on a quiet "Files" line —
+  click a chip to open the file in a pane, "+n more" past six, and "preview" unfolds the
+  documents' tiles on demand. A turn that only edited docs therefore costs one line, not a wall
+  of excerpts. A file the prose already embeds inline (`![](figs/plot.png)`) is left out — its
+  card is beside the words about it. A stopped or failed turn keeps its gallery. Tiles stay fresh
+  when a file is overwritten, and say so when one is gone.
 - **How the gallery finds shell-written files.** No structured event names them, so the reducer
   lists the artifact-shaped paths the turn's commands, command outputs and prose *mention*
   (`artifacts.ts`), and the gallery keeps those the daemon confirms exist and were **modified
