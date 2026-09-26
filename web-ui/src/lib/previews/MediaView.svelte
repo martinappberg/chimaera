@@ -105,7 +105,9 @@
   function onTime(): void {
     const el = media;
     if (el === null) return;
-    now = el.currentTime;
+    // Audio plays on in a hidden window: its label need not re-render there
+    // (the next tick after the window returns catches it up).
+    if (!document.hidden) now = el.currentTime;
     if (stopAt !== null && el.currentTime >= stopAt) {
       stopAt = null;
       el.pause();
@@ -114,8 +116,11 @@
 
   function momentSelection(): FileSelection {
     const r = range;
-    const fragment = r !== null ? timeFragment(r.start, r.end) : timeFragment(now);
-    return { kind: "file", path, startLine: null, endLine: null, text: "", fragment, label: momentLabel };
+    // The live playhead at click time (the label may trail it by a tick).
+    const t = media?.currentTime ?? now;
+    const fragment = r !== null ? timeFragment(r.start, r.end) : timeFragment(t);
+    const label = r !== null ? `${clockLabel(r.start)}–${clockLabel(r.end)}` : clockLabel(t);
+    return { kind: "file", path, startLine: null, endLine: null, text: "", fragment, label };
   }
 
   const momentLabel = $derived(
