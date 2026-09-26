@@ -19,7 +19,7 @@
   import { Marked } from "marked";
   import type { Parser } from "@lezer/common";
   import { untrack } from "svelte";
-  import { rawTicketUrl, resolveDocPath, safeDecodeUri } from "./files";
+  import { lastRawTicketUrl, rawTicketUrl, resolveDocPath, safeDecodeUri } from "./files";
   import { retain, release, type FileEntry } from "./fileStore.svelte";
   import {
     NOTEBOOK_PAGE_MAX,
@@ -268,10 +268,16 @@
           img.setAttribute("src", mime === "image/svg+xml" ? svgUrl(att.data[mime]) : base64Url(mime, att.data[mime]));
         } else img.removeAttribute("src");
       } else if (src !== "" && !/^[a-z][a-z0-9+.-]*:/i.test(src) && !src.startsWith("//")) {
-        img.removeAttribute("src");
+        // The last answer at once (a re-render keeps its src), then the
+        // daemon's current one if the image changed since.
         const target = resolveDocPath(path, safeDecodeUri(src.split("#")[0]));
+        const last = lastRawTicketUrl(target);
+        if (last !== null) img.setAttribute("src", last);
+        else img.removeAttribute("src");
         void rawTicketUrl(target).then(
-          (url) => img.setAttribute("src", url),
+          (url) => {
+            if (url !== last) img.setAttribute("src", url);
+          },
           () => img.setAttribute("alt", `${img.alt || src} (not found)`),
         );
       }

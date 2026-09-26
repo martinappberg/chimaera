@@ -603,6 +603,8 @@ export async function fsXlsx(
  * Mint a single-path ticket and return the unauthenticated /raw/ URL for it
  * (iframes and <img> cannot send Authorization headers; the bearer token must
  * never appear in such a URL). Tickets expire server-side after ~10 minutes.
+ * The daemon answers the SAME ticket for a file it already ticketed at the
+ * same version (renewing it), and a new one once the file changed.
  */
 export async function fsRawUrl(path: string): Promise<string> {
   const body = await json<{ ticket: string }>(
@@ -616,23 +618,60 @@ export async function fsRawUrl(path: string): Promise<string> {
 }
 
 /**
- * Per-path `/raw/` URL memo (write-once artifacts). A ticket is valid ~10 min;
- * re-minting one on every mount — as the chat artifact cards did — spends a
- * round-trip AND changes the `<img>` src, forcing the browser to re-fetch and
- * re-decode an image it already has (the flash). Memoizing the URL per path
- * keeps the src STABLE across re-renders/remounts, so a cached image just shows.
- * Safe for write-once outputs (plots, result tables) whose bytes don't change;
- * live-updating previews mint their own fresh tickets on change (see fileStore).
+ * `/raw/` URLs for files a surface draws by path alone — a document's
+ * images (reading view, live mode, a deck, a notebook's markdown). Because
+ * the daemon keeps a file's ticket while the file is unchanged, the URL (and
+ * the browser's cached copy behind it) lasts exactly as long as the bytes:
+ * asking again never makes an unchanged image flash, and an overwritten one
+ * gets a new URL rather than the cached old bytes. So nothing here may hold
+ * an answer for long — an 8-minute memo per path once kept showing a file's
+ * previous version.
+ *
+ * What the memo still saves is round trips: asks for a path while one is on
+ * the wire share it, and an answer is reused for RAW_REUSE_MS (a render's
+ * burst, an editor re-rendering the block it edits), after which the next
+ * ask goes to the daemon again. None of these callers knows the file's
+ * version to key by; a pane's own file rides the file store's version-aware
+ * `ensureRawUrl` instead.
  */
-const ticketUrls = new Map<string, { url: string; at: number }>();
-const TICKET_MEMO_MS = 8 * 60 * 1000;
+const RAW_REUSE_MS = 2_000;
+/** The daemon's tickets live ~10 min from the last ask; stop well short. */
+const RAW_TICKET_MS = 8 * 60 * 1000;
+const RAW_MEMO_MAX = 256;
+const rawAnswers = new Map<string, { url: string; at: number }>();
+const rawAsking = new Map<string, Promise<string>>();
 
-export async function rawTicketUrl(path: string): Promise<string> {
-  const hit = ticketUrls.get(path);
-  if (hit !== undefined && Date.now() - hit.at < TICKET_MEMO_MS) return hit.url;
-  const url = await fsRawUrl(path);
-  ticketUrls.set(path, { url, at: Date.now() });
-  return url;
+/** The current `/raw/` URL for `path` (see above). */
+export function rawTicketUrl(path: string): Promise<string> {
+  const hit = rawAnswers.get(path);
+  if (hit !== undefined && Date.now() - hit.at < RAW_REUSE_MS) return Promise.resolve(hit.url);
+  let asking = rawAsking.get(path);
+  if (asking === undefined) {
+    asking = fsRawUrl(path)
+      .then((url) => {
+        rawAnswers.delete(path);
+        rawAnswers.set(path, { url, at: Date.now() });
+        if (rawAnswers.size > RAW_MEMO_MAX) {
+          const oldest = rawAnswers.keys().next().value;
+          if (oldest !== undefined) rawAnswers.delete(oldest);
+        }
+        return url;
+      })
+      .finally(() => rawAsking.delete(path));
+    rawAsking.set(path, asking);
+  }
+  return asking;
+}
+
+/**
+ * The last URL answered for `path` while its ticket is surely alive, else
+ * null: for a re-render that must set an `<img>` src at once (no flash).
+ * It may predate an overwrite, so follow it with `rawTicketUrl` and switch
+ * when that answers a different URL.
+ */
+export function lastRawTicketUrl(path: string): string | null {
+  const hit = rawAnswers.get(path);
+  return hit !== undefined && Date.now() - hit.at < RAW_TICKET_MS ? hit.url : null;
 }
 
 /**
@@ -961,15 +1000,6 @@ export function viewKindFor(path: string): FileViewKind {
   if (MERMAID_EXTS.has(ext)) return "mermaid";
   if (BINARY_EXTS.has(ext)) return "binary";
   return "text";
-}
-
-/** View kinds the chat renders inline under tool cards (images, tabular
- *  data, PDFs — the "job output" formats worth seeing without a click). */
-const INLINE_PREVIEW_KINDS = new Set<FileViewKind>(["image", "table", "pdf"]);
-
-/** True when the chat can inline-preview this path's kind. */
-export function canInlinePreview(path: string): boolean {
-  return INLINE_PREVIEW_KINDS.has(viewKindFor(path));
 }
 
 /** Largest file the daemon accepts for an in-place edit (PUT /fs/file). */

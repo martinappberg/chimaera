@@ -21,7 +21,7 @@ import { LanguageDescription } from "@codemirror/language";
 import { languages } from "@codemirror/language-data";
 import { highlightCode } from "@lezer/highlight";
 import { codeHighlight } from "../cm";
-import { dirname, fsValidate, rawTicketUrl, resolveDocPath, safeDecodeUri } from "../files";
+import { dirname, fsValidate, lastRawTicketUrl, rawTicketUrl, resolveDocPath, safeDecodeUri } from "../files";
 import { loadMath, mathNow } from "../mathLoad";
 import { renderMermaid } from "../../shared/mermaid";
 import type { LinkContext } from "../docLinks";
@@ -56,37 +56,19 @@ interface Unit {
 
 // --- images -----------------------------------------------------------------------
 
-/** Ticket URLs by path, read synchronously so a block re-rendered for an
- *  edit next to its image keeps the same src (no request, no flash).
- *  Tickets live ~10 min on the daemon; entries retire before that. */
-const TICKET_MS = 8 * 60 * 1000;
-const tickets = new Map<string, { url: string; at: number }>();
-const TICKETS_MAX = 256;
+/** `![[name]]` resolutions kept (a document rarely names more). */
+const NAMED_MAX = 256;
 
-function ticketNow(path: string): string | null {
-  const hit = tickets.get(path);
-  return hit !== undefined && Date.now() - hit.at < TICKET_MS ? hit.url : null;
-}
-
-function rememberTicket(path: string, url: string): void {
-  tickets.delete(path);
-  tickets.set(path, { url, at: Date.now() });
-  if (tickets.size > TICKETS_MAX) {
-    const oldest = tickets.keys().next().value;
-    if (oldest !== undefined) tickets.delete(oldest);
-  }
-}
-
+/** Point `img` at `path`'s `/raw/` URL: at once with the last answer, so a
+ *  block re-rendered for an edit next to its image keeps its src (no
+ *  flash), then with the daemon's current one when that differs — the
+ *  image changed on disk since (a new version is a new ticket). */
 function pointAt(img: HTMLImageElement, path: string, stamp: string): void {
-  const now = ticketNow(path);
-  if (now !== null) {
-    img.src = now;
-    return;
-  }
+  const last = lastRawTicketUrl(path);
+  if (last !== null) img.src = last;
   rawTicketUrl(path).then(
     (url) => {
-      rememberTicket(path, url);
-      if (img.dataset.mdSrc === stamp) img.src = url;
+      if (img.dataset.mdSrc === stamp && url !== last) img.src = url;
     },
     () => {
       // missing/unreadable target: the alt text shows
@@ -113,7 +95,7 @@ function resolveNamed(name: string, dir: string, ws: string | null): Promise<str
       },
     );
     named.set(key, p);
-    if (named.size > TICKETS_MAX) {
+    if (named.size > NAMED_MAX) {
       const oldest = named.keys().next().value;
       if (oldest !== undefined) named.delete(oldest);
     }

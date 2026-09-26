@@ -1,13 +1,16 @@
 <script lang="ts">
   /**
    * A slice of a table: CSV/TSV and the bioinformatics formats through
-   * `fs/table` (`#row=a-b`, RFC 7111 — row 1 is the header line when the
-   * file has one), spreadsheets through `fs/xlsx` (`#sheet=S&range=A1:F20`).
-   * Without a selection, the first rows. One request for exactly the rows
-   * shown; the full grid is one click away.
+   * `fs/table` (`#row=a-b`, `#col=`, `#cell=`, RFC 7111 — row 1 is the
+   * header line when the file has one), spreadsheets through `fs/xlsx`
+   * (`#sheet=S&range=A1:F20`, A1 counted from the sheet's corner, which the
+   * first page's `origin` places on the grid). Without a selection, the
+   * first rows. One request for exactly the rows shown (two when a range's
+   * sheet does not start at A1); the full grid is one click away.
    */
-  import { fsTable, fsXlsx, tablePreset, type TablePage } from "../../previews/files";
-  import { tableWindow, type EmbedFragment } from "./fragment";
+  import { fsTable, fsXlsx, tablePreset, type TablePage, type XlsxPage } from "../../previews/files";
+  import { a1Column } from "../locator";
+  import { rangeLabel, rangeOutside, tableSlice, tableWindow, type EmbedFragment } from "./fragment";
 
   interface Props {
     path: string;
@@ -30,30 +33,54 @@
   let error = $state<string | null>(null);
 
   const hasHeader = $derived(kind === "xlsx" || (tablePreset(path)?.header ?? true));
-  /** Rows as RFC 7111 / A1 numbers them, from the fragment. */
-  const rowSel = $derived.by((): EmbedFragment["rows"] => {
-    if (frag.rows !== undefined) return frag.rows;
-    const r = frag.range;
-    if (r !== undefined && r.r1 !== null) return { start: r.r1, end: r.r2 ?? r.r1 };
-    return undefined;
-  });
-  const win = $derived(tableWindow(rowSel, hasHeader, compact ? TILE_ROWS : PEEK));
-  const visibleRows = $derived(Math.min(win.limit, compact ? TILE_ROWS : 12));
+  const peek = $derived(compact ? TILE_ROWS : PEEK);
+  const range = $derived(frag.at?.range);
+  const sheet = $derived(frag.at?.sheet ?? null);
+
+  /** Where the sheet's used range starts (0-based row, column), as its
+   *  first page reported it, for this file version and sheet. Until then
+   *  a range is read as if the sheet started at A1 (most do). */
+  let learned = $state.raw<{ key: string; origin: readonly [number, number] } | null>(null);
+  const sheetKey = $derived(`${path}\u0000${version}\u0000${sheet ?? ""}`);
+  const origin = $derived<readonly [number, number] | null>(
+    kind === "xlsx" && learned !== null && learned.key === sheetKey ? learned.origin : null,
+  );
+  /** The selected block: RFC 7111 rows (the header row is row 1), grid columns. */
+  const slice = $derived(tableSlice(frag, origin ?? [0, 0]));
+  /** A range wholly above or left of the sheet's data: nothing to show. */
+  const outside = $derived(range !== undefined && origin !== null && rangeOutside(range, origin));
+  const win = $derived(tableWindow(slice, hasHeader, peek));
+  // Primitives, so a re-derived but equal window does not refetch.
+  const offset = $derived(win.offset);
+  const limit = $derived(win.limit);
+  const visibleRows = $derived(Math.min(limit, compact ? TILE_ROWS : 12));
 
   let gen = 0;
   $effect(() => {
     const p = path;
     const k = kind;
-    const { offset, limit } = win;
-    const sheet = frag.sheet ?? null;
+    const o = offset;
+    const l = limit;
+    const s = sheet;
+    const key = sheetKey;
     void version;
-    if (!active) return;
+    if (!active || outside) return;
     const mine = ++gen;
     error = null;
-    const load = k === "xlsx" ? fsXlsx(p, sheet, offset, limit) : fsTable(p, offset, limit);
+    const load = k === "xlsx" ? fsXlsx(p, s, o, l) : fsTable(p, o, l);
     load.then(
       (t) => {
-        if (mine === gen) page = t;
+        if (mine !== gen) return;
+        if (k === "xlsx") {
+          const at = (t as XlsxPage).origin ?? [0, 0];
+          const known = origin;
+          if (known === null || known[0] !== at[0] || known[1] !== at[1]) learned = { key, origin: [at[0], at[1]] };
+          // Fetched for a range read from A1 while the sheet starts elsewhere:
+          // these are other rows. The window moves, and its fetch lands instead.
+          const w = tableWindow(tableSlice(frag, at), hasHeader, peek);
+          if (w.offset !== o || w.limit !== l) return;
+        }
+        page = t;
       },
       (e: unknown) => {
         if (mine === gen) error = e instanceof Error ? e.message : "couldn't read this table";
@@ -61,19 +88,25 @@
     );
   });
 
-  /** Column indices shown: the range's columns, else the first MAX_COLS. */
+  /** Column indices shown: the slice's columns, else the first MAX_COLS. */
   const cols = $derived.by(() => {
     const n = page?.columns.length ?? 0;
-    const r = frag.range;
-    const from = r?.c1 != null ? r.c1 - 1 : 0;
-    const to = r?.c2 != null ? r.c2 : r?.c1 != null ? r.c1 : n;
+    const c = slice?.col;
+    const from = c !== undefined ? c - 1 : 0;
+    const to = c !== undefined ? (slice?.endCol ?? c) : n;
     const all = Array.from({ length: Math.max(0, Math.min(n, to) - from) }, (_, i) => from + i);
     return all.slice(0, MAX_COLS);
   });
-  const elided = $derived(page !== null && frag.range === undefined && page.columns.length > MAX_COLS);
-  /** The first row number shown, as the fragment counts rows. */
-  const firstNumber = $derived(win.offset + (hasHeader ? 2 : 1));
-  const numbered = $derived(rowSel !== undefined);
+  const elided = $derived(page !== null && slice?.col === undefined && page.columns.length > MAX_COLS);
+  /** The first row number shown, as the fragment counts rows: RFC 7111's
+   *  for `row=`, the sheet's own for an A1 range. */
+  const firstNumber = $derived(offset + (hasHeader ? 2 : 1) + (range !== undefined ? (origin?.[0] ?? 0) : 0));
+  const numbered = $derived(slice?.row !== undefined);
+  const outsideNote = $derived(
+    outside && range !== undefined && origin !== null
+      ? `${rangeLabel(range)} is outside this sheet's data, which starts at ${a1Column(origin[1] + 1)}${origin[0] + 1}`
+      : null,
+  );
 
   const footer = $derived.by(() => {
     if (page === null) return "";
@@ -94,6 +127,8 @@
 <div class="table-body" class:tile={compact} style:--rows={visibleRows} style:--row-h="{ROW_H}px">
   {#if error !== null}
     <div class="note">{error}</div>
+  {:else if outsideNote !== null}
+    <div class="note">{outsideNote}</div>
   {:else}
     <div class="scroll">
       {#if page !== null}

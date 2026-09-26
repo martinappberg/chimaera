@@ -211,17 +211,32 @@ const PAREN_SUFFIX_RE = /^(.*[^\s(])\((\d{1,7})(?:,(\d{1,7}))?\)$/s;
 /** A tool-call wrapper: `Read(src/x.ts)`, `Update(…)`. */
 const CALL_RE = /^([\p{L}\p{N}_.]+)\((.+)\)$/su;
 
-function withLines(path: string, line?: string, col?: string, endLine?: string): FileRef {
-  const ref: FileRef = { path };
+type Lines = Pick<FileRef, "line" | "col" | "endLine">;
+
+function linesOf(line?: string, col?: string, endLine?: string): Lines {
+  const out: Lines = {};
   const l = line !== undefined ? Number.parseInt(line, 10) : 0;
   if (l >= 1) {
-    ref.line = l;
+    out.line = l;
     const c = col !== undefined ? Number.parseInt(col, 10) : 0;
-    if (c >= 1) ref.col = c;
+    if (c >= 1) out.col = c;
     const e = endLine !== undefined ? Number.parseInt(endLine, 10) : 0;
-    if (e > l) ref.endLine = e;
+    if (e > l) out.endLine = e;
   }
-  return ref;
+  return out;
+}
+
+function withLines(path: string, line?: string, col?: string, endLine?: string): FileRef {
+  return { path, ...linesOf(line, col, endLine) };
+}
+
+/** The lines a GitHub anchor names (`L12`, `L12-L20`, `L12C3-L20C1`, without
+ *  the `#`), or null when `anchor` is not one. `L0` is one that names no
+ *  line: `{}`, never a heading slug or a locator. Embed cards read line
+ *  ranges through this too (`embed/fragment.ts`). */
+export function lineAnchor(anchor: string): Lines | null {
+  const m = LINE_ANCHOR_RE.exec(anchor);
+  return m !== null ? linesOf(m[1], m[2], m[3]) : null;
 }
 
 /**
@@ -303,7 +318,7 @@ export function findFileRef(text: string, opts: FileRefOptions = {}): FoundRef |
   }
 
   let ref: FileRef;
-  const lineAnchor = anchor !== null ? LINE_ANCHOR_RE.exec(anchor) : null;
+  const lines = anchor !== null ? lineAnchor(anchor) : null;
   const colon = p.indexOf(":");
   if (colon >= 0) {
     const m = LINE_SUFFIX_RE.exec(p.slice(colon));
@@ -313,8 +328,8 @@ export function findFileRef(text: string, opts: FileRefOptions = {}): FoundRef |
     // token text is still `text.slice(from, e)` here.)
     if (m[4] !== undefined && !delimited && !url && hash < 0) end = from + p.length - m[4].length;
     ref = withLines(p.slice(0, colon), m[1], m[2], m[3]);
-  } else if (lineAnchor !== null) {
-    ref = withLines(p, lineAnchor[1], lineAnchor[2], lineAnchor[3]);
+  } else if (lines !== null) {
+    ref = { path: p, ...lines };
   } else {
     const m = PAREN_SUFFIX_RE.exec(p);
     ref = m !== null ? withLines(m[1], m[2], m[3]) : { path: p };
@@ -344,7 +359,7 @@ export function findFileRef(text: string, opts: FileRefOptions = {}): FoundRef |
   }
   if (!qualifies(path, bare)) return null;
   ref.path = path;
-  if (anchor !== null && lineAnchor === null && ref.line === undefined) {
+  if (anchor !== null && lines === null && ref.line === undefined) {
     const at = parseLocator(anchor, path);
     if (at !== null) ref.at = at;
   }
