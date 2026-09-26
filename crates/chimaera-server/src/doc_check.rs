@@ -19,6 +19,7 @@
 //! under `fs::FILESYSTEM_WORK` on a blocking thread ([`run_blocking`]).
 
 use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -232,8 +233,16 @@ pub(crate) fn check_path(path: &Path, root: Option<&Path>) -> anyhow::Result<Rep
             meta.len()
         );
     }
-    let bytes =
-        std::fs::read(&doc).with_context(|| format!("{}: failed to read", doc.display()))?;
+    // Bounded again at the read: the file may have grown (or been swapped)
+    // since the stat.
+    let bytes = read_regular(&doc, MAX_DOC_BYTES)
+        .with_context(|| format!("{}: failed to read", doc.display()))?
+        .with_context(|| {
+            format!(
+                "{} is too large to check (over the {MAX_DOC_BYTES}-byte limit)",
+                doc.display()
+            )
+        })?;
     let text = String::from_utf8_lossy(&bytes);
     let root = root.map(|r| std::fs::canonicalize(r).unwrap_or_else(|_| r.to_path_buf()));
     Ok(check_text(&text, &doc, root.as_deref()))
@@ -309,6 +318,9 @@ fn parse_options(frontmatter: bool) -> comrak::Options<'static> {
 #[derive(Clone, Copy)]
 struct Meta {
     dir: bool,
+    /// A regular file: the only kind a check ever opens (a device such as
+    /// `/dev/zero` never ends; a FIFO blocks its open).
+    file: bool,
     len: u64,
 }
 
@@ -531,8 +543,9 @@ pub(crate) fn check_text(text: &str, doc: &Path, root: Option<&Path>) -> Report 
             format!(
                 "{n} link or embed target{} not checked: a check stats at most \
                  {MAX_TARGET_STATS} targets and reads at most {MAX_TARGET_READS} \
-                 files within {} s.",
+                 files of up to {} MB within {} s.",
                 if n == 1 { " was" } else { "s were" },
+                MAX_TARGET_READ_BYTES / (1024 * 1024),
                 CHECK_BUDGET.as_secs()
             ),
             "Split a very large document, or check the remaining links by hand.".to_string(),
@@ -595,6 +608,7 @@ impl Checker<'_> {
         let meta = match std::fs::metadata(path) {
             Ok(m) => Some(Meta {
                 dir: m.is_dir(),
+                file: m.is_file(),
                 len: m.len(),
             }),
             Err(err)
@@ -617,13 +631,16 @@ impl Checker<'_> {
     fn facts(&mut self, path: &Path, meta: Meta) -> Option<&Facts> {
         if !self.reads.contains_key(path) {
             if self.reads.len() >= MAX_TARGET_READS
-                || meta.dir
+                || !meta.file
                 || meta.len > MAX_TARGET_READ_BYTES
                 || Instant::now() >= self.deadline
             {
                 return None;
             }
-            let facts = std::fs::read(path).ok().map(|bytes| {
+            // Over the cap (the file grew since the stat): too large to
+            // check, like one that was already over it.
+            let bytes = read_regular(path, MAX_TARGET_READ_BYTES).ok().flatten();
+            let facts = bytes.map(|bytes| {
                 let text = String::from_utf8_lossy(&bytes);
                 let anchors = is_markdown(path).then(|| markdown_anchors(&text));
                 Facts {
@@ -1023,7 +1040,9 @@ impl Checker<'_> {
                 if let Some(fragment) = fragment.filter(|f| !f.is_empty()) {
                     if resolved == self.doc {
                         self.check_own_fragment(t, fragment);
-                    } else if !meta.dir {
+                    } else if meta.file {
+                        // A directory, device or FIFO has no lines or
+                        // headings to check.
                         self.check_target_fragment(t, url, &resolved, meta, fragment);
                     }
                 }
@@ -1243,6 +1262,32 @@ impl Checker<'_> {
 }
 
 // ---- helpers ----------------------------------------------------------------
+
+/// Read `path` when it is a regular file of at most `cap` bytes (`Ok(None)`
+/// past the cap). Callers stat first and open only regular files; the open
+/// is still `O_NONBLOCK` and re-checked by `fstat`, so a FIFO or device
+/// swapped in after that stat can neither block this worker (and its
+/// `FILESYSTEM_WORK` permit) nor stream without end, and `take` bounds a
+/// file that grew.
+pub(crate) fn read_regular(path: &Path, cap: u64) -> std::io::Result<Option<Vec<u8>>> {
+    use rustix::fs::{Mode, OFlags};
+    let fd = rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK,
+        Mode::empty(),
+    )?;
+    let file = std::fs::File::from(fd);
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(meta.len().min(cap) as usize);
+    file.take(cap + 1).read_to_end(&mut bytes)?;
+    Ok((bytes.len() as u64 <= cap).then_some(bytes))
+}
 
 fn is_markdown(path: &Path) -> bool {
     path.extension().and_then(|e| e.to_str()).is_some_and(|e| {

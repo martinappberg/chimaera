@@ -394,6 +394,97 @@ fn oversized_documents_are_refused() {
     assert!(format!("{err:#}").contains("too large"), "{err:#}");
 }
 
+/// `check_path` on its own thread, failing (not hanging) past `secs`: a
+/// target read that blocks or never ends is exactly the bug under test.
+fn check_within(path: PathBuf, root: Option<PathBuf>, secs: u64) -> Vec<Issue> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(check_path(&path, root.as_deref()).map(|r| r.issues));
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(secs))
+        .expect("check_document must not block or read without end")
+        .unwrap()
+}
+
+fn mkfifo(path: &std::path::Path) {
+    let status = std::process::Command::new("mkfifo")
+        .arg(path)
+        .status()
+        .expect("mkfifo");
+    assert!(status.success());
+}
+
+/// A `#L` fragment makes the checker read its target: a device that never
+/// ends (`/dev/zero`) or a FIFO with no writer must never be opened.
+#[test]
+fn special_file_targets_are_never_read() {
+    let dir = fixture("dc-special");
+    mkfifo(&dir.join("pipe"));
+    let up = "../".repeat(dir.components().count());
+    let doc =
+        format!("[a](/dev/zero#L1)\n\n[b]({up}dev/zero#L1)\n\n[c](pipe#L1)\n\n[d](pipe#heading)\n");
+    let path = dir.join("doc.md");
+    std::fs::write(&path, &doc).unwrap();
+    // With a root too: `/dev/zero` misses under it, then falls back to the
+    // local absolute path.
+    for root in [None, Some(dir.clone())] {
+        let issues = check_within(path.clone(), root, 20);
+        assert!(
+            issues
+                .iter()
+                .all(|i| i.code != "line-out-of-range" && i.code != "unchecked"),
+            "{issues:#?}"
+        );
+    }
+}
+
+#[test]
+fn a_fifo_or_device_document_is_refused_without_opening_it() {
+    let dir = fixture("dc-fifo-doc");
+    let fifo = dir.join("doc.md");
+    mkfifo(&fifo);
+    for path in [fifo, PathBuf::from("/dev/zero")] {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(check_path(&path, None).map(|r| r.issues.len()));
+        });
+        let err = rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("must not block")
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("not a file"), "{err:#}");
+    }
+}
+
+/// An oversize target is too large to check, never read whole; the bounded
+/// reader itself refuses special files and caps a file that grew.
+#[test]
+fn oversize_targets_are_not_read() {
+    let dir = fixture("dc-big-target");
+    let big = std::fs::File::create(dir.join("big.txt")).unwrap();
+    big.set_len(3 * 1024 * 1024).unwrap();
+    std::fs::write(dir.join("doc.md"), "[b](big.txt#L1)\n").unwrap();
+    let issues = check_within(dir.join("doc.md"), None, 20);
+    assert_eq!(codes(&issues), [(1, "unchecked")]);
+    assert!(issues[0].message.contains("of up to 2 MB"), "{issues:#?}");
+
+    let small = dir.join("small.txt");
+    std::fs::write(&small, b"abcd").unwrap();
+    assert_eq!(
+        crate::doc_check::read_regular(&small, 4)
+            .unwrap()
+            .as_deref(),
+        Some(&b"abcd"[..])
+    );
+    assert_eq!(crate::doc_check::read_regular(&small, 3).unwrap(), None);
+    let pipe = dir.join("pipe");
+    mkfifo(&pipe);
+    for special in [pipe.as_path(), std::path::Path::new("/dev/zero")] {
+        let err = crate::doc_check::read_regular(special, 16).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{special:?}");
+    }
+}
+
 // ---- the route ---------------------------------------------------------------
 
 #[tokio::test]

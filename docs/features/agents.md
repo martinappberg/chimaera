@@ -234,7 +234,9 @@ spawn.rs,recents.rs}`. Wire: `POST/GET/DELETE/PATCH /api/v1/sessions*`, `GET /ap
   duplicate heading slugs, plain `http://` links. Viewer locators (`#page=`, `#row=`, `#/json`)
   are not checked. Bounds: documents ≤ 4 MB, ≤ 500 issues (the least severe dropped first),
   ≤ 200 target stats, ≤ 20 target reads of ≤ 2 MB, a 10 s budget (the rest reported as one
-  "unchecked" note), all under the shared filesystem limiter, off the reactor. The chip checks
+  "unchecked" note), all under the shared filesystem limiter, off the reactor. Only regular
+  files are ever opened (non-blocking, re-checked after the open, and read through the size cap),
+  so a link to a device such as `/dev/zero` or to a FIFO is never read. The chip checks
   only while it can be seen (window visible, its tab's layer active), debounced after a disk
   change, and stays hidden when a check fails. Installs are atomic (temp, fsync, rename), refuse
   an existing file over 1 MiB or with an unmatched marker, and are idempotent (`changed: false`).
