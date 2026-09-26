@@ -881,6 +881,9 @@ export type FileViewKind =
   | "pdf"
   | "video"
   | "audio"
+  | "notebook"
+  | "log"
+  | "mermaid"
   | "binary"
   | "text";
 
@@ -906,6 +909,10 @@ const TABLE_EXTS = new Set([
 ]);
 /** Spreadsheets parsed server-side (calamine) into the same paged table grid. */
 const SPREADSHEET_EXTS = new Set(["xlsx", "xls", "xlsm", "ods"]);
+/** Program output read tail-first (slurm-*.out, *.stderr, .nextflow.log…).
+ *  A gzipped log stays text: it has no known size to read a tail from. */
+const LOG_EXTS = new Set(["log", "out", "err", "stdout", "stderr"]);
+const MERMAID_EXTS = new Set(["mmd", "mermaid"]);
 /**
  * Extensions we know are binary up front — straight to the info card, no
  * fetch. Everything not listed anywhere goes down the text path, which
@@ -946,6 +953,9 @@ export function viewKindFor(path: string): FileViewKind {
   if (ext === "pdf") return "pdf";
   if (VIDEO_EXTS.has(ext)) return "video";
   if (AUDIO_EXTS.has(ext)) return "audio";
+  if (ext === "ipynb") return "notebook";
+  if (LOG_EXTS.has(ext)) return "log";
+  if (MERMAID_EXTS.has(ext)) return "mermaid";
   if (BINARY_EXTS.has(ext)) return "binary";
   return "text";
 }

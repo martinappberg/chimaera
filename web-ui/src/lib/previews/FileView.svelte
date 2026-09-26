@@ -1,19 +1,26 @@
 <script lang="ts">
   /**
-   * Dispatch a file tab to its preview by extension: image / markdown /
-   * sandboxed html / paged table / PDF / video + audio / read-only code /
-   * binary info card.
+   * Dispatch a file tab to its preview by extension: image / markdown (or
+   * slides, for a Marp deck) / sandboxed html / paged table / PDF / video +
+   * audio / notebook / log / mermaid diagram / read-only code / binary info
+   * card.
    * The "text" path fetches the first 256KB here and sniffs it — anything
    * with NUL bytes falls through to the info card, so extensionless
    * binaries and .gz never render as garbage.
+   *
+   * Per-tab overrides live here, reset when the tab shows another path: a
+   * binary file opened as text anyway, a Marp deck shown as markdown, a
+   * diagram shown as source.
    */
-  import type { Component } from "svelte";
+  import { untrack, type Component, type Snippet } from "svelte";
   import { looksBinary, midTruncate, viewKindFor, type FileChunk } from "./files";
   import { retain, release, type FileEntry } from "./fileStore.svelte";
+  import { isMarpFrontmatter, isMarpSource } from "./marp";
   import ImageView from "./ImageView.svelte";
   import MediaView from "./MediaView.svelte";
   import TableView from "./TableView.svelte";
   import BinaryView from "./BinaryView.svelte";
+  import RawTextView from "./RawTextView.svelte";
   import Spinner from "./Spinner.svelte";
 
   interface Props {
@@ -36,6 +43,30 @@
   );
   const external = $derived(wsNorm !== null && path !== wsNorm && !path.startsWith(`${wsNorm}/`));
 
+  // --- per-tab overrides -----------------------------------------------------------
+
+  /** A binary file the reader asked to see as text anyway. */
+  let asText = $state(false);
+  /** A log whose bytes turned out binary (its size, for the card). */
+  let logBinary = $state<number | null>(null);
+  /** Whether this markdown file is a Marp deck: null until its first chunk
+   *  or render says. Decided once per tab, so an edit that adds or removes
+   *  `marp: true` never swaps the view out from under the editor. */
+  let marp = $state<boolean | null>(null);
+  let slidesMode = $state<"slides" | "markdown">("slides");
+  let mermaidMode = $state<"diagram" | "source">("diagram");
+  $effect(() => {
+    void path;
+    asText = false;
+    logBinary = null;
+    marp = null;
+    slidesMode = "slides";
+    mermaidMode = "diagram";
+  });
+
+  /** Kinds whose first chunk this view reads (and sniffs) itself. */
+  const readsChunk = (k: string, text: boolean) => k === "text" || k === "mermaid" || text;
+
   // CodeMirror is by far the heaviest dependency in the app; load it only
   // when a text file is actually opened so the terminal-only path stays lean.
   let CodeView = $state<Component<{ path: string; first: FileChunk }> | null>(null);
@@ -47,9 +78,18 @@
   let HtmlView = $state<Component<{ path: string }> | null>(null);
   let XlsxView = $state<Component<{ path: string }> | null>(null);
   let PdfView = $state<Component<{ path: string }> | null>(null);
+  let NotebookView = $state<Component<{ path: string; wsRoot?: string | null }> | null>(null);
+  let LogView = $state<Component<{ path: string; onBinary?: (size: number) => void }> | null>(null);
+  let SlidesView = $state<Component<{ path: string; switcher?: Snippet }> | null>(null);
+  let MermaidView = $state<Component<{ path: string; chunk: FileChunk; switcher?: Snippet }> | null>(
+    null,
+  );
   let lazyError = $state<string | null>(null);
+  const wantsCode = $derived(
+    (kind === "text" && !asText) || (kind === "mermaid" && mermaidMode === "source"),
+  );
   $effect(() => {
-    if (kind !== "text" || CodeView !== null) return;
+    if (!wantsCode || CodeView !== null) return;
     void import("./CodeView.svelte").then(
       (m) => (CodeView = m.default),
       () => (lazyError = "failed to load the text preview"),
@@ -84,6 +124,34 @@
     );
   });
   $effect(() => {
+    if (kind !== "notebook" || NotebookView !== null) return;
+    void import("./NotebookView.svelte").then(
+      (m) => (NotebookView = m.default),
+      () => (lazyError = "failed to load the notebook preview"),
+    );
+  });
+  $effect(() => {
+    if (kind !== "log" || LogView !== null) return;
+    void import("./LogView.svelte").then(
+      (m) => (LogView = m.default),
+      () => (lazyError = "failed to load the log preview"),
+    );
+  });
+  $effect(() => {
+    if (kind !== "markdown" || marp !== true || SlidesView !== null) return;
+    void import("./SlidesView.svelte").then(
+      (m) => (SlidesView = m.default),
+      () => (lazyError = "failed to load the slides preview"),
+    );
+  });
+  $effect(() => {
+    if (kind !== "mermaid" || MermaidView !== null) return;
+    void import("./MermaidView.svelte").then(
+      (m) => (MermaidView = m.default),
+      () => (lazyError = "failed to load the diagram preview"),
+    );
+  });
+  $effect(() => {
     void path;
     lazyError = null;
   });
@@ -96,20 +164,24 @@
 
   // The store entry for this path: retaining pins it warm across a tab switch
   // (no refetch on return) and marks it on-screen, so a disk change revalidates
-  // it live. Only the "text" kind reads its first chunk here; the other kinds
-  // mount a sub-view that reads its own payload from the same entry.
+  // it live. Only the kinds read as text read their first chunk here; the
+  // other kinds mount a sub-view that reads its own payload from the same entry.
   let entry = $state<FileEntry | null>(null);
   $effect(() => {
     const p = path;
     const e = retain(p);
     entry = e;
-    if (viewKindFor(p) === "text") void e.ensureChunk();
+    if (readsChunk(viewKindFor(p), false)) void e.ensureChunk();
     else void e.ensureMtime();
     return () => release(p);
   });
+  // "Open as text" on an extension-known binary: its chunk was never read.
+  $effect(() => {
+    if (asText && kind === "binary") void entry?.ensureChunk();
+  });
 
   const probe = $derived.by<TextProbe>(() => {
-    if (kind !== "text") return { state: "loading" };
+    if (!readsChunk(kind, asText)) return { state: "loading" };
     const e = entry;
     // `entry` is assigned in the effect below (which runs AFTER this derived
     // re-evaluates on a path change), so on a switch it briefly still points at
@@ -121,11 +193,59 @@
     if (e.chunkError !== null) return { state: "error", message: e.chunkError };
     const chunk = e.chunk;
     if (chunk === null) return { state: "loading" };
-    return looksBinary(chunk.bytes)
+    return looksBinary(chunk.bytes) && !asText
       ? { state: "binary", size: chunk.size }
       : { state: "text", chunk };
   });
+
+  // Decide once whether a markdown file is a Marp deck, from whichever of
+  // its payloads lands first: the reading render's frontmatter, or the
+  // editor's source chunk. No extra request either way.
+  $effect(() => {
+    if (kind !== "markdown" || untrack(() => marp) !== null) return;
+    const e = entry;
+    if (e === null || e.path !== path) return;
+    const md = e.markdown;
+    if (md !== null) {
+      marp = md.frontmatter !== null && isMarpFrontmatter(md.frontmatter);
+      return;
+    }
+    const chunk = e.chunk;
+    if (chunk !== null) {
+      marp = isMarpSource(new TextDecoder().decode(chunk.bytes.subarray(0, 16 * 1024)));
+    }
+  });
 </script>
+
+{#snippet slidesSwitch()}
+  <div class="switch" role="tablist" aria-label="deck view">
+    <button class="seg" class:on={slidesMode === "slides"} role="tab" aria-selected={slidesMode === "slides"}
+      onclick={() => (slidesMode = "slides")}>slides</button
+    >
+    <button class="seg" class:on={slidesMode === "markdown"} role="tab" aria-selected={slidesMode === "markdown"}
+      onclick={() => (slidesMode = "markdown")}>markdown</button
+    >
+  </div>
+{/snippet}
+
+{#snippet mermaidSwitch()}
+  <div class="switch" role="tablist" aria-label="diagram view">
+    <button class="seg" class:on={mermaidMode === "diagram"} role="tab" aria-selected={mermaidMode === "diagram"}
+      onclick={() => (mermaidMode = "diagram")}>diagram</button
+    >
+    <button class="seg" class:on={mermaidMode === "source"} role="tab" aria-selected={mermaidMode === "source"}
+      onclick={() => (mermaidMode = "source")}>source</button
+    >
+  </div>
+{/snippet}
+
+{#snippet lazyFallback()}
+  {#if lazyError !== null}
+    <div class="file-error">{lazyError}</div>
+  {:else}
+    <Spinner />
+  {/if}
+{/snippet}
 
 {#key path}
   <div class="file-view">
@@ -140,24 +260,43 @@
         <span class="ext-text">{midTruncate(path, 80)}</span>
       </div>
     {/if}
+    {#if asText && probe.state === "text"}
+      <!-- A binary shown as text: say so, and offer the way back. -->
+      <div class="alt-bar" role="status">
+        <span class="alt-note">binary file shown as text</span>
+        <span class="spacer"></span>
+        <button class="seg" onclick={() => (asText = false)}>file info</button>
+      </div>
+    {:else if kind === "mermaid" && mermaidMode === "source"}
+      <div class="alt-bar">
+        <span class="spacer"></span>
+        {@render mermaidSwitch()}
+      </div>
+    {/if}
     <div class="viewer">
       {#if kind === "image"}
         <ImageView {path} />
+      {:else if kind === "markdown" && marp === true && slidesMode === "slides"}
+        {#if SlidesView !== null}
+          <SlidesView {path} switcher={slidesSwitch} />
+        {:else}
+          {@render lazyFallback()}
+        {/if}
       {:else if kind === "markdown"}
         {#if MarkdownView !== null}
           <MarkdownView {path} {fontSize} {wsRoot} />
-        {:else if lazyError !== null}
-          <div class="file-error">{lazyError}</div>
+          {#if marp === true}
+            <!-- Over the markdown bar's free right end. -->
+            <div class="switch-float">{@render slidesSwitch()}</div>
+          {/if}
         {:else}
-          <Spinner />
+          {@render lazyFallback()}
         {/if}
       {:else if kind === "html"}
         {#if HtmlView !== null}
           <HtmlView {path} />
-        {:else if lazyError !== null}
-          <div class="file-error">{lazyError}</div>
         {:else}
-          <Spinner />
+          {@render lazyFallback()}
         {/if}
       {:else if kind === "table"}
         <TableView {path} />
@@ -166,40 +305,56 @@
           {#key entry?.mtime ?? path}
             <XlsxView {path} />
           {/key}
-        {:else if lazyError !== null}
-          <div class="file-error">{lazyError}</div>
         {:else}
-          <Spinner />
+          {@render lazyFallback()}
         {/if}
       {:else if kind === "pdf"}
         {#if PdfView !== null}
           {#key entry?.mtime ?? path}
             <PdfView {path} />
           {/key}
-        {:else if lazyError !== null}
-          <div class="file-error">{lazyError}</div>
         {:else}
-          <Spinner />
+          {@render lazyFallback()}
         {/if}
       {:else if kind === "video" || kind === "audio"}
         <!-- Not keyed on mtime like the other ticketed views: MediaView
              swaps a re-minted URL in place and keeps the playhead. -->
         <MediaView {path} {kind} />
-      {:else if kind === "binary"}
+      {:else if kind === "notebook"}
+        {#if NotebookView !== null}
+          <NotebookView {path} {wsRoot} />
+        {:else}
+          {@render lazyFallback()}
+        {/if}
+      {:else if kind === "log" && logBinary !== null}
+        <BinaryView {path} knownSize={logBinary} />
+      {:else if kind === "log"}
+        {#if LogView !== null}
+          <LogView {path} onBinary={(size) => (logBinary = size)} />
+        {:else}
+          {@render lazyFallback()}
+        {/if}
+      {:else if kind === "mermaid" && mermaidMode === "diagram" && probe.state === "text" && !asText}
+        {#if MermaidView !== null}
+          <MermaidView {path} chunk={probe.chunk} switcher={mermaidSwitch} />
+        {:else}
+          {@render lazyFallback()}
+        {/if}
+      {:else if kind === "binary" && !asText}
         {#key entry?.mtime ?? path}
-          <BinaryView {path} />
+          <BinaryView {path} onText={() => (asText = true)} />
         {/key}
+      {:else if probe.state === "text" && asText}
+        <RawTextView {path} first={probe.chunk} />
       {:else if probe.state === "text"}
         {#if CodeView !== null}
           <CodeView {path} first={probe.chunk} />
-        {:else if lazyError !== null}
-          <div class="file-error">{lazyError}</div>
         {:else}
-          <Spinner />
+          {@render lazyFallback()}
         {/if}
       {:else if probe.state === "binary"}
         {#key entry?.mtime ?? path}
-          <BinaryView {path} knownSize={probe.size} />
+          <BinaryView {path} knownSize={probe.size} onText={() => (asText = true)} />
         {/key}
       {:else if probe.state === "error"}
         <div class="file-error">{probe.message}</div>
@@ -252,6 +407,75 @@
     direction: ltr;
   }
 
+  /* The strip an alternate text view gets, matching the viewers' own bars. */
+  .alt-bar {
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    height: 26px;
+    padding: 0 0.5rem 0 0.7rem;
+    border-bottom: 1px solid var(--edge);
+    font-size: var(--text-xs);
+    color: var(--muted);
+    min-width: 0;
+  }
+
+  .alt-note {
+    color: var(--warn);
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .spacer {
+    flex: 1;
+  }
+
+  .switch {
+    display: flex;
+    align-items: center;
+    gap: 1px;
+  }
+
+  .switch-float {
+    position: absolute;
+    top: 0;
+    right: 0;
+    /* One pixel short of the bar, so its bottom rule stays unbroken. */
+    height: 25px;
+    display: flex;
+    align-items: center;
+    padding: 0 0.5rem 0 0.6rem;
+    background: var(--term-bg);
+  }
+
+  .seg {
+    appearance: none;
+    border: none;
+    background: none;
+    font: inherit;
+    font-size: var(--text-xs);
+    letter-spacing: 0.04em;
+    color: var(--muted);
+    cursor: pointer;
+    padding: 2px 8px;
+    border-radius: 4px;
+    transition:
+      background-color 0.12s ease,
+      color 0.12s ease;
+  }
+
+  .seg:hover {
+    color: var(--fg);
+  }
+
+  .seg.on {
+    color: var(--fg);
+    background: var(--row-active);
+  }
+
   .file-error {
     position: absolute;
     inset: 0;
@@ -262,5 +486,11 @@
     font-size: var(--text-md);
     padding: 1rem;
     text-align: center;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .seg {
+      transition: none;
+    }
   }
 </style>
