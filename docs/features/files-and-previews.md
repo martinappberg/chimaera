@@ -3,7 +3,8 @@
 Browsing and managing the workspace's files. The file tree and the Finder browse, open,
 and — via their right-click context menus — create, rename, delete, and download files
 and folders; the preview service streams file bytes and renders them as code, markdown,
-tables, PDFs, images, video and audio, sandboxed HTML, or a binary info card — plus a light single-file
+tables, PDFs, images, video and audio, sandboxed HTML, Jupyter notebooks, program logs,
+Marp slide decks, mermaid diagrams, or a binary info card — plus a light single-file
 editor. Everything streams (never whole-file loads) to hold the daemon's ~150 MB RSS
 budget on shared login nodes.
 
@@ -11,10 +12,11 @@ budget on shared login nodes.
 `fileStore.svelte.ts` the content store, `CodeView`, `MarkdownView` + `mdDoc.ts` /
 `docLinks.ts` / `mdLive.ts` and the markdown engine in `doc/` (`parser.ts`, `model.ts`,
 `render.ts`, `reader.ts`), `TableView`, `PdfView`, `ImageView`, `MediaView`, `HtmlView`, `BinaryView`,
-`FinderView`, `cm.ts`) +
+`NotebookView` + `notebook.ts`, `LogView` + `logText.ts`, `SlidesView` + `marp.ts`,
+`MermaidView`, `RawTextView`, `ansi.ts`, `FinderView`, `cm.ts`) +
 `web-ui/src/lib/workspace/FileTree.svelte` + glyphs in `web-ui/src/lib/shared/`
-(`FileIcon`, `FolderIcon`, `icons.ts`). Daemon: **all preview endpoints are in
-`crates/chimaera-server/src/fs.rs`** (there is no separate previews module). The file diff
+(`FileIcon`, `FolderIcon`, `icons.ts`). Daemon: **the preview endpoints are in
+`crates/chimaera-server/src/fs.rs`**, except the notebook pager (`notebook.rs`). The file diff
 viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
 
 ## The file tree
@@ -87,7 +89,8 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   a cut into the same folder is a no-op. Files can also be **dragged from the OS desktop** onto
   a Finder column or a FILES-tree folder to upload into it (see
   [drag-drop-and-uploads.md](drag-drop-and-uploads.md)). Delete always confirms in a modal
-  (permanent — no server-side trash). Download streams a single file as-is (forced via the
+  (permanent — no server-side trash), which names any file under the path with unsaved edits:
+  the delete discards those buffers too. Download streams a single file as-is (forced via the
   anchor `download` attribute so it never navigates the native webview), a folder as
   `<name>.zip`; it is **hidden on local workspaces** (the file already lives on this machine)
   and shown only on remote ones, where the window's origin *is* the ssh tunnel.
@@ -150,7 +153,9 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   rename of the file or a parent (the buffer re-keys) all come back to the same text and undo
   stack. `shared/editing.ts`'s `dirtyFiles` mirrors the store, so the tab dot, beforeunload and
   the reload gate protect an unmounted dirty buffer too. A clean buffer is forgotten with its last
-  view.
+  view. Two views mounted on one buffer at once (a tab mid-move) never both edit: the newer takes
+  over and the older shows "open in another pane" — and resumes, from the buffer's current state,
+  if the newer one unmounts first.
 - **Closing asks.** Every close of a tab whose file is dirty — ×, middle-click, Close / Close
   Others / Close All, Cmd/Ctrl+W and the close-view chord — opens **Save / Don't save / Cancel**
   (one dialog for several files). A save that fails keeps its tab open with the reason. Save
@@ -184,15 +189,24 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   the merge. When both copies exist with different text the newer wins by the writers' own
   clocks (each PUT carries the client's `updated_ms`, answered back as `client_updated_ms`), not
   the daemon's arrival stamp, which runs on another machine's clock; a mirror copy from an older
-  client falls back to that stamp. A save of exactly that text, or a discard, clears both copies; mirror writes for a
-  path land in issue order, so a late journal write never re-creates a cleared draft. A
-  hide/pagehide flush sends drafts as keepalive requests only within a shared 56 KiB budget of
+  client falls back to that stamp. A save of exactly that text, or a discard, clears both
+  copies — but only the record this window wrote (each carries a per-page `writer` id; the
+  mirror's `DELETE ?writer=` spares another window's) or one holding exactly the saved or
+  discarded text, so one window's save never drops another window's draft of the same file.
+  Mirror writes for a path land in issue order, so a late journal write never re-creates a
+  cleared draft. A hide/pagehide flush re-journals every dirty buffer even when its text is
+  unchanged (another window may have overwritten the path's one record) and sends drafts as
+  keepalive requests only within a shared 56 KiB budget of
   encoded body bytes (the browser's keepalive quota); the rest go as normal requests, with the
   IndexedDB copy regardless. A journal that failed
   everywhere shows "draft not backed up" in the status bar. Older daemons without the routes fall
   back to IndexedDB only.
 - **Other windows.** Same-origin windows announce dirty paths over a `BroadcastChannel`; a window
-  showing a file another one holds unsaved shows "Unsaved edits in another window".
+  showing a file another one holds unsaved shows "Unsaved edits in another window", and does not
+  offer that window's live draft as a recovery. A window holding unsaved edits re-announces them
+  every 10 s (60 s while hidden, the browser's own throttled pace); peers forget a window silent
+  for 30 s (3 min if it said it was hidden), so one that crashed without its goodbye stops hiding
+  its draft from recovery. Nothing beats while a window holds no unsaved edits.
 - **Key behaviors.** Read chunk cap 2 MB (default 256 KB); PUT body cap 1 MB (editing is for small
   text files — 413 over). Writes go through a hidden tmp sibling + rename, keep the original
   mode, and call `git::mark_path_dirty` so the git panel refreshes without polling. Gzip
@@ -513,6 +527,63 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   Vorbis in WebKit) — and gets a card saying so, with try again and, on a remote host, a
   download so it can play locally. A parked pane pauses its video (it doesn't resume by
   itself); audio keeps playing.
+- **Notebooks.** `.ipynb` opens read-only in `NotebookView.svelte`: code cells highlighted
+  (the editor's `--syn-*` palette, parsers from `@codemirror/language-data` via `highlight.ts`)
+  beside their `[n]` execution counts; markdown cells through `marked` + DOMPurify with chat's
+  profile (no `<style>`, web links in a new tab without an opener), math (`$…$`, `$$…$$`,
+  `\(…\)`, `\[…\]`, `\begin{…}` blocks) typeset through the shared KaTeX policy only when a
+  cell has any, `attachment:` images inlined and relative ones through `/raw` tickets, links
+  followed like the markdown view's. Outputs: stdout/stderr and tracebacks in ANSI color
+  (the theme's terminal palette, carriage-return progress bars collapsed to their last state);
+  png/jpeg/gif as data URLs; SVG as an `<img>` (never live markup); `text/html` in an iframe
+  sandboxed with **no** permissions (`sandbox=""`, `srcdoc`, the theme's colors written in),
+  sized from a sanitized offscreen layout, capped at 440px with *show all* and a drag handle;
+  `text/markdown` and `text/latex` rendered. The rail beside a cell's outputs folds them. The
+  daemon pages cells — `GET /fs/notebook?path=&offset=&limit=` → `{cells, offset, total,
+  language, nbformat}` — walking the file with serde's streaming visitor so only the page's
+  cells are ever held: source ≤ 64 MB, ≤ 100 cells a page and ≤ 8 MB of payload (a page can
+  come back short; the next starts at `offset + cells.length`), each output reduced to its
+  richest drawable mime plus `text/plain`, a payload over 8 MB replaced by its size
+  (`omitted`), text over 200 KB cut (`truncated`); one parse at a time. The first open is one
+  page (up to 24 cells), then more page in while the end is within reach; a disk change
+  re-reads the loaded cells in place; `#cell=N` (a reveal) loads up to the cell, scrolls to it and flashes it. nbformat 3
+  is refused with how to upgrade it.
+- **Logs.** `.log`, `.out`, `.err`, `.stdout`, `.stderr` (so `slurm-*.out` and `.nextflow.log`)
+  open in `LogView.svelte`, read-only and tail-first: one 64 KB read (a small log arrives
+  whole) then the last 256 KB, opened at the bottom. *Load earlier* pages back 256 KB at a
+  time without moving the lines being read; the view keeps a 4 MB window sliding over a file
+  of any size (pages fall off the far end), with *top*, *bottom* and *load later*. ANSI colors
+  map to the theme's terminal palette (256-color and truecolor fold to its 16), other escapes
+  are dropped, progress bars collapse, and error / warning lines are tinted, counted in the bar
+  and jumped between (`logText.ts`: Python exceptions, Slurm cancellations, OOM kills; "0
+  errors" stays quiet). **Follow** (on at open) polls the tail every 2 s — only while the pane
+  and the window are visible — keeps the view pinned, shows a line still being written, and
+  stops when the reader scrolls up (scrolling back to the bottom resumes it). With follow off,
+  a disk change still appends the new lines without moving the view and shows a *new output*
+  pill. Wrap is a per-browser preference; a tail that turns out binary falls back to the
+  info card. A gzipped log stays in the text view (no known size to read a tail from).
+- **Slides (Marp).** A markdown file whose frontmatter says `marp: true` opens in
+  `SlidesView.svelte`, with a **slides | markdown** switch (the markdown side is the normal
+  markdown view). FileView decides once per tab from whichever payload the markdown view
+  fetches first (the reading render's frontmatter or the source chunk), so detection costs no
+  request and an edit never swaps the view out from under the editor. `@marp-team/marp-core`
+  renders in the browser (`html: false`, no script, math as KaTeX MathML, emoji as text — no
+  CDN fetches) with relative images rewritten to `/raw` tickets first; the slides draw in
+  script-less sandboxed iframes, the whole deck at native size in one frame that is moved and
+  scaled to show a slide (instant paging, exact layout at any pane size, no WebKit
+  foreignObject scaling bug). Arrows / PageUp / PageDown / Space / Home / End page the deck, a
+  thumbnail strip jumps, **present** goes full screen (or covers the window where a webview
+  refuses), **print** opens the browser's dialog with one slide per page (save as PDF there),
+  `#slide=N` reveals a slide, and a disk change re-renders in place keeping the slide. Decks
+  over 2 MB of source are refused. The bundle stubs MathJax and the uncommon highlight.js
+  grammars (see `vite.config.ts`), so the chunk is ~730 KB (226 KB gzipped), loaded only by
+  a deck.
+- **Mermaid files.** `.mmd` / `.mermaid` open in `MermaidView.svelte` through the shared,
+  strict renderer (`shared/mermaid.ts`): redrawn when the theme flips or the file changes (the
+  last good drawing stays up, dimmed while redrawing, with the parse error in the bar), fit to
+  the pane without enlarging a small diagram, zoom steps and 1:1, export as SVG or as a 2× PNG
+  (a diagram with HTML labels can't rasterize in every engine; the bar says so). A
+  **diagram | source** switch shows the file in the editor.
 - **Release-safe lazy views.** File and other heavyweight workbench views load from immutable hashed
   chunks. The entry document is never cached and is stamped with the source build that served it,
   so a later health response cannot mistake a replacement daemon for that document's build. Vite's
@@ -521,7 +592,11 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   when the current asset graph is unavailable. Reload waits behind unsaved file edits and chat
   drafts that exist only in memory, with an explicit reload-anyway escape hatch.
 - **Binary / Finder.** Non-text files get an info card (`BinaryView`: name, size, modified time
-  from the parent listing; no hex view yet); `FinderView` is a directory browser surface.
+  from the parent listing; no hex view yet) with **open as text** — a per-tab override
+  (`RawTextView`): the bytes decoded read-only (the editor refuses binary content), control
+  bytes drawn as their Unicode control pictures so a NUL stays visible, 256 KB at a time up
+  to 4 MB, *file info* to go back — and, on a remote host (the `host=` window rule the
+  downloads share), a **download** button; `FinderView` is a directory browser surface.
 
 ## Preview keep-alive & live-update
 

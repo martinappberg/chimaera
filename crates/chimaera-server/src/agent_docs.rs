@@ -183,6 +183,18 @@ fn read_existing(path: &Path) -> anyhow::Result<Option<String>> {
 /// writing through a symlink to its target. The temp file is removed on
 /// every error path.
 fn write_atomic(path: &Path, contents: &str) -> anyhow::Result<()> {
+    write_atomic_if(path, contents, || Ok(true)).map(|_| ())
+}
+
+/// [`write_atomic`], renaming only if `unchanged()` still holds once the temp
+/// file is written — the last moment before the rename, so a concurrent
+/// edit made while we merged is not overwritten. `Ok(false)` (the temp
+/// removed, nothing written) when it no longer holds.
+fn write_atomic_if(
+    path: &Path,
+    contents: &str,
+    unchanged: impl FnOnce() -> anyhow::Result<bool>,
+) -> anyhow::Result<bool> {
     let target = match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_symlink() => std::fs::canonicalize(path)
             .with_context(|| format!("{} is a dangling symlink", path.display()))?,
@@ -207,7 +219,7 @@ fn write_atomic(path: &Path, contents: &str) -> anyhow::Result<()> {
         ".{name}.chimaera-{}-{nanos}.tmp",
         std::process::id()
     ));
-    let result = (|| -> anyhow::Result<()> {
+    let result = (|| -> anyhow::Result<bool> {
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -219,29 +231,58 @@ fn write_atomic(path: &Path, contents: &str) -> anyhow::Result<()> {
         file.write_all(contents.as_bytes())
             .and_then(|()| file.sync_all())
             .with_context(|| format!("failed to write {}", tmp.display()))?;
+        if !unchanged()? {
+            return Ok(false);
+        }
         std::fs::rename(&tmp, &target)
             .with_context(|| format!("failed to rename into {}", target.display()))?;
-        Ok(())
+        Ok(true)
     })();
-    if result.is_err() {
+    if !matches!(result, Ok(true)) {
         let _ = std::fs::remove_file(&tmp);
         return result;
     }
     if let Ok(dir) = std::fs::File::open(parent) {
         let _ = dir.sync_all();
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Write the block into `AGENTS.md` at `path`. Returns (changed, created).
 pub(crate) fn install_agents_md(path: &Path) -> anyhow::Result<(bool, bool)> {
-    let existing = read_existing(path)?;
-    let next = upsert_block(existing.as_deref(), &agents_block())?;
-    if existing.as_deref() == Some(next.as_str()) {
-        return Ok((false, false));
+    install_agents_md_with(path, || {})
+}
+
+/// [`install_agents_md`], with `before_check` run between writing the temp
+/// file and re-reading `path` (tests use it to edit the file mid-install).
+///
+/// The merge is a read-modify-write of a file an agent or the user may be
+/// editing: right before the rename the file is read again, and a change
+/// since the merge's read means one fresh merge over the new text; a second
+/// change refuses with an error rather than overwrite either edit.
+fn install_agents_md_with(
+    path: &Path,
+    mut before_check: impl FnMut(),
+) -> anyhow::Result<(bool, bool)> {
+    for _attempt in 0..2 {
+        let existing = read_existing(path)?;
+        let next = upsert_block(existing.as_deref(), &agents_block())?;
+        if existing.as_deref() == Some(next.as_str()) {
+            return Ok((false, false));
+        }
+        let written = write_atomic_if(path, &next, || {
+            before_check();
+            Ok(read_existing(path)? == existing)
+        })?;
+        if written {
+            return Ok((true, existing.is_none()));
+        }
     }
-    write_atomic(path, &next)?;
-    Ok((true, existing.is_none()))
+    anyhow::bail!(
+        "{} kept changing while the section was being written; nothing was written — \
+         try again once it is idle",
+        path.display()
+    )
 }
 
 /// Write the skill at `path` (its folder created). Returns (changed, created).
@@ -352,6 +393,7 @@ pub(crate) async fn install(
         other => return respond(Err(anyhow::anyhow!("unknown install target {other:?}"))),
     };
     let target = body.target.clone();
+    let written = path.clone();
     let result = crate::doc_check::run_blocking(move || {
         let (changed, created) = if is_skill {
             install_skill(&path)?
@@ -362,6 +404,11 @@ pub(crate) async fn install(
         Ok(json!({"target": target, "path": path, "changed": changed, "created": created}))
     })
     .await;
+    // Like a save: the git panel and any open preview refresh now, not at
+    // the next backstop poll.
+    if result.as_ref().is_ok_and(|body| body["changed"] == true) {
+        crate::git::mark_path_dirty(&state, &written.to_string_lossy()).await;
+    }
     respond(result)
 }
 
@@ -408,6 +455,106 @@ mod tests {
         assert_eq!(agents_md_state(Some(&lone)), "broken");
         let reversed = format!("{END}\n{START}\n");
         assert!(upsert_block(Some(&reversed), &agents_block()).is_err());
+    }
+
+    fn scratch(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "chimaera-agent-docs-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn leftovers(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect()
+    }
+
+    /// An edit that lands while the block is being merged in is kept: the
+    /// install re-reads right before the rename and merges again.
+    #[test]
+    fn agents_md_install_keeps_an_edit_made_mid_install() {
+        let dir = scratch("race-once");
+        let path = dir.join("AGENTS.md");
+        std::fs::write(
+            &path, "# Repo
+",
+        )
+        .unwrap();
+        let mut edits = 0;
+        let (changed, created) = install_agents_md_with(&path, || {
+            if edits == 0 {
+                std::fs::write(
+                    &path,
+                    "# Repo
+
+A rule an agent just added.
+",
+                )
+                .unwrap();
+            }
+            edits += 1;
+        })
+        .unwrap();
+        assert_eq!((changed, created), (true, false));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            format!(
+                "# Repo
+
+A rule an agent just added.
+
+{}
+",
+                agents_block()
+            )
+        );
+        assert!(leftovers(&dir).is_empty());
+    }
+
+    /// A file that keeps changing is refused, never overwritten.
+    #[test]
+    fn agents_md_install_refuses_a_file_that_keeps_changing() {
+        let dir = scratch("race-always");
+        let path = dir.join("AGENTS.md");
+        std::fs::write(
+            &path, "# Repo
+",
+        )
+        .unwrap();
+        let mut n = 0;
+        let err = install_agents_md_with(&path, || {
+            n += 1;
+            std::fs::write(
+                &path,
+                format!(
+                    "# Repo
+
+edit {n}
+"
+                ),
+            )
+            .unwrap();
+        })
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("kept changing"), "{err:#}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "# Repo
+
+edit 2
+"
+        );
+        assert!(leftovers(&dir).is_empty());
     }
 
     #[test]

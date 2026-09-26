@@ -220,6 +220,8 @@ export interface DraftBody {
   /** When the writer's text last changed, by the WRITER's clock (what it sent
    *  as `updated_ms`); null from an older writer or daemon. */
   client_updated_ms: number | null;
+  /** The window that wrote it (drafts.ts `WRITER`); null from an older one. */
+  writer: string | null;
 }
 
 export type DraftPutResult = "ok" | "too-large" | "unsupported";
@@ -231,23 +233,31 @@ function draftsUnsupported(status: number): boolean {
 
 /** The JSON body of a draft PUT (drafts.ts weighs it against the browser's
  *  keepalive quota before asking for `keepalive`). */
-export function draftPutBody(path: string, baseHash: string, text: string, updatedMs: number): string {
-  return JSON.stringify({ path, base_hash: baseHash, text, updated_ms: updatedMs });
+export function draftPutBody(
+  path: string,
+  baseHash: string,
+  text: string,
+  updatedMs: number,
+  writer: string,
+): string {
+  return JSON.stringify({ path, base_hash: baseHash, text, updated_ms: updatedMs, writer });
 }
 
-/** Mirror a draft; `updatedMs` is this client's time for the text (an older
- *  daemon ignores it). `keepalive` lets a small body outlive a closing page. */
+/** Mirror a draft; `updatedMs` is this client's time for the text and
+ *  `writer` this window's id (an older daemon ignores both). `keepalive` lets
+ *  a small body outlive a closing page. */
 export async function fsDraftPut(
   path: string,
   baseHash: string,
   text: string,
   updatedMs: number,
+  writer: string,
   keepalive = false,
 ): Promise<DraftPutResult> {
   const res = await api("/fs/drafts", {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
-    body: draftPutBody(path, baseHash, text, updatedMs),
+    body: draftPutBody(path, baseHash, text, updatedMs, writer),
     keepalive,
     signal: AbortSignal.timeout(15_000),
   });
@@ -274,6 +284,7 @@ export async function fsDraftGet(path: string): Promise<DraftBody | null> {
       text: body.text,
       updated_ms: typeof body.updated_ms === "number" ? body.updated_ms : 0,
       client_updated_ms: typeof body.client_updated_ms === "number" ? body.client_updated_ms : null,
+      writer: typeof body.writer === "string" ? body.writer : null,
     };
   } catch {
     return null; // not JSON (an older daemon's fallback), so not a draft
@@ -307,9 +318,11 @@ export async function fsDraftList(): Promise<DraftSummary[] | null> {
   }
 }
 
-/** Drop the daemon's draft for `path` (a no-op on an older daemon). */
-export async function fsDraftDelete(path: string, keepalive = false): Promise<void> {
+/** Drop the daemon's draft for `path` (a no-op on an older daemon) — only
+ *  when `writer` wrote it, if given (an older daemon drops it regardless). */
+export async function fsDraftDelete(path: string, writer: string | null, keepalive = false): Promise<void> {
   const q = new URLSearchParams({ path });
+  if (writer !== null) q.set("writer", writer);
   const res = await api(`/fs/draft?${q.toString()}`, {
     method: "DELETE",
     keepalive,
@@ -868,6 +881,9 @@ export type FileViewKind =
   | "pdf"
   | "video"
   | "audio"
+  | "notebook"
+  | "log"
+  | "mermaid"
   | "binary"
   | "text";
 
@@ -893,6 +909,10 @@ const TABLE_EXTS = new Set([
 ]);
 /** Spreadsheets parsed server-side (calamine) into the same paged table grid. */
 const SPREADSHEET_EXTS = new Set(["xlsx", "xls", "xlsm", "ods"]);
+/** Program output read tail-first (slurm-*.out, *.stderr, .nextflow.log…).
+ *  A gzipped log stays text: it has no known size to read a tail from. */
+const LOG_EXTS = new Set(["log", "out", "err", "stdout", "stderr"]);
+const MERMAID_EXTS = new Set(["mmd", "mermaid"]);
 /**
  * Extensions we know are binary up front — straight to the info card, no
  * fetch. Everything not listed anywhere goes down the text path, which
@@ -933,6 +953,9 @@ export function viewKindFor(path: string): FileViewKind {
   if (ext === "pdf") return "pdf";
   if (VIDEO_EXTS.has(ext)) return "video";
   if (AUDIO_EXTS.has(ext)) return "audio";
+  if (ext === "ipynb") return "notebook";
+  if (LOG_EXTS.has(ext)) return "log";
+  if (MERMAID_EXTS.has(ext)) return "mermaid";
   if (BINARY_EXTS.has(ext)) return "binary";
   return "text";
 }

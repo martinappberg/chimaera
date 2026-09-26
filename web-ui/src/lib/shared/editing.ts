@@ -27,6 +27,34 @@ export function forgetDirty(path: string): void {
   setDirty(path, false);
 }
 
+/** Paths with unsaved edits at or under `root`: what deleting `root` in-app
+ *  throws away (the buffer store discards every buffer under a delete). */
+export function dirtyUnder(root: string, dirty: ReadonlySet<string>): string[] {
+  const prefix = root.endsWith("/") ? root : `${root}/`;
+  return [...dirty].filter((p) => p === root || p.startsWith(prefix)).sort();
+}
+
+/**
+ * The sentence a delete confirmation adds when the delete would discard
+ * unsaved edits: the files by name (relative to a deleted folder), three at
+ * most, then a count. "" when nothing unsaved is under `root`.
+ */
+export function unsavedDeleteNote(root: string, dirty: ReadonlySet<string>): string {
+  const lost = dirtyUnder(root, dirty);
+  if (lost.length === 0) return "";
+  const name = (p: string): string =>
+    `“${p === root ? p.slice(p.lastIndexOf("/") + 1) : p.slice(root.length).replace(/^\/+/, "")}”`;
+  const shown = lost.slice(0, 3).map(name);
+  const more = lost.length - shown.length;
+  const list =
+    more > 0
+      ? `${shown.join(", ")} and ${more} more`
+      : shown.length === 1
+        ? shown[0]
+        : `${shown.slice(0, -1).join(", ")} and ${shown[shown.length - 1]}`;
+  return ` Unsaved edits in ${list} will be discarded.`;
+}
+
 /**
  * Whether this window's daemon link (the `/ws/events` socket) is up. App feeds
  * it; a save that failed on a dead link waits for it before its one retry.

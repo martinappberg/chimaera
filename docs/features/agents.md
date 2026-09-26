@@ -203,7 +203,9 @@ spawn.rs,recents.rs}`. Wire: `POST/GET/DELETE/PATCH /api/v1/sessions*`, `GET /ap
 - **How it's used.** Nothing to set up for agents launched in Chimaera: the chimaera MCP server's
   `initialize` instructions carry a six-line documents paragraph, `document_guide` (no args)
   returns the full guide, and `check_document {path}` returns a readable report (a relative path
-  resolves against the session's cwd, then its workspace root). In the preview, a quiet
+  resolves against the session's cwd, then its workspace root). Both are read-only and
+  pre-approved for every session (`mcp::ALWAYS_ALLOWED_TOOLS`, beside `notify`), so neither
+  raises a permission prompt. In the preview, a quiet
   **"N issues"** chip appears on the markdown toolbar when the document has errors or warnings
   (red with any error, amber otherwise; notes only appear in its popover); clicking an issue
   reveals its line in reading, live or source. For agents launched **outside** Chimaera,
@@ -240,6 +242,9 @@ spawn.rs,recents.rs}`. Wire: `POST/GET/DELETE/PATCH /api/v1/sessions*`, `GET /ap
   only while it can be seen (window visible, its tab's layer active), debounced after a disk
   change, and stays hidden when a check fails. Installs are atomic (temp, fsync, rename), refuse
   an existing file over 1 MiB or with an unmatched marker, and are idempotent (`changed: false`).
+  The `AGENTS.md` merge re-reads the file right before its rename, so an edit that landed
+  meanwhile (an agent, the user) is merged once more rather than overwritten, and a file that
+  keeps changing is refused; a write refreshes the git panel and open previews like a save.
   There is no Codex skill install; Codex reads the `AGENTS.md` section.
 
 ## Status: partial

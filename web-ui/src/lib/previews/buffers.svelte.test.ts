@@ -8,6 +8,7 @@ const mocks = vi.hoisted(() => ({
   fsWrite: vi.fn(),
   settings: { "editor.autosave": "off", "editor.autosaveDelay": 1000 } as Record<string, unknown>,
   drafts: {
+    WRITER: "this-window",
     journal: vi.fn(async () => ({ local: true, remote: "ok" })),
     journaled: (r: { local: boolean; remote: string }) => r.local || r.remote === "ok",
     clear: vi.fn(async () => {}),
@@ -26,7 +27,17 @@ vi.mock("../settings/store.svelte", () => ({
 }));
 
 import { FileConflictError, type FileChunk, type WriteResult } from "./files";
-import { bufferFor, openBuffer, releaseBuffer, type Buffer } from "./buffers.svelte";
+import {
+  bufferFor,
+  openBuffer,
+  Presence,
+  PRESENCE_HIDDEN_TTL_MS,
+  PRESENCE_TTL_MS,
+  releaseBuffer,
+  type Buffer,
+  type PresenceBus,
+  type PresenceMsg,
+} from "./buffers.svelte";
 import { retain, release } from "./fileStore.svelte";
 import { dirtyFiles } from "../shared/editing";
 import { lastFsMutation } from "../workspace/fsEvents";
@@ -139,6 +150,43 @@ describe("buffer lifetime", () => {
     expect(get(dirtyFiles).has(path)).toBe(false);
   });
 
+  it("hands the buffer back to a superseded view when the live one unmounts first", () => {
+    const path = `/w/standby-${++seq}.md`;
+    const buf = openBuffer(path, chunk("one\n", "h0", "m0"));
+    const older = new FakeView(buf.stateFor([]));
+    const events: string[] = [];
+    const resumeOlder = () => {
+      older.state = buf.stateFor([]);
+      events.push("resumed");
+      buf.attach(older as unknown as EditorView, () => events.push("superseded"), resumeOlder);
+    };
+    buf.attach(older as unknown as EditorView, () => events.push("superseded"), resumeOlder);
+
+    // A second view of the path (a tab mid-move) takes over and is typed in.
+    const newer = new FakeView(openBuffer(path, chunk("one\n", "h0", "m0")).stateFor([]));
+    buf.attach(newer as unknown as EditorView, () => {}, () => {});
+    expect(events).toEqual(["superseded"]);
+    newer.type(0, "zero ");
+
+    // It unmounts first: the older view resumes with the current text and
+    // is live again (its keystrokes reach the buffer).
+    close(buf, newer);
+    expect(events).toEqual(["superseded", "resumed"]);
+    expect(older.text).toBe("zero one\n");
+    older.type(0, "! ");
+    expect(buf.current.doc.toString()).toBe("! zero one\n");
+    expect(buf.dirty).toBe(true);
+
+    // A superseded view that unmounts is simply forgotten.
+    const third = new FakeView(openBuffer(path, chunk("one\n", "h0", "m0")).stateFor([]));
+    buf.attach(third as unknown as EditorView, () => {}, () => {});
+    close(buf, older);
+    close(buf, third);
+    expect(events).toEqual(["superseded", "resumed", "superseded"]);
+    buf.discard();
+    expect(bufferFor(path)).toBeUndefined();
+  });
+
   it("follows a rename of a parent folder", () => {
     const path = `/w/dir-${++seq}/notes.md`;
     const dir = path.slice(0, path.lastIndexOf("/"));
@@ -181,7 +229,7 @@ describe("saving", () => {
       expect.objectContaining({ expectHash: "h1" }),
     );
     expect(buf.dirty).toBe(false);
-    expect(mocks.drafts.clear).toHaveBeenCalledWith(path);
+    expect(mocks.drafts.clear).toHaveBeenCalledWith(path, { writer: "this-window", text: "cba\n" });
     close(buf, view);
   });
 
@@ -382,7 +430,8 @@ describe("the journal", () => {
     view.type(2, "b"); // "xab"
     mocks.fsWrite.mockResolvedValueOnce({ hash: "h1", mtime: "m1" });
     expect(await buf.save()).toBe(true); // clean: the draft is cleared
-    expect(mocks.drafts.clear).toHaveBeenCalledWith(path);
+    // This window's record, or anyone's holding exactly the saved text.
+    expect(mocks.drafts.clear).toHaveBeenCalledWith(path, { writer: "this-window", text: "xab" });
     land({ local: true, remote: "ok" }); // the stale write completes last
     await journaling;
 
@@ -396,5 +445,123 @@ describe("the journal", () => {
     expect(mocks.drafts.journal).toHaveBeenCalledWith(expect.objectContaining({ path, text: "xa" }), false);
     buf.discard();
     close(buf, view);
+  });
+
+  it("re-journals unchanged text on the hide/pagehide flush (another window may have overwritten it)", async () => {
+    const path = `/w/flush-${++seq}.txt`;
+    const { buf, view } = fresh(path, "x");
+    view.type(1, "y");
+    await buf.journal();
+    await buf.journal(); // unchanged: the memo skips it
+    expect(mocks.drafts.journal).toHaveBeenCalledTimes(1);
+    await buf.journal(true); // the flush always writes
+    expect(mocks.drafts.journal).toHaveBeenCalledTimes(2);
+    expect(mocks.drafts.journal).toHaveBeenLastCalledWith(expect.objectContaining({ text: "xy" }), true);
+    buf.discard();
+    // A discard drops only this window's record.
+    expect(mocks.drafts.clear).toHaveBeenLastCalledWith(path, { writer: "this-window" });
+    close(buf, view);
+  });
+
+  it("clears a draft found on open by its writer or its text, not as this window's", async () => {
+    const path = `/w/found-${++seq}.txt`;
+    const found = { path, baseHash: "h0", baseText: null, text: "theirs", updatedMs: 1, writer: "dead-window" };
+    mocks.drafts.find.mockImplementationOnce(async () => found as never);
+    const { buf, view } = fresh(path, "x");
+    await vi.waitFor(() => expect(buf.recovered).not.toBeNull());
+    buf.discardDraft();
+    expect(mocks.drafts.clear).toHaveBeenLastCalledWith(path, { writer: "dead-window", text: "theirs" });
+    close(buf, view);
+  });
+});
+
+describe("presence across windows of this origin", () => {
+  /** Windows on one fake BroadcastChannel; a window can crash (go silent). */
+  function bus() {
+    const ends = new Set<PresenceBus>();
+    const open = (): PresenceBus & { crash(): void } => {
+      const end: PresenceBus & { crash(): void } = {
+        onmessage: null,
+        postMessage(msg: PresenceMsg) {
+          if (!ends.has(end)) return;
+          for (const other of ends) {
+            if (other !== end) other.onmessage?.({ data: structuredClone(msg) } as MessageEvent<PresenceMsg>);
+          }
+        },
+        crash: () => void ends.delete(end),
+      };
+      ends.add(end);
+      return end;
+    };
+    return open;
+  }
+
+  function window_(open: () => PresenceBus & { crash(): void }, dirty: string[] = [], hidden = false) {
+    const state = { dirty, hidden };
+    const end = open();
+    const p = new Presence(end, () => state.dirty, () => state.hidden);
+    return { p, end, state };
+  }
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("forgets a window that died without saying goodbye", () => {
+    vi.useFakeTimers();
+    const open = bus();
+    const b = window_(open);
+    const a = window_(open, ["/w/p.md"]);
+    a.p.announce("/w/p.md", true);
+    expect(b.p.elsewhere.has("/w/p.md")).toBe(true);
+
+    // Alive, its heartbeat keeps it held well past the TTL.
+    vi.advanceTimersByTime(PRESENCE_TTL_MS * 3);
+    expect(b.p.heldElsewhere("/w/p.md")).toBe(true);
+
+    // Crashed: silent, so gone once the TTL runs out (the peer's own timer).
+    a.end.crash();
+    vi.advanceTimersByTime(PRESENCE_TTL_MS + 1_000);
+    expect(b.p.elsewhere.has("/w/p.md")).toBe(false);
+    expect(b.p.heldElsewhere("/w/p.md")).toBe(false);
+    a.p.leave();
+    b.p.leave();
+  });
+
+  it("gives a hidden window longer, and beats only while it holds unsaved edits", () => {
+    vi.useFakeTimers();
+    const open = bus();
+    const b = window_(open);
+    const a = window_(open, ["/w/q.md"]);
+    a.p.announce("/w/q.md", true);
+    a.state.hidden = true;
+    a.p.visibilityChanged();
+    a.end.crash(); // e.g. frozen or killed while hidden
+    vi.advanceTimersByTime(PRESENCE_TTL_MS * 2);
+    expect(b.p.heldElsewhere("/w/q.md")).toBe(true);
+    vi.advanceTimersByTime(PRESENCE_HIDDEN_TTL_MS);
+    expect(b.p.heldElsewhere("/w/q.md")).toBe(false);
+    a.p.leave();
+
+    // A window with nothing unsaved leaves no timer behind.
+    const c = window_(open, ["/w/r.md"]);
+    c.p.announce("/w/r.md", true);
+    c.state.dirty = [];
+    c.p.announce("/w/r.md", false);
+    vi.advanceTimersByTime(PRESENCE_TTL_MS * 2);
+    b.p.leave();
+    c.p.leave();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("drops a window at once on its goodbye, and answers a newcomer's hello", () => {
+    const open = bus();
+    const a = window_(open, ["/w/s.md"]);
+    a.p.announce("/w/s.md", true);
+    const late = window_(open); // says hello; `a` answers with its state
+    expect(late.p.elsewhere.has("/w/s.md")).toBe(true);
+    a.p.leave();
+    expect(late.p.elsewhere.has("/w/s.md")).toBe(false);
+    late.p.leave();
   });
 });

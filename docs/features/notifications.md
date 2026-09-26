@@ -70,9 +70,9 @@ and in `App.svelte` the view reporting + `focusFromNotification`.
 - **Where it lives.** `mcp.rs` (`notify_tool_def`, `notify`, `ALWAYS_ALLOWED_TOOLS`),
   `notices.rs::push_agent_notice`.
 - **Key behaviors.** Pre-approved for every session so it never raises a permission prompt
-  of its own — claude via `permissions.allow: ["mcp__chimaera__notify"]` in the generated
-  settings, codex via `SpawnSpec.mcp_auto_approve` (the driver answers that one tool's
-  elicitation). Rate-limited per session (one per 5s, 20 per hour; the refusal text tells the
+  of its own — claude via `permissions.allow: ["mcp__chimaera__notify", …]` in the generated
+  settings, codex via `SpawnSpec.mcp_auto_approve` (the driver answers those tools'
+  elicitations); `ALWAYS_ALLOWED_TOOLS` also holds the read-only document tools. Rate-limited per session (one per 5s, 20 per hour; the refusal text tells the
   agent why). An agent message supersedes the automatic `done`/`input` notice for the same
   session for 2 minutes, so "notify me when done" pings once, in the agent's words. With
   "Messages from Agents" off, the tool answers that the user turned it off.

@@ -2,6 +2,7 @@ import { readdirSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { defineConfig, type Plugin } from "vite";
 import { svelte } from "@sveltejs/vite-plugin-svelte";
 
@@ -99,8 +100,49 @@ function entryBundleBudget(): Plugin {
   };
 }
 
+/** Marp pins an older KaTeX and loads it as CommonJS; hand it the app's own
+ * ES build instead, so slides and the shared math chunk run one KaTeX (and
+ * the chunk chat loads never grows a second copy). */
+function marpSharesKatex(): Plugin {
+  const esm = fileURLToPath(new URL("./node_modules/katex/dist/katex.mjs", import.meta.url));
+  return {
+    name: "chimaera-marp-katex",
+    enforce: "pre",
+    resolveId(source, importer) {
+      if (source === "katex" && importer !== undefined && /[\\/]@marp-team[\\/]marp-core[\\/]/.test(importer)) {
+        return esm;
+      }
+      return null;
+    },
+  };
+}
+
+/** highlight.js grammars the slides view keeps real (what decks in this
+ * workbench show); the rest of Marp's ~190 resolve to a plain stub. */
+const MARP_HLJS_KEEP = [
+  "bash", "c", "cpp", "css", "diff", "dockerfile", "fortran", "go", "ini", "java",
+  "javascript", "json", "julia", "julia-repl", "latex", "makefile", "markdown", "matlab",
+  "perl", "plaintext", "python", "python-repl", "r", "ruby", "rust", "scala", "shell",
+  "sql", "typescript", "xml", "yaml",
+];
+
 export default defineConfig({
-  plugins: [svelte(), devManifest(), entryBundleBudget(), pdfjsAssets()],
+  plugins: [svelte(), devManifest(), entryBundleBudget(), pdfjsAssets(), marpSharesKatex()],
+  resolve: {
+    // Marp (the slides view, its own lazy chunk) imports all of MathJax and
+    // every highlight.js grammar up front: stubs for those — slides render
+    // math with KaTeX (see SlidesView), uncommon languages as plain text.
+    alias: [
+      {
+        find: /^mathjax-full\/js\/.*$/,
+        replacement: fileURLToPath(new URL("./src/lib/previews/stubs/mathjax.cjs", import.meta.url)),
+      },
+      {
+        find: new RegExp(`^highlight\\.js/lib/languages/(?!(?:${MARP_HLJS_KEEP.join("|")})$)[\\w-]+$`),
+        replacement: fileURLToPath(new URL("./src/lib/previews/stubs/hljs-language.cjs", import.meta.url)),
+      },
+    ],
+  },
   // The tab-switch perf harness (src/lib/perf) compiles in only on request;
   // every other build tree-shakes it out.
   define: { __CHIMAERA_PERF__: JSON.stringify(process.env.CHIMAERA_PERF === "1") },
@@ -114,7 +156,10 @@ export default defineConfig({
         // the pin Rollup folds a module into its static importer's chunk, and
         // the previews' dynamic import would drag the whole chat bundle in.
         manualChunks(id) {
-          if (/[\\/]node_modules[\\/](katex|dompurify)[\\/]/.test(id)) return "math";
+          // Top-level packages only: a dependency's own nested copy must not
+          // ride into the chunk chat loads.
+          const nested = id.indexOf("node_modules") !== id.lastIndexOf("node_modules");
+          if (!nested && /[\\/]node_modules[\\/](katex|dompurify)[\\/]/.test(id)) return "math";
           if (/[\\/]lib[\\/]shared[\\/]math\.ts$/.test(id)) return "math";
           return undefined;
         },

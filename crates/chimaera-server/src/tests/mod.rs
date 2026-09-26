@@ -11,6 +11,7 @@ mod ledger;
 mod links;
 mod mastermind;
 mod mcp;
+mod notebook;
 mod notices;
 mod proxy;
 mod recents;

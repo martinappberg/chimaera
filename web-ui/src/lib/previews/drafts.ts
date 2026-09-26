@@ -16,6 +16,12 @@
  * follows a save waits for the journal PUT before it, which could otherwise
  * land last and re-create a stale draft. (IndexedDB orders its own
  * readwrite transactions.)
+ *
+ * Both layers hold ONE draft per path, but several windows may hold the same
+ * file dirty. Every record names its `writer` (this page's `WRITER`), and a
+ * clear removes only a record this window wrote — or one whose text is known
+ * safe to drop (it is on disk, or the user discarded exactly it) — so one
+ * window's save or discard never deletes another window's draft.
  */
 
 import {
@@ -32,6 +38,8 @@ import {
 export interface DraftRecord {
   /** Absolute path; the IndexedDB key. */
   path: string;
+  /** The window that journaled it (`WRITER`); absent from older records. */
+  writer?: string;
   /** Content hash of the disk version the draft was typed against ("" = unknown). */
   baseHash: string;
   /** That version's text, when this origin journaled it (the daemon keeps none). */
@@ -45,6 +53,22 @@ export interface JournalResult {
   /** "superseded": a newer write or clear for the path was issued before
    *  this one's turn came, so it was never sent (the newer one counts). */
   remote: DraftPutResult | "failed" | "superseded";
+}
+
+/** This page's writer id: stamped on every record it journals. */
+export const WRITER = Math.random().toString(36).slice(2) + Date.now().toString(36);
+
+/** Which record a clear may remove: one `writer` wrote, or one holding
+ *  exactly `text`. Records naming no writer match only by text. */
+export interface DraftMatch {
+  writer?: string;
+  text?: string;
+}
+
+function matches(rec: DraftRecord, m: DraftMatch): boolean {
+  return (
+    (m.writer !== undefined && rec.writer === m.writer) || (m.text !== undefined && rec.text === m.text)
+  );
 }
 
 const DB_NAME = "chimaera-drafts";
@@ -145,9 +169,13 @@ async function localGet(path: string): Promise<DraftRecord | null> {
     : null;
 }
 
-async function localDelete(path: string): Promise<void> {
+/** Delete `path`'s record if it matches, read and deleted in one transaction. */
+async function localDelete(path: string, m: DraftMatch): Promise<void> {
   await withStore("readwrite", async (store) => {
-    await promised(store.delete(path));
+    const rec = (await promised(store.get(path))) as DraftRecord | undefined;
+    if (rec !== undefined && typeof rec.text === "string" && matches(rec, m)) {
+      await promised(store.delete(path));
+    }
     return true;
   });
 }
@@ -213,7 +241,9 @@ function reserveKeepalive(rec: DraftRecord): number {
   // UTF-8 never has fewer bytes than UTF-16 code units: skip encoding a
   // body that cannot fit anyway.
   if (rec.text.length > room) return 0;
-  const bytes = new TextEncoder().encode(draftPutBody(rec.path, rec.baseHash, rec.text, rec.updatedMs)).length;
+  const bytes = new TextEncoder().encode(
+    draftPutBody(rec.path, rec.baseHash, rec.text, rec.updatedMs, WRITER),
+  ).length;
   if (bytes > room) return 0;
   keepaliveInFlight += bytes;
   return bytes;
@@ -223,7 +253,7 @@ async function sendPut(rec: DraftRecord, keepalive: boolean): Promise<JournalRes
   const reserved = keepalive ? reserveKeepalive(rec) : 0;
   try {
     const r = await mirrorWrite(() =>
-      fsDraftPut(rec.path, rec.baseHash, rec.text, rec.updatedMs, reserved > 0),
+      fsDraftPut(rec.path, rec.baseHash, rec.text, rec.updatedMs, WRITER, reserved > 0),
     );
     if (r === "unsupported") remoteUnsupported = true;
     return r;
@@ -299,9 +329,10 @@ async function remoteFind(path: string): Promise<DraftBody | null> {
   }
 }
 
-/** Journal a dirty buffer to both layers. */
+/** Journal a dirty buffer to both layers, as this window's record. */
 export async function journal(rec: DraftRecord, keepalive = false): Promise<JournalResult> {
-  const [local, remote] = await Promise.all([localPut(rec), remotePut(rec, keepalive)]);
+  const mine: DraftRecord = { ...rec, writer: WRITER };
+  const [local, remote] = await Promise.all([localPut(mine), remotePut(mine, keepalive)]);
   return { local, remote };
 }
 
@@ -310,15 +341,20 @@ export function journaled(r: JournalResult): boolean {
   return r.local || r.remote === "ok";
 }
 
-/** Drop both copies (a save of exactly this text landed, or the user
- *  discarded). The DELETE waits for any journal PUT issued before it. */
-export async function clear(path: string, keepalive = false): Promise<void> {
+/**
+ * Drop `path`'s draft from both layers where it matches `m` — by default only
+ * a record this window wrote. The mirror, which cannot compare text, drops
+ * only `m.writer`'s record (any record when `m` names no writer: an older
+ * client's draft found on open). The DELETE waits for any journal PUT issued
+ * before it.
+ */
+export async function clear(path: string, m: DraftMatch = { writer: WRITER }, keepalive = false): Promise<void> {
   await Promise.all([
-    localDelete(path),
+    localDelete(path, m),
     remoteUnsupported
       ? undefined
       : inLane(path, () =>
-          mirrorWrite(() => fsDraftDelete(path, keepalive)).catch(() => {
+          mirrorWrite(() => fsDraftDelete(path, m.writer ?? null, keepalive)).catch(() => {
             // offline or refused: a stale mirror is recognized on reopen (it
             // matches the disk and is dropped then) or offered, never applied
           }),
@@ -348,6 +384,7 @@ export async function find(path: string): Promise<DraftRecord | null> {
         : null,
     text: remote.text,
     updatedMs: remoteMs,
+    writer: remote.writer ?? undefined,
   };
   if (local === null) return fromRemote;
   if (local.text === remote.text) return local;
