@@ -2,7 +2,9 @@
   /**
    * "Save changes before closing?" for tabs whose files hold unsaved edits —
    * every close gesture routes here (the ×, middle-click, the context menu's
-   * Close / Close Others / Close All, Cmd/Ctrl+W and the native close-view).
+   * Close / Close Others / Close All, Cmd/Ctrl+W and the native close-view),
+   * and the native app's window close and quit ask through it too, over
+   * every unsaved file in the window (layout/windowClose.svelte.ts).
    * Save closes only what saved; a failure keeps its tab open with the reason
    * inline. Don't save drops the edits (and their journaled draft). Focus
    * lands on Save — the choice that loses nothing — and Escape cancels.
@@ -21,12 +23,14 @@
     paths: string[];
     saving: boolean;
     error: string | null;
+    /** What happens without saving: a tab or window closes, or the app quits. */
+    action?: "close" | "quit";
     onSave(): void;
     onDiscard(): void;
     onCancel(): void;
   }
 
-  let { paths, saving, error, onSave, onDiscard, onCancel }: Props = $props();
+  let { paths, saving, error, action = "close", onSave, onDiscard, onCancel }: Props = $props();
 
   let dialogEl: HTMLDivElement | undefined = $state();
   // Save disables itself while saving; a disabled button drops focus to the
@@ -67,7 +71,7 @@
     <div class="title">{title}</div>
     <div class="body">
       {#if paths.length === 1}
-        Your edits will be lost if you close without saving.
+        Your edits will be lost if you {action} without saving.
       {:else}
         <ul class="files">
           {#each paths as p (p)}

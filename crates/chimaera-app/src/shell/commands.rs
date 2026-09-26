@@ -1540,6 +1540,31 @@ pub(super) fn report_window_view(
     Ok(())
 }
 
+/// How many files hold unsaved edits in this window, pushed by the page
+/// whenever that changes, so a close or quit decides without asking the page
+/// first (see `unsaved`). Keyed by the calling window: a page can only speak
+/// for itself.
+#[tauri::command]
+pub(super) fn report_unsaved(
+    webview: tauri::WebviewWindow,
+    state: State<'_, Shell>,
+    count: u32,
+) -> Result<(), String> {
+    if state.window_scope(webview.label()).is_none() {
+        return Err("this window is not registered".to_string());
+    }
+    super::unsaved::report(webview.app_handle(), webview.label(), count);
+    Ok(())
+}
+
+/// This window's answer to an `unsaved-prompt`: `shown` (the dialog is up),
+/// `proceed` (saved all, or don't save) or `cancel`. A reply to anything but
+/// the window's current prompt is ignored.
+#[tauri::command]
+pub(super) fn reply_unsaved(webview: tauri::WebviewWindow, id: u64, reply: super::unsaved::Reply) {
+    super::unsaved::reply(webview.app_handle(), webview.label(), id, reply);
+}
+
 /// The session a notification click opened this window for (see
 /// `notices::take_pending_focus`); `None` once taken or when nothing is owed.
 #[tauri::command]
@@ -1663,6 +1688,17 @@ pub(super) fn open_external(url: String) -> Result<(), String> {
 pub(super) async fn begin_update(app: AppHandle) -> Result<(), String> {
     use tauri_plugin_updater::UpdaterExt;
     tracing::info!("ipc: begin_update");
+    // The relaunch at the end is a restart, which Tauri will not let the
+    // unsaved-edits guard hold, so refuse up front instead of dropping them.
+    match super::unsaved::windows_with_unsaved(&app) {
+        0 => {}
+        1 => return Err("A window has unsaved edits — save or discard them, then update.".into()),
+        n => {
+            return Err(format!(
+                "{n} windows have unsaved edits — save or discard them, then update."
+            ))
+        }
+    }
     let updater = app.updater().map_err(|e| e.to_string())?;
     let update = updater
         .check()

@@ -26,6 +26,7 @@ mod connect;
 mod drag;
 pub(crate) mod notices;
 mod restore;
+mod unsaved;
 
 pub use restore::open_ui_window;
 
@@ -126,9 +127,13 @@ pub struct Shell {
     /// Last confirmed first-paint palette per host. Unlike web storage this
     /// survives volatile daemon/tunnel ports and app restarts.
     appearance: Mutex<crate::appearance::AppearanceCache>,
-    /// Set on ExitRequested: window teardown during quit must NOT remove
-    /// records from the registry, or quitting would forget every window.
+    /// Set once a quit is going ahead (after the unsaved-edits guard let it
+    /// through): window teardown during quit must NOT remove records from the
+    /// registry, or quitting would forget every window.
     quitting: AtomicBool,
+    /// Each window's unsaved-file count and the close/quit prompts it is
+    /// answering (see `unsaved`).
+    unsaved: Mutex<unsaved::Guard>,
     /// The held power assertion for the "caffeinate" toggle — Some = armed
     /// (this machine won't idle/display/system-sleep). Dropped to disarm; the
     /// guard drops on quit, so the assertion never outlives the app.
@@ -494,15 +499,29 @@ pub(crate) fn tray_windows(app: &AppHandle) -> Vec<(String, String)> {
     out
 }
 
-/// Explicit quit (menu / tray / ⌘Q): flag `quitting` BEFORE exiting so the
-/// last window's `CloseRequested` skips the drop-to-home reopen, and its
-/// `Destroyed` keeps the window in the registry for next launch. Distinguishes
-/// "the user asked to quit" from "the user closed the last window".
+/// Explicit quit (menu / tray / ⌘Q). Windows with unsaved edits are asked
+/// first (`unsaved`); a quit they hold is finished by `finish_quit` once the
+/// last of them lets go, or dropped when one cancels.
 pub(crate) fn request_quit(app: &AppHandle) {
     if let Some(shell) = app.try_state::<Shell>() {
-        // Idempotent: Tauri delivers a tray menu event to BOTH the tray's own
-        // handler and the global app handler, so "quit" can arrive twice — do
-        // the exit once.
+        // An exit is already under way (Tauri delivers a tray menu event to
+        // BOTH the tray's own handler and the global app handler).
+        if shell.quitting.load(Ordering::Relaxed) {
+            return;
+        }
+        if !unsaved::quit_may_proceed(app) {
+            return;
+        }
+    }
+    finish_quit(app);
+}
+
+/// Exit now, nothing left to ask: flag `quitting` BEFORE exiting so each
+/// window's `Destroyed` keeps it in the registry for the next launch (the
+/// flag is what tells "the user quit" from "the user closed the last window").
+pub(crate) fn finish_quit(app: &AppHandle) {
+    if let Some(shell) = app.try_state::<Shell>() {
+        // Idempotent: do the exit once however many paths arrive here.
         if shell.quitting.swap(true, Ordering::Relaxed) {
             return;
         }
@@ -937,6 +956,7 @@ pub(crate) fn finish_startup(handle: &tauri::AppHandle, local: LocalDaemon) -> t
             registry: Mutex::new(WindowRegistry::load_default()),
             appearance: Mutex::new(crate::appearance::AppearanceCache::load_default()),
             quitting: AtomicBool::new(false),
+            unsaved: Mutex::new(unsaved::Guard::default()),
             caffeinate: Mutex::new(None),
             drags: Mutex::new(HashMap::new()),
             done_drags: Mutex::new(HashMap::new()),
@@ -1041,6 +1061,8 @@ pub fn run() {
             commands::cache_appearance,
             commands::report_window_scope,
             commands::report_window_view,
+            commands::report_unsaved,
+            commands::reply_unsaved,
             commands::take_pending_focus,
             commands::notification_permission,
             commands::request_notification_permission,
@@ -1057,6 +1079,14 @@ pub fn run() {
                 return;
             };
             match event {
+                // A window holding unsaved edits asks its page before it
+                // goes (Save all / Don't save / Cancel); one with nothing
+                // unsaved closes as it always has.
+                tauri::WindowEvent::CloseRequested { api, .. } => {
+                    if unsaved::hold_window_close(window.app_handle(), window.label()) {
+                        api.prevent_close();
+                    }
+                }
                 // Forget a window's scope once it's gone, so focus-existing
                 // never raises a dead label. Destroyed (not CloseRequested,
                 // which can be vetoed) fires after teardown completes. The
@@ -1085,6 +1115,9 @@ pub fn run() {
                     lock(&shell.focus_order).retain(|l| l != window.label());
                     notices::window_gone(window.app_handle(), window.label());
                     let scope = lock(&shell.windows).remove(window.label());
+                    // After the scope and focus entries are gone: a quit this
+                    // window was holding moves on to the next one.
+                    unsaved::window_destroyed(window.app_handle(), window.label());
                     if !shell.quitting.load(Ordering::Relaxed) {
                         if let Some(scope) = scope {
                             lock(&shell.registry).remove(&scope.stable_id);
@@ -1140,6 +1173,10 @@ pub fn run() {
             // completes, so a click that launched the app is delivered.
             crate::notify::init(&handle);
             crate::menu::install(app)?;
+            // Dock › Quit and logout reach the unsaved-edits guard only
+            // through this AppKit delegate hook (see `unsaved`).
+            #[cfg(target_os = "macos")]
+            unsaved::install_os_quit_hook(&handle);
             // The menu-bar / system-tray status item. Installed before the
             // daemon is up (its click handlers read Shell.local, populated by
             // runtime); non-fatal if the platform tray is unavailable.
@@ -1219,8 +1256,16 @@ pub fn run() {
             }
             // Quit teardown destroys every window; flag it FIRST so those
             // Destroyed events keep the registry intact for the next launch.
-            tauri::RunEvent::ExitRequested { .. } => {
+            // A programmatic exit that did not come through `request_quit`
+            // asks windows with unsaved edits first, like any quit.
+            tauri::RunEvent::ExitRequested { code, api, .. } => {
                 if let Some(state) = app.try_state::<Shell>() {
+                    if unsaved::exit_may_hold(code, state.quitting.load(Ordering::Relaxed))
+                        && !unsaved::quit_may_proceed(app)
+                    {
+                        api.prevent_exit();
+                        return;
+                    }
                     state.quitting.store(true, Ordering::Relaxed);
                     lock(&state.registry).save_if_dirty();
                 }
