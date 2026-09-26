@@ -164,6 +164,74 @@ async fn drafts_keep_the_writers_clock_beside_the_daemons() {
         .any(|d| d["path"] == "/w/old.md" && d["client_updated_ms"].is_null()));
 }
 
+/// Two windows on one file share its draft key: a `writer`-scoped DELETE
+/// removes only the draft that window wrote, never another window's (or an
+/// older client's, which names no writer); a plain DELETE still removes any.
+#[tokio::test]
+async fn drafts_delete_by_writer_spares_another_windows_draft() {
+    let state = test_state();
+    let put = |path: &'static str, writer: Option<&'static str>| {
+        let state = state.clone();
+        async move {
+            request(
+                &state,
+                Method::PUT,
+                "/api/v1/fs/drafts",
+                Some(serde_json::json!({"path": path, "text": "t", "writer": writer})),
+            )
+            .await
+        }
+    };
+    let delete = |path: &'static str, writer: &'static str| {
+        let state = state.clone();
+        async move {
+            request(
+                &state,
+                Method::DELETE,
+                &format!("/api/v1/fs/draft?path={path}&writer={writer}"),
+                None,
+            )
+            .await
+            .0
+        }
+    };
+    assert_eq!(
+        put("/w/p.md", Some("win-b")).await.0,
+        StatusCode::NO_CONTENT
+    );
+    let (_, body) = request(&state, Method::GET, &draft_uri("/w/p.md"), None).await;
+    assert_eq!(body["writer"], "win-b");
+
+    // Window A saved or discarded: window B's draft stays.
+    assert_eq!(delete("/w/p.md", "win-a").await, StatusCode::NO_CONTENT);
+    assert!(draft_file(&state, "/w/p.md").exists());
+    assert!(meta_file(&state, "/w/p.md").exists());
+    // Judged from the draft file when the sidecar is gone.
+    std::fs::remove_file(meta_file(&state, "/w/p.md")).unwrap();
+    assert_eq!(delete("/w/p.md", "win-a").await, StatusCode::NO_CONTENT);
+    assert!(draft_file(&state, "/w/p.md").exists());
+    assert_eq!(delete("/w/p.md", "win-b").await, StatusCode::NO_CONTENT);
+    assert!(!draft_file(&state, "/w/p.md").exists());
+
+    // An older client's draft names no writer: only a plain DELETE takes it.
+    assert_eq!(put("/w/old.md", None).await.0, StatusCode::NO_CONTENT);
+    assert_eq!(delete("/w/old.md", "win-a").await, StatusCode::NO_CONTENT);
+    assert!(draft_file(&state, "/w/old.md").exists());
+    let (status, _) = request(&state, Method::DELETE, &draft_uri("/w/old.md"), None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(!draft_file(&state, "/w/old.md").exists());
+    assert!(!meta_file(&state, "/w/old.md").exists());
+
+    let (status, _) = request(
+        &state,
+        Method::PUT,
+        "/api/v1/fs/drafts",
+        Some(serde_json::json!({"path": "/w/x.md", "text": "t", "writer": "w".repeat(129)})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
 /// The listing reads only the small sidecars — never the (up to 1 MiB) draft
 /// files — and skips a draft whose sidecar is missing or corrupt.
 #[tokio::test]

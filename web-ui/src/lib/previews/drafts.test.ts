@@ -31,12 +31,19 @@ const net = vi.hoisted(() => {
   return {
     store,
     sent,
-    fsDraftPut: (path: string, _base: string, text: string, _updatedMs: number, keepalive = false) =>
+    fsDraftPut: (
+      path: string,
+      _base: string,
+      text: string,
+      _updatedMs: number,
+      _writer: string,
+      keepalive = false,
+    ) =>
       hold({ kind: "put", path, text, keepalive }, () => {
         store.set(path, text);
         return "ok" as const;
       }),
-    fsDraftDelete: (path: string, keepalive = false) =>
+    fsDraftDelete: (path: string, _writer: string | null, keepalive = false) =>
       hold({ kind: "delete", path, keepalive }, () => {
         store.delete(path);
       }),

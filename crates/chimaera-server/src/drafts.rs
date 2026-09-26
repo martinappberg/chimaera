@@ -45,6 +45,8 @@ const MAX_DRAFTS_TOTAL_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_DRAFT_PATH_BYTES: usize = 4096;
 /// Longest `base_hash` accepted (a hex SHA-256 is 64).
 const MAX_BASE_HASH_BYTES: usize = 128;
+/// Longest `writer` id accepted (a browser window's random id).
+const MAX_WRITER_BYTES: usize = 128;
 /// Request-body ceiling for `PUT /fs/drafts`. JSON escaping can grow a
 /// 1 MiB text up to sixfold (`\u0000`), so the body limit sits above that
 /// and the 1 MiB text cap is judged on the decoded text (413).
@@ -73,6 +75,11 @@ struct StoredDraft {
     /// time — like with like, whatever the skew between the two machines.
     #[serde(default)]
     client_updated_ms: Option<u64>,
+    /// The browser window that wrote it (its random per-page id), so a
+    /// window's clear removes only its own draft: two windows on one file
+    /// share this one key. `None` from an older client.
+    #[serde(default)]
+    writer: Option<String>,
     /// UTF-8 length of `text`.
     bytes: u64,
     text: String,
@@ -87,6 +94,8 @@ struct DraftMeta {
     updated_ms: u64,
     #[serde(default)]
     client_updated_ms: Option<u64>,
+    #[serde(default)]
+    writer: Option<String>,
     bytes: u64,
 }
 
@@ -264,6 +273,8 @@ pub(crate) struct PutDraftRequest {
     /// lose the draft.
     #[serde(default)]
     updated_ms: Option<serde_json::Value>,
+    #[serde(default)]
+    writer: Option<String>,
 }
 
 /// A client epoch-ms value, when it is one (a finite, non-negative number
@@ -276,11 +287,11 @@ fn client_ms(value: Option<&serde_json::Value>) -> Option<u64> {
         .map(|v| v as u64)
 }
 
-/// PUT /api/v1/fs/drafts {path, base_hash: string|null, text, updated_ms?} —
-/// store (or replace) the draft for `path` and its listing sidecar;
-/// `updated_ms` (the writer's clock) comes back as `client_updated_ms`. 204;
-/// 413 when `text` is over 1 MiB (UTF-8 bytes); 400 for an empty or overlong
-/// `path` / `base_hash`. Beyond 64 drafts or 16 MiB in total (both files
+/// PUT /api/v1/fs/drafts {path, base_hash: string|null, text, updated_ms?,
+/// writer?} — store (or replace) the draft for `path` and its listing
+/// sidecar; `updated_ms` (the writer's clock) comes back as
+/// `client_updated_ms`, `writer` as itself. 204; 413 when `text` is over 1 MiB
+/// (UTF-8 bytes); 400 for an empty or overlong `path` / `base_hash` / `writer`. Beyond 64 drafts or 16 MiB in total (both files
 /// counted) the least recently updated drafts are evicted.
 pub(crate) async fn put_draft(
     State(state): State<Arc<AppState>>,
@@ -305,6 +316,13 @@ pub(crate) async fn put_draft(
     {
         return json_error(StatusCode::BAD_REQUEST, "base_hash is too long");
     }
+    if body
+        .writer
+        .as_ref()
+        .is_some_and(|w| w.len() > MAX_WRITER_BYTES)
+    {
+        return json_error(StatusCode::BAD_REQUEST, "writer is too long");
+    }
     let root = state.drafts_root.clone();
     crate::fs::blocking_response(move || {
         let stored = StoredDraft {
@@ -313,6 +331,7 @@ pub(crate) async fn put_draft(
             base_hash: body.base_hash,
             updated_ms: now_ms(),
             client_updated_ms: client_ms(body.updated_ms.as_ref()),
+            writer: body.writer,
             text: body.text,
         };
         let contents = serde_json::to_vec(&stored).context("failed to encode draft")?;
@@ -321,6 +340,7 @@ pub(crate) async fn put_draft(
             base_hash: stored.base_hash.clone(),
             updated_ms: stored.updated_ms,
             client_updated_ms: stored.client_updated_ms,
+            writer: stored.writer.clone(),
             bytes: stored.bytes,
         })
         .context("failed to encode draft metadata")?;
@@ -358,7 +378,8 @@ fn read_meta(file: &Path, id: &str) -> Option<DraftMeta> {
 }
 
 /// GET /api/v1/fs/drafts — `{drafts: [{path, base_hash, updated_ms,
-/// client_updated_ms, bytes}]}` newest first (by `updated_ms`), without text. Reads only the sidecars; a draft whose
+/// client_updated_ms, writer, bytes}]}` newest first (by `updated_ms`),
+/// without text. Reads only the sidecars; a draft whose
 /// sidecar is missing or corrupt is skipped.
 pub(crate) async fn list_drafts(State(state): State<Arc<AppState>>) -> Response {
     let root = state.drafts_root.clone();
@@ -395,11 +416,15 @@ pub(crate) async fn list_drafts(State(state): State<Arc<AppState>>) -> Response 
 #[derive(Deserialize)]
 pub(crate) struct DraftQuery {
     path: String,
+    /// DELETE only: remove the draft only when this window wrote it.
+    #[serde(default)]
+    writer: Option<String>,
 }
 
 /// GET /api/v1/fs/draft?path= — `{path, base_hash, text, updated_ms,
-/// client_updated_ms}`, or 404 when there is no (readable) draft for exactly
-/// this path. `client_updated_ms` is null for a draft stored without one.
+/// client_updated_ms, writer}`, or 404 when there is no (readable) draft for
+/// exactly this path. `client_updated_ms` / `writer` are null for a draft
+/// stored without them.
 pub(crate) async fn get_draft(
     State(state): State<Arc<AppState>>,
     Query(query): Query<DraftQuery>,
@@ -425,6 +450,7 @@ pub(crate) async fn get_draft(
                 "text": draft.text,
                 "updated_ms": draft.updated_ms,
                 "client_updated_ms": draft.client_updated_ms,
+                "writer": draft.writer,
             }))
             .into_response(),
             _ => json_error(StatusCode::NOT_FOUND, "no draft for this path"),
@@ -433,8 +459,22 @@ pub(crate) async fn get_draft(
     .await
 }
 
-/// DELETE /api/v1/fs/draft?path= — drop the draft for `path` and its
-/// sidecar (sidecar first). 204 whether or not one existed.
+/// Who wrote the stored draft `id` for `path`: its sidecar's `writer`, else
+/// (no readable sidecar) the draft file's. `None` when neither reads — then
+/// there is nothing a writer could own.
+fn stored_writer(root: &Path, id: &str, path: &str) -> Option<Option<String>> {
+    if let Some(meta) = read_meta(&meta_file(root, id), id) {
+        return Some(meta.writer);
+    }
+    let bytes = std::fs::read(draft_file(root, id)).ok()?;
+    let draft: StoredDraft = serde_json::from_slice(&bytes).ok()?;
+    (draft.path == path).then_some(draft.writer)
+}
+
+/// DELETE /api/v1/fs/draft?path=&writer= — drop the draft for `path` and its
+/// sidecar (sidecar first). With `writer`, only a draft that window wrote
+/// goes (another window's — or an older client's, which names none — stays).
+/// 204 whether or not one existed or went.
 pub(crate) async fn delete_draft(
     State(state): State<Arc<AppState>>,
     Query(query): Query<DraftQuery>,
@@ -443,6 +483,13 @@ pub(crate) async fn delete_draft(
     crate::fs::blocking_response(move || {
         let id = draft_id(&query.path);
         let _writing = crate::lock(&DRAFTS_WRITE);
+        if let Some(writer) = &query.writer {
+            let owned = stored_writer(&root, &id, &query.path)
+                .is_none_or(|stored| stored.as_deref() == Some(writer.as_str()));
+            if !owned {
+                return Ok(StatusCode::NO_CONTENT.into_response());
+            }
+        }
         remove_if_present(&meta_file(&root, &id))?;
         remove_if_present(&draft_file(&root, &id))?;
         Ok(StatusCode::NO_CONTENT.into_response())
