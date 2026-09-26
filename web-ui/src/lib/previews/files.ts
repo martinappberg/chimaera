@@ -1002,15 +1002,6 @@ export function viewKindFor(path: string): FileViewKind {
   return "text";
 }
 
-/** View kinds the chat renders inline under tool cards (images, tabular
- *  data, PDFs — the "job output" formats worth seeing without a click). */
-const INLINE_PREVIEW_KINDS = new Set<FileViewKind>(["image", "table", "pdf"]);
-
-/** True when the chat can inline-preview this path's kind. */
-export function canInlinePreview(path: string): boolean {
-  return INLINE_PREVIEW_KINDS.has(viewKindFor(path));
-}
-
 /** Largest file the daemon accepts for an in-place edit (PUT /fs/file). */
 export const EDIT_MAX_BYTES = 1024 * 1024;
 
