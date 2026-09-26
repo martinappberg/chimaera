@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io::BufReader;
-use std::path::PathBuf;
+use std::path::Path;
 
 use anyhow::Context;
 use axum::extract::Query;
@@ -47,28 +47,6 @@ const MAX_NOTEBOOK_PAGE_BYTES: usize = 8 * 1024 * 1024;
 /// alone would admit eight at once. A parse is sub-second, so the queue is
 /// short.
 static NOTEBOOK_WORK: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
-
-/// `~`-expanded, canonical, and a regular file (fs.rs keeps its own copy of
-/// this resolution private).
-fn canonical_file(raw: &str) -> anyhow::Result<PathBuf> {
-    let expanded = match raw.strip_prefix("~/") {
-        Some(rest) => home()?.join(rest),
-        None if raw == "~" => home()?,
-        None => PathBuf::from(raw),
-    };
-    let path = std::fs::canonicalize(&expanded).with_context(|| expanded.display().to_string())?;
-    if !path.is_file() {
-        anyhow::bail!("{} is not a file", path.display());
-    }
-    Ok(path)
-}
-
-fn home() -> anyhow::Result<PathBuf> {
-    match std::env::var_os("HOME") {
-        Some(home) if !home.is_empty() => Ok(PathBuf::from(home)),
-        _ => anyhow::bail!("HOME is not set"),
-    }
-}
 
 /// A JSON object from owned values. `json!` serializes each value by
 /// reference — a deep copy of every multi-megabyte payload string — so the
@@ -120,13 +98,23 @@ fn read_notebook(
     limit: usize,
     page_budget: usize,
 ) -> anyhow::Result<Value> {
-    let path = canonical_file(raw)?;
-    let file = std::fs::File::open(&path)
+    let path = crate::fs::canonical_file(raw)?;
+    read_notebook_at(&path, offset, limit, page_budget)
+}
+
+/// One page of the notebook at canonical `path`. The open is
+/// [`crate::fs::open_regular`]: a FIFO swapped in after `canonical_file`'s
+/// check must not park this worker while it holds the only
+/// [`NOTEBOOK_WORK`] permit.
+fn read_notebook_at(
+    path: &Path,
+    offset: usize,
+    limit: usize,
+    page_budget: usize,
+) -> anyhow::Result<Value> {
+    let (file, meta) = crate::fs::open_regular(path)
         .with_context(|| format!("{}: failed to open", path.display()))?;
-    let size = file
-        .metadata()
-        .with_context(|| format!("{}: failed to stat", path.display()))?
-        .len();
+    let size = meta.len();
     if size > MAX_NOTEBOOK_BYTES {
         anyhow::bail!(
             "notebook is {} MB — over the {} MB preview cap",
@@ -811,6 +799,38 @@ impl<'de> Visitor<'de> for TracebackSeed {
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+
+    /// A FIFO in the notebook's place (swapped in after the path check) is
+    /// refused at once — a plain open would wait for a writer forever while
+    /// holding the one notebook permit.
+    #[test]
+    fn a_fifo_in_place_of_the_notebook_never_blocks() {
+        let dir = std::env::temp_dir().join(format!("chimaera-nb-fifo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("swapped.ipynb");
+        std::fs::remove_file(&fifo).ok();
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo");
+        assert!(status.success());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let at = fifo.clone();
+        std::thread::spawn(move || {
+            tx.send(read_notebook_at(&at, 0, 10, MAX_NOTEBOOK_PAGE_BYTES).map(|_| ()))
+                .ok();
+        });
+        let answer = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("opening a FIFO blocked");
+        let err = answer.unwrap_err();
+        assert!(format!("{err:#}").contains("not a regular file"), "{err:#}");
+        // The route's path check refuses it up front too.
+        let err =
+            read_notebook(&fifo.to_string_lossy(), 0, 10, MAX_NOTEBOOK_PAGE_BYTES).unwrap_err();
+        assert!(format!("{err:#}").contains("is not a file"), "{err:#}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn capped_text_cuts_on_a_char_boundary_and_counts_the_rest() {

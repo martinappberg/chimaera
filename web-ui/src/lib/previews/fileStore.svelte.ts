@@ -29,7 +29,7 @@ import { get } from "svelte/store";
 import {
   fsFile,
   fsMarkdown,
-  fsRawUrl,
+  fsRawTicket,
   fsTable,
   type FileChunk,
   type MarkdownDoc,
@@ -74,6 +74,9 @@ export class FileEntry {
 
   /** Unauthenticated `/raw` URL for <img>/<iframe>/pdf.js. */
   rawUrl = $state<string | null>(null);
+  /** The canonical file name `rawUrl`'s ticket is bound to (a symlink's
+   *  target's, never the pane path's): what an HTML frame loads its page by. */
+  rawName = $state<string | null>(null);
   rawError = $state<string | null>(null);
 
   /** Whether any payload is cached — i.e. the entry is "warm", not cold. */
@@ -218,7 +221,9 @@ export class FileEntry {
     const load = (async (): Promise<void> => {
       this.rawError = null;
       try {
-        this.rawUrl = await fsRawUrl(this.path);
+        const t = await fsRawTicket(this.path);
+        this.rawName = t.name;
+        this.rawUrl = t.url;
         this.rawMintedAt = Date.now();
       } catch (e) {
         this.rawError = e instanceof Error ? e.message : "failed to load file";
@@ -287,9 +292,10 @@ export class FileEntry {
     }
     if (this.rawUrl !== null) {
       jobs.push(
-        fsRawUrl(this.path)
-          .then((u) => {
-            this.rawUrl = u;
+        fsRawTicket(this.path)
+          .then((t) => {
+            this.rawName = t.name;
+            this.rawUrl = t.url;
             this.rawMintedAt = Date.now();
           })
           .catch(() => {

@@ -6,7 +6,7 @@ vi.mock("../net/api", () => ({
   ApiError: class extends Error {},
 }));
 
-import { lastRawTicketUrl, rawTicketUrl } from "./files";
+import { fsRawTicket, lastRawTicketUrl, rawTicketUrl } from "./files";
 
 /** The daemon: one ticket per (path, version), like its TicketStore. */
 const versions = new Map<string, number>();
@@ -71,5 +71,22 @@ describe("rawTicketUrl", () => {
     await expect(rawTicketUrl("/w/e.png")).rejects.toThrow("offline");
     expect(lastRawTicketUrl("/w/e.png")).toBeNull();
     expect(await rawTicketUrl("/w/e.png")).toBe("/raw/t-wepng-v1");
+  });
+});
+
+describe("fsRawTicket", () => {
+  beforeEach(() => {
+    mocks.api.mockReset();
+  });
+
+  it("answers the canonical name the ticket is bound to", async () => {
+    // Asked through a symlink, the daemon names the target.
+    mocks.api.mockResolvedValueOnce(new Response(JSON.stringify({ ticket: "t-9", name: "report.html" })));
+    expect(await fsRawTicket("/w/latest.html")).toEqual({ url: "/raw/t-9", name: "report.html" });
+    mocks.api.mockResolvedValueOnce(new Response(JSON.stringify({ ticket: "t-8", name: ".summary.html" })));
+    expect(await fsRawTicket("/w/.summary.html")).toEqual({ url: "/raw/t-8", name: ".summary.html" });
+    // A daemon that doesn't say leaves the caller to its own name.
+    mocks.api.mockResolvedValueOnce(new Response(JSON.stringify({ ticket: "t-7" })));
+    expect(await fsRawTicket("/w/a.html")).toEqual({ url: "/raw/t-7", name: null });
   });
 });

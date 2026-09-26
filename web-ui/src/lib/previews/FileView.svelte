@@ -2,20 +2,22 @@
   /**
    * Dispatch a file tab to its preview by extension: image / markdown (or
    * slides, for a Marp deck) / sandboxed html / paged table / PDF / video +
-   * audio / notebook / log / mermaid diagram / read-only code / binary info
-   * card.
+   * audio / notebook / log / mermaid diagram / Word / PowerPoint / diagram
+   * board (JSON Canvas, Excalidraw, draw.io) / Parquet / read-only code /
+   * binary info card.
    * The "text" path fetches the first 256KB here and sniffs it — anything
    * with NUL bytes falls through to the info card, so extensionless
    * binaries and .gz never render as garbage.
    *
    * Per-tab overrides live here, reset when the tab shows another path: a
    * binary file opened as text anyway, a Marp deck shown as markdown, a
-   * diagram shown as source.
+   * diagram or board shown as source.
    */
   import { untrack, type Component, type Snippet } from "svelte";
   import { looksBinary, midTruncate, viewKindFor, type FileChunk } from "./files";
   import { retain, release, type FileEntry } from "./fileStore.svelte";
   import { isMarpFrontmatter, isMarpSource } from "./marp";
+  import { nextVersionKey, VERSION_KEY_START } from "./versionKey";
   import ImageView from "./ImageView.svelte";
   import MediaView from "./MediaView.svelte";
   import TableView from "./TableView.svelte";
@@ -55,6 +57,7 @@
   let marp = $state<boolean | null>(null);
   let slidesMode = $state<"slides" | "markdown">("slides");
   let mermaidMode = $state<"diagram" | "source">("diagram");
+  let boardMode = $state<"board" | "source">("board");
   $effect(() => {
     void path;
     asText = false;
@@ -62,10 +65,13 @@
     marp = null;
     slidesMode = "slides";
     mermaidMode = "diagram";
+    boardMode = "board";
   });
 
   /** Kinds whose first chunk this view reads (and sniffs) itself. */
   const readsChunk = (k: string, text: boolean) => k === "text" || k === "mermaid" || text;
+  /** A board's source view reads its chunk too (only once asked for). */
+  const boardSource = $derived(kind === "board" && boardMode === "source");
 
   // CodeMirror is by far the heaviest dependency in the app; load it only
   // when a text file is actually opened so the terminal-only path stays lean.
@@ -84,9 +90,13 @@
   let MermaidView = $state<Component<{ path: string; chunk: FileChunk; switcher?: Snippet }> | null>(
     null,
   );
+  let DocxView = $state<Component<{ path: string }> | null>(null);
+  let PptxView = $state<Component<{ path: string }> | null>(null);
+  let BoardView = $state<Component<{ path: string; wsRoot?: string | null; switcher?: Snippet }> | null>(null);
+  let ParquetView = $state<Component<{ path: string }> | null>(null);
   let lazyError = $state<string | null>(null);
   const wantsCode = $derived(
-    (kind === "text" && !asText) || (kind === "mermaid" && mermaidMode === "source"),
+    (kind === "text" && !asText) || (kind === "mermaid" && mermaidMode === "source") || boardSource,
   );
   $effect(() => {
     if (!wantsCode || CodeView !== null) return;
@@ -152,6 +162,34 @@
     );
   });
   $effect(() => {
+    if (kind !== "docx" || DocxView !== null) return;
+    void import("./DocxView.svelte").then(
+      (m) => (DocxView = m.default),
+      () => (lazyError = "failed to load the Word preview"),
+    );
+  });
+  $effect(() => {
+    if (kind !== "pptx" || PptxView !== null) return;
+    void import("./PptxView.svelte").then(
+      (m) => (PptxView = m.default),
+      () => (lazyError = "failed to load the PowerPoint preview"),
+    );
+  });
+  $effect(() => {
+    if (kind !== "board" || BoardView !== null) return;
+    void import("./BoardView.svelte").then(
+      (m) => (BoardView = m.default),
+      () => (lazyError = "failed to load the board preview"),
+    );
+  });
+  $effect(() => {
+    if (kind !== "parquet" || ParquetView !== null) return;
+    void import("./ParquetView.svelte").then(
+      (m) => (ParquetView = m.default),
+      () => (lazyError = "failed to load the Parquet preview"),
+    );
+  });
+  $effect(() => {
     void path;
     lazyError = null;
   });
@@ -175,13 +213,26 @@
     else void e.ensureMtime();
     return () => release(p);
   });
-  // "Open as text" on an extension-known binary: its chunk was never read.
+  // The views that read their whole file again on a new version remount on
+  // this key: it moves when the version token CHANGES, not when it first
+  // lands on a cold open (see versionKey.ts) — that remount read the file
+  // twice and lost a spreadsheet's range reveal.
+  let version = VERSION_KEY_START;
+  let versionKey = $state(0);
   $effect(() => {
-    if (asText && kind === "binary") void entry?.ensureChunk();
+    const e = entry;
+    if (e === null) return;
+    version = nextVersionKey(version, e.path, e.mtime);
+    if (version.key !== untrack(() => versionKey)) versionKey = version.key;
+  });
+  // "Open as text" on an extension-known binary, or a board's source: its
+  // chunk was never read.
+  $effect(() => {
+    if ((asText && kind === "binary") || boardSource) void entry?.ensureChunk();
   });
 
   const probe = $derived.by<TextProbe>(() => {
-    if (!readsChunk(kind, asText)) return { state: "loading" };
+    if (!readsChunk(kind, asText) && !boardSource) return { state: "loading" };
     const e = entry;
     // `entry` is assigned in the effect below (which runs AFTER this derived
     // re-evaluates on a path change), so on a switch it briefly still points at
@@ -239,6 +290,17 @@
   </div>
 {/snippet}
 
+{#snippet boardSwitch()}
+  <div class="switch" role="tablist" aria-label="board view">
+    <button class="seg" class:on={boardMode === "board"} role="tab" aria-selected={boardMode === "board"}
+      onclick={() => (boardMode = "board")}>board</button
+    >
+    <button class="seg" class:on={boardMode === "source"} role="tab" aria-selected={boardMode === "source"}
+      onclick={() => (boardMode = "source")}>source</button
+    >
+  </div>
+{/snippet}
+
 {#snippet lazyFallback()}
   {#if lazyError !== null}
     <div class="file-error">{lazyError}</div>
@@ -272,6 +334,11 @@
         <span class="spacer"></span>
         {@render mermaidSwitch()}
       </div>
+    {:else if boardSource}
+      <div class="alt-bar">
+        <span class="spacer"></span>
+        {@render boardSwitch()}
+      </div>
     {/if}
     <div class="viewer">
       {#if kind === "image"}
@@ -302,7 +369,7 @@
         <TableView {path} />
       {:else if kind === "xlsx"}
         {#if XlsxView !== null}
-          {#key entry?.mtime ?? path}
+          {#key versionKey}
             <XlsxView {path} />
           {/key}
         {:else}
@@ -310,7 +377,7 @@
         {/if}
       {:else if kind === "pdf"}
         {#if PdfView !== null}
-          {#key entry?.mtime ?? path}
+          {#key versionKey}
             <PdfView {path} />
           {/key}
         {:else}
@@ -340,8 +407,35 @@
         {:else}
           {@render lazyFallback()}
         {/if}
+      {:else if kind === "docx"}
+        {#if DocxView !== null}
+          <DocxView {path} />
+        {:else}
+          {@render lazyFallback()}
+        {/if}
+      {:else if kind === "pptx"}
+        {#if PptxView !== null}
+          <PptxView {path} />
+        {:else}
+          {@render lazyFallback()}
+        {/if}
+      {:else if kind === "board" && boardMode === "board"}
+        {#if BoardView !== null}
+          <BoardView {path} {wsRoot} switcher={boardSwitch} />
+        {:else}
+          {@render lazyFallback()}
+        {/if}
+      {:else if kind === "parquet"}
+        {#if ParquetView !== null}
+          <!-- Keyed on the version: a rewritten file is a new footer and new offsets. -->
+          {#key versionKey}
+            <ParquetView {path} />
+          {/key}
+        {:else}
+          {@render lazyFallback()}
+        {/if}
       {:else if kind === "binary" && !asText}
-        {#key entry?.mtime ?? path}
+        {#key versionKey}
           <BinaryView {path} onText={() => (asText = true)} />
         {/key}
       {:else if probe.state === "text" && asText}
@@ -353,7 +447,7 @@
           {@render lazyFallback()}
         {/if}
       {:else if probe.state === "binary"}
-        {#key entry?.mtime ?? path}
+        {#key versionKey}
           <BinaryView {path} knownSize={probe.size} onText={() => (asText = true)} />
         {/key}
       {:else if probe.state === "error"}

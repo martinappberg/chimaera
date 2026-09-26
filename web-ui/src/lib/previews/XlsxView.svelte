@@ -112,6 +112,12 @@
     const table = req.range !== undefined ? a1ToBlock(req.range, origin) : req.table;
     if (table !== undefined) gridReveal = { table, nonce: ++revealNonce };
   });
+
+  // A reveal is held (pendingReveal) until its sheet has loaded, so this
+  // view must outlive a cold open: FileView keys it on a version token that
+  // moves only when the file CHANGES (versionKey.ts), not when the token
+  // first lands. A reveal still pending when the view goes is dropped — the
+  // one global slot may hold a newer reveal for another file by then.
 </script>
 
 <div class="xlsx-view">

@@ -142,12 +142,36 @@ fn canonical_parent_join(raw: &str) -> anyhow::Result<PathBuf> {
 }
 
 /// Canonicalize `raw` and require a regular file (not a directory).
-fn canonical_file(raw: &str) -> anyhow::Result<PathBuf> {
+pub(crate) fn canonical_file(raw: &str) -> anyhow::Result<PathBuf> {
     let path = canonical(raw)?;
     if !path.is_file() {
         anyhow::bail!("{} is not a file", path.display());
     }
     Ok(path)
+}
+
+/// Open `path` for reading, only as a regular file: `O_NONBLOCK`, then an
+/// `fstat` of the descriptor itself. Callers stat (or canonicalize) first,
+/// but a FIFO swapped in after that check would park a plain `open` until a
+/// writer shows up — holding a blocking worker and whatever limiter permit
+/// the caller took — and a device (`/dev/zero`) would stream without end.
+/// `O_NONBLOCK` changes nothing for a regular file's reads.
+pub(crate) fn open_regular(path: &Path) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
+    use rustix::fs::{Mode, OFlags};
+    let fd = rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK,
+        Mode::empty(),
+    )?;
+    let file = std::fs::File::from(fd);
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    Ok((file, meta))
 }
 
 /// True when the path names a gzip stream: `.gz`, or bgzip's `.bgz`. BGZF is
@@ -4437,6 +4461,11 @@ pub(crate) struct TicketRequest {
 /// never appears in a URL. A ticket is a per-path snapshot: renaming the
 /// path afterwards makes the fetch 404, deliberately. Minting again for an
 /// unchanged file answers the same ticket (see [`TicketStore`]).
+///
+/// Answers `{ticket, name}`: `name` is the file name of the CANONICAL path
+/// the ticket is bound to, which a symlink (`latest.html -> runs/42/…`) or
+/// `~` can hide from the caller — an HTML frame addresses its page as
+/// `/raw/{ticket}/{name}` (see [`raw_asset`]).
 pub(crate) async fn create_ticket(
     State(state): State<Arc<AppState>>,
     Json(body): Json<TicketRequest>,
@@ -4458,8 +4487,9 @@ pub(crate) async fn create_ticket(
                 .into_response();
         }
     };
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
     let ticket = crate::lock(&state.tickets).mint(path, version);
-    Json(json!({"ticket": ticket})).into_response()
+    Json(json!({"ticket": ticket, "name": name})).into_response()
 }
 
 /// Parse a single `Range: bytes=...` header value against a file of `total`
@@ -4495,10 +4525,12 @@ fn parse_byte_range(value: &str, total: u64) -> Option<Result<(u64, u64), ()>> {
 }
 
 /// GET /raw/{ticket} — the ticketed file's bytes, no bearer auth (mounted
-/// outside the /api auth layer). Content-Type comes from the extension. HTML
-/// is confined with `Content-Security-Policy: sandbox allow-scripts` and no
-/// referrer; SVG gets a script-less sandbox (scripts never run in <img>, but
-/// direct navigation should not run them either). Single byte ranges are
+/// outside the /api auth layer). Content-Type comes from the extension, and
+/// every response says `X-Content-Type-Options: nosniff`. HTML is confined
+/// with `Content-Security-Policy: sandbox allow-scripts` and no referrer;
+/// every other type a browser renders as a document with markup (XML, XSL,
+/// SVG, MathML — an XML file's XHTML `<script>` runs on direct navigation)
+/// gets a script-less sandbox (see [`raw_sandbox`]). Single byte ranges are
 /// honored (206/416; pdf.js fetches pages lazily this way). 404 on unknown
 /// or expired tickets, and on files that vanished since the ticket was minted.
 /// Cacheable for the ticket's remaining life, revalidated by `ETag` (see
@@ -4511,50 +4543,68 @@ pub(crate) async fn raw(
     let Some((path, fresh_for)) = crate::lock(&state.tickets).lookup_ttl(&ticket) else {
         return raw_not_found();
     };
-    let file = match tokio::fs::File::open(&path).await {
-        Ok(file) => file,
-        Err(err) => {
+    // `open_regular` (non-blocking open + fstat re-check): a FIFO or device
+    // swapped in at the ticketed path since the mint must never park a
+    // blocking-pool thread in `open`. Tickets may also name directories
+    // (folder downloads); /raw itself stays file-only — a 404, not a listing.
+    let opened = {
+        let path = path.clone();
+        tokio::task::spawn_blocking(move || open_regular(&path)).await
+    };
+    let (file, meta) = match opened {
+        Ok(Ok((file, meta))) => (tokio::fs::File::from_std(file), meta),
+        Ok(Err(err)) => {
             tracing::warn!(path = %path.display(), %err, "ticketed file unreadable");
             return raw_not_found();
         }
-    };
-    let meta = match file.metadata().await {
-        // Tickets may now name directories (folder downloads); /raw itself
-        // stays file-only — a dir ticket here is a 404, not a listing.
-        Ok(meta) if meta.is_file() => meta,
-        Ok(_) => return raw_not_found(),
         Err(err) => {
-            tracing::warn!(path = %path.display(), %err, "ticketed file unstattable");
+            tracing::warn!(path = %path.display(), %err, "ticketed file open panicked");
             return raw_not_found();
         }
     };
-    serve_raw(file, &meta, &path, &headers, fresh_for).await
+    serve_raw(file, &meta, &path, &headers, RawRoute::File { fresh_for }).await
 }
 
 /// GET /raw/{ticket}/{*rest} — a file beside an HTML report, so the report's
 /// relative `app.js`, `style.css` or `figs/a.png` load inside its frame (the
-/// previews point the frame at `/raw/{ticket}/{its own name}`, which makes
-/// every relative URL land here). Only a ticket naming an HTML document
-/// opens its folder, and only downward: `rest` must be plain components (no
-/// `..`, no absolute path, no hidden `.name` anywhere), and every component
+/// previews point the frame at `/raw/{ticket}/{its own name}` — the
+/// canonical name the ticket mint answers — which makes every relative URL
+/// land here). The ticket's own file is served by its name even when that
+/// name is hidden (`.summary.html`). Only a ticket naming an HTML document
+/// opens its folder, and only downward: any other `rest` must be plain
+/// components (no `..`, no absolute path, no hidden `.name` anywhere), and every component
 /// is opened `O_NOFOLLOW` beneath the folder's descriptor
 /// ([`crate::download::open_beneath`]), so a symlink can never lead out of
-/// the subtree. Same sandbox CSP, range and cache rules as [`raw`]. The
-/// frame has no origin, so its scripts can LOAD these files (script, style,
-/// image, media tags) but never READ them with fetch/XHR — no CORS header is
-/// sent on purpose: a report must not be able to read out its neighbors.
+/// the subtree. Every response here is sandboxed, whatever its type (HTML
+/// with `allow-scripts`, like the report; everything else without): a file
+/// the report names is not trusted to be what its extension says, and a
+/// sandbox header on a script, style or image it loads is inert. Same
+/// range rules as [`raw`]; cached as `private, no-cache` with the file's
+/// own `ETag` — revalidated on every load (a 304 while unchanged), since an
+/// asset's URL only changes when the PAGE does, and a regenerated
+/// `figs/umap.png` must not stay cached behind an unchanged report. The
+/// frame has no origin, so its scripts
+/// can LOAD these files (script, style, image, media tags) but never READ
+/// them with fetch/XHR — no CORS header is sent on purpose: a report must
+/// not be able to read out its neighbors.
 pub(crate) async fn raw_asset(
     State(state): State<Arc<AppState>>,
     axum::extract::Path((ticket, rest)): axum::extract::Path<(String, String)>,
     headers: HeaderMap,
 ) -> Response {
-    let Some((path, fresh_for)) = crate::lock(&state.tickets).lookup_ttl(&ticket) else {
+    let Some(path) = crate::lock(&state.tickets).lookup(&ticket) else {
         return raw_not_found();
     };
     if !opens_its_folder(&path) {
         return raw_not_found();
     }
-    let (Some(relative), Some(dir)) = (asset_relative(&rest), path.parent()) else {
+    // The page itself, by its canonical name: allowed even when hidden, as
+    // that name is the one the ticket was minted for, not one the page chose.
+    let own = path
+        .file_name()
+        .filter(|name| name.as_encoded_bytes() == rest.as_bytes())
+        .map(PathBuf::from);
+    let (Some(relative), Some(dir)) = (own.or_else(|| asset_relative(&rest)), path.parent()) else {
         return raw_not_found();
     };
     let dir = dir.to_path_buf();
@@ -4577,13 +4627,73 @@ pub(crate) async fn raw_asset(
         &meta,
         &relative,
         &headers,
-        fresh_for,
+        RawRoute::Folder,
     )
     .await
 }
 
 fn raw_not_found() -> Response {
-    (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response()
+    let mut response = (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response();
+    response.headers_mut().insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    response
+}
+
+/// Which `/raw` route a response answers: it decides the sandbox and the
+/// caching.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RawRoute {
+    /// `/raw/{ticket}`: the ticketed file itself, whose URL is stable per
+    /// file version — cacheable for the ticket's remaining life.
+    File { fresh_for: Duration },
+    /// `/raw/{ticket}/{*rest}`: a file in an HTML report's folder, whose URL
+    /// outlives its version — revalidated on every load.
+    Folder,
+}
+
+/// The `Content-Security-Policy` a `/raw` response of type `mime` carries.
+/// HTML and XHTML (the reports) run their scripts in a sandbox, which gives
+/// them an opaque origin — never the daemon's. Every other type a browser
+/// renders as a document with markup, where a `<script>` could run in the
+/// daemon's origin on direct navigation (`text/xml` holding XHTML, XSL, SVG,
+/// MathML, any `+xml`), gets a sandbox with no scripts at all; so does
+/// everything under a report's folder.
+fn raw_sandbox(mime: &mime_guess::Mime, route: RawRoute) -> Option<&'static str> {
+    let sub = mime.subtype().as_str();
+    if sub == "html" || mime.essence_str() == "application/xhtml+xml" {
+        return Some("sandbox allow-scripts");
+    }
+    let markup = sub == "xml"
+        || sub == "xsl"
+        || sub == "mathml"
+        || sub.starts_with("xml-")
+        || mime.suffix() == Some(mime_guess::mime::XML);
+    (markup || route == RawRoute::Folder).then_some("sandbox")
+}
+
+/// The security headers every `/raw` response carries (304 and 416 too:
+/// a revalidation must not strip what the cached copy was served with).
+fn raw_security_headers(
+    mime: &mime_guess::Mime,
+    route: RawRoute,
+) -> Vec<(HeaderName, HeaderValue)> {
+    let mut out = vec![(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    )];
+    if let Some(csp) = raw_sandbox(mime, route) {
+        out.push((
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static(csp),
+        ));
+        out.push((
+            header::REFERRER_POLICY,
+            HeaderValue::from_static("no-referrer"),
+        ));
+    }
+    out
 }
 
 /// Whether a ticket's file opens its folder to [`raw_asset`]: HTML documents
@@ -4668,26 +4778,32 @@ fn etag_matches(headers: &HeaderMap, etag: &str) -> bool {
 }
 
 /// Stream an opened regular file as a `/raw` response. Caching: a strong
-/// `ETag` (version token + size), `Last-Modified`, and `Cache-Control:
-/// private, max-age=` the ticket's remaining life — the URL is stable per
-/// file version (see [`TicketStore`]), so within that window the browser
-/// reuses its copy outright and afterwards revalidates to a 304 instead of
-/// re-downloading over the tunnel. `name` decides the content type.
+/// `ETag` (version token + size) and `Last-Modified`, with, for the ticketed
+/// file itself, `Cache-Control: private, max-age=` the ticket's remaining
+/// life — the URL is stable per file version (see [`TicketStore`]), so
+/// within that window the browser reuses its copy outright and afterwards
+/// revalidates to a 304 instead of re-downloading over the tunnel. A file
+/// in a report's folder is `private, no-cache`: revalidated every load.
+/// `name` decides the content type, and with `route` the sandbox
+/// ([`raw_security_headers`], on every status).
 async fn serve_raw(
     mut file: tokio::fs::File,
     meta: &std::fs::Metadata,
     name: &Path,
     headers: &HeaderMap,
-    fresh_for: Duration,
+    route: RawRoute,
 ) -> Response {
     let total = meta.len();
     let etag = raw_etag(meta);
+    let mime = mime_guess::from_path(name).first_or_octet_stream();
+    let security = raw_security_headers(&mime, route);
+    let cache_control = match route {
+        RawRoute::File { fresh_for } => format!("private, max-age={}", fresh_for.as_secs()),
+        RawRoute::Folder => "private, no-cache".to_string(),
+    };
     let mut validators: Vec<(HeaderName, HeaderValue)> = vec![
         (header::ETAG, ascii_header(&etag)),
-        (
-            header::CACHE_CONTROL,
-            ascii_header(&format!("private, max-age={}", fresh_for.as_secs())),
-        ),
+        (header::CACHE_CONTROL, ascii_header(&cache_control)),
     ];
     if let Ok(modified) = meta.modified() {
         validators.push((
@@ -4698,6 +4814,7 @@ async fn serve_raw(
     if etag_matches(headers, &etag) {
         let mut response = StatusCode::NOT_MODIFIED.into_response();
         response.headers_mut().extend(validators);
+        response.headers_mut().extend(security);
         return response;
     }
 
@@ -4717,6 +4834,7 @@ async fn serve_raw(
             if let Ok(value) = HeaderValue::from_str(&format!("bytes */{total}")) {
                 response.headers_mut().insert(header::CONTENT_RANGE, value);
             }
+            response.headers_mut().extend(security);
             return response;
         }
     };
@@ -4729,7 +4847,6 @@ async fn serve_raw(
         return raw_not_found();
     }
 
-    let mime = mime_guess::from_path(name).first_or_octet_stream();
     // Stream the selected span. The previous `vec![0; len]` loaded an
     // un-ranged file (or attacker-chosen large range) wholly into daemon RSS.
     let body = Body::from_stream(tokio_util::io::ReaderStream::new(file.take(len)));
@@ -4744,25 +4861,11 @@ async fn serve_raw(
     )
         .into_response();
     response.headers_mut().extend(validators);
+    response.headers_mut().extend(security);
     if status == StatusCode::PARTIAL_CONTENT {
         if let Ok(value) = HeaderValue::from_str(&format!("bytes {start}-{end}/{total}")) {
             response.headers_mut().insert(header::CONTENT_RANGE, value);
         }
-    }
-    let sandbox = match mime.essence_str() {
-        "text/html" | "application/xhtml+xml" => {
-            Some(HeaderValue::from_static("sandbox allow-scripts"))
-        }
-        "image/svg+xml" => Some(HeaderValue::from_static("sandbox")),
-        _ => None,
-    };
-    if let Some(csp) = sandbox {
-        let headers = response.headers_mut();
-        headers.insert(header::CONTENT_SECURITY_POLICY, csp);
-        headers.insert(
-            header::REFERRER_POLICY,
-            HeaderValue::from_static("no-referrer"),
-        );
     }
     response
 }

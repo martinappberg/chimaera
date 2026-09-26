@@ -80,7 +80,9 @@ pub(crate) struct ResolveTargetsRequest {
 /// A target is written as a document writes it: `figs/plot.png`,
 /// `../data.csv#row=1-20`, `my%20plot.png`, `/docs/x.md`, `file:///abs`.
 /// The fragment and any query never take part in resolution, and escapes are
-/// decoded. Resolution is strict, exactly like document links
+/// decoded — so a caller holding a real filesystem path (`/scratch/run#2/…`,
+/// `/data/50%/…`) percent-escapes `%`, `#`, `?` and whitespace first (the
+/// UI's `pathTarget`). Resolution is strict, exactly like document links
 /// (`fs/validate` with `strict`): the exact join onto `base` then each of
 /// `bases`; an absolute (or `~`) target as-is, and a root-relative `/x` that
 /// misses also onto the workspace root (GitHub's reading). No diff-prefix
@@ -289,24 +291,13 @@ fn describe(state: &AppState, path: &Path) -> Option<serde_json::Value> {
     Some(info)
 }
 
-/// Open a regular file for header reads: `O_NONBLOCK`, and re-checked on the
-/// descriptor, so a FIFO or device swapped in after the stat cannot block.
-fn open_regular(path: &Path) -> Option<std::fs::File> {
-    let fd = rustix::fs::open(
-        path,
-        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NONBLOCK,
-        rustix::fs::Mode::empty(),
-    )
-    .ok()?;
-    let file = std::fs::File::from(fd);
-    file.metadata().ok()?.is_file().then_some(file)
-}
-
 /// An image's pixel size from its header, or `None` when the header does not
 /// say (or is not what the extension claims). Raster formats are sniffed by
 /// their magic bytes, so a JPEG saved as `.png` still answers.
 pub(crate) fn image_dimensions(path: &Path, ext: &str) -> Option<(u32, u32)> {
-    let mut file = open_regular(path)?;
+    // `O_NONBLOCK` + an fstat re-check: a FIFO or device swapped in after
+    // the stat cannot block.
+    let (mut file, _) = crate::fs::open_regular(path).ok()?;
     let dims = if ext == "svg" {
         let mut text = Vec::new();
         (&mut file)

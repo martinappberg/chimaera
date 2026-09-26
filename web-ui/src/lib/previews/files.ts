@@ -607,14 +607,25 @@ export async function fsXlsx(
  * same version (renewing it), and a new one once the file changed.
  */
 export async function fsRawUrl(path: string): Promise<string> {
-  const body = await json<{ ticket: string }>(
+  return (await fsRawTicket(path)).url;
+}
+
+/**
+ * `fsRawUrl` plus the file name of the canonical path the ticket is bound
+ * to (null from a daemon that doesn't say). An HTML frame addresses its page
+ * by that name under the ticket (`/raw/{ticket}/{name}`): the name in the
+ * pane's path is a symlink's (`latest.html -> runs/42/report.html`) or can
+ * be hidden, and the daemon serves the ticket's own file only by its name.
+ */
+export async function fsRawTicket(path: string): Promise<{ url: string; name: string | null }> {
+  const body = await json<{ ticket: string; name?: string | null }>(
     await api("/fs/ticket", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ path }),
     }),
   );
-  return `/raw/${body.ticket}`;
+  return { url: `/raw/${body.ticket}`, name: typeof body.name === "string" ? body.name : null };
 }
 
 /**
@@ -926,6 +937,10 @@ export type FileViewKind =
   | "notebook"
   | "log"
   | "mermaid"
+  | "docx"
+  | "pptx"
+  | "board"
+  | "parquet"
   | "binary"
   | "text";
 
@@ -955,6 +970,16 @@ const SPREADSHEET_EXTS = new Set(["xlsx", "xls", "xlsm", "ods"]);
  *  A gzipped log stays text: it has no known size to read a tail from. */
 const LOG_EXTS = new Set(["log", "out", "err", "stdout", "stderr"]);
 const MERMAID_EXTS = new Set(["mmd", "mermaid"]);
+/** Word documents drawn in the browser (docx-preview); legacy binary .doc is
+ *  not this format and stays on the info card. */
+const DOCX_EXTS = new Set(["docx", "docm", "dotx"]);
+/** PowerPoint decks (pptx-renderer); legacy binary .ppt stays on the card. */
+const PPTX_EXTS = new Set(["pptx", "pptm", "ppsx", "potx"]);
+/** Diagram boards: JSON Canvas, Excalidraw, draw.io. `.excalidraw.json` is
+ *  matched by name in viewKindFor; `.drawio.svg`/`.drawio.png` stay images. */
+const BOARD_EXTS = new Set(["canvas", "excalidraw", "drawio", "dio"]);
+/** Columnar data read over ranged `/raw` requests (hyparquet). */
+const PARQUET_EXTS = new Set(["parquet"]);
 /**
  * Extensions we know are binary up front — straight to the info card, no
  * fetch. Everything not listed anywhere goes down the text path, which
@@ -969,8 +994,8 @@ const BINARY_EXTS = new Set([
   "avi", "mkv",
   "woff", "woff2", "ttf", "otf", "eot",
   "tif", "tiff", "heic", "psd",
-  "sqlite", "db", "parquet", "feather", "h5", "hdf5",
-  "docx", "doc", "pptx", "ppt",
+  "sqlite", "db", "feather", "h5", "hdf5",
+  "doc", "ppt",
   "bam", "bai", "cram", "crai", "bcf", "csi", "tbi", "bigwig", "bw", "bigbed", "bb",
 ]);
 
@@ -998,6 +1023,10 @@ export function viewKindFor(path: string): FileViewKind {
   if (ext === "ipynb") return "notebook";
   if (LOG_EXTS.has(ext)) return "log";
   if (MERMAID_EXTS.has(ext)) return "mermaid";
+  if (DOCX_EXTS.has(ext)) return "docx";
+  if (PPTX_EXTS.has(ext)) return "pptx";
+  if (BOARD_EXTS.has(ext) || basename(path).toLowerCase().endsWith(".excalidraw.json")) return "board";
+  if (PARQUET_EXTS.has(ext)) return "parquet";
   if (BINARY_EXTS.has(ext)) return "binary";
   return "text";
 }
