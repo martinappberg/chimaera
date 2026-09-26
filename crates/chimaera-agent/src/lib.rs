@@ -1012,8 +1012,7 @@ impl ChatManager {
     /// still in use — a session between processes (respawn, view switch,
     /// resurrection) owns a journal it is about to reopen. Blocking fs: run
     /// it off the reactor.
-    pub fn prune_journal_dir(&self, keep: &HashSet<String>) {
-        let mut keep = keep.clone();
+    pub fn prune_journal_dir(&self, mut keep: HashSet<String>) {
         keep.extend(self.sessions.lock().expect("sessions lock").keys().cloned());
         if let Err(err) = journal::prune_dir(
             &self.journal_dir,

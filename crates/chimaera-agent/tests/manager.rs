@@ -1990,9 +1990,20 @@ async fn journal_prune_never_evicts_a_live_session() {
     }
 
     fx.manager
-        .prune_journal_dir(&std::collections::HashSet::new());
+        .prune_journal_dir(std::collections::HashSet::new());
 
     assert!(live.exists(), "the live session's journal was pruned");
+    // mtime only moves forward, so still being a day old now means it was the
+    // oldest file when the prune ran — a late driver write would otherwise
+    // make this test pass vacuously.
+    let age = std::fs::metadata(&live)
+        .and_then(|m| m.modified())
+        .map(|t| t.elapsed().unwrap_or_default())
+        .expect("live mtime");
+    assert!(
+        age >= Duration::from_secs(80_000),
+        "precondition: the live journal was the oldest"
+    );
     let remaining: Vec<String> = std::fs::read_dir(&dir)
         .expect("read dir")
         .flatten()

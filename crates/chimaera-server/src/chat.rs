@@ -204,7 +204,7 @@ pub(crate) async fn prune_journals(state: &Arc<AppState>, spawning: Option<&str>
     keep.extend(spawning.map(str::to_string));
     // Stats every journal (and may unlink some) on a possibly-NFS dir.
     let manager = Arc::clone(&state.chat);
-    if let Err(err) = tokio::task::spawn_blocking(move || manager.prune_journal_dir(&keep)).await {
+    if let Err(err) = tokio::task::spawn_blocking(move || manager.prune_journal_dir(keep)).await {
         tracing::warn!(%err, "chat journal prune worker failed");
     }
 }

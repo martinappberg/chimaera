@@ -893,8 +893,8 @@ pub fn seed_journal(dir: &Path, session_id: &str, events: &[AgentEvent]) -> Resu
 /// an idle live session's journal is routinely the oldest file here — and it
 /// is what that session's gap replay and its next resurrection read from.
 /// Kept journals still count toward the budget, so history is evicted to make
-/// room for them; if they alone exceed it, pruning stops short rather than
-/// cut into a journal in use.
+/// room for them; if they alone exceed it, every history journal goes and
+/// pruning stops short of the kept ones rather than cut into a journal in use.
 pub fn prune_dir(
     dir: &Path,
     max_bytes: u64,
@@ -929,10 +929,15 @@ pub fn prune_dir(
         if kept {
             continue;
         }
-        if fs::remove_file(path).is_ok() {
-            total -= size;
-            count -= 1;
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            // A concurrent prune (every spawn runs one) already freed it;
+            // not counting it would evict an extra history journal.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => continue,
         }
+        total -= size;
+        count -= 1;
     }
     Ok(())
 }
@@ -1297,13 +1302,8 @@ mod tests {
     fn prune_dir_removes_oldest_first() {
         let dir = tempfile::tempdir().unwrap();
         for i in 0..6 {
-            let path = dir.path().join(format!("s-{i}.jsonl"));
-            fs::write(&path, vec![b'x'; 1000]).unwrap();
             // Distinct mtimes, oldest = lowest index.
-            let mtime = SystemTime::now() - std::time::Duration::from_secs(600 - i as u64 * 60);
-            let file = fs::File::open(&path).unwrap();
-            file.set_times(fs::FileTimes::new().set_modified(mtime))
-                .unwrap();
+            backdated(dir.path(), &format!("s-{i}.jsonl"), 1000, 600 - i * 60);
         }
 
         let none = HashSet::new();
