@@ -119,6 +119,19 @@ where
 /// Spawn a real shell session tagged as an agent (synthetic record with a
 /// known hook key), without needing a claude binary.
 pub(super) fn inject_agent(state: &Arc<AppState>, key: &str) -> String {
+    inject_agent_running(state, key, None)
+}
+
+/// `inject_agent`, but its PTY runs a process that never writes. A live
+/// terminal title outranks the first prompt in `display_name`, and a login
+/// shell's rc (Ubuntu's sets `user@host: dir` with every prompt) writes one
+/// whenever the shell gets there, so a test reading the name must not have
+/// a shell underneath.
+pub(super) fn inject_silent_agent(state: &Arc<AppState>, key: &str) -> String {
+    inject_agent_running(state, key, Some(vec!["sleep".into(), "600".into()]))
+}
+
+fn inject_agent_running(state: &Arc<AppState>, key: &str, command: Option<Vec<String>>) -> String {
     let info = state
         .sessions
         .spawn(chimaera_pty::SpawnOpts {
@@ -126,7 +139,7 @@ pub(super) fn inject_agent(state: &Arc<AppState>, key: &str) -> String {
             name: None,
             cols: 80,
             rows: 24,
-            command: None,
+            command,
             id: None,
             env: Vec::new(),
             env_remove: Vec::new(),

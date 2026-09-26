@@ -1454,7 +1454,8 @@ async fn agent_title_tail_bulk_catchup_keeps_head_titles() {
 #[tokio::test]
 async fn agent_first_prompt_is_provisional_display_name() {
     let state = test_state();
-    let id = inject_agent(&state, "k");
+    // No shell underneath: a shell's title would outrank the prompt.
+    let id = inject_silent_agent(&state, "k");
 
     // No hook data yet: the generic agent name.
     assert_eq!(session_entry(&state, &id).await["display_name"], "claude");
