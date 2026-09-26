@@ -282,11 +282,27 @@ export function filtersPresent(groups: readonly TimelineGroup[]): TimelineFilter
   return order.filter((f) => f === "all" || groups.some((g) => filterMatches(g, f)));
 }
 
-/** The command's program name for the row's mono identity ("snakemake"). */
+/** The command's program name ("snakemake"), env assignments and paths
+ *  stripped. */
 export function commandHead(text: string): string {
-  const first = text.trim().split(/\s+/)[0] ?? "";
+  const words = text.trim().split(/\s+/);
+  const first = words.find((w) => !/^[A-Za-z_][A-Za-z0-9_]*=/.test(w)) ?? "";
   const slash = first.lastIndexOf("/");
   return slash >= 0 ? first.slice(slash + 1) : first;
+}
+
+/** The command as the row shows it: program + arguments, env assignments
+ *  dropped, the program's path stripped, capped for a one-line identity. */
+export function commandLabel(text: string, max = 48): string {
+  const words = text.trim().split(/\s+/);
+  const start = words.findIndex((w) => !/^[A-Za-z_][A-Za-z0-9_]*=/.test(w));
+  const rest = start < 0 ? [] : words.slice(start);
+  if (rest.length > 0) {
+    const slash = rest[0].lastIndexOf("/");
+    if (slash >= 0) rest[0] = rest[0].slice(slash + 1);
+  }
+  const label = rest.join(" ");
+  return label.length > max ? `${label.slice(0, max - 1)}…` : label;
 }
 
 /** Unread notes addressed to the Mastermind past `seenSeq`. */

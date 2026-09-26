@@ -4,6 +4,7 @@ import {
   GROUP_GAP_MS,
   badNewsFirst,
   commandHead,
+  commandLabel,
   dayGroups,
   filterGroups,
   filtersPresent,
@@ -185,9 +186,12 @@ describe("evidence + durations", () => {
     expect(formatDuration(min(120))).toBe("2h");
   });
 
-  it("names a command by its program", () => {
+  it("names a command by its program and labels it without env noise", () => {
     expect(commandHead("/usr/bin/snakemake -j 32 de_all")).toBe("snakemake");
     expect(commandHead("  Rscript scripts/de.R")).toBe("Rscript");
+    expect(commandHead("FOO=1 BAR=2 python run.py")).toBe("python");
+    expect(commandLabel("FOO=1 /opt/bin/snakemake -j 32 de_all")).toBe("snakemake -j 32 de_all");
+    expect(commandLabel("x".repeat(60), 10)).toBe("xxxxxxxxx…");
   });
 });
 

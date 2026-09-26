@@ -379,10 +379,14 @@
   /** The workspace the current baseline was captured for (null = none yet). */
   let baselineFor: string | null = null;
   $effect(() => {
-    const shown = visible && $pageVisible && windowFocused;
+    const shown = visible && $pageVisible;
     const ws = wsId;
     const head = timelineStore.head;
     const settled = timelineStore.available !== null;
+    // The read mark advances only while someone is actually looking —
+    // visible AND the window focused; a visible-but-unfocused dashboard
+    // still captures its baseline so the rows it shows are the right ones.
+    const reading = shown && windowFocused;
     if (!shown || ws === null) {
       // Hidden: the next show captures a fresh baseline.
       baselineFor = null;
@@ -394,7 +398,7 @@
         baseline = lastSeen(ws, head) ?? { seq: 0, ts: 0 };
         baselineFor = ws;
       }
-      if (head > 0) markSeen(ws, head);
+      if (reading && head > 0) markSeen(ws, head);
     });
   });
 

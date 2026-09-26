@@ -16,6 +16,7 @@
   import type { TimelineEntry } from "./timeline.svelte";
   import {
     commandHead,
+    commandLabel,
     formatClock,
     formatDuration,
     groupDurationMs,
@@ -166,12 +167,16 @@
         </span>
       {/if}
     {:else if first.kind === "command"}
-      {#if live && sid !== null}
-        <button class="name link" onclick={() => onOpenSession(sid)} title="open the terminal">{name}</button>
-      {:else if name !== ""}
-        <span class="name">{name}</span>
+      <!-- The terminal's name leads unless it IS the program ("snakemake
+           snakemake …" reads as a stutter); the command text is the identity. -->
+      {#if name !== "" && name !== commandHead(first.command?.text ?? "")}
+        {#if live && sid !== null}
+          <button class="name link" onclick={() => onOpenSession(sid)} title="open the terminal">{name}</button>
+        {:else}
+          <span class="name">{name}</span>
+        {/if}
       {/if}
-      <span class="cmd" title={first.command?.text}>{commandHead(first.command?.text ?? "")}</span>
+      <span class="cmd" title={first.command?.text}>{commandLabel(first.command?.text ?? "")}</span>
       <span class="title">
         {#if first.command?.exit !== undefined && first.command.exit !== 0}
           failed after {formatDuration(first.command.ms)}

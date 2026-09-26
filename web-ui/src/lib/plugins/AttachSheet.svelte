@@ -374,11 +374,7 @@
       <span class="fnote">Knowledge fills as soon as <span class="mono">.living/</span> appears.</span>
       {#if error !== null}<span class="err">{error}</span>{/if}
       <button class="opt quiet" use:focusOnMount onclick={onClose}>Cancel</button>
-      <button
-        class="opt primary"
-        disabled={busy !== null || plugin === null || (!detected && canSetup && setupAgents.length === 0 && !needsTrust && !plugin.on)}
-        onclick={() => void complete()}
-      >
+      <button class="opt primary" disabled={busy !== null || plugin === null} onclick={() => void complete()}>
         {busy === "complete" ? "working…" : primaryLabel}
       </button>
     </footer>
