@@ -804,6 +804,16 @@ fn run_artifacts_turn(n: u32) {
             "out/summary.csv",
             "cluster,n,marker\nA,412,CD3E\nB,198,MS4A1\n",
         );
+        // A wide figure the prose never names: the gallery's own tile.
+        write(
+            "figs/heatmap.svg",
+            "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 320 120'>\
+             <rect width='320' height='120' fill='#f4f4f8'/>\
+             <rect x='20' y='20' width='60' height='80' fill='#2e9e6b'/>\
+             <rect x='100' y='20' width='60' height='80' fill='#8fd0b0'/>\
+             <rect x='180' y='20' width='60' height='80' fill='#4a76c4'/>\
+             <rect x='260' y='20' width='40' height='80' fill='#c9d6f0'/></svg>\n",
+        );
         write(
             "report.html",
             "<!doctype html><title>QC report</title><h1>QC report</h1><p>412 + 198 cells.</p>\n",
@@ -812,11 +822,16 @@ fn run_artifacts_turn(n: u32) {
             "ma-1",
             &id("b1"),
             "Bash",
-            json!({ "command": "python scripts/plot.py --out figs/umap.svg --table out/summary.csv --report report.html" }),
+            // The real CLI prefixes an absolute `cd`, which alone overflows
+            // the title's 120 chars: the files are only in `command`.
+            json!({ "command": format!(
+                "cd \"{}\" && python scripts/plot.py --out figs/umap.svg --heatmap figs/heatmap.svg --table out/summary.csv --report report.html",
+                cwd.display()
+            ) }),
         );
         tool_result(
             &id("b1"),
-            "wrote figs/umap.svg\nwrote out/summary.csv\nwrote report.html\n",
+            "wrote figs/umap.svg\nwrote figs/heatmap.svg\nwrote out/summary.csv\nwrote report.html\n",
         );
         stream(json!({ "type": "message_start", "message": { "id": "ma-2" } }));
         stream_text(

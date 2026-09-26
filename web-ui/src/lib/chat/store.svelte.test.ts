@@ -1736,6 +1736,20 @@ describe("ChatStore turn artifacts (the made-this-turn gallery)", () => {
     });
   });
 
+  it("scans the whole command, not the truncated title", () => {
+    const store = foldAt([
+      [1000, { type: "user_message", text: "make me a table", attachments: 0 }],
+      [1010, { type: "turn_started", turn_id: "t1" }],
+      [1020, { type: "tool_call", id: "b1", kind: "execute", title: "Bash: cd \"/very/long/absolute/path/that/eats/the/whole/title/budget/before/anything/useful/appears…", status: "in_progress",
+               command: "cd \"/very/long/absolute/path/that/eats/the/whole/title/budget/before/anything/useful/appears/at/all\" && python3 -c 'open(\"out/summary.csv\",\"w\").write(\"a,b\\n\")'" }],
+      [1030, { type: "tool_call_update", id: "b1", status: "completed", content: { kind: "output", text: "" } }],
+      [1040, { type: "message_chunk", turn_id: "t1", text: "Done." }],
+      [2000, { type: "turn_completed", turn_id: "t1", usage: {} }],
+    ]);
+    const end = store.blocks.find((b) => b.kind === "turn_end");
+    expect(end?.kind === "turn_end" ? end.mentioned : []).toEqual(["out/summary.csv"]);
+  });
+
   it("each turn scans only itself", () => {
     const store = foldAt([
       ...TURN,

@@ -715,6 +715,7 @@ mod tests {
             locations: vec![path.into()],
             status,
             cross_turn: false,
+            command: None,
         }
     }
     fn done(id: &str, status: ToolStatus) -> AgentEvent {

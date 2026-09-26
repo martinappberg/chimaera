@@ -169,7 +169,7 @@
       title={statusTitle}
     >
       <span class="glyph">{glyph}</span>
-      <span class="title" class:with-live={liveLine !== null}>{block.title}</span>
+      <span class="title" class:with-live={liveLine !== null} title={block.command ?? undefined}>{block.title}</span>
       {#if liveLine !== null}
         <span class="live">{liveLine}</span>
       {/if}

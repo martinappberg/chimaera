@@ -289,19 +289,87 @@
     color: var(--activity-fg, var(--muted));
     font-size: var(--text-xs);
   }
+  /* A figure strip, not a grid of boxes: tiles share one row height and
+     take their width from what they show — a picture's own aspect ratio, a
+     report's page width — and wrap like figures laid on a desk. */
   .gallery {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(min(260px, 100%), 1fr));
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-start;
     gap: 10px;
     margin: 0 0 10px;
   }
   .tile {
     display: flex;
-    min-width: 0;
-    height: 252px;
+    flex: none;
+    width: fit-content;
+    min-width: 200px;
+    max-width: 100%;
+    height: 230px;
+    border-radius: 10px;
+    transition:
+      transform 0.15s ease,
+      box-shadow 0.15s ease;
   }
+  .tile:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 10px 24px -14px color-mix(in srgb, var(--fg) 45%, transparent);
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .tile,
+    .tile:hover {
+      transform: none;
+      transition: none;
+    }
+  }
+  /* The shared embed card, worn as a tile: the name becomes a caption
+     under the picture, the picture fills the tile to its edges, and the
+     tile's width follows the picture. */
   .tile > :global(.embed-card) {
     flex: 1;
+    flex-direction: column-reverse;
+    width: fit-content;
+    min-width: 100%;
+    border-radius: 10px;
+  }
+  .tile > :global(.embed-card > .head) {
+    border-bottom: none;
+    border-top: 1px solid color-mix(in srgb, var(--edge) 55%, transparent);
+  }
+  .tile :global(.image-body.tile) {
+    padding: 0;
+    background: none;
+  }
+  .tile :global(.image-body.tile .frame) {
+    border-radius: 0;
+  }
+  /* A picture's tile hugs the picture (drawn at its own size, never
+     scaled up, at most a row tall): a wide figure is a wide, short tile,
+     not a figure floating in a box. */
+  .tile:has(> :global(.embed-card[data-embed-kind="image"])) {
+    height: auto;
+    max-height: 230px;
+  }
+  .tile > :global(.embed-card[data-embed-kind="image"]) {
+    height: auto;
+  }
+  /* Kinds without a natural width take a page's worth. */
+  .tile > :global(.embed-card[data-embed-kind="html"]),
+  .tile > :global(.embed-card[data-embed-kind="video"]),
+  .tile > :global(.embed-card[data-embed-kind="audio"]) {
+    width: 320px;
+  }
+  .tile > :global(.embed-card[data-embed-kind="pdf"]) {
+    width: 220px;
+  }
+  .tile > :global(.embed-card[data-embed-kind="markdown"]),
+  .tile > :global(.embed-card[data-embed-kind="table"]),
+  .tile > :global(.embed-card[data-embed-kind="xlsx"]),
+  .tile > :global(.embed-card[data-embed-kind="notebook"]),
+  .tile > :global(.embed-card[data-embed-kind="code"]),
+  .tile > :global(.embed-card[data-embed-kind="file"]),
+  .tile > :global(.embed-card[data-embed-kind="pending"]) {
+    width: 280px;
   }
   .files {
     display: flex;

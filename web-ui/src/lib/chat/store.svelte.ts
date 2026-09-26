@@ -301,6 +301,10 @@ export type ChatBlock = BlockIdentity &
        *  (claude `tool_use_summary`, "Listed files in directory") — the tool
        *  group's title once it lands, a model round after the batch. */
       summary: string | null;
+      /** The whole command an execute tool ran (the title keeps ~120 chars,
+       *  and claude's `cd "…/abs/path" && …` prefix eats them): what the
+       *  turn-end gallery scans for the files a script wrote. */
+      command: string | null;
     }
   | { kind: "notice"; text: string; tone: "info" | "error" }
   | {
@@ -1090,6 +1094,7 @@ export class ChatStore {
         if (row !== undefined && row.kind === "tool") {
           row.title = ev.title as string;
           row.locations = (ev.locations as string[]) ?? [];
+          if (typeof ev.command === "string") row.command = ev.command;
           // A late enriching re-emit must never walk a finished tool back to
           // pending/in_progress — the authoritative result already landed.
           if (row.status !== "completed" && row.status !== "failed") {
@@ -1112,6 +1117,7 @@ export class ChatStore {
               streaming: false,
               crossTurn: ev.cross_turn === true,
               summary: null,
+              command: typeof ev.command === "string" ? ev.command : null,
             }),
           );
           this.toolIndex.set(ev.id as string, this.blocks.length - 1);
@@ -1883,7 +1889,8 @@ export class ChatStore {
       if (b.kind !== "tool" || b.denied) continue;
       if (b.tool === "execute" || b.tool === "other") {
         if (b.content?.text !== undefined) shell.push(b.content.text);
-        shell.push(b.title);
+        // The whole command when the wire carries it; the title otherwise.
+        shell.push(b.command ?? b.title);
       }
       if (b.status !== "completed") continue;
       for (const loc of b.locations) {
