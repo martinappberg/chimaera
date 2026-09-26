@@ -4,7 +4,14 @@
  * so highlighted code reads identically whether you're editing or reviewing.
  * All colors are theme tokens (var(--syn-*)/var(--fg)…), so light/dark just work.
  */
-import { EditorSelection, StateEffect, StateField, type Extension, type Range } from "@codemirror/state";
+import {
+  EditorSelection,
+  StateEffect,
+  StateField,
+  type EditorState,
+  type Extension,
+  type Range,
+} from "@codemirror/state";
 import { Decoration, EditorView, type DecorationSet } from "@codemirror/view";
 import { HighlightStyle } from "@codemirror/language";
 import { tags as t } from "@lezer/highlight";
@@ -173,6 +180,12 @@ const flashField = StateField.define<DecorationSet>({
   },
   provide: (f) => EditorView.decorations.from(f),
 });
+
+/** The lines a reveal is lighting in `state` (live mode lights a rendered
+ *  block the same way). The same set while nothing changes. */
+export function revealFlashRanges(state: EditorState): DecorationSet {
+  return state.field(flashField, false) ?? Decoration.none;
+}
 
 /** The reveal-flash state + its look; include once per editor. */
 export const revealFlash: Extension = [

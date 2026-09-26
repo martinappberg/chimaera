@@ -346,6 +346,25 @@ export class Buffer {
     this.afterChange(ours);
   }
 
+  /**
+   * A user's edit made outside the editor (a task box ticked in the reading
+   * view): through the attached view when there is one, else the stored
+   * state — either way it counts as typing (dirty, undoable, autosaved,
+   * journaled). False when the buffer can't take an edit now (view-only,
+   * still loading).
+   */
+  edit(spec: TransactionSpec): boolean {
+    if (!this.editable || this.loading || this.disposed) return false;
+    if (this.view !== null) {
+      this.view.dispatch({ ...spec, userEvent: "input" });
+      return true;
+    }
+    const tr = this.st.update({ ...spec, userEvent: "input" });
+    this.st = tr.state;
+    if (tr.docChanged) this.afterChange(false);
+    return true;
+  }
+
   /** Route a transaction through the attached view, else the stored state. */
   private dispatch(spec: TransactionSpec): void {
     if (this.view !== null) {
