@@ -23,7 +23,9 @@ shipped; the phases below remain the design record.
     hardened write path.
   - Phase 1: one file-reference parser, the `fs/validate` ladder, and open-at-line.
   - Phases 2 and 3: one lezer renderer behind reading and live, a parity corpus, and
-    an outline. Live is now the default mode.
+    an outline. Live is now the default mode. Hover previews on links (reading on rest,
+    live on Mod, Mod+K from the keyboard): a note's section through the same renderer,
+    any other file as its embed card's compact body.
   - Phase 4: embed cards in documents and chat, `resolve_targets`, cacheable `/raw`,
     and HTML reports that load their own assets.
   - Phase 5: the locator grammar, pointing from every viewer, and region crops.
@@ -34,6 +36,12 @@ shipped; the phases below remain the design record.
       bioinformatics presets.
     - New viewers: notebooks, logs, Marp slides, mermaid, media, Word, PowerPoint,
       diagram boards (JSON Canvas, Excalidraw, draw.io) and Parquet.
+    - Publishing a markdown document, built in the browser: one self-contained HTML
+      file (pictures inlined up to 50 MB, MathML, SVG diagrams, no script), print to
+      PDF, and a zip bundle of the document and the files it names, laid out so its
+      links still resolve. The zip is client-side (`jszip`), not a daemon route: a
+      "these paths" variant of the folder download would need a new multi-path ticket,
+      and the bundle's copy of the document is rewritten in the browser anyway.
 - **Cut by the maintainer** (judged by what a user actually opens and uses):
   - image compare, pixel readout and PDF thumbnails;
   - table stats and sorting, and the sequence, hex, archive and JSON-tree views;
@@ -41,9 +49,7 @@ shipped; the phases below remain the design record.
   - EPUB/email and the LibreOffice path.
 - **Not yet built:**
   - `![](note.md#Heading)` transclusion (cards show an excerpt);
-  - hover previews on links;
   - the "what changed" gutter;
-  - publishing (self-contained HTML, PDF and zip export of a markdown document);
   - server-side thumbnails (measure first).
 
 ## The short version

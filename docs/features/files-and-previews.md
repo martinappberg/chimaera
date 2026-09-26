@@ -448,6 +448,70 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   shows as literal text. Clicking an issue reveals its line; it re-checks after disk changes,
   only while visible. Details:
   [agents.md](agents.md#documents-the-portable-dialect-check_document-and-the-issues-chip).
+
+  **Hover previews on links** (`previews/doc/hoverPreview.svelte.ts`, the popover
+  `doc/HoverPreview.svelte`, pure pieces in `doc/hover.ts`). In **reading**, rest the pointer
+  on a link for 400 ms; in **live**, where a plain hover edits, hold Mod (Cmd or Ctrl) over a
+  link — in a rendered block or in the source being edited — and letting go of Mod keeps it
+  open while the pointer stays. From the keyboard, **Mod+K** on a focused link (reading) or
+  with the cursor in a link (live) shows it, and again hides it. What it shows: a `.md` link
+  (or a `#heading` in this document) the section it names — its heading down to the next of
+  the same rank — or the document's opening, drawn by the reading renderer (equations,
+  highlighted fences, diagrams, pictures), a step smaller and height-capped; a footnote
+  reference, its note; any other file, the compact body its [embed card](#embed-cards) gives
+  it at the link's fragment (a PDF page, a picture or its `#xywh=` region, a table's rows, a
+  code excerpt). Web links show nothing. The target resolves through the document's embed
+  answers (one `fs/resolve_targets`, shared with the views; a wikilink by name), and a note's
+  text is one bounded `fs/file` read (the last few kept by version) — all only once the
+  preview is due, so passing over a link loads nothing and leaving first cancels it. The
+  popover sits on the app's floating surface (`.overlay-surface`) inside the view's content
+  box, below the link or above it when that has more room; its content is inert (links don't
+  follow, nothing takes focus) but scrolls, and moving onto it keeps it. It goes on leave,
+  Escape, any other key, a press elsewhere, a scroll, or a mode switch.
+
+  **Publishing** (the toolbar's **publish** menu, `previews/PublishButton.svelte`; the work,
+  loaded on first use, is `previews/doc/publishRun.ts`, its pure pieces `doc/publish.ts` and
+  the page's stylesheet `doc/publishCss.ts`). Everything is built in the browser from bytes
+  the daemon already serves (`/raw` tickets), so on a remote workspace it crosses the tunnel
+  once, the daemon writes nothing, and the file downloads through the browser (`saveBlob`, as
+  the boards' and mermaid exports do). A short note by the button says what was saved and
+  what was left out.
+  - **Export HTML** — one self-contained `<name>.html` that opens anywhere, offline: the
+    document as the view shows it (unsaved edits included) through the reading renderer's DOM
+    target, serialized, in the reading view's look on a light theme (the app's own when it is
+    light, else the default light), sized for a standalone page. Equations are KaTeX's
+    **MathML** (the reading view's own output), which the browser draws with the system's
+    math font — no KaTeX CSS or font files; code uses the system monospace. Mermaid is laid
+    out as SVG, fences highlighted. Pictures (inline, image embeds, raw-HTML `<img>`) are
+    inlined as `data:` URLs, in document order up to **50 MB** of picture bytes; past that,
+    or when a file is missing, a picture becomes a link named by its alt text, and the note
+    counts them. A web picture is inlined when its host allows the read (CORS), else linked.
+    Any other embed becomes a link card (file name, the piece it showed, its caption);
+    relative links stay relative; a by-name embed points at where the note is. The
+    frontmatter's `title`, `summary` and `updated` become a small title block (under the
+    document's own `# Title` when that already says it). Ids lose the app's `user-content-`
+    namespace so `#heading` and footnote links work on the page. No script, and a
+    `Content-Security-Policy` meta (`default-src 'none'; img-src data:; style-src
+    'unsafe-inline'`) so nothing on the page loads or runs.
+  - **Print / save as PDF** — that page in a hidden, script-free, same-origin frame handed to
+    the print dialog (as the slides view prints). Print rules: page margins, no break right
+    after a heading or inside a figure, fence, alert, diagram, table row or list item, table
+    headers repeated, long code lines wrapped, colors kept (a done task's box, an alert's
+    tint). In the native app (WKWebView) the dialog is the system print panel; PDF is under
+    its PDF menu.
+  - **Export bundle (.zip)** — the document as saved (unsaved edits aren't in it; the note
+    says so) plus every local file it links or embeds — links, images, reference
+    definitions, wikilinks, raw HTML `src`/`href` (`doc/publish.ts` `docTargets`) — resolved
+    as document links resolve (beside the document, a root-relative `/x` also under the
+    workspace root, a wikilink by name), only inside the workspace (the document's folder
+    when it has none). Files keep the places their links name, under one folder named after
+    the document that mirrors the deepest directory holding them all, so relative links
+    resolve unzipped, on GitHub and in Obsidian; only an absolute path is rewritten into a
+    relative one, in the copy (an unchanged document keeps its exact bytes). Linked notes come
+    along, not what they link in turn. Folders, files outside the workspace and files past
+    **500 files / 100 MB** are left out and counted in the note. Built client-side with
+    `jszip` (already shipped for Office files; already-compressed formats are stored), four
+    reads at a time.
 - **Tables (CSV/TSV and bioinformatics text, incl. gzip).**
   `GET /api/v1/fs/table?path=&offset_rows=&limit_rows=&delim=auto` returns one page (header row +
   string cells; rows cap 1000/page; delimiter from the name, else sniffed from the first line that is
