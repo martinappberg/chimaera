@@ -106,6 +106,18 @@ export interface SaveDirtyResult {
   timedOut: boolean;
 }
 
+/**
+ * The close dialogs' line for files a Save left unsaved: a dead link (the
+ * deadline passed; the save carries on in the background) reads differently
+ * from a refusal or failure, whose reason the file's editor shows.
+ */
+export function unsavedCloseError(paths: readonly string[], timedOut: boolean): string {
+  const names = paths.map((p) => `“${p.slice(p.lastIndexOf("/") + 1)}”`).join(", ");
+  return timedOut
+    ? `${names} not saved — the daemon isn't answering (it keeps trying in the background)`
+    : `couldn't save ${names} — its editor shows why`;
+}
+
 const TIMED_OUT = Symbol("timed out");
 
 function within(save: Promise<boolean>, ms: number): Promise<boolean | typeof TIMED_OUT> {
