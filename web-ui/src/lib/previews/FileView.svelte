@@ -2,15 +2,16 @@
   /**
    * Dispatch a file tab to its preview by extension: image / markdown (or
    * slides, for a Marp deck) / sandboxed html / paged table / PDF / video +
-   * audio / notebook / log / mermaid diagram / read-only code / binary info
-   * card.
+   * audio / notebook / log / mermaid diagram / Word / PowerPoint / diagram
+   * board (JSON Canvas, Excalidraw, draw.io) / Parquet / read-only code /
+   * binary info card.
    * The "text" path fetches the first 256KB here and sniffs it — anything
    * with NUL bytes falls through to the info card, so extensionless
    * binaries and .gz never render as garbage.
    *
    * Per-tab overrides live here, reset when the tab shows another path: a
    * binary file opened as text anyway, a Marp deck shown as markdown, a
-   * diagram shown as source.
+   * diagram or board shown as source.
    */
   import { untrack, type Component, type Snippet } from "svelte";
   import { looksBinary, midTruncate, viewKindFor, type FileChunk } from "./files";
@@ -55,6 +56,7 @@
   let marp = $state<boolean | null>(null);
   let slidesMode = $state<"slides" | "markdown">("slides");
   let mermaidMode = $state<"diagram" | "source">("diagram");
+  let boardMode = $state<"board" | "source">("board");
   $effect(() => {
     void path;
     asText = false;
@@ -62,10 +64,13 @@
     marp = null;
     slidesMode = "slides";
     mermaidMode = "diagram";
+    boardMode = "board";
   });
 
   /** Kinds whose first chunk this view reads (and sniffs) itself. */
   const readsChunk = (k: string, text: boolean) => k === "text" || k === "mermaid" || text;
+  /** A board's source view reads its chunk too (only once asked for). */
+  const boardSource = $derived(kind === "board" && boardMode === "source");
 
   // CodeMirror is by far the heaviest dependency in the app; load it only
   // when a text file is actually opened so the terminal-only path stays lean.
@@ -84,9 +89,13 @@
   let MermaidView = $state<Component<{ path: string; chunk: FileChunk; switcher?: Snippet }> | null>(
     null,
   );
+  let DocxView = $state<Component<{ path: string }> | null>(null);
+  let PptxView = $state<Component<{ path: string }> | null>(null);
+  let BoardView = $state<Component<{ path: string; wsRoot?: string | null; switcher?: Snippet }> | null>(null);
+  let ParquetView = $state<Component<{ path: string }> | null>(null);
   let lazyError = $state<string | null>(null);
   const wantsCode = $derived(
-    (kind === "text" && !asText) || (kind === "mermaid" && mermaidMode === "source"),
+    (kind === "text" && !asText) || (kind === "mermaid" && mermaidMode === "source") || boardSource,
   );
   $effect(() => {
     if (!wantsCode || CodeView !== null) return;
@@ -152,6 +161,34 @@
     );
   });
   $effect(() => {
+    if (kind !== "docx" || DocxView !== null) return;
+    void import("./DocxView.svelte").then(
+      (m) => (DocxView = m.default),
+      () => (lazyError = "failed to load the Word preview"),
+    );
+  });
+  $effect(() => {
+    if (kind !== "pptx" || PptxView !== null) return;
+    void import("./PptxView.svelte").then(
+      (m) => (PptxView = m.default),
+      () => (lazyError = "failed to load the PowerPoint preview"),
+    );
+  });
+  $effect(() => {
+    if (kind !== "board" || BoardView !== null) return;
+    void import("./BoardView.svelte").then(
+      (m) => (BoardView = m.default),
+      () => (lazyError = "failed to load the board preview"),
+    );
+  });
+  $effect(() => {
+    if (kind !== "parquet" || ParquetView !== null) return;
+    void import("./ParquetView.svelte").then(
+      (m) => (ParquetView = m.default),
+      () => (lazyError = "failed to load the Parquet preview"),
+    );
+  });
+  $effect(() => {
     void path;
     lazyError = null;
   });
@@ -175,13 +212,14 @@
     else void e.ensureMtime();
     return () => release(p);
   });
-  // "Open as text" on an extension-known binary: its chunk was never read.
+  // "Open as text" on an extension-known binary, or a board's source: its
+  // chunk was never read.
   $effect(() => {
-    if (asText && kind === "binary") void entry?.ensureChunk();
+    if ((asText && kind === "binary") || boardSource) void entry?.ensureChunk();
   });
 
   const probe = $derived.by<TextProbe>(() => {
-    if (!readsChunk(kind, asText)) return { state: "loading" };
+    if (!readsChunk(kind, asText) && !boardSource) return { state: "loading" };
     const e = entry;
     // `entry` is assigned in the effect below (which runs AFTER this derived
     // re-evaluates on a path change), so on a switch it briefly still points at
@@ -239,6 +277,17 @@
   </div>
 {/snippet}
 
+{#snippet boardSwitch()}
+  <div class="switch" role="tablist" aria-label="board view">
+    <button class="seg" class:on={boardMode === "board"} role="tab" aria-selected={boardMode === "board"}
+      onclick={() => (boardMode = "board")}>board</button
+    >
+    <button class="seg" class:on={boardMode === "source"} role="tab" aria-selected={boardMode === "source"}
+      onclick={() => (boardMode = "source")}>source</button
+    >
+  </div>
+{/snippet}
+
 {#snippet lazyFallback()}
   {#if lazyError !== null}
     <div class="file-error">{lazyError}</div>
@@ -271,6 +320,11 @@
       <div class="alt-bar">
         <span class="spacer"></span>
         {@render mermaidSwitch()}
+      </div>
+    {:else if boardSource}
+      <div class="alt-bar">
+        <span class="spacer"></span>
+        {@render boardSwitch()}
       </div>
     {/if}
     <div class="viewer">
@@ -337,6 +391,33 @@
       {:else if kind === "mermaid" && mermaidMode === "diagram" && probe.state === "text" && !asText}
         {#if MermaidView !== null}
           <MermaidView {path} chunk={probe.chunk} switcher={mermaidSwitch} />
+        {:else}
+          {@render lazyFallback()}
+        {/if}
+      {:else if kind === "docx"}
+        {#if DocxView !== null}
+          <DocxView {path} />
+        {:else}
+          {@render lazyFallback()}
+        {/if}
+      {:else if kind === "pptx"}
+        {#if PptxView !== null}
+          <PptxView {path} />
+        {:else}
+          {@render lazyFallback()}
+        {/if}
+      {:else if kind === "board" && boardMode === "board"}
+        {#if BoardView !== null}
+          <BoardView {path} {wsRoot} switcher={boardSwitch} />
+        {:else}
+          {@render lazyFallback()}
+        {/if}
+      {:else if kind === "parquet"}
+        {#if ParquetView !== null}
+          <!-- Keyed on the version: a rewritten file is a new footer and new offsets. -->
+          {#key entry?.mtime ?? path}
+            <ParquetView {path} />
+          {/key}
         {:else}
           {@render lazyFallback()}
         {/if}

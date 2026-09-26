@@ -509,6 +509,101 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   the pane without enlarging a small diagram, zoom steps and 1:1, export as SVG or as a 2× PNG
   (a diagram with HTML labels can't rasterize in every engine; the bar says so). A
   **diagram | source** switch shows the file in the editor.
+- **Word documents.** `.docx` (and `.docm`, `.dotx`) open read-only in `DocxView.svelte`, drawn
+  in the browser by `docx-preview` from one streamed `/raw` read (refused past 50 MB with an honest
+  message and, on a remote host, a download): pages at their set size on the desk, white in both
+  themes; zoom steps (⌘+ / ⌘− / ⌘0 when the page has focus), **fit width**, a **p / N** page
+  indicator that follows the scroll, and the browser's own find (the text is real text). Pages are
+  where the file's saved page breaks put them; line breaks are the browser's, so they can differ
+  from Word's. The document is untrusted: it renders into detached nodes that
+  `officeSafety.ts` (`sanitizeRendered`) strips of anything that could load or run — active
+  elements and handlers go, sources stay only if they're the package's own `blob:`/`data:` parts,
+  and every stylesheet is re-read through an inert document's CSSOM so a `url()` smuggled in
+  through a font or theme name (escapes included) is dropped, with a quiet "N external resources
+  not loaded" in the bar — and only then attaches them inside a shadow root, so the document's CSS
+  can't touch the app. Alt chunks (embedded HTML) are never rendered. `#bookmark` links scroll,
+  web links open like any other link, nothing else navigates. Word's Symbol/Wingdings bullets
+  (private-use characters most systems can't draw) show as their Unicode equivalents. A disk
+  change re-renders in place and keeps the reading position.
+- **PowerPoint decks.** `.pptx` (and `.pptm`, `.ppsx`, `.potx`) open in `PptxView.svelte`,
+  drawn by `@aiden0z/pptx-renderer` in the Marp viewer's chrome: arrows / PageUp / PageDown /
+  Space / Home / End page the deck, a thumbnail strip jumps, **present** goes full screen,
+  `#slide=N` reveals a slide (clamped to the deck), and **speaker notes** (read straight from the
+  package; the renderer doesn't model them) show under the stage. Hidden slides are dimmed and
+  tagged. The package is parsed with the renderer's zip limits for untrusted input, media and slide
+  nodes decoded lazily, and every external relationship that would load something (a linked
+  picture, video or audio) removed before the model is built (`pptxDeck.ts`,
+  `stripExternalRels`), so a deck never fetches; web links route through the app. The stage keeps
+  up to four rendered slides stacked in its slot and shows one — they stay attached, because the
+  renderer finishes text layout asynchronously and a detached slide measures as empty and loses
+  its text — and the strip mounts only the thumbnails near its visible span, two per tick. Charts
+  draw with ECharts (most of the viewer's ~1.1 MB / 345 KB-gzip chunk, loaded only by a deck).
+  Animations and transitions aren't played and missing fonts fall back to the system's; the ⓘ in
+  the bar says so, and counts shapes that couldn't be drawn. Refused past 100 MB.
+- **Diagram boards.** JSON Canvas (`.canvas`), Excalidraw (`.excalidraw`, `.excalidraw.json`)
+  and draw.io (`.drawio`, `.dio`; `.drawio.svg` / `.drawio.png` stay images) open on one pannable
+  surface, `BoardView.svelte`: drag or scroll to pan, pinch or ⌘/Ctrl+scroll to zoom at the
+  pointer, **fit** and **1:1** in the bar (keys: 0, 1, +/−, arrows), the view remembered per
+  file, and a **board | source** switch to the editor. Each format parses in its own lazy module
+  under `previews/boards/`; the file is read once (16 MB cap, 50 MB for Excalidraw's inline
+  images) and re-read in place on a disk change, keeping the view. Nothing a board names is
+  fetched from the network.
+  - **JSON Canvas** (spec 1.0, `canvas.ts` + `CanvasBoard.svelte`): groups with their labels,
+    cubic edges between the named sides (or the facing ones) with arrow ends and labels, then the
+    cards. Text cards are markdown through `marked` + DOMPurify with chat's profile (a single
+    newline breaks, as in Obsidian; a remote image shows as a note instead of loading); file
+    cards resolve Obsidian's vault-relative paths against the canvas's folder and each parent
+    (`fs/validate`, strict), open in a pane on click (⌘-click beside), show images inline through
+    a `/raw` ticket, and mark a missing file; link cards show the address and open it like any
+    link. The six preset colors are the theme's own hues. Double-click a text card to select its
+    text.
+  - **Excalidraw** (`excalidraw.ts`): drawn to SVG with Excalidraw's own engine — roughjs,
+    seeded per element with Excalidraw's stroke options — and perfect-freehand for pen strokes:
+    shapes with their fill styles and rounded corners, lines and arrows with every arrowhead, text
+    at Excalidraw's baseline metrics, embedded images from the file's own data URLs (crop and
+    flip kept), frames clipping their contents, arrow labels on a gap in the line. The official
+    `exportToSvg` was measured and rejected: `@excalidraw/utils` is one 19.6 MB module (14 MB
+    gzipped, every font subset inlined) and the full package needs React and a font CDN; this is
+    ~7 KB gzipped plus roughjs (~11 KB). Text uses the drawing's font names with system fallbacks
+    (a handwriting face where one is installed).
+  - **draw.io** (`drawio.ts`, `xml.ts`, `drawioSvg.ts`): plain or compressed pages (URI-encoded,
+    raw-deflated, base64'd — draw.io's default save), one tab per page. No renderer on npm fit:
+    the diagrams.net viewer is a CDN script, mxGraph/maxGraph (~115 KB gzipped) don't know
+    draw.io's own shapes or its label sanitizing, and the lighter converters are GPL. This draws
+    the common subset: rectangles (rounded), ellipses, rhombi, triangles, hexagons, cylinders,
+    clouds, process / document / parallelogram / trapezoid / step / note / card / actor shapes,
+    swimlanes and groups, draw.io's flowchart stencils, and edges routed as draw.io would
+    (straight, orthogonal with or without waypoints and fixed exit/entry points, elbow,
+    entity-relation; rounded and curved) with its markers and labels. HTML labels go through
+    DOMPurify with a text-only profile and a style filter that drops anything that could fetch;
+    images draw only from `data:` URLs (a linked one is a dashed box, counted in the bar). An
+    unknown stencil draws as a labelled box, and the bar says how many.
+  - **Colors and export.** Excalidraw and draw.io drawings assume white paper: in a dark theme
+    they're shown the way Excalidraw's own dark mode does it (inverted with hues kept, photos
+    restored), with **original colors** in the bar to switch back. Both export as SVG and a 2×
+    PNG in their own colors (a draw.io page with HTML labels may not rasterize in every engine;
+    the bar says so). JSON Canvas is drawn with the theme's tokens.
+- **Parquet.** `.parquet` opens in `ParquetView.svelte`, read in the browser with `hyparquet`
+  over ranged requests to the file's `/raw` ticket (`parquet.ts`), so only the bytes a page of
+  rows needs cross the tunnel and the daemon holds nothing. The first request is a 64 KB suffix
+  read (the footer, and the file's size from `Content-Range`); the metadata gives the row count,
+  schema and codecs at once. Rows page into the shared `TableView` through its `fetchPage`
+  override (paging, virtualization, jump to row, cell expand and copy all come with it). A file
+  with an offset index (Spark, parquet-mr, pyarrow's `write_page_index`) reads only the pages
+  under the rows; for one without — pyarrow's default single row group of up to ~1M rows, where
+  a plain read would fetch whole column chunks — the viewer walks the flat columns' page headers
+  lazily and hands hyparquet the same page locations, header by header or through 512 KB windows
+  depending on the link's measured bandwidth-delay product. Read bytes go through a 48 MB range
+  cache, and an aged ticket is re-minted on a 404. Measured on a 16 MB, 1M-row snappy file with
+  one row group: the first screen reads 3.3 MB in 15 ranged requests; a jump to row 700,000
+  takes ~0.8 s on a simulated 50 ms / 10 MB/s tunnel. Snappy and uncompressed are built in; gzip,
+  zstd, LZ4 and LZ4_RAW ship with the viewer, Brotli loads on demand (~66 KB gzipped); LZO (or
+  an encrypted file) gets a clear message, with the schema still readable. The bar shows rows,
+  columns, row groups, codecs and **read X of Y**; a **schema** tab lists every column with its
+  logical type (nested fields indented) and the file's facts (writer, page index, metadata keys).
+  Values read as text: timestamps in UTC, dates without a clock, 32-bit floats at their own
+  precision, nested values as JSON, binary as hex, and control characters as their Unicode
+  pictures.
 - **Release-safe lazy views.** File and other heavyweight workbench views load from immutable hashed
   chunks. The entry document is never cached and is stamped with the source build that served it,
   so a later health response cannot mistake a replacement daemon for that document's build. Vite's
