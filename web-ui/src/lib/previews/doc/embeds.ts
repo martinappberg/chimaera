@@ -6,13 +6,19 @@
  * the document (the reading article, live mode's blocks) draws from the
  * answers. An answer carries the file's version and a `/raw` ticket the
  * daemon keeps for that version, so a block drawn again reuses its URL (no
- * flash) and an overwritten file gets a new one.
+ * flash) and an overwritten file gets a new one. What the daemon leaves
+ * unanswered (unreachable, out of time) is asked again with a bounded
+ * backoff, and at once when the daemon link returns — never while the page
+ * is hidden.
  *
  * Targets resolve as document links do: beside the document, then the
  * workspace root (a root-relative `/x` too). An `![[name]]` that misses
  * there is looked up by name, as Obsidian finds it.
  */
 import type { Tree } from "@lezer/common";
+import { daemonLinkUp } from "../../shared/editing";
+import { pageVisible } from "../../shared/visibility";
+import { retryDelayMs } from "../../net/reconnect";
 import { inlineOf, type DocText, type InlineOptions } from "../mdTable";
 import { isMath } from "../mdMath";
 import { dirname, fsValidate, safeDecodeUri } from "../files";
@@ -86,6 +92,16 @@ const REFRESH_MS = 60_000;
 /** Past this an answer's ticket may be gone: not drawn from, asked again. */
 const TICKET_MS = 8 * 60_000;
 const ANSWERS_MAX = 1000;
+/** A request that has not answered by now never will: its asks stay
+ *  unknown, and are retried (the daemon's own budget is 5 s). */
+const RESOLVE_TIMEOUT_MS = 20_000;
+/** References the daemon left unanswered (it was unreachable, or out of
+ *  time) are asked again after this, doubling to RETRY_MAX_MS, at most
+ *  RETRY_ROUNDS times in a row — and at once when the daemon link comes
+ *  back or the page is shown again, which also starts the count over. */
+const RETRY_MIN_MS = 2_000;
+const RETRY_MAX_MS = 60_000;
+const RETRY_ROUNDS = 8;
 
 interface Ask {
   ref: EmbedRef;
@@ -104,6 +120,14 @@ export class DocEmbeds {
   private synced: EmbedRef[] = [];
   private syncedKey: string | null = null;
   private disposed = false;
+  /** Asked, and left unknown: asked again (`retry`). */
+  private readonly failed = new Map<string, EmbedRef>();
+  private retryTimer: ReturnType<typeof setTimeout> | null = null;
+  private rounds = 0;
+  /** Unsubscribes the link and visibility watch, held while `failed` is. */
+  private unwatch: (() => void) | null = null;
+  private linkUp = true;
+  private shown = true;
 
   constructor(
     /** The document's absolute path: targets resolve beside it. */
@@ -171,6 +195,7 @@ export class DocEmbeds {
     if (key === this.syncedKey) return;
     this.syncedKey = key;
     this.synced = [...byKey.values()];
+    for (const k of [...this.failed.keys()]) if (!byKey.has(k)) this.failed.delete(k);
     for (const r of this.synced) void this.ask(r);
   }
 
@@ -194,6 +219,8 @@ export class DocEmbeds {
     for (const a of this.queued.values()) a.resolve(null);
     this.queued.clear();
     this.listeners.clear();
+    this.failed.clear();
+    this.settleRetry();
   }
 
   private async flush(): Promise<void> {
@@ -212,9 +239,71 @@ export class DocEmbeds {
       const key = refKey(a.ref);
       if (this.inflight.get(key) === a) this.inflight.delete(key);
       const r = results.get(key) ?? null;
-      if (r !== null && !this.disposed) this.store(key, r, at);
+      if (!this.disposed && r !== null) {
+        this.store(key, r, at);
+        this.failed.delete(key);
+      } else if (!this.disposed && this.failed.size < ANSWERS_MAX) {
+        this.failed.set(key, a.ref);
+      }
       a.resolve(r);
     }
+    this.settleRetry();
+  }
+
+  /** After an answer: while anything is left unknown, keep watching for the
+   *  daemon's return and arm the next round (bounded); else stop. */
+  private settleRetry(): void {
+    if (this.disposed || this.failed.size === 0) {
+      if (this.retryTimer !== null) clearTimeout(this.retryTimer);
+      this.retryTimer = null;
+      this.rounds = 0;
+      this.unwatch?.();
+      this.unwatch = null;
+      return;
+    }
+    this.watch();
+    if (this.retryTimer !== null || this.rounds >= RETRY_ROUNDS || !this.shown || !this.linkUp) return;
+    const backoff = Math.min(RETRY_MAX_MS, RETRY_MIN_MS * 2 ** this.rounds);
+    this.rounds++;
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = null;
+      this.retry();
+    }, retryDelayMs(backoff, false, this.rounds));
+  }
+
+  /** Ask the unknown references again — only while someone can see the
+   *  page and the daemon link is up; otherwise their return asks (`watch`),
+   *  so a hidden window or a dead link runs no timers. */
+  private retry(): void {
+    if (this.disposed || !this.shown || !this.linkUp) return;
+    for (const r of [...this.failed.values()]) void this.ask(r);
+  }
+
+  private watch(): void {
+    if (this.unwatch !== null) return;
+    let armed = false;
+    const back = (): void => {
+      if (!armed) return;
+      if (this.retryTimer !== null) clearTimeout(this.retryTimer);
+      this.retryTimer = null;
+      this.rounds = 0;
+      this.retry();
+    };
+    const link = daemonLinkUp.subscribe((up) => {
+      const was = this.linkUp;
+      this.linkUp = up;
+      if (up && !was) back();
+    });
+    const page = pageVisible.subscribe((v) => {
+      const was = this.shown;
+      this.shown = v;
+      if (v && !was) back();
+    });
+    armed = true;
+    this.unwatch = () => {
+      link();
+      page();
+    };
   }
 
   private store(key: string, r: TargetResult, at: number): void {
@@ -239,7 +328,11 @@ export class DocEmbeds {
     const strict = await resolveTargets(
       refs.map((r) => r.target),
       base,
-      { bases: ctx.wsRoot !== null ? [ctx.wsRoot] : [], workspaceId: ctx.workspaceId },
+      {
+        bases: ctx.wsRoot !== null ? [ctx.wsRoot] : [],
+        workspaceId: ctx.workspaceId,
+        signal: AbortSignal.timeout(RESOLVE_TIMEOUT_MS),
+      },
     );
     const named: EmbedRef[] = [];
     for (const r of refs) {
@@ -276,7 +369,9 @@ export class DocEmbeds {
     let answers: Record<string, TargetResult>;
     try {
       // Real paths: escaped so the daemon reads them as the files they name.
-      answers = await resolveTargets([...new Set(found.values())].map(pathTarget), "/");
+      answers = await resolveTargets([...new Set(found.values())].map(pathTarget), "/", {
+        signal: AbortSignal.timeout(RESOLVE_TIMEOUT_MS),
+      });
     } catch {
       return out;
     }
