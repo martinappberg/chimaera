@@ -378,9 +378,13 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
       said in place; a click opens it in a pane (in live: Mod+click; a plain click edits its
       line). Every image-shaped reference in the document, inline ones too, resolves in
       **one** `fs/resolve_targets` round trip (`doc/embeds.ts` `DocEmbeds`, shared by the two
-      views; asked again when the set changes or the file changes on disk; a `![[name]]` that
-      misses beside the document costs one by-name lookup more). A drawn-again block reuses
-      its answer, so nothing flashes; cards are destroyed with their block. A card's excerpt
+      views; asked again when the set changes or the file changes on disk — not for this
+      window's own saves; a `![[name]]` that misses beside the document costs one by-name
+      lookup more). What the daemon leaves unanswered (unreachable, out of time) is asked
+      again with a bounded backoff, and at once when the daemon link returns — never while
+      the page is hidden. A drawn-again block reuses its answer, so nothing flashes; an answer
+      past its ticket's life is asked again before anything draws or opens from it; cards are
+      destroyed with their block. A card's excerpt
       of another note is the card's own (marked), not a transclusion through this renderer.
     - **Anchors.** Heading and footnote ids carry GitHub's `user-content-` prefix (heading
       slugs GitHub's, `-1`, `-2` on repeats), so a document can't clobber the app's own ids;
