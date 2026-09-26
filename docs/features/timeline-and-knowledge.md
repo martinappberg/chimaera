@@ -150,7 +150,13 @@ and the Mastermind-tier MCP tool `read_timeline`.
 > this line is derived and may be regenerated; everything below is deliberate and must not
 > be "helpfully" changed without asking.
 
-*pending* — the questionnaire has not been run for the Timeline or Knowledge. The design's
-maintainer decisions (2026-09-25) are recorded in the
-[plan](../timeline-knowledge-plugins-plan.md#decisions-maintainer-2026-09-25); capture the
-intent via **capture-feature-intent** when this ships as a `feat:`.
+### Timeline & Knowledge — why it exists
+_Captured 2026-09-25 (from the maintainer, via capture-feature-intent)._
+
+- **Problem it solves:** all four of the maintainer's triggers — the Mastermind was "sometimes superfluous, not really always doing anything" and the dashboard "doesn't say much and feels redundant"; Chimaera should know what is going on in each project — fully mycelium-compatible with good UI on top, yet still working a little without it; agents across vendors (claude ↔ codex, even subagents) should be able to talk to each other; and attaching mycelium should be quick and plugin-like, generic enough for LaTeX and other harnesses later.
+- **How settled it is (intended vs provisional):** only the *why* is settled. The entry anatomy, what counts as notable, attribution, the Knowledge sections, layout and names are how it works for now.
+- **Deliberately open / where it may go:** all left open for later, not ruled out: a Browse/marketplace for skills and plugins; more workbench plugins (LaTeX, built by another agent; the specified-but-unbuilt views/settings/commands contribution points); a Chimaera-side knowledge store (today, without mycelium, Knowledge shows guidance files and Claude memory only); and agents directing each other beyond informational notes (subagents addressable).
+- **Do not change (or: open to change):** open to change — an addition to the core, not a core bet. Offered four candidates to freeze (nothing changes for agents unless a plugin is on; Chimaera never curates knowledge; notes never start a turn; hook trust is never silent), the maintainer answered "all can change". They are how it was built today, not locked contracts.
+
+The design's maintainer decisions (2026-09-25) are in the
+[plan](../timeline-knowledge-plugins-plan.md#decisions-maintainer-2026-09-25).

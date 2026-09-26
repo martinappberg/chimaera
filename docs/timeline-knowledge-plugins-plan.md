@@ -661,6 +661,10 @@ proceeds on B1 in parallel with everything else.
 
 ## Appendix: what we deliberately do NOT build
 
+_Not built now — but the maintainer's intent capture (2026-09-25) leaves a
+Chimaera-side knowledge store and agents directing each other open for
+later rather than ruled out._
+
 - A knowledge store of our own, a "keep"/curation step, or any write into
   knowledge files.
 - Delivery that starts a turn; agent-to-agent commands; addressing subagents.

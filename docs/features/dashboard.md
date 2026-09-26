@@ -333,3 +333,11 @@ decisions block + §10 of [docs/agent-dashboard-plan.md](../agent-dashboard-plan
   (TUI cards carry it from the statusline heartbeat; the chat wire doesn't yet), codex
   TUI telemetry (consent-gated by codex itself — pitched as a dashboard card),
   kanban-style managed columns (never — derived states only).
+
+### The re-centred dashboard (Since you left · Where things stand · Now · Brief me) — why it exists
+_Captured 2026-09-25 (from the maintainer, via capture-feature-intent)._
+
+- **Problem it solves:** all four of the maintainer's triggers — the Mastermind was "sometimes superfluous, not really always doing anything" and the dashboard "doesn't say much and feels redundant"; Chimaera should know what is going on in each project — fully mycelium-compatible with good UI on top, yet still working a little without it; agents across vendors (claude ↔ codex, even subagents) should be able to talk to each other; and attaching mycelium should be quick and plugin-like, generic enough for LaTeX and other harnesses later.
+- **How settled it is (intended vs provisional):** only the *why* is settled. Which sections exist, their order, the one-line Now and the Brief me shape are how it works for now.
+- **Deliberately open / where it may go:** all left open for later, not ruled out: a Browse/marketplace for skills and plugins; more workbench plugins (LaTeX, built by another agent; the specified-but-unbuilt views/settings/commands contribution points); a Chimaera-side knowledge store (today, without mycelium, Knowledge shows guidance files and Claude memory only); and agents directing each other beyond informational notes (subagents addressable).
+- **Do not change (or: open to change):** open to change — an addition to the core, not a core bet. Offered four candidates to freeze (nothing changes for agents unless a plugin is on; Chimaera never curates knowledge; notes never start a turn; hook trust is never silent), the maintainer answered "all can change". They are how it was built today, not locked contracts.
