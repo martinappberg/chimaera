@@ -42,7 +42,9 @@ core; an addition can change when there's a clear improvement. Don't be too stri
 | Page | What it covers |
 |---|---|
 | [workbench.md](workbench.md) | Workspaces, home screen, the pane/tab/split workbench, drag-and-drop, zoom, focus mode, quick-open, folder picker, layout persistence, keybindings |
-| [dashboard.md](dashboard.md) | The workspace dashboard (landing surface): the attention lane with inline permission answering, density-adaptive agent cards with provenance tiers, subagent drop-down, changed-file attribution, recents & git summary |
+| [dashboard.md](dashboard.md) | The workspace dashboard (landing surface), re-centred on questions: the attention lane with inline permission answering, Since you left, Where things stand, the one-line Now (or density-adaptive agent cards with provenance tiers), and the Mastermind dock with Brief me |
+| [timeline-and-knowledge.md](timeline-and-knowledge.md) | The per-workspace Timeline the daemon writes (agent turns, notable commands, ended Slurm jobs, crashes, knowledge changes, agent notes) and the read-only Knowledge view over what agents recorded (mycelium's `.living/`, guidance files, claude memory) |
+| [plugins.md](plugins.md) | The Plugins tab: opt-in workbench plugins (manifests, per-workspace switch, install/setup, plugin MCP tools), agent plugins + the Skills view (asked of claude/codex themselves), in-app codex hook trust, the Agent notes plugin |
 | [terminals.md](terminals.md) | Persistent daemon-owned terminals, reconnect/resize/resync, clickable path links, clipboard & provenance, live theming, the exec engine, the command journal |
 | [agents.md](agents.md) | Launching coding agents (real TUI + structured chat), the launcher, managed install/update, agent detection, the session rail & attention state, rename/kill, recents & resume |
 | [chat-mode.md](chat-mode.md) | Structured chat mode (Tier B): the composer, model/effort/mode/thinking/ultracode controls, tool cards, permission & question prompts, rewind, MCP panel, usage, inline artifacts, the seq journal & gap-replay, view-switch |

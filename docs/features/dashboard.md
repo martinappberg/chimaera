@@ -1,20 +1,26 @@
 # The workspace dashboard
 
-The landing surface of a workspace: which agents need you, what everyone is doing, what
-they produced, and where you left off — one glance, every element one click from the live
-session. An empty workspace layout opens onto it; ⌘0 / the rail's `dashboard` row reach it
-any time. This is the larger dashboard/Mastermind design
-([docs/agent-dashboard-plan.md](../agent-dashboard-plan.md)) through v1: the surface
-(v0.1), the status-feed depth (v0.2), and the Mastermind dock (v1).
+The landing surface of a workspace, re-centred on questions: what needs me (the attention
+lane), what happened while I was away (**Since you left**), where the project stands
+(**Where things stand**), and who is running (the one-line **Now**) — every element one click
+from the live session, the Timeline, or Knowledge. An empty workspace layout opens onto it;
+⌘0 / the rail's `dashboard` row reach it any time. This is the dashboard/Mastermind design
+([docs/agent-dashboard-plan.md](../agent-dashboard-plan.md)) through v1 — the surface (v0.1),
+the status-feed depth (v0.2), the Mastermind dock (v1) — re-centred by
+[docs/timeline-knowledge-plugins-plan.md](../timeline-knowledge-plugins-plan.md) §3 and §8.
 
 **Where it lives (shared):** UI `web-ui/src/lib/dashboard/` (`DashboardView.svelte`,
-`AgentCard.svelte`, `AttentionCard.svelte`, `MastermindDock.svelte`, `dash.ts`); the
+`SinceYouLeft.svelte`, `WhereThingsStand.svelte`, `NowLine.svelte`, `AgentCard.svelte`,
+`AttentionCard.svelte`, `MastermindDock.svelte`, `dash.ts`); the
 `dashboard` surface in `web-ui/src/lib/layout/layout.ts` (`DashboardTab`, `openDashboard`,
 key `v:dashboard`) and its branches in `Pane.svelte`/`PaneTabs.svelte`; the landing switch
 + rail row + ⌘0 in `web-ui/src/App.svelte` (`pruneAndAutoOpen`, `openDashboardSurface`,
 `dashCtx`). The surface renders from the existing `/ws/events` roster, the chat journal
 via `web-ui/src/lib/chat/chatPool.ts` (`acquireChat`/`releaseChat`, refcounted), the git status store,
-and the rail's recents; the dock additionally rides the Mastermind daemon surface
+the Timeline / Knowledge / plugin stores (`workspace/timeline.svelte.ts`,
+`workspace/knowledge.ts`, `plugins/store.ts` — see
+[timeline-and-knowledge.md](timeline-and-knowledge.md) and [plugins.md](plugins.md)), and
+the rail's recents (blank state); the dock additionally rides the Mastermind daemon surface
 (`PUT`/`DELETE /api/v1/workspaces/{id}/mastermind` in
 `crates/chimaera-server/src/api/workspaces.rs`, the `mastermind` fields on the
 workspace/session wire, helpers in `web-ui/src/lib/workspace/sessions.ts`).
@@ -27,8 +33,10 @@ workspace/session wire, helpers in `web-ui/src/lib/workspace/sessions.ts`).
   restores the old first-session behavior). Manual: the fixed `dashboard` rail row above
   the terminals section, or Mod+0 (the same pinned-chord family as Mod+1–9; the digit `0`
   ride-along lives in `web-ui/src/lib/shared/keys.ts::chordDigit`). The
-  `dashboard.cardDensity` setting keeps roster cards comfortable, forces compact rows, or
-  retains the automatic seven-agent threshold.
+  `dashboard.roster` setting (default `line`) picks the one-line Now or today's roster as
+  cards (the dashboard's "show cards" / "show one line" links flip it); in cards mode
+  `dashboard.cardDensity` keeps cards comfortable, forces compact rows, or retains the
+  automatic seven-agent threshold.
 - **Key behaviors.** Singleton tab (re-opening focuses it); serialized additively in the
   layout blob (`{v:"dashboard"}` — older builds skip it without resetting the layout).
   When **nothing is running** (no agents, no terminals, no Mastermind) the surface shows
@@ -49,12 +57,50 @@ workspace/session wire, helpers in `web-ui/src/lib/workspace/sessions.ts`).
   answering there). Structured questions surface as "has a question — answer in the chat"
   (the door, not an inline form). TUI sessions say honestly what is known ("needs
   permission — answer in the terminal") and offer the door.
-- **Key behaviors.** Renders only when non-empty — quiet means quiet. Dead errored
-  sessions stay in the roster, not the lane.
+- **Key behaviors.** Renders only when non-empty, under the label **Needs you** — quiet
+  means quiet. Dead errored sessions stay in the roster, not the lane.
+
+## Since you left
+
+- **What & when.** "What happened while I was away?" — the workspace
+  [Timeline](timeline-and-knowledge.md#the-timeline) past this viewer's last look.
+- **How it's used.** Rows (the shared `workspace/TimelineRow.svelte` anatomy: the user's
+  prompt as headline, the agent's first real sentence as result, evidence) grouped per
+  session, **bad news first** (failed commands and jobs, crashes, errored turns, contradicted
+  findings — `workspace/timelineModel.ts`), ≤8 rows, then "open timeline →" for the rest;
+  empty is one line ("Nothing new since 14:02").
+- **Key behaviors.** Per viewer, not daemon state: the baseline is the seq this browser had
+  looked up to (localStorage via `lastSeen`/`markSeen`), captured each time the dashboard
+  becomes visible and held while it stays visible so rows don't vanish under the reader; the
+  mark advances only while the window is also focused. A stored seq above the daemon's head
+  (data dir wiped) resets. Hidden entirely on a daemon without a Timeline route.
+
+## Where things stand
+
+- **What & when.** "Where is the project?" — the top of
+  [Knowledge](timeline-and-knowledge.md#knowledge): contradicted findings first, then the
+  strongest with mycelium's confidence ladder, the next steps and a warn-toned blocker from
+  the handoff; "open knowledge →".
+- **Key behaviors.** Without a structured provider it is one quiet line offering "Use mycelium
+  →" (the attach sheet — [plugins.md](plugins.md#workbench-plugins)). Hidden on a daemon
+  without a knowledge route.
+
+## Now (the roster line)
+
+- **What & when.** "Who's running?" as ONE line by default (`NowLine.svelte`) — the rail
+  already lists sessions, so the dashboard stops competing: each agent's name in mono plus an
+  honest phrase from the rail's vocabulary (its `now_line` / status detail while working,
+  "waiting on you", "errored", "finished", "idle", "exited"), up to 6 then "+N more",
+  terminals folded into a count ("2 terminals · 1 running"), a quiet `↳` on the agent this
+  window was in most recently (the old "last active" jump), and "show cards".
+- **Key behaviors.** Every name opens its live session. "show cards" sets
+  `dashboard.roster: "cards"`, which renders the roster cards below instead.
 
 ## Roster cards
 
-- **What & when.** One card per agent session: who, doing what, needs what, produced what.
+- **What & when.** One card per agent session: who, doing what, needs what, produced what —
+  shown in cards mode (`dashboard.roster: "cards"`) under the "Now" label, with plain shells
+  summarized beneath.
 - **How it's used.** The whole card opens the live session (via the same reveal path the
   git panel uses, `LayoutCtrl.revealWorktreeSession`-adjacent `onOpenSession`). The
   evidence row ("N files · view changes") opens the session-scoped Changes view beside the
@@ -85,8 +131,8 @@ workspace/session wire, helpers in `web-ui/src/lib/workspace/sessions.ts`).
     with a warn-toned "stalled — no output for 3+ min" — the claim is likely stale and
     the card says so.
   - **Density-adaptive**: one agent → a hero card (plan snapshot, subagents open by
-    default); 2–6 → a card grid; 7+ → compact triage rows. The side column collapses under
-    the pane's own width (container query), not the window's.
+    default); 2–6 → a card grid; 7+ → compact triage rows (`dashboard.cardDensity` can pin
+    either).
   - **Calm ordering**: the roster sorts live-before-dead only (`dash.ts::rosterWeight`),
     NOT per activity state — a chat agent cycles running↔finished every turn, and a
     roster that re-ranks on each turn boundary reads as chaos (the state dot + strip
@@ -106,7 +152,8 @@ workspace/session wire, helpers in `web-ui/src/lib/workspace/sessions.ts`).
     is about this viewer's eyes, not daemon state); focusing the session clears it. Never
     a state color — the state dot owns state; the highlight only says "new".
   - **Bounded rich detail**: warm chat stores are acquired for attention-lane chat
-    sessions always, plus running chats up to a small cap (`RICH_CAP = 4`), so the
+    sessions first (up to `RICH_LANE_MAX = 8`), then running chats top up to a shared
+    cap (`RICH_CAP = 4`), so the
     dashboard can never churn the chat pool's LRU out from under open tabs; released on
     unmount (`releaseChat`, never `disposeChat`). Cards beyond the cap render wire truth
     only — empty is honest, fabricated is lying.
@@ -118,29 +165,20 @@ workspace/session wire, helpers in `web-ui/src/lib/workspace/sessions.ts`).
 - Plain shells collapse to one summary row ("N terminals · M running a command") with
   per-shell chips, plus `+ terminal` / `+ agent` spawners.
 
-## The activity column
+## Git, changed files & recents
 
-- **Changed files** — newest-first union of every agent's `files_touched` (attributed with
-  a per-agent chip) and uncommitted git paths no agent claimed (chip `you`, tooltip states
-  attribution is best-effort). Click opens the file in the active pane. Cap 10.
-- **Recents** — the rail's daemon-persisted recents, resumable, cap 5. Shown only in
-  **settled** quiet moments (attention lane empty, no agent mid-work) — during live work
-  the column stays lean, and quiet must HOLD for a beat (~10s) before recents reappear so
-  the per-turn idle gap of a chat agent doesn't flicker the section in and out (hiding
-  stays immediate — kicking off work is a deliberate moment). The blank state keeps its
-  own recents regardless.
-- **"Last active"** — above the columns, a one-click jump back into this window's most
-  recently active agent (shown only when there's more than one agent, so it isn't the
-  whole story). Named for what it IS (the row you were last in), not the old bare
-  "continue" that read like a stuck state.
-- **Git** — branch, ahead/behind, change count; opens the source-control panel. Reads the
-  live `gitStatus` store (epoch-driven, never polled).
+The surface is one column of question-shaped sections — there is no separate activity
+column any more. **Git** is the strip's branch chip (ahead/behind + uncommitted count,
+opening source control; the live `gitStatus` store, epoch-driven, never polled).
+**Changed files** ride each Timeline episode's evidence (and a card's evidence row in cards
+mode). **Recents** show only in the blank state ("pick up where you left off", cap 5). The
+old "last active" jump is the `↳` mark on the Now line.
 
 ## The Mastermind dock
 
 - **What & when.** The one home of the workspace's privileged agent (plan §7: exactly one
-  per workspace, it delegates rather than does): a full-height third column right of the
-  activity column, `MastermindDock.svelte`. Until one exists the dock is a **setup card**
+  per workspace, it delegates rather than does): a full-height column right of the
+  dashboard's sections, `MastermindDock.svelte`. Until one exists the dock is a **setup card**
   — brand mark, plain-English help (sees every session, answers questions, delegates
   work; never does the work itself; bills as your own account), the agent choice, the
   ask-first/auto mode choice, and Start.
@@ -152,7 +190,16 @@ workspace/session wire, helpers in `web-ui/src/lib/workspace/sessions.ts`).
   (never in the attention lane). The header's `acts:` badge (and its `⋯` menu) switches
   the gate with an inline confirm — a mode change is a re-PUT that restarts the session;
   neither agent re-reads its gating after spawn — and the menu's "retire" (inline confirm
-  → `DELETE`) unbinds and ends the session.
+  → `DELETE`) unbinds and ends the session. For a chat Mastermind a **prompt row** sits
+  above the embedded chat: **Brief me** always — one turn with a canned prompt and a fixed
+  answer shape (*Needs you · Done · Problems · Next*, sessions cited by name, reading
+  `read_timeline` + `workspace_status` first); the notes inbox chip ("N new notes from
+  agents") whenever [Agent notes](plugins.md#agent-notes) addressed to "mastermind" are
+  unread (its cursor is per browser, localStorage); and, while the transcript is empty,
+  "What should I do next?" / "Anything conflicting?" plus a quiet "Use mycelium for
+  Knowledge →" line when that plugin isn't active. Each is one user click sending one
+  prompt over the session's own socket (the composer's path), disabled while the
+  Mastermind is busy or disconnected; a failed send surfaces as a notice, never a queue.
 - **Key behaviors.**
   - **The act gate (ask first vs auto) is its own badge — `acts:`** — deliberately named
     for what it gates (the Mastermind's OWN workspace acts), not to be confused with the
@@ -173,8 +220,19 @@ workspace/session wire, helpers in `web-ui/src/lib/workspace/sessions.ts`).
     read-tool list, so ask-mode semantics are identical: reads silent, acts prompt.
     A mode switch keeps the bound agent. PUT errors (the 409 missing-binary conflict
     included) surface inline in the server's own words.
-  - **Reactive-only**: nothing in the UI ever triggers a Mastermind turn — no briefing
-    prompt on setup, no event-nudged sends. It speaks when the user types.
+  - **Reactive-only**: nothing ever triggers a Mastermind turn on its own — no briefing
+    prompt on setup, no timer, no event-nudged sends, and an agent note never starts one.
+    It speaks when the user types or clicks one of the prompt-row buttons.
+  - **Senses & memory** (the Mastermind MCP tier, `crates/chimaera-server/src/mcp.rs`):
+    beyond the roster digest, `workspace_status` carries each terminal's last few commands
+    with exit codes (redacted heads, never output), the cached Slurm snapshot (never a cold
+    `squeue`), what the environment prelude *loads* (module/conda/source lines only — never
+    exported values), what each open window shows (the additive `surfaces` key the client sends on
+    its view-state PUT — identities only, `web-ui/src/lib/layout/surfaces.ts`), and the
+    active plugins. `read_timeline` is its memory
+    ([timeline-and-knowledge.md](timeline-and-knowledge.md#the-timeline)); both are reads,
+    pre-allowed in ask mode via the shared `MASTERMIND_READ_TOOLS` list. Terminal output is
+    read with `read_session` (`read_terminal` reaches only terminals linked to it).
   - **The observer, not the observed**: session rows flagged `mastermind: true` are
     filtered out of the rail, the roster/lane, the chord map, quick-open, the home-screen
     rollups, and the recents-adjacent surfaces. The dock is the only place it renders.
@@ -194,13 +252,18 @@ workspace/session wire, helpers in `web-ui/src/lib/workspace/sessions.ts`).
 
 - **Status must be honest** (design spine): a card can never fake-green; every state comes
   from the same `agent_state`/`dotState` vocabulary the rail uses.
-- **No new wire, no new routes** in v0.1 — the surface composes existing client state; the
-  daemon is untouched.
-- The return strip is the workspace vital-signs line: name · branch chip · the summary
-  sentence ("2 working · 1 waiting on you · 1 finished" — counts agents; terminals
-  summarize separately) · a compute chip when the daemon sees a scheduler (`computeStatus`:
-  Slurm running/pending counts, or a live walltime countdown inside an allocation; nothing
-  renders otherwise — never a queue table).
+- **Composes, never owns, state**: the surface reads existing client stores — the
+  roster, git, and the Timeline, Knowledge and plugin stores behind
+  `GET /workspaces/{id}/timeline` / `…/knowledge` / `…/plugins`, refetched off the
+  `/ws/events` `timeline` epoch nudge and quiet while hidden. A daemon without those routes
+  hides the sections rather than showing a spinner.
+- **Only user-clicked turns**: nothing on the dashboard or dock starts an agent turn on its
+  own (Brief me, the suggestion chips and the inbox chip are each one click, one turn).
+- The return strip is the workspace vital-signs line: name · branch chip (ahead/behind +
+  uncommitted count) · the summary sentence ("2 working · 1 needs you · 1 finished", or
+  "all quiet" — counts agents) · a compute chip when the daemon sees a scheduler
+  (`computeStatus`: Slurm running/pending counts, or a live walltime countdown inside an
+  allocation; nothing renders otherwise — never a queue table).
 
 **Verified live (2026-07-15):** empty-workspace landing + blank state; spawn terminal +
 claude chat from the dashboard; the attention lane rendering a real Write permission and
