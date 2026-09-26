@@ -11,8 +11,11 @@ import { readFileSync, existsSync, statSync } from 'node:fs';
 import { dirname, resolve, join } from 'node:path';
 
 const root = execSync('git rev-parse --show-toplevel').toString().trim();
+// Test fixtures are inputs to parsers (a mycelium `.living/` tree, sample
+// documents with deliberately broken links), not documentation: skipped.
 const files = execSync("git ls-files -co --exclude-standard '*.md'", { cwd: root })
-  .toString().split('\n').filter(Boolean);
+  .toString().split('\n').filter(Boolean)
+  .filter((f) => !/(^|\/)tests\/fixtures\//.test(f));
 
 // GitHub-flavored heading slug: lowercase, drop anything but word chars/space/hyphen
 // (backticks and punctuation vanish), spaces -> hyphens.
