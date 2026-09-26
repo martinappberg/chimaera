@@ -161,3 +161,20 @@ _Captured 2026-07-12 (from the maintainer)._
 - **Do not change (or: open to change):** *"keep a smooth UX for the user"* — don't regress the
   core "never silently lose a chat" property (the daemon-owns-everything bet above). Grade: an
   **addition** — the exact resurrect-vs-retire mechanics can change if improved.
+
+### Restart carryover — why it exists
+_Captured 2026-09-25 (from the maintainer)._
+
+- **Problem it solves:** updating should not cost you where a chat was — *"just nice, to be able to
+  update more consistently."* A chat that comes back with its bridge, ultracode and cut-off work
+  picked up makes an update something you just do.
+- **How settled it is:** *"not at all — whatever is best UI / UX."* Every mechanic is provisional:
+  the automatic message and its on-by-default setting, the "restore unless clearly no longer needed"
+  wording, the 10-minute loop guard, and SIGTERM also ending background work on a view switch or
+  rewind.
+- **Deliberately open / where it may go:** what is left out (TUI sessions, the UI-only thinking
+  toggle, queued-but-undelivered messages, codex cross-turn agents) and the Mastermind exclusion are
+  fine as they stand; the aim is *"as seamless an experience as possible."*
+- **Do not change (or: open to change):** open to change — *"this can change."* Grade: an
+  **addition**; improve it toward a smoother update freely. The one thing it serves is the core bet
+  above: a restart never silently loses a chat.
