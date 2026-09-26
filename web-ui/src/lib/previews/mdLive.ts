@@ -40,7 +40,7 @@ import {
   type DecorationSet,
   type ViewUpdate,
 } from "@codemirror/view";
-import { syntaxTree } from "@codemirror/language";
+import { ensureSyntaxTree, syntaxTree } from "@codemirror/language";
 import {
   Facet,
   StateField,
@@ -54,14 +54,9 @@ import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
 import { languages } from "@codemirror/language-data";
 import type { SyntaxNode, SyntaxNodeRef, Tree } from "@lezer/common";
 import { rawTicketUrl, resolveDocPath, safeDecodeUri } from "./files";
-import {
-  MATH_MARK,
-  isDisplayMath,
-  isMath,
-  mathDelimiters,
-  mathExtension,
-  mathSource,
-} from "./mdMath";
+import { MATH_MARK, isDisplayMath, isMath, mathDelimiters, mathSource } from "./mdMath";
+import { docExtensions } from "./doc/parser";
+import { frontmatterOf, outlineOf, type OutlineEntry } from "./doc/model";
 import {
   completeRow,
   linkDestination,
@@ -100,17 +95,19 @@ const linkContext = Facet.define<() => LinkContext, () => LinkContext>({
 });
 
 /**
- * The GFM markdown language (tables, task lists, strikethrough, autolinks;
- * nested fenced-code highlighting via the shared registry) plus `$`/`$$`
- * math (`mdMath`, whose delimiter rules mirror the reading view's comrak). A
- * module SINGLETON: the host keeps it active in both live and source modes,
- * so a mode flip reconfigures around the same Language instance and
- * CodeMirror never reparses the document.
+ * The GFM markdown language with the shared document extensions — `$`/`$$`
+ * math, single-tilde strikethrough, footnotes, wikilinks (`doc/parser.ts`,
+ * the ONE configuration the reading renderer parses with too) — plus nested
+ * fenced-code highlighting via the shared registry. A module SINGLETON: the
+ * host keeps it active in both live and source modes, so a mode flip
+ * reconfigures around the same Language instance and CodeMirror never
+ * reparses the document. Node types this decorator has no rule for (a
+ * footnote reference, a wikilink) simply stay visible source.
  */
 export const markdownLanguageExt: Extension = markdown({
   base: markdownLanguage,
   codeLanguages: languages,
-  extensions: [mathExtension],
+  extensions: docExtensions,
 });
 
 // --- widgets -----------------------------------------------------------------
@@ -315,17 +312,6 @@ function linkUrlIn(target: EventTarget | null): string | null {
   return url === null ? null : webUrl(url);
 }
 
-/** An HTML character reference as its character. The token is lezer's
- *  Entity — `&`, a name or number, `;` by its regex, so it can hold no
- *  markup — and a textarea's innerHTML is RCDATA: references decode, tags
- *  cannot form. An unknown name decodes to itself. */
-let entityDecoder: HTMLTextAreaElement | null = null;
-function decodeEntity(source: string): string {
-  entityDecoder ??= document.createElement("textarea");
-  entityDecoder.innerHTML = source;
-  return entityDecoder.value;
-}
-
 /** The table whose range holds `pos`, modelled from the CURRENT tree. */
 function tableAt(state: EditorState, pos: number): TableModel | null {
   for (
@@ -342,15 +328,21 @@ function tableAt(state: EditorState, pos: number): TableModel | null {
  *  inline code span in its live class), an equation through the shared
  *  KaTeX policy, an image under the plugin's URL policy (its source text
  *  when that refuses), a link as an anchor without href — it opens on
- *  Mod+press like every live link. */
+ *  Mod+press like every live link. Raw HTML, a footnote reference and a
+ *  wikilink stay their source text, as they do on the editor's lines. */
 function renderInline(parent: HTMLElement, inline: readonly Inline[], view: EditorView): void {
   for (const i of inline) {
     switch (i.kind) {
       case "text":
         parent.append(document.createTextNode(i.text));
         break;
-      case "entity":
-        parent.append(document.createTextNode(decodeEntity(i.source)));
+      case "break":
+        parent.append(document.createElement("br"));
+        break;
+      case "html":
+      case "footnote":
+      case "wikilink":
+        parent.append(document.createTextNode(i.source));
         break;
       case "math":
         parent.append(mathElement(i.source, i.display, view));
@@ -604,22 +596,18 @@ const widgetQuoteCopy = Decoration.widget({ widget: quoteCopyWidget, side: 1 });
 /**
  * End offset of a leading YAML frontmatter block (0 = none). The markdown
  * parser has no frontmatter notion — without this, `---` fences would render
- * as rules and `title:`-then-`---` as a setext heading. Strict shape: an
- * UNindented `---` first line, a closing `---`, and at least one `key:` line
- * between — a document that merely opens with a thematic break must not have
- * its head restyled as metadata. Bounded scan; recomputed only on doc change.
+ * as rules and `title:`-then-`---` as a setext heading. The reading view's
+ * rule (`doc/model.ts frontmatterOf`, the daemon's): an UNindented `---`
+ * first line, a closing line exactly `---` within 200 lines, and at least one
+ * `key:` line between — a document that merely opens with a thematic break
+ * must not have its head restyled as metadata. Reads only those first 200
+ * lines; recomputed only on doc change.
  */
 function frontmatterEnd(state: EditorState): number {
   const doc = state.doc;
   if (doc.lines < 2 || doc.line(1).text !== "---") return 0;
-  const cap = Math.min(doc.lines, 200);
-  let sawKey = false;
-  for (let i = 2; i <= cap; i++) {
-    const t = doc.line(i).text;
-    if (t.trimEnd() === "---") return sawKey ? doc.line(i).to : 0;
-    if (/^[A-Za-z0-9_-]+\s*:/.test(t)) sawKey = true;
-  }
-  return 0;
+  const head = doc.sliceString(0, doc.line(Math.min(doc.lines, 201)).to);
+  return frontmatterOf(head)?.end ?? 0;
 }
 
 interface Span {
@@ -1276,7 +1264,7 @@ function followLiveLink(view: EditorView, href: string, e: MouseEvent): void {
     docPath: doc,
     wsRoot: ctx.wsRoot,
     workspaceId: ctx.workspaceId,
-    toAnchor: (anchor) => revealAnchorInSource(doc, anchor),
+    toAnchor: (anchor) => revealAnchorInSource(doc, anchor, view.state.doc.toString()),
     toLines: (r) => requestReveal(doc, r),
     hint: (text) => showLinkHint(box, e.clientX, e.clientY, text),
   };
@@ -1492,6 +1480,41 @@ const liveTheme: Extension = EditorView.theme({
   },
   "&.cm-md-live .lp-copy.copied .ic-check": { display: "block" },
 });
+
+// --- outline -----------------------------------------------------------------
+
+/** The editor CodeView mounted inside `host` (found from its DOM, so the
+ *  host needs no handle on CodeView's internals). */
+export function editorIn(host: HTMLElement): EditorView | null {
+  const dom = host.querySelector<HTMLElement>(".cm-editor");
+  return dom === null ? null : EditorView.findFromDOM(dom);
+}
+
+/** The document's headings from the editor's own syntax tree, with the
+ *  anchors the reading view gives them (frontmatter skipped). A tree the
+ *  background parser hasn't finished is completed within a short budget. */
+export function editorOutline(view: EditorView): OutlineEntry[] {
+  const state = view.state;
+  const tree = ensureSyntaxTree(state, state.doc.length, 30) ?? syntaxTree(state);
+  return outlineOf(tree, state.doc, frontmatterEnd(state));
+}
+
+/** Where `scrollEditorTo` lands a line: this far below the visible top. */
+const JUMP_MARGIN = 24;
+
+/** The document position at the top of the editor's visible area — read
+ *  just below the line a jump lands on, so a jump and the scroll agree. */
+export function editorTopPos(view: EditorView): number {
+  const top = view.scrollDOM.getBoundingClientRect().top;
+  return view.lineBlockAtHeight(Math.max(0, top - view.documentTop) + JUMP_MARGIN + 8).from;
+}
+
+/** Scroll the editor so `pos`'s line sits near the top — the cursor stays
+ *  where it is, so a heading jumped to keeps rendering (live reveals the
+ *  line the selection is on). */
+export function scrollEditorTo(view: EditorView, pos: number): void {
+  view.dispatch({ effects: EditorView.scrollIntoView(pos, { y: "start", yMargin: JUMP_MARGIN }) });
+}
 
 /**
  * The live-preview behavior set (decorations, link handling, wrapping, the

@@ -5,24 +5,39 @@
    *  browser's storage (never shared, never read back by the daemon). */
   const modeMemory = createModeMemory(() => localStorage);
   const PROPS_KEY = "chimaera.markdownPropsCollapsed";
-  function readPropsCollapsed(): boolean {
+  const OUTLINE_KEY = "chimaera.markdownOutline";
+  function readFlag(key: string): boolean {
     try {
-      return localStorage.getItem(PROPS_KEY) === "1";
+      return localStorage.getItem(key) === "1";
     } catch {
       return false;
     }
   }
+  function writeFlag(key: string, on: boolean): void {
+    try {
+      localStorage.setItem(key, on ? "1" : "0");
+    } catch {
+      // storage unavailable: the choice lasts for this view
+    }
+  }
+  /** Source bytes as text, decoded the way the editor decodes them. */
+  const utf8 = new TextDecoder();
 </script>
 
 <script lang="ts">
   /**
    * Markdown with Obsidian-style modes: live | reading | source.
    *
-   * READING is the complete, non-editable render — the authoritative
-   * server-side comrak GFM (sanitized; `$`/`$$` math arrives as LaTeX
-   * literals this view typesets), which refreshes from disk on save or an
-   * agent write. Its frontmatter shows as a properties panel, its links open
-   * in the workbench (docLinks.ts), and every block carries its source lines
+   * READING is the complete, non-editable render, drawn HERE from the
+   * document's current text (`currentText`: the editor's buffer once it
+   * holds the file, unsaved edits included, else the file as read) by the
+   * shared renderer (`doc/`: one parser for every view, lezer; the reader
+   * keeps unchanged blocks' DOM across updates, so an agent rewriting one
+   * paragraph re-flows nothing else). A file the client can't hold — over
+   * the 1 MB edit cap, binary, unreadable — falls back to the daemon's
+   * render (comrak → ammonia, the same markup). Either way its frontmatter
+   * shows as a properties panel, its links open in the workbench
+   * (docLinks.ts), and every block carries its source lines
    * (`data-sourcepos`), so a selection references real line numbers and a
    * reveal lands on the right block. LIVE is an editable reading view — the
    * shared CodeMirror editor with the mdLive decoration set rendering
@@ -32,7 +47,8 @@
    * extension swap, never a remount), and the editor mounts once and survives
    * every toggle, so flipping modes never drops an unsaved buffer or its undo
    * history. Saves, the dirty dot, and conflict handling all come from
-   * CodeView (Cmd/Ctrl+S).
+   * CodeView (Cmd/Ctrl+S). The OUTLINE panel lists the headings in every
+   * mode and follows the scroll.
    * A file opens in the mode it was last shown in, else the
    * `editor.markdownDefaultMode` setting (reading by default). Editing is
    * offered only for files under the 1MB cap; larger markdown opens in
@@ -40,8 +56,10 @@
   */
   import { untrack, type Component } from "svelte";
   import type { Extension } from "@codemirror/state";
+  import type { EditorView } from "@codemirror/view";
   import {
     EDIT_MAX_BYTES,
+    fsFile,
     looksBinary,
     rawTicketUrl,
     resolveDocPath,
@@ -50,7 +68,10 @@
   } from "./files";
   import { retain, release, type FileEntry } from "./fileStore.svelte";
   import { clearSelection, setSelection } from "../shared/reference";
-  import { getSetting } from "../settings/store.svelte";
+  import { activeTheme, getSetting } from "../settings/store.svelte";
+  import { getActiveWorkspaceId } from "../net/api";
+  import { DocReader, MathTypesetter, mathSpans } from "./doc/reader";
+  import { createReadingWindow, type ReadingWindow } from "./readingWindow";
   import { copyText } from "../shared/clipboard";
   import { copyLabel, copyPayload, decorateCopyTargets } from "../shared/copyDecor";
   import { markScrollRegions, watchWidth } from "../shared/scrollRegion";
@@ -61,7 +82,6 @@
   import { hasUrlScheme, isWebUrl, urlMenuEntries } from "../shared/urlOpen";
   import { contextMenu } from "../shared/contextMenu.svelte";
   import { revealRequest, takeReveal, type Reveal } from "../shared/reveal";
-  import { loadMath, mathNow } from "./mathLoad";
   import { readingWindow } from "./readingWindow";
   import {
     frontmatterLineSpan,
@@ -97,8 +117,17 @@
   let { path, fontSize = undefined, wsRoot = null }: Props = $props();
 
   /** Read at click time, so the memoized live extension set never has to
-   *  change when the workspace does. */
-  const linkContext = (): LinkContext => ({ wsRoot, workspaceId: null });
+   *  change when the workspace does. The window's workspace enables the
+   *  daemon's by-name fallback (a wikilink, a moved file). */
+  const linkContext = (): LinkContext => {
+    let workspaceId: string | null = null;
+    try {
+      workspaceId = getActiveWorkspaceId();
+    } catch {
+      // storage unavailable: resolve without the workspace fallback
+    }
+    return { wsRoot, workspaceId };
+  };
 
   // Prose base size: the pane override, else the Markdown preference. Drives
   // the reading body AND the live editor, so the two views read identically.
@@ -134,6 +163,9 @@
     Component<{
       path: string;
       first: FileChunk;
+      /** The editor's text on mount and after every change: the reading
+       *  render's source while the editor holds the file. */
+      onDoc?: (text: string) => void;
       extra?: Extension;
       autoLanguage?: boolean;
       /** Whether the editor takes reveal requests for its path. The hidden
@@ -172,29 +204,64 @@
     (): Extension => (editorMode === "live" ? liveSet : sourceSet) ?? [],
   );
 
-  // The shared store entry: reading HTML lives here (cached across tab
-  // switches, and re-rendered in place when the file changes on disk — a save
-  // in the editor, or an agent write, both flow through the store).
+  // The shared store entry: the source's first chunk lives here (cached
+  // across tab switches, and refreshed in place when the file changes on
+  // disk — a save in the editor, or an agent write, both flow through the
+  // store), and the daemon's render for the fallback.
   let entry = $state<FileEntry | null>(null);
-  const html = $derived(entry?.markdown?.html ?? null);
-  const error = $derived(entry?.markdownError ?? null);
-  /** The leading YAML block, lifted out of the render by the daemon (null on
-   *  a document without one, and on an older daemon that renders it inline). */
-  const frontmatter = $derived(entry?.markdown?.frontmatter ?? null);
+
+  /** Whether this view draws the document itself: known once the source is
+   *  probed; false over the edit cap, for binary content, or when the source
+   *  can't be read — the daemon's render stands in then. */
+  let clientRender = $state<boolean | null>(null);
+  /** The editor's buffer, once the editor holds the file (CodeView's sink:
+   *  on mount and after every change, a reload from disk included). */
+  let editorText = $state<string | null>(null);
+  /** A whole-file read for a source past the store's first chunk (256 KB)
+   *  and under the edit cap, with the version it read. */
+  let wholeText = $state<{ mtime: string | null; text: string } | null>(null);
+  /** The store's first chunk as text, when it IS the whole file. */
+  const chunkText = $derived.by(() => {
+    const c = entry?.chunk ?? null;
+    return c === null || c.truncated || c.size > EDIT_MAX_BYTES ? null : utf8.decode(c.bytes);
+  });
+
+  /**
+   * The document's current text, the reading render's one input: the
+   * editor's buffer while the editor holds the file (unsaved edits
+   * included), else the file as last read. Null while unknown. The source
+   * sits behind this one function so it can move to a shared buffer store.
+   */
+  function currentText(): string | null {
+    if (editorText !== null) return editorText;
+    if (chunkText !== null) return chunkText;
+    return wholeText?.text ?? null;
+  }
+  const docText = $derived(currentText());
+
+  // The daemon's render (the fallback).
+  const html = $derived(clientRender === false ? (entry?.markdown?.html ?? null) : null);
+  const error = $derived(clientRender === false ? (entry?.markdownError ?? null) : null);
+  /** The leading YAML block's text from whichever render shows (null on a
+   *  document without one, and on an older daemon that renders it inline). */
+  let clientFrontmatter = $state<string | null>(null);
+  const frontmatter = $derived(
+    clientRender === true ? clientFrontmatter : (entry?.markdown?.frontmatter ?? null),
+  );
   const fmEntries = $derived(frontmatter === null ? null : parseFrontmatter(frontmatter));
   /** The panel stands in for the block's lines, fences included. */
   const fmSourcepos = $derived(
     frontmatter === null ? null : `1:1-${frontmatterLineSpan(frontmatter)}:3`,
   );
-  let propsCollapsed = $state(readPropsCollapsed());
+  let propsCollapsed = $state(readFlag(PROPS_KEY));
   function toggleProps(): void {
     propsCollapsed = !propsCollapsed;
-    try {
-      localStorage.setItem(PROPS_KEY, propsCollapsed ? "1" : "0");
-    } catch {
-      // storage unavailable: the choice lasts for this view
-    }
+    writeFlag(PROPS_KEY, propsCollapsed);
   }
+  /** Bumped after every client render: what follows the render (reveals,
+   *  anchors, scroll regions, the outline's place) re-checks on it. */
+  let renderTick = $state(0);
+  const readingReady = $derived(clientRender === true ? renderTick > 0 : html !== null);
 
   // Reset per path — BEFORE the retain effect in source order, so a path swap
   // resets the view before the new entry is opened. The opening mode is the
@@ -216,6 +283,14 @@
     srcBinary = false;
     entered = false;
     codeLoadError = null;
+    clientRender = null;
+    editorText = null;
+    wholeText = null;
+    clientFrontmatter = null;
+    renderTick = 0;
+    readingOutline = [];
+    liveOutline = [];
+    currentHeading = -1;
   });
 
   // Retain + open the chosen mode. `path` is the only tracked dependency —
@@ -267,12 +342,115 @@
     if (req === modeReq) mode = "reading";
   }
 
-  // The server render is fetched on the first reading entry (not eagerly —
-  // the editor modes only need the raw source). Once populated, the store
-  // refreshes it in place on every disk change or in-app save.
+  // Reading draws from the source, so its first entry probes it (the store's
+  // first chunk: one request, reused by the editor modes). A source the
+  // client can't hold turns to the daemon's render, which the store then
+  // refreshes in place on every disk change or in-app save.
   $effect(() => {
     if (mode !== "reading") return;
-    void entry?.ensureMarkdown();
+    const e = entry;
+    if (e !== null) untrack(() => void prepareReading(e));
+  });
+
+  async function prepareReading(e: FileEntry): Promise<void> {
+    if (clientRender !== null) return;
+    if (srcSize === null) {
+      await e.ensureChunk();
+      if (entry !== e || clientRender !== null) return;
+      // A concurrent editor entry may have adopted it first.
+      if (srcSize === null && adoptChunk(e) === "failed") {
+        clientRender = false;
+        void e.ensureMarkdown();
+        return;
+      }
+    }
+    clientRender = editable === true;
+    if (!clientRender) void e.ensureMarkdown();
+  }
+
+  // A source past the first chunk is read whole (under the cap), and again
+  // when the file changes on disk — unless the editor already holds it.
+  $effect(() => {
+    const e = entry;
+    const c = e?.chunk ?? null;
+    if (mode !== "reading" || clientRender !== true || editorText !== null) return;
+    if (e === null || c === null || !c.truncated || c.size > EDIT_MAX_BYTES) return;
+    const mtime = e.mtime;
+    if (untrack(() => wholeText !== null && wholeText.mtime === mtime && mtime !== null)) return;
+    let live = true;
+    fsFile(path, 0, EDIT_MAX_BYTES).then(
+      (full) => {
+        if (live && entry === e) wholeText = { mtime: full.mtime ?? mtime, text: utf8.decode(full.bytes) };
+      },
+      () => {
+        // Unreadable now: the last text stays; with none, the daemon's render.
+        if (!live || entry !== e || untrack(() => wholeText !== null)) return;
+        clientRender = false;
+        void e.ensureMarkdown();
+      },
+    );
+    return () => {
+      live = false;
+    };
+  });
+
+  // --- the client render --------------------------------------------------------
+  let clientArticle = $state<HTMLElement | null>(null);
+  /** The reader and the article's window, owned by the effect below (plain:
+   *  never proxied); `readerTick` announces a new pair to the render. */
+  let reader: DocReader | null = null;
+  let articleWindow: ReadingWindow | null = null;
+  let readerTick = $state(0);
+  const themeMode = $derived(activeTheme().kind);
+
+  $effect(() => {
+    const el = clientArticle;
+    const docPath = path;
+    if (el === null) return;
+    const win = createReadingWindow(el);
+    const r = new DocReader(el, {
+      docPath,
+      links: linkContext,
+      theme: untrack(() => themeMode),
+      // A wide equation typeset late is a scroller the last pass missed.
+      onLayout: () => {
+        if (readingEl !== null) markScrollRegions(readingEl, [[".md-math-display", null]]);
+      },
+    });
+    reader = r;
+    articleWindow = win;
+    untrack(() => readerTick++);
+    return () => {
+      r.destroy();
+      win.destroy();
+      if (reader === r) reader = null;
+      if (articleWindow === win) articleWindow = null;
+    };
+  });
+
+  // Diagrams follow the theme.
+  $effect(() => {
+    const theme = themeMode;
+    void readerTick;
+    reader?.setTheme(theme);
+  });
+
+  // The render: the current text into the article, incrementally — only
+  // while reading shows (a hidden pane catches up on its next entry).
+  $effect(() => {
+    void readerTick;
+    const text = docText;
+    const el = clientArticle;
+    const r = reader;
+    if (mode !== "reading" || r === null || el === null || text === null) return;
+    articleWindow?.restore();
+    const res = r.update(text);
+    clientFrontmatter = res.frontmatter;
+    readingOutline = res.outline;
+    decorateCopyTargets(el);
+    markTasks(el);
+    articleWindow?.schedule();
+    untrack(() => renderTick++);
   });
 
   async function enterEditor(target: "live" | "source"): Promise<void> {
@@ -294,6 +472,11 @@
         barNote = disabledReason;
         return;
       }
+    } else if (!entered && e.chunk !== null && e.chunk !== chunk) {
+      // Reading probed the source earlier and the file has changed on disk
+      // since (the store refreshed it): the editor mounts on today's bytes,
+      // never on a stale snapshot it would then reload over a first keystroke.
+      adoptChunk(e);
     }
     entered = true;
     mode = target;
@@ -319,25 +502,46 @@
   const selOwner = {};
   let contentEl = $state<HTMLDivElement | null>(null);
 
-  // Copy chrome on fenced blocks + blockquotes (the same affordance as the
-  // chat transcript, via the shared decorator), document-relative image
-  // resolution, and task-item marks. Scoped to the rendered article (never
-  // the editor subtree, nor the Svelte-owned properties panel) and gated on
-  // reading being shown — a hidden render pane skips the DOM walk and
-  // catches up when reading is next entered (mode is a dependency).
+  // The daemon's render (the fallback) gets the chrome the client render
+  // draws itself: copy buttons on fences and quotes (the chat transcript's
+  // affordance, via the shared decorator), document-relative images, task
+  // marks, typeset equations, and the outline read off its headings. Scoped
+  // to the rendered article (never the editor subtree, nor the Svelte-owned
+  // properties panel) and gated on reading being shown — a hidden render
+  // pane skips the DOM walk and catches up when reading is next entered.
   let readingEl = $state<HTMLDivElement | null>(null);
   let articleEl = $state<HTMLElement | null>(null);
   $effect(() => {
     void html;
-    if (mode !== "reading") return;
+    if (mode !== "reading" || clientRender !== false) return;
     const content = articleEl;
     if (content === null) return;
     decorateCopyTargets(content);
     stampImages(content);
     markTasks(content);
-    typesetMath(content);
-    return cancelTypeset;
+    readingOutline = outlineOfRender(content);
+    const math = new MathTypesetter(() => {
+      if (readingEl !== null) markScrollRegions(readingEl, [[".md-math-display", null]]);
+    });
+    math.add(mathSpans([content]));
+    return () => math.stop();
   });
+
+  /** The outline of a daemon render: its headings, their ids and lines. */
+  function outlineOfRender(root: HTMLElement): OutlineItem[] {
+    const out: OutlineItem[] = [];
+    for (const h of root.querySelectorAll<HTMLElement>("h1, h2, h3, h4, h5, h6")) {
+      const line = parseSourcepos(h.getAttribute("data-sourcepos"))?.start ?? 0;
+      out.push({
+        level: Number(h.tagName.slice(1)),
+        text: (h.textContent ?? "").replace(/\s+/g, " ").trim(),
+        id: (h.id ?? "").replace(/^user-content-/, ""),
+        from: line,
+        line,
+      });
+    }
+    return out;
+  }
 
   /** Task items (`- [x]`) arrive as `span.md-task[data-task]` at the head of
    *  their item. The item drops its bullet (the box stands in for it, as in
@@ -476,23 +680,26 @@
   // (acceptReveal). On render, too: the request may predate the fetch.
   $effect(() => {
     void $revealRequest;
-    if (mode !== "reading" || html === null || readingEl === null) return;
+    void renderTick;
+    if (mode !== "reading" || !readingReady || readingEl === null) return;
     const req = takeReveal(path);
     if (req !== null) afterLayout(() => revealInReading(req));
   });
 
   // A link from another document (`this.md#heading`) left its anchor
   // pending for this path. Reading scrolls to the element; the editor
-  // modes map it to a line through the render and reveal that.
+  // modes map it to a line (through the buffer's own headings once the
+  // editor holds it) and reveal that.
   $effect(() => {
     void $anchorRequests;
+    void renderTick;
     if (mode === "reading") {
-      if (html === null || readingEl === null) return;
+      if (!readingReady || readingEl === null) return;
       const anchor = takeAnchor(path);
       if (anchor !== null) afterLayout(() => void toAnchorInReading(anchor));
     } else {
       const anchor = takeAnchor(path);
-      if (anchor !== null) void revealAnchorInSource(path, anchor);
+      if (anchor !== null) void revealAnchorInSource(path, anchor, untrack(() => editorText));
     }
   });
 
@@ -509,6 +716,7 @@
   const READING_SCROLLERS = [["table, pre > code, .md-math-display", null]] as const;
   $effect(() => {
     void html;
+    void renderTick;
     void bodyFont; // dep: A−/A+ reflows every scroller
     if (mode !== "reading") return;
     const scroll = readingEl;
@@ -523,88 +731,6 @@
     ];
     return () => stops.forEach((stop) => stop());
   });
-
-  /** Equations in a rendered document. The server emits each one — inline
-   *  `$…$`/`$$…$$`, a `$$` block, a ```math fence — as an escaped LaTeX
-   *  literal in `span[data-math-style]` (the one non-default attribute the
-   *  sanitizer keeps; blocks are promoted to comrak's math fence and its
-   *  `<pre><code>` rewritten to the same span, so this is the ONE seam) and the
-   *  client typesets it under the shared KaTeX policy (`shared/math`,
-   *  loaded on demand at the first equation, memoized). The pass is
-   *  idempotent (a typeset span carries `.md-math`; a fresh server render
-   *  brings fresh spans) and time-sliced: lecture notes with thousands of
-   *  equations typeset their first screen synchronously and the rest at
-   *  idle, so a refresh mid agent-rewrite can't stall the workbench. */
-  type MathModule = typeof import("../shared/math");
-  let typesetJob: { cancelled: boolean; handle: number | null; idle: boolean } | null = null;
-
-  function cancelTypeset(): void {
-    const job = typesetJob;
-    if (job === null) return;
-    job.cancelled = true;
-    if (job.handle !== null) {
-      if (job.idle) cancelIdleCallback(job.handle);
-      else clearTimeout(job.handle);
-    }
-    typesetJob = null;
-  }
-
-  /** Past this, a "source" is not an equation but a document — an unclosed
-   *  ```math fence runs to the end of the file by CommonMark's rules — and
-   *  one KaTeX job over it would stall the workbench for seconds. It stays
-   *  readable text (live shows the same shape as mono source). */
-  const MAX_MATH_SOURCE = 16 * 1024;
-
-  function typesetSpan(span: HTMLElement, math: MathModule): void {
-    if (!span.isConnected || span.classList.contains("md-math")) return;
-    const display = span.dataset.mathStyle === "display";
-    const source = span.textContent ?? "";
-    span.classList.add("md-math");
-    // `$$ $$` has nothing to typeset, as in live.
-    if (source.trim().length === 0 || source.length > MAX_MATH_SOURCE) return;
-    if (display) span.classList.add("md-math-display");
-    span.innerHTML = math.safeMathHtml(source, display);
-  }
-
-  function typesetMath(root: HTMLElement): void {
-    cancelTypeset();
-    const spans = Array.from(
-      root.querySelectorAll<HTMLElement>("span[data-math-style]:not(.md-math)"),
-    );
-    if (spans.length === 0) return;
-    const job = { cancelled: false, handle: null as number | null, idle: false };
-    typesetJob = job;
-    let i = 0;
-    const slice = (math: MathModule): void => {
-      if (job.cancelled) return;
-      job.handle = null;
-      const deadline = performance.now() + 8;
-      while (i < spans.length && performance.now() < deadline) typesetSpan(spans[i++], math);
-      // The equations this slice just laid out: a wide one is a scroller
-      // that didn't exist when the reading view was marked, and no box the
-      // width watcher sees changes when it appears.
-      markScrollRegions(root, [[".md-math-display", null]]);
-      if (i >= spans.length) {
-        typesetJob = null;
-        return;
-      }
-      // WKWebView (the native app) has no requestIdleCallback: a short
-      // timeout stands in — the chat's path-stamping fallback.
-      if (typeof requestIdleCallback === "function") {
-        job.idle = true;
-        job.handle = requestIdleCallback(() => slice(math), { timeout: 500 });
-      } else {
-        job.idle = false;
-        job.handle = window.setTimeout(() => slice(math), 16);
-      }
-    };
-    const math = mathNow();
-    if (math !== null) slice(math);
-    else
-      void loadMath().then(slice, () => {
-        // KaTeX failed to load: the LaTeX literals stay readable as text.
-      });
-  }
 
   /** `![](figs/plot.png)` in a document: the rendered src is relative, which
    *  the browser would resolve against the APP origin (a guaranteed 404).
@@ -696,15 +822,20 @@
     e.preventDefault();
     const x = e.clientX;
     const y = e.clientY;
-    void followDocHref(href, split, {
-      docPath: path,
-      ...linkContext(),
-      toAnchor: toAnchorInReading,
-      toLines: revealInReading,
-      hint: (text) => {
-        if (contentEl !== null) showLinkHint(contentEl, x, y, text);
+    void followDocHref(
+      href,
+      split,
+      {
+        docPath: path,
+        ...linkContext(),
+        toAnchor: toAnchorInReading,
+        toLines: revealInReading,
+        hint: (text) => {
+          if (contentEl !== null) showLinkHint(contentEl, x, y, text);
+        },
       },
-    });
+      { byName: anchor.hasAttribute("data-wikilink") },
+    );
   }
 
   function onLinkContextMenu(e: MouseEvent): void {
@@ -834,7 +965,220 @@
     };
   });
 
+  // --- outline ---------------------------------------------------------------------
+  // The headings of the document in every mode: reading reads them off its
+  // render, live and source off the editor's own syntax tree (with the ids
+  // the reading view gives them). The current one follows the scroll; a
+  // click jumps — reading scrolls to the heading, the editor scrolls its
+  // line to the top without moving the cursor.
+
+  interface OutlineItem {
+    level: number;
+    text: string;
+    /** The anchor, unprefixed. */
+    id: string;
+    /** Source offset (editor) — the reading render's line for a daemon render. */
+    from: number;
+    line: number;
+  }
+
+  let outlineOpen = $state(readFlag(OUTLINE_KEY));
+  let readingOutline = $state.raw<OutlineItem[]>([]);
+  let liveOutline = $state.raw<OutlineItem[]>([]);
+  let currentHeading = $state(-1);
+  const outline = $derived(mode === "reading" ? readingOutline : liveOutline);
+  /** Indentation starts at the shallowest level present. */
+  const outlineBase = $derived(outline.reduce((m, h) => Math.min(m, h.level), 6));
+
+  function toggleOutline(): void {
+    outlineOpen = !outlineOpen;
+    writeFlag(OUTLINE_KEY, outlineOpen);
+  }
+
+  /** The heading the reading pane's top sits in: the last one at or above
+   *  the line a jump lands headings on (`scrollToEl`), so a click and the
+   *  scroll agree — document order is geometric order, so a binary search
+   *  over the headings' rects. Scrolled to the end, the last heading in
+   *  view wins: a short final section never reaches the top. */
+  function headingAtTop(root: HTMLElement, items: readonly OutlineItem[]): number {
+    const box = root.getBoundingClientRect();
+    const atEnd = root.scrollTop + root.clientHeight >= root.scrollHeight - 2 && root.scrollTop > 0;
+    const top = atEnd ? box.bottom - 24 : box.top + Math.min(72, root.clientHeight / 4) + 8;
+    const rectTop = (i: number): number =>
+      findAnchor(root, items[i].id)?.getBoundingClientRect().top ?? Infinity;
+    let lo = 0;
+    let hi = items.length - 1;
+    let found = -1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (rectTop(mid) <= top) {
+        found = mid;
+        lo = mid + 1;
+      } else {
+        hi = mid - 1;
+      }
+    }
+    return found;
+  }
+
+  $effect(() => {
+    if (!outlineOpen || mode !== "reading") return;
+    const root = readingEl;
+    const items = readingOutline;
+    void renderTick;
+    if (root === null) return;
+    let frame = 0;
+    const measure = (): void => {
+      frame = 0;
+      currentHeading = headingAtTop(root, items);
+    };
+    const onScroll = (): void => {
+      if (frame === 0) frame = requestAnimationFrame(measure);
+    };
+    measure();
+    root.addEventListener("scroll", onScroll, { passive: true });
+    return () => {
+      root.removeEventListener("scroll", onScroll);
+      if (frame !== 0) cancelAnimationFrame(frame);
+    };
+  });
+
+  // The editor behind live/source, found from its DOM once CodeView has
+  // mounted it (a few frames after the layer appears).
+  let editLayerEl = $state<HTMLDivElement | null>(null);
+  let liveView = $state.raw<EditorView | null>(null);
+  $effect(() => {
+    const layer = editLayerEl;
+    const live = liveMod;
+    void CodeView;
+    liveView = null;
+    if (layer === null || live === null || !outlineOpen) return;
+    let tries = 0;
+    let frame = 0;
+    const find = (): void => {
+      frame = 0;
+      const view = live.editorIn(layer);
+      if (view !== null) liveView = view;
+      else if (++tries < 120) frame = requestAnimationFrame(find);
+    };
+    find();
+    return () => {
+      if (frame !== 0) cancelAnimationFrame(frame);
+    };
+  });
+
+  // Live/source: the outline follows the buffer (settled, not per key).
+  $effect(() => {
+    void docText;
+    const view = liveView;
+    const live = liveMod;
+    if (!outlineOpen || mode === "reading" || view === null || live === null) return;
+    const read = (): void => {
+      const doc = view.state.doc;
+      liveOutline = live.editorOutline(view).map((h) => ({ ...h, line: doc.lineAt(h.from).number }));
+    };
+    if (untrack(() => liveOutline.length === 0)) {
+      read();
+      return;
+    }
+    const timer = setTimeout(read, 150);
+    return () => clearTimeout(timer);
+  });
+
+  $effect(() => {
+    const view = liveView;
+    const live = liveMod;
+    const items = liveOutline;
+    if (!outlineOpen || mode === "reading" || view === null || live === null) return;
+    let frame = 0;
+    const measure = (): void => {
+      frame = 0;
+      const top = live.editorTopPos(view);
+      let found = -1;
+      for (let i = 0; i < items.length && items[i].from <= top; i++) found = i;
+      currentHeading = found;
+    };
+    const onScroll = (): void => {
+      if (frame === 0) frame = requestAnimationFrame(measure);
+    };
+    measure();
+    view.scrollDOM.addEventListener("scroll", onScroll, { passive: true });
+    return () => {
+      view.scrollDOM.removeEventListener("scroll", onScroll);
+      if (frame !== 0) cancelAnimationFrame(frame);
+    };
+  });
+
+  function jumpTo(i: number): void {
+    const item = outline[i];
+    if (item === undefined) return;
+    if (mode === "reading") {
+      toAnchorInReading(item.id);
+    } else if (liveView !== null && liveMod !== null) {
+      liveMod.scrollEditorTo(liveView, item.from);
+    }
+    currentHeading = i;
+  }
 </script>
+
+<!-- The frontmatter as properties: a sibling of the article, never inside
+     it (the fallback's raw-HTML range owns the article's first and last
+     nodes — readingWindow's boundary rule; the client article is the
+     reader's alone). Every value is text-interpolated; the file's YAML is
+     never markup. -->
+{#snippet properties(fm: string)}
+  <section
+    class="md-props"
+    class:collapsed={propsCollapsed}
+    style:font-size="{bodyFont}px"
+    data-sourcepos={fmSourcepos}
+    aria-label="properties"
+  >
+    <button
+      type="button"
+      class="md-props-head"
+      aria-expanded={!propsCollapsed}
+      onclick={toggleProps}
+    >
+      <Chevron open={!propsCollapsed} size={10} />
+      <span>properties</span>
+      {#if fmEntries !== null}<span class="md-props-count">{fmEntries.length}</span>{/if}
+    </button>
+    {#if !propsCollapsed}
+      {#if fmEntries !== null && fmEntries.length > 0}
+        <dl class="md-props-list">
+          {#each fmEntries as prop, i (i)}
+            <dt>{prop.key}</dt>
+            <dd>
+              {#if prop.value.kind === "list"}
+                {#each prop.value.items as item, j (j)}
+                  <span class="md-prop-chip">{item}</span>
+                {:else}
+                  <span class="md-prop-empty">—</span>
+                {/each}
+              {:else if prop.value.kind === "bool"}
+                <span
+                  class="md-task"
+                  data-task={prop.value.value ? "done" : "todo"}
+                  role="img"
+                  aria-label={prop.value.value ? "true" : "false"}
+                ></span>
+              {:else if prop.value.kind === "raw"}
+                <pre class="md-prop-raw">{prop.value.text}</pre>
+              {:else if prop.value.text === ""}
+                <span class="md-prop-empty">—</span>
+              {:else}
+                <span class="md-prop-text">{prop.value.text}</span>
+              {/if}
+            </dd>
+          {/each}
+        </dl>
+      {:else}
+        <pre class="md-props-raw">{stripFences(fm)}</pre>
+      {/if}
+    {/if}
+  </section>
+{/snippet}
 
 <div class="md-view" style:--markdown-line-height={bodyLineHeight}>
   <div class="md-bar">
@@ -871,147 +1215,141 @@
     {:else if barNote !== null}
       <span class="md-bar-note">{barNote}</span>
     {/if}
+    <span class="md-bar-fill"></span>
     <DocIssues {path} {wsRoot} mtime={entry?.mtime ?? null} />
+    <button
+      class="seg"
+      class:on={outlineOpen}
+      aria-pressed={outlineOpen}
+      title="headings of this document"
+      onclick={toggleOutline}>outline</button
+    >
   </div>
 
-  <!-- Delegated link handling: the interactive targets are the rendered
-       document's own <a> elements, which are already focusable and fire a
-       native click on Enter that bubbles here — so keyboard access needs no
-       separate handler on the container. -->
-  <!-- svelte-ignore a11y_no_static_element_interactions -->
-  <!-- svelte-ignore a11y_click_events_have_key_events -->
-  <div
-    class="md-content"
-    bind:this={contentEl}
-    onclick={onLinkClick}
-    onauxclick={onLinkAuxClick}
-    oncontextmenu={onLinkContextMenu}
-  >
-    {#if mode === "reading" && chipPos !== null}
-      <ReferenceChip x={chipPos.x} y={chipPos.y} />
-    {/if}
-
-    <!-- Authoritative server render (comrak). Shown in reading mode; kept in
-         the DOM (just hidden) so re-entering reading needs no re-render.
-         Focusable so keyboard scrolling works in WKWebView (Safari never
-         auto-focuses scrollers), named after the file for the landmark list. -->
-    <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+  <div class="md-main">
+    <!-- Delegated link handling: the interactive targets are the rendered
+         document's own <a> elements, which are already focusable and fire a
+         native click on Enter that bubbles here — so keyboard access needs
+         no separate handler on the container. -->
+    <!-- svelte-ignore a11y_no_static_element_interactions -->
+    <!-- svelte-ignore a11y_click_events_have_key_events -->
     <div
-      class="md-scroll"
-      class:hidden={mode !== "reading"}
-      role="region"
-      aria-label={fileLabel}
-      tabindex="0"
-      bind:this={readingEl}
+      class="md-content"
+      bind:this={contentEl}
+      onclick={onLinkClick}
+      onauxclick={onLinkAuxClick}
+      oncontextmenu={onLinkContextMenu}
     >
-      {#if error !== null}
-        <div class="file-error">{error}</div>
-      {:else if html !== null}
-        {#if frontmatter !== null}
-          <!-- The frontmatter as properties: a sibling of the article, never
-               inside it (the raw-HTML range owns the article's first and
-               last nodes — readingWindow's boundary rule). Every value is
-               text-interpolated; the file's YAML is never markup. -->
-          <section
-            class="md-props"
-            class:collapsed={propsCollapsed}
-            style:font-size="{bodyFont}px"
-            data-sourcepos={fmSourcepos}
-            aria-label="properties"
-          >
-            <button
-              type="button"
-              class="md-props-head"
-              aria-expanded={!propsCollapsed}
-              onclick={toggleProps}
-            >
-              <Chevron open={!propsCollapsed} size={10} />
-              <span>properties</span>
-              {#if fmEntries !== null}<span class="md-props-count">{fmEntries.length}</span>{/if}
-            </button>
-            {#if !propsCollapsed}
-              {#if fmEntries !== null && fmEntries.length > 0}
-                <dl class="md-props-list">
-                  {#each fmEntries as prop, i (i)}
-                    <dt>{prop.key}</dt>
-                    <dd>
-                      {#if prop.value.kind === "list"}
-                        {#each prop.value.items as item, j (j)}
-                          <span class="md-prop-chip">{item}</span>
-                        {:else}
-                          <span class="md-prop-empty">—</span>
-                        {/each}
-                      {:else if prop.value.kind === "bool"}
-                        <span
-                          class="md-task"
-                          data-task={prop.value.value ? "done" : "todo"}
-                          role="img"
-                          aria-label={prop.value.value ? "true" : "false"}
-                        ></span>
-                      {:else if prop.value.kind === "raw"}
-                        <pre class="md-prop-raw">{prop.value.text}</pre>
-                      {:else if prop.value.text === ""}
-                        <span class="md-prop-empty">—</span>
-                      {:else}
-                        <span class="md-prop-text">{prop.value.text}</span>
-                      {/if}
-                    </dd>
-                  {/each}
-                </dl>
-              {:else}
-                <pre class="md-props-raw">{stripFences(frontmatter)}</pre>
-              {/if}
-            {/if}
-          </section>
-        {/if}
-        <article
-          class="md-body"
-          class:after-props={frontmatter !== null}
-          style:font-size="{bodyFont}px"
-          bind:this={articleEl}
-          use:readingWindow={[html, bodyFont, bodyLineHeight]}
-        >
-          <!-- eslint-disable-next-line svelte/no-at-html-tags — sanitized server-side -->
-          {@html html}
-        </article>
-      {:else}
-        <Spinner />
+      {#if mode === "reading" && chipPos !== null}
+        <ReferenceChip x={chipPos.x} y={chipPos.y} />
       {/if}
-    </div>
 
-    <!-- The one editor (live preview ⇄ raw source via the extra-extension
-         swap). Mounts on the first live/source entry and then persists,
-         CSS-hidden in reading, so no toggle drops the buffer. The prose size
-         rides CSS variables so an A−/A+ resize never reconfigures the editor
-         (the live theme is static — see mdLive). -->
-    {#if entered && chunk !== null}
-      {@const first = chunk}
+      <!-- The rendered document. Shown in reading mode; kept in the DOM
+           (just hidden) so re-entering reading re-renders only what changed.
+           Focusable so keyboard scrolling works in WKWebView (Safari never
+           auto-focuses scrollers), named after the file for the landmark
+           list. -->
+      <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
       <div
-        class="edit-layer"
-        class:hidden={mode === "reading"}
-        style:--lp-font-size="{bodyFont}px"
-        style:--lp-line-height={bodyLineHeight}
+        class="md-scroll"
+        class:hidden={mode !== "reading"}
+        role="region"
+        aria-label={fileLabel}
+        tabindex="0"
+        bind:this={readingEl}
       >
-        {#if CodeView !== null}
-          <CodeView
-            {path}
-            {first}
-            {extra}
-            autoLanguage={false}
-            acceptReveal={mode !== "reading"}
-          />
-        {:else if codeLoadError !== null}
-          <div class="file-error">{codeLoadError}</div>
+        {#if clientRender === true}
+          {#if frontmatter !== null}{@render properties(frontmatter)}{/if}
+          <!-- The client render: the reader owns every child. -->
+          <article
+            class="md-body"
+            class:after-props={frontmatter !== null}
+            style:font-size="{bodyFont}px"
+            bind:this={clientArticle}
+          ></article>
+          {#if renderTick === 0}
+            <Spinner />
+          {/if}
+        {:else if clientRender === false && error !== null}
+          <div class="file-error">{error}</div>
+        {:else if clientRender === false && html !== null}
+          {#if frontmatter !== null}{@render properties(frontmatter)}{/if}
+          <!-- The daemon's render (the fallback), sanitized server-side. -->
+          <article
+            class="md-body"
+            class:after-props={frontmatter !== null}
+            style:font-size="{bodyFont}px"
+            bind:this={articleEl}
+            use:readingWindow={[html, bodyFont, bodyLineHeight]}
+          >
+            <!-- eslint-disable-next-line svelte/no-at-html-tags — sanitized server-side -->
+            {@html html}
+          </article>
         {:else}
           <Spinner />
         {/if}
       </div>
-    {:else if mode !== "reading"}
-      <!-- The source is still on its way in (openDefault's first fetch); a
-           fetch failure lands in reading, so this is only ever a wait. -->
-      <div class="md-scroll">
-        <Spinner />
-      </div>
+
+      <!-- The one editor (live preview ⇄ raw source via the extra-extension
+           swap). Mounts on the first live/source entry and then persists,
+           CSS-hidden in reading, so no toggle drops the buffer. The prose
+           size rides CSS variables so an A−/A+ resize never reconfigures the
+           editor (the live theme is static — see mdLive). -->
+      {#if entered && chunk !== null}
+        {@const first = chunk}
+        <div
+          class="edit-layer"
+          class:hidden={mode === "reading"}
+          style:--lp-font-size="{bodyFont}px"
+          style:--lp-line-height={bodyLineHeight}
+          bind:this={editLayerEl}
+        >
+          {#if CodeView !== null}
+            <CodeView
+              {path}
+              {first}
+              {extra}
+              autoLanguage={false}
+              acceptReveal={mode !== "reading"}
+              onDoc={(text: string) => (editorText = text)}
+            />
+          {:else if codeLoadError !== null}
+            <div class="file-error">{codeLoadError}</div>
+          {:else}
+            <Spinner />
+          {/if}
+        </div>
+      {:else if mode !== "reading"}
+        <!-- The source is still on its way in (openDefault's first fetch); a
+             fetch failure lands in reading, so this is only ever a wait. -->
+        <div class="md-scroll">
+          <Spinner />
+        </div>
+      {/if}
+    </div>
+
+    {#if outlineOpen}
+      <nav class="md-outline" aria-label="outline">
+        {#if outline.length === 0}
+          <p class="md-outline-empty">no headings</p>
+        {:else}
+          <ul>
+            {#each outline as item, i (item.from)}
+              <li>
+                <button
+                  type="button"
+                  class="md-outline-item"
+                  class:current={i === currentHeading}
+                  aria-current={i === currentHeading ? "location" : undefined}
+                  title={item.text}
+                  style:padding-left="{0.7 + (item.level - outlineBase) * 0.85}em"
+                  onclick={() => jumpTo(i)}>{item.text === "" ? "(untitled)" : item.text}</button
+                >
+              </li>
+            {/each}
+          </ul>
+        {/if}
+      </nav>
     {/if}
   </div>
 </div>
@@ -1081,10 +1419,74 @@
     color: var(--muted);
   }
 
+  .md-bar-fill {
+    flex: 1;
+  }
+
+  /* The document and, when open, the outline beside it. */
+  .md-main {
+    flex: 1;
+    display: flex;
+    min-height: 0;
+  }
+
   .md-content {
     flex: 1;
     position: relative;
-    min-height: 0;
+    min-width: 0;
+  }
+
+  .md-outline {
+    flex: none;
+    width: 15rem;
+    max-width: 40%;
+    overflow-y: auto;
+    scrollbar-width: thin;
+    border-left: 1px solid var(--edge);
+    padding: 0.55rem 0;
+    font-size: var(--text-sm);
+  }
+
+  .md-outline ul {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+  }
+
+  .md-outline-item {
+    appearance: none;
+    display: block;
+    width: 100%;
+    border: none;
+    border-left: 2px solid transparent;
+    background: none;
+    font: inherit;
+    text-align: left;
+    color: var(--muted);
+    padding-top: 0.2rem;
+    padding-bottom: 0.2rem;
+    padding-right: 0.7rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    cursor: pointer;
+  }
+
+  .md-outline-item:hover {
+    color: var(--fg);
+    background: var(--row-hover);
+  }
+
+  .md-outline-item.current {
+    color: var(--fg);
+    border-left-color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 8%, transparent);
+  }
+
+  .md-outline-empty {
+    margin: 0;
+    padding: 0.2rem 0.8rem;
+    color: var(--muted);
   }
 
   .md-scroll {
@@ -1609,6 +2011,44 @@
 
   .md-body :global(img) {
     max-width: 100%;
+  }
+
+  /* A wikilink reads as a link with a quieter, dotted rule: it resolves by
+     name (docLinks), so it may land somewhere a path link wouldn't. */
+  .md-body :global(a.wikilink) {
+    text-decoration: underline dotted color-mix(in srgb, var(--accent) 55%, transparent);
+    text-underline-offset: 0.18em;
+  }
+
+  /* Mermaid: the laid-out diagram, centered and never wider than the
+     column (a wide one scrolls); the source shows while it lays out and,
+     with the parser's message, when it can't. */
+  .md-body :global(.md-mermaid) {
+    margin: 0.9em 0;
+  }
+
+  .md-body :global(.md-mermaid-svg) {
+    overflow-x: auto;
+    scrollbar-width: thin;
+  }
+
+  .md-body :global(.md-mermaid-svg svg) {
+    display: block;
+    max-width: 100%;
+    height: auto;
+    margin: 0 auto;
+  }
+
+  /* The parser's message keeps its lines: its caret points into the one
+     above it. */
+  .md-body :global(.md-mermaid-note) {
+    margin: 0 0 0.4em;
+    font-family: var(--mono);
+    font-size: 0.76em;
+    line-height: 1.45;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    color: var(--err);
   }
 
   .md-body :global(input[type="checkbox"]) {
