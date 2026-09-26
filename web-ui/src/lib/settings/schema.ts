@@ -519,9 +519,9 @@ const DEFS = {
     title: "Markdown Default Mode",
     category: "Editor",
     description:
-      "How a Markdown file opens the first time: the rendered reading view, the editable live preview, or raw source. After that, each file reopens in the mode you last picked.",
+      "How a Markdown file opens the first time: live (the rendered document you can type in — only the block you are editing shows as source), the read-only reading view, or raw source. After that, each file reopens in the mode you last picked.",
     type: "enum",
-    default: "reading",
+    default: "live",
     options: [
       { value: "reading", label: "Reading" },
       { value: "live", label: "Live" },
