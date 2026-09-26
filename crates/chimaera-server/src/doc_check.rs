@@ -44,10 +44,13 @@ const MAX_TARGET_STATS: usize = 200;
 /// for `#L` fragments), each at most [`MAX_TARGET_READ_BYTES`].
 const MAX_TARGET_READS: usize = 20;
 const MAX_TARGET_READ_BYTES: u64 = 2 * 1024 * 1024;
-/// Directory listings read to suggest a fix for a broken link (case
-/// mismatches), each capped at [`MAX_SUGGEST_ENTRIES`] names.
-const MAX_SUGGEST_SCANS: usize = 20;
-const MAX_SUGGEST_ENTRIES: usize = 1000;
+/// Directory listings read per check, each capped at [`MAX_LISTING_ENTRIES`]
+/// names, cached per directory. They catch the case mismatches: a link that
+/// resolves on a case-insensitive filesystem (macOS, Windows), where an agent
+/// often writes, but not on the Linux hosts or GitHub where the document is
+/// read; and they name the real file when a link is broken.
+const MAX_DIR_LISTINGS: usize = 50;
+const MAX_LISTING_ENTRIES: usize = 1000;
 /// Embeds larger than this are slow to load remotely and heavy on GitHub.
 const LARGE_EMBED_BYTES: u64 = 10 * 1024 * 1024;
 /// Wall-clock budget for the target stats and reads of one check: targets
@@ -361,6 +364,14 @@ enum Spelling {
     Absolute,
 }
 
+/// The names in one directory, read once per check.
+struct Listing {
+    names: HashSet<String>,
+    /// False when the read stopped at [`MAX_LISTING_ENTRIES`]: a name absent
+    /// from a partial listing proves nothing.
+    complete: bool,
+}
+
 struct Checker<'a> {
     doc: &'a Path,
     doc_dir: PathBuf,
@@ -369,7 +380,8 @@ struct Checker<'a> {
     truncated: bool,
     stats: HashMap<PathBuf, Option<Meta>>,
     reads: HashMap<PathBuf, Option<Facts>>,
-    suggest_scans: usize,
+    /// Directory listings (`None` = unreadable), at most [`MAX_DIR_LISTINGS`].
+    listings: HashMap<PathBuf, Option<Listing>>,
     unchecked: usize,
     first_unchecked_line: usize,
     checked_targets: usize,
@@ -396,7 +408,7 @@ pub(crate) fn check_text(text: &str, doc: &Path, root: Option<&Path>) -> Report 
         truncated: false,
         stats: HashMap::new(),
         reads: HashMap::new(),
-        suggest_scans: 0,
+        listings: HashMap::new(),
         unchecked: 0,
         first_unchecked_line: 0,
         checked_targets: 0,
@@ -1011,14 +1023,24 @@ impl Checker<'_> {
                 spelling = Spelling::Absolute;
             }
         }
+        // Where the written components start, for the case walk.
+        let base = match spelling {
+            Spelling::Relative => Some(self.doc_dir.clone()),
+            Spelling::RootRelative => self.root.map(Path::to_path_buf),
+            Spelling::Absolute => None,
+        };
         match stat {
             Stat::Unchecked => self.note_unchecked(t.line),
             Stat::Missing => {
                 self.checked_targets += 1;
-                self.broken(t, url, &decoded, &resolved, spelling);
+                self.broken(t, url, &decoded, &resolved, spelling, base.as_deref());
             }
             Stat::Found(meta) => {
                 self.checked_targets += 1;
+                if let Some(real) = base.and_then(|b| self.case_mismatch(&b, &decoded)) {
+                    self.broken_by_case(t, url, &resolved, &real);
+                    return;
+                }
                 if spelling == Spelling::Absolute {
                     self.absolute_path(t, url, Some(&resolved));
                 }
@@ -1081,15 +1103,16 @@ impl Checker<'_> {
         decoded: &str,
         resolved: &Path,
         spelling: Spelling,
+        base: Option<&Path>,
     ) {
         let embed = t.kind == TargetKind::Embed;
-        let mut fix = None;
-        if let Some(found) = self.case_variant(resolved) {
-            let rel = encode_spaces(&relative_to(&self.doc_dir, &found));
-            fix = Some(format!(
-                "Paths are case-sensitive: the file on disk is `{rel}`; link that."
-            ));
-        }
+        // The real spelling when only case is wrong: every written component
+        // from `base`, or the last one of an absolute path.
+        let real = match base {
+            Some(base) => self.case_mismatch(base, decoded),
+            None => self.case_variant(resolved),
+        };
+        let mut fix = real.map(|real| self.case_fix(&real));
         if fix.is_none() && spelling == Spelling::Relative {
             if let Some(root) = self.root {
                 let from_root = normalize(&root.join(decoded));
@@ -1141,24 +1164,101 @@ impl Checker<'_> {
             .to_string()
     }
 
+    /// A link that exists only because this filesystem ignores case. Reported
+    /// like a missing file: it is one on a case-sensitive host and on GitHub.
+    fn broken_by_case(&mut self, t: &Target, url: &str, resolved: &Path, real: &Path) {
+        let embed = t.kind == TargetKind::Embed;
+        let fix = self.case_fix(real);
+        self.push(
+            t.line,
+            Severity::Error,
+            if embed { "broken-embed" } else { "broken-link" },
+            format!(
+                "{} `{url}` points at `{}`, which exists here only because this filesystem \
+                 ignores case; on a case-sensitive host (Linux, GitHub) it does not exist.",
+                if embed { "Embed" } else { "Link" },
+                self.shown(resolved)
+            ),
+            fix,
+        );
+    }
+
+    fn case_fix(&self, real: &Path) -> String {
+        let rel = encode_spaces(&relative_to(&self.doc_dir, real));
+        format!("Paths are case-sensitive: the file on disk is `{rel}`; link that.")
+    }
+
+    /// Walk the components an author wrote from `base`, each against its
+    /// directory's listing. `Some(real)` when a component matched only by
+    /// case: the path spelled as it is on disk. `None` when every component
+    /// is spelled right, or when a listing is unavailable (unreadable,
+    /// truncated, over budget) — a finding needs proof, not a guess.
+    fn case_mismatch(&mut self, base: &Path, written: &str) -> Option<PathBuf> {
+        let mut real = base.to_path_buf();
+        let mut mismatched = false;
+        for component in written.split('/') {
+            match component {
+                "" | "." => {}
+                ".." => real = real.parent()?.to_path_buf(),
+                name => {
+                    let listing = self.listing(&real)?;
+                    if listing.names.contains(name) {
+                        real.push(name);
+                        continue;
+                    }
+                    if !listing.complete {
+                        return None;
+                    }
+                    let variant = Self::case_insensitive(listing, name)?.to_string();
+                    real.push(variant);
+                    mismatched = true;
+                }
+            }
+        }
+        mismatched.then_some(real)
+    }
+
     /// A sibling whose name differs from `path`'s only in case.
     fn case_variant(&mut self, path: &Path) -> Option<PathBuf> {
         let parent = path.parent()?;
-        let name = path.file_name()?.to_str()?.to_lowercase();
-        if self.suggest_scans >= MAX_SUGGEST_SCANS || Instant::now() >= self.deadline {
-            return None;
+        let name = path.file_name()?.to_str()?;
+        let variant = Self::case_insensitive(self.listing(parent)?, name)?;
+        Some(parent.join(variant))
+    }
+
+    fn case_insensitive<'l>(listing: &'l Listing, name: &str) -> Option<&'l str> {
+        let lower = name.to_lowercase();
+        listing
+            .names
+            .iter()
+            .find(|n| n.to_lowercase() == lower)
+            .map(String::as_str)
+    }
+
+    /// `dir`'s listing, read once (bounded by count, entries and budget).
+    /// `None` when unavailable — the caller then has nothing to prove with.
+    fn listing(&mut self, dir: &Path) -> Option<&Listing> {
+        if !self.listings.contains_key(dir) {
+            if self.listings.len() >= MAX_DIR_LISTINGS || Instant::now() >= self.deadline {
+                return None;
+            }
+            let listing = std::fs::read_dir(dir).ok().map(|entries| {
+                let mut names = HashSet::new();
+                let mut complete = true;
+                for entry in entries.filter_map(Result::ok) {
+                    if names.len() >= MAX_LISTING_ENTRIES {
+                        complete = false;
+                        break;
+                    }
+                    if let Some(name) = entry.file_name().to_str() {
+                        names.insert(name.to_string());
+                    }
+                }
+                Listing { names, complete }
+            });
+            self.listings.insert(dir.to_path_buf(), listing);
         }
-        self.suggest_scans += 1;
-        std::fs::read_dir(parent)
-            .ok()?
-            .take(MAX_SUGGEST_ENTRIES)
-            .filter_map(Result::ok)
-            .find(|e| {
-                e.file_name()
-                    .to_str()
-                    .is_some_and(|n| n.to_lowercase() == name)
-            })
-            .map(|e| e.path())
+        self.listings.get(dir).and_then(Option::as_ref)
     }
 
     fn check_own_fragment(&mut self, t: &Target, fragment: &str) {
