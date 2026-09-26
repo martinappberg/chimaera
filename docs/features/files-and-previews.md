@@ -185,15 +185,24 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   the merge. When both copies exist with different text the newer wins by the writers' own
   clocks (each PUT carries the client's `updated_ms`, answered back as `client_updated_ms`), not
   the daemon's arrival stamp, which runs on another machine's clock; a mirror copy from an older
-  client falls back to that stamp. A save of exactly that text, or a discard, clears both copies; mirror writes for a
-  path land in issue order, so a late journal write never re-creates a cleared draft. A
-  hide/pagehide flush sends drafts as keepalive requests only within a shared 56 KiB budget of
+  client falls back to that stamp. A save of exactly that text, or a discard, clears both
+  copies — but only the record this window wrote (each carries a per-page `writer` id; the
+  mirror's `DELETE ?writer=` spares another window's) or one holding exactly the saved or
+  discarded text, so one window's save never drops another window's draft of the same file.
+  Mirror writes for a path land in issue order, so a late journal write never re-creates a
+  cleared draft. A hide/pagehide flush re-journals every dirty buffer even when its text is
+  unchanged (another window may have overwritten the path's one record) and sends drafts as
+  keepalive requests only within a shared 56 KiB budget of
   encoded body bytes (the browser's keepalive quota); the rest go as normal requests, with the
   IndexedDB copy regardless. A journal that failed
   everywhere shows "draft not backed up" in the status bar. Older daemons without the routes fall
   back to IndexedDB only.
 - **Other windows.** Same-origin windows announce dirty paths over a `BroadcastChannel`; a window
-  showing a file another one holds unsaved shows "Unsaved edits in another window".
+  showing a file another one holds unsaved shows "Unsaved edits in another window", and does not
+  offer that window's live draft as a recovery. A window holding unsaved edits re-announces them
+  every 10 s (60 s while hidden, the browser's own throttled pace); peers forget a window silent
+  for 30 s (3 min if it said it was hidden), so one that crashed without its goodbye stops hiding
+  its draft from recovery. Nothing beats while a window holds no unsaved edits.
 - **Key behaviors.** Read chunk cap 2 MB (default 256 KB); PUT body cap 1 MB (editing is for small
   text files — 413 over). Writes go through a hidden tmp sibling + rename, keep the original
   mode, and call `git::mark_path_dirty` so the git panel refreshes without polling. Gzip

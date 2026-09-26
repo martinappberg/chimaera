@@ -817,19 +817,22 @@ export class Buffer {
     }
   }
 
-  /** The buffer matches the disk: its journal has nothing left to protect. */
+  /** The buffer matches the disk: its journal has nothing left to protect
+   *  (this window's draft, or anyone's holding exactly the disk text). */
   private afterClean(): void {
-    this.clearDraft(this.path);
+    this.clearDraft(this.path, { writer: drafts.WRITER, text: this.baseText });
     this.maybeDispose();
   }
 
-  /** Drop `path`'s journaled draft; a journal write still in flight then
-   *  never marks its text journaled (drafts.ts orders the mirror ops), and
-   *  edits still unsaved here are journaled afresh after the clear. */
-  private clearDraft(path: string): void {
+  /** Drop `path`'s journaled draft — by default only the one this window
+   *  wrote: another window of this origin may hold the same file dirty under
+   *  the same key. A journal write still in flight then never marks its text
+   *  journaled (drafts.ts orders the mirror ops), and edits still unsaved
+   *  here are journaled afresh after the clear. */
+  private clearDraft(path: string, match: drafts.DraftMatch = { writer: drafts.WRITER }): void {
     this.journalEpoch++;
     this.journaledText = null;
-    void drafts.clear(path);
+    void drafts.clear(path, match);
     if (this.dirty && path === this.path) this.scheduleJournal();
   }
 
@@ -871,7 +874,10 @@ export class Buffer {
     this.journalTimer = null;
     if (!this.dirty || this.disposed) return;
     const text = this.current.doc.toString();
-    if (text === this.journaledText) return;
+    // The hide/pagehide flush writes even unchanged text: another window of
+    // this origin may have overwritten the path's one record since, and this
+    // page may not come back.
+    if (text === this.journaledText && !keepalive) return;
     const epoch = ++this.journalEpoch;
     const r = await drafts.journal(
       {
@@ -896,11 +902,12 @@ export class Buffer {
     const rec = await drafts.find(this.path);
     if (rec === null || this.disposed) return;
     if (rec.text === this.baseText) {
-      this.clearDraft(this.path); // nothing to recover
+      // Nothing to recover: drop that record, whoever wrote it.
+      this.clearDraft(this.path, { writer: rec.writer, text: rec.text });
       return;
     }
     // Live in another window of this origin, not lost: that window owns it.
-    if (presence.elsewhere.has(this.path)) return;
+    if (presence.heldElsewhere(this.path)) return;
     if (rec.text === this.current.doc.toString()) return;
     this.recovered = rec;
   }
@@ -943,10 +950,12 @@ export class Buffer {
     if (this.dirty) this.conflict = { kind: "changed", disk };
   }
 
+  /** Drop the offered draft — the record it came from, whoever wrote it. */
   discardDraft(): void {
-    if (this.recovered === null) return;
+    const rec = this.recovered;
+    if (rec === null) return;
     this.recovered = null;
-    this.clearDraft(this.path);
+    this.clearDraft(this.path, { writer: rec.writer, text: rec.text });
   }
 
   // --- lifecycle ------------------------------------------------------------
@@ -1065,6 +1074,7 @@ if (typeof document !== "undefined" && typeof window !== "undefined") {
   };
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "hidden") flush();
+    presence.visibilityChanged();
   });
   window.addEventListener("pagehide", () => {
     flush();
@@ -1074,33 +1084,69 @@ if (typeof document !== "undefined" && typeof window !== "undefined") {
 
 // --- other windows of this origin ---------------------------------------------
 
+/** A window not heard from for this long is gone — it crashed or was killed
+ *  without its "bye" — and its paths stop counting as held elsewhere. */
+export const PRESENCE_TTL_MS = 30_000;
+/** A window holding unsaved edits re-announces them this often. */
+export const PRESENCE_HEARTBEAT_MS = 10_000;
+/** Hidden, the browser throttles timers (Chrome: to once a minute), so a
+ *  hidden window beats at that pace and what it announced lives longer. */
+export const PRESENCE_HIDDEN_HEARTBEAT_MS = 60_000;
+export const PRESENCE_HIDDEN_TTL_MS = 3 * 60_000;
+
+export type PresenceMsg =
+  | { t: "dirty"; win: string; path: string; dirty: boolean }
+  | { t: "hello"; win: string }
+  | { t: "state"; win: string; paths: string[]; hidden?: boolean }
+  | { t: "bye"; win: string };
+
+/** The slice of BroadcastChannel presence uses (tests pass a fake). */
+export interface PresenceBus {
+  postMessage(msg: PresenceMsg): void;
+  onmessage: ((e: MessageEvent<PresenceMsg>) => void) | null;
+}
+
+interface Peer {
+  paths: Set<string>;
+  /** When this window last heard from it (its own clock). */
+  seen: number;
+  hidden: boolean;
+}
+
 /**
  * Same-origin windows announce which paths they hold unsaved, so a second
  * window on the same file shows "unsaved edits in another window" instead of
- * a silent fork. Cross-origin windows (another tunnel port) cannot see this;
- * the content-hash precondition and the merge cover them.
+ * a silent fork — and does not offer that window's live draft as a recovery.
+ * Cross-origin windows (another tunnel port) cannot see this; the
+ * content-hash precondition and the merge cover them.
+ *
+ * A window that dies without its "bye" (a crash, a killed process) must not
+ * hide its draft from recovery for ever, so a window re-announces its dirty
+ * paths every PRESENCE_HEARTBEAT_MS while it holds any, and peers drop one
+ * silent past PRESENCE_TTL_MS. The heartbeat is a deliberate exemption from
+ * visibility gating — a hidden window still owns its edits — but it runs
+ * only while this window holds unsaved edits, slows to the browser's own
+ * hidden-timer pace, and says it is hidden so peers wait longer for it. The
+ * peer-side expiry timer runs only while this window is visible and some
+ * peer is known; a hidden window re-checks on return and on every read.
  */
-type PresenceMsg =
-  | { t: "dirty"; win: string; path: string; dirty: boolean }
-  | { t: "hello"; win: string }
-  | { t: "state"; win: string; paths: string[] }
-  | { t: "bye"; win: string };
-
-class Presence {
-  /** Paths some OTHER window holds dirty. */
+export class Presence {
+  /** Paths some OTHER live window holds dirty. */
   elsewhere = $state<ReadonlySet<string>>(new Set());
-  private readonly win =
-    Math.random().toString(36).slice(2) + Date.now().toString(36);
-  private readonly byWin = new Map<string, Set<string>>();
-  private readonly channel: BroadcastChannel | null;
+  private readonly win = Math.random().toString(36).slice(2) + Date.now().toString(36);
+  private readonly peers = new Map<string, Peer>();
+  private readonly channel: PresenceBus | null;
+  private readonly mine: () => string[];
+  private readonly hidden: () => boolean;
+  private heartbeat: ReturnType<typeof setTimeout> | null = null;
+  private expiry: ReturnType<typeof setTimeout> | null = null;
 
-  constructor() {
-    this.channel =
-      typeof window !== "undefined" && typeof BroadcastChannel !== "undefined"
-        ? new BroadcastChannel("chimaera.buffers")
-        : null;
-    if (this.channel === null) return;
-    this.channel.onmessage = (e: MessageEvent<PresenceMsg>) => this.receive(e.data);
+  constructor(channel: PresenceBus | null, mine: () => string[], hidden: () => boolean) {
+    this.channel = channel;
+    this.mine = mine;
+    this.hidden = hidden;
+    if (channel === null) return;
+    channel.onmessage = (e: MessageEvent<PresenceMsg>) => this.receive(e.data);
     this.post({ t: "hello", win: this.win });
   }
 
@@ -1112,33 +1158,107 @@ class Presence {
     }
   }
 
+  /** Tell peers every path this window holds unsaved (none: nothing to say). */
+  private postState(): void {
+    const paths = this.mine();
+    if (paths.length > 0) this.post({ t: "state", win: this.win, paths, hidden: this.hidden() });
+  }
+
+  /** Keep re-announcing while this window holds unsaved edits. */
+  private beat(): void {
+    if (this.channel === null || this.heartbeat !== null || this.mine().length === 0) return;
+    this.heartbeat = setTimeout(
+      () => {
+        this.heartbeat = null;
+        this.postState();
+        this.beat();
+      },
+      this.hidden() ? PRESENCE_HIDDEN_HEARTBEAT_MS : PRESENCE_HEARTBEAT_MS,
+    );
+  }
+
   private receive(msg: PresenceMsg): void {
     if (msg === null || typeof msg !== "object" || msg.win === this.win) return;
     if (msg.t === "hello") {
-      const mine = [...buffers.values()].filter((b) => b.dirty).map((b) => b.path);
-      if (mine.length > 0) this.post({ t: "state", win: this.win, paths: mine });
+      this.postState();
       return;
     }
-    if (msg.t === "bye") this.byWin.delete(msg.win);
-    else if (msg.t === "state") this.byWin.set(msg.win, new Set(msg.paths));
-    else if (msg.t === "dirty") {
-      const set = this.byWin.get(msg.win) ?? new Set<string>();
-      if (msg.dirty) set.add(msg.path);
-      else set.delete(msg.path);
-      this.byWin.set(msg.win, set);
+    if (msg.t === "bye") {
+      this.peers.delete(msg.win);
+    } else {
+      const peer = this.peers.get(msg.win) ?? { paths: new Set<string>(), seen: 0, hidden: false };
+      peer.seen = Date.now();
+      if (msg.t === "state") {
+        peer.paths = new Set(msg.paths);
+        peer.hidden = msg.hidden === true;
+      } else if (msg.dirty) peer.paths.add(msg.path);
+      else peer.paths.delete(msg.path);
+      if (peer.paths.size > 0) this.peers.set(msg.win, peer);
+      else this.peers.delete(msg.win);
     }
+    this.refresh();
+  }
+
+  /** Recompute `elsewhere`, dropping peers silent past their TTL; while any
+   *  remain and this window is visible, wake at the next expiry. */
+  private refresh(): void {
+    const now = Date.now();
     const all = new Set<string>();
-    for (const s of this.byWin.values()) for (const p of s) all.add(p);
-    this.elsewhere = all;
+    let next = Infinity;
+    for (const [win, peer] of this.peers) {
+      const until = peer.seen + (peer.hidden ? PRESENCE_HIDDEN_TTL_MS : PRESENCE_TTL_MS);
+      if (until <= now) {
+        this.peers.delete(win);
+        continue;
+      }
+      next = Math.min(next, until);
+      for (const path of peer.paths) all.add(path);
+    }
+    if (all.size !== this.elsewhere.size || [...all].some((p) => !this.elsewhere.has(p))) {
+      this.elsewhere = all;
+    }
+    if (this.expiry !== null) clearTimeout(this.expiry);
+    this.expiry = null;
+    if (next !== Infinity && !this.hidden()) {
+      this.expiry = setTimeout(() => {
+        this.expiry = null;
+        this.refresh();
+      }, next - now);
+    }
+  }
+
+  /** Whether a live window of this origin holds `path` unsaved right now. */
+  heldElsewhere(path: string): boolean {
+    this.refresh();
+    return this.elsewhere.has(path);
   }
 
   announce(path: string, dirty: boolean): void {
     this.post({ t: "dirty", win: this.win, path, dirty });
+    this.beat();
+  }
+
+  /** Shown or hidden: tell peers (the TTL they give us changes), re-pace the
+   *  heartbeat, and catch up on (or stop) peer expiry. */
+  visibilityChanged(): void {
+    this.postState();
+    if (this.heartbeat !== null) clearTimeout(this.heartbeat);
+    this.heartbeat = null;
+    this.beat();
+    this.refresh();
   }
 
   leave(): void {
+    for (const t of [this.heartbeat, this.expiry]) if (t !== null) clearTimeout(t);
+    this.heartbeat = this.expiry = null;
     this.post({ t: "bye", win: this.win });
   }
 }
 
-export const presence = new Presence();
+export const presence = new Presence(
+  typeof window !== "undefined" && typeof BroadcastChannel !== "undefined"
+    ? new BroadcastChannel("chimaera.buffers")
+    : null,
+  () => [...buffers.values()].filter((b) => b.dirty).map((b) => b.path),
+  () => typeof document !== "undefined" && document.visibilityState === "hidden",
+);

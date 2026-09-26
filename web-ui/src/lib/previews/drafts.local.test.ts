@@ -7,7 +7,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
  * runs without IndexedDB, as a private window would.)
  */
 const idb = vi.hoisted(() => {
-  type Rec = { path: string } & Record<string, unknown>;
+  type Rec = { path: string; text?: unknown; writer?: unknown };
   const data = new Map<string, Rec>();
   const later = (f: () => void) => setTimeout(f, 0);
 
@@ -81,6 +81,7 @@ const net = vi.hoisted(() => ({
     text: string;
     updated_ms: number;
     client_updated_ms: number | null;
+    writer: string | null;
   },
   fsDraftPut: vi.fn(async () => "ok" as const),
   fsDraftDelete: vi.fn(async () => {}),
@@ -97,7 +98,7 @@ vi.mock("./files", async (orig) => ({
   fsDraftGet: async () => net.remote,
 }));
 
-import { find, journal, type DraftRecord } from "./drafts";
+import { clear, find, journal, WRITER, type DraftRecord } from "./drafts";
 
 /** A recent base time: the journal prunes records older than 30 days. */
 const T = Date.now();
@@ -113,6 +114,8 @@ const rec = (path: string, text: string, updatedMs: number): DraftRecord => ({
 beforeEach(() => {
   idb.data.clear();
   net.remote = null;
+  net.fsDraftPut.mockClear();
+  net.fsDraftDelete.mockClear();
 });
 
 describe("finding the newest draft across both layers", () => {
@@ -121,7 +124,14 @@ describe("finding the newest draft across both layers", () => {
     // This origin typed "local" at t=2000 (its clock); the mirror holds an
     // older text sent at t=1000 — but its daemon's clock runs far ahead.
     await journal(rec(path, "local", T + 2_000));
-    net.remote = { path, base_hash: "h0", text: "mirror", updated_ms: T + 9_000_000, client_updated_ms: T + 1_000 };
+    net.remote = {
+      path,
+      base_hash: "h0",
+      text: "mirror",
+      updated_ms: T + 9_000_000,
+      client_updated_ms: T + 1_000,
+      writer: "w2",
+    };
     expect((await find(path))?.text).toBe("local");
 
     // A genuinely newer mirror copy (typed later on another origin) wins.
@@ -134,7 +144,7 @@ describe("finding the newest draft across both layers", () => {
   it("falls back to the daemon's stamp for a mirror copy without the writer's time", async () => {
     const path = "/w/legacy.md";
     await journal(rec(path, "local", T + 2_000));
-    net.remote = { path, base_hash: "h0", text: "mirror", updated_ms: T + 1_500, client_updated_ms: null };
+    net.remote = { path, base_hash: "h0", text: "mirror", updated_ms: T + 1_500, client_updated_ms: null, writer: null };
     expect((await find(path))?.text).toBe("local");
     net.remote = { ...net.remote, updated_ms: T + 2_500 };
     expect((await find(path))?.text).toBe("mirror");
@@ -142,6 +152,45 @@ describe("finding the newest draft across both layers", () => {
 
   it("sends this client's time with the mirror write", async () => {
     await journal(rec("/w/sent.md", "t", T + 4_242));
-    expect(net.fsDraftPut).toHaveBeenCalledWith("/w/sent.md", "h0", "t", T + 4_242, false);
+    expect(net.fsDraftPut).toHaveBeenCalledWith("/w/sent.md", "h0", "t", T + 4_242, WRITER, false);
+  });
+});
+
+describe("two windows of one origin share a path's record", () => {
+  it("clears only this window's record, or one holding exactly the given text", async () => {
+    const path = "/w/shared.md";
+    // Another window of this origin journaled its own unsaved text last.
+    idb.data.set(path, { ...rec(path, "theirs", T), writer: "other-window" });
+    await clear(path); // this window saved or discarded
+    expect(idb.data.get(path)?.text).toBe("theirs");
+    // The mirror DELETE names this window: the daemon spares the other's.
+    expect(net.fsDraftDelete).toHaveBeenLastCalledWith(path, WRITER, false);
+
+    // A draft found on open and discarded (or equal to the disk) goes by
+    // its own writer or text.
+    await clear(path, { writer: "other-window", text: "theirs" });
+    expect(idb.data.has(path)).toBe(false);
+    expect(net.fsDraftDelete).toHaveBeenLastCalledWith(path, "other-window", false);
+
+    // This window's own record goes on a plain clear.
+    await journal(rec(path, "mine", T + 1));
+    expect(idb.data.get(path)?.writer).toBe(WRITER);
+    await clear(path);
+    expect(idb.data.has(path)).toBe(false);
+
+    // An older client's record names no writer: only its text matches it,
+    // and the mirror drop is then unconditional.
+    idb.data.set(path, rec(path, "legacy", T));
+    await clear(path, { writer: undefined, text: "other" });
+    expect(idb.data.has(path)).toBe(true);
+    await clear(path, { writer: undefined, text: "legacy" });
+    expect(idb.data.has(path)).toBe(false);
+    expect(net.fsDraftDelete).toHaveBeenLastCalledWith(path, null, false);
+  });
+
+  it("carries the writer of a draft found only in the mirror", async () => {
+    const path = "/w/remote-only.md";
+    net.remote = { path, base_hash: "h0", text: "t", updated_ms: T, client_updated_ms: T, writer: "w9" };
+    expect((await find(path))?.writer).toBe("w9");
   });
 });
