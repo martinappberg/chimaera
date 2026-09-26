@@ -1173,6 +1173,8 @@ mod tests {
             nodes: String::new(),
             cpus: String::new(),
             mem: String::new(),
+            elapsed: String::new(),
+            workdir: String::new(),
         };
         // Cached PENDING + manifest on disk + living client → RUNNING/ready
         // with the manifest's node and an estimated countdown.

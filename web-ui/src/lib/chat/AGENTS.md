@@ -212,6 +212,18 @@ per-chunk work proportional to the TRAILING OPEN SEGMENT, not the message:
   A visible top sentinel while a short live tail fills the viewport is layout,
   not reader intent: it may prepend only while retaining the tail, and stops at
   the DOM cap instead of silently paging the reader away from live activity.
+- **A pinned follower leaves the live edge only by its own hand.** In WebKit a
+  scroll event lands a frame late (rows appended in between make a reader who
+  never moved look scrolled up), and scrollTop is clamped wherever a re-render
+  momentarily shrinks the content (an up-move nobody made). So `onScroll`
+  keeps `atBottom` for a non-move, and — while a turn runs — for an up-move
+  with no wheel/pointer/touch/key input behind it (WebKit dispatches those
+  ahead of the scroll they cause; the wheel listener must stay passive). The
+  live-tail chrome gates on `atLiveEdge`, which counts a tail window whose
+  appended row is one flush from rendering as live: tearing the status row out
+  and back in per append was one of those shrinks. Repro: the real-WebKit
+  harness in `scripts/perf/transcript-scroll/` with a page script that sends
+  and samples the gap.
 - **Never write `scrollTop` while a gesture may be in flight.** WebKit (the
   native app) has no scroll anchoring, and its scrolling thread owns the
   position during a fling: a mid-gesture `scrollTop` write — any correction for

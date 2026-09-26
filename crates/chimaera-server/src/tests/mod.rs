@@ -1,3 +1,4 @@
+mod agent_view;
 mod agents;
 mod chat;
 mod doc_check;
@@ -14,6 +15,7 @@ mod mastermind;
 mod mcp;
 mod notebook;
 mod notices;
+mod plugins;
 mod proxy;
 mod recents;
 mod resumables;

@@ -1,0 +1,12 @@
+# Agent notes — agents leave short notes for each other and for the
+# Mastermind, on the Timeline. Mail, not phone: a note never starts a turn.
+id = "agent-notes"
+name = "Agent notes"
+summary = "Agents leave short notes for each other and for the Mastermind."
+
+[provides]
+mcp_tools = ["post_note", "read_notes"]
+
+[adds]
+ui = ["Notes on the Timeline, each with a deliver button"]
+agents = ["2 tools for every agent here: post_note · read_notes", "never starts a turn"]

@@ -35,7 +35,9 @@
   import { isUnread } from "../workspace/unread.svelte";
   import { decoFor } from "../workspace/gitDeco";
   import { PINNED } from "../shared/keys";
-  import { keyHint } from "../shared/keybindings";
+  import { keyHint, keyHintSuffix } from "../shared/keybindings";
+  import BrandMark from "../shared/BrandMark.svelte";
+  import { mastermindPanel, setMastermindPanelOpen } from "../dashboard/mastermindPanelState.svelte";
   import { activeSelection, referenceTarget, requestReference } from "../shared/reference";
   import { dismiss } from "../shared/dismiss";
   import FileIcon from "../shared/FileIcon.svelte";
@@ -368,6 +370,9 @@
     if (tab.surface === "terminal") return sessionLabel(tab.sessionId);
     if (tab.surface === "settings") return "Settings";
     if (tab.surface === "dashboard") return "Dashboard";
+    if (tab.surface === "timeline") return "Timeline";
+    if (tab.surface === "knowledge") return "Knowledge";
+    if (tab.surface === "plugins") return "Plugins";
     if (tab.surface === "finder") return basename(tab.path) || "Finder";
     if (tab.surface === "git") return "Source Control";
     if (tab.surface === "diff") return `${basename(tab.path)} (diff)`;
@@ -715,14 +720,15 @@
           {:else if tab.surface === "settings"}
             <svg class="glyph" viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
               <title>settings</title>
-              <circle cx="8" cy="8" r="2.2" fill="none" stroke="currentColor" stroke-width="1.4" />
+              <!-- A cog: settings. -->
               <path
-                d="M8 1.8v2M8 12.2v2M1.8 8h2M12.2 8h2M3.6 3.6l1.4 1.4M11 11l1.4 1.4M12.4 3.6L11 5M5 11l-1.4 1.4"
+                d="M6.77 3.05L6.98 1.18A6.9 6.9 0 0 1 9.02 1.18L9.23 3.05A5.1 5.1 0 0 1 10.63 3.63L12.10 2.45A6.9 6.9 0 0 1 13.55 3.90L12.37 5.37A5.1 5.1 0 0 1 12.95 6.77L14.82 6.98A6.9 6.9 0 0 1 14.82 9.02L12.95 9.23A5.1 5.1 0 0 1 12.37 10.63L13.55 12.10A6.9 6.9 0 0 1 12.10 13.55L10.63 12.37A5.1 5.1 0 0 1 9.23 12.95L9.02 14.82A6.9 6.9 0 0 1 6.98 14.82L6.77 12.95A5.1 5.1 0 0 1 5.37 12.37L3.90 13.55A6.9 6.9 0 0 1 2.45 12.10L3.63 10.63A5.1 5.1 0 0 1 3.05 9.23L1.18 9.02A6.9 6.9 0 0 1 1.18 6.98L3.05 6.77A5.1 5.1 0 0 1 3.63 5.37L2.45 3.90A6.9 6.9 0 0 1 3.90 2.45L5.37 3.63A5.1 5.1 0 0 1 6.77 3.05Z"
                 fill="none"
                 stroke="currentColor"
-                stroke-width="1.4"
-                stroke-linecap="round"
+                stroke-width="1.3"
+                stroke-linejoin="round"
               />
+              <circle cx="8" cy="8" r="2.2" fill="none" stroke="currentColor" stroke-width="1.3" />
             </svg>
           {:else if tab.surface === "finder"}
             <span class="tab-glyph" class:on={i === node.active}>
@@ -774,6 +780,38 @@
                 fill="none"
                 stroke="currentColor"
                 stroke-width="1.4"
+                stroke-linejoin="round"
+              />
+            </svg>
+          {:else if tab.surface === "timeline"}
+            <!-- A clock face: what happened, when. -->
+            <svg class="glyph" viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
+              <title>timeline</title>
+              <circle cx="8" cy="8" r="5.7" fill="none" stroke="currentColor" stroke-width="1.4" />
+              <path d="M8 4.8V8l2.4 1.6" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" />
+            </svg>
+          {:else if tab.surface === "knowledge"}
+            <!-- An open notebook: what the project knows. -->
+            <svg class="glyph" viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
+              <title>knowledge</title>
+              <path
+                d="M2.5 3.2c1.8-.7 3.6-.6 5.5.5v9c-1.9-1.1-3.7-1.2-5.5-.5zM13.5 3.2c-1.8-.7-3.6-.6-5.5.5v9c1.9-1.1 3.7-1.2 5.5-.5z"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.3"
+                stroke-linejoin="round"
+              />
+            </svg>
+          {:else if tab.surface === "plugins"}
+            <!-- A plug: opt-in add-ons. -->
+            <svg class="glyph" viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
+              <title>plugins</title>
+              <path
+                d="M5.5 2v3M10.5 2v3M4 5h8v2.5a4 4 0 0 1-8 0zM8 11.5V14"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.4"
+                stroke-linecap="round"
                 stroke-linejoin="round"
               />
             </svg>
@@ -1085,6 +1123,27 @@
         </svg>
       </button>
     </div>
+    {#if mastermindPanel.available && !mastermindPanel.open && mastermindPanel.cornerPaneId === node.id}
+      <!-- The window's ONE way into its Mastermind panel: only in the pane
+           whose bar touches the window's top-right corner, where the panel
+           opens. Persistent but quiet; the dot is the only signal it ever
+           gives (it needs you, or answered while the panel was closed). -->
+      <button
+        class="mm-toggle"
+        class:attn={mastermindPanel.attention}
+        title="Mastermind{keyHintSuffix('mastermind')}{mastermindPanel.attention
+          ? ' — needs you or has a new reply'
+          : ''}"
+        aria-label="open the Mastermind"
+        onclick={(e) => {
+          e.stopPropagation();
+          setMastermindPanelOpen(true);
+        }}
+      >
+        <BrandMark size={13} title="Mastermind" />
+        {#if mastermindPanel.attention}<span class="mm-dot" aria-hidden="true"></span>{/if}
+      </button>
+    {/if}
 
     {#if linkMenuOpen}
       <div class="overlay-surface link-menu" role="menu" aria-label="link to agent">
@@ -1669,6 +1728,48 @@
     align-items: center;
     gap: 4px;
     padding-left: 4px;
+  }
+
+  .mm-toggle {
+    position: relative;
+    flex: none;
+    appearance: none;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 22px;
+    margin-right: 2px;
+    padding: 0;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    background: none;
+    color: var(--muted);
+    opacity: 0.7;
+    cursor: pointer;
+    transition:
+      opacity 0.12s ease,
+      background-color 0.12s ease,
+      border-color 0.12s ease;
+  }
+  .mm-toggle:hover,
+  .mm-toggle:focus-visible,
+  .mm-toggle.attn {
+    opacity: 1;
+  }
+  .mm-toggle:hover {
+    background: var(--row-hover);
+    border-color: var(--edge);
+  }
+  .mm-dot {
+    position: absolute;
+    top: 2px;
+    right: 2px;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--accent);
+    box-shadow: 0 0 0 1.5px var(--bg);
   }
 
   .controls {

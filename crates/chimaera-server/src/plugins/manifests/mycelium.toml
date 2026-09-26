@@ -1,0 +1,30 @@
+# Mycelium — project memory your agents record as they work.
+# Chimaera only READS what mycelium writes (.living/, .mycelium/); installs
+# and per-project setup are mycelium's own, run by the agents' own CLIs.
+id = "mycelium"
+name = "Mycelium"
+summary = "Project memory your agents record as they work — findings, decisions, learnings."
+homepage = "https://github.com/arjunrajlaboratory/mycelium"
+
+[detect]
+any = [".living/INDEX.md", ".living/learnings.md", ".living/findings", "MYCELIUM.md"]
+
+[requires.agent_plugins.claude]
+id = "mycelium@mycelium"
+marketplace = "arjunrajlaboratory/mycelium"
+
+[requires.agent_plugins.codex]
+id = "mycelium@mycelium"
+marketplace = "arjunrajlaboratory/mycelium"
+
+[setup]
+# mycelium's own documented default prompt (.codex-plugin/plugin.json).
+prompt = "Set up Mycelium in this repository."
+
+[provides]
+knowledge = "mycelium"
+mcp_tools = ["knowledge_search", "knowledge_get"]
+
+[adds]
+ui = ["Fills Knowledge and “Where things stand”"]
+agents = ["2 read tools for every agent here: knowledge_search · knowledge_get"]

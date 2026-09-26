@@ -306,7 +306,12 @@ async fn mcp_tier_gates_on_the_binding() {
         assert!(mm_tools.contains(&tool.to_string()), "{mm_tools:?}");
     }
     let worker_tools = tool_names(&state, &worker, "wk").await;
-    assert_eq!(worker_tools, BASE_TOOLS, "workers get the base tier only");
+    let mut expected = BASE_TOOLS.to_vec();
+    expected.push("tell_mastermind");
+    assert_eq!(
+        worker_tools, expected,
+        "workers get the base tier plus tell_mastermind — never the Mastermind tier"
+    );
 
     // The call gate matches the listing: a worker naming a mastermind tool
     // gets a JSON-RPC error that names the Mastermind.
@@ -650,4 +655,105 @@ async fn mastermind_changes_are_serialized_per_workspace() {
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
     wait_session_gone(&state, &mm).await;
+}
+
+/// Workers reach the Mastermind with no plugin switched on: tell_mastermind
+/// is offered exactly to the supervised view, records a note to the
+/// Mastermind, and — in ask-first mode — waits in its inbox (no wake).
+#[tokio::test]
+async fn workers_tell_the_mastermind_and_ask_mode_keeps_it_in_the_inbox() {
+    let state = test_state();
+    let ws = make_workspace(&state, "tell-mm").await;
+    let mm = inject_agent(&state, "kmm");
+    let worker = inject_agent(&state, "kw");
+    lock(&state.session_workspaces).insert(worker.clone(), ws.clone());
+
+    let has = |names: Vec<String>| names.iter().any(|n| n == "tell_mastermind");
+    assert!(
+        !has(tool_names(&state, &worker, "kw").await),
+        "no Mastermind, nothing to tell"
+    );
+
+    bind_as_mastermind(&state, &ws, &mm);
+    assert!(has(tool_names(&state, &worker, "kw").await));
+    assert!(
+        !has(tool_names(&state, &mm, "kmm").await),
+        "never offered to the Mastermind itself"
+    );
+
+    let (is_err, text) = mcp_tool_call(
+        &state,
+        &worker,
+        "kw",
+        "tell_mastermind",
+        serde_json::json!({"text": "the loader API changed under qc/"}),
+    )
+    .await;
+    assert!(!is_err, "{text}");
+    assert!(
+        text.contains("inbox"),
+        "ask-first waits for the user: {text}"
+    );
+    let (_, page) = request(
+        &state,
+        Method::GET,
+        &format!("/api/v1/workspaces/{ws}/timeline"),
+        None,
+    )
+    .await;
+    let note = &page["entries"][0]["note"];
+    assert_eq!(note["to"], "mastermind");
+    assert_eq!(note["from_sid"], worker.as_str());
+    assert!(note.get("woke").is_none(), "not woken in ask mode: {note}");
+
+    // Auto mode, but the Mastermind has no live chat to wake: the message
+    // still lands in the inbox, and no wake is claimed or reported.
+    lock(&state.workspaces)
+        .set_mastermind(
+            &ws,
+            Some(workspaces::MastermindCfg {
+                session_id: mm.clone(),
+                mode: workspaces::MastermindMode::Auto,
+                agent: "claude".to_string(),
+            }),
+        )
+        .unwrap();
+    let (is_err, text) = mcp_tool_call(
+        &state,
+        &worker,
+        "kw",
+        "tell_mastermind",
+        serde_json::json!({"text": "qc/ is green again"}),
+    )
+    .await;
+    assert!(!is_err, "{text}");
+    assert!(
+        text.contains("hands it over"),
+        "no live Mastermind chat: inbox, never a wake: {text}"
+    );
+    let (_, page) = request(
+        &state,
+        Method::GET,
+        &format!("/api/v1/workspaces/{ws}/timeline"),
+        None,
+    )
+    .await;
+    let note = &page["entries"][0]["note"];
+    assert_eq!(note["text"], "qc/ is green again");
+    assert!(note.get("woke").is_none(), "{note}");
+
+    // Named but never offered: the call gate refuses the Mastermind itself.
+    let (_, out) = mcp_post(
+        &state,
+        &mm,
+        "kmm",
+        serde_json::json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {"name": "tell_mastermind", "arguments": {"text": "hi"}}}),
+    )
+    .await;
+    assert!(out["error"]["message"].as_str().is_some(), "{out}");
+
+    for sid in [mm, worker] {
+        state.sessions.kill(&sid).ok();
+    }
 }
