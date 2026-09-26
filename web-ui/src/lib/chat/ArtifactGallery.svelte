@@ -111,6 +111,8 @@
   });
   const visuals = $derived(all.filter((t) => artifactShape(t.path) === "visual").slice(0, MAX_TILES));
   const documents = $derived(all.filter((t) => artifactShape(t.path) === "document").slice(0, MAX_TILES * 3));
+  /** The fold previews the first tiles' worth; the chips still name them all. */
+  const previewed = $derived(documents.slice(0, MAX_TILES));
   const chips = $derived(allChips || documents.length <= MAX_CHIPS ? documents : documents.slice(0, MAX_CHIPS));
 
   function open(path: string, kind: "file" | "dir", reveal?: import("../shared/reveal").Reveal): void {
@@ -119,7 +121,7 @@
 </script>
 
 {#snippet tiles(items: Tile[], label: string)}
-  <div class="gallery" aria-label={label}>
+  <div class="gallery" role="group" aria-label={label}>
     {#each items as tile (tile.path)}
       <div class="tile">
         <EmbedCard
@@ -141,7 +143,7 @@
   {#if documents.length > 0}
     <!-- Documents are opened, not stared at: one chip each, the same quiet
          voice as a folded activity line, and their tiles behind a fold. -->
-    <div class="files" aria-label="files this turn">
+    <div class="files" role="group" aria-label="files this turn">
       <span class="files-label">Files</span>
       {#each chips as doc (doc.path)}
         <button
@@ -168,7 +170,7 @@
       </button>
     </div>
     {#if peek}
-      {@render tiles(documents, "files this turn, previewed")}
+      {@render tiles(previewed, "files this turn, previewed")}
     {/if}
   {/if}
 </div>

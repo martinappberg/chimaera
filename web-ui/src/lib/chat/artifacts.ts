@@ -14,7 +14,8 @@
  * or mentioned in passing is older than the turn and stays out.
  */
 
-import { innerExtension } from "../previews/files";
+import { viewKindFor } from "../previews/files";
+import { splitTarget } from "../shared/embed/embed";
 
 /** What a turn's file is FOR, which decides how the gallery shows it:
  *  a `visual` is looked at (a figure, a rendered report, a PDF, a clip) and
@@ -22,40 +23,39 @@ import { innerExtension } from "../previews/files";
  *  a notebook, a deck) and gets a one-line chip — its tile only on request. */
 export type ArtifactShape = "visual" | "document";
 
-/** Extensions whose files the turn's gallery shows expanded: the outputs
- *  people look at. */
-const VISUAL_EXTS = new Set([
-  // figures
-  "png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "avif",
-  // rendered reports
-  "html", "htm", "pdf",
-  // media
-  "mp4", "webm", "m4v", "mov", "ogv", "mp3", "wav", "m4a", "flac", "ogg", "oga", "opus", "aac",
-]);
-
-/** Extensions whose files the gallery lists as chips: the outputs people
- *  open. Source code is neither (its diff is already in the tool card). */
-const DOCUMENT_EXTS = new Set([
-  // documents and decks
-  "md", "markdown", "docx", "pptx",
-  // tables
-  "csv", "tsv", "xlsx", "xls", "xlsm", "ods",
-  "vcf", "bed", "bedgraph", "narrowpeak", "broadpeak", "gff", "gff3", "gtf",
-  // notebooks
-  "ipynb",
-]);
-
-/** The shape of a path's file, or null when it is not an artifact. */
+/** The shape of a path's file, or null when it is not an artifact. Decided
+ *  from the workbench's own view kinds (one extension table, so a format
+ *  the previews learn is one the gallery knows). Source code, logs and
+ *  configs are not artifacts: an edit's diff is already in the tool card. */
 export function artifactShape(path: string): ArtifactShape | null {
-  const ext = innerExtension(path);
-  if (VISUAL_EXTS.has(ext)) return "visual";
-  if (DOCUMENT_EXTS.has(ext)) return "document";
-  return null;
+  switch (viewKindFor(path)) {
+    case "image":
+    case "html":
+    case "pdf":
+    case "video":
+    case "audio":
+      return "visual";
+    case "markdown":
+    case "table":
+    case "xlsx":
+    case "notebook":
+    case "docx":
+    case "pptx":
+      return "document";
+    default:
+      return null;
+  }
 }
 
 /** Whether a path is the kind of file a turn's gallery shows. */
 export function isArtifactPath(path: string): boolean {
   return artifactShape(path) !== null;
+}
+
+/** A URL (`https://…`, `file:`) or a protocol-relative `//host` — never a
+ *  local path. */
+function isUrlLike(token: string): boolean {
+  return /^[a-z][a-z0-9+.-]*:/i.test(token) || token.startsWith("//");
 }
 
 /** A whitespace/quote/bracket-delimited token. */
@@ -86,7 +86,7 @@ export function artifactMentions(texts: readonly string[], cap = 24): string[] {
       // Trailing sentence punctuation and markdown emphasis come off.
       const t = m[0].replace(/^[*_]+/, "").replace(/[.:!?*_]+$/, "");
       if (t.length < 3 || seen.has(t) || !PATHLIKE.test(t)) continue;
-      if (/^[a-z][a-z0-9+.-]*:/i.test(t) || t.startsWith("//")) continue;
+      if (isUrlLike(t)) continue;
       if (!isArtifactPath(t) || (t.startsWith(".") && !t.startsWith("./") && !t.startsWith("../"))) continue;
       seen.add(t);
       out.push(t);
@@ -97,24 +97,25 @@ export function artifactMentions(texts: readonly string[], cap = 24): string[] {
 }
 
 /** A markdown image/embed in agent prose: `![alt](target)`, the target
- *  optionally `<…>`-wrapped and carrying a `#fragment`. */
-const PROSE_EMBED = /!\[[^\]]*\]\(\s*<?([^)\s>]+)>?/g;
+ *  either `<…>`-wrapped (spaces allowed) or bare, optionally with a
+ *  `#fragment`. */
+const PROSE_EMBED = /!\[[^\]]*\]\(\s*(?:<([^>]+)>|([^)\s]+))/g;
+/** Fenced and inline code, where an embed is text, not a card. */
+const CODE_SPANS = /```[\s\S]*?```|`[^`\n]*`/g;
 
 /**
  * The local files the turn's prose already embeds as cards
  * (`![](figs/plot.png)`, `![](paper.pdf#page=3)`), as written, fragments
  * off. Rendered inline beside the words that describe them, they need no
- * second showing in the gallery.
+ * second showing in the gallery. An embed quoted inside code is not one.
  */
 export function proseEmbedTargets(texts: readonly string[]): string[] {
   const out: string[] = [];
   const seen = new Set<string>();
   for (const text of texts) {
-    for (const m of text.matchAll(PROSE_EMBED)) {
-      const target = m[1].split("#")[0];
-      if (target === "" || seen.has(target) || /^[a-z][a-z0-9+.-]*:/i.test(target) || target.startsWith("//")) {
-        continue;
-      }
+    for (const m of text.replace(CODE_SPANS, "").matchAll(PROSE_EMBED)) {
+      const target = splitTarget(m[1] ?? m[2]).path;
+      if (target === "" || seen.has(target) || isUrlLike(target)) continue;
       seen.add(target);
       out.push(target);
     }

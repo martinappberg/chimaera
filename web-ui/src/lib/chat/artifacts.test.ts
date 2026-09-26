@@ -21,13 +21,16 @@ describe("isArtifactPath", () => {
 
 describe("artifactShape", () => {
   it("tells what is looked at from what is opened", () => {
-    for (const p of ["figs/umap.png", "fig.svg", "report.html", "paper.pdf", "clip.mp4", "talk.mp3"]) {
+    // Every image the previews render is a visual (favicon.ico included).
+    for (const p of ["figs/umap.png", "fig.svg", "favicon.ico", "report.html", "paper.pdf", "clip.mp4", "talk.mp3"]) {
       expect(artifactShape(p), p).toBe("visual");
     }
-    for (const p of ["notes.md", "out/summary.csv", "t.tsv.gz", "run.ipynb", "deck.pptx", "calls.vcf"]) {
+    for (const p of ["notes.md", "out/summary.csv", "t.tsv.gz", "run.ipynb", "deck.pptx", "memo.docm", "calls.vcf"]) {
       expect(artifactShape(p), p).toBe("document");
     }
-    expect(artifactShape("main.rs")).toBeNull();
+    for (const p of ["main.rs", "run.log", "flow.mmd", "config.json"]) {
+      expect(artifactShape(p), p).toBeNull();
+    }
   });
 });
 
@@ -36,8 +39,16 @@ describe("prose embeds", () => {
     const texts = [
       "Here it is:\n\n![umap](figs/umap.png)\n\nand page 3: ![p](<paper.pdf#page=3>)",
       "![again](figs/umap.png) ![web](https://x.test/a.png) ![abs](/home/me/proj/out/report.html)",
+      "![spaced](<figs/my plot.png>)",
+      // Quoted in code, an embed is text, not a card.
+      "Use `![x](inline.png)` like so:\n\n```md\n![y](fenced.png)\n```\n",
     ];
-    expect(proseEmbedTargets(texts)).toEqual(["figs/umap.png", "paper.pdf", "/home/me/proj/out/report.html"]);
+    expect(proseEmbedTargets(texts)).toEqual([
+      "figs/umap.png",
+      "paper.pdf",
+      "/home/me/proj/out/report.html",
+      "figs/my plot.png",
+    ]);
   });
 
   it("matches a tool's absolute path and a text mention against the embeds", () => {
