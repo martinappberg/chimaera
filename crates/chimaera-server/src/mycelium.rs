@@ -1426,11 +1426,33 @@ fn list_items<'s>(lines: impl IntoIterator<Item = &'s str>) -> Vec<ListItem> {
     items
 }
 
+/// A list slot that says there is nothing, with a reason attached — "None.
+/// The claim holds by definition.", "None — resolved", "No open questions:
+/// …". What follows the lead word decides: punctuation means "none", a word
+/// means a real item ("None of the samples replicate — why?" is a question).
+fn says_none(s: &str) -> bool {
+    let t = s.trim().trim_start_matches(['*', '_', '`']).to_lowercase();
+    [
+        "none",
+        "no open questions",
+        "no questions",
+        "nothing open",
+        "n/a",
+    ]
+    .iter()
+    .any(|lead| {
+        t.strip_prefix(lead).is_some_and(|rest| {
+            let rest = rest.trim_start_matches(['*', '_', '`']).trim_start();
+            rest.is_empty() || rest.starts_with(['.', ':', ',', ';', '—', '–', '-', '!', '('])
+        })
+    })
+}
+
 /// Kept (not done, not filler) item texts, capped.
 fn live_items(items: Vec<ListItem>, cap: usize) -> Vec<String> {
     items
         .into_iter()
-        .filter(|item| !item.done && !is_placeholder(&item.text))
+        .filter(|item| !item.done && !is_placeholder(&item.text) && !says_none(&item.text))
         .take(cap)
         .map(|item| cap_text(item.text))
         .collect()
@@ -2055,7 +2077,7 @@ fn parse_finding(
 
     let open: Vec<ListItem> = list_items(question_lines)
         .into_iter()
-        .filter(|q| !q.done && !is_placeholder(&q.text))
+        .filter(|q| !q.done && !is_placeholder(&q.text) && !says_none(&q.text))
         .collect();
     if open.len() > MAX_QUESTIONS_PER_FINDING {
         notes.push(format!(
@@ -3706,5 +3728,25 @@ SESSION RESUME — Last session (2026-09-15 17:40):
         assert!(!is_stale_stop_line("Pending: batch 3 FASTQs"));
         // Linear on a hostile line: many leads, no tail.
         assert!(!is_stale_stop_line(&"stop hook ".repeat(200_000)));
+    }
+
+    #[test]
+    fn a_none_with_a_reason_is_not_an_open_question() {
+        for none in [
+            "None. The claim holds by the definition of the successor function.",
+            "None",
+            "**None** — resolved in F-002",
+            "No open questions: the ledger is complete.",
+            "N/A (single dataset)",
+        ] {
+            assert!(says_none(none), "{none}");
+        }
+        for real in [
+            "None of the samples replicate — why?",
+            "Nonetheless, does lane 4 differ?",
+            "Does 200 UMIs let ambient RNA in?",
+        ] {
+            assert!(!says_none(real), "{real}");
+        }
     }
 }

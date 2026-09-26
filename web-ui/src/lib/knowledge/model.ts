@@ -223,7 +223,7 @@ export function sectionNav(k: Knowledge): SectionNav[] {
   if (k.decisions.length > 0) out.push({ key: "decided", label: "What we decided", count: k.decisions.length });
   if (k.learnings.length > 0) out.push({ key: "watch", label: "Watch out for", count: k.learnings.length });
   if (k.todos.length + k.questions.length > 0)
-    out.push({ key: "open", label: "Open", count: k.todos.length + k.questions.length });
+    out.push({ key: "open", label: "To do & questions", count: k.todos.length + k.questions.length });
   if (k.guidance.length > 0) out.push({ key: "guide", label: "Guidance & memory", count: k.guidance.length });
   return out;
 }

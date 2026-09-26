@@ -199,7 +199,7 @@
   import { computeStatus, initCompute, queuedJobCount } from "./lib/workspace/compute";
   import { surfacesOf } from "./lib/layout/surfaces";
   import { activateTimelineWorkspace, onTimelineNudge } from "./lib/workspace/timeline.svelte";
-  import { activateKnowledgeWorkspace, knowledge } from "./lib/workspace/knowledge";
+  import { activateKnowledgeWorkspace } from "./lib/workspace/knowledge";
   import {
     activatePluginsWorkspace,
     attachRequest,
@@ -1156,6 +1156,10 @@
   const knowledgeOpen = $derived.by(() => {
     const p = findPane(layout.root, layout.focusedPaneId);
     return p?.tabs[p.active]?.surface === "knowledge";
+  });
+  const pluginsOpen = $derived.by(() => {
+    const p = findPane(layout.root, layout.focusedPaneId);
+    return p?.tabs[p.active]?.surface === "plugins";
   });
 
   // --- context bridge: reference target resolution ---------------------------
@@ -4710,13 +4714,29 @@
               />
             </svg>
             <span class="dash-label">knowledge</span>
-            {#if $knowledge !== null && $knowledge.counts.findings > 0}
-              <span class="dash-count"
-                >{$knowledge.counts.findings} finding{$knowledge.counts.findings === 1 ? "" : "s"}</span
-              >
-            {/if}
           </button>
         {/if}
+
+        <!-- Plugins (Installed · Skills): always a row — it is where a
+             plugin gets added in the first place. -->
+        <button
+          class="row dash-row"
+          class:dash-active={pluginsOpen}
+          title="plugins & skills — add-ons for this workspace, and every skill your agents can use"
+          onclick={openPluginsSurface}
+        >
+          <svg class="dash-glyph" viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
+            <path
+              d="M2.5 2.5h4.2v4.2H2.5zM9.3 2.5h4.2v4.2H9.3zM2.5 9.3h4.2v4.2H2.5zM11.4 9.3v4.2M9.3 11.4h4.2"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.3"
+              stroke-linejoin="round"
+              stroke-linecap="round"
+            />
+          </svg>
+          <span class="dash-label">plugins</span>
+        </button>
 
         <!-- Terminals first (there are few), agents below (there are many);
              this order is also the mod+1–9 order and the strip order. -->
@@ -5813,16 +5833,6 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  /* The knowledge row's quiet count ("5 findings"), right-aligned like the
-     session rows' trailing meta. */
-  .dash-count {
-    margin-left: auto;
-    flex: none;
-    font-size: var(--text-xs);
-    color: var(--muted);
-    white-space: nowrap;
-  }
-
   .row:hover {
     background: var(--row-hover);
   }

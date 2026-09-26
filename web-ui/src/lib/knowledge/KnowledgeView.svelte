@@ -115,8 +115,9 @@
             What your agents have recorded in this project —
             <span class="mono">{counts.findings}</span> finding{counts.findings === 1 ? "" : "s"} ·
             <span class="mono">{counts.decisions}</span> decision{counts.decisions === 1 ? "" : "s"} ·
-            <span class="mono">{counts.learnings}</span> learning{counts.learnings === 1 ? "" : "s"} ·
-            <span class="mono">{counts.open}</span> open
+            <span class="mono">{counts.learnings}</span> learning{counts.learnings === 1 ? "" : "s"}{#if raw.todos.length > 0}{" · "}<span
+                class="mono">{raw.todos.length}</span> to do{/if}{#if raw.questions.length > 0}{" · "}<span
+                class="mono">{raw.questions.length}</span> open question{raw.questions.length === 1 ? "" : "s"}{/if}
           </p>
         {:else}
           <p class="sub">What your agents are told — and what they could record here.</p>
@@ -337,7 +338,7 @@
 
           {#if providerActive && shown.todos.length + shown.questions.length > 0 && show("open")}
             <section aria-labelledby="k-open">
-              <h2 id="k-open" class="lbl">Open</h2>
+              <h2 id="k-open" class="lbl">To do &amp; questions</h2>
               <div class="open" class:two={shown.todos.length > 0 && shown.questions.length > 0}>
                 {#if shown.todos.length > 0}
                   <div class="ocol">
