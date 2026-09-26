@@ -9,11 +9,12 @@
    * Bounded by the server's source-size cap; no in-place editing (a spreadsheet
    * is not a text file).
    */
+  import { untrack } from "svelte";
   import { fsXlsx, type TablePage } from "./files";
   import TableView from "./TableView.svelte";
   import Spinner from "./Spinner.svelte";
   import { a1ToBlock, blockToA1, sheetFragment, type TableBlock } from "../shared/locator";
-  import { revealRequest, takeReveal, type Reveal } from "../shared/reveal";
+  import { requestReveal, revealRequest, takeReveal, type Reveal } from "../shared/reveal";
 
   interface Props {
     path: string;
@@ -111,6 +112,15 @@
     pendingReveal = null;
     const table = req.range !== undefined ? a1ToBlock(req.range, origin) : req.table;
     if (table !== undefined) gridReveal = { table, nonce: ++revealNonce };
+  });
+
+  // A reveal taken but not yet applied goes back to the store when this view
+  // goes first, for the instance that replaces it: FileView remounts a
+  // spreadsheet once its version token lands ({#key entry.mtime}) — on a
+  // cold open, moments after the open that carried the reveal.
+  $effect(() => () => {
+    const req = untrack(() => pendingReveal);
+    if (req !== null) requestReveal(path, req);
   });
 </script>
 
