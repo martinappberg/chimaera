@@ -39,8 +39,8 @@ use crate::model::{
     BG_LABEL_MAX, BG_PATH_MAX, BG_TASKS_CAP, COMMAND_ID_MAX, DIFF_FILE_BUDGET, DIFF_TURN_BUDGET,
     PLAN_BLOCKED_CAP, PLAN_DESC_MAX, PLAN_LABEL_MAX, PLAN_TASKS_CAP, SLASH_COMMANDS_CAP,
     SLASH_DESCRIPTION_MAX, SLASH_NAME_MAX, STATUS_DETAIL_MAX, SUBAGENT_RESULT_MAX,
-    TOOL_SUMMARY_IDS_CAP, TOOL_SUMMARY_MAX, WF_AGENTS_CAP, WF_AGENTS_SET_BUDGET,
-    WF_AGENT_LABEL_MAX,
+    TOOL_SUMMARY_IDS_CAP, TOOL_SUMMARY_MAX, UNHANDLED_REQUESTS_CAP, UNHANDLED_REQUEST_NAME_MAX,
+    WF_AGENTS_CAP, WF_AGENTS_SET_BUDGET, WF_AGENT_LABEL_MAX,
 };
 use crate::model::{RemoteControlSnapshot, RemoteControlState};
 use crate::ndjson::{JsonlChild, JsonlSink, JsonlStream};
@@ -2506,14 +2506,21 @@ impl ClaudeMapper {
             // elicitation, oauth refreshes). But never park SILENTLY — the
             // agent's later "I was blocked" prose must not be the only trace
             // the ask existed. One notice per subtype, not per frame.
-            let subtype = request["subtype"].as_str().unwrap_or("unknown");
             // `subtype` is agent-influenced; bound the once-per-subtype dedupe
             // set (real streams carry a handful of distinct control subtypes)
-            // so a buggy/hostile stream can't grow it without end.
-            const MAX_NOTICED_CONTROLS: usize = 64;
-            let fresh = self.noticed_controls.len() < MAX_NOTICED_CONTROLS
-                && self.noticed_controls.insert(subtype.to_string());
+            // and the name itself so a buggy/hostile stream can't grow either
+            // without end. The codex driver shares both caps, but answers its
+            // unhandled server requests with an error: a JSON-RPC request has
+            // no other settler, so an unanswered one stalls the agent until
+            // the app-server's own timeout, where it has one.
+            let subtype = truncate_label(
+                request["subtype"].as_str().unwrap_or("unknown"),
+                UNHANDLED_REQUEST_NAME_MAX,
+            );
+            let fresh = self.noticed_controls.len() < UNHANDLED_REQUESTS_CAP
+                && self.noticed_controls.insert(subtype.clone());
             if fresh {
+                tracing::warn!(%subtype, "claude sent a control request chimaera does not handle");
                 step.events.push(AgentEvent::Notice {
                     text: format!(
                         "claude sent a request chimaera doesn't handle yet ({subtype}) — \
@@ -6577,6 +6584,37 @@ pub(crate) mod tests {
             step.events.is_empty(),
             "one notice per subtype, not per frame"
         );
+    }
+
+    /// The subtype is agent-influenced: its name is capped in the notice and
+    /// the once-per-subtype set is bounded (the codex driver shares both caps
+    /// for its unhandled server requests).
+    #[test]
+    fn unknown_control_subtype_notices_are_bounded() {
+        let mut m = mapper();
+        let long = "x".repeat(UNHANDLED_REQUEST_NAME_MAX * 4);
+        let step = m.on_frame(&json!({
+            "type": "control_request",
+            "request_id": "req-long",
+            "request": { "subtype": long },
+        }));
+        match &step.events[..] {
+            [AgentEvent::Notice { text }] => assert!(
+                !text.contains(&long) && text.len() < UNHANDLED_REQUEST_NAME_MAX * 3,
+                "the subtype is capped in the notice: {} bytes",
+                text.len()
+            ),
+            other => panic!("expected one Notice, got {other:?}"),
+        }
+        for i in 0..UNHANDLED_REQUESTS_CAP * 2 {
+            let step = m.on_frame(&json!({
+                "type": "control_request",
+                "request_id": format!("req-{i}"),
+                "request": { "subtype": format!("future_{i}") },
+            }));
+            assert!(step.outbound.is_empty(), "unknown subtypes still park");
+        }
+        assert_eq!(m.noticed_controls.len(), UNHANDLED_REQUESTS_CAP);
     }
 
     #[test]
