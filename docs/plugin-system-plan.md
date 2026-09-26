@@ -244,8 +244,9 @@ Limits, all in the host:
 |---|---|---|
 | Time per call | 5 s for tools, queries and events; 30 s for knowledge | epoch interruption: a 100 ms ticker, a wall-clock deadline checked on each tick, then a trap |
 | Memory per instance | 64 MiB linear memory | `StoreLimits` |
-| Compiled code | cached on disk per component hash | wasmtime's cache under `~/.cache/chimaera/wasmtime` (measured in the PoC; a first-party plugin may ship precompiled later if cold compile is slow on a login node) |
-| WASI | clocks and random only; no files, no env, no args, no network | `WasiCtxBuilder` with nothing granted |
+| Compiled code | once per daemon lifetime, in memory (25 to 50 ms for a small component) | `runtime.rs`; an on-disk `.cwasm` (`Component::serialize`) is P4 if a login node's cold compile hurts; wasmtime's own `cache` feature stays out |
+| Virtual memory | 64 MiB reserved per instance, not wasmtime's 4 GiB default | `memory_reservation`, `memory_guard_size`, `memory_reservation_for_growth` |
+| WASI | nothing granted: no files, no env, no args, no network; the guest's stderr captured (4 KiB) and logged on a trap | `WasiCtxBuilder::new()` |
 | Reads | `cap` bytes per read, 8 MiB ceiling; 4,096 entries per list | `hostfns.rs` |
 | State | 64 KiB per plugin per workspace | `hostfns.rs` |
 | Timeline appends | 10 per session per minute; `note` entries only; text ≤ 2 KiB | `hostfns.rs` |
@@ -286,10 +287,14 @@ lines and the attach sheet read the same routes.
 ## Packaging and third parties
 
 - **First-party, now:** the plugin crates live under `plugins/` in this
-  repository as workspace members (they compile natively for clippy and tests,
-  and to WASM for the artifact). Their move to their own repositories is a file
-  copy plus a line in `scripts/build-plugins.sh` that downloads the pinned
-  release artifact with its checksum instead of building.
+  repository as **their own cargo workspace** (`plugins/Cargo.toml`, depending on
+  `../crates/chimaera-plugin-api` by path): built to WASM by the script, checked
+  and unit-tested natively from that workspace (`cargo clippy` / `cargo test`
+  with `--manifest-path plugins/Cargo.toml`), never compiled by the daemon
+  workspace (a cdylib with component export names does not link natively on
+  macOS). Their move to their own repositories is a file copy plus a line in
+  `scripts/build-plugins.sh` that downloads the pinned release artifact with its
+  checksum instead of building.
 - **A plugin repository** is a claude and codex marketplace repository (so its
   skills, hooks and agent-side pieces install through the agents' own managers,
   as the authoring guide requires) plus the crate and its `plugin.toml`, and a
@@ -315,17 +320,65 @@ the memory cap refusing a 200 MiB allocation, a guest panic surviving as an
 error, cold and warm compile time, instantiate time, call latency, RSS, the
 binary-size delta, and a `cargo zigbuild` musl cross-build of a wasmtime host.
 
-Measured (filled in from the spike):
+Measured (2026-09-26, wasmtime 49.0.1, wit-bindgen 0.62.0, Rust 1.96.0, a 58 KB
+guest component; the scratch host and guest are the reference for the real host):
 
 | Measurement | Value |
 |---|---|
 | the daemon today (release, stripped, UI embedded, macOS arm64) | 26.8 MB |
-| host binary size delta (release, stripped) | _pending_ |
-| cold component compile / warm (cache) | _pending_ |
-| instantiate | _pending_ |
-| call latency (mean of 1,000) | _pending_ |
-| RSS: engine + one instance | _pending_ |
-| musl x86_64 / aarch64 cross-build | _pending_ |
+| host binary delta, Cranelift JIT in (release, stripped) | +9.4 MiB macOS arm64 · +13.2 MiB x86_64 musl · +9.4 MiB aarch64 musl |
+| the same with wasmtime's `cache` feature | +0.75 to +0.9 MiB more, plus zstd C code, a background worker and `.wip` files: **not used** |
+| host binary delta, runtime-only (no Cranelift, precompiled `.cwasm` only) | +2.5 MiB on every target |
+| cold component compile (single-threaded Cranelift) | 25 to 30 ms (47 ms the very first run) |
+| warm load from a serialized `.cwasm` (`serialize` / `deserialize_file`) | 0.1 to 0.2 ms |
+| instantiate (Store + WASI context + instance) | 120 µs the first time, 17 to 25 µs after |
+| one call (mean of 1,000, a small file read inside) | 18 to 20 µs; p99 24 to 54 µs |
+| RSS: bare / after Engine + one JIT compile / after an instance / after 1,000 calls | 2.4 / 15 / 15.6 / 15.9 MB (about 10 MB of the compile's RSS stays; a runtime-only host sits at 3 to 5 MB) |
+| virtual memory per live instance | 4 GiB by default; 69 MiB with `memory_reservation(64 MiB)`, `memory_guard_size(64 KiB)`, `memory_reservation_for_growth(0)`, at no latency cost. **Set it**: login nodes run with `ulimit -v` |
+| a busy loop, 1 s deadline | interrupted at 1.003 to 1.043 s; the daemon survives; the instance is dead (`CannotEnterComponent`) and is re-created in about 20 µs |
+| a 200 MiB allocation under a 64 MiB cap | a trap; the host survives; 16 + 40 MiB on the same instance succeed |
+| a guest panic | a trap with the message on the guest's stderr; the host survives; a fresh instance works |
+| musl cross-build with `cargo zigbuild` | x86_64 and aarch64 both build static, stripped, no warnings (with or without the cache feature) |
+
+Facts the host is built on: `wasmtime` with `default-features = false` and
+`component-model`, `async`, `runtime`, `std`, `cranelift` (the defaults pull in
+gc, threads, pooling, profiling, coredump and more); `wasmtime-wasi` with only
+`p2`; `bindgen!` with `imports: { default: async }, exports: { default: async }`;
+`Config::async_support` is a deprecated no-op in 49 (async is implied by the
+`_async` calls); `epoch_interruption(true)` and an epoch deadline **armed per
+call** (the deadline starts at 0, so an unarmed store traps on instantiate) with
+a callback that yields to tokio on each tick and interrupts past the wall-clock
+deadline; `wasmtime_wasi::p2::add_to_linker_async` (the wasip2 std imports
+`wasi:io` and `wasi:cli` at 0.2.6; wasmtime-wasi 49 serves them by semver; no
+files, clocks, random or sockets are imported by a guest that does not use
+them); `WasiCtxBuilder::new()` with nothing granted and the guest's stderr
+captured, capped, and logged on a trap. Components are compiled once per daemon
+lifetime and kept in memory; an on-disk `.cwasm` cache is P4 if a login node's
+cold compile hurts. No Cargo dependency needs pinning between wit-bindgen and
+wasmtime-wasi.
+
+**One decision for the maintainer.** Cranelift in the daemon costs 9 to 13 MiB
+of binary and about 10 MB of resident memory after a plugin is compiled, and lets
+any `plugin.wasm` load, including a third party's. A runtime-only daemon costs
+2.5 MiB and 3 to 5 MB, and loads only components precompiled for its exact
+target and wasmtime version, so every plugin (first-party in CI, third-party by a
+`chimaera plugin build` step somewhere with Cranelift) ships per-target
+artifacts. The PoC builds the JIT host, since it is the one that keeps the
+third-party story simple; P4 measures the runtime-only build on a real login node
+if the size matters.
+
+**A packaging fact the spike settled.** A plugin crate (a `cdylib`) does not link
+for the native target on macOS: its export names contain `#`, which Apple's
+linker reads as a comment in the exported-symbols list. `cargo check`, clippy
+and `cargo test` are fine (the test harness links the rlib, not the cdylib), but
+a plain `cargo build --workspace` would fail. So the plugin crates form **their
+own cargo workspace under `plugins/`**, built only through the script for
+`wasm32-wasip2` and checked and unit-tested natively from there; the daemon
+workspace never compiles them. That also keeps the daemon's lockfile free of
+wit-bindgen's copies of the wasm-tools crates, and mirrors where the plugins are
+going. A native unit test must not call a host import (the stub aborts the test
+binary), so plugin crates keep their pure logic in modules that take data, not
+the host.
 
 ### P1: the API crate, the host, Agent notes as WASM
 
@@ -365,24 +418,25 @@ WIT (0.2) and the LaTeX plan's `build` point on them; the UI-facing `query`
 route; precompiled first-party components if cold compile is slow on a login
 node.
 
-## Risks the proof must answer
+## Risks, and what the spike answered
 
-- **wasmtime on musl.** The release builds cross-compile with `cargo zigbuild`.
-  wasmtime is pure Rust with Cranelift, but its optional compile cache pulls in
-  zstd's C code; the spike builds both ways.
-- **Binary size.** The daemon is deployed over ssh on every update. If wasmtime
-  costs more than about 20 MB, the PoC records it and the decision is the
-  maintainer's; the design does not change.
-- **Cold compile on a login node.** Cranelift compiling a 2 MB component on a
-  busy node could take seconds; the cache makes it once per plugin version, and
-  first-party components can ship precompiled per target if it matters.
-- **Native compile of plugin crates.** The workspace's clippy and test runs
-  compile the plugin crates for the host target; the bindings must build there
-  (stubs) or the crates leave the workspace and build only through the script.
-- **A plugin's memory is the daemon's RSS.** 64 MiB per instance and 64 instances
-  is a 4 GiB worst case on paper; the idle eviction and the fact that a typical
-  plugin uses a few MiB keep the real number small, and the live proof measures
-  it.
+- **wasmtime on musl: answered.** Both musl targets cross-build with
+  `cargo zigbuild`, static and stripped, with or without the cache feature.
+- **Binary size: measured, under the line.** 9.4 MiB (arm64) to 13.2 MiB
+  (x86_64) with Cranelift; 2.5 MiB runtime-only. The JIT host is the PoC; the
+  runtime-only trade is the maintainer's call in P4.
+- **Cold compile on a login node: small so far.** 25 to 50 ms for a 58 KB
+  component on a laptop; the mycelium reader will be larger and P2 measures it.
+  Once per daemon lifetime; an on-disk `.cwasm` is the fallback.
+- **Native compile of plugin crates: answered by moving them.** The plugin
+  workspace is separate; the daemon never compiles a cdylib.
+- **A plugin's memory is the daemon's RSS.** About 10 MB stays resident after a
+  compile, plus each instance's linear memory (a few MiB typical, 64 MiB cap).
+  64 instances is a 4 GiB worst case on paper; idle eviction and the live proof's
+  RSS reading (P3) keep it honest. Virtual memory per instance is 69 MiB with the
+  reservation set, not 4 GiB, which matters under `ulimit -v`.
+- **A trapped instance is dead**, by design: every trap costs the plugin its
+  instance and a 20 µs re-creation, never the daemon.
 
 ## Out of scope
 
