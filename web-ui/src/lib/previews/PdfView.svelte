@@ -186,9 +186,9 @@
     // 32px accounts for page horizontal margins in the column.
     return Math.max((containerWidth - 32) / widest, 0.1);
   });
-  // The default: fit width, but never past pdf.js's own automatic-zoom cap
-  // (its MAX_AUTO_SCALE), so a page in a wide pane stays at reading size
-  // instead of filling it. "fit" is the uncapped width.
+  // The default: fit width, capped so a page in a wide pane stays at reading
+  // size instead of filling it (a Letter page is 765 px wide at the cap;
+  // scale 1 here is 1 CSS px per PDF point). "fit" is the uncapped width.
   const AUTO_MAX_SCALE = 1.25;
   function scaleOf(z: Zoom): number {
     return z === "fit" ? fitScale : z === "auto" ? Math.min(fitScale, AUTO_MAX_SCALE) : z;
@@ -1592,7 +1592,13 @@
       >
     </button>
     <div class="zoom">
-      <button class="zbtn" class:on={zoom === "fit"} onclick={() => (zoom = "fit")} title="fit width">fit</button>
+      <!-- Pressed again, fit goes back to the default size, the only way back to it. -->
+      <button
+        class="zbtn"
+        class:on={zoom === "fit"}
+        onclick={() => (zoom = zoom === "fit" ? "auto" : "fit")}
+        title={zoom === "fit" ? "back to the default size" : "fit width"}>fit</button
+      >
       <button class="zbtn" class:on={zoom === 1} onclick={() => (zoom = 1)} title="actual size">100%</button>
       <button class="zbtn ic" onclick={zoomOut} aria-label="zoom out" title="zoom out">−</button>
       <span class="zpct">{zoomPct}%</span>
