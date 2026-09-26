@@ -1,10 +1,11 @@
 <script module lang="ts">
-  /** Per-tab scroll + zoom memory, keyed by path. Module-scoped so it
-   * survives the component unmount/remount that a tab switch triggers. */
+  /** Per-tab scroll + zoom + sidebar memory, keyed by path. Module-scoped so
+   * it survives the component unmount/remount that a tab switch triggers. */
   interface PdfMem {
     zoom: "fit" | number;
     scrollTop: number;
     scrollLeft: number;
+    outline: boolean;
   }
   const memory = new Map<string, PdfMem>();
   const MEMORY_CAP = 100;
@@ -12,22 +13,36 @@
 
 <script lang="ts">
   /**
-   * PDF preview via pdf.js (worker bundled locally — no CDN, air-gapped rule).
-   * Pages render lazily as they scroll into view; fit-width by default with
-   * fit/100%/± zoom controls, ctrl/⌘-wheel zoom anchored at the cursor, a
-   * selectable text layer over each page, per-tab scroll+zoom memory, and a
-   * "p / N" indicator that follows the scroll and takes a page to jump to.
-   * Bytes come through the ticketed /raw/ URL (range requests supported
-   * server-side), so the bearer token never lands in a fetchable URL.
+   * PDF preview via pdf.js (worker, fonts, CMaps and wasm bundled locally —
+   * no CDN, air-gapped rule). Pages render lazily as they scroll into view;
+   * fit-width by default with fit/100%/± zoom controls, ctrl/⌘-wheel zoom
+   * anchored at the cursor, a selectable text layer, clickable links, an
+   * outline sidebar, find (⌘/Ctrl+F), per-tab scroll+zoom memory, `page` /
+   * `region` reveals, and a "p / N" indicator that follows the scroll and
+   * takes a page to jump to. Bytes come through the ticketed /raw/ URL in
+   * ranges, fetched only as pages need them (a remote tunnel never streams
+   * the whole file up front); the bearer token never lands in a URL.
    */
-  import { onMount } from "svelte";
-  import * as pdfjs from "pdfjs-dist";
+  import { onMount, untrack } from "svelte";
+  // The legacy build: pdf.js 6's modern build calls `Map.prototype.
+  // getOrInsertComputed` on every render and range read, which WebKit (the
+  // macOS app) and Chromium before 145 lack — pages stayed blank, and ranged
+  // loading threw. The legacy build carries the polyfills, worker included.
+  import * as pdfjs from "pdfjs-dist/legacy/build/pdf.mjs";
   import type { PDFDocumentProxy, PDFPageProxy } from "pdfjs-dist";
   // Vite bundles the worker as a local asset; nothing is fetched from a CDN.
-  import workerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
+  import workerUrl from "pdfjs-dist/legacy/build/pdf.worker.min.mjs?url";
   import { retain, release } from "./fileStore.svelte";
+  import { revealRequest, takeReveal, type Reveal } from "../shared/reveal";
+  import { activateUrl, isWebUrl } from "../shared/urlOpen";
+  import { findInPage, findPattern, pageText, type ItemRange, type PageText } from "./pdfFind";
 
   pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
+
+  /** Where the build ships pdf.js's font, CMap, wasm and ICC data (see
+   *  `pdfjsAssets` in vite.config.ts). Without the standard fonts a PDF
+   *  that references Helvetica without embedding it paints no text at all. */
+  const PDFJS_DATA = new URL(`${import.meta.env.BASE_URL}assets/pdfjs-${pdfjs.version}/`, location.href).href;
 
   interface Props {
     path: string;
@@ -42,8 +57,26 @@
     h: number;
   }
 
+  interface OutlineNode {
+    title: string;
+    dest: string | unknown[] | null;
+    url: string | null;
+    bold: boolean;
+    italic: boolean;
+    items: OutlineNode[];
+  }
+
+  /** One find match: its page, the text-item slices it covers, and where it
+   *  sits on the page (CSS px at scale 1, from the page top). */
+  interface FindHit {
+    page: number;
+    ranges: ItemRange[];
+    y: number;
+  }
+
   type PdfTextContent = Awaited<ReturnType<PDFPageProxy["getTextContent"]>>;
   type PdfTextReader = ReadableStreamDefaultReader<PdfTextContent>;
+  type PdfTextItem = Extract<PdfTextContent["items"][number], { str: string }>;
 
   let scroller = $state<HTMLDivElement | null>(null);
   let containerWidth = $state(0);
@@ -53,7 +86,7 @@
   /** The page field's text while the user is typing in it (null = follow
    *  the scroll). */
   let pageDraft = $state<string | null>(null);
-  let pages = $state<PageInfo[]>([]);
+  let pages = $state.raw<PageInfo[]>([]);
   let numPages = $state(0);
   let error = $state<string | null>(null);
   let loading = $state(true);
@@ -61,6 +94,27 @@
   /** "fit" (fit width) or an explicit CSS scale factor. */
   let zoom = $state<"fit" | number>("fit");
   let restored = false;
+
+  let outline = $state.raw<OutlineNode[]>([]);
+  let outlineOpen = $state(false);
+  /** Expanded outline entries, by their path of indices ("0.3.1"). */
+  let outlineExpanded = $state<Set<string>>(new Set());
+
+  let findOpen = $state(false);
+  let findQuery = $state("");
+  let findInput = $state<HTMLInputElement | null>(null);
+  let matches = $state.raw<FindHit[]>([]);
+  let current = $state(-1);
+  let searching = $state(false);
+  /** Pages whose text is over the item ceiling: not searched, and said so. */
+  let unsearched = $state(0);
+  let matchesCapped = $state(false);
+  let findGen = 0;
+  let findTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /** A revealed region (PDF points from the page's top-left, at 100%). */
+  let region = $state<{ page: number; x: number; y: number; w: number; h: number } | null>(null);
+  let regionFlash = $state(0);
 
   let doc: PDFDocumentProxy | null = null;
   let task: ReturnType<typeof pdfjs.getDocument> | null = null;
@@ -72,11 +126,19 @@
    *  UI thread after its pane is gone. */
   const renderTasks = new Map<number, ReturnType<PDFPageProxy["render"]>>();
   const textLayers = new Map<number, InstanceType<typeof pdfjs.TextLayer>>();
-  const textReaders = new Map<number, PdfTextReader>();
+  const textReaders = new Set<PdfTextReader>();
   /** Completed text layers reserve from one viewer-wide DOM budget. */
   const textItemCounts = new Map<number, number>();
   /** Pages over the per-page ceiling stay canvas-only across zoom rerenders. */
   const complexTextPages = new Set<number>();
+  /** Each rendered text layer's spans and their strings, for find highlights
+   *  (span i shows item i's string — pdf.js's TextLayer contract). */
+  const pageSpans = new Map<number, { spans: HTMLElement[]; strs: string[]; painted: number[] }>();
+  /** Pages whose link layer is built (positions are zoom-independent). */
+  const linkedPages = new Set<number>();
+  /** Searchable text per page, kept within a character budget. */
+  const findText = new Map<number, { pt: PageText; ys: Float32Array }>();
+  let findTextChars = 0;
   let observer: IntersectionObserver | null = null;
   let disposed = false;
   let restoreFrame: number | null = null;
@@ -94,12 +156,17 @@
   const MAX_TEXT_ITEMS_PER_PAGE = 5_000;
   const MAX_TEXT_ITEMS_TOTAL = 12_000;
   const PAGE_INFO_BATCH = 24;
+  /** Find stops counting here; the bar says so. */
+  const MAX_MATCHES = 5_000;
+  /** Page text kept for repeat searches (UTF-16 units, ~2 bytes each). */
+  const FIND_TEXT_BUDGET = 8_000_000;
 
   // Effective CSS scale: fit-width divides the container by the widest page,
   // clamped so a tiny pane doesn't render illegibly small.
   const fitScale = $derived.by(() => {
     if (pages.length === 0 || containerWidth === 0) return 1;
-    const widest = Math.max(...pages.map((p) => p.w));
+    let widest = 0;
+    for (const p of pages) if (p.w > widest) widest = p.w;
     // 32px accounts for page horizontal margins in the column.
     return Math.max((containerWidth - 32) / widest, 0.1);
   });
@@ -141,6 +208,23 @@
     el.scrollTop = pageTops[i] - SCROLL_PAD / 2;
   }
 
+  /** Scroll so point `y` (CSS px at scale 1, from the page top) of page `n`
+   *  sits a quarter of the way down the view; null `y` = the page's top. */
+  function scrollToPagePoint(n: number, y: number | null, x: number | null = null): void {
+    const el = scroller;
+    if (el === null || pageTops.length === 0) return;
+    const i = Math.min(Math.max(Math.round(n), 1), pageTops.length) - 1;
+    if (y === null) {
+      el.scrollTop = pageTops[i] - SCROLL_PAD / 2;
+    } else {
+      el.scrollTop = Math.max(0, pageTops[i] + y * scale - containerHeight / 4);
+    }
+    if (x !== null && el.scrollWidth > el.clientWidth) {
+      const pageLeft = Math.max(0, (el.scrollWidth - pages[i].w * scale) / 2);
+      el.scrollLeft = Math.max(0, pageLeft + x * scale - containerWidth / 3);
+    }
+  }
+
   function onPageKey(e: KeyboardEvent): void {
     const input = e.currentTarget as HTMLInputElement;
     if (e.key === "Enter") {
@@ -154,10 +238,23 @@
     }
   }
 
+  function errorText(e: unknown, fallback: string): string {
+    return e instanceof Error
+      ? e.message
+      : typeof e === "object" && e !== null && "message" in e
+        ? String(e.message)
+        : e === undefined
+          ? fallback
+          : String(e);
+  }
+
   onMount(() => {
     disposed = false;
     const mem = memory.get(path);
-    if (mem !== undefined) zoom = mem.zoom;
+    if (mem !== undefined) {
+      zoom = mem.zoom;
+      outlineOpen = mem.outline;
+    }
     // Pin + share the ticketed /raw/ URL through the store (cached across a tab
     // switch — no re-mint). pdf.js still re-parses on remount; the URL cache and
     // the per-tab scroll/zoom memory are what make the return feel instant.
@@ -168,7 +265,19 @@
         if (disposed) return;
         const url = fileEntry.rawUrl;
         if (url === null) throw new Error(fileEntry.rawError ?? "failed to open pdf");
-        const loadingTask = pdfjs.getDocument({ url });
+        const loadingTask = pdfjs.getDocument({
+          url,
+          // Fetch only the byte ranges the visible pages need (the daemon
+          // serves ranges); streaming would pull the whole file down a slow
+          // tunnel before the first page could use it.
+          disableAutoFetch: true,
+          disableStream: true,
+          cMapUrl: `${PDFJS_DATA}cmaps/`,
+          cMapPacked: true,
+          standardFontDataUrl: `${PDFJS_DATA}standard_fonts/`,
+          wasmUrl: `${PDFJS_DATA}wasm/`,
+          iccUrl: `${PDFJS_DATA}iccs/`,
+        });
         task = loadingTask;
         const d = await loadingTask.promise;
         if (disposed) {
@@ -177,34 +286,43 @@
         }
         doc = d;
         numPages = d.numPages;
-        const infos: PageInfo[] = [];
-        for (let n = 1; n <= d.numPages; n++) {
+        // Every page gets a placeholder sized like page 1 at once, so the
+        // scrollbar, jumps and reveals work before the size walk below has
+        // visited later pages (each visit is a ranged read on a remote host).
+        const first = await d.getPage(1);
+        if (disposed) return;
+        const vp1 = first.getViewport({ scale: 1 });
+        first.cleanup();
+        const infos: PageInfo[] = Array.from({ length: d.numPages }, (_, i) => ({
+          num: i + 1,
+          w: vp1.width,
+          h: vp1.height,
+        }));
+        pages = [...infos];
+        loading = false;
+        void loadOutline(d);
+        let changed = false;
+        for (let n = 2; n <= d.numPages; n++) {
           const page = await d.getPage(n);
           if (disposed) {
             page.cleanup();
             return;
           }
           const vp = page.getViewport({ scale: 1 });
-          infos.push({ num: n, w: vp.width, h: vp.height });
           page.cleanup();
-          // A large PDF should paint its first pages without waiting for a
-          // serial metadata walk across the whole document. Batch updates
-          // avoid O(n²) array churn while letting the observer start early.
-          if (n === 1 || n % PAGE_INFO_BATCH === 0 || n === d.numPages) {
+          if (vp.width !== infos[n - 1].w || vp.height !== infos[n - 1].h) {
+            infos[n - 1] = { num: n, w: vp.width, h: vp.height };
+            changed = true;
+          }
+          // Batch updates avoid O(n²) array churn on a long document.
+          if (changed && (n % PAGE_INFO_BATCH === 0 || n === d.numPages)) {
             pages = [...infos];
-            loading = false;
+            changed = false;
           }
         }
       } catch (e) {
         if (!disposed) {
-          error =
-            e instanceof Error
-              ? e.message
-              : typeof e === "object" && e !== null && "message" in e
-                ? String(e.message)
-                : e === undefined
-                  ? "failed to open pdf"
-                  : String(e);
+          error = errorText(e, "failed to open pdf");
           loading = false;
         }
       }
@@ -212,6 +330,7 @@
 
     return () => {
       disposed = true;
+      findGen += 1;
       release(path);
       saveMemory();
       observer?.disconnect();
@@ -219,9 +338,11 @@
       restoreFrame = null;
       if (reRenderTimer !== null) clearTimeout(reRenderTimer);
       reRenderTimer = null;
+      if (findTimer !== null) clearTimeout(findTimer);
+      findTimer = null;
       for (const renderTask of renderTasks.values()) renderTask.cancel();
       for (const textLayer of textLayers.values()) textLayer.cancel();
-      for (const reader of textReaders.values()) {
+      for (const reader of textReaders) {
         void reader.cancel(new Error("PDF view closed")).catch(() => {});
       }
       renderTasks.clear();
@@ -229,6 +350,9 @@
       textReaders.clear();
       textItemCounts.clear();
       complexTextPages.clear();
+      pageSpans.clear();
+      linkedPages.clear();
+      findText.clear();
       rendered.clear();
       renderingPages.clear();
       renderedScale.clear();
@@ -244,7 +368,7 @@
     const el = scroller;
     if (el === null) return;
     memory.delete(path);
-    memory.set(path, { zoom, scrollTop: el.scrollTop, scrollLeft: el.scrollLeft });
+    memory.set(path, { zoom, scrollTop: el.scrollTop, scrollLeft: el.scrollLeft, outline: outlineOpen });
     while (memory.size > MEMORY_CAP) {
       const oldest = memory.keys().next().value;
       if (oldest === undefined) break;
@@ -268,16 +392,9 @@
     return () => ro.disconnect();
   });
 
-  // Restore remembered scroll once pages have laid out.
+  // Restore remembered scroll once pages have laid out (a reveal wins).
   $effect(() => {
-    if (
-      restored ||
-      pages.length === 0 ||
-      pages.length !== numPages ||
-      scroller === null ||
-      containerWidth === 0
-    )
-      return;
+    if (restored || loading || pages.length === 0 || scroller === null || containerWidth === 0) return;
     const mem = memory.get(path);
     restored = true;
     if (mem !== undefined) {
@@ -293,9 +410,10 @@
   });
 
   // Lazy-render observer: render a page's canvas as its slot nears the viewport.
+  // Slots are keyed by page number, so a size refinement keeps them observed.
   $effect(() => {
     const el = scroller;
-    if (el === null || pages.length === 0) return;
+    if (el === null || loading || numPages === 0) return;
     const io = new IntersectionObserver(
       (entries) => {
         for (const entry of entries) {
@@ -322,12 +440,15 @@
 
   // On scale change: immediately stretch existing canvases (smooth), then
   // re-rasterize crisply after a short settle so a zoom gesture stays fluid.
+  // Text, link and highlight layers follow at once: they size from the
+  // slot's --total-scale-factor.
   let reRenderTimer: ReturnType<typeof setTimeout> | null = null;
   $effect(() => {
     const s = scale;
+    const list = pages;
     // Cheap immediate stretch of what's already drawn.
     for (const [n, canvas] of rendered) {
-      const info = pages.find((p) => p.num === n);
+      const info = list[n - 1];
       if (info === undefined) continue;
       canvas.style.width = `${info.w * s}px`;
       canvas.style.height = `${info.h * s}px`;
@@ -386,6 +507,7 @@
       rememberRendered(n, canvas);
       // Selectable text layer, positioned by --total-scale-factor.
       await renderTextLayer(page, slot, s);
+      if (!linkedPages.has(n)) await renderLinkLayer(page, slot, s);
     } catch {
       // a page failed to render; leave its placeholder in place
     } finally {
@@ -410,23 +532,27 @@
       if (rendered.size <= MAX_RENDERED_PAGES) break;
       if (old === n || nearbyPages.has(old) || renderingPages.has(old)) continue;
       oldCanvas.remove();
-      scroller?.querySelector<HTMLElement>(`[data-page="${old}"] .textLayer`)?.remove();
+      const oldSlot = scroller?.querySelector<HTMLElement>(`[data-page="${old}"]`);
+      oldSlot?.querySelector(".textLayer")?.remove();
+      oldSlot?.querySelector(".annotationLayer")?.remove();
       rendered.delete(old);
       renderedScale.delete(old);
       textItemCounts.delete(old);
+      pageSpans.delete(old);
+      linkedPages.delete(old);
     }
   }
 
-  /** Read only enough streamed text to decide whether a selectable layer is
-   * safe. Cancelling at the ceiling prevents a tiny, highly-compressed vector
-   * PDF from expanding into an unbounded main-thread object graph. */
+  /** Read only enough streamed text to decide whether it is safe to use.
+   * Cancelling at the ceiling prevents a tiny, highly-compressed vector PDF
+   * from expanding into an unbounded main-thread object graph. */
   async function readBoundedTextContent(page: PDFPageProxy): Promise<PdfTextContent | null | undefined> {
     const stream = page.streamTextContent({
       includeMarkedContent: true,
       disableNormalization: true,
     }) as ReadableStream<PdfTextContent>;
     const reader = stream.getReader();
-    textReaders.set(page.pageNumber, reader);
+    textReaders.add(reader);
     const items: PdfTextContent["items"] = [];
     const styles: PdfTextContent["styles"] = {};
     let lang: string | null = null;
@@ -450,7 +576,7 @@
       // Cancellation and malformed text content do not affect the canvas.
       return undefined;
     } finally {
-      if (textReaders.get(page.pageNumber) === reader) textReaders.delete(page.pageNumber);
+      textReaders.delete(reader);
       reader.releaseLock();
     }
   }
@@ -460,6 +586,7 @@
     textLayers.delete(pageNumber);
     slot.querySelector(".textLayer")?.remove();
     textItemCounts.delete(pageNumber);
+    pageSpans.delete(pageNumber);
     if (remember) complexTextPages.add(pageNumber);
     selectionLimited = true;
   }
@@ -494,21 +621,472 @@
         slot.appendChild(layer);
       }
       layer.replaceChildren();
-      layer.style.setProperty("--total-scale-factor", String(s));
-      layer.style.setProperty("--scale-round-x", "1px");
-      layer.style.setProperty("--scale-round-y", "1px");
       const viewport = page.getViewport({ scale: s });
       const tl = new pdfjs.TextLayer({ textContentSource: source, container: layer, viewport });
       textLayers.set(page.pageNumber, tl);
       await tl.render();
+      pageSpans.set(page.pageNumber, {
+        spans: tl.textDivs as HTMLElement[],
+        strs: tl.textContentItemsStr as string[],
+        painted: [],
+      });
+      paintHighlights(page.pageNumber);
     } catch {
       // text layer is a progressive enhancement; ignore failures
       layer?.remove();
       textItemCounts.delete(page.pageNumber);
+      pageSpans.delete(page.pageNumber);
     } finally {
       textLayers.delete(page.pageNumber);
     }
   }
+
+  // --- links ---------------------------------------------------------------------
+
+  /** The slice of pdf.js's link-service contract that link annotations use.
+   *  External URLs go through the app's one link policy (`activateUrl`: a
+   *  live local app opens in a pane, anything else in the real browser);
+   *  anything but http(s) is inert. */
+  const linkService = {
+    externalLinkEnabled: true,
+    isInPresentationMode: false,
+    rotation: 0,
+    eventBus: null,
+    get pagesCount(): number {
+      return numPages;
+    },
+    get page(): number {
+      return currentPage;
+    },
+    addLinkAttributes(link: HTMLAnchorElement, url: string): void {
+      if (!isWebUrl(url)) {
+        link.removeAttribute("href");
+        return;
+      }
+      link.href = url;
+      link.rel = "noopener noreferrer";
+      link.title = url;
+      link.addEventListener("click", (e) => {
+        e.preventDefault();
+        activateUrl(url, e.metaKey || e.ctrlKey);
+      });
+    },
+    getDestinationHash: (): string => "#",
+    getAnchorUrl: (): string => "#",
+    goToDestination(dest: string | unknown[]): void {
+      void goToDestination(dest);
+    },
+    goToPage(n: number): void {
+      jumpToPage(n);
+    },
+    executeNamedAction(action: string): void {
+      const n = currentPage;
+      if (action === "NextPage") jumpToPage(n + 1);
+      else if (action === "PrevPage") jumpToPage(n - 1);
+      else if (action === "FirstPage") jumpToPage(1);
+      else if (action === "LastPage") jumpToPage(numPages);
+    },
+    executeSetOCGState(): void {},
+    getAttachmentContent: async (): Promise<null> => null,
+  };
+
+  /** Build the page's link layer (links only: no forms, no scripting). */
+  async function renderLinkLayer(page: PDFPageProxy, slot: HTMLElement, s: number): Promise<void> {
+    try {
+      const all = await page.getAnnotations({ intent: "display" });
+      if (disposed || !slot.isConnected) return;
+      linkedPages.add(page.pageNumber);
+      const links = all.filter((a) => a.subtype === "Link");
+      if (links.length === 0) return;
+      slot.querySelector(".annotationLayer")?.remove();
+      const div = document.createElement("div");
+      div.className = "annotationLayer";
+      slot.appendChild(div);
+      const viewport = page.getViewport({ scale: s });
+      const layer = new pdfjs.AnnotationLayer({
+        div,
+        page,
+        viewport,
+        linkService,
+        accessibilityManager: null,
+        annotationCanvasMap: null,
+        annotationEditorUIManager: null,
+        structTreeLayer: null,
+        commentManager: null,
+        annotationStorage: null,
+      });
+      await layer.render({
+        div,
+        page,
+        viewport: viewport.clone({ dontFlip: true }),
+        annotations: links,
+        linkService: linkService as unknown as Parameters<typeof layer.render>[0]["linkService"],
+        renderForms: false,
+        enableScripting: false,
+      });
+    } catch {
+      // links are an enhancement; the page itself is already drawn
+    }
+  }
+
+  /** Resolve a PDF destination (named, or explicit `[ref, {name}, …args]`)
+   *  and scroll to its page and point. */
+  async function goToDestination(dest: string | unknown[] | null): Promise<void> {
+    const d = doc;
+    if (d === null || dest === null) return;
+    try {
+      const explicit = typeof dest === "string" ? await d.getDestination(dest) : dest;
+      if (!Array.isArray(explicit) || explicit.length === 0) return;
+      const [ref, kind, ...args] = explicit as [unknown, { name?: string } | undefined, ...unknown[]];
+      let index: number;
+      if (typeof ref === "object" && ref !== null) {
+        index = await d.getPageIndex(ref as Parameters<PDFDocumentProxy["getPageIndex"]>[0]);
+      } else if (Number.isInteger(ref)) {
+        index = ref as number;
+      } else {
+        return;
+      }
+      const n = index + 1;
+      if (disposed || n < 1 || n > numPages) return;
+      const num = (v: unknown): number | null => (typeof v === "number" && Number.isFinite(v) ? v : null);
+      let left: number | null = null;
+      let top: number | null = null;
+      switch (kind?.name) {
+        case "XYZ":
+          left = num(args[0]);
+          top = num(args[1]);
+          break;
+        case "FitH":
+        case "FitBH":
+          top = num(args[0]);
+          break;
+        case "FitR":
+          left = num(args[0]);
+          top = num(args[3]);
+          break;
+        default:
+          break;
+      }
+      if (top === null) {
+        scrollToPagePoint(n, null);
+        return;
+      }
+      const page = await d.getPage(n);
+      const [x, y] = page.getViewport({ scale: 1 }).convertToViewportPoint(left ?? 0, top);
+      page.cleanup();
+      if (disposed) return;
+      scrollToPagePoint(n, Math.max(0, y), left === null ? null : x);
+    } catch {
+      // a broken destination goes nowhere
+    }
+  }
+
+  // --- outline -------------------------------------------------------------------
+
+  async function loadOutline(d: PDFDocumentProxy): Promise<void> {
+    try {
+      const raw = await d.getOutline();
+      if (disposed || raw === null) return;
+      const convert = (items: typeof raw): OutlineNode[] =>
+        items.map((it) => ({
+          title: it.title,
+          dest: it.dest,
+          url: it.url,
+          bold: it.bold,
+          italic: it.italic,
+          items: convert(it.items ?? []),
+        }));
+      outline = convert(raw);
+      // The first level opens expanded; deeper levels on demand.
+      outlineExpanded = new Set(outline.map((_, i) => String(i)));
+    } catch {
+      outline = [];
+    }
+  }
+
+  function toggleOutlineNode(key: string): void {
+    const next = new Set(outlineExpanded);
+    if (next.has(key)) next.delete(key);
+    else next.add(key);
+    outlineExpanded = next;
+  }
+
+  function openOutlineNode(node: OutlineNode, e: MouseEvent): void {
+    if (node.url !== null) {
+      if (isWebUrl(node.url)) activateUrl(node.url, e.metaKey || e.ctrlKey);
+      return;
+    }
+    void goToDestination(node.dest);
+  }
+
+  function toggleOutline(): void {
+    outlineOpen = !outlineOpen;
+    saveMemory();
+  }
+
+  // --- find ----------------------------------------------------------------------
+
+  function openFind(): void {
+    findOpen = true;
+    queueMicrotask(() => {
+      findInput?.focus();
+      findInput?.select();
+    });
+    if (findQuery.trim() !== "" && matches.length === 0 && !searching) startSearch();
+  }
+
+  function closeFind(): void {
+    findOpen = false;
+    findGen += 1;
+    searching = false;
+    if (findTimer !== null) clearTimeout(findTimer);
+    findTimer = null;
+    matches = [];
+    current = -1;
+    paintAll();
+    scroller?.focus();
+  }
+
+  function onFindInput(e: Event): void {
+    findQuery = (e.currentTarget as HTMLInputElement).value;
+    if (findTimer !== null) clearTimeout(findTimer);
+    findTimer = setTimeout(() => {
+      findTimer = null;
+      startSearch();
+    }, 180);
+  }
+
+  function onFindKey(e: KeyboardEvent): void {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      if (findTimer !== null) {
+        clearTimeout(findTimer);
+        findTimer = null;
+        startSearch();
+        return;
+      }
+      step(e.shiftKey ? -1 : 1);
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      closeFind();
+    }
+  }
+
+  /** ⌘/Ctrl+F anywhere in the view opens find (the browser's own find
+   *  cannot see pages that are not rendered). */
+  function onViewKey(e: KeyboardEvent): void {
+    if ((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "f") {
+      e.preventDefault();
+      openFind();
+    } else if (e.key === "Escape" && region !== null && !findOpen) {
+      region = null;
+    }
+  }
+
+  /** Searchable text for page `n`: null when the page is over the item
+   *  ceiling (never searched), undefined when it could not be read. */
+  async function pageSearchText(n: number): Promise<{ pt: PageText; ys: Float32Array } | null | undefined> {
+    const hit = findText.get(n);
+    if (hit !== undefined) return hit;
+    if (complexTextPages.has(n)) return null;
+    const d = doc;
+    if (d === null) return undefined;
+    const page = await d.getPage(n);
+    try {
+      const content = await readBoundedTextContent(page);
+      if (content === null) {
+        complexTextPages.add(n);
+        return null;
+      }
+      if (content === undefined) return undefined;
+      const items = content.items.filter((it): it is PdfTextItem => "str" in it);
+      const pt = pageText(items);
+      // Each item's top edge, for scrolling to a match on a page whose text
+      // layer is not rendered yet.
+      const vp = page.getViewport({ scale: 1 });
+      const ys = new Float32Array(items.length);
+      items.forEach((it, i) => {
+        const [, y] = vp.convertToViewportPoint(it.transform[4], it.transform[5]);
+        ys[i] = y - (it.height || Math.abs(it.transform[3]) || 0);
+      });
+      const entry = { pt, ys };
+      if (findTextChars + pt.text.length <= FIND_TEXT_BUDGET) {
+        findText.set(n, entry);
+        findTextChars += pt.text.length;
+      }
+      return entry;
+    } finally {
+      page.cleanup();
+    }
+  }
+
+  /** Walk every page for the query, one page per task so the UI stays
+   *  responsive; results arrive progressively. The walk starts at the page
+   *  being read and wraps, so the first match is the nearest one ahead. */
+  function startSearch(): void {
+    const gen = ++findGen;
+    const re = findPattern(findQuery);
+    matches = [];
+    current = -1;
+    unsearched = 0;
+    matchesCapped = false;
+    paintAll();
+    if (re === null || doc === null || numPages === 0) {
+      searching = false;
+      return;
+    }
+    searching = true;
+    const start = Math.max(1, currentPage);
+    void (async () => {
+      const found: FindHit[] = [];
+      let skipped = 0;
+      for (let k = 0; k < numPages; k++) {
+        const n = ((start - 1 + k) % numPages) + 1;
+        let text: Awaited<ReturnType<typeof pageSearchText>>;
+        try {
+          text = await pageSearchText(n);
+        } catch {
+          text = undefined;
+        }
+        if (gen !== findGen || disposed) return;
+        if (text === null || text === undefined) {
+          skipped += 1;
+        } else {
+          for (const ranges of findInPage(text.pt, re, MAX_MATCHES - found.length)) {
+            found.push({ page: n, ranges, y: Math.max(0, text.ys[ranges[0].item] ?? 0) });
+          }
+        }
+        if (found.length > 0 && current === -1) {
+          current = 0;
+          matches = [...found];
+          revealMatch(0);
+        }
+        if (found.length >= MAX_MATCHES) {
+          matchesCapped = true;
+          break;
+        }
+        // Publish every few pages (and at the end) so the count climbs.
+        if (k % 8 === 7) {
+          matches = [...found];
+          unsearched = skipped;
+          paintAll();
+        }
+        await new Promise<void>((r) => setTimeout(r, 0));
+        if (gen !== findGen || disposed) return;
+      }
+      // Present matches in document order, keeping the current one current.
+      const selected = current >= 0 ? found[current] : undefined;
+      found.sort((a, b) => a.page - b.page || a.y - b.y);
+      matches = found;
+      current = selected !== undefined ? found.indexOf(selected) : found.length > 0 ? 0 : -1;
+      unsearched = skipped;
+      searching = false;
+      paintAll();
+    })();
+  }
+
+  function step(dir: 1 | -1): void {
+    if (matches.length === 0) {
+      if (!searching) startSearch();
+      return;
+    }
+    current = (current + dir + matches.length) % matches.length;
+    revealMatch(current);
+  }
+
+  function revealMatch(i: number): void {
+    const hit = matches[i];
+    if (hit === undefined) return;
+    scrollToPagePoint(hit.page, hit.y);
+    paintAll();
+  }
+
+  /** Repaint find highlights on every rendered text layer. */
+  function paintAll(): void {
+    for (const n of pageSpans.keys()) paintHighlights(n);
+  }
+
+  /** Wrap this page's matched substrings in highlight spans (the current
+   *  match marked), restoring any spans painted before. */
+  function paintHighlights(n: number): void {
+    const layer = pageSpans.get(n);
+    if (layer === undefined) return;
+    for (const i of layer.painted) {
+      const span = layer.spans[i];
+      if (span !== undefined) span.textContent = layer.strs[i];
+    }
+    layer.painted = [];
+    if (!findOpen || matches.length === 0) return;
+    const byItem = new Map<number, { from: number; to: number; selected: boolean }[]>();
+    matches.forEach((hit, m) => {
+      if (hit.page !== n) return;
+      for (const r of hit.ranges) {
+        const list = byItem.get(r.item) ?? [];
+        list.push({ from: r.from, to: r.to, selected: m === current });
+        byItem.set(r.item, list);
+      }
+    });
+    for (const [i, ranges] of byItem) {
+      const span = layer.spans[i];
+      const str = layer.strs[i];
+      if (span === undefined || str === undefined) continue;
+      ranges.sort((a, b) => a.from - b.from);
+      const frag = document.createDocumentFragment();
+      let pos = 0;
+      for (const r of ranges) {
+        const from = Math.max(r.from, pos);
+        if (from > pos) frag.append(str.slice(pos, from));
+        if (r.to <= from) continue;
+        const mark = document.createElement("span");
+        mark.className = r.selected ? "highlight selected" : "highlight";
+        mark.textContent = str.slice(from, r.to);
+        frag.append(mark);
+        pos = r.to;
+      }
+      if (pos < str.length) frag.append(str.slice(pos));
+      span.replaceChildren(frag);
+      layer.painted.push(i);
+    }
+  }
+
+  const findStatus = $derived.by(() => {
+    if (findQuery.trim() === "") return "";
+    if (matches.length === 0) return searching ? "searching…" : "no matches";
+    const count = `${matches.length.toLocaleString("en-US")}${searching || matchesCapped ? "+" : ""}`;
+    return `${current + 1} / ${count}`;
+  });
+
+  // --- reveals ---------------------------------------------------------------------
+
+  // `#page=N` (and `#xywh=` on that page) from a link or an agent: taken once
+  // the page column exists; it wins over the remembered scroll position.
+  $effect(() => {
+    void $revealRequest;
+    if (loading || pages.length === 0 || scroller === null) return;
+    const req = takeReveal(path);
+    if (req === null) return;
+    untrack(() => applyReveal(req));
+  });
+
+  function applyReveal(req: Reveal): void {
+    const n = req.page ?? (req.region !== undefined ? 1 : null);
+    if (n === null) return;
+    restored = true;
+    if (restoreFrame !== null) cancelAnimationFrame(restoreFrame);
+    restoreFrame = null;
+    const page = Math.min(Math.max(Math.round(n), 1), numPages);
+    const r = req.region;
+    if (r !== undefined && [r.x, r.y, r.w, r.h].every(Number.isFinite) && r.w > 0 && r.h > 0) {
+      region = { page, ...r };
+      regionFlash += 1;
+      scrollToPagePoint(page, r.y, r.x);
+    } else {
+      region = null;
+      scrollToPagePoint(page, null);
+    }
+  }
+
+  // --- zoom ------------------------------------------------------------------------
 
   function zoomIn(): void {
     const cur = zoom === "fit" ? fitScale : zoom;
@@ -556,8 +1134,67 @@
   });
 </script>
 
-<div class="pdf-view">
+{#snippet outlineItems(nodes: OutlineNode[], prefix: string, depth: number)}
+  {#each nodes as node, i (i)}
+    {@const key = prefix === "" ? String(i) : `${prefix}.${i}`}
+    {@const open = outlineExpanded.has(key)}
+    <li>
+      <div class="ol-row" style:padding-left={`${0.35 + depth * 0.85}rem`}>
+        {#if node.items.length > 0}
+          <button
+            class="ol-twist"
+            class:open
+            aria-label={open ? "collapse" : "expand"}
+            aria-expanded={open}
+            onclick={() => toggleOutlineNode(key)}
+          >
+            <svg viewBox="0 0 16 16" width="10" height="10" aria-hidden="true"
+              ><path d="M6 4l4 4-4 4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" /></svg
+            >
+          </button>
+        {:else}
+          <span class="ol-twist-pad"></span>
+        {/if}
+        <button
+          class="ol-title"
+          class:bold={node.bold}
+          class:italic={node.italic}
+          title={node.url ?? node.title}
+          onclick={(e) => openOutlineNode(node, e)}>{node.title || "(untitled)"}</button
+        >
+      </div>
+      {#if open && node.items.length > 0}
+        <ul>
+          {@render outlineItems(node.items, key, depth + 1)}
+        </ul>
+      {/if}
+    </li>
+  {/each}
+{/snippet}
+
+<!-- svelte-ignore a11y_no_static_element_interactions -->
+<div class="pdf-view" onkeydown={onViewKey}>
   <div class="pdf-bar">
+    {#if outline.length > 0}
+      <button
+        class="zbtn ic"
+        class:on={outlineOpen}
+        onclick={toggleOutline}
+        aria-label="outline"
+        aria-pressed={outlineOpen}
+        title="outline"
+      >
+        <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"
+          ><path
+            d="M3 4h10M5.5 8H13M5.5 12H13"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.4"
+            stroke-linecap="round"
+          /></svg
+        >
+      </button>
+    {/if}
     {#if numPages > 0 && pages.length > 0}
       <span class="pages">
         <input
@@ -585,7 +1222,31 @@
         >selection limited</span
       >
     {/if}
+    {#if region !== null}
+      <span class="selection-note region-note">
+        region on p. {region.page}
+        <button class="zbtn ic sm" aria-label="clear the region" title="clear the region" onclick={() => (region = null)}
+          >×</button
+        >
+      </span>
+    {/if}
     <span class="spacer"></span>
+    <button
+      class="zbtn ic"
+      class:on={findOpen}
+      onclick={() => (findOpen ? closeFind() : openFind())}
+      aria-label="find"
+      title="find (⌘/Ctrl+F)"
+    >
+      <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"
+        ><circle cx="7" cy="7" r="4.2" fill="none" stroke="currentColor" stroke-width="1.4" /><path
+          d="M10.2 10.2L13.5 13.5"
+          stroke="currentColor"
+          stroke-width="1.4"
+          stroke-linecap="round"
+        /></svg
+      >
+    </button>
     <div class="zoom">
       <button class="zbtn" class:on={zoom === "fit"} onclick={() => (zoom = "fit")} title="fit width">fit</button>
       <button class="zbtn" class:on={zoom === 1} onclick={() => (zoom = 1)} title="actual size">100%</button>
@@ -595,21 +1256,86 @@
     </div>
   </div>
 
-  <div class="pdf-scroll" bind:this={scroller} onwheel={onWheel} onscroll={onScroll}>
-    {#if error !== null}
-      <div class="file-error">{error}</div>
-    {:else if loading}
-      <div class="file-loading">opening…</div>
-    {:else}
-      {#each pages as p (p.num)}
-        <div
-          class="pdf-slot"
-          data-page={p.num}
-          style:width={`${p.w * scale}px`}
-          style:height={`${p.h * scale}px`}
-        ></div>
-      {/each}
+  {#if findOpen}
+    <div class="find-bar" role="search">
+      <input
+        bind:this={findInput}
+        class="find-input"
+        type="text"
+        placeholder="find in document"
+        aria-label="find in document"
+        spellcheck="false"
+        value={findQuery}
+        oninput={onFindInput}
+        onkeydown={onFindKey}
+      />
+      <span class="find-status" aria-live="polite">{findStatus}</span>
+      {#if unsearched > 0}
+        <span
+          class="find-note"
+          title="these pages carry more text items than the viewer reads (plots that draw every point as text), so they were not searched"
+          >{unsearched} {unsearched === 1 ? "page" : "pages"} not searched</span
+        >
+      {/if}
+      {#if matchesCapped}
+        <span class="find-note">first {MAX_MATCHES.toLocaleString("en-US")} shown</span>
+      {/if}
+      <span class="spacer"></span>
+      <button class="zbtn ic" onclick={() => step(-1)} aria-label="previous match" title="previous (Shift+Enter)"
+        >↑</button
+      >
+      <button class="zbtn ic" onclick={() => step(1)} aria-label="next match" title="next (Enter)">↓</button>
+      <button class="zbtn ic" onclick={closeFind} aria-label="close find" title="close (Esc)">×</button>
+    </div>
+  {/if}
+
+  <div class="pdf-body">
+    {#if outlineOpen && outline.length > 0}
+      <nav class="pdf-outline" aria-label="document outline">
+        <ul>
+          {@render outlineItems(outline, "", 0)}
+        </ul>
+      </nav>
     {/if}
+    <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+    <div
+      class="pdf-scroll"
+      bind:this={scroller}
+      onwheel={onWheel}
+      onscroll={onScroll}
+      tabindex="0"
+      role="document"
+      aria-label="PDF pages"
+    >
+      {#if error !== null}
+        <div class="file-error">{error}</div>
+      {:else if loading}
+        <div class="file-loading">opening…</div>
+      {:else}
+        {#each pages as p (p.num)}
+          <div
+            class="pdf-slot"
+            data-page={p.num}
+            style:width={`${p.w * scale}px`}
+            style:height={`${p.h * scale}px`}
+            style:--total-scale-factor={scale}
+          >
+            {#if region !== null && region.page === p.num}
+              {#key regionFlash}
+                <div
+                  class="pdf-region"
+                  aria-hidden="true"
+                  style:left={`${region.x * scale}px`}
+                  style:top={`${region.y * scale}px`}
+                  style:width={`${region.w * scale}px`}
+                  style:height={`${region.h * scale}px`}
+                ></div>
+              {/key}
+            {/if}
+          </div>
+        {/each}
+      {/if}
+    </div>
   </div>
 </div>
 
@@ -621,7 +1347,8 @@
     flex-direction: column;
   }
 
-  .pdf-bar {
+  .pdf-bar,
+  .find-bar {
     flex: none;
     display: flex;
     align-items: center;
@@ -631,6 +1358,41 @@
     border-bottom: 1px solid var(--edge);
     font-size: var(--text-xs);
     color: var(--muted);
+    white-space: nowrap;
+  }
+
+  .find-bar {
+    gap: 0.45rem;
+    padding-left: 0.5rem;
+  }
+
+  .find-input {
+    appearance: none;
+    width: min(22rem, 45%);
+    min-width: 8rem;
+    height: 19px;
+    padding: 0 0.45rem;
+    border: 1px solid var(--edge);
+    border-radius: 4px;
+    background: var(--term-bg);
+    font: inherit;
+    color: var(--fg);
+  }
+
+  .find-input:focus {
+    outline: none;
+    border-color: color-mix(in srgb, var(--accent) 55%, var(--edge));
+  }
+
+  .find-status {
+    font-variant-numeric: tabular-nums;
+    color: var(--fg);
+  }
+
+  .find-note {
+    color: var(--muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
   .pages {
@@ -674,6 +1436,13 @@
     color: var(--muted);
   }
 
+  .region-note {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    color: var(--fg);
+  }
+
   .spacer {
     flex: 1;
   }
@@ -715,10 +1484,20 @@
   }
 
   .zbtn.ic {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
     min-width: 20px;
-    text-align: center;
+    height: 20px;
+    padding: 0 0.3rem;
     font-size: var(--text-lg);
     line-height: 1;
+  }
+
+  .zbtn.ic.sm {
+    min-width: 16px;
+    height: 16px;
+    font-size: var(--text-sm);
   }
 
   .zpct {
@@ -727,15 +1506,114 @@
     font-variant-numeric: tabular-nums;
   }
 
-  .pdf-scroll {
+  .pdf-body {
     flex: 1;
     min-height: 0;
+    display: flex;
+  }
+
+  .pdf-outline {
+    flex: none;
+    width: clamp(160px, 26%, 280px);
+    overflow: auto;
+    padding: 0.35rem 0;
+    border-right: 1px solid var(--edge);
+    background: var(--term-bg);
+    font-size: var(--text-sm);
+    scrollbar-width: thin;
+    scrollbar-color: color-mix(in srgb, var(--fg) 22%, transparent) transparent;
+  }
+
+  .pdf-outline ul {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+  }
+
+  .ol-row {
+    display: flex;
+    align-items: center;
+    gap: 1px;
+    padding-right: 0.4rem;
+  }
+
+  .ol-twist,
+  .ol-twist-pad {
+    flex: none;
+    width: 16px;
+    height: 20px;
+  }
+
+  .ol-twist {
+    appearance: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: none;
+    background: none;
+    padding: 0;
+    color: var(--muted);
+    cursor: pointer;
+    border-radius: 3px;
+  }
+
+  .ol-twist svg {
+    transition: transform 0.12s ease;
+  }
+
+  .ol-twist.open svg {
+    transform: rotate(90deg);
+  }
+
+  .ol-twist:hover {
+    color: var(--fg);
+  }
+
+  .ol-title {
+    appearance: none;
+    flex: 1;
+    min-width: 0;
+    border: none;
+    background: none;
+    padding: 0.15rem 0.35rem;
+    border-radius: 4px;
+    font: inherit;
+    color: var(--fg);
+    text-align: left;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    cursor: pointer;
+  }
+
+  .ol-title:hover {
+    background: var(--row-hover);
+  }
+
+  .ol-title:focus-visible,
+  .ol-twist:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+  }
+
+  .ol-title.bold {
+    font-weight: 600;
+  }
+
+  .ol-title.italic {
+    font-style: italic;
+  }
+
+  .pdf-scroll {
+    flex: 1;
+    min-width: 0;
     overflow: auto;
     display: flex;
     flex-direction: column;
     align-items: center;
     gap: 12px;
     padding: 14px 0;
+    outline: none;
     background: color-mix(in srgb, var(--fg) 4%, var(--term-bg));
     scrollbar-width: thin;
     scrollbar-color: color-mix(in srgb, var(--fg) 22%, transparent) transparent;
@@ -744,17 +1622,21 @@
   .pdf-slot {
     flex: none;
     position: relative;
+    /* A PDF page is paper: white in every theme. */
     background: #fff;
     box-shadow: 0 1px 6px rgba(0, 0, 0, 0.18);
     border-radius: 2px;
     overflow: hidden;
+    --scale-round-x: 1px;
+    --scale-round-y: 1px;
   }
 
   .pdf-slot :global(.pdf-canvas) {
     display: block;
   }
 
-  /* pdf.js text layer: transparent, absolutely-positioned selectable spans. */
+  /* pdf.js text layer (its viewer CSS, trimmed): transparent spans sized from
+     --total-scale-factor, so selection and find highlights sit on the glyphs. */
   .pdf-slot :global(.textLayer) {
     position: absolute;
     inset: 0;
@@ -762,11 +1644,16 @@
     overflow: clip;
     opacity: 1;
     line-height: 1;
+    letter-spacing: normal;
+    word-spacing: normal;
     text-size-adjust: none;
     forced-color-adjust: none;
     transform-origin: 0 0;
     caret-color: CanvasText;
     z-index: 1;
+    --min-font-size: 1;
+    --text-scale-factor: calc(var(--total-scale-factor) * var(--min-font-size));
+    --min-font-size-inv: calc(1 / var(--min-font-size));
   }
 
   .pdf-slot :global(.textLayer span),
@@ -778,13 +1665,87 @@
     transform-origin: 0% 0%;
   }
 
-  .pdf-slot :global(.textLayer span.markedContent) {
-    top: 0;
-    height: 0;
+  .pdf-slot :global(.textLayer > :not(.markedContent)),
+  .pdf-slot :global(.textLayer .markedContent span:not(.markedContent)) {
+    z-index: 1;
+    --font-height: 0;
+    font-size: calc(var(--text-scale-factor) * var(--font-height));
+    --scale-x: 1;
+    --rotate: 0deg;
+    transform: rotate(var(--rotate)) scaleX(var(--scale-x)) scale(var(--min-font-size-inv));
+  }
+
+  .pdf-slot :global(.textLayer .markedContent) {
+    display: contents;
+  }
+
+  .pdf-slot :global(.textLayer span.highlight) {
+    position: static;
+    margin: -1px;
+    padding: 1px;
+    border-radius: 3px;
+    font-size: inherit;
+    transform: none;
+    background: color-mix(in srgb, var(--accent) 28%, transparent);
+  }
+
+  .pdf-slot :global(.textLayer span.highlight.selected) {
+    background: color-mix(in srgb, var(--accent) 55%, transparent);
+    box-shadow: 0 0 0 1px var(--accent);
   }
 
   .pdf-slot :global(.textLayer ::selection) {
     background: rgba(80, 140, 220, 0.35);
+  }
+
+  /* pdf.js link layer: absolutely placed sections over the canvas, one
+     anchor filling each. */
+  .pdf-slot :global(.annotationLayer) {
+    position: absolute;
+    top: 0;
+    left: 0;
+    pointer-events: none;
+    transform-origin: 0 0;
+    z-index: 2;
+  }
+
+  .pdf-slot :global(.annotationLayer section) {
+    position: absolute;
+    text-align: initial;
+    pointer-events: auto;
+    box-sizing: border-box;
+    transform-origin: 0 0;
+  }
+
+  .pdf-slot :global(.annotationLayer .linkAnnotation > a) {
+    position: absolute;
+    inset: 0;
+    font-size: 1em;
+    border-radius: 2px;
+  }
+
+  .pdf-slot :global(.annotationLayer .linkAnnotation > a:hover) {
+    background: color-mix(in srgb, var(--accent) 16%, transparent);
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 50%, transparent);
+  }
+
+  .pdf-region {
+    position: absolute;
+    z-index: 3;
+    box-sizing: border-box;
+    pointer-events: none;
+    border: 2px solid var(--accent);
+    border-radius: 2px;
+    background: color-mix(in srgb, var(--accent) 8%, transparent);
+    animation: region-in 1.6s ease-out;
+  }
+
+  @keyframes region-in {
+    0%,
+    40% {
+      background: color-mix(in srgb, var(--accent) 26%, transparent);
+      box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 30%, transparent);
+    }
   }
 
   .file-error,
@@ -794,5 +1755,16 @@
     font-size: var(--text-md);
     padding: 1rem;
     text-align: center;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .zbtn,
+    .ol-twist svg {
+      transition: none;
+    }
+
+    .pdf-region {
+      animation: none;
+    }
   }
 </style>
