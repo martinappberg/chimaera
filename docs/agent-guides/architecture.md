@@ -106,9 +106,9 @@ on the alternate screen cannot restore the primary screen's scrollback
   that wrote it — so `connect`'s probe also reports the node it ran on (`uname -n`), and a
   manifest another node wrote is never judged by that node's `kill -0`. Connect routes the
   alias to the manifest's node instead (a per-alias `Route` in `chimaera-remote`: the node's
-  own `HostName` with the alias's ssh config, else a `-W` leg through the alias's master for
-  names only the cluster resolves), takes the liveness verdict there, and pins every later
-  ssh call for the alias to it. Nothing is started unless the daemon is provably dead on its
+  own `HostName` with the alias's ssh config when the laptop and the cluster resolve it to the
+  same address, else a `-W` leg through the alias's master), takes the liveness verdict there,
+  and pins every later ssh call for the alias to it (for the life of the process). Nothing is started unless the daemon is provably dead on its
   node or the node's name no longer resolves inside the cluster; an unreachable node is an
   honest error. Reaching another login node is a fresh ssh login — on a Duo cluster, one more
   prompt (verified on Sherlock, 2026-09-25: login→login ssh isn't hostbased there). Sites

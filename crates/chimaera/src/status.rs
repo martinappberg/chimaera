@@ -13,7 +13,12 @@ pub async fn run(host: Option<&str>) -> anyhow::Result<()> {
 fn local() -> anyhow::Result<()> {
     match Manifest::load()? {
         None => println!("not running"),
-        Some(m) if !m.written_here() => report_elsewhere(&m, "this node"),
+        Some(m) if !m.written_here() => println!(
+            "registered on {} (pid {}, build {}) — another node's daemon; check it there",
+            m.hostname,
+            m.pid,
+            m.build.as_deref().unwrap_or("pre-build-id")
+        ),
         Some(m) if m.is_alive() => report_running(&m),
         Some(m) => report_stale(&m),
     }

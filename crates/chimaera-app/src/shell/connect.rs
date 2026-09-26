@@ -86,9 +86,21 @@ pub(super) struct HostStatus {
     /// hashed UI chunks never span daemon builds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) build: Option<String>,
+    /// On `connected`: the login node the tunnel is pinned to (a pool alias
+    /// whose daemon runs on another node than where the alias lands).
+    /// Every connected event carries it, so a row re-routed by a reconnect it
+    /// didn't start never keeps a stale node.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) node: Option<String>,
 }
 
-fn connected_status(alias: &str, local_port: u16, token: &str, build: Option<&str>) -> HostStatus {
+fn connected_status(
+    alias: &str,
+    local_port: u16,
+    token: &str,
+    build: Option<&str>,
+    node: Option<&str>,
+) -> HostStatus {
     HostStatus {
         alias: alias.to_string(),
         status: "connected",
@@ -97,6 +109,7 @@ fn connected_status(alias: &str, local_port: u16, token: &str, build: Option<&st
         error: None,
         reason: None,
         build: build.map(str::to_string),
+        node: node.map(str::to_string),
     }
 }
 
@@ -150,6 +163,7 @@ async fn publish_connected_state(app: &AppHandle, state: &Shell, alias: &str) ->
                 tunnel.local_port,
                 &tunnel.manifest.token,
                 tunnel.manifest.build.as_deref(),
+                tunnel.route.node(),
             ),
         )
     };
@@ -316,6 +330,7 @@ pub(super) async fn do_connect(
                     error: Some(e.clone()),
                     reason: None,
                     build: None,
+                    node: None,
                 },
             );
         }
@@ -492,6 +507,7 @@ async fn drop_compute_tunnels_of(app: &AppHandle, state: &Shell, alias: &str) {
                         .to_string(),
                 ),
                 build: None,
+                node: None,
             },
         );
     }
@@ -553,12 +569,19 @@ mod tests {
 
     #[test]
     fn connected_status_carries_the_authoritative_endpoint() {
-        let status = connected_status("Sherlock", 43123, "fresh-token", Some("build.2"));
+        let status = connected_status(
+            "Sherlock",
+            43123,
+            "fresh-token",
+            Some("build.2"),
+            Some("sh03-ln06.stanford.edu"),
+        );
         assert_eq!(status.alias, "Sherlock");
         assert_eq!(status.status, "connected");
         assert_eq!(status.local_port, Some(43123));
         assert_eq!(status.token.as_deref(), Some("fresh-token"));
         assert_eq!(status.build.as_deref(), Some("build.2"));
+        assert_eq!(status.node.as_deref(), Some("sh03-ln06.stanford.edu"));
     }
 
     #[test]

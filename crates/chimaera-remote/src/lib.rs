@@ -443,19 +443,31 @@ fn valid_node_name(node: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
-/// The routes to try, in order, for reaching `node`. A dotted name is the
-/// cluster's own DNS name — dial it directly first (one prompt, no second
-/// connection to keep up). A bare name would resolve through THIS machine's
-/// search domains, which can reach an unrelated host (and send it the
-/// password the prompt asks for), so it only ever travels inside the cluster.
-fn routes_to(node: &str) -> Vec<Route> {
-    if node.contains('.') {
-        vec![
-            Route::Node(node.to_string()),
-            Route::NodeViaAlias(node.to_string()),
-        ]
+/// The routes to try, in order, for reaching `node`. The direct dial goes
+/// first — one prompt, no second connection to keep up — but only when THIS
+/// machine resolves the name to an address the cluster resolves it to
+/// (`cluster` from the landed node, `local` here). Otherwise the name may
+/// reach an unrelated host through this machine's search domains, which the
+/// trust-on-first-use host-key policy would accept and the password prompt
+/// would then be answered to; such a name only ever travels inside the
+/// cluster.
+fn routes_to(node: &str, cluster: &[std::net::IpAddr], local: &[std::net::IpAddr]) -> Vec<Route> {
+    let via = Route::NodeViaAlias(node.to_string());
+    if cluster.iter().any(|addr| local.contains(addr)) {
+        vec![Route::Node(node.to_string()), via]
     } else {
-        vec![Route::NodeViaAlias(node.to_string())]
+        vec![via]
+    }
+}
+
+/// Where THIS machine resolves `node` (its sshd port), bounded so a slow
+/// resolver can't stall a connect. Empty on failure — the direct rung is then
+/// skipped, never guessed.
+async fn local_addrs(node: &str) -> Vec<std::net::IpAddr> {
+    let lookup = tokio::net::lookup_host((node, 22));
+    match tokio::time::timeout(Duration::from_secs(5), lookup).await {
+        Ok(Ok(addrs)) => addrs.map(|addr| addr.ip()).collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -934,6 +946,8 @@ pub async fn http_alive_authed(port: u16, token: &str) -> bool {
 trait RemoteOps {
     fn route(&self, host: &str) -> Route;
     fn set_route(&self, host: &str, route: Route);
+    /// Where THIS machine resolves `node` (see [`routes_to`]).
+    async fn local_addrs(&self, node: &str) -> Vec<std::net::IpAddr>;
     async fn remote_probe(&self, host: &str) -> anyhow::Result<ProbeRun>;
     async fn remote_sessions_count(
         &self,
@@ -976,6 +990,9 @@ impl RemoteOps for SshOps {
     }
     fn set_route(&self, host: &str, route: Route) {
         set_route(host, route)
+    }
+    async fn local_addrs(&self, node: &str) -> Vec<std::net::IpAddr> {
+        local_addrs(node).await
     }
     async fn remote_probe(&self, host: &str) -> anyhow::Result<ProbeRun> {
         probe_run(host, self.home).await
@@ -1081,8 +1098,9 @@ async fn locate(
         landed.node
     );
     progress(Phase::Routing { node: node.clone() });
+    let local = ops.local_addrs(&node).await;
     let mut why = String::new();
-    for route in routes_to(&node) {
+    for route in routes_to(&node, &landed.manifest_node_addrs, &local) {
         ops.set_route(host, route.clone());
         match ops.remote_probe(host).await {
             // The verdict now comes from the node that wrote the manifest.
@@ -1090,11 +1108,17 @@ async fn locate(
                 tracing::info!("{host}: reached {node} ({route:?})");
                 return Ok(Some((p.manifest, p.alive)));
             }
-            // The name leads back to the node we landed on: a renamed host,
-            // so the first probe's verdict was local after all.
-            Ok(ProbeRun::Ran(Some(p))) if same_node(&p.node, &landed.node) => {
+            // Inside the cluster the name leads back to the node we landed
+            // on: a renamed host, whose own verdict is the local one. Only
+            // the `-W` route proves that — the user's ssh config can send
+            // the direct dial anywhere (a ProxyCommand with a fixed target
+            // ignores `HostName`), so a direct dial landing back here says
+            // nothing about the name.
+            Ok(ProbeRun::Ran(Some(p)))
+                if matches!(route, Route::NodeViaAlias(_)) && same_node(&p.node, &landed.node) =>
+            {
                 ops.set_route(host, Route::Alias);
-                return Ok(Some((landed.manifest, landed.alive)));
+                return Ok(Some((p.manifest, p.alive)));
             }
             // No manifest over this route: either that node's daemon just
             // stopped (a graceful stop removes it), or the dial reached a
@@ -1399,13 +1423,15 @@ const SH_MANIFEST_HOSTNAME: &str =
     r#"sed -n 's/.*"hostname"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$f" | head -n 1"#;
 
 /// POSIX-sh fragment setting `$d` to whether node name `$h` exists in the
-/// name service of the node the script runs on: `found`, `gone` (the resolver
-/// answered "no such name", `EAI_NONAME`), or `unknown` (no perl, or no clear
-/// answer). Not `getent`: it exits the same for "no such name" and "the DNS
-/// server is down", and an outage must never read as "that node is gone".
-/// The verdict rides stdout, not an exit code — perl dying at compile time
-/// exits with whatever `errno` held.
-const SH_NODE_RESOLVES: &str = r#"d=unknown; if command -v perl >/dev/null 2>&1; then r=$(perl -MSocket=:addrinfo -e 'my ($e) = getaddrinfo($ARGV[0], "22"); print STDOUT ($e ? ($e == EAI_NONAME() ? "gone" : "unknown") : "found")' "$h" 2>/dev/null); case "$r" in found|gone) d=$r;; esac; fi;"#;
+/// name service of the node the script runs on (`$n`): `found <addr>…` (its
+/// addresses, for the direct-route check), `gone` (the resolver answered "no
+/// such name", `EAI_NONAME`), or `unknown` (no perl, no clear answer, or a
+/// resolver that can't even resolve `$n` itself — one that knows no node
+/// names must never declare a node gone). Not `getent`: it exits the same for
+/// "no such name" and "the DNS server is down", and an outage must never read
+/// as "that node is gone". The verdict rides stdout, not an exit code — perl
+/// dying at compile time exits with whatever `errno` held.
+const SH_NODE_RESOLVES: &str = r#"d=unknown; if command -v perl >/dev/null 2>&1; then r=$(perl -MSocket=:addrinfo,SOCK_STREAM -e 'use strict; my ($h, $n) = @ARGV; my ($own) = getaddrinfo($n, "22"); if ($own) { print STDOUT "unknown"; exit 0 } my ($e, @r) = getaddrinfo($h, "22", {socktype => SOCK_STREAM()}); if ($e) { print STDOUT ($e == EAI_NONAME() ? "gone" : "unknown"); exit 0 } my %s; print STDOUT join(" ", "found", grep { defined $_ and not $s{$_}++ } map { (getnameinfo($_->{addr}, NI_NUMERICHOST()))[1] } @r)' "$h" "$n" 2>/dev/null); case "$r" in found*|gone) d=$r;; esac; fi;"#;
 
 /// What one probe exec found, seen from the node it ran on.
 #[derive(Clone, Debug)]
@@ -1421,6 +1447,8 @@ pub struct Probe {
     /// resolves on `node`. `Some(false)` is the cluster's name service saying
     /// the node no longer exists; `None` = not asked, or no clear answer.
     pub manifest_node_resolves: Option<bool>,
+    /// The addresses `node` resolves that name to (when it does).
+    pub manifest_node_addrs: Vec<std::net::IpAddr>,
 }
 
 impl Probe {
@@ -1611,10 +1639,17 @@ fn parse_probe_output(stdout: &str) -> anyhow::Result<Option<Probe>> {
     };
     check_trailer_pid(&manifest, trailer, "probe")?;
     let alive = trailer_verdict(trailer).context("probe output carried no alive/dead verdict")?;
-    let manifest_node_resolves = match trailer_field(trailer, "dns") {
+    let mut dns = trailer_field(trailer, "dns")
+        .unwrap_or_default()
+        .split_whitespace();
+    let manifest_node_resolves = match dns.next() {
         Some("found") => Some(true),
         Some("gone") => Some(false),
         _ => None,
+    };
+    let manifest_node_addrs = match manifest_node_resolves {
+        Some(true) => dns.filter_map(|addr| addr.parse().ok()).collect(),
+        _ => Vec::new(),
     };
     // The resolver was asked about the name the remote `sed` read: the same
     // cross-check as the pid, so a sed/serde disagreement can never turn into
@@ -1632,6 +1667,7 @@ fn parse_probe_output(stdout: &str) -> anyhow::Result<Option<Probe>> {
         node,
         alive,
         manifest_node_resolves,
+        manifest_node_addrs,
     }))
 }
 
@@ -2625,17 +2661,22 @@ fn master_proxy_command(host: &str, pin: Option<&str>) -> String {
             .iter()
             .map(|opt| format!("\"{}\"", opt.replace('%', "%%"))),
     );
-    words.push(format!("-W %h:%p {host}"));
+    // The alias is user input that reaches a shell: single-quoted, with `%`
+    // doubled for the outer ssh's own token expansion.
+    words.push(format!(
+        "-W %h:%p '{}'",
+        host.replace('%', "%%").replace('\'', r"'\''")
+    ));
     words.join(" ")
 }
 
-/// [`master_proxy_command`] over whichever master `host`'s route rides: a
-/// login node's own for [`Route::Node`]; the alias's for
+/// [`master_proxy_command`] over whichever master the login alias's `route`
+/// rides: a login node's own for [`Route::Node`]; the alias's for
 /// [`Route::NodeViaAlias`] too, since that node's master is itself carried
 /// over it.
-fn node_proxy_command(host: &str) -> String {
-    match route_of(host) {
-        Route::Node(node) => master_proxy_command(host, Some(&node)),
+fn node_proxy_command(host: &str, route: &Route) -> String {
+    match route {
+        Route::Node(node) => master_proxy_command(host, Some(node)),
         Route::Alias | Route::NodeViaAlias(_) => master_proxy_command(host, None),
     }
 }
@@ -2644,7 +2685,7 @@ fn node_proxy_command(host: &str) -> String {
 /// owns its connection; a per-node master would leak sockets per job), fail
 /// fast instead of prompting (a rung probe must never hang on interactive
 /// auth — a cluster that needs it reads as "rung unavailable" for now).
-fn node_ssh_base(host: &str) -> Command {
+fn node_ssh_base(host: &str, route: &Route) -> Command {
     let mut c = transport_command("ssh");
     c.env(ASKPASS_ALIAS_ENV, host);
     c.args([
@@ -2662,7 +2703,7 @@ fn node_ssh_base(host: &str) -> Command {
         "ServerAliveCountMax=3",
         "-o",
     ]);
-    c.arg(format!("ProxyCommand={}", node_proxy_command(host)));
+    c.arg(format!("ProxyCommand={}", node_proxy_command(host, route)));
     c
 }
 
@@ -2687,11 +2728,12 @@ async fn node_target(host: &str, node: &str) -> String {
 
 fn spawn_node_tunnel(
     host: &str,
+    route: &Route,
     node_target: &str,
     local: u16,
     remote: u16,
 ) -> anyhow::Result<Child> {
-    node_ssh_base(host)
+    node_ssh_base(host, route)
         .args(["-o", "ExitOnForwardFailure=yes"])
         .arg("-N")
         .arg("-L")
@@ -2710,12 +2752,13 @@ fn spawn_node_tunnel(
 /// login node.
 fn spawn_chained_node_tunnel(
     host: &str,
+    route: &Route,
     node: &str,
     local: u16,
     relay_port: u16,
     remote: u16,
 ) -> anyhow::Result<Child> {
-    ssh_base(host)
+    ssh_base_via(host, route)
         .args(["-o", "ExitOnForwardFailure=yes"])
         .arg("-L")
         .arg(format!("{local}:127.0.0.1:{relay_port}"))
@@ -2737,11 +2780,12 @@ fn spawn_chained_node_tunnel(
 
 fn spawn_direct_node_tunnel(
     host: &str,
+    route: &Route,
     node: &str,
     local: u16,
     remote: u16,
 ) -> anyhow::Result<Child> {
-    ssh_base(host)
+    ssh_base_via(host, route)
         .args(["-o", "ExitOnForwardFailure=yes"])
         .arg("-N")
         .arg("-L")
@@ -2769,6 +2813,11 @@ pub async fn connect_compute_node(
     routable: bool,
 ) -> anyhow::Result<ComputeTunnel> {
     anyhow::ensure!(!node.is_empty(), "job {job_id} has no node yet (queued?)");
+    // One read of the login alias's route for the whole ladder: every rung's
+    // forward registers on that master, and every cancel (and the tunnel's
+    // own close) must reach the same one even if a login reconnect re-routes
+    // the alias meanwhile.
+    let route = route_of(host);
     let mk = |local_port, rung, master_forward, child| ComputeTunnel {
         host: host.to_string(),
         node: node.to_string(),
@@ -2778,14 +2827,14 @@ pub async fn connect_compute_node(
         token: token.to_string(),
         rung,
         master_forward,
-        route: route_of(host),
+        route: route.clone(),
         child,
     };
 
     // Rung B1 — laptop ssh end-to-end to the node; daemon stays loopback.
     let target = node_target(host, node).await;
     let local = pick_local_port(None, port)?;
-    match spawn_node_tunnel(host, &target, local, port) {
+    match spawn_node_tunnel(host, &route, &target, local, port) {
         Ok(mut child) => match wait_for_port(local, &mut child).await {
             Ok(mux) => {
                 if tunnel_proven(local, token, 10, mux, &mut child)
@@ -2812,7 +2861,8 @@ pub async fn connect_compute_node(
     // early-exit branch or by tunnel_proven's still-running check.
     for relay_port in [fastrand_port(), fastrand_port(), fastrand_port()] {
         let local = pick_local_port(None, port)?;
-        let Ok(mut child) = spawn_chained_node_tunnel(host, node, local, relay_port, port) else {
+        let Ok(mut child) = spawn_chained_node_tunnel(host, &route, node, local, relay_port, port)
+        else {
             break;
         };
         // The outer `-L` rides `ssh_base`, so the login master holds the
@@ -2832,12 +2882,12 @@ pub async fn connect_compute_node(
             }
             Ok(_) => {
                 child.kill().await.ok();
-                cancel_master_forward(host, &route_of(host), &outer_spec).await;
+                cancel_master_forward(host, &route, &outer_spec).await;
                 tracing::info!(%node, relay_port, "chained rung forwarded but the job daemon did not answer");
             }
             Err(err) => {
                 child.kill().await.ok();
-                cancel_master_forward(host, &route_of(host), &outer_spec).await;
+                cancel_master_forward(host, &route, &outer_spec).await;
                 tracing::info!(%node, relay_port, %err, "chained rung attempt failed");
             }
         }
@@ -2847,7 +2897,7 @@ pub async fn connect_compute_node(
     if routable {
         let local = pick_local_port(None, port)?;
         let spec = format!("{local}:{node}:{port}");
-        if let Ok(mut child) = spawn_direct_node_tunnel(host, node, local, port) {
+        if let Ok(mut child) = spawn_direct_node_tunnel(host, &route, node, local, port) {
             match wait_for_port(local, &mut child).await {
                 Ok(mux) => {
                     if let Some(mux) = tunnel_proven(local, token, 10, mux, &mut child).await {
@@ -2866,7 +2916,7 @@ pub async fn connect_compute_node(
                     let cancel_master = forward_delegated(mux, &mut child);
                     child.kill().await.ok();
                     if cancel_master {
-                        cancel_master_forward(host, &route_of(host), &spec).await;
+                        cancel_master_forward(host, &route, &spec).await;
                     }
                 }
                 Err(err) => tracing::info!(%node, %err, "rung A unavailable"),
@@ -3089,10 +3139,20 @@ mod tests {
         assert!(!p.here(), "written on another node");
         assert_eq!(p.node, "ln02");
         assert_eq!(p.manifest_node_resolves, Some(false));
-        let p = parse_probe_output(&framed("pid=42\nnode=ln02\nhost=host\ndns=found\ndead\n"))
-            .unwrap()
-            .expect("manifest");
+        let p = parse_probe_output(&framed(
+            "pid=42\nnode=ln02\nhost=host\ndns=found 10.0.0.1 fe80::1%eth0 ::1\ndead\n",
+        ))
+        .unwrap()
+        .expect("manifest");
         assert_eq!(p.manifest_node_resolves, Some(true));
+        assert_eq!(
+            p.manifest_node_addrs,
+            vec![
+                "10.0.0.1".parse::<std::net::IpAddr>().unwrap(),
+                "::1".parse().unwrap()
+            ],
+            "numeric addresses; a scoped link-local is skipped"
+        );
         let p = parse_probe_output(&framed("pid=42\nnode=ln02\nhost=host\ndns=unknown\ndead\n"))
             .unwrap()
             .expect("manifest");
@@ -3324,6 +3384,14 @@ mod tests {
         node
     }
 
+    /// The resolver control in the probe: a node that can't resolve its own
+    /// name never answers `found`/`gone` (CI sandboxes may lack a self entry).
+    #[cfg(unix)]
+    fn own_name_resolves() -> bool {
+        use std::net::ToSocketAddrs;
+        (uname_n().as_str(), 22).to_socket_addrs().is_ok()
+    }
+
     #[cfg(unix)]
     fn perl_available() -> bool {
         std::process::Command::new("perl")
@@ -3378,11 +3446,15 @@ mod tests {
                 .unwrap()
                 .expect("manifest");
             assert!(!p.here(), "{shell}: written on another node");
-            if perl_available() {
+            if perl_available() && own_name_resolves() {
                 assert_eq!(
                     p.manifest_node_resolves,
                     Some(true),
                     "{shell}: localhost resolves"
+                );
+                assert!(
+                    !p.manifest_node_addrs.is_empty(),
+                    "{shell}: with its addresses"
                 );
             }
             write_manifest_on(&path, dead_pid(), "chimaera-gone-node.invalid");
@@ -3660,7 +3732,7 @@ mod tests {
         assert_eq!(alias(&ssh_cmd("Sherlock")), Some("Sherlock".into()));
         assert_eq!(alias(&scp_cmd("remote-2")), Some("remote-2".into()));
         assert_eq!(
-            alias(&node_ssh_base("login.example.edu")),
+            alias(&node_ssh_base("login.example.edu", &Route::Alias)),
             Some("login.example.edu".into())
         );
     }
@@ -4030,6 +4102,8 @@ mod tests {
         /// Overrides the default probe (the manifest, written on the node
         /// the probe lands on) — for multi-node scenarios.
         probe: Option<ProbeScript>,
+        /// Where "this machine" resolves any node name.
+        local: Vec<std::net::IpAddr>,
     }
 
     impl FakeOps {
@@ -4043,6 +4117,7 @@ mod tests {
                 resolved_bin: PathBuf::from("/unused"),
                 start_manifest: fake_manifest(Some(chimaera_core::BUILD_ID), 999),
                 probe: None,
+                local: vec![CLUSTER_ADDR],
             }
         }
         fn record(&self, c: Call) {
@@ -4064,6 +4139,9 @@ mod tests {
         fn set_route(&self, _host: &str, route: Route) {
             *self.route.borrow_mut() = route;
         }
+        async fn local_addrs(&self, _node: &str) -> Vec<std::net::IpAddr> {
+            self.local.clone()
+        }
         async fn remote_probe(&self, _host: &str) -> anyhow::Result<ProbeRun> {
             self.record(Call::RemoteProbe);
             if let Some(probe) = &self.probe {
@@ -4074,6 +4152,7 @@ mod tests {
                 manifest: m,
                 alive: self.alive,
                 manifest_node_resolves: None,
+                manifest_node_addrs: Vec::new(),
             })))
         }
         async fn remote_sessions_count(
@@ -4371,6 +4450,10 @@ mod tests {
 
     const LN01: &str = "ln01.cluster.edu";
     const LN02: &str = "ln02.cluster.edu";
+    /// Where the cluster resolves a routed node's name; the fake's "this
+    /// machine" agrees unless a test says otherwise.
+    const CLUSTER_ADDR: std::net::IpAddr =
+        std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1));
 
     /// The daemon's manifest, written on `node`.
     fn manifest_on(node: &str, build: Option<&str>, pid: u32) -> Manifest {
@@ -4392,6 +4475,10 @@ mod tests {
             node: node.to_string(),
             alive,
             manifest_node_resolves: resolves,
+            manifest_node_addrs: match resolves {
+                Some(true) => vec![CLUSTER_ADDR],
+                _ => Vec::new(),
+            },
         })))
     }
 
@@ -4587,7 +4674,7 @@ mod tests {
         let fake = pool(
             manifest_on(LN01, Some(chimaera_core::BUILD_ID), 42),
             false,
-            None,
+            Some(true),
             |_, _| {
                 ssh_failed("ssh: Could not resolve hostname ln01.cluster.edu: nodename nor servname provided")
             },
@@ -4653,23 +4740,53 @@ mod tests {
         assert_eq!(elsewhere.calls(), vec![Call::RemoteProbe; 3]);
     }
 
-    /// A bare node name is never dialed from this machine (its search
-    /// domains could reach an unrelated host — and hand it the password);
-    /// it only travels inside the cluster.
+    /// A name this machine resolves somewhere else than the cluster does is
+    /// never dialed from here (a search domain can turn it into an unrelated
+    /// host — and hand that host the password); it only travels inside the
+    /// cluster.
     #[tokio::test]
-    async fn a_bare_node_name_is_only_reached_from_inside_the_cluster() {
-        let fake = pool(
-            manifest_on("login1", Some(chimaera_core::BUILD_ID), 42),
-            false,
-            Some(true),
-            |route, m| match route {
-                Route::NodeViaAlias(n) if n == "login1" => seen_from("login1", m, true, None),
-                other => panic!("dialed {other:?}"),
-            },
-        );
+    async fn a_node_this_machine_resolves_elsewhere_is_only_reached_inside_the_cluster() {
+        let fake = FakeOps {
+            local: vec!["203.0.113.9".parse().unwrap()],
+            ..pool(
+                manifest_on("login1", Some(chimaera_core::BUILD_ID), 42),
+                false,
+                Some(true),
+                |route, m| match route {
+                    Route::NodeViaAlias(n) if n == "login1" => seen_from("login1", m, true, None),
+                    other => panic!("dialed {other:?}"),
+                },
+            )
+        };
         let ((manifest, ..), _) = run_resolve(&fake, false).await;
         assert_eq!(manifest.pid, 42);
         assert_eq!(*fake.route.borrow(), Route::NodeViaAlias("login1".into()));
+    }
+
+    /// The user's ssh config can send the direct dial anywhere (a
+    /// ProxyCommand with a fixed target ignores `HostName`). Landing back on
+    /// the node we started from proves nothing about the name there — the
+    /// in-cluster route decides, and here finds the daemon alive on ln01.
+    #[tokio::test]
+    async fn a_direct_dial_redirected_back_here_is_not_a_renamed_host() {
+        let fake = pool(
+            manifest_on(LN01, Some(chimaera_core::BUILD_ID), 42),
+            false,
+            Some(true),
+            |route, m| match route {
+                Route::Node(_) => seen_from(LN02, m, false, Some(true)),
+                Route::NodeViaAlias(_) => seen_from(LN01, m, true, None),
+                Route::Alias => unreachable!(),
+            },
+        );
+        let ((manifest, ..), _) = run_resolve(&fake, false).await;
+        assert_eq!(manifest.pid, 42, "attaches to ln01's live daemon");
+        assert_eq!(
+            fake.calls(),
+            vec![Call::RemoteProbe; 3],
+            "no fresh start from ln02's verdict"
+        );
+        assert_eq!(*fake.route.borrow(), Route::NodeViaAlias(LN01.into()));
     }
 
     /// The node's name no longer exists in the cluster (decommissioned or
@@ -4709,6 +4826,11 @@ mod tests {
         let ((manifest, ..), _) = run_resolve(&fake, false).await;
         assert_eq!(manifest.pid, 42);
         assert_eq!(*fake.route.borrow(), Route::Alias, "one node — no route");
+        assert_eq!(
+            fake.routed().last().map(|(_, route)| route.clone()),
+            Some(Route::NodeViaAlias("old-name.cluster.edu".into())),
+            "only the in-cluster route may prove a rename"
+        );
     }
 
     /// A manifest's node name is data from a remote disk: anything but a
@@ -4795,7 +4917,7 @@ mod tests {
             .strip_prefix("ProxyCommand=")
             .expect("a ProxyCommand");
         assert!(proxy.starts_with("ssh "), "{proxy}");
-        assert!(proxy.ends_with(" -W %h:%p pool"), "{proxy}");
+        assert!(proxy.ends_with(" -W %h:%p 'pool'"), "{proxy}");
         assert!(
             proxy.contains("%%C"),
             "ControlPath token survives the outer expansion: {proxy}"
@@ -4805,6 +4927,8 @@ mod tests {
             "the first leg is the alias's own master: {proxy}"
         );
         assert!(master_proxy_command("pool", Some(LN01)).contains(&format!("-o HostName={LN01}")));
+        // The alias reaches a local shell and ssh's own `%` expansion.
+        assert!(master_proxy_command("a;b%h'c", None).ends_with(r"-W %h:%p 'a;b%%h'\''c'"));
     }
 
     #[test]
@@ -4824,13 +4948,27 @@ mod tests {
         ] {
             assert!(!valid_node_name(bad), "{bad}");
         }
-        assert_eq!(
-            routes_to(LN01),
-            vec![Route::Node(LN01.into()), Route::NodeViaAlias(LN01.into())]
+        let (a, b): (std::net::IpAddr, std::net::IpAddr) = (
+            "10.0.0.1".parse().unwrap(),
+            "171.67.99.169".parse().unwrap(),
         );
         assert_eq!(
-            routes_to("login1"),
-            vec![Route::NodeViaAlias("login1".into())]
+            routes_to(LN01, &[a, b], &[b]),
+            vec![Route::Node(LN01.into()), Route::NodeViaAlias(LN01.into())],
+            "the direct dial reaches an address the cluster means"
+        );
+        assert_eq!(
+            routes_to("sh04-ln03", &[a], &[b]),
+            vec![Route::NodeViaAlias("sh04-ln03".into())],
+            "resolved elsewhere here (Sherlock's bare names: 10.x inside, public outside)"
+        );
+        assert_eq!(
+            routes_to(LN01, &[a], &[]),
+            vec![Route::NodeViaAlias(LN01.into())]
+        );
+        assert_eq!(
+            routes_to(LN01, &[], &[a]),
+            vec![Route::NodeViaAlias(LN01.into())]
         );
     }
 

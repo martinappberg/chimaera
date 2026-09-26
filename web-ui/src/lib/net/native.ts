@@ -392,6 +392,9 @@ export interface HostStatusEvent {
   reason?: string;
   /** Source build now served through this tunnel. */
   build?: string;
+  /** On "connected": the login node the tunnel is pinned to (absent = wherever
+   *  the alias lands). Every connected event carries it. */
+  node?: string;
 }
 
 /**

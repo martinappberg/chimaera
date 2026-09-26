@@ -305,6 +305,9 @@
                   ...h,
                   status: e.status === "connected" ? "connected" : "disconnected",
                   local_port: e.status === "connected" ? (e.local_port ?? h.local_port) : null,
+                  // Authoritative on every connected event: a reconnect this
+                  // window didn't start may have re-routed the alias.
+                  node: e.status === "connected" ? (e.node ?? null) : h.node,
                 }
               : h,
           );

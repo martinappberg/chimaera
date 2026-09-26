@@ -107,21 +107,27 @@ a `RemoteOps` trait. See also [native-app.md](native-app.md) for the windows/hos
   reports its node (`uname -n`), and when the manifest names another node, `locate` never judges
   it from the wrong one: it routes the alias to the manifest's node (the row shows "reaching the
   daemon on <node>…"; that node is a fresh ssh login, so a Duo cluster prompts once more) and
-  takes the liveness verdict there. The learned `Route` is per alias and process-wide — the
-  tunnel, stops, session counts, compute tunnels, and wedge checks all follow it, and the next
-  reconnect dials that node first. A dotted node name is dialed directly with the alias's own ssh
-  config (`-o HostName=<node>`: user, keys, ProxyJump carry over); if that never reaches an sshd,
-  or the name is bare (resolving it on the laptop could reach — and send the password to — an
-  unrelated host), it goes through the alias's master as a `-W` leg, resolved inside the
-  cluster. A fresh start happens only when the daemon is provably dead **on its node**, or the
-  node's name no longer resolves on the node we landed on (perl's `getaddrinfo` answering
-  `EAI_NONAME` — not `getent`, which can't tell "no such name" from "DNS is down"). Anything else
-  — auth refused, node down, firewalled (a RHEL `icmp-host-prohibited` reject reads as "No route to
-  host", so that is not proof either) — is an error naming both nodes, and nothing starts: a second
-  daemon would resume the same ledger's sessions next to the running one. A connected row routed
-  this way reads `online · <node> · 127.0.0.1:<port>`. The start-wait accepts only a manifest
-  written on its own node, the daemon removes the manifest on shutdown only while it is still
-  its own record, and `chimaera kill`/`status` on a node refuse to judge another node's record.
+  takes the liveness verdict there. The learned `Route` is per alias and lives in the running
+  app/CLI process — the tunnel, stops, session counts, compute tunnels, and wedge checks all
+  follow it, and later reconnects in that process dial that node first; a relaunch relearns it
+  (one more prompt on a Duo cluster). The node is dialed directly with the alias's own ssh config
+  (`-o HostName=<node>`: user, keys, ProxyJump carry over) only when the laptop resolves its name
+  to an address the cluster resolves it to — otherwise a search domain could reach, and send the
+  password to, an unrelated host (Sherlock's bare `sh04-ln03` is `10.20.0.63` inside and public
+  outside). Else, or if the direct dial never reaches an sshd, it goes through the alias's master
+  as a `-W` leg, resolved inside the cluster. Only that in-cluster route can show a renamed host
+  (the manifest's old name leading back to the node we landed on) — the user's ssh config may
+  point the direct dial anywhere. A fresh start happens only when the daemon is provably dead
+  **on its node**, or the node's name no longer resolves on the node we landed on (perl's
+  `getaddrinfo` answering `EAI_NONAME` — not `getent`, which can't tell "no such name" from "DNS
+  is down" — and only from a resolver that can resolve its own node's name). Anything else —
+  auth refused, node down, firewalled (a RHEL `icmp-host-prohibited` reject reads as "No route to
+  host", so that is not proof either) — is an error naming both nodes, and nothing starts: a
+  second daemon would resume the same ledger's sessions next to the running one. A connected row
+  routed this way reads `online · <node> · 127.0.0.1:<port>` (every `connected` event carries the
+  node). The start-wait accepts only a manifest written on its own node, the daemon removes the
+  manifest on shutdown only while it is still its own record, and `chimaera kill`/`status` on a
+  node refuse to judge another node's record.
 - **TOFU host keys.** `StrictHostKeyChecking=accept-new` lets a windowed app with no tty reach a
   never-seen host (it still refuses a *changed* key). `ServerAliveInterval/CountMax` notice a dead
   link within ~45s.

@@ -308,10 +308,12 @@ impl Manifest {
     /// replaced the file since; removing that one would make every client read
     /// "not running" while it serves. Returns whether the file was removed.
     /// Best-effort, not a lock: a replacement landing between the read and the
-    /// unlink still loses, the same window the startup guard accepts.
+    /// unlink still loses, the same window the startup guard accepts. A file
+    /// that doesn't parse is not the record this daemon wrote atomically, so
+    /// it is left alone — never a failed shutdown.
     pub fn remove_if_owned(&self) -> anyhow::Result<bool> {
-        match Self::load()? {
-            Some(current)
+        match Self::load() {
+            Ok(Some(current))
                 if current.pid == self.pid
                     && current.started_at == self.started_at
                     && same_node(&current.hostname, &self.hostname) =>
@@ -593,6 +595,12 @@ mod tests {
         assert!(manifest.remove_if_owned().unwrap(), "our own record goes");
         assert!(Manifest::load().unwrap().is_none());
         assert!(!manifest.remove_if_owned().unwrap(), "absent is not ours");
+        std::fs::write(Manifest::path(), b"{not json").unwrap();
+        assert!(
+            !manifest.remove_if_owned().unwrap(),
+            "a corrupt file is not ours, and not a failed shutdown"
+        );
+        Manifest::remove().unwrap();
 
         std::fs::remove_dir_all(&tmp_home).ok();
     }
