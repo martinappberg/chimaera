@@ -110,8 +110,9 @@ gap-replay idea as the PTY transport, realized for structured streams.
   spawn journals an empty `BackgroundTasks` level-set before its first event;
   this is the crash/restart boundary that keeps a reused journal from reviving
   tasks that died with the previous daemon process.
-- A `--resume` forks a NEW native session id (claude); never pin `--session-id`
-  with `--resume`. Codex resumes in-protocol (the id survives).
+- Take a resumed claude session's native id from `system/init`: older CLIs
+  forked a NEW id on `--resume`, 2.1.283 keeps it (PROTOCOL.md Pass 33). Never
+  pin `--session-id` with `--resume`. Codex resumes in-protocol (the id survives).
 - Every stop we initiate SIGTERMs the child before closing stdin
   (`ChildGuard::terminate`; then the grace, then SIGKILL), and a daemon stop
   runs it for every live driver (the server's `stop_all_for_exit`) instead of

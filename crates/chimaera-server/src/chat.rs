@@ -2631,7 +2631,8 @@ pub(crate) async fn fork_session(
 
 /// Spawn (or respawn) a chat driver for `id` from a recipe. Shared by
 /// create_session and the view switch. `pinned_override` lets create pass a
-/// fresh --session-id uuid; resumes leave it None (claude forks a new id).
+/// fresh --session-id uuid; resumes leave it None (the id comes from
+/// `system/init`: older claude CLIs forked a new one on --resume).
 /// Seed a resumed session's fresh journal so `attach` replays the whole
 /// conversation before the live `Init` (the agents replay nothing over the
 /// wire). Two sources, in preference order:

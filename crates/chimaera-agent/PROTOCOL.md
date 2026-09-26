@@ -8,7 +8,8 @@ KNOW, how we know it, and what we have not adopted yet. Re-verify with
 Sources:
 - **live**: probed against the real CLIs (claude 2.1.206, codex 0.142.5;
   codex 0.144.2 from Pass 16 on; claude 2.1.259 + codex 0.153.0 from Pass 30
-  on; claude 2.1.280/2.1.281 + codex 0.156.1 from Pass 31 on).
+  on; claude 2.1.280/2.1.281 + codex 0.156.1 from Pass 31 on; claude 2.1.283
+  + codex 0.157.1 from Pass 33 on).
 - **official schema/docs**: Codex's upstream `codex-rs/app-server/README.md`
   and the version-specific output of `codex app-server generate-ts` /
   `generate-json-schema` (the preferred shape inventory for the installed
@@ -112,8 +113,9 @@ extension either), `channel_enable`, `apply_flag_settings`, `reload_skills`,
   `UserPromptSubmit`, which does not fire for stdin `user` messages. Anything
   that hung off that hook (first-prompt capture, `@term:` autolink) must run
   off the protocol's own input path in chat mode.
-- A `--resume` forks a NEW native session id; it arrives via `system/init`
-  (never pin `--session-id` together with `--resume`).
+- A `--resume`'s native session id arrives via `system/init`: older CLIs
+  forked a NEW id, 2.1.283 keeps the resumed one (Pass 33). Never pin
+  `--session-id` together with `--resume`.
 - Bonus stream frames: `rate_limit_event` (adopted — see pass 4),
   `system/thinking_tokens` `{estimated_tokens, estimated_tokens_delta,
   uuid}` (ADOPTED pass 5: fires during thinking even when the display is
@@ -2440,3 +2442,38 @@ Observed on 2.1.283, not adopted: on a `--resume`d session, the first user messa
 ### Gate (Pass 32)
 
 Hermetic: the `Carryover` fold (bridge through Init snapshots and RemoteControl, ultracode, turn start and end, running and non-ambient filtering, reset on exit), origin stamping pairing only with a Send echo, `carryover_reports_process_state_and_ultracode_restores` (fake-claude: bridge, bootstrapped ultracode read back unchosen, tagged echo, background set, reset on exit), the ledger round trip with carryover (older or malformed entries load as `None`), and the message builder. Live on an isolated daemon with fake-claude, four daemon lives: bridge and ultracode restored, the message listing `bg-0` sent once and the agent restarting the task, a bridge the user had turned off staying off while `chat.remoteControlAtStart` was on, a cut-off turn told to continue, no message with `chat.resumeAfterRestart` off, and a 0.19 s daemon stop with two chats. The real-claude stop probes are above. Live suite: `driver_initial_ultracode_applies_without_a_pick` (free) and `driver_stop_ends_claudes_detached_background_work` (one Haiku turn: the driver stop leaves no `run_in_background` process). `just chat-smoke` on claude 2.1.283 + codex 0.156.1: 23/23 (the codex cases that run real turns first failed on an expired codex login, `workspace routing discovery unauthorized (401)`, and passed after `codex login`).
+
+## Pass 33 (2026-09-25 — drift check claude 2.1.283 + codex 0.157.1): pins bumped, no driver change. ADOPTED.
+
+The installed CLIs had moved past both pins (claude 2.1.281 → 2.1.283, codex 0.156.1 → 0.157.1). Sources: `just chat-smoke` against the real installs, the generated codex app-server schemas of both versions, the SDK schema `.describe()` text of both claude binaries, free control probes, and five small paid probes (about $0.28: one advisor turn and three resume pairs, on Haiku). The 0.156.1 codex came from `npm install --prefix <scratch> @openai/codex@0.156.1`, the 2.1.281 claude from `npm pack @anthropic-ai/claude-code-darwin-arm64@2.1.281` (the platform package holds the bare binary), so neither global install was touched.
+
+### Live suite
+
+23/23 on claude 2.1.283 + codex 0.157.1 (7 codex, 16 claude and driver cases), with no drift warning. The claude and driver cases ran a second time on their own (16/16), because the advisor probe below left `advisorModel` in the user's settings while the first run was still going, and a claude spawned in that window inherited it. `codex_turn_summary_setting_is_applied` saw one reasoning-summary delta.
+
+### Codex 0.156.1 → 0.157.1: the generated schema
+
+`codex app-server generate-ts --experimental` and `generate-json-schema` on both binaries. The diff is purely additive. New client requests `account/gatewayOAuth/login|read|cancel` and notification `account/gatewayOAuth/changed {authUrl, providerId, status: notReady|started|succeeded|failed, error}`, with `InitializeCapabilities.explicitGatewayOauth`. New optional or nullable fields: `McpResourceReadParams.target {connectorId, linkId}`, `McpServerStatus.httpOrigin`, `PluginSummary.extensions` (entrypoints, icons, quick actions, search providers, settings), `ThreadItemEntry.startedAtMs|completedAtMs` (`thread/items/list`), `ThreadRealtimeStartParams.backendReasoningStatus`. Nothing was removed or renamed. Every method literal in `codex.rs` is still in the unions except three that were already absent from 0.156.1 and are fallbacks: `turn/failed` (the legacy arm, Pass 31), `thread/rollback` (used only when `thread/revert` is unsupported) and `item/plan` (a default item id, not a method).
+
+### Claude 2.1.281 → 2.1.283: the SDK schema text
+
+Mostly minifier churn. Substantive changes: `set_max_thinking_tokens` now tells an omitted `max_thinking_tokens` (budget unchanged, for a display-only change) from `null` (reset to the session default); the driver always sends a number (31999 or 0), so it is unaffected. `plugin_errors` is public now, and an entry for a `--plugin-dir` that did not load carries its `path`. New `@internal` fields that reach no mapped frame: a per-send frame timing breakdown, a usage-limit grace signal, an `external_metadata` `artifacts` patch, and `thinking.display` on stream events (live: the `stream_event` wrapper carries `thinking_display: "updates"` on `message_start` and thinking blocks). New settings: `availableModels` prefix matching, `blockedModels` and a match mode. New tool parameters: an attached-machine target and a `taskId` for "the result that moved the command to the background".
+
+### Claude: `--resume` keeps the session id
+
+2.1.283's `system/init` after `--resume <id>` carried the resumed id in all three probes, including one whose session was created with `--session-id`. The Quirks note above said a resume forks a new id; it now says the id comes from `system/init`, which is where the driver already takes it.
+
+### Claude: the empty `result` after a resume (Pass 32), explained
+
+It is not every resume. A clean resume (the previous process finished its turn and exited) answered the first send with one normal turn, twice. It reproduces when the previous process was SIGTERMed while a `run_in_background` Bash was running: the resumed process answers the first send with `system/init`, then a `result` with `num_turns: 0`, `duration_ms: 25`, `duration_api_ms: 0`, `stop_reason: null`, `usage.iterations: []` and the previous `total_cost_usd`, then a second `system/init` and the real turn. The cause is in the on-disk transcript: at resume the CLI finds the background shell has no completion record and queues its own user message, `<task-notification>…<status>stopped</status><summary>Background shell command didn't finish before the previous session ended</summary>…`. The first send drains that notification as a turn without an API call, which is the empty result. The notification never reaches stdout, like the other queue-injected messages (Pass 31). The model sees it in the next turn's context, so after a daemon restart a claude agent learns its background shell died from the CLI too, before chimaera's pick-up message. Only Bash was probed; Monitors were not. Not adopted: the driver still maps the empty result to an empty completed turn before the real one.
+
+### Claude: the advisor server tool (observed, not adopted)
+
+- **Enabling it.** `--advisor <model>`, the `advisorModel` setting, `apply_flag_settings {advisorModel: "sonnet"}` (`null` clears it; live), or `/advisor [fable|opus|sonnet|off]` ("Let Claude consult a stronger model at key moments", in the `initialize` catalog). **`/advisor <model>` sent as a stream-json message persists `advisorModel` to the user's `~/.claude/settings.json`**, as the TUI does, and so changes every Claude Code session on the machine (it did during this pass). Probe it only against a throwaway HOME. `get_settings.applied.advisor` names the resolved model (`sonnet` → `claude-sonnet-5`, `opus` → `claude-opus-5-5`, `null` when none); neither `initialize` nor `system/init` carries it. A feature flag gates it (or `CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL`), `CLAUDE_CODE_DISABLE_ADVISOR_TOOL` turns it off, and the advisor must rank at least as high as the working model (`advisor_rank` in the CLI's model catalog). A bad pairing is `api_error: "advisor_incompatible"`.
+- **Wire** (live; Haiku with a Sonnet advisor, `--include-partial-messages`). `content_block_start {type: "server_tool_use", id: "srvtoolu_…", name: "advisor", input: {}}` and its per-block assistant frame; then about 38 s with nothing but one `ping` stream event; then `content_block_start {type: "advisor_tool_result", tool_use_id, content: {type: "advisor_result", text}}`, with the whole advice in the start event and no deltas, and its per-block assistant frame. The model then continues in the same API response (same `request_id`). The frames carry no advisor model, but the on-disk transcript entries do (`advisorModel: "claude-sonnet-5"`). `result.usage.iterations` lists the advisor's call as `{type: "advisor_message", model, input_tokens, output_tokens}` and `modelUsage` bills its model separately: $0.125 of the turn's $0.151, because the advisor reads the whole context (45k input tokens here). Other result contents, from the schema and the binary: `advisor_redacted_result`, `advisor_tool_result_error {error_code}`, and a refusal (`stop_reason: "refusal"`).
+- **What the TUI shows.** An "Advising using <model>" row with a spinner. When it resolves: "Advisor has reviewed the conversation and will apply the feedback" (the advice text only in verbose or transcript mode), "Advisor unavailable (<code>)", or "Advisor declined to advise on this request".
+- **Chimaera today** drops both blocks: the assistant content loop maps `text`, `thinking` and `tool_use` only. The chat shows nothing while the advisor works and never shows the advice. Supporting it is a follow-up.
+
+### Gate (Pass 33)
+
+`just chat-smoke` 23/23 as above. No driver code changed; the pins moved (`TESTED_CLAUDE_VERSION = "2.1.283"`, `TESTED_CODEX_VERSION = "0.157.1"`) and the resume-id notes were corrected.
