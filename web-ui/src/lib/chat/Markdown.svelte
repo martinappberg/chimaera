@@ -18,7 +18,23 @@
         node.setAttribute("rel", "noopener noreferrer");
       }
     }
+    // A LOCAL image in agent prose (`![](figs/plot.png)`) is an embed, not a
+    // URL: left as a src the browser would fetch it against the app's own
+    // origin (a broken image, a stray request). Its target moves to a data
+    // attribute here, before the HTML can reach the DOM, and the component
+    // swaps the inert <img> for an embed card (upgradeEmbeds). Scoped to this
+    // component's sanitize calls: the hook is global to DOMPurify.
+    if (deferLocalImages && node instanceof Element && node.tagName === "IMG") {
+      const src = node.getAttribute("src") ?? "";
+      if (src !== "" && !/^(https?:|data:|blob:)/i.test(src) && !src.startsWith("//")) {
+        node.removeAttribute("src");
+        node.removeAttribute("srcset");
+        node.setAttribute("data-md-embed", src);
+      }
+    }
   });
+  /** True only inside this component's own `DOMPurify.sanitize` calls. */
+  let deferLocalImages = false;
 </script>
 
 <script lang="ts">
@@ -42,6 +58,10 @@
   import { extractFileRefs, parseFileRef, revealOf, type FileRef, type FoundRef } from "../shared/fileRef";
   import { activateUrl, isWebUrl, urlMenuEntries } from "../shared/urlOpen";
   import { contextMenu } from "../shared/contextMenu.svelte";
+  import { safeDecodeUri } from "../previews/files";
+  import { parseSizeHint, splitTarget } from "../shared/embed/embed";
+  import { mountEmbed, type EmbedHandle } from "../shared/embed/mount.svelte";
+  import type { EmbedResolver } from "./embeds";
 
   interface Props {
     text: string;
@@ -63,6 +83,9 @@
     /** Fired after each streaming reveal batch — lets the host keep the
      *  transcript pinned to the bottom as words grow between wire chunks. */
     onReveal?: () => void;
+    /** Resolves local images in the prose (`![](figs/plot.png)`) against
+     *  the session's directories, so they render as embed cards. */
+    embeds?: EmbedResolver;
   }
 
   let {
@@ -72,7 +95,65 @@
     onOpenPath,
     resolvePaths,
     onReveal,
+    embeds,
   }: Props = $props();
+
+  /** Embed slots this component built, each with the (hidden) placeholder
+   *  it stands beside and its card. The placeholder belongs to the rendered
+   *  HTML, so its leaving the DOM (a re-render, a rewritten stream, the
+   *  settle swap) is what retires the slot: the card is destroyed and the
+   *  slot removed — even when it sat outside the nodes `{@html}` tracks. */
+  const mountedEmbeds = new Map<HTMLElement, { img: HTMLElement; card: EmbedHandle | null }>();
+
+  function sweepEmbeds(all = false): void {
+    for (const [slot, { img, card }] of mountedEmbeds) {
+      if (all || !img.isConnected || !slot.isConnected) {
+        card?.destroy();
+        slot.remove();
+        mountedEmbeds.delete(slot);
+      }
+    }
+  }
+
+  /** Swap every inert local-image placeholder in `root` (the sanitizer's
+   *  `data-md-embed` <img>) for an embed card in a slot this component
+   *  builds. Runs on settled/closed content only — the per-chunk open tail
+   *  keeps its placeholders, so a card never churns with the stream. */
+  function upgradeEmbeds(root: HTMLElement): void {
+    sweepEmbeds();
+    for (const img of root.querySelectorAll<HTMLImageElement>("img[data-md-embed]:not(.md-embed-src)")) {
+      const target = img.getAttribute("data-md-embed") ?? "";
+      const { alt, width } = parseSizeHint(img.getAttribute("alt") ?? "");
+      const { path, fragment } = splitTarget(target);
+      const shown = safeDecodeUri(path);
+      const slot = document.createElement("div");
+      slot.className = "md-embed";
+      // The placeholder stays (hidden) rather than being replaced: it may be
+      // a top-level node of the settled `{@html}`, whose teardown walks the
+      // nodes it inserted.
+      img.before(slot);
+      img.classList.add("md-embed-src");
+      const resolver = embeds;
+      if (resolver === undefined && !shown.startsWith("/")) {
+        // Nowhere to resolve a relative path: say what was meant, quietly.
+        slot.classList.add("md-embed-text");
+        slot.textContent = alt !== "" ? `${alt} (${shown})` : shown;
+        mountedEmbeds.set(slot, { img, card: null });
+        continue;
+      }
+      const card = mountEmbed(slot, {
+        path: shown,
+        fragment,
+        alt,
+        width,
+        ...(resolver !== undefined ? { resolve: () => resolver.resolve(target) } : {}),
+        ...(onOpenPath !== undefined
+          ? { onOpen: (p, kind, reveal) => onOpenPath(p, kind, reveal !== undefined ? { reveal } : {}) }
+          : {}),
+      });
+      mountedEmbeds.set(slot, { img, card });
+    }
+  }
 
   /** What a stamped path affordance opens. Kept off the DOM: sanitized agent
    *  HTML can forge classes and data-* attributes, so a click honors only an
@@ -203,7 +284,7 @@
     // Inline code: the whole span when it is a reference, else the
     // references inside it (`cat results/x.csv`).
     for (const code of root.querySelectorAll("code")) {
-      if (code.closest("pre, a, .md-path") !== null || code.querySelector(".md-path") !== null) {
+      if (code.closest("pre, a, .md-path, .md-embed") !== null || code.querySelector(".md-path") !== null) {
         continue;
       }
       const t = code.textContent ?? "";
@@ -222,7 +303,7 @@
     // href it cannot classify (`main.rs:12`), so a link left without one
     // offers its text instead.
     for (const a of root.querySelectorAll("a")) {
-      if (a.classList.contains("md-path")) continue;
+      if (a.classList.contains("md-path") || a.closest(".md-embed") !== null) continue;
       const href = a.getAttribute("href") ?? "";
       let ref: FileRef | null;
       if (href === "") {
@@ -238,7 +319,7 @@
     }
     // Bare references in prose ("saved to results/plot.png:12"). Collected
     // first: wrapping mutates the walked tree.
-    for (const node of textNodes(root, "pre, code, a, .md-path, .katex")) stampText(node);
+    for (const node of textNodes(root, "pre, code, a, .md-path, .katex, .md-embed")) stampText(node);
     if (missed) missedAt = Date.now();
     if (unknown.size === 0) return;
     void resolver.resolve(unknown).then((linkable) => {
@@ -388,7 +469,12 @@
   // explicitly (and the style attribute) — otherwise injected CSS applies
   // document-wide.
   function sanitizeHtml(raw: string): string {
-    return DOMPurify.sanitize(raw, { FORBID_TAGS: ["style"], FORBID_ATTR: ["style"] });
+    deferLocalImages = true;
+    try {
+      return DOMPurify.sanitize(raw, { FORBID_TAGS: ["style"], FORBID_ATTR: ["style"] });
+    } finally {
+      deferLocalImages = false;
+    }
   }
 
   function parseSanitized(source: string): string {
@@ -469,7 +555,7 @@
 
   const wordFilter = {
     acceptNode: (n: Node) =>
-      (n.textContent ?? "").trim().length > 0 && n.parentElement?.closest(".katex") == null
+      (n.textContent ?? "").trim().length > 0 && n.parentElement?.closest(".katex, .md-embed") == null
         ? NodeFilter.FILTER_ACCEPT
         : NodeFilter.FILTER_REJECT,
   };
@@ -593,6 +679,7 @@
   function clearLiveDom(): void {
     if (liveEl === null) return;
     liveEl.replaceChildren();
+    sweepEmbeds();
     prefixQueue = [];
     tailQueue = [];
     ledger.reset();
@@ -656,6 +743,9 @@
       // Fully revealed: no spans at all — born clean for selection-copy.
     }
     liveEl.insertBefore(root, tailEl);
+    // After the word wrap (a card's own text must never become reveal
+    // spans) and once attached (a card finds its scroller for lazy loads).
+    upgradeEmbeds(root);
     unstamped.push(root);
   }
 
@@ -805,6 +895,7 @@
     decorateCopyTargets(el);
     stampPaths(el);
     markTableRegions(el);
+    upgradeEmbeds(el);
   });
 
   // A turn ended (the resolver dropped its misses): a settled block that
@@ -872,6 +963,7 @@
     clearCopied();
     clearUnwrapTimers();
     cancelIdleStamp?.();
+    sweepEmbeds(true);
   });
 </script>
 
@@ -1105,5 +1197,29 @@
     border: none;
     border-top: 1px solid var(--edge);
     margin: 0.6em 0;
+  }
+  /* Local images are embed cards (upgradeEmbeds). Until a streaming
+     segment closes, its placeholder holds a quiet box of about a card's
+     header height; once upgraded it is hidden beside its card. */
+  .md :global(img[data-md-embed]) {
+    display: block;
+    width: min(100%, 420px);
+    height: 64px;
+    margin: 0.4em 0;
+    border: 1px dashed color-mix(in srgb, var(--edge) 80%, transparent);
+    border-radius: 8px;
+    color: var(--muted);
+    font-size: var(--text-xs);
+  }
+  .md :global(img.md-embed-src) {
+    display: none;
+  }
+  .md :global(.md-embed) {
+    display: block;
+    max-width: 100%;
+  }
+  .md :global(.md-embed-text) {
+    color: var(--muted);
+    font-size: var(--text-sm);
   }
 </style>

@@ -93,6 +93,7 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         .route("/fs/notebook", get(notebook::notebook))
         .route("/fs/quickopen", get(quickopen::quickopen))
         .route("/fs/validate", post(fs::validate))
+        .route("/fs/resolve_targets", post(crate::embed::resolve_targets))
         // The portable-dialect checker (the reading view's issues chip; the
         // MCP `check_document` tool runs the same code) and the opt-in
         // "teach agents" installs behind Settings.
@@ -174,6 +175,8 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         .route("/ws/chat/{id}", get(ws::chat_ws))
         .route("/ws/events", get(ws::events_ws))
         .route("/raw/{ticket}", get(fs::raw))
+        // An HTML report's relative assets, confined to its folder.
+        .route("/raw/{ticket}/{*rest}", get(fs::raw_asset))
         .route("/download/{ticket}", get(download::download))
         // Three spellings because `{*path}` refuses an EMPTY tail: the bare
         // form redirects to the slashed form, the slashed form IS the app's

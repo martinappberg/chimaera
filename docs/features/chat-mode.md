@@ -457,13 +457,34 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
 
 ## Inline artifacts
 
-- **What & when.** The output *is* the point of many jobs — after a turn's closing prose, a gallery
-  previews the previewable files that turn produced (image thumbnail, CSV/TSV first-rows peek,
-  embedded PDF). Click a tile to open the full viewer in a pane.
-- **Where.** `ArtifactGallery.svelte`, `InlinePreview.svelte`; `turn_end.artifacts` collected by
-  scanning back to the turn boundary (only *written* previewable files + touched images; a merely
-  *read* CSV isn't an artifact; capped at 8). Uses `POST /api/v1/fs/ticket` → `GET /raw/{ticket}` and
-  `GET /api/v1/fs/table`.
+- **What & when.** The output *is* the point of many jobs. Files show in the transcript as **embed
+  cards** — the same cards documents use ([files & previews](files-and-previews.md#embed-cards)):
+  a figure, a PDF page, a table slice, a sandboxed HTML report with its assets, a notebook cell, a
+  slide, a player, a document excerpt, a file card. Click a card's name (or ↗) to open the full
+  viewer in a pane at the same spot.
+- **Images in agent prose.** `![alt](figs/plot.png)` renders the file (it used to be a broken
+  image): the target resolves against the session's live directory, then where it started, then
+  the workspace root — strictly, an embed names one file — and any fragment picks the piece
+  (`paper.pdf#page=3`, `run.py#L10-L30`, `data.csv#row=2-9`). A file the agent announces before
+  writing shows as "not found" and turns into its card when it appears.
+- **Made this turn.** After a turn's closing prose, a gallery of compact tiles shows what the turn
+  made — including files written by **shell commands** (a plot saved by a script, a rendered
+  report), not only by edit tools. HTML reports, markdown, PDFs, tables and spreadsheets,
+  notebooks, slides and media; never source code (its diff is in the tool card). A stopped or
+  failed turn keeps its gallery. Tiles stay fresh when a file is overwritten, and say so when one
+  is gone.
+- **How the gallery finds shell-written files.** No structured event names them, so the reducer
+  lists the artifact-shaped paths the turn's commands, command outputs and prose *mention*
+  (`artifacts.ts`), and the gallery keeps those the daemon confirms exist and were **modified
+  inside the turn** — between its journal-stamped start and end (daemon clock on both sides, a few
+  seconds' slack). A file merely `cat`-ed, or rewritten by a later turn, stays out. One
+  `resolve_targets` round trip per gallery, when it nears the viewport; replay rebuilds the same
+  `turn_end` from the journal.
+- **Where.** `Markdown.svelte` (the sanitizer moves a local `<img>` src out of reach; cards mount
+  beside the placeholder on settled content and closed stream segments, and are destroyed with
+  it), `ArtifactGallery.svelte`, `artifacts.ts`, `embeds.ts` (`EmbedResolver`),
+  `store.svelte.ts` (`turn_end.artifacts` / `mentioned` / `startedAtMs` / `endedAtMs` /
+  `aborted`), `shared/embed/`. Uses `POST /api/v1/fs/resolve_targets` and `GET /raw/{ticket}`.
 
 ## Reconnect & gap-replay
 
