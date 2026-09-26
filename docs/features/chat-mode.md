@@ -183,7 +183,8 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   confirms it. The parser is the terminal's (`shared/fileRef.ts`: `:12`, `:12:3`, `#L12-L20`,
   `@mentions`, `a/`/`b/` diff sides, `…/` tails, `file://`, wrappers and punctuation, Unicode), and
   the candidates resolve against the session's live cwd, its spawn cwd and the workspace root,
-  then the workspace index (unique basename or path suffix). Click opens the file at the line;
+  then the workspace index (unique basename or path suffix). Click opens the file at the line, or
+  at a locator's spot (`paper.pdf#page=3&xywh=…`, `de.tsv#row=5-9`, `demo.mp4#t=30`);
   Cmd/Ctrl+click opens it in a split; a directory opens in the Finder; a name several files
   answer to (dashed underline) asks which in the context menu. Every renderer in a chat shares one
   batched, cached resolver (`paths.ts` `PathResolver`), its answers keyed by the candidate AND the

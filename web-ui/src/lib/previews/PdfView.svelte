@@ -36,6 +36,10 @@
   import { revealRequest, takeReveal, type Reveal } from "../shared/reveal";
   import { activateUrl, isWebUrl } from "../shared/urlOpen";
   import { findInPage, findPattern, pageText, type ItemRange, type PageText } from "./pdfFind";
+  import { clampRegion, cropSize, screenToPage, type Point, type Region } from "./imageRegion";
+  import { activeSelection, clearSelection, setSelection, type FileSelection } from "../shared/reference";
+  import { xywhFragment } from "../shared/locator";
+  import ReferenceChip from "../shared/ReferenceChip.svelte";
 
   pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
 
@@ -115,6 +119,17 @@
   /** A revealed region (PDF points from the page's top-left, at 100%). */
   let region = $state<{ page: number; x: number; y: number; w: number; h: number } | null>(null);
   let regionFlash = $state(0);
+
+  /** The area tool is on: a drag draws a box instead of selecting text
+   *  (Shift-drag draws one either way). */
+  let areaMode = $state(false);
+  /** The box being dragged, then the one pointed at (PDF points). */
+  let pick = $state.raw<({ page: number } & Region) | null>(null);
+  /** Where the "reference in agent" chip sits (px in .pdf-body), for a
+   *  text selection or a finished box. */
+  let chipPos = $state<{ x: number; y: number } | null>(null);
+  let chipLabel = $state<string | undefined>(undefined);
+  let body = $state<HTMLDivElement | null>(null);
 
   let doc: PDFDocumentProxy | null = null;
   let task: ReturnType<typeof pdfjs.getDocument> | null = null;
@@ -878,8 +893,10 @@
     if ((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "f") {
       e.preventDefault();
       openFind();
-    } else if (e.key === "Escape" && region !== null && !findOpen) {
-      region = null;
+    } else if (e.key === "Escape" && !findOpen) {
+      if (pick !== null) clearPick();
+      else if (region !== null) region = null;
+      else if (areaMode) areaMode = false;
     }
   }
 
@@ -1075,14 +1092,304 @@
     if (restoreFrame !== null) cancelAnimationFrame(restoreFrame);
     restoreFrame = null;
     const page = Math.min(Math.max(Math.round(n), 1), numPages);
-    const r = req.region;
+    let r = req.region;
+    const info = pages[page - 1];
+    if (r?.percent === true && info !== undefined) {
+      // `#xywh=percent:…` is relative to the page's own size.
+      r = { x: (r.x / 100) * info.w, y: (r.y / 100) * info.h, w: (r.w / 100) * info.w, h: (r.h / 100) * info.h };
+    }
     if (r !== undefined && [r.x, r.y, r.w, r.h].every(Number.isFinite) && r.w > 0 && r.h > 0) {
-      region = { page, ...r };
+      region = { page, x: r.x, y: r.y, w: r.w, h: r.h };
       regionFlash += 1;
       scrollToPagePoint(page, r.y, r.x);
     } else {
       region = null;
       scrollToPagePoint(page, null);
+    }
+  }
+
+  // --- pointing at part of a page (context bridge) -----------------------------------
+  //
+  // A text selection sends its page and quote (`#page=3 "…"`); a box drawn
+  // with the area tool (or Shift-drag) sends `#page=3&xywh=…` in PDF points
+  // plus a PNG crop rendered from the page's vectors. Both publish through
+  // the shared reference bridge and show the shared chip.
+
+  const selOwner = {};
+  /** What this view last published, and which kind: it clears only its
+   *  own, and a newer selection elsewhere is told apart by identity. */
+  let published: FileSelection | null = null;
+  let publishedKind: "text" | "area" | null = null;
+  /** An in-flight box drag (page-point anchor + client start). */
+  let dragFrom: { page: number; at: Point; client: Point; pointer: number } | null = null;
+  let dragging = $state(false);
+  let chipFrame = 0;
+  /** Crops wait on a render; only the newest box's lands. */
+  let pickGen = 0;
+  /** Crop raster: 2 px per point, the long side capped where models downsample. */
+  const CROP_FACTOR = 2;
+  const CROP_CAP = 1568;
+  /** Text taken from under a box, before the composer's own excerpt cut. */
+  const REGION_TEXT_MAX = 2000;
+  /** Room the chip needs inside .pdf-body (px). */
+  const CHIP_W = 170;
+  const CHIP_H = 28;
+
+  function publish(sel: FileSelection, kind: "text" | "area"): void {
+    published = sel;
+    publishedKind = kind;
+    setSelection(selOwner, sel);
+  }
+
+  function unpublish(kind: "text" | "area" | null = null): void {
+    if (kind !== null && publishedKind !== kind) return;
+    published = null;
+    publishedKind = null;
+    chipPos = null;
+    clearSelection(selOwner);
+  }
+
+  // A newer selection elsewhere (another view, a terminal) replaces this
+  // one: the chip goes, and so does a finished box.
+  $effect(() => {
+    const a = $activeSelection;
+    if (published === null || a === published) return;
+    const wasArea = publishedKind === "area";
+    published = null;
+    publishedKind = null;
+    chipPos = null;
+    if (wasArea && dragFrom === null) pick = null;
+  });
+
+  $effect(() => {
+    document.addEventListener("selectionchange", syncTextSelection);
+    return () => {
+      document.removeEventListener("selectionchange", syncTextSelection);
+      if (chipFrame !== 0) cancelAnimationFrame(chipFrame);
+      chipFrame = 0;
+      unpublish();
+    };
+  });
+
+  /** The page a DOM node sits on, or null outside every page. */
+  function nodePage(node: Node): number | null {
+    const el = node instanceof Element ? node : node.parentElement;
+    const n = Number(el?.closest<HTMLElement>("[data-page]")?.dataset.page);
+    return Number.isFinite(n) && n >= 1 ? n : null;
+  }
+
+  function syncTextSelection(): void {
+    const el = scroller;
+    const s = document.getSelection();
+    if (el === null || s === null || s.rangeCount === 0 || s.isCollapsed) {
+      unpublish("text");
+      return;
+    }
+    const range = s.getRangeAt(0);
+    const text = s.toString();
+    if (!el.contains(range.commonAncestorContainer) || text.trim() === "") {
+      unpublish("text");
+      return;
+    }
+    const first = nodePage(range.startContainer) ?? nodePage(range.endContainer);
+    if (first === null) return;
+    const last = nodePage(range.endContainer) ?? first;
+    // A text selection replaces a box.
+    if (pick !== null && dragFrom === null) {
+      pick = null;
+      pickGen += 1;
+    }
+    const label = last > first ? `pp. ${first}–${last}` : `p. ${first}`;
+    publish({ kind: "file", path, startLine: null, endLine: null, text, fragment: `page=${first}`, label }, "text");
+    chipLabel = label;
+    placeChip();
+  }
+
+  /** The chip's spot in .pdf-body for a client point, kept inside it. */
+  function chipAt(clientX: number, clientY: number): { x: number; y: number } | null {
+    const b = body;
+    if (b === null) return null;
+    const r = b.getBoundingClientRect();
+    const clamp = (n: number, lo: number, hi: number) => Math.min(Math.max(n, lo), Math.max(lo, hi));
+    return {
+      x: clamp(clientX - r.left, 4, r.width - CHIP_W),
+      y: clamp(clientY - r.top, 4, r.height - CHIP_H - 4),
+    };
+  }
+
+  /** Geometry only: re-anchor the chip to its selection or box (a scroll
+   *  or a zoom moves them; neither changes what is selected). */
+  function placeChip(): void {
+    if (publishedKind === "text") {
+      const s = document.getSelection();
+      if (s === null || s.rangeCount === 0) return;
+      const range = s.getRangeAt(0);
+      const rects = range.getClientRects();
+      const last = rects.length > 0 ? rects[rects.length - 1] : range.getBoundingClientRect();
+      chipPos = chipAt(last.right + 4, last.bottom + 6);
+    } else if (publishedKind === "area" && pick !== null) {
+      const slot = scroller?.querySelector<HTMLElement>(`[data-page="${pick.page}"]`);
+      if (slot === null || slot === undefined) return;
+      const r = slot.getBoundingClientRect();
+      const left = r.left + pick.x * scale;
+      const right = r.left + (pick.x + pick.w) * scale;
+      chipPos = chipAt(Math.max(left, right - CHIP_W), r.top + (pick.y + pick.h) * scale + 6);
+    }
+  }
+
+  function schedulePlaceChip(): void {
+    if (chipPos === null || chipFrame !== 0) return;
+    chipFrame = requestAnimationFrame(() => {
+      chipFrame = 0;
+      placeChip();
+    });
+  }
+
+  // A zoom re-lays the pages out: re-anchor once they have their new size.
+  $effect(() => {
+    void scale;
+    untrack(schedulePlaceChip);
+  });
+
+  function clearPick(): void {
+    pick = null;
+    pickGen += 1;
+    unpublish("area");
+  }
+
+  function toggleArea(): void {
+    areaMode = !areaMode;
+    if (areaMode) document.getSelection()?.removeAllRanges();
+    scroller?.focus({ preventScroll: true });
+  }
+
+  function slotPoint(page: number, clientX: number, clientY: number): Point | null {
+    const slot = scroller?.querySelector<HTMLElement>(`[data-page="${page}"]`);
+    if (slot === null || slot === undefined) return null;
+    const r = slot.getBoundingClientRect();
+    return screenToPage(clientX, clientY, { x: r.left, y: r.top }, scale);
+  }
+
+  function onPagePointerDown(e: PointerEvent): void {
+    if (e.button !== 0 || !(areaMode || e.shiftKey)) return;
+    const slot = e.target instanceof Element ? e.target.closest<HTMLElement>(".pdf-slot") : null;
+    const n = Number(slot?.dataset.page);
+    if (slot === null || !Number.isFinite(n) || pages[n - 1] === undefined) return;
+    const at = slotPoint(n, e.clientX, e.clientY);
+    if (at === null) return;
+    // The press draws a box: no text selection, no link.
+    e.preventDefault();
+    document.getSelection()?.removeAllRanges();
+    if (pick !== null) clearPick();
+    dragFrom = { page: n, at, client: { x: e.clientX, y: e.clientY }, pointer: e.pointerId };
+    dragging = true;
+    scroller?.setPointerCapture(e.pointerId);
+    scroller?.focus({ preventScroll: true });
+  }
+
+  function onPagePointerMove(e: PointerEvent): void {
+    const from = dragFrom;
+    if (from === null || e.pointerId !== from.pointer) return;
+    // A few pixels of jitter is a click, not a box.
+    if (pick === null && Math.hypot(e.clientX - from.client.x, e.clientY - from.client.y) < 4) return;
+    const info = pages[from.page - 1];
+    const to = slotPoint(from.page, e.clientX, e.clientY);
+    if (info === undefined || to === null) return;
+    // Points are continuous (the locator rounds each edge): no pixel snapping.
+    const box = clampRegion({ x: from.at.x, y: from.at.y, w: to.x - from.at.x, h: to.y - from.at.y }, info.w, info.h);
+    pick = box === null ? null : { page: from.page, ...box };
+  }
+
+  function onPagePointerUp(e: PointerEvent): void {
+    const from = dragFrom;
+    if (from === null || e.pointerId !== from.pointer) return;
+    dragFrom = null;
+    dragging = false;
+    if (scroller?.hasPointerCapture(e.pointerId) === true) scroller.releasePointerCapture(e.pointerId);
+    const p = pick;
+    if (p === null) {
+      clearPick();
+      return;
+    }
+    void finishPick(p);
+  }
+
+  /** Publish a finished box once its crop is drawn. */
+  async function finishPick(p: { page: number } & Region): Promise<void> {
+    const gen = ++pickGen;
+    const text = regionText(p);
+    const crop = await renderCrop(p);
+    if (gen !== pickGen || disposed) return;
+    const label = `p. ${p.page} region`;
+    const sel: FileSelection = {
+      kind: "file",
+      path,
+      startLine: null,
+      endLine: null,
+      text,
+      fragment: `page=${p.page}&${xywhFragment(p)}`,
+      label,
+    };
+    if (crop !== null) sel.crop = crop;
+    publish(sel, "area");
+    chipLabel = label;
+    placeChip();
+  }
+
+  /** The text under a box, in reading order, from the rendered text layer
+   *  (a span counts when its middle is inside); "" when the page has none. */
+  function regionText(p: { page: number } & Region): string {
+    const layer = pageSpans.get(p.page);
+    const slot = scroller?.querySelector<HTMLElement>(`[data-page="${p.page}"]`);
+    if (layer === undefined || slot === null || slot === undefined) return "";
+    const r = slot.getBoundingClientRect();
+    const x0 = r.left + p.x * scale;
+    const y0 = r.top + p.y * scale;
+    const x1 = x0 + p.w * scale;
+    const y1 = y0 + p.h * scale;
+    const parts: string[] = [];
+    let chars = 0;
+    for (let i = 0; i < layer.spans.length && chars < REGION_TEXT_MAX; i++) {
+      const str = layer.strs[i];
+      if (str === undefined || str.trim() === "") continue;
+      const b = layer.spans[i].getBoundingClientRect();
+      const cx = b.left + b.width / 2;
+      const cy = b.top + b.height / 2;
+      if (cx < x0 || cx > x1 || cy < y0 || cy > y1) continue;
+      parts.push(str);
+      chars += str.length + 1;
+    }
+    return parts.join(" ").replace(/\s+/g, " ").trim().slice(0, REGION_TEXT_MAX);
+  }
+
+  /** The box as a PNG, drawn from the page's vectors at 2× (capped). */
+  async function renderCrop(p: { page: number } & Region): Promise<Blob | null> {
+    const d = doc;
+    if (d === null) return null;
+    let page: PDFPageProxy | null = null;
+    try {
+      page = await d.getPage(p.page);
+      if (disposed) return null;
+      const size = cropSize(p, CROP_FACTOR, CROP_CAP);
+      // The offsets move the box's corner to the canvas origin; the canvas
+      // clips the rest of the page away.
+      const viewport = page.getViewport({
+        scale: size.scale,
+        offsetX: -p.x * size.scale,
+        offsetY: -p.y * size.scale,
+      });
+      const canvas = document.createElement("canvas");
+      canvas.width = size.w;
+      canvas.height = size.h;
+      const ctx = canvas.getContext("2d");
+      if (ctx === null) return null;
+      await page.render({ canvas, canvasContext: ctx, viewport }).promise;
+      return await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/png"));
+    } catch {
+      // No pixels: the locator alone still goes.
+      return null;
+    } finally {
+      page?.cleanup();
     }
   }
 
@@ -1123,6 +1430,7 @@
   function onScroll(): void {
     saveMemory();
     if (scroller !== null) scrollY = scroller.scrollTop;
+    schedulePlaceChip();
   }
 
   const zoomPct = $derived(Math.round(scale * 100));
@@ -1173,7 +1481,7 @@
 {/snippet}
 
 <!-- svelte-ignore a11y_no_static_element_interactions -->
-<div class="pdf-view" onkeydown={onViewKey}>
+<div class="pdf-view" class:area={areaMode} onkeydown={onViewKey}>
   <div class="pdf-bar">
     {#if outline.length > 0}
       <button
@@ -1222,6 +1530,14 @@
         >selection limited</span
       >
     {/if}
+    {#if pick !== null && !dragging}
+      <span class="selection-note region-note" title="the area you pointed at, in PDF points">
+        area on p. {pick.page} · {Math.round(pick.w)}×{Math.round(pick.h)} pt
+        <button class="zbtn ic sm" aria-label="clear the area" title="clear the area (Esc)" onclick={clearPick}
+          >×</button
+        >
+      </span>
+    {/if}
     {#if region !== null}
       <span class="selection-note region-note">
         region on p. {region.page}
@@ -1231,6 +1547,26 @@
       </span>
     {/if}
     <span class="spacer"></span>
+    <button
+      class="zbtn ic"
+      class:on={areaMode}
+      onclick={toggleArea}
+      aria-label="select an area"
+      aria-pressed={areaMode}
+      title={areaMode
+        ? "drag a box on a page to reference it in an agent — click to stop (Esc)"
+        : "select an area to reference in an agent (or Shift-drag)"}
+    >
+      <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"
+        ><path
+          d="M2.5 5V3.5a1 1 0 0 1 1-1H5M11 2.5h1.5a1 1 0 0 1 1 1V5M13.5 11v1.5a1 1 0 0 1-1 1H11M5 13.5H3.5a1 1 0 0 1-1-1V11M7.2 2.5h1.6M7.2 13.5h1.6M2.5 7.2v1.6M13.5 7.2v1.6"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="1.3"
+          stroke-linecap="round"
+        /></svg
+      >
+    </button>
     <button
       class="zbtn ic"
       class:on={findOpen}
@@ -1289,7 +1625,10 @@
     </div>
   {/if}
 
-  <div class="pdf-body">
+  <div class="pdf-body" bind:this={body}>
+    {#if chipPos !== null}
+      <ReferenceChip x={chipPos.x} y={chipPos.y} label={chipLabel} />
+    {/if}
     {#if outlineOpen && outline.length > 0}
       <nav class="pdf-outline" aria-label="document outline">
         <ul>
@@ -1303,6 +1642,10 @@
       bind:this={scroller}
       onwheel={onWheel}
       onscroll={onScroll}
+      onpointerdown={onPagePointerDown}
+      onpointermove={onPagePointerMove}
+      onpointerup={onPagePointerUp}
+      onpointercancel={onPagePointerUp}
       tabindex="0"
       role="document"
       aria-label="PDF pages"
@@ -1331,6 +1674,17 @@
                   style:height={`${region.h * scale}px`}
                 ></div>
               {/key}
+            {/if}
+            {#if pick !== null && pick.page === p.num}
+              <div
+                class="pdf-pick"
+                class:drawing={dragging}
+                aria-hidden="true"
+                style:left={`${pick.x * scale}px`}
+                style:top={`${pick.y * scale}px`}
+                style:width={`${pick.w * scale}px`}
+                style:height={`${pick.h * scale}px`}
+              ></div>
             {/if}
           </div>
         {/each}
@@ -1507,9 +1861,38 @@
   }
 
   .pdf-body {
+    position: relative;
     flex: 1;
     min-height: 0;
     display: flex;
+  }
+
+  /* The area tool: the page takes a crosshair, and its text and link layers
+     step aside so a drag draws a box instead of selecting or following. */
+  .pdf-view.area .pdf-slot {
+    cursor: crosshair;
+  }
+
+  .pdf-view.area .pdf-slot :global(.textLayer),
+  .pdf-view.area .pdf-slot :global(.annotationLayer) {
+    pointer-events: none;
+  }
+
+  .pdf-pick {
+    position: absolute;
+    z-index: 4;
+    box-sizing: border-box;
+    pointer-events: none;
+    border: 1.5px solid var(--accent);
+    border-radius: 2px;
+    background: color-mix(in srgb, var(--accent) 10%, transparent);
+    /* A light halo keeps the edge readable on dark figures. */
+    box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.7);
+  }
+
+  .pdf-pick.drawing {
+    border-style: dashed;
+    background: color-mix(in srgb, var(--accent) 6%, transparent);
   }
 
   .pdf-outline {

@@ -3,10 +3,15 @@
     "File references as Claude, Codex and Gemini write them (chat prose, TUI tool lines, diffs, compiler and grep output), with what `shared/fileRef.ts` must make of each. `fileRef.test.ts` runs every case; the daemon's resolver tests may read the same file.",
     "refs — one reference: `input` is a token (or, with `delimited: true`, a whole markdown link target or code span, where spaces belong to the path). `expect` is the parse — path plus 1-based line/col/endLine when present — or null when the input is not a path candidate. `bare: true` parses the way the terminal's hover does (single-segment names admitted).",
     "text — a run of prose or a terminal line: `expect` lists every reference found, in order, as `text` (the exact span a link underlines) plus the parse.",
-    "The client only proposes candidates: `and/or` or `a/src/x.rs` are candidates because only the daemon knows whether they exist (it strips a diff prefix when the path misses, and suffix-matches an abbreviated tail)."
+    "The client only proposes candidates: `and/or` or `a/src/x.rs` are candidates because only the daemon knows whether they exist (it strips a diff prefix when the path misses, and suffix-matches an abbreviated tail).",
+    "`at` is a locator fragment's spot (`shared/locator.ts`): PDF page, image or page region, media time, a CSV/TSV block (RFC 7111 rows: the header line is row 1), a spreadsheet sheet and A1 range, a notebook cell, a slide. Style `chimaera` is what the workbench itself types when the user points at part of a file."
   ],
   "refs": [
-    { "style": "claude", "input": "src/main.rs:42", "expect": { "path": "src/main.rs", "line": 42 } },
+    {
+      "style": "claude",
+      "input": "src/main.rs:42",
+      "expect": { "path": "src/main.rs", "line": 42 }
+    },
     {
       "style": "claude",
       "input": "web-ui/src/lib/chat/Markdown.svelte:128",
@@ -15,15 +20,43 @@
     {
       "style": "claude",
       "input": "crates/chimaera-server/src/fs.rs:1667-1748",
-      "expect": { "path": "crates/chimaera-server/src/fs.rs", "line": 1667, "endLine": 1748 }
+      "expect": {
+        "path": "crates/chimaera-server/src/fs.rs",
+        "line": 1667,
+        "endLine": 1748
+      }
     },
-    { "style": "claude", "input": "src/x.ts:12:5", "expect": { "path": "src/x.ts", "line": 12, "col": 5 } },
-    { "style": "claude", "input": "src/x.rs:0", "expect": { "path": "src/x.rs" } },
-    { "style": "claude", "input": "src/x.rs:20-12", "expect": { "path": "src/x.rs", "line": 20 } },
+    {
+      "style": "claude",
+      "input": "src/x.ts:12:5",
+      "expect": { "path": "src/x.ts", "line": 12, "col": 5 }
+    },
+    {
+      "style": "claude",
+      "input": "src/x.rs:0",
+      "expect": { "path": "src/x.rs" }
+    },
+    {
+      "style": "claude",
+      "input": "src/x.rs:20-12",
+      "expect": { "path": "src/x.rs", "line": 20 }
+    },
     { "style": "claude", "input": "main.py:", "expect": { "path": "main.py" } },
-    { "style": "claude", "input": "docs/features/terminals.md.", "expect": { "path": "docs/features/terminals.md" } },
-    { "style": "claude", "input": "@web-ui/src/App.svelte", "expect": { "path": "web-ui/src/App.svelte" } },
-    { "style": "claude", "input": "@README.md", "expect": { "path": "README.md" } },
+    {
+      "style": "claude",
+      "input": "docs/features/terminals.md.",
+      "expect": { "path": "docs/features/terminals.md" }
+    },
+    {
+      "style": "claude",
+      "input": "@web-ui/src/App.svelte",
+      "expect": { "path": "web-ui/src/App.svelte" }
+    },
+    {
+      "style": "claude",
+      "input": "@README.md",
+      "expect": { "path": "README.md" }
+    },
     { "style": "claude", "input": "@@", "expect": null },
     {
       "style": "claude",
@@ -35,65 +68,225 @@
       "input": "Read(/home/user/project/results/qc/report.html)",
       "expect": { "path": "/home/user/project/results/qc/report.html" }
     },
-    { "style": "claude", "input": "(results/figs/plot.png)", "expect": { "path": "results/figs/plot.png" } },
-    { "style": "claude", "input": "(results/figs/plot.png).", "expect": { "path": "results/figs/plot.png" } },
-    { "style": "claude", "input": "\"config/settings.json\"", "expect": { "path": "config/settings.json" } },
-    { "style": "claude", "input": "'src/x.rs',", "expect": { "path": "src/x.rs" } },
-    { "style": "claude", "input": "**src/lib.rs**", "expect": { "path": "src/lib.rs" } },
-    { "style": "claude", "input": "**`docs/plan.md`**", "expect": { "path": "docs/plan.md" } },
-    { "style": "claude", "input": "<src/x.rs>", "expect": { "path": "src/x.rs" } },
-    { "style": "claude", "input": "[src/x.rs]", "expect": { "path": "src/x.rs" } },
-    { "style": "claude", "input": "~/data/run1/log.txt", "expect": { "path": "~/data/run1/log.txt" } },
-    { "style": "claude", "input": "./scripts/check.sh", "expect": { "path": "./scripts/check.sh" } },
-    { "style": "claude", "input": "../shared/fileRef.ts", "expect": { "path": "../shared/fileRef.ts" } },
+    {
+      "style": "claude",
+      "input": "(results/figs/plot.png)",
+      "expect": { "path": "results/figs/plot.png" }
+    },
+    {
+      "style": "claude",
+      "input": "(results/figs/plot.png).",
+      "expect": { "path": "results/figs/plot.png" }
+    },
+    {
+      "style": "claude",
+      "input": "\"config/settings.json\"",
+      "expect": { "path": "config/settings.json" }
+    },
+    {
+      "style": "claude",
+      "input": "'src/x.rs',",
+      "expect": { "path": "src/x.rs" }
+    },
+    {
+      "style": "claude",
+      "input": "**src/lib.rs**",
+      "expect": { "path": "src/lib.rs" }
+    },
+    {
+      "style": "claude",
+      "input": "**`docs/plan.md`**",
+      "expect": { "path": "docs/plan.md" }
+    },
+    {
+      "style": "claude",
+      "input": "<src/x.rs>",
+      "expect": { "path": "src/x.rs" }
+    },
+    {
+      "style": "claude",
+      "input": "[src/x.rs]",
+      "expect": { "path": "src/x.rs" }
+    },
+    {
+      "style": "claude",
+      "input": "~/data/run1/log.txt",
+      "expect": { "path": "~/data/run1/log.txt" }
+    },
+    {
+      "style": "claude",
+      "input": "./scripts/check.sh",
+      "expect": { "path": "./scripts/check.sh" }
+    },
+    {
+      "style": "claude",
+      "input": "../shared/fileRef.ts",
+      "expect": { "path": "../shared/fileRef.ts" }
+    },
     { "style": "claude", "input": ".env", "expect": { "path": ".env" } },
-    { "style": "claude", "input": ".github/workflows/ci.yml", "expect": { "path": ".github/workflows/ci.yml" } },
-    { "style": "claude", "input": "__init__.py", "expect": { "path": "__init__.py" } },
-    { "style": "claude", "input": "Makefile", "expect": { "path": "Makefile" } },
-    { "style": "claude", "input": "Snakefile:14", "expect": { "path": "Snakefile", "line": 14 } },
-    { "style": "claude", "input": "résumé.pdf", "expect": { "path": "résumé.pdf" } },
-    { "style": "claude", "input": "données/x.csv", "expect": { "path": "données/x.csv" } },
-    { "style": "claude", "input": "model.safetensors", "expect": { "path": "model.safetensors" } },
-    { "style": "claude", "input": "icon@2x.png", "expect": { "path": "icon@2x.png" } },
-    { "style": "claude", "input": "app/[id]/page.tsx", "expect": { "path": "app/[id]/page.tsx" } },
-    { "style": "claude", "input": "notebooks/eda.ipynb:5", "expect": { "path": "notebooks/eda.ipynb", "line": 5 } },
-    { "style": "codex", "input": "src/app.ts#L42", "expect": { "path": "src/app.ts", "line": 42 } },
+    {
+      "style": "claude",
+      "input": ".github/workflows/ci.yml",
+      "expect": { "path": ".github/workflows/ci.yml" }
+    },
+    {
+      "style": "claude",
+      "input": "__init__.py",
+      "expect": { "path": "__init__.py" }
+    },
+    {
+      "style": "claude",
+      "input": "Makefile",
+      "expect": { "path": "Makefile" }
+    },
+    {
+      "style": "claude",
+      "input": "Snakefile:14",
+      "expect": { "path": "Snakefile", "line": 14 }
+    },
+    {
+      "style": "claude",
+      "input": "résumé.pdf",
+      "expect": { "path": "résumé.pdf" }
+    },
+    {
+      "style": "claude",
+      "input": "données/x.csv",
+      "expect": { "path": "données/x.csv" }
+    },
+    {
+      "style": "claude",
+      "input": "model.safetensors",
+      "expect": { "path": "model.safetensors" }
+    },
+    {
+      "style": "claude",
+      "input": "icon@2x.png",
+      "expect": { "path": "icon@2x.png" }
+    },
+    {
+      "style": "claude",
+      "input": "app/[id]/page.tsx",
+      "expect": { "path": "app/[id]/page.tsx" }
+    },
+    {
+      "style": "claude",
+      "input": "notebooks/eda.ipynb:5",
+      "expect": { "path": "notebooks/eda.ipynb", "line": 5 }
+    },
+    {
+      "style": "codex",
+      "input": "src/app.ts#L42",
+      "expect": { "path": "src/app.ts", "line": 42 }
+    },
     {
       "style": "codex",
       "input": "src/app.ts#L42-L50",
       "expect": { "path": "src/app.ts", "line": 42, "endLine": 50 }
     },
-    { "style": "codex", "input": "src/app.ts#L42-50", "expect": { "path": "src/app.ts", "line": 42, "endLine": 50 } },
-    { "style": "codex", "input": "src/app.ts#L42C7", "expect": { "path": "src/app.ts", "line": 42, "col": 7 } },
+    {
+      "style": "codex",
+      "input": "src/app.ts#L42-50",
+      "expect": { "path": "src/app.ts", "line": 42, "endLine": 50 }
+    },
+    {
+      "style": "codex",
+      "input": "src/app.ts#L42C7",
+      "expect": { "path": "src/app.ts", "line": 42, "col": 7 }
+    },
     {
       "style": "codex",
       "input": "/Users/me/proj/src/app.ts:42",
       "expect": { "path": "/Users/me/proj/src/app.ts", "line": 42 }
     },
-    { "style": "codex", "input": "src/x.rs:12:3:", "expect": { "path": "src/x.rs", "line": 12, "col": 3 } },
-    { "style": "codex", "input": "a/src/x.rs", "expect": { "path": "a/src/x.rs" } },
-    { "style": "codex", "input": "b/web-ui/src/App.svelte", "expect": { "path": "b/web-ui/src/App.svelte" } },
-    { "style": "codex", "input": "…/figs/plot.png", "expect": { "path": "figs/plot.png" } },
-    { "style": "codex", "input": ".../chat/paths.ts:9", "expect": { "path": "chat/paths.ts", "line": 9 } },
-    { "style": "codex", "input": "web-ui/…/chat/paths.ts", "expect": { "path": "chat/paths.ts" } },
-    { "style": "codex", "input": "…ts/figs/plot.png", "expect": { "path": "figs/plot.png" } },
+    {
+      "style": "codex",
+      "input": "src/x.rs:12:3:",
+      "expect": { "path": "src/x.rs", "line": 12, "col": 3 }
+    },
+    {
+      "style": "codex",
+      "input": "a/src/x.rs",
+      "expect": { "path": "a/src/x.rs" }
+    },
+    {
+      "style": "codex",
+      "input": "b/web-ui/src/App.svelte",
+      "expect": { "path": "b/web-ui/src/App.svelte" }
+    },
+    {
+      "style": "codex",
+      "input": "…/figs/plot.png",
+      "expect": { "path": "figs/plot.png" }
+    },
+    {
+      "style": "codex",
+      "input": ".../chat/paths.ts:9",
+      "expect": { "path": "chat/paths.ts", "line": 9 }
+    },
+    {
+      "style": "codex",
+      "input": "web-ui/…/chat/paths.ts",
+      "expect": { "path": "chat/paths.ts" }
+    },
+    {
+      "style": "codex",
+      "input": "…ts/figs/plot.png",
+      "expect": { "path": "figs/plot.png" }
+    },
     { "style": "codex", "input": "…plot.png", "expect": null },
-    { "style": "gemini", "input": "src/index.ts(12,3):", "expect": { "path": "src/index.ts", "line": 12, "col": 3 } },
-    { "style": "gemini", "input": "file:///home/u/notes/todo.md", "expect": { "path": "/home/u/notes/todo.md" } },
-    { "style": "gemini", "input": "file://localhost/tmp/x.log", "expect": { "path": "/tmp/x.log" } },
+    {
+      "style": "gemini",
+      "input": "src/index.ts(12,3):",
+      "expect": { "path": "src/index.ts", "line": 12, "col": 3 }
+    },
+    {
+      "style": "gemini",
+      "input": "file:///home/u/notes/todo.md",
+      "expect": { "path": "/home/u/notes/todo.md" }
+    },
+    {
+      "style": "gemini",
+      "input": "file://localhost/tmp/x.log",
+      "expect": { "path": "/tmp/x.log" }
+    },
     { "style": "gemini", "input": "file://server/share/x.txt", "expect": null },
     {
       "style": "gemini",
       "input": "file:///home/u/My%20Notes/plan.md#L3",
       "expect": { "path": "/home/u/My Notes/plan.md", "line": 3 }
     },
-    { "style": "gemini", "input": "（results/plot.png）", "expect": { "path": "results/plot.png" } },
-    { "style": "gemini", "input": "「src/x.rs」", "expect": { "path": "src/x.rs" } },
-    { "style": "gemini", "input": "results/plot.png。", "expect": { "path": "results/plot.png" } },
-    { "style": "gemini", "input": "“notes/draft.md”", "expect": { "path": "notes/draft.md" } },
+    {
+      "style": "gemini",
+      "input": "（results/plot.png）",
+      "expect": { "path": "results/plot.png" }
+    },
+    {
+      "style": "gemini",
+      "input": "「src/x.rs」",
+      "expect": { "path": "src/x.rs" }
+    },
+    {
+      "style": "gemini",
+      "input": "results/plot.png。",
+      "expect": { "path": "results/plot.png" }
+    },
+    {
+      "style": "gemini",
+      "input": "“notes/draft.md”",
+      "expect": { "path": "notes/draft.md" }
+    },
     { "style": "generic", "input": "and/or", "expect": { "path": "and/or" } },
-    { "style": "generic", "input": "https://github.com/org/repo/blob/main/src/x.rs#L10", "expect": null },
-    { "style": "generic", "input": "https://support.claude.com/en/a-b", "expect": null },
+    {
+      "style": "generic",
+      "input": "https://github.com/org/repo/blob/main/src/x.rs#L10",
+      "expect": null
+    },
+    {
+      "style": "generic",
+      "input": "https://support.claude.com/en/a-b",
+      "expect": null
+    },
     { "style": "generic", "input": "mailto:me@example.com", "expect": null },
     { "style": "generic", "input": "me@example.com", "expect": null },
     { "style": "generic", "input": "1.2.3", "expect": null },
@@ -102,7 +295,11 @@
     { "style": "generic", "input": "e.g.", "expect": null },
     { "style": "generic", "input": "i.e.,", "expect": null },
     { "style": "generic", "input": "std::fs::read", "expect": null },
-    { "style": "generic", "input": "git@github.com:org/repo.git", "expect": null },
+    {
+      "style": "generic",
+      "input": "git@github.com:org/repo.git",
+      "expect": null
+    },
     { "style": "generic", "input": "localhost:8080", "expect": null },
     { "style": "generic", "input": "src/**/*.ts", "expect": null },
     { "style": "generic", "input": "$HOME/x.txt", "expect": null },
@@ -111,7 +308,12 @@
     { "style": "generic", "input": "-la", "expect": null },
     { "style": "generic", "input": "--output=results/x.csv", "expect": null },
     { "style": "generic", "input": "crates", "expect": null },
-    { "style": "generic", "input": "crates", "bare": true, "expect": { "path": "crates" } },
+    {
+      "style": "generic",
+      "input": "crates",
+      "bare": true,
+      "expect": { "path": "crates" }
+    },
     { "style": "generic", "input": "4.8", "bare": true, "expect": null },
     { "style": "generic", "input": "Screenshot (1).png", "expect": null },
     {
@@ -126,11 +328,36 @@
       "delimited": true,
       "expect": { "path": "my notes/plan draft.md" }
     },
-    { "style": "claude", "input": "cat results/x.csv", "delimited": true, "expect": null },
-    { "style": "claude", "input": "python scripts/run.py --fast", "delimited": true, "expect": null },
-    { "style": "claude", "input": "npm run check", "delimited": true, "expect": null },
-    { "style": "claude", "input": " src/lib.rs:7 ", "delimited": true, "expect": { "path": "src/lib.rs", "line": 7 } },
-    { "style": "codex", "input": "src/a.rs#L10", "delimited": true, "expect": { "path": "src/a.rs", "line": 10 } },
+    {
+      "style": "claude",
+      "input": "cat results/x.csv",
+      "delimited": true,
+      "expect": null
+    },
+    {
+      "style": "claude",
+      "input": "python scripts/run.py --fast",
+      "delimited": true,
+      "expect": null
+    },
+    {
+      "style": "claude",
+      "input": "npm run check",
+      "delimited": true,
+      "expect": null
+    },
+    {
+      "style": "claude",
+      "input": " src/lib.rs:7 ",
+      "delimited": true,
+      "expect": { "path": "src/lib.rs", "line": 7 }
+    },
+    {
+      "style": "codex",
+      "input": "src/a.rs#L10",
+      "delimited": true,
+      "expect": { "path": "src/a.rs", "line": 10 }
+    },
     {
       "style": "codex",
       "input": "/abs/proj/src/a.rs:10",
@@ -143,31 +370,293 @@
       "delimited": true,
       "expect": { "path": "demo assets/demo.csv" }
     },
-    { "style": "claude", "input": "docs/guide.md#installation", "delimited": true, "expect": { "path": "docs/guide.md" } },
-    { "style": "codex", "input": "README.md?plain=1#L5", "delimited": true, "expect": { "path": "README.md", "line": 5 } },
-    { "style": "claude", "input": "#section", "delimited": true, "expect": null },
-    { "style": "claude", "input": "./demo-assets/", "delimited": true, "expect": { "path": "./demo-assets/" } },
-    { "style": "claude", "input": "bad%zzescape/x.md", "delimited": true, "expect": { "path": "bad%zzescape/x.md" } }
+    {
+      "style": "claude",
+      "input": "docs/guide.md#installation",
+      "delimited": true,
+      "expect": { "path": "docs/guide.md" }
+    },
+    {
+      "style": "codex",
+      "input": "README.md?plain=1#L5",
+      "delimited": true,
+      "expect": { "path": "README.md", "line": 5 }
+    },
+    {
+      "style": "claude",
+      "input": "#section",
+      "delimited": true,
+      "expect": null
+    },
+    {
+      "style": "claude",
+      "input": "./demo-assets/",
+      "delimited": true,
+      "expect": { "path": "./demo-assets/" }
+    },
+    {
+      "style": "claude",
+      "input": "bad%zzescape/x.md",
+      "delimited": true,
+      "expect": { "path": "bad%zzescape/x.md" }
+    },
+    {
+      "style": "chimaera",
+      "input": "@paper.pdf#page=3",
+      "expect": { "path": "paper.pdf", "at": { "page": 3 } }
+    },
+    {
+      "style": "chimaera",
+      "input": "@paper.pdf#page=3&xywh=72,90,200,120",
+      "expect": {
+        "path": "paper.pdf",
+        "at": { "page": 3, "region": { "x": 72, "y": 90, "w": 200, "h": 120 } }
+      }
+    },
+    {
+      "style": "chimaera",
+      "input": "@figs/umap.png#xywh=160,120,320,240",
+      "expect": {
+        "path": "figs/umap.png",
+        "at": { "region": { "x": 160, "y": 120, "w": 320, "h": 240 } }
+      }
+    },
+    {
+      "style": "claude",
+      "input": "figs/umap.png#xywh=percent:25,25,50,50",
+      "expect": {
+        "path": "figs/umap.png",
+        "at": {
+          "region": { "x": 25, "y": 25, "w": 50, "h": 50, "percent": true }
+        }
+      }
+    },
+    {
+      "style": "codex",
+      "input": "figs/umap.png#xywh=pixel:10.5,20,30,40",
+      "expect": {
+        "path": "figs/umap.png",
+        "at": { "region": { "x": 10.5, "y": 20, "w": 30, "h": 40 } }
+      }
+    },
+    {
+      "style": "generic",
+      "input": "figs/umap.png#xywh=10,20,0,5",
+      "expect": { "path": "figs/umap.png" }
+    },
+    {
+      "style": "chimaera",
+      "input": "@demo.mp4#t=30,45",
+      "expect": {
+        "path": "demo.mp4",
+        "at": { "time": { "start": 30, "end": 45 } }
+      }
+    },
+    {
+      "style": "chimaera",
+      "input": "@talk.mp3#t=12.5",
+      "expect": { "path": "talk.mp3", "at": { "time": { "start": 12.5 } } }
+    },
+    {
+      "style": "claude",
+      "input": "demo.mp4#t=npt:1:02:03.5,1:02:10",
+      "expect": {
+        "path": "demo.mp4",
+        "at": { "time": { "start": 3723.5, "end": 3730 } }
+      }
+    },
+    {
+      "style": "gemini",
+      "input": "demo.mp4#t=,20",
+      "expect": {
+        "path": "demo.mp4",
+        "at": { "time": { "start": 0, "end": 20 } }
+      }
+    },
+    {
+      "style": "generic",
+      "input": "demo.mp4#t=20,10",
+      "expect": { "path": "demo.mp4", "at": { "time": { "start": 20 } } }
+    },
+    {
+      "style": "chimaera",
+      "input": "@results/de.tsv#row=5-9",
+      "expect": {
+        "path": "results/de.tsv",
+        "at": { "table": { "row": 5, "endRow": 9 } }
+      }
+    },
+    {
+      "style": "chimaera",
+      "input": "@results/de.csv#cell=5,2",
+      "expect": {
+        "path": "results/de.csv",
+        "at": { "table": { "row": 5, "col": 2 } }
+      }
+    },
+    {
+      "style": "chimaera",
+      "input": "@results/de.csv#cell=5,2-9,4",
+      "expect": {
+        "path": "results/de.csv",
+        "at": { "table": { "row": 5, "col": 2, "endRow": 9, "endCol": 4 } }
+      }
+    },
+    {
+      "style": "claude",
+      "input": "results/de.csv#col=2",
+      "expect": { "path": "results/de.csv", "at": { "table": { "col": 2 } } }
+    },
+    {
+      "style": "codex",
+      "input": "results/de.csv#row=5-*",
+      "expect": { "path": "results/de.csv", "at": { "table": { "row": 5 } } }
+    },
+    {
+      "style": "generic",
+      "input": "results/de.csv#row=5;8-9",
+      "expect": { "path": "results/de.csv", "at": { "table": { "row": 5 } } }
+    },
+    {
+      "style": "generic",
+      "input": "results/de.csv#cell=7",
+      "expect": { "path": "results/de.csv" }
+    },
+    {
+      "style": "chimaera",
+      "input": "@summary.xlsx#sheet=Genes&range=A1:F20",
+      "expect": {
+        "path": "summary.xlsx",
+        "at": {
+          "sheet": "Genes",
+          "range": { "row": 1, "col": 1, "endRow": 20, "endCol": 6 }
+        }
+      }
+    },
+    {
+      "style": "chimaera",
+      "input": "@summary.xlsx#sheet=Q1%20Summary&range=B2",
+      "expect": {
+        "path": "summary.xlsx",
+        "at": { "sheet": "Q1 Summary", "range": { "row": 2, "col": 2 } }
+      }
+    },
+    {
+      "style": "claude",
+      "input": "summary.xlsx#range=Genes!$B$2:$F$9",
+      "expect": {
+        "path": "summary.xlsx",
+        "at": {
+          "sheet": "Genes",
+          "range": { "row": 2, "col": 2, "endRow": 9, "endCol": 6 }
+        }
+      }
+    },
+    {
+      "style": "codex",
+      "input": "summary.xlsx#range=C:A",
+      "expect": {
+        "path": "summary.xlsx",
+        "at": { "range": { "col": 1, "endCol": 3 } }
+      }
+    },
+    {
+      "style": "chimaera",
+      "input": "@analysis.ipynb#cell=7",
+      "expect": { "path": "analysis.ipynb", "at": { "cell": 7 } }
+    },
+    {
+      "style": "generic",
+      "input": "analysis.ipynb#cell=5,2",
+      "expect": { "path": "analysis.ipynb" }
+    },
+    {
+      "style": "chimaera",
+      "input": "@deck.md#slide=3",
+      "expect": { "path": "deck.md", "at": { "slide": 3 } }
+    },
+    {
+      "style": "claude",
+      "input": "deck.pptx#slide=12",
+      "expect": { "path": "deck.pptx", "at": { "slide": 12 } }
+    },
+    {
+      "style": "generic",
+      "input": "paper.pdf#page=0",
+      "expect": { "path": "paper.pdf" }
+    },
+    {
+      "style": "gemini",
+      "input": "paper.pdf#page=4&zoom=100",
+      "expect": { "path": "paper.pdf", "at": { "page": 4 } }
+    },
+    {
+      "style": "claude",
+      "input": "paper.pdf#page=4.",
+      "expect": { "path": "paper.pdf", "at": { "page": 4 } }
+    },
+    {
+      "style": "claude",
+      "input": "(paper.pdf#page=3&xywh=72,90,200,120).",
+      "expect": {
+        "path": "paper.pdf",
+        "at": { "page": 3, "region": { "x": 72, "y": 90, "w": 200, "h": 120 } }
+      }
+    },
+    {
+      "style": "claude",
+      "input": "paper%20v2.pdf#page=4",
+      "delimited": true,
+      "expect": { "path": "paper v2.pdf", "at": { "page": 4 } }
+    },
+    {
+      "style": "claude",
+      "input": "figs/plot.png#xywh=1,2,3,4",
+      "delimited": true,
+      "expect": {
+        "path": "figs/plot.png",
+        "at": { "region": { "x": 1, "y": 2, "w": 3, "h": 4 } }
+      }
+    }
   ],
   "text": [
     {
       "style": "claude",
       "input": "I updated `web-ui/src/lib/chat/paths.ts:31` and web-ui/src/App.svelte:1924.",
       "expect": [
-        { "text": "web-ui/src/lib/chat/paths.ts:31", "path": "web-ui/src/lib/chat/paths.ts", "line": 31 },
-        { "text": "web-ui/src/App.svelte:1924", "path": "web-ui/src/App.svelte", "line": 1924 }
+        {
+          "text": "web-ui/src/lib/chat/paths.ts:31",
+          "path": "web-ui/src/lib/chat/paths.ts",
+          "line": 31
+        },
+        {
+          "text": "web-ui/src/App.svelte:1924",
+          "path": "web-ui/src/App.svelte",
+          "line": 1924
+        }
       ]
     },
     {
       "style": "claude",
       "input": "⏺ Update(web-ui/src/lib/terminal/links.ts)",
-      "expect": [{ "text": "web-ui/src/lib/terminal/links.ts", "path": "web-ui/src/lib/terminal/links.ts" }]
+      "expect": [
+        {
+          "text": "web-ui/src/lib/terminal/links.ts",
+          "path": "web-ui/src/lib/terminal/links.ts"
+        }
+      ]
     },
-    { "style": "claude", "input": "  ⎿  Read 42 lines (ctrl+o to expand)", "expect": [] },
+    {
+      "style": "claude",
+      "input": "  ⎿  Read 42 lines (ctrl+o to expand)",
+      "expect": []
+    },
     {
       "style": "claude",
       "input": "  ⎿  Wrote 12 lines to results/qc/summary.md",
-      "expect": [{ "text": "results/qc/summary.md", "path": "results/qc/summary.md" }]
+      "expect": [
+        { "text": "results/qc/summary.md", "path": "results/qc/summary.md" }
+      ]
     },
     {
       "style": "claude",
@@ -181,7 +670,9 @@
     {
       "style": "claude",
       "input": "- results/figs/plot.png: the final figure",
-      "expect": [{ "text": "results/figs/plot.png", "path": "results/figs/plot.png" }]
+      "expect": [
+        { "text": "results/figs/plot.png", "path": "results/figs/plot.png" }
+      ]
     },
     {
       "style": "claude",
@@ -228,7 +719,12 @@
     {
       "style": "gemini",
       "input": "✔  ReadFile src/components/Button.tsx",
-      "expect": [{ "text": "src/components/Button.tsx", "path": "src/components/Button.tsx" }]
+      "expect": [
+        {
+          "text": "src/components/Button.tsx",
+          "path": "src/components/Button.tsx"
+        }
+      ]
     },
     {
       "style": "gemini",
@@ -243,20 +739,37 @@
         { "text": "src/x.rs", "path": "src/x.rs" }
       ]
     },
-    { "style": "generic", "input": "--- a/src/x.rs", "expect": [{ "text": "a/src/x.rs", "path": "a/src/x.rs" }] },
-    { "style": "generic", "input": "+++ b/src/x.rs", "expect": [{ "text": "b/src/x.rs", "path": "b/src/x.rs" }] },
+    {
+      "style": "generic",
+      "input": "--- a/src/x.rs",
+      "expect": [{ "text": "a/src/x.rs", "path": "a/src/x.rs" }]
+    },
+    {
+      "style": "generic",
+      "input": "+++ b/src/x.rs",
+      "expect": [{ "text": "b/src/x.rs", "path": "b/src/x.rs" }]
+    },
     {
       "style": "generic",
       "input": "diff --git a/web-ui/src/App.svelte b/web-ui/src/App.svelte",
       "expect": [
-        { "text": "a/web-ui/src/App.svelte", "path": "a/web-ui/src/App.svelte" },
+        {
+          "text": "a/web-ui/src/App.svelte",
+          "path": "a/web-ui/src/App.svelte"
+        },
         { "text": "b/web-ui/src/App.svelte", "path": "b/web-ui/src/App.svelte" }
       ]
     },
     {
       "style": "generic",
       "input": "  File \"/home/u/proj/train.py\", line 88, in <module>",
-      "expect": [{ "text": "/home/u/proj/train.py", "path": "/home/u/proj/train.py", "line": 88 }]
+      "expect": [
+        {
+          "text": "/home/u/proj/train.py",
+          "path": "/home/u/proj/train.py",
+          "line": 88
+        }
+      ]
     },
     {
       "style": "generic",
@@ -266,12 +779,26 @@
     {
       "style": "generic",
       "input": "  --> src/main.rs:4:9",
-      "expect": [{ "text": "src/main.rs:4:9", "path": "src/main.rs", "line": 4, "col": 9 }]
+      "expect": [
+        {
+          "text": "src/main.rs:4:9",
+          "path": "src/main.rs",
+          "line": 4,
+          "col": 9
+        }
+      ]
     },
     {
       "style": "generic",
       "input": "src/index.ts(12,3): error TS2345: Argument of type 'string'",
-      "expect": [{ "text": "src/index.ts(12,3)", "path": "src/index.ts", "line": 12, "col": 3 }]
+      "expect": [
+        {
+          "text": "src/index.ts(12,3)",
+          "path": "src/index.ts",
+          "line": 12,
+          "col": 3
+        }
+      ]
     },
     {
       "style": "generic",
@@ -287,7 +814,11 @@
       "input": "See https://github.com/org/repo and src/x.rs",
       "expect": [{ "text": "src/x.rs", "path": "src/x.rs" }]
     },
-    { "style": "generic", "input": "Version 1.2.3 of numpy (e.g. 4.8) is fine.", "expect": [] },
+    {
+      "style": "generic",
+      "input": "Version 1.2.3 of numpy (e.g. 4.8) is fine.",
+      "expect": []
+    },
     { "style": "generic", "input": "wait... then go", "expect": [] },
     {
       "style": "generic",
@@ -312,6 +843,78 @@
       "expect": [
         { "text": "résumé.pdf", "path": "résumé.pdf" },
         { "text": "données/x.csv", "path": "données/x.csv" }
+      ]
+    },
+    {
+      "style": "chimaera",
+      "input": "@paper.pdf#page=3&xywh=72,90,200,120 \"Figure 2\" (region image: /home/u/.chimaera/uploads/s-1/ref-1.png)",
+      "expect": [
+        {
+          "text": "@paper.pdf#page=3&xywh=72,90,200,120",
+          "path": "paper.pdf",
+          "at": {
+            "page": 3,
+            "region": { "x": 72, "y": 90, "w": 200, "h": 120 }
+          }
+        },
+        {
+          "text": "/home/u/.chimaera/uploads/s-1/ref-1.png",
+          "path": "/home/u/.chimaera/uploads/s-1/ref-1.png"
+        }
+      ]
+    },
+    {
+      "style": "chimaera",
+      "input": "@results/de.tsv#cell=5,2-6,3 \"gene\\\\tlog2FC\\\\nTP53\\\\t2.1\"",
+      "expect": [
+        {
+          "text": "@results/de.tsv#cell=5,2-6,3",
+          "path": "results/de.tsv",
+          "at": { "table": { "row": 5, "col": 2, "endRow": 6, "endCol": 3 } }
+        }
+      ]
+    },
+    {
+      "style": "claude",
+      "input": "Rows results/de.tsv#row=5-9, then demo.mp4#t=30,45.",
+      "expect": [
+        {
+          "text": "results/de.tsv#row=5-9",
+          "path": "results/de.tsv",
+          "at": { "table": { "row": 5, "endRow": 9 } }
+        },
+        {
+          "text": "demo.mp4#t=30,45",
+          "path": "demo.mp4",
+          "at": { "time": { "start": 30, "end": 45 } }
+        }
+      ]
+    },
+    {
+      "style": "codex",
+      "input": "See `summary.xlsx#sheet=Genes&range=B2:F9` and deck.md#slide=3",
+      "expect": [
+        {
+          "text": "summary.xlsx#sheet=Genes&range=B2:F9",
+          "path": "summary.xlsx",
+          "at": {
+            "sheet": "Genes",
+            "range": { "row": 2, "col": 2, "endRow": 9, "endCol": 6 }
+          }
+        },
+        { "text": "deck.md#slide=3", "path": "deck.md", "at": { "slide": 3 } }
+      ]
+    },
+    {
+      "style": "generic",
+      "input": "python plot.py --out=figs/a.png#xywh=1,2,3,4",
+      "expect": [
+        { "text": "plot.py", "path": "plot.py" },
+        {
+          "text": "figs/a.png#xywh=1,2,3,4",
+          "path": "figs/a.png",
+          "at": { "region": { "x": 1, "y": 2, "w": 3, "h": 4 } }
+        }
       ]
     }
   ]

@@ -98,7 +98,10 @@ pipe), `POST /api/v1/sessions` (spawn), `POST /api/v1/sessions/{id}/exec`,
 - **How it's used.** Hover a path; if the daemon confirms it exists, it underlines. A file opens
   in the **active pane** (reusing an already-open tab) at the line the reference names —
   `src/x.rs:42`, `:42:7`, `:42-60`, `#L42`, `#L42-L60`, `#L42C7`, tsc's `x.ts(42,7)`, a Python
-  traceback's `File "x.py", line 42` — which the file view scrolls to. A directory opens/reuses the
+  traceback's `File "x.py", line 42` — which the file view scrolls to; a locator lands on its spot
+  (`paper.pdf#page=3&xywh=72,272,320,220`, `de.tsv#row=40-42`, `book.xlsx#sheet=S&range=D6:E7`,
+  `talk.wav#t=12`, `nb.ipynb#cell=7`, `deck.md#slide=3`; see
+  [pointing at part of a file](files-and-previews.md#pointing-at-part-of-a-file)). A directory opens/reuses the
   Finder beside the terminal. Cmd/Ctrl+click forces a new split. Clicking a name several files
   answer to opens a menu of the matches.
 - **Where it lives.** `web-ui/src/lib/terminal/links.ts` (`PathLinkProvider`), the parser it

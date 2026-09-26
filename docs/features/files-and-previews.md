@@ -644,6 +644,67 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   `fragment.ts` (the fragment grammar), `mount.svelte.ts` (`mountEmbed(el, props) → {update,
   destroy}` for renderers that own raw DOM); `crates/chimaera-server/src/embed.rs`.
 
+## Pointing at part of a file
+
+- **What & when.** Point at part of any file — lines, a PDF passage, a box on an image or PDF
+  page, table cells, a media moment, a notebook cell, a slide — and hand exactly that to an agent.
+  The same **reference in agent** chip (and chord, `⇧⌘R` / `Ctrl+Shift+R`) as a code selection,
+  typed into the target agent's input and never submitted.
+- **How it's used.**
+  - **Code, diff, markdown reading:** select text. Markdown sends its source lines plus the heading
+    it sits under.
+  - **PDF:** select text (sends the page and the quote), or turn on the **select area** tool in the
+    bar (or Shift-drag) and draw a box: the page, the box in PDF points, the text under it, and a
+    PNG of it rendered from the page's vectors at 2×. Esc clears the box, then the tool.
+  - **Image:** the same area tool (or Shift-drag; a plain drag still pans): the box in the image's
+    own pixels and a PNG of exactly those pixels (an SVG drawn at 2×). The box and chip follow zoom.
+  - **CSV/TSV and spreadsheets:** select cells (or whole rows from the row numbers); the chip sits
+    under the block. The values go along as TSV, header first.
+  - **Video/audio:** the bar's **@ 0:12** button sends the playhead; **mark range** twice marks a
+    range, which the button (and the chord) then sends.
+  - **Notebook cell / slide:** hover it; its **@** button sends it, with its source or text.
+- **What the agent gets.** One line, `@<path>#<locator> (<context>) "<quote>"`, each part after the
+  path optional:
+
+  | Pointed at | Typed |
+  |---|---|
+  | code lines | `@src/a.py#L40-L58 "def filter(…"` |
+  | markdown lines | `@report.md#L11-L11 (§ Results) "The effect held…"` |
+  | PDF text | `@paper.pdf#page=1 "The effect held across…"` |
+  | PDF area | `@paper.pdf#page=3&xywh=72,272,320,220 "Figure 2: scores by group"` + the crop |
+  | image area | `@figs/umap.png#xywh=380,120,120,100` + the crop |
+  | table cells / rows | `@de.tsv#cell=6,2-10,4 "log2FC\tpadj\n2.05\t0.005…"`, `@de.tsv#row=13-15 "…"` |
+  | spreadsheet | `@book.xlsx#sheet=Q1%20Summary&range=D6:E7 "score\tnote\n2.5\tsecond…"` |
+  | media | `@talk.wav#t=3.5`, `@talk.wav#t=2,6.25` |
+  | notebook cell / slide | `@analysis.ipynb#cell=2 "import pandas…"`, `@deck.md#slide=2 "Results…"` |
+
+  The pixels: a **chat** target gets the crop as an image attachment (the pasted-screenshot
+  pipeline and its caps); a **terminal** agent (Claude, Codex, anything) gets it uploaded to the
+  session's landing pad (`POST /sessions/{id}/upload`, `ref-N.png`) and ` (region image: <path>)`
+  appended, so any agent can open it. A failed upload still types the locator; its chip says why.
+- **Where it lives.** `web-ui/src/lib/shared/locator.ts` (the fragment grammar, both directions,
+  and the TSV quote), `shared/reference.ts` (`FileSelection`'s `fragment` / `quote` / `context` /
+  `crop` / `label`, `composeSelectionReference`, `referenceNow`), `shared/ReferenceChip.svelte` +
+  `ReferenceButton.svelte`, `App.svelte` `referenceSelection` (the one handler: chat attach vs
+  terminal upload), the viewers (`PdfView`, `ImageView`, `TableView` + `XlsxView`, `MediaView`,
+  `NotebookView`, `SlidesView`, `MarkdownView`), region math in `previews/imageRegion.ts`. The
+  daemon's `fs/xlsx` reports the sheet's used-range `origin`, so A1 references are the sheet's own.
+- **Key behaviors.**
+  - **Locators are links too.** The same fragments open at the spot from chat, a terminal, or a
+    document link (`fileRef.ts` via `locator.ts`, `docLinks.ts`): a PDF page and box, an image
+    box (`percent:` too), a media time (a range plays to its end, then pauses), table rows and
+    cells (jump, flash, outline), a sheet and A1 range, a notebook cell, a slide.
+  - **Table rows are RFC 7111's**, as embed cards read them: the header line is row 1, so the
+    grid's rows 5–9 go out as `#row=6-10` (a header-less format such as BED counts from its first
+    record), and a `#row=` link lands back on the grid's own numbers. Spreadsheet A1 follows the
+    sheet: a table whose used range starts at C4 references D6, not B2.
+  - **Quotes are one line and capped.** Text quotes are the usual ~200-character excerpt. A table
+    block's TSV escapes tabs and newlines as `\t` and `\n` (a real one would drive a terminal
+    agent's input) and stops at 50 rows × 20 columns or 8 KB with an honest `…`; rows not loaded
+    say so the same way. Crops cap at 1568 px on the long side.
+  - **One selection at a time.** A newer selection anywhere replaces a box or block's chip; a
+    one-click button (cell, slide, moment) publishes, sends and lets go.
+
 ## Preview keep-alive & live-update
 
 - **What & when.** A pane keeps recently-viewed rendered views alive (hidden, not destroyed) across
@@ -822,3 +883,15 @@ _Intent pending — drafted from the maintainer's request, 2026-09-06; questionn
 - **Pending.** The three-level sticky cap, the hover-lit parent guide, and the collapse-all
   placement beside the filter have not been confirmed with the maintainer — capture via
   **capture-feature-intent** when available.
+
+### Pointing at part of a file — why it exists
+_Intent pending — drafted from the maintainer's request, 2026-09-26; questionnaire not yet run._
+
+- **Problem it solves (from the request).** "Reference parts of any file, even parts of images,
+  so it's super easy to interact with." Code selections already reached an agent; a figure, a PDF
+  passage, table cells or a moment in a recording did not, so the user described them in words.
+  Now pointing is the same gesture everywhere and the agent gets the exact spot (and the pixels).
+- **Pending.** The one-selection model (no basket of several spots), crops uploaded rather than
+  pasted into terminal agents, table fragments counting rows the RFC 7111 way (so they differ by
+  one from the grid's row numbers), and the chip-only affordance (no context menu) have not been confirmed
+  with the maintainer — capture via **capture-feature-intent** when available.

@@ -871,14 +871,32 @@
       linesAt(range.startContainer, range.startOffset),
       linesAt(range.endContainer, Math.max(range.endOffset - 1, 0)),
     );
+    const heading = headingAt(range.startContainer);
     setSelection(selOwner, {
       kind: "file",
       path,
       startLine: lines?.start ?? null,
       endLine: lines?.end ?? null,
       text,
+      // Where it sits, for the agent: `@doc.md#L40-L42 (§ Results) "…"`.
+      ...(heading !== null ? { context: `§ ${heading}` } : {}),
     });
     chipPos = chipPosFor(content, range);
+  }
+
+  /** The heading a reading-view node sits under: the last h1–h6 at or
+   *  before it in document order (null above the first heading). */
+  function headingAt(node: Node): string | null {
+    const root = readingEl;
+    if (root === null) return null;
+    let found: Element | null = null;
+    for (const h of root.querySelectorAll("h1, h2, h3, h4, h5, h6")) {
+      const before = h === node || h.contains(node) || (h.compareDocumentPosition(node) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
+      if (!before) break;
+      found = h;
+    }
+    const text = found?.textContent?.replace(/\s+/g, " ").trim() ?? "";
+    return text === "" ? null : text;
   }
 
   /** The source lines of the innermost mapped block holding a selection
