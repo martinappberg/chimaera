@@ -55,8 +55,9 @@ export interface FileChunk {
   /**
    * SHA-256 (hex) of the whole file (`X-Content-Hash`). The daemon sends it
    * only when the body IS the complete raw file — offset 0, not truncated, not
-   * a decompressed gzip — so a partial read can never pose as a version. Null
-   * otherwise, and from older daemons (callers fall back to `mtime`).
+   * a decompressed gzip — so a partial read can never pose as a version, and
+   * only when no write raced the read (so it always names `mtime`'s version).
+   * Null otherwise, and from older daemons (callers fall back to `mtime`).
    */
   hash: string | null;
 }
