@@ -369,3 +369,32 @@ describe("disk changes", () => {
     close(buf, view);
   });
 });
+
+describe("the journal", () => {
+  it("never marks text journaled when its write lands after a save cleared the draft", async () => {
+    const path = `/w/late-journal-${++seq}.txt`;
+    const { buf, view } = fresh(path, "x");
+    view.type(1, "a"); // "xa"
+    type Result = { local: boolean; remote: "ok" };
+    let land!: (r: Result) => void;
+    mocks.drafts.journal.mockImplementationOnce(() => new Promise<Result>((r) => (land = r)));
+    const journaling = buf.journal(); // "xa", still in flight
+    view.type(2, "b"); // "xab"
+    mocks.fsWrite.mockResolvedValueOnce({ hash: "h1", mtime: "m1" });
+    expect(await buf.save()).toBe(true); // clean: the draft is cleared
+    expect(mocks.drafts.clear).toHaveBeenCalledWith(path);
+    land({ local: true, remote: "ok" }); // the stale write completes last
+    await journaling;
+
+    // Back to exactly the text that write carried: it is unsaved again and
+    // must be journaled, not skipped as "already journaled".
+    view.dispatch({ changes: { from: 2, to: 3 } });
+    expect(buf.dirty).toBe(true);
+    mocks.drafts.journal.mockClear();
+    await buf.journal();
+    expect(mocks.drafts.journal).toHaveBeenCalledTimes(1);
+    expect(mocks.drafts.journal).toHaveBeenCalledWith(expect.objectContaining({ path, text: "xa" }), false);
+    buf.discard();
+    close(buf, view);
+  });
+});

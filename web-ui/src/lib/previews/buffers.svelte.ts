@@ -224,6 +224,9 @@ export class Buffer {
   private autosaveTimer: ReturnType<typeof setTimeout> | null = null;
   private noticeTimer: ReturnType<typeof setTimeout> | null = null;
   private journaledText: string | null = null;
+  /** Bumped by every journal write and draft clear this buffer issues: a
+   *  write that completes after a newer one (or a clear) changes nothing. */
+  private journalEpoch = 0;
 
   constructor(path: string, first: FileChunk) {
     this.path = path;
@@ -661,8 +664,7 @@ export class Buffer {
     this.clearNotice();
     if (this.editable) this.setText(this.baseText, "reload", true);
     this.refreshDirty();
-    void drafts.clear(this.path);
-    this.journaledText = null;
+    this.clearDraft(this.path);
     this.maybeDispose();
   }
 
@@ -817,9 +819,18 @@ export class Buffer {
 
   /** The buffer matches the disk: its journal has nothing left to protect. */
   private afterClean(): void {
-    this.journaledText = null;
-    void drafts.clear(this.path);
+    this.clearDraft(this.path);
     this.maybeDispose();
+  }
+
+  /** Drop `path`'s journaled draft; a journal write still in flight then
+   *  never marks its text journaled (drafts.ts orders the mirror ops), and
+   *  edits still unsaved here are journaled afresh after the clear. */
+  private clearDraft(path: string): void {
+    this.journalEpoch++;
+    this.journaledText = null;
+    void drafts.clear(path);
+    if (this.dirty && path === this.path) this.scheduleJournal();
   }
 
   // --- autosave -------------------------------------------------------------
@@ -861,6 +872,7 @@ export class Buffer {
     if (!this.dirty || this.disposed) return;
     const text = this.current.doc.toString();
     if (text === this.journaledText) return;
+    const epoch = ++this.journalEpoch;
     const r = await drafts.journal(
       {
         path: this.path,
@@ -871,10 +883,11 @@ export class Buffer {
       },
       keepalive,
     );
-    if (this.disposed) return;
+    // Only the newest write's outcome counts: a newer journal or a clear (a
+    // save landed) was issued meanwhile. A clean buffer has nothing at risk.
+    if (this.disposed || epoch !== this.journalEpoch) return;
     const ok = drafts.journaled(r);
     if (ok) this.journaledText = text;
-    // Only the newest text's outcome counts; a clean buffer has nothing at risk.
     this.journalFailed = this.dirty && !ok;
   }
 
@@ -883,7 +896,7 @@ export class Buffer {
     const rec = await drafts.find(this.path);
     if (rec === null || this.disposed) return;
     if (rec.text === this.baseText) {
-      void drafts.clear(this.path); // nothing to recover
+      this.clearDraft(this.path); // nothing to recover
       return;
     }
     // Live in another window of this origin, not lost: that window owns it.
@@ -933,7 +946,7 @@ export class Buffer {
   discardDraft(): void {
     if (this.recovered === null) return;
     this.recovered = null;
-    void drafts.clear(this.path);
+    this.clearDraft(this.path);
   }
 
   // --- lifecycle ------------------------------------------------------------
@@ -954,8 +967,7 @@ export class Buffer {
       presence.announce(from, false);
       setDirty(to, true);
       presence.announce(to, true);
-      void drafts.clear(from);
-      this.journaledText = null;
+      this.clearDraft(from);
       this.scheduleJournal();
     }
   }

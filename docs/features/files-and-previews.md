@@ -152,7 +152,10 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   view.
 - **Closing asks.** Every close of a tab whose file is dirty — ×, middle-click, Close / Close
   Others / Close All, Cmd/Ctrl+W and the close-view chord — opens **Save / Don't save / Cancel**
-  (one dialog for several files). A save that fails keeps its tab open with the reason.
+  (one dialog for several files). A save that fails keeps its tab open with the reason. Save
+  waits at most 15 s (a dead link): past that it reports "not saved" and hands control back
+  while the save carries on in the background. Cancel and Escape stay live while saving and
+  only keep the tabs open.
 - **Saves are verified.** A save sends the base's content hash; success (whose reply carries the
   new hash) marks the buffer clean only if nothing was typed since it was sent (save
   generations). A save gets a 20 s timeout and one automatic retry once the events link is back
@@ -288,7 +291,8 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   **Links in documents open** (`previews/docLinks.ts`, both modes). A document-relative path
   (`other.md`, `../data/run.csv`, `figs/a%20b.png`, a local `file://` URL) resolves against
   the document's folder, a root-relative `/docs/x.md` also against the workspace root, and
-  the daemon confirms it (`POST /fs/validate`) before anything opens; the file (or folder)
+  the daemon confirms it (`POST /fs/validate`, `strict`: only the exact join, so a broken
+  `b/spec.md` never opens `spec.md`) before anything opens; the file (or folder)
   then opens through the shared opener (`shared/openPath.ts`, registered by the app) —
   Cmd/Ctrl+click or a middle-click opens it beside. `#L12` / `#L12-L20` opens the file at
   those lines (a reveal); `other.md#heading` opens the document and then scrolls to the

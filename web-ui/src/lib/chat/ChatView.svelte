@@ -9,6 +9,7 @@
     groupByBases,
     PathResolver,
     resolveAndOpen,
+    resolveScope,
     type ValidateAnswer,
   } from "./paths";
   import { listAgents } from "../workspace/launcher";
@@ -1095,7 +1096,12 @@
     });
     return answer;
   }
-  const prosePaths = new PathResolver(validateProse, { root: () => linkContext().root });
+  // The scope reads the session and workspace untracked: a template that
+  // peeks must not re-render on every session update, only on answers.
+  const prosePaths = new PathResolver(validateProse, {
+    root: () => linkContext().root,
+    scope: (c) => untrack(() => resolveScope(linkContext(), c)),
+  });
 
   // A turn end is when files the agent mentioned have come to exist: drop
   // the misses so the renderers holding them ask again.

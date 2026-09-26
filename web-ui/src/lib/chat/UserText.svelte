@@ -2,7 +2,7 @@
   import { extractFileRefs, revealOf, type FileRef } from "../shared/fileRef";
   import MathText from "./MathText.svelte";
   import { splitUserMath } from "./math";
-  import { menuPoint, openResolution, type OpenPathFn, type PathResolver, type Resolution } from "./paths";
+  import { menuPoint, reopenResolution, type OpenPathFn, type PathResolver, type Resolution } from "./paths";
 
   /**
    * The user's own message text: plain (never markdown — prompts are not
@@ -93,13 +93,19 @@
     return `open ${t.text}${t.ref?.line !== undefined ? ` at line ${t.ref.line}` : ""} in a pane`;
   }
 
+  /** Open what the daemon answers NOW (the standing answer may predate a
+   *  move or a delete); re-read the cache after, so a reference that is
+   *  gone stops looking clickable. */
   function activate(e: MouseEvent, t: Token, res: Resolution) {
-    if (onOpenPath === undefined) return;
-    openResolution(res, onOpenPath, {
+    if (onOpenPath === undefined || t.ref === null) return;
+    const opts = {
       split: e.metaKey || e.ctrlKey,
       reveal: revealOf(t.ref),
       at: menuPoint(e, e.currentTarget as Element),
-      label: (p) => resolvePaths?.label(p) ?? p,
+      label: (p: string) => resolvePaths?.label(p) ?? p,
+    };
+    void reopenResolution(resolvePaths, t.ref.path, res, onOpenPath, opts).then((now) => {
+      if (now !== res) answered += 1; // a fresh answer (unanswered: the stamp stands)
     });
   }
 </script>

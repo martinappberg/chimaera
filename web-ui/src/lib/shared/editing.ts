@@ -7,7 +7,7 @@
  * this out of the layout tree (and free of CodeMirror, which loads lazily)
  * means App and the panes can act on unsaved state before any editor loaded.
  */
-import { writable } from "svelte/store";
+import { get, writable } from "svelte/store";
 
 /** Paths with unsaved edits in this window (mounted or not). */
 export const dirtyFiles = writable<Set<string>>(new Set());
@@ -59,4 +59,60 @@ export function saveDirtyFile(path: string): Promise<boolean> {
 
 export function discardDirtyFile(path: string): void {
   host?.discard(path);
+}
+
+/**
+ * How long the close dialog's "Save" waits before handing control back. A
+ * save across a dead link waits for the link to return (the buffer retries
+ * once it does), so without a deadline the dialog could say "saving…" for
+ * ever.
+ */
+export const CLOSE_SAVE_DEADLINE_MS = 15_000;
+
+export interface SaveDirtyResult {
+  /** On disk and clean now. */
+  saved: string[];
+  /** Refused, failed, dirty again (keys landed mid-save), or unconfirmed at the deadline. */
+  unsaved: string[];
+  /** The deadline passed with a save still unconfirmed (it carries on in the background). */
+  timedOut: boolean;
+}
+
+const TIMED_OUT = Symbol("timed out");
+
+function within(save: Promise<boolean>, ms: number): Promise<boolean | typeof TIMED_OUT> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(TIMED_OUT), ms);
+    const done = (ok: boolean) => {
+      clearTimeout(timer);
+      resolve(ok);
+    };
+    save.then(done, () => done(false));
+  });
+}
+
+/**
+ * Save `paths` one after another for the close dialog, waiting at most
+ * `deadlineMs` in all. A save still running at the deadline is NOT abandoned
+ * — it may yet land — but its path reports unsaved and the rest are not
+ * started, so the dialog can say "not saved" and give control back. Null when
+ * `cancelled()` turned true (checked after every wait): the caller then
+ * touches nothing.
+ */
+export async function saveDirtyFiles(
+  paths: readonly string[],
+  opts: { deadlineMs: number; cancelled?: () => boolean },
+): Promise<SaveDirtyResult | null> {
+  const deadline = Date.now() + opts.deadlineMs;
+  const out: SaveDirtyResult = { saved: [], unsaved: [], timedOut: false };
+  for (const path of new Set(paths)) {
+    const left = deadline - Date.now();
+    const r = out.timedOut || left <= 0 ? TIMED_OUT : await within(saveDirtyFile(path), left);
+    if (opts.cancelled?.() === true) return null;
+    if (r === TIMED_OUT) out.timedOut = true;
+    // Saved, but keys landed meanwhile: still dirty, so it keeps asking.
+    if (r === true && !get(dirtyFiles).has(path)) out.saved.push(path);
+    else out.unsaved.push(path);
+  }
+  return out;
 }

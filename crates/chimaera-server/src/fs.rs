@@ -2666,6 +2666,11 @@ pub(crate) struct ValidateRequest {
     /// workspace-index fallbacks below, scoped to this workspace's index.
     #[serde(default)]
     workspace_id: Option<String>,
+    /// Additive: only the exact join onto each base — no diff-prefix strip,
+    /// no workspace-index fallback. A document's own link names one file; a
+    /// broken `b/spec.md` must stay broken rather than open `spec.md`.
+    #[serde(default)]
+    strict: bool,
 }
 
 /// A candidate eligible for the bare-basename fallback: a single path segment
@@ -2714,9 +2719,13 @@ fn entry_json(path: &Path, kind: &str) -> serde_json::Value {
 }
 
 /// The direct rungs of the ladder: an absolute or `~` candidate as-is; else
-/// joined onto each base in order; else, for a git diff prefix (`a/`, `b/`),
-/// the remainder joined onto each base. First hit wins.
-fn resolve_direct(candidate: &str, bases: &[PathBuf]) -> Option<(PathBuf, &'static str)> {
+/// joined onto each base in order; else (unless `strict`), for a git diff
+/// prefix (`a/`, `b/`), the remainder joined onto each base. First hit wins.
+fn resolve_direct(
+    candidate: &str,
+    bases: &[PathBuf],
+    strict: bool,
+) -> Option<(PathBuf, &'static str)> {
     let expanded = expand_tilde(candidate).ok()?;
     if expanded.is_absolute() {
         return resolve_entry(&expanded);
@@ -2726,6 +2735,9 @@ fn resolve_direct(candidate: &str, bases: &[PathBuf]) -> Option<(PathBuf, &'stat
         .find_map(|base| resolve_entry(&base.join(&expanded)))
     {
         return Some(hit);
+    }
+    if strict {
+        return None;
     }
     let rest = candidate
         .strip_prefix("a/")
@@ -2790,7 +2802,7 @@ fn judge_index_matches(
     }
 }
 
-/// POST /api/v1/fs/validate {candidates, base, bases?, workspace_id?} —
+/// POST /api/v1/fs/validate {candidates, base, bases?, workspace_id?, strict?} —
 /// batched existence check behind the terminal, chat and document link
 /// providers: only path-like strings that resolve to something real get
 /// underlined. Answers `{valid: {[cand]: {path, kind}}, ambiguous: {[cand]:
@@ -2812,6 +2824,9 @@ fn judge_index_matches(
 ///    `results/figs/plot.png`). One match → `valid`; several → `ambiguous`
 ///    (at most [`MAX_AMBIGUOUS`], shortest path first) for the client to
 ///    offer a choice, never an arbitrary pick.
+///
+/// `strict` (document links) stops after rung 2: a link a document spells
+/// out must name exactly that file. Chat and terminal text stay lenient.
 ///
 /// Bounds: the index is the quickopen walk — entry/depth/time-capped,
 /// ignore-respecting (so `target/`, `work/` and symlinked trees are
@@ -2863,8 +2878,11 @@ pub(crate) async fn validate(
             if Instant::now() >= deadline {
                 break;
             }
-            if let Some((path, kind)) = resolve_direct(candidate, &bases) {
+            if let Some((path, kind)) = resolve_direct(candidate, &bases, body.strict) {
                 valid.insert(candidate.clone(), entry_json(&path, kind));
+                continue;
+            }
+            if body.strict {
                 continue;
             }
             let Some(workspace_id) = body.workspace_id.as_deref() else {

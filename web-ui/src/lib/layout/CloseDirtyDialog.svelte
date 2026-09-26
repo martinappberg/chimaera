@@ -6,6 +6,10 @@
    * Save closes only what saved; a failure keeps its tab open with the reason
    * inline. Don't save drops the edits (and their journaled draft). Focus
    * lands on Save — the choice that loses nothing — and Escape cancels.
+   * Cancel (button, Escape, scrim) stays live while saving: a save across a
+   * dead link must never trap the user, and cancelling only keeps the tabs
+   * open (a save already sent may still land). Don't save waits, since the
+   * in-flight write could land after the discard.
    * Scrim + dialog per ConfirmDialog.
    */
   import { focusOnMount } from "../shared/focusOnMount";
@@ -24,6 +28,13 @@
 
   let { paths, saving, error, onSave, onDiscard, onCancel }: Props = $props();
 
+  let dialogEl: HTMLDivElement | undefined = $state();
+  // Save disables itself while saving; a disabled button drops focus to the
+  // body, where Escape would no longer reach this dialog. Hold it here.
+  $effect(() => {
+    if (saving) dialogEl?.focus();
+  });
+
   const title = $derived(
     paths.length === 1
       ? `Save changes to “${basename(paths[0])}”?`
@@ -34,13 +45,11 @@
 <div
   class="backdrop"
   role="presentation"
-  onclick={() => {
-    if (!saving) onCancel();
-  }}
+  onclick={onCancel}
   onkeydown={(e) => {
     if (e.key === "Escape") {
       e.stopPropagation();
-      if (!saving) onCancel();
+      onCancel();
     }
   }}
 >
@@ -51,6 +60,7 @@
     aria-modal="true"
     aria-label={title}
     tabindex="-1"
+    bind:this={dialogEl}
     use:modalFocus
     onclick={(e) => e.stopPropagation()}
   >
@@ -72,7 +82,7 @@
     <div class="actions">
       <button class="opt quiet discard" disabled={saving} onclick={onDiscard}>don't save</button>
       <span class="spacer"></span>
-      <button class="opt quiet" disabled={saving} onclick={onCancel}>cancel</button>
+      <button class="opt quiet" onclick={onCancel}>cancel</button>
       <button class="opt primary" disabled={saving} use:focusOnMount onclick={onSave}>
         {saving ? "saving…" : paths.length === 1 ? "save" : "save all"}
       </button>

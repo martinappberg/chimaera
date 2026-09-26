@@ -370,7 +370,10 @@ const CANDIDATE_MAX_BYTES = 1024;
  * `workspaceId`, a unique basename or unique path suffix in that
  * workspace's index (`figs/plot.png` → `results/figs/plot.png`), or up to
  * five `ambiguous` matches. A miss is simply absent, never an error.
- * `workspaceId` and `bases` are additive: older daemons ignore them.
+ * `strict` (document links) keeps only the exact join onto each base — no
+ * prefix strip, no index fallback — so a broken `b/spec.md` link stays
+ * broken. `workspaceId`, `bases` and `strict` are additive: older daemons
+ * ignore them.
  *
  * The server caps each request at VALIDATE_MAX; loop in VALIDATE_MAX-sized
  * batches (bounded by VALIDATE_CAP), sequentially to keep the daemon's
@@ -382,6 +385,7 @@ export async function fsValidate(
   base: string,
   workspaceId: string | null = null,
   bases: string[] = [],
+  opts: { strict?: boolean } = {},
 ): Promise<ValidateResult> {
   const out: ValidateResult = { valid: {}, ambiguous: {}, unchecked: [] };
   const sendable = [...new Set(candidates)].filter(
@@ -404,6 +408,7 @@ export async function fsValidate(
             base,
             ...(workspaceId !== null ? { workspace_id: workspaceId } : {}),
             ...(extra.length > 0 ? { bases: extra } : {}),
+            ...(opts.strict === true ? { strict: true } : {}),
           }),
         }),
       );
