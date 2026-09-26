@@ -177,6 +177,21 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   narration as ordinary agent prose — the way the Claude apps do — while real reasoning stays in
   Thought lines. Codex's commentary messages already arrive as prose; Codex reasoning summaries are
   now requested (`turn/start.summary: "auto"`, unless the user's config sets its own).
+- **File references are links.** A path in agent prose, in inline code (the whole span, or the
+  paths inside a command like `cat results/x.csv`), in a markdown link target
+  (`[x](src/a.rs#L10)`, `%20` escapes), or in your own message becomes a link once the daemon
+  confirms it. The parser is the terminal's (`shared/fileRef.ts`: `:12`, `:12:3`, `#L12-L20`,
+  `@mentions`, `a/`/`b/` diff sides, `…/` tails, `file://`, wrappers and punctuation, Unicode), and
+  the candidates resolve against the session's live cwd, its spawn cwd and the workspace root,
+  then the workspace index (unique basename or path suffix). Click opens the file at the line;
+  Cmd/Ctrl+click opens it in a split; a directory opens in the Finder; a name several files
+  answer to (dashed underline) asks which in the context menu. Every renderer in a chat shares one
+  batched, cached resolver (`paths.ts` `PathResolver`): a miss is asked again after 15 s, after
+  every turn end (files the agent mentioned may exist now), when the pointer comes back to the
+  message, and on a click of a local link; a daemon error is never cached as a miss. Stamping
+  stays off the streaming hot path (idle, per closed segment, the open tail at settle), and a
+  batch that lands after the stream settled re-stamps the settled message. Only elements the
+  renderer stamped open anything: agent HTML that forges the classes opens nothing.
 - **Live status line.** While a turn runs: elapsed · output tokens this turn · running tasks
   (subagents + background work) · what it is doing — the agent's own phrase when it offers one
   (Claude `task_summary`, "Measuring file sizes…"), else Thinking / Writing / Running tools.
@@ -278,8 +293,10 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
 ## Tool cards, permissions & questions
 
 - **Tool cards + grouping.** Each tool call is a collapsible card (title, glyph, status dot,
-  output/diff, a `↗` to open the touched file). Consecutive calls condense into a group ("6 commands
-  · 2 files"). Groups are collapsed by default, including while work is running, and remain
+  output/diff, a `↗` to open what it touched — with a count and a compact list when it touched
+  several; each location resolves against the session first, so a relative Grep/Glob `path` or
+  Codex change opens, and a directory opens in the Finder). Consecutive calls condense into a
+  group ("6 commands · 2 files"). Groups are collapsed by default, including while work is running, and remain
   expandable on demand; the summary badge (`running…` / `failed` / `recovered`) carries the verdict
   without turning live activity or history into a wall of command rows.
   Tool calls upsert by id (a late enriching re-emit never walks a finished tool back to
@@ -486,7 +503,7 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   in chat”; a terminal resurrected after daemon restart uses its durable resume handle even before a
   fresh transcript hook arrives. A busy `Running` agent needs `force` (409). **Billing note:**
   the TUI side bills like an interactive session; the chat side drives the structured protocol. This
-  is also the **`/login` recovery** path (see [Composing & sending](#composing-sending)): an
+  is also the **`/login` recovery** path (see [Composing & sending](#composing--sending)): an
   expired-auth session flips to its TUI so claude's native auth flow can run.
 - **Branch at any message, without stopping the source.** Hover an assistant response and choose its
   fork action to create a new idle chat immediately after that response. The composer is empty and no

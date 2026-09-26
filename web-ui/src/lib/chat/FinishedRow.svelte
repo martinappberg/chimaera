@@ -1,7 +1,7 @@
 <script lang="ts">
   import Chevron from "../shared/Chevron.svelte";
   import Markdown from "./Markdown.svelte";
-  import type { ResolvePaths } from "./paths";
+  import type { OpenPathFn, PathResolver } from "./paths";
   import type { ChatBlock } from "./store.svelte";
 
   /**
@@ -15,8 +15,8 @@
     block: Extract<ChatBlock, { kind: "finished" }>;
     /** Open a file the task wrote (its full output). */
     onOpenFile?: (path: string) => void;
-    onOpenPath?: (path: string, kind: "file" | "dir") => void;
-    resolvePaths?: ResolvePaths;
+    onOpenPath?: OpenPathFn;
+    resolvePaths?: PathResolver;
     visible?: boolean;
     sourceIndex?: number;
     sourceUid?: number;

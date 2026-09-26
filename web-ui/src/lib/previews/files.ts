@@ -2,6 +2,9 @@
  * Client for the daemon's file service (M3 wave 1):
  *   GET  /fs/list?path=&hidden=      directory listing (dirs first, sorted)
  *   GET  /fs/file?path=&offset=&limit=   raw bytes + X-File-Size/X-Truncated
+ *                                    (+ X-Content-Hash on a complete raw read)
+ *   PUT  /fs/file?path=&expect_hash= content-hash-guarded write
+ *   /fs/drafts, /fs/draft            the unsaved-edit journal mirror
  *   GET  /fs/markdown?path=          server-rendered, sanitized GFM HTML
  *   GET  /fs/table?path=&offset_rows=&limit_rows=   paged CSV/TSV
  *   POST /fs/ticket {path}           short-lived unauthenticated /raw/ URL
@@ -49,6 +52,13 @@ export interface FileChunk {
    * conflict check. Null on an older daemon that omits the header.
    */
   mtime: string | null;
+  /**
+   * SHA-256 (hex) of the whole file (`X-Content-Hash`). The daemon sends it
+   * only when the body IS the complete raw file — offset 0, not truncated, not
+   * a decompressed gzip — so a partial read can never pose as a version. Null
+   * otherwise, and from older daemons (callers fall back to `mtime`).
+   */
+  hash: string | null;
 }
 
 export interface TablePage {
@@ -81,9 +91,14 @@ export async function fsList(path: string, hidden = false): Promise<FsListing> {
   return json(await api(`/fs/list?${q.toString()}`));
 }
 
-export async function fsFile(path: string, offset = 0, limit = FILE_CHUNK): Promise<FileChunk> {
+export async function fsFile(
+  path: string,
+  offset = 0,
+  limit = FILE_CHUNK,
+  signal?: AbortSignal,
+): Promise<FileChunk> {
   const q = new URLSearchParams({ path, offset: String(offset), limit: String(limit) });
-  const res = await api(`/fs/file?${q.toString()}`);
+  const res = await api(`/fs/file?${q.toString()}`, signal !== undefined ? { signal } : {});
   if (!res.ok) {
     let message = `request failed with status ${res.status}`;
     try {
@@ -98,31 +113,59 @@ export async function fsFile(path: string, offset = 0, limit = FILE_CHUNK): Prom
   const size = Number(res.headers.get("X-File-Size") ?? bytes.length);
   const truncated = res.headers.get("X-Truncated") === "true";
   const mtime = res.headers.get("X-Mtime");
-  return { bytes, size: Number.isFinite(size) ? size : bytes.length, truncated, mtime };
+  const hash = res.headers.get("X-Content-Hash");
+  return { bytes, size: Number.isFinite(size) ? size : bytes.length, truncated, mtime, hash };
 }
 
 /** A concurrent-modification conflict raised by PUT /fs/file (HTTP 409). */
 export class FileConflictError extends Error {
-  constructor(message = "file changed on disk") {
+  /** The current disk version, when the daemon reports it (409 headers). */
+  readonly hash: string | null;
+  readonly mtime: string | null;
+  constructor(
+    message = "file changed on disk",
+    hash: string | null = null,
+    mtime: string | null = null,
+  ) {
     super(message);
     this.name = "FileConflictError";
+    this.hash = hash;
+    this.mtime = mtime;
   }
 }
 
+export interface WriteOptions {
+  /** Refuse (409) unless the file on disk hashes to this — the preferred,
+   *  content-verified precondition. */
+  expectHash?: string | null;
+  /** Metadata precondition, for a daemon that never sent a content hash. */
+  expectMtime?: string | null;
+  signal?: AbortSignal;
+}
+
+export interface WriteResult {
+  mtime: string | null;
+  /** SHA-256 of what is now on disk; null from older daemons. */
+  hash: string | null;
+}
+
 /**
- * Write `bytes` to `path` via PUT /fs/file. When `expectMtime` is given the
- * daemon refuses (409 → FileConflictError) if the file changed on disk since
- * that mtime — the caller offers reload/overwrite. Other failures surface as
- * ApiError (400 dir/missing-parent, 413 over the 1MB cap). Resolves to the
- * new mtime (X-Mtime on the 204) so the editor can keep tracking edits.
+ * Write `bytes` to `path` via PUT /fs/file. With a precondition the daemon
+ * refuses (409 → FileConflictError) when the disk moved on. Only one is sent,
+ * the hash when known: a daemon new enough to report hashes checks them, and
+ * one that already holds exactly these bytes answers success without writing,
+ * so a retry after a lost reply is safe. Other failures surface as ApiError
+ * (400 dir/missing-parent, 413 over the 1MB cap); a dead link or an abort
+ * rejects with the fetch's own error.
  */
 export async function fsWrite(
   path: string,
   bytes: Uint8Array,
-  expectMtime: string | null = null,
-): Promise<string | null> {
+  opts: WriteOptions = {},
+): Promise<WriteResult> {
   const q = new URLSearchParams({ path });
-  if (expectMtime !== null) q.set("expect_mtime", expectMtime);
+  if (opts.expectHash != null) q.set("expect_hash", opts.expectHash);
+  else if (opts.expectMtime != null) q.set("expect_mtime", opts.expectMtime);
   // Copy into a fresh ArrayBuffer-backed view so the body is a plain
   // BodyInit (Uint8Array over SharedArrayBuffer is not).
   const body = bytes.slice();
@@ -130,8 +173,15 @@ export async function fsWrite(
     method: "PUT",
     headers: { "Content-Type": "application/octet-stream" },
     body,
+    ...(opts.signal !== undefined ? { signal: opts.signal } : {}),
   });
-  if (res.status === 409) throw new FileConflictError();
+  if (res.status === 409) {
+    throw new FileConflictError(
+      "file changed on disk",
+      res.headers.get("X-Content-Hash"),
+      res.headers.get("X-Mtime"),
+    );
+  }
   if (!res.ok) {
     let message = `save failed with status ${res.status}`;
     try {
@@ -142,7 +192,107 @@ export async function fsWrite(
     }
     throw new ApiError(res.status, message);
   }
-  return res.headers.get("X-Mtime");
+  return { mtime: res.headers.get("X-Mtime"), hash: res.headers.get("X-Content-Hash") };
+}
+
+// --- the unsaved-edit journal's daemon mirror -------------------------------
+// A new tunnel port is a new browser origin with an empty IndexedDB, so dirty
+// text is mirrored to the daemon (~/.chimaera/drafts). Older daemons lack the
+// routes: every helper degrades to "unsupported"/null rather than an error.
+
+export interface DraftBody {
+  path: string;
+  base_hash: string;
+  text: string;
+  updated_ms: number;
+}
+
+export type DraftPutResult = "ok" | "too-large" | "unsupported";
+
+/** Statuses meaning "this daemon has no drafts route". */
+function draftsUnsupported(status: number): boolean {
+  return status === 404 || status === 405 || status === 501;
+}
+
+/** Mirror a draft. `keepalive` lets a small body outlive a closing page. */
+export async function fsDraftPut(
+  path: string,
+  baseHash: string,
+  text: string,
+  keepalive = false,
+): Promise<DraftPutResult> {
+  const res = await api("/fs/drafts", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path, base_hash: baseHash, text }),
+    keepalive,
+    signal: AbortSignal.timeout(15_000),
+  });
+  if (res.ok) return "ok";
+  if (res.status === 413) return "too-large";
+  if (draftsUnsupported(res.status)) return "unsupported";
+  throw new ApiError(res.status, `draft mirror failed with status ${res.status}`);
+}
+
+/** The daemon's draft for `path`, or null (none, or an older daemon). */
+export async function fsDraftGet(path: string): Promise<DraftBody | null> {
+  const q = new URLSearchParams({ path });
+  const res = await api(`/fs/draft?${q.toString()}`, { signal: AbortSignal.timeout(10_000) });
+  if (!res.ok) {
+    if (draftsUnsupported(res.status) || res.status === 400) return null;
+    throw new ApiError(res.status, `draft read failed with status ${res.status}`);
+  }
+  try {
+    const body = (await res.json()) as Partial<DraftBody>;
+    if (typeof body.text !== "string" || typeof body.path !== "string") return null;
+    return {
+      path: body.path,
+      base_hash: typeof body.base_hash === "string" ? body.base_hash : "",
+      text: body.text,
+      updated_ms: typeof body.updated_ms === "number" ? body.updated_ms : 0,
+    };
+  } catch {
+    return null; // not JSON (an older daemon's fallback), so not a draft
+  }
+}
+
+export interface DraftSummary {
+  path: string;
+  base_hash: string;
+  updated_ms: number;
+  bytes: number;
+}
+
+/**
+ * Every mirrored draft (summaries only), or null from a daemon without the
+ * route. Cheaper to consult on open than fetching one draft, which answers a
+ * plain "none" with a 404 the browser logs as a failed resource.
+ */
+export async function fsDraftList(): Promise<DraftSummary[] | null> {
+  const res = await api("/fs/drafts", { signal: AbortSignal.timeout(10_000) });
+  if (!res.ok) {
+    if (draftsUnsupported(res.status)) return null;
+    throw new ApiError(res.status, `draft list failed with status ${res.status}`);
+  }
+  try {
+    const body = (await res.json()) as { drafts?: DraftSummary[] };
+    return Array.isArray(body.drafts) ? body.drafts : null;
+  } catch {
+    return null; // not JSON (an older daemon's fallback)
+  }
+}
+
+/** Drop the daemon's draft for `path` (a no-op on an older daemon). */
+export async function fsDraftDelete(path: string, keepalive = false): Promise<void> {
+  const q = new URLSearchParams({ path });
+  const res = await api(`/fs/draft?${q.toString()}`, {
+    method: "DELETE",
+    keepalive,
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (!res.ok && !draftsUnsupported(res.status)) {
+    throw new ApiError(res.status, `draft delete failed with status ${res.status}`);
+  }
 }
 
 export interface QuickOpenEntry {
@@ -184,6 +334,19 @@ export interface ValidatedPath {
   kind: "file" | "dir";
 }
 
+/** A /fs/validate answer, merged across batches. */
+export interface ValidateResult {
+  /** Candidate (as sent) → its one resolution. */
+  valid: Record<string, ValidatedPath>;
+  /** Candidate → the (at most five) files it could mean, when the
+   *  workspace-index fallback found several. Empty from older daemons. */
+  ambiguous: Record<string, ValidatedPath[]>;
+  /** Candidates that were never answered: past VALIDATE_CAP, or in a batch
+   *  that failed after an earlier one succeeded. Unknown, NOT misses —
+   *  callers must not cache them as such. */
+  unchecked: string[];
+}
+
 /** Server cap on candidates per /fs/validate request. */
 export const VALIDATE_MAX = 50;
 
@@ -192,44 +355,67 @@ export const VALIDATE_MAX = 50;
  *  VALIDATE_MAX requests, currently 4). */
 export const VALIDATE_CAP = 200;
 
+/** Server cap on extra `bases` per request. */
+export const VALIDATE_BASES_MAX = 8;
+
+/** Server cap on one candidate's length, in UTF-8 bytes. */
+const CANDIDATE_MAX_BYTES = 1024;
+
 /**
- * Batch existence check behind the terminal link provider, per the
- * /fs/validate contract: candidates resolve absolutely or against the
- * absolute `base`, `~` expands, and only hits come back (keyed by the
- * candidate as sent). Misses are simply absent — never errors.
+ * Batch existence check behind every path link (terminal, chat, tool
+ * cards), per the /fs/validate contract. Each candidate must be a clean path
+ * (no `:12` suffix, `#L` anchor or wrapper — `shared/fileRef.ts` makes
+ * them). The daemon's ladder: absolute / `~` → `base`, then each of `bases`
+ * in order → the same without a leading `a/` / `b/` diff prefix → with
+ * `workspaceId`, a unique basename or unique path suffix in that
+ * workspace's index (`figs/plot.png` → `results/figs/plot.png`), or up to
+ * five `ambiguous` matches. A miss is simply absent, never an error.
+ * `workspaceId` and `bases` are additive: older daemons ignore them.
  *
- * `workspaceId` (additive — older daemons ignore it) enables the daemon's
- * bare-basename fallback: a slash-less `name.ext` candidate that misses the
- * base also resolves when exactly ONE file in that workspace's index bears
- * the name ("FIGURE_PLAN.md" mentioned bare, living at paper/FIGURE_PLAN.md).
- *
- * The server caps each request at VALIDATE_MAX; callers cache the FULL sent
- * list as resolved, so anything past that cap would otherwise stick as a
- * permanent miss. Loop in VALIDATE_MAX-sized batches (bounded by VALIDATE_CAP)
- * so every candidate is actually validated. Batches run sequentially to keep
- * the daemon's concurrent load low.
+ * The server caps each request at VALIDATE_MAX; loop in VALIDATE_MAX-sized
+ * batches (bounded by VALIDATE_CAP), sequentially to keep the daemon's
+ * concurrent load low. A candidate over the byte cap can never validate
+ * and is dropped (a miss). Throws only when nothing was answered.
  */
 export async function fsValidate(
   candidates: string[],
   base: string,
   workspaceId: string | null = null,
-): Promise<Record<string, ValidatedPath>> {
-  const capped = candidates.slice(0, VALIDATE_CAP);
-  const out: Record<string, ValidatedPath> = {};
+  bases: string[] = [],
+): Promise<ValidateResult> {
+  const out: ValidateResult = { valid: {}, ambiguous: {}, unchecked: [] };
+  const sendable = [...new Set(candidates)].filter(
+    (c) => c.length > 0 && new TextEncoder().encode(c).length <= CANDIDATE_MAX_BYTES,
+  );
+  const capped = sendable.slice(0, VALIDATE_CAP);
+  out.unchecked.push(...sendable.slice(VALIDATE_CAP));
+  const extra = [...new Set(bases)].filter((b) => b !== base).slice(0, VALIDATE_BASES_MAX);
   for (let i = 0; i < capped.length; i += VALIDATE_MAX) {
     const batch = capped.slice(i, i + VALIDATE_MAX);
-    const body = await json<{ valid: Record<string, ValidatedPath> }>(
-      await api("/fs/validate", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          candidates: batch,
-          base,
-          ...(workspaceId !== null ? { workspace_id: workspaceId } : {}),
+    type Body = { valid?: Record<string, ValidatedPath>; ambiguous?: Record<string, ValidatedPath[]> };
+    let body: Body;
+    try {
+      body = await json<Body>(
+        await api("/fs/validate", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            candidates: batch,
+            base,
+            ...(workspaceId !== null ? { workspace_id: workspaceId } : {}),
+            ...(extra.length > 0 ? { bases: extra } : {}),
+          }),
         }),
-      }),
-    );
-    Object.assign(out, body.valid);
+      );
+    } catch (err) {
+      if (i === 0) throw err;
+      out.unchecked.push(...capped.slice(i));
+      break;
+    }
+    Object.assign(out.valid, body.valid ?? {});
+    for (const [cand, matches] of Object.entries(body.ambiguous ?? {})) {
+      if (Array.isArray(matches) && matches.length > 0) out.ambiguous[cand] = matches;
+    }
   }
   return out;
 }

@@ -396,7 +396,7 @@ function createEntry(id: string, parent: HTMLElement, fontOverride: number | und
       registerPathLinks(term, id, {
         context: (sid) =>
           handlers?.linkContext(sid) ?? { cwd: null, root: null, workspaceId: null },
-        open: (sid, path, kind, newSplit) => handlers?.onOpenPath(sid, path, kind, newSplit),
+        open: (sid, path, kind, opts) => handlers?.onOpenPath(sid, path, kind, opts),
       }),
       registerUrlLinks(term, id, {
         open: (sid, target, newSplit) => handlers?.onOpenUrl(sid, target, newSplit),
