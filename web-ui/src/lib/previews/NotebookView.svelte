@@ -77,10 +77,12 @@
     return () => release(path);
   });
 
-  /** Read cells [0, count) — one request per server page — and adopt them
-   *  unless a newer read started meanwhile. */
+  /** Read cells [0, count) and adopt them unless a newer read started
+   *  meanwhile. The daemon may answer a payload-heavy page short: `fill`
+   *  keeps asking (re-reading what was loaded, reaching a revealed cell);
+   *  the first open takes one page, so it paints after one parse. */
   let generation = 0;
-  async function readFirst(count: number): Promise<void> {
+  async function readFirst(count: number, fill = true): Promise<void> {
     const gen = ++generation;
     const got: NotebookCell[] = [];
     let t = 0;
@@ -90,7 +92,7 @@
       got.push(...page.cells);
       t = page.total;
       lang = page.language;
-      if (page.cells.length === 0 || got.length >= t) break;
+      if (!fill || page.cells.length === 0 || got.length >= t) break;
     }
     if (gen !== generation) return;
     cells = got;
@@ -111,16 +113,20 @@
       return;
     }
     seen = m;
-    const want = Math.max(FIRST, untrack(() => cells.length));
-    readFirst(want).catch((e: unknown) => {
+    const have = untrack(() => cells.length);
+    readFirst(Math.max(FIRST, have), have > 0).catch((e: unknown) => {
       loadError = e instanceof Error ? e.message : "failed to read the notebook";
     });
   });
+
+  /** How far below the view the next page starts loading. */
+  const AHEAD_PX = 1200;
 
   async function loadMore(): Promise<void> {
     if (loadingMore || !loaded || cells.length >= total) return;
     loadingMore = true;
     const gen = generation;
+    let added = false;
     try {
       const page = await fsNotebook(path, cells.length, MORE);
       if (gen !== generation) return;
@@ -128,6 +134,7 @@
       // one starts where this ended.
       if (page.cells.length > 0 && page.cells[0].index === cells.length) {
         cells = [...cells, ...page.cells];
+        added = true;
       }
       total = page.total;
     } catch (e) {
@@ -135,6 +142,18 @@
     } finally {
       loadingMore = false;
     }
+    // Short pages can leave the end still in reach: the observer only
+    // reports changes, so keep going while it is.
+    if (added) requestAnimationFrame(() => {
+      if (nearEnd()) void loadMore();
+    });
+  }
+
+  function nearEnd(): boolean {
+    const root = scrollEl;
+    const s = sentinel;
+    if (root === null || s === null) return false;
+    return s.getBoundingClientRect().top - root.getBoundingClientRect().bottom < AHEAD_PX;
   }
 
   // Page in as the end comes near.
@@ -146,7 +165,7 @@
       (entries) => {
         if (entries.some((e) => e.isIntersecting)) void loadMore();
       },
-      { root, rootMargin: "0px 0px 1200px 0px" },
+      { root, rootMargin: `0px 0px ${AHEAD_PX}px 0px` },
     );
     io.observe(s);
     return () => io.disconnect();
