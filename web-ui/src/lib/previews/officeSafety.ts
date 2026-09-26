@@ -17,6 +17,21 @@ export function isInlineSource(url: string): boolean {
   return /^\s*(blob:|data:(image|font|audio|video)\/)/i.test(url);
 }
 
+/**
+ * Whether a loading attribute (`src`, `poster`, `data`, an `href` on
+ * anything but a link) may keep `value` on element `el`: bytes already in
+ * the page, or — for an `href` — a same-document `#id` reference, which
+ * never fetches (pptx-renderer draws WordArt text warps as
+ * `<textPath href="#text-warp-N">`; SVG `<use>`, gradients and filters
+ * point at `#id`s too). Not on an `<image>`, where `#x` would name the page
+ * itself as the picture to load.
+ */
+export function keepsSource(el: string, attr: string, value: string): boolean {
+  if (isInlineSource(value)) return true;
+  const ref = attr === "href" || attr === "xlink:href";
+  return ref && el.toLowerCase() !== "image" && /^\s*#/.test(value);
+}
+
 /** Links a reader may follow (the viewer routes the click itself). */
 export function isFollowableHref(href: string): boolean {
   return /^\s*(https?:|mailto:|#)/i.test(href);
@@ -150,7 +165,7 @@ export function sanitizeRendered(nodes: Iterable<Node>): number {
           continue;
         }
         if (name === "src" || name === "poster" || name === "data" || (name === "href" && el.localName !== "a") || name === "xlink:href") {
-          if (!isInlineSource(attr.value)) {
+          if (!keepsSource(el.localName, name, attr.value)) {
             el.removeAttribute(attr.name);
             blocked += 1;
           }

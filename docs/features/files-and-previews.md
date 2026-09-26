@@ -617,7 +617,9 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   where the file's saved page breaks put them; line breaks are the browser's, so they can differ
   from Word's. The document is untrusted: it renders into detached nodes that
   `officeSafety.ts` (`sanitizeRendered`) strips of anything that could load or run — active
-  elements and handlers go, sources stay only if they're the package's own `blob:`/`data:` parts,
+  elements and handlers go, sources stay only if they're the package's own `blob:`/`data:` parts
+  (or, for an `href`, a same-document `#id` — a PowerPoint WordArt warp's `<textPath>` — never on an
+  `<image>`),
   and every stylesheet is re-read through an inert document's CSSOM so a `url()` smuggled in
   through a font or theme name (escapes included) is dropped, with a quiet "N external resources
   not loaded" in the bar — and only then attaches them inside a shadow root, so the document's CSS

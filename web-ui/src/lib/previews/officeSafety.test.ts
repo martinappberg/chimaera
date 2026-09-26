@@ -1,5 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { attrFetches, cssUrls, cssValueFetches, isFollowableHref, isInlineSource, stripExternalRels } from "./officeSafety";
+import {
+  attrFetches,
+  cssUrls,
+  cssValueFetches,
+  isFollowableHref,
+  isInlineSource,
+  keepsSource,
+  stripExternalRels,
+} from "./officeSafety";
 
 describe("office documents stay offline", () => {
   it("allows only in-page sources", () => {
@@ -10,6 +18,24 @@ describe("office documents stay offline", () => {
     expect(isInlineSource("https://example.org/a.png")).toBe(false);
     expect(isInlineSource("//example.org/a.png")).toBe(false);
     expect(isInlineSource("/raw/abc")).toBe(false);
+  });
+
+  it("keeps in-page sources and same-document references only", () => {
+    // A WordArt warp: the text rides a path defined in the same SVG.
+    expect(keepsSource("textPath", "href", "#text-warp-3")).toBe(true);
+    expect(keepsSource("textPath", "xlink:href", "#text-warp-3")).toBe(true);
+    expect(keepsSource("use", "href", " #glyph1")).toBe(true);
+    expect(keepsSource("linearGradient", "href", "#grad0")).toBe(true);
+    expect(keepsSource("image", "href", "blob:http://h/1")).toBe(true);
+    // An <image> href of `#x` would load the page itself.
+    expect(keepsSource("image", "href", "#x")).toBe(false);
+    // Fragments are only references in an href, never a src.
+    expect(keepsSource("img", "src", "#x")).toBe(false);
+    expect(keepsSource("video", "poster", "#x")).toBe(false);
+    for (const url of ["https://evil.test/p.svg#x", "//evil.test/x#y", "/raw/t#x", "x.svg#y", "javascript:alert(1)"]) {
+      expect(keepsSource("textPath", "href", url)).toBe(false);
+      expect(keepsSource("use", "xlink:href", url)).toBe(false);
+    }
   });
 
   it("lets a reader follow web, mail and in-document links only", () => {
