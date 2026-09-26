@@ -86,7 +86,8 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   a cut into the same folder is a no-op. Files can also be **dragged from the OS desktop** onto
   a Finder column or a FILES-tree folder to upload into it (see
   [drag-drop-and-uploads.md](drag-drop-and-uploads.md)). Delete always confirms in a modal
-  (permanent — no server-side trash). Download streams a single file as-is (forced via the
+  (permanent — no server-side trash), which names any file under the path with unsaved edits:
+  the delete discards those buffers too. Download streams a single file as-is (forced via the
   anchor `download` attribute so it never navigates the native webview), a folder as
   `<name>.zip`; it is **hidden on local workspaces** (the file already lives on this machine)
   and shown only on remote ones, where the window's origin *is* the ssh tunnel.

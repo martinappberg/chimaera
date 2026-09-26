@@ -181,6 +181,7 @@
     discardDirtyFile,
     noteDaemonLink,
     saveDirtyFiles,
+    unsavedDeleteNote,
   } from "./lib/shared/editing";
   import {
     activateGitWorkspace,
@@ -5321,7 +5322,7 @@
     title={$pendingDelete.kind === "dir" ? "Delete folder" : "Delete file"}
     body={`Permanently delete “${basename($pendingDelete.path)}”${
       $pendingDelete.kind === "dir" ? " and everything inside it" : ""
-    }? This cannot be undone.`}
+    }? This cannot be undone.${unsavedDeleteNote($pendingDelete.path, $dirtyFiles)}`}
     confirmLabel="delete"
     danger
     error={deleteError}

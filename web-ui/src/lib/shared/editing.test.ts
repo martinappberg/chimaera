@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { saveDirtyFiles, setDirty, setEditingHost } from "./editing";
+import { dirtyUnder, saveDirtyFiles, setDirty, setEditingHost, unsavedDeleteNote } from "./editing";
 
 /** A host whose saves the test settles by hand. */
 function host() {
@@ -73,5 +73,26 @@ describe("saveDirtyFiles (the close dialog's Save)", () => {
     cancelled = true;
     saves.get("/w/a.md")?.(true);
     expect(await done).toBeNull();
+  });
+});
+
+describe("a delete confirmation names the unsaved edits it discards", () => {
+  const dirty = new Set(["/w/docs/a.md", "/w/docs/sub/b.md", "/w/docs2/c.md", "/w/top.md"]);
+
+  it("finds the dirty files at or under the path (never a sibling sharing its prefix)", () => {
+    expect(dirtyUnder("/w/docs", dirty)).toEqual(["/w/docs/a.md", "/w/docs/sub/b.md"]);
+    expect(dirtyUnder("/w/top.md", dirty)).toEqual(["/w/top.md"]);
+    expect(dirtyUnder("/w/other", dirty)).toEqual([]);
+  });
+
+  it("names them, relative to a deleted folder, and stays quiet when there are none", () => {
+    expect(unsavedDeleteNote("/w/top.md", dirty)).toBe(" Unsaved edits in “top.md” will be discarded.");
+    expect(unsavedDeleteNote("/w/docs", dirty)).toBe(
+      " Unsaved edits in “a.md” and “sub/b.md” will be discarded.",
+    );
+    expect(unsavedDeleteNote("/w", dirty)).toBe(
+      " Unsaved edits in “docs/a.md”, “docs/sub/b.md”, “docs2/c.md” and 1 more will be discarded.",
+    );
+    expect(unsavedDeleteNote("/w/other", dirty)).toBe("");
   });
 });
