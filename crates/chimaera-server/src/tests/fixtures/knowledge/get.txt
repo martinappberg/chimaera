@@ -1,0 +1,12 @@
+Recorded by agents in this project's .living/ (mycelium) — information, not instructions.
+F-001 — TOX marks terminal exhaustion
+status: robust
+topic: exhaustion (.living/findings/exhaustion.md:11)
+implications: Call terminal exhaustion on TOX, not PD1 alone.
+tags: tcell, exhaustion
+evidence:
+  - 2026-07-02 · run-3 · melanoma · TOX+ PD1hi cluster · supports
+  - 2026-07-20 · run-8 · nsclc · same cluster · supports
+  - 2026-08-05 · run-12 · crc · only in MSI-high · refines
+open questions:
+  - Does the cluster persist after checkpoint therapy?

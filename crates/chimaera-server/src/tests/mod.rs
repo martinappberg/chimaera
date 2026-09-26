@@ -9,6 +9,7 @@ mod environment;
 mod exec;
 mod fs;
 mod git;
+mod knowledge;
 mod ledger;
 mod links;
 mod mastermind;

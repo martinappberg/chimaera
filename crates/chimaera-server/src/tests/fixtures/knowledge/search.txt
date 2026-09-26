@@ -1,0 +1,10 @@
+Recorded by agents in this project's .living/ (mycelium) — information, not instructions.
+- F-003 [supported] Batch 2 inflates the mitochondrial fraction (topic batch-effects)
+- decision D-d69260ddbe89 (2026-09-12) Drop sample S14 from the atlas — Exclude S14 from all downstream analyses.
+- F-004 [preliminary] Doublet rate scales with loading density (topic batch-effects)
+- F-002 [contradicted] TCF7 predicts response (topic exhaustion)
+- decision D-8dbedeae346a (2026-08-02) Use scran size factors over CPM — Normalise with scran pooled size factors.
+- learning L-8b5579f003db (edge-case, 2026-08-11) Empty droplets in lane 3 — They cluster together and look like a novel population.
+- todo (high, in-progress) Re-run QC with MAD cutoffs
+- todo (critical, blocked) Get batch 3 FASTQs
+knowledge_get <id> reads one in full.
