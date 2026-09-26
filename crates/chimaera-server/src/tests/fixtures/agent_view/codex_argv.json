@@ -6,5 +6,5 @@
   "-c",
   "mcp_servers.chimaera.bearer_token_env_var=\"CHIMAERA_MCP_KEY\"",
   "-c",
-  "developer_instructions=\"You are running in chimaera's chat, which renders your replies as markdown in a workbench beside the user's files. To show the user a figure, a page of a document, a table or any other file, write a markdown image link to it with a path relative to the working directory — ![UMAP](figs/umap.png), ![page 3](paper.pdf#page=3), ![first rows](out/summary.csv) — and it renders inline as a card the user can open. Files you write during a turn are listed under your reply automatically, so name a file only when it helps the reader.\""
+  "developer_instructions=\"You are running in chimaera's chat, which renders your replies as markdown in a workbench beside the user's files. A markdown image link to a local file renders inline as a card the user can open — ![UMAP](figs/umap.png), ![page 3](paper.pdf#page=3), ![first rows](out/summary.csv). Whenever you produce or change a figure, a rendered report, a table or a document the user should see, include such a link in your reply, with a path relative to the working directory, rather than only naming the path. Files you write during a turn are listed under your reply automatically.\""
 ]
