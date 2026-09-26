@@ -317,7 +317,19 @@ pub(crate) async fn blocking_response<F>(work: F) -> Response
 where
     F: FnOnce() -> anyhow::Result<Response> + Send + 'static,
 {
-    let permit = FILESYSTEM_WORK
+    blocking_response_on(&FILESYSTEM_WORK, work).await
+}
+
+/// [`blocking_response`] under another limiter: a subsystem whose bursts
+/// must never take the shared `FILESYSTEM_WORK` permits (the draft mirror).
+pub(crate) async fn blocking_response_on<F>(
+    limiter: &'static tokio::sync::Semaphore,
+    work: F,
+) -> Response
+where
+    F: FnOnce() -> anyhow::Result<Response> + Send + 'static,
+{
+    let permit = limiter
         .acquire()
         .await
         .expect("filesystem work semaphore is never closed");

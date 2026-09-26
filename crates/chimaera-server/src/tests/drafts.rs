@@ -367,3 +367,55 @@ async fn drafts_require_the_bearer_token() {
         assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {uri}");
     }
 }
+
+/// Writes under the caps never scan the directory: one scan (the first
+/// write) learns what is there, and the eviction tests above show a write
+/// past a cap still scans and evicts.
+#[tokio::test]
+async fn drafts_scan_for_eviction_only_when_a_cap_may_be_exceeded() {
+    let state = test_state();
+    for i in 0..20 {
+        let (status, _) = put_draft(&state, &format!("/w/{}.md", i % 5), None, "x").await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+    assert_eq!(crate::drafts::eviction_scans(&state.drafts_root).await, 1);
+    // A crash's stale temp is swept by the next scan, not by every write.
+    let temp = state.drafts_root.join(".stale.json.0123456789abcdef.tmp");
+    std::fs::write(&temp, b"x").unwrap();
+    age_file(&temp, 3600);
+    for _ in 0..70 {
+        let (status, _) = put_draft(&state, "/w/0.md", None, "x").await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+    assert_eq!(crate::drafts::eviction_scans(&state.drafts_root).await, 2);
+    assert!(!temp.exists());
+}
+
+/// A pagehide burst of draft PUTs rides the drafts' own limiter: it lands
+/// even while every shared filesystem permit is taken, and never takes one.
+#[tokio::test]
+async fn drafts_never_take_the_shared_filesystem_permits() {
+    let state = test_state();
+    let held = crate::fs::FILESYSTEM_WORK.acquire_many(8).await.unwrap();
+    let burst: Vec<_> = (0..12)
+        .map(|i| {
+            let state = state.clone();
+            tokio::spawn(
+                async move { put_draft(&state, &format!("/w/b{i}.md"), None, "x").await.0 },
+            )
+        })
+        .collect();
+    let landed = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        let mut statuses = Vec::new();
+        for put in burst {
+            statuses.push(put.await.unwrap());
+        }
+        statuses
+    })
+    .await
+    .expect("draft PUTs must not wait on the shared filesystem limiter");
+    drop(held);
+    assert!(landed.iter().all(|s| *s == StatusCode::NO_CONTENT));
+    let (_, body) = request(&state, Method::GET, "/api/v1/fs/drafts", None).await;
+    assert_eq!(body["drafts"].as_array().unwrap().len(), 12);
+}

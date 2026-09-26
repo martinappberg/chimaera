@@ -17,12 +17,14 @@
 //! pair, and a missing or corrupt file is skipped, never fatal. Drafts hold
 //! unsaved user text, so the directory is 0700 and each file 0600 from
 //! creation — `~/.chimaera` may sit on a shared login node. All filesystem
-//! work runs off the reactor under the shared filesystem limiter.
+//! work runs off the reactor under the drafts' own small limiter
+//! ([`DRAFTS_WORK`]): a pagehide flush PUTs every dirty buffer at once, and
+//! that burst must never take the shared `fs::FILESYSTEM_WORK` permits.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
@@ -58,9 +60,62 @@ const STALE_TEMP_AGE: Duration = Duration::from_secs(600);
 /// and hash caps), so anything bigger is not ours.
 const MAX_META_FILE_BYTES: u64 = 16 * 1024;
 
-/// Serializes draft mutations (write + eviction, delete). Reads need no lock:
+/// A full eviction scan also runs after this many writes, even under the
+/// caps: it notices another daemon sharing the directory and sweeps a
+/// crash's temp files.
+const RESCAN_EVERY_WRITES: u32 = 64;
+
+/// The draft routes' limiter, apart from `fs::FILESYSTEM_WORK`.
+static DRAFTS_WORK: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+
+/// Serializes draft mutations (write + eviction, delete) and owns what each
+/// drafts directory is believed to hold. An async lock, taken BEFORE a
+/// [`DRAFTS_WORK`] permit: queued writes wait without a permit or a parked
+/// blocking thread, so reads still get through a burst. Reads need no lock:
 /// every write lands by atomic rename.
-static DRAFTS_WRITE: Mutex<()> = Mutex::new(());
+static DRAFTS_WRITE: tokio::sync::Mutex<BTreeMap<PathBuf, Usage>> =
+    tokio::sync::Mutex::const_new(BTreeMap::new());
+
+/// One drafts directory as this daemon last scanned it, plus the writes and
+/// deletes since: each draft's bytes (both files). An eviction scan (a
+/// `read_dir` and a stat per file — slow on NFS) runs only when this says a
+/// cap is exceeded, on the first write, or every [`RESCAN_EVERY_WRITES`].
+#[derive(Default)]
+struct Usage {
+    drafts: HashMap<String, u64>,
+    writes_since_scan: u32,
+    /// Full scans run (0 = this directory was never scanned).
+    scans: usize,
+}
+
+impl Usage {
+    /// Record a write of `bytes` for `id`; scan and evict when it may be due.
+    fn wrote(&mut self, root: &Path, id: &str, bytes: u64) {
+        self.drafts.insert(id.to_owned(), bytes);
+        self.writes_since_scan += 1;
+        let over = self.drafts.len() > MAX_DRAFTS
+            || self.drafts.values().sum::<u64>() > MAX_DRAFTS_TOTAL_BYTES;
+        if self.scans == 0 || over || self.writes_since_scan >= RESCAN_EVERY_WRITES {
+            self.drafts = evict(root, id);
+            self.writes_since_scan = 0;
+            self.scans += 1;
+        }
+    }
+}
+
+/// Full eviction scans run so far for `root` (tests).
+#[cfg(test)]
+pub(crate) async fn eviction_scans(root: &Path) -> usize {
+    DRAFTS_WRITE.lock().await.get(root).map_or(0, |u| u.scans)
+}
+
+/// Run draft work on a blocking thread under [`DRAFTS_WORK`].
+async fn blocking<F>(work: F) -> Response
+where
+    F: FnOnce() -> anyhow::Result<Response> + Send + 'static,
+{
+    crate::fs::blocking_response_on(&DRAFTS_WORK, work).await
+}
 
 /// One draft file (`<id>.json`), self-contained for `GET /fs/draft`.
 #[derive(Serialize, Deserialize)]
@@ -210,9 +265,11 @@ struct DraftFiles {
 /// `keep` (the id just written) never evicted. Recency is the draft file's
 /// mtime, so enforcement needs one stat per file, never a parse. An evicted
 /// pair goes sidecar first. Also sweeps temp files a crash left behind.
-fn evict(root: &Path, keep: &str) {
+/// Returns the drafts kept, with their bytes (both files).
+fn evict(root: &Path, keep: &str) -> HashMap<String, u64> {
+    let mut kept = HashMap::new();
     let Ok(read) = std::fs::read_dir(root) else {
-        return;
+        return kept;
     };
     let now = SystemTime::now();
     let mut kept_len = 0u64;
@@ -246,20 +303,21 @@ fn evict(root: &Path, keep: &str) {
             let _ = std::fs::remove_file(&path);
         }
     }
-    let mut drafts: Vec<DraftFiles> = drafts.into_values().collect();
-    drafts.sort_by_key(|files| std::cmp::Reverse(files.modified));
-    let mut count = 1usize;
+    let mut drafts: Vec<(String, DraftFiles)> = drafts.into_iter().collect();
+    drafts.sort_by_key(|(_, files)| std::cmp::Reverse(files.modified));
+    kept.insert(keep.to_owned(), kept_len);
     let mut total = kept_len;
-    for files in drafts {
-        if count < MAX_DRAFTS && total.saturating_add(files.len) <= MAX_DRAFTS_TOTAL_BYTES {
-            count += 1;
+    for (id, files) in drafts {
+        if kept.len() < MAX_DRAFTS && total.saturating_add(files.len) <= MAX_DRAFTS_TOTAL_BYTES {
             total += files.len;
+            kept.insert(id, files.len);
         } else {
             for file in [files.meta, files.draft].into_iter().flatten() {
                 let _ = std::fs::remove_file(&file);
             }
         }
     }
+    kept
 }
 
 #[derive(Deserialize)]
@@ -324,7 +382,8 @@ pub(crate) async fn put_draft(
         return json_error(StatusCode::BAD_REQUEST, "writer is too long");
     }
     let root = state.drafts_root.clone();
-    crate::fs::blocking_response(move || {
+    let mut usage = DRAFTS_WRITE.lock().await;
+    blocking(move || {
         let stored = StoredDraft {
             bytes: body.text.len() as u64,
             path: body.path,
@@ -345,12 +404,15 @@ pub(crate) async fn put_draft(
         })
         .context("failed to encode draft metadata")?;
         let id = draft_id(&stored.path);
-        let _writing = crate::lock(&DRAFTS_WRITE);
         ensure_root(&root)?;
         // The draft first: a sidecar must never advertise text that isn't there.
         write_private(&draft_file(&root, &id), &contents)?;
         write_private(&meta_file(&root, &id), &meta)?;
-        evict(&root, &id);
+        usage.entry(root.clone()).or_default().wrote(
+            &root,
+            &id,
+            (contents.len() + meta.len()) as u64,
+        );
         Ok(StatusCode::NO_CONTENT.into_response())
     })
     .await
@@ -383,7 +445,7 @@ fn read_meta(file: &Path, id: &str) -> Option<DraftMeta> {
 /// sidecar is missing or corrupt is skipped.
 pub(crate) async fn list_drafts(State(state): State<Arc<AppState>>) -> Response {
     let root = state.drafts_root.clone();
-    crate::fs::blocking_response(move || {
+    blocking(move || {
         let mut drafts: Vec<DraftMeta> = Vec::new();
         let read = match std::fs::read_dir(&root) {
             Ok(read) => Some(read),
@@ -430,7 +492,7 @@ pub(crate) async fn get_draft(
     Query(query): Query<DraftQuery>,
 ) -> Response {
     let root = state.drafts_root.clone();
-    crate::fs::blocking_response(move || {
+    blocking(move || {
         let file = draft_file(&root, &draft_id(&query.path));
         let stored = match std::fs::read(&file) {
             Ok(bytes) => serde_json::from_slice::<StoredDraft>(&bytes).ok(),
@@ -480,9 +542,9 @@ pub(crate) async fn delete_draft(
     Query(query): Query<DraftQuery>,
 ) -> Response {
     let root = state.drafts_root.clone();
-    crate::fs::blocking_response(move || {
+    let mut usage = DRAFTS_WRITE.lock().await;
+    blocking(move || {
         let id = draft_id(&query.path);
-        let _writing = crate::lock(&DRAFTS_WRITE);
         if let Some(writer) = &query.writer {
             let owned = stored_writer(&root, &id, &query.path)
                 .is_none_or(|stored| stored.as_deref() == Some(writer.as_str()));
@@ -492,6 +554,9 @@ pub(crate) async fn delete_draft(
         }
         remove_if_present(&meta_file(&root, &id))?;
         remove_if_present(&draft_file(&root, &id))?;
+        if let Some(usage) = usage.get_mut(&root) {
+            usage.drafts.remove(&id);
+        }
         Ok(StatusCode::NO_CONTENT.into_response())
     })
     .await
