@@ -92,7 +92,7 @@ const MAX_TICKETS: usize = 4096;
 /// blocking pool can grow very large under a request burst; on NFS/Lustre that
 /// turns one stalled mount into host-wide thread and syscall pressure. Queued
 /// requests remain asynchronous, so terminals/chat/health stay responsive.
-static FILESYSTEM_WORK: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8);
+pub(crate) static FILESYSTEM_WORK: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8);
 
 /// The daemon user's home directory (`$HOME`).
 fn home_dir() -> anyhow::Result<PathBuf> {
@@ -1692,6 +1692,33 @@ impl LineMap {
 
     fn is_identity(&self) -> bool {
         self.anchors.is_empty()
+    }
+}
+
+/// What [`markdown_to_html`] hands comrak, for `doc_check`'s AST walk (the
+/// checker must parse a document exactly as the reading view does): the
+/// `$$`-promoted text, how many leading lines an accepted [`frontmatter`]
+/// block spans (None = no block, so no front-matter option), and the line map.
+pub(crate) struct MarkdownParseInput<'t> {
+    pub(crate) text: Cow<'t, str>,
+    pub(crate) frontmatter_lines: Option<usize>,
+    lines: LineMap,
+}
+
+impl MarkdownParseInput<'_> {
+    /// The source line of line `line` (1-based) of [`Self::text`].
+    pub(crate) fn source_line(&self, line: usize) -> usize {
+        self.lines.source_line(line as u32) as usize
+    }
+}
+
+pub(crate) fn markdown_parse_input(text: &str) -> MarkdownParseInput<'_> {
+    let frontmatter_lines = frontmatter(text).map(|f| f.lines);
+    let (text, lines) = promote_math_blocks_mapped(text);
+    MarkdownParseInput {
+        text,
+        frontmatter_lines,
+        lines,
     }
 }
 

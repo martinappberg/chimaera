@@ -23,6 +23,11 @@
 //! call from the binding, never granted — and every act call leaves a
 //! tracing audit line. `message_agent`/`interrupt_agent` reach chat sessions
 //! only: nothing ever types into a TUI (the exec-409 wall).
+//!
+//! Every tier also gets the document tools: `document_guide` (the portable
+//! markdown dialect, `doc_guide.md`) and `check_document` (`doc_check`, the
+//! same checker as the reading view's issues chip), announced by a short
+//! paragraph in the initialize instructions.
 
 use std::sync::Arc;
 
@@ -114,6 +119,18 @@ with the shell's own facilities (sbatch, nohup ... &) or a larger \
 timeout_ms. If the shell is busy your exec queues until its prompt \
 returns. State changes (cd, module load, exports) persist in the shell — \
 that is usually why the user linked it.";
+
+/// The documents paragraph every session gets (all tiers): the portable
+/// dialect in brief, the two document tools, and how to cite files so the
+/// workbench can open them. Every Claude and Codex session loads this —
+/// keep it short; `document_guide` carries the rest.
+const DOCUMENTS_INSTRUCTIONS: &str = "\n\n\
+Documents: write portable markdown (GFM tables, task lists, footnotes; \
+`> [!NOTE]` alerts; `$…$` math; mermaid fences; YAML frontmatter), embed files \
+as `![alt text](relative/path#fragment)`, and link with relative paths, never \
+absolute local ones. Call document_guide for the full rules; run \
+check_document on a document before handing it over. In replies, cite files \
+workspace-relative as `path:line`, `path#L10-L20` or a relative markdown link.";
 
 /// Extra instructions for a WORKER in a workspace that has a Mastermind:
 /// sets the expectation up front, so a relayed message doesn't read as a
@@ -242,13 +259,14 @@ fn initialize_result(params: &Value, mastermind: bool, supervised: bool) -> Valu
         .get("protocolVersion")
         .and_then(|v| v.as_str())
         .unwrap_or(PROTOCOL_FALLBACK);
-    let instructions = if mastermind {
-        format!("{INSTRUCTIONS}{MASTERMIND_INSTRUCTIONS}")
+    let tier = if mastermind {
+        MASTERMIND_INSTRUCTIONS
     } else if supervised {
-        format!("{INSTRUCTIONS}{SUPERVISED_INSTRUCTIONS}")
+        SUPERVISED_INSTRUCTIONS
     } else {
-        INSTRUCTIONS.to_string()
+        ""
     };
+    let instructions = format!("{INSTRUCTIONS}{DOCUMENTS_INSTRUCTIONS}{tier}");
     json!({
         "protocolVersion": requested,
         "capabilities": { "tools": {} },
@@ -455,7 +473,56 @@ fn base_tool_defs() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        json!({
+            "name": "document_guide",
+            "description": "The full guide to writing documents the user reads in Chimaera: \
+                            the portable markdown dialect (it also renders on GitHub and in \
+                            Obsidian), links and embeds with fragments, frontmatter, and how \
+                            to reference files in replies. Read it before writing a report, \
+                            README or notes.",
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false},
+        }),
+        json!({
+            "name": "check_document",
+            "description": "Check a markdown document before handing it over: broken relative \
+                            links and embeds, missing heading anchors and line ranges, \
+                            dangling footnotes, absolute local paths, images without alt \
+                            text or over 10 MB, and syntax GitHub shows as literal text \
+                            (wikilinks, MDX, ::: blocks, MyST directives, unsupported alert \
+                            types). Returns each issue with its line and a fix.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["path"],
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "The markdown file: relative to this session's working \
+                                        directory (then the workspace root), or absolute",
+                    },
+                },
+                "additionalProperties": false,
+            },
+        }),
     ]
+}
+
+/// check_document — the same checker as the reading view's issues chip,
+/// resolving a relative `path` against the session's cwd, then its
+/// workspace root (which also anchors root-relative `/docs/x.md` links).
+async fn check_document(state: &Arc<AppState>, agent_id: &str, args: &Value) -> Value {
+    let Some(raw) = args.get("path").and_then(|p| p.as_str()) else {
+        return tool_error("missing required argument: path".to_string());
+    };
+    let cwd = state
+        .sessions
+        .get(agent_id)
+        .map(|info| info.cwd)
+        .or_else(|| state.chat.get(agent_id).map(|info| info.cwd));
+    let root = workspace_of(state, agent_id).map(|w| w.root);
+    match crate::doc_check::agent_report(raw.to_string(), cwd, root).await {
+        Ok(report) => tool_text(report),
+        Err(err) => tool_error(err),
+    }
 }
 
 /// Result content for a successful tool call.
@@ -497,6 +564,8 @@ async fn tools_call(
         "list_terminals" => Ok(list_terminals(state, agent_id).await),
         "run_in_terminal" => Ok(run_in_terminal(state, agent_id, &args).await),
         "read_terminal" => Ok(read_terminal(state, agent_id, &args).await),
+        "document_guide" => Ok(tool_text(crate::agent_docs::GUIDE.to_string())),
+        "check_document" => Ok(check_document(state, agent_id, &args).await),
         "workspace_status" | "read_session" | "list_changed_files" | "spawn_agent"
         | "spawn_terminal" | "message_agent" | "interrupt_agent" => {
             let Some(workspace) = workspace_of(state, agent_id) else {

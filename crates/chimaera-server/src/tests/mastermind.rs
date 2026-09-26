@@ -6,6 +6,15 @@
 use super::support::*;
 use crate::*;
 
+/// Every session's MCP tools (the linked-terminal and document tools).
+const BASE_TOOLS: [&str; 5] = [
+    "list_terminals",
+    "run_in_terminal",
+    "read_terminal",
+    "document_guide",
+    "check_document",
+];
+
 /// PUT the mastermind and return (status, body).
 async fn put_mastermind(
     state: &Arc<AppState>,
@@ -296,11 +305,7 @@ async fn mcp_tier_gates_on_the_binding() {
         assert!(mm_tools.contains(&tool.to_string()), "{mm_tools:?}");
     }
     let worker_tools = tool_names(&state, &worker, "wk").await;
-    assert_eq!(
-        worker_tools,
-        ["list_terminals", "run_in_terminal", "read_terminal"],
-        "workers get the base tier only"
-    );
+    assert_eq!(worker_tools, BASE_TOOLS, "workers get the base tier only");
 
     // The call gate matches the listing: a worker naming a mastermind tool
     // gets a JSON-RPC error that names the Mastermind.
@@ -347,10 +352,7 @@ async fn mcp_tier_gates_on_the_binding() {
     // Unbind (fire the Mastermind): the tier drops on the very next call.
     lock(&state.workspaces).set_mastermind(&ws, None).unwrap();
     let fired = tool_names(&state, &mastermind, "mmk").await;
-    assert_eq!(
-        fired,
-        ["list_terminals", "run_in_terminal", "read_terminal"]
-    );
+    assert_eq!(fired, BASE_TOOLS);
 
     state.sessions.kill(&mastermind).ok();
     state.sessions.kill(&worker).ok();
