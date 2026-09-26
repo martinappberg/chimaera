@@ -94,7 +94,11 @@ pub(crate) const MASTERMIND_READ_TOOLS: [&str; 5] = [
 /// `mcp_auto_approve`). Only side-effect-free-for-the-workspace tools belong
 /// here — `notify` shows the user a notification and nothing else, and a
 /// permission prompt for "may I notify you?" would itself be a notification.
-pub(crate) const ALWAYS_ALLOWED_TOOLS: [&str; 1] = ["notify"];
+/// The document tools are read-only (`document_guide` is fixed text;
+/// `check_document` stats and reads, bounded, only regular files — see
+/// `doc_check`), and the instructions ask every session to call them, so a
+/// prompt per call would train users to click through prompts.
+pub(crate) const ALWAYS_ALLOWED_TOOLS: [&str; 3] = ["notify", "document_guide", "check_document"];
 
 /// Every Mastermind-tier tool name — the dispatch gate's single source, so
 /// adding a tool means extending THIS list + `mastermind_tool_defs` (a
