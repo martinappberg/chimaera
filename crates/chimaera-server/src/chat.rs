@@ -139,13 +139,9 @@ pub(crate) fn new_manager(
     use std::sync::atomic::{AtomicU64, Ordering};
     use tokio::sync::mpsc::error::TrySendError;
 
-    if let Err(err) = chimaera_agent::journal::prune_dir(
-        &journal_dir,
-        chimaera_agent::journal::DIR_MAX_BYTES,
-        chimaera_agent::journal::DIR_MAX_FILES,
-    ) {
-        tracing::warn!(%err, "chat journal prune failed");
-    }
+    // No journal prune here: construction runs before the boot ledger is
+    // restored, when the chats about to resurrect are live nowhere yet — see
+    // `prune_journals`, which `ledger::consume_boot` runs once restore settles.
     let (tx, rx) = tokio::sync::mpsc::channel(CHAT_SIGNAL_CAPACITY);
     let event_tx = tx.clone();
     let dropped = Arc::new(AtomicU64::new(0));
@@ -188,6 +184,29 @@ pub(crate) fn new_manager(
         }),
     ));
     (manager, rx)
+}
+
+/// Enforce the chat-journal dir budget without evicting a journal still in
+/// use. The manager protects its own registry; this adds every agent session
+/// the daemon holds — a chat running as its TUI keeps the journal a switch
+/// back reopens, and every spawn path records the session before it spawns —
+/// plus `spawning`, the session whose journal the caller is about to reopen.
+///
+/// A no-op until the boot ledger is restored: the chats it will resurrect are
+/// live nowhere yet, and their journals are what they resume from. The
+/// resurrection spawns therefore skip it, and `ledger::consume_boot` runs it
+/// once the roster is whole.
+pub(crate) async fn prune_journals(state: &Arc<AppState>, spawning: Option<&str>) {
+    if !*state.restored.borrow() {
+        return;
+    }
+    let mut keep: HashSet<String> = crate::lock(&state.agents).keys().cloned().collect();
+    keep.extend(spawning.map(str::to_string));
+    // Stats every journal (and may unlink some) on a possibly-NFS dir.
+    let manager = Arc::clone(&state.chat);
+    if let Err(err) = tokio::task::spawn_blocking(move || manager.prune_journal_dir(keep)).await {
+        tracing::warn!(%err, "chat journal prune worker failed");
+    }
 }
 
 /// The catalog of any live claude chat session in workspace `ws` (they all
@@ -3045,6 +3064,10 @@ pub(crate) async fn spawn_chat_session(
     pinned_override: Option<String>,
 ) -> anyhow::Result<ChatInfo> {
     let recovered_effort = codex_initial_effort(state, &recipe).await;
+    // Re-enforce the journal-dir budget as sessions are created: pruning only
+    // at boot lets a weeks-long daemon accumulate one capped journal per
+    // session past the documented ceiling.
+    prune_journals(state, Some(&id)).await;
     // A reopened conversation (resume, rewind, fork, post-restart
     // resurrection) comes back with its own last model, effort and mode —
     // the journal index carries them per native id because neither agent
@@ -3062,16 +3085,13 @@ pub(crate) async fn spawn_chat_session(
     let model = start.model;
     let initial_effort = start.effort;
     let initial_mode = start.mode;
-    // Legacy recovery can yield while a concurrent retire removes the shared
-    // identity. From here through ChatManager::spawn there are no awaits, so
-    // this closes that race without resurrecting an untracked billing process.
+    // Legacy recovery and the prune can yield while a concurrent retire
+    // removes the shared identity. From here through ChatManager::spawn there
+    // are no awaits, so this closes that race without resurrecting an
+    // untracked billing process.
     if crate::lock(&state.agents).get(&id).is_none() {
         anyhow::bail!("chat session retired before spawn");
     }
-    // Re-enforce the journal-dir budget as sessions are created: the
-    // construction-time prune alone lets a weeks-long daemon accumulate one
-    // capped journal per session past the documented ceiling.
-    state.chat.prune_journal_dir();
     // Claude's quiet portable context is file-backed to keep the bounded but
     // potentially large transcript off argv. Recreate it on every respawn:
     // runtime files are explicitly scrub-safe.
