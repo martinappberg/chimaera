@@ -62,11 +62,12 @@ import {
   type Text as CmText,
 } from "@codemirror/state";
 import type { SyntaxNode } from "@lezer/common";
-import { contextOf, depsOf, footnotesOf, frontmatterOf, TextLines, type DocContext } from "./doc/model";
+import { contextOf, depsOf, footnotesOf, frontmatterOf, refsKey, TextLines, type DocContext } from "./doc/model";
 import { renderFootnotes, renderRun } from "./doc/render";
 import { Hydrator, markTasks } from "./doc/reader";
 import {
   HeightCache,
+  SILENT,
   hashString,
   nodesIn,
   revealedOf,
@@ -188,6 +189,9 @@ interface LiveLayout {
 const DEFAULT_LAYOUT: LiveLayout = { key: "", line: 27, char: 8.6, width: 620 };
 
 const focusEffect = StateEffect.define<boolean>();
+/** The editor gained or lost focus (the view plugin dispatches it; tests
+ *  drive a bare state with it). */
+export const liveFocus = (focused: boolean): StateEffect<boolean> => focusEffect.of(focused);
 const layoutEffect = StateEffect.define<LiveLayout>();
 const propsEffect = StateEffect.define<boolean>();
 
@@ -207,20 +211,24 @@ interface LiveState {
   fmEnd: number;
   /** The footnote section's identity, "" when there is none. */
   notes: string;
-  /** Document-wide facts for rendering (heading ids, footnotes, refs). */
-  cx: DocContext;
+  /** Every link reference definition, as block identities read them. */
+  defs: string;
+  /** Document-wide facts for rendering (heading ids, footnotes, refs),
+   *  made when a block is first drawn for this document: an edit inside
+   *  one block never needs them. */
+  cx: DocContext | null;
   focused: boolean;
   /** The properties panel is folded. */
   collapsed: boolean;
   layout: LiveLayout;
   flash: DecorationSet;
   deco: DecorationSet;
-  /** Widget → the segment it draws (-1: the footnote section). */
-  owner: Map<WidgetType, number>;
   /** Widgets by identity, kept across states so an unchanged block's
    *  widget is the same object (CodeMirror's comparison is then free). */
   pool: Map<string, LiveWidget>;
 }
+
+type Structure = Pick<LiveState, "segs" | "keys" | "edges" | "fmEnd" | "notes" | "defs" | "cx">;
 
 /** Heights measured in this session (every live view shares them). */
 const heights = new HeightCache();
@@ -256,8 +264,19 @@ function writeCollapsed(on: boolean): void {
   }
 }
 
+function identity(state: EditorState, s: Segment, deps: (from: number, to: number, src: string) => string): [string, Edges] {
+  const doc = state.doc;
+  if (s.kind === "block") {
+    const src = doc.sliceString(s.blockFrom, s.blockTo);
+    const key = `${s.names}\u0000${src}\u0000${deps(s.blockFrom, s.blockTo, src)}`;
+    return [key, edgesFor(key, state, s)];
+  }
+  if (s.kind === "front") return [`front\u0000${doc.sliceString(0, s.blockTo)}`, { head: [], tail: PROPS_TAIL }];
+  return ["", { head: [], tail: [] }];
+}
+
 /** Segments, identities and edges of the document as it stands. */
-function structure(state: EditorState): Pick<LiveState, "segs" | "keys" | "edges" | "fmEnd" | "notes" | "cx"> {
+function structure(state: EditorState): Structure {
   const doc = state.doc;
   const tree = syntaxTree(state);
   const fmEnd = frontmatterEnd(state);
@@ -267,18 +286,9 @@ function structure(state: EditorState): Pick<LiveState, "segs" | "keys" | "edges
   const keys: string[] = [];
   const edges: Edges[] = [];
   for (const s of segs) {
-    if (s.kind === "block") {
-      const src = doc.sliceString(s.blockFrom, s.blockTo);
-      const key = `${s.names}\u0000${src}\u0000${deps(s.blockFrom, s.blockTo, src)}`;
-      keys.push(key);
-      edges.push(edgesFor(key, state, s));
-    } else if (s.kind === "front") {
-      keys.push(`front\u0000${doc.sliceString(0, s.blockTo)}`);
-      edges.push({ head: [], tail: PROPS_TAIL });
-    } else {
-      keys.push("");
-      edges.push({ head: [], tail: [] });
-    }
+    const [key, e] = identity(state, s, deps);
+    keys.push(key);
+    edges.push(e);
   }
   let notes = "";
   if (cx.footnotes.length > 0) {
@@ -291,7 +301,186 @@ function structure(state: EditorState): Pick<LiveState, "segs" | "keys" | "edges
         })
         .join("\u0001");
   }
-  return { segs, keys, edges, fmEnd, notes, cx };
+  return { segs, keys, edges, fmEnd, notes, defs: refsKey(cx), cx };
+}
+
+/** Nodes other blocks' rendering reads (heading ids, reference
+ *  definitions, footnotes): an edit that changes any of them — its text,
+ *  or which of them exist — can reach every block. */
+const FACTS = /Heading|LinkReference|FootnoteDefinition/;
+/** Raw HTML groups the blocks after it into one run: never patched. */
+const HTML = /HTMLBlock|ProcessingInstructionBlock/;
+
+/** Block containers the facts nest in (the context's own descent). */
+const CONTAINER = /^(Blockquote|BulletList|OrderedList|ListItem)$/;
+
+/** The fact-bearing blocks in `node` (itself, or nested in containers), as
+ *  text: equal before and after an edit means the facts held there. */
+function factsIn(node: SyntaxNode, doc: CmText, out: string[]): void {
+  if (FACTS.test(node.name)) {
+    out.push(`${node.name}\u0000${doc.sliceString(node.from, node.to)}`);
+    return;
+  }
+  if (CONTAINER.test(node.name)) for (let c = node.firstChild; c !== null; c = c.nextSibling) factsIn(c, doc, out);
+}
+
+/**
+ * The structure after an edit, recomputed only around it: the segments the
+ * edit touched and one on each side (a line can join the block above or
+ * below), grown until the new tree's blocks end where an untouched old
+ * segment begins; everything else keeps its identity and shifts. Null when
+ * the edit may reach further — a heading, a definition, raw HTML, a
+ * footnote, frontmatter, a parse still in progress — and the whole
+ * structure is recomputed instead.
+ */
+function restructure(v: LiveState, tr: Transaction): (Structure & { i0: number; i1: number; j1: number }) | null {
+  const state = tr.state;
+  const doc = state.doc;
+  const tree = syntaxTree(state);
+  const segs = v.segs;
+  const n = segs.length;
+  if (n === 0 || tree.length < doc.length || segs[n - 1].kind === "raw") return null;
+  if (frontmatterEnd(state) !== v.fmEnd) return null;
+  let a0 = -1;
+  let a1 = -1;
+  tr.changes.iterChangedRanges((fromA, toA) => {
+    if (a0 < 0) a0 = fromA;
+    a1 = toA;
+  });
+  let i0 = segmentAt(segs, a0);
+  let i1 = segmentAt(segs, a1);
+  if (i0 < 0 || i1 < 0 || segs[i0].kind === "front") return null;
+  i0 = Math.max(0, i0 - 1);
+  i1 = Math.min(n - 1, i1 + 1);
+  if (segs[i0].kind === "front") i0++;
+  const rFrom = tr.changes.mapPos(segs[i0].from, -1);
+  let rTo = 0;
+  let nodes: SyntaxNode[] = [];
+  for (;;) {
+    const next = segs[i1 + 1];
+    rTo = next === undefined ? doc.length : tr.changes.mapPos(next.from, 1) - 1;
+    nodes = nodesIn(tree, rFrom, rTo);
+    const last = nodes[nodes.length - 1];
+    if (last === undefined || last.to <= rTo) break;
+    if (next === undefined) return null;
+    i1++; // the edit grew a block over the next one (an open fence): take it in
+  }
+  const before = tree.topNode.childBefore(rFrom);
+  if (nodes.length === 0 || (before !== null && before.to >= rFrom)) return null;
+  const oldText = tr.startState.doc.sliceString(segs[i0].from, segs[i1].to);
+  const newText = doc.sliceString(rFrom, rTo);
+  if (HTML.test(segs.slice(i0, i1 + 1).map((x) => x.names).join(",")) || HTML.test(nodes.map((x) => x.name).join(",")))
+    return null;
+  // A heading or definition beside the edit is fine; one the edit changed
+  // (or made, or removed) renumbers or re-resolves the whole document. Its
+  // block, unchanged, keeps its identity (its heading ids hold).
+  const oldDoc = tr.startState.doc;
+  const oldTree = syntaxTree(tr.startState);
+  const oldFacts: string[] = [];
+  const kept = new Map<string, number>();
+  for (let i = i0; i <= i1; i++) {
+    const s = segs[i];
+    const f: string[] = [];
+    for (const node of nodesIn(oldTree, s.blockFrom, s.blockTo)) factsIn(node, oldDoc, f);
+    if (f.length === 0) continue;
+    oldFacts.push(...f);
+    kept.set(`${s.names}\u0000${oldDoc.sliceString(s.blockFrom, s.blockTo)}`, i);
+  }
+  const newFacts: string[][] = nodes.map((node) => {
+    const f: string[] = [];
+    factsIn(node, doc, f);
+    return f;
+  });
+  if (oldFacts.join("\u0001") !== newFacts.flat().join("\u0001")) return null;
+  if (oldText.includes("[^") || newText.includes("[^")) return null;
+  if (v.notes !== "" && tr.changes.newLength !== tr.changes.length && oldText.split("\n").length !== newText.split("\n").length)
+    return null;
+  // The region as segments, with segmentsOf's rules: its first one starts
+  // where the region does (lines before the first block are the first
+  // segment's), each runs to the line before the next.
+  const region: Segment[] = [];
+  for (const node of nodes) {
+    const blockFrom = doc.lineAt(node.from).from;
+    const prev = region[region.length - 1];
+    if (prev !== undefined && blockFrom <= prev.blockTo) return null;
+    region.push({
+      kind: SILENT.has(node.name) ? "source" : "block",
+      from: region.length === 0 ? rFrom : blockFrom,
+      to: 0,
+      blockFrom,
+      blockTo: Math.max(node.to, blockFrom),
+      names: node.name,
+    });
+  }
+  for (let k = 0; k < region.length; k++) {
+    const next = region[k + 1];
+    region[k].to = next === undefined ? rTo : Math.max(region[k].blockTo, next.from - 1);
+  }
+  // Identities: a fact-bearing block must be one the edit left as it was;
+  // any other block reads only the definitions (no footnote references:
+  // checked above).
+  const defs = v.defs;
+  const deps = (_from: number, _to: number, src: string): string => (defs !== "" && src.includes("[") ? `\u0001${defs}` : "");
+  const keys: string[] = [];
+  const edges: Edges[] = [];
+  for (const [k, s] of region.entries()) {
+    if (newFacts[k].length > 0) {
+      const i = kept.get(`${s.names}\u0000${doc.sliceString(s.blockFrom, s.blockTo)}`);
+      if (i === undefined) return null;
+      keys.push(v.keys[i]);
+      edges.push(v.edges[i]);
+      continue;
+    }
+    const [key, e] = identity(state, s, deps);
+    keys.push(key);
+    edges.push(e);
+  }
+  const delta = tr.changes.newLength - tr.changes.length;
+  const shift = (s: Segment): Segment => ({
+    ...s,
+    from: s.from + delta,
+    to: s.to + delta,
+    blockFrom: s.blockFrom + delta,
+    blockTo: s.blockTo + delta,
+  });
+  return {
+    segs: [...segs.slice(0, i0), ...region, ...segs.slice(i1 + 1).map(shift)],
+    keys: [...v.keys.slice(0, i0), ...keys, ...v.keys.slice(i1 + 1)],
+    edges: [...v.edges.slice(0, i0), ...edges, ...v.edges.slice(i1 + 1)],
+    fmEnd: v.fmEnd,
+    notes: v.notes,
+    defs,
+    cx: null,
+    i0,
+    i1,
+    j1: i0 + region.length - 1,
+  };
+}
+
+/** The document-wide facts for rendering blocks of `state`. */
+function contextFor(state: EditorState): DocContext {
+  const st = state.field(liveField);
+  // A memo on the state's own value: made once per document version.
+  st.cx ??= contextOf(state.doc, syntaxTree(state), new TextLines(state.doc), st.fmEnd);
+  return st.cx;
+}
+
+/** Widget → the segment it draws (-1: the footnote section), per state,
+ *  built when a widget is first drawn for it. */
+const owners = new WeakMap<LiveState, Map<WidgetType, number>>();
+
+function ownerOf(st: LiveState, w: WidgetType): number {
+  let map = owners.get(st);
+  if (map === undefined) {
+    const m = new Map<WidgetType, number>();
+    st.deco.between(0, Number.MAX_SAFE_INTEGER, (from, _to, value) => {
+      const widget = value.spec.widget as WidgetType | undefined;
+      if (widget !== undefined) m.set(widget, widget instanceof NotesWidget ? -1 : segmentAt(st.segs, from));
+    });
+    owners.set(st, m);
+    map = m;
+  }
+  return map.get(w) ?? -2;
 }
 
 function sameFlags(a: readonly boolean[], b: readonly boolean[]): boolean {
@@ -319,19 +508,33 @@ function heightKey(layout: LiveLayout, hid: string): string {
   return `${layout.key}\u0000${hid}`;
 }
 
-/** The decorations for `st`: a block widget for every rendered segment, a
- *  gap widget above every revealed one, the footnote section at the end. */
-function decorate(st: LiveState, state: EditorState): { deco: DecorationSet; owner: Map<WidgetType, number>; pool: Map<string, LiveWidget> } {
-  const ranges: ReturnType<Decoration["range"]>[] = [];
-  const owner = new Map<WidgetType, number>();
-  const pool = new Map<string, LiveWidget>();
+type DecoRange = ReturnType<Decoration["range"]>;
+
+/** Where decorating finds a widget by identity, and keeps a new one. */
+interface WidgetPool {
+  get(id: string): LiveWidget | undefined;
+  set(id: string, w: LiveWidget): void;
+}
+
+/**
+ * Decorations for segments [j0, j1] of `st` (the whole document by
+ * default): a block widget for every rendered segment, a gap widget above
+ * every revealed one, and — when the range reaches the end — the footnote
+ * section. Widgets come from `pool` when their identity is unchanged.
+ */
+function decorateRange(
+  st: LiveState,
+  state: EditorState,
+  pool: WidgetPool,
+  j0 = 0,
+  j1 = st.segs.length - 1,
+  notes = j1 === st.segs.length - 1,
+): DecoRange[] {
+  const ranges: DecoRange[] = [];
   const doc = state.doc;
   const get = <W extends LiveWidget>(id: string, make: (hid: string, est: (guess: () => number) => number) => W): W => {
-    const hit = st.pool.get(id) ?? pool.get(id);
-    if (hit !== undefined) {
-      pool.set(id, hit);
-      return hit as W;
-    }
+    const hit = pool.get(id);
+    if (hit !== undefined) return hit as W;
     const hid = hashString(id);
     const w = make(hid, (guess) => heights.get(heightKey(st.layout, hid)) ?? guess());
     pool.set(id, w);
@@ -345,53 +548,79 @@ function decorate(st: LiveState, state: EditorState): { deco: DecorationSet; own
     });
     return hit;
   };
+  // The trailing edge the first segment's gap collapses against.
   let prev: readonly Shape[] = [];
   let prevKey = "";
-  st.segs.forEach((s, i) => {
+  for (let i = j0 - 1; i >= 0; i--) {
+    const s = st.segs[i];
+    if (s.kind === "front") {
+      prev = PROPS_TAIL;
+      prevKey = "props";
+      break;
+    }
+    const t = st.edges[i].tail;
+    if (s.kind === "block" && t.length > 0) {
+      prev = t;
+      prevKey = shapeKey(t);
+      break;
+    }
+  }
+  for (let i = j0; i <= j1; i++) {
+    const s = st.segs[i];
     const key = st.keys[i];
     if (s.kind === "front") {
       if (!st.revealed[i]) {
         const flash = flashed(s.from, s.to);
         const id = `P\u0000${key}\u0000${st.collapsed}\u0000${flash}`;
         const w = get(id, (hid, est) => new PropsWidget(id, hid, est(() => (st.collapsed ? 40 : 160)), key.slice(6), st.collapsed, flash));
-        owner.set(w, i);
         ranges.push(Decoration.replace({ widget: w, block: true }).range(s.from, s.to));
       }
       prev = PROPS_TAIL;
       prevKey = "props";
-      return;
+      continue;
     }
-    if (s.kind !== "block") return;
+    if (s.kind !== "block") continue;
     const edges = st.edges[i];
+    const tail = prev;
     if (!st.revealed[i]) {
       const flash = flashed(s.from, s.to);
       const id = `B\u0000${key}\u0000${prevKey}\u0000${flash}`;
-      const tail = prev;
       const w = get(id, (hid, est) =>
         new BlockWidget(id, hid, est(() => guessHeight(st.layout, doc, s.blockFrom, s.blockTo, s.names)), key, tail, flash),
       );
-      owner.set(w, i);
       ranges.push(Decoration.replace({ widget: w, block: true }).range(s.from, s.to));
     } else {
       const id = `G\u0000${prevKey}\u0000${shapeKey(edges.head)}`;
-      const tail = prev;
       const w = get(id, (hid, est) => new GapWidget(id, hid, est(() => Math.round(st.layout.line * 0.45)), tail, edges.head));
-      owner.set(w, i);
       ranges.push(Decoration.widget({ widget: w, block: true, side: -1 }).range(s.from));
     }
     if (edges.tail.length > 0) {
       prev = edges.tail;
       prevKey = shapeKey(edges.tail);
     }
-  });
-  if (st.notes !== "") {
+  }
+  if (st.notes !== "" && notes) {
     const id = `N\u0000${st.notes}\u0000${prevKey}`;
     const tail = prev;
     const w = get(id, (hid, est) => new NotesWidget(id, hid, est(() => st.layout.line * 3), tail));
-    owner.set(w, -1);
     ranges.push(Decoration.widget({ widget: w, block: true, side: 1 }).range(doc.length));
   }
-  return { deco: Decoration.set(ranges, true), owner, pool };
+  return ranges;
+}
+
+/** Every decoration, with a fresh pool of just the widgets in use (the
+ *  old pool's reused where their identity holds). */
+function decorate(st: LiveState, state: EditorState): { deco: DecorationSet; pool: Map<string, LiveWidget> } {
+  const used = new Map<string, LiveWidget>();
+  const pool: WidgetPool = {
+    get: (id) => {
+      const w = used.get(id) ?? st.pool.get(id);
+      if (w !== undefined) used.set(id, w);
+      return w;
+    },
+    set: (id, w) => void used.set(id, w),
+  };
+  return { deco: Decoration.set(decorateRange(st, state, pool), true), pool: used };
 }
 
 export const liveField = StateField.define<LiveState>({
@@ -405,7 +634,6 @@ export const liveField = StateField.define<LiveState>({
       layout: DEFAULT_LAYOUT,
       flash: revealFlashRanges(state),
       deco: Decoration.none,
-      owner: new Map(),
       pool: new Map(),
     };
     return { ...st, ...decorate(st, state) };
@@ -419,10 +647,11 @@ export const liveField = StateField.define<LiveState>({
       else if (e.is(layoutEffect)) layout = e.value;
       else if (e.is(propsEffect)) collapsed = e.value;
     }
-    const structural = tr.docChanged || syntaxTree(tr.state) !== syntaxTree(tr.startState);
+    const treeChanged = syntaxTree(tr.state) !== syntaxTree(tr.startState);
     const flash = revealFlashRanges(tr.state);
     if (
-      !structural &&
+      !tr.docChanged &&
+      !treeChanged &&
       tr.selection === undefined &&
       focused === v.focused &&
       collapsed === v.collapsed &&
@@ -430,25 +659,59 @@ export const liveField = StateField.define<LiveState>({
       flash === v.flash
     )
       return v;
+    const ranges = focused ? tr.state.selection.ranges : [];
+    // An edit inside a block: patch the structure and decorations around it.
+    const inc = tr.docChanged && collapsed === v.collapsed && flash === v.flash ? restructure(v, tr) : null;
+    if (inc !== null) {
+      const revealed = revealedOf(inc.segs, ranges);
+      const moved = inc.j1 - inc.i1;
+      let same = v.pool.size <= 2 * inc.segs.length + 256;
+      for (let k = 0; same && k < inc.i0; k++) same = revealed[k] === v.revealed[k];
+      for (let k = inc.j1 + 1; same && k < inc.segs.length; k++) same = revealed[k] === v.revealed[k - moved];
+      const st: LiveState = { ...v, ...inc, revealed, focused, collapsed, layout, flash };
+      if (!same) return { ...st, ...decorate(st, tr.state) };
+      // The region and the segment after it (its gap reads the region's
+      // last block), through the end when the footnote section follows.
+      const hi = Math.min(inc.j1 + 1, inc.segs.length - 1);
+      const upto = st.notes !== "" && hi === inc.segs.length - 1 ? tr.state.doc.length : inc.segs[hi].to;
+      const lo = inc.segs[inc.i0].from;
+      const pool: WidgetPool = { get: (id) => v.pool.get(id), set: (id, w) => void v.pool.set(id, w) };
+      const add = decorateRange(st, tr.state, pool, inc.i0, hi);
+      const deco = v.deco.map(tr.changes).update({
+        filter: (from) => from < lo || from > upto,
+        filterFrom: lo,
+        filterTo: upto,
+        add,
+        sort: true,
+      });
+      return { ...st, deco };
+    }
+    const structural = tr.docChanged || treeChanged;
     const base = structural ? structure(tr.state) : v;
-    let revealed: readonly boolean[] = revealedOf(base.segs, focused ? tr.state.selection.ranges : []);
-    const sameSegs = !structural;
-    if (sameSegs && sameFlags(revealed, v.revealed)) revealed = v.revealed;
-    const st: LiveState = {
-      ...v,
-      segs: base.segs,
-      keys: base.keys,
-      edges: base.edges,
-      fmEnd: base.fmEnd,
-      notes: base.notes,
-      cx: base.cx,
-      revealed,
-      focused,
-      collapsed,
-      layout,
-      flash,
-    };
+    let revealed: readonly boolean[] = revealedOf(base.segs, ranges);
+    if (!structural && sameFlags(revealed, v.revealed)) revealed = v.revealed;
+    const st: LiveState = { ...v, ...base, revealed, focused, collapsed, layout, flash };
     if (!structural && revealed === v.revealed && collapsed === v.collapsed && flash === v.flash) return st;
+    if (!structural && collapsed === v.collapsed && flash === v.flash) {
+      // Only reveals moved (a click, an arrow key, focus): swap just those
+      // segments' widgets — a block's gap never depends on whether its
+      // neighbour is revealed, only on its text.
+      const changed: number[] = [];
+      for (let i = 0; i < revealed.length; i++) if (revealed[i] !== v.revealed[i]) changed.push(i);
+      if (changed.length <= 64 && v.pool.size <= 2 * st.segs.length + 256) {
+        const pool: WidgetPool = { get: (id) => v.pool.get(id), set: (id, w) => void v.pool.set(id, w) };
+        const starts = new Set(changed.map((i) => st.segs[i].from));
+        const add = changed.flatMap((i) => decorateRange(st, tr.state, pool, i, i, false));
+        const deco = v.deco.update({
+          filter: (from, _to, value) => !starts.has(from) || value.spec.widget instanceof NotesWidget,
+          filterFrom: st.segs[changed[0]].from,
+          filterTo: st.segs[changed[changed.length - 1]].from,
+          add,
+          sort: true,
+        });
+        return { ...st, deco };
+      }
+    }
     return { ...st, ...decorate(st, tr.state) };
   },
   provide: (f) => [
@@ -514,14 +777,30 @@ function hydratorFor(view: EditorView): Hydrator {
   return h;
 }
 
-/** Re-lay out a live view's diagrams for a theme change. */
+/** Re-lay out a live view's diagrams for a theme change (kept blocks
+ *  drawn for the other theme are dropped). */
 export function setLiveTheme(view: EditorView, theme: "light" | "dark"): void {
   hydrators.get(view)?.setTheme(theme, view.contentDOM);
+  drawnByView.delete(view);
 }
 
 /** Which content a widget DOM shows (updateDOM reuses it when only the
  *  ghost or the flash changed). */
 const drawn = new WeakMap<HTMLElement, string>();
+
+/** Blocks each view drew, by what they render (bounded, least recently
+ *  drawn first out). Line numbers in a kept block are the ones it was drawn
+ *  at; presses map them through `data-lp-line`. */
+const drawnByView = new WeakMap<EditorView, Map<string, HTMLElement>>();
+const DRAWN_MAX = 300;
+function drawnBlocks(view: EditorView): Map<string, HTMLElement> {
+  let m = drawnByView.get(view);
+  if (m === undefined) {
+    m = new Map();
+    drawnByView.set(view, m);
+  }
+  return m;
+}
 
 /** A zero-height copy of an edge chain: its margins take part in collapsing
  *  (a `tail` ghost lends its bottom margins, a `head` ghost its top). */
@@ -581,9 +860,8 @@ abstract class LiveWidget extends WidgetType {
 
 /** Draw the document nodes of `seg` into `root` as the reader does. */
 function drawRun(view: EditorView, root: HTMLElement, seg: Segment): void {
-  const st = view.state.field(liveField);
   const h = hydratorFor(view);
-  renderRun(root, nodesIn(syntaxTree(view.state), seg.blockFrom, seg.blockTo), { t: h.target, cx: st.cx });
+  renderRun(root, nodesIn(syntaxTree(view.state), seg.blockFrom, seg.blockTo), { t: h.target, cx: contextFor(view.state) });
 }
 
 /** What every rendered widget does once drawn: the reader's decorations,
@@ -613,10 +891,20 @@ class BlockWidget extends LiveWidget {
     super(id, hid, est);
   }
   toDOM(view: EditorView): HTMLElement {
+    // A block that was revealed and renders again (the cursor left it)
+    // comes back as it was drawn — highlighted, typeset — not redrawn.
+    const cache = drawnBlocks(view);
+    const kept = cache.get(this.block);
+    if (kept !== undefined && !kept.isConnected) {
+      cache.delete(this.block);
+      cache.set(this.block, kept);
+      this.updateDOM(kept);
+      return kept;
+    }
     const root = document.createElement("div");
     root.className = this.flash ? "lp-block md-doc md-flash" : "lp-block md-doc";
     const st = view.state.field(liveField);
-    const seg = st.segs[st.owner.get(this) ?? -1];
+    const seg = st.segs[ownerOf(st, this)];
     if (seg === undefined) return root;
     root.dataset.lpLine = String(view.state.doc.lineAt(seg.blockFrom).number);
     const g = ghost(this.prev, "tail");
@@ -624,6 +912,11 @@ class BlockWidget extends LiveWidget {
     drawRun(view, root, seg);
     finish(view, root);
     drawn.set(root, this.block);
+    cache.set(this.block, root);
+    if (cache.size > DRAWN_MAX) {
+      const oldest = cache.keys().next().value;
+      if (oldest !== undefined) cache.delete(oldest);
+    }
     return root;
   }
   /** Same block with another neighbour above, or a flash: only the ghost
@@ -676,8 +969,8 @@ class NotesWidget extends LiveWidget {
     root.dataset.lpLine = "1";
     const g = ghost(this.prev, "tail");
     if (g !== null) root.append(g);
-    const st = view.state.field(liveField);
-    renderFootnotes(root, footnotesOf(st.cx), { t: hydratorFor(view).target, cx: st.cx });
+    const cx = contextFor(view.state);
+    renderFootnotes(root, footnotesOf(cx), { t: hydratorFor(view).target, cx });
     finish(view, root);
     return root;
   }

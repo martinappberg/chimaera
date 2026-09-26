@@ -376,6 +376,14 @@ export function contextOf(doc: DocText, tree: Tree, lines: Lines, start = 0): Do
   return { doc, lines, tree, refs, footnoteDefs, headingIds, outline, footnoteRefs, footnotes, inline };
 }
 
+/** Every reference definition, as a block that could hold a reference
+ *  link reads them ("" when there are none). */
+export function refsKey(cx: DocContext): string {
+  return cx.refs.size === 0
+    ? ""
+    : [...cx.refs.entries()].map(([k, d]) => `${k}\u0000${d.url}\u0000${d.title ?? ""}`).join("\u0001");
+}
+
 /**
  * What a stretch of the document's rendering reads beyond its own text:
  * the ids of the headings in it, the numbers of the footnote references
@@ -386,10 +394,7 @@ export function contextOf(doc: DocText, tree: Tree, lines: Lines, start = 0): Do
 export function depsOf(cx: DocContext): (from: number, to: number, src: string) => string {
   const headings = [...cx.headingIds.entries()].sort((a, b) => a[0] - b[0]);
   const refs = [...cx.footnoteRefs.entries()].sort((a, b) => a[0] - b[0]);
-  const defs =
-    cx.refs.size === 0
-      ? ""
-      : [...cx.refs.entries()].map(([k, d]) => `${k}\u0000${d.url}\u0000${d.title ?? ""}`).join("\u0001");
+  const defs = refsKey(cx);
   /** The first entry at or after `pos`. */
   const lowerBound = (list: readonly [number, unknown][], pos: number): number => {
     let lo = 0;

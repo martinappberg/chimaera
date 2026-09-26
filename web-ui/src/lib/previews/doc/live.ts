@@ -47,7 +47,7 @@ export interface Segment {
  *  click: they stay visible source. (A footnote definition renders in the
  *  footnote section at the end, whose entry leads back to it — so in place
  *  it is an empty block, as in reading.) */
-const SILENT = new Set(["LinkReference", "CommentBlock"]);
+export const SILENT: ReadonlySet<string> = new Set(["LinkReference", "CommentBlock"]);
 
 /** The document's top-level nodes after `start` (frontmatter the editor
  *  parsed as markdown is not body). */
