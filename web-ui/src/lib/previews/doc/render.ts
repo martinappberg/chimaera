@@ -547,7 +547,10 @@ export function anchorSourceLine(source: string, anchor: string): number | null 
 /** What only a page can do, supplied by the reader: fetch image bytes,
  *  lay out diagrams, load highlighting grammars. */
 export interface DomHooks {
-  image(img: HTMLImageElement, src: string, wikilink: string | null): void;
+  /** Point `img` at its bytes. The seam where an image becomes an embed:
+   *  a node returned here is drawn in the image's place (reading and live
+   *  both render through it). */
+  image(img: HTMLImageElement, src: string, wikilink: string | null): Node | void;
   code(code: HTMLElement, lang: string, text: string): void;
   mermaid(box: HTMLElement, source: string): void;
 }
@@ -572,8 +575,10 @@ export class DomTarget implements Target<Node> {
     const frag = sanitizeHtml(html);
     // What the island's markdown (a run an HTML block opened) drew as
     // markup gets the same hydration as everywhere else.
-    for (const img of frag.querySelectorAll<HTMLImageElement>("img[data-md-src]"))
-      this.hooks.image(img, img.dataset.mdSrc ?? "", null);
+    for (const img of frag.querySelectorAll<HTMLImageElement>("img[data-md-src]")) {
+      const out = this.hooks.image(img, img.dataset.mdSrc ?? "", null);
+      if (out instanceof Node && out !== img) img.replaceWith(out);
+    }
     for (const code of frag.querySelectorAll<HTMLElement>("pre > code[data-lang]")) {
       const lang = code.dataset.lang ?? "";
       const text = code.textContent ?? "";
@@ -616,8 +621,8 @@ export class DomTarget implements Target<Node> {
     const img = document.createElement("img");
     img.alt = alt;
     if (title !== null) img.title = title;
-    if (src !== "" || wikilink !== null) this.hooks.image(img, src, wikilink);
-    return img;
+    if (src === "" && wikilink === null) return img;
+    return this.hooks.image(img, src, wikilink) ?? img;
   }
 }
 

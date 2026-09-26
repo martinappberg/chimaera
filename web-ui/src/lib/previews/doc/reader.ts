@@ -27,24 +27,16 @@ import { renderMermaid } from "../../shared/mermaid";
 import type { LinkContext } from "../docLinks";
 import {
   bodyText,
+  depsOf,
   htmlOfNode,
   htmlRuns,
   documentContext,
   footnotesOf,
-  type DocContext,
   type OutlineEntry,
 } from "./model";
 import { DomTarget, renderFootnotes, renderRun, topLevel, type DomHooks } from "./render";
 
-export interface ReaderOptions {
-  /** The document's absolute path: relative images resolve beside it. */
-  docPath: string;
-  /** Read when used: the workspace an `![[embed]]` resolves in. */
-  links: () => LinkContext;
-  theme: "light" | "dark";
-  /** After equations typeset (a new wide one may need a scroll region). */
-  onLayout?: () => void;
-}
+export type ReaderOptions = HydratorOptions;
 
 export interface ReadResult {
   /** The leading YAML block's text (the properties panel), or null. */
@@ -368,15 +360,35 @@ function shiftSourcepos(nodes: readonly Node[], delta: number): void {
 
 const mermaidSource = new WeakMap<HTMLElement, string>();
 
-export class DocReader {
-  private units: Unit[] = [];
-  private prev: { text: string; tree: Tree } | null = null;
-  private readonly target: DomTarget;
+export interface HydratorOptions {
+  /** The document's absolute path: relative images resolve beside it. */
+  docPath: string;
+  /** Read when used: the workspace an `![[embed]]` resolves in. */
+  links: () => LinkContext;
+  theme: "light" | "dark";
+  /** Drawn content changed size after the fact (an equation typeset, a
+   *  diagram laid out). */
+  onLayout?: () => void;
+}
+
+/**
+ * What only a page can do for rendered blocks, shared by the reading
+ * article and the live editor's block widgets so the two draw a block
+ * identically: the DOM target with its hooks — images beside the document
+ * (tickets, `![[name]]`), fences through the lezer highlighter, mermaid per
+ * theme — and the time-sliced passes that paint fences and typeset
+ * equations once the nodes are in the page.
+ *
+ * The image hook is where an image becomes something richer: returning a
+ * node from `DomHooks.image` puts it in the image's place in both views.
+ */
+export class Hydrator {
+  readonly target: DomTarget;
   private theme: "light" | "dark";
   private readonly math: MathTypesetter;
-  /** Fences drawn by the pass in progress: painted once they are in the
-   *  article, in slices (a warm grammar would otherwise paint every fence of
-   *  a first render synchronously). */
+  /** Fences drawn since the last `settle`: painted once they are in the
+   *  page, in slices (a warm grammar would otherwise paint every fence of a
+   *  first render synchronously). */
   private fences: Fence[] = [];
   /** Fences whose grammar just loaded, requeued as one batch: a grammar's
    *  load settles every fence waiting on it in the same microtask run. */
@@ -387,10 +399,7 @@ export class DocReader {
     }),
   );
 
-  constructor(
-    private readonly root: HTMLElement,
-    private readonly opts: ReaderOptions,
-  ) {
+  constructor(private readonly opts: HydratorOptions) {
     this.theme = opts.theme;
     const hooks: DomHooks = {
       image: (img, src, wikilink) => this.image(img, src, wikilink),
@@ -406,12 +415,134 @@ export class DocReader {
     this.math = new MathTypesetter(() => this.opts.onLayout?.());
   }
 
+  /** `fresh` just went into the page: paint the fences drawn since the
+   *  last call and typeset the equations in it. */
+  settle(fresh: readonly Node[]): void {
+    this.highlighter.add(this.fences.splice(0));
+    this.math.add(mathSpans(fresh));
+  }
+
+  /** Re-lay out every diagram under `root` for a theme change. */
+  setTheme(theme: "light" | "dark", root: ParentNode): void {
+    if (theme === this.theme) return;
+    this.theme = theme;
+    for (const box of root.querySelectorAll<HTMLElement>(".md-mermaid")) {
+      const source = mermaidSource.get(box);
+      if (source !== undefined) this.drawMermaid(box, source);
+    }
+  }
+
+  destroy(): void {
+    this.math.stop();
+    this.highlighter.stop();
+    this.fences = [];
+    this.loaded = [];
+  }
+
+  private image(img: HTMLImageElement, src: string, wikilink: string | null): void {
+    const { docPath } = this.opts;
+    if (wikilink !== null) {
+      img.dataset.mdSrc = wikilink;
+      void resolveNamed(wikilink, dirname(docPath), this.opts.links().workspaceId).then((path) => {
+        if (path !== null && img.dataset.mdSrc === wikilink) pointAt(img, path, wikilink);
+      });
+      return;
+    }
+    if (/^([a-z][a-z0-9+.-]*:|\/\/)/i.test(src)) {
+      img.src = src;
+      return;
+    }
+    img.dataset.mdSrc = src;
+    pointAt(img, resolveDocPath(docPath, safeDecodeUri(src)), src);
+  }
+
+  private drawMermaid(box: HTMLElement, source: string): void {
+    const theme = this.theme;
+    box.dataset.theme = theme;
+    renderMermaid(source, theme).then(
+      (svg) => {
+        if (box.dataset.theme !== theme) return; // a newer theme's render owns it
+        const holder = document.createElement("div");
+        holder.className = "md-mermaid-svg";
+        holder.innerHTML = svg; // sanitized by shared/mermaid (strict mode + DOMPurify)
+        box.classList.remove("md-mermaid-error");
+        box.replaceChildren(holder);
+        this.opts.onLayout?.();
+      },
+      (err: unknown) => {
+        if (box.dataset.theme !== theme) return;
+        const note = document.createElement("p");
+        note.className = "md-mermaid-note";
+        note.textContent = `diagram error: ${err instanceof Error ? err.message : String(err)}`;
+        const pre = document.createElement("pre");
+        const code = document.createElement("code");
+        code.textContent = source;
+        pre.append(code);
+        box.classList.add("md-mermaid-error");
+        box.replaceChildren(note, pre);
+        this.opts.onLayout?.();
+      },
+    );
+  }
+}
+
+/** Block elements a done task's text stops at (its nested blocks keep
+ *  their own ink). */
+const TASK_BLOCK_TAGS = new Set(["UL", "OL", "P", "DIV", "PRE", "BLOCKQUOTE", "TABLE"]);
+
+/**
+ * Task items (`- [x]`) arrive as `span.md-task[data-task]` at the head of
+ * their item. The item drops its bullet (the box stands in for it), and a
+ * done item's own text — up to its first nested block, so a sub-list keeps
+ * its ink — is wrapped to read muted and struck through. A CSS `:has()`
+ * would do the first half, but its invalidation cost on a long document in
+ * WebKit is exactly the restyle churn the pane parking fights; a class set
+ * once is free. Idempotent: a fresh render brings fresh spans. Both views
+ * run it on what they draw (the server fallback too).
+ */
+export function markTasks(root: ParentNode): void {
+  for (const box of root.querySelectorAll<HTMLElement>("span.md-task[data-task]")) {
+    const item = box.closest("li");
+    if (item !== null && !item.classList.contains("md-task-item")) {
+      item.classList.add("md-task-item");
+    }
+    if (box.dataset.task !== "done") continue;
+    if (box.nextElementSibling?.classList.contains("md-task-text")) continue;
+    const wrap = document.createElement("span");
+    wrap.className = "md-task-text";
+    let n = box.nextSibling;
+    while (n !== null && !(n instanceof HTMLElement && TASK_BLOCK_TAGS.has(n.tagName))) {
+      const next = n.nextSibling;
+      wrap.append(n);
+      n = next;
+    }
+    // The space after the box stays outside, or the strike starts on it.
+    const head = wrap.firstChild;
+    const lead = head instanceof Text ? /^\s+/.exec(head.data) : null;
+    if (head instanceof Text && lead !== null) head.data = head.data.slice(lead[0].length);
+    box.after(wrap);
+    if (lead !== null) box.after(document.createTextNode(lead[0]));
+  }
+}
+
+export class DocReader {
+  private units: Unit[] = [];
+  private prev: { text: string; tree: Tree } | null = null;
+  private readonly hydrator: Hydrator;
+
+  constructor(
+    private readonly root: HTMLElement,
+    opts: ReaderOptions,
+  ) {
+    this.hydrator = new Hydrator(opts);
+  }
+
   /** Bring the article in step with `source` (the document's full text). */
   update(source: string): ReadResult {
     const { text, frontmatter } = bodyText(source);
     const cx = documentContext(text, this.prev);
     this.prev = { text, tree: cx.tree };
-    const env = { t: this.target, cx };
+    const env = { t: this.hydrator.target, cx };
 
     const pool = new Map<string, Unit[]>();
     for (const u of this.units) {
@@ -419,7 +550,7 @@ export class DocReader {
       if (list === undefined) pool.set(u.key, [u]);
       else list.push(u);
     }
-    const deps = this.depsFor(cx);
+    const deps = depsOf(cx);
     const next: Unit[] = [];
     const fresh: Node[] = [];
     const place = (key: string, line: number, draw: (into: DocumentFragment) => void): void => {
@@ -476,8 +607,7 @@ export class DocReader {
     }
     this.units = next;
 
-    this.highlighter.add(this.fences.splice(0));
-    this.math.add(mathSpans(fresh));
+    this.hydrator.settle(fresh);
     return {
       frontmatter: frontmatter?.raw ?? null,
       outline: cx.outline.map((h) => ({ ...h, line: cx.lines.lineOf(h.from) })),
@@ -487,102 +617,12 @@ export class DocReader {
 
   /** Re-lay out every diagram for a theme change. */
   setTheme(theme: "light" | "dark"): void {
-    if (theme === this.theme) return;
-    this.theme = theme;
-    for (const box of this.root.querySelectorAll<HTMLElement>(".md-mermaid")) {
-      const source = mermaidSource.get(box);
-      if (source !== undefined) this.drawMermaid(box, source);
-    }
+    this.hydrator.setTheme(theme, this.root);
   }
 
   destroy(): void {
-    this.math.stop();
-    this.highlighter.stop();
-    this.fences = [];
-    this.loaded = [];
+    this.hydrator.destroy();
     this.units = [];
     this.prev = null;
   }
-
-  /**
-   * What a stretch of the document's rendering reads beyond its own text:
-   * the ids of the headings in it, the numbers of the footnote references
-   * in it, and — when it could hold a reference link — every definition.
-   */
-  private depsFor(cx: DocContext): (from: number, to: number, src: string) => string {
-    const headings = [...cx.headingIds.entries()].sort((a, b) => a[0] - b[0]);
-    const refs = [...cx.footnoteRefs.entries()].sort((a, b) => a[0] - b[0]);
-    const defs =
-      cx.refs.size === 0
-        ? ""
-        : [...cx.refs.entries()].map(([k, d]) => `${k}\u0000${d.url}\u0000${d.title ?? ""}`).join("\u0001");
-    /** The first entry at or after `pos`. */
-    const lowerBound = (list: readonly [number, unknown][], pos: number): number => {
-      let lo = 0;
-      let hi = list.length;
-      while (lo < hi) {
-        const mid = (lo + hi) >> 1;
-        if (list[mid][0] < pos) lo = mid + 1;
-        else hi = mid;
-      }
-      return lo;
-    };
-    return (from, to, src) => {
-      let out = "";
-      for (let k = lowerBound(headings, from); k < headings.length && headings[k][0] < to; k++)
-        out += `#${headings[k][1]}`;
-      for (let k = lowerBound(refs, from); k < refs.length && refs[k][0] < to; k++) {
-        const f = refs[k][1];
-        out += `^${f.label}:${f.n}:${f.nth}`;
-      }
-      if (defs !== "" && src.includes("[")) out += `\u0001${defs}`;
-      return out;
-    };
-  }
-
-  private image(img: HTMLImageElement, src: string, wikilink: string | null): void {
-    const { docPath } = this.opts;
-    if (wikilink !== null) {
-      img.dataset.mdSrc = wikilink;
-      void resolveNamed(wikilink, dirname(docPath), this.opts.links().workspaceId).then((path) => {
-        if (path !== null && img.dataset.mdSrc === wikilink) pointAt(img, path, wikilink);
-      });
-      return;
-    }
-    if (/^([a-z][a-z0-9+.-]*:|\/\/)/i.test(src)) {
-      img.src = src;
-      return;
-    }
-    img.dataset.mdSrc = src;
-    pointAt(img, resolveDocPath(docPath, safeDecodeUri(src)), src);
-  }
-
-  private drawMermaid(box: HTMLElement, source: string): void {
-    const theme = this.theme;
-    box.dataset.theme = theme;
-    renderMermaid(source, theme).then(
-      (svg) => {
-        if (box.dataset.theme !== theme) return; // a newer theme's render owns it
-        const holder = document.createElement("div");
-        holder.className = "md-mermaid-svg";
-        holder.innerHTML = svg; // sanitized by shared/mermaid (strict mode + DOMPurify)
-        box.classList.remove("md-mermaid-error");
-        box.replaceChildren(holder);
-      },
-      (err: unknown) => {
-        if (box.dataset.theme !== theme) return;
-        const note = document.createElement("p");
-        note.className = "md-mermaid-note";
-        note.textContent = `diagram error: ${err instanceof Error ? err.message : String(err)}`;
-        const pre = document.createElement("pre");
-        const code = document.createElement("code");
-        code.textContent = source;
-        pre.append(code);
-        box.classList.add("md-mermaid-error");
-        box.replaceChildren(note, pre);
-      },
-    );
-  }
 }
-
-
