@@ -315,6 +315,16 @@ async fn deliver(sink: &mut JsonlSink, io: &DriverIo, step: DriverStep) -> Deliv
     Delivery::Ok
 }
 
+/// Whether a `--version` line names exactly the pinned version. The line is
+/// the CLI's own phrasing ("2.1.204 (Claude Code)", "codex-cli 0.142.5"), so
+/// compare whole tokens: a substring test passes 0.157.10 against a 0.157.1
+/// pin.
+fn version_matches_pin(detected: &str, tested: &str) -> bool {
+    detected
+        .split(|c: char| c.is_whitespace() || c == '(' || c == ')')
+        .any(|token| token.strip_prefix('v').unwrap_or(token) == tested)
+}
+
 /// Journal + broadcast the client-visible face of a startup failure, then the
 /// terminal `Exited`. The handshake-failure exit paths previously returned
 /// before any event reached the pump: the reason and stderr tail went only to
@@ -425,11 +435,9 @@ pub async fn run_driver<D: Driver>(driver: D, spec: SpawnSpec, mut io: DriverIo)
     // pinned TESTED_*_VERSION, but most updates stay compatible — refusing to
     // spawn would break every routine update. A daemon log line (never a chat
     // notice — unparsed frames already degrade visibly on their own) is the
-    // ready-made diagnosis when a drifted binary later misbehaves. Substring
-    // match because the probe line is the CLI's own phrasing
-    // ("2.1.204 (Claude Code)", "codex-cli 0.142.5").
+    // ready-made diagnosis when a drifted binary later misbehaves.
     if let Some(detected) = spec.agent_version.as_deref() {
-        if !detected.contains(driver.tested_version()) {
+        if !version_matches_pin(detected, driver.tested_version()) {
             tracing::warn!(
                 agent = driver.kind(),
                 detected,
@@ -565,5 +573,21 @@ pub async fn run_driver<D: Driver>(driver: D, spec: SpawnSpec, mut io: DriverIo)
     match exit {
         DriverExit::Clean(_) => DriverExit::Clean(status),
         other => other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::version_matches_pin;
+
+    #[test]
+    fn version_pin_matches_whole_tokens_only() {
+        assert!(version_matches_pin("2.1.283 (Claude Code)", "2.1.283"));
+        assert!(version_matches_pin("codex-cli 0.157.1", "0.157.1"));
+        assert!(version_matches_pin("codex-cli v0.157.1", "0.157.1"));
+        assert!(!version_matches_pin("codex-cli 0.157.10", "0.157.1"));
+        assert!(!version_matches_pin("codex-cli 0.157.1-alpha.2", "0.157.1"));
+        assert!(!version_matches_pin("12.1.283 (Claude Code)", "2.1.283"));
+        assert!(!version_matches_pin("", "2.1.283"));
     }
 }

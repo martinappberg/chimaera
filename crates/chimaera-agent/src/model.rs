@@ -32,6 +32,12 @@ pub const BG_LABEL_MAX: usize = 200;
 pub const BG_PATH_MAX: usize = 1024;
 /// One-line cap for the `SessionStatus` fields (a status line, not prose).
 pub const STATUS_DETAIL_MAX: usize = 256;
+/// Distinct unhandled agent→client request kinds (claude control subtypes,
+/// codex server-request methods) a session remembers having announced. Each
+/// kind is noticed once; the name is agent-influenced, so the set is bounded.
+pub const UNHANDLED_REQUESTS_CAP: usize = 64;
+/// Cap for an unhandled request's name in a notice or error reply.
+pub const UNHANDLED_REQUEST_NAME_MAX: usize = 80;
 /// `UserMessage.origin` for the message the daemon sends a resurrected
 /// session when a restart cut its work off (see `ChatManager::command_as`).
 pub const ORIGIN_RESTART: &str = "restart";
