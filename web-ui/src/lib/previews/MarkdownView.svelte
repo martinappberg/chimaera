@@ -93,6 +93,7 @@
     isMdMode,
     parseFrontmatter,
     parseSourcepos,
+    placeOffset,
     revealIndex,
     spanLines,
     stripFences,
@@ -539,13 +540,15 @@
   }
 
   // --- keeping your place across modes ----------------------------------------
-  // The top visible block's first source line, and how far its text sits
-  // below the view's top edge: every block of every mode knows its lines,
-  // so a switch puts the same block at the same height.
+  // The top visible block's first source line, how far its text sits below
+  // the view's top edge, and its height: every block of every mode knows
+  // its lines, so a switch puts the same block at the same height (one
+  // scrolled partly by keeps that share of itself by: `placeOffset`).
 
   interface Place {
     line: number;
     offset: number;
+    height: number;
   }
 
   /** The live/source editor, found from its DOM (null until mounted). */
@@ -578,7 +581,7 @@
       const r = el.getBoundingClientRect();
       if (r.bottom <= top + 1) continue;
       const range = parseSourcepos(el.getAttribute("data-sourcepos"));
-      if (range !== null) return { line: range.start, offset: r.top - top };
+      if (range !== null) return { line: range.start, offset: r.top - top, height: r.height };
     }
     return null;
   }
@@ -597,8 +600,8 @@
         place.line,
       );
       if (i < 0) return;
-      const top = blocks[i].getBoundingClientRect().top - root.getBoundingClientRect().top;
-      root.scrollTop += top - place.offset;
+      const r = blocks[i].getBoundingClientRect();
+      root.scrollTop += r.top - root.getBoundingClientRect().top - placeOffset(place.offset, place.height, r.height);
     });
   }
 
@@ -609,7 +612,7 @@
       if (req !== modeReq) return;
       const view = editorView();
       if (view !== null && view.scrollDOM.clientHeight > 0) {
-        liveMod?.restoreEditorPlace(view, place.line, place.offset);
+        liveMod?.restoreEditorPlace(view, place.line, place.offset, place.height);
         return;
       }
       await new Promise((r) => requestAnimationFrame(r));

@@ -8,10 +8,32 @@ import {
   parseFrontmatter,
   parseLineFragment,
   parseSourcepos,
+  placeOffset,
   revealIndex,
   spanLines,
   stripFences,
 } from "./mdDoc";
+
+describe("placeOffset", () => {
+  it("keeps a block in view at its offset", () => {
+    expect(placeOffset(12, 90, 22)).toBe(12);
+    expect(placeOffset(0, 90, 22)).toBe(0);
+  });
+  it("keeps the share of a block scrolled partly by", () => {
+    // A 90px figure 40px past the edge is one 22px source line.
+    expect(placeOffset(-40, 90, 22)).toBeCloseTo(-9.78, 2);
+    expect(placeOffset(-9.78, 22, 90)).toBeCloseTo(-40, 1);
+    expect(placeOffset(-30, 60, 60)).toBe(-30);
+  });
+  it("keeps the gap below a block wholly past the edge", () => {
+    expect(placeOffset(-40, 27, 27)).toBe(-40);
+    expect(placeOffset(-40, 27, 58)).toBe(-71);
+  });
+  it("falls back to the offset without heights", () => {
+    expect(placeOffset(-40, 0, 22)).toBe(-40);
+    expect(placeOffset(-40, 90, 0)).toBe(-40);
+  });
+});
 
 describe("parseFrontmatter", () => {
   it("reads scalars, flow lists and booleans", () => {

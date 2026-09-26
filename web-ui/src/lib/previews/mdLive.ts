@@ -55,6 +55,7 @@ import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
 import { languages } from "@codemirror/language-data";
 import type { SyntaxNode, SyntaxNodeRef, Tree } from "@lezer/common";
 import { lastRawTicketUrl, rawTicketUrl, resolveDocPath, safeDecodeUri } from "./files";
+import { placeOffset } from "./mdDoc";
 import { MATH_MARK, isDisplayMath, isMath, mathDelimiters, mathSource } from "./mdMath";
 import { docExtensions } from "./doc/parser";
 import { outlineOf, type OutlineEntry } from "./doc/model";
@@ -1521,10 +1522,16 @@ export function scrollEditorTo(view: EditorView, pos: number): void {
   view.dispatch({ effects: EditorView.scrollIntoView(pos, { y: "start", yMargin: JUMP_MARGIN }) });
 }
 
-/** Where the top visible block's text begins on screen, for a block that
- *  starts at `pos`: a rendered block's first element (below its gap), a
- *  source line's box. Null while not laid out. */
-function contentTop(view: EditorView, pos: number): number | null {
+/** The end of the top-level block whose first line starts at `pos`. */
+function blockEnd(view: EditorView, pos: number): number {
+  const n = syntaxTree(view.state).topNode.childBefore(pos + 1);
+  return n !== null && n.to >= pos ? n.to : view.state.doc.lineAt(pos).to;
+}
+
+/** Where the top visible block's text is on screen, for a block from `pos`
+ *  to `end`: a rendered block's first element (below its gap), else its
+ *  source lines. Null while not laid out. */
+function contentBox(view: EditorView, pos: number, end: number): { top: number; height: number } | null {
   let at: Node | null;
   try {
     const d = view.domAtPos(pos, 1);
@@ -1539,16 +1546,20 @@ function contentTop(view: EditorView, pos: number): number | null {
   if (el === null) return null;
   if (el.classList.contains("lp-block") || el.classList.contains("lp-props")) {
     const first = Array.from(el.children).find((c) => !c.classList.contains("lp-ghost-tail"));
-    return (first ?? el).getBoundingClientRect().top;
+    const r = (first ?? el).getBoundingClientRect();
+    return { top: r.top, height: r.height };
   }
-  return el.getBoundingClientRect().top;
+  const top = el.getBoundingClientRect().top;
+  const bottom = view.lineBlockAt(Math.min(end, view.state.doc.length)).bottom + view.documentTop;
+  return { top, height: Math.max(0, bottom - top) };
 }
 
 /** The editor's place: the first line of the block at the top of the
- *  visible area and how far its text sits below that edge (negative when
- *  scrolled into it). Null while hidden. Reading maps it through the
- *  blocks' source lines, so a mode switch keeps the same block on top. */
-export function editorPlace(view: EditorView): { line: number; offset: number } | null {
+ *  visible area, how far its text sits below that edge (negative when
+ *  scrolled into it), and its height. Null while hidden. Reading maps it
+ *  through the blocks' source lines, so a mode switch keeps the same block
+ *  on top. */
+export function editorPlace(view: EditorView): { line: number; offset: number; height: number } | null {
   const rect = view.scrollDOM.getBoundingClientRect();
   if (rect.height <= 0) return null;
   const docY = rect.top - view.documentTop;
@@ -1561,19 +1572,23 @@ export function editorPlace(view: EditorView): { line: number; offset: number } 
   const n = syntaxTree(view.state).topNode.childBefore(block.from + 1);
   if (n !== null && n.from < start) start = view.state.doc.lineAt(n.from).from;
   const first = start === block.from ? block : view.lineBlockAt(start);
-  const top = contentTop(view, start);
+  const box = contentBox(view, start, blockEnd(view, start));
   return {
     line: view.state.doc.lineAt(start).number,
-    offset: top === null || first.bottom < docY ? first.top - docY : top - rect.top,
+    offset: box === null || first.bottom < docY ? first.top - docY : box.top - rect.top,
+    height: box?.height ?? 0,
   };
 }
 
-/** Put line `line`'s block at `offset` below the visible top: scrolled
- *  there by the height map first, then corrected against the drawn text
- *  once it is laid out (a block the map only estimated). */
-export function restoreEditorPlace(view: EditorView, line: number, offset: number): void {
+/** Put line `line`'s block at `offset` below the visible top (a share of
+ *  it past the edge when it was `height` tall and scrolled into:
+ *  `placeOffset`): scrolled there by the height map first, then corrected
+ *  against the drawn text once it is laid out (a block the map only
+ *  estimated). */
+export function restoreEditorPlace(view: EditorView, line: number, offset: number, height = 0): void {
   const doc = view.state.doc;
   const pos = doc.line(Math.min(Math.max(1, line), doc.lines)).from;
+  const end = blockEnd(view, pos);
   view.dispatch({ effects: EditorView.scrollIntoView(pos, { y: "start", yMargin: offset }) });
   // Between frames, not inside CodeMirror's measure: a scroll there is
   // taken as the anchor's own movement and undone. Blocks drawn for the
@@ -1581,9 +1596,9 @@ export function restoreEditorPlace(view: EditorView, line: number, offset: numbe
   let still = 0;
   const correct = (tries: number): void => {
     if (!view.dom.isConnected) return;
-    const top = contentTop(view, pos);
-    if (top === null) return;
-    const d = top - view.scrollDOM.getBoundingClientRect().top - offset;
+    const box = contentBox(view, pos, end);
+    if (box === null) return;
+    const d = box.top - view.scrollDOM.getBoundingClientRect().top - placeOffset(offset, height, box.height);
     if (Math.abs(d) > 0.5) {
       view.scrollDOM.scrollTop += d;
       still = 0;
