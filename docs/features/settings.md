@@ -55,6 +55,15 @@ a `settings` frame on `/ws/events`. Map: [settings/AGENTS.md](../../web-ui/src/l
   agent/mode are workspace state edited in its setup card, while Environment preludes remain scoped
   records rather than being flattened into global preferences.
 
+## Updates status
+
+- **Updates section** (`UpdatesStatus.svelte`, above the `update.autoCheck` switch) — the one place that
+  answers "is there an update?": a line each for the app (native), the daemon serving this window
+  ("chimaera" in a browser, "local daemon" / "daemon on \<host\>" in the app) and the agent CLIs (one
+  summary line, "Agents ↓" jumps there). Each says up to date / \<new\> available / couldn't check (with
+  the reason) / not checked yet, plus when it last checked and the cadence; "check now" asks every source
+  at once. Agents read "up to date" only when every installed agent's version and latest are both known.
+
 ## Agents settings & themes
 
 - **Agents panel** (`AgentsSettings.svelte`) — update/uninstall managed agent runtimes and set an

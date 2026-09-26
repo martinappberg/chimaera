@@ -120,13 +120,25 @@ PTY snapshot-on-attach ([terminals.md](terminals.md)) and the chat seq-journal g
   newer chimaera exists — so even a browser-only user learns about updates from the daemon they're
   already talking to. *Applying* updates stays with the clients (the app's signed updater;
   `chimaera connect --update-daemon`).
-- **Where it lives.** `update.rs` (`get_update`, `run_checker`). Route `GET /api/v1/update` + an
-  `update` frame on `/ws/events`.
+- **Where it lives.** `update.rs` (`get_update`, `run_checker`, `check_now`). Route `GET /api/v1/update`
+  (`?refresh=true` = "check now") + an `update` frame on `/ws/events`.
 - **Key behaviors.** Transport is a bounded `curl` subprocess (10s, 1 MB) — the one HTTP client every
   HPC site ships and proxies. Check interval 6h with a 60s initial delay (staggers login nodes booting
   together). Dev builds (version `0.0.1`) stay silent and off the network unless `CHIMAERA_RELEASES_API`
-  overrides; users can disable with `update.autoCheck`. Test knobs: `CHIMAERA_RELEASES_API`,
-  `CHIMAERA_UPDATE_CURRENT`.
+  overrides; users can disable with `update.autoCheck` (an explicit `?refresh=true` still runs — the
+  setting governs phoning home on its own). Test knobs: `CHIMAERA_RELEASES_API`,
+  `CHIMAERA_UPDATE_CURRENT` (also reported as `current`, so a dev build exercises the whole UI).
+- **A failed check is reported as one.** The status carries one `state` word
+  (`unchecked | current | available | failed`), `checked_at` (last attempt) vs `succeeded_at`
+  (last answer), the failure in plain words (`error`: curl's own diagnosis minus its prefix; a
+  GitHub 403/429 is named as the rate limit a shared login-node address hits), `dev`, and
+  `interval_secs`. A known newer release outranks a later failed re-check — the release didn't stop
+  existing. Every finished check moves the epoch, so windows' "checked 2h ago" stays true. Checks are
+  serialized (`AppState.update_check`): a "check now" landing mid-check waits and reuses that answer.
+- **Where it shows.** The update toast ([native-app.md](native-app.md#update-toast)), Settings → Updates
+  ([settings.md](settings.md#updates-status)), and the home screen's version stamp — "· \<new\>
+  available" in accent when a release is known, a hover that says when it last checked, and a click that
+  checks now.
 
 ---
 

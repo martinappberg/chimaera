@@ -12,8 +12,12 @@
 //! Periodic awareness lives here too: a slow loop re-checks the updater
 //! endpoint and broadcasts `app-update` to every window, so the toast shows
 //! up wherever you are working, not just on a freshly opened home screen.
+//! Every check's outcome is also kept (`status`), so a window opened after
+//! the broadcast — or one asking "am I up to date?" — reads the answer
+//! instead of waiting six hours for the next one.
 
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -77,28 +81,95 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-/// One updater check. `None` = up to date, or the endpoint is unreachable —
-/// a missing release must never surface as an error on a timer.
-pub async fn poll_app_update(app: &AppHandle) -> Option<String> {
-    let updater = app.updater().ok()?;
-    match updater.check().await {
-        Ok(Some(update)) => Some(update.version),
-        Ok(None) => None,
-        Err(e) => {
-            tracing::debug!("update check unavailable: {e}");
-            None
+/// What the shell last learned from the signed-update endpoint — the
+/// native half of "is there an update?", beside the daemon's
+/// `GET /api/v1/update`. A failed check keeps the last known answer and says
+/// why it failed, so "couldn't check" never reads as "up to date".
+#[derive(Clone, Default, Serialize)]
+pub struct AppUpdateStatus {
+    /// This app's own version.
+    pub current: String,
+    /// A dev build never checks: its "update" would swap the build under test.
+    pub dev: bool,
+    /// The most recent check attempt (unix seconds), successful or not.
+    pub checked_at: Option<u64>,
+    /// A newer signed version, when the last good answer had one.
+    pub available: Option<String>,
+    /// Why the most recent attempt failed; cleared by the next success.
+    pub error: Option<String>,
+    /// The periodic re-check cadence, so the UI can say "every 6 hours".
+    pub interval_secs: u64,
+}
+
+struct Known {
+    checked_at: Option<u64>,
+    available: Option<String>,
+    error: Option<String>,
+}
+
+static KNOWN: Mutex<Known> = Mutex::new(Known {
+    checked_at: None,
+    available: None,
+    error: None,
+});
+
+fn known() -> std::sync::MutexGuard<'static, Known> {
+    KNOWN.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The last check's outcome, without checking.
+pub fn status(app: &AppHandle) -> AppUpdateStatus {
+    let known = known();
+    AppUpdateStatus {
+        current: app.package_info().version.to_string(),
+        dev: chimaera_core::is_dev_build(),
+        checked_at: known.checked_at,
+        available: known.available.clone(),
+        error: known.error.clone(),
+        interval_secs: CHECK_INTERVAL.as_secs(),
+    }
+}
+
+/// One updater check, recorded. A dev build is answered without the network
+/// (it never offers a release); an unreachable endpoint is recorded as the
+/// failure it is and logged at debug — never raised on a timer.
+pub async fn check(app: &AppHandle) -> AppUpdateStatus {
+    if chimaera_core::is_dev_build() {
+        return status(app);
+    }
+    let result = match app.updater() {
+        Ok(updater) => updater.check().await.map_err(|e| e.to_string()),
+        Err(e) => Err(e.to_string()),
+    };
+    {
+        let mut known = known();
+        known.checked_at = Some(unix_now());
+        match result {
+            Ok(update) => {
+                known.available = update.map(|u| u.version);
+                known.error = None;
+            }
+            Err(e) => {
+                tracing::debug!("update check unavailable: {e}");
+                // Bounded: this rides IPC into every asking window.
+                known.error = Some(e.chars().take(200).collect());
+            }
         }
     }
+    status(app)
 }
 
 /// Broadcast `app-update` to every window whenever a newer signed build
 /// exists. Windows decide presentation (the toast) and snoozing; the shell
-/// only reports.
+/// only reports. A dev build never polls (see `check`).
 pub fn spawn_update_watch(app: AppHandle) {
+    if chimaera_core::is_dev_build() {
+        return;
+    }
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(INITIAL_DELAY).await;
         loop {
-            if let Some(version) = poll_app_update(&app).await {
+            if let Some(version) = check(&app).await.available {
                 let _ = app.emit("app-update", version);
             }
             tokio::time::sleep(CHECK_INTERVAL).await;

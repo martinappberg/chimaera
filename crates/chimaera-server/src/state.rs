@@ -47,6 +47,9 @@ pub(crate) struct AppState {
     pub(crate) agent_updates: Mutex<HashMap<agents::AgentKind, agent_updates::AgentLatest>>,
     /// Bumped when the update status changes; drives the `update` ws frame.
     pub(crate) update_epoch: std::sync::atomic::AtomicU64,
+    /// Serializes release checks (the periodic one and any "check now"), so
+    /// concurrent asks share one fetch — see `update::check_now`.
+    pub(crate) update_check: tokio::sync::Mutex<()>,
     /// User settings (the settings.json ground truth), stored in the config
     /// dir; mtime-checked on read so hand-edits surface without a restart.
     pub(crate) settings: Mutex<settings::SettingsStore>,
@@ -247,6 +250,7 @@ impl AppState {
             session_themes: Mutex::new(HashMap::new()),
             update: Mutex::new(update::UpdateStatus::default()),
             update_epoch: std::sync::atomic::AtomicU64::new(0),
+            update_check: tokio::sync::Mutex::new(()),
             agent_updates: Mutex::new(HashMap::new()),
             settings: Mutex::new(settings::SettingsStore::load(
                 config_dir.join("settings.json"),
