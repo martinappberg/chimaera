@@ -2292,6 +2292,363 @@ mod markdown_tests {
     }
 }
 
+/// The reading view's parity corpus: every construct the client renderer
+/// (`web-ui/src/lib/previews/doc/`) draws, rendered here through comrak +
+/// ammonia and compared under one normalization — Vitest runs the client
+/// half over the same file with the same steps (`doc/parity.test.ts`).
+#[cfg(test)]
+mod markdown_parity_tests {
+    use super::*;
+
+    const PARITY_FIXTURE: &str =
+        include_str!("../../../web-ui/src/lib/previews/doc/parity.fixture.json");
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Divergence {
+        side: String,
+        reason: String,
+    }
+
+    /// Strict on purpose: a misspelled key would silently drop its pin.
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ParityCase {
+        note: String,
+        md: String,
+        html: String,
+        diverges: Option<Divergence>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ParityFixture {
+        about: Vec<String>,
+        cases: Vec<ParityCase>,
+    }
+
+    /// The only attributes compared: what the reading view's CSS and link,
+    /// anchor and task logic key on. Everything else (`data-sourcepos`,
+    /// `rel`, `title`, the math marker) is dropped.
+    const KEEP_ATTRS: &[&str] = &[
+        "align",
+        "alt",
+        "class",
+        "data-task",
+        "href",
+        "id",
+        "src",
+        "start",
+    ];
+
+    /// Whitespace next to these tags is layout, not content.
+    const BLOCK_TAGS: &[&str] = &[
+        "address",
+        "article",
+        "aside",
+        "blockquote",
+        "br",
+        "dd",
+        "details",
+        "div",
+        "dl",
+        "dt",
+        "figcaption",
+        "figure",
+        "footer",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "header",
+        "hr",
+        "li",
+        "ol",
+        "p",
+        "pre",
+        "section",
+        "summary",
+        "table",
+        "tbody",
+        "td",
+        "tfoot",
+        "th",
+        "thead",
+        "tr",
+        "ul",
+    ];
+
+    /// Named references the normalization decodes (numeric ones always):
+    /// the serializer's own plus the few the corpus writes.
+    const ENTITIES: &[(&str, &str)] = &[
+        ("amp", "&"),
+        ("lt", "<"),
+        ("gt", ">"),
+        ("quot", "\""),
+        ("apos", "'"),
+        ("nbsp", "\u{a0}"),
+        ("copy", "\u{a9}"),
+        ("hellip", "\u{2026}"),
+        ("mdash", "\u{2014}"),
+        ("ndash", "\u{2013}"),
+    ];
+
+    enum Token {
+        Text(String),
+        Tag {
+            name: String,
+            close: bool,
+            attrs: Vec<(String, String)>,
+        },
+    }
+
+    fn decode_entities(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut rest = s;
+        while let Some(i) = rest.find('&') {
+            out.push_str(&rest[..i]);
+            rest = &rest[i..];
+            let decoded = rest.find(';').and_then(|end| {
+                let name = &rest[1..end];
+                let ch = if let Some(num) = name.strip_prefix('#') {
+                    let code = match num.strip_prefix(['x', 'X']) {
+                        Some(hex) => u32::from_str_radix(hex, 16).ok(),
+                        None => num.parse().ok(),
+                    };
+                    code.and_then(char::from_u32).map(String::from)
+                } else {
+                    ENTITIES
+                        .iter()
+                        .find(|(n, _)| *n == name)
+                        .map(|(_, v)| (*v).to_owned())
+                };
+                ch.map(|c| (c, end + 1))
+            });
+            match decoded {
+                Some((text, len)) => {
+                    out.push_str(&text);
+                    rest = &rest[len..];
+                }
+                None => {
+                    out.push('&');
+                    rest = &rest[1..];
+                }
+            }
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// Tags and text; comments are dropped. A `<` that opens no tag is text.
+    fn tokenize(html: &str) -> Vec<Token> {
+        let b = html.as_bytes();
+        let mut tokens = Vec::new();
+        let mut text_from = 0;
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] != b'<' {
+                i += 1;
+                continue;
+            }
+            if html[i..].starts_with("<!--") {
+                tokens.push(Token::Text(html[text_from..i].to_owned()));
+                i = html[i..].find("-->").map_or(b.len(), |e| i + e + 3);
+                text_from = i;
+                continue;
+            }
+            let close = b.get(i + 1) == Some(&b'/');
+            let mut j = i + 1 + usize::from(close);
+            if !b.get(j).is_some_and(u8::is_ascii_alphabetic) {
+                i += 1;
+                continue;
+            }
+            let name_from = j;
+            while b.get(j).is_some_and(u8::is_ascii_alphanumeric) {
+                j += 1;
+            }
+            let name = html[name_from..j].to_ascii_lowercase();
+            let mut attrs = Vec::new();
+            let mut closed = false;
+            while j < b.len() {
+                match b[j] {
+                    b'>' => {
+                        j += 1;
+                        closed = true;
+                        break;
+                    }
+                    b' ' | b'\t' | b'\n' | b'\r' | b'/' => j += 1,
+                    _ => {
+                        let from = j;
+                        while j < b.len() && !b" \t\n\r=>/".contains(&b[j]) {
+                            j += 1;
+                        }
+                        let attr = html[from..j].to_ascii_lowercase();
+                        while j < b.len() && b" \t\n\r".contains(&b[j]) {
+                            j += 1;
+                        }
+                        let mut value = String::new();
+                        if b.get(j) == Some(&b'=') {
+                            j += 1;
+                            while j < b.len() && b" \t\n\r".contains(&b[j]) {
+                                j += 1;
+                            }
+                            let from = j;
+                            match b.get(j) {
+                                Some(&q @ (b'"' | b'\'')) => {
+                                    let end = html[j + 1..]
+                                        .find(q as char)
+                                        .map_or(b.len(), |e| j + 1 + e);
+                                    value = html[j + 1..end].to_owned();
+                                    j = (end + 1).min(b.len());
+                                }
+                                _ => {
+                                    while j < b.len() && !b" \t\n\r>".contains(&b[j]) {
+                                        j += 1;
+                                    }
+                                    value = html[from..j].to_owned();
+                                }
+                            }
+                        }
+                        attrs.push((attr, decode_entities(&value)));
+                    }
+                }
+            }
+            if !closed {
+                break;
+            }
+            tokens.push(Token::Text(html[text_from..i].to_owned()));
+            tokens.push(Token::Tag { name, close, attrs });
+            i = j;
+            text_from = j;
+        }
+        tokens.push(Token::Text(html[text_from..].to_owned()));
+        tokens
+    }
+
+    /// The corpus's normalization: lowercase tags, only [`KEEP_ATTRS`]
+    /// (sorted, `class` whitespace collapsed), entities decoded and
+    /// re-escaped one way, ASCII whitespace collapsed, whitespace beside a
+    /// block tag dropped, comments gone. `doc/parity.test.ts` mirrors it.
+    fn normalize(html: &str) -> String {
+        let is_block = |t: Option<&Token>| matches!(t, Some(Token::Tag { name, .. }) if BLOCK_TAGS.contains(&name.as_str()));
+        let tokens = tokenize(html);
+        let mut out = String::with_capacity(html.len());
+        for (k, token) in tokens.iter().enumerate() {
+            match token {
+                Token::Text(raw) => {
+                    let decoded = decode_entities(raw);
+                    let mut text = String::with_capacity(decoded.len());
+                    let mut space = false;
+                    for c in decoded.chars() {
+                        if matches!(c, ' ' | '\t' | '\n' | '\r' | '\u{c}') {
+                            space = true;
+                            continue;
+                        }
+                        if space {
+                            text.push(' ');
+                            space = false;
+                        }
+                        text.push(c);
+                    }
+                    if space {
+                        text.push(' ');
+                    }
+                    let mut text = text.as_str();
+                    if k == 0 || is_block(k.checked_sub(1).and_then(|p| tokens.get(p))) {
+                        text = text.trim_start_matches(' ');
+                    }
+                    if k + 1 == tokens.len() || is_block(tokens.get(k + 1)) {
+                        text = text.trim_end_matches(' ');
+                    }
+                    for c in text.chars() {
+                        match c {
+                            '&' => out.push_str("&amp;"),
+                            '<' => out.push_str("&lt;"),
+                            '>' => out.push_str("&gt;"),
+                            _ => out.push(c),
+                        }
+                    }
+                }
+                Token::Tag { name, close, attrs } => {
+                    out.push('<');
+                    if *close {
+                        out.push('/');
+                    }
+                    out.push_str(name);
+                    let mut kept: Vec<&(String, String)> = attrs
+                        .iter()
+                        .filter(|(k, _)| KEEP_ATTRS.contains(&k.as_str()))
+                        .collect();
+                    kept.sort_by(|a, b| a.0.cmp(&b.0));
+                    for (attr, value) in kept {
+                        let value = if attr == "class" {
+                            value.split_ascii_whitespace().collect::<Vec<_>>().join(" ")
+                        } else {
+                            value.clone()
+                        };
+                        out.push(' ');
+                        out.push_str(attr);
+                        out.push_str("=\"");
+                        out.push_str(&value.replace('&', "&amp;").replace('"', "&quot;"));
+                        out.push('"');
+                    }
+                    out.push('>');
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn normalization_is_the_documented_one() {
+        assert_eq!(
+            normalize("<P data-sourcepos=\"1:1-1:3\" CLASS=\" a  b \">x\n  y</P>\n<!-- c --><br />\nz &amp; &lt;&#65;&copy;"),
+            "<p class=\"a b\">x y</p><br>z &amp; &lt;A\u{a9}"
+        );
+        assert_eq!(
+            normalize("<a title=\"t\" href=\"/x?a=1&amp;b=2\" rel=\"noopener\">l</a> <em>e</em>"),
+            "<a href=\"/x?a=1&amp;b=2\">l</a> <em>e</em>"
+        );
+    }
+
+    #[test]
+    fn parity_corpus_matches_the_server_render() {
+        let fixture: ParityFixture =
+            serde_json::from_str(PARITY_FIXTURE).expect("the fixture parses");
+        assert!(!fixture.about.is_empty());
+        assert!(
+            fixture.cases.len() >= 80,
+            "the corpus covers every construct"
+        );
+        let mut failures = Vec::new();
+        for c in &fixture.cases {
+            if let Some(d) = &c.diverges {
+                assert!(
+                    matches!(d.side.as_str(), "client" | "server") && !d.reason.is_empty(),
+                    "{}: a divergence names its side and reason",
+                    c.note
+                );
+                if d.side == "server" {
+                    continue;
+                }
+            }
+            // The body only: `markdown_to_html` sets frontmatter aside, as
+            // the reading view's properties panel shows it instead.
+            let got = normalize(&sanitize_markdown(&markdown_to_html(&c.md)));
+            let want = normalize(&c.html);
+            if got != want {
+                failures.push(format!(
+                    "{}\n  md:   {:?}\n  want: {want}\n  got:  {got}",
+                    c.note, c.md
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+}
+
 #[derive(Deserialize)]
 pub(crate) struct TableQuery {
     path: String,
