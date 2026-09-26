@@ -84,6 +84,8 @@
   import Chevron from "../shared/Chevron.svelte";
   import Spinner from "./Spinner.svelte";
   import DocIssues from "./DocIssues.svelte";
+  import PublishButton from "./PublishButton.svelte";
+  import { HoverPreviews } from "./doc/hoverPreview.svelte";
   import { hasUrlScheme, isWebUrl, urlMenuEntries } from "../shared/urlOpen";
   import { contextMenu } from "../shared/contextMenu.svelte";
   import { revealRequest, takeReveal, type Reveal } from "../shared/reveal";
@@ -1262,6 +1264,37 @@
     }
     currentHeading = i;
   }
+
+  // --- hover previews on links (doc/hoverPreview) ------------------------------------
+  // Reading: rest on a link; live: hold Mod over one; either: Mod+K on it.
+  // Everything is read when a preview is due, so the controller is made
+  // once per content box; a mode switch or another document closes it.
+  let hoverPreviews: HoverPreviews | null = null;
+  $effect(() => {
+    const root = contentEl;
+    if (root === null) return;
+    const h = new HoverPreviews({
+      root,
+      docPath: () => filePath,
+      mode: () => mode,
+      text: () => docText,
+      links: linkContext,
+      embeds: () => docEmbeds,
+      theme: () => themeMode,
+      fontSize: () => bodyFont,
+      editor: editorView,
+    });
+    hoverPreviews = h;
+    return () => {
+      h.destroy();
+      if (hoverPreviews === h) hoverPreviews = null;
+    };
+  });
+  $effect(() => {
+    void mode;
+    void filePath;
+    hoverPreviews?.hide();
+  });
 </script>
 
 <!-- The frontmatter as properties: a sibling of the article, never inside
@@ -1360,6 +1393,7 @@
     {/if}
     <span class="md-bar-fill"></span>
     <DocIssues {path} {wsRoot} mtime={entry?.mtime ?? null} />
+    <PublishButton {path} text={docText} links={linkContext} />
     <button
       class="seg"
       class:on={outlineOpen}
