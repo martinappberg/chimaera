@@ -260,6 +260,13 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   http(s)/`data:image` URLs and leave other schemes as source. The live mode mirrors all of
   it (quote cards, ticketed image widgets, fence + quote copy) inside the editor; raw HTML
   in a document is **never rendered** there — it stays visible source.
+
+  The toolbar carries a quiet **"N issues"** chip (`previews/DocIssues.svelte`) when the
+  daemon's portable-dialect check (`GET /api/v1/fs/check_document`) finds errors or warnings:
+  broken links and embeds, missing anchors, absolute paths, missing alt text, syntax GitHub
+  shows as literal text. Clicking an issue reveals its line; it re-checks after disk changes,
+  only while visible. Details:
+  [agents.md](agents.md#documents-the-portable-dialect-check_document-and-the-issues-chip).
 - **Tables (CSV/TSV, incl. gzip).** `GET /api/v1/fs/table?path=&offset_rows=&limit_rows=&delim=auto`
   returns one page (header row + string cells; rows cap 1000/page; delimiter auto-sniffed; `.gz`/`.bgz`
   transparent). `TableView.svelte`. Bioinformatics reality — big delimited files are the norm.
