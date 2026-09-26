@@ -25,6 +25,7 @@
    * near the viewport, stay fresh when a file is overwritten, and say so
    * when one is gone.
    */
+  import type { Snippet } from "svelte";
   import Chevron from "../shared/Chevron.svelte";
   import FileIcon from "../shared/FileIcon.svelte";
   import EmbedCard from "../shared/embed/EmbedCard.svelte";
@@ -48,6 +49,9 @@
     /** Resolves mentioned paths against the session's directories. */
     resolver?: EmbedResolver;
     onOpenPath?: (path: string, kind: PathKind, opts?: OpenPathOptions) => void;
+    /** The reply's rail (time · copy · fork), signing off after the block:
+     *  at the right end of the chip line, or under the tiles. */
+    rail?: Snippet;
   }
 
   let {
@@ -58,6 +62,7 @@
     covered = [],
     resolver,
     onOpenPath,
+    rail,
   }: Props = $props();
 
   /** Precise about what the block is: everything the turn wrote, or what
@@ -240,6 +245,9 @@
   {#if visuals.length > 0}
     <div class="label">{heading}</div>
     {@render tiles(visuals, heading.toLowerCase())}
+    {#if rail !== undefined && documents.length === 0}
+      <div class="rail-row">{@render rail()}</div>
+    {/if}
   {/if}
   {#if documents.length > 0}
     <!-- Documents are opened, not stared at: one chip each, the same quiet
@@ -273,6 +281,9 @@
         preview
         <Chevron open={peek} />
       </button>
+      {#if rail !== undefined}
+        <span class="rail">{@render rail()}</span>
+      {/if}
     </div>
     {#if peek}
       {@render tiles(previewed, "documents written this turn, previewed")}
@@ -370,6 +381,16 @@
   }
   .files-label {
     margin-right: 2px;
+  }
+  /* The reply's rail, at the far end of the last row (or under the tiles). */
+  .rail {
+    display: inline-flex;
+    margin-left: auto;
+  }
+  .rail-row {
+    display: flex;
+    justify-content: flex-end;
+    margin: -4px 0 8px;
   }
   .chip,
   .more,

@@ -493,7 +493,9 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   chip line, so a turn costs one line. Two files sharing a name show their folders (against
   everything the turn wrote, linked in the prose or not). A chip knows
   its file: gone (struck, not clickable) or changed after this turn (its tooltip says so), kept
-  current by the disk monitor while on screen. A stopped or failed turn keeps its block. Tiles
+  current by the disk monitor while on screen. The reply's rail (time · copy · fork) signs off
+  after the block — at the end of the chip line, or under the tiles — rather than between the
+  prose and the block; it shows on hover of either. A stopped or failed turn keeps its block. Tiles
   stay fresh when a file is overwritten, and say so when one is gone.
 - **How the gallery finds shell-written files.** No structured event names them, so the reducer
   lists the artifact-shaped paths the turn's commands and command outputs *mention*, plus figures

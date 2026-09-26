@@ -1983,6 +1983,24 @@
     return byMessage;
   });
 
+  /** The turn-end blocks that carry the rail (time · copy · fork) of the
+   *  reply just above them: with a "written this turn" block after a reply,
+   *  the rail signs off the whole turn — after the figures and chips, not
+   *  between them and the prose. Keyed by the block's uid; `railMoved` is
+   *  the set of replies whose own rail is therefore absent. Adjacency by
+   *  render order, like turnDurations. */
+  const railHosts = $derived.by(() => {
+    const hosts = new Map<number, Extract<ChatBlock, { kind: "message" }>>();
+    renderBlocks.forEach((block, i) => {
+      if (block.kind !== "turn_end" || i === 0) return;
+      if (block.artifacts.length === 0 && block.mentioned.length === 0) return;
+      const prev = renderBlocks[i - 1];
+      if (prev.kind === "message") hosts.set(block.uid, prev);
+    });
+    return hosts;
+  });
+  const railMoved = $derived(new Set([...railHosts.values()].map((m) => m.uid)));
+
   /** Identity of the last block (the streaming reveal keys off it). Queued
    *  sends render from their own pending tail, not `blocks`, so this is
    *  simply the delivered-block tail. Compared by UID, not index: a frozen
@@ -2222,13 +2240,15 @@
               if (visible && atBottom && !composerEngaged) queueBottomScroll();
             }}
           />
-          <AgentMessageMeta
-            text={item.block.text}
-            sentAtMs={item.block.sentAtMs}
-            nowMs={messageTimeNowMs}
-            onFork={() => askFork(item.block, item.index)}
-            turnDuration={turnDurations.get(item.block.uid) ?? null}
-          />
+          {#if !railMoved.has(item.block.uid)}
+            <AgentMessageMeta
+              text={item.block.text}
+              sentAtMs={item.block.sentAtMs}
+              nowMs={messageTimeNowMs}
+              onFork={() => askFork(item.block, item.index)}
+              turnDuration={turnDurations.get(item.block.uid) ?? null}
+            />
+          {/if}
         </div>
       {:else if item.block.kind === "question"}
         <!-- The transcript's memory of an ask: invisible while the pending
@@ -2286,6 +2306,7 @@
         <div class="source-block" data-block-index={item.index} data-block-uid={item.block.uid}>
           <!-- What the turn made previews here, after the closing prose. -->
           {#if block.artifacts.length > 0 || block.mentioned.length > 0}
+            {@const signed = railHosts.get(block.uid)}
             <ArtifactGallery
               paths={block.artifacts}
               mentioned={block.mentioned}
@@ -2294,7 +2315,19 @@
               endedAtMs={block.endedAtMs}
               resolver={proseEmbeds}
               onOpenPath={openProsePath}
-            />
+            >
+              {#snippet rail()}
+                {#if signed !== undefined}
+                  <AgentMessageMeta
+                    text={signed.text}
+                    sentAtMs={signed.sentAtMs}
+                    nowMs={messageTimeNowMs}
+                    onFork={() => askFork(signed, store.blocks.indexOf(signed))}
+                    turnDuration={turnDurations.get(signed.uid) ?? null}
+                  />
+                {/if}
+              {/snippet}
+            </ArtifactGallery>
           {/if}
 
         </div>
@@ -2836,7 +2869,6 @@
     color: var(--err);
   }
   .msg.agent {
-    position: relative;
     padding: 2px 0;
   }
   /* A settled message and its hover rail are one inline flow: the rail
@@ -2852,20 +2884,15 @@
   .msg.agent > :global(.md > p:last-child) {
     display: inline;
   }
-  /* When the rail cannot follow the last word — the message ends with a
-     code block, a table, a figure the prose embeds — it floats at the
-     message's bottom-right corner on hover and takes no line of its own,
-     so nothing sits between the figure and whatever follows the turn. A
-     page-coloured backing keeps it legible over a full-width block. */
-  .msg.agent:not(:has(> :global(.md > p:last-child))) :global(.agent-message-meta),
-  .msg.agent:has(> :global(.md > p:last-child > .md-embed)) :global(.agent-message-meta) {
-    position: absolute;
-    right: 0;
-    bottom: 2px;
+  .msg.agent:not(:has(> :global(.md > p:last-child))) :global(.agent-message-meta) {
     margin-left: 0;
-    padding: 0 4px;
-    border-radius: 6px;
-    background: var(--bg);
+  }
+  /* A reply followed by a "written this turn" block hands its rail to the
+     block (see railHosts): the rail signs off the whole turn, after the
+     figures and chips, and shows on hover of either the reply or the block. */
+  .source-block:hover :global(.agent-message-meta),
+  .msg.agent:hover + .source-block :global(.agent-message-meta) {
+    opacity: 1;
   }
   .msg.agent.streaming :global(.agent-message-meta) {
     display: none;
