@@ -87,11 +87,19 @@ const DOC = [
   "",
 ].join("\n");
 
+/** Equal headings (one id each: `same`, `same-1`, …) around short blocks,
+ *  so most edits land between two of them. */
+const DUPS =
+  Array.from({ length: 10 }, (_, k) => `## Same\n\nword ${k}\n\n${k % 3 === 2 ? "> ## Same\n\n[d]: x\n\n" : ""}`).join("") +
+  "end\n";
+
 /** Frontmatter whose YAML opens a fence the editor's markdown parse runs
  *  to the end of the document. */
 const FENCED_FM = "---\ntitle: x\nexample: |\n  ```\n---\n\n";
 
 const INSERTS = ["x", " ", "\n", "\n\n", "- ", "```", "# ", "## ", "> ", "|", "**", "[", "---\n", "1. ", "[^1]", "<div>", "$$"];
+/** Typing that keeps a document's blocks as they are (most of the time). */
+const TYPING = ["x", " ", "ab"];
 
 describe("the live field's incremental update", () => {
   it("matches a full recomputation after every edit", () => {
@@ -102,9 +110,12 @@ describe("the live field's incremental update", () => {
       [11, false, DOC],
       [23, true, DOC],
       [42, true, DOC],
+      [13, true, DUPS, TYPING],
+      [29, true, DUPS, TYPING],
       [5, true, FENCED_FM + DOC],
     ] as const;
-    for (const [seed, focused, text] of runs) {
+    for (const [seed, focused, text, inserts = INSERTS] of runs) {
+      const typing = inserts === TYPING;
       const next = rng(seed);
       let focus: boolean = focused;
       let state = fresh(text, 30, focus);
@@ -122,10 +133,10 @@ describe("the live field's incremental update", () => {
           focus = !focus;
           spec = { effects: liveFocus(focus) };
         } else if (roll < 0.5 && len > 0) {
-          const to = Math.min(len, at + 1 + Math.floor(next() * 12));
+          const to = Math.min(len, at + 1 + (typing ? 0 : Math.floor(next() * 12)));
           spec = { changes: { from: at, to }, selection: { anchor: at } };
         } else {
-          const ins = INSERTS[Math.floor(next() * INSERTS.length)];
+          const ins = inserts[Math.floor(next() * inserts.length)];
           spec = { changes: { from: at, insert: ins }, selection: { anchor: at + ins.length } };
         }
         state = state.update(spec).state;
@@ -153,6 +164,37 @@ describe("the live field's incremental update", () => {
     }
     // Nearly every step compares.
     expect(treeDiffs).toBeLessThan(steps / 10);
+  });
+
+  it("keeps equal headings apart when typing between them", () => {
+    const text = "# Doc\n\n## Same\n\nbetween\n\n## Same\n\n[d]: x\n\nmiddle\n\n[d]: x\n\n## Same\n\nend\n";
+    for (const word of ["between", "middle"]) {
+      let state = fresh(text, text.indexOf(word), true);
+      for (const ch of "typed ") {
+        const at = state.selection.main.head;
+        state = state.update({ changes: { from: at, insert: ch }, selection: { anchor: at + 1 } }).state;
+        const want = summary(fresh(state.doc.toString(), state.selection.main.head, true));
+        const got = summary(state);
+        expect(got.keys, word).toEqual(want.keys);
+        expect(got.deco, word).toEqual(want.deco);
+      }
+      // Three headings, three ids.
+      const ids = state.field(liveField).keys.filter((k) => k.startsWith("ATXHeading2"));
+      expect(new Set(ids).size).toBe(3);
+    }
+    // One edit that swaps two equal headings' places (a quoted and a bare
+    // one): each keeps the id of its place, not its twin's.
+    const swap = "# Doc\n\n## Same\n\n> ## Same\n\nx\n\n## Same\n\nend\n";
+    let state = fresh(swap, swap.indexOf("x"), true);
+    const from = swap.indexOf("> ## Same");
+    const to = swap.indexOf("\n\nend");
+    state = state.update({
+      changes: { from, to, insert: "## Same\n\nx\n\n> ## Same" },
+      selection: { anchor: from + 10 },
+    }).state;
+    const want = summary(fresh(state.doc.toString(), state.selection.main.head, true));
+    expect(summary(state).keys).toEqual(want.keys);
+    expect(summary(state).deco).toEqual(want.deco);
   });
 
   it("draws the body from its own parse when a fence opened in the frontmatter runs on", () => {

@@ -473,14 +473,17 @@ function restructure(v: LiveState, tr: Transaction): (Structure & { i0: number; 
   const oldDoc = tr.startState.doc;
   const oldTree = syntaxTree(tr.startState);
   const oldFacts: string[] = [];
-  const kept = new Map<string, number>();
+  // The fact-bearing blocks in order: a heading's id is its place among the
+  // headings, so the k-th one after the edit keeps the k-th one's identity
+  // (never an equal twin's — two `## Notes` have two ids).
+  const kept: { text: string; i: number }[] = [];
   for (let i = i0; i <= i1; i++) {
     const s = segs[i];
     const f: string[] = [];
     for (const node of nodesIn(oldTree, s.blockFrom, s.blockTo)) factsIn(node, oldDoc, f);
     if (f.length === 0) continue;
     oldFacts.push(...f);
-    kept.set(`${s.names}\u0000${oldDoc.sliceString(s.blockFrom, s.blockTo)}`, i);
+    kept.push({ text: `${s.names}\u0000${oldDoc.sliceString(s.blockFrom, s.blockTo)}`, i });
   }
   const newFacts: string[][] = nodes.map((node) => {
     const f: string[] = [];
@@ -519,18 +522,20 @@ function restructure(v: LiveState, tr: Transaction): (Structure & { i0: number; 
   const deps = (_from: number, _to: number, src: string): string => (defs !== "" && src.includes("[") ? `\u0001${defs}` : "");
   const keys: string[] = [];
   const edges: Edges[] = [];
+  let facts = 0;
   for (const [k, s] of region.entries()) {
     if (newFacts[k].length > 0) {
-      const i = kept.get(`${s.names}\u0000${doc.sliceString(s.blockFrom, s.blockTo)}`);
-      if (i === undefined) return null;
-      keys.push(v.keys[i]);
-      edges.push(v.edges[i]);
+      const old = kept[facts++];
+      if (old === undefined || old.text !== `${s.names}\u0000${doc.sliceString(s.blockFrom, s.blockTo)}`) return null;
+      keys.push(v.keys[old.i]);
+      edges.push(v.edges[old.i]);
       continue;
     }
     const [key, e] = identity(doc, tree, s, deps);
     keys.push(key);
     edges.push(e);
   }
+  if (facts !== kept.length) return null;
   const delta = tr.changes.newLength - tr.changes.length;
   const shift = (s: Segment): Segment => ({
     ...s,
