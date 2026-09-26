@@ -27,6 +27,11 @@ the first new plugins on it ([latex-reports-plan.md](latex-reports-plan.md)).
    one static daemon over ssh still carries everything and nothing is downloaded
    to a host by surprise. Third-party plugins install into `~/.chimaera/plugins/`
    later, through the same host and limits.
+5. **Versions and updates are baked in.** Every plugin has a version and an API
+   version, an installed plugin can be updated (and rolled back) on its own
+   cadence with a visible, checksum-verified download, and the daemon says on
+   the card which version is running and where it came from
+   ([Versions and updates](#versions-and-updates)).
 
 ## The short version
 
@@ -299,16 +304,83 @@ lines and the attach sheet read the same routes.
   skills, hooks and agent-side pieces install through the agents' own managers,
   as the authoring guide requires) plus the crate and its `plugin.toml`, and a
   release that publishes `plugin.wasm`.
-- **Installed plugins (later):** `~/.chimaera/plugins/<id>/{plugin.toml,plugin.wasm}`,
-  written by a visible install from a release URL with the checksum shown, or by
-  `chimaera plugin add`. Same host, same limits; the card names the source; an
-  id that exists both embedded and installed is a conflict the card shows, never
-  a silent override. A component targeting a WIT version this daemon does not
-  serve renders "needs a newer chimaera" and stays off.
+- **Installed plugins:** `~/.chimaera/plugins/<id>/<version>/{plugin.toml,plugin.wasm}`
+  behind a `current` link, written by a visible install from a plugin
+  repository's release with the checksum shown, or by `chimaera plugin add`.
+  Same host, same limits; the card names the source and the version. Versions,
+  precedence between an embedded and an installed copy, compatibility gates and
+  updates are their own section: [Versions and updates](#versions-and-updates).
 - **Trust** is what the sandbox gives: a third-party plugin cannot read outside
   the workspace, cannot run anything, cannot reach the network, and cannot take
   the daemon down. What it can do is what the manifest says it adds, and every
   Timeline write it makes is attributed to it.
+
+## Versions and updates
+
+Plugins have their own release cadence, so versions and updates are part of the
+contract from the start, not a later feature. Everything here follows the two
+rules the daemon already applies to agent CLIs: never guess that an update
+exists, and never install or update anything without the user's click and a
+visible, checksum-verified download.
+
+- **Every manifest carries `version`** (the plugin's own, semver) and **`api`**
+  (the WIT version it targets), and may carry **`requires.chimaera`** (a semver
+  requirement on the daemon, for a plugin that needs a host import that arrived
+  in a later daemon). The manifest is the one source of truth: the build script
+  refuses a first-party plugin whose `plugin.toml` version differs from its
+  crate's `Cargo.toml` version, rather than injecting one.
+- **The wire says what is running.** `GET /plugins` and `GET /workspaces/{id}/plugins`
+  gain `version`, `api`, `source` (`embedded` | `installed`), the installed copy's
+  path, and `update` (`{version, url, checked_ms}`, present only when a check found
+  a newer compatible release). The card shows `name · version` with a source chip
+  ("ships with chimaera 0.4.1" or "installed"), an **Update** chip when one is
+  available, and **Remove** / **Use previous** for installed copies. Nothing
+  else on the wire changes.
+- **Layout:** `~/.chimaera/plugins/<id>/<version>/{plugin.toml,plugin.wasm}`
+  with an atomic `current` symlink swap (rename over the old link, the managed
+  agent runtimes' idiom in `runtimes.rs`). An update never touches the version
+  in use, the previous version stays for a one-click rollback, and moving
+  `current` drops the plugin's instances: a running session sees the new tools
+  on its next `tools/list` and the new paragraph at its next `initialize`.
+- **Precedence, never silent:** the same id embedded and installed → the higher
+  version loads and the card names both ("0.3.2 installed · 0.3.1 ships with
+  chimaera"); equal versions → the embedded copy; an installed copy older than
+  the embedded one is shown as stale with **Remove**.
+- **Compatibility gates, before a component loads:** `api` must be a WIT version
+  this host serves (0.1 now; a host may serve two worlds during a major
+  transition), and `requires.chimaera` must match `chimaera_core::VERSION`. A
+  mismatch renders "needs chimaera ≥ x" or "needs a newer plugin" on the card
+  and the plugin stays off. Because a component is portable across wasmtime
+  versions (only a precompiled `.cwasm` binds to one), a daemon update never
+  invalidates an installed plugin, and an additive WIT bump keeps every older
+  plugin loading.
+- **Where updates come from:** the manifest's `[release]` section, `github =
+  "owner/repo"` (the releases API; assets `plugin.wasm`, `plugin.toml` and
+  `SHA256SUMS`; tags `v<version>`), later a plain `url` base. The checker asks
+  each installed plugin's source at most once a day and on **Check now**, with
+  the same cadence and a `CHIMAERA_PLUGIN_RELEASES_API` test knob as the daemon's
+  own `update.rs`, compares semver, and only reports a release whose `api` and
+  `requires.chimaera` this daemon satisfies. It never downloads on its own.
+- **Update and install are one path:** `POST /plugins/{pid}/update` and
+  `POST /plugins/install {github, version?}` download `plugin.wasm` and
+  `plugin.toml` into `<id>/<version>/`, verify the sha256 against `SHA256SUMS`,
+  check the new manifest's gates, then swap `current`; any failure leaves the
+  old version current and says why. `chimaera plugin add|update|remove` are the
+  same routes from the CLI. Embedded plugins update with the daemon through the
+  existing update flow, and their card says so.
+- **State across versions:** the host's per-(plugin, workspace) state and the
+  per-workspace switch follow the plugin id, not the version. A new version must
+  tolerate what an older one stored (the API guide says so; Agent notes'
+  cursors are the example). A plugin that wants a clean slate writes a new key.
+- **Pinning, once plugins live in their own repositories:** `plugins/plugins.lock`
+  (id, version, source, sha256 of `plugin.wasm`) is what `scripts/build-plugins.sh`
+  fetches for the release binary, so a first-party bump is a reviewed change to
+  one file and the daemon embeds exactly those bytes.
+- **Versioning the interface itself:** the WIT package version is the contract.
+  Adding a host import is a minor bump (0.2 adds `exec` and `watch`); changing
+  or removing an export is a new major with a new world, which the host serves
+  beside the old one for a transition. The `chimaera-plugin-api` crate's
+  version tracks the WIT.
 
 ## Proof of concept: phases and what each must show
 
@@ -401,7 +473,34 @@ fixtures is byte-identical before and after (a snapshot test), the Timeline
 attribution tests pass, and the reader's own unit tests run natively in the
 plugin crate.
 
-### P3: docs and the live proof
+Measured (2026-09-26, macOS arm64, the daemon's tests in release,
+`--test-threads=1`, the `tests/fixtures/living` workspace):
+`plugins/dist/mycelium/plugin.wasm` is 305,006 bytes; the first `knowledge` ask
+(Cranelift compile + instantiate + read) takes 202 to 209 ms, about 200 ms of
+it the compile (the spike's 58 KB guest compiled in 25 to 50 ms); an ask in a
+second workspace (instantiate + read) 1.3 to 1.7 ms; the stamp-unchanged answer
+0.40 to 0.50 ms. The daemon's source loses 4,226 lines (`mycelium.rs`, the
+native manifest, the native tool arms) and gains 222.
+
+### P3: versions, the installed directory, updates
+
+Everything in [Versions and updates](#versions-and-updates): `version`, `api`
+and `requires.chimaera` in the manifest with the build script's version check;
+the wire fields and the card (version, source chip, Update, Remove, Use
+previous); the installed directory with `current` links, the precedence rule and
+the compatibility gates; the release checker behind `CHIMAERA_PLUGIN_RELEASES_API`;
+the install, update, remove and rollback routes with the checksum-verified
+download and the atomic swap; `chimaera plugin add|update|remove|list`. Tests
+run against a local fake releases server, as `update.rs`'s do: a newer
+compatible release is offered and an incompatible one is not, an update swaps
+`current` and drops instances, a bad checksum leaves the old version current,
+precedence picks the higher version and the card names both, a stale installed
+copy is flagged. The live proof installs a plugin from a fake release into the
+isolated daemon's home, sees it on the card, bumps the fake release, sees
+**Update**, updates, and watches a session's next `tools/list` carry the new
+version's tools.
+
+### P4: docs and the live proof
 
 Maps (`crates/chimaera-plugin-api/AGENTS.md`, `plugins/AGENTS.md`, the server
 map's plugins rows), the feature page, the authoring guide rewritten around the
@@ -411,12 +510,11 @@ when switched off; post and read through the MCP endpoint; the hook hint; a
 workspace with `.living/` showing Knowledge through the WASM reader; the fault
 path (a plugin built to panic) leaving the daemon up; RSS before and after.
 
-### P4: after the proof
+### P5: after the proof
 
-The installed-plugin directory and the Browse install; `exec` and `watch` in the
-WIT (0.2) and the LaTeX plan's `build` point on them; the UI-facing `query`
-route; precompiled first-party components if cold compile is slow on a login
-node.
+The Browse view over plugin repositories; `exec` and `watch` in the WIT (0.2)
+and the LaTeX plan's `build` point on them; the UI-facing `query` route;
+precompiled first-party components if cold compile is slow on a login node.
 
 ## Risks, and what the spike answered
 
