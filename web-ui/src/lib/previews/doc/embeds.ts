@@ -16,7 +16,7 @@ import type { Tree } from "@lezer/common";
 import { inlineOf, type DocText, type InlineOptions } from "../mdTable";
 import { isMath } from "../mdMath";
 import { dirname, fsValidate, safeDecodeUri } from "../files";
-import { isMissing, resolveTargets, splitTarget, type TargetResult } from "../../shared/embed/embed";
+import { isMissing, pathTarget, resolveTargets, splitTarget, type TargetResult } from "../../shared/embed/embed";
 import type { LinkContext } from "../docLinks";
 import { embedSpecOf, type EmbedRef } from "./render";
 
@@ -247,13 +247,14 @@ export class DocEmbeds {
     if (found.size === 0) return miss();
     let answers: Record<string, TargetResult>;
     try {
-      answers = await resolveTargets([...new Set(found.values())], "/");
+      // Real paths: escaped so the daemon reads them as the files they name.
+      answers = await resolveTargets([...new Set(found.values())].map(pathTarget), "/");
     } catch {
       return out;
     }
     for (const r of refs) {
       const path = found.get(r);
-      out.set(refKey(r), (path !== undefined ? answers[path] : undefined) ?? { missing: true });
+      out.set(refKey(r), (path !== undefined ? answers[pathTarget(path)] : undefined) ?? { missing: true });
     }
     return out;
   }
