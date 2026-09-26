@@ -17,6 +17,10 @@
   import { basename, fsDownload, fsRawUrl, humanSize } from "./files";
   import { retain, release, type FileEntry } from "./fileStore.svelte";
   import { isRemoteHost } from "../net/api";
+  import { activeSelection, clearSelection, setSelection, type FileSelection } from "../shared/reference";
+  import { clockLabel, timeFragment } from "../shared/locator";
+  import { revealRequest, takeReveal } from "../shared/reveal";
+  import ReferenceButton from "../shared/ReferenceButton.svelte";
   import Spinner from "./Spinner.svelte";
 
   interface Props {
@@ -80,6 +84,102 @@
     if (r !== null) {
       el.currentTime = Math.min(r.time, el.duration || r.time);
       if (r.playing) void el.play().catch(() => {});
+    }
+    applyTime();
+  }
+
+  // --- pointing at a moment (context bridge) and landing on one (`#t=`) ------------
+
+  /** The playhead, for the "reference this moment" button's label. */
+  let now = $state(0);
+  /** "mark range" was pressed once: the range starts here. */
+  let markFrom = $state<number | null>(null);
+  /** A marked (or revealed) range, in seconds. */
+  let range = $state<{ start: number; end: number } | null>(null);
+  /** A revealed range plays to its end, then pauses (once). */
+  let stopAt: number | null = null;
+  let pendingTime: { start: number; end?: number } | null = null;
+  const selOwner = {};
+  let published: FileSelection | null = null;
+
+  function onTime(): void {
+    const el = media;
+    if (el === null) return;
+    now = el.currentTime;
+    if (stopAt !== null && el.currentTime >= stopAt) {
+      stopAt = null;
+      el.pause();
+    }
+  }
+
+  function momentSelection(): FileSelection {
+    const r = range;
+    const fragment = r !== null ? timeFragment(r.start, r.end) : timeFragment(now);
+    return { kind: "file", path, startLine: null, endLine: null, text: "", fragment, label: momentLabel };
+  }
+
+  const momentLabel = $derived(
+    range !== null ? `${clockLabel(range.start)}–${clockLabel(range.end)}` : clockLabel(now),
+  );
+
+  /** First press marks the start, the second the end (either order). */
+  function mark(): void {
+    const t = media?.currentTime ?? now;
+    if (markFrom === null) {
+      markFrom = t;
+      return;
+    }
+    const a = Math.min(markFrom, t);
+    const b = Math.max(markFrom, t);
+    markFrom = null;
+    if (b - a < 0.05) return;
+    range = { start: a, end: b };
+    // A marked range is a selection: the reference chord sends it too.
+    const sel = momentSelection();
+    published = sel;
+    setSelection(selOwner, sel);
+  }
+
+  function clearRange(): void {
+    range = null;
+    markFrom = null;
+    stopAt = null;
+    if (published !== null) {
+      published = null;
+      clearSelection(selOwner);
+    }
+  }
+
+  $effect(() => {
+    const a = $activeSelection;
+    if (published !== null && a !== published) published = null;
+  });
+
+  $effect(() => () => {
+    if (published !== null) clearSelection(selOwner);
+    published = null;
+  });
+
+  $effect(() => {
+    void $revealRequest;
+    const req = takeReveal(path);
+    if (req?.time === undefined) return;
+    pendingTime = req.time;
+    untrack(applyTime);
+  });
+
+  /** Seek to a revealed moment once the player knows its duration. */
+  function applyTime(): void {
+    const el = media;
+    const t = pendingTime;
+    if (el === null || t === null || el.readyState < HTMLMediaElement.HAVE_METADATA) return;
+    pendingTime = null;
+    const end = Number.isFinite(el.duration) ? el.duration : Infinity;
+    el.currentTime = Math.min(t.start, end);
+    now = el.currentTime;
+    if (t.end !== undefined && t.end > t.start) {
+      range = { start: t.start, end: Math.min(t.end, end) };
+      stopAt = range.end;
     }
   }
 
@@ -203,6 +303,25 @@
   <div class="media-bar">
     <span class="facts" class:dim={facts === ""}>{facts === "" ? kind : facts}</span>
     <span class="spacer"></span>
+    {#if src !== null && failure === null}
+      {#if range !== null}
+        <!-- The @ button carries the range; this only lets go of it. -->
+        <button class="bbtn" onclick={clearRange} title="clear the range and point at the playhead again"
+          >clear range</button
+        >
+      {:else}
+        <button
+          class="bbtn"
+          class:on={markFrom !== null}
+          onclick={mark}
+          title={markFrom === null
+            ? "mark the start of a range to reference (press again at its end)"
+            : "mark the end of the range here"}
+          >{markFrom === null ? "mark range" : `from ${clockLabel(markFrom)} · mark end`}</button
+        >
+      {/if}
+      <ReferenceButton pick={momentSelection} label={momentLabel} text={momentLabel} />
+    {/if}
     {#if remote}
       <button class="bbtn" onclick={() => void fsDownload(path)} title="download to this computer"
         >download</button
@@ -249,6 +368,8 @@
           aria-label={basename(path)}
           onloadedmetadata={onMeta}
           onloadeddata={onLoaded}
+          ontimeupdate={onTime}
+          onseeked={onTime}
           onerror={() => void onError()}
         ></video>
       {:else}
@@ -262,6 +383,8 @@
             aria-label={basename(path)}
             onloadedmetadata={onMeta}
             onloadeddata={onLoaded}
+            ontimeupdate={onTime}
+            onseeked={onTime}
             onerror={() => void onError()}
           ></audio>
         </div>
@@ -324,6 +447,12 @@
     background: var(--row-hover);
     color: var(--fg);
   }
+
+  .bbtn.on {
+    color: var(--accent);
+  }
+
+
 
   .stage {
     position: relative;

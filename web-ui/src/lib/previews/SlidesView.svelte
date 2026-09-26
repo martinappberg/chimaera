@@ -19,6 +19,8 @@
   import { relativeImages, rewriteImages, slideCount, slideDocument, slideSize } from "./marp";
   import { revealRequest, takeReveal } from "../shared/reveal";
   import Spinner from "./Spinner.svelte";
+  import ReferenceButton from "../shared/ReferenceButton.svelte";
+  import type { FileSelection } from "../shared/reference";
 
   interface Props {
     path: string;
@@ -152,6 +154,19 @@
     if (d === null) pendingSlide = i;
     else go(i);
   });
+
+  /** The current slide as a reference: `#slide=N` with its text as the quote. */
+  function slideSelection(): FileSelection | null {
+    const d = deck;
+    if (d === null) return null;
+    const n = current + 1;
+    // The render's own markup, parsed inert (a DOMParser document runs and
+    // loads nothing); each slide is one of Marp's inline SVGs.
+    const doc = new DOMParser().parseFromString(d.html, "text/html");
+    const svg = doc.querySelectorAll("svg[data-marpit-svg]")[current];
+    const text = (svg?.textContent ?? "").replace(/\s+/g, " ").trim().slice(0, 2000);
+    return { kind: "file", path, startLine: null, endLine: null, text, fragment: `slide=${n}`, label: `slide ${n}` };
+  }
 
   function go(i: number): void {
     const d = deck;
@@ -350,6 +365,11 @@
           style:height="{h * count}px"
           style:transform="scale({scale}) translateY({-current * h}px)"
         ></iframe>
+        {#if !presenting}
+          <span class="slide-ref">
+            <ReferenceButton pick={slideSelection} label="slide {current + 1}" text="slide {current + 1}" />
+          </span>
+        {/if}
       </div>
       {#if presenting}
         <span class="present-count">{current + 1} / {count}</span>
@@ -503,6 +523,28 @@
     box-shadow:
       0 0 0 1px color-mix(in srgb, var(--fg) 10%, transparent),
       0 2px 12px color-mix(in srgb, var(--fg) 14%, transparent);
+  }
+
+  /* The slide's "reference in agent" button: its top-right corner, shown
+     while the stage is hovered or the button focused. */
+  .slide-ref {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    z-index: 1;
+    opacity: 0;
+    transition: opacity 0.12s ease;
+  }
+
+  .stage:hover .slide-ref,
+  .slide-ref:focus-within {
+    opacity: 1;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .slide-ref {
+      transition: none;
+    }
   }
 
   .presenting .slide-box {

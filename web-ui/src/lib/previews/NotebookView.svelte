@@ -41,6 +41,8 @@
   import { activeTheme, getSetting } from "../settings/store.svelte";
   import { humanSize } from "./files";
   import NotebookHtml from "./NotebookHtml.svelte";
+  import ReferenceButton from "../shared/ReferenceButton.svelte";
+  import type { FileSelection } from "../shared/reference";
   import Spinner from "./Spinner.svelte";
 
   interface Props {
@@ -183,6 +185,20 @@
   });
 
   // --- #cell=N ------------------------------------------------------------------
+
+  /** A cell as a reference: `#cell=N` (1-based) with its source as the quote. */
+  function cellSelection(cell: NotebookCell): FileSelection {
+    const n = cell.index + 1;
+    return {
+      kind: "file",
+      path,
+      startLine: null,
+      endLine: null,
+      text: cell.source,
+      fragment: `cell=${n}`,
+      label: `cell ${n}`,
+    };
+  }
 
   let pendingCell: number | null = null;
   $effect(() => {
@@ -435,6 +451,10 @@
       <div class="nb-doc" style:--nb-code-font="{codeFont}px" style:--nb-prose-font="{proseFont}px">
         {#each cells as cell (cell.index)}
           <section class="cell {cell.cell_type}" data-cell={cell.index}>
+            <!-- Point an agent at this cell: `#cell=N` plus its source. -->
+            <span class="cell-ref">
+              <ReferenceButton pick={() => cellSelection(cell)} label="cell {cell.index + 1}" />
+            </span>
             {#if cell.cell_type === "code"}
               <div class="gutter" aria-label="execution count">
                 [{cell.execution_count ?? " "}]
@@ -601,12 +621,34 @@
   }
 
   .cell {
+    position: relative;
     display: grid;
     grid-template-columns: 6ch minmax(0, 1fr);
     column-gap: 10px;
     margin: 0 0 14px;
     border-radius: 6px;
     scroll-margin-top: 12px;
+  }
+
+  /* The cell's "reference in agent" button: in the gutter under the
+     execution count, shown while the cell is hovered or the button focused. */
+  .cell-ref {
+    position: absolute;
+    top: calc(0.55em + var(--nb-code-font) * 1.6);
+    right: calc(100% - 6ch);
+    z-index: 1;
+    opacity: 0;
+    transition: opacity 0.12s ease;
+  }
+
+  .cell.markdown .cell-ref,
+  .cell.raw .cell-ref {
+    top: 0.4em;
+  }
+
+  .cell:hover .cell-ref,
+  .cell-ref:focus-within {
+    opacity: 1;
   }
 
   .cell.markdown {
@@ -1017,7 +1059,8 @@
 
   @media (prefers-reduced-motion: reduce) {
     .copy,
-    .out-rail {
+    .out-rail,
+    .cell-ref {
       transition: none;
     }
     .cell:global(.flash) {

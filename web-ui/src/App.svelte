@@ -86,14 +86,16 @@
     uploadAndInsert,
     uploadJobs,
     uploadToDir,
+    uploadToSession,
   } from "./lib/net/uploads";
   import { get } from "svelte/store";
   import {
     activeSelection,
     clearSelection,
     composeAgentPathReference,
-    composeFileReference,
+    composeSelectionReference,
     composeShellPathReference,
+    needsCropUpload,
     composeTerminalReference,
     referenceTarget,
     composeProvenanceSuffix,
@@ -1685,28 +1687,51 @@
     const sel = get(activeSelection);
     const target = refTargetSession;
     if (sel === null || target === null) return;
-    let text: string;
-    if (sel.kind === "file") {
-      const root = workspace?.root;
-      const rel = root !== undefined ? workspaceRelative(sel.path, root) : sel.path;
-      text = composeFileReference(rel, sel.startLine, sel.endLine, sel.text);
-    } else {
-      const src = sessionsById.get(sel.sessionId);
-      const name =
-        displayNames.get(sel.sessionId) ?? (src !== undefined ? displayName(src) : "terminal");
-      text = composeTerminalReference(name, sel.text);
-    }
+    const targetId = target.id;
+    const kind = target.ui === "chat" ? "chat" : "terminal";
     // A reference never lands out of sight: surface the target agent first,
     // splitting beside the selection's own pane when it is not open anywhere.
-    if (sessionPaneId(layout, target.id) === null) {
+    if (sessionPaneId(layout, targetId) === null) {
       const beside =
         (sel.kind === "terminal" ? sessionPaneId(layout, sel.sessionId) : null) ??
         layout.focusedPaneId;
       layout = splitPane(layout, beside, "row");
-      layout = openSession(layout, target.id);
+      layout = openSession(layout, targetId);
     }
-    typeIntoSession(target.id, text);
+    if (sel.kind === "terminal") {
+      const src = sessionsById.get(sel.sessionId);
+      const name =
+        displayNames.get(sel.sessionId) ?? (src !== undefined ? displayName(src) : "terminal");
+      typeIntoSession(targetId, composeTerminalReference(name, sel.text));
+      return;
+    }
+    const root = workspace?.root;
+    const rel = root !== undefined ? workspaceRelative(sel.path, root) : sel.path;
+    const crop = sel.crop;
+    if (crop !== undefined && needsCropUpload(sel, kind)) {
+      // Pixels for a terminal agent: a file in the session's landing pad
+      // (bounded, pruned with the session), its path typed after the
+      // locator. A failed upload still sends the locator (its chip says why).
+      const name = `ref-${++refCropSeq}.png`;
+      void trackFileOp("Sending the region image…", (progress) =>
+        uploadToSession(targetId, crop, name, progress),
+      ).then((up) => typeIntoSession(targetId, composeSelectionReference(rel, sel, kind, up?.path ?? null)));
+      return;
+    }
+    if (crop !== undefined && kind === "chat") {
+      // Chat sees the pixels as an attachment, through the same downscale
+      // and payload caps as a pasted screenshot.
+      const label = sel.label;
+      void imageToAttachment(crop).then((image) => {
+        if (image !== null) attachImageToComposer(targetId, label !== undefined ? { ...image, label } : image);
+      });
+    }
+    typeIntoSession(targetId, composeSelectionReference(rel, sel, kind));
   }
+
+  /** Names each region image a terminal agent receives (`ref-1.png`, …);
+   *  the landing pad dedupes a name that is already there. */
+  let refCropSeq = 0;
 
   /**
    * Drag-to-reference drop: type the dropped path (file OR folder) into the

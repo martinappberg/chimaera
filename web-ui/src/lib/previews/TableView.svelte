@@ -13,6 +13,10 @@
   import { retain, release, type FileEntry } from "./fileStore.svelte";
   import { getSetting } from "../settings/store.svelte";
   import { copyText } from "../shared/clipboard";
+  import { activeSelection, clearSelection, setSelection, type FileSelection } from "../shared/reference";
+  import { revealRequest, takeReveal, type Reveal } from "../shared/reveal";
+  import { tableFragment, tableLabel, tsvQuote, TSV_LIMITS, type TableBlock } from "../shared/locator";
+  import ReferenceChip from "../shared/ReferenceChip.svelte";
   import Spinner from "./Spinner.svelte";
   import {
     autoColumnWidths,
@@ -32,9 +36,18 @@
      *  reference (e.g. a `$derived`); a fresh inline closure each render churns
      *  this component's effect. */
     fetchPage?: (offset: number, limit: number) => Promise<TablePage>;
+    /** How a selected block is addressed for an agent: the fragment and
+     *  its words. Default: RFC 7111 syntax on 1-based data rows (CSV/TSV);
+     *  the xlsx viewer passes its sheet + A1 form. Pass a STABLE reference. */
+    locate?: (b: TableBlock) => { fragment: string; label: string };
+    /** A block to land on, handed down by a host that takes its reveals
+     *  itself (xlsx: the sheet comes first). 1-based data rows/columns;
+     *  `nonce` re-triggers an identical one. Without a host, the grid takes
+     *  `#row=`/`#col=`/`#cell=` reveals for `path` from the reveal store. */
+    reveal?: { table: NonNullable<Reveal["table"]>; nonce: number } | null;
   }
 
-  let { path, fetchPage = undefined }: Props = $props();
+  let { path, fetchPage = undefined, locate = undefined, reveal = null }: Props = $props();
 
   /** Rows per fetched page (settings ground truth, read per request). */
   const pageRows = () => getSetting("files.tableRowsPerPage");
@@ -92,9 +105,15 @@
   }
   let sel = $state<Sel | null>(null);
   let anchor: { r: number; c: number } | null = null;
-  let selecting = false;
+  /** A drag is in progress: the block is published once it settles. */
+  let selecting = $state(false);
+  /** The drag left its first cell: no text selection while it lasts. */
+  let blockDrag = $state(false);
+  /** A revealed block (`#cell=5,2-9,4`): outlined until the next press. */
+  let hit = $state<Sel | null>(null);
 
-  let flashRow = $state<number | null>(null);
+  /** Rows flashing after a jump (file row numbers, inclusive). */
+  let flashRows = $state<{ from: number; to: number } | null>(null);
   let flashTimer: ReturnType<typeof setTimeout> | null = null;
   let jumpGen = 0;
   /** The footer row field's text while typing (null = follow the scroll). */
@@ -423,7 +442,8 @@
 
   // --- jump to row -------------------------------------------------------------
 
-  function scrollToRow(r: number): void {
+  /** Scroll row `r` into view and flash it (through `to`, for a block). */
+  function scrollToRow(r: number, to = r): void {
     const el = scroller;
     if (el === null) return;
     const i = r - loadedOffset;
@@ -431,21 +451,22 @@
     const top = Math.max(0, (i - 2) * rowH);
     el.scrollTop = top;
     scrollTop = el.scrollTop;
-    flashRow = r;
+    flashRows = { from: r, to: Math.max(r, to) };
     if (flashTimer !== null) clearTimeout(flashTimer);
     flashTimer = setTimeout(() => {
       flashTimer = null;
-      flashRow = null;
+      flashRows = null;
     }, FLASH_MS);
   }
 
-  /** Show 1-based row `n`: a scroll when it is loaded, else a new window
-   *  fetched around it (the daemon seeks via its row index). */
-  async function jumpTo(n: number): Promise<void> {
+  /** Show 1-based row `n` (flashing through row `to`): a scroll when it is
+   *  loaded, else a new window fetched around it (the daemon seeks via its
+   *  row index). Resolves once the row shows. */
+  async function jumpTo(n: number, to = n): Promise<void> {
     let target = n - 1;
     if (total !== null && total > 0) target = Math.min(target, total - 1);
     if (target >= loadedOffset && target < loadedOffset + rows.length) {
-      scrollToRow(target);
+      scrollToRow(target, to - 1);
       return;
     }
     const gen = ++jumpGen;
@@ -470,7 +491,7 @@
       apply(page, "replace");
       target = Math.min(target, page.offset + page.rows.length - 1);
       await tick();
-      scrollToRow(target);
+      scrollToRow(target, Math.max(target, to - 1));
       void tick().then(maybePrefetch);
     } catch (e) {
       if (gen === jumpGen && p === path) error = e instanceof Error ? e.message : "jump failed";
@@ -567,6 +588,7 @@
   function onCellDown(e: PointerEvent, r: number, c: number): void {
     if (e.button !== 0) return;
     selecting = true;
+    hit = null;
     if (e.shiftKey && anchor !== null) {
       sel = { r0: anchor.r, c0: anchor.c, r1: r, c1: c };
     } else {
@@ -578,11 +600,19 @@
   function onCellEnter(r: number, c: number): void {
     if (!selecting || anchor === null) return;
     sel = { r0: anchor.r, c0: anchor.c, r1: r, c1: c };
+    // Leaving the first cell makes it a block drag: the text selection a
+    // press inside one cell starts (for copying part of it) must not smear
+    // across the grid under the block highlight.
+    if (!blockDrag && (r !== anchor.r || c !== anchor.c)) {
+      blockDrag = true;
+      window.getSelection()?.removeAllRanges();
+    }
   }
 
   function onRowGutterDown(e: PointerEvent, r: number): void {
     if (e.button !== 0) return;
     selecting = true;
+    hit = null;
     const lastC = widths.length - 1;
     if (e.shiftKey && anchor !== null) {
       sel = { r0: anchor.r, c0: 0, r1: r, c1: lastC };
@@ -599,11 +629,13 @@
 
   function endSelect(): void {
     selecting = false;
+    blockDrag = false;
   }
 
   /** Global pointer-up: end any in-flight cell drag or column resize. */
   function onWindowPointerUp(): void {
     selecting = false;
+    blockDrag = false;
     resizeCol = null;
   }
 
@@ -639,7 +671,8 @@
       }
     } else if (e.key === "Escape") {
       if (expanded !== null) expanded = null;
-      else sel = null;
+      else if (sel !== null) sel = null;
+      else hit = null;
     }
   }
 
@@ -689,6 +722,155 @@
       scroller?.focus();
     }
   }
+
+  // --- pointing at a block (context bridge) ---------------------------------------
+  //
+  // A settled selection goes to an agent as its locator (`#cell=5,2-9,4`,
+  // `#row=5-9`, or the host's sheet + A1 form) plus its values as a small
+  // one-line TSV (header first, capped at 50 rows × 20 columns / 8 KB).
+
+  const selOwner = {};
+  let published: FileSelection | null = null;
+  /** Cmd+C's text rides along (copy provenance) only for modest blocks. */
+  const PROVENANCE_MAX_CELLS = 5_000;
+  const CHIP_W = 170;
+
+  const defaultLocate = (b: TableBlock) => ({ fragment: tableFragment(b), label: tableLabel(b) });
+
+  /** The block, 1-based, as the locator helpers take it. */
+  function blockOf(s: Sel): TableBlock {
+    return {
+      r0: s.r0 + 1,
+      r1: s.r1 + 1,
+      c0: s.c0 + 1,
+      c1: s.c1 + 1,
+      wholeRows: s.c0 === 0 && s.c1 === widths.length - 1,
+    };
+  }
+
+  /** The block's values: the loaded part of it, honest about the rest. */
+  function blockQuote(s: Sel): string {
+    const from = Math.max(s.r0, loadedOffset);
+    const to = Math.min(s.r1, loadedOffset + rows.length - 1, from + TSV_LIMITS.maxRows);
+    const out: string[][] = [];
+    for (let r = from; r <= to; r++) out.push((rows[r - loadedOffset] ?? []).slice(s.c0, s.c1 + 1));
+    const header = columns.length > 0 ? columns.slice(s.c0, s.c1 + 1) : null;
+    const clippedAfter = s.r1 > loadedOffset + rows.length - 1 && out.length <= TSV_LIMITS.maxRows;
+    return tsvQuote(header, out, TSV_LIMITS, s.r0 < loadedOffset, clippedAfter);
+  }
+
+  function publishBlock(s: Sel | null): void {
+    if (s === null || rows.length === 0 || widths.length === 0) {
+      if (published !== null) {
+        published = null;
+        clearSelection(selOwner);
+      }
+      return;
+    }
+    const b = blockOf(s);
+    const { fragment, label } = (locate ?? defaultLocate)(b);
+    const cells = (s.r1 - s.r0 + 1) * (s.c1 - s.c0 + 1);
+    const sel: FileSelection = {
+      kind: "file",
+      path,
+      startLine: null,
+      endLine: null,
+      text: cells <= PROVENANCE_MAX_CELLS ? selectionText() : "",
+      fragment,
+      quote: blockQuote(s),
+      label,
+    };
+    published = sel;
+    setSelection(selOwner, sel);
+  }
+
+  // Publish once a drag settles (and on every keyboard/gutter change).
+  $effect(() => {
+    const s = selN;
+    if (selecting) return;
+    untrack(() => publishBlock(s));
+  });
+
+  // A newer selection elsewhere takes over: this block's chip goes (the
+  // block itself stays selected for copying).
+  let superseded = $state(false);
+  $effect(() => {
+    const a = $activeSelection;
+    superseded = published !== null && a !== published;
+  });
+
+  $effect(() => () => {
+    if (published !== null) clearSelection(selOwner);
+    published = null;
+  });
+
+  const chipLabel = $derived(selN === null || widths.length === 0 ? undefined : (locate ?? defaultLocate)(blockOf(selN)).label);
+
+  /** The chip, under the block's last row, right-aligned to its last column
+   *  (content coordinates: it scrolls with the grid). */
+  const chipPos = $derived.by(() => {
+    const s = selN;
+    if (s === null || selecting || superseded || rows.length === 0) return null;
+    const last = Math.min(Math.max(s.r1 - loadedOffset, 0), rows.length - 1);
+    const headH = head?.offsetHeight ?? rowH;
+    let left = gutterW;
+    for (let c = 0; c < s.c0; c++) left += widths[c] ?? 0;
+    let right = left;
+    for (let c = s.c0; c <= s.c1; c++) right += widths[c] ?? 0;
+    return { x: Math.max(left + 4, right - CHIP_W), y: headH + (last + 1) * rowH + 4 };
+  });
+
+  // --- landing on a block (`#row=`, `#col=`, `#cell=`) -----------------------------
+
+  let revealGen = 0;
+
+  /** Jump to a revealed block, flash its rows and outline its cells. */
+  async function revealBlock(t: NonNullable<Reveal["table"]>): Promise<void> {
+    const gen = ++revealGen;
+    const lastC = Math.max(0, widths.length - 1);
+    const c0 = Math.min((t.col ?? 1) - 1, lastC);
+    const c1 = t.col === undefined ? lastC : Math.min((t.endCol ?? t.col) - 1, lastC);
+    const firstRow = t.row ?? 1;
+    const lastRow = t.row === undefined ? firstRow : (t.endRow ?? t.row);
+    await jumpTo(firstRow, lastRow);
+    if (gen !== revealGen) return;
+    const r0 = firstRow - 1;
+    const r1 = t.row === undefined ? loadedOffset + rows.length - 1 : lastRow - 1;
+    hit = { r0, r1, c0, c1 };
+    // Bring the first column into view when it is off to the side.
+    const el = scroller;
+    if (el !== null && t.col !== undefined) {
+      let x = gutterW;
+      for (let c = 0; c < c0; c++) x += widths[c] ?? 0;
+      if (x < el.scrollLeft + gutterW || x > el.scrollLeft + el.clientWidth - 60) {
+        el.scrollLeft = Math.max(0, x - gutterW - 24);
+      }
+    }
+  }
+
+  function inHit(r: number, c: number): boolean {
+    const h = hit;
+    return h !== null && r >= h.r0 && r <= h.r1 && c >= h.c0 && c <= h.c1;
+  }
+
+  // CSV/TSV: take `#row=`/`#col=`/`#cell=` reveals once the first page is
+  // in (the xlsx host hands its own down instead).
+  $effect(() => {
+    void $revealRequest;
+    if (fetchPage !== undefined || rows.length === 0 || widths.length === 0) return;
+    const req = takeReveal(path);
+    const t = req?.table;
+    if (t === undefined) return;
+    untrack(() => void revealBlock(t));
+  });
+
+  let seenReveal = 0;
+  $effect(() => {
+    const r = reveal;
+    if (r === null || r.nonce === seenReveal || rows.length === 0 || widths.length === 0) return;
+    seenReveal = r.nonce;
+    untrack(() => void revealBlock(r.table));
+  });
 </script>
 
 <svelte:window onpointerup={onWindowPointerUp} onpointerdown={onWindowPointerDown} onkeydown={onWindowKey} />
@@ -711,9 +893,12 @@
       aria-rowcount={total ?? -1}
     >
       <span class="char-probe" aria-hidden="true">0000000000</span>
+      {#if chipPos !== null}
+        <ReferenceChip x={chipPos.x} y={chipPos.y} label={chipLabel} />
+      {/if}
       <!-- The last, unsized column takes whatever the pane has left, so the
            sized ones keep their widths instead of being stretched. -->
-      <table style:width={`max(100%, ${tableW}px)`}>
+      <table class:block-drag={blockDrag} style:width={`max(100%, ${tableW}px)`}>
         <colgroup>
           <col style:width={`${gutterW}px`} />
           {#each widths as w, c (c)}
@@ -748,7 +933,7 @@
           {/if}
           {#each visibleRows as row, i (loadedOffset + win.start + i)}
             {@const r = loadedOffset + win.start + i}
-            <tr class="row" class:flash={flashRow === r}>
+            <tr class="row" class:flash={flashRows !== null && r >= flashRows.from && r <= flashRows.to}>
               <td
                 class="ln gut"
                 class:selrow={inSel(r, 0)}
@@ -759,6 +944,7 @@
                 <td
                   class:num={numericCols.has(c)}
                   class:sel={inSel(r, c)}
+                  class:hit={inHit(r, c)}
                   onpointerdown={(e) => onCellDown(e, r, c)}
                   onpointerenter={() => onCellEnter(r, c)}
                   ondblclick={(e) => openCell(e, r, c)}>{row[c] ?? ""}</td
@@ -957,10 +1143,20 @@
     font-variant-numeric: tabular-nums;
   }
 
+  table.block-drag {
+    user-select: none;
+  }
+
   td.sel,
   td.selrow {
     background: color-mix(in srgb, var(--accent, #4a90d9) 22%, transparent);
     color: var(--fg);
+  }
+
+  /* A revealed block (a `#cell=` link): outlined until the next press. */
+  td.hit:not(.sel) {
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 55%, transparent);
   }
 
   .ln {
