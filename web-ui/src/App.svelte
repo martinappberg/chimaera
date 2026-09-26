@@ -139,6 +139,9 @@
     setBrowserPath,
     setBrowserTarget,
     openDashboard,
+    openTimeline,
+    openKnowledge,
+    openPlugins,
     openGit,
     openSession,
     openSettings,
@@ -182,6 +185,15 @@
     type DiffMode,
   } from "./lib/workspace/git";
   import { computeStatus, initCompute, queuedJobCount } from "./lib/workspace/compute";
+  import { surfacesOf } from "./lib/layout/surfaces";
+  import { activateTimelineWorkspace, onTimelineNudge } from "./lib/workspace/timeline.svelte";
+  import { activateKnowledgeWorkspace, knowledge } from "./lib/workspace/knowledge";
+  import {
+    activatePluginsWorkspace,
+    attachRequest,
+    closeAttachSheet,
+    knowledgeProviderActive,
+  } from "./lib/plugins/store";
   import ComputeStrip from "./lib/workspace/ComputeStrip.svelte";
   import {
     dropSpotAt,
@@ -958,6 +970,11 @@
   $effect(() => {
     const wsId = activeWsId;
     void activateGitWorkspace(wsId);
+    // The Timeline / Knowledge / plugin-status stores follow the same
+    // activate-on-switch, nudge-to-refetch discipline (one small GET each).
+    void activateTimelineWorkspace(wsId);
+    void activateKnowledgeWorkspace(wsId);
+    void activatePluginsWorkspace(wsId);
     eventsSocket?.watch(wsId);
   });
 
@@ -1023,6 +1040,11 @@
     const p = findPane(layout.root, layout.focusedPaneId);
     return p?.tabs[p.active]?.surface === "dashboard";
   });
+  /** … or Knowledge (the conditional rail row below it). */
+  const knowledgeOpen = $derived.by(() => {
+    const p = findPane(layout.root, layout.focusedPaneId);
+    return p?.tabs[p.active]?.surface === "knowledge";
+  });
 
   // --- context bridge: reference target resolution ---------------------------
 
@@ -1055,6 +1077,9 @@
     onNewAgent: newAgentPrimary,
     onOpenGit: openGitPanel,
     onOpenSession: openSess,
+    onOpenTimeline: openTimelineSurface,
+    onOpenKnowledge: openKnowledgeSurface,
+    onOpenPlugins: openPluginsSurface,
   });
 
   /**
@@ -1297,7 +1322,15 @@
   // Persist the layout (debounced in viewState) whenever it changes, keyed
   // by (window, workspace) so each workspace keeps its own tree.
   $effect(() => {
-    const blob: Record<string, unknown> = { v: 1, ws: activeWsId, layout: serializeLayout(layout) };
+    // `surfaces` is the additive, normalized "what this window shows" list
+    // (design §8): the daemon reads only that key and treats `layout` as
+    // opaque, so the layout blob itself stays exactly as before.
+    const blob: Record<string, unknown> = {
+      v: 1,
+      ws: activeWsId,
+      layout: serializeLayout(layout),
+      surfaces: surfacesOf(layout, workspace?.root ?? null),
+    };
     if (detachedWindow) {
       blob.dt = 1;
       if (detachOrigin !== null) blob.origin = detachOrigin;
@@ -1386,6 +1419,7 @@
       },
       onSettings: applyRemoteSettings,
       onGit: onGitNudge,
+      onTimeline: onTimelineNudge,
       onUpdate: (status) => (updateState.daemon = status),
       onRecents: (epoch) => {
         // Invalidate-and-pull, like git: a conversation retired somewhere;
@@ -2558,6 +2592,8 @@
         v: 1,
         ws: activeWsId,
         layout: serializeLayout(layout),
+        // This window is leaving the workspace: it shows none of it now.
+        surfaces: [],
       });
     }
     // Flush the outgoing workspace's pending layout write under its own key,
@@ -2866,6 +2902,36 @@
     layout = openDashboard(layout);
     if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
   }
+
+  /** Open/focus the workspace Timeline (dashboard link, quick-open). */
+  function openTimelineSurface(): void {
+    if (activeWsId === null || !layoutReady) return;
+    layout = openTimeline(layout);
+    if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
+  }
+
+  /** Open/focus Knowledge (rail row when a provider is active, dashboard
+   *  link, quick-open). */
+  function openKnowledgeSurface(): void {
+    if (activeWsId === null || !layoutReady) return;
+    layout = openKnowledge(layout);
+    if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
+  }
+
+  /** Open/focus the Plugins tab (quick-open, the attach affordances). */
+  function openPluginsSurface(): void {
+    if (activeWsId === null || !layoutReady) return;
+    layout = openPlugins(layout);
+    if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
+  }
+
+  /** Quick-open commands: the workspace surfaces that have no file or session
+   *  to match on ("Timeline", "Knowledge", "Plugins"). */
+  const quickOpenCommands = [
+    { id: "timeline", label: "Timeline", hint: "what happened", run: openTimelineSurface },
+    { id: "knowledge", label: "Knowledge", hint: "what we know", run: openKnowledgeSurface },
+    { id: "plugins", label: "Plugins", hint: "add-ons for this workspace", run: openPluginsSurface },
+  ];
 
   function focusDirection(dir: FocusDir): void {
     layout = moveFocus(layout, dir);
@@ -3647,6 +3713,7 @@
       v: 1,
       ws: wsId,
       layout: serializeLayout(solo),
+      surfaces: surfacesOf(solo, workspace?.root ?? null),
       dt: 1,
       origin: winKey,
     };
@@ -3907,9 +3974,15 @@
                 ? "Changes"
                 : tab.surface === "dashboard"
                   ? "Dashboard"
-                  : tab.surface === "browser"
-                    ? (tab.host || "Browser")
-                    : "Settings";
+                  : tab.surface === "timeline"
+                    ? "Timeline"
+                    : tab.surface === "knowledge"
+                      ? "Knowledge"
+                      : tab.surface === "plugins"
+                        ? "Plugins"
+                        : tab.surface === "browser"
+                          ? (tab.host || "Browser")
+                          : "Settings";
   }
 
   // --- linked terminals ------------------------------------------------------
@@ -4436,6 +4509,34 @@
             <span class="kbd-badge" aria-hidden="true">0</span>
           {/if}
         </button>
+
+        {#if $knowledgeProviderActive}
+          <!-- Knowledge earns a rail row only while a structured provider
+               (mycelium) is active here — with nothing recorded there is
+               nothing to open, and the row would be chrome. -->
+          <button
+            class="row dash-row"
+            class:dash-active={knowledgeOpen}
+            title="knowledge — what your agents have recorded in this project"
+            onclick={openKnowledgeSurface}
+          >
+            <svg class="dash-glyph" viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
+              <path
+                d="M2.5 3.2c1.8-.7 3.6-.6 5.5.5v9c-1.9-1.1-3.7-1.2-5.5-.5zM13.5 3.2c-1.8-.7-3.6-.6-5.5.5v9c1.9-1.1 3.7-1.2 5.5-.5z"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.3"
+                stroke-linejoin="round"
+              />
+            </svg>
+            <span class="dash-label">knowledge</span>
+            {#if $knowledge !== null && $knowledge.counts.findings > 0}
+              <span class="dash-count"
+                >{$knowledge.counts.findings} finding{$knowledge.counts.findings === 1 ? "" : "s"}</span
+              >
+            {/if}
+          </button>
+        {/if}
 
         <!-- Terminals first (there are few), agents below (there are many);
              this order is also the mod+1–9 order and the strip order. -->
@@ -5079,10 +5180,29 @@
     workspaceId={activeWsId}
     sessions={wsSessions}
     sessionNames={displayNames}
+    commands={quickOpenCommands}
     onOpenFile={quickOpenFile}
     onOpenSession={quickOpenSession}
     onClose={closeQuickOpen}
   />
+{/if}
+
+{#if $attachRequest !== null && activeWsId !== null}
+  <!-- The "Use mycelium for Knowledge" sheet: one modal instance for every
+       surface that opens it (Knowledge's empty card, the dashboard line,
+       the plugin card, the Mastermind dock). Lazy — it rides the plugins
+       chunk, not the always-loaded shell. -->
+  {#await import("./lib/plugins/AttachSheet.svelte") then { default: AttachSheet }}
+    <AttachSheet
+      wsId={activeWsId}
+      pluginId={$attachRequest.pluginId}
+      onOpenSession={(id) => {
+        closeAttachSheet();
+        openSess(id);
+      }}
+      onClose={closeAttachSheet}
+    />
+  {/await}
 {/if}
 
 <!-- Blocking re-auth overlay: the daemon rejected this window's token
@@ -5492,6 +5612,15 @@
     font-size: var(--text-sm);
     overflow: hidden;
     text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  /* The knowledge row's quiet count ("5 findings"), right-aligned like the
+     session rows' trailing meta. */
+  .dash-count {
+    margin-left: auto;
+    flex: none;
+    font-size: var(--text-xs);
+    color: var(--muted);
     white-space: nowrap;
   }
 

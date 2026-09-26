@@ -4,19 +4,25 @@
    * privileged agent (dashboard plan §7). Three honest states: no binding →
    * the setup card (agent + ask/auto mode + start); a bound, live session →
    * identity header + the embedded chat (a plain ChatView on the chat pool);
-   * a binding whose session is gone → say so and offer the reset. Reactive-
-   * only by design: nothing here ever triggers a Mastermind turn — it speaks
-   * when the user types into its composer, never before.
+   * a binding whose session is gone → say so and offer the reset. Only
+   * USER-CLICKED turns: nothing here starts a Mastermind turn on its own —
+   * "Brief me", the suggestion chips and the notes-inbox chip are each one
+   * click that sends one canned prompt over the session's own socket (the
+   * same path as typing into the composer), never a timer or a reaction.
    */
   import BrandMark from "../shared/BrandMark.svelte";
   import ChatView from "../chat/ChatView.svelte";
   import { acquireChat, releaseChat } from "../chat/chatPool";
   import type { ChatStore } from "../chat/store.svelte";
+  import type { ChatSocket } from "../chat/chatWs";
   import { dismiss } from "../shared/dismiss";
   import { resolvedTheme } from "../settings/store.svelte";
   import { ApiError } from "../net/api";
   import { deleteMastermind, putMastermind, type Session } from "../workspace/sessions";
   import type { LayoutCtrl } from "../layout/dnd";
+  import { inboxSeen, markInboxSeen, timelineStore } from "../workspace/timeline.svelte";
+  import { mastermindInbox } from "../workspace/timelineModel";
+  import { myceliumPlugin, openAttachSheet } from "../plugins/store";
 
   interface Props {
     /** The binding from the workspaces wire; null = unconfigured. */
@@ -90,7 +96,8 @@
   );
 
   // A second refcounted hold on the SAME pool entry the embedded ChatView
-  // uses — read-only, for the native-mode cross-check below.
+  // uses — the store for the native-mode cross-check below, the socket for
+  // the one-click prompts (Brief me, the chips, the inbox).
   //
   // Key the effect on the id STRING, not the `live` object: every /ws/events
   // snapshot hands us a fresh session-object identity, so depending on `live`
@@ -100,19 +107,76 @@
   const mmId = $derived(
     cfg !== null && live !== null && live.ui === "chat" ? live.id : null,
   );
-  let mmStore = $state<ChatStore | null>(null);
+  let mm = $state<{ store: ChatStore; socket: ChatSocket } | null>(null);
+  const mmStore = $derived(mm?.store ?? null);
   $effect(() => {
     const id = mmId;
     if (id === null) {
-      mmStore = null;
+      mm = null;
       return;
     }
-    mmStore = acquireChat(id).store;
+    mm = acquireChat(id);
     return () => {
       releaseChat(id);
-      mmStore = null;
+      mm = null;
     };
   });
+
+  /** "Brief me": one user-started turn with a fixed answer shape — the
+   *  judgment across sessions and time the dashboard itself can't do. */
+  const BRIEF_PROMPT =
+    "Brief me on this workspace. Use read_timeline and workspace_status (and knowledge_search when you have it) " +
+    "before answering. Reply with exactly four headed sections — Needs you · Done · Problems · Next — citing " +
+    "sessions by name. Be terse: short lines, no preamble, no repetition of what the dashboard already shows.";
+  const SUGGESTIONS: { label: string; text: string }[] = [
+    { label: "Brief me", text: BRIEF_PROMPT },
+    {
+      label: "What should I do next?",
+      text: "Given the timeline and where things stand, what should I do next? Name the one or two things that unblock the most, and which session each belongs to.",
+    },
+    {
+      label: "Anything conflicting?",
+      text: "Look across the running sessions and recent timeline: is anything conflicting — two agents on the same files, a decision one contradicts, a finding a result undercuts? Say what and where, or say there is nothing.",
+    }
+  ];
+
+  /** Send one canned prompt over the bound session's socket — the composer's
+   *  own path. Never lose the click: a closed socket surfaces as a notice
+   *  (no client-side queue; reconnect replays the daemon's gap, not ours). */
+  function sendPrompt(text: string): void {
+    if (mm === null) return;
+    const sent = mm.socket.send({ type: "send", blocks: [{ type: "text", text }] });
+    if (!sent) mm.store.notice("not connected — brief not sent, try again", "error");
+  }
+  /** The chat can take a prompt right now (bound, chat-mode, connected, idle). */
+  const canPrompt = $derived(mm !== null && mm.store.connected && !mm.store.running);
+  /** The transcript is empty: the suggestion chips earn their place. */
+  const emptyChat = $derived(
+    mm !== null && mm.store.blocks.length === 0 && mm.store.pendingSends.length === 0 && !mm.store.running,
+  );
+
+  /** Agent notes addressed to the Mastermind that it hasn't been handed
+   *  (the inbox is client-side: the dock's own cursor in localStorage;
+   *  `inboxSeenTick` bumps after a read so the derived list re-reads it). */
+  let inboxSeenTick = $state(0);
+  const unread = $derived.by(() => {
+    void inboxSeenTick;
+    return mastermindInbox(timelineStore.entries, inboxSeen(wsId));
+  });
+  function readInbox(): void {
+    const n = unread.length;
+    if (n === 0) return;
+    const top = Math.max(...unread.map((e) => e.seq));
+    sendPrompt(
+      `You have ${n} new note${n === 1 ? "" : "s"} from agents — read ${n === 1 ? "it" : "them"} with read_notes and tell me what matters.`,
+    );
+    markInboxSeen(wsId, top);
+    inboxSeenTick += 1;
+  }
+
+  /** Mycelium isn't active here: the dock offers the one quiet line that
+   *  gives the Mastermind (and Knowledge) something to read. */
+  const offerMycelium = $derived($myceliumPlugin !== null && !$myceliumPlugin.active);
 
   /** Claude's native permission modes that DON'T raise a prompt for a
    *  non-allowlisted MCP act — the set that makes our ask-first gate moot.
@@ -217,6 +281,19 @@
         acts: {modeLabel(cfg.mode)}
       </button>
       <span class="sp"></span>
+      {#if live !== null && live.ui === "chat"}
+        <!-- One click, one turn: the canned brief over the session's socket. -->
+        <button
+          class="brief"
+          disabled={!canPrompt}
+          title={canPrompt
+            ? "one turn: Needs you · Done · Problems · Next — billed to your account"
+            : mm === null || !mm.store.connected
+              ? "not connected"
+              : "the Mastermind is busy"}
+          onclick={() => sendPrompt(BRIEF_PROMPT)}>Brief me</button
+        >
+      {/if}
       <!-- Default node.contains inside-test: the button + its menu stay open.
            (Never the .menu-host class — that selector belongs to ChatView's
            own dismiss and would pin a pane chat's open menu on our clicks.) -->
@@ -377,6 +454,33 @@
       <button class="cta quiet" disabled={pending} onclick={retire}>reset</button>
     </div>
   {:else if live !== null}
+    {#if unread.length > 0 || emptyChat}
+      <!-- Suggested prompts while the transcript is empty, and the notes
+           inbox whenever agents left something for the Mastermind — each a
+           user click that starts one turn. -->
+      <div class="chips">
+        {#if unread.length > 0}
+          <button
+            class="chip inbox"
+            disabled={!canPrompt}
+            title="hand these notes to the Mastermind — one turn"
+            onclick={readInbox}
+          >
+            ✉ {unread.length} new note{unread.length === 1 ? "" : "s"} from agents
+          </button>
+        {/if}
+        {#if emptyChat}
+          {#each SUGGESTIONS as s (s.label)}
+            <button class="chip" disabled={!canPrompt} onclick={() => sendPrompt(s.text)}>{s.label}</button>
+          {/each}
+          {#if offerMycelium}
+            <button class="quietline" onclick={() => openAttachSheet("mycelium")}>
+              Use mycelium for Knowledge → gives the Mastermind your project's findings and decisions to read
+            </button>
+          {/if}
+        {/if}
+      </div>
+    {/if}
     <!-- The embedded chat: the same ChatView the panes use, on the same chat
          pool, scoped by the wrapper so it behaves at dock width. -->
     <div class="dock-chat">
@@ -453,6 +557,79 @@
   button.modechip:hover {
     color: var(--fg);
     border-color: color-mix(in srgb, var(--accent) 55%, var(--edge));
+  }
+
+  /* "Brief me": the header's one primary action — accent-tinted, small. */
+  .brief {
+    flex: none;
+    appearance: none;
+    font: inherit;
+    font-size: var(--text-xs);
+    font-weight: 500;
+    padding: 2px 10px;
+    border-radius: 999px;
+    border: 1px solid color-mix(in srgb, var(--accent) 55%, var(--edge));
+    background: color-mix(in srgb, var(--accent) 14%, transparent);
+    color: var(--fg);
+    cursor: pointer;
+    white-space: nowrap;
+    transition: background-color 0.12s ease;
+  }
+  .brief:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--accent) 24%, transparent);
+  }
+  .brief:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+
+  /* Suggested prompts + the notes inbox: quiet pills above the chat. */
+  .chips {
+    flex: none;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    padding: 10px 12px 6px;
+    border-bottom: 1px solid var(--edge);
+  }
+  .chip {
+    appearance: none;
+    border: 1px solid var(--edge);
+    background: none;
+    color: var(--fg);
+    font: inherit;
+    font-size: var(--text-xs);
+    padding: 3px 10px;
+    border-radius: 999px;
+    cursor: pointer;
+    transition: border-color 0.12s ease;
+  }
+  .chip:hover:not(:disabled) {
+    border-color: color-mix(in srgb, var(--accent) 55%, var(--edge));
+  }
+  .chip:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+  .chip.inbox {
+    border-color: color-mix(in srgb, var(--warn) 55%, var(--edge));
+    background: color-mix(in srgb, var(--warn) 10%, transparent);
+  }
+  .quietline {
+    appearance: none;
+    border: none;
+    background: none;
+    padding: 4px 2px 0;
+    font: inherit;
+    font-size: var(--text-xs);
+    color: var(--muted);
+    text-align: left;
+    line-height: 1.45;
+    cursor: pointer;
+    flex-basis: 100%;
+  }
+  .quietline:hover {
+    color: var(--fg);
   }
 
   /* The native-mode caveat: a quiet warn line, the stall-pill tone. */

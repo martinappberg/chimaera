@@ -33,6 +33,10 @@ export interface DashCtx {
   onOpenGit: () => void;
   /** Open/focus a session tab (rail-click semantics). */
   onOpenSession: (id: string) => void;
+  /** Open/focus the workspace singletons the dashboard links into. */
+  onOpenTimeline: () => void;
+  onOpenKnowledge: () => void;
+  onOpenPlugins: () => void;
 }
 
 /**

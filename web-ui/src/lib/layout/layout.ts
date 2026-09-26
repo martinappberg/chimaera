@@ -69,6 +69,18 @@ export interface GitTab {
 export interface DashboardTab {
   surface: "dashboard";
 }
+/** The workspace Timeline (what happened) — a singleton view. */
+export interface TimelineTab {
+  surface: "timeline";
+}
+/** Knowledge (what the agents recorded) — a singleton view. */
+export interface KnowledgeTab {
+  surface: "knowledge";
+}
+/** Plugins (Installed · Skills · Browse) — a singleton view. */
+export interface PluginsTab {
+  surface: "plugins";
+}
 /**
  * A review of the files ONE session changed — a session-scoped changes list
  * built on the same git status/diff APIs as the source-control panel. Keyed by
@@ -104,6 +116,9 @@ export type Tab =
   | GitTab
   | ChangesTab
   | DashboardTab
+  | TimelineTab
+  | KnowledgeTab
+  | PluginsTab
   | BrowserTab;
 
 /** Identity key for the no-duplicates invariant (one tab per surface). */
@@ -116,6 +131,11 @@ export function tabKey(t: Tab): string {
   if (t.surface === "diff") return `g:${t.mode}:${t.path}`;
   if (t.surface === "git") return "v:git";
   if (t.surface === "dashboard") return "v:dashboard";
+  // Explicit keys: the trailing fallthrough is settings', and a new singleton
+  // that fell into it would alias the settings tab in the dedupe set.
+  if (t.surface === "timeline") return "v:timeline";
+  if (t.surface === "knowledge") return "v:knowledge";
+  if (t.surface === "plugins") return "v:plugins";
   if (t.surface === "changes") return `changes:${t.sessionId}`;
   // `w:` (web) — its own namespace beside the Finder's `d:` and diff's `g:`.
   if (t.surface === "browser") return `w:${t.id}`;
@@ -521,6 +541,21 @@ export function openGit(l: Layout): Layout {
 /** Open (or focus) the workspace dashboard. */
 export function openDashboard(l: Layout): Layout {
   return openTab(l, { surface: "dashboard" });
+}
+
+/** Open (or focus) the workspace Timeline. */
+export function openTimeline(l: Layout): Layout {
+  return openTab(l, { surface: "timeline" });
+}
+
+/** Open (or focus) Knowledge. */
+export function openKnowledge(l: Layout): Layout {
+  return openTab(l, { surface: "knowledge" });
+}
+
+/** Open (or focus) the Plugins tab. */
+export function openPlugins(l: Layout): Layout {
+  return openTab(l, { surface: "plugins" });
 }
 
 /** Open (or focus) the session-scoped changes review. */
@@ -1267,6 +1302,9 @@ function serNode(node: LayoutNode): SNode {
         if (t.surface === "diff") return { gd: t.path, dm: t.mode };
         if (t.surface === "git") return { v: "git" };
         if (t.surface === "dashboard") return { v: "dashboard" };
+        if (t.surface === "timeline") return { v: "timeline" };
+        if (t.surface === "knowledge") return { v: "knowledge" };
+        if (t.surface === "plugins") return { v: "plugins" };
         if (t.surface === "changes") return { cs: t.sessionId };
         if (t.surface === "browser") return { w: t.host, wo: t.port, wi: t.id, wp: t.path };
         return { v: "settings" };
@@ -1326,6 +1364,12 @@ function deserNode(
         tab = { surface: "git" };
       } else if (t.v === "dashboard") {
         tab = { surface: "dashboard" };
+      } else if (t.v === "timeline") {
+        tab = { surface: "timeline" };
+      } else if (t.v === "knowledge") {
+        tab = { surface: "knowledge" };
+      } else if (t.v === "plugins") {
+        tab = { surface: "plugins" };
       } else if (typeof t.cs === "string" && t.cs.length > 0) {
         tab = { surface: "changes", sessionId: t.cs };
       } else if (
@@ -1500,6 +1544,26 @@ if (import.meta.env.DEV) {
     dbRound !== null &&
       findPane(dbRound.root, dbRound.focusedPaneId)?.tabs[0]?.surface === "dashboard",
     "dashboard tab round-trips",
+  );
+
+  // timeline / knowledge / plugins: singletons with their OWN keys (never
+  // the settings fallthrough) that survive serialization
+  let tk = defaultLayout();
+  tk = openTimeline(tk);
+  tk = openTimeline(tk);
+  tk = openKnowledge(tk);
+  tk = openKnowledge(tk);
+  tk = openPlugins(tk);
+  tk = openPlugins(tk);
+  tk = openSettings(tk);
+  ok(tabCount(tk) === 4, "timeline/knowledge/plugins never duplicate nor alias settings");
+  const tkRound = deserializeLayout(JSON.parse(JSON.stringify(serializeLayout(tk))));
+  ok(
+    tkRound !== null &&
+      findPane(tkRound.root, tkRound.focusedPaneId)
+        ?.tabs.map((t) => t.surface)
+        .join() === "timeline,knowledge,plugins,settings",
+    "timeline/knowledge/plugins tabs round-trip",
   );
 
   // settings surface: singleton (dedupes) and survives serialization

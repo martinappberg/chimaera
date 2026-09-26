@@ -86,6 +86,7 @@ export type SettingsMap = {
   "agents.defaultView": "chat" | "terminal";
   "dashboard.landing": "auto" | "never";
   "dashboard.cardDensity": "auto" | "comfortable" | "compact";
+  "dashboard.roster": "line" | "cards";
   "chat.fontSize": number;
   "chat.fontFamily": string;
   "chat.lineHeight": number;
@@ -243,6 +244,19 @@ const DEFS = {
       { value: "auto", label: "Auto" },
       { value: "comfortable", label: "Comfortable" },
       { value: "compact", label: "Compact" },
+    ],
+    scope: "client",
+  },
+  "dashboard.roster": {
+    title: "Now",
+    category: "Dashboard",
+    description:
+      "How the dashboard shows who is running. One line keeps the rail as the place with the detail; Cards shows today's roster as agent cards (the dashboard's \"show cards\" link flips this too).",
+    type: "enum",
+    default: "line",
+    options: [
+      { value: "line", label: "One line" },
+      { value: "cards", label: "Cards" },
     ],
     scope: "client",
   },
