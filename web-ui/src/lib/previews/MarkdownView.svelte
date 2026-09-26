@@ -39,11 +39,14 @@
    * shows as a properties panel, its links open in the workbench
    * (docLinks.ts), and every block carries its source lines
    * (`data-sourcepos`), so a selection references real line numbers and a
-   * reveal lands on the right block. LIVE is the reading view you type in —
-   * the shared CodeMirror editor where every block the cursor is not in is
-   * the same renderer's DOM under the same CSS (`.md-doc`, below; mdBlocks),
-   * and only the block being edited shows as source, styled inline (mdLive).
-   * Task boxes toggle the source in both. SOURCE is the same editor as plain
+   * reveal lands on the right block. LIVE is that same render until you
+   * double-click a block: then the shared CodeMirror editor takes its place
+   * (`editing`), where every block the cursor is not in is the same
+   * renderer's DOM under the same CSS (`.md-doc`, below; mdBlocks) and only
+   * the block being edited shows as source, styled inline (mdLive); Esc
+   * returns to the render, your place kept. So a plain click, a drag, a link
+   * in live behave exactly as in reading — a document is read far more than
+   * it is edited. Task boxes toggle the source in both. SOURCE is the same editor as plain
    * raw markdown. A mode switch keeps the block at the top of the view on
    * top. Live and source share ONE editor instance (an
    * extension swap, never a remount), and the editor mounts once and survives
@@ -176,6 +179,15 @@
 
   type Mode = MdMode;
   let mode = $state<Mode>("reading");
+  /** Live only: whether the editor has taken the render's place (a
+   *  double-click on a block; Esc, or the live tab again, ends it). */
+  let editing = $state(false);
+  /** The rendered document shows — reading, and live until a double-click.
+   *  Every display decision reads THIS; `mode` is the tab. */
+  const render = $derived(mode === "reading" || (mode === "live" && !editing));
+  /** The reading column: the chat transcript's measure, one setting for
+   *  both — a document reads like a transcript, never narrower. */
+  const measure = $derived(getSetting("chat.contentWidth"));
   let chunk = $state<FileChunk | null>(null);
   let chunkError = $state<string | null>(null);
   /** Why an editor mode just refused (the file turned out over the cap or
@@ -315,6 +327,7 @@
       return modeMemory.get(p) ?? (isMdMode(setting) ? setting : "live");
     });
     mode = initial;
+    editing = false;
     editorMode = initial === "source" ? "source" : "live";
     modeReq++;
     chunk = null;
@@ -364,9 +377,10 @@
   }
 
   async function openDefault(e: FileEntry): Promise<void> {
-    // Reading needs no source: the chunk is fetched (and the editor mounted)
-    // on the first live/source click, so a plain read costs one request.
-    if (mode === "reading") return;
+    // The render needs no editor: the chunk is fetched (and the editor
+    // mounted) on the first source click or double-click, so a plain read
+    // costs one request.
+    if (render) return;
     const req = modeReq;
     await e.ensureChunk();
     if (entry !== e || chunk !== null) return; // path changed, or a toggle won
@@ -388,7 +402,7 @@
   // client can't hold turns to the daemon's render, which the store then
   // refreshes in place on every disk change or in-app save.
   $effect(() => {
-    if (mode !== "reading") return;
+    if (!render) return;
     const e = entry;
     if (e !== null) untrack(() => void prepareReading(e));
   });
@@ -414,7 +428,7 @@
   $effect(() => {
     const e = entry;
     const c = e?.chunk ?? null;
-    if (mode !== "reading" || clientRender !== true || editorText !== null) return;
+    if (!render || clientRender !== true || editorText !== null) return;
     if (e === null || c === null || !c.truncated || c.size > EDIT_MAX_BYTES) return;
     const mtime = e.mtime;
     if (untrack(() => wholeText !== null && wholeText.mtime === mtime && mtime !== null)) return;
@@ -486,7 +500,7 @@
     const text = docText;
     const el = clientArticle;
     const r = reader;
-    if (mode !== "reading" || r === null || el === null || text === null) return;
+    if (!render || r === null || el === null || text === null) return;
     articleWindow?.restore();
     const res = r.update(text);
     clientFrontmatter = res.frontmatter;
@@ -497,7 +511,14 @@
     untrack(() => renderTick++);
   });
 
-  async function enterEditor(target: "live" | "source", place: Place | null = null): Promise<void> {
+  /** Show the editor in `target` mode; `point` (a double-click's screen
+   *  point) puts the cursor on the character there once the editor stands
+   *  in the render's place. */
+  async function enterEditor(
+    target: "live" | "source",
+    place: Place | null = null,
+    point: { x: number; y: number } | null = null,
+  ): Promise<void> {
     const e = entry;
     if (e === null || editable === false) return;
     const req = modeReq;
@@ -524,25 +545,76 @@
     }
     entered = true;
     mode = target;
+    editing = target === "live";
     editorMode = target;
     modeMemory.set(path, target);
-    if (place !== null) void placeEditor(place, req);
+    void placeEditor(place, req, point);
   }
 
-  function setMode(m: Mode): void {
-    if (m === mode) return;
+  /** Live's editor gives the render back its place (Esc, the live tab). */
+  function leaveEditing(): void {
+    if (!editing) return;
+    const place = capturePlace();
+    modeReq++;
+    editing = false;
+    // Live may have folded the panel meanwhile.
+    propsCollapsed = readFlag(PROPS_KEY);
+    if (place !== null) void placeReading(place);
+    // The editor's focus went with its box; the reading pane takes it so
+    // the keyboard keeps scrolling.
+    void tick().then(() => readingEl?.focus({ preventScroll: true }));
+  }
+
+  /** A double-click on the rendered document in live: edit here. Controls
+   *  keep their own double-clicks (a link's second click is still a click,
+   *  a task box toggles, a button acts). */
+  function onRenderDblclick(e: MouseEvent): void {
+    if (!render || mode !== "live" || editable !== true || e.button !== 0) return;
+    const t = e.target;
+    if (!(t instanceof Element)) return;
+    if (t.closest("a[href], button, input, select, textarea, summary, video, audio, iframe, .md-task") !== null) return;
+    // The word the double-click selected would otherwise linger under the
+    // editor's own cursor.
+    document.getSelection()?.removeAllRanges();
     const place = capturePlace();
     modeReq++;
     barNote = null;
-    if (m === "reading") {
-      mode = "reading";
-      modeMemory.set(path, "reading");
-      // Live may have folded the panel meanwhile.
-      propsCollapsed = readFlag(PROPS_KEY);
-      if (place !== null) void placeReading(place);
-    } else {
-      void enterEditor(m, place);
+    void enterEditor("live", place, { x: e.clientX, y: e.clientY });
+  }
+
+  /** Esc in live's editor returns to the render — unless the editor took
+   *  the key itself (a selection collapsed, a panel closed), or a hover
+   *  preview did (it stops the key on the window, capturing). */
+  function onEditorKey(e: KeyboardEvent): void {
+    if (e.key !== "Escape" || e.defaultPrevented || e.isComposing || mode !== "live" || !editing) return;
+    e.preventDefault();
+    leaveEditing();
+  }
+
+  function setMode(m: Mode): void {
+    if (m === mode) {
+      // The live tab clicked while its editor shows: Esc's mouse path.
+      if (m === "live") leaveEditing();
+      return;
     }
+    const place = capturePlace();
+    const wasRender = render;
+    modeReq++;
+    barNote = null;
+    if (m === "source") {
+      void enterEditor(m, place);
+      return;
+    }
+    // Reading, and live: both show the render (live edits on a double-click).
+    mode = m;
+    editing = false;
+    modeMemory.set(path, m);
+    // The hidden editor stands ready in live for the next double-click
+    // (no flash of source on entry).
+    if (m === "live") editorMode = "live";
+    // Live may have folded the panel meanwhile.
+    propsCollapsed = readFlag(PROPS_KEY);
+    if (!wasRender && place !== null) void placeReading(place);
   }
 
   // --- keeping your place across modes ----------------------------------------
@@ -576,7 +648,7 @@
   }
 
   function capturePlace(): Place | null {
-    if (mode !== "reading") {
+    if (!render) {
       const view = editorView();
       return view === null || liveMod === null ? null : liveMod.editorPlace(view);
     }
@@ -599,7 +671,7 @@
     await tick();
     afterLayout(() => {
       const root = readingEl;
-      if (root === null || req !== modeReq || mode !== "reading") return;
+      if (root === null || req !== modeReq || !render) return;
       const blocks = readingBlocks();
       const i = revealIndex(
         blocks.map((el) => parseSourcepos(el.getAttribute("data-sourcepos"))),
@@ -611,14 +683,29 @@
     });
   }
 
-  /** Once the editor shows (a first entry mounts it), the same. */
-  async function placeEditor(place: Place, req: number): Promise<void> {
+  /** Once the editor shows (a first entry mounts it), the same — then the
+   *  cursor on the character under `point`, the render's double-click, now
+   *  that the block sits where it did (mdBlocks `enterAtPoint`; off any
+   *  block, the nearest position). */
+  async function placeEditor(
+    place: Place | null,
+    req: number,
+    point: { x: number; y: number } | null = null,
+  ): Promise<void> {
     await tick();
     for (let tries = 0; tries < 60; tries++) {
       if (req !== modeReq) return;
       const view = editorView();
       if (view !== null && view.scrollDOM.clientHeight > 0) {
-        liveMod?.restoreEditorPlace(view, place.line, place.offset, place.height);
+        if (place !== null) await liveMod?.restoreEditorPlace(view, place.line, place.offset, place.height);
+        if (point === null || req !== modeReq) return;
+        // Re-found: the editor may have remounted while the place settled.
+        const now = editorView();
+        if (now === null || liveMod === null) return;
+        if (liveMod.enterAtPoint(now, point.x, point.y)) return;
+        const pos = now.posAtCoords(point, false);
+        now.dispatch({ selection: { anchor: pos } });
+        now.focus();
         return;
       }
       await new Promise((r) => requestAnimationFrame(r));
@@ -678,7 +765,7 @@
   let articleEl = $state<HTMLElement | null>(null);
   $effect(() => {
     void html;
-    if (mode !== "reading" || clientRender !== false) return;
+    if (!render || clientRender !== false) return;
     const content = articleEl;
     if (content === null) return;
     decorateCopyTargets(content);
@@ -812,7 +899,7 @@
   $effect(() => {
     void $revealRequest;
     void renderTick;
-    if (mode !== "reading" || !readingReady || readingEl === null) return;
+    if (!render || !readingReady || readingEl === null) return;
     const req = takeReveal(path);
     if (req !== null) afterLayout(() => revealInReading(req));
   });
@@ -824,7 +911,7 @@
   $effect(() => {
     void $anchorRequests;
     void renderTick;
-    if (mode === "reading") {
+    if (render) {
       if (!readingReady || readingEl === null) return;
       const anchor = takeAnchor(path);
       if (anchor !== null) afterLayout(() => void toAnchorInReading(anchor));
@@ -849,7 +936,7 @@
     void html;
     void renderTick;
     void bodyFont; // dep: A−/A+ reflows every scroller
-    if (mode !== "reading") return;
+    if (!render) return;
     const scroll = readingEl;
     if (scroll === null) return;
     const recheck = () => markScrollRegions(scroll, READING_SCROLLERS);
@@ -1080,7 +1167,7 @@
   }
 
   $effect(() => {
-    if (mode !== "reading") {
+    if (!render) {
       chipPos = null;
       clearSelection(selOwner);
       return;
@@ -1131,7 +1218,7 @@
   let readingOutline = $state.raw<OutlineItem[]>([]);
   let liveOutline = $state.raw<OutlineItem[]>([]);
   let currentHeading = $state(-1);
-  const outline = $derived(mode === "reading" ? readingOutline : liveOutline);
+  const outline = $derived(render ? readingOutline : liveOutline);
   /** Indentation starts at the shallowest level present. */
   const outlineBase = $derived(outline.reduce((m, h) => Math.min(m, h.level), 6));
 
@@ -1167,7 +1254,7 @@
   }
 
   $effect(() => {
-    if (!outlineOpen || mode !== "reading") return;
+    if (!outlineOpen || !render) return;
     const root = readingEl;
     const items = readingOutline;
     void renderTick;
@@ -1217,7 +1304,7 @@
     void docText;
     const view = liveView;
     const live = liveMod;
-    if (!outlineOpen || mode === "reading" || view === null || live === null) return;
+    if (!outlineOpen || render || view === null || live === null) return;
     const read = (): void => {
       const doc = view.state.doc;
       liveOutline = live.editorOutline(view).map((h) => ({ ...h, line: doc.lineAt(h.from).number }));
@@ -1234,7 +1321,7 @@
     const view = liveView;
     const live = liveMod;
     const items = liveOutline;
-    if (!outlineOpen || mode === "reading" || view === null || live === null) return;
+    if (!outlineOpen || render || view === null || live === null) return;
     let frame = 0;
     const measure = (): void => {
       frame = 0;
@@ -1257,7 +1344,7 @@
   function jumpTo(i: number): void {
     const item = outline[i];
     if (item === undefined) return;
-    if (mode === "reading") {
+    if (render) {
       toAnchorInReading(item.id);
     } else if (liveView !== null && liveMod !== null) {
       liveMod.scrollEditorTo(liveView, item.from);
@@ -1276,7 +1363,8 @@
     const h = new HoverPreviews({
       root,
       docPath: () => filePath,
-      mode: () => mode,
+      // The render's link manners (a rest previews) whenever it shows.
+      mode: () => (render ? "reading" : mode),
       text: () => docText,
       links: linkContext,
       embeds: () => docEmbeds,
@@ -1292,6 +1380,7 @@
   });
   $effect(() => {
     void mode;
+    void editing;
     void filePath;
     hoverPreviews?.hide();
   });
@@ -1356,7 +1445,7 @@
   </section>
 {/snippet}
 
-<div class="md-view" style:--markdown-line-height={bodyLineHeight}>
+<div class="md-view" style:--markdown-line-height={bodyLineHeight} style:--doc-measure="{measure}px">
   <div class="md-bar">
     <div class="toggle" role="tablist" aria-label="markdown mode">
       <button
@@ -1364,7 +1453,7 @@
         class:on={mode === "live"}
         role="tab"
         aria-selected={mode === "live"}
-        title={editable === false ? disabledReason : "reading view you can edit (live preview)"}
+        title={editable === false ? disabledReason : "the rendered document — double-click to edit in place, Esc to finish"}
         disabled={editable === false}
         onclick={() => setMode("live")}>live</button
       >
@@ -1373,7 +1462,7 @@
         class:on={mode === "reading"}
         role="tab"
         aria-selected={mode === "reading"}
-        title="rendered document"
+        title="the rendered document, read-only"
         onclick={() => setMode("reading")}>reading</button
       >
       <button
@@ -1390,6 +1479,10 @@
       <span class="md-bar-err">{chunkError}</span>
     {:else if barNote !== null}
       <span class="md-bar-note">{barNote}</span>
+    {:else if mode === "live" && editable === true}
+      <!-- The gesture, where it is looked for: live reads like reading, so
+           the bar says how to edit, and how to stop. -->
+      <span class="md-bar-note">{editing ? "esc finishes editing" : "double-click to edit"}</span>
     {/if}
     <span class="md-bar-fill"></span>
     <DocIssues {path} {wsRoot} mtime={entry?.mtime ?? null} />
@@ -1417,7 +1510,7 @@
       onauxclick={onLinkAuxClick}
       oncontextmenu={onLinkContextMenu}
     >
-      {#if mode === "reading" && chipPos !== null}
+      {#if render && chipPos !== null}
         <ReferenceChip x={chipPos.x} y={chipPos.y} />
       {/if}
 
@@ -1429,11 +1522,12 @@
       <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
       <div
         class="md-scroll"
-        class:hidden={mode !== "reading"}
+        class:hidden={!render}
         role="region"
         aria-label={fileLabel}
         tabindex="0"
         bind:this={readingEl}
+        ondblclick={onRenderDblclick}
       >
         {#if clientRender === true}
           {#if frontmatter !== null}{@render properties(frontmatter)}{/if}
@@ -1474,12 +1568,14 @@
            editor (the live theme is static — see mdLive). -->
       {#if entered && chunk !== null}
         {@const first = chunk}
+        <!-- svelte-ignore a11y_no_static_element_interactions -->
         <div
           class="edit-layer"
-          class:hidden={mode === "reading"}
+          class:hidden={render}
           style:--lp-font-size="{bodyFont}px"
           style:--lp-line-height={bodyLineHeight}
           bind:this={editLayerEl}
+          onkeydown={onEditorKey}
         >
           {#if CodeView !== null}
             <CodeView
@@ -1487,7 +1583,7 @@
               {first}
               {extra}
               autoLanguage={false}
-              acceptReveal={mode !== "reading"}
+              acceptReveal={!render}
               onDoc={(text: string) => (editorText = text)}
             />
           {:else if codeLoadError !== null}
@@ -1496,7 +1592,7 @@
             <Spinner />
           {/if}
         </div>
-      {:else if mode !== "reading"}
+      {:else if !render}
         <!-- The source is still on its way in (openDefault's first fetch); a
              fetch failure lands in reading, so this is only ever a wait. -->
         <div class="md-scroll">
@@ -1699,7 +1795,10 @@
   /* Base font-size is set inline (per-pane text size); every size below is in
      `em` so A−/A+ scales the whole document uniformly, like the terminal. */
   .md-body {
-    max-width: 70ch;
+    /* The chat transcript's measure (Content Width, --doc-measure on the
+       root) plus this box's side padding: a document reads like a
+       transcript, never narrower. The live editor's column matches (mdLive). */
+    max-width: calc(var(--doc-measure) + 4rem);
     margin: 0 auto;
     padding: 2.2rem 2rem 3.5rem;
     font-size: var(--text-lg);
@@ -1725,7 +1824,7 @@
   /* Same box as .md-body (border-box via app.css), so the card lines up
      with the column under it. */
   .md-view :global(.md-props) {
-    max-width: 70ch;
+    max-width: calc(var(--doc-measure) + 4rem);
     margin: 1.6rem auto 0;
     padding: 0 2rem;
     line-height: 1.45;

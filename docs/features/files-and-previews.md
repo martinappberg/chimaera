@@ -221,10 +221,11 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   A file opens in the mode it was last shown in — remembered per file in this browser's
   `localStorage` (the 300 most recently opened; `mdDoc.ts` `createModeMemory`, every access
   guarded, so a private window just forgets) — else in the **Markdown Default Mode** setting
-  (`editor.markdownDefaultMode`: live, reading or source; **live** by default — it reads
-  exactly like reading until you type). Opening in reading costs one request, the source
-  (the store's first 256 KB chunk, which the editor modes reuse; a source past it and under
-  the 1 MB edit cap is read whole once): the editor mounts on the first live/source click.
+  (`editor.markdownDefaultMode`: live, reading or source; **live** by default — it IS the
+  reading view until you double-click). Opening in reading or live costs one request, the
+  source (the store's first 256 KB chunk, which the editor modes reuse; a source past it and
+  under the 1 MB edit cap is read whole once): the editor mounts on the first source click or
+  double-click.
   Files over the 1 MB edit cap and binary-content files always open in reading and stay
   there (an editor click on one says why in the mode bar).
   **One parser for every view** (`previews/doc/parser.ts`): lang-markdown's GFM language plus
@@ -235,7 +236,14 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   `[[note|alias]]`, `[[note#heading]]`, `![[embed]]`). Live parses with it through
   lang-markdown, reading through the same configured parser, so the two can't disagree
   about what a line is.
-  - **live** is the reading view you can type into — Typora's model. Every top-level block
+  - **live** is the reading view with editing a double-click away. It shows the reading
+    render itself (same DOM, same manners: a click selects, a link opens, a rest previews, a
+    drag references) until you **double-click** a block — then the editor takes the render's
+    place with that block where it was and the cursor on the character under the pointer
+    (`MarkdownView` `editing`; mdBlocks `enterAtPoint`, the press mapping below) — and
+    **Esc**, or the live tab again, returns to the render with your place kept (the mode bar
+    names both gestures). A document is read far more than it is edited, so live never
+    turns a click into a cursor. In the editor, Typora's model: every top-level block
     the cursor is not in is the reading renderer's own DOM for it (block widgets from a state
     field, `mdBlocks.ts`, drawn by `doc/render.ts` with the same `.md-doc` CSS), so live and
     reading match block for block — same elements, same tops and heights, light and dark;

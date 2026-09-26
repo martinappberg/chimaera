@@ -367,7 +367,7 @@ const DEFS = {
     title: "Content Width",
     category: "Chat",
     description:
-      "Maximum width in pixels of the transcript, composer, and live work trays. Narrower panes still fit their available space.",
+      "Maximum width in pixels of the chat transcript, composer, and live work trays — and of a Markdown document's reading column, so a document reads like a transcript. Narrower panes still fit their available space.",
     type: "integer",
     default: 832,
     min: 480,
@@ -534,7 +534,7 @@ const DEFS = {
     title: "Markdown Default Mode",
     category: "Editor",
     description:
-      "How a Markdown file opens the first time: live (the rendered document you can type in — only the block you are editing shows as source), the read-only reading view, or raw source. After that, each file reopens in the mode you last picked.",
+      "How a Markdown file opens the first time: live (the rendered document; double-click a block to edit it in place — only that block shows as source — and Esc returns to the page), the read-only reading view, or raw source. After that, each file reopens in the mode you last picked.",
     type: "enum",
     default: "live",
     options: [

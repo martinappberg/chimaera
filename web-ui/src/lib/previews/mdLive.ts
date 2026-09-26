@@ -91,7 +91,7 @@ import {
 } from "./mdBlocks";
 import { bodyTree, isFigureLine } from "./doc/live";
 
-export { setLivePropsCollapsed, setLiveTheme } from "./mdBlocks";
+export { enterAtPoint, setLivePropsCollapsed, setLiveTheme } from "./mdBlocks";
 
 /**
  * The GFM markdown language with the shared document extensions — `$`/`$$`
@@ -1273,10 +1273,13 @@ const liveTheme: Extension = EditorView.theme({
     fontFamily: "var(--ui-font)",
     lineHeight: "var(--lp-line-height, 1.6)",
   },
+  // The column is the chat transcript's measure (Content Width setting,
+  // set on the view root as --doc-measure): a document reads like a
+  // transcript, and never narrower. Text width plus this box's side padding.
   "&.cm-md-live .cm-content": {
     flex: "0 1 auto",
     width: "100%",
-    maxWidth: "70ch",
+    maxWidth: "calc(var(--doc-measure, 52rem) + 4rem)",
     margin: "0 auto",
     boxSizing: "border-box",
     padding: "2.2rem 2rem 3.5rem",
@@ -1590,7 +1593,7 @@ export function editorPlace(view: EditorView): { line: number; offset: number; h
  *  `placeOffset`): scrolled there by the height map first, then corrected
  *  against the drawn text once it is laid out (a block the map only
  *  estimated). */
-export function restoreEditorPlace(view: EditorView, line: number, offset: number, height = 0): void {
+export function restoreEditorPlace(view: EditorView, line: number, offset: number, height = 0): Promise<void> {
   const doc = view.state.doc;
   const pos = doc.line(Math.min(Math.max(1, line), doc.lines)).from;
   const end = blockEnd(view, pos);
@@ -1598,21 +1601,26 @@ export function restoreEditorPlace(view: EditorView, line: number, offset: numbe
   // Between frames, not inside CodeMirror's measure: a scroll there is
   // taken as the anchor's own movement and undone. Blocks drawn for the
   // first time settle over a few frames; stop once the text holds still.
-  let still = 0;
-  const correct = (tries: number): void => {
-    if (!view.dom.isConnected) return;
-    const box = contentBox(view, pos, end);
-    if (box === null) return;
-    const d = box.top - view.scrollDOM.getBoundingClientRect().top - placeOffset(offset, height, box.height);
-    if (Math.abs(d) > 0.5) {
-      view.scrollDOM.scrollTop += d;
-      still = 0;
-    } else if (++still >= 2) {
-      return;
-    }
-    if (tries > 0) requestAnimationFrame(() => correct(tries - 1));
-  };
-  requestAnimationFrame(() => requestAnimationFrame(() => correct(12)));
+  // Resolves when it has (a caller placing a cursor by screen point waits
+  // for the block to be where it will stay).
+  return new Promise((resolve) => {
+    let still = 0;
+    const correct = (tries: number): void => {
+      if (!view.dom.isConnected) return resolve();
+      const box = contentBox(view, pos, end);
+      if (box === null) return resolve();
+      const d = box.top - view.scrollDOM.getBoundingClientRect().top - placeOffset(offset, height, box.height);
+      if (Math.abs(d) > 0.5) {
+        view.scrollDOM.scrollTop += d;
+        still = 0;
+      } else if (++still >= 2) {
+        return resolve();
+      }
+      if (tries > 0) requestAnimationFrame(() => correct(tries - 1));
+      else resolve();
+    };
+    requestAnimationFrame(() => requestAnimationFrame(() => correct(12)));
+  });
 }
 
 /**
