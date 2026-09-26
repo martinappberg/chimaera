@@ -6,6 +6,7 @@
 //! everything a session left behind when it ends.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -57,22 +58,13 @@ fn sanitize_name(raw: &str) -> Option<String> {
 }
 
 /// Current (bytes, file-count) in a session's uploads dir (flat — uploads are
-/// never nested). Missing dir reads as (0, 0). One scan feeds both caps.
+/// never nested). Missing dir reads as (0, 0). One scan feeds both caps; one
+/// blocking-pool hop for the whole scan.
 async fn dir_usage(dir: &Path) -> (u64, usize) {
-    let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
-        return (0, 0);
-    };
-    let mut total = 0u64;
-    let mut count = 0usize;
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        if let Ok(meta) = entry.metadata().await {
-            if meta.is_file() {
-                total += meta.len();
-                count += 1;
-            }
-        }
-    }
-    (total, count)
+    let dir = dir.to_path_buf();
+    tokio::task::spawn_blocking(move || dir_usage_blocking(&dir))
+        .await
+        .unwrap_or((0, 0))
 }
 
 /// POST /api/v1/sessions/{id}/upload?name= — stream the raw request body into
@@ -397,6 +389,11 @@ fn internal(path: &Path, what: &str, err: &anyhow::Error) -> Response {
         .into_response()
 }
 
+/// How long a chat send waits for its images' saved copies (see
+/// `save_send_images`). Local disks take milliseconds; this only bites a
+/// stalled network filesystem.
+const SAVE_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// The saved copy's extension for an image media type; `None` for a type the
 /// daemon does not keep (the pixels still reach the agent).
 fn image_extension(media_type: &str) -> Option<&'static str> {
@@ -420,7 +417,10 @@ fn image_extension(media_type: &str) -> Option<&'static str> {
 /// Decode and writes run on the blocking pool (`~/.chimaera` sits on NFS on
 /// the login nodes this daemon serves). The base64 is cloned into it: at
 /// most `COMMAND_IMAGE_BASE64_TOTAL_MAX`, transient, and the command stays
-/// intact whatever happens to the save.
+/// intact whatever happens to the save. The send waits on the save, so the
+/// save gets `SAVE_BUDGET`: a stalled filesystem costs the message its
+/// pictures, never its delivery — the abandoned save stops before its next
+/// image, and whatever it still finishes is taken back.
 ///
 /// Answers the saved paths, so a send the chat manager then refuses can
 /// take its copies back (`discard_saved_images`).
@@ -451,9 +451,26 @@ pub(crate) async fn save_send_images(
         return Vec::new();
     }
     let dir = state.uploads_root.join(session_id);
-    let saved = tokio::task::spawn_blocking(move || save_images_blocking(&dir, wanted))
-        .await
-        .unwrap_or_default();
+    let abandoned = Arc::new(AtomicBool::new(false));
+    let flag = abandoned.clone();
+    let mut save = tokio::task::spawn_blocking(move || save_images_blocking(&dir, wanted, &flag));
+    let saved = match tokio::time::timeout(SAVE_BUDGET, &mut save).await {
+        Ok(joined) => joined.unwrap_or_default(),
+        Err(_) => {
+            abandoned.store(true, Ordering::SeqCst);
+            tracing::warn!(
+                session_id,
+                "saving chat images took too long; sent without copies"
+            );
+            // Whatever it still finishes is referenced by nothing.
+            tokio::spawn(async move {
+                if let Ok(late) = save.await {
+                    discard_saved_images(late.into_iter().map(|(_, path)| path).collect());
+                }
+            });
+            Vec::new()
+        }
+    };
     let mut paths = Vec::with_capacity(saved.len());
     for (index, saved_path) in saved {
         if let Some(ContentBlock::Image { path, .. }) = blocks.get_mut(index) {
@@ -481,9 +498,10 @@ pub(crate) fn discard_saved_images(paths: Vec<String>) {
 /// a hidden tmp sibling (never visible half-written), checking the session
 /// caps before every file. Answers `(block index, absolute path)` for each
 /// image saved.
-fn save_images_blocking(
+pub(crate) fn save_images_blocking(
     dir: &Path,
     images: Vec<(usize, &'static str, String)>,
+    abandoned: &AtomicBool,
 ) -> Vec<(usize, String)> {
     use base64::Engine as _;
     if let Err(err) = std::fs::create_dir_all(dir) {
@@ -493,6 +511,9 @@ fn save_images_blocking(
     let (mut bytes_used, mut files_used) = dir_usage_blocking(dir);
     let mut saved = Vec::new();
     for (index, ext, data) in images {
+        if abandoned.load(Ordering::SeqCst) {
+            break;
+        }
         let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data.as_bytes()) else {
             tracing::debug!("chat image is not valid base64; not saved");
             continue;
@@ -520,7 +541,7 @@ fn save_images_blocking(
     saved
 }
 
-/// `dir_usage` for the blocking pool.
+/// `dir_usage`'s scan, for callers already on the blocking pool.
 fn dir_usage_blocking(dir: &Path) -> (u64, usize) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return (0, 0);

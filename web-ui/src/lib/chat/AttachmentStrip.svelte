@@ -55,8 +55,14 @@
   let near = $state(false);
   /** Resolve answers by path; absent = not asked yet, null = unreachable. */
   let answers = $state.raw<Record<string, TargetResult | null>>({});
-  /** Pictures whose bytes failed to load. */
+  /** `/raw` URLs whose bytes failed to load — by URL, so a fresh ticket
+   *  after a re-resolve gets its own try. */
   let broken = $state.raw<Set<string>>(new Set());
+  /** Re-asks after an unreachable answer (a tunnel mid-reconnect): a few,
+   *  spaced out, then the tile stays empty until it remounts. Bounded, so
+   *  no visibility gate. */
+  const RETRIES = 3;
+  let attempt = $state(0);
 
   $effect(() => {
     const el = host;
@@ -81,8 +87,10 @@
   // every card asking in the same frame).
   $effect(() => {
     const wanted = paths;
+    const tries = attempt;
     if (!near || wanted === undefined || wanted.length === 0) return;
     let stale = false;
+    let retry: ReturnType<typeof setTimeout> | null = null;
     void Promise.all(wanted.map((p) => resolveFile(p))).then((results) => {
       if (stale) return;
       const next: Record<string, TargetResult | null> = {};
@@ -92,21 +100,25 @@
         if (r !== null && !isMissing(r)) rememberSize(p, r.width, r.height);
       });
       answers = next;
+      if (results.includes(null) && tries < RETRIES) {
+        retry = setTimeout(() => (attempt = tries + 1), 3000 * (tries + 1));
+      }
     });
     return () => {
       stale = true;
+      if (retry !== null) clearTimeout(retry);
     };
   });
 
-  function markBroken(path: string): void {
-    broken = new Set([...broken, path]);
+  function markBroken(url: string): void {
+    broken = new Set([...broken, url]);
   }
 
-  function savedTitle(path: string, answer: TargetResult | null | undefined): string {
+  function savedTitle(path: string, answer: TargetResult | null | undefined, failed: boolean): string {
     const name = basename(path);
     if (answer === null) return `${name} · couldn't reach the daemon`;
     if (answer !== undefined && isMissing(answer)) return `${name} · no longer on disk (uploads end with their session)`;
-    if (broken.has(path)) return `${name} · couldn't load this image`;
+    if (failed) return `${name} · couldn't load this image`;
     return onOpen !== undefined ? `open ${name} in a pane` : name;
   }
 </script>
@@ -146,17 +158,19 @@
     {#each paths as path (path)}
       {@const answer = answers[path]}
       {@const hit = answer !== undefined && answer !== null && !isMissing(answer) ? answer : null}
-      {@const url = hit !== null && !broken.has(path) ? rawUrl(hit) : null}
+      {@const raw = hit !== null ? rawUrl(hit) : null}
+      {@const failed = raw !== null && broken.has(raw)}
+      {@const url = failed ? null : raw}
       {@const box = tileBox(hit ?? sizes.get(path) ?? null, SAVED.row, SAVED.min, SAVED.max)}
-      {@const gone = (answer !== undefined && answer !== null && isMissing(answer)) || broken.has(path)}
+      {@const gone = (answer !== undefined && answer !== null && isMissing(answer)) || failed}
       <button
         class="tile pic saved-tile"
         class:gone
         type="button"
         style:width="{box.width}px"
         style:height="{box.height}px"
-        title={savedTitle(path, answer)}
-        aria-label={savedTitle(path, answer)}
+        title={savedTitle(path, answer, failed)}
+        aria-label={savedTitle(path, answer, failed)}
         disabled={hit === null || onOpen === undefined}
         onclick={(e) => onOpen?.(path, e)}
       >
@@ -166,7 +180,7 @@
             alt={basename(path)}
             decoding="async"
             draggable="false"
-            onerror={() => markBroken(path)}
+            onerror={() => markBroken(url)}
           />
         {:else if gone}
           <FileIcon {path} size={18} broken />
@@ -196,7 +210,10 @@
     border-radius: 10px;
     background: color-mix(in srgb, var(--fg) 4%, transparent);
   }
+  /* A tiny picture still gets a tile its ✕ doesn't cover. */
   .tile.draft {
+    min-width: 32px;
+    min-height: 32px;
     border-radius: 8px;
   }
   .pic {

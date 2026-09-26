@@ -4,6 +4,8 @@
  * intake paths produce identical, size-bounded attachments.
  */
 
+import { frameWidth } from "../shared/embed/embed";
+
 export interface ImageAttachment {
   media_type: string;
   data: string;
@@ -68,7 +70,6 @@ export function tileBox(
   const w = size?.width ?? 0;
   const h = size?.height ?? 0;
   if (w <= 0 || h <= 0) return { width: rowHeight, height: rowHeight };
-  const height = Math.min(rowHeight, h);
-  const width = Math.round(Math.min(maxWidth, Math.max(minWidth, (w / h) * height)));
-  return { width, height };
+  const width = Math.min(maxWidth, Math.max(minWidth, frameWidth({ w, h }, rowHeight)));
+  return { width, height: Math.min(rowHeight, h) };
 }

@@ -318,3 +318,12 @@ async fn a_refused_send_takes_its_saved_images_back() {
     }
     panic!("saved copies still on disk: {saved:?}");
 }
+
+#[test]
+fn an_abandoned_save_writes_nothing_more() {
+    let dir = test_dir("abandoned-chat-images");
+    let abandoned = std::sync::atomic::AtomicBool::new(true);
+    let saved = upload::save_images_blocking(&dir, vec![(0, "png", "QUJD".into())], &abandoned);
+    assert!(saved.is_empty());
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+}
