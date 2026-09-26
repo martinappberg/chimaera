@@ -74,9 +74,6 @@
     onOpen,
   }: Props = $props();
 
-  const frag = $derived(parseEmbedFragment(fragment));
-  const label = $derived(fragmentLabel(frag));
-
   /** A fresher answer than `info` (a self-resolve, or a refresh after the
    *  file changed on disk). Cleared when the host hands a new `info`. */
   let fetched = $state<TargetResult | null>(null);
@@ -91,6 +88,10 @@
   const hit = $derived<TargetInfo | null>(current !== null && !isMissing(current) ? current : null);
   const kind = $derived(hit !== null ? embedKind(hit) : null);
   const name = $derived(basename(hit?.path ?? path) || path);
+  /** The piece to show, read as links and references read it (`cell=`
+   *  depends on the file's extension). */
+  const frag = $derived(parseEmbedFragment(fragment, hit?.path ?? path));
+  const label = $derived(fragmentLabel(frag));
 
   let card = $state<HTMLElement | null>(null);
   /** Near the scroller's viewport: load (one-way — a loaded body stays). */
@@ -289,7 +290,7 @@
     <ImageBody
       {url}
       natural={hit.width !== undefined && hit.height !== undefined ? { w: hit.width, h: hit.height } : null}
-      region={frag.region}
+      region={frag.at?.region}
       alt={alt || name}
       hint={width}
       {compact}
@@ -297,7 +298,7 @@
       onOpen={open}
     />
   {:else if kind === "pdf"}
-    <PdfBody {url} page={frag.page ?? 1} region={frag.region} {compact} active={near} onOpen={open} />
+    <PdfBody {url} page={frag.at?.page ?? 1} region={frag.at?.region} {compact} active={near} onOpen={open} />
   {:else if kind === "code"}
     <CodeBody path={hit.path} version={hit.version} lines={frag.lines} {compact} active={near} />
   {:else if kind === "table" || kind === "xlsx"}
@@ -305,15 +306,15 @@
   {:else if kind === "html"}
     <HtmlBody {url} title={name} {compact} active={near} />
   {:else if kind === "video" || kind === "audio"}
-    <MediaBody {url} {kind} time={frag.time} {compact} active={near} onDownload={remote ? download : undefined} />
+    <MediaBody {url} {kind} time={frag.at?.time} {compact} active={near} onDownload={remote ? download : undefined} />
   {:else if kind === "notebook"}
-    <NotebookBody path={hit.path} version={hit.version} cell={frag.cell} {compact} active={near} />
+    <NotebookBody path={hit.path} version={hit.version} cell={frag.at?.cell} {compact} active={near} />
   {:else if kind === "markdown"}
     <MarkdownBody
       path={hit.path}
       version={hit.version}
       anchor={frag.anchor}
-      slide={frag.slide}
+      slide={frag.at?.slide}
       {compact}
       active={near}
       onOpen={open}

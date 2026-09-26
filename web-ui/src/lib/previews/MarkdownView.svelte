@@ -60,6 +60,7 @@
   import {
     EDIT_MAX_BYTES,
     fsFile,
+    lastRawTicketUrl,
     looksBinary,
     rawTicketUrl,
     resolveDocPath,
@@ -735,9 +736,10 @@
   /** `![](figs/plot.png)` in a document: the rendered src is relative, which
    *  the browser would resolve against the APP origin (a guaranteed 404).
    *  Re-point each such image at a short-lived ticketed /raw/ URL for the
-   *  path relative to the file — the same mechanism as inline chat previews;
-   *  `rawTicketUrl` memoizes so re-renders keep the src stable (no flash).
-   *  Web/data URLs pass through untouched. */
+   *  path relative to the file: the last answer at once, so a re-render
+   *  keeps the src (no flash), then the daemon's current one if the image
+   *  changed since (a new version is a new ticket). Web/data URLs pass
+   *  through untouched. */
   function stampImages(root: HTMLElement): void {
     for (const img of root.querySelectorAll("img")) {
       const src = img.getAttribute("src") ?? "";
@@ -745,9 +747,11 @@
       if (img.dataset.mdSrc === src) continue;
       img.dataset.mdSrc = src;
       const target = resolveDocPath(path, safeDecodeUri(src));
+      const last = lastRawTicketUrl(target);
+      if (last !== null) img.src = last;
       rawTicketUrl(target).then(
         (url) => {
-          if (img.isConnected && img.dataset.mdSrc === src) img.src = url;
+          if (img.isConnected && img.dataset.mdSrc === src && url !== last) img.src = url;
         },
         () => {
           // missing/unreadable target: leave the img alone (alt text shows)

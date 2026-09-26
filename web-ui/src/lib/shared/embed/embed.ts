@@ -18,7 +18,8 @@
 
 import { api, ApiError } from "../../net/api";
 import { basename, viewKindFor } from "../../previews/files";
-import type { EmbedFragment, Region } from "./fragment";
+import type { Locator } from "../reveal";
+import type { Region } from "./fragment";
 
 /** One resolved target (the daemon's answer, verbatim). */
 export interface TargetInfo {
@@ -216,7 +217,7 @@ export function rawUrl(info: TargetInfo): string | null {
 }
 
 /** A media element's source with its `#t=` moment (browsers seek natively). */
-export function mediaUrl(url: string, time: EmbedFragment["time"]): string {
+export function mediaUrl(url: string, time: Locator["time"]): string {
   if (time === undefined) return url;
   return `${url}#t=${time.start}${time.end !== undefined ? `,${time.end}` : ""}`;
 }
@@ -252,7 +253,7 @@ export function cropLayout(
 ): { aspect: number; width: number; height: number; left: number; top: number } | null {
   if (natural.w <= 0 || natural.h <= 0) return null;
   const px =
-    region.unit === "percent"
+    region.percent === true
       ? {
           x: (region.x / 100) * natural.w,
           y: (region.y / 100) * natural.h,
