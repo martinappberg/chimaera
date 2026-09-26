@@ -150,14 +150,17 @@
   });
   // The file changed on disk (an agent's rewrite regenerates its figures
   // too): its references are asked again, and changed files redraw. The
-  // first version seen is the one the first render already asked about.
+  // first version seen is the one the first render already asked about;
+  // this window's own saves (every autosave) are no such change.
   let embedsSeen: { embeds: DocEmbeds; mtime: string | null } | null = null;
   $effect(() => {
-    const mtime = entry?.mtime ?? null;
+    const e = entry;
+    const mtime = e?.mtime ?? null;
     const embeds = docEmbeds;
     const seen = embedsSeen;
     embedsSeen = { embeds, mtime };
-    if (seen !== null && seen.embeds === embeds && seen.mtime !== null && seen.mtime !== mtime) embeds.refresh();
+    if (seen === null || seen.embeds !== embeds || seen.mtime === null || seen.mtime === mtime) return;
+    if (e?.isOwnWrite(mtime) !== true) embeds.refresh();
   });
   /** What live mode reads at draw time (stable, like the link context). */
   const liveHost = { theme: (): "light" | "dark" => themeMode, embeds: (): DocEmbeds => docEmbeds };

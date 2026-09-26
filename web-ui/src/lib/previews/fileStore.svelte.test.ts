@@ -48,3 +48,27 @@ describe("FileEntry.ensureRawUrl", () => {
     expect(secondFinished).toBe(true);
   });
 });
+
+describe("FileEntry.isOwnWrite", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("tells this window's own save from a rewrite elsewhere", async () => {
+    const entry = new FileEntry("docs/notes.md");
+    expect(entry.isOwnWrite("m1")).toBe(false);
+    // An in-app save lands: its token is the entry's, and ours.
+    entry.noteWrite("m2");
+    expect(entry.mtime).toBe("m2");
+    expect(entry.isOwnWrite("m2")).toBe(true);
+    // The daemon's watch reports another version: not ours.
+    mocks.fsFile.mockResolvedValue({ bytes: new Uint8Array(0), size: 0, truncated: false, mtime: "m3", hash: null });
+    await entry.revalidate();
+    expect(entry.mtime).toBe("m3");
+    expect(entry.isOwnWrite("m3")).toBe(false);
+    // A save whose reply carried no token claims nothing.
+    entry.noteWrite(null);
+    expect(entry.isOwnWrite(null)).toBe(false);
+    expect(entry.isOwnWrite("m2")).toBe(false);
+  });
+});
