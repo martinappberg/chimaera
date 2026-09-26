@@ -99,6 +99,7 @@
     revealIndex,
     spanLines,
     stripFences,
+    taskBoxAt,
     type MdMode,
     type SourceRange,
   } from "./mdDoc";
@@ -151,14 +152,17 @@
   });
   // The file changed on disk (an agent's rewrite regenerates its figures
   // too): its references are asked again, and changed files redraw. The
-  // first version seen is the one the first render already asked about.
+  // first version seen is the one the first render already asked about;
+  // this window's own saves (every autosave) are no such change.
   let embedsSeen: { embeds: DocEmbeds; mtime: string | null } | null = null;
   $effect(() => {
-    const mtime = entry?.mtime ?? null;
+    const e = entry;
+    const mtime = e?.mtime ?? null;
     const embeds = docEmbeds;
     const seen = embedsSeen;
     embedsSeen = { embeds, mtime };
-    if (seen !== null && seen.embeds === embeds && seen.mtime !== null && seen.mtime !== mtime) embeds.refresh();
+    if (seen === null || seen.embeds !== embeds || seen.mtime === null || seen.mtime === mtime) return;
+    if (e?.isOwnWrite(mtime) !== true) embeds.refresh();
   });
   /** What live mode reads at draw time (stable, like the link context). */
   const liveHost = { theme: (): "light" | "dark" => themeMode, embeds: (): DocEmbeds => docEmbeds };
@@ -622,10 +626,6 @@
   }
 
   // --- task boxes in reading -----------------------------------------------------
-  /** `- [ ]` at the head of a list item's first line (inside quotes too):
-   *  the text before the box, and its mark. */
-  const TASK_LINE = /^([ \t]*(?:>[ \t]?)*[ \t]*(?:[-+*]|\d{1,9}[.)])[ \t]+)\[([ xX])\]/;
-
   /**
    * A box clicked in reading toggles the source, through the file's one
    * buffer (the editor's, when it holds the file) — an edit like any other:
@@ -639,22 +639,20 @@
     if (clientRender !== true || editable !== true || text === null || first === null) return;
     const range = parseSourcepos(box.closest("[data-sourcepos]")?.getAttribute("data-sourcepos"));
     if (range === null) return;
-    const lines = text.split("\n");
-    const lineText = lines[range.start - 1];
-    const m = lineText === undefined ? null : TASK_LINE.exec(lineText);
-    if (m === null) return;
+    const task = taskBoxAt(text, range.start);
+    if (task === null) return;
     const buf = openBuffer(path, first);
     try {
       for (let tries = 0; buf.loading && tries < 100; tries++) await new Promise((r) => setTimeout(r, 30));
       const doc = buf.current.doc;
       // The buffer must hold the text reading drew (it can differ only when
       // unsaved edits live in a buffer this view never showed).
-      if (range.start > doc.lines || doc.line(range.start).text !== lineText) {
+      if (range.start > doc.lines || doc.line(range.start).text !== task.text) {
         entered = true;
         return;
       }
-      const from = doc.line(range.start).from + m[1].length;
-      if (!buf.edit({ changes: { from, to: from + 3, insert: m[2] === " " ? "[x]" : "[ ]" } })) return;
+      const from = doc.line(range.start).from + task.at;
+      if (!buf.edit({ changes: { from, to: from + 3, insert: task.done ? "[ ]" : "[x]" } })) return;
       if (editorText === null) editorText = buf.current.doc.toString();
       entered = true;
     } finally {

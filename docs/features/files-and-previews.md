@@ -161,7 +161,9 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   (one dialog for several files). A save that fails keeps its tab open with the reason. Save
   waits at most 15 s (a dead link): past that it reports "not saved" and hands control back
   while the save carries on in the background. Cancel and Escape stay live while saving and
-  only keep the tabs open.
+  only keep the tabs open. In the native app, closing a window or quitting asks the same way
+  over every unsaved file in the window (see
+  [native-app.md](native-app.md#unsaved-edits-on-close-and-quit)).
 - **Saves are verified.** A save sends the base's content hash; success (whose reply carries the
   new hash) marks the buffer clean only if nothing was typed since it was sent (save
   generations). A save gets a 20 s timeout and one automatic retry once the events link is back

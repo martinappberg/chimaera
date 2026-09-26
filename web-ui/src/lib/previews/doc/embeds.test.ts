@@ -15,6 +15,7 @@ vi.mock("../files", async (orig) => ({
 }));
 
 import { DocEmbeds, embedTargets, refKey } from "./embeds";
+import { noteDaemonLink } from "../../shared/editing";
 import { documentContext } from "./model";
 import { embedSpecOf, soleEmbed } from "./render";
 import { isFigureLine } from "./live";
@@ -140,7 +141,11 @@ describe("the document's answers", () => {
     ]);
     await vi.advanceTimersByTimeAsync(20);
     expect(mocks.resolveTargets).toHaveBeenCalledTimes(1);
-    expect(mocks.resolveTargets).toHaveBeenCalledWith(["a.png", "b.pdf"], "/ws/docs", { bases: ["/ws"], workspaceId: "w-1" });
+    expect(mocks.resolveTargets).toHaveBeenCalledWith(
+      ["a.png", "b.pdf"],
+      "/ws/docs",
+      expect.objectContaining({ bases: ["/ws"], workspaceId: "w-1" }),
+    );
     expect(await a).toMatchObject({ path: "/ws/docs/a.png" });
     expect(e.answer({ target: "b.pdf", byName: false })).toEqual({ missing: true });
     // The same set again asks nothing; a changed set asks again, whole.
@@ -171,6 +176,57 @@ describe("the document's answers", () => {
     expect(seen).toEqual([`${refKey({ target: "a.png", byName: false })}:v1`, `${refKey({ target: "a.png", byName: false })}:v2`]);
   });
 
+  it("tells subscribers an expired answer asked again, even when the daemon renewed the same ticket", async () => {
+    const ref = { target: "a.png", byName: false };
+    mocks.resolveTargets.mockResolvedValue({ "a.png": hit("/ws/a.png", "v1") });
+    const e = new DocEmbeds("/ws/doc.md", ctx);
+    const seen: string[] = [];
+    e.subscribe((_key, a) => seen.push("missing" in a ? "missing" : a.ticket ?? ""));
+    e.sync([ref]);
+    await vi.advanceTimersByTimeAsync(20);
+    expect(seen).toEqual(["t-v1"]);
+    // Aging, not expired: drawn from, asked again, unchanged — nobody told.
+    await vi.advanceTimersByTimeAsync(2 * 60_000);
+    expect(e.answer(ref)).toMatchObject({ ticket: "t-v1" });
+    await vi.advanceTimersByTimeAsync(20);
+    expect(seen).toEqual(["t-v1"]);
+    // Expired: an image drawn now finds no answer, and waits on the ask.
+    await vi.advanceTimersByTimeAsync(9 * 60_000);
+    expect(e.answer(ref)).toBeUndefined();
+    void e.ask(ref);
+    await vi.advanceTimersByTimeAsync(20);
+    expect(seen).toEqual(["t-v1", "t-v1"]);
+    expect(e.answer(ref)).toMatchObject({ ticket: "t-v1" });
+  });
+
+  it("acts on a file at once with a fresh answer, and after asking again with an expired one", async () => {
+    const ref = { target: "a.png", byName: false };
+    const gone = { target: "gone.png", byName: false };
+    mocks.resolveTargets.mockResolvedValue({ "a.png": hit("/ws/a.png", "v1"), "gone.png": { missing: true } });
+    const e = new DocEmbeds("/ws/doc.md", ctx);
+    const opened: string[] = [];
+    const open = (a: { path: string }) => void opened.push(a.path);
+    // Never answered: asked, then acted on.
+    expect(e.use(ref, open)).toBe(true);
+    expect(opened).toEqual([]);
+    await vi.advanceTimersByTimeAsync(20);
+    expect(opened).toEqual(["/ws/a.png"]);
+    // Fresh: at once.
+    expect(e.use(ref, open)).toBe(true);
+    expect(opened).toEqual(["/ws/a.png", "/ws/a.png"]);
+    // Expired (the same ticket renewed): asked again, then acted on.
+    await vi.advanceTimersByTimeAsync(9 * 60_000);
+    expect(e.use(ref, open)).toBe(true);
+    expect(opened).toHaveLength(2);
+    await vi.advanceTimersByTimeAsync(20);
+    expect(opened).toEqual(["/ws/a.png", "/ws/a.png", "/ws/a.png"]);
+    // Known missing: nothing to act on, and the caller is told so.
+    void e.ask(gone);
+    await vi.advanceTimersByTimeAsync(20);
+    expect(e.use(gone, open)).toBe(false);
+    expect(opened).toHaveLength(3);
+  });
+
   it("finds an `![[name]]` missing beside the document by name", async () => {
     mocks.resolveTargets
       .mockResolvedValueOnce({ "plot.png": { missing: true }, "gone.png": { missing: true } })
@@ -192,6 +248,101 @@ describe("the document's answers", () => {
     await vi.advanceTimersByTimeAsync(20);
     expect(await a).toBeNull();
     expect(e.answer({ target: "a.png", byName: false })).toBeUndefined();
+    e.dispose();
+  });
+
+  it("asks again what the daemon left unknown, backing off", async () => {
+    const ref = { target: "a.png", byName: false };
+    mocks.resolveTargets.mockRejectedValueOnce(new Error("offline")).mockResolvedValue({ "a.png": hit("/ws/a.png") });
+    const e = new DocEmbeds("/ws/doc.md", ctx);
+    const seen: string[] = [];
+    e.subscribe((_key, a) => seen.push("missing" in a ? "missing" : a.path));
+    e.sync([ref]);
+    await vi.advanceTimersByTimeAsync(20);
+    expect(mocks.resolveTargets).toHaveBeenCalledTimes(1);
+    expect(seen).toEqual([]);
+    // The first retry comes within its jittered 2 s.
+    await vi.advanceTimersByTimeAsync(2_500);
+    expect(mocks.resolveTargets).toHaveBeenCalledTimes(2);
+    expect(seen).toEqual(["/ws/a.png"]);
+    // Answered: nothing more is asked.
+    await vi.advanceTimersByTimeAsync(10 * 60_000);
+    expect(mocks.resolveTargets).toHaveBeenCalledTimes(2);
+    e.dispose();
+  });
+
+  it("gives up after a bounded number of rounds, and starts over when the daemon link returns", async () => {
+    const ref = { target: "a.png", byName: false };
+    mocks.resolveTargets.mockRejectedValue(new Error("offline"));
+    const e = new DocEmbeds("/ws/doc.md", ctx);
+    e.sync([ref]);
+    await vi.advanceTimersByTimeAsync(60 * 60_000);
+    const rounds = mocks.resolveTargets.mock.calls.length;
+    expect(rounds).toBeGreaterThan(3);
+    expect(rounds).toBeLessThanOrEqual(1 + 8);
+    // The link drops and comes back: asked at once, answered.
+    mocks.resolveTargets.mockResolvedValue({ "a.png": hit("/ws/a.png") });
+    noteDaemonLink(false);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(mocks.resolveTargets.mock.calls.length).toBe(rounds);
+    noteDaemonLink(true);
+    await vi.advanceTimersByTimeAsync(20);
+    expect(mocks.resolveTargets.mock.calls.length).toBe(rounds + 1);
+    expect(e.answer(ref)).toMatchObject({ path: "/ws/a.png" });
+    e.dispose();
+  });
+
+  it("waits for the daemon link while it is down, rather than retrying into it", async () => {
+    const ref = { target: "a.png", byName: false };
+    noteDaemonLink(false);
+    try {
+      mocks.resolveTargets.mockRejectedValue(new Error("offline"));
+      const e = new DocEmbeds("/ws/doc.md", ctx);
+      e.sync([ref]);
+      await vi.advanceTimersByTimeAsync(10 * 60_000);
+      expect(mocks.resolveTargets).toHaveBeenCalledTimes(1);
+      mocks.resolveTargets.mockResolvedValue({ "a.png": hit("/ws/a.png") });
+      noteDaemonLink(true);
+      await vi.advanceTimersByTimeAsync(20);
+      expect(mocks.resolveTargets).toHaveBeenCalledTimes(2);
+      expect(e.answer(ref)).toMatchObject({ path: "/ws/a.png" });
+      // Disposed: a later failure and the link's return ask nothing.
+      e.dispose();
+      noteDaemonLink(false);
+      noteDaemonLink(true);
+      await vi.advanceTimersByTimeAsync(10 * 60_000);
+      expect(mocks.resolveTargets).toHaveBeenCalledTimes(2);
+    } finally {
+      noteDaemonLink(true);
+    }
+  });
+
+  it("runs no retries while the page is hidden, and asks when it is shown", async () => {
+    const page = Object.assign(new EventTarget(), { visibilityState: "visible" });
+    const g = globalThis as { document?: unknown };
+    g.document = page;
+    const show = (state: "visible" | "hidden") => {
+      page.visibilityState = state;
+      page.dispatchEvent(new Event("visibilitychange"));
+    };
+    try {
+      const ref = { target: "a.png", byName: false };
+      mocks.resolveTargets.mockRejectedValue(new Error("offline"));
+      const e = new DocEmbeds("/ws/doc.md", ctx);
+      e.sync([ref]);
+      await vi.advanceTimersByTimeAsync(20);
+      show("hidden");
+      await vi.advanceTimersByTimeAsync(30 * 60_000);
+      // The round armed before the page hid fires into nothing.
+      expect(mocks.resolveTargets).toHaveBeenCalledTimes(1);
+      mocks.resolveTargets.mockResolvedValue({ "a.png": hit("/ws/a.png") });
+      show("visible");
+      await vi.advanceTimersByTimeAsync(20);
+      expect(e.answer(ref)).toMatchObject({ path: "/ws/a.png" });
+      e.dispose();
+    } finally {
+      delete g.document;
+    }
   });
 
   it("stops asking once disposed", async () => {

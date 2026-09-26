@@ -26,9 +26,10 @@ pub fn install(app: &App) -> tauri::Result<()> {
         .enabled(false)
         .build(handle)?;
 
-    // A custom Quit (not the predefined one) so it routes through
-    // `request_quit`, which flags the intent — otherwise the shell can't tell
-    // an explicit quit from closing the last window (which drops to home).
+    // A custom Quit (not the predefined one, which quits without the shell
+    // deciding anything) so it routes through `request_quit`: windows with
+    // unsaved edits are asked first (shell/unsaved.rs), and the quit intent is
+    // flagged so the window set survives for the next launch.
     let quit = MenuItemBuilder::with_id("quit", "Quit Chimaera")
         .accelerator("CmdOrCtrl+Q")
         .build(handle)?;

@@ -206,6 +206,23 @@ export function parseSourcepos(attr: string | null | undefined): SourceRange | n
   return { start, end: Math.max(Number(m[3]), start) };
 }
 
+/** `- [ ]` at the head of a list item's first line (inside quotes too):
+ *  the text before the box, and its mark. */
+const TASK_LINE = /^([ \t]*(?:>[ \t]?)*[ \t]*(?:[-+*]|\d{1,9}[.)])[ \t]+)\[([ xX])\]/;
+
+/**
+ * The task box on 1-based `line` of `text`: that line as an editor holds it
+ * (no line break — a CRLF or CR file's `\r` included — so it compares with
+ * CodeMirror's), where its `[` sits in it, and whether it is done. Null
+ * when the line holds no box.
+ */
+export function taskBoxAt(text: string, line: number): { text: string; at: number; done: boolean } | null {
+  const lineText = text.split(/\r\n?|\n/)[line - 1];
+  const m = lineText === undefined ? null : TASK_LINE.exec(lineText);
+  if (lineText === undefined || m === null) return null;
+  return { text: lineText, at: m[1].length, done: m[2] !== " " };
+}
+
 /** The lines a selection covers, from the ranges at its two ends (either
  *  may be unknown — a node outside any mapped block). */
 export function spanLines(a: SourceRange | null, b: SourceRange | null): SourceRange | null {

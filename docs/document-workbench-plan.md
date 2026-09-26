@@ -19,8 +19,9 @@ shipped; the phases below remain the design record.
 
 - **Shipped:**
   - Phase 0: buffers outlive views, the close prompt, hash-verified idempotent saves,
-    three-way merge, byte fidelity, the draft journal and its daemon mirror, and the
-    hardened write path.
+    three-way merge, byte fidelity, the draft journal and its daemon mirror, the
+    hardened write path, and the native app asking before a window close or quit drops
+    unsaved edits.
   - Phase 1: one file-reference parser, the `fs/validate` ladder, and open-at-line.
   - Phases 2 and 3: one lezer renderer behind reading and live, a parity corpus, and
     an outline. Live is now the default mode. Hover previews on links (reading on rest,

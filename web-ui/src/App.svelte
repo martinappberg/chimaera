@@ -183,6 +183,7 @@
     discardDirtyFile,
     noteDaemonLink,
     saveDirtyFiles,
+    unsavedCloseError,
     unsavedDeleteNote,
   } from "./lib/shared/editing";
   import {
@@ -243,8 +244,11 @@
     onLocalDaemonUpdated,
     onFocusSession,
     onMenu,
+    onUnsavedPrompt,
     openDetachedPopup,
     openDetachedWindow,
+    replyUnsaved,
+    reportUnsaved,
     reportWindowScope,
     reportWindowView,
     setCaffeinate,
@@ -292,6 +296,7 @@
   import { contextMenu } from "./lib/shared/contextMenu.svelte";
   import ConfirmDialog from "./lib/shared/ConfirmDialog.svelte";
   import CloseDirtyDialog from "./lib/layout/CloseDirtyDialog.svelte";
+  import { WindowCloseGuard } from "./lib/layout/windowClose.svelte";
   import { fsDeleteOp, lastFsMutation, notifyCreated, pendingDelete } from "./lib/workspace/fsEvents";
   import {
     currentDiskWatches,
@@ -719,6 +724,8 @@
   let closeError = $state<string | null>(null);
   /** Bumped by Cancel: a "Save" still waiting then touches nothing. */
   let closeAttempt = 0;
+  /** The native window close / app quit over this window's unsaved files. */
+  const windowClose = new WindowCloseGuard(replyUnsaved);
   /** Element that held focus when the picker opened; restored on close. */
   let pickerRestoreEl: HTMLElement | null = null;
 
@@ -2614,6 +2621,20 @@
     return () => window.removeEventListener("beforeunload", handler);
   });
 
+  // The native app's close/quit guard: a webview gets no beforeunload when
+  // its window closes or the app quits, so the shell decides from the
+  // unsaved count this window pushes (no round trip, and no prompt when
+  // nothing is unsaved) and asks here when it holds one.
+  const unsavedCount = $derived($dirtyFiles.size);
+  $effect(() => {
+    if (!isNativeShell()) return;
+    void reportUnsaved(unsavedCount).catch(() => {});
+  });
+  $effect(() => {
+    if (!isNativeShell()) return;
+    return asyncDisposer(onUnsavedPrompt((p) => windowClose.receive(p)));
+  });
+
   // A file that became dirty must never be a PREVIEW tab: an unsaved edit
   // that the next preview open silently replaced would be lost. Promote any
   // dirty preview tab to a permanent one. untrack() so writing `layout` here
@@ -3122,10 +3143,10 @@
     detachTabs(batch.filter((t) => !failed.includes(t)));
     pendingClose = [...failed, ...pendingClose.filter((t) => !batch.includes(t))];
     if (failed.length > 0) {
-      const names = failed.map((t) => (t.surface === "file" ? `“${basename(t.path)}”` : ""));
-      closeError = r.timedOut
-        ? `${names.join(", ")} not saved — the daemon isn't answering (it keeps trying in the background)`
-        : `couldn't save ${names.join(", ")} — its editor shows why`;
+      closeError = unsavedCloseError(
+        failed.flatMap((t) => (t.surface === "file" ? [t.path] : [])),
+        r.timedOut,
+      );
     }
   }
 
@@ -5359,8 +5380,20 @@
   />
 {/if}
 
+<!-- The native window close / app quit over every unsaved file here; it takes
+     precedence over a tab close already asking (whose files it includes). -->
+{#if windowClose.prompt !== null}
+  <CloseDirtyDialog
+    paths={windowClose.prompt.paths}
+    saving={windowClose.saving}
+    error={windowClose.error}
+    action={windowClose.prompt.reason}
+    onSave={() => void windowClose.save()}
+    onDiscard={() => windowClose.discard()}
+    onCancel={() => windowClose.cancel()}
+  />
 <!-- Closing tabs whose files hold unsaved edits: save / don't save / cancel. -->
-{#if pendingClosePaths.length > 0}
+{:else if pendingClosePaths.length > 0}
   <CloseDirtyDialog
     paths={pendingClosePaths}
     saving={closeSaving}

@@ -714,6 +714,7 @@ name = "chimaera-agent"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "nix 0.31.3",
  "rand 0.10.2",
  "serde",
  "serde_json",
@@ -814,6 +815,7 @@ dependencies = [
  "flate2",
  "futures",
  "hostname",
+ "httpdate",
  "hyper",
  "hyper-util",
  "libproc",
@@ -822,6 +824,7 @@ dependencies = [
  "rustix",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "tokio",
  "tokio-util",
  "tower-http 0.7.0",

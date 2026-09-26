@@ -76,6 +76,7 @@ import { contextMenu } from "../shared/contextMenu.svelte";
 import { isFollowable, type LinkContext } from "./docLinks";
 import {
   docPath,
+  figureHeldAt,
   followLiveLink,
   frontmatterEnd,
   liveField,
@@ -88,7 +89,7 @@ import {
   tableAt,
   type LiveHost,
 } from "./mdBlocks";
-import { isFigureLine } from "./doc/live";
+import { bodyTree, isFigureLine } from "./doc/live";
 
 export { setLivePropsCollapsed, setLiveTheme } from "./mdBlocks";
 
@@ -849,7 +850,9 @@ function buildDecorations(
       const line = doc.lineAt(node.from);
       if (line.to < node.to) return false; // spans lines: replace is illegal from a plugin
       if (active(line.from, line.to)) return false; // show source while editing it
-      if (isFigureLine(line.text)) return false; // its figure is drawn below it (mdBlocks)
+      // Its figure is drawn below it (mdBlocks), unless the line is part of
+      // a larger block, which draws no figure.
+      if (isFigureLine(line.text) && figureHeldAt(state, line.from)) return false;
       const urlNode = node.node.getChild("URL");
       if (urlNode === null) return false; // reference-style: leave as source
       const marks = node.node.getChildren("LinkMark");
@@ -978,7 +981,7 @@ function livePlugin(path: string): Extension {
         // blocks, a reveal): the walk covers a different set of lines.
         const live = u.state.field(liveField, false);
         const was = u.startState.field(liveField, false);
-        const swapped = live?.revealed !== was?.revealed || live?.segs !== was?.segs;
+        const swapped = live?.revealed !== was?.revealed || live?.segs !== was?.segs || live?.held !== was?.held;
         if (!u.docChanged && !u.viewportChanged && !treeChanged && !swapped) {
           if (!u.selectionSet) return;
           // Reveal granularity is whole lines: a cursor move WITHIN the
@@ -1497,12 +1500,14 @@ export function editorIn(host: HTMLElement): EditorView | null {
 }
 
 /** The document's headings from the editor's own syntax tree, with the
- *  anchors the reading view gives them (frontmatter skipped). A tree the
+ *  anchors the reading view gives them (frontmatter skipped; the body parsed
+ *  on its own when a node opened there swallowed body lines). A tree the
  *  background parser hasn't finished is completed within a short budget. */
 export function editorOutline(view: EditorView): OutlineEntry[] {
   const state = view.state;
   const tree = ensureSyntaxTree(state, state.doc.length, 30) ?? syntaxTree(state);
-  return outlineOf(tree, state.doc, frontmatterEnd(state));
+  const fmEnd = frontmatterEnd(state);
+  return outlineOf(bodyTree(tree, state.doc, fmEnd) ?? tree, state.doc, fmEnd);
 }
 
 /** Where `scrollEditorTo` lands a line: this far below the visible top. */

@@ -94,6 +94,8 @@ export class FileEntry {
   rawMintedAt = 0;
   /** Last global unknown-change generation this entry has checked against. */
   seenAllStaleEpoch = 0;
+  /** The token this window's last in-app save landed (`noteWrite`). */
+  private writtenMtime: string | null = null;
   /** In-flight guard so concurrent mtime probes don't double-fetch. */
   private loading = { mtime: false };
   /** Raw consumers must await the same ticket mint, not merely suppress duplicates. */
@@ -337,7 +339,14 @@ export class FileEntry {
   noteWrite(mtime: string | null): void {
     this.missing = false;
     if (mtime !== null) this.mtime = mtime;
+    this.writtenMtime = mtime;
     void this.refreshPayloads();
+  }
+
+  /** Whether `mtime` is the version this window's own last save wrote —
+   *  not a change from elsewhere (an agent's rewrite, another window). */
+  isOwnWrite(mtime: string | null): boolean {
+    return mtime !== null && mtime === this.writtenMtime;
   }
 
   /** Preserve a mounted editor entry while recording that its disk path died. */
