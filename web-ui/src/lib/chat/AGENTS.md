@@ -36,8 +36,10 @@ hard-resets and rebuilds.
 | `store.svelte.ts` | `ChatStore` — the reducer + all reactive view state (`blocks`, `pending`, `pendingSends`, `questions`, model/mode, activity, exited/degraded/connected/fatalError — the last cleared by a fresh `init`, a `forked` marker, or a journal reset; a SOCKET-origin fatal (a handshake failure via `onFatalError`) also clears on the next successful `ready`, while a journal `error{fatal}` outlives reconnects until the driver is genuinely relaunched), including initial replay hydration through the ready-frame `head`. **The single source of truth for the view.** Every block carries a monotonic per-store `uid` (the transcript's keyed-render key — never an array index). `blocks` is capped at ~2000 with hysteresis: it runs one 64-block slack past the cap, then one batch splice trims back to the cap behind a single "earlier history trimmed" notice (so the O(n) index rebuild runs once per batch, not per event at cap); `trimmedCount` counts the NET front shift (dropped − the replacing notice), making a block's virtual index (`trimmedCount + i`) invariant and `virtualTotal` (`blocks.length + trimmedCount`) monotonic at cap. `structuralVersion` counts insertions/removals (net lengths are a false proxy — a retracted-then-reappended tail cancels out) and `epoch` stamps the transcript generation (a journal reset restarts the trim numbering). `activeAgents` is the reducer-maintained live-subagents set (same proxies as `blocks`, so tray rows update in place — no per-event full-blocks filter), and `tool_output_delta` accumulation is capped client-side (12 KiB head + rolling 4 KiB tail behind the server's own "[N bytes omitted]" marker; the authoritative result replaces it). Its reducer has a vitest test (`store.svelte.test.ts`) — the one place the UI is unit-tested. |
 | `chatWs.ts` / `cooperativeQueue.ts` | `ChatSocket` — connect/auth/reconnect(backoff)/gap-replay, then dispatch replay/live/control frames through one order-preserving cooperative queue so a cold history cannot starve browser input. Per-command refusals (`command_failed` / `invalid_command`) are visible but nonfatal. Shares reconnect accounting with `../terminal/ws.ts`. |
 | `chatPool.ts` | Session-keyed warm reducer/socket + scroll/render-window/followed-revision cursor. The agent keeps folding while a tab's bounded DOM snapshot is hidden or its view is evicted; client-pool eviction never stops the daemon-owned process. |
-| `ChatView.svelte` | The host: renders a bottom-anchored transcript window (64 blocks initially, 192 maximum; automatically pages earlier near the top, with a compatibility fallback button; explicit later pages + a direct jump to newest), and hangs the header/composer/overlays/panels off itself. Non-tool rows are keyed `b-${block.uid}` and tool groups `g-${firstTool.id}` — **stable identities, never array indices**, so an at-cap trim's front-splice cannot remount the whole window (one caveat: a group whose FIRST tool is trimmed away changes key and remounts). "New rows vs in-place chunk" detection keys on the store's `structuralVersion` (never net lengths), a reducer trim shifts the view's absolute range AND its rendered slice by the trim delta (`trimShift`) so range, rows, and index labels keep agreeing — falling back to the tail when the whole window was trimmed — and cursors/ranges are discarded, never shifted, across a store `epoch` change. Re-activating a hidden tab whose window+content are unchanged since its freeze skips the range rebuild entirely (the frozen rows rebind to live proxies on the next event or bottom-reach). Visible tail rows are reducer proxies; hidden/history rows are one inert snapshot. A fresh replay stays gated until `head`, so it never paints oldest-to-newest. Still the big one — keep new chrome in child components, not inline. |
-| `transcriptWindow.ts` | Pure range math for the 64-block/192-block sliding transcript DOM window — array coordinates throughout; saved cursors alone persist in trim-stable virtual coordinates, converted back at the boundary by `restoreVirtualWindow` (the one stale-cursor policy, with a one-page floor) while `trimShift` keeps a mounted range aligned across a trim. Tests cover both paging directions, stale cursor repair, and both trim conversions. |
+| `ChatView.svelte` | The host: renders a bottom-anchored transcript window (64 blocks initially, 192 maximum) that pages automatically in both directions — scroll-driven prefetch mounts the next page about two viewports ahead in the reader's direction of travel (one page per frame), sentinels cover windows that end inside the viewport, and fallback buttons appear only without IntersectionObserver — plus a direct jump to newest. A **history spacer** ahead of the column stands in for the unmounted earlier history (sized by `heightModel.ts`) and absorbs every above-viewport height change for a scrolled-up reader (see the scroll invariant below); a scrollbar drag deep into it mounts the page the model puts there (`pageAround`). It hangs the header/composer/overlays/panels off itself. Non-tool rows are keyed `b-${block.uid}` and tool groups `g-${firstTool.id}` — **stable identities, never array indices**, so an at-cap trim's front-splice cannot remount the whole window (one caveat: a group whose FIRST tool is trimmed away changes key and remounts). "New rows vs in-place chunk" detection keys on the store's `structuralVersion` (never net lengths), a reducer trim shifts the view's absolute range AND its rendered slice by the trim delta (`trimShift`) so range, rows, and index labels keep agreeing — falling back to the tail when the whole window was trimmed — and cursors/ranges are discarded, never shifted, across a store `epoch` change. Re-activating a hidden tab whose window+content are unchanged since its freeze skips the range rebuild entirely (the frozen rows rebind to live proxies on the next event or bottom-reach). Visible tail rows are reducer proxies; hidden/history rows are one inert snapshot. A fresh replay stays gated until `head`, so it never paints oldest-to-newest. Still the big one — keep new chrome in child components, not inline. |
+| `transcriptWindow.ts` | Pure range math for the 64-block/192-block sliding transcript DOM window — array coordinates throughout; saved cursors alone persist in trim-stable virtual coordinates, converted back at the boundary by `restoreVirtualWindow` (the one stale-cursor policy, with a one-page floor) while `trimShift` keeps a mounted range aligned across a trim. Also the scroll policy: `prefetchPage` (direction-gated, so a short window cannot ping-pong), `pageAround` (a far jump's page), and the spacer's `spacerTarget` / `spacerNeedsRebalance` with the WebKit rationale. Tests cover both paging directions, stale cursor repair, both trim conversions, prefetch, and the spacer policy. |
+| `readingAnchor.ts` | The reading anchor: the top-level row at the viewport's top edge and its transform-free (`offsetTop`) position in the column; `measureShift` re-finds it by node, uid, then source-index range after a re-render. DOM-only, no state. |
+| `heightModel.ts` | Content-based height model for unmounted blocks (kind + wrapped text length, tool runs on one line), in relative units the view calibrates against the mounted window; `HistoryWeights` keeps incremental prefix sums (rebuilt per epoch/trim/measure) and maps a spacer position back to a block. Own vitest suite. |
 | `ChatHeader.svelte` | The header row: model / mode / effort pickers, usage + `/mcp` entry, the Remote Control chip + popover (state dot, open-on-claude.ai / copy link / on-off; reads `store.remoteControl` + `remoteControlAvailable`, sends `set_remote_control` through the host), session identity (always names which agent — Claude or Codex). |
 | `EffortPopover.svelte` | The reasoning-effort ladder picker (uses the agent-native vocabulary verbatim — never relabel `xhigh`). |
 | `Composer.svelte` / `composer.ts` | Input chrome plus the pure slash-context, argument-completion, and Codex skill-block helpers (covered by `composer.test.ts`). Slash discovery is whitespace-boundary aware; path fragments must stay ordinary text. |
@@ -192,21 +194,37 @@ per-chunk work proportional to the TRAILING OPEN SEGMENT, not the message:
   becomes visible. Live-set or client-pool eviction may unmount a view or close
   a parked *client socket*, never the agent; the next acquire gap-replays the
   journal.
-- **Scroll restoration is window-aware and has one writer.** Save `scrollTop`,
-  the bounded block range **in virtual coordinates** (array index + the store's
-  `trimmedCount`, so a cap trim while parked can't strand the cursor), whether
-  it still tracks the tail, and the transcript revision the reader followed.
-  Page/activation changes anchor by node identity first (uid-keyed rows
-  survive range writes), then source-row index; stream/Markdown/content and
-  transcript-viewport resize
-  follow requests coalesce into one frame. Pinned-tray/composer height changes
-  are inputs to that same writer, never independent scroll owners. A live tail
-  continues rendering while the reader scrolls or types, but
-  a non-empty draft pauses auto-follow. Hidden tabs snapshot once and must not
+- **Scroll restoration is window-aware and has one writer.** Save the
+  scroll offset **relative to the rendered rows** (spacer excluded — it is
+  re-derived on remount), the bounded block range **in virtual coordinates**
+  (array index + the store's `trimmedCount`, so a cap trim while parked can't
+  strand the cursor), whether it still tracks the tail, and the transcript
+  revision the reader followed. Stream/Markdown/content and transcript-viewport
+  resize follow requests coalesce into one frame. Pinned-tray/composer height
+  changes are inputs to that same writer, never independent scroll owners. A
+  live tail continues rendering while the reader scrolls or types, but a
+  non-empty draft pauses auto-follow. Hidden tabs snapshot once and must not
   retain reactive block proxies. Replay never remounts the entire transcript.
   A visible top sentinel while a short live tail fills the viewport is layout,
   not reader intent: it may prepend only while retaining the tail, and stops at
   the DOM cap instead of silently paging the reader away from live activity.
+- **Never write `scrollTop` while a gesture may be in flight.** WebKit (the
+  native app) has no scroll anchoring, and its scrolling thread owns the
+  position during a fling: a mid-gesture `scrollTop` write — any correction for
+  rows mounted above the reader — snaps back for a frame or two (measured with
+  real momentum wheel events; see field notes 2026-09-25). A scrolled-up
+  reader's anchor row is held by resizing the **history spacer** instead: page
+  writes, trims, fold regrouping, and previews decoding above them (the column
+  ResizeObserver runs before paint) all shift the spacer by exactly the
+  anchor's movement. The spacer may go negative when the model underestimates
+  (rows pulled past the scroll origin, like the old rendered edge). Scroll
+  writes are reserved for the bottom-follow writer, a restore, and the idle
+  rebalance (no scroll event for 160 ms), which re-sizes the spacer to the
+  model with one compensating write. The transcript sets
+  `overflow-anchor: none` so Chromium doesn't correct the same shift twice.
+  Verify changes here with the real-wheel harness in
+  `scripts/perf/transcript-scroll/` — Chromium, jsdom and the Browser pane
+  hide the WebKit behavior.
 - **Fork boundaries are event-backed.** A rendered block's `forkSeq` is the
   latest sequence that makes that message true on replay (a queued user message
   advances on its `sent` update; a final Codex assistant message advances on
