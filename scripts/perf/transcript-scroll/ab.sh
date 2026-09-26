@@ -12,6 +12,12 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DIST="$(git -C "$HERE" rev-parse --show-toplevel)/web-ui/dist"
 SCENARIO="$1"
+# Validate before the loop deletes web-ui/dist: a missing build must not
+# leave the daemon with nothing to serve.
+: "${URL:?set URL to the app URL with ?scrollSession= and #token=}"
+for build in "${BUILD_A:?set BUILD_A}" "${BUILD_B:?set BUILD_B}"; do
+  [ -f "$build/index.html" ] || { echo "not a built UI: $build" >&2; exit 2; }
+done
 RUNNER="${RUNNER:-wk}"
 REPORT="${REPORT:-page/jumps.js}"
 

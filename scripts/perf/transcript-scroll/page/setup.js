@@ -13,11 +13,15 @@
   const byText = (sel, text) =>
     Array.from(document.querySelectorAll(sel)).find((el) => el.textContent.trim() === text);
   const transcript = () => document.querySelector(".chat.visible .transcript");
-  for (let i = 0; i < 80 && transcript() === null; i++) {
-    const row = byText("span, div, button, a", sessionName);
+  // The app restores the last open tab, so "a transcript is visible" is not
+  // enough: keep going until the requested session is the active tab.
+  const activeTab = () => document.querySelector(".tab.active .tab-name")?.textContent.trim();
+  for (let i = 0; i < 80 && (transcript() === null || activeTab() !== sessionName); i++) {
+    // Rail rows open on pointer-down or Enter, not click.
+    const row = byText("span.name", sessionName)?.closest(".row");
     if (row) {
-      row.click();
-      diag("clicked session");
+      row.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+      diag("opened session");
     } else {
       const ws = byText("span, div, button, a", workspaceName);
       if (ws) {

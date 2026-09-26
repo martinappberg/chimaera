@@ -270,41 +270,10 @@
     anchorRevision += 1;
   }
 
-  interface TranscriptAnchor {
-    node: HTMLElement;
-    /** The anchored row's block uid (a group's first tool) — trim-proof
-     *  identity, unlike the index label which goes stale by the trim delta
-     *  the moment a reducer trim outruns the last render. */
-    uid: number | null;
-    index: number | null;
-    top: number;
-    scrollTop: number;
-  }
-
-  function readTranscriptAnchor(): TranscriptAnchor | null {
-    const el = transcriptEl;
-    const column = columnEl;
-    if (el === null || column === null) return null;
-    const viewportTop = el.getBoundingClientRect().top;
-    const node = Array.from(column.querySelectorAll<HTMLElement>("[data-block-index]")).find(
-      (candidate) => candidate.getBoundingClientRect().bottom > viewportTop,
-    );
-    if (node === undefined) return null;
-    const parsed = Number(node.dataset.blockIndex);
-    const uidParsed = Number(node.dataset.blockUid);
-    return {
-      node,
-      uid: Number.isFinite(uidParsed) ? uidParsed : null,
-      index: Number.isFinite(parsed) ? parsed : null,
-      top: node.getBoundingClientRect().top,
-      scrollTop: el.scrollTop,
-    };
-  }
-
   /** The anchored row's CURRENT absolute index, resolved by uid identity
    *  against the rendered slice (immune to stale DOM labels after a trim
    *  shift); the parsed label is the fallback for a row already dropped. */
-  function anchorArrayIndex(anchor: TranscriptAnchor): number | null {
+  function anchorArrayIndex(anchor: ReadingAnchor): number | null {
     if (anchor.uid !== null) {
       const offset = renderBlocks.findIndex((b) => b.uid === anchor.uid);
       if (offset !== -1) return renderStart + offset;
@@ -314,7 +283,8 @@
 
   function canDiscardBefore(start: number): boolean {
     if (start <= renderStart) return true;
-    const anchor = readTranscriptAnchor();
+    const anchor =
+      transcriptEl === null || columnEl === null ? null : selectAnchor(transcriptEl, columnEl);
     if (anchor === null) return false;
     const index = anchorArrayIndex(anchor);
     return index !== null && index >= start;
@@ -409,7 +379,10 @@
     }
     const cpl = charsPerLine();
     let weight = 0;
-    for (let i = renderStart; i < renderEnd; i++) {
+    // Bounded by the live array: a reset or tail splice can shrink it before
+    // the windowing effect repairs renderEnd.
+    const end = Math.min(renderEnd, store.blocks.length);
+    for (let i = renderStart; i < end; i++) {
       weight += blockWeight(store.blocks[i], i > 0 ? store.blocks[i - 1] : null, cpl);
     }
     if (first === null || last === null || weight <= 0) return nominal;
@@ -432,10 +405,11 @@
     const sizedFor = `${renderStart}|${historyGeneration()}`;
     if (onlyIfMoved && sizedFor === spacerSizedFor) return;
     spacerSizedFor = sizedFor;
-    // A window shorter than the viewport is still filling from the sentinel;
-    // blank space above it would only push the rows down.
+    // A followed tail shorter than the viewport is still filling from the
+    // sentinel; blank space above it would only push the rows down. A short
+    // history page keeps its room, or the next page could not be absorbed.
     const target =
-      column.offsetHeight < el.clientHeight
+      atBottom && column.offsetHeight < el.clientHeight
         ? 0
         : spacerTarget(
             historyWeights.upTo(store.blocks, renderStart, charsPerLine(), historyGeneration()),
@@ -467,6 +441,18 @@
     });
   });
 
+  // A re-hydrating transcript (a journal reset) shows only its loading line;
+  // room held for the old history would push that line out of view. The
+  // re-mounted tail sizes the spacer afresh.
+  $effect(() => {
+    if (!store.hydrating) return;
+    untrack(() => {
+      setSpacer(0);
+      spacerSizedFor = "";
+      readingAnchor = null;
+    });
+  });
+
   /** Mount the next page in the reader's direction of travel once it is
    *  within reach, so a fling never stops dead at the rendered edge. */
   function maybePrefetch(): void {
@@ -494,10 +480,18 @@
   function farJump(el: HTMLElement, view: DOMRect, rows: DOMRect): boolean {
     if (renderStart === 0 || spacerPx <= 0) return false;
     if (rows.top - view.bottom < el.clientHeight * PREFETCH_VIEWPORTS) return false;
-    const perWeight = windowPxPerWeight();
-    historyWeights.upTo(store.blocks, renderStart, charsPerLine(), historyGeneration());
+    const earlier = historyWeights.upTo(
+      store.blocks,
+      renderStart,
+      charsPerLine(),
+      historyGeneration(),
+    );
+    // Map by the spacer's own proportion, not the model's px scale: it has
+    // absorbed real page heights since it was sized, and its two ends must
+    // still mean block 0 and the window's first block.
     const spacerTop = rows.top - spacerPx;
-    const index = Math.min(renderStart - 1, historyWeights.indexAt((view.top - spacerTop) / perWeight));
+    const fraction = Math.min(1, Math.max(0, (view.top - spacerTop) / spacerPx));
+    const index = Math.min(renderStart - 1, historyWeights.indexAt(fraction * earlier));
     const page = pageAround(index, store.blocks.length);
     pagingTranscript = true;
     setRange(page.start, page.end, { live: false, tail: false });
@@ -825,9 +819,13 @@
       queueBottomScroll();
     } else {
       atBottom = false;
+      // Prepending to a window that still ends at the live edge is scrolling
+      // within the tail, not paging away from it: keep it live until the cap
+      // drops the newest page (then it is an explicit history page).
+      const keepsTail = tracksTail && plan.settled.end >= store.blocks.length;
       setRangeAnchored(plan.settled.start, plan.settled.end, {
-        live: false,
-        tail: false,
+        live: keepsTail,
+        tail: keepsTail,
       });
     }
     void tick().then(afterPaging);
@@ -913,15 +911,17 @@
   // The forward twin: scroll-driven prefetch (maybePrefetch) usually mounts
   // the next page long before the reader gets here, but a window that already
   // ends inside the viewport produces no scroll event to drive it. Re-created
-  // per page (it reads renderEnd), so a sentinel still in view keeps paging.
+  // per page (it reads renderEnd), so a sentinel still in view keeps paging;
+  // `hasLaterRows` is derived so a live turn's appends don't rebuild it.
+  const hasLaterRows = $derived(renderEnd < store.blocks.length);
   $effect(() => {
     const root = transcriptEl;
     const sentinel = laterSentinelEl;
-    const hasLater = renderEnd < store.blocks.length;
+    void renderEnd;
     if (
       !canAutoLoadHistory ||
       !visible ||
-      !hasLater ||
+      !hasLaterRows ||
       store.hydrating ||
       root === null ||
       sentinel === null

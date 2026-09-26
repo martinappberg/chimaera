@@ -4,7 +4,7 @@
 // usage: node cdp-scroll.mjs <url> <setup.js> <analyze.js> <scenario>
 //   scenario items: up:<px>:<speed> | down:<px>:<speed> | wait:<ms> | js:<expr>
 import { spawn } from "node:child_process";
-import { readFileSync, mkdtempSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -58,5 +58,9 @@ await evaluate(analyze);
 let out = null;
 for (let i = 0; i < 40 && out === null; i++) { out = await evaluate("window.__out ?? null"); if (out === null) await sleep(250); }
 console.log(out);
-chrome.kill();
+await new Promise((r) => {
+  chrome.once("exit", r);
+  chrome.kill();
+});
+rmSync(profile, { recursive: true, force: true });
 process.exit(0);
