@@ -179,8 +179,11 @@
   // version is a new ticket, so the body reloads fresh bytes); a delete
   // turns the card into its missing state. Registered only while visible —
   // the daemon's watch list is small (64 paths) and shared with open panes.
+  /** A primitive, so a refresh to a new version (same path) keeps the
+   *  registration instead of dropping and re-adding it. */
+  const watchedPath = $derived(hit?.path ?? null);
   $effect(() => {
-    const target = hit?.path ?? null;
+    const target = watchedPath;
     if (!onScreen || target === null) return;
     retainDiskFile(target);
     let first = true;
