@@ -144,10 +144,13 @@ One privileged chat session per workspace (the dashboard plan §6/§7 —
   from the binding too. A Mastermind that dies on its own clears its binding
   in `recents::retire` (and skips Recents).
 
-Codex chat sessions (workers) get the per-session chimaera MCP injected at
-spawn via `-c mcp_servers.chimaera.url=…` (`launcher::build_codex_chat_command`,
-verified codex 0.144.2) — the same key-in-URL endpoint claude's
-`--mcp-config` points at.
+Codex chat sessions get the per-session chimaera MCP injected at spawn via
+`-c mcp_servers.chimaera.url=…` + `bearer_token_env_var` — the key rides the
+spawn env, never world-readable argv (`launcher::build_codex_chat_command`).
+Codex TUIs get the same injection only while a workbench plugin with tools
+is active in the workspace (`launcher::codex_tui_mcp_args`, `spawn.rs`), with
+a per-tool `approval_mode="approve"` for exactly those tools plus `notify`;
+with none on, a codex TUI's argv is unchanged.
 
 ## The chat-mode seam (`chat.rs`) — the part this doc exists for
 

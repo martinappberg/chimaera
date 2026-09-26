@@ -1109,7 +1109,6 @@
     onOpenSession: openSess,
     onOpenTimeline: openTimelineSurface,
     onOpenKnowledge: openKnowledgeSurface,
-    onOpenPlugins: openPluginsSurface,
   });
 
   /**

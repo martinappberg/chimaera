@@ -18,6 +18,31 @@ the unmerged Loadout plan (`docs/skills-manager-plan.md` on branch
 `claude/chimaera-skills-manager-4c4110`), which it absorbs. Items marked
 **[decide]** are the maintainer's call.
 
+## As built — where it differs from the design below
+
+- Plugins switch **per workspace only** (`Workspace.plugins_on`, off by
+  default); there is no global `plugins.enabled` setting.
+- **session** crash entries come from chat exits only. Hook-less TUIs
+  (codex/gemini terminals) write no episodes.
+- The interactive-program exclusions are a fixed list in `episodes.rs`, not
+  a setting.
+- Codex's installed plugins are inferred from the `pluginId` on its skills
+  and hooks (PROTOCOL.md Pass 32), not `plugin/installed`; a codex plugin
+  with neither doesn't appear.
+- Claude memory is read from `~/.claude/projects/<encoded cwd>/memory`.
+  Without mycelium there is no "latest episodes" fallback for *Where we
+  left off*.
+- The Plugins tab opens from quick-open; the dashboard, dock and Knowledge
+  open the attach sheet directly.
+- The Mastermind reads knowledge through the mycelium plugin's
+  `knowledge_search` / `knowledge_get` (offered whenever it is active), not
+  a separate `knowledge` tool.
+- Knowledge *recorded by* is read back from the Timeline's episode
+  evidence (it survives a restart). Agent-notes read cursors live in
+  memory, so a restart can show old notes as unread again.
+- Codex TUIs get the chimaera MCP (and so the plugin tools) only while a
+  plugin with tools is active in the workspace.
+
 ## Decisions (maintainer, 2026-09-25)
 
 1. **The dashboard leads with questions**, not the roster: the roster demotes
