@@ -7,6 +7,10 @@
 //! paths every two seconds and occasionally hash directory entry names as a
 //! metadata-cache backstop. All filesystem work runs off the async reactor and
 //! every dimension is capped.
+//!
+//! Writes the daemon hears about (agent hooks, chat edit events, saves — all
+//! via `git::mark_path_dirty`) skip the poll: they are broadcast as
+//! [`Touched`] paths, and each client re-stats only the ones it watches.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -25,6 +29,13 @@ const MAX_WATCH_TOTAL_BYTES: usize = 64 * 1024;
 /// Mirrors `fs::MAX_DIR_ENTRIES`: the monitor must never walk farther than the
 /// listing surface it invalidates.
 const MAX_LISTING_ENTRIES: usize = crate::fs::MAX_DIR_ENTRIES;
+
+/// Paths one write touched, as the writer named them and canonicalized
+/// (deduped). Matched against a client's watched paths exactly.
+pub(crate) type Touched = std::sync::Arc<[PathBuf]>;
+/// Broadcast depth of [`Touched`] messages. A burst beyond it only lags a
+/// receiver, which then relies on the regular poll for what it skipped.
+pub(crate) const TOUCHED_CAPACITY: usize = 256;
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct FsChanges {
@@ -206,6 +217,39 @@ impl FsWatch {
                 }
             };
 
+        self.apply(observed)
+    }
+
+    /// Re-stat, right now, the watched files among `touched` and the watched
+    /// directories that hold one of them, so a write the daemon heard about
+    /// reaches the client without waiting for the next poll. Baselines update
+    /// exactly as a poll's would (a later poll does not report it again), and
+    /// no directory listing is walked: a changed directory drops its name
+    /// baseline, as on the fast path. Nothing watched → no filesystem work.
+    pub(crate) async fn poll_touched(&mut self, touched: &[PathBuf]) -> FsChanges {
+        let files: Vec<WatchPath> = self
+            .files
+            .iter()
+            .filter(|p| touched.contains(&p.disk))
+            .cloned()
+            .collect();
+        let dirs: Vec<WatchPath> = self
+            .dirs
+            .iter()
+            .filter(|d| touched.iter().any(|t| t.parent() == Some(d.disk.as_path())))
+            .cloned()
+            .collect();
+        if files.is_empty() && dirs.is_empty() {
+            return FsChanges::default();
+        }
+        let observed =
+            match tokio::task::spawn_blocking(move || observe(files, dirs, HashSet::new())).await {
+                Ok(value) => value,
+                Err(join) => {
+                    tracing::debug!(%join, "filesystem watch task failed");
+                    return FsChanges::default();
+                }
+            };
         self.apply(observed)
     }
 
@@ -471,6 +515,40 @@ mod tests {
         std::fs::remove_file(&file).unwrap();
         let removed = watch.poll(true).await;
         assert_eq!(removed.removed, [file.to_string_lossy()]);
+    }
+
+    /// A daemon-observed write is reported at once for a watched file (and
+    /// its watched directory), without waiting for the poll ceiling, and is
+    /// not reported a second time by the next poll.
+    #[tokio::test]
+    async fn touched_paths_are_restated_immediately_and_only_when_watched() {
+        let root = TempDir::new("touched");
+        let file = root.0.join("doc.md");
+        std::fs::write(&file, b"one").unwrap();
+        let mut watch = FsWatch::new();
+        watch.set(
+            vec![file.to_string_lossy().into_owned()],
+            vec![root.0.to_string_lossy().into_owned()],
+        );
+        let _ = watch.poll(true).await;
+
+        // Within the poll ceiling a regular poll reports nothing...
+        std::fs::write(&file, b"two, longer").unwrap();
+        assert!(watch.poll(false).await.is_empty());
+        // ...but the touched path is re-stated right away.
+        let changes = watch.poll_touched(std::slice::from_ref(&file)).await;
+        assert_eq!(changes.files, [file.to_string_lossy()]);
+        assert!(watch.poll(true).await.files.is_empty(), "reported twice");
+
+        // A new file in a watched directory: the directory is re-stated.
+        let child = root.0.join("new.md");
+        std::fs::write(&child, b"x").unwrap();
+        let changes = watch.poll_touched(std::slice::from_ref(&child)).await;
+        assert_eq!(changes.dirs, [root.0.to_string_lossy()]);
+
+        // Paths nobody watches cost nothing and report nothing.
+        let elsewhere = PathBuf::from("/nonexistent/elsewhere.md");
+        assert!(watch.poll_touched(&[elsewhere]).await.is_empty());
     }
 
     #[tokio::test]

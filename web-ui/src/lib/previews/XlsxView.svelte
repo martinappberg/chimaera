@@ -12,6 +12,8 @@
   import { fsXlsx, type TablePage } from "./files";
   import TableView from "./TableView.svelte";
   import Spinner from "./Spinner.svelte";
+  import { a1ToBlock, blockToA1, sheetFragment, type TableBlock } from "../shared/locator";
+  import { revealRequest, takeReveal, type Reveal } from "../shared/reveal";
 
   interface Props {
     path: string;
@@ -45,6 +47,9 @@
       .then((page) => {
         if (cancelled) return;
         sheets = page.sheets;
+        origin = page.origin ?? [0, 0];
+        // A reveal belongs to the grid it was made for, never the next sheet's.
+        if (page.sheet !== sheetLoaded) gridReveal = null;
         sheetLoaded = page.sheet;
       })
       .catch((e) => {
@@ -65,6 +70,54 @@
     const s = sheetLoaded ?? "";
     return (offset: number, limit: number): Promise<TablePage> => fsXlsx(p, s, offset, limit);
   });
+
+  /** Where the sheet's used range starts (0-based): the grid's header row. */
+  let origin = $state<[number, number]>([0, 0]);
+
+  // A selected block goes to an agent as the sheet and its A1 range. Stable
+  // per sheet (a fresh closure per render would churn the grid's effect).
+  const locate = $derived.by(() => {
+    const sheet = sheetLoaded ?? "";
+    const o: [number, number] = [origin[0], origin[1]];
+    return (b: TableBlock) => {
+      const range = blockToA1(b, o);
+      return { fragment: sheetFragment(sheet, range), label: `${sheet}!${range}` };
+    };
+  });
+
+  // `#sheet=S&range=B2:F9` (or a bare `#range=`, or `#row=`/`#cell=`): the
+  // sheet first, then the block on its grid once that sheet has loaded.
+  let pendingReveal = $state.raw<Reveal | null>(null);
+  let gridReveal = $state.raw<{ table: NonNullable<Reveal["table"]>; nonce: number } | null>(null);
+  let revealNonce = 0;
+
+  $effect(() => {
+    void $revealRequest;
+    const req = takeReveal(path);
+    if (req === null) return;
+    if (req.sheet === undefined && req.range === undefined && req.table === undefined) return;
+    pendingReveal = req;
+  });
+
+  $effect(() => {
+    const req = pendingReveal;
+    const loaded = sheetLoaded;
+    if (req === null || loaded === null) return;
+    if (req.sheet !== undefined && req.sheet !== loaded && sheets.includes(req.sheet)) {
+      // Switch sheets; this runs again once that sheet's probe lands.
+      if (selected !== req.sheet) selected = req.sheet;
+      return;
+    }
+    pendingReveal = null;
+    const table = req.range !== undefined ? a1ToBlock(req.range, origin) : req.table;
+    if (table !== undefined) gridReveal = { table, nonce: ++revealNonce };
+  });
+
+  // A reveal is held (pendingReveal) until its sheet has loaded, so this
+  // view must outlive a cold open: FileView keys it on the entry's `changes`
+  // count, which moves only when the file CHANGES, not when the first token
+  // lands. A reveal still pending when the view goes is dropped — the
+  // one global slot may hold a newer reveal for another file by then.
 </script>
 
 <div class="xlsx-view">
@@ -89,7 +142,7 @@
     {/if}
     <div class="grid">
       {#key sheetLoaded}
-        <TableView {path} fetchPage={pageFetcher} />
+        <TableView {path} fetchPage={pageFetcher} {locate} reveal={gridReveal} />
       {/key}
     </div>
   {/if}

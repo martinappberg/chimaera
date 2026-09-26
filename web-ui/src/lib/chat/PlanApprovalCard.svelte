@@ -8,14 +8,14 @@
    * feedback-denial). Option ids/labels come from the driver verbatim.
    */
   import Markdown from "./Markdown.svelte";
-  import type { ResolvePaths } from "./paths";
+  import type { OpenPathFn, PathResolver } from "./paths";
   import type { PendingPermission } from "./store.svelte";
 
   interface Props {
     request: PendingPermission;
     onDecide: (optionId: string, feedback?: string) => void;
-    onOpenPath?: (path: string, kind: "file" | "dir") => void;
-    resolvePaths?: ResolvePaths;
+    onOpenPath?: OpenPathFn;
+    resolvePaths?: PathResolver;
     /** False while the owning retained chat tab is hidden. The card and its
      *  comment stay mounted, but neither face may steal focus. */
     visible?: boolean;

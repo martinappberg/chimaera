@@ -7,8 +7,10 @@ paths: ["web-ui/**"]
 
 Svelte 5 (runes). Build/check needs **Node 22** (`nvm use 22`; the nvm default 16
 errors). Depth: [chat/AGENTS.md](../../web-ui/src/lib/chat/AGENTS.md),
-[dashboard/AGENTS.md](../../web-ui/src/lib/dashboard/AGENTS.md), and
-[settings/AGENTS.md](../../web-ui/src/lib/settings/AGENTS.md).
+[dashboard/AGENTS.md](../../web-ui/src/lib/dashboard/AGENTS.md),
+[settings/AGENTS.md](../../web-ui/src/lib/settings/AGENTS.md),
+[knowledge/AGENTS.md](../../web-ui/src/lib/knowledge/AGENTS.md), and
+[plugins/AGENTS.md](../../web-ui/src/lib/plugins/AGENTS.md).
 
 `src/lib/` is grouped by concern, not flat: **`net/`** (api, ws-adjacent transport,
 reconnect, native bridge, the `/ws/events` socket) · **`layout/`** (the split/pane/tab

@@ -66,12 +66,27 @@ export interface HostState {
   remote_build: string | null;
   /** Live sessions counted when the update decision was made. */
   live_sessions: number | null;
+  /**
+   * The login node the daemon runs on when the alias names a pool of login
+   * nodes and the connection is pinned to one other than where a new ssh
+   * connection lands (null = wherever the alias lands).
+   */
+  node: string | null;
 }
 
 /** Progress of an in-flight connect, mirrored from chimaera-remote phases. */
 export interface ConnectProgress {
   alias: string;
-  phase: "probing" | "updating" | "downloading" | "installing" | "starting" | "tunneling";
+  phase:
+    | "probing"
+    | "routing"
+    | "updating"
+    | "downloading"
+    | "installing"
+    | "starting"
+    | "tunneling";
+  /** The login node a `routing` phase is reaching (it may ask to authenticate). */
+  node?: string;
 }
 
 /** Build parity of the local daemon, as decided at app startup. */
@@ -377,6 +392,9 @@ export interface HostStatusEvent {
   reason?: string;
   /** Source build now served through this tunnel. */
   build?: string;
+  /** On "connected": the login node the tunnel is pinned to (absent = wherever
+   *  the alias lands). Every connected event carries it. */
+  node?: string;
 }
 
 /**
@@ -417,6 +435,51 @@ export async function reportWindowScope(
  */
 export async function reportWindowView(visible: string[]): Promise<void> {
   await tauri()?.core.invoke<void>("report_window_view", { visible });
+}
+
+/**
+ * Tell the shell how many files hold unsaved edits in this window, whenever
+ * that changes. The shell decides a window close or the app's quit from this
+ * count without asking the page first, so a window with nothing unsaved
+ * closes with no prompt. No-op in a browser (beforeunload guards there).
+ */
+export async function reportUnsaved(count: number): Promise<void> {
+  await tauri()?.core.invoke<void>("report_unsaved", { count });
+}
+
+/** Why the shell is asking this window about its unsaved edits. */
+export type UnsavedReason = "close" | "quit";
+
+/**
+ * The shell held this window's close, or the app's quit, because this window
+ * reported unsaved edits. `id` is stable across repeated asks of one prompt;
+ * every reply carries it.
+ */
+export interface UnsavedPrompt {
+  id: number;
+  reason: UnsavedReason;
+}
+
+/**
+ * - `shown`: the dialog is up — the page is alive, so the shell waits for the
+ *   user instead of treating the window as hung (it proceeds anyway after a
+ *   few seconds without this).
+ * - `proceed`: every file saved, or Don't save — the close or quit goes ahead.
+ * - `cancel`: keep the window; a quit is abandoned.
+ */
+export type UnsavedReply = "shown" | "proceed" | "cancel";
+
+/** The shell asks about this window's unsaved edits (window-scoped, like onMenu). */
+export function onUnsavedPrompt(handler: (p: UnsavedPrompt) => void): Promise<() => void> {
+  const t = tauri();
+  if (t === null) return Promise.resolve(() => {});
+  return t.webviewWindow
+    .getCurrentWebviewWindow()
+    .listen<UnsavedPrompt>("unsaved-prompt", (e) => handler(e.payload));
+}
+
+export async function replyUnsaved(id: number, reply: UnsavedReply): Promise<void> {
+  await tauri()?.core.invoke<void>("reply_unsaved", { id, reply });
 }
 
 /**

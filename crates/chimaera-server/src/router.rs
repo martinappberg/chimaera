@@ -6,8 +6,9 @@ use tower_http::trace::TraceLayer;
 
 use crate::AppState;
 use crate::{
-    agents, api, chat, compute, compute_jobs, download, environment, fs, git, launcher, links, mcp,
-    notices, proxy, quickopen, recents, runtimes, settings, update, upload, view_state, ws,
+    agent_probe, agents, api, chat, compute, compute_jobs, download, drafts, environment, fs, git,
+    launcher, links, mcp, notebook, notices, plugins, proxy, quickopen, recents, runtimes,
+    settings, timeline, update, upload, view_state, ws,
 };
 
 /// Build the axum router (factored out so tests can drive it with `oneshot`).
@@ -15,6 +16,8 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
     // Consumes the chat manager's hook signals for the daemon's lifetime
     // (no-op when already running — tests may build several routers).
     chat::spawn_signal_task(state.clone());
+    // Finished Slurm jobs → the Timeline (idempotent; idle without a queue).
+    crate::episodes::spawn_jobs_task(state.clone());
     let api = Router::new()
         .route("/health", get(api::health))
         .route(
@@ -28,6 +31,42 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         .route(
             "/workspaces/{id}/mastermind",
             put(api::put_mastermind).delete(api::delete_mastermind),
+        )
+        .route("/workspaces/{id}/timeline", get(timeline::get_timeline))
+        // Agent notes: the USER sends a note to its addressee (their click).
+        .route(
+            "/workspaces/{id}/timeline/{seq}/deliver",
+            post(crate::notes::deliver),
+        )
+        // Workbench plugins: the catalog, per-workspace status, and the
+        // per-workspace switch (`Workspace.plugins_on`; off by default).
+        .route("/plugins", get(plugins::list_plugins))
+        .route("/workspaces/{id}/plugins", get(plugins::workspace_plugins))
+        .route(
+            "/workspaces/{id}/plugins/{pid}",
+            put(plugins::put_workspace_plugin),
+        )
+        .route(
+            "/workspaces/{id}/plugins/{pid}/trust-hooks",
+            post(agent_probe::trust_hooks),
+        )
+        .route(
+            "/workspaces/{id}/plugins/{pid}/install",
+            post(plugins::install_requirement),
+        )
+        .route(
+            "/workspaces/{id}/plugins/{pid}/setup",
+            post(plugins::setup_workspace),
+        )
+        // What each agent CLI reports it has here (asked of the agents).
+        .route(
+            "/workspaces/{id}/agent-plugins",
+            get(agent_probe::agent_plugins),
+        )
+        .route("/workspaces/{id}/skills", get(agent_probe::skills))
+        .route(
+            "/workspaces/{id}/knowledge",
+            get(crate::knowledge::get_knowledge),
         )
         .route(
             "/sessions",
@@ -89,8 +128,29 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         .route("/fs/markdown", get(fs::markdown))
         .route("/fs/table", get(fs::table))
         .route("/fs/xlsx", get(fs::xlsx))
+        .route("/fs/notebook", get(notebook::notebook))
         .route("/fs/quickopen", get(quickopen::quickopen))
         .route("/fs/validate", post(fs::validate))
+        .route("/fs/resolve_targets", post(crate::embed::resolve_targets))
+        // The portable-dialect checker (the reading view's issues chip; the
+        // MCP `check_document` tool runs the same code) and the opt-in
+        // "teach agents" installs behind Settings.
+        .route("/fs/check_document", get(crate::doc_check::check_document))
+        .route("/agent-docs", get(crate::agent_docs::status))
+        .route("/agent-docs/install", post(crate::agent_docs::install))
+        // The draft mirror (unsaved editor text; see `drafts`). The body
+        // limit only makes room for JSON escaping — the 1 MiB text cap is
+        // judged on the decoded text.
+        .route(
+            "/fs/drafts",
+            get(drafts::list_drafts).put(drafts::put_draft).layer(
+                axum::extract::DefaultBodyLimit::max(drafts::MAX_DRAFT_BODY_BYTES),
+            ),
+        )
+        .route(
+            "/fs/draft",
+            get(drafts::get_draft).delete(drafts::delete_draft),
+        )
         .route("/fs/mkdir", post(fs::mkdir))
         .route("/fs/create", post(fs::create))
         .route("/fs/rename", post(fs::rename))
@@ -153,6 +213,8 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         .route("/ws/chat/{id}", get(ws::chat_ws))
         .route("/ws/events", get(ws::events_ws))
         .route("/raw/{ticket}", get(fs::raw))
+        // An HTML report's relative assets, confined to its folder.
+        .route("/raw/{ticket}/{*rest}", get(fs::raw_asset))
         .route("/download/{ticket}", get(download::download))
         // Three spellings because `{*path}` refuses an EMPTY tail: the bare
         // form redirects to the slashed form, the slashed form IS the app's

@@ -19,6 +19,11 @@ No schema rows, an explicit Save (fetch-merge-put — the PUT replaces the whole
 map, so other workspaces' entries must round-trip), and an empty editor deletes
 its scope's entry rather than persisting `{text: ""}`.
 
+**Exception — Documents.** Also store-backed: `DocumentsSettings.svelte` drives
+the opt-in "teach agents the document dialect" installs over
+`/api/v1/agent-docs` (an `AGENTS.md` block, a Claude Code skill). The daemon
+owns the text; the confirm dialog shows it verbatim before anything is written.
+
 ## File map
 
 | File | What it owns |
@@ -29,6 +34,8 @@ its scope's entry rather than persisting `{text: ""}`.
 | `AgentsSettings.svelte` | Per-agent binary/model settings (paths, managed installs). |
 | `EnvironmentSettings.svelte` | The Environment prelude panel (bespoke, `/api/v1/environment`-backed — see the exception above). |
 | `environment.ts` | Wire types + `getEnvironment`/`putEnvironment` for the prelude map. |
+| `DocumentsSettings.svelte` | The Documents panel: the opt-in AGENTS.md / Claude skill installs (see the exception above). |
+| `agentDocs.ts` | Wire types + `getAgentDocs`/`installAgentDocs` for `/api/v1/agent-docs`. |
 | `NotificationStatus.svelte` | The Notifications section's status line: whether the OS (native) or browser will show alerts, with Allow / Open System Settings / Send test. The switches below it are ordinary schema rows. |
 | `SettingRow.svelte` | One schema-driven control. |
 | `SettingsJson.svelte` | The raw-JSON editor (validates against the schema). |

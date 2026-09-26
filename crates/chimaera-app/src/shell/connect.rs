@@ -46,12 +46,19 @@ pub struct HostState {
     outdated: bool,
     remote_build: Option<String>,
     live_sessions: Option<usize>,
+    /// The login node the daemon runs on, when the alias names a pool of
+    /// login nodes and the connection is pinned to one other than where a
+    /// new ssh connection lands (`None` = wherever the alias lands).
+    node: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
 struct ConnectProgress {
     alias: String,
     phase: &'static str,
+    /// The login node a `routing` phase is reaching.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    node: Option<String>,
 }
 
 /// Live tunnel liveness, pushed as hosts drop or reconnect (see the health
@@ -79,9 +86,21 @@ pub(super) struct HostStatus {
     /// hashed UI chunks never span daemon builds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) build: Option<String>,
+    /// On `connected`: the login node the tunnel is pinned to (a pool alias
+    /// whose daemon runs on another node than where the alias lands).
+    /// Every connected event carries it, so a row re-routed by a reconnect it
+    /// didn't start never keeps a stale node.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) node: Option<String>,
 }
 
-fn connected_status(alias: &str, local_port: u16, token: &str, build: Option<&str>) -> HostStatus {
+fn connected_status(
+    alias: &str,
+    local_port: u16,
+    token: &str,
+    build: Option<&str>,
+    node: Option<&str>,
+) -> HostStatus {
     HostStatus {
         alias: alias.to_string(),
         status: "connected",
@@ -90,6 +109,7 @@ fn connected_status(alias: &str, local_port: u16, token: &str, build: Option<&st
         error: None,
         reason: None,
         build: build.map(str::to_string),
+        node: node.map(str::to_string),
     }
 }
 
@@ -116,6 +136,7 @@ pub(super) fn state_for(
         outdated: tunnel.is_some_and(|t| t.outdated),
         remote_build: tunnel.and_then(|t| t.remote_build.clone()),
         live_sessions: tunnel.and_then(|t| t.live_sessions),
+        node: tunnel.and_then(|t| t.route.node().map(str::to_string)),
     }
 }
 
@@ -142,6 +163,7 @@ async fn publish_connected_state(app: &AppHandle, state: &Shell, alias: &str) ->
                 tunnel.local_port,
                 &tunnel.manifest.token,
                 tunnel.manifest.build.as_deref(),
+                tunnel.route.node(),
             ),
         )
     };
@@ -175,26 +197,33 @@ async fn run_connect(
     let progress_app = app.clone();
     let progress_alias = alias.to_string();
     chimaera_remote::connect(alias, opts, move |phase| {
-        let phase = match phase {
-            Phase::Probing => "probing",
-            Phase::Updating => "updating",
-            Phase::Downloading { .. } => "downloading",
-            Phase::Installing { .. } => "installing",
-            Phase::Starting => "starting",
-            Phase::Tunneling { .. } => "tunneling",
+        let (phase, node) = match phase {
+            Phase::Probing => ("probing", None),
+            // A second authentication prompt may follow — for that node.
+            Phase::Routing { node } => ("routing", Some(node)),
+            Phase::Updating => ("updating", None),
+            Phase::Downloading { .. } => ("downloading", None),
+            Phase::Installing { .. } => ("installing", None),
+            Phase::Starting => ("starting", None),
+            Phase::Tunneling { .. } => ("tunneling", None),
         };
-        emit_progress(&progress_app, &progress_alias, phase);
+        emit_progress_at(&progress_app, &progress_alias, phase, node);
     })
     .await
 }
 
 /// One `connect-progress` event: the phase label a host row shows.
 fn emit_progress(app: &AppHandle, alias: &str, phase: &'static str) {
+    emit_progress_at(app, alias, phase, None);
+}
+
+fn emit_progress_at(app: &AppHandle, alias: &str, phase: &'static str, node: Option<String>) {
     let _ = app.emit(
         "connect-progress",
         ConnectProgress {
             alias: alias.to_string(),
             phase,
+            node,
         },
     );
 }
@@ -301,6 +330,7 @@ pub(super) async fn do_connect(
                     error: Some(e.clone()),
                     reason: None,
                     build: None,
+                    node: None,
                 },
             );
         }
@@ -477,6 +507,7 @@ async fn drop_compute_tunnels_of(app: &AppHandle, state: &Shell, alias: &str) {
                         .to_string(),
                 ),
                 build: None,
+                node: None,
             },
         );
     }
@@ -538,12 +569,19 @@ mod tests {
 
     #[test]
     fn connected_status_carries_the_authoritative_endpoint() {
-        let status = connected_status("Sherlock", 43123, "fresh-token", Some("build.2"));
+        let status = connected_status(
+            "Sherlock",
+            43123,
+            "fresh-token",
+            Some("build.2"),
+            Some("sh03-ln06.stanford.edu"),
+        );
         assert_eq!(status.alias, "Sherlock");
         assert_eq!(status.status, "connected");
         assert_eq!(status.local_port, Some(43123));
         assert_eq!(status.token.as_deref(), Some("fresh-token"));
         assert_eq!(status.build.as_deref(), Some("build.2"));
+        assert_eq!(status.node.as_deref(), Some("sh03-ln06.stanford.edu"));
     }
 
     #[test]

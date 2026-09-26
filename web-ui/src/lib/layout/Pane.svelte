@@ -1,6 +1,8 @@
 <script lang="ts">
   import { keepsPaneViewAlive, tabKey, type PaneNode, type Tab } from "./layout";
   import { untrack, type Component } from "svelte";
+  import { get } from "svelte/store";
+  import { dirtyFiles } from "../shared/editing";
   import { sessionLabel, type Session } from "../workspace/sessions";
   import type { DropSpot, LayoutCtrl } from "./dnd";
   import { registerPane, unregisterPane, zoneWord } from "./dnd";
@@ -127,6 +129,19 @@
   const LIVE_CAP = 8;
   let liveKeys = $state<string[]>([]);
 
+  /** Trim the MRU to LIVE_CAP from its cold end, never evicting a file with
+   *  unsaved edits: its buffer would survive in the store anyway, but its
+   *  view (scroll, search panel, selection chip) is what the user left. */
+  function trimLive(keys: string[], dirty: ReadonlySet<string>): string[] {
+    if (keys.length <= LIVE_CAP) return keys;
+    const out = [...keys];
+    for (let i = out.length - 1; i > 0 && out.length > LIVE_CAP; i--) {
+      const k = out[i];
+      if (!(k.startsWith("f:") && dirty.has(k.slice(2)))) out.splice(i, 1);
+    }
+    return out;
+  }
+
   function retainView(tab: Tab): boolean {
     return keepsPaneViewAlive(
       tab,
@@ -144,7 +159,7 @@
         liveKeys =
           i < 0 ? [key, ...liveKeys] : [key, ...liveKeys.slice(0, i), ...liveKeys.slice(i + 1)];
       }
-      if (liveKeys.length > LIVE_CAP) liveKeys = liveKeys.slice(0, LIVE_CAP);
+      if (liveKeys.length > LIVE_CAP) liveKeys = trimLive(liveKeys, get(dirtyFiles));
     });
   });
 
@@ -422,6 +437,33 @@
       />
     {:else if viewErrors.dashboard}
       {@render loadFailure("dashboard", "dashboard")}
+    {:else}
+      <Spinner />
+    {/if}
+  {:else if tab.surface === "timeline"}
+    {@const TimelineView = views.timeline}
+    {#if TimelineView !== undefined}
+      <TimelineView {dash} {sessions} {names} {wsId} {wsRoot} paneId={node.id} {ctrl} visible={active} />
+    {:else if viewErrors.timeline}
+      {@render loadFailure("timeline", "timeline")}
+    {:else}
+      <Spinner />
+    {/if}
+  {:else if tab.surface === "knowledge"}
+    {@const KnowledgeView = views.knowledge}
+    {#if KnowledgeView !== undefined}
+      <KnowledgeView {wsId} {wsRoot} paneId={node.id} {ctrl} visible={active} />
+    {:else if viewErrors.knowledge}
+      {@render loadFailure("knowledge", "knowledge")}
+    {:else}
+      <Spinner />
+    {/if}
+  {:else if tab.surface === "plugins"}
+    {@const PluginsView = views.plugins}
+    {#if PluginsView !== undefined}
+      <PluginsView {dash} {wsId} {wsRoot} paneId={node.id} {ctrl} visible={active} />
+    {:else if viewErrors.plugins}
+      {@render loadFailure("plugins", "plugins")}
     {:else}
       <Spinner />
     {/if}

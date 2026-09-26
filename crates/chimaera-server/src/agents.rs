@@ -166,6 +166,7 @@ pub(crate) fn write_settings(
     theme: Option<&str>,
     user_statusline: Option<&serde_json::Value>,
     mastermind: Option<crate::workspaces::MastermindMode>,
+    plugin_tools: &[String],
 ) -> anyhow::Result<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
 
@@ -179,8 +180,8 @@ pub(crate) fn write_settings(
     if let Some(theme) = theme {
         settings["theme"] = json!(theme);
     }
-    // Every session pre-allows the prompt-free tools (`notify`); a
-    // Mastermind adds its tier's gate on top.
+    // Every session pre-allows the prompt-free tools (`notify`, the
+    // read-only document tools); a Mastermind adds its tier's gate on top.
     let mut allow: Vec<String> = crate::mcp::ALWAYS_ALLOWED_TOOLS
         .iter()
         .map(|t| format!("mcp__chimaera__{t}"))
@@ -195,6 +196,12 @@ pub(crate) fn write_settings(
         ),
         Some(crate::workspaces::MastermindMode::Auto) => allow = vec!["mcp__chimaera".into()],
         None => {}
+    }
+    // Tools of workbench plugins active in the session's workspace at spawn
+    // (the user switched them on; each card says it adds them). Auto already
+    // allows the whole server; none active adds nothing.
+    if mastermind != Some(crate::workspaces::MastermindMode::Auto) {
+        allow.extend(plugin_tools.iter().map(|t| format!("mcp__chimaera__{t}")));
     }
     settings["permissions"] = json!({ "allow": allow });
     if let Some(passthrough) = statusline_passthrough(user_statusline) {
@@ -603,6 +610,47 @@ pub(crate) async fn ingest(
         state.changes.notify_waiters();
     }
 
+    // The Timeline's hooks tier: claude TUIs only. Claude CHAT sessions fire
+    // the same `--settings` hooks, and the protocol already records their
+    // turns — gate on the PTY registry (and skip a view switch in flight) or
+    // every chat turn lands twice.
+    if state.sessions.get(&id).is_some() && !crate::lock(&state.chat_switching).contains_key(&id) {
+        let now = crate::timeline::now_ms();
+        let draft = {
+            let mut tui = crate::lock(&state.tui_episodes);
+            match event {
+                "UserPromptSubmit" => payload
+                    .get("prompt")
+                    .and_then(|p| p.as_str())
+                    .and_then(|p| tui.prompt(&id, now, p)),
+                "PostToolUse" => {
+                    tui.tool(&id, touched_path.as_deref());
+                    None
+                }
+                // Stop carries the final message (`last_assistant_message`,
+                // present in the claude 2.1.259 Stop hook input); a repeat
+                // Stop with no open turn is dropped.
+                "Stop" => tui.stop(
+                    &id,
+                    now,
+                    "finished",
+                    payload
+                        .get("last_assistant_message")
+                        .and_then(|m| m.as_str()),
+                ),
+                "StopFailure" => tui.stop(&id, now, "errored", None),
+                "SessionEnd" => tui.stop(&id, now, "exited", None),
+                _ => None,
+            }
+        };
+        if event == "UserPromptSubmit" {
+            crate::knowledge::prime(&state, &id).await;
+        }
+        if let Some(draft) = draft {
+            crate::episodes::record(&state, &id, draft, "hooks").await;
+        }
+    }
+
     // An agent writing a file is the signature git refresh trigger: the hook we
     // already ingest IS the mechanism — no polling, no terminal-text parsing.
     if let Some(path) = touched_path {
@@ -642,6 +690,25 @@ pub(crate) async fn ingest(
     if event == "UserPromptSubmit" {
         if let Some(prompt) = payload.get("prompt").and_then(|p| p.as_str()) {
             context.extend(crate::mcp::autolink_mentions(&state, &id, prompt));
+        }
+    }
+
+    // Agent notes (a plugin the user switched on): mail waits to be read —
+    // a one-line hint on a carrier that already fires, never a new turn.
+    if matches!(event, "SessionStart" | "UserPromptSubmit")
+        && crate::plugins::active_for_session(&state, &id)
+            .await
+            .iter()
+            .any(|m| m.id == "agent-notes")
+    {
+        let unread = crate::notes::unread_count(&state, &id).await;
+        if unread > 0 {
+            context.push(format!(
+                "{unread} unread note{} from other sessions in this workspace — \
+                 read_notes shows {}.",
+                if unread == 1 { "" } else { "s" },
+                if unread == 1 { "it" } else { "them" },
+            ));
         }
     }
 
@@ -698,6 +765,9 @@ pub(crate) fn spawn_agent_watch(state: Arc<AppState>, session_id: String) {
                 // This loop only retires on PTY absence — a chat driver keeps
                 // the session alive via `session_alive`, and its own exit path
                 // retires first — so the surface here is always the terminal.
+                // A hook turn still open at death never gets its Stop.
+                crate::lock(&state.tui_episodes).forget(&session_id);
+                crate::lock(&state.notes).forget_session(&session_id);
                 crate::recents::retire(
                     &state,
                     &session_id,
@@ -895,7 +965,7 @@ mod tests {
     fn settings_file_embeds_hook_url() {
         let sid = fresh_session_id();
         let key = fresh_agent_key();
-        let path = write_settings(&sid, &key, 43999, None, None, None).unwrap();
+        let path = write_settings(&sid, &key, 43999, None, None, None, &[]).unwrap();
         let contents = std::fs::read_to_string(&path).unwrap();
         let value: serde_json::Value = serde_json::from_str(&contents).unwrap();
         let url = format!("http://127.0.0.1:43999/api/v1/agent-events/{sid}?key={key}");
@@ -909,11 +979,16 @@ mod tests {
         // No theme requested: the settings stay hooks-only (a user with an
         // explicit theme choice is never overridden).
         assert!(value.get("theme").is_none());
-        // Not a mastermind: only the prompt-free `notify` is pre-allowed —
-        // every other tool (the terminal tools included) still prompts.
+        // Not a mastermind: only the prompt-free tools (`notify`, the
+        // read-only document tools) are pre-allowed — every other tool (the
+        // terminal tools included) still prompts.
         assert_eq!(
             value["permissions"]["allow"],
-            json!(["mcp__chimaera__notify"])
+            json!([
+                "mcp__chimaera__notify",
+                "mcp__chimaera__document_guide",
+                "mcp__chimaera__check_document",
+            ])
         );
         use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
@@ -929,7 +1004,7 @@ mod tests {
     fn settings_file_merges_theme_next_to_hooks() {
         let sid = fresh_session_id();
         let key = fresh_agent_key();
-        let path = write_settings(&sid, &key, 43999, Some("light"), None, None).unwrap();
+        let path = write_settings(&sid, &key, 43999, Some("light"), None, None, &[]).unwrap();
         let value: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(value["theme"], "light");
@@ -954,17 +1029,28 @@ mod tests {
         let key = fresh_agent_key();
 
         let sid = fresh_session_id();
-        let path =
-            write_settings(&sid, &key, 43999, None, None, Some(MastermindMode::Ask)).unwrap();
+        let path = write_settings(
+            &sid,
+            &key,
+            43999,
+            None,
+            None,
+            Some(MastermindMode::Ask),
+            &[],
+        )
+        .unwrap();
         let value: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(
             value["permissions"]["allow"],
             json!([
                 "mcp__chimaera__notify",
+                "mcp__chimaera__document_guide",
+                "mcp__chimaera__check_document",
                 "mcp__chimaera__workspace_status",
                 "mcp__chimaera__read_session",
                 "mcp__chimaera__list_changed_files",
+                "mcp__chimaera__read_timeline",
                 "mcp__chimaera__list_terminals",
                 "mcp__chimaera__read_terminal",
             ])
@@ -978,8 +1064,16 @@ mod tests {
         std::fs::remove_file(statusline_script_path(&sid)).ok();
 
         let sid = fresh_session_id();
-        let path =
-            write_settings(&sid, &key, 43999, None, None, Some(MastermindMode::Auto)).unwrap();
+        let path = write_settings(
+            &sid,
+            &key,
+            43999,
+            None,
+            None,
+            Some(MastermindMode::Auto),
+            &[],
+        )
+        .unwrap();
         let value: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(value["permissions"]["allow"], json!(["mcp__chimaera"]));
@@ -999,7 +1093,7 @@ mod tests {
         // (a) No user statusline: wrapper injected, prints nothing itself.
         let sid = fresh_session_id();
         let key = fresh_agent_key();
-        let path = write_settings(&sid, &key, 43999, None, None, None).unwrap();
+        let path = write_settings(&sid, &key, 43999, None, None, None, &[]).unwrap();
         let value: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let script_path = statusline_script_path(&sid);
@@ -1055,7 +1149,7 @@ mod tests {
         // (b) A user statusline command: piped the same stdin, padding kept.
         let sid = fresh_session_id();
         let user = json!({"type": "command", "command": "my-status --flag", "padding": 0});
-        let path = write_settings(&sid, &key, 43999, None, Some(&user), None).unwrap();
+        let path = write_settings(&sid, &key, 43999, None, Some(&user), None, &[]).unwrap();
         let value: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(value["statusLine"]["padding"], 0);
@@ -1085,7 +1179,7 @@ mod tests {
             json!({"type": "widget"}),
         ] {
             let sid = fresh_session_id();
-            let path = write_settings(&sid, &key, 43999, None, Some(&user), None).unwrap();
+            let path = write_settings(&sid, &key, 43999, None, Some(&user), None, &[]).unwrap();
             let value: serde_json::Value =
                 serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
             assert!(value.get("statusLine").is_none(), "{user}");

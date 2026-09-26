@@ -42,7 +42,7 @@ Each area carries its own `AGENTS.md` map (file table + the invariants that bite
 | `crates/chimaera-remote` | SSH orchestration for `connect` (thorough in-code docs) | — |
 | `crates/chimaera-server` | the daemon: every route + WS + business logic; embeds `web-ui/dist` | [map](crates/chimaera-server/AGENTS.md) |
 | `crates/chimaera-app` | the Tauri 2 native shell (its own standalone workspace) | [map](crates/chimaera-app/AGENTS.md) |
-| `web-ui/` | the Svelte 5 client the daemon serves | [chat](web-ui/src/lib/chat/AGENTS.md) · [dashboard](web-ui/src/lib/dashboard/AGENTS.md) · [settings](web-ui/src/lib/settings/AGENTS.md) |
+| `web-ui/` | the Svelte 5 client the daemon serves | [chat](web-ui/src/lib/chat/AGENTS.md) · [dashboard](web-ui/src/lib/dashboard/AGENTS.md) · [settings](web-ui/src/lib/settings/AGENTS.md) · [knowledge](web-ui/src/lib/knowledge/AGENTS.md) · [plugins](web-ui/src/lib/plugins/AGENTS.md) |
 
 The maps above tell you how the code is *structured*. For what the app **does** — feature
 by feature, with how each is used and where it's wired — see the **[feature catalog](docs/features/README.md)**
@@ -91,8 +91,9 @@ pane and no HPC access; a SessionStart hook installs the web-UI deps and builds
   skill); the PR says what you ran and observed. The web UI has targeted Vitest
   coverage, but no browser/component tests — the live preview remains its runtime net.
 - **The daemon runs on shared HPC login nodes.** ~150 MB RSS, no unbounded buffers,
-  no busy loops, hard preview ceilings. **No SQLite near NFS/Lustre**; durable state
-  is append-only, size-capped JSONL under `~/.chimaera`; hot state is reconstructible.
+  no busy loops, hard preview ceilings. **No SQLite near NFS/Lustre**; durable logs
+  are append-only, size-capped JSONL under `~/.chimaera` (small whole-file state is
+  capped JSON rewritten atomically); hot state is reconstructible.
 - **The daemon↔UI wire is a stable public interface.** Core structs serialize
   straight to it — don't let its shape drift as a side effect of a refactor.
 - **Agent wire formats are pinned, not trusted** — a driver or agent-CLI change

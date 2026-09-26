@@ -13,7 +13,7 @@ is a thin delegation to a sibling library crate. Parent map: repo-root
 - **IS NOT**: the daemon. `serve` is a 3-line delegation to
   `chimaera_server::run`. The **daemon lifecycle you're probably looking for**
   (manifest write/remove, SIGINT/SIGTERM, graceful shutdown, restart handoff,
-  ledger snapshot) lives in `chimaera-server/src/lib.rs::run()`, NOT here.
+  ledger snapshot) lives in `chimaera-server/src/lifecycle.rs::run()`, NOT here.
 
 ## File map
 
@@ -22,8 +22,8 @@ is a thin delegation to a sibling library crate. Parent map: repo-root
 | `main.rs` | clap `Cli`/`Command` defs, all flags, `main()` dispatch, `parse_port` (`$PORT` fallback), `#[global_allocator]` mimalloc, tracing→stderr, and the tokio runtime's explicit sizing (4 workers / 128 blocking — see the invariants below). The crate's only tests (CLI parse assertions). |
 | `connect.rs` | `connect <host>`: calls `chimaera_remote::connect` with a progress closure, records the host, opens the tunnel URL, holds until Ctrl-C. |
 | `daemonize.rs` | `serve --daemonize`: fork + `setsid` + re-exec so the daemon outlives its launching shell/ssh channel; re-points non-regular-file stdio at `/dev/null` (a caller's log redirect is kept). |
-| `status.rs` | `status [host]`: local reads `chimaera_core::Manifest`; remote goes through `chimaera_remote`. |
-| `kill.rs` | `kill`: SIGTERM the manifest pid, poll `is_alive()` ~5s, remove the manifest. |
+| `status.rs` | `status [host]`: local reads `chimaera_core::Manifest`; remote goes through `chimaera_remote`. A manifest another login node wrote is reported as registered there, never as running or stale. |
+| `kill.rs` | `kill`: SIGTERM the manifest pid, poll `is_alive()` ~5s, remove the manifest — only for a manifest written on this node. |
 | `doctor.rs` | `doctor`: probe write access to data/runtime dirs + ssh/claude on PATH. |
 
 (`shell-integration` prints `chimaera_core::shellint::snippet()` — handled inline in `main.rs`.)
@@ -35,7 +35,9 @@ is a thin delegation to a sibling library crate. Parent map: repo-root
   subcommand, or making `serve` require args, silently breaks `connect`.
 - **The manifest is the single source of truth for "is a local daemon running."**
   It is written/removed by `chimaera_server::run`; `status`/`kill` only read it (and
-  clean it up when the pid is dead). It is 0600 (carries the bearer token).
+  clean it up when the pid is dead). It is 0600 (carries the bearer token). On a home
+  shared across HPC login nodes its pid is meaningful only on the node that wrote it
+  (`Manifest::written_here`) — anywhere else neither signal nor remove it.
 - **Port precedence:** explicit `--port` > `$PORT` env > OS-assigned free port.
 - **The reactor is four threads wide, not one per core.** `main()` pins
   `worker_threads(4)` / `max_blocking_threads(128)` (a login node has 64–192 cores; the

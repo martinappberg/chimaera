@@ -46,7 +46,18 @@
     type Session,
     type Workspace,
     isMastermind,
+    needsAttention,
   } from "./lib/workspace/sessions";
+  // Type-only: the panel (and the ChatView it embeds) loads on first open,
+  // never in the always-loaded entry bundle.
+  import type MastermindPanel from "./lib/dashboard/MastermindPanel.svelte";
+  import type { MastermindContext } from "./lib/dashboard/mastermindPanelState.svelte";
+  import {
+    mastermindPanel,
+    setMastermindChrome,
+    setMastermindPanelOpen,
+    toggleMastermindPanel,
+  } from "./lib/dashboard/mastermindPanelState.svelte";
   import { foldUnread, isUnread, markSeen } from "./lib/workspace/unread.svelte";
   import {
     getAgentDefault,
@@ -86,14 +97,16 @@
     uploadAndInsert,
     uploadJobs,
     uploadToDir,
+    uploadToSession,
   } from "./lib/net/uploads";
   import { get } from "svelte/store";
   import {
     activeSelection,
     clearSelection,
     composeAgentPathReference,
-    composeFileReference,
+    composeSelectionReference,
     composeShellPathReference,
+    needsCropUpload,
     composeTerminalReference,
     referenceTarget,
     composeProvenanceSuffix,
@@ -116,6 +129,7 @@
     dropTab,
     dropTabAtRootEdge,
     findPane,
+    topRightPane,
     focusPane,
     focusedFile as focusedFileOf,
     focusedSession as focusedSessionOf,
@@ -139,6 +153,9 @@
     setBrowserPath,
     setBrowserTarget,
     openDashboard,
+    openTimeline,
+    openKnowledge,
+    openPlugins,
     openGit,
     openSession,
     openSettings,
@@ -168,11 +185,22 @@
     type SplitDir,
     type Tab,
   } from "./lib/layout/layout";
-  import type { PathKind } from "./lib/terminal/links";
+  import type { LinkContext } from "./lib/shared/fileRef";
+  import { openPath, setPathOpener, type OpenPathOptions, type PathKind } from "./lib/shared/openPath";
+  import type { Reveal } from "./lib/shared/reveal";
+  import { setChatLinkContext } from "./lib/chat/paths";
   import type { UrlTarget } from "./lib/terminal/urlLinks";
   import { setUrlPaneOpener, urlMenuEntries } from "./lib/shared/urlOpen";
   import { basename, fileTabTitles, fsProbe, viewKindFor } from "./lib/previews/files";
-  import { dirtyFiles } from "./lib/shared/editing";
+  import {
+    CLOSE_SAVE_DEADLINE_MS,
+    dirtyFiles,
+    discardDirtyFile,
+    noteDaemonLink,
+    saveDirtyFiles,
+    unsavedCloseError,
+    unsavedDeleteNote,
+  } from "./lib/shared/editing";
   import {
     activateGitWorkspace,
     gitEnv,
@@ -183,6 +211,15 @@
     type DiffMode,
   } from "./lib/workspace/git";
   import { computeStatus, initCompute, queuedJobCount } from "./lib/workspace/compute";
+  import { surfacesOf } from "./lib/layout/surfaces";
+  import { activateTimelineWorkspace, onTimelineNudge } from "./lib/workspace/timeline.svelte";
+  import { activateKnowledgeWorkspace } from "./lib/workspace/knowledge";
+  import {
+    activatePluginsWorkspace,
+    attachRequest,
+    closeAttachSheet,
+    knowledgeProviderActive,
+  } from "./lib/plugins/store";
   import ComputeStrip from "./lib/workspace/ComputeStrip.svelte";
   import {
     dropSpotAt,
@@ -231,8 +268,11 @@
     onLocalDaemonUpdated,
     onFocusSession,
     onMenu,
+    onUnsavedPrompt,
     openDetachedPopup,
     openDetachedWindow,
+    replyUnsaved,
+    reportUnsaved,
     reportWindowScope,
     reportWindowView,
     setCaffeinate,
@@ -279,6 +319,8 @@
   import ContextMenuHost from "./lib/shared/ContextMenuHost.svelte";
   import { contextMenu } from "./lib/shared/contextMenu.svelte";
   import ConfirmDialog from "./lib/shared/ConfirmDialog.svelte";
+  import CloseDirtyDialog from "./lib/layout/CloseDirtyDialog.svelte";
+  import { WindowCloseGuard } from "./lib/layout/windowClose.svelte";
   import { fsDeleteOp, lastFsMutation, notifyCreated, pendingDelete } from "./lib/workspace/fsEvents";
   import {
     currentDiskWatches,
@@ -699,6 +741,15 @@
   let treeCreateNonce = 0;
   /** A failed delete's message; keeps the confirm dialog open. */
   let deleteError = $state<string | null>(null);
+  /** File tabs whose close waits on "save changes?" (held by identity — the
+   *  indices shift as other tabs close around them). */
+  let pendingClose = $state<Tab[]>([]);
+  let closeSaving = $state(false);
+  let closeError = $state<string | null>(null);
+  /** Bumped by Cancel: a "Save" still waiting then touches nothing. */
+  let closeAttempt = 0;
+  /** The native window close / app quit over this window's unsaved files. */
+  const windowClose = new WindowCloseGuard(replyUnsaved);
   /** Element that held focus when the picker opened; restored on close. */
   let pickerRestoreEl: HTMLElement | null = null;
 
@@ -963,6 +1014,11 @@
   $effect(() => {
     const wsId = activeWsId;
     void activateGitWorkspace(wsId);
+    // The Timeline / Knowledge / plugin-status stores follow the same
+    // activate-on-switch, nudge-to-refetch discipline (one small GET each).
+    void activateTimelineWorkspace(wsId);
+    void activateKnowledgeWorkspace(wsId);
+    void activatePluginsWorkspace(wsId);
     eventsSocket?.watch(wsId);
   });
 
@@ -1033,6 +1089,80 @@
     layout.zoomedPaneId !== null ? findPane(layout.root, layout.zoomedPaneId) : null,
   );
 
+  // --- the window's Mastermind panel ------------------------------------------
+  // One right-hand panel per window, on every view; its only entry points are
+  // the corner icon (in the pane touching the window's top-right), ⌘J and
+  // Quick Open. A workspace without a Mastermind shows no icon at all.
+  const mmCfg = $derived(workspace?.mastermind ?? null);
+  const mmSession = $derived(
+    mmCfg !== null ? (sessionsById.get(mmCfg.session_id) ?? null) : null,
+  );
+  const mmCornerPaneId = $derived(zoomedPane?.id ?? topRightPane(layout.root).id);
+  let bodyWidth = $state(0);
+  let MastermindPanelView = $state<typeof MastermindPanel | null>(null);
+  $effect(() => {
+    if (!mastermindPanel.open || MastermindPanelView !== null) return;
+    import("./lib/dashboard/MastermindPanel.svelte").then(
+      (m) => {
+        MastermindPanelView = m.default;
+      },
+      (err: unknown) => {
+        // A chunk that can't load (stale assets after an update) must not
+        // leave an "open" panel nobody can see: close it so the corner icon
+        // and ⌘J work again.
+        console.error("Mastermind panel failed to load", err);
+        setMastermindPanelOpen(false);
+      },
+    );
+  });
+  $effect(() => {
+    setMastermindChrome({
+      available: mmCfg !== null,
+      cornerPaneId: mmCornerPaneId,
+      attention:
+        mmSession !== null &&
+        mmSession.alive &&
+        (needsAttention(mmSession) || isUnread(mmSession.id)),
+    });
+  });
+  // A reply that lands while the panel is open was seen — it must not light
+  // the icon's dot the moment the panel closes.
+  $effect(() => {
+    const id = mmSession?.id;
+    if (id !== undefined && mastermindPanel.open && $pageVisible && isUnread(id)) markSeen(id);
+  });
+  /** What the focused tab IS, for the panel's one context question ("How's
+   *  <session> doing?", "What changed in <file>?") — null when the focused
+   *  tab isn't something the Mastermind can read about. */
+  const mmContext = $derived.by((): MastermindContext | null => {
+    const pane = findPane(layout.root, layout.focusedPaneId);
+    const tab = pane !== null ? pane.tabs[pane.active] : undefined;
+    if (tab === undefined) return null;
+    const root = workspace?.root;
+    const rel = (p: string) => (root !== undefined ? workspaceRelative(p, root) : p);
+    switch (tab.surface) {
+      case "file":
+      case "diff":
+        return { kind: "file", name: rel(tab.path).split("/").pop() ?? tab.path, ref: rel(tab.path) };
+      case "finder": {
+        const r = rel(tab.path);
+        // The root is "." — the chip names the workspace instead.
+        const name = r === "." ? (workspace?.name ?? "this workspace") : r.split("/").slice(-2).join("/");
+        return { kind: "folder", name, ref: r };
+      }
+      case "terminal":
+      case "changes": {
+        const s = sessionsById.get(tab.sessionId);
+        if (s === undefined) return null;
+        const name = displayNames.get(s.id) ?? s.name;
+        const kind = tab.surface === "changes" ? "changes" : s.kind === "agent" ? "session" : "terminal";
+        return { kind, name, ref: s.id };
+      }
+      default:
+        return null;
+    }
+  });
+
   /** Sessions in the active workspace blocked on the user's approval. */
   // A detached solo window badges only ITS OWN sessions: workspace-wide
   // attention is the main window's wayfinding, and a torn-off pane wearing
@@ -1052,6 +1182,15 @@
   const dashboardOpen = $derived.by(() => {
     const p = findPane(layout.root, layout.focusedPaneId);
     return p?.tabs[p.active]?.surface === "dashboard";
+  });
+  /** … or Knowledge (the conditional rail row below it). */
+  const knowledgeOpen = $derived.by(() => {
+    const p = findPane(layout.root, layout.focusedPaneId);
+    return p?.tabs[p.active]?.surface === "knowledge";
+  });
+  const pluginsOpen = $derived.by(() => {
+    const p = findPane(layout.root, layout.focusedPaneId);
+    return p?.tabs[p.active]?.surface === "plugins";
   });
 
   // --- context bridge: reference target resolution ---------------------------
@@ -1085,6 +1224,8 @@
     onNewAgent: newAgentPrimary,
     onOpenGit: openGitPanel,
     onOpenSession: openSess,
+    onOpenTimeline: openTimelineSurface,
+    onOpenKnowledge: openKnowledgeSurface,
   });
 
   /**
@@ -1327,7 +1468,15 @@
   // Persist the layout (debounced in viewState) whenever it changes, keyed
   // by (window, workspace) so each workspace keeps its own tree.
   $effect(() => {
-    const blob: Record<string, unknown> = { v: 1, ws: activeWsId, layout: serializeLayout(layout) };
+    // `surfaces` is the additive, normalized "what this window shows" list
+    // (design §8): the daemon reads only that key and treats `layout` as
+    // opaque, so the layout blob itself stays exactly as before.
+    const blob: Record<string, unknown> = {
+      v: 1,
+      ws: activeWsId,
+      layout: serializeLayout(layout),
+      surfaces: surfacesOf(layout, workspace?.root ?? null),
+    };
     if (detachedWindow) {
       blob.dt = 1;
       if (detachOrigin !== null) blob.origin = detachOrigin;
@@ -1401,6 +1550,12 @@
     setUrlPaneOpener((target, newSplit) =>
       openBrowserFromPane(layout.focusedPaneId, target, newSplit),
     );
+    // Every path link (terminal, chat prose, tool cards, documents) opens
+    // through one opener, so a line reveal and Cmd/Ctrl-click split work
+    // wherever the link was; chat resolves against the same per-session
+    // context as terminal links.
+    setPathOpener(openPathInLayout);
+    setChatLinkContext(linkContext);
     setReferenceHandler(referenceSelection);
     setUploadPathInserter(insertUploadedPath);
     // OS-desktop file drags: window-level so the navigate-away default is
@@ -1416,6 +1571,7 @@
       },
       onSettings: applyRemoteSettings,
       onGit: onGitNudge,
+      onTimeline: onTimelineNudge,
       onUpdate: (status) => (updateState.daemon = status),
       onRecents: (epoch) => {
         // Invalidate-and-pull, like git: a conversation retired somewhere;
@@ -1442,6 +1598,8 @@
         // health sample, which the recovery kick fetches promptly).
         if (up && !eventsUp) resetLinkRtt();
         eventsUp = up;
+        // A save that died with the link retries once it is back.
+        noteDaemonLink(up);
       },
       onFatal: (message) => {
         if (message === "unauthorized") notifyUnauthorized();
@@ -1580,6 +1738,8 @@
       stopChordHints();
       setReferenceHandler(null);
       setUploadPathInserter(null);
+      setPathOpener(null);
+      setChatLinkContext(null);
       events.close();
       pool.disposePool();
       chatPool.disposeAllChats();
@@ -1657,28 +1817,51 @@
     const sel = get(activeSelection);
     const target = refTargetSession;
     if (sel === null || target === null) return;
-    let text: string;
-    if (sel.kind === "file") {
-      const root = workspace?.root;
-      const rel = root !== undefined ? workspaceRelative(sel.path, root) : sel.path;
-      text = composeFileReference(rel, sel.startLine, sel.endLine, sel.text);
-    } else {
-      const src = sessionsById.get(sel.sessionId);
-      const name =
-        displayNames.get(sel.sessionId) ?? (src !== undefined ? displayName(src) : "terminal");
-      text = composeTerminalReference(name, sel.text);
-    }
+    const targetId = target.id;
+    const kind = target.ui === "chat" ? "chat" : "terminal";
     // A reference never lands out of sight: surface the target agent first,
     // splitting beside the selection's own pane when it is not open anywhere.
-    if (sessionPaneId(layout, target.id) === null) {
+    if (sessionPaneId(layout, targetId) === null) {
       const beside =
         (sel.kind === "terminal" ? sessionPaneId(layout, sel.sessionId) : null) ??
         layout.focusedPaneId;
       layout = splitPane(layout, beside, "row");
-      layout = openSession(layout, target.id);
+      layout = openSession(layout, targetId);
     }
-    typeIntoSession(target.id, text);
+    if (sel.kind === "terminal") {
+      const src = sessionsById.get(sel.sessionId);
+      const name =
+        displayNames.get(sel.sessionId) ?? (src !== undefined ? displayName(src) : "terminal");
+      typeIntoSession(targetId, composeTerminalReference(name, sel.text));
+      return;
+    }
+    const root = workspace?.root;
+    const rel = root !== undefined ? workspaceRelative(sel.path, root) : sel.path;
+    const crop = sel.crop;
+    if (crop !== undefined && needsCropUpload(sel, kind)) {
+      // Pixels for a terminal agent: a file in the session's landing pad
+      // (bounded, pruned with the session), its path typed after the
+      // locator. A failed upload still sends the locator (its chip says why).
+      const name = `ref-${++refCropSeq}.png`;
+      void trackFileOp("Sending the region image…", (progress) =>
+        uploadToSession(targetId, crop, name, progress),
+      ).then((up) => typeIntoSession(targetId, composeSelectionReference(rel, sel, kind, up?.path ?? null)));
+      return;
+    }
+    if (crop !== undefined && kind === "chat") {
+      // Chat sees the pixels as an attachment, through the same downscale
+      // and payload caps as a pasted screenshot.
+      const label = sel.label;
+      void imageToAttachment(crop).then((image) => {
+        if (image !== null) attachImageToComposer(targetId, label !== undefined ? { ...image, label } : image);
+      });
+    }
+    typeIntoSession(targetId, composeSelectionReference(rel, sel, kind));
   }
+
+  /** Names each region image a terminal agent receives (`ref-1.png`, …);
+   *  the landing pad dedupes a name that is already there. */
+  let refCropSeq = 0;
 
   /**
    * Drag-to-reference drop: type the dropped path (file OR folder) into the
@@ -1920,18 +2103,16 @@
 
   // --- clickable paths: the bridge's return direction ------------------------
 
-  /** Resolution context for a session's terminal link provider. */
-  function linkContext(id: string): {
-    cwd: string | null;
-    root: string | null;
-    workspaceId: string | null;
-  } {
+  /** Resolution context for a session's path links (terminal and chat). */
+  function linkContext(id: string): LinkContext {
     const s = sessionsById.get(id);
     // The session's own workspace, else the active one — the same preference
     // order the root fallback uses, so root and workspaceId stay in step.
     const ws = workspaces.find((w) => w.id === s?.workspace_id) ?? workspace;
     return {
       cwd: s?.cwd_current ?? s?.cwd ?? null,
+      // Scrollback and older messages were written from the spawn directory.
+      spawnCwd: s?.cwd ?? null,
       root: ws?.root ?? null,
       workspaceId: ws?.id ?? null,
     };
@@ -1973,19 +2154,37 @@
     layout = openTab(layout, freshBrowserTab("", 0, "/"));
   }
 
-  /** A confirmed terminal path link was activated. */
-  function onOpenPath(id: string, path: string, kind: PathKind, newSplit: boolean): void {
+  /** A confirmed terminal path link was activated: anchor the open on the
+   *  pane showing that session, not merely the focused one. */
+  function onOpenPath(
+    id: string,
+    path: string,
+    kind: PathKind,
+    opts: { split: boolean; reveal?: Reveal },
+  ): void {
     const loc = paneForTab(layout.root, { surface: "terminal", sessionId: id });
-    const fromPane = loc?.paneId ?? layout.focusedPaneId;
+    openPath(path, kind, { ...opts, fromPane: loc?.paneId });
+  }
+
+  /**
+   * The workbench's path opener (registered with `shared/openPath.ts`; every
+   * link surface calls `openPath`). Directory names open in the Finder
+   * (browsing anywhere, in or out of the workspace); an in-workspace dir is
+   * ALSO revealed in the FILES side-tree (revealInTree is a no-op outside the
+   * root). Files follow `openFileFromPane`; `openPath` has already requested
+   * the line reveal, which the file view takes once it shows the path.
+   */
+  function openPathInLayout(path: string, kind: PathKind, opts: OpenPathOptions): void {
+    const from = opts.fromPane;
+    const fromPane =
+      from !== undefined && findPane(layout.root, from) !== null ? from : layout.focusedPaneId;
+    const split = opts.split === true;
     if (kind === "dir") {
-      // Directory names open in the Finder (browsing anywhere, in or out of the
-      // workspace); an in-workspace dir is ALSO revealed in the FILES side-tree
-      // (revealInTree is a no-op outside the root).
-      openDirInFinder(fromPane, path, newSplit);
+      openDirInFinder(fromPane, path, split);
       revealInTree(path);
       return;
     }
-    openFileFromPane(fromPane, path, newSplit);
+    openFileFromPane(fromPane, path, split);
   }
 
   /**
@@ -2383,6 +2582,10 @@
         }
         layout = { ...layout, focusMode: !layout.focusMode };
         return;
+      case "mastermind":
+        intercept();
+        toggleMastermindPanel();
+        return;
       case "cyclePrev":
         intercept();
         cycle(-1);
@@ -2545,6 +2748,20 @@
     return () => window.removeEventListener("beforeunload", handler);
   });
 
+  // The native app's close/quit guard: a webview gets no beforeunload when
+  // its window closes or the app quits, so the shell decides from the
+  // unsaved count this window pushes (no round trip, and no prompt when
+  // nothing is unsaved) and asks here when it holds one.
+  const unsavedCount = $derived($dirtyFiles.size);
+  $effect(() => {
+    if (!isNativeShell()) return;
+    void reportUnsaved(unsavedCount).catch(() => {});
+  });
+  $effect(() => {
+    if (!isNativeShell()) return;
+    return asyncDisposer(onUnsavedPrompt((p) => windowClose.receive(p)));
+  });
+
   // A file that became dirty must never be a PREVIEW tab: an unsaved edit
   // that the next preview open silently replaced would be lost. Promote any
   // dirty preview tab to a permanent one. untrack() so writing `layout` here
@@ -2611,6 +2828,8 @@
         v: 1,
         ws: activeWsId,
         layout: serializeLayout(layout),
+        // This window is leaving the workspace: it shows none of it now.
+        surfaces: [],
       });
     }
     // Flush the outgoing workspace's pending layout write under its own key,
@@ -2949,6 +3168,42 @@
     if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
   }
 
+  /** Open/focus the workspace Timeline (dashboard link, quick-open). */
+  function openTimelineSurface(): void {
+    if (activeWsId === null || !layoutReady) return;
+    layout = openTimeline(layout);
+    if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
+  }
+
+  /** Open/focus Knowledge (rail row when a provider is active, dashboard
+   *  link, quick-open). */
+  function openKnowledgeSurface(): void {
+    if (activeWsId === null || !layoutReady) return;
+    layout = openKnowledge(layout);
+    if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
+  }
+
+  /** Open/focus the Plugins tab (quick-open, the attach affordances). */
+  function openPluginsSurface(): void {
+    if (activeWsId === null || !layoutReady) return;
+    layout = openPlugins(layout);
+    if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
+  }
+
+  /** Quick-open commands: the workspace surfaces that have no file or session
+   *  to match on ("Timeline", "Knowledge", "Plugins"). */
+  const quickOpenCommands = [
+    { id: "timeline", label: "Timeline", hint: "what happened", run: openTimelineSurface },
+    { id: "knowledge", label: "Knowledge", hint: "what we know", run: openKnowledgeSurface },
+    { id: "plugins", label: "Plugins", hint: "add-ons for this workspace", run: openPluginsSurface },
+    {
+      id: "mastermind",
+      label: "Mastermind",
+      hint: "the workspace's Mastermind panel",
+      run: () => setMastermindPanelOpen(true),
+    },
+  ];
+
   function focusDirection(dir: FocusDir): void {
     layout = moveFocus(layout, dir);
     const sid = focusedSessionOf(layout);
@@ -2982,7 +3237,13 @@
   function closeView(paneId: string): void {
     const p = findPane(layout.root, paneId);
     if (p === null) return;
-    layout = p.tabs.length > 0 ? detachTab(layout, paneId, p.active) : closePane(layout, paneId);
+    const active = p.tabs[p.active];
+    if (active !== undefined) {
+      // A dirty file asks first (and keeps its tab until answered).
+      if (!closeTabs([active])) return;
+    } else {
+      layout = closePane(layout, paneId);
+    }
     const sid = focusedSessionOf(layout);
     const focusedId = layout.focusedPaneId;
     // After the flush: closing a pane restructures the tree, which can
@@ -2991,6 +3252,84 @@
       if (sid !== null) pool.focusTerminal(sid);
       else paneRootEl(focusedId)?.focus();
     });
+  }
+
+  /** Detach these tabs wherever they are now (views only; sessions live on). */
+  function detachTabs(tabs: readonly Tab[]): void {
+    let next = layout;
+    for (const t of tabs) {
+      const loc = paneForTab(next.root, t);
+      if (loc !== null) next = detachTab(next, loc.paneId, loc.index);
+    }
+    layout = next;
+  }
+
+  /**
+   * Close tabs by identity. Clean ones go at once; a file with unsaved edits
+   * joins the "save changes?" dialog and keeps its tab until answered — its
+   * buffer would survive a plain close (the buffer store keeps dirty text),
+   * but a close gesture must never leave edits stranded without asking.
+   * True when everything closed right away.
+   */
+  function closeTabs(tabs: readonly Tab[]): boolean {
+    const dirty = get(dirtyFiles);
+    const held = tabs.filter((t) => t.surface === "file" && dirty.has(t.path));
+    detachTabs(tabs.filter((t) => !held.includes(t)));
+    if (held.length === 0) return true;
+    const known = new Set(pendingClose.map(tabKey));
+    pendingClose = [...pendingClose, ...held.filter((t) => !known.has(tabKey(t)))];
+    closeError = null;
+    return false;
+  }
+
+  const pendingClosePaths = $derived(
+    pendingClose.flatMap((t) => (t.surface === "file" ? [t.path] : [])),
+  );
+
+  /**
+   * "Save": save each file; close those that saved, keep the rest asking.
+   * Bounded: past the deadline (a dead link) it reports "not saved" and
+   * hands control back while the save carries on in the background.
+   */
+  async function saveAndClose(): Promise<void> {
+    if (closeSaving) return;
+    closeSaving = true;
+    closeError = null;
+    const attempt = ++closeAttempt;
+    const batch = pendingClose;
+    const r = await saveDirtyFiles(
+      batch.flatMap((t) => (t.surface === "file" ? [t.path] : [])),
+      { deadlineMs: CLOSE_SAVE_DEADLINE_MS, cancelled: () => attempt !== closeAttempt },
+    );
+    // Cancelled while waiting: the tabs stay open, the dialog is already gone.
+    if (r === null) return;
+    closeSaving = false;
+    const failed = batch.filter((t) => t.surface === "file" && r.unsaved.includes(t.path));
+    detachTabs(batch.filter((t) => !failed.includes(t)));
+    pendingClose = [...failed, ...pendingClose.filter((t) => !batch.includes(t))];
+    if (failed.length > 0) {
+      closeError = unsavedCloseError(
+        failed.flatMap((t) => (t.surface === "file" ? [t.path] : [])),
+        r.timedOut,
+      );
+    }
+  }
+
+  /** "Don't save": drop the edits (and their drafts), then close. */
+  function discardAndClose(): void {
+    for (const t of pendingClose) if (t.surface === "file") discardDirtyFile(t.path);
+    detachTabs(pendingClose);
+    pendingClose = [];
+    closeError = null;
+  }
+
+  /** Also while saving: the tabs stay open and dirty, and a save already
+   *  sent may still land in the background. */
+  function cancelClose(): void {
+    closeAttempt++;
+    closeSaving = false;
+    pendingClose = [];
+    closeError = null;
   }
 
   /**
@@ -3376,8 +3715,10 @@
       if (sid !== null) pool.focusTerminal(sid);
     },
     closeTab(paneId, index) {
-      // Detaches the view only — the session stays alive in the rail.
-      layout = detachTab(layout, paneId, index);
+      // Detaches the view only — the session stays alive in the rail. A file
+      // with unsaved edits asks first.
+      const tab = findPane(layout.root, paneId)?.tabs[index];
+      if (tab !== undefined) closeTabs([tab]);
     },
     setRatio(splitId, ratio) {
       layout = setRatio(layout, splitId, ratio);
@@ -3416,12 +3757,7 @@
       openFileFromPane(paneId, path, newSplit);
     },
     openPathFrom(paneId, path, kind, newSplit) {
-      if (kind === "dir") {
-        openDirInFinder(paneId, path, newSplit);
-        revealInTree(path);
-      } else {
-        openFileFromPane(paneId, path, newSplit);
-      }
+      openPath(path, kind, { fromPane: paneId, split: newSplit });
     },
     openChangesFrom(paneId, sessionId, newSplit) {
       openChangesFromPane(paneId, sessionId, newSplit);
@@ -3729,6 +4065,7 @@
       v: 1,
       ws: wsId,
       layout: serializeLayout(solo),
+      surfaces: surfacesOf(solo, workspace?.root ?? null),
       dt: 1,
       origin: winKey,
     };
@@ -3989,9 +4326,15 @@
                 ? "Changes"
                 : tab.surface === "dashboard"
                   ? "Dashboard"
-                  : tab.surface === "browser"
-                    ? (tab.host || "Browser")
-                    : "Settings";
+                  : tab.surface === "timeline"
+                    ? "Timeline"
+                    : tab.surface === "knowledge"
+                      ? "Knowledge"
+                      : tab.surface === "plugins"
+                        ? "Plugins"
+                        : tab.surface === "browser"
+                          ? (tab.host || "Browser")
+                          : "Settings";
   }
 
   // --- linked terminals ------------------------------------------------------
@@ -4290,7 +4633,7 @@
       onOpenFolder={openPicker}
     />
   {:else}
-  <div class="body">
+  <div class="body" bind:clientWidth={bodyWidth}>
     <aside
       class="rail"
       class:collapsed={layout.focusMode}
@@ -4524,6 +4867,51 @@
           {#if hintsActive()}
             <span class="kbd-badge" aria-hidden="true">0</span>
           {/if}
+        </button>
+
+        {#if $knowledgeProviderActive}
+          <!-- Knowledge earns a rail row only while a structured provider
+               (mycelium) is active here — with nothing recorded there is
+               nothing to open, and the row would be chrome. -->
+          <button
+            class="row dash-row"
+            class:dash-active={knowledgeOpen}
+            title="knowledge — what your agents have recorded in this project"
+            onclick={openKnowledgeSurface}
+          >
+            <svg class="dash-glyph" viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
+              <path
+                d="M2.5 3.2c1.8-.7 3.6-.6 5.5.5v9c-1.9-1.1-3.7-1.2-5.5-.5zM13.5 3.2c-1.8-.7-3.6-.6-5.5.5v9c1.9-1.1 3.7-1.2 5.5-.5z"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.3"
+                stroke-linejoin="round"
+              />
+            </svg>
+            <span class="dash-label">knowledge</span>
+          </button>
+        {/if}
+
+        <!-- Plugins (Installed · Skills): always a row — it is where a
+             plugin gets added in the first place. -->
+        <button
+          class="row dash-row"
+          class:dash-active={pluginsOpen}
+          title="plugins & skills — add-ons for this workspace, and every skill your agents can use"
+          onclick={openPluginsSurface}
+        >
+          <svg class="dash-glyph" viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
+            <!-- The plugins tab's own plug (PaneTabs): one glyph per surface. -->
+            <path
+              d="M5.5 2v3M10.5 2v3M4 5h8v2.5a4 4 0 0 1-8 0zM8 11.5V14"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.4"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            />
+          </svg>
+          <span class="dash-label">plugins</span>
         </button>
 
         <!-- Terminals first (there are few), agents below (there are many);
@@ -4938,14 +5326,15 @@
             onclick={openSettingsSurface}
           >
             <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
-              <circle cx="8" cy="8" r="2.2" fill="none" stroke="currentColor" stroke-width="1.4" />
+              <!-- A cog: settings. -->
               <path
-                d="M8 1.8v2M8 12.2v2M1.8 8h2M12.2 8h2M3.6 3.6l1.4 1.4M11 11l1.4 1.4M12.4 3.6L11 5M5 11l-1.4 1.4"
+                d="M6.77 3.05L6.98 1.18A6.9 6.9 0 0 1 9.02 1.18L9.23 3.05A5.1 5.1 0 0 1 10.63 3.63L12.10 2.45A6.9 6.9 0 0 1 13.55 3.90L12.37 5.37A5.1 5.1 0 0 1 12.95 6.77L14.82 6.98A6.9 6.9 0 0 1 14.82 9.02L12.95 9.23A5.1 5.1 0 0 1 12.37 10.63L13.55 12.10A6.9 6.9 0 0 1 12.10 13.55L10.63 12.37A5.1 5.1 0 0 1 9.23 12.95L9.02 14.82A6.9 6.9 0 0 1 6.98 14.82L6.77 12.95A5.1 5.1 0 0 1 5.37 12.37L3.90 13.55A6.9 6.9 0 0 1 2.45 12.10L3.63 10.63A5.1 5.1 0 0 1 3.05 9.23L1.18 9.02A6.9 6.9 0 0 1 1.18 6.98L3.05 6.77A5.1 5.1 0 0 1 3.63 5.37L2.45 3.90A6.9 6.9 0 0 1 3.90 2.45L5.37 3.63A5.1 5.1 0 0 1 6.77 3.05Z"
                 fill="none"
                 stroke="currentColor"
-                stroke-width="1.4"
-                stroke-linecap="round"
+                stroke-width="1.3"
+                stroke-linejoin="round"
               />
+              <circle cx="8" cy="8" r="2.2" fill="none" stroke="currentColor" stroke-width="1.3" />
             </svg>
           </button>
         {/if}
@@ -5022,6 +5411,19 @@
         {/if}
       {/if}
     </main>
+    {#if mastermindPanel.open && MastermindPanelView !== null && layoutReady && activeWsId !== null}
+      <MastermindPanelView
+        cfg={mmCfg}
+        session={mmSession}
+        wsId={activeWsId}
+        paneId={layout.focusedPaneId}
+        {ctrl}
+        refresh={refreshWorkspaces}
+        visible
+        context={mmContext}
+        hostWidth={bodyWidth}
+      />
+    {/if}
   </div>
 
   {#if layout.focusMode}
@@ -5173,10 +5575,29 @@
     workspaceId={activeWsId}
     sessions={wsSessions}
     sessionNames={displayNames}
+    commands={quickOpenCommands}
     onOpenFile={quickOpenFile}
     onOpenSession={quickOpenSession}
     onClose={closeQuickOpen}
   />
+{/if}
+
+{#if $attachRequest !== null && activeWsId !== null}
+  <!-- The "Use mycelium for Knowledge" sheet: one modal instance for every
+       surface that opens it (Knowledge's empty card, the dashboard line,
+       the plugin card, the Mastermind dock). Lazy — it rides the plugins
+       chunk, not the always-loaded shell. -->
+  {#await import("./lib/plugins/AttachSheet.svelte") then { default: AttachSheet }}
+    <AttachSheet
+      wsId={activeWsId}
+      pluginId={$attachRequest.pluginId}
+      onOpenSession={(id) => {
+        closeAttachSheet();
+        openSess(id);
+      }}
+      onClose={closeAttachSheet}
+    />
+  {/await}
 {/if}
 
 <!-- Blocking re-auth overlay: the daemon rejected this window's token
@@ -5197,7 +5618,7 @@
     title={$pendingDelete.kind === "dir" ? "Delete folder" : "Delete file"}
     body={`Permanently delete “${basename($pendingDelete.path)}”${
       $pendingDelete.kind === "dir" ? " and everything inside it" : ""
-    }? This cannot be undone.`}
+    }? This cannot be undone.${unsavedDeleteNote($pendingDelete.path, $dirtyFiles)}`}
     confirmLabel="delete"
     danger
     error={deleteError}
@@ -5206,6 +5627,30 @@
       pendingDelete.set(null);
       deleteError = null;
     }}
+  />
+{/if}
+
+<!-- The native window close / app quit over every unsaved file here; it takes
+     precedence over a tab close already asking (whose files it includes). -->
+{#if windowClose.prompt !== null}
+  <CloseDirtyDialog
+    paths={windowClose.prompt.paths}
+    saving={windowClose.saving}
+    error={windowClose.error}
+    action={windowClose.prompt.reason}
+    onSave={() => void windowClose.save()}
+    onDiscard={() => windowClose.discard()}
+    onCancel={() => windowClose.cancel()}
+  />
+<!-- Closing tabs whose files hold unsaved edits: save / don't save / cancel. -->
+{:else if pendingClosePaths.length > 0}
+  <CloseDirtyDialog
+    paths={pendingClosePaths}
+    saving={closeSaving}
+    error={closeError}
+    onSave={() => void saveAndClose()}
+    onDiscard={discardAndClose}
+    onCancel={cancelClose}
   />
 {/if}
 
@@ -5354,6 +5799,7 @@
   }
 
   .body {
+    position: relative;
     flex: 1;
     display: flex;
     min-height: 0;
@@ -5588,7 +6034,6 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-
   .row:hover {
     background: var(--row-hover);
   }

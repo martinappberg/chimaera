@@ -2,7 +2,8 @@
   /**
    * HTML file view with a preview | split | edit toggle. Preview is the
    * sandboxed iframe the daemon serves under CSP
-   * "sandbox allow-scripts" (relative assets resolve through the /raw ticket).
+   * "sandbox allow-scripts" (relative assets resolve through the ticket's
+   * folder-confined `/raw/{ticket}/{path}` route).
    * Edit is the shared CodeMirror editor in HTML mode (Cmd/Ctrl+S saves; dirty
    * dot + conflict handling come from CodeView). SPLIT puts the editor beside a
    * live preview of the editor's buffer (a sandboxed `srcdoc` iframe, same
@@ -15,7 +16,7 @@
    * cap.
   */
   import type { Component } from "svelte";
-  import { EDIT_MAX_BYTES, type FileChunk } from "./files";
+  import { basename, EDIT_MAX_BYTES, type FileChunk } from "./files";
   import { retain, release, type FileEntry } from "./fileStore.svelte";
   import SplitEditPreview from "./SplitEditPreview.svelte";
   import Spinner from "./Spinner.svelte";
@@ -68,7 +69,17 @@
     void e.ensureRawUrl();
     return () => release(path);
   });
-  const url = $derived(entry?.rawUrl ?? null);
+  // The frame loads the page by its own name UNDER the ticket
+  // (`/raw/{ticket}/report.html`), so its relative `app.js` / `figs/a.png`
+  // resolve to `/raw/{ticket}/app.js` — the daemon's folder-confined route.
+  // The name is the ticket's canonical file's, not the pane path's: opened
+  // through `latest.html -> runs/42/report.html` the page and its assets
+  // live in runs/42, and a hidden `.summary.html` is served only by name.
+  const url = $derived(
+    entry?.rawUrl != null
+      ? `${entry.rawUrl}/${encodeURIComponent(entry.rawName ?? basename(path))}`
+      : null,
+  );
   const error = $derived(entry?.rawError ?? null);
 
   // Reset per path.
@@ -89,15 +100,19 @@
     // CodeView handles the rest (background fill + save/dirty/conflict flow).
     const e = entry;
     if (e === null) return;
-    if (chunk === null && chunkError === null) {
+    // A failed fetch is retried on the next click (the store refetches a
+    // missing chunk): gating on the old error left `entered` set with no
+    // chunk, so the edit layer stayed blank for the life of the tab.
+    if (chunk === null) {
+      chunkError = null;
       await e.ensureChunk();
-      if (e.chunk !== null) {
-        chunk = e.chunk;
-        editable = e.chunk.size <= EDIT_MAX_BYTES;
-      } else {
+      if (entry !== e) return; // path changed while fetching
+      if (e.chunk === null) {
         chunkError = e.chunkError ?? "failed to load source";
         return;
       }
+      chunk = e.chunk;
+      editable = e.chunk.size <= EDIT_MAX_BYTES;
     }
     if (editable === false) return; // too large; stay in preview
     entered = true;

@@ -209,6 +209,21 @@ pub(crate) async fn prune_journals(state: &Arc<AppState>, spawning: Option<&str>
     }
 }
 
+/// The catalog of any live claude chat session in workspace `ws` (they all
+/// see the same host-level built-ins); None when none is running.
+pub(crate) fn claude_catalog_in_workspace(
+    state: &AppState,
+    ws: &str,
+) -> Option<Vec<(String, String)>> {
+    let sessions: Vec<String> = crate::lock(&state.session_workspaces)
+        .iter()
+        .filter(|(_, w)| w.as_str() == ws)
+        .map(|(sid, _)| sid.clone())
+        .collect();
+    let catalogs = crate::lock(&state.chat_catalogs);
+    sessions.iter().find_map(|sid| catalogs.get(sid).cloned())
+}
+
 /// Consume chat signals for the daemon's lifetime. Called once from `app()`;
 /// the receiver is stashed in AppState so construction stays sync.
 pub(crate) fn spawn_signal_task(state: Arc<AppState>) {
@@ -220,6 +235,9 @@ pub(crate) fn spawn_signal_task(state: Arc<AppState>) {
         // to their completion event (which carries no locations). See
         // `nudge_on_edit`. Owned by this single pump task, so no lock needed.
         let mut pending_edits: HashMap<(String, String), Vec<String>> = HashMap::new();
+        // Per-session turn folds for the Timeline (protocol tier). Owned by
+        // this single task, like `pending_edits`.
+        let mut episodes = crate::episodes::ChatEpisodes::default();
         while let Some(signal) = rx.recv().await {
             match signal {
                 ChatSignal::Event(id, entry) => {
@@ -240,11 +258,59 @@ pub(crate) fn spawn_signal_task(state: Arc<AppState>) {
                     // apply_chat_event: it is async and the std-mutex agents
                     // guard is already dropped.
                     nudge_on_edit(&state, &mut pending_edits, &id, &entry.ev).await;
+                    // A claude session's catalog (skills + commands, built-ins
+                    // included) for the Skills view — the only source for
+                    // skills that have no file.
+                    if let AgentEvent::Init { slash_commands, .. } = &entry.ev {
+                        let is_claude = crate::lock(&state.agents)
+                            .get(&id)
+                            .is_some_and(|r| r.kind == crate::agents::AgentKind::Claude);
+                        if is_claude && !slash_commands.is_empty() {
+                            let catalog = slash_commands
+                                .iter()
+                                .take(200)
+                                .map(|c| (c.name.clone(), c.description.clone()))
+                                .collect();
+                            crate::lock(&state.chat_catalogs).insert(id.clone(), catalog);
+                        }
+                    }
+                    if matches!(entry.ev, AgentEvent::TurnStarted { .. }) {
+                        crate::knowledge::prime(&state, &id).await;
+                    }
+                    if let Some(draft) = episodes.observe(&id, entry.ts, &entry.ev) {
+                        crate::episodes::record(&state, &id, draft, "protocol").await;
+                    }
                     state.changes.notify_waiters();
                 }
                 ChatSignal::Exit(id, exit) => {
-                    // A dead session's un-completed edits will never land.
-                    pending_edits.retain(|(s, _), _| s != &id);
+                    // A view switch / rewind respawns under the same id, and a
+                    // slow driver's reap can land after the successor is up
+                    // (see handle_chat_exit): that exit is the deliberate
+                    // kill, and the live successor's per-session state —
+                    // its open turn, catalog, edits, note cursor — must
+                    // survive it. Only a real death is history.
+                    let successor_chat = state.chat.get(&id).is_some_and(|c| c.alive);
+                    let deliberate = successor_chat
+                        || state.sessions.get(&id).is_some()
+                        || crate::lock(&state.chat_switching).contains_key(&id);
+                    if !successor_chat {
+                        // A dead driver's un-completed edits will never land.
+                        pending_edits.retain(|(s, _), _| s != &id);
+                        crate::lock(&state.chat_catalogs).remove(&id);
+                        if deliberate {
+                            episodes.forget(&id);
+                        }
+                    }
+                    // Record the death BEFORE handle_chat_exit: retiring drops
+                    // the workspace mapping the Timeline entry needs.
+                    if !deliberate {
+                        crate::lock(&state.notes).forget_session(&id);
+                        let now = crate::timeline::now_ms();
+                        if let Some(draft) = episodes.flush(&id, now) {
+                            crate::episodes::record(&state, &id, draft, "protocol").await;
+                        }
+                        crate::episodes::record_exit(&state, &id, &exit).await;
+                    }
                     handle_chat_exit(&state, &id, exit).await;
                     state.changes.notify_waiters();
                 }
@@ -1016,6 +1082,7 @@ async fn resolve_respawn_inputs(
                 crate::runtimes::claude_settings_gates(&state.claude_settings_path, workspace_root)
                     .await;
             let settings_theme = (!theme_set).then_some(theme);
+            let plugin_tools = crate::plugins::spawn_allow(state, workspace_id).await;
             let settings = crate::agents::write_settings(
                 id,
                 &key,
@@ -1023,6 +1090,7 @@ async fn resolve_respawn_inputs(
                 settings_theme,
                 user_statusline.as_ref(),
                 mastermind,
+                &plugin_tools,
             )
             .map_err(|err| err.to_string())?;
             let mcp = crate::agents::write_mcp_config(id, &key, state.port)
@@ -2838,6 +2906,7 @@ pub(crate) async fn spawn_fresh_chat(
             crate::runtimes::claude_settings_gates(&state.claude_settings_path, &workspace.root)
                 .await;
         let settings_theme = (!theme_set).then_some(spec.theme.as_str());
+        let plugin_tools = crate::plugins::spawn_allow(state, &workspace.id).await;
         let s = crate::agents::write_settings(
             &id,
             &key,
@@ -2845,6 +2914,7 @@ pub(crate) async fn spawn_fresh_chat(
             settings_theme,
             user_statusline.as_ref(),
             spec.mastermind,
+            &plugin_tools,
         )
         .map_err(ChatSpawnFailure::Internal)?;
         let m = crate::agents::write_mcp_config(&id, &key, state.port)
@@ -3137,25 +3207,12 @@ pub(crate) async fn spawn_chat_session(
     // settings pre-allow is generated from — the two vendors' ask modes
     // cannot drift); auto pre-approves the whole chimaera server. Workers
     // (mastermind: None) keep every prompt except the prompt-free tools
-    // (`notify`) every session pre-approves.
+    // (`notify`, the read-only document tools) every session pre-approves.
+    // Active workbench plugins' tools join the pre-approved set too (the user
+    // switched the plugin on; its card names the tools) — for workers as well.
     if recipe.kind == AgentKind::Codex {
-        let always = crate::mcp::ALWAYS_ALLOWED_TOOLS
-            .iter()
-            .map(|t| t.to_string());
-        spec.mcp_auto_approve = Some(chimaera_agent::driver::McpAutoApprove {
-            server: "chimaera".to_string(),
-            tools: match recipe.mastermind {
-                Some(crate::workspaces::MastermindMode::Ask) => Some(
-                    crate::mcp::MASTERMIND_READ_TOOLS
-                        .iter()
-                        .map(|t| t.to_string())
-                        .chain(always)
-                        .collect(),
-                ),
-                Some(crate::workspaces::MastermindMode::Auto) => None,
-                None => Some(always.collect()),
-            },
-        });
+        let plugin_tools = crate::plugins::spawn_allow(state, &recipe.workspace_id).await;
+        spec.mcp_auto_approve = Some(codex_mcp_auto_approve(recipe.mastermind, plugin_tools));
     }
     // Codex selects its create-time model in-protocol at thread open; Claude
     // already received the same recipe value through build_chat_command.
@@ -3309,6 +3366,7 @@ pub(crate) async fn resurrect_chat(
         let (theme_set, user_statusline) =
             crate::runtimes::claude_settings_gates(&state.claude_settings_path, &root).await;
         let settings_theme = (!theme_set).then_some(entry.theme.as_str());
+        let plugin_tools = crate::plugins::spawn_allow(state, &workspace.id).await;
         let s = crate::agents::write_settings(
             &entry.id,
             &key,
@@ -3316,6 +3374,7 @@ pub(crate) async fn resurrect_chat(
             settings_theme,
             user_statusline.as_ref(),
             mastermind_mode,
+            &plugin_tools,
         )?;
         let m = crate::agents::write_mcp_config(&entry.id, &key, state.port)?;
         (Some(s), Some(m))
@@ -3447,6 +3506,34 @@ pub(crate) async fn resurrect_chat(
             crate::lock(&state.session_workspaces).remove(&entry.id);
             Err(e)
         }
+    }
+}
+
+/// The codex driver's standing consent to chimaera MCP tool calls (see the
+/// gating note in `spawn_chat_session`): the prompt-free tools and the
+/// workspace's active plugin tools for every session, plus a Mastermind's
+/// tier.
+fn codex_mcp_auto_approve(
+    mastermind: Option<crate::workspaces::MastermindMode>,
+    plugin_tools: Vec<String>,
+) -> chimaera_agent::driver::McpAutoApprove {
+    let always = crate::mcp::ALWAYS_ALLOWED_TOOLS
+        .iter()
+        .map(|t| t.to_string())
+        .chain(plugin_tools);
+    chimaera_agent::driver::McpAutoApprove {
+        server: "chimaera".to_string(),
+        tools: match mastermind {
+            Some(crate::workspaces::MastermindMode::Ask) => Some(
+                crate::mcp::MASTERMIND_READ_TOOLS
+                    .iter()
+                    .map(|t| t.to_string())
+                    .chain(always)
+                    .collect(),
+            ),
+            Some(crate::workspaces::MastermindMode::Auto) => None,
+            None => Some(always.collect()),
+        },
     }
 }
 
@@ -3583,6 +3670,41 @@ fn restart_message(carry: &chimaera_agent::Carryover) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Codex elicits every MCP call; the driver answers the prompt-free
+    /// tools (notify and the read-only document tools) for every session.
+    #[test]
+    fn codex_pre_approves_the_prompt_free_tools_for_every_session() {
+        use crate::workspaces::MastermindMode;
+        let worker = codex_mcp_auto_approve(None, Vec::new());
+        assert_eq!(worker.server, "chimaera");
+        assert_eq!(
+            worker.tools,
+            Some(vec![
+                "notify".to_string(),
+                "document_guide".to_string(),
+                "check_document".to_string(),
+            ])
+        );
+        let ask = codex_mcp_auto_approve(Some(MastermindMode::Ask), Vec::new())
+            .tools
+            .unwrap();
+        for tool in [
+            "workspace_status",
+            "notify",
+            "document_guide",
+            "check_document",
+        ] {
+            assert!(ask.iter().any(|t| t == tool), "{tool} in {ask:?}");
+        }
+        assert!(!ask
+            .iter()
+            .any(|t| t == "spawn_agent" || t == "run_in_terminal"));
+        assert_eq!(
+            codex_mcp_auto_approve(Some(MastermindMode::Auto), Vec::new()).tools,
+            None
+        );
+    }
 
     fn seq_line(n: u64, ev: AgentEvent) -> String {
         serde_json::to_string(&SeqEvent { seq: n, ts: 0, ev }).unwrap()

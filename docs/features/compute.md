@@ -8,7 +8,7 @@ with the agent dashboard; launching onto compute nodes is the home screen's Mode
 On a laptop (no scheduler) the whole surface is invisible. First slice of the M5 HPC
 layer's *placement axis*; the deep design (Mode 1 login-node job control, Mode 2
 compute-node sessions) lives in the
-[architecture guide](../agent-guides/architecture.md#environment-prelude-compute-node-sessions).
+[architecture guide](../agent-guides/architecture.md#environment-prelude--compute-node-sessions).
 
 **Where it lives (shared):** daemon `crates/chimaera-server/src/compute.rs` (detection +
 snapshot service + route). UI `web-ui/src/lib/workspace/compute.ts` (store/poller) and the
@@ -45,6 +45,12 @@ Wire: `GET /api/v1/compute` (bearer-authed; `?refresh=true` re-detects).
     skipped (Slurm warning banners precede output on some clusters).
   - The default partition carries sinfo's `*` suffix → surfaced as `"default": true`;
     duplicate (partition, avail) rows are merged, "up" wins.
+  - **Ended jobs feed the Timeline** ([timeline-and-knowledge.md](timeline-and-knowledge.md#the-timeline)):
+    two consecutive *good* snapshots diff into ended-job reports (Slurm's terminal state when
+    squeue showed one, else `ENDED` — never a guessed COMPLETED); a daemon task
+    (`episodes::spawn_jobs_task`) drains them every 60s into the workspace whose root holds the
+    job's workdir, and refreshes the snapshot itself only while such a job is live and nothing
+    fresher than 60s is cached. Off-cluster it does no work.
   - **Test knob:** `CHIMAERA_SLURM_BINDIR` points at a directory of stand-in
     `srun`/`scancel`/`squeue`/`sinfo` so the whole surface can be driven live without a cluster
     (the `CHIMAERA_RELEASES_API` pattern).

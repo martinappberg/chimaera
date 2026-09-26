@@ -11,8 +11,22 @@
 </script>
 
 <script lang="ts">
+  import { untrack } from "svelte";
   import { innerExtension } from "./files";
   import { retain, release, type FileEntry } from "./fileStore.svelte";
+  import { revealRequest, takeReveal } from "../shared/reveal";
+  import {
+    clampRegion,
+    cropSize,
+    dragRegion,
+    frameRegion,
+    screenToImage,
+    type Point,
+    type Region,
+  } from "./imageRegion";
+  import { activeSelection, clearSelection, setSelection, type FileSelection } from "../shared/reference";
+  import { xywhFragment } from "../shared/locator";
+  import ReferenceChip from "../shared/ReferenceChip.svelte";
   import Spinner from "./Spinner.svelte";
 
   interface Props {
@@ -156,12 +170,22 @@
 
   function onPointerDown(e: PointerEvent): void {
     if (e.button !== 0 || natural === null) return;
-    dragging = true;
-    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    const el = e.currentTarget as HTMLElement;
+    el.focus({ preventScroll: true });
+    el.setPointerCapture(e.pointerId);
     e.preventDefault();
+    if (areaMode || e.shiftKey) {
+      startBox(e);
+      return;
+    }
+    dragging = true;
   }
 
   function onPointerMove(e: PointerEvent): void {
+    if (boxFrom !== null) {
+      moveBox(e);
+      return;
+    }
     if (!dragging) return;
     tx += e.movementX;
     ty += e.movementY;
@@ -170,10 +194,162 @@
   }
 
   function onPointerUp(e: PointerEvent): void {
-    if (!dragging) return;
+    const el = e.currentTarget as HTMLElement;
+    if (el.hasPointerCapture(e.pointerId)) el.releasePointerCapture(e.pointerId);
+    if (boxFrom !== null) {
+      endBox(e);
+      return;
+    }
     dragging = false;
-    (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId);
   }
+
+  // --- pointing at a region (context bridge) ---------------------------------------
+  //
+  // The area tool (or Shift-drag) draws a box in natural pixels; it goes to
+  // an agent as `#xywh=x,y,w,h` plus a PNG crop of exactly those pixels.
+
+  /** The area tool is on: a drag draws a box instead of panning. */
+  let areaMode = $state(false);
+  /** The box being drawn, then the one pointed at (natural pixels). */
+  let pick = $state.raw<Region | null>(null);
+  /** The box is drawn and published (its chip shows). */
+  let pickReady = $state(false);
+  let boxFrom: { at: Point; client: Point; pointer: number } | null = null;
+  let imgEl = $state<HTMLImageElement | null>(null);
+  const selOwner = {};
+  let published: FileSelection | null = null;
+  let pickGen = 0;
+  /** Crop raster long-side cap (past it a model downsamples anyway). */
+  const CROP_CAP = 1568;
+  const CHIP_W = 170;
+  const CHIP_H = 28;
+
+  function viewportOrigin(): Point | null {
+    const r = viewport?.getBoundingClientRect();
+    return r === undefined ? null : { x: r.left, y: r.top };
+  }
+
+  function startBox(e: PointerEvent): void {
+    const origin = viewportOrigin();
+    if (origin === null) return;
+    if (pick !== null) clearPick();
+    boxFrom = {
+      at: screenToImage(e.clientX, e.clientY, origin, { scale, tx, ty }),
+      client: { x: e.clientX, y: e.clientY },
+      pointer: e.pointerId,
+    };
+  }
+
+  function moveBox(e: PointerEvent): void {
+    const from = boxFrom;
+    const origin = viewportOrigin();
+    if (from === null || origin === null || natural === null || e.pointerId !== from.pointer) return;
+    // A few pixels of jitter is a click, not a box.
+    if (pick === null && Math.hypot(e.clientX - from.client.x, e.clientY - from.client.y) < 4) return;
+    const to = screenToImage(e.clientX, e.clientY, origin, { scale, tx, ty });
+    pick = dragRegion(from.at, to, natural.w, natural.h);
+  }
+
+  function endBox(e: PointerEvent): void {
+    const from = boxFrom;
+    if (from === null || e.pointerId !== from.pointer) return;
+    boxFrom = null;
+    const p = pick;
+    if (p === null) {
+      clearPick();
+      return;
+    }
+    void finishPick(p);
+  }
+
+  async function finishPick(p: Region): Promise<void> {
+    const gen = ++pickGen;
+    const crop = await renderCrop(p);
+    if (gen !== pickGen) return;
+    const sel: FileSelection = {
+      kind: "file",
+      path,
+      startLine: null,
+      endLine: null,
+      text: "",
+      fragment: xywhFragment(p),
+      label: `region ${p.w}×${p.h}`,
+    };
+    if (crop !== null) sel.crop = crop;
+    published = sel;
+    setSelection(selOwner, sel);
+    pickReady = true;
+  }
+
+  /** The box's pixels as a PNG: a raster image's own pixels (1×), an SVG
+   *  drawn crisp at 2×. The image is same-origin (a /raw/ ticket). */
+  async function renderCrop(p: Region): Promise<Blob | null> {
+    const img = imgEl;
+    if (img === null || !img.complete) return null;
+    const size = cropSize(p, isSvg ? 2 : 1, CROP_CAP);
+    const canvas = document.createElement("canvas");
+    canvas.width = size.w;
+    canvas.height = size.h;
+    const ctx = canvas.getContext("2d");
+    if (ctx === null) return null;
+    try {
+      ctx.drawImage(img, p.x, p.y, p.w, p.h, 0, 0, size.w, size.h);
+      return await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/png"));
+    } catch {
+      // An undecodable image: the locator alone still goes.
+      return null;
+    }
+  }
+
+  function clearPick(): void {
+    pick = null;
+    pickReady = false;
+    pickGen += 1;
+    if (published !== null) {
+      published = null;
+      clearSelection(selOwner);
+    }
+  }
+
+  function toggleArea(): void {
+    areaMode = !areaMode;
+    viewport?.focus({ preventScroll: true });
+  }
+
+  function onViewKey(e: KeyboardEvent): void {
+    if (e.key !== "Escape") return;
+    if (pick !== null) clearPick();
+    else if (areaMode) areaMode = false;
+    else return;
+    e.preventDefault();
+  }
+
+  // A newer selection elsewhere replaces this box.
+  $effect(() => {
+    const a = $activeSelection;
+    if (published === null || a === published) return;
+    published = null;
+    pickReady = false;
+    if (boxFrom === null) pick = null;
+  });
+
+  $effect(() => () => {
+    if (published !== null) clearSelection(selOwner);
+    published = null;
+  });
+
+  /** The chip sits under the box's bottom-right corner, inside the viewport. */
+  const chipPos = $derived.by(() => {
+    const p = pick;
+    if (p === null || !pickReady) return null;
+    const clamp = (n: number, lo: number, hi: number) => Math.min(Math.max(n, lo), Math.max(lo, hi));
+    const left = tx + p.x * scale;
+    const right = tx + (p.x + p.w) * scale;
+    return {
+      x: clamp(Math.max(left, right - CHIP_W), 4, vw - CHIP_W),
+      y: clamp(ty + (p.y + p.h) * scale + 6, 4, vh - CHIP_H - 4),
+    };
+  });
 
   function zoomStep(dir: 1 | -1): void {
     // ~1.25x per press, from wherever we are, centered.
@@ -202,6 +378,48 @@
   });
 
   const gridStep = $derived(showGrid ? scale : 0);
+
+  /** A revealed region (`#xywh=` in image pixels), outlined until cleared. */
+  let region = $state<Region | null>(null);
+  /** Bumped per reveal so a repeat of the same region flashes again. */
+  let regionFlash = $state(0);
+
+  // Take a reveal once the image has a size and the viewport a box; a
+  // request that arrives first waits for both.
+  $effect(() => {
+    void $revealRequest;
+    if (natural === null || vw === 0 || vh === 0) return;
+    const req = takeReveal(path);
+    if (req?.region === undefined) return;
+    const { percent, ...raw } = req.region;
+    const n = natural;
+    // `#xywh=percent:…` is relative to the image's own size.
+    const r = percent === true
+      ? { x: (raw.x / 100) * n.w, y: (raw.y / 100) * n.h, w: (raw.w / 100) * n.w, h: (raw.h / 100) * n.h }
+      : raw;
+    untrack(() => showRegion(r));
+  });
+
+  /** Outline `r` and frame it: centered, zoomed to fill most of the view. */
+  function showRegion(r: Region): void {
+    if (natural === null) return;
+    const clipped = clampRegion(r, natural.w, natural.h);
+    if (clipped === null) return;
+    // Half the view, so the region reads in its context; capped below the
+    // pixel-grid zoom, where a figure stops looking like a figure.
+    const view = frameRegion(clipped, vw, vh, {
+      fill: 0.5,
+      minScale: Math.min(fitScale(), 1),
+      maxScale: GRID_SCALE / 2,
+    });
+    region = clipped;
+    regionFlash += 1;
+    mode = "free";
+    scale = view.scale;
+    tx = view.tx;
+    ty = view.ty;
+    clampPan();
+  }
 </script>
 
 <div class="image-view">
@@ -209,7 +427,57 @@
     <span class="dims" class:dim={natural === null}>
       {#if natural !== null}{natural.w}×{natural.h}{isSvg ? " · svg" : ""}{:else}—{/if}
     </span>
+    {#if region !== null}
+      <span class="region-chip" title="revealed region (image pixels)">
+        <span class="region-text">{Math.round(region.x)},{Math.round(region.y)} · {Math.round(region.w)}×{Math.round(
+            region.h,
+          )}</span>
+        <button class="zbtn ic sm" onclick={() => showRegion(region!)} aria-label="frame the region" title="frame the region">
+          <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"
+            ><path
+              d="M2.5 5.5v-3h3M10.5 2.5h3v3M13.5 10.5v3h-3M5.5 13.5h-3v-3"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.4"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            /></svg
+          >
+        </button>
+        <button class="zbtn ic sm" onclick={() => (region = null)} aria-label="clear the region" title="clear the region"
+          >×</button
+        >
+      </span>
+    {/if}
+    {#if pick !== null && pickReady}
+      <span class="region-chip" title="the area you pointed at (image pixels)">
+        <span class="region-text">area {pick.x},{pick.y} · {pick.w}×{pick.h}</span>
+        <button class="zbtn ic sm" onclick={clearPick} aria-label="clear the area" title="clear the area (Esc)"
+          >×</button
+        >
+      </span>
+    {/if}
     <span class="spacer"></span>
+    <button
+      class="zbtn ic sm area-btn"
+      class:on={areaMode}
+      onclick={toggleArea}
+      aria-label="select an area"
+      aria-pressed={areaMode}
+      title={areaMode
+        ? "drag a box on the image to reference it in an agent — click to stop (Esc)"
+        : "select an area to reference in an agent (or Shift-drag)"}
+    >
+      <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"
+        ><path
+          d="M2.5 5V3.5a1 1 0 0 1 1-1H5M11 2.5h1.5a1 1 0 0 1 1 1V5M13.5 11v1.5a1 1 0 0 1-1 1H11M5 13.5H3.5a1 1 0 0 1-1-1V11M7.2 2.5h1.6M7.2 13.5h1.6M2.5 7.2v1.6M13.5 7.2v1.6"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="1.3"
+          stroke-linecap="round"
+        /></svg
+      >
+    </button>
     <div class="zoom">
       <button class="zbtn" class:on={mode === "fit"} onclick={applyFit} title="fit to window">fit</button>
       <button
@@ -224,11 +492,16 @@
     </div>
   </div>
 
+  <!-- Focusable (not tabbable) so Esc reaches it after a press on the image. -->
+  <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+  <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
   <div
     class="viewport"
     class:grabbing={dragging}
+    class:area={areaMode}
     role="application"
-    aria-label="image viewer — scroll to zoom, drag to pan, double-click to toggle fit"
+    aria-label="image viewer — scroll to zoom, drag to pan (Shift-drag points at an area), double-click to toggle fit"
+    tabindex="-1"
     bind:this={viewport}
     onwheel={onWheel}
     ondblclick={onDblClick}
@@ -236,12 +509,14 @@
     onpointermove={onPointerMove}
     onpointerup={onPointerUp}
     onpointercancel={onPointerUp}
+    onkeydown={onViewKey}
   >
     {#if error !== null}
       <div class="file-error">{error}</div>
     {:else if url !== null}
       <!-- checkerboard shows through wherever the image is transparent -->
       <img
+        bind:this={imgEl}
         src={url}
         alt={path}
         class:pixelated={!isSvg && scale > 1}
@@ -261,6 +536,30 @@
           style:transform={`translate(${tx}px, ${ty}px)`}
           style:background-size={`${gridStep}px ${gridStep}px`}
         ></div>
+      {/if}
+      {#if region !== null && natural !== null}
+        {#key regionFlash}
+          <div
+            class="region-mark"
+            aria-hidden="true"
+            style:transform={`translate(${tx + region.x * scale}px, ${ty + region.y * scale}px)`}
+            style:width={`${region.w * scale}px`}
+            style:height={`${region.h * scale}px`}
+          ></div>
+        {/key}
+      {/if}
+      {#if pick !== null && natural !== null}
+        <div
+          class="pick-mark"
+          class:drawing={!pickReady}
+          aria-hidden="true"
+          style:transform={`translate(${tx + pick.x * scale}px, ${ty + pick.y * scale}px)`}
+          style:width={`${pick.w * scale}px`}
+          style:height={`${pick.h * scale}px`}
+        ></div>
+      {/if}
+      {#if chipPos !== null && pick !== null}
+        <ReferenceChip x={chipPos.x} y={chipPos.y} label={`region ${pick.w}×${pick.h}`} />
       {/if}
     {:else}
       <Spinner />
@@ -369,6 +668,36 @@
     cursor: grabbing;
   }
 
+  .viewport:focus {
+    outline: none;
+  }
+
+  .viewport.area {
+    cursor: crosshair;
+  }
+
+  /* The pointed-at area: solid once drawn, dashed while dragging. */
+  .pick-mark {
+    position: absolute;
+    top: 0;
+    left: 0;
+    box-sizing: border-box;
+    pointer-events: none;
+    border: 1.5px solid var(--accent);
+    border-radius: 2px;
+    background: color-mix(in srgb, var(--accent) 10%, transparent);
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--term-bg) 70%, transparent);
+  }
+
+  .pick-mark.drawing {
+    border-style: dashed;
+    background: color-mix(in srgb, var(--accent) 6%, transparent);
+  }
+
+  .zbtn.on.area-btn {
+    color: var(--accent);
+  }
+
   img {
     position: absolute;
     top: 0;
@@ -399,6 +728,56 @@
       linear-gradient(to bottom, color-mix(in srgb, var(--fg) 22%, transparent) 1px, transparent 1px);
   }
 
+  .region-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    padding-left: 0.55rem;
+    border-left: 1px solid var(--edge);
+    font-family: var(--mono);
+    font-variant-numeric: tabular-nums;
+    color: var(--fg);
+  }
+
+  .region-text {
+    margin-right: 0.2rem;
+  }
+
+  .zbtn.ic.sm {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    height: 18px;
+    font-size: var(--text-sm);
+    min-width: 18px;
+  }
+
+  /* The revealed region: an accent frame that stays, and a veil over the
+     rest of the image that fades — the eye lands on it in both themes and on
+     any image, without dimming what you inspect afterwards. */
+  .region-mark {
+    position: absolute;
+    top: 0;
+    left: 0;
+    box-sizing: border-box;
+    pointer-events: none;
+    border: 2px solid var(--accent);
+    border-radius: 2px;
+    box-shadow:
+      0 0 0 1px color-mix(in srgb, var(--term-bg) 70%, transparent),
+      0 0 0 100vmax transparent;
+    animation: region-in 1.6s ease-out;
+  }
+
+  @keyframes region-in {
+    0%,
+    40% {
+      box-shadow:
+        0 0 0 1px color-mix(in srgb, var(--term-bg) 70%, transparent),
+        0 0 0 100vmax color-mix(in srgb, var(--term-bg) 45%, transparent);
+    }
+  }
+
   .file-error {
     margin: auto;
     color: var(--muted);
@@ -410,6 +789,10 @@
   @media (prefers-reduced-motion: reduce) {
     .zbtn {
       transition: none;
+    }
+
+    .region-mark {
+      animation: none;
     }
   }
 </style>

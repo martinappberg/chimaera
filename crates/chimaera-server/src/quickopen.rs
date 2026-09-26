@@ -1,8 +1,8 @@
 //! Quick-open file index: GET /api/v1/fs/quickopen fuzzy-matches a
 //! workspace's files by name/path for the Cmd+P palette. The same cached
-//! index backs the `/fs/validate` bare-basename fallback (see
-//! [`workspace_index_if_free`] / [`unique_file_named`]), so link validation
-//! never adds a second walker.
+//! index backs the `/fs/validate` bare-basename and path-suffix fallbacks
+//! (see [`workspace_index_if_free`] / [`files_named`] /
+//! [`entries_with_suffix`]), so link validation never adds a second walker.
 //!
 //! The index is a bounded walk of the workspace root, and on a login node
 //! that root is routinely a 20k-entry NFS tree that takes seconds to crawl.
@@ -453,19 +453,32 @@ fn build(slot: &Slot, root: &Path, ignore: Option<&[String]>) -> Arc<Vec<Indexed
     files
 }
 
-/// The absolute path of the single FILE named `name` (exact, case-sensitive)
-/// in the index — `None` when absent OR ambiguous. Refusing on ambiguity is
-/// the false-positive defense for bare-basename links: `main.rs` mentioned in
-/// a multi-crate repo must not underline and open an arbitrary one.
-pub(crate) fn unique_file_named<'a>(files: &'a [IndexedFile], name: &str) -> Option<&'a str> {
-    let mut found: Option<&str> = None;
-    for file in files.iter().filter(|f| !f.is_dir && f.name == name) {
-        if found.is_some() {
-            return None;
-        }
-        found = Some(&file.path);
-    }
-    found
+/// Every FILE named exactly `name` (case-sensitive) — the bare-basename
+/// fallback's candidates, unsorted.
+pub(crate) fn files_named<'a>(files: &'a [IndexedFile], name: &str) -> Vec<&'a IndexedFile> {
+    files
+        .iter()
+        .filter(|f| !f.is_dir && f.name == name)
+        .collect()
+}
+
+/// Every entry (file or directory) whose workspace-relative path is `suffix`
+/// or ends with `/` + `suffix` — the partial-path fallback (`figs/plot.png`
+/// for `results/figs/plot.png`). Whole components only: `s/plot.png` never
+/// matches `figs/plot.png`. Unsorted.
+pub(crate) fn entries_with_suffix<'a>(
+    files: &'a [IndexedFile],
+    suffix: &str,
+) -> Vec<&'a IndexedFile> {
+    files
+        .iter()
+        .filter(|f| {
+            f.rel == suffix
+                || f.rel
+                    .strip_suffix(suffix)
+                    .is_some_and(|head| head.ends_with('/'))
+        })
+        .collect()
 }
 
 /// A walk's entries plus whether a guard (or an unreadable root) cut it

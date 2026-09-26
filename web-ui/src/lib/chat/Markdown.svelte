@@ -18,7 +18,23 @@
         node.setAttribute("rel", "noopener noreferrer");
       }
     }
+    // A LOCAL image in agent prose (`![](figs/plot.png)`) is an embed, not a
+    // URL: left as a src the browser would fetch it against the app's own
+    // origin (a broken image, a stray request). Its target moves to a data
+    // attribute here, before the HTML can reach the DOM, and the component
+    // swaps the inert <img> for an embed card (upgradeEmbeds). Scoped to this
+    // component's sanitize calls: the hook is global to DOMPurify.
+    if (deferLocalImages && node instanceof Element && node.tagName === "IMG") {
+      const src = node.getAttribute("src") ?? "";
+      if (src !== "" && !/^(https?:|data:|blob:)/i.test(src) && !src.startsWith("//")) {
+        node.removeAttribute("src");
+        node.removeAttribute("srcset");
+        node.setAttribute("data-md-embed", src);
+      }
+    }
   });
+  /** True only inside this component's own `DOMPurify.sanitize` calls. */
+  let deferLocalImages = false;
 </script>
 
 <script lang="ts">
@@ -28,9 +44,24 @@
   import { getSetting } from "../settings/store.svelte";
   import { advanceSegments, type SegmenterState } from "./streamSegments";
   import { RevealLedger } from "./revealLedger";
-  import { pathCandidate, trimPathWord, type PathHit, type ResolvePaths } from "./paths";
+  import {
+    codeSpanRefs,
+    hrefRef,
+    MISS_TTL_MS,
+    menuPoint,
+    openResolution,
+    reopenResolution,
+    type OpenPathFn,
+    type PathResolver,
+    type Resolution,
+  } from "./paths";
+  import { extractFileRefs, parseFileRef, revealOf, type FileRef, type FoundRef } from "../shared/fileRef";
   import { activateUrl, isWebUrl, urlMenuEntries } from "../shared/urlOpen";
   import { contextMenu } from "../shared/contextMenu.svelte";
+  import { safeDecodeUri } from "../previews/files";
+  import { parseSizeHint, splitTarget } from "../shared/embed/embed";
+  import { mountEmbed, type EmbedHandle } from "../shared/embed/mount.svelte";
+  import type { EmbedResolver } from "./embeds";
 
   interface Props {
     text: string;
@@ -44,15 +75,17 @@
      *  hide-tax) — and resumes with its reveal cursor intact on show. */
     visible?: boolean;
     /** Open a VALIDATED path the prose references — files land in a viewer
-     *  pane, directories in the Finder. */
-    onOpenPath?: (path: string, kind: "file" | "dir") => void;
-    /** Batch-validate path candidates against the daemon (the terminal
-     *  link provider's mechanism): only real files/dirs get the click
-     *  affordance. Returns canonical absolute path + kind per HIT. */
-    resolvePaths?: ResolvePaths;
+     *  pane (at the referenced line), directories in the Finder. */
+    onOpenPath?: OpenPathFn;
+    /** The chat's path resolver (the daemon validates every candidate):
+     *  only real files/dirs get the click affordance. */
+    resolvePaths?: PathResolver;
     /** Fired after each streaming reveal batch — lets the host keep the
      *  transcript pinned to the bottom as words grow between wire chunks. */
     onReveal?: () => void;
+    /** Resolves local images in the prose (`![](figs/plot.png)`) against
+     *  the session's directories, so they render as embed cards. */
+    embeds?: EmbedResolver;
   }
 
   let {
@@ -62,12 +95,75 @@
     onOpenPath,
     resolvePaths,
     onReveal,
+    embeds,
   }: Props = $props();
 
-  /** candidate text → validated hit or "miss"; lives for the component so
-   *  streaming re-renders re-stamp from cache instead of refetching. */
-  const resolved = new Map<string, PathHit | "miss">();
-  const inflight = new Set<string>();
+  /** Embed slots this component built, each with the (hidden) placeholder
+   *  it stands beside and its card. The placeholder belongs to the rendered
+   *  HTML, so its leaving the DOM (a re-render, a rewritten stream, the
+   *  settle swap) is what retires the slot: the card is destroyed and the
+   *  slot removed — even when it sat outside the nodes `{@html}` tracks. */
+  const mountedEmbeds = new Map<HTMLElement, { img: HTMLElement; card: EmbedHandle | null }>();
+
+  function sweepEmbeds(all = false): void {
+    for (const [slot, { img, card }] of mountedEmbeds) {
+      if (all || !img.isConnected || !slot.isConnected) {
+        card?.destroy();
+        slot.remove();
+        mountedEmbeds.delete(slot);
+      }
+    }
+  }
+
+  /** Swap every inert local-image placeholder in `root` (the sanitizer's
+   *  `data-md-embed` <img>) for an embed card in a slot this component
+   *  builds. Runs on settled/closed content only — the per-chunk open tail
+   *  keeps its placeholders, so a card never churns with the stream. */
+  function upgradeEmbeds(root: HTMLElement): void {
+    sweepEmbeds();
+    for (const img of root.querySelectorAll<HTMLImageElement>("img[data-md-embed]:not(.md-embed-src)")) {
+      const target = img.getAttribute("data-md-embed") ?? "";
+      const { alt, width } = parseSizeHint(img.getAttribute("alt") ?? "");
+      const { path, fragment } = splitTarget(target);
+      const shown = safeDecodeUri(path);
+      const slot = document.createElement("div");
+      slot.className = "md-embed";
+      // The placeholder stays (hidden) rather than being replaced: it may be
+      // a top-level node of the settled `{@html}`, whose teardown walks the
+      // nodes it inserted.
+      img.before(slot);
+      img.classList.add("md-embed-src");
+      const resolver = embeds;
+      if (resolver === undefined && !shown.startsWith("/")) {
+        // Nowhere to resolve a relative path: say what was meant, quietly.
+        slot.classList.add("md-embed-text");
+        slot.textContent = alt !== "" ? `${alt} (${shown})` : shown;
+        mountedEmbeds.set(slot, { img, card: null });
+        continue;
+      }
+      const card = mountEmbed(slot, {
+        path: shown,
+        fragment,
+        alt,
+        width,
+        ...(resolver !== undefined ? { resolve: () => resolver.resolve(target) } : {}),
+        ...(onOpenPath !== undefined
+          ? { onOpen: (p, kind, reveal) => onOpenPath(p, kind, reveal !== undefined ? { reveal } : {}) }
+          : {}),
+      });
+      mountedEmbeds.set(slot, { img, card });
+    }
+  }
+
+  /** What a stamped path affordance opens. Kept off the DOM: sanitized agent
+   *  HTML can forge classes and data-* attributes, so a click honors only an
+   *  element this component stamped (a forged one opens nothing). */
+  const stamps = new WeakMap<Element, { ref: FileRef; res: Resolution }>();
+  /** When a stamp pass last left a candidate unlinked (a miss): the pass
+   *  that follows the miss TTL, or a turn end, asks again. */
+  let missedAt: number | null = null;
+  /** A turn ended while this block was hidden: re-stamp its misses on show. */
+  let restampOnShow = false;
 
   // Copy-button chrome comes from the shared decorator (also used by the
   // markdown file preview): injected post-sanitize from literals only, never
@@ -108,110 +204,137 @@
     }, 1400);
   }
 
-  function markPath(node: Element, label: string, hit: PathHit) {
+  function markPath(node: Element, label: string, ref: FileRef, res: Resolution) {
+    if (res.state === "miss") return;
     node.classList.add("md-path");
+    node.classList.toggle("md-ambiguous", res.state === "ambiguous");
     node.setAttribute("role", "button");
     // Generated prose/code spans are not naturally focusable. Anchors already
     // are, so only add a tab stop to the synthetic controls.
     if (node.tagName !== "A") node.setAttribute("tabindex", "0");
-    node.setAttribute("data-path", hit.path);
-    node.setAttribute("data-kind", hit.kind);
+    const at = ref.line !== undefined ? ` at line ${ref.line}` : "";
     node.setAttribute(
       "title",
-      hit.kind === "dir" ? `browse ${label} in the finder` : `open ${label} in a pane`,
+      res.state === "ambiguous"
+        ? `${label} matches ${res.matches.length} files — choose one`
+        : res.hit.kind === "dir"
+          ? `browse ${label} in the finder`
+          : `open ${label}${at} in a pane`,
     );
+    stamps.set(node, { ref, res });
   }
 
-  /** Stamp the click affordance onto inline code spans AND bare prose words
-   *  that validate as real paths. Unknown candidates batch to the daemon
-   *  once; the resolve callback re-stamps from cache. */
-  function stampPaths(root: HTMLElement) {
-    if (onOpenPath === undefined || resolvePaths === undefined) return;
-    const unknownSet = new Set<string>();
-    const want = (candidate: string): PathHit | null => {
-      const hit = resolved.get(candidate);
-      if (hit !== undefined && hit !== "miss") return hit;
-      if (hit === undefined && !inflight.has(candidate)) unknownSet.add(candidate);
-      return null;
-    };
-    for (const code of root.querySelectorAll("code")) {
-      if (code.closest("pre") !== null || code.classList.contains("md-path")) continue;
-      const t = code.textContent ?? "";
-      if (!pathCandidate(t)) continue;
-      const hit = want(t);
-      if (hit !== null) markPath(code, t, hit);
+  /** Undo `markPath`: the reference no longer resolves. */
+  function unmarkPath(node: Element) {
+    stamps.delete(node);
+    node.classList.remove("md-path", "md-ambiguous");
+    node.removeAttribute("role");
+    node.removeAttribute("title");
+    if (node.tagName !== "A") node.removeAttribute("tabindex");
+  }
+
+  /** Wrap each found reference in a text node with its affordance. Right to
+   *  left, so earlier offsets stay valid across splits. */
+  function wrapRefs(node: Text, found: { f: FoundRef; res: Resolution }[]) {
+    for (let i = found.length - 1; i >= 0; i--) {
+      const { f, res } = found[i];
+      const tail = node.splitText(f.start);
+      tail.splitText(f.end - f.start);
+      const span = document.createElement("span");
+      markPath(span, tail.data, f.ref, res);
+      tail.parentNode?.replaceChild(span, tail);
+      span.appendChild(tail);
     }
-    // Markdown links to a LOCAL path ("[demo.csv](demo-assets/demo.csv)") —
-    // agents write these constantly. The href is the candidate; a schemeless
-    // (non-http) target that validates routes to a pane instead of trying to
-    // navigate the SPA. Local anchors that DON'T validate are neutralized on
-    // click (below) so they never blow away the workbench either.
-    for (const a of root.querySelectorAll("a")) {
-      if (a.classList.contains("md-path")) continue;
-      const href = a.getAttribute("href") ?? "";
-      if (href === "" || /^[a-z][a-z0-9+.-]*:/i.test(href) || href.startsWith("#")) continue;
-      a.classList.add("md-local");
-      // Agent-authored hrefs are untrusted. A malformed percent escape makes
-      // decodeURI throw; without this guard one bad link aborts the whole
-      // post-render effect on every streaming chunk (paths/copy/reveal all
-      // stop updating). It is still neutralized as a local link below.
-      let decoded: string;
-      try {
-        decoded = decodeURI(href);
-      } catch {
-        continue;
-      }
-      const cand = decoded.replace(/^\.\//, "").replace(/\/+$/, "");
-      if (!pathCandidate(cand)) continue;
-      const hit = want(cand);
-      if (hit !== null) markPath(a, cand, hit);
-    }
-    // Bare words in prose ("saved to results/plot.png") — same validation,
-    // same affordance. Collect first: wrapping mutates the walked tree.
+  }
+
+  function textNodes(root: Node, skip: string): Text[] {
     const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
       acceptNode: (n) =>
-        n.parentElement?.closest("pre, code, a, .md-path, .katex") == null
-          ? NodeFilter.FILTER_ACCEPT
-          : NodeFilter.FILTER_REJECT,
+        n.parentElement?.closest(skip) == null ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT,
     });
     const nodes: Text[] = [];
     while (walker.nextNode()) nodes.push(walker.currentNode as Text);
-    for (const node of nodes) {
-      const words = [...(node.textContent ?? "").matchAll(/\S+/g)];
-      // Right-to-left so earlier match indices stay valid across splits.
-      for (let i = words.length - 1; i >= 0; i--) {
-        const { head } = trimPathWord(words[i][0]);
-        if (!pathCandidate(head)) continue;
-        const hit = want(head);
-        if (hit === null) continue;
-        const start = words[i].index;
-        const tail = node.splitText(start);
-        tail.splitText(head.length);
-        const span = document.createElement("span");
-        markPath(span, head, hit);
-        tail.parentNode?.replaceChild(span, tail);
-        span.appendChild(tail);
+    return nodes;
+  }
+
+  /** Stamp the click affordance onto inline code spans, local markdown
+   *  links AND bare prose references that the daemon resolves. Unknown
+   *  candidates batch to the resolver; when any comes back linkable this
+   *  root re-stamps (at idle) from its cache. */
+  function stampPaths(root: HTMLElement) {
+    const resolver = resolvePaths;
+    if (onOpenPath === undefined || resolver === undefined) return;
+    const unknown = new Set<string>();
+    let missed = false;
+    const want = (ref: FileRef): Resolution | null => {
+      const res = resolver.peek(ref.path);
+      if (res === undefined) unknown.add(ref.path);
+      else if (res.state === "miss") missed = true;
+      else return res;
+      return null;
+    };
+    const stampText = (node: Text) => {
+      const found: { f: FoundRef; res: Resolution }[] = [];
+      for (const f of extractFileRefs(node.data)) {
+        const res = want(f.ref);
+        if (res !== null) found.push({ f, res });
       }
+      wrapRefs(node, found);
+    };
+    // Inline code: the whole span when it is a reference, else the
+    // references inside it (`cat results/x.csv`).
+    for (const code of root.querySelectorAll("code")) {
+      if (code.closest("pre, a, .md-path, .md-embed") !== null || code.querySelector(".md-path") !== null) {
+        continue;
+      }
+      const t = code.textContent ?? "";
+      const { whole, parts } = codeSpanRefs(t);
+      const wholeRes = whole !== null ? want(whole) : null;
+      if (whole !== null && wholeRes !== null) {
+        markPath(code, t.trim(), whole, wholeRes);
+        continue;
+      }
+      if (parts.length > 0) for (const node of textNodes(code, ".md-path, .katex")) stampText(node);
     }
-    if (unknownSet.size > 0) {
-      const unknown = [...unknownSet];
-      for (const u of unknown) inflight.add(u);
-      void resolvePaths(unknown)
-        .then((hits) => {
-          for (const u of unknown) {
-            resolved.set(u, hits.get(u) ?? "miss");
-            inflight.delete(u);
-          }
-          // Re-stamp ONLY the root this sweep walked, and at idle: a
-          // synchronous whole-tree re-walk here re-created the O(message)
-          // per-chunk cost this pipeline removed (once per segment that
-          // found unknown candidates).
-          enqueueStamp(root);
-        })
-        .catch(() => {
-          for (const u of unknown) inflight.delete(u);
-        });
+    // Markdown links to a LOCAL path ("[demo.csv](demo-assets/demo.csv)",
+    // "[x](src/a.rs#L10)") — agents write these constantly. A schemeless
+    // target that resolves opens in a pane instead of navigating the SPA;
+    // one that doesn't is neutralized on click (below). DOMPurify drops an
+    // href it cannot classify (`main.rs:12`), so a link left without one
+    // offers its text instead.
+    for (const a of root.querySelectorAll("a")) {
+      if (a.classList.contains("md-path") || a.closest(".md-embed") !== null) continue;
+      const href = a.getAttribute("href") ?? "";
+      let ref: FileRef | null;
+      if (href === "") {
+        ref = parseFileRef(a.textContent ?? "", { delimited: true });
+      } else {
+        if (/^[a-z][a-z0-9+.-]*:/i.test(href) || href.startsWith("#")) continue;
+        a.classList.add("md-local");
+        ref = hrefRef(href);
+      }
+      if (ref === null) continue;
+      const res = want(ref);
+      if (res !== null) markPath(a, ref.path, ref, res);
     }
+    // Bare references in prose ("saved to results/plot.png:12"). Collected
+    // first: wrapping mutates the walked tree.
+    for (const node of textNodes(root, "pre, code, a, .md-path, .katex, .md-embed")) stampText(node);
+    if (missed) missedAt = Date.now();
+    if (unknown.size === 0) return;
+    void resolver.resolve(unknown).then((linkable) => {
+      if (!linkable) {
+        missedAt = Date.now();
+        return;
+      }
+      // Re-stamp at idle, and ONLY the root this sweep walked: a synchronous
+      // whole-tree re-walk here re-created the O(message) per-chunk cost this
+      // pipeline removed. If the stream settled while the batch was in
+      // flight, that root is gone — the canonical parse replaced it — so the
+      // settled root takes the re-stamp (the settle race).
+      const target = root.isConnected ? root : !streaming ? el : null;
+      if (target !== null) enqueueStamp(target);
+    });
   }
 
   /** Synchronously mark schemeless (non-#) anchors `md-local` so the click
@@ -250,19 +373,19 @@
       return;
     }
     const node = target?.closest?.(".md-path");
-    if (node !== null && node !== undefined && onOpenPath !== undefined) {
+    if (node !== null && node !== undefined && stamps.has(node)) {
       // An anchor would navigate the SPA away; a validated path opens a pane.
       if (node.tagName === "A") e.preventDefault();
-      const path = node.getAttribute("data-path");
-      const kind = node.getAttribute("data-kind");
-      if (path !== null && (kind === "file" || kind === "dir")) onOpenPath(path, kind);
+      activatePath(node, e);
       return;
     }
     // A local-path anchor that never validated: still swallow the click so a
-    // stale relative href can't replace the whole workbench with a 404.
+    // stale relative href can't replace the whole workbench with a 404 —
+    // and ask again now (the file may exist since the last answer).
     const local = target?.closest?.("a.md-local");
     if (local !== null && local !== undefined) {
       e.preventDefault();
+      retryLocal(local, e);
       return;
     }
     // A web link. The anchor carries target=_blank as a fallback, but in the
@@ -291,12 +414,52 @@
     if (e.key !== "Enter" && e.key !== " ") return;
     const target = e.target as Element | null;
     const node = target?.closest?.(".md-path");
-    if (node === null || node === undefined || onOpenPath === undefined) return;
-    const path = node.getAttribute("data-path");
-    const kind = node.getAttribute("data-kind");
-    if (path === null || (kind !== "file" && kind !== "dir")) return;
+    if (node === null || node === undefined || !stamps.has(node)) return;
     e.preventDefault();
-    onOpenPath(path, kind);
+    activatePath(node, e);
+  }
+
+  /** Open what a stamped affordance names: a file at its line (Cmd/Ctrl:
+   *  in a split), a directory in the Finder, an ambiguous name via a menu
+   *  of its matches — as the daemon answers NOW (the stamp may predate a
+   *  move or a delete). A reference that is gone loses its affordance. */
+  function activatePath(node: Element, e: MouseEvent | KeyboardEvent) {
+    const stamp = stamps.get(node);
+    if (stamp === undefined || onOpenPath === undefined) return;
+    const opts = {
+      split: e.metaKey || e.ctrlKey,
+      reveal: revealOf(stamp.ref),
+      at: menuPoint(e, node),
+      label: (p: string) => resolvePaths?.label(p) ?? p,
+    };
+    void reopenResolution(resolvePaths, stamp.ref.path, stamp.res, onOpenPath, opts).then((res) => {
+      if (!node.isConnected || stamps.get(node) !== stamp) return;
+      if (res.state === "miss") unmarkPath(node);
+      else if (res !== stamp.res) markPath(node, node.textContent ?? stamp.ref.path, stamp.ref, res);
+    });
+  }
+
+  /** A local link with no standing answer: resolve it now (a click always
+   *  retries a miss) and open it if it resolves. */
+  function retryLocal(a: Element, e: MouseEvent) {
+    const ref = hrefRef(a.getAttribute("href") ?? "");
+    const resolver = resolvePaths;
+    const open = onOpenPath;
+    if (ref === null || open === undefined || resolver === undefined) return;
+    const opts = { split: e.metaKey || e.ctrlKey, reveal: revealOf(ref), at: menuPoint(e, a) };
+    void resolver.resolveNow(ref.path).then((res) => {
+      if (res === undefined || res.state === "miss") return;
+      if (a.isConnected) markPath(a, ref.path, ref, res); // it links from now on
+      openResolution(res, open, { ...opts, label: (p) => resolver.label(p) });
+    });
+  }
+
+  /** Hovering a message whose misses have expired asks about them again. */
+  function onPointerEnter() {
+    if (missedAt === null || streaming || el === null) return;
+    if (Date.now() - missedAt < MISS_TTL_MS) return;
+    missedAt = null;
+    enqueueStamp(el);
   }
 
   // Agent prose is untrusted model output rendered into the workbench DOM:
@@ -306,7 +469,12 @@
   // explicitly (and the style attribute) — otherwise injected CSS applies
   // document-wide.
   function sanitizeHtml(raw: string): string {
-    return DOMPurify.sanitize(raw, { FORBID_TAGS: ["style"], FORBID_ATTR: ["style"] });
+    deferLocalImages = true;
+    try {
+      return DOMPurify.sanitize(raw, { FORBID_TAGS: ["style"], FORBID_ATTR: ["style"] });
+    } finally {
+      deferLocalImages = false;
+    }
   }
 
   function parseSanitized(source: string): string {
@@ -387,7 +555,7 @@
 
   const wordFilter = {
     acceptNode: (n: Node) =>
-      (n.textContent ?? "").trim().length > 0 && n.parentElement?.closest(".katex") == null
+      (n.textContent ?? "").trim().length > 0 && n.parentElement?.closest(".katex, .md-embed") == null
         ? NodeFilter.FILTER_ACCEPT
         : NodeFilter.FILTER_REJECT,
   };
@@ -511,6 +679,7 @@
   function clearLiveDom(): void {
     if (liveEl === null) return;
     liveEl.replaceChildren();
+    sweepEmbeds();
     prefixQueue = [];
     tailQueue = [];
     ledger.reset();
@@ -574,6 +743,9 @@
       // Fully revealed: no spans at all — born clean for selection-copy.
     }
     liveEl.insertBefore(root, tailEl);
+    // After the word wrap (a card's own text must never become reveal
+    // spans) and once attached (a card finds its scroller for lazy loads).
+    upgradeEmbeds(root);
     unstamped.push(root);
   }
 
@@ -723,6 +895,25 @@
     decorateCopyTargets(el);
     stampPaths(el);
     markTableRegions(el);
+    upgradeEmbeds(el);
+  });
+
+  // A turn ended (the resolver dropped its misses): a settled block that
+  // left a reference unlinked asks again — now if shown, else on show.
+  $effect(() => {
+    const resolver = resolvePaths;
+    if (resolver === undefined) return;
+    return resolver.onExpire(() => {
+      if (missedAt === null || streaming || el === null) return;
+      missedAt = null;
+      if (visible) enqueueStamp(el);
+      else restampOnShow = true;
+    });
+  });
+  $effect(() => {
+    if (!visible || streaming || !restampOnShow || el === null) return;
+    restampOnShow = false;
+    enqueueStamp(el);
   });
 
   /** Keyboard reach for the transcript's horizontal scrollers
@@ -772,6 +963,7 @@
     clearCopied();
     clearUnwrapTimers();
     cancelIdleStamp?.();
+    sweepEmbeds(true);
   });
 </script>
 
@@ -782,6 +974,7 @@
   onclick={onClick}
   onkeydown={onKeydown}
   oncontextmenu={onContextMenu}
+  onpointerenter={onPointerEnter}
 >
   {#if streaming}
     <!-- Streaming: children are managed imperatively (renderStream) — closed
@@ -899,6 +1092,11 @@
   .md :global(code.md-path:hover) {
     background: color-mix(in srgb, var(--accent) 12%, transparent);
   }
+  /* Several files answer to this name: the dashed underline says a click
+     asks which. */
+  .md :global(.md-path.md-ambiguous) {
+    text-decoration-style: dashed;
+  }
   .md :global(pre) {
     position: relative; /* the copy button's anchor */
     background: color-mix(in srgb, var(--fg) 5%, transparent);
@@ -999,5 +1197,29 @@
     border: none;
     border-top: 1px solid var(--edge);
     margin: 0.6em 0;
+  }
+  /* Local images are embed cards (upgradeEmbeds). Until a streaming
+     segment closes, its placeholder holds a quiet box of about a card's
+     header height; once upgraded it is hidden beside its card. */
+  .md :global(img[data-md-embed]) {
+    display: block;
+    width: min(100%, 420px);
+    height: 64px;
+    margin: 0.4em 0;
+    border: 1px dashed color-mix(in srgb, var(--edge) 80%, transparent);
+    border-radius: 8px;
+    color: var(--muted);
+    font-size: var(--text-xs);
+  }
+  .md :global(img.md-embed-src) {
+    display: none;
+  }
+  .md :global(.md-embed) {
+    display: block;
+    max-width: 100%;
+  }
+  .md :global(.md-embed-text) {
+    color: var(--muted);
+    font-size: var(--text-sm);
   }
 </style>

@@ -100,10 +100,19 @@ on the alternate screen cannot restore the primary screen's scrollback
 - Claude's own `~/.claude/projects` JSONL transcripts are the agent's source of truth;
   chimaerad stores only an overlay (attention events, tags, Slurm links). Crash recovery is
   nearly free: cold-restart → re-attach every session via `--resume` with preserved cwd.
-- A tiny `~/.chimaera/manifest.json` (hostname, port, 0600 token, pid, version) lets clients
-  landing on a different round-robin login node discover and route to the node actually
-  running the daemon. **Validate this at your own center in week 1** — some sites don't allow
-  addressing individual login nodes.
+- A tiny `~/.chimaera/manifest.json` (hostname, port, 0600 token, pid, version) is the
+  registry. On a login-node pool (one round-robin name over nodes that share `$HOME`) every
+  node sees the same file, but its pid and loopback port mean something only on the node
+  that wrote it — so `connect`'s probe also reports the node it ran on (`uname -n`), and a
+  manifest another node wrote is never judged by that node's `kill -0`. Connect routes the
+  alias to the manifest's node instead (a per-alias `Route` in `chimaera-remote`: the node's
+  own `HostName` with the alias's ssh config when the laptop and the cluster resolve it to the
+  same address, else a `-W` leg through the alias's master), takes the liveness verdict there,
+  and pins every later ssh call for the alias to it (for the life of the process). Nothing is started unless the daemon is provably dead on its
+  node or the node's name no longer resolves inside the cluster; an unreachable node is an
+  honest error. Reaching another login node is a fresh ssh login — on a Duo cluster, one more
+  prompt (verified on Sherlock, 2026-09-25: login→login ssh isn't hostbased there). Sites
+  that don't allow addressing individual login nodes get the error, never a second daemon.
 - Resource discipline is a feature: <1 core steady-state, target ~150 MB RSS, no server-side
   rendering (tmux's CPU model, not zellij's ~4x), hard memory ceilings on preview extraction —
   Arbiter2-class login-node policing kills processes, and a Parquet spike must never take the
@@ -650,15 +659,14 @@ so each new format is one server match-arm + one UI component.
   `/raw/` path into a sandboxed iframe (`sandbox=allow-scripts`, no `allow-same-origin`, strict
   CSP, all external network blocked). MultiQC is self-contained by design, so it just works.
   Nobody else ships this.
-- **CSV/TSV/Parquet**: server-side paging via the arrow-rs `parquet` crate (footer
-  metadata/schema fast path, row-group and page-level reads, projection pushdown — no query
-  engine needed) plus the `csv` crate with byte-offset indexing for TSV/CSV; hard memory caps;
-  paginated slices as Arrow IPC binary frames into a virtualized table. A 50 GB Parquet opens
-  instantly because only the visible page materializes. Verification note: full polars would
-  add 20–40 MB+ to the binary and isn't needed for paging — add it (`default-features =
-  false`) only if server-side filtering/aggregation later becomes a real feature. Scope
-  honestly: row-group-metadata stats and paging, not full-scan sort/global-stats (which would
-  violate the daemon's own resource budget).
+- **CSV/TSV**: server-side paging with a sparse byte-offset row index; hard memory caps;
+  paginated JSON slices into a virtualized table.
+- **Parquet**: read in the *browser* with `hyparquet` over ranged `/raw` requests — footer
+  first, then only the column chunks (or, with an offset index or a walk of the page headers,
+  only the pages) under the visible rows. The daemon streams byte ranges and holds nothing, so
+  a 50 GB file costs it no memory and the binary no Arrow dependency; the tunnel carries only
+  what's on screen. Scope honestly: paging and schema, not full-scan sort or global statistics.
+  Details: [files and previews](../features/files-and-previews.md#rendered-previews).
 - **Compressed reality check (from adversarial review)**: bioinformatics tabular files are
   overwhelmingly `.tsv.gz`/`.csv.gz`/`.vcf.gz`/bgzip. Gzip has no random access — the preview
   layer needs a decompression tier from day one: stream the head immediately, background-spool
@@ -681,7 +689,13 @@ input — Claude Code's native `@path` mention plus the line range and the quote
 *without submitting*, so you review and press Enter. The workbench knows exactly what you're
 looking at (path, line range), so agents get surgical context instead of pasted mystery text.
 Plain Cmd+C stays untouched (never spooky). Wave 2 of this: selections in *terminal* panes
-reference the session's scrollback.
+reference the session's scrollback. Wave 3 (2026-09, "reference parts of any file, even parts
+of images"): every viewer points — a PDF passage or a box on a page, a box on an image, table
+cells, a media moment, a notebook cell, a slide — as a locator fragment
+(`@paper.pdf#page=3&xywh=… "…"`, one grammar in `shared/locator.ts`, which also makes those
+fragments open at their spot from any link), with the pixels attached in chat or uploaded to
+the session's landing pad for a terminal agent. See
+[pointing at part of a file](../features/files-and-previews.md#pointing-at-part-of-a-file).
 
 **Clickable paths — the bridge's return direction (author, 2026-07-06):** agents produce
 files; opening them should be one click, both ways of detecting them:
