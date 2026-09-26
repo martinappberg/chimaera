@@ -179,7 +179,11 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   `~/.chimaera/drafts`) — a new tunnel port is a new origin with an empty IndexedDB. Opening a
   file whose draft differs from the disk shows "Recovered unsaved changes from …" with Restore /
   Discard, never a silent restore; a draft typed against an older disk version restores through
-  the merge. A save of exactly that text, or a discard, clears both copies. A journal that failed
+  the merge. A save of exactly that text, or a discard, clears both copies; mirror writes for a
+  path land in issue order, so a late journal write never re-creates a cleared draft. A
+  hide/pagehide flush sends drafts as keepalive requests only within a shared 56 KiB budget of
+  encoded body bytes (the browser's keepalive quota); the rest go as normal requests, with the
+  IndexedDB copy regardless. A journal that failed
   everywhere shows "draft not backed up" in the status bar. Older daemons without the routes fall
   back to IndexedDB only.
 - **Other windows.** Same-origin windows announce dirty paths over a `BroadcastChannel`; a window
