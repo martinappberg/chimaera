@@ -42,8 +42,8 @@ gap-replay idea as the PTY transport, realized for structured streams.
 
 | File | What it owns | Start here when… |
 |---|---|---|
-| `lib.rs` | `ChatManager`: the session registry + pump task (`absorb`) + `spawn`/`attach`/`command`/`kill`/`remove`; owns the 32 MiB / 64-message retained-Send budget across its channel and both drivers' pending FIFOs. | adding session lifecycle, changing fan-out, touching `ChatInfo`, or command admission. |
-| `driver.rs` | The `AgentAdapter`/`Mapper` traits, `SpawnSpec` (incl. protocol-side `initial_model`, `agent_version`, `rollback_turns`, native `fork_at`, and quiet `portable_context`), `DriverIo`, `DriverExit`, handshake/kill timeouts; the harness `run_driver` (journals the probed version on `Init` + a non-fatal drift Notice vs `tested_version()`, surfaces startup-failure as a visible event, and drives the `tick`/`drain_pending` mapper hooks). | adding a new agent, changing spawn inputs, exit classification, or the version/startup/teardown harness. |
+| `lib.rs` | `ChatManager`: the session registry + pump task (`absorb`) + `spawn`/`attach`/`command`/`kill`/`remove`; owns the 32 MiB / 64-message retained-Send budget across its channel and both drivers' pending FIFOs (each reservation pairs with its driver echo, which is how `command_as` stamps a daemon-sent message's `UserMessage.origin`). Also folds each session's `Carryover` — what dies with the process (bridge, ultracode, running turn, background work) — for the server's ledger (`carryover()`). | adding session lifecycle, changing fan-out, touching `ChatInfo`, or command admission. |
+| `driver.rs` | The `AgentAdapter`/`Mapper` traits, `SpawnSpec` (incl. protocol-side `initial_model`, `initial_ultracode`, `agent_version`, `rollback_turns`, native `fork_at`, and quiet `portable_context`), `DriverIo`, `DriverExit`, handshake/kill timeouts; the harness `run_driver` (journals the probed version on `Init` + a non-fatal drift Notice vs `tested_version()`, surfaces startup-failure as a visible event, and drives the `tick`/`drain_pending` mapper hooks). | adding a new agent, changing spawn inputs, exit classification, or the version/startup/teardown harness. |
 | `model.rs` | The normalized `AgentEvent` / `AgentCommand` types (ACP-shaped), including bounded slash catalogs, native skill input blocks, the latest-wins `RemoteControl` event + `SetRemoteControl` command, `UserMessage.origin`, and the transcript surfaces (`ToolSummary`, `SubagentFinished`, `TurnTokens`, `ActivityLine`; `BackgroundTask.monitor/ambient`); authoritative command-ingress validation, `Usage`, the delta `Coalescer`, and the size caps (`COMMAND_*`, `cap_output`, `cap_head_tail`, `DIFF_*_BUDGET`, `BG_*`). | adding an event/command kind, or a cap. |
 | `claude.rs` | The Claude Code driver: bidirectional `stream-json` + the `control_response` protocol, incl. the Remote Control bridge (`remote_control` control + `system/bridge_state`, `SpawnSpec.remote_control` at-start), the initialize offer flags, the tool-family titles, narration classification (a thinking block's signature says whether it is prose — held briefly until known; `signature_is_narration`), per-batch tool labels, and the subagent/background/monitor lifecycle. Pinned to `TESTED_CLAUDE_VERSION`. | claude protocol work. |
 | `codex.rs` | The Codex driver: `codex app-server` JSON-RPC 2.0, thread/turn/steer lifecycle, cwd-scoped `skills/list` + native skill inputs, questions, approvals (incl. the `{permissions, scope}` profile reply) + default auto-review, model/mode settings, Remote Control status relay, reasoning summaries (`turn/start.summary: "auto"` unless configured), collab-stint finishes, and `commandActions` exploration rows. Pinned to `TESTED_CODEX_VERSION`. | codex protocol work. |
@@ -112,6 +112,12 @@ gap-replay idea as the PTY transport, realized for structured streams.
   tasks that died with the previous daemon process.
 - A `--resume` forks a NEW native session id (claude); never pin `--session-id`
   with `--resume`. Codex resumes in-protocol (the id survives).
+- A daemon stop ends drivers through the polite path (stdin closed, grace, then
+  SIGKILL — the server's `stop_all_for_exit`), not the runtime's drop-time
+  SIGKILL: claude's Bash shells are detached, so only its own teardown ends
+  them (PROTOCOL.md Pass 32). What the process held is `Carryover`; the server
+  snapshots it BEFORE the stop, because the teardown journals the bridge off
+  and an empty background set.
 - Remote Control is process-owned on both wires: claude's bridge dies with the
   driver (teardown journals the Off), codex's lives on its app-server DAEMON
   (a per-session app-server only reports `disabled`; no enable RPC exists).

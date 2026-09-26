@@ -42,6 +42,8 @@ async fn chat_handshake_failure_degrades_to_pty_on_same_id() {
             rollback_turns: None,
             revert_before_turn: None,
             remote_control_at_start: false,
+            carry_remote_control: None,
+            carry_ultracode: false,
             theme: "dark".into(),
             prelude: None,
             mastermind: None,

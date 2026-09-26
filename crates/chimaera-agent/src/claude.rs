@@ -483,6 +483,11 @@ impl Driver for ClaudeDriver {
                 }));
             }
         }
+        // Ultracode after the effort: it raises effort itself, so applying
+        // the remembered effort second would undo it.
+        if spec.initial_ultracode {
+            initial.push(mapper.on_command(AgentCommand::SetUltracode { enabled: true }));
+        }
         mapper.bootstrapping = false;
         // Remote Control at start — the embedder's standing choice, honored
         // only where the CLI offers the bridge. It rides the ordinary command

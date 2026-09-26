@@ -80,6 +80,10 @@ impl std::error::Error for CommandQueueFull {}
 struct SendReservation {
     token: u64,
     bytes: usize,
+    /// Who sent it when the daemon did so itself (`UserMessage.origin`),
+    /// stamped onto the driver's echo — the one event this reservation pairs
+    /// with, so neither driver has to carry the tag.
+    origin: Option<&'static str>,
 }
 
 #[derive(Default)]
@@ -94,7 +98,11 @@ struct CommandBudget {
 }
 
 impl CommandBudget {
-    fn reserve(&mut self, bytes: usize) -> Result<u64, CommandQueueFull> {
+    fn reserve(
+        &mut self,
+        bytes: usize,
+        origin: Option<&'static str>,
+    ) -> Result<u64, CommandQueueFull> {
         if self.sends >= RETAINED_SENDS_MAX
             || bytes > RETAINED_SEND_BYTES_MAX.saturating_sub(self.bytes)
         {
@@ -104,7 +112,11 @@ impl CommandBudget {
         self.next_token = self.next_token.wrapping_add(1);
         self.bytes = self.bytes.saturating_add(bytes);
         self.sends = self.sends.saturating_add(1);
-        self.unassigned.push_back(SendReservation { token, bytes });
+        self.unassigned.push_back(SendReservation {
+            token,
+            bytes,
+            origin,
+        });
         Ok(token)
     }
 
@@ -121,7 +133,9 @@ impl CommandBudget {
         }
     }
 
-    fn observe(&mut self, event: &AgentEvent) {
+    /// Pair a Send echo with its reservation. Mutable so the echo can take
+    /// the reservation's origin before it is journaled.
+    fn observe(&mut self, event: &mut AgentEvent) {
         match event {
             // Command-originated Send echoes always carry their driver-minted
             // delivery id. Id-less UserMessages come from transcript import
@@ -130,11 +144,15 @@ impl CommandBudget {
             AgentEvent::UserMessage {
                 id: Some(id),
                 queued,
+                origin,
                 ..
             } => {
                 let Some(reservation) = self.unassigned.pop_front() else {
                     return;
                 };
+                if origin.is_none() {
+                    *origin = reservation.origin.map(str::to_string);
+                }
                 if *queued {
                     if let Some(previous) = self.queued.remove(id) {
                         self.release(previous);
@@ -280,6 +298,88 @@ impl BackgroundWork {
     }
 }
 
+/// What a session's driver PROCESS holds that dies with it — the part of the
+/// session a daemon restart cannot resume from the conversation alone. The
+/// server's ledger snapshots it, and resurrection re-establishes what it can
+/// (the bridge, ultracode) and tells the agent about what it cannot (its
+/// background work, a cut-off turn). Folded from the same events as
+/// [`ChatInfo`] but kept off the session-list wire: only the ledger reads it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Carryover {
+    /// The Remote Control bridge was on (connecting or connected).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub remote_control: bool,
+    /// Ultracode was on (claude's session-scoped flag).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ultracode: bool,
+    /// A turn was running, including one parked on a permission or question.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub turn_in_flight: bool,
+    /// Background work still running: the level-set minus settled and
+    /// ambient tasks. Bounded by the drivers' `BG_TASKS_CAP`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub background: Vec<CarriedTask>,
+}
+
+/// One running background task, as much of it as a successor needs to name
+/// it: the ids the agent's own tool results used, and its label. Workflow
+/// progress is deliberately dropped — it changes on every tick, and the
+/// ledger that stores this rewrites on change.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CarriedTask {
+    pub id: String,
+    pub task_type: String,
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_name: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub monitor: bool,
+}
+
+impl Carryover {
+    fn observe(&mut self, ev: &AgentEvent) {
+        use model::RemoteControlState as Rc;
+
+        match ev {
+            // Claude re-emits Init mid-process; the snapshot it carries is
+            // the bridge as it stands, so this never wipes a live one.
+            AgentEvent::Init { remote_control, .. } => {
+                self.remote_control = remote_control
+                    .as_ref()
+                    .is_some_and(|rc| matches!(rc.state, Rc::Connecting | Rc::Connected));
+            }
+            AgentEvent::RemoteControl { state, .. } => {
+                self.remote_control = matches!(state, Rc::Connecting | Rc::Connected);
+            }
+            AgentEvent::EffortState { ultracode, .. } => self.ultracode = *ultracode,
+            AgentEvent::TurnStarted { .. } => self.turn_in_flight = true,
+            AgentEvent::TurnCompleted { .. } | AgentEvent::TurnAborted { .. } => {
+                self.turn_in_flight = false;
+            }
+            AgentEvent::BackgroundTasks { tasks, .. } => {
+                self.background = tasks
+                    .iter()
+                    .filter(|t| t.status == "running" && !t.ambient)
+                    .map(|t| CarriedTask {
+                        id: t.id.clone(),
+                        task_type: t.task_type.clone(),
+                        description: t.description.clone(),
+                        workflow_name: t.workflow_name.clone(),
+                        monitor: t.monitor,
+                    })
+                    .collect();
+            }
+            AgentEvent::Exited { .. } => *self = Carryover::default(),
+            _ => {}
+        }
+    }
+
+    /// Work the restart cut off: something the agent itself has to pick up.
+    pub fn interrupted_work(&self) -> bool {
+        self.turn_in_flight || !self.background.is_empty()
+    }
+}
+
 /// Fold the driver's authoritative model/mode state into the lightweight
 /// session-list snapshot. The attached chat store consumes the same events;
 /// keeping this fold beside `ChatInfo` prevents dashboard rows and fresh WS
@@ -336,6 +436,7 @@ fn fold_session_metadata(info: &mut ChatInfo, ev: &AgentEvent) {
 struct ChatSession {
     info: Mutex<ChatInfo>,
     background_work: Mutex<BackgroundWork>,
+    carryover: Mutex<Carryover>,
     journal: Arc<Journal>,
     cmd_tx: mpsc::Sender<AgentCommand>,
     events_tx: broadcast::Sender<Arc<SeqEvent>>,
@@ -490,6 +591,7 @@ impl ChatManager {
         let session = Arc::new(ChatSession {
             info: Mutex::new(info.clone()),
             background_work: Mutex::new(BackgroundWork::default()),
+            carryover: Mutex::new(Carryover::default()),
             journal: Arc::clone(&journal),
             cmd_tx,
             events_tx: events_tx.clone(),
@@ -563,11 +665,16 @@ impl ChatManager {
     }
 
     /// Journal + broadcast one event and fold it into the session info.
-    async fn absorb(&self, id: &str, session: &ChatSession, ev: AgentEvent) {
+    async fn absorb(&self, id: &str, session: &ChatSession, mut ev: AgentEvent) {
         session
             .command_budget
             .lock()
             .expect("command budget lock")
+            .observe(&mut ev);
+        session
+            .carryover
+            .lock()
+            .expect("carryover lock")
             .observe(&ev);
         let background_running = session
             .background_work
@@ -788,6 +895,18 @@ impl ChatManager {
     }
 
     pub async fn command(&self, id: &str, cmd: AgentCommand) -> Result<()> {
+        self.command_as(id, cmd, None).await
+    }
+
+    /// [`Self::command`] for a send the DAEMON makes on its own (not a
+    /// client's): its echo journals with `UserMessage.origin = origin`, so the
+    /// transcript says who spoke. Ignored for commands that are not sends.
+    pub async fn command_as(
+        &self,
+        id: &str,
+        cmd: AgentCommand,
+        origin: Option<&'static str>,
+    ) -> Result<()> {
         cmd.validate_ingress().context("invalid agent command")?;
         let session = self.get_session(id)?;
         let _order = session.command_order.lock().await;
@@ -796,7 +915,7 @@ impl ChatManager {
                 .command_budget
                 .lock()
                 .expect("command budget lock")
-                .reserve(bytes)?;
+                .reserve(bytes, origin)?;
             Some(EnqueueReservation {
                 budget: &session.command_budget,
                 token: Some(token),
@@ -838,6 +957,15 @@ impl ChatManager {
             .expect("sessions lock")
             .get(id)
             .map(|s| s.info.lock().expect("info lock").clone())
+    }
+
+    /// The live process's [`Carryover`] — what a restart would cut off.
+    pub fn carryover(&self, id: &str) -> Option<Carryover> {
+        self.sessions
+            .lock()
+            .expect("sessions lock")
+            .get(id)
+            .map(|s| s.carryover.lock().expect("carryover lock").clone())
     }
 
     pub fn list(&self) -> Vec<ChatInfo> {
@@ -1014,9 +1142,9 @@ mod tests {
     #[test]
     fn command_budget_bounds_bytes_and_releases_on_delivery() {
         let mut budget = CommandBudget::default();
-        let first = budget.reserve(RETAINED_SEND_BYTES_MAX - 1).unwrap();
-        assert_eq!(budget.reserve(2), Err(CommandQueueFull));
-        budget.observe(&AgentEvent::UserMessage {
+        let first = budget.reserve(RETAINED_SEND_BYTES_MAX - 1, None).unwrap();
+        assert_eq!(budget.reserve(2, None), Err(CommandQueueFull));
+        budget.observe(&mut AgentEvent::UserMessage {
             text: "queued".to_string(),
             attachments: 0,
             id: Some("q1".to_string()),
@@ -1024,7 +1152,7 @@ mod tests {
             origin: None,
         });
         assert_eq!(budget.bytes, RETAINED_SEND_BYTES_MAX - 1);
-        budget.observe(&AgentEvent::UserMessageUpdate {
+        budget.observe(&mut AgentEvent::UserMessageUpdate {
             id: "q1".to_string(),
             state: model::UserMessageState::Sent,
         });
@@ -1040,10 +1168,10 @@ mod tests {
     fn command_budget_bounds_tiny_send_count_and_clears_on_exit() {
         let mut budget = CommandBudget::default();
         for _ in 0..RETAINED_SENDS_MAX {
-            budget.reserve(0).unwrap();
+            budget.reserve(0, None).unwrap();
         }
-        assert_eq!(budget.reserve(0), Err(CommandQueueFull));
-        budget.observe(&AgentEvent::Exited { status: None });
+        assert_eq!(budget.reserve(0, None), Err(CommandQueueFull));
+        budget.observe(&mut AgentEvent::Exited { status: None });
         assert_eq!(budget.bytes, 0);
         assert_eq!(budget.sends, 0);
         assert!(budget.unassigned.is_empty());
@@ -1052,8 +1180,8 @@ mod tests {
     #[test]
     fn idless_feedback_does_not_consume_a_send_reservation() {
         let mut budget = CommandBudget::default();
-        budget.reserve(1024).unwrap();
-        budget.observe(&AgentEvent::UserMessage {
+        budget.reserve(1024, None).unwrap();
+        budget.observe(&mut AgentEvent::UserMessage {
             text: "try a dry run first".to_string(),
             attachments: 0,
             id: None,
@@ -1063,7 +1191,7 @@ mod tests {
         assert_eq!(budget.bytes, 1024);
         assert_eq!(budget.unassigned.len(), 1);
 
-        budget.observe(&AgentEvent::UserMessage {
+        budget.observe(&mut AgentEvent::UserMessage {
             text: "the actual send".to_string(),
             attachments: 0,
             id: Some("q1".to_string()),
@@ -1077,7 +1205,7 @@ mod tests {
     #[test]
     fn enqueue_reservation_drop_releases_quota_unless_disarmed() {
         let budget = Mutex::new(CommandBudget::default());
-        let token = budget.lock().unwrap().reserve(1024).unwrap();
+        let token = budget.lock().unwrap().reserve(1024, None).unwrap();
         {
             let _guard = EnqueueReservation {
                 budget: &budget,
@@ -1086,7 +1214,7 @@ mod tests {
         }
         assert_eq!(budget.lock().unwrap().bytes, 0);
 
-        let token = budget.lock().unwrap().reserve(2048).unwrap();
+        let token = budget.lock().unwrap().reserve(2048, None).unwrap();
         {
             let mut guard = EnqueueReservation {
                 budget: &budget,
@@ -1095,5 +1223,134 @@ mod tests {
             guard.disarm();
         }
         assert_eq!(budget.lock().unwrap().bytes, 2048);
+    }
+
+    #[test]
+    fn daemon_origin_rides_the_echo_its_reservation_pairs_with() {
+        let mut budget = CommandBudget::default();
+        budget.reserve(64, Some(model::ORIGIN_RESTART)).unwrap();
+        budget.reserve(64, None).unwrap();
+        // Id-less feedback consumes nothing, so it cannot steal the tag.
+        let mut feedback = AgentEvent::UserMessage {
+            text: "feedback".to_string(),
+            attachments: 0,
+            id: None,
+            queued: false,
+            origin: None,
+        };
+        budget.observe(&mut feedback);
+        let origin_of = |ev: &AgentEvent| match ev {
+            AgentEvent::UserMessage { origin, .. } => origin.clone(),
+            _ => unreachable!(),
+        };
+        assert_eq!(origin_of(&feedback), None);
+        let echo = |id: &str| AgentEvent::UserMessage {
+            text: "sent".to_string(),
+            attachments: 0,
+            id: Some(id.to_string()),
+            queued: false,
+            origin: None,
+        };
+        let mut first = echo("m1");
+        budget.observe(&mut first);
+        assert_eq!(origin_of(&first).as_deref(), Some(model::ORIGIN_RESTART));
+        let mut second = echo("m2");
+        budget.observe(&mut second);
+        assert_eq!(origin_of(&second), None, "a client send stays untagged");
+    }
+
+    fn running_task(id: &str, task_type: &str) -> model::BackgroundTask {
+        model::BackgroundTask {
+            id: id.into(),
+            task_type: task_type.into(),
+            description: format!("{id} work"),
+            status: "running".into(),
+            started_at_ms: 1,
+            workflow_name: None,
+            agents: Vec::new(),
+            agents_total: 0,
+            agents_done: 0,
+            monitor: false,
+            ambient: false,
+            tool_use_id: None,
+        }
+    }
+
+    #[test]
+    fn carryover_tracks_what_dies_with_the_process() {
+        use model::RemoteControlState as Rc;
+
+        let mut carry = Carryover::default();
+        assert!(!carry.interrupted_work());
+
+        carry.observe(&AgentEvent::RemoteControl {
+            state: Rc::Connected,
+            session_url: Some("https://claude.ai/code/session_x".into()),
+            name: None,
+            detail: None,
+        });
+        carry.observe(&AgentEvent::EffortState {
+            effort: Some("xhigh".into()),
+            ultracode: true,
+            chosen: true,
+        });
+        let mut monitor = running_task("bg-2", "local_bash");
+        monitor.monitor = true;
+        let mut settled = running_task("bg-3", "local_bash");
+        settled.status = "completed".into();
+        let mut ambient = running_task("bg-4", "local_bash");
+        ambient.ambient = true;
+        carry.observe(&AgentEvent::BackgroundTasks {
+            tasks: vec![
+                running_task("bg-1", "local_bash"),
+                monitor,
+                settled,
+                ambient,
+            ],
+            closed: Vec::new(),
+        });
+        assert!(carry.remote_control && carry.ultracode);
+        assert_eq!(
+            carry
+                .background
+                .iter()
+                .map(|t| (t.id.as_str(), t.monitor))
+                .collect::<Vec<_>>(),
+            [("bg-1", false), ("bg-2", true)],
+            "settled and ambient tasks are not work to pick up"
+        );
+        assert!(carry.interrupted_work(), "background work alone counts");
+
+        carry.observe(&AgentEvent::TurnStarted {
+            turn_id: "t1".into(),
+        });
+        assert!(carry.turn_in_flight);
+        // Claude's mid-process Init repeats the live bridge; it never wipes it.
+        carry.observe(&AgentEvent::Init {
+            native_session_id: "native".into(),
+            model: None,
+            modes: Vec::new(),
+            current_mode: None,
+            slash_commands: Vec::new(),
+            models: Vec::new(),
+            agent_version: None,
+            remote_control_available: true,
+            remote_control_auto_enable: false,
+            remote_control: Some(model::RemoteControlSnapshot {
+                state: Rc::Connected,
+                session_url: None,
+                name: None,
+            }),
+        });
+        assert!(carry.remote_control);
+        carry.observe(&AgentEvent::TurnAborted {
+            turn_id: "t1".into(),
+            reason: "interrupted".into(),
+            interrupted: true,
+        });
+        assert!(!carry.turn_in_flight);
+
+        carry.observe(&AgentEvent::Exited { status: Some(0) });
+        assert_eq!(carry, Carryover::default(), "nothing outlives the process");
     }
 }

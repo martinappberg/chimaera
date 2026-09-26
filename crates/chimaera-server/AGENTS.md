@@ -16,7 +16,7 @@ the module you need and read its header doc.
 | `state.rs` | `AppState` (every shared handle) + `lock()`. |
 | `router.rs` | `app()` — the axum route table. |
 | `lifecycle.rs` | The daemon `run()` lifecycle (bind/handoff/manifest/serve/graceful-shutdown) + the listener helpers. |
-| `ledger.rs` | The session ledger: snapshot/restore for restart handoff + resurrection. Covers **both** surfaces — PTY sessions and chat sessions (via `state.chat`); a chat resurrects through `chat::resurrect_chat`. |
+| `ledger.rs` | The session ledger: snapshot/restore for restart handoff + resurrection. Covers **both** surfaces — PTY sessions and chat sessions (via `state.chat`); a chat resurrects through `chat::resurrect_chat`, carrying its process `Carryover` (bridge, ultracode, cut-off work). The reconciler stops writing once `stopping` is set — the graceful stop owns the last write. |
 | `api/` | REST, split by resource: `workspaces`/`sessions`/`exec`/`shutdown`/`env` + `mod.rs` (auth+health+re-exports). |
 | `exec.rs` | `run_exec` — the transport-neutral "type a command into a live shell, with sentinel policy" helper, shared by `api::exec_session` (REST) and `mcp::run_in_terminal` (so `mcp` doesn't depend on `api`). |
 | `persist.rs` | `atomic_write_json` — the shared temp-write + rename dance for the small JSON state stores (view-state/ledger/workspaces/recents/settings). |
@@ -207,7 +207,15 @@ the lifecycle, keep them consistent:
   `chat::resurrect_chat` (regenerate settings/mcp, `--resume`/thread, reuse the
   journal) and retires the rest into Recents (`ui=Chat`). The graceful-shutdown
   path must **not** retire chats (that drops their workspace mapping and the
-  reconciler would lose them) — the snapshot carries them.
+  reconciler would lose them) — the snapshot carries them. It does END them
+  (`chat::stop_all_for_exit`, after the final ledger flush and the dead-chat
+  retire loop) so claude's detached background shells die with their agent;
+  with `stopping` set, `handle_chat_exit` and the agent watcher do nothing for
+  those exits. The ledger's per-chat `carryover` brings back the bridge and
+  ultracode (`ChatRecipe.carry_*`) and, when a turn or background work was cut
+  off and the conversation resumed, one `origin: "restart"` message to the
+  agent (`restart_message`, gated by `chat.resumeAfterRestart`; never to a
+  Mastermind — the daemon doesn't start its turns).
 - **`close-all` / `shutdown` must stop chat drivers too** (`kill_all` only
   covers PTYs).
 - **Resource discipline is a review criterion.** ~150 MB RSS, no unbounded

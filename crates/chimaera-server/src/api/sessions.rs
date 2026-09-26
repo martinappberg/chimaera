@@ -392,6 +392,8 @@ async fn spawn_chat_ui(
         rollback_turns: None,
         revert_before_turn: None,
         remote_control_at_start: true,
+        carry_remote_control: None,
+        carry_ultracode: false,
         theme: theme.to_string(),
         prelude: body.prelude.clone().filter(|p| !p.trim().is_empty()),
         // A resumed recent is never the Mastermind: retiring one clears the

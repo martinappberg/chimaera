@@ -77,6 +77,11 @@ pub(crate) struct LedgerAgent {
     /// The chat model in use, so a resurrected chat re-selects it. `None` for a
     /// TUI agent (the model is the CLI's own concern there).
     pub(crate) model: Option<String>,
+    /// What the chat's live process held that dies with it — the bridge,
+    /// ultracode, background work, a running turn — so resurrection can
+    /// re-establish or report it. `None` for a TUI agent and for an older
+    /// ledger (resurrection then falls back to the at-start settings).
+    pub(crate) carryover: Option<chimaera_agent::Carryover>,
 }
 
 /// What the previous daemon left behind.
@@ -108,6 +113,7 @@ impl LedgerEntry {
                 "title": a.title,
                 "ui": a.ui,
                 "model": a.model,
+                "carryover": a.carryover,
             })),
         })
     }
@@ -129,6 +135,11 @@ impl LedgerEntry {
                     .and_then(|u| serde_json::from_value::<SessionUi>(u.clone()).ok())
                     .unwrap_or(SessionUi::Term),
                 model: a.get("model").and_then(|m| m.as_str()).map(str::to_string),
+                // Additive and load-tolerant: absent, null or malformed = None.
+                carryover: a
+                    .get("carryover")
+                    .filter(|c| !c.is_null())
+                    .and_then(|c| serde_json::from_value(c.clone()).ok()),
             }),
         };
         Some(LedgerEntry {
@@ -278,6 +289,15 @@ pub(crate) async fn run(state: Arc<AppState>) {
             _ = tokio::time::sleep(RECONCILE_TICK) => {}
         }
         let (entries, links) = snapshot(&state);
+        // Once the daemon is stopping, the graceful stop owns the last write
+        // (lifecycle's final flush) and then ends the chat drivers politely.
+        // A snapshot taken from here on could see those deliberately ended
+        // chats as dead and drop them — they would never resurrect. The check
+        // follows the snapshot: `stopping` is set before any driver is ended,
+        // so a snapshot taken while it was clear still saw them alive.
+        if state.stopping.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
         crate::lock(&state.ledger).write_if_changed(&entries, &links);
         tokio::time::sleep(WRITE_DEBOUNCE).await;
     }
@@ -324,6 +344,7 @@ pub(crate) fn snapshot(state: &AppState) -> (Vec<LedgerEntry>, HashMap<String, S
                 title: record.display_name(info.title.as_deref()),
                 ui: SessionUi::Term,
                 model: None,
+                carryover: None,
             });
             Some(LedgerEntry {
                 id: info.id.clone(),
@@ -377,6 +398,7 @@ pub(crate) fn snapshot(state: &AppState) -> (Vec<LedgerEntry>, HashMap<String, S
                     title,
                     ui: SessionUi::Chat,
                     model: c.model.clone(),
+                    carryover: state.chat.carryover(&c.id),
                 }),
             })
         })
@@ -652,6 +674,7 @@ mod tests {
                 title: "fix the tests".into(),
                 ui: SessionUi::Term,
                 model: None,
+                carryover: None,
             }),
             ..shell_entry()
         }
@@ -762,12 +785,27 @@ mod tests {
         let path = dir.join("sessions.json");
         let mut store = LedgerStore::new(path.clone());
 
+        let mut chat = chat_entry(AgentKind::Claude, Some("conv-2"));
+        chat.id = "s-3".into();
+        chat.agent.as_mut().unwrap().carryover = Some(chimaera_agent::Carryover {
+            remote_control: true,
+            ultracode: true,
+            turn_in_flight: true,
+            background: vec![chimaera_agent::CarriedTask {
+                id: "bg-1".into(),
+                task_type: "local_bash".into(),
+                description: "Watch the CI run".into(),
+                workflow_name: None,
+                monitor: true,
+            }],
+        });
         let entries = vec![
             shell_entry(),
             LedgerEntry {
                 pinned_name: Some("data wrangling".into()),
                 ..agent_entry(AgentKind::Claude, Some("conv-1"))
             },
+            chat,
         ];
         let links: HashMap<String, String> = [("s-1".to_string(), "s-2".to_string())].into();
         store.write_if_changed(&entries, &links);
@@ -789,6 +827,20 @@ mod tests {
         let old = LedgerStore::new(path.clone()).load_boot();
         assert_eq!(old.sessions.len(), 1);
         assert_eq!(old.sessions[0].created_at, 0);
+
+        // An older chat entry without "carryover" (or a malformed one) loads
+        // as None, which resurrection reads as "fall back to the settings".
+        std::fs::write(
+            &path,
+            r#"{"sessions":[{"id":"c-old","workspace_id":"w1","cwd":"/tmp","cols":80,"rows":24,"theme":"dark","agent":{"kind":"claude","title":"t","ui":"chat"}},{"id":"c-bad","workspace_id":"w1","cwd":"/tmp","cols":80,"rows":24,"theme":"dark","agent":{"kind":"claude","title":"t","ui":"chat","carryover":{"background":"nope"}}}],"links":{}}"#,
+        )
+        .unwrap();
+        let old = LedgerStore::new(path.clone()).load_boot();
+        assert_eq!(old.sessions.len(), 2);
+        assert!(old
+            .sessions
+            .iter()
+            .all(|e| e.agent.as_ref().unwrap().carryover.is_none()));
 
         // Unchanged snapshots skip the write (mtime stays put).
         let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();

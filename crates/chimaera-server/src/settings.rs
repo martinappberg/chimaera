@@ -156,6 +156,18 @@ impl SettingsStore {
             .unwrap_or(false)
     }
 
+    /// Daemon-consumed key: when a restart cut a chat's work off (a running
+    /// turn, background commands / monitors / workflows), send the resumed
+    /// agent one message saying what stopped (see `chat::resurrect_chat`).
+    /// Default on: it only fires when there is work to pick up, and that is
+    /// the point of the restart surviving at all; each one starts a turn.
+    pub(crate) fn resume_after_restart(&mut self) -> bool {
+        self.current()
+            .get("chat.resumeAfterRestart")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true)
+    }
+
     /// Daemon-consumed key: ask Claude for its per-batch tool labels (the
     /// transcript's tool-group titles). Default on: the labels are what the
     /// official clients show; each costs one small-model call.

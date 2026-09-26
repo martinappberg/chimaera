@@ -55,6 +55,37 @@ PTY snapshot-on-attach ([terminals.md](terminals.md)) and the chat seq-journal g
   prunes still-respawning tabs. A busy handoff port after ~5s falls back to an OS-assigned port (stay up
   on a fresh port rather than die); a crash leaves no handoff; an explicit conflicting `--port` wins.
 
+## Restart carryover (chat sessions)
+
+- **What & when.** Resuming the conversation brings back what the agent *said*, not what its process
+  *held*. On an update or restart, each chat also comes back with the parts that die with the
+  process: the **Remote Control bridge** (on if it was on, off if you turned it off — this wins over
+  `chat.remoteControlAtStart`), **ultracode**, and, when the restart cut work off, **one message to
+  the agent** listing what stopped — a turn that was still running, and background commands,
+  monitors, workflows and background agents — asking it to restart what it still needs and carry on.
+- **How it's used.** Nothing to do. The message appears in the transcript as a user bubble tagged
+  **sent by chimaera after a restart** and starts a turn on your account. It is sent only when work
+  was actually cut off and the conversation really resumed (a chat that had to boot fresh has no
+  memory of that work), and never to a workspace Mastermind, whose turns the daemon never starts. Setting **Pick Up Interrupted Work After a Restart**
+  (`chat.resumeAfterRestart`, default on) turns the message off; the bridge and ultracode come back
+  either way. Model, effort and mode already came back through the journal index.
+- **Where it lives.** `chimaera-agent` `lib.rs` (`Carryover` — folded per session from the event
+  stream, read by `ChatManager::carryover`; `command_as` stamps a daemon-sent message's
+  `UserMessage.origin = "restart"` via the Send↔echo reservation), `ledger.rs`
+  (`LedgerAgent.carryover`), `chat.rs` (`resurrect_chat` → `ChatRecipe.carry_*`,
+  `SpawnSpec.initial_ultracode`, `restart_message`; `stop_all_for_exit`), `lifecycle.rs`.
+- **Key behaviors.** A graceful stop now **ends chat agents cleanly** before the daemon exits (stdin
+  closed, the 3 s kill grace, then SIGKILL) instead of the runtime's drop-time SIGKILL. That matters
+  because Claude Code starts its background shells detached: a SIGKILLed claude leaves them running
+  on the host (a dev server holding its port, a monitor's `tail -f` that never ends), and the resumed
+  agent would then start each one a second time; with stdin closed, claude kills its held
+  background tasks itself (PROTOCOL.md Pass 32). This runs after the ledger's final flush, and with
+  `stopping` set: the ledger reconciler stops writing, and the chat exit path and the agent watcher
+  retire nothing, so the deliberately ended chats stay in the ledger and never land in Recents.
+  Measured: 0.19 s to stop with two chats (fake agents). A crash still leaves whatever the process
+  held; the ledger's last reconcile (≤ 5 s old) still carries it. TUI sessions are out of scope —
+  claude resumes there with `--resume`, but nothing types into a PTY on the user's behalf.
+
 ## Graceful shutdown & close-all
 
 - **What & when.** End every session (daemon stays up), or end everything and stop the daemon.

@@ -68,6 +68,7 @@ async fn ledger_resurrects_sessions_across_restart() {
             title: "port the parser".to_string(),
             ui: chimaera_agent::model::SessionUi::Term,
             model: None,
+            carryover: None,
         }),
     });
     ledger::restore(&state2, boot).await;
@@ -167,6 +168,7 @@ async fn ledger_restore_disabled_still_lands_recents() {
                     title: "fix the flaky tests".to_string(),
                     ui: chimaera_agent::model::SessionUi::Term,
                     model: None,
+                    carryover: None,
                 }),
             },
         ],
