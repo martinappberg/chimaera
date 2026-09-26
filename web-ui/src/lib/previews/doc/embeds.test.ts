@@ -171,6 +171,29 @@ describe("the document's answers", () => {
     expect(seen).toEqual([`${refKey({ target: "a.png", byName: false })}:v1`, `${refKey({ target: "a.png", byName: false })}:v2`]);
   });
 
+  it("tells subscribers an expired answer asked again, even when the daemon renewed the same ticket", async () => {
+    const ref = { target: "a.png", byName: false };
+    mocks.resolveTargets.mockResolvedValue({ "a.png": hit("/ws/a.png", "v1") });
+    const e = new DocEmbeds("/ws/doc.md", ctx);
+    const seen: string[] = [];
+    e.subscribe((_key, a) => seen.push("missing" in a ? "missing" : a.ticket ?? ""));
+    e.sync([ref]);
+    await vi.advanceTimersByTimeAsync(20);
+    expect(seen).toEqual(["t-v1"]);
+    // Aging, not expired: drawn from, asked again, unchanged — nobody told.
+    await vi.advanceTimersByTimeAsync(2 * 60_000);
+    expect(e.answer(ref)).toMatchObject({ ticket: "t-v1" });
+    await vi.advanceTimersByTimeAsync(20);
+    expect(seen).toEqual(["t-v1"]);
+    // Expired: an image drawn now finds no answer, and waits on the ask.
+    await vi.advanceTimersByTimeAsync(9 * 60_000);
+    expect(e.answer(ref)).toBeUndefined();
+    void e.ask(ref);
+    await vi.advanceTimersByTimeAsync(20);
+    expect(seen).toEqual(["t-v1", "t-v1"]);
+    expect(e.answer(ref)).toMatchObject({ ticket: "t-v1" });
+  });
+
   it("finds an `![[name]]` missing beside the document by name", async () => {
     mocks.resolveTargets
       .mockResolvedValueOnce({ "plot.png": { missing: true }, "gone.png": { missing: true } })

@@ -535,7 +535,7 @@ export class Hydrator {
     this.track(img, ref, null);
     const a = this.embeds.answer(ref);
     if (a !== undefined) pointImg(img, a);
-    else void this.embeds.ask(ref);
+    else void this.embeds.ask(ref); // reaches `answered`, a renewed expired answer too
   }
 
   /** An image-syntax block: an embed card in a slot of its own, drawn from

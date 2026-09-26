@@ -156,7 +156,8 @@ export class DocEmbeds {
     for (const r of this.synced) void this.ask(r);
   }
 
-  /** Changed answers (a first answer, a new version, a file gone). */
+  /** Changed answers (a first answer, a new version, a file gone), and an
+   *  expired one answered again. */
   subscribe(fn: EmbedListener): () => void {
     this.listeners.add(fn);
     return () => this.listeners.delete(fn);
@@ -200,7 +201,10 @@ export class DocEmbeds {
       const oldest = this.answers.keys().next().value;
       if (oldest !== undefined) this.answers.delete(oldest);
     }
-    if (prev === undefined || !sameAnswer(prev.r, r)) for (const fn of this.listeners) fn(key, r);
+    // An expired answer was never drawn from: whatever mounted meanwhile
+    // waits on this one, even when the daemon renewed the same ticket.
+    if (prev === undefined || at - prev.at >= TICKET_MS || !sameAnswer(prev.r, r))
+      for (const fn of this.listeners) fn(key, r);
   }
 
   private async resolve(refs: readonly EmbedRef[]): Promise<Map<string, TargetResult>> {
