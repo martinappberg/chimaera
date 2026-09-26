@@ -1,0 +1,836 @@
+{
+  "about": [
+    "The reading view's parity corpus: one case list for both markdown renderers — the client's (web-ui/src/lib/previews/doc/, run by doc/parity.test.ts through its string target) and the daemon's comrak + ammonia fallback (crates/chimaera-server/src/fs.rs markdown_parity_tests). A case added here runs on both sides.",
+    "md — the document. html — the expected body HTML (frontmatter is never body), compared after the shared normalization: lowercase tags; only the href, src, alt, id, class, align, start and data-task attributes, sorted; entities decoded and re-escaped one way; ASCII whitespace collapsed and dropped beside block tags; comments removed. data-sourcepos is dropped by that rule.",
+    "diverges — set on a case the two sides are KNOWN to disagree on: `side` names the renderer that is skipped (the other must match `html`), `reason` says why. Fix a divergence on the client wherever feasible instead of adding one."
+  ],
+  "cases": [
+    {
+      "note": "a plain paragraph",
+      "md": "Hello world.\n",
+      "html": "<p>Hello world.</p>"
+    },
+    {
+      "note": "two paragraphs",
+      "md": "One.\n\nTwo.\n",
+      "html": "<p>One.</p><p>Two.</p>"
+    },
+    {
+      "note": "a soft break flows",
+      "md": "first line\nsecond line\n",
+      "html": "<p>first line second line</p>"
+    },
+    {
+      "note": "a hard break from two spaces",
+      "md": "first  \nsecond\n",
+      "html": "<p>first<br>second</p>"
+    },
+    {
+      "note": "a hard break from a backslash",
+      "md": "first\\\nsecond\n",
+      "html": "<p>first<br>second</p>"
+    },
+    {
+      "note": "trailing spaces at the paragraph end are no break",
+      "md": "last line  \n",
+      "html": "<p>last line</p>"
+    },
+    {
+      "note": "backslash escapes",
+      "md": "\\*not em\\* \\_ \\# \\[x\\] \\\\\n",
+      "html": "<p>*not em* _ # [x] \\</p>"
+    },
+    {
+      "note": "entities decode",
+      "md": "&amp; &copy; &#35; &#x41; &lt;tag&gt; &hellip;\n",
+      "html": "<p>&amp; © # A &lt;tag&gt; …</p>"
+    },
+    {
+      "note": "an unknown entity stays literal",
+      "md": "a &nosuch; b\n",
+      "html": "<p>a &amp;nosuch; b</p>"
+    },
+    {
+      "note": "emphasis and strong",
+      "md": "*a* _b_ **c** __d__ ***e***\n",
+      "html": "<p><em>a</em> <em>b</em> <strong>c</strong> <strong>d</strong> <em><strong>e</strong></em></p>"
+    },
+    {
+      "note": "nested emphasis",
+      "md": "**bold *and em* inside**\n",
+      "html": "<p><strong>bold <em>and em</em> inside</strong></p>"
+    },
+    {
+      "note": "intraword underscores stay literal",
+      "md": "snake_case_word and a*b*c\n",
+      "html": "<p>snake_case_word and a<em>b</em>c</p>"
+    },
+    {
+      "note": "double-tilde strikethrough",
+      "md": "~~gone~~ here\n",
+      "html": "<p><del>gone</del> here</p>"
+    },
+    {
+      "note": "single-tilde strikethrough",
+      "md": "~gone~ here\n",
+      "html": "<p><del>gone</del> here</p>"
+    },
+    {
+      "note": "single-tilde strikethrough across words",
+      "md": "a ~two words~ b\n",
+      "html": "<p>a <del>two words</del> b</p>"
+    },
+    {
+      "note": "superscript syntax stays literal",
+      "md": "x^2^ and ^up^\n",
+      "html": "<p>x^2^ and ^up^</p>"
+    },
+    {
+      "note": "emoji shortcodes stay literal",
+      "md": ":smile: and :+1:\n",
+      "html": "<p>:smile: and :+1:</p>"
+    },
+    {
+      "note": "inline code",
+      "md": "`code` and ``a ` b``\n",
+      "html": "<p><code>code</code> and <code>a ` b</code></p>"
+    },
+    {
+      "note": "inline code strips one surrounding space",
+      "md": "` a ` and `  b  `\n",
+      "html": "<p><code>a</code> and <code> b </code></p>"
+    },
+    {
+      "note": "inline code keeps markup characters",
+      "md": "`<b>*x*</b> &amp;`\n",
+      "html": "<p><code>&lt;b&gt;*x*&lt;/b&gt; &amp;amp;</code></p>"
+    },
+    {
+      "note": "an inline link",
+      "md": "[text](https://ex.com/a)\n",
+      "html": "<p><a href=\"https://ex.com/a\">text</a></p>"
+    },
+    {
+      "note": "a link with a title",
+      "md": "[t](/p \"Title\")\n",
+      "html": "<p><a href=\"/p\">t</a></p>"
+    },
+    {
+      "note": "a relative link with a fragment",
+      "md": "[doc](other.md#sec)\n",
+      "html": "<p><a href=\"other.md#sec\">doc</a></p>"
+    },
+    {
+      "note": "an angle-bracket destination with spaces",
+      "md": "[x](<my file.md>)\n",
+      "html": "<p><a href=\"my%20file.md\">x</a></p>"
+    },
+    {
+      "note": "a full reference link",
+      "md": "[a][ref]\n\n[ref]: https://x.org\n",
+      "html": "<p><a href=\"https://x.org\">a</a></p>"
+    },
+    {
+      "note": "collapsed and shortcut reference links",
+      "md": "[ref][] and [ref]\n\n[ref]: /u\n",
+      "html": "<p><a href=\"/u\">ref</a> and <a href=\"/u\">ref</a></p>"
+    },
+    {
+      "note": "an undefined reference stays literal",
+      "md": "[nope] and [a][nope]\n",
+      "html": "<p>[nope] and [a][nope]</p>"
+    },
+    {
+      "note": "reference labels match case- and space-insensitively",
+      "md": "[Foo Bar]\n\n[foo  bar]: /x\n",
+      "html": "<p><a href=\"/x\">Foo Bar</a></p>"
+    },
+    {
+      "note": "the first definition of a label wins",
+      "md": "[r]\n\n[r]: /first\n[r]: /second\n",
+      "html": "<p><a href=\"/first\">r</a></p>"
+    },
+    {
+      "note": "an angle autolink",
+      "md": "<https://ex.com/a?b=1>\n",
+      "html": "<p><a href=\"https://ex.com/a?b=1\">https://ex.com/a?b=1</a></p>"
+    },
+    {
+      "note": "an angle email autolink",
+      "md": "<me@ex.com>\n",
+      "html": "<p><a href=\"mailto:me@ex.com\">me@ex.com</a></p>"
+    },
+    {
+      "note": "a bare www autolink drops trailing punctuation",
+      "md": "see www.example.com.\n",
+      "html": "<p>see <a href=\"http://www.example.com\">www.example.com</a>.</p>"
+    },
+    {
+      "note": "a bare https autolink keeps balanced parens",
+      "md": "go to https://ex.com/a_(b).\n",
+      "html": "<p>go to <a href=\"https://ex.com/a_(b)\">https://ex.com/a_(b)</a>.</p>"
+    },
+    {
+      "note": "a bare email autolink",
+      "md": "mail foo@bar.com now\n",
+      "html": "<p>mail <a href=\"mailto:foo@bar.com\">foo@bar.com</a> now</p>"
+    },
+    {
+      "note": "an image",
+      "md": "![alt](figs/a.png)\n",
+      "html": "<p><img alt=\"alt\" src=\"figs/a.png\"></p>"
+    },
+    {
+      "note": "an image alt is plain text",
+      "md": "![an *em* alt](a.png \"T\")\n",
+      "html": "<p><img alt=\"an em alt\" src=\"a.png\"></p>"
+    },
+    {
+      "note": "a remote image",
+      "md": "![x](https://ex.com/i.png)\n",
+      "html": "<p><img alt=\"x\" src=\"https://ex.com/i.png\"></p>"
+    },
+    {
+      "note": "a linked image",
+      "md": "[![i](a.png)](https://ex.com)\n",
+      "html": "<p><a href=\"https://ex.com\"><img alt=\"i\" src=\"a.png\"></a></p>"
+    },
+    {
+      "note": "entities in link text and destination",
+      "md": "[a&amp;b](/x?a=1&b=2)\n",
+      "html": "<p><a href=\"/x?a=1&amp;b=2\">a&amp;b</a></p>"
+    },
+    {
+      "note": "a link label with code and emphasis",
+      "md": "[`code` *em*](/c)\n",
+      "html": "<p><a href=\"/c\"><code>code</code> <em>em</em></a></p>"
+    },
+    {
+      "note": "ATX headings, every level",
+      "md": "# One\n## Two\n### Three\n#### Four\n##### Five\n###### Six\n",
+      "html": "<h1 id=\"user-content-one\">One<a class=\"anchor\" href=\"#one\"></a></h1><h2 id=\"user-content-two\">Two<a class=\"anchor\" href=\"#two\"></a></h2><h3 id=\"user-content-three\">Three<a class=\"anchor\" href=\"#three\"></a></h3><h4 id=\"user-content-four\">Four<a class=\"anchor\" href=\"#four\"></a></h4><h5 id=\"user-content-five\">Five<a class=\"anchor\" href=\"#five\"></a></h5><h6 id=\"user-content-six\">Six<a class=\"anchor\" href=\"#six\"></a></h6>"
+    },
+    {
+      "note": "closing hashes are not content",
+      "md": "## Title ##\n",
+      "html": "<h2 id=\"user-content-title\">Title<a class=\"anchor\" href=\"#title\"></a></h2>"
+    },
+    {
+      "note": "setext headings",
+      "md": "Top\n===\n\nSub\n---\n",
+      "html": "<h1 id=\"user-content-top\">Top<a class=\"anchor\" href=\"#top\"></a></h1><h2 id=\"user-content-sub\">Sub<a class=\"anchor\" href=\"#sub\"></a></h2>"
+    },
+    {
+      "note": "a heading with inline formatting",
+      "md": "# Hello `code` *em*\n",
+      "html": "<h1 id=\"user-content-hello-code-em\">Hello <code>code</code> <em>em</em><a class=\"anchor\" href=\"#hello-code-em\"></a></h1>"
+    },
+    {
+      "note": "duplicate headings get numbered ids",
+      "md": "# Same\n\n# Same\n\n# Same\n",
+      "html": "<h1 id=\"user-content-same\">Same<a class=\"anchor\" href=\"#same\"></a></h1><h1 id=\"user-content-same-1\">Same<a class=\"anchor\" href=\"#same-1\"></a></h1><h1 id=\"user-content-same-2\">Same<a class=\"anchor\" href=\"#same-2\"></a></h1>"
+    },
+    {
+      "note": "heading ids keep unicode, drop punctuation",
+      "md": "## Ünï code, (yes)!\n",
+      "html": "<h2 id=\"user-content-ünï-code-yes\">Ünï code, (yes)!<a class=\"anchor\" href=\"#ünï-code-yes\"></a></h2>"
+    },
+    {
+      "note": "a heading id from a link label",
+      "md": "## See [the docs](/d)\n",
+      "html": "<h2 id=\"user-content-see-the-docs\">See <a href=\"/d\">the docs</a><a class=\"anchor\" href=\"#see-the-docs\"></a></h2>"
+    },
+    {
+      "note": "an empty heading",
+      "md": "#\n\ntext\n",
+      "html": "<h1 id=\"user-content-\"><a class=\"anchor\" href=\"#\"></a></h1><p>text</p>"
+    },
+    {
+      "note": "a heading needs no blank line after it",
+      "md": "# Head\ntext\n",
+      "html": "<h1 id=\"user-content-head\">Head<a class=\"anchor\" href=\"#head\"></a></h1><p>text</p>"
+    },
+    {
+      "note": "thematic breaks",
+      "md": "***\n\n---\n\n___\n",
+      "html": "<hr><hr><hr>"
+    },
+    {
+      "note": "a rule after a paragraph needs a blank line",
+      "md": "para\n\n---\n",
+      "html": "<p>para</p><hr>"
+    },
+    {
+      "note": "a blockquote",
+      "md": "> quoted\n> text\n",
+      "html": "<blockquote><p>quoted text</p></blockquote>"
+    },
+    {
+      "note": "a lazy blockquote continuation",
+      "md": "> a\nb\n",
+      "html": "<blockquote><p>a b</p></blockquote>"
+    },
+    {
+      "note": "nested blockquotes",
+      "md": "> a\n>> b\n",
+      "html": "<blockquote><p>a</p><blockquote><p>b</p></blockquote></blockquote>"
+    },
+    {
+      "note": "a blockquote holding a list and code",
+      "md": "> - one\n> - two\n>\n>     code\n",
+      "html": "<blockquote><ul><li><p>one</p></li><li><p>two</p><p>code</p></li></ul></blockquote>"
+    },
+    {
+      "note": "a tight bullet list",
+      "md": "- a\n- b\n- c\n",
+      "html": "<ul><li>a</li><li>b</li><li>c</li></ul>"
+    },
+    {
+      "note": "a loose bullet list",
+      "md": "- a\n\n- b\n",
+      "html": "<ul><li><p>a</p></li><li><p>b</p></li></ul>"
+    },
+    {
+      "note": "an ordered list starting at 3",
+      "md": "3. c\n4. d\n",
+      "html": "<ol start=\"3\"><li>c</li><li>d</li></ol>"
+    },
+    {
+      "note": "an ordered list with parens",
+      "md": "1) a\n2) b\n",
+      "html": "<ol><li>a</li><li>b</li></ol>"
+    },
+    {
+      "note": "nested lists",
+      "md": "- a\n  1. b\n  2. c\n- d\n  - e\n",
+      "html": "<ul><li>a<ol><li>b</li><li>c</li></ol></li><li>d<ul><li>e</li></ul></li></ul>"
+    },
+    {
+      "note": "a list item with two paragraphs",
+      "md": "- first\n\n  second\n- next\n",
+      "html": "<ul><li><p>first</p><p>second</p></li><li><p>next</p></li></ul>"
+    },
+    {
+      "note": "a list interrupts a paragraph",
+      "md": "para\n- item\n",
+      "html": "<p>para</p><ul><li>item</li></ul>"
+    },
+    {
+      "note": "changing the bullet starts a new list",
+      "md": "- a\n* b\n",
+      "html": "<ul><li>a</li></ul><ul><li>b</li></ul>"
+    },
+    {
+      "note": "task list items",
+      "md": "- [ ] todo\n- [x] done\n- [X] also done\n",
+      "html": "<ul class=\"contains-task-list\"><li class=\"task-list-item\"><span class=\"md-task\" data-task=\"todo\"></span> todo</li><li class=\"task-list-item\"><span class=\"md-task\" data-task=\"done\"></span> done</li><li class=\"task-list-item\"><span class=\"md-task\" data-task=\"done\"></span> also done</li></ul>"
+    },
+    {
+      "note": "nested and ordered tasks",
+      "md": "1. [ ] one\n2. [x] two\n   - [ ] sub\n",
+      "html": "<ol class=\"contains-task-list\"><li class=\"task-list-item\"><span class=\"md-task\" data-task=\"todo\"></span> one</li><li class=\"task-list-item\"><span class=\"md-task\" data-task=\"done\"></span> two<ul class=\"contains-task-list\"><li class=\"task-list-item\"><span class=\"md-task\" data-task=\"todo\"></span> sub</li></ul></li></ol>"
+    },
+    {
+      "note": "a task marker needs text after it",
+      "md": "- [ ]\n- [x]a\n",
+      "html": "<ul class=\"contains-task-list\"><li class=\"task-list-item\"><span class=\"md-task\" data-task=\"todo\"></span></li><li>[x]a</li></ul>"
+    },
+    {
+      "note": "a fenced block with a language",
+      "md": "```js\nlet a = 1;\n```\n",
+      "html": "<pre><code>let a = 1; </code></pre>"
+    },
+    {
+      "note": "a tilde fence without a language",
+      "md": "~~~\nplain\n~~~\n",
+      "html": "<pre><code>plain </code></pre>"
+    },
+    {
+      "note": "fence content is escaped verbatim",
+      "md": "```\n<div>&amp;</div>\n\n*x*\n```\n",
+      "html": "<pre><code>&lt;div&gt;&amp;amp;&lt;/div&gt; *x* </code></pre>"
+    },
+    {
+      "note": "an unclosed fence runs to the end",
+      "md": "```py\nx = 1\n\ny = 2\n",
+      "html": "<pre><code>x = 1 y = 2 </code></pre>"
+    },
+    {
+      "note": "an indented code block",
+      "md": "    code line\n    more\n",
+      "html": "<pre><code>code line more </code></pre>"
+    },
+    {
+      "note": "a fence inside a list item",
+      "md": "- item\n\n  ```sh\n  ls -la\n  ```\n",
+      "html": "<ul><li><p>item</p><pre><code>ls -la </code></pre></li></ul>"
+    },
+    {
+      "note": "a fence inside a blockquote",
+      "md": "> ```\n> quoted code\n> ```\n",
+      "html": "<blockquote><pre><code>quoted code </code></pre></blockquote>"
+    },
+    {
+      "note": "a fence info string with attributes",
+      "md": "``` rust title=x\nfn main() {}\n```\n",
+      "html": "<pre><code>fn main() {} </code></pre>"
+    },
+    {
+      "note": "inline math",
+      "md": "Euler: $e^{i\\pi}+1=0$.\n",
+      "html": "<p>Euler: <span>e^{i\\pi}+1=0</span>.</p>"
+    },
+    {
+      "note": "currency stays text",
+      "md": "costs $5 and $10\n",
+      "html": "<p>costs $5 and $10</p>"
+    },
+    {
+      "note": "display math inside a paragraph",
+      "md": "so $$x^2$$ holds\n",
+      "html": "<p>so <span>x^2</span> holds</p>"
+    },
+    {
+      "note": "a $$ block",
+      "md": "$$\n\\frac{a}{b}\n$$\n",
+      "html": "<p><span>\\frac{a}{b} </span></p>"
+    },
+    {
+      "note": "a math fence",
+      "md": "```math\nx^2 + y^2\n```\n",
+      "html": "<p><span>x^2 + y^2 </span></p>"
+    },
+    {
+      "note": "math escapes stay LaTeX",
+      "md": "$a<b$ and $\\$5$\n",
+      "html": "<p><span>a&lt;b</span> and <span>\\$5</span></p>"
+    },
+    {
+      "note": "a mermaid fence",
+      "md": "```mermaid\ngraph TD\n  A-->B\n```\n",
+      "html": "<pre><code>graph TD A--&gt;B </code></pre>"
+    },
+    {
+      "note": "a table",
+      "md": "| a | b |\n|---|---|\n| 1 | 2 |\n",
+      "html": "<table><thead><tr><th>a</th><th>b</th></tr></thead><tbody><tr><td>1</td><td>2</td></tr></tbody></table>"
+    },
+    {
+      "note": "table alignment",
+      "md": "| l | c | r | n |\n|:--|:-:|--:|---|\n| 1 | 2 | 3 | 4 |\n",
+      "html": "<table><thead><tr><th align=\"left\">l</th><th align=\"center\">c</th><th align=\"right\">r</th><th>n</th></tr></thead><tbody><tr><td align=\"left\">1</td><td align=\"center\">2</td><td align=\"right\">3</td><td>4</td></tr></tbody></table>"
+    },
+    {
+      "note": "table cells hold inline markup",
+      "md": "| x | y |\n|---|---|\n| `a\\|b` | [l](/u) **s** |\n",
+      "html": "<table><thead><tr><th>x</th><th>y</th></tr></thead><tbody><tr><td><code>a|b</code></td><td><a href=\"/u\">l</a> <strong>s</strong></td></tr></tbody></table>"
+    },
+    {
+      "note": "short and long table rows",
+      "md": "| a | b |\n|---|---|\n| 1 |\n| 1 | 2 | 3 |\n",
+      "html": "<table><thead><tr><th>a</th><th>b</th></tr></thead><tbody><tr><td>1</td><td></td></tr><tr><td>1</td><td>2</td></tr></tbody></table>"
+    },
+    {
+      "note": "a header-only table",
+      "md": "| a |\n|---|\n",
+      "html": "<table><thead><tr><th>a</th></tr></thead></table>"
+    },
+    {
+      "note": "a table inside a blockquote",
+      "md": "> | a |\n> |---|\n> | 1 |\n",
+      "html": "<blockquote><table><thead><tr><th>a</th></tr></thead><tbody><tr><td>1</td></tr></tbody></table></blockquote>"
+    },
+    {
+      "note": "an HTML block",
+      "md": "<div>\nhi\n</div>\n",
+      "html": "<div>hi</div>"
+    },
+    {
+      "note": "inline HTML",
+      "md": "press <kbd>Ctrl</kbd>+<kbd>C</kbd>\n",
+      "html": "<p>press <kbd>Ctrl</kbd>+<kbd>C</kbd></p>"
+    },
+    {
+      "note": "an HTML comment block renders nothing",
+      "md": "<!-- hidden -->\n\nshown\n",
+      "html": "<p>shown</p>"
+    },
+    {
+      "note": "script is removed",
+      "md": "<script>alert(1)</script>\n\nafter\n",
+      "html": "<p>after</p>",
+      "diverges": {
+        "side": "client",
+        "reason": "sanitizing needs a DOM: the renderer's string target (what Vitest can run) passes a document's raw HTML through, and DOMPurify runs only in the page's DOM target — which drops it as the daemon's ammonia does (checked in the browser)"
+      }
+    },
+    {
+      "note": "event handlers and styles are removed",
+      "md": "<p style=\"color:red\" onclick=\"x()\">hi</p>\n",
+      "html": "<p>hi</p>",
+      "diverges": {
+        "side": "client",
+        "reason": "sanitizing needs a DOM: the renderer's string target (what Vitest can run) passes a document's raw HTML through, and DOMPurify runs only in the page's DOM target — which drops it as the daemon's ammonia does (checked in the browser)"
+      }
+    },
+    {
+      "note": "details and summary",
+      "md": "<details>\n<summary>More</summary>\n\nbody\n\n</details>\n",
+      "html": "<details><summary>More</summary><p>body</p></details>"
+    },
+    {
+      "note": "a raw checkbox becomes a task box",
+      "md": "<input type=\"checkbox\" checked>\n",
+      "html": "<span class=\"md-task\" data-task=\"done\"></span>"
+    },
+    {
+      "note": "raw HTML ids are namespaced",
+      "md": "<p id=\"app\">x</p>\n",
+      "html": "<p>x</p>",
+      "diverges": {
+        "side": "client",
+        "reason": "sanitizing needs a DOM: the renderer's string target (what Vitest can run) passes a document's raw HTML through, and DOMPurify runs only in the page's DOM target — which drops it as the daemon's ammonia does (checked in the browser)"
+      }
+    },
+    {
+      "note": "a raw image keeps a relative src",
+      "md": "<img src=\"figs/b.png\" alt=\"b\">\n",
+      "html": "<img alt=\"b\" src=\"figs/b.png\">"
+    },
+    {
+      "note": "a raw link keeps its href",
+      "md": "<a href=\"https://ex.com\">ex</a>\n",
+      "html": "<p><a href=\"https://ex.com\">ex</a></p>"
+    },
+    {
+      "note": "every GitHub alert type",
+      "md": "> [!NOTE]\n> n\n\n> [!TIP]\n> t\n\n> [!IMPORTANT]\n> i\n\n> [!WARNING]\n> w\n\n> [!CAUTION]\n> c\n",
+      "html": "<div class=\"markdown-alert markdown-alert-note\"><p class=\"markdown-alert-title\">Note</p><p>n</p></div><div class=\"markdown-alert markdown-alert-tip\"><p class=\"markdown-alert-title\">Tip</p><p>t</p></div><div class=\"markdown-alert markdown-alert-important\"><p class=\"markdown-alert-title\">Important</p><p>i</p></div><div class=\"markdown-alert markdown-alert-warning\"><p class=\"markdown-alert-title\">Warning</p><p>w</p></div><div class=\"markdown-alert markdown-alert-caution\"><p class=\"markdown-alert-title\">Caution</p><p>c</p></div>"
+    },
+    {
+      "note": "an alert marker is case-insensitive",
+      "md": "> [!tip]\n> lower\n",
+      "html": "<div class=\"markdown-alert markdown-alert-tip\"><p class=\"markdown-alert-title\">Tip</p><p>lower</p></div>"
+    },
+    {
+      "note": "an alert with a custom title",
+      "md": "> [!WARNING] Mind the gap\n> careful\n",
+      "html": "<div class=\"markdown-alert markdown-alert-warning\"><p class=\"markdown-alert-title\">Mind the gap</p><p>careful</p></div>"
+    },
+    {
+      "note": "an alert holding blocks",
+      "md": "> [!NOTE]\n> para\n>\n> - item\n",
+      "html": "<div class=\"markdown-alert markdown-alert-note\"><p class=\"markdown-alert-title\">Note</p><p>para</p><ul><li>item</li></ul></div>"
+    },
+    {
+      "note": "an unknown alert type is a plain quote",
+      "md": "> [!FOO]\n> body\n",
+      "html": "<blockquote><p>[!FOO] body</p></blockquote>"
+    },
+    {
+      "note": "an alert marker must open the quote",
+      "md": "> text\n> [!NOTE]\n",
+      "html": "<blockquote><p>text [!NOTE]</p></blockquote>"
+    },
+    {
+      "note": "a footnote",
+      "md": "Hi[^1].\n\n[^1]: A greeting.\n",
+      "html": "<p>Hi<sup class=\"footnote-ref\"><a href=\"#fn-1\" id=\"user-content-fnref-1\">1</a></sup>.</p><section class=\"footnotes\"><ol><li id=\"user-content-fn-1\"><p>A greeting. <a class=\"footnote-backref\" href=\"#fnref-1\">↩</a></p></li></ol></section>"
+    },
+    {
+      "note": "a named footnote referenced twice",
+      "md": "A[^n] and B[^n].\n\n[^n]: Shared.\n",
+      "html": "<p>A<sup class=\"footnote-ref\"><a href=\"#fn-n\" id=\"user-content-fnref-n\">1</a></sup> and B<sup class=\"footnote-ref\"><a href=\"#fn-n\" id=\"user-content-fnref-n-2\">1</a></sup>.</p><section class=\"footnotes\"><ol><li id=\"user-content-fn-n\"><p>Shared. <a class=\"footnote-backref\" href=\"#fnref-n\">↩</a> <a class=\"footnote-backref\" href=\"#fnref-n-2\">↩<sup class=\"footnote-ref\">2</sup></a></p></li></ol></section>"
+    },
+    {
+      "note": "footnotes number in reference order",
+      "md": "x[^b] y[^a]\n\n[^a]: Alpha.\n[^b]: Beta.\n",
+      "html": "<p>x<sup class=\"footnote-ref\"><a href=\"#fn-b\" id=\"user-content-fnref-b\">1</a></sup> y<sup class=\"footnote-ref\"><a href=\"#fn-a\" id=\"user-content-fnref-a\">2</a></sup></p><section class=\"footnotes\"><ol><li id=\"user-content-fn-b\"><p>Beta. <a class=\"footnote-backref\" href=\"#fnref-b\">↩</a></p></li><li id=\"user-content-fn-a\"><p>Alpha. <a class=\"footnote-backref\" href=\"#fnref-a\">↩</a></p></li></ol></section>"
+    },
+    {
+      "note": "an unreferenced definition is dropped",
+      "md": "text[^1]\n\n[^1]: used\n[^2]: unused\n",
+      "html": "<p>text<sup class=\"footnote-ref\"><a href=\"#fn-1\" id=\"user-content-fnref-1\">1</a></sup></p><section class=\"footnotes\"><ol><li id=\"user-content-fn-1\"><p>used <a class=\"footnote-backref\" href=\"#fnref-1\">↩</a></p></li></ol></section>"
+    },
+    {
+      "note": "a reference without a definition stays literal",
+      "md": "text[^missing]\n",
+      "html": "<p>text[^missing]</p>"
+    },
+    {
+      "note": "a footnote with continuation blocks",
+      "md": "t[^1]\n\n[^1]: First para.\n\n    Second para.\n",
+      "html": "<p>t<sup class=\"footnote-ref\"><a href=\"#fn-1\" id=\"user-content-fnref-1\">1</a></sup></p><section class=\"footnotes\"><ol><li id=\"user-content-fn-1\"><p>First para.</p><p>Second para. <a class=\"footnote-backref\" href=\"#fnref-1\">↩</a></p></li></ol></section>"
+    },
+    {
+      "note": "frontmatter is not part of the body",
+      "md": "---\ntitle: T\ntags: [a, b]\n---\n\n# Body\n",
+      "html": "<h1 id=\"user-content-body\">Body<a class=\"anchor\" href=\"#body\"></a></h1>"
+    },
+    {
+      "note": "a leading rule without keys is not frontmatter",
+      "md": "---\n\nintro\n\n---\n",
+      "html": "<hr><p>intro</p><hr>"
+    },
+    {
+      "note": "a wikilink",
+      "md": "see [[Other Note]]\n",
+      "html": "<p>see <a class=\"wikilink\" href=\"Other%20Note.md\">Other Note</a></p>",
+      "diverges": {
+        "side": "server",
+        "reason": "wikilinks are read for Obsidian vaults on the client only; the daemon's comrak runs without its wikilink extension, so the server fallback shows them as literal text"
+      }
+    },
+    {
+      "note": "a wikilink with an alias",
+      "md": "see [[target|the alias]]\n",
+      "html": "<p>see <a class=\"wikilink\" href=\"target.md\">the alias</a></p>",
+      "diverges": {
+        "side": "server",
+        "reason": "wikilinks are read for Obsidian vaults on the client only; the daemon's comrak runs without its wikilink extension, so the server fallback shows them as literal text"
+      }
+    },
+    {
+      "note": "a wikilink to a heading",
+      "md": "see [[notes#Setup]]\n",
+      "html": "<p>see <a class=\"wikilink\" href=\"notes.md#setup\">notes#Setup</a></p>",
+      "diverges": {
+        "side": "server",
+        "reason": "wikilinks are read for Obsidian vaults on the client only; the daemon's comrak runs without its wikilink extension, so the server fallback shows them as literal text"
+      }
+    },
+    {
+      "note": "an image embed",
+      "md": "![[plot.png]]\n",
+      "html": "<p><img alt=\"plot.png\" src=\"plot.png\"></p>",
+      "diverges": {
+        "side": "server",
+        "reason": "wikilinks are read for Obsidian vaults on the client only; the daemon's comrak runs without its wikilink extension, so the server fallback shows them as literal text"
+      }
+    },
+    {
+      "note": "a non-image embed is a file link",
+      "md": "![[notes.md]]\n",
+      "html": "<p><a class=\"wikilink wikilink-embed\" href=\"notes.md\">notes.md</a></p>",
+      "diverges": {
+        "side": "server",
+        "reason": "wikilinks are read for Obsidian vaults on the client only; the daemon's comrak runs without its wikilink extension, so the server fallback shows them as literal text"
+      }
+    },
+    {
+      "note": "a destination's escapes and unicode are href-escaped",
+      "md": "[a](/x\\_y) [b](/é) [c](/a b)\n",
+      "html": "<p><a href=\"/x_y\">a</a> <a href=\"/%C3%A9\">b</a> [c](/a b)</p>"
+    },
+    {
+      "note": "heading ids drop symbols and keep double dashes",
+      "md": "# A &amp; B 🎉 _x_\n",
+      "html": "<h1 id=\"user-content-a--b--x\">A &amp; B 🎉 <em>x</em><a class=\"anchor\" href=\"#a--b--x\"></a></h1>"
+    },
+    {
+      "note": "heading ids dedupe across levels",
+      "md": "# A\n## A\n### a\n",
+      "html": "<h1 id=\"user-content-a\">A<a class=\"anchor\" href=\"#a\"></a></h1><h2 id=\"user-content-a-1\">A<a class=\"anchor\" href=\"#a-1\"></a></h2><h3 id=\"user-content-a-2\">a<a class=\"anchor\" href=\"#a-2\"></a></h3>"
+    },
+    {
+      "note": "a hard break in a setext heading",
+      "md": "a\\\nb\n===\n",
+      "html": "<h1 id=\"user-content-a-b\">a<br>b<a class=\"anchor\" href=\"#a-b\"></a></h1>"
+    },
+    {
+      "note": "a multi-line setext heading",
+      "md": "a\nb\n===\n",
+      "html": "<h1 id=\"user-content-a-b\">a b<a class=\"anchor\" href=\"#a-b\"></a></h1>"
+    },
+    {
+      "note": "an escaped closing hash is heading text",
+      "md": "# a \\#\n",
+      "html": "<h1 id=\"user-content-a-\">a #<a class=\"anchor\" href=\"#a-\"></a></h1>"
+    },
+    {
+      "note": "an image and math feed the heading id",
+      "md": "# ![i](a.png) t $x$\n",
+      "html": "<h1 id=\"user-content-i-t-x\"><img alt=\"i\" src=\"a.png\"> t <span>x</span><a class=\"anchor\" href=\"#i-t-x\"></a></h1>"
+    },
+    {
+      "note": "an empty list item",
+      "md": "-\n- b\n",
+      "html": "<ul><li></li><li>b</li></ul>"
+    },
+    {
+      "note": "an ordered list starting at 0",
+      "md": "0. a\n1. b\n",
+      "html": "<ol start=\"0\"><li>a</li><li>b</li></ol>"
+    },
+    {
+      "note": "a loose task list keeps the box outside the paragraph",
+      "md": "- [ ] a\n\n- [x] b\n",
+      "html": "<ul class=\"contains-task-list\"><li class=\"task-list-item\"><span class=\"md-task\" data-task=\"todo\"></span><p>a</p></li><li class=\"task-list-item\"><span class=\"md-task\" data-task=\"done\"></span><p>b</p></li></ul>"
+    },
+    {
+      "note": "two blockquotes split by a blank line",
+      "md": "> a\n\n> b\n",
+      "html": "<blockquote><p>a</p></blockquote><blockquote><p>b</p></blockquote>"
+    },
+    {
+      "note": "a lazy continuation inside a quoted list",
+      "md": "> - a\nb\n",
+      "html": "<blockquote><ul><li>a b</li></ul></blockquote>"
+    },
+    {
+      "note": "an alert with only its marker",
+      "md": "> [!NOTE]\n",
+      "html": "<div class=\"markdown-alert markdown-alert-note\"><p class=\"markdown-alert-title\">Note</p></div>"
+    },
+    {
+      "note": "an alert inside a list item",
+      "md": "- > [!TIP]\n  > inner\n",
+      "html": "<ul><li><div class=\"markdown-alert markdown-alert-tip\"><p class=\"markdown-alert-title\">Tip</p><p>inner</p></div></li></ul>"
+    },
+    {
+      "note": "an alert inside a blockquote",
+      "md": "> > [!NOTE]\n> > x\n",
+      "html": "<blockquote><div class=\"markdown-alert markdown-alert-note\"><p class=\"markdown-alert-title\">Note</p><p>x</p></div></blockquote>"
+    },
+    {
+      "note": "an alert marker needs the space after >",
+      "md": ">[!NOTE]\n>body\n",
+      "html": "<blockquote><p>[!NOTE] body</p></blockquote>"
+    },
+    {
+      "note": "an alert title is plain text",
+      "md": "> [!NOTE] **Bold** title\n> body\n",
+      "html": "<div class=\"markdown-alert markdown-alert-note\"><p class=\"markdown-alert-title\">**Bold** title</p><p>body</p></div>"
+    },
+    {
+      "note": "a code span across lines",
+      "md": "`a\nb`\n",
+      "html": "<p><code>a b</code></p>"
+    },
+    {
+      "note": "strikethrough across a soft break",
+      "md": "~~a\nb~~\n",
+      "html": "<p><del>a b</del></p>"
+    },
+    {
+      "note": "three tildes inline are text",
+      "md": "a ~~~x~~~ b\n",
+      "html": "<p>a ~~~x~~~ b</p>"
+    },
+    {
+      "note": "an autolink keeps its query",
+      "md": "https://ex.com/p?q=1&r=2\n",
+      "html": "<p><a href=\"https://ex.com/p?q=1&amp;r=2\">https://ex.com/p?q=1&amp;r=2</a></p>"
+    },
+    {
+      "note": "a bare email drops a trailing dot",
+      "md": "first.last@ex.co.uk.\n",
+      "html": "<p><a href=\"mailto:first.last@ex.co.uk\">first.last@ex.co.uk</a>.</p>"
+    },
+    {
+      "note": "a bare www link drops a trailing underscore",
+      "md": "www.ex.com/a_b_\n",
+      "html": "<p><a href=\"http://www.ex.com/a_b\">www.ex.com/a_b</a>_</p>"
+    },
+    {
+      "note": "an angle www is not an autolink",
+      "md": "<www.ex.com>\n",
+      "html": "<p>&lt;www.ex.com&gt;</p>"
+    },
+    {
+      "note": "a nested link leaves the outer as text",
+      "md": "[a [b](/b) c](/a)\n",
+      "html": "<p>[a <a href=\"/b\">b</a> c](/a)</p>"
+    },
+    {
+      "note": "a javascript link loses its href",
+      "md": "[x](javascript:alert(1))\n",
+      "html": "<p><a>x</a></p>"
+    },
+    {
+      "note": "a data image loses its src",
+      "md": "![x](data:image/png;base64,AAAA)\n",
+      "html": "<p><img alt=\"x\"></p>"
+    },
+    {
+      "note": "a file link loses its href",
+      "md": "[f](file:///etc/passwd)\n",
+      "html": "<p><a>f</a></p>"
+    },
+    {
+      "note": "an indented fence strips its indent",
+      "md": "  ```\n  a\n   b\n  ```\n",
+      "html": "<pre><code>a b </code></pre>"
+    },
+    {
+      "note": "an empty fence",
+      "md": "```\n```\n",
+      "html": "<pre><code></code></pre>"
+    },
+    {
+      "note": "a fence of one blank line",
+      "md": "```\n\n```\n",
+      "html": "<pre><code> </code></pre>"
+    },
+    {
+      "note": "an indented block keeps inner blank lines",
+      "md": "    a\n\n    b\n\n\npara\n",
+      "html": "<pre><code>a b </code></pre><p>para</p>"
+    },
+    {
+      "note": "an HTML block runs to the blank line",
+      "md": "<div>x</div>\npara\n",
+      "html": "<div>x</div>para"
+    },
+    {
+      "note": "markdown between block HTML tags",
+      "md": "<details>\n<summary>S</summary>\n\n- a\n\n</details>\n",
+      "html": "<details><summary>S</summary><ul><li>a</li></ul></details>"
+    },
+    {
+      "note": "markdown inside an inline tag",
+      "md": "<b>*x*</b>\n",
+      "html": "<p><b><em>x</em></b></p>"
+    },
+    {
+      "note": "a table cell unescapes a pipe",
+      "md": "| a |\n|---|\n| x \\| y |\n",
+      "html": "<table><thead><tr><th>a</th></tr></thead><tbody><tr><td>x | y</td></tr></tbody></table>"
+    },
+    {
+      "note": "a footnote definition ends the paragraph before it",
+      "md": "para\n[^1]: def\n\nx[^1]\n",
+      "html": "<p>para</p><p>x<sup class=\"footnote-ref\"><a href=\"#fn-1\" id=\"user-content-fnref-1\">1</a></sup></p><section class=\"footnotes\"><ol><li id=\"user-content-fn-1\"><p>def <a class=\"footnote-backref\" href=\"#fnref-1\">↩</a></p></li></ol></section>"
+    },
+    {
+      "note": "back-to-back footnote definitions",
+      "md": "[^1]: a\n[^2]: b\n\nx[^1] y[^2]\n",
+      "html": "<p>x<sup class=\"footnote-ref\"><a href=\"#fn-1\" id=\"user-content-fnref-1\">1</a></sup> y<sup class=\"footnote-ref\"><a href=\"#fn-2\" id=\"user-content-fnref-2\">2</a></sup></p><section class=\"footnotes\"><ol><li id=\"user-content-fn-1\"><p>a <a class=\"footnote-backref\" href=\"#fnref-1\">↩</a></p></li><li id=\"user-content-fn-2\"><p>b <a class=\"footnote-backref\" href=\"#fnref-2\">↩</a></p></li></ol></section>"
+    },
+    {
+      "note": "a footnote label is href-escaped",
+      "md": "x[^é]\n\n[^é]: e\n",
+      "html": "<p>x<sup class=\"footnote-ref\"><a href=\"#fn-%C3%A9\" id=\"user-content-fnref-%C3%A9\">1</a></sup></p><section class=\"footnotes\"><ol><li id=\"user-content-fn-%C3%A9\"><p>e <a class=\"footnote-backref\" href=\"#fnref-%C3%A9\">↩</a></p></li></ol></section>"
+    },
+    {
+      "note": "a footnote definition's lazy line",
+      "md": "x[^1]\n\n[^1]: a\nlazy\n",
+      "html": "<p>x<sup class=\"footnote-ref\"><a href=\"#fn-1\" id=\"user-content-fnref-1\">1</a></sup></p><section class=\"footnotes\"><ol><li id=\"user-content-fn-1\"><p>a lazy <a class=\"footnote-backref\" href=\"#fnref-1\">↩</a></p></li></ol></section>"
+    },
+    {
+      "note": "a footnote holding a list",
+      "md": "a[^1]\n\n[^1]: intro\n    - one\n    - two\n",
+      "html": "<p>a<sup class=\"footnote-ref\"><a href=\"#fn-1\" id=\"user-content-fnref-1\">1</a></sup></p><section class=\"footnotes\"><ol><li id=\"user-content-fn-1\"><p>intro</p><ul><li>one</li><li>two</li></ul><a class=\"footnote-backref\" href=\"#fnref-1\">↩</a></li></ol></section>"
+    },
+    {
+      "note": "a footnote reference in a table cell",
+      "md": "| a |\n|---|\n| x[^1] |\n\n[^1]: d\n",
+      "html": "<table><thead><tr><th>a</th></tr></thead><tbody><tr><td>x<sup class=\"footnote-ref\"><a href=\"#fn-1\" id=\"user-content-fnref-1\">1</a></sup></td></tr></tbody></table><section class=\"footnotes\"><ol><li id=\"user-content-fn-1\"><p>d <a class=\"footnote-backref\" href=\"#fnref-1\">↩</a></p></li></ol></section>"
+    },
+    {
+      "note": "a footnote label with a space is a link reference",
+      "md": "a[^My Note]\n\n[^my note]: def\n",
+      "html": "<p>a<a href=\"def\">^My Note</a></p>"
+    }
+  ]
+}
