@@ -59,7 +59,8 @@ leash-drawing in `web-ui/src/App.svelte`; the drag band that arms a link is in
   **Mastermind** additionally gets its tier — reads `workspace_status` / `read_timeline` /
   `read_session` / `list_changed_files`, acts `spawn_agent` / `spawn_terminal` /
   `message_agent` / `interrupt_agent` ([dashboard.md](dashboard.md#the-mastermind-panel)) — by
-  who it is, not by a grant. **Workbench plugins** add tools only where they're active —
+  who it is, not by a grant. A **worker in a workspace with a Mastermind** also gets
+  `tell_mastermind` (the supervised view). **Workbench plugins** add tools only where they're active —
   `knowledge_search` / `knowledge_get` (mycelium), `post_note` / `read_notes` (Agent notes) —
   each with an instruction paragraph at `initialize` ([plugins.md](plugins.md#workbench-plugins)).
   A plugin-free worker's view (tools, instructions, generated settings, codex argv) is pinned

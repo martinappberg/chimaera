@@ -299,6 +299,12 @@
       {/if}
     </div>
     <span></span>
+  {:else if first.kind === "note" && first.note?.to === "mastermind" && first.note.woke === true}
+    <!-- Only the settled fact: an inbox hand-over happens in the panel, so a
+         "still in the inbox" line here would go stale. -->
+    <span></span>
+    <div class="result quiet">the Mastermind read it right away</div>
+    <span></span>
   {/if}
 </div>
 

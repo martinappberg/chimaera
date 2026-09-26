@@ -62,6 +62,8 @@ export interface TimelineNote {
   /** A session id, "mastermind", or absent (everyone). */
   to?: string;
   text: string;
+  /** A message to the Mastermind that already woke it (auto mode). */
+  woke?: boolean;
 }
 
 /** One wire entry (crates/chimaera-server/src/timeline.rs `Entry`); only the

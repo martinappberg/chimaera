@@ -167,6 +167,10 @@ pub(crate) struct Note {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) to: Option<String>,
     pub(crate) text: String,
+    /// A message to the Mastermind that already woke it (auto mode) — not
+    /// in its inbox any more. Additive; absent = false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) woke: bool,
 }
 
 impl Entry {

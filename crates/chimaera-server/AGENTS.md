@@ -148,9 +148,12 @@ Codex chat sessions get the per-session chimaera MCP injected at spawn via
 `-c mcp_servers.chimaera.url=…` + `bearer_token_env_var` — the key rides the
 spawn env, never world-readable argv (`launcher::build_codex_chat_command`).
 Codex TUIs get the same injection only while a workbench plugin with tools
-is active in the workspace (`launcher::codex_tui_mcp_args`, `spawn.rs`), with
-a per-tool `approval_mode="approve"` for exactly those tools plus `notify`;
-with none on, a codex TUI's argv is unchanged.
+is active in the workspace or a Mastermind is appointed (`plugins::spawn_allow`
+→ `launcher::codex_tui_mcp_args`, `spawn.rs`), with a per-tool
+`approval_mode="approve"` for exactly those tools (plus `tell_mastermind` and
+`notify`); with neither, a codex TUI's argv is unchanged. Workers message the
+Mastermind with `tell_mastermind` (`notes.rs`: inbox in ask-first, a capped
+wake in auto).
 
 ## The chat-mode seam (`chat.rs`) — the part this doc exists for
 

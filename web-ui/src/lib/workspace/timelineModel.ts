@@ -307,5 +307,8 @@ export function commandLabel(text: string, max = 48): string {
 
 /** Unread notes addressed to the Mastermind past `seenSeq`. */
 export function mastermindInbox(entries: readonly TimelineEntry[], seenSeq: number): TimelineEntry[] {
-  return entries.filter((e) => e.kind === "note" && e.note?.to === "mastermind" && e.seq > seenSeq);
+  // A message that already woke the Mastermind (auto mode) was read.
+  return entries.filter(
+    (e) => e.kind === "note" && e.note?.to === "mastermind" && e.note.woke !== true && e.seq > seenSeq,
+  );
 }

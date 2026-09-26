@@ -59,7 +59,8 @@ tools ride the per-session MCP endpoint ([linked-terminals.md](linked-terminals.
     TUI — `-c mcp_servers.chimaera.url=…` + `bearer_token_env_var="CHIMAERA_MCP_KEY"` (the key
     in the PTY env, never argv) + per-tool `approval_mode="approve"` (live: a pre-approved
     tool runs with no prompt, a linked-terminal tool still asks — PROTOCOL.md Pass 33). **A codex TUI gets the chimaera MCP server at all only while a
-    plugin with tools is active in its workspace** — with none on, its argv is unchanged.
+    plugin with tools is active in its workspace, or a Mastermind is appointed there** — with
+    neither, its argv is unchanged.
     Pre-allows are baked at spawn: a claude session or codex chat started before the switch
     sees the tools (tools/list is per call) but its agent asks per call, and a codex TUI
     started before it has no chimaera server until respawned; switching off gates calls at
@@ -127,7 +128,9 @@ tools ride the per-session MCP endpoint ([linked-terminals.md](linked-terminals.
 ## Agent notes
 
 - **What & when.** Agents leave short notes for each other and for the Mastermind, on the
-  Timeline — heads-ups, questions, "I'm changing the loader API". **Mail, not phone:** posting
+  Timeline — heads-ups, questions, "I'm changing the loader API". (Reaching the Mastermind
+  needs no plugin: every worker in a workspace with one has `tell_mastermind` —
+  [dashboard.md](dashboard.md#the-mastermind-panel).) **Mail, not phone:** posting
   never starts a turn anywhere, so no ping-pong loops, no surprise bills, no chain a poisoned
   note could set off. Talking isn't commanding: every reader gets notes framed as information.
 - **How it's used.** Switch "Agent notes" on for the workspace (it has no footprint, so on =

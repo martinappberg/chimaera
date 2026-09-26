@@ -239,14 +239,24 @@ pub(crate) async fn active_for_session(state: &AppState, sid: &str) -> Vec<&'sta
 }
 
 /// MCP tools to pre-allow for a session spawned in `ws`: those of every
-/// plugin active there (empty — and so no settings change at all — when
-/// none is).
+/// plugin active there, plus `tell_mastermind` when the workspace has a
+/// Mastermind (empty — and so no settings change at all — when neither).
 pub(crate) async fn spawn_allow(state: &AppState, ws: &str) -> Vec<String> {
-    active(state, ws)
+    let mut tools: Vec<String> = active(state, ws)
         .await
         .iter()
         .flat_map(|m| m.provides.mcp_tools.iter().cloned())
-        .collect()
+        .collect();
+    // A workspace with a Mastermind: its workers may message it without a
+    // prompt (the Mastermind's own spawn carrying the entry is inert — the
+    // tool is never offered to it).
+    if crate::lock(&state.workspaces)
+        .get(ws)
+        .is_some_and(|w| w.mastermind.is_some())
+    {
+        tools.push("tell_mastermind".to_string());
+    }
+    tools
 }
 
 /// The workspace a session belongs to, if any.

@@ -787,8 +787,8 @@ fn codex_mcp_overrides(url: &str) -> [String; 4] {
 }
 
 /// Argv tail giving a codex TUI the chimaera endpoint while plugin tools are
-/// active in its workspace (the caller passes none otherwise, so a codex TUI
-/// spawn with no plugin on stays byte-identical). `approve` — the active
+/// active in its workspace or a Mastermind is appointed (the caller passes
+/// none otherwise, so a codex TUI spawn with neither stays byte-identical). `approve` — the active
 /// plugins' tools plus `notify`, the list claude's `permissions.allow` carries —
 /// ride per-tool `approval_mode = "approve"` so the user's opt-in isn't
 /// re-asked on every call (the app-server ignores that key, Pass 19; the TUI

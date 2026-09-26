@@ -84,6 +84,23 @@
         "type": "object"
       },
       "name": "notify"
+    },
+    {
+      "description": "Send this workspace's Mastermind (the coordinating agent the user appointed) a short message: a finding that matters beyond this session, a blocker, or a question for it. It reads it right away when the user lets it act on its own; otherwise when the user hands it over. Never starts a turn anywhere else. Not for progress chatter.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "text": {
+            "description": "The message (under 2 KB)",
+            "type": "string"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "type": "object"
+      },
+      "name": "tell_mastermind"
     }
   ]
 }

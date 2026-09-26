@@ -41,7 +41,10 @@ the unmerged Loadout plan (`docs/skills-manager-plan.md` on branch
   evidence (it survives a restart). Agent-notes read cursors live in
   memory, so a restart can show old notes as unread again.
 - Codex TUIs get the chimaera MCP (and so the plugin tools) only while a
-  plugin with tools is active in the workspace.
+  plugin with tools is active in the workspace (or a Mastermind is appointed).
+- Workers reach the Mastermind without the Agent notes plugin: `tell_mastermind`
+  (maintainer, 2026-09-26) — inbox in ask-first mode, a capped wake in auto mode.
+- The Mastermind lives in a window panel on every view, not in the dashboard.
 
 ## Decisions (maintainer, 2026-09-25)
 
