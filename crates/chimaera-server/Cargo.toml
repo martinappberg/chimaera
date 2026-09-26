@@ -32,9 +32,18 @@ sha2.workspace = true
 comrak = { version = "0.54.0", default-features = false }
 ammonia = "4.1.3"
 csv = "1.4.0"
-# Workbench plugin manifests (`plugins/manifests/*.toml`, embedded): parse +
-# serde only — no editing, no serialization.
+# Workbench plugin manifests (`plugin.toml`, embedded): parse + serde only —
+# no editing, no serialization.
 toml = { version = "0.9", default-features = false, features = ["parse", "serde"] }
+# The plugin host (`plugins/runtime.rs`): WASM components (the
+# `chimaera:plugin` world) under epoch deadlines and memory caps. Pinned
+# exactly: the embedding API changes between majors. Only what the host
+# uses — the defaults pull in gc, threads, pooling, profiling, coredumps;
+# `cache` (an on-disk code cache with a background worker) and
+# `parallel-compilation` stay out on purpose.
+wasmtime = { version = "=49.0.1", default-features = false, features = ["component-model", "async", "runtime", "std", "cranelift"] }
+# WASI for the guest's std (wasi:io, wasi:cli), with nothing granted.
+wasmtime-wasi = { version = "=49.0.1", default-features = false, features = ["p2"] }
 # Spreadsheet previews (xlsx/xls/xlsm/ods) → the same paged TablePage the CSV
 # viewer renders. calamine reads a whole sheet into memory, so the fs/xlsx
 # handler caps both source size and ZIP expansion before parsing.

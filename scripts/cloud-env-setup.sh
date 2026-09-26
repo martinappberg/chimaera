@@ -14,7 +14,7 @@
 # and not assume the repo is on disk.
 set -u
 
-# Pre-install the pinned compiler + musl targets so they're in the snapshot instead
+# Pre-install the pinned compiler + musl/WASM targets so they're in the snapshot instead
 # of downloaded per session. rust-toolchain.toml stays the one source of truth:
 # read it from main (the cache rebuilds weekly, so this tracks bumps); the literal
 # is only a fallback. A stale pin costs a per-session download, never correctness —
@@ -33,7 +33,8 @@ if ! command -v rustup >/dev/null 2>&1; then
 fi
 rustup toolchain install "$TOOLCHAIN" --profile minimal \
   --component rustfmt --component clippy \
-  --target x86_64-unknown-linux-musl --target aarch64-unknown-linux-musl || true
+  --target x86_64-unknown-linux-musl --target aarch64-unknown-linux-musl \
+  --target wasm32-wasip2 || true
 
 # `just` runs the gate (`just check`). Ubuntu 24.04 packages it; crates.io is the
 # fallback if the apt mirror is unreachable.

@@ -40,7 +40,9 @@ Each area carries its own `AGENTS.md` map (file table + the invariants that bite
 | `crates/chimaera-pty` | the persistent PTY / terminal engine | [map](crates/chimaera-pty/AGENTS.md) |
 | `crates/chimaera-agent` | the structured-agent engine (drivers, journal) | [map](crates/chimaera-agent/AGENTS.md) · [PROTOCOL](crates/chimaera-agent/PROTOCOL.md) |
 | `crates/chimaera-remote` | SSH orchestration for `connect` (thorough in-code docs) | — |
-| `crates/chimaera-server` | the daemon: every route + WS + business logic; embeds `web-ui/dist` | [map](crates/chimaera-server/AGENTS.md) |
+| `crates/chimaera-server` | the daemon: every route + WS + business logic; embeds `web-ui/dist` and `plugins/dist` | [map](crates/chimaera-server/AGENTS.md) |
+| `crates/chimaera-plugin-api` | the plugin interface: the `chimaera:plugin` WIT world + the Rust side plugins implement | [map](crates/chimaera-plugin-api/AGENTS.md) |
+| `plugins/` | first-party plugins (WASM components; their own cargo workspace) | [map](plugins/AGENTS.md) |
 | `crates/chimaera-app` | the Tauri 2 native shell (its own standalone workspace) | [map](crates/chimaera-app/AGENTS.md) |
 | `web-ui/` | the Svelte 5 client the daemon serves | [chat](web-ui/src/lib/chat/AGENTS.md) · [dashboard](web-ui/src/lib/dashboard/AGENTS.md) · [settings](web-ui/src/lib/settings/AGENTS.md) · [knowledge](web-ui/src/lib/knowledge/AGENTS.md) · [plugins](web-ui/src/lib/plugins/AGENTS.md) |
 
@@ -66,6 +68,7 @@ just check                         # fmt --check + clippy -D warnings + test (pi
 npm --prefix web-ui run check      # svelte-check
 npm --prefix web-ui run test       # targeted Vitest suites (not browser/component tests)
 npm --prefix web-ui run build      # emits web-ui/dist, which the daemon embeds (rust-embed)
+bash scripts/build-plugins.sh      # emits plugins/dist (WASM plugins), embedded the same way; `just plugins`
 node scripts/check-doc-links.mjs   # every relative markdown link + #anchor resolves
 node scripts/check-agent-assets.mjs # Claude/Codex skill + agent bridges stay in sync
 node scripts/check-workflow-security.mjs # immutable Actions pins + explicit permissions

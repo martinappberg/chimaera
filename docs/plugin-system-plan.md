@@ -129,14 +129,14 @@ interface types {
 
 /// What a plugin may ask the host. Every function is bounded by the host.
 interface host {
-    use types.{context, stat, entry, session, json, level};
+    use types.{context, stat as file-stat, entry, session, json, level};
 
     /// Workspace files. Paths are workspace-relative; no component may be a
     /// symlink; reads stop at `cap` bytes; listings at `cap` entries. All of
     /// it runs off the reactor behind the filesystem semaphore.
     read: func(cx: context, path: string, cap: u32) -> result<list<u8>, string>;
-    stat: func(cx: context, path: string) -> result<stat, string>;
-    list: func(cx: context, path: string, cap: u32) -> result<list<entry>, string>;
+    stat: func(cx: context, path: string) -> result<file-stat, string>;
+    %list: func(cx: context, path: string, cap: u32) -> result<list<entry>, string>;
 
     /// Small per-(plugin, workspace) state the host keeps for the plugin
     /// (cursors, caches): 64 KiB per plugin per workspace, in memory.

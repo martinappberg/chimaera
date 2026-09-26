@@ -1,0 +1,12 @@
+# Test-only: built into plugins/dist-test, embedded only by the daemon's
+# test builds. Each tool pokes one host limit.
+id = "test-fixture"
+name = "Test fixture"
+summary = "Pokes the plugin host's limits in the daemon's tests."
+api = "0.1"
+
+[provides]
+mcp_tools = ["echo", "loop", "allocate", "panic", "read", "state", "append", "recent"]
+
+[adds]
+agents = ["8 test tools: echo · loop · allocate · panic · read · state · append · recent"]

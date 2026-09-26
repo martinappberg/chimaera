@@ -251,10 +251,25 @@ pub(crate) async fn mcp(
         && workspace_of(&state, &agent_id)
             .and_then(|w| w.mastermind)
             .is_some();
+    // What the active plugins add (paragraphs, tool defs) — asked of them
+    // only when one is active, so a plugin-free workspace hands agents
+    // byte-identical answers.
+    let (plugin_paragraphs, plugin_tools) =
+        match crate::plugins::workspace_of_session(&state, &agent_id) {
+            Some(ws) if !plugins.is_empty() && matches!(method, "initialize" | "tools/list") => {
+                crate::plugins::tools::offered(&state, &plugins, &ws).await
+            }
+            _ => (Vec::new(), Vec::new()),
+        };
     let result = match method {
-        "initialize" => Ok(initialize_result(&params, mastermind, supervised, &plugins)),
+        "initialize" => Ok(initialize_result(
+            &params,
+            mastermind,
+            supervised,
+            &plugin_paragraphs,
+        )),
         "ping" => Ok(json!({})),
-        "tools/list" => Ok(json!({ "tools": tool_defs(mastermind, supervised, &plugins) })),
+        "tools/list" => Ok(json!({ "tools": tool_defs(mastermind, supervised, plugin_tools) })),
         "tools/call" => {
             tools_call(&state, &agent_id, mastermind, supervised, &plugins, &params).await
         }
@@ -294,7 +309,7 @@ fn initialize_result(
     params: &Value,
     mastermind: bool,
     supervised: bool,
-    plugins: &[&'static crate::plugins::Manifest],
+    plugin_paragraphs: &[String],
 ) -> Value {
     // Echo a protocol version we can serve; the shapes we use are stable
     // across all published revisions.
@@ -312,10 +327,8 @@ fn initialize_result(
     let mut instructions = format!("{INSTRUCTIONS}{DOCUMENTS_INSTRUCTIONS}{tier}");
     // Active plugins append their own paragraph — nothing when none is on,
     // so a plugin-free workspace hands agents byte-identical instructions.
-    for m in plugins {
-        if let Some(text) = crate::plugins::tools::instructions(&m.id) {
-            instructions.push_str(text);
-        }
+    for paragraph in plugin_paragraphs {
+        instructions.push_str(paragraph);
     }
     json!({
         "protocolVersion": requested,
@@ -474,11 +487,7 @@ fn mastermind_tool_defs() -> Vec<Value> {
     ]
 }
 
-fn tool_defs(
-    mastermind: bool,
-    supervised: bool,
-    plugins: &[&'static crate::plugins::Manifest],
-) -> Value {
+fn tool_defs(mastermind: bool, supervised: bool, plugin_tools: Vec<Value>) -> Value {
     let mut tools = base_tool_defs();
     tools.push(notify_tool_def());
     if supervised {
@@ -487,9 +496,7 @@ fn tool_defs(
     if mastermind {
         tools.extend(mastermind_tool_defs());
     }
-    for m in plugins {
-        tools.extend(crate::plugins::tools::defs(&m.id));
-    }
+    tools.extend(plugin_tools);
     Value::Array(tools)
 }
 
@@ -725,7 +732,7 @@ async fn tools_call(
                 ),
             ));
         }
-        return Ok(crate::plugins::tools::call(state, agent_id, name, &args).await);
+        return Ok(crate::plugins::tools::call(state, owner, agent_id, name, &args).await);
     }
     match name {
         "list_terminals" => Ok(list_terminals(state, agent_id).await),

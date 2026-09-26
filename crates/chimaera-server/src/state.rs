@@ -195,6 +195,13 @@ pub(crate) struct AppState {
     /// Per-workspace plugin footprint detection (see `plugins`): refreshed
     /// off the reactor, read-only on the MCP hot path.
     pub(crate) plugin_detect: Mutex<plugins::DetectCache>,
+    /// The plugin host's per-daemon half (see `plugins::runtime`): live
+    /// WASM instances (≤ 64, idle-evicted), fault counts, what each plugin
+    /// offers, the `emit` ring. Hot state; nothing persisted.
+    pub(crate) plugin_runtime: plugins::runtime::PluginRuntime,
+    /// What plugins keep per workspace through the host (`state-put`):
+    /// 64 KiB per (plugin, workspace), in memory.
+    pub(crate) plugin_state: Mutex<plugins::hostfns::PluginStates>,
     /// Hook-driven turns of claude TUIs in flight (the Timeline's hooks
     /// tier; see `episodes`). Bounded by live sessions.
     pub(crate) tui_episodes: Mutex<episodes::TuiEpisodes>,
@@ -208,8 +215,9 @@ pub(crate) struct AppState {
     /// Init), for the Skills view's "built into the agent" group. Bounded by
     /// live sessions; dropped on exit.
     pub(crate) chat_catalogs: Mutex<HashMap<String, Vec<(String, String)>>>,
-    /// Agent-notes plugin state: per-session post rate windows and read
-    /// cursors (in memory; notes themselves live on the Timeline).
+    /// Notes in core: per-session post rate windows (shared by
+    /// `tell_mastermind` and plugins' Timeline appends) and the Mastermind
+    /// wake caps (in memory; notes themselves live on the Timeline).
     pub(crate) notes: Mutex<notes::NotesState>,
     /// Knowledge-provider cache, the Timeline's diff baseline, and who
     /// recorded what (see `knowledge`). Hot state; rebuilt from the files.
@@ -291,6 +299,8 @@ impl AppState {
             codex_config_path: home.join(".codex").join("config.toml"),
             timeline: timeline::TimelineService::new(data_dir.join("workspace")),
             plugin_detect: Mutex::new(plugins::DetectCache::default()),
+            plugin_runtime: plugins::runtime::PluginRuntime::default(),
+            plugin_state: Mutex::new(plugins::hostfns::PluginStates::default()),
             tui_episodes: Mutex::new(episodes::TuiEpisodes::default()),
             timeline_jobs_started: std::sync::atomic::AtomicBool::new(false),
             probes: agent_probe::ProbeState::default(),

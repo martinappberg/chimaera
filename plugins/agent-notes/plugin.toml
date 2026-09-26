@@ -3,6 +3,8 @@
 id = "agent-notes"
 name = "Agent notes"
 summary = "Agents leave short notes for each other and for the Mastermind."
+# The chimaera:plugin WIT version the component targets.
+api = "0.1"
 
 [provides]
 mcp_tools = ["post_note", "read_notes"]

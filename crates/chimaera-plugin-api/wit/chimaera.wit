@@ -1,0 +1,102 @@
+package chimaera:plugin@0.1.0;
+
+interface types {
+    /// A JSON document as text (serde on both sides).
+    type json = string;
+
+    /// Who is asking. Every call carries one.
+    record context {
+        /// The workspace id the call is for.
+        workspace: string,
+        /// The calling agent session (tool calls, hook events); absent for
+        /// workspace-level asks (knowledge, queries from the UI).
+        session: option<string>,
+        /// That session is the workspace's Mastermind.
+        mastermind: bool,
+    }
+
+    record tool-def { name: string, description: string, input-schema: json }
+    record tool-result { text: string, is-error: bool }
+
+    record stat { size: u64, mtime-ms: u64, is-dir: bool }
+    record entry { name: string, is-dir: bool, is-symlink: bool }
+
+    record session { id: string, kind: string, name: string, chat: bool, alive: bool, mastermind: bool }
+
+    /// Knowledge: a stamp that changes when the source files do, and the
+    /// snapshot in the fixed shape the Knowledge view reads.
+    record snapshot { stamp: json, data: json }
+
+    variant event {
+        /// A hook the agent already fires (SessionStart, UserPromptSubmit);
+        /// the plugin may answer with one line of context for the agent.
+        hook(hook),
+        session-ended(string),
+        switched-on,
+        switched-off,
+    }
+    record hook { session: string, name: string }
+
+    enum level { debug, info, warn, error }
+}
+
+/// What a plugin may ask the host. Every function is bounded by the host.
+interface host {
+    use types.{context, stat as file-stat, entry, session, json, level};
+
+    /// Workspace files. Paths are workspace-relative; no component may be a
+    /// symlink; reads stop at `cap` bytes; listings at `cap` entries. All of
+    /// it runs off the reactor behind the filesystem semaphore.
+    read: func(cx: context, path: string, cap: u32) -> result<list<u8>, string>;
+    stat: func(cx: context, path: string) -> result<file-stat, string>;
+    %list: func(cx: context, path: string, cap: u32) -> result<list<entry>, string>;
+
+    /// Small per-(plugin, workspace) state the host keeps for the plugin
+    /// (cursors, caches): 64 KiB per plugin per workspace, in memory.
+    state-get: func(cx: context, key: string) -> option<json>;
+    state-put: func(cx: context, key: string, value: json) -> result<_, string>;
+
+    /// The workspace's sessions, and one session's display name.
+    sessions: func(cx: context) -> list<session>;
+
+    /// The Timeline. `entry` is the wire shape of an entry; the host accepts
+    /// the kinds a plugin may write (`note` today), fills seq/ts/name, and
+    /// rate-caps appends per session (10 a minute). `recent` returns the
+    /// newest entries of the given kinds, newest first, at most `limit`.
+    timeline-append: func(cx: context, entry: json) -> result<u64, string>;
+    timeline-recent: func(cx: context, kinds: list<string>, limit: u32) -> list<json>;
+
+    /// A frame on /ws/events: {"type":"plugin","plugin":<id>, ...event}.
+    emit: func(cx: context, event: json);
+
+    now-ms: func() -> u64;
+    log: func(level: level, message: string);
+}
+
+/// What a plugin provides. Every export is optional in effect: a plugin
+/// without tools returns an empty list, one without knowledge returns none.
+interface plugin {
+    use types.{context, tool-def, tool-result, snapshot, event, json};
+
+    /// The MCP tools offered in workspaces where the plugin is on. Names
+    /// must equal the manifest's provides.mcp_tools.
+    tools: func() -> list<tool-def>;
+    /// The paragraph appended to the agents' MCP instructions where on.
+    instructions: func() -> option<string>;
+    call-tool: func(cx: context, name: string, args: json) -> tool-result;
+
+    /// The Knowledge snapshot, or none when `known` is still current.
+    knowledge: func(cx: context, known: option<json>) -> result<option<snapshot>, string>;
+
+    /// Reads the UI makes (GET /workspaces/{id}/plugins/{pid}/query/{name}).
+    query: func(cx: context, name: string, args: json) -> result<json, string>;
+
+    /// Something happened. A hook event may return one line the host adds to
+    /// the agent's hook context (the "N unread notes" hint).
+    on-event: func(cx: context, event: event) -> option<string>;
+}
+
+world chimaera-plugin {
+    import host;
+    export plugin;
+}

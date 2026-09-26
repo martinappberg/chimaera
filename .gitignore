@@ -1,6 +1,11 @@
 /target
 node_modules/
 web-ui/dist/
+# First-party plugin builds (scripts/build-plugins.sh); the plugins workspace
+# has its own target dir.
+plugins/dist/
+plugins/dist-test/
+plugins/target/
 # The native shell is a standalone cargo workspace (Tauri stays out of the
 # daemon workspace), so it has its own target dir.
 crates/chimaera-app/target/

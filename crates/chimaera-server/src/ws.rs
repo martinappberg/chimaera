@@ -967,6 +967,8 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
     // Notices start at the head: a (re)connecting window is told about what
     // happens from now on, never handed old alerts as new.
     let mut last_notice = state.notices.head();
+    // Plugin `emit` frames, same rule: from now on, never a replay.
+    let mut last_plugin_event = state.plugin_runtime.events_head();
     // A new window's FIRST settings frame gets one fresh disk read (off the
     // reactor): a hand-edit inside the watcher's poll window must not greet
     // a fresh window with stale settings. Steady-state sends stay cached.
@@ -1112,6 +1114,17 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
         }
         if let Some(frame) = crate::notices::frame_since(&state, &mut last_notice) {
             if socket.send(Message::Text(frame.into())).await.is_err() {
+                return;
+            }
+        }
+        // `{"type":"plugin", ...}` — additive; a client ignores types it
+        // doesn't know.
+        for frame in state.plugin_runtime.events_since(&mut last_plugin_event) {
+            if socket
+                .send(Message::Text(frame.as_ref().into()))
+                .await
+                .is_err()
+            {
                 return;
             }
         }

@@ -1,11 +1,16 @@
 //! Workbench plugins: opt-in add-ons that say exactly what they add.
-//! Design: docs/timeline-knowledge-plugins-plan.md §6.
+//! Design: docs/timeline-knowledge-plugins-plan.md §6; the plugin host:
+//! docs/plugin-system-plan.md.
 //!
-//! A plugin is a small TOML manifest (data, never code) plus, for
-//! first-party plugins, daemon code behind NAMED capabilities
-//! (`provides.knowledge = "mycelium"` → `crate::mycelium`). Manifests are
-//! embedded in the binary and version with it; there is no dynamic loading
-//! and no third-party code path.
+//! A plugin is a small TOML manifest (data, never code) plus its behaviour,
+//! which is one of two sources:
+//! - **WASM** (`Source::Wasm`): a component (`plugin.wasm`) built from
+//!   `plugins/<crate>` by `scripts/build-plugins.sh` and embedded from
+//!   `plugins/dist`, like `web-ui/dist`. It runs in `runtime` (the sandbox)
+//!   and asks the daemon for everything through `hostfns` (bounded).
+//! - **Native** (`Source::Native`): named first-party code in the daemon
+//!   (`provides.knowledge = "mycelium"` → `crate::mycelium`). Mycelium only,
+//!   until it moves to WASM too.
 //!
 //! State is minimal by design: a plugin is switched on per workspace
 //! (`Workspace.plugins_on` — the Plugins page is per workspace, so is its
@@ -18,6 +23,7 @@
 //! The invariant this module exists to keep: with no plugin active, nothing
 //! an agent sees changes (MCP tools/list, instructions, generated settings).
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::{Arc, LazyLock};
@@ -27,22 +33,38 @@ use axum::extract::{Path as AxPath, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use rust_embed::RustEmbed;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::AppState;
 
+pub(crate) mod hostfns;
+pub(crate) mod runtime;
 pub(crate) mod tools;
 
 /// How long a workspace's detect result is trusted before a re-stat.
 const DETECT_TTL: Duration = Duration::from_secs(30);
 
-/// The first-party manifests. Adding a plugin = a manifest here + the named
-/// capabilities it provides (see docs/agent-guides/plugins.md).
-const MANIFESTS: [&str; 2] = [
-    include_str!("manifests/mycelium.toml"),
-    include_str!("manifests/agent-notes.toml"),
-];
+/// The native plugins' manifests (behaviour in the daemon, named by
+/// capability). New plugins are WASM crates under `plugins/`.
+const NATIVE: [&str; 1] = [include_str!("manifests/mycelium.toml")];
+
+/// The WIT version (`chimaera:plugin@0.1.x`) this host serves.
+pub(crate) const API: &str = "0.1";
+
+/// The first-party WASM plugins, `<id>/{plugin.toml,plugin.wasm}`, built by
+/// `scripts/build-plugins.sh`. Release builds embed the folder; debug builds
+/// read it from disk when the catalog loads (rust-embed's debug mode).
+#[derive(RustEmbed)]
+#[folder = "../../plugins/dist"]
+struct Dist;
+
+/// The test-only plugins (the host's fixture): embedded by test builds only.
+#[cfg(test)]
+#[derive(RustEmbed)]
+#[folder = "../../plugins/dist-test"]
+struct DistTest;
 
 #[derive(Deserialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
@@ -52,6 +74,9 @@ pub(crate) struct Manifest {
     pub(crate) summary: String,
     #[serde(default)]
     pub(crate) homepage: Option<String>,
+    /// The WIT version a WASM plugin's component targets (`"0.1"`).
+    #[serde(default)]
+    pub(crate) api: Option<String>,
     #[serde(default)]
     pub(crate) detect: Detect,
     #[serde(default)]
@@ -62,6 +87,32 @@ pub(crate) struct Manifest {
     pub(crate) provides: Provides,
     #[serde(default)]
     pub(crate) adds: Adds,
+    /// Where the behaviour lives — set by the catalog, never by the TOML.
+    #[serde(skip)]
+    pub(crate) source: Source,
+}
+
+/// A plugin's behaviour: daemon code, or a component the runtime runs.
+#[derive(Clone, Default)]
+pub(crate) enum Source {
+    #[default]
+    Native,
+    Wasm(Cow<'static, [u8]>),
+}
+
+impl std::fmt::Debug for Source {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Source::Native => f.write_str("Native"),
+            Source::Wasm(bytes) => write!(f, "Wasm({} bytes)", bytes.len()),
+        }
+    }
+}
+
+impl Manifest {
+    pub(crate) fn is_wasm(&self) -> bool {
+        matches!(self.source, Source::Wasm(_))
+    }
 }
 
 /// Workspace-relative paths whose presence makes the plugin active here.
@@ -122,27 +173,123 @@ pub(crate) struct Adds {
     pub(crate) agents: Vec<String>,
 }
 
-static CATALOG: LazyLock<Vec<Manifest>> = LazyLock::new(|| {
-    MANIFESTS
-        .iter()
-        .filter_map(|text| match toml::from_str::<Manifest>(text) {
-            Ok(manifest) => Some(manifest),
-            // Unreachable in a tested build (`every_manifest_parses`); a
-            // broken manifest must not take the daemon down with it.
-            Err(err) => {
-                tracing::error!(%err, "invalid embedded plugin manifest");
-                None
+fn parse_manifest(text: &str) -> Option<Manifest> {
+    match toml::from_str::<Manifest>(text) {
+        Ok(manifest) => Some(manifest),
+        // Unreachable in a tested build (`every_manifest_parses`); a broken
+        // manifest must not take the daemon down with it.
+        Err(err) => {
+            tracing::error!(%err, "invalid embedded plugin manifest");
+            None
+        }
+    }
+}
+
+/// Every `<id>/plugin.toml` + `<id>/plugin.wasm` pair in an embedded dist
+/// folder, by id. A pair that doesn't hold together (no component, an id
+/// that isn't its folder's, a WIT version this host doesn't serve) is left
+/// out, loudly: unreachable for a dist this build's script laid out.
+fn load_dist<E: RustEmbed>() -> Vec<Manifest> {
+    let mut dirs: Vec<String> = E::iter()
+        .filter_map(|path| path.strip_suffix("/plugin.toml").map(str::to_string))
+        .collect();
+    dirs.sort();
+    dirs.dedup();
+    dirs.into_iter()
+        .filter_map(|dir| {
+            let text = E::get(&format!("{dir}/plugin.toml"))?;
+            let mut m = parse_manifest(&String::from_utf8_lossy(&text.data))?;
+            let Some(wasm) = E::get(&format!("{dir}/plugin.wasm")) else {
+                tracing::error!(plugin = %dir, "embedded plugin has no plugin.wasm");
+                return None;
+            };
+            if m.id != dir || m.api.as_deref() != Some(API) {
+                tracing::error!(
+                    plugin = %dir,
+                    id = %m.id,
+                    api = ?m.api,
+                    "embedded plugin refused: its id must be its folder and its api {API}"
+                );
+                return None;
             }
+            m.source = Source::Wasm(wasm.data);
+            Some(m)
         })
         .collect()
+}
+
+/// What this daemon ships: the native manifests, then the embedded WASM
+/// plugins by id. Loaded once; the order is the Plugins page's.
+static PRODUCTION: LazyLock<Vec<Manifest>> = LazyLock::new(|| {
+    let mut all: Vec<Manifest> = NATIVE.iter().filter_map(|t| parse_manifest(t)).collect();
+    all.extend(load_dist::<Dist>());
+    all
 });
 
-pub(crate) fn catalog() -> &'static [Manifest] {
-    &CATALOG
+/// The shipped catalog — never the test fixtures.
+pub(crate) fn production_catalog() -> &'static [Manifest] {
+    &PRODUCTION
+}
+
+/// The catalog every lookup reads: the shipped plugins (plus, in a test
+/// build, whatever `test_catalog` added).
+pub(crate) fn catalog() -> Vec<&'static Manifest> {
+    #[allow(unused_mut)]
+    let mut all: Vec<&'static Manifest> = production_catalog().iter().collect();
+    #[cfg(test)]
+    all.extend(test_catalog::extra());
+    all
 }
 
 pub(crate) fn manifest(id: &str) -> Option<&'static Manifest> {
-    catalog().iter().find(|m| m.id == id)
+    catalog().into_iter().find(|m| m.id == id)
+}
+
+/// Test builds only: plugins added to this test process's catalog, beside
+/// the shipped ones (`catalog()` sees them; `production_catalog()` never
+/// does). Leaked on purpose — a test process's catalog lives as long as it.
+#[cfg(test)]
+pub(crate) mod test_catalog {
+    use super::*;
+
+    static EXTRA: std::sync::Mutex<Vec<&'static Manifest>> = std::sync::Mutex::new(Vec::new());
+
+    pub(crate) fn extra() -> Vec<&'static Manifest> {
+        crate::lock(&EXTRA).clone()
+    }
+
+    /// Add a WASM plugin (its manifest text + component bytes); idempotent
+    /// by id — the first registration wins.
+    pub(crate) fn add(manifest: &str, wasm: Vec<u8>) -> &'static Manifest {
+        let mut extra = crate::lock(&EXTRA);
+        let mut m: Manifest = toml::from_str(manifest).expect("test manifest parses");
+        if let Some(existing) = extra.iter().find(|e| e.id == m.id) {
+            return existing;
+        }
+        m.source = Source::Wasm(Cow::Owned(wasm));
+        let leaked: &'static Manifest = Box::leak(Box::new(m));
+        extra.push(leaked);
+        leaked
+    }
+
+    /// The host's fixture plugin (`plugins/test-fixture`, built into
+    /// `plugins/dist-test`), added to the catalog.
+    pub(crate) fn fixture() -> &'static Manifest {
+        add(&fixture_manifest(), fixture_wasm())
+    }
+
+    pub(crate) fn fixture_manifest() -> String {
+        let file = DistTest::get("test-fixture/plugin.toml")
+            .expect("plugins/dist-test/test-fixture — run scripts/build-plugins.sh");
+        String::from_utf8(file.data.into_owned()).unwrap()
+    }
+
+    pub(crate) fn fixture_wasm() -> Vec<u8> {
+        DistTest::get("test-fixture/plugin.wasm")
+            .expect("plugins/dist-test/test-fixture — run scripts/build-plugins.sh")
+            .data
+            .into_owned()
+    }
 }
 
 /// Per-workspace detect results: plugin ids whose footprint is present.
@@ -160,7 +307,7 @@ impl DetectCache {
 /// Stat every manifest's detect paths under `root` (blocking).
 fn detect_blocking(root: &Path) -> BTreeSet<String> {
     catalog()
-        .iter()
+        .into_iter()
         .filter(|m| {
             m.detect.any.is_empty() || m.detect.any.iter().any(|rel| present_unlinked(root, rel))
         })
@@ -224,7 +371,7 @@ pub(crate) async fn active(state: &AppState, ws: &str) -> Vec<&'static Manifest>
         None => refresh_detect(state, ws).await,
     };
     catalog()
-        .iter()
+        .into_iter()
         .filter(|m| on.contains(&m.id) && found.contains(&m.id))
         .collect()
 }
@@ -287,7 +434,7 @@ fn not_found(what: &str) -> Response {
 
 /// GET /plugins — the catalog (what exists on this daemon).
 pub(crate) async fn list_plugins() -> Response {
-    let plugins: Vec<Value> = catalog().iter().map(manifest_json).collect();
+    let plugins: Vec<Value> = catalog().into_iter().map(manifest_json).collect();
     Json(json!({"schema": 1, "plugins": plugins})).into_response()
 }
 
@@ -304,7 +451,7 @@ pub(crate) async fn workspace_plugins(
     let on: BTreeSet<String> = workspace.plugins_on.iter().cloned().collect();
     let found = refresh_detect(&state, &id).await;
     let plugins: Vec<Value> = catalog()
-        .iter()
+        .into_iter()
         .map(|m| {
             let mut v = manifest_json(m);
             let is_on = on.contains(&m.id);
@@ -312,6 +459,11 @@ pub(crate) async fn workspace_plugins(
             v["on"] = json!(is_on);
             v["detected"] = json!(detected);
             v["active"] = json!(is_on && detected);
+            // Additive, and only when there is one: why the plugin isn't
+            // answering here (the card shows it).
+            if let Some(fault) = state.plugin_runtime.fault(m, &id) {
+                v["fault"] = json!(fault);
+            }
             v["requires"] = json!(m
                 .requires
                 .agent_plugins
@@ -353,6 +505,10 @@ pub(crate) async fn put_workspace_plugin(
     let result = crate::lock(&state.workspaces).set_plugin_on(&id, &pid, body.on);
     match result {
         Ok(Some(workspace)) => {
+            // Either way the plugin starts over here: a fresh instance on
+            // next use, and a fault cleared (switching off and on is how
+            // the user retries a faulted plugin).
+            state.plugin_runtime.reset(&pid, &id);
             // The switch is the moment agents' view changes: re-detect now
             // so the next connect answers from a fresh footprint.
             refresh_detect(&state, &id).await;
@@ -568,14 +724,21 @@ mod tests {
 
     #[test]
     fn every_manifest_parses_and_ids_are_unique() {
+        let embedded = Dist::iter().filter(|p| p.ends_with("/plugin.toml")).count();
         assert_eq!(
-            catalog().len(),
-            MANIFESTS.len(),
-            "a manifest failed to parse"
+            production_catalog().len(),
+            NATIVE.len() + embedded,
+            "a manifest failed to parse or its component was refused"
         );
-        let ids: BTreeSet<&str> = catalog().iter().map(|m| m.id.as_str()).collect();
-        assert_eq!(ids.len(), catalog().len());
-        for m in catalog() {
+        let ids: BTreeSet<&str> = production_catalog().iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids.len(), production_catalog().len());
+        let notes = production_catalog()
+            .iter()
+            .find(|m| m.id == "agent-notes")
+            .expect("agent-notes ships (run scripts/build-plugins.sh)");
+        assert!(notes.is_wasm());
+        assert_eq!(notes.api.as_deref(), Some(API));
+        for m in production_catalog() {
             assert!(!m.summary.is_empty(), "{} needs a summary", m.id);
             assert!(
                 !m.adds.ui.is_empty() || !m.adds.agents.is_empty(),
@@ -600,11 +763,19 @@ mod tests {
         assert!(!cli_safe("a;rm -rf"));
         assert!(!cli_safe("$(x)"));
         assert!(!cli_safe(""));
-        for m in catalog() {
+        for m in production_catalog() {
             for req in m.requires.agent_plugins.values() {
                 assert!(cli_safe(&req.id) && cli_safe(&req.marketplace), "{}", m.id);
             }
         }
+    }
+
+    #[test]
+    fn the_test_fixture_never_ships() {
+        test_catalog::fixture();
+        assert!(catalog().iter().any(|m| m.id == "test-fixture"));
+        assert!(production_catalog().iter().all(|m| m.id != "test-fixture"));
+        assert!(Dist::iter().all(|p| !p.starts_with("test-")));
     }
 
     #[test]

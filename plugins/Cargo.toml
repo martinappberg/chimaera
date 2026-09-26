@@ -1,0 +1,26 @@
+# The first-party plugins: their own cargo workspace, never the daemon's. A
+# plugin crate is a cdylib that only links for wasm32-wasip2 (its component
+# export names do not link natively on macOS), so it is built by
+# scripts/build-plugins.sh and checked/unit-tested natively from here:
+#   cargo clippy --manifest-path plugins/Cargo.toml --all-targets -- -D warnings
+#   cargo test --manifest-path plugins/Cargo.toml
+[workspace]
+resolver = "2"
+members = ["agent-notes", "test-fixture"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+repository = "https://github.com/martinappberg/chimaera"
+publish = false
+
+[workspace.dependencies]
+chimaera-plugin-api = { path = "../crates/chimaera-plugin-api" }
+
+# Small components: every plugin is embedded in the daemon binary.
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1
+opt-level = "s"

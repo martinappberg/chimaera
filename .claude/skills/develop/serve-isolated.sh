@@ -24,6 +24,10 @@ if [ ! -f "$ROOT/web-ui/dist/index.html" ]; then
   echo "web-ui not built — run first (Node 22):  npm --prefix web-ui ci && npm --prefix web-ui run build" >&2
   exit 1
 fi
+if [ ! -d "$ROOT/plugins/dist" ]; then
+  echo "plugins not built — run first:  bash scripts/build-plugins.sh" >&2
+  exit 1
+fi
 
 # exec so signals (preview_stop) reach the daemon directly; CHIMAERA_HOME and
 # $PORT are inherited.

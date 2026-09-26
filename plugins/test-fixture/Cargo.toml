@@ -1,0 +1,16 @@
+# Exercises the plugin host's limits in the daemon's tests
+# (crates/chimaera-server/src/tests/plugin_host.rs). Laid out under
+# plugins/dist-test, which only test builds embed: never in a real catalog.
+[package]
+name = "chimaera-plugin-test-fixture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+chimaera-plugin-api.workspace = true

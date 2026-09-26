@@ -4,6 +4,7 @@ members = [
     "crates/chimaera",
     "crates/chimaera-agent",
     "crates/chimaera-core",
+    "crates/chimaera-plugin-api",
     "crates/chimaera-pty",
     "crates/chimaera-remote",
     "crates/chimaera-server",
@@ -47,6 +48,7 @@ alacritty_terminal = "0.26"
 
 chimaera-agent = { path = "crates/chimaera-agent" }
 chimaera-core = { path = "crates/chimaera-core" }
+chimaera-plugin-api = { path = "crates/chimaera-plugin-api" }
 chimaera-pty = { path = "crates/chimaera-pty" }
 chimaera-remote = { path = "crates/chimaera-remote" }
 chimaera-server = { path = "crates/chimaera-server" }

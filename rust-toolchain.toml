@@ -5,6 +5,7 @@
 [toolchain]
 channel = "1.96.0"
 components = ["rustfmt", "clippy"]
-# The musl targets the release/musl jobs cross-compile for; harmless on
-# native jobs, and it keeps target install out of the workflow YAML.
-targets = ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"]
+# The musl targets the release/musl jobs cross-compile for, and the WASM
+# target the first-party plugins build for (scripts/build-plugins.sh);
+# harmless on native jobs, and it keeps target install out of the workflow YAML.
+targets = ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl", "wasm32-wasip2"]

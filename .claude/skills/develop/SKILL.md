@@ -53,19 +53,22 @@ gitignored) and takes an **auto-assigned free port** (`autoPort`, via `$PORT`).
 the real `$HOME`, so `~/.claude` auth still works. No Vite, so no 5173 clash and
 no Node needed at run time.
 
-**One-time build first** (the script fails fast if either is missing):
+**One-time build first** (the script fails fast if any is missing):
 
 ```sh
 nvm use 22 && npm --prefix web-ui ci \
   && npm --prefix web-ui run build            # Node 22 — the nvm default (16) errors
-cargo build -p chimaera                       # rust-embed requires dist to exist first
+bash scripts/build-plugins.sh                 # plugins/dist (WASM plugins); needs the wasm32-wasip2 target
+cargo build -p chimaera                       # rust-embed requires both dists to exist first
 ```
 
 Then `preview_start chimaerad-isolated`, read the printed
 `http://127.0.0.1:<port>/#token=…` from `preview_logs`, and navigate the preview
 there (serve mode has no `/dev/manifest` auto-auth — the token rides the URL
 fragment). A **debug** daemon reads `web-ui/dist` from disk per request, so after
-a UI change just rebuild the UI and reload the page — no daemon restart.
+a UI change just rebuild the UI and reload the page — no daemon restart. It reads
+`plugins/dist` from disk once, when its plugin catalog loads: after
+`bash scripts/build-plugins.sh`, restart the daemon (no cargo rebuild needed).
 
 To reset this worktree's isolated daemon state, delete `.chimaera-dev/`.
 

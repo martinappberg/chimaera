@@ -5,7 +5,7 @@
   "identifier": "dev.chimaera.app",
   "build": {
     "frontendDist": "assets",
-    "beforeBuildCommand": "cd ../../web-ui && npm install && npm run build"
+    "beforeBuildCommand": "cd ../../web-ui && npm install && npm run build && cd .. && bash scripts/build-plugins.sh"
   },
   "app": {
     "withGlobalTauri": true,

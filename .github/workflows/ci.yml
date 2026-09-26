@@ -89,9 +89,16 @@ jobs:
         # unchecked it evicts the very main entries this job exists to prime.
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      # The first-party plugins (their own cargo workspace, built to WASM):
+      # chimaera-server embeds plugins/dist (and, in tests, plugins/dist-test)
+      # at compile time, like web-ui/dist.
+      - run: bash scripts/build-plugins.sh
       - run: cargo fmt --all --check
+      - run: cargo fmt --all --manifest-path plugins/Cargo.toml --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy --manifest-path plugins/Cargo.toml --all-targets -- -D warnings
       - run: cargo test --workspace
+      - run: cargo test --manifest-path plugins/Cargo.toml
 
   musl:
     needs: ui
@@ -112,6 +119,7 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo install cargo-zigbuild
+      - run: bash scripts/build-plugins.sh
       - run: cargo zigbuild --release --target ${{ matrix.target }} -p chimaera
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

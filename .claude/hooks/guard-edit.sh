@@ -14,6 +14,7 @@ deny() {
 
 case "$f" in
   */web-ui/dist/*)                     deny "web-ui/dist is a build artifact (rust-embed serves it) — edit web-ui/src and rebuild." ;;
+  */plugins/dist/*|*/plugins/dist-test/*|*/plugins/target/*) deny "plugins/dist* is build output (scripts/build-plugins.sh) — edit the plugin crate and rebuild." ;;
   */target/*|*/chimaera-app/target/*)  deny "target/ is cargo build output — edit the source crate." ;;
   */node_modules/*)                    deny "node_modules is vendored — change package.json, not a dep." ;;
   */.chimaera-dev/*)                   deny ".chimaera-dev is the isolated daemon's runtime state — not source." ;;
