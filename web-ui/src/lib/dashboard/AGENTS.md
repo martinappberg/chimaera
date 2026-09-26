@@ -9,12 +9,14 @@ Parent map: repo-root [AGENTS.md](../../../../AGENTS.md).
 
 | File | What it owns |
 |---|---|
-| `DashboardView.svelte` | The surface, re-centred on questions (design §3): the vital-signs strip (name · the branch chip with ahead/behind + uncommitted count, opening source control · the sentence · the Slurm compute chip), **Needs you** (the attention lane, inline permission answering over warm chat sockets), **Since you left**, **Where things stand**, **Now** (one line by default; `dashboard.roster: "cards"` shows today's roster as `AgentCard`s), the blank state with recents, and the Mastermind dock column/pill wiring (user-resizable to full width). It captures the viewer's "last look" baseline (localStorage, per workspace) each time it becomes visible + focused. |
+| `DashboardView.svelte` | The surface, re-centred on questions (design §3): the vital-signs strip (name · the branch chip with ahead/behind + uncommitted count, opening source control · the sentence · the Slurm compute chip), **Needs you** (the attention lane, inline permission answering over warm chat sockets), **Since you left**, **Where things stand**, **Now** (one line by default; `dashboard.roster: "cards"` shows today's roster as `AgentCard`s), the blank state with recents, and the quiet "Ask the Mastermind ⌘J" pill (the Mastermind itself lives in the window panel). It captures the viewer's "last look" baseline (localStorage, per workspace) each time it becomes visible + focused. |
 | `SinceYouLeft.svelte` | The Timeline past the viewer's last look: grouped per session, bad news first, ≤8 rows of `../workspace/TimelineRow.svelte`, "open timeline →"; empty is one line ("Nothing new since 14:02"). |
 | `WhereThingsStand.svelte` | The top of Knowledge: contradicted first, then the strongest findings with the ladder, next steps, a warn-toned blocker; without a structured provider one quiet line + "Use mycelium →" (the attach sheet). |
 | `NowLine.svelte` | Who is running as one line (name in mono + an honest phrase from the rail's vocabulary, terminals folded into a count, "show cards"). |
 | `AgentCard.svelte` | One roster card (cards mode): provenance tier (worn as words by the degraded tiers only), state dot, unread mark, now-line (incl. the post-turn `status_detail`), ctx meter/cost, the work drop-down (subagents ∪ background tasks — workflow rows carry name + agent tally), evidence rows. |
-| `MastermindDock.svelte` | The Mastermind's only home: setup card (agent + ask/auto), embedded `ChatView` on the chat pool, the clickable `acts:` gate badge, **Brief me** + the empty-transcript suggestion chips + the Agent-notes inbox chip (each one user click = one canned prompt over the session socket), the quiet "Use mycelium" line, the native-permission-mode caveat line, expand/collapse, mode-switch/retire, the honest gone/degraded states. |
+| `MastermindDock.svelte` | The Mastermind's content, hosted by `MastermindPanel`: setup card (agent + ask/auto), embedded `ChatView` on the chat pool, the clickable `acts:` gate badge, **Brief me** + the "Ask about" context chip (the focused tab as a composer reference) + the empty-transcript suggestion chips + the Agent-notes inbox chip (each one user click = one canned prompt over the session socket), the quiet "Use mycelium" line, the native-permission-mode caveat line, close (expand only when a host passes `onToggleExpand`), mode-switch/retire, the honest gone/degraded states. The header reflows against its own width (container query) so no control is pushed off the edge. |
+| `MastermindPanel.svelte` | The window's ONE right-hand Mastermind panel (mounted beside the stage in `App.svelte`, lazy-loaded on first open so `ChatView` stays out of the entry bundle): a sibling card of the panes, left-edge resize, docked or — on a narrow window — floating over the stage. |
+| `mastermindPanelState.svelte.ts` | Its runes state: open/closed per window (sessionStorage), width per profile (localStorage), and what the corner icon in `PaneTabs` needs (`available`, `cornerPaneId` = `layout.topRightPane`, `attention`). Mutated only through its functions. |
 | `AttentionCard.svelte` | One "needs you" lane entry (unchanged by the rework). |
 | `dash.ts` | Shared derivations: `provenanceOf`, `rosterWeight`, `relPath`, the `DashCtx` type (incl. the openers for the Timeline / Knowledge / Plugins singletons). |
 
@@ -30,9 +32,10 @@ Parent map: repo-root [AGENTS.md](../../../../AGENTS.md).
 - **Warm chat detail rides the shared chat pool** (`chat/chatPool.ts`), which
   refcounts holds — acquire/release in pairs, and keep the lane acquisition
   bounded (`RICH_LANE_MAX`).
-- A retained dashboard must pass pane visibility through the Mastermind dock to
-  `ChatView`; a hidden dashboard keeps the socket/reducer warm but freezes chat
-  DOM work like any other hidden chat tab.
+- `visible` into `MastermindDock`/`ChatView` means what it means for a pane tab
+  ("this surface is showing"): an open panel passes `true`. Never feed it document
+  visibility — `ChatView` freezes a `visible: false` transcript, so a panel opened
+  in a background window rendered empty (found live).
 - **Only user-clicked turns.** Nothing in this folder starts a Mastermind
   turn on its own — no timer, no reaction to state. "Brief me", the
   suggestion chips and the inbox chip each send ONE canned prompt on the

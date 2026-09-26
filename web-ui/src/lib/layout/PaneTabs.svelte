@@ -35,7 +35,9 @@
   import { isUnread } from "../workspace/unread.svelte";
   import { decoFor } from "../workspace/gitDeco";
   import { PINNED } from "../shared/keys";
-  import { keyHint } from "../shared/keybindings";
+  import { keyHint, keyHintSuffix } from "../shared/keybindings";
+  import BrandMark from "../shared/BrandMark.svelte";
+  import { mastermindPanel, setMastermindPanelOpen } from "../dashboard/mastermindPanelState.svelte";
   import { activeSelection, referenceTarget, requestReference } from "../shared/reference";
   import { dismiss } from "../shared/dismiss";
   import FileIcon from "../shared/FileIcon.svelte";
@@ -1113,6 +1115,27 @@
         </svg>
       </button>
     </div>
+    {#if mastermindPanel.available && !mastermindPanel.open && mastermindPanel.cornerPaneId === node.id}
+      <!-- The window's ONE way into its Mastermind panel: only in the pane
+           whose bar touches the window's top-right corner, where the panel
+           opens. Persistent but quiet; the dot is the only signal it ever
+           gives (it needs you, or answered while the panel was closed). -->
+      <button
+        class="mm-toggle"
+        class:attn={mastermindPanel.attention}
+        title="Mastermind{keyHintSuffix('mastermind')}{mastermindPanel.attention
+          ? ' — needs you or has a new reply'
+          : ''}"
+        aria-label="open the Mastermind"
+        onclick={(e) => {
+          e.stopPropagation();
+          setMastermindPanelOpen(true);
+        }}
+      >
+        <BrandMark size={13} title="Mastermind" />
+        {#if mastermindPanel.attention}<span class="mm-dot" aria-hidden="true"></span>{/if}
+      </button>
+    {/if}
 
     {#if linkMenuOpen}
       <div class="overlay-surface link-menu" role="menu" aria-label="link to agent">
@@ -1697,6 +1720,48 @@
     align-items: center;
     gap: 4px;
     padding-left: 4px;
+  }
+
+  .mm-toggle {
+    position: relative;
+    flex: none;
+    appearance: none;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 22px;
+    margin-right: 2px;
+    padding: 0;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    background: none;
+    color: var(--muted);
+    opacity: 0.7;
+    cursor: pointer;
+    transition:
+      opacity 0.12s ease,
+      background-color 0.12s ease,
+      border-color 0.12s ease;
+  }
+  .mm-toggle:hover,
+  .mm-toggle:focus-visible,
+  .mm-toggle.attn {
+    opacity: 1;
+  }
+  .mm-toggle:hover {
+    background: var(--row-hover);
+    border-color: var(--edge);
+  }
+  .mm-dot {
+    position: absolute;
+    top: 2px;
+    right: 2px;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--accent);
+    box-shadow: 0 0 0 1.5px var(--bg);
   }
 
   .controls {

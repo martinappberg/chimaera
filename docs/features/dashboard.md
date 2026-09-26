@@ -6,12 +6,13 @@ lane), what happened while I was away (**Since you left**), where the project st
 from the live session, the Timeline, or Knowledge. An empty workspace layout opens onto it;
 ⌘0 / the rail's `dashboard` row reach it any time. This is the dashboard/Mastermind design
 ([docs/agent-dashboard-plan.md](../agent-dashboard-plan.md)) through v1 — the surface (v0.1),
-the status-feed depth (v0.2), the Mastermind dock (v1) — re-centred by
+the status-feed depth (v0.2), the Mastermind (v1, now a window panel) — re-centred by
 [docs/timeline-knowledge-plugins-plan.md](../timeline-knowledge-plugins-plan.md) §3 and §8.
 
 **Where it lives (shared):** UI `web-ui/src/lib/dashboard/` (`DashboardView.svelte`,
 `SinceYouLeft.svelte`, `WhereThingsStand.svelte`, `NowLine.svelte`, `AgentCard.svelte`,
-`AttentionCard.svelte`, `MastermindDock.svelte`, `dash.ts`); the
+`AttentionCard.svelte`, `MastermindDock.svelte`, `MastermindPanel.svelte`,
+`mastermindPanelState.svelte.ts`, `dash.ts`); the
 `dashboard` surface in `web-ui/src/lib/layout/layout.ts` (`DashboardTab`, `openDashboard`,
 key `v:dashboard`) and its branches in `Pane.svelte`/`PaneTabs.svelte`; the landing switch
 + rail row + ⌘0 in `web-ui/src/App.svelte` (`pruneAndAutoOpen`, `openDashboardSurface`,
@@ -20,7 +21,7 @@ via `web-ui/src/lib/chat/chatPool.ts` (`acquireChat`/`releaseChat`, refcounted),
 the Timeline / Knowledge / plugin stores (`workspace/timeline.svelte.ts`,
 `workspace/knowledge.ts`, `plugins/store.ts` — see
 [timeline-and-knowledge.md](timeline-and-knowledge.md) and [plugins.md](plugins.md)), and
-the rail's recents (blank state); the dock additionally rides the Mastermind daemon surface
+the rail's recents (blank state); the Mastermind panel additionally rides the Mastermind daemon surface
 (`PUT`/`DELETE /api/v1/workspaces/{id}/mastermind` in
 `crates/chimaera-server/src/api/workspaces.rs`, the `mastermind` fields on the
 workspace/session wire, helpers in `web-ui/src/lib/workspace/sessions.ts`).
@@ -41,9 +42,9 @@ workspace/session wire, helpers in `web-ui/src/lib/workspace/sessions.ts`).
   layout blob (`{v:"dashboard"}` — older builds skip it without resetting the layout).
   When **nothing is running** (no agents, no terminals, no Mastermind) the surface shows
   no dashboard chrome at all — a launcher-style blank state (brand mark, `+ new agent` /
-  `+ terminal` / a quiet `+ mastermind` leading to the dock's setup card, recents,
-  quick-open hint). A **bound Mastermind counts as something running**: the chrome shows
-  (the dock plus an honest "No workers running yet." roster area with the same spawners)
+  `+ terminal` / a quiet `+ mastermind` opening the window's Mastermind panel on its setup
+  card, recents, quick-open hint). A **bound Mastermind counts as something running**: the
+  chrome shows (an honest "No workers running yet." roster area with the same spawners)
   instead of the blank state. Before the first session snapshot it shows a skeleton,
   never a false "everything died".
 
@@ -175,16 +176,18 @@ opening source control; the live `gitStatus` store, epoch-driven, never polled).
 mode). **Recents** show only in the blank state ("pick up where you left off", cap 5). The
 old "last active" jump is the `↳` mark on the Now line.
 
-## The Mastermind dock
+## The Mastermind panel
 
 - **What & when.** The one home of the workspace's privileged agent (plan §7: exactly one
-  per workspace, it delegates rather than does): a full-height column right of the
-  dashboard's sections, `MastermindDock.svelte`. Until one exists the dock is a **setup card**
+  per workspace, it delegates rather than does): a right-hand panel of the **window**, on
+  every view — a file, a chat, a terminal, the dashboard — never one per pane
+  (`MastermindPanel.svelte` hosting `MastermindDock.svelte`, mounted beside the stage in
+  `App.svelte`). Until one exists the panel shows a **setup card**
   — brand mark, plain-English help (sees every session, answers questions, delegates
   work; never does the work itself; bills as your own account), the agent choice, the
   ask-first/auto mode choice, and Start.
 - **How it's used.** Start `PUT`s `/workspaces/{id}/mastermind {agent, mode, theme}`; the
-  daemon creates the chat session AND binds it in one step and the dock swaps to the
+  daemon creates the chat session AND binds it in one step and the panel swaps to the
   identity header (mark · "Mastermind" · agent chip · the clickable `acts:` gate badge)
   over an **embedded `ChatView`** — the same component the panes use, on the same chat
   pool, so permission prompts of an ask-mode Mastermind render inline in its own chat
@@ -210,7 +213,7 @@ old "last active" jump is the `↳` mark on the Now line.
   - **The two-mode caveat (claude, ask mode).** The ask-first gate works by NOT
     pre-allowing acts — which only bites while claude's own permission mode actually
     asks. If the user flips claude's native mode to auto/bypass (its header picker or
-    shift+tab), the dock says so in a warn line rather than wearing an `acts: ask first`
+    shift+tab), the panel says so in a warn line rather than wearing an `acts: ask first`
     badge that's silently moot. Codex has no such caveat — its gate is the driver
     answering elicitations, which no native mode bypasses.
   - **Claude or codex.** Both enforce the mode through their own harness: claude via
@@ -236,15 +239,24 @@ old "last active" jump is the `↳` mark on the Now line.
     read with `read_session` (`read_terminal` reaches only terminals linked to it).
   - **The observer, not the observed**: session rows flagged `mastermind: true` are
     filtered out of the rail, the roster/lane, the chord map, quick-open, the home-screen
-    rollups, and the recents-adjacent surfaces. The dock is the only place it renders.
-  - **Collapse + resize**: panes ≥ ~1240px (the pane's own measured width, not the
-    window's) get the docked column with a header `»` collapse; narrower panes get a slim
-    right-edge pill ("mastermind" + the mark, plus an amber dot when it waits on you)
-    that opens the dock as a right-pinned overlay. The docked column is **drag-resizable**
-    from a left-edge handle (the rail-resize idiom: drag to size, double-click to reset;
-    width persists per browser profile) all the way up to the **whole surface** — dragging
-    past the clamp, or the header's `⤢` button, expands it to fill the dashboard (a
-    transient focus mode, not persisted). No horizontal scroll, no overlap.
+    rollups, and the recents-adjacent surfaces. The panel is where it renders.
+  - **Getting to it — never pushy.** It never opens on its own. The ways in: the
+    Mastermind mark in the tab bar of the pane touching the window's **top-right corner**
+    (exactly one per window, only while a Mastermind is bound — no Mastermind, no icon),
+    **⌘J** (`keys.mastermind`, rebindable; also opens the setup card), Quick Open's
+    "Mastermind", and the dashboard strip's quiet "Ask the Mastermind ⌘J" pill. The icon's
+    only signal is a dot when the Mastermind waits on a permission or finished a reply
+    while the panel was closed (the per-window unread mark, which a Mastermind earns like
+    any agent and which clears whenever the panel is open in a visible window).
+  - **Open / closed and size.** Open/closed is remembered per window (sessionStorage —
+    survives a reload of that window, never shared with another); the width (300–640 px,
+    default 380) per browser profile, drag-resized from the panel's left edge (double-click
+    resets). It docks beside the stage as a sibling of the pane cards; when that would
+    leave the panes under ~560 px it floats over the stage's right edge instead.
+  - **"Ask about this".** While the panel is open, a dashed chip beside Brief me names the
+    focused tab (a file, folder, diff, session, terminal, or a session's changes) — one
+    click puts its reference (`@path`, or the session's name + id) into the composer. It
+    never sends and never rides along implicitly.
   - **Honest gone-state**: a binding whose session is missing/dead says "the Mastermind
     session is gone — set it up again" with a reset (DELETE, then the setup card) —
     never a ghost chat.
@@ -258,7 +270,7 @@ old "last active" jump is the `↳` mark on the Now line.
   `GET /workspaces/{id}/timeline` / `…/knowledge` / `…/plugins`, refetched off the
   `/ws/events` `timeline` epoch nudge and quiet while hidden. A daemon without those routes
   hides the sections rather than showing a spinner.
-- **Only user-clicked turns**: nothing on the dashboard or dock starts an agent turn on its
+- **Only user-clicked turns**: nothing on the dashboard or the Mastermind panel starts an agent turn on its
   own (Brief me, the suggestion chips and the inbox chip are each one click, one turn).
 - The return strip is the workspace vital-signs line: name · branch chip (ahead/behind +
   uncommitted count) · the summary sentence ("2 working · 1 needs you · 1 finished", or

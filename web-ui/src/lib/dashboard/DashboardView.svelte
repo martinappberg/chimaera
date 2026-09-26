@@ -8,9 +8,9 @@
    * git/timeline/knowledge/plugin stores) plus a BOUNDED set of warm chat
    * stores for inline permission answering. It is a router into live
    * sessions and the Timeline/Knowledge views, never a replacement. The
-   * Mastermind dock rides along as a full-height third column (collapsing
-   * to an edge pill): the one home of the workspace's privileged agent,
-   * which the roster deliberately never lists.
+   * Mastermind lives in the window's own panel (MastermindPanel — every
+   * view, one per window); the dashboard only offers the quiet way in, and
+   * the roster deliberately never lists it.
    */
   import { onMount, untrack } from "svelte";
   import { flip } from "svelte/animate";
@@ -18,7 +18,7 @@
   import SessionGlyph from "../shared/SessionGlyph.svelte";
   import AgentCard from "./AgentCard.svelte";
   import AttentionCard from "./AttentionCard.svelte";
-  import MastermindDock from "./MastermindDock.svelte";
+  import { mastermindPanel, setMastermindPanelOpen } from "./mastermindPanelState.svelte";
   import NowLine from "./NowLine.svelte";
   import SinceYouLeft from "./SinceYouLeft.svelte";
   import WhereThingsStand from "./WhereThingsStand.svelte";
@@ -111,103 +111,12 @@
 
   const nothingRunning = $derived(wsSessions.length === 0);
 
-  // --- the Mastermind dock -------------------------------------------------------
+  // --- the Mastermind ------------------------------------------------------------
   //
   // A bound Mastermind means the workspace is NOT "nothing running": the
-  // dashboard chrome shows (dock + an honest empty roster) instead of the
-  // launcher blank state. The true blank state offers "+ mastermind", which
-  // opens the chrome with the dock's setup card visible.
-
-  /** The Mastermind's roster row (looked up in the UNFILTERED map). */
-  const mmSession = $derived(
-    dash.mastermind !== null ? (sessions.get(dash.mastermind.session_id) ?? null) : null,
-  );
-  /** Honest pill affordance: an ask-mode Mastermind waiting on a permission
-   *  must be findable while the dock is collapsed (wire state, no store). */
-  const mmAttn = $derived(mmSession !== null && mmSession.alive && needsAttention(mmSession));
-
-  /** The user asked for the setup card from the blank state. */
-  let mastermindSetup = $state(false);
-  const blank = $derived(nothingRunning && dash.mastermind === null && !mastermindSetup);
-
-  // Collapse mechanism: the dock mounts/unmounts on toggle, so the width
-  // gate is the PANE's own measured width (bind:clientWidth — a container
-  // measure like the 860px activity-column query, never a window media
-  // query). Wide panes get the docked third column; narrower ones a slim
-  // edge pill that opens the dock as an overlay. Local state only (v1).
-  let dashWidth = $state(0);
-  const dockWide = $derived(dashWidth >= 1240);
-  /** Wide-mode manual collapse (the dock header's » button). */
-  let dockCollapsed = $state(false);
-  /** Narrow-mode overlay toggle (the edge pill). */
-  let overlayOpen = $state(false);
-  const dockOverlay = $derived(!dockWide && overlayOpen);
-  const showDock = $derived((dockWide && !dockCollapsed) || dockOverlay);
-
-  // --- dock width: draggable, expandable to the whole surface ------------------
-  //
-  // The dock is a sidebar the user can pull out — anywhere from the slim
-  // default to the FULL dashboard (the surface underneath is a summary; the
-  // Mastermind conversation is sometimes the main event). Width persists
-  // per browser profile (the rail-width idiom); expanded is a transient
-  // focus mode, deliberately not persisted.
-  const DOCK_MIN = 300;
-  const DOCK_DEFAULT = 360;
-  const DOCK_WIDTH_KEY = "chimaera.dashboard.dockWidth";
-  let dockWidth = $state(DOCK_DEFAULT);
-  let dockExpanded = $state(false);
-  onMount(() => {
-    const saved = Number(localStorage.getItem(DOCK_WIDTH_KEY));
-    if (Number.isFinite(saved) && saved >= DOCK_MIN) dockWidth = Math.round(saved);
-  });
-  /** Clamp so the surface keeps a readable remainder — or goes full. */
-  const dockMax = $derived(Math.max(DOCK_MIN, dashWidth - 320));
-  const dockPx = $derived(Math.min(dockWidth, dockMax));
-
-  let dockResizing = $state(false);
-  function onDockResizeDown(e: PointerEvent): void {
-    if (e.button !== 0) return;
-    e.preventDefault();
-    const handle = e.currentTarget as HTMLElement;
-    handle.setPointerCapture(e.pointerId);
-    dockResizing = true;
-    const startX = e.clientX;
-    const startW = dockExpanded ? dashWidth : dockPx;
-    const move = (ev: PointerEvent) => {
-      const w = startW + (startX - ev.clientX);
-      // Dragging past the clamp toward the left edge snaps to full.
-      dockExpanded = w > dockMax + 40;
-      dockWidth = Math.min(Math.max(w, DOCK_MIN), dockMax);
-    };
-    const up = () => {
-      dockResizing = false;
-      handle.removeEventListener("pointermove", move);
-      handle.removeEventListener("pointerup", up);
-      localStorage.setItem(DOCK_WIDTH_KEY, String(Math.round(dockWidth)));
-    };
-    handle.addEventListener("pointermove", move);
-    handle.addEventListener("pointerup", up);
-  }
-  function resetDockWidth(): void {
-    dockExpanded = false;
-    dockWidth = DOCK_DEFAULT;
-    localStorage.setItem(DOCK_WIDTH_KEY, String(DOCK_DEFAULT));
-  }
-
-  function openDock(): void {
-    if (dockWide) dockCollapsed = false;
-    else overlayOpen = true;
-  }
-  function collapseDock(): void {
-    if (dockWide) dockCollapsed = true;
-    else overlayOpen = false;
-  }
-  function openMastermindSetup(): void {
-    mastermindSetup = true;
-    // The setup card must actually appear, whatever the pane width.
-    dockCollapsed = false;
-    overlayOpen = true;
-  }
+  // dashboard chrome shows (an honest empty roster) instead of the launcher
+  // blank state. The Mastermind itself lives in the window's panel.
+  const blank = $derived(nothingRunning && dash.mastermind === null);
 
   /** "Continue where you left off": this window's most recent agent, else the
    *  newest live one. Rendered only when it isn't already the whole story. */
@@ -415,7 +324,7 @@
   const dirtyCount = $derived($gitStatus?.entries.length ?? 0);
 </script>
 
-<div class="dashboard" bind:clientWidth={dashWidth}>
+<div class="dashboard">
   {#if !dash.ready}
     <div class="skeleton"><span>connecting…</span></div>
   {:else if blank}
@@ -433,7 +342,7 @@
         <button
           class="cta quiet"
           title="one agent that watches the whole workspace and delegates work"
-          onclick={openMastermindSetup}>+ mastermind</button
+          onclick={() => setMastermindPanelOpen(true)}>+ mastermind</button
         >
       </div>
       {#if dash.recents.length > 0}
@@ -486,6 +395,22 @@
         </span>
         {#if computeChip !== null}
           <span class="compute" title={computeChip.title}>{computeChip.text}</span>
+        {/if}
+        {#if !mastermindPanel.open}
+          <!-- The way into the window's Mastermind panel — quiet, and only a
+               suggestion: it never opens by itself. -->
+          <button
+            class="askmm"
+            class:setup={dash.mastermind === null}
+            title={dash.mastermind !== null
+              ? "open the Mastermind panel — it stays with you on every view"
+              : "set up a Mastermind: one agent that watches the whole workspace and delegates work"}
+            onclick={() => setMastermindPanelOpen(true)}
+          >
+            <BrandMark size={12} title="Mastermind" />
+            <span>{dash.mastermind !== null ? "Ask the Mastermind" : "mastermind"}</span>
+            {#if keyHint("mastermind") !== ""}<kbd>{keyHint("mastermind")}</kbd>{/if}
+          </button>
         {/if}
       </header>
 
@@ -602,56 +527,6 @@
       </div>
         </div>
       </div>
-
-      {#if wsId !== null}
-        {#if showDock}
-          <div
-            class="dockcol"
-            class:overlay={dockOverlay}
-            class:expanded={dockExpanded}
-            class:resizing={dockResizing}
-            style:width={dockExpanded ? "100%" : `${dockPx}px`}
-          >
-            <!-- Pull the dock wider (up to the whole surface) — the rail-
-                 resize idiom: drag the edge, double-click to reset. -->
-            <div
-              class="dock-resize"
-              role="separator"
-              aria-orientation="vertical"
-              aria-label="resize the Mastermind dock"
-              title="drag to resize · double-click to reset"
-              onpointerdown={onDockResizeDown}
-              ondblclick={resetDockWidth}
-            ></div>
-            <MastermindDock
-              cfg={dash.mastermind}
-              session={mmSession}
-              {wsId}
-              {paneId}
-              {ctrl}
-              refresh={dash.refreshWorkspaces}
-              onCollapse={collapseDock}
-              expanded={dockExpanded}
-              onToggleExpand={() => (dockExpanded = !dockExpanded)}
-              {visible}
-            />
-          </div>
-        {:else}
-          <button
-            class="pill"
-            title={dash.mastermind !== null
-              ? "open the Mastermind dock"
-              : "set up the Mastermind — one agent that watches the whole workspace"}
-            onclick={openDock}
-          >
-            <BrandMark size={14} title="Mastermind" />
-            <span class="pill-label">mastermind</span>
-            {#if mmAttn}
-              <span class="pill-dot" title="the Mastermind needs you"></span>
-            {/if}
-          </button>
-        {/if}
-      {/if}
     </div>
   {/if}
 </div>
@@ -772,86 +647,43 @@
     gap: 22px;
   }
 
-  /* The Mastermind dock: a full-height third column right of the activity
-     column, user-resizable up to the whole surface (width set inline).
-     Narrow panes swap it for the edge pill; the pill opens it as an overlay
-     pinned to the pane's right edge (see .dockcol.overlay). */
-  .dockcol {
-    position: relative;
+  /* The way into the window's Mastermind panel: a quiet pill at the end of
+     the vital-signs strip; "setup" (no Mastermind yet) is quieter still. */
+  .askmm {
     flex: none;
-    min-width: 0;
-    min-height: 0;
-    display: flex;
-    flex-direction: column;
-    border-left: 1px solid var(--edge);
-    background: var(--bg);
-  }
-  .dockcol.overlay {
-    position: absolute;
-    top: 0;
-    right: 0;
-    bottom: 0;
-    max-width: calc(100% - 44px);
-    z-index: 6;
-    box-shadow: -10px 0 32px rgba(0, 0, 0, 0.22);
-  }
-  .dockcol.overlay.expanded {
-    max-width: 100%;
-  }
-
-  /* The width handle: a quiet splitter on the dock's left edge (the
-     rail-resize idiom — invisible until hovered/dragged). */
-  .dock-resize {
-    position: absolute;
-    top: 0;
-    bottom: 0;
-    left: -3px;
-    width: 7px;
-    cursor: col-resize;
-    z-index: 7;
-  }
-  .dock-resize:hover,
-  .dockcol.resizing .dock-resize {
-    background: color-mix(in srgb, var(--accent) 30%, transparent);
-  }
-
-  /* The collapsed dock: a slim right-edge strip, always reachable. */
-  .pill {
-    flex: none;
-    width: 30px;
+    align-self: center;
     appearance: none;
-    border: none;
-    border-left: 1px solid var(--edge);
-    background: none;
-    color: var(--muted);
-    cursor: pointer;
-    display: flex;
-    flex-direction: column;
+    display: inline-flex;
     align-items: center;
-    gap: 8px;
-    padding: 12px 0;
+    gap: 6px;
+    padding: 3px 8px 3px 7px;
+    border: 1px solid var(--edge);
+    border-radius: 999px;
+    background: none;
+    color: var(--fg);
     font: inherit;
+    font-size: var(--text-xs);
+    cursor: pointer;
     transition:
-      color 0.12s ease,
+      border-color 0.12s ease,
       background-color 0.12s ease;
   }
-  .pill:hover {
-    color: var(--fg);
-    background: var(--row-hover);
+  .askmm:hover {
+    border-color: color-mix(in srgb, var(--accent) 55%, var(--edge));
+    background: color-mix(in srgb, var(--accent) 8%, transparent);
   }
-  .pill-label {
-    writing-mode: vertical-rl;
+  .askmm.setup {
+    border-color: transparent;
+    color: var(--muted);
+  }
+  .askmm kbd {
     font-family: var(--mono);
-    font-size: var(--text-xs);
-    letter-spacing: 0.08em;
-  }
-  .pill-dot {
-    flex: none;
-    width: 7px;
-    height: 7px;
-    border-radius: 50%;
-    background: var(--warn);
-    box-shadow: 0 0 0 3px color-mix(in srgb, var(--warn) 16%, transparent);
+    font-size: 10px;
+    color: var(--muted);
+    border: 1px solid var(--edge);
+    border-radius: 4px;
+    padding: 0 4px;
+    line-height: 1.5;
   }
 
   /* Chrome without workers (a Mastermind is bound): honest, minimal. */

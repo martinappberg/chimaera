@@ -16,6 +16,8 @@
   import type { ChatStore } from "../chat/store.svelte";
   import type { ChatSocket } from "../chat/chatWs";
   import { dismiss } from "../shared/dismiss";
+  import { insertIntoComposer } from "../chat/composerBus";
+  import { keyHintSuffix } from "../shared/keybindings";
   import { resolvedTheme } from "../settings/store.svelte";
   import { ApiError } from "../net/api";
   import { deleteMastermind, putMastermind, type Session } from "../workspace/sessions";
@@ -34,14 +36,19 @@
     ctrl: LayoutCtrl;
     /** Re-sync the workspaces list after a PUT/DELETE (the binding lives there). */
     refresh: () => Promise<void>;
-    /** Collapse the dock back to the edge pill / close the overlay. */
+    /** Close the panel. */
     onCollapse: () => void;
-    /** The dock currently fills the whole dashboard surface. */
-    expanded: boolean;
-    /** Toggle between the sidebar width and the full surface. */
-    onToggleExpand: () => void;
-    /** False while the retained dashboard pane is hidden. */
+    /** The panel currently fills its whole host (only with onToggleExpand). */
+    expanded?: boolean;
+    /** Toggle between the sidebar width and the full host; absent = no
+     *  expand control (the window panel has no surface to fill). */
+    onToggleExpand?: () => void;
+    /** False while the host is hidden (gates recurring work). */
     visible?: boolean;
+    /** What the user is looking at in this window (the focused tab), as a
+     *  one-click reference chip — the text lands in the composer, never
+     *  sent on its own. Null when the focused tab isn't referenceable. */
+    context?: { label: string; text: string; title: string } | null;
   }
 
   let {
@@ -52,9 +59,10 @@
     ctrl,
     refresh,
     onCollapse,
-    expanded,
+    expanded = false,
     onToggleExpand,
     visible = true,
+    context = null,
   }: Props = $props();
 
   /** Setup-card mode choice; ask-first is the default (plan §6). */
@@ -323,14 +331,19 @@
     {:else}
       <span class="sp"></span>
     {/if}
+    {#if onToggleExpand !== undefined}
+      <button
+        class="hbtn"
+        title={expanded ? "restore the dock width" : "expand the dock to the whole surface"}
+        aria-label={expanded ? "restore the dock width" : "expand the dock"}
+        onclick={onToggleExpand}>{expanded ? "⤡" : "⤢"}</button
+      >
+    {/if}
     <button
       class="hbtn"
-      title={expanded ? "restore the dock width" : "expand the dock to the whole surface"}
-      aria-label={expanded ? "restore the dock width" : "expand the dock"}
-      onclick={onToggleExpand}>{expanded ? "⤡" : "⤢"}</button
-    >
-    <button class="hbtn" title="collapse the dock" aria-label="collapse the dock" onclick={onCollapse}
-      >»</button
+      title="close the Mastermind{keyHintSuffix('mastermind')}"
+      aria-label="close the Mastermind"
+      onclick={onCollapse}>»</button
     >
   </header>
 
@@ -458,6 +471,18 @@
               : "the Mastermind is busy"}
           onclick={() => sendPrompt(BRIEF_PROMPT)}>Brief me</button
         >
+        {#if context !== null && context.text !== "" && !context.text.includes(live.id)}
+          <!-- What you're looking at, as a reference you finish the question
+               around: it lands in the composer, it never sends itself. -->
+          <button
+            class="sugg ctx"
+            title="add {context.title} to your message"
+            onclick={() => insertIntoComposer(live.id, context.text)}
+          >
+            <span class="ctx-plus" aria-hidden="true">+</span>
+            <span class="ctx-label">{context.label}</span>
+          </button>
+        {/if}
         {#if unread.length > 0}
           <button
             class="sugg inbox"
@@ -541,7 +566,7 @@
   }
   /* Narrow dock: the brand mark carries the name; the agent chip may
      ellipsize before any control is pushed off the edge. */
-  @container (max-width: 380px) {
+  @container (max-width: 360px) {
     .title {
       display: none;
     }
@@ -616,6 +641,28 @@
   .sugg.inbox {
     border-color: color-mix(in srgb, var(--warn) 55%, var(--edge));
     background: color-mix(in srgb, var(--warn) 10%, transparent);
+  }
+  /* "+ qc/thresholds.R": what you're looking at, dashed like an unfilled
+     slot — it adds to your message rather than asking anything itself. */
+  .sugg.ctx {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    max-width: 100%;
+    min-width: 0;
+    border-style: dashed;
+  }
+  .ctx-plus {
+    color: var(--accent);
+    font-weight: 600;
+  }
+  .ctx-label {
+    font-family: var(--mono);
+    font-size: var(--text-xs);
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .quietline {
     appearance: none;

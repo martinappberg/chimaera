@@ -231,6 +231,12 @@ export function panes(node: LayoutNode): PaneNode[] {
   return [...panes(node.a), ...panes(node.b)];
 }
 
+/** The pane whose tab bar touches the window's top-right corner: the right
+ *  child of every side-by-side split, the top child of every stacked one. */
+export function topRightPane(node: LayoutNode): PaneNode {
+  return node.type === "pane" ? node : topRightPane(node.dir === "row" ? node.b : node.a);
+}
+
 export function findPane(node: LayoutNode, id: string): PaneNode | null {
   if (node.type === "pane") return node.id === id ? node : null;
   return findPane(node.a, id) ?? findPane(node.b, id);
@@ -1561,6 +1567,17 @@ if (import.meta.env.DEV) {
       findPane(dbRound.root, dbRound.focusedPaneId)?.tabs[0]?.surface === "dashboard",
     "dashboard tab round-trips",
   );
+
+  // topRightPane: right child of a row split, top child of a col split
+  {
+    let tr = defaultLayout();
+    const first = tr.focusedPaneId;
+    tr = splitPane(tr, first, "row");
+    const right = topRightPane(tr.root).id;
+    ok(right !== first, "row split: the new right pane");
+    tr = splitPane(tr, right, "col");
+    ok(topRightPane(tr.root).id === right, "col split under it: the top pane stays");
+  }
 
   // timeline / knowledge / plugins: singletons with their OWN keys (never
   // the settings fallthrough) that survive serialization

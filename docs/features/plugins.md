@@ -31,7 +31,7 @@ tools ride the per-session MCP endpoint ([linked-terminals.md](linked-terminals.
   (Install, "Review & trust →") — then what each agent CLI reports (below). A host chip names
   the host, since installs are per host. Mycelium's **attach sheet** ("Use mycelium for
   Knowledge", also reached from Knowledge's card, the dashboard's "Where things stand", and the
-  Mastermind dock's quiet line) runs three live-checked steps: 1 install for your agents (a
+  Mastermind panel's quiet line) runs three live-checked steps: 1 install for your agents (a
   visible terminal running `<agent> plugin marketplace add arjunrajlaboratory/mycelium`, then
   `claude plugin install mycelium@mycelium` or `codex plugin add mycelium@mycelium`) · 2 trust
   codex's hooks (see below) · 3 set up this workspace (the plugin's own prompt, "Set up
@@ -138,8 +138,8 @@ tools ride the per-session MCP endpoint ([linked-terminals.md](linked-terminals.
   rides the `SessionStart` / `UserPromptSubmit` hook responses claude already fires; (c) the
   user clicks "deliver to <name>" on the Timeline row of a note addressed to one session — a
   real, attributed, quoted message they chose to send; (d) is the Mastermind — a "N new notes
-  from agents" chip on the dock, where one click is one turn asking it to `read_notes`
-  ([dashboard.md](dashboard.md#the-mastermind-dock)).
+  from agents" chip in the Mastermind panel, where one click is one turn asking it to `read_notes`
+  ([dashboard.md](dashboard.md#the-mastermind-panel)).
 - **Coverage.** claude chat / TUI — read, post, hinted, addressable; codex chat — read, post,
   pull-only; codex TUI — read, post, pull-only (it gets the MCP server because this plugin has
   tools); shells — none. Any session in the workspace can be a `to`; **deliver** needs a

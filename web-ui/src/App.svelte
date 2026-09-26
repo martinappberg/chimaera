@@ -46,7 +46,17 @@
     type Session,
     type Workspace,
     isMastermind,
+    needsAttention,
   } from "./lib/workspace/sessions";
+  // Type-only: the panel (and the ChatView it embeds) loads on first open,
+  // never in the always-loaded entry bundle.
+  import type MastermindPanel from "./lib/dashboard/MastermindPanel.svelte";
+  import {
+    mastermindPanel,
+    setMastermindChrome,
+    setMastermindPanelOpen,
+    toggleMastermindPanel,
+  } from "./lib/dashboard/mastermindPanelState.svelte";
   import { foldUnread, isUnread, markSeen } from "./lib/workspace/unread.svelte";
   import {
     getAgentDefault,
@@ -116,6 +126,7 @@
     dropTab,
     dropTabAtRootEdge,
     findPane,
+    topRightPane,
     focusPane,
     focusedFile as focusedFileOf,
     focusedSession as focusedSessionOf,
@@ -1049,6 +1060,77 @@
   const zoomedPane = $derived(
     layout.zoomedPaneId !== null ? findPane(layout.root, layout.zoomedPaneId) : null,
   );
+
+  // --- the window's Mastermind panel ------------------------------------------
+  // One right-hand panel per window, on every view; its only entry points are
+  // the corner icon (in the pane touching the window's top-right), ⌘J and
+  // Quick Open. A workspace without a Mastermind shows no icon at all.
+  const mmCfg = $derived(workspace?.mastermind ?? null);
+  const mmSession = $derived(
+    mmCfg !== null ? (sessionsById.get(mmCfg.session_id) ?? null) : null,
+  );
+  const mmCornerPaneId = $derived(zoomedPane?.id ?? topRightPane(layout.root).id);
+  let bodyWidth = $state(0);
+  let MastermindPanelView = $state<typeof MastermindPanel | null>(null);
+  $effect(() => {
+    if (!mastermindPanel.open || MastermindPanelView !== null) return;
+    void import("./lib/dashboard/MastermindPanel.svelte").then((m) => {
+      MastermindPanelView = m.default;
+    });
+  });
+  $effect(() => {
+    setMastermindChrome({
+      available: mmCfg !== null,
+      cornerPaneId: mmCornerPaneId,
+      attention:
+        mmSession !== null &&
+        mmSession.alive &&
+        (needsAttention(mmSession) || isUnread(mmSession.id)),
+    });
+  });
+  // A reply that lands while the panel is open was seen — it must not light
+  // the icon's dot the moment the panel closes.
+  $effect(() => {
+    const id = mmSession?.id;
+    if (id !== undefined && mastermindPanel.open && $pageVisible && isUnread(id)) markSeen(id);
+  });
+  /** The focused tab as a reference the panel offers ("+ qc/thresholds.R"):
+   *  one click puts it in the composer — nothing is ever sent implicitly. */
+  const mmContext = $derived.by((): { label: string; text: string; title: string } | null => {
+    const pane = findPane(layout.root, layout.focusedPaneId);
+    const tab = pane !== null ? pane.tabs[pane.active] : undefined;
+    if (tab === undefined) return null;
+    const root = workspace?.root;
+    const rel = (p: string) => (root !== undefined ? workspaceRelative(p, root) : p);
+    const short = (r: string) => r.split("/").slice(-2).join("/");
+    switch (tab.surface) {
+      case "file":
+      case "diff": {
+        const r = rel(tab.path);
+        return { label: short(r), text: `@${r} `, title: r };
+      }
+      case "finder": {
+        const r = rel(tab.path);
+        return { label: `${short(r)}/`, text: `@${r} `, title: `the folder ${r}` };
+      }
+      case "terminal":
+      case "changes": {
+        const s = sessionsById.get(tab.sessionId);
+        if (s === undefined) return null;
+        const name = displayNames.get(s.id) ?? s.name;
+        const what = s.kind === "agent" ? "session" : "terminal";
+        return tab.surface === "changes"
+          ? {
+              label: `${name} · changes`,
+              text: `the changes session "${name}" (${s.id}) made `,
+              title: `the changes ${name} made`,
+            }
+          : { label: name, text: `${what} "${name}" (${s.id}) `, title: `the ${what} ${name}` };
+      }
+      default:
+        return null;
+    }
+  });
 
   /** Sessions in the active workspace blocked on the user's approval. */
   // A detached solo window badges only ITS OWN sessions: workspace-wide
@@ -2416,6 +2498,10 @@
         }
         layout = { ...layout, focusMode: !layout.focusMode };
         return;
+      case "mastermind":
+        intercept();
+        toggleMastermindPanel();
+        return;
       case "cyclePrev":
         intercept();
         cycle(-1);
@@ -3012,6 +3098,12 @@
     { id: "timeline", label: "Timeline", hint: "what happened", run: openTimelineSurface },
     { id: "knowledge", label: "Knowledge", hint: "what we know", run: openKnowledgeSurface },
     { id: "plugins", label: "Plugins", hint: "add-ons for this workspace", run: openPluginsSurface },
+    {
+      id: "mastermind",
+      label: "Mastermind",
+      hint: "the workspace's Mastermind panel",
+      run: () => setMastermindPanelOpen(true),
+    },
   ];
 
   function focusDirection(dir: FocusDir): void {
@@ -4362,7 +4454,7 @@
       onOpenFolder={openPicker}
     />
   {:else}
-  <div class="body">
+  <div class="body" bind:clientWidth={bodyWidth}>
     <aside
       class="rail"
       class:collapsed={layout.focusMode}
@@ -5122,6 +5214,19 @@
         {/if}
       {/if}
     </main>
+    {#if mastermindPanel.open && MastermindPanelView !== null && layoutReady && activeWsId !== null}
+      <MastermindPanelView
+        cfg={mmCfg}
+        session={mmSession}
+        wsId={activeWsId}
+        paneId={layout.focusedPaneId}
+        {ctrl}
+        refresh={refreshWorkspaces}
+        visible
+        context={mmContext}
+        hostWidth={bodyWidth}
+      />
+    {/if}
   </div>
 
   {#if layout.focusMode}
@@ -5473,6 +5578,7 @@
   }
 
   .body {
+    position: relative;
     flex: 1;
     display: flex;
     min-height: 0;
