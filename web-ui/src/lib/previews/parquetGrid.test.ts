@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   ByteCache,
+  chunkSpan,
   contentRangeTotal,
   formatCell,
   formatDate,
@@ -131,5 +132,37 @@ describe("cells", () => {
     expect(formatDate(new Date(Date.UTC(2026, 0, 2)), "value")).toBe("2026-01-02 00:00:00");
     expect(formatCell(new Date(Date.UTC(2026, 0, 2)), "date")).toBe("2026-01-02");
     expect(formatDate(new Date(NaN), "value")).toBe("invalid date");
+  });
+});
+
+describe("chunkSpan", () => {
+  const meta = (dict: bigint | undefined, data: bigint, size: bigint) => ({
+    dictionary_page_offset: dict,
+    data_page_offset: data,
+    total_compressed_size: size,
+  });
+
+  it("starts at the dictionary page when there is one", () => {
+    expect(chunkSpan(meta(4n, 104n, 500n), 10_000)).toEqual({ start: 4, end: 504 });
+    expect(chunkSpan(meta(undefined, 104n, 500n), 10_000)).toEqual({ start: 104, end: 604 });
+  });
+
+  it("reads a dictionary offset of 0 as none, like hyparquet", () => {
+    // Not byte 0 of the file: that is the `PAR1` magic.
+    expect(chunkSpan(meta(0n, 104n, 500n), 10_000)).toEqual({ start: 104, end: 604 });
+  });
+
+  it("refuses a span that isn't a chunk of this file", () => {
+    // Inside the leading magic, past the footer, empty.
+    expect(chunkSpan(meta(undefined, 2n, 500n), 10_000)).toBeNull();
+    expect(chunkSpan(meta(undefined, 9_800n, 500n), 10_000)).toBeNull();
+    expect(chunkSpan(meta(undefined, 104n, 0n), 10_000)).toBeNull();
+    // A dictionary after its data page, or a data page outside the chunk.
+    expect(chunkSpan(meta(900n, 104n, 500n), 10_000)).toBeNull();
+    expect(chunkSpan(meta(4n, 700n, 500n), 10_000)).toBeNull();
+    // Offsets past what a double holds exactly.
+    expect(chunkSpan(meta(undefined, 2n ** 60n, 500n), 2 ** 62)).toBeNull();
+    // At the footer's edge is fine.
+    expect(chunkSpan(meta(undefined, 9_500n, 500n), 10_000)).toEqual({ start: 9_500, end: 10_000 });
   });
 });

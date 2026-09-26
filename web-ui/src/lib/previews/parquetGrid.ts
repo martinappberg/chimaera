@@ -57,6 +57,33 @@ export function walkCovers(walkedRows: number, done: boolean, to: number): boole
   return done || walkedRows >= to;
 }
 
+/**
+ * Where a column chunk's page headers start and end, for a header walk.
+ * The chunk begins at its dictionary page when it has one, else at its first
+ * data page — and a `dictionary_page_offset` of 0 means "none" (some writers
+ * store 0 rather than leave it out), exactly as hyparquet reads it (`||`).
+ * Null when the span isn't a chunk of this file: it must start after the
+ * leading `PAR1`, end before the footer (`dataEnd`), and hold the first data
+ * page; a walk from anywhere else parses garbage, so the caller reads the
+ * chunk whole instead.
+ */
+export function chunkSpan(
+  meta: {
+    dictionary_page_offset?: bigint | number;
+    data_page_offset: bigint | number;
+    total_compressed_size: bigint | number;
+  },
+  dataEnd: number,
+): { start: number; end: number } | null {
+  const data = Number(meta.data_page_offset);
+  const dict = Number(meta.dictionary_page_offset ?? 0);
+  const start = dict > 0 ? dict : data;
+  const end = start + Number(meta.total_compressed_size);
+  if (![data, start, end].every(Number.isSafeInteger)) return null;
+  if (start < 4 || end <= start || end > dataEnd || data < start || data >= end) return null;
+  return { start, end };
+}
+
 /** `Content-Range: bytes a-b/total` → total (null when absent or `*`). */
 export function contentRangeTotal(header: string | null): number | null {
   if (header === null) return null;

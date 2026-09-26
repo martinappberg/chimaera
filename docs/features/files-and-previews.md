@@ -700,7 +700,10 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   under the rows; for one without — pyarrow's default single row group of up to ~1M rows, where
   a plain read would fetch whole column chunks — the viewer walks the flat columns' page headers
   lazily and hands hyparquet the same page locations, header by header or through 512 KB windows
-  depending on the link's measured bandwidth-delay product. Read bytes go through a 48 MB range
+  depending on the link's measured bandwidth-delay product. A walk starts where hyparquet reads the
+  chunk (its dictionary page, a `dictionary_page_offset` of 0 meaning none) and only when that span
+  lies between the leading magic and the footer and holds the first data page (`chunkSpan`);
+  otherwise that chunk is read whole. Read bytes go through a 48 MB range
   cache, and an aged ticket is re-minted on a 404. Measured on a 16 MB, 1M-row snappy file with
   one row group: the first screen reads 3.3 MB in 15 ranged requests; a jump to row 700,000
   takes ~0.8 s on a simulated 50 ms / 10 MB/s tunnel. Snappy and uncompressed are built in; gzip,

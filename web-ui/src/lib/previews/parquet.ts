@@ -32,6 +32,7 @@ import { decompress as zstd } from "fzstd";
 import { fsRawUrl } from "./files";
 import {
   ByteCache,
+  chunkSpan,
   contentRangeTotal,
   groupSpans,
   groupsForRange,
@@ -339,12 +340,14 @@ export class ParquetSource {
   private walkTo(key: string, meta: ColumnMetaData, groupRows: number, to: number): Promise<PageLocation[] | null> {
     let walk = this.walks.get(key);
     if (walk === undefined) {
-      const start = Number(meta.dictionary_page_offset ?? meta.data_page_offset);
+      // The footer is its metadata, its 4-byte length and `PAR1`.
+      const span = chunkSpan(meta, this.file.byteLength - 8 - this.metadata.metadata_length);
+      if (span === null) return Promise.resolve(null);
       walk = {
         pages: [],
-        next: start,
+        next: span.start,
         rows: 0,
-        end: start + Number(meta.total_compressed_size),
+        end: span.end,
         done: false,
         lock: Promise.resolve(),
       };
