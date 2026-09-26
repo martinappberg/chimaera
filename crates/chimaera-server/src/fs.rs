@@ -3064,6 +3064,10 @@ fn read_xlsx(
     Ok(json!({
         "sheets": sheets,
         "sheet": sheet_name,
+        // The used range's first cell (0-based row, column): the header row
+        // need not be row 1, and the UI writes A1 references for the user's
+        // selections from it.
+        "origin": range.start().map(|(row, col)| [row, col]),
         "columns": columns,
         "rows": rows,
         "offset": offset_rows,
