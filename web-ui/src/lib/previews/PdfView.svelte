@@ -2,11 +2,13 @@
   /** Per-tab scroll + zoom + sidebar memory, keyed by path. Module-scoped so
    * it survives the component unmount/remount that a tab switch triggers. */
   interface PdfMem {
-    zoom: "fit" | number;
+    zoom: Zoom;
     scrollTop: number;
     scrollLeft: number;
     outline: boolean;
   }
+  /** "auto" (fit width, capped), "fit" (fit width) or a CSS scale factor. */
+  type Zoom = "auto" | "fit" | number;
   const memory = new Map<string, PdfMem>();
   const MEMORY_CAP = 100;
 </script>
@@ -15,7 +17,7 @@
   /**
    * PDF preview via pdf.js (worker, fonts, CMaps and wasm bundled locally —
    * no CDN, air-gapped rule). Pages render lazily as they scroll into view;
-   * fit-width by default with fit/100%/± zoom controls, ctrl/⌘-wheel zoom
+   * fit-width capped at 125% by default with fit/100%/± zoom controls, ctrl/⌘-wheel zoom
    * anchored at the cursor, a selectable text layer, clickable links, an
    * outline sidebar, find (⌘/Ctrl+F), per-tab scroll+zoom memory, `page` /
    * `region` reveals, and a "p / N" indicator that follows the scroll and
@@ -95,8 +97,7 @@
   let error = $state<string | null>(null);
   let loading = $state(true);
   let selectionLimited = $state(false);
-  /** "fit" (fit width) or an explicit CSS scale factor. */
-  let zoom = $state<"fit" | number>("fit");
+  let zoom = $state<Zoom>("auto");
   let restored = false;
 
   let outline = $state.raw<OutlineNode[]>([]);
@@ -185,7 +186,14 @@
     // 32px accounts for page horizontal margins in the column.
     return Math.max((containerWidth - 32) / widest, 0.1);
   });
-  const scale = $derived(zoom === "fit" ? fitScale : zoom);
+  // The default: fit width, but never past pdf.js's own automatic-zoom cap
+  // (its MAX_AUTO_SCALE), so a page in a wide pane stays at reading size
+  // instead of filling it. "fit" is the uncapped width.
+  const AUTO_MAX_SCALE = 1.25;
+  function scaleOf(z: Zoom): number {
+    return z === "fit" ? fitScale : z === "auto" ? Math.min(fitScale, AUTO_MAX_SCALE) : z;
+  }
+  const scale = $derived(scaleOf(zoom));
 
   /** Layout of the page column, from the slot sizes alone (no DOM reads):
    *  it mirrors .pdf-scroll's padding and gap below. */
@@ -482,7 +490,7 @@
   async function renderPage(n: number, slot: HTMLElement): Promise<void> {
     const d = doc;
     if (d === null || disposed || !slot.isConnected) return;
-    const s = zoom === "fit" ? fitScale : zoom;
+    const s = scaleOf(zoom);
     if (renderingPages.has(n) || renderedScale.get(n) === s) return;
     renderingPages.add(n);
     let page: PDFPageProxy | null = null;
@@ -531,7 +539,7 @@
       renderingPages.delete(n);
       // A zoom/fit change may land while this page is rasterizing. Never
       // render into the same canvas concurrently; finish once, then catch up.
-      const currentScale = zoom === "fit" ? fitScale : zoom;
+      const currentScale = scaleOf(zoom);
       if (!disposed && renderedAtScale && currentScale !== s && slot.isConnected) {
         void renderPage(n, slot);
       }
@@ -1396,11 +1404,11 @@
   // --- zoom ------------------------------------------------------------------------
 
   function zoomIn(): void {
-    const cur = zoom === "fit" ? fitScale : zoom;
+    const cur = scaleOf(zoom);
     zoom = Math.min(cur + 0.25, 6);
   }
   function zoomOut(): void {
-    const cur = zoom === "fit" ? fitScale : zoom;
+    const cur = scaleOf(zoom);
     zoom = Math.max(cur - 0.25, 0.25);
   }
 
@@ -1410,7 +1418,7 @@
     const el = scroller;
     if (el === null) return;
     e.preventDefault();
-    const cur = zoom === "fit" ? fitScale : zoom;
+    const cur = scaleOf(zoom);
     const factor = Math.exp(-e.deltaY * 0.0015);
     const next = Math.min(Math.max(cur * factor, 0.25), 6);
     const rect = el.getBoundingClientRect();

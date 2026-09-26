@@ -610,6 +610,8 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   background walk corrects odd-sized pages in batches. The toolbar shows **p / N** for the page
   being read (the one under a line a third of the way down the viewport, computed from the slot
   sizes, no DOM reads) and takes a page number: type it and press Enter to jump (Escape reverts).
+  A PDF opens at the pane's width capped at 125% (pdf.js's own automatic zoom), so a page in a wide
+  pane stays at reading size; **fit** is the uncapped width, **100%** actual size.
   - **Outline** — a toolbar button (only when the document has bookmarks) opens them as a sidebar,
     first level expanded and deeper levels on demand; a click resolves the destination (named or
     explicit; `XYZ`, `FitH` and `FitR` land on their point) and scrolls there. Open or closed is
