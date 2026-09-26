@@ -3,7 +3,8 @@ import { EditorState, type TransactionSpec } from "@codemirror/state";
 import { ensureSyntaxTree, syntaxTree } from "@codemirror/language";
 import type { WidgetType } from "@codemirror/view";
 import { markdownLanguageExt } from "./mdLive";
-import { liveField, liveFocus } from "./mdBlocks";
+import { isFigureLine } from "./doc/live";
+import { figureHeldAt, liveField, liveFocus } from "./mdBlocks";
 
 const extensions = [markdownLanguageExt, liveField];
 
@@ -86,16 +87,38 @@ const DOC = [
   "",
 ].join("\n");
 
+/** Equal headings (one id each: `same`, `same-1`, …) around short blocks,
+ *  so most edits land between two of them. */
+const DUPS =
+  Array.from({ length: 10 }, (_, k) => `## Same\n\nword ${k}\n\n${k % 3 === 2 ? "> ## Same\n\n[d]: x\n\n" : ""}`).join("") +
+  "end\n";
+
+/** Frontmatter whose YAML opens a fence the editor's markdown parse runs
+ *  to the end of the document. */
+const FENCED_FM = "---\ntitle: x\nexample: |\n  ```\n---\n\n";
+
 const INSERTS = ["x", " ", "\n", "\n\n", "- ", "```", "# ", "## ", "> ", "|", "**", "[", "---\n", "1. ", "[^1]", "<div>", "$$"];
+/** Typing that keeps a document's blocks as they are (most of the time). */
+const TYPING = ["x", " ", "ab"];
 
 describe("the live field's incremental update", () => {
   it("matches a full recomputation after every edit", () => {
     let treeDiffs = 0;
     let steps = 0;
-    for (const [seed, focused] of [[7, true], [11, false], [23, true], [42, true]] as const) {
+    const runs = [
+      [7, true, DOC],
+      [11, false, DOC],
+      [23, true, DOC],
+      [42, true, DOC],
+      [13, true, DUPS, TYPING],
+      [29, true, DUPS, TYPING],
+      [5, true, FENCED_FM + DOC],
+    ] as const;
+    for (const [seed, focused, text, inserts = INSERTS] of runs) {
+      const typing = inserts === TYPING;
       const next = rng(seed);
       let focus: boolean = focused;
-      let state = fresh(DOC, 30, focus);
+      let state = fresh(text, 30, focus);
       for (let step = 0; step < 400; step++) {
         steps++;
         const len = state.doc.length;
@@ -110,10 +133,10 @@ describe("the live field's incremental update", () => {
           focus = !focus;
           spec = { effects: liveFocus(focus) };
         } else if (roll < 0.5 && len > 0) {
-          const to = Math.min(len, at + 1 + Math.floor(next() * 12));
+          const to = Math.min(len, at + 1 + (typing ? 0 : Math.floor(next() * 12)));
           spec = { changes: { from: at, to }, selection: { anchor: at } };
         } else {
-          const ins = INSERTS[Math.floor(next() * INSERTS.length)];
+          const ins = inserts[Math.floor(next() * inserts.length)];
           spec = { changes: { from: at, insert: ins }, selection: { anchor: at + ins.length } };
         }
         state = state.update(spec).state;
@@ -143,6 +166,62 @@ describe("the live field's incremental update", () => {
     expect(treeDiffs).toBeLessThan(steps / 10);
   });
 
+  it("keeps equal headings apart when typing between them", () => {
+    const text = "# Doc\n\n## Same\n\nbetween\n\n## Same\n\n[d]: x\n\nmiddle\n\n[d]: x\n\n## Same\n\nend\n";
+    for (const word of ["between", "middle"]) {
+      let state = fresh(text, text.indexOf(word), true);
+      for (const ch of "typed ") {
+        const at = state.selection.main.head;
+        state = state.update({ changes: { from: at, insert: ch }, selection: { anchor: at + 1 } }).state;
+        const want = summary(fresh(state.doc.toString(), state.selection.main.head, true));
+        const got = summary(state);
+        expect(got.keys, word).toEqual(want.keys);
+        expect(got.deco, word).toEqual(want.deco);
+      }
+      // Three headings, three ids.
+      const ids = state.field(liveField).keys.filter((k) => k.startsWith("ATXHeading2"));
+      expect(new Set(ids).size).toBe(3);
+    }
+    // One edit that swaps two equal headings' places (a quoted and a bare
+    // one): each keeps the id of its place, not its twin's.
+    const swap = "# Doc\n\n## Same\n\n> ## Same\n\nx\n\n## Same\n\nend\n";
+    let state = fresh(swap, swap.indexOf("x"), true);
+    const from = swap.indexOf("> ## Same");
+    const to = swap.indexOf("\n\nend");
+    state = state.update({
+      changes: { from, to, insert: "## Same\n\nx\n\n> ## Same" },
+      selection: { anchor: from + 10 },
+    }).state;
+    const want = summary(fresh(state.doc.toString(), state.selection.main.head, true));
+    expect(summary(state).keys).toEqual(want.keys);
+    expect(summary(state).deco).toEqual(want.deco);
+  });
+
+  it("draws the body from its own parse when a fence opened in the frontmatter runs on", () => {
+    const text = `${FENCED_FM}# Body\n\npara one\n\n- item\n`;
+    let state = fresh(text, text.indexOf("para"), false);
+    const kinds = (s: EditorState) => s.field(liveField).segs.map((g) => `${g.kind}:${g.names}`);
+    const want = ["front:Frontmatter", "block:ATXHeading1", "block:Paragraph", "block:BulletList"];
+    expect(kinds(state)).toEqual(want);
+    // The properties panel covers the frontmatter's lines and no more.
+    const panel = (s: EditorState): number => {
+      let to = -1;
+      s.field(liveField).deco.between(0, s.doc.length, (from, end, value) => {
+        const w = value.spec.widget as (WidgetType & { id?: string }) | undefined;
+        if (w?.id?.startsWith("P\u0000") === true && from === 0) to = end;
+      });
+      return to;
+    };
+    expect(panel(state)).toBeLessThan(text.indexOf("# Body"));
+    // Typing in the body: still drawn from the body's own parse.
+    const at = state.doc.toString().indexOf("one");
+    state = state.update({ selection: { anchor: at }, effects: liveFocus(true) }).state;
+    state = state.update({ changes: { from: at, insert: "and " }, selection: { anchor: at + 4 } }).state;
+    expect(kinds(state)).toEqual(want);
+    expect(state.field(liveField).revealed).toEqual([false, false, true, false]);
+    expect(panel(state)).toBeLessThan(state.doc.toString().indexOf("# Body"));
+  });
+
   it("keeps a revealed figure drawn as entered until the cursor leaves", () => {
     const figure = DOC.indexOf("![plot]");
     let state = fresh(DOC, figure + 2, true);
@@ -166,6 +245,37 @@ describe("the live field's incremental update", () => {
     // Entered again: drawn as it now reads.
     state = state.update({ selection: { anchor: path + 2 } }).state;
     expect(preview(state)).toContain("figs/chart.png");
+  });
+
+  it("holds a figure under its line only for a paragraph that is the one image", () => {
+    const text = [
+      "Text above",
+      "![inline](figs/a.png)",
+      "and below.",
+      "",
+      "- item",
+      "  ![listed](figs/b.png)",
+      "",
+      "![figure](figs/c.png)",
+      "",
+    ].join("\n");
+    const line = (s: EditorState, src: string) => s.doc.line(s.doc.toString().split("\n").indexOf(src) + 1);
+    const at = (s: EditorState, src: string) => line(s, src).from;
+    // Each image line reads as a figure's source on its own…
+    for (const src of ["![inline](figs/a.png)", "  ![listed](figs/b.png)", "![figure](figs/c.png)"])
+      expect(isFigureLine(src)).toBe(true);
+    // …but revealed with the cursor on another line of its block, it is
+    // drawn inline (a larger block holds no figure).
+    let state = fresh(text, at(fresh(text, 0, true), "Text above"), true);
+    expect(figureHeldAt(state, at(state, "![inline](figs/a.png)"))).toBe(false);
+    state = state.update({ selection: { anchor: at(state, "- item") } }).state;
+    expect(figureHeldAt(state, at(state, "  ![listed](figs/b.png)"))).toBe(false);
+    // A one-image paragraph revealed: its figure stays drawn below it.
+    state = state.update({ selection: { anchor: at(state, "![figure](figs/c.png)") + 3 } }).state;
+    expect(figureHeldAt(state, at(state, "![figure](figs/c.png)"))).toBe(true);
+    // Unfocused, nothing is revealed and nothing held.
+    state = state.update({ effects: liveFocus(false) }).state;
+    expect(figureHeldAt(state, at(state, "![figure](figs/c.png)"))).toBe(false);
   });
 
   it("keeps an unchanged block's widget across an edit elsewhere", () => {

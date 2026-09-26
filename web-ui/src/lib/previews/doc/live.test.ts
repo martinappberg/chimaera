@@ -4,6 +4,8 @@ import { docParser } from "./parser";
 import { frontmatterOf } from "./model";
 import {
   alignPrefix,
+  bodyTree,
+  crossesFrontmatter,
   edgeChain,
   HeightCache,
   hashString,
@@ -50,6 +52,43 @@ describe("segmentsOf", () => {
   it("gives leading blank lines to the first block and frontmatter its own segment", () => {
     expect(segs("\n\nHello\n")).toEqual(['block:"\\n\\nHello\\n"']);
     expect(segs("---\ntitle: x\n---\n\nBody\n")).toEqual(['front:"---\\ntitle: x\\n---\\n"', 'block:"Body\\n"']);
+  });
+
+  it("ends frontmatter on its closing line when a fence or HTML block opened in the YAML runs on", () => {
+    // The editor reads the YAML as markdown: the fence opened there runs to
+    // the end, the `<div>` to the next blank line.
+    const fence = "---\ntitle: x\nexample: |\n  ```\n---\n\n# Body\n\npara\n";
+    const html = '---\ntitle: x\ndesc: >\n  <div class="x">\n---\n# Heading right after\nPara\n\nnext para\n';
+    // Never under the properties panel: what the node swallowed stays source.
+    expect(segs(fence)).toEqual(['front:"---\\ntitle: x\\nexample: |\\n  ```\\n---"', 'source:"\\n# Body\\n\\npara\\n"']);
+    expect(segs(html)).toEqual([
+      'front:"---\\ntitle: x\\ndesc: >\\n  <div class=\\"x\\">\\n---"',
+      'source:"# Heading right after\\nPara\\n"',
+      'block:"next para\\n"',
+    ]);
+    // The body parsed on its own, as reading parses it, segments as blocks.
+    const body = (src: string): string[] => {
+      const { doc, tree, fmEnd } = parse(src);
+      const own = bodyTree(tree, doc, fmEnd);
+      expect(own).not.toBeNull();
+      return segmentsOf(own ?? tree, doc, fmEnd).map((s) => `${s.kind}:${JSON.stringify(doc.sliceString(s.from, s.to))}`);
+    };
+    expect(body(fence)).toEqual([
+      'front:"---\\ntitle: x\\nexample: |\\n  ```\\n---\\n"',
+      'block:"# Body\\n"',
+      'block:"para\\n"',
+    ]);
+    expect(body(html)).toEqual([
+      'front:"---\\ntitle: x\\ndesc: >\\n  <div class=\\"x\\">\\n---"',
+      'block:"# Heading right after"',
+      'block:"Para\\n"',
+      'block:"next para\\n"',
+    ]);
+    // Frontmatter the editor's tree ends on (a closed fence, a setext
+    // underline): its own tree serves.
+    const closed = parse("---\ntitle: x\nexample: |\n  ```\n  code\n  ```\n---\n\n# Body\n");
+    expect(crossesFrontmatter(closed.tree, closed.fmEnd)).toBe(false);
+    expect(bodyTree(closed.tree, closed.doc, closed.fmEnd)).toBeNull();
   });
 
   it("keeps definitions and comments as source and groups an HTML-opened run", () => {

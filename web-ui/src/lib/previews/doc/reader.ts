@@ -469,13 +469,16 @@ export class Hydrator {
     }
   }
 
-  /** Open what the card in `slot` shows in a pane, at its fragment. */
+  /** Open what the card in `slot` shows in a pane, at its fragment — once
+   *  answered again when its answer expired. False when there is nothing
+   *  to open (no card, a missing file). */
   openEmbed(slot: HTMLElement): boolean {
     const d = this.drawn.get(slot);
-    const a = d === undefined ? undefined : this.embeds.answer(d.ref);
-    if (d === undefined || a === undefined || isMissing(a)) return false;
-    const reveal = fragmentReveal(parseEmbedFragment(splitTarget(d.ref.target).fragment, a.path));
-    return openPath(a.path, a.kind, reveal !== undefined ? { reveal } : {});
+    if (d === undefined) return false;
+    return this.embeds.use(d.ref, (a) => {
+      const reveal = fragmentReveal(parseEmbedFragment(splitTarget(d.ref.target).fragment, a.path));
+      openPath(a.path, a.kind, reveal !== undefined ? { reveal } : {});
+    });
   }
 
   destroy(): void {
@@ -535,7 +538,7 @@ export class Hydrator {
     this.track(img, ref, null);
     const a = this.embeds.answer(ref);
     if (a !== undefined) pointImg(img, a);
-    else void this.embeds.ask(ref);
+    else void this.embeds.ask(ref); // reaches `answered`, a renewed expired answer too
   }
 
   /** An image-syntax block: an embed card in a slot of its own, drawn from

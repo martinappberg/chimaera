@@ -12,7 +12,9 @@ import {
   revealIndex,
   spanLines,
   stripFences,
+  taskBoxAt,
 } from "./mdDoc";
+import { EditorState } from "@codemirror/state";
 
 describe("placeOffset", () => {
   it("keeps a block in view at its offset", () => {
@@ -281,5 +283,31 @@ describe("createModeMemory", () => {
     }));
     expect(() => full.set("/a", "live")).not.toThrow();
     expect(createModeMemory(() => null).get("/a")).toBeNull();
+  });
+});
+
+describe("taskBoxAt", () => {
+  it("finds a list item's box, in quotes and ordered lists too", () => {
+    const text = "# T\n\n- [ ] one\n- [x] two\n> 1. [X] quoted\n* not [ ] a box\n";
+    expect(taskBoxAt(text, 3)).toEqual({ text: "- [ ] one", at: 2, done: false });
+    expect(taskBoxAt(text, 4)).toEqual({ text: "- [x] two", at: 2, done: true });
+    expect(taskBoxAt(text, 5)).toEqual({ text: "> 1. [X] quoted", at: 5, done: true });
+    expect(taskBoxAt(text, 6)).toBeNull();
+    expect(taskBoxAt(text, 1)).toBeNull();
+    expect(taskBoxAt(text, 99)).toBeNull();
+  });
+
+  it("reads a CRLF (or CR) file's line as the editor holds it", () => {
+    for (const eol of ["\r\n", "\r"]) {
+      const text = ["# Tasks", "", "- [ ] first", "- [x] second", ""].join(eol);
+      // CodeMirror splits on every line break and keeps none of it.
+      const doc = EditorState.create({ doc: text }).doc;
+      for (const n of [3, 4]) {
+        const box = taskBoxAt(text, n);
+        expect(box?.text).toBe(doc.line(n).text);
+        expect(doc.sliceString(doc.line(n).from + (box?.at ?? 0), doc.line(n).from + (box?.at ?? 0) + 3)).toMatch(/^\[[ x]\]$/);
+      }
+      expect(taskBoxAt(text, 4)?.done).toBe(true);
+    }
   });
 });

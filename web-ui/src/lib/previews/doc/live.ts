@@ -13,8 +13,9 @@
  * nothing rendered to click, always show as source; the tail of a document
  * the background parser has not reached yet is source until it has.
  */
-import type { SyntaxNode, Tree } from "@lezer/common";
+import type { SyntaxNode, Tree, TreeFragment } from "@lezer/common";
 import { htmlRuns, type LinedText } from "./model";
+import { docParser } from "./parser";
 import type { DocText } from "../mdTable";
 
 /** What the segment code reads from a document (CodeMirror's `Text`). */
@@ -66,11 +67,40 @@ export function nodesIn(tree: Tree, from: number, to: number): SyntaxNode[] {
   return out;
 }
 
+/** Whether a node the editor parsed inside the frontmatter (it reads the
+ *  YAML as markdown) runs past its end: a fence or an HTML block opened in
+ *  the YAML swallows the body lines after it. */
+export function crossesFrontmatter(tree: Tree, fmEnd: number): boolean {
+  if (fmEnd <= 0) return false;
+  const last = tree.topNode.childBefore(fmEnd);
+  return last !== null && last.to > fmEnd;
+}
+
+/**
+ * The tree to segment and draw the body by when the editor's own cannot
+ * serve (`crossesFrontmatter`): the document parsed as reading parses it,
+ * the frontmatter blanked (lines and offsets kept), from `fragments` of the
+ * last such parse when given. Null when the editor's tree serves.
+ */
+export function bodyTree(
+  tree: Tree,
+  doc: LiveDoc,
+  fmEnd: number,
+  fragments?: readonly TreeFragment[],
+): Tree | null {
+  if (!crossesFrontmatter(tree, fmEnd)) return null;
+  const text = doc.sliceString(0, doc.length);
+  return docParser.parse(text.slice(0, fmEnd).replace(/[^\n]/g, " ") + text.slice(fmEnd), fragments);
+}
+
 /**
  * Split `doc` into segments by its (possibly partial) syntax tree. `fmEnd`
- * is where frontmatter ends (0 = none). Segments are sorted, disjoint and
- * line-aligned; lines before the first block belong to it, lines after the
- * last block to the last one.
+ * is where frontmatter ends (0 = none): its segment ends on the closing
+ * line, whatever the tree made of the YAML — body lines a node opened there
+ * swallowed stay source (a caller draws the body from `bodyTree`'s tree, so
+ * there are none). Segments are sorted, disjoint and line-aligned; lines
+ * before the first block belong to it, lines after the last block to the
+ * last one.
  */
 export function segmentsOf(tree: Tree, doc: LiveDoc, fmEnd: number): Segment[] {
   const nodes = topNodes(tree, fmEnd);
@@ -86,6 +116,11 @@ export function segmentsOf(tree: Tree, doc: LiveDoc, fmEnd: number): Segment[] {
   if (fmEnd > 0) {
     const end = doc.lineAt(Math.min(fmEnd, doc.length)).to;
     out.push({ kind: "front", from: 0, to: end, blockFrom: 0, blockTo: end, names: "Frontmatter" });
+    const cross = crossesFrontmatter(tree, fmEnd) ? tree.topNode.childBefore(fmEnd) : null;
+    if (cross !== null && end < doc.length) {
+      const from = end + 1;
+      out.push({ kind: "source", from, to: 0, blockFrom: from, blockTo: Math.max(from, cross.to), names: cross.name });
+    }
   }
   for (const run of runs) {
     const first = run[0];

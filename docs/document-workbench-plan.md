@@ -1,15 +1,50 @@
 # Documents, files & references: the plan
 
-Dated 2026-09-25. A plan, not a record: nothing here has shipped yet. It covers the
-markdown viewer, every other file viewer, embeds, file links from agents, pointing
-agents at parts of files, how files show up in chat, and safe editing over a remote
-link. It was built from four code maps of the current tree (commit `f44a8b7`) and a
-survey of how Obsidian, Typora, iA Writer, VS Code, GitHub, Notion and others do it.
-Every claim about the current code below was traced to a file and line; the maps are
-summarized in the [appendix](#appendix-what-the-code-does-today).
+Dated 2026-09-25. It covers the markdown viewer, every other file viewer, embeds, file
+links from agents, pointing agents at parts of files, how files show up in chat, and
+safe editing over a remote link. It was built from four code maps of the tree at
+commit `f44a8b7` and a survey of how Obsidian, Typora, iA Writer, VS Code, GitHub,
+Notion and others do it. The [appendix](#appendix-what-the-code-does-today) describes
+the code as it was **before** this work.
 
 LaTeX and Typst reports are **out of scope here** by the maintainer's call (a
 separate effort); see [Out of scope](#out-of-scope).
+
+## Status (2026-09-26)
+
+Built in martinappberg/chimaera#159. The feature pages
+([files and previews](features/files-and-previews.md), [agents](features/agents.md),
+[chat mode](features/chat-mode.md), [terminals](features/terminals.md)) describe what
+shipped; the phases below remain the design record.
+
+- **Shipped:**
+  - Phase 0: buffers outlive views, the close prompt, hash-verified idempotent saves,
+    three-way merge, byte fidelity, the draft journal and its daemon mirror, and the
+    hardened write path.
+  - Phase 1: one file-reference parser, the `fs/validate` ladder, and open-at-line.
+  - Phases 2 and 3: one lezer renderer behind reading and live, a parity corpus, and
+    an outline. Live is now the default mode.
+  - Phase 4: embed cards in documents and chat, `resolve_targets`, cacheable `/raw`,
+    and HTML reports that load their own assets.
+  - Phase 5: the locator grammar, pointing from every viewer, and region crops.
+  - Phase 6: the MCP guide, `check_document`, the issues chip, and the opt-in
+    installs.
+  - Phase 7:
+    - PDF (fixed blank pages, find, outline, links), and virtualized tables with
+      bioinformatics presets.
+    - New viewers: notebooks, logs, Marp slides, mermaid, media, Word, PowerPoint,
+      diagram boards (JSON Canvas, Excalidraw, draw.io) and Parquet.
+- **Cut by the maintainer** (judged by what a user actually opens and uses):
+  - image compare, pixel readout and PDF thumbnails;
+  - table stats and sorting, and the sequence, hex, archive and JSON-tree views;
+  - the reference basket, agent-opened tabs (`show_user`) and backlinks;
+  - EPUB/email and the LibreOffice path.
+- **Not yet built:**
+  - `![](note.md#Heading)` transclusion (cards show an excerpt);
+  - hover previews on links;
+  - the "what changed" gutter;
+  - publishing (self-contained HTML, PDF and zip export of a markdown document);
+  - server-side thumbnails (measure first).
 
 ## The short version
 
