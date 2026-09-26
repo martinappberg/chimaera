@@ -626,7 +626,9 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   can't touch the app. Alt chunks (embedded HTML) are never rendered. `#bookmark` links scroll,
   web links open like any other link, nothing else navigates. Word's Symbol/Wingdings bullets
   (private-use characters most systems can't draw) show as their Unicode equivalents. A disk
-  change re-renders in place and keeps the reading position.
+  change re-renders in place and keeps the reading position. docx-preview never revokes the `blob:`
+  URLs it mints for images, fonts and bullets, so the view records them (`blobUrls.ts`) and revokes
+  a render's set when the next render replaces it or the view unmounts.
 - **PowerPoint decks.** `.pptx` (and `.pptm`, `.ppsx`, `.potx`) open in `PptxView.svelte`,
   drawn by `@aiden0z/pptx-renderer` in the Marp viewer's chrome: arrows / PageUp / PageDown /
   Space / Home / End page the deck, a thumbnail strip jumps, **present** goes full screen,

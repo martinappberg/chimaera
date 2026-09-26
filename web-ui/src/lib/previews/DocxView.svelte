@@ -17,6 +17,7 @@
   import { retain, release, type FileEntry } from "./fileStore.svelte";
   import { fetchRawBytes, TooLargeError } from "./rawBytes";
   import { sanitizeRendered } from "./officeSafety";
+  import { captureBlobUrls, revokeAll } from "./blobUrls";
   import { activateUrl } from "../shared/urlOpen";
   import { isRemoteHost } from "../net/api";
   import Spinner from "./Spinner.svelte";
@@ -36,6 +37,9 @@
   interface Rendered {
     nodes: Node[];
     blocked: number;
+    /** The `blob:` URLs this render's images, fonts and bullets use: revoked
+     *  when the next render replaces it, or the view goes. */
+    urls: string[];
   }
 
   let entry = $state<FileEntry | null>(null);
@@ -56,15 +60,23 @@
     docx ??= import("docx-preview");
     const lib = await docx;
     let nodes: Node[];
+    let urls: string[] = [];
     try {
       const doc = await lib.parseAsync(bytes, OPTIONS);
+      urls = captureBlobUrls(doc);
       nodes = await lib.renderDocument(doc, OPTIONS);
     } catch {
+      revokeAll(urls);
       throw new Error("this file couldn't be read as a Word document (legacy .doc files aren't supported)");
     }
-    const blocked = sanitizeRendered(nodes);
-    unsymbolBullets(nodes);
-    return { nodes, blocked };
+    try {
+      const blocked = sanitizeRendered(nodes);
+      unsymbolBullets(nodes);
+      return { nodes, blocked, urls };
+    } catch (e) {
+      revokeAll(urls);
+      throw e;
+    }
   }
 
   /** Word's default bullets are private-use characters in the Symbol and
@@ -127,8 +139,14 @@
     const mine = ++gen;
     void build(path).then(
       (r) => {
-        if (mine !== gen) return;
+        if (mine !== gen) {
+          revokeAll(r.urls);
+          return;
+        }
+        // The old render's nodes leave the page as this one attaches.
+        const old = rendered;
         rendered = r;
+        if (old !== null) revokeAll(old.urls);
         error = null;
         tooLarge = false;
       },
@@ -138,6 +156,14 @@
         error = e instanceof Error ? e.message : "the document could not be opened";
       },
     );
+  });
+
+  // Gone: nothing shows this render's blob URLs any more, and a build still
+  // in flight lands on a stale generation (and revokes its own).
+  $effect(() => () => {
+    gen += 1;
+    const r = untrack(() => rendered);
+    if (r !== null) revokeAll(r.urls);
   });
 
   // --- the page desk ------------------------------------------------------------
