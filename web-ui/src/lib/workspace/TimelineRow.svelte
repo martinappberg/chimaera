@@ -82,7 +82,6 @@
         const end = last.end ?? "unknown";
         if (end === "errored") return { mark: "✕", tone: "err", title: "the turn errored" };
         if (end === "finished") return { mark: "●", tone: "accent", title: "finished" };
-        if (end === "waiting") return { mark: "●", tone: "warn", title: "waiting on you" };
         if (end === "interrupted") return { mark: "○", tone: "muted", title: "interrupted" };
         if (end === "exited") return { mark: "○", tone: "muted", title: "the session exited" };
         return { mark: "○", tone: "muted", title: "outcome unknown" };
@@ -137,11 +136,7 @@
   });
 
   const tierTitle = $derived(
-    first.tier === "hooks"
-      ? "seen through Claude Code hooks — coarse but honest"
-      : first.tier === "output"
-        ? "seen from terminal output only — no result line"
-        : null,
+    first.tier === "hooks" ? "seen through Claude Code hooks — coarse but honest" : null,
   );
 </script>
 
@@ -297,8 +292,6 @@
     <div class="result quiet">
       {#if deliverState !== null}
         {deliverState}
-      {:else if first.note.delivered === true}
-        delivered
       {:else}
         <button class="inline-link" onclick={() => onDeliver(first)} title="send this note to {noteTo} as a real message — your click starts that turn"
           >deliver to {noteTo}</button

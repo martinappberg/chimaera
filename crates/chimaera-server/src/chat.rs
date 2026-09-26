@@ -249,16 +249,28 @@ pub(crate) fn spawn_signal_task(state: Arc<AppState>) {
                     state.changes.notify_waiters();
                 }
                 ChatSignal::Exit(id, exit) => {
-                    // A dead session's un-completed edits will never land.
-                    pending_edits.retain(|(s, _), _| s != &id);
-                    crate::lock(&state.chat_catalogs).remove(&id);
-                    crate::lock(&state.notes).forget_session(&id);
+                    // A view switch / rewind respawns under the same id, and a
+                    // slow driver's reap can land after the successor is up
+                    // (see handle_chat_exit): that exit is the deliberate
+                    // kill, and the live successor's per-session state —
+                    // its open turn, catalog, edits, note cursor — must
+                    // survive it. Only a real death is history.
+                    let successor_chat = state.chat.get(&id).is_some_and(|c| c.alive);
+                    let deliberate = successor_chat
+                        || state.sessions.get(&id).is_some()
+                        || crate::lock(&state.chat_switching).contains_key(&id);
+                    if !successor_chat {
+                        // A dead driver's un-completed edits will never land.
+                        pending_edits.retain(|(s, _), _| s != &id);
+                        crate::lock(&state.chat_catalogs).remove(&id);
+                        if deliberate {
+                            episodes.forget(&id);
+                        }
+                    }
                     // Record the death BEFORE handle_chat_exit: retiring drops
-                    // the workspace mapping the Timeline entry needs. A
-                    // deliberate view switch is not history.
-                    if crate::lock(&state.chat_switching).contains_key(&id) {
-                        episodes.forget(&id);
-                    } else {
+                    // the workspace mapping the Timeline entry needs.
+                    if !deliberate {
+                        crate::lock(&state.notes).forget_session(&id);
                         let now = crate::timeline::now_ms();
                         if let Some(draft) = episodes.flush(&id, now) {
                             crate::episodes::record(&state, &id, draft, "protocol").await;

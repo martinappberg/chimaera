@@ -150,7 +150,7 @@ export function groupEvidence(g: TimelineGroup): {
   let recorded = null as TimelineRecorded | null;
   for (const e of g.entries) {
     const ev = e.evidence;
-    turns += ev?.turns ?? 1;
+    turns += 1;
     if (ev === undefined) continue;
     for (const f of ev.files ?? []) if (!files.includes(f) && files.length < 10) files.push(f);
     filesN += ev.files_n ?? ev.files?.length ?? 0;

@@ -265,6 +265,11 @@ async fn claude_state(state: &AppState) -> Value {
         Err(err) => return json!({"agent": "claude", "available": false, "error": err}),
     };
     let _permit = GATE.acquire().await;
+    // Whoever held the gate may have just filled the cache (two views asking
+    // at once): don't rerun a dozen login-shell CLI calls for the same answer.
+    if let Some(hit) = state.probes.get("claude") {
+        return hit;
+    }
     let listed = run_bounded(&wrapped(&bin, &["plugin", "list", "--json"]), None).await;
     let plugins: Vec<Value> = match listed.and_then(|out| {
         serde_json::from_str::<Vec<Value>>(out.trim())
@@ -322,6 +327,9 @@ async fn codex_raw(state: &AppState, root: &Path) -> Value {
         Err(err) => return json!({"available": false, "error": err}),
     };
     let _permit = GATE.acquire().await;
+    if let Some(hit) = state.probes.get(&key) {
+        return hit;
+    }
     let result = async {
         let mut rpc = CodexRpc::open(&bin, root).await?;
         let cwd = root.to_string_lossy().into_owned();

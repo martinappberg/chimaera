@@ -39,7 +39,7 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
             post(crate::notes::deliver),
         )
         // Workbench plugins: the catalog, per-workspace status, and the
-        // per-workspace off switch (enabling is the `plugins.enabled` setting).
+        // per-workspace switch (`Workspace.plugins_on`; off by default).
         .route("/plugins", get(plugins::list_plugins))
         .route("/workspaces/{id}/plugins", get(plugins::workspace_plugins))
         .route(

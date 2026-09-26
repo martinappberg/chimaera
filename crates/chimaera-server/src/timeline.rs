@@ -72,7 +72,7 @@ pub(crate) struct Entry {
     pub(crate) agent: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) ui: Option<String>,
-    /// Fidelity of an episode: protocol (chat) › hooks (claude TUI) › output.
+    /// Fidelity of an episode: protocol (chat) › hooks (claude TUI).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) tier: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

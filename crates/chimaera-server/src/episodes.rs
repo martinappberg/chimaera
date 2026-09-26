@@ -9,14 +9,16 @@
 //!   [`TuiEpisodes`] in `agents::ingest` (PTY sessions only — claude chat
 //!   sessions fire the same `--settings` hooks, and counting them twice would
 //!   double every chat turn).
-//! - **output** (hook-less TUIs): recorded elsewhere from output recency.
+//!
+//! Hook-less TUIs (codex/gemini terminals) produce no episodes: the daemon
+//! never sees their turns.
 //!
 //! Anatomy (plan §4): the headline is the user's own prompt; the result is
 //! the first meaningful sentence of the agent's final message; the evidence
 //! is files · duration · tools · end state. Nothing here calls a model.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chimaera_agent::model::{AgentEvent, ToolKind, ToolStatus, UserMessageState};
@@ -439,10 +441,32 @@ fn is_interactive(text: &str) -> bool {
     base == "salloc" || (base == "srun" && rest.contains(&"--pty"))
 }
 
+/// `scheme://user:pass@host` → `scheme://user:•••@host`; a bare
+/// `scheme://TOKEN@host` masks the whole userinfo.
+fn mask_url_userinfo(tok: &str) -> Option<String> {
+    let start = tok.find("://")? + 3;
+    let rest = &tok[start..];
+    let at = rest[..rest.find('/').unwrap_or(rest.len())].rfind('@')?;
+    let masked = match rest[..at].split_once(':') {
+        Some((user, _)) => format!("{user}:•••"),
+        None => "•••".to_string(),
+    };
+    Some(format!("{}{masked}{}", &tok[..start], &rest[at..]))
+}
+
+/// `user:password` (curl `-u`, `--user=`) → `user:•••`; a bare user stays.
+fn mask_user_pass(value: &str) -> String {
+    match value.split_once(':') {
+        Some((user, _)) => format!("{user}:•••"),
+        None => value.to_string(),
+    }
+}
+
 /// Mask values that look like secrets before a command line is persisted or
 /// shown to a model: `KEY=value` where the key names a credential, the
-/// argument after a credential flag (`--token x`, `-p x`), and anything
-/// after "Bearer"/"Authorization:".
+/// argument after a credential flag (`--token x`, `-p x`), the password half
+/// of `-u`/`--user user:pass`, URL userinfo, mysql's glued `-pSECRET`, and
+/// anything after "Bearer"/"Authorization:".
 pub(crate) fn redact_command(text: &str) -> String {
     const SENSITIVE: [&str; 10] = [
         "token",
@@ -468,11 +492,24 @@ pub(crate) fn redact_command(text: &str) -> String {
         /// After "Authorization:": a scheme word (Bearer/Basic/Token) is
         /// kept and the credential after it masked.
         AfterAuth,
+        /// After `-u`/`--user`: only a `user:pass` value is secret.
+        UserPass,
     }
+    let program = text
+        .split_whitespace()
+        .next()
+        .map(|p| p.rsplit('/').next().unwrap_or(p).to_lowercase())
+        .unwrap_or_default();
+    let glued_password = program.starts_with("mysql") || program.starts_with("mariadb");
     let mut out: Vec<String> = Vec::new();
     let mut mask = Mask::No;
     for tok in text.split_whitespace() {
         match mask {
+            Mask::UserPass => {
+                out.push(mask_user_pass(tok));
+                mask = Mask::No;
+                continue;
+            }
             Mask::AfterAuth if matches!(bare(tok).as_str(), "bearer" | "basic" | "token") => {
                 out.push(tok.to_string());
                 mask = Mask::Next;
@@ -485,11 +522,23 @@ pub(crate) fn redact_command(text: &str) -> String {
             }
             Mask::No => {}
         }
-        if let Some((key, _)) = tok.split_once('=') {
+        if let Some((key, value)) = tok.split_once('=') {
             if sensitive(key) {
                 out.push(format!("{key}=•••"));
                 continue;
             }
+            if key == "--user" {
+                out.push(format!("{key}={}", mask_user_pass(value)));
+                continue;
+            }
+        }
+        if let Some(masked) = mask_url_userinfo(tok) {
+            out.push(masked);
+            continue;
+        }
+        if glued_password && tok.len() > 2 && tok.starts_with("-p") {
+            out.push("-p•••".to_string());
+            continue;
         }
         let word = bare(tok);
         out.push(tok.to_string());
@@ -497,6 +546,8 @@ pub(crate) fn redact_command(text: &str) -> String {
             mask = Mask::AfterAuth;
         } else if word == "bearer" || (tok.starts_with('-') && (sensitive(tok) || tok == "-p")) {
             mask = Mask::Next;
+        } else if tok == "-u" || tok == "--user" {
+            mask = Mask::UserPass;
         }
     }
     out.join(" ")
@@ -541,6 +592,10 @@ const JOBS_TICK: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The workspace whose root contains `workdir` (longest root wins).
 fn workspace_for_dir(state: &AppState, workdir: &str) -> Option<String> {
+    workspace_root_for_dir(state, workdir).map(|(id, _)| id)
+}
+
+fn workspace_root_for_dir(state: &AppState, workdir: &str) -> Option<(String, PathBuf)> {
     if workdir.is_empty() {
         return None;
     }
@@ -550,7 +605,20 @@ fn workspace_for_dir(state: &AppState, workdir: &str) -> Option<String> {
         .into_iter()
         .filter(|w| dir.starts_with(&w.root))
         .max_by_key(|w| w.root.as_os_str().len())
-        .map(|w| w.id)
+        .map(|w| (w.id, w.root))
+}
+
+/// Whether a live job may keep the background poll alive: only one owned by
+/// a project workspace. A root at `$HOME` (or above it) claims every job the
+/// user runs, which would turn the poll into a standing once-a-minute squeue
+/// for as long as anything is queued; its ended jobs are still recorded
+/// whenever a viewer's own refresh notices them.
+fn keeps_poll_alive(state: &AppState, workdir: &str, home: Option<&Path>) -> bool {
+    workspace_root_for_dir(state, workdir).is_some_and(|(_, root)| is_project_root(&root, home))
+}
+
+fn is_project_root(root: &Path, home: Option<&Path>) -> bool {
+    home.is_none_or(|home| !home.starts_with(root))
 }
 
 /// Finished Slurm jobs → Timeline entries. One tick a minute: drain what
@@ -564,6 +632,7 @@ pub(crate) fn spawn_jobs_task(state: Arc<AppState>) {
     {
         return;
     }
+    let home = std::env::var_os("HOME").map(PathBuf::from);
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(JOBS_TICK).await;
@@ -571,7 +640,7 @@ pub(crate) fn spawn_jobs_task(state: Arc<AppState>) {
                 at.elapsed() >= JOBS_TICK
                     && snap.jobs.iter().any(|j| {
                         crate::compute::is_live_state(&j.state)
-                            && workspace_for_dir(&state, &j.workdir).is_some()
+                            && keeps_poll_alive(&state, &j.workdir, home.as_deref())
                     })
             });
             if live_attributed {
@@ -852,6 +921,29 @@ mod tests {
             "tool --api-key=••• run"
         );
         assert_eq!(redact_command("snakemake -j 32"), "snakemake -j 32");
+        assert_eq!(
+            redact_command("curl -u me:hunter2 https://x"),
+            "curl -u me:••• https://x"
+        );
+        assert_eq!(
+            redact_command("curl --user=me:hunter2 x"),
+            "curl --user=me:••• x"
+        );
+        assert_eq!(redact_command("squeue -u martin"), "squeue -u martin");
+        assert_eq!(redact_command("mysql -phunter2 db"), "mysql -p••• db");
+        assert_eq!(redact_command("mkdir -pv out"), "mkdir -pv out");
+        assert_eq!(
+            redact_command("git clone https://me:tok@github.com/o/r"),
+            "git clone https://me:•••@github.com/o/r"
+        );
+        assert_eq!(
+            redact_command("git push https://ghp_abc@github.com/o/r"),
+            "git push https://•••@github.com/o/r"
+        );
+        assert_eq!(
+            redact_command("open https://example.com/a@b"),
+            "open https://example.com/a@b"
+        );
     }
 
     #[test]
@@ -861,5 +953,16 @@ mod tests {
             relative_to(Some(Path::new("/w")), "/elsewhere/c"),
             "/elsewhere/c"
         );
+    }
+
+    #[test]
+    fn only_project_roots_keep_the_job_poll_alive() {
+        let home = Some(Path::new("/home/u"));
+        assert!(is_project_root(Path::new("/home/u/proj"), home));
+        assert!(is_project_root(Path::new("/scratch/u/proj"), home));
+        assert!(!is_project_root(Path::new("/home/u"), home));
+        assert!(!is_project_root(Path::new("/home"), home));
+        assert!(!is_project_root(Path::new("/"), home));
+        assert!(is_project_root(Path::new("/home/u"), None));
     }
 }
