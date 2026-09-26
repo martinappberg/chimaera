@@ -1521,7 +1521,7 @@ export function scrollEditorTo(view: EditorView, pos: number): void {
 function contentTop(view: EditorView, pos: number): number | null {
   let at: Node | null;
   try {
-    const d = view.domAtPos(pos);
+    const d = view.domAtPos(pos, 1);
     at = d.node instanceof Element ? (d.node.childNodes[d.offset] ?? d.node) : d.node;
   } catch {
     return null;
@@ -1548,10 +1548,17 @@ export function editorPlace(view: EditorView): { line: number; offset: number } 
   const docY = rect.top - view.documentTop;
   let block = view.lineBlockAtHeight(Math.max(0, docY));
   if (block.bottom <= docY + 1 && block.to < view.state.doc.length) block = view.lineBlockAt(block.to + 1);
-  const top = contentTop(view, block.from);
+  // The top-level block that line belongs to — a blank line, to the block
+  // above it, as live's segments have it (source draws a block as its
+  // lines, live as one widget): its first line is the place.
+  let start = block.from;
+  const n = syntaxTree(view.state).topNode.childBefore(block.from + 1);
+  if (n !== null && n.from < start) start = view.state.doc.lineAt(n.from).from;
+  const first = start === block.from ? block : view.lineBlockAt(start);
+  const top = contentTop(view, start);
   return {
-    line: view.state.doc.lineAt(block.from).number,
-    offset: top === null ? block.top - docY : top - rect.top,
+    line: view.state.doc.lineAt(start).number,
+    offset: top === null || first.bottom < docY ? first.top - docY : top - rect.top,
   };
 }
 
@@ -1562,20 +1569,24 @@ export function restoreEditorPlace(view: EditorView, line: number, offset: numbe
   const doc = view.state.doc;
   const pos = doc.line(Math.min(Math.max(1, line), doc.lines)).from;
   view.dispatch({ effects: EditorView.scrollIntoView(pos, { y: "start", yMargin: offset }) });
-  const correct = (tries: number): void =>
-    view.requestMeasure({
-      read: (v) => {
-        const top = contentTop(v, pos);
-        return top === null ? null : top - v.scrollDOM.getBoundingClientRect().top;
-      },
-      write: (top, v) => {
-        if (top === null) return;
-        const d = top - offset;
-        if (Math.abs(d) > 0.5) v.scrollDOM.scrollTop += d;
-        if (tries > 0 && Math.abs(d) > 0.5) requestAnimationFrame(() => correct(tries - 1));
-      },
-    });
-  requestAnimationFrame(() => correct(2));
+  // Between frames, not inside CodeMirror's measure: a scroll there is
+  // taken as the anchor's own movement and undone. Blocks drawn for the
+  // first time settle over a few frames; stop once the text holds still.
+  let still = 0;
+  const correct = (tries: number): void => {
+    if (!view.dom.isConnected) return;
+    const top = contentTop(view, pos);
+    if (top === null) return;
+    const d = top - view.scrollDOM.getBoundingClientRect().top - offset;
+    if (Math.abs(d) > 0.5) {
+      view.scrollDOM.scrollTop += d;
+      still = 0;
+    } else if (++still >= 2) {
+      return;
+    }
+    if (tries > 0) requestAnimationFrame(() => correct(tries - 1));
+  };
+  requestAnimationFrame(() => requestAnimationFrame(() => correct(12)));
 }
 
 /**
