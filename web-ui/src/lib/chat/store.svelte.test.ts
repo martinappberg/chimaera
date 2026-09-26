@@ -1695,6 +1695,82 @@ describe("ChatStore turn artifacts (the made-this-turn gallery)", () => {
     expect(plain.blocks.map((b) => b.kind)).toEqual(["message", "notice"]);
   });
 
+  it("shows only what the prose did not: an embedded figure and a linked document are covered", () => {
+    const store = foldAt([
+      ...TURN.slice(0, -2),
+      [1080, { type: "message_chunk", turn_id: "t1", text: "Done:\n\n![umap](figs/umap.png)\n\nNotes are in notes.md; the report is report/index.html." }],
+      [2000, { type: "turn_completed", turn_id: "t1", usage: {} }],
+    ]);
+    const end = store.blocks.find((b) => b.kind === "turn_end");
+    // notes.md is linked by the prose; the figure is embedded; the report is
+    // only named, and a link is not a picture.
+    expect(end).toMatchObject({ kind: "turn_end", artifacts: [], covered: ["/p/notes.md", "figs/umap.png"] });
+    const mentioned = end?.kind === "turn_end" ? end.mentioned : [];
+    expect(mentioned).toContain("report/index.html");
+    expect(mentioned).not.toContain("figs/umap.png");
+    expect(mentioned).not.toContain("notes.md");
+  });
+
+  it("a name covers the shallowest file only, and silence covers nothing", () => {
+    const quiet = foldAt([
+      ...TURN.slice(0, 4),
+      [1042, { type: "tool_call", id: "w2", kind: "edit", title: "Write docs/notes.md", locations: ["/p/docs/notes.md"], status: "in_progress" }],
+      [1044, { type: "tool_call_update", id: "w2", status: "completed" }],
+      [1080, { type: "message_chunk", turn_id: "t1", text: "Updated the notes." }],
+      [2000, { type: "turn_completed", turn_id: "t1", usage: {} }],
+    ]);
+    expect(quiet.blocks.find((b) => b.kind === "turn_end")).toMatchObject({
+      artifacts: ["/p/notes.md", "/p/docs/notes.md"],
+      covered: [],
+    });
+    const named = foldAt([
+      ...TURN.slice(0, 4),
+      [1042, { type: "tool_call", id: "w2", kind: "edit", title: "Write docs/notes.md", locations: ["/p/docs/notes.md"], status: "in_progress" }],
+      [1044, { type: "tool_call_update", id: "w2", status: "completed" }],
+      [1080, { type: "message_chunk", turn_id: "t1", text: "Updated notes.md." }],
+      [2000, { type: "turn_completed", turn_id: "t1", usage: {} }],
+    ]);
+    expect(named.blocks.find((b) => b.kind === "turn_end")).toMatchObject({
+      artifacts: ["/p/docs/notes.md"],
+      covered: ["/p/notes.md"],
+    });
+  });
+
+  it("every name in a long reply covers its file", () => {
+    const n = 40;
+    const tools: [number, Record<string, unknown>][] = [];
+    for (let i = 0; i < n; i++) {
+      tools.push([1020 + i * 2, { type: "tool_call", id: `w${i}`, kind: "edit", title: `Write out/t${i}.csv`, locations: [`/p/out/t${i}.csv`], status: "in_progress" }]);
+      tools.push([1021 + i * 2, { type: "tool_call_update", id: `w${i}`, status: "completed" }]);
+    }
+    const names = Array.from({ length: n }, (_, i) => `out/t${i}.csv`).join(", ");
+    const store = foldAt([
+      [1000, { type: "user_message", text: "split the table", attachments: 0 }],
+      [1010, { type: "turn_started", turn_id: "t1" }],
+      ...tools,
+      [1900, { type: "message_chunk", turn_id: "t1", text: `Wrote ${names}.` }],
+      [2000, { type: "turn_completed", turn_id: "t1", usage: {} }],
+    ]);
+    // Everything was named, so nothing is left for the gallery to show.
+    const end = store.blocks.find((b) => b.kind === "turn_end");
+    expect(end).toMatchObject({ artifacts: [], mentioned: [] });
+    expect(end?.kind === "turn_end" ? end.covered : []).toHaveLength(n);
+  });
+
+  it("scans the whole command, not the truncated title", () => {
+    const store = foldAt([
+      [1000, { type: "user_message", text: "make me a table", attachments: 0 }],
+      [1010, { type: "turn_started", turn_id: "t1" }],
+      [1020, { type: "tool_call", id: "b1", kind: "execute", title: "Bash: cd \"/very/long/absolute/path/that/eats/the/whole/title/budget/before/anything/useful/appears…", status: "in_progress",
+               command: "cd \"/very/long/absolute/path/that/eats/the/whole/title/budget/before/anything/useful/appears/at/all\" && python3 -c 'open(\"out/summary.csv\",\"w\").write(\"a,b\\n\")'" }],
+      [1030, { type: "tool_call_update", id: "b1", status: "completed", content: { kind: "output", text: "" } }],
+      [1040, { type: "message_chunk", turn_id: "t1", text: "Done." }],
+      [2000, { type: "turn_completed", turn_id: "t1", usage: {} }],
+    ]);
+    const end = store.blocks.find((b) => b.kind === "turn_end");
+    expect(end?.kind === "turn_end" ? end.mentioned : []).toEqual(["out/summary.csv"]);
+  });
+
   it("each turn scans only itself", () => {
     const store = foldAt([
       ...TURN,

@@ -2543,3 +2543,8 @@ These are read by a SHORT-LIVED `codex app-server` the daemon opens for the Plug
 #### Gate (Pass 35)
 
 Hermetic: `agent_probe` tests (details totals, hook command summary, SKILL.md frontmatter), `plugins` route/MCP-gate/notes tests, `codex_tui_mcp_args_pre_approve_only_plugin_tools`, and the `agent_view` fixtures pinning the plugin-free worker view. Live: the throwaway-`CODEX_HOME` trust probe above; the rest in the PR's live verification.
+
+## Pass 36 (2026-09-26 — one live claude 2.1.283 turn through the daemon): the whole command rides `tool_call`. ADOPTED.
+
+An execute `ToolCall` (claude `Bash`/`PowerShell`, codex command executions) now carries the additive `command: Option<String>` — the tool's full command text, clipped to 8 KiB head+tail (`clip_command`). The `title` stays the ~120-char label it was, and the live turn showed why that is not enough for clients that scan the command: claude prefixes every Bash call with `cd "<absolute cwd>" && …`, which alone overflows the title, so the files a script wrote (`out/summary.csv`) never appeared in it. `None` is skipped on serialization, so every other tool and every old journal is byte-identical (`event_serde_round_trips_with_stable_tags` pins it). Consumer today: the web UI's turn-end block (`collectTurnArtifacts` scans `command ?? title`).
+

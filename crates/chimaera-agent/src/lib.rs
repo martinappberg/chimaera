@@ -1135,6 +1135,7 @@ mod tests {
             locations: Vec::new(),
             status: model::ToolStatus::InProgress,
             cross_turn: true,
+            command: None,
         };
         assert_eq!(work.observe(&opened), 1);
         assert_eq!(work.observe(&opened), 1, "a row upsert never double-counts");

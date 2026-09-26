@@ -161,6 +161,7 @@ fn tool_call_cross_turn_flag_is_additive() {
         locations: Vec::new(),
         status: ToolStatus::InProgress,
         cross_turn,
+        command: None,
     };
     assert_eq!(
         serde_json::to_value(call(false)).unwrap(),

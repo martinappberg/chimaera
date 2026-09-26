@@ -346,6 +346,7 @@ impl Translator {
             locations: tool_locations(input),
             status: ToolStatus::Completed,
             cross_turn: false,
+            command: None,
         });
         if let Some(diff) = edit_diff_content(name, input) {
             out.push(AgentEvent::ToolCallUpdate {

@@ -473,28 +473,47 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   slide, a player, a document excerpt, a file card. Click a card's name (or ↗) to open the full
   viewer in a pane at the same spot.
 - **Images in agent prose.** `![alt](figs/plot.png)` renders the file (it used to be a broken
-  image): the target resolves against the session's live directory, then where it started, then
+  image). Agents are told so: every **chat** spawn (never a TUI one) carries a short host frame —
+  claude via `--append-system-prompt`, codex via `developer_instructions`, a forked branch at the
+  head of its portable context — saying that a markdown image link with a workspace-relative path
+  renders inline as a card and that written files are listed under the reply automatically, so
+  the agent shows a figure without being asked to. The frame: the target resolves against the session's live directory, then where it started, then
   the workspace root — strictly, an embed names one file — and any fragment picks the piece
   (`paper.pdf#page=3`, `run.py#L10-L30`, `data.csv#row=2-9`). A file the agent announces before
   writing shows as "not found" and turns into its card when it appears.
-- **Made this turn.** After a turn's closing prose, a gallery of compact tiles shows what the turn
-  made — including files written by **shell commands** (a plot saved by a script, a rendered
-  report), not only by edit tools. HTML reports, markdown, PDFs, tables and spreadsheets,
-  notebooks, slides and media; never source code (its diff is in the tool card). A stopped or
-  failed turn keeps its gallery. Tiles stay fresh when a file is overwritten, and say so when one
-  is gone.
+- **Written this turn.** After a turn's closing prose, the files the turn wrote — created or
+  changed, by its edit tools or by **shell commands** (a plot saved by a script, a rendered
+  report); never source code (its diff is in the tool card). The block **adds, never repeats**:
+  the prose is the reader's first view of the turn, so a figure it embeds inline
+  (`![](figs/plot.png)`) is not tiled again and a document it links is not chipped again (a name
+  claims the shallowest match, so `notes.md` covers the one at the base, not `docs/notes.md`); a
+  figure the prose only names still shows, because a link is not a picture. The heading says
+  "Written this turn" when the prose named none of it and "Also written" when it named some; a
+  turn whose prose covers everything ends with no block. Two shapes by what a file is *for*: a
+  **visual** (a figure, an HTML report, a PDF, a clip) is something to look at, so it shows as a
+  compact tile; a **document** (markdown, docx/pptx, tables and spreadsheets, notebooks) is
+  something to open, so it shows as one chip on a quiet line — click to open in a pane, "+n
+  more" past six, "preview" unfolds the documents' tiles; with no tiles the heading sits on the
+  chip line, so a turn costs one line. Two files sharing a name show their folders (against
+  everything the turn wrote, linked in the prose or not). A chip knows
+  its file: gone (struck, not clickable) or changed after this turn (its tooltip says so), kept
+  current by the disk monitor while on screen. A stopped or failed turn keeps its block. Tiles
+  stay fresh when a file is overwritten, and say so when one is gone.
 - **How the gallery finds shell-written files.** No structured event names them, so the reducer
-  lists the artifact-shaped paths the turn's commands, command outputs and prose *mention*
-  (`artifacts.ts`), and the gallery keeps those the daemon confirms exist and were **modified
-  inside the turn** — between its journal-stamped start and end (daemon clock on both sides, a few
+  lists the artifact-shaped paths the turn's commands and command outputs *mention*, plus figures
+  the prose names without embedding (`artifacts.ts`), and the gallery keeps those the daemon
+  confirms exist and were **modified inside the turn**. A command is scanned whole: an execute
+  `tool_call` carries its full text in the additive `command` field (8 KiB head+tail), because
+  the ~120-char `title` is spent on claude's `cd "…/absolute/path" && …` prefix before any file
+  name appears — between its journal-stamped start and end (daemon clock on both sides, a few
   seconds' slack). A file merely `cat`-ed, or rewritten by a later turn, stays out. One
   `resolve_targets` round trip per gallery, when it nears the viewport; replay rebuilds the same
   `turn_end` from the journal.
 - **Where.** `Markdown.svelte` (the sanitizer moves a local `<img>` src out of reach; cards mount
   beside the placeholder on settled content and closed stream segments, and are destroyed with
   it), `ArtifactGallery.svelte`, `artifacts.ts`, `embeds.ts` (`EmbedResolver`),
-  `store.svelte.ts` (`turn_end.artifacts` / `mentioned` / `startedAtMs` / `endedAtMs` /
-  `aborted`), `shared/embed/`. Uses `POST /api/v1/fs/resolve_targets` and `GET /raw/{ticket}`.
+  `store.svelte.ts` (`turn_end.artifacts` / `mentioned` / `covered` / `startedAtMs` /
+  `endedAtMs` / `aborted`), `shared/embed/`. Uses `POST /api/v1/fs/resolve_targets` and `GET /raw/{ticket}`.
 
 ## Reconnect & gap-replay
 
@@ -592,6 +611,14 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
 > skill when a `feat:` ships in this area. **Never** inferred from code. Everything above
 > this line is derived and may be regenerated; everything below is deliberate and must not
 > be "helpfully" changed without asking.
+
+### The turn-end block — "Written this turn" / "Also written" — why it exists
+_Captured 2026-09-26 from the maintainer's own words in the session that shipped it (PR #171); the settled/open questions are still pending._
+
+- **Why (maintainer, verbatim):** "'Made this turn · 3 files' — is this really even only when just files have been changed? Should this really be expanded? I know when agents want to show images figures etc. that is good, but just like this? I feel maybe collapsed by default or something, and in a better way." Later: "when the agent links to files here there is a lot of information on what was written that turn? like is that how we want it. Can we think about this so it becomes optimal experience for the user. And also think about the wording. If a file is only changed, is it really made that turn?" And: "can we make the tiles etc. prettier? so that it actually looks nice for the user? Still with our own touch but so that one actually wants to use this app."
+- **Decisions the maintainer took in that session:** no hover-peek on chips ("too cluttered"); one heading, not two; chips must know their file's state; same-named files must be told apart; billed CLI runs are fine for verifying this.
+- **What this fixed in the design:** the block now adds what the prose did not already show (an embedded figure is not tiled again, a linked document is not chipped again), the heading is precise ("Written", never "made", for an edited document; "Also written" when the prose showed a share), figures are a strip of captioned tiles, documents one line of chips.
+- _Settled vs. free-to-change, and what must not be "fixed": pending — not yet asked._
 
 ### Conversation branching — why it exists
 _Captured 2026-07-19 (from the maintainer, in-session)._

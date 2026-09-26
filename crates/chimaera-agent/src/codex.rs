@@ -208,11 +208,12 @@ use crate::driver::{
     SpawnSpec, IDLE_FLUSH_GRACE_TICKS, INTERRUPT_GRACE_TICKS,
 };
 use crate::model::{
-    cap_output, fmt_elapsed_secs, truncate_label, AgentCommand, AgentEvent, ChunkKind, Coalescer,
-    CompactionPhase, ContentBlock, PermissionOption, PermissionOptionKind, RemoteControlSnapshot,
-    RemoteControlState, SlashCommand, ToolContent, ToolKind, ToolStatus, Usage, UserMessageState,
-    BG_LABEL_MAX, SKILL_PATH_MAX, SLASH_COMMANDS_CAP, SLASH_DESCRIPTION_MAX, SLASH_NAME_MAX,
-    SUBAGENT_RESULT_MAX, UNHANDLED_REQUESTS_CAP, UNHANDLED_REQUEST_NAME_MAX,
+    cap_output, clip_command, fmt_elapsed_secs, truncate_label, AgentCommand, AgentEvent,
+    ChunkKind, Coalescer, CompactionPhase, ContentBlock, PermissionOption, PermissionOptionKind,
+    RemoteControlSnapshot, RemoteControlState, SlashCommand, ToolContent, ToolKind, ToolStatus,
+    Usage, UserMessageState, BG_LABEL_MAX, SKILL_PATH_MAX, SLASH_COMMANDS_CAP,
+    SLASH_DESCRIPTION_MAX, SLASH_NAME_MAX, SUBAGENT_RESULT_MAX, UNHANDLED_REQUESTS_CAP,
+    UNHANDLED_REQUEST_NAME_MAX,
 };
 use crate::ndjson::{JsonlSink, JsonlStream};
 
@@ -2286,6 +2287,7 @@ impl CodexMapper {
             locations,
             status: ToolStatus::InProgress,
             cross_turn: false,
+            command: None,
         });
     }
 
@@ -2320,6 +2322,11 @@ impl CodexMapper {
                     }
                     let (kind, title, locations) = command_exploration(item)
                         .unwrap_or_else(|| (ToolKind::Execute, command_title(item), Vec::new()));
+                    // Every command execution carries its command, an
+                    // exploration row included: `cat > out.csv <<EOF` reads
+                    // as a `cat`, and the gallery's mtime check already keeps
+                    // a merely-read file out.
+                    let command = command_text(item).map(clip_command);
                     step.events.push(AgentEvent::ToolCall {
                         id,
                         kind,
@@ -2327,6 +2334,7 @@ impl CodexMapper {
                         locations,
                         status: ToolStatus::InProgress,
                         cross_turn: false,
+                        command,
                     });
                 } else {
                     let failed =
@@ -2429,6 +2437,7 @@ impl CodexMapper {
                         locations: Vec::new(),
                         status: ToolStatus::InProgress,
                         cross_turn: false,
+                        command: None,
                     });
                 } else {
                     let failed = item["error"].is_object()
@@ -2478,6 +2487,7 @@ impl CodexMapper {
                         locations: Vec::new(),
                         status: ToolStatus::InProgress,
                         cross_turn: false,
+                        command: None,
                     });
                 } else {
                     // Honor the item status like every other item type — a
@@ -2511,6 +2521,7 @@ impl CodexMapper {
                         locations: Vec::new(),
                         status: ToolStatus::InProgress,
                         cross_turn: false,
+                        command: None,
                     });
                 } else {
                     // Re-emit with the saved path so the open affordance
@@ -2531,6 +2542,7 @@ impl CodexMapper {
                         },
                         status: ToolStatus::InProgress,
                         cross_turn: false,
+                        command: None,
                     });
                     step.events.push(AgentEvent::ToolCallUpdate {
                         id,
@@ -2568,6 +2580,7 @@ impl CodexMapper {
                     locations: Vec::new(),
                     status: ToolStatus::InProgress,
                     cross_turn: false,
+                    command: None,
                 });
                 if completed {
                     let failed =
@@ -2691,6 +2704,7 @@ impl CodexMapper {
                         ToolStatus::InProgress
                     },
                     cross_turn: false,
+                    command: None,
                 });
             }
             // A client-registered dynamic tool ran (0.153.0). Chimaera
@@ -2722,6 +2736,7 @@ impl CodexMapper {
                     locations: Vec::new(),
                     status,
                     cross_turn: false,
+                    command: None,
                 });
             }
             // A hook injected prompt text into the conversation (0.153.0
@@ -2793,6 +2808,7 @@ impl CodexMapper {
             locations,
             status: ToolStatus::InProgress,
             cross_turn: false,
+            command: None,
         });
         if !completed {
             return;
@@ -2979,6 +2995,7 @@ impl CodexMapper {
                     locations: Vec::new(),
                     status: ToolStatus::InProgress,
                     cross_turn: true,
+                    command: None,
                 });
             }
             let agent = &mut self.collab_agents[idx];
@@ -3023,6 +3040,7 @@ impl CodexMapper {
             locations: Vec::new(),
             status: ToolStatus::InProgress,
             cross_turn: true,
+            command: None,
         });
         let mut agent = CollabAgent::new(thread, row_id, name, note);
         if !note.is_empty() {
@@ -4630,12 +4648,15 @@ fn command_exploration(item: &Value) -> Option<(ToolKind, String, Vec<String>)> 
 
 /// `commandActions[0].command` is the bare command; the raw `command` field
 /// carries the `/bin/zsh -lc '…'` wrapper.
-fn command_title(item: &Value) -> String {
-    let raw = item["commandActions"][0]["command"]
+/// The command text a command-execution item carries, as codex wrote it.
+fn command_text(item: &Value) -> Option<&str> {
+    item["commandActions"][0]["command"]
         .as_str()
         .or(item["command"].as_str())
-        .unwrap_or("command");
-    truncate_label(raw, 120)
+}
+
+fn command_title(item: &Value) -> String {
+    truncate_label(command_text(item).unwrap_or("command"), 120)
 }
 
 /// The extension's exact steer-retry extraction: the live turn id sits in
@@ -7336,6 +7357,7 @@ mod tests {
                 locations: Vec::new(),
                 status: ToolStatus::InProgress,
                 cross_turn: true,
+                command: None,
             }]
         );
 
@@ -7424,6 +7446,7 @@ mod tests {
                     locations: Vec::new(),
                     status: ToolStatus::InProgress,
                     cross_turn: true,
+                    command: None,
                 },
                 AgentEvent::ToolCallUpdate {
                     id: "agent:sub-1#2".into(),
@@ -7711,6 +7734,7 @@ mod tests {
                     locations: Vec::new(),
                     status: ToolStatus::InProgress,
                     cross_turn: false,
+                    command: None,
                 },
                 AgentEvent::ToolCallUpdate {
                     id: "call_w1".into(),
@@ -8475,6 +8499,7 @@ mod tests {
                 locations: vec!["/repo/shot.png".into()],
                 status: ToolStatus::Completed,
                 cross_turn: false,
+                command: None,
             }
         );
         let step = m.on_frame(&json!({

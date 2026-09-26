@@ -32,15 +32,15 @@ use crate::driver::{
     SpawnSpec, INTERRUPT_GRACE_TICKS,
 };
 use crate::model::{
-    cap_head_tail, cap_output, fmt_elapsed_secs, truncate_label, AgentCommand, AgentEvent,
-    BackgroundTask, BackgroundTaskClose, ChunkKind, Coalescer, CompactionPhase, ContentBlock,
-    ModeInfo, PermissionOption, PermissionOptionKind, PlanEntry, PlanStatus, SlashCommand,
-    ToolContent, ToolKind, ToolStatus, Usage, UsageWindow, UserMessageState, WorkflowAgent,
-    BG_LABEL_MAX, BG_PATH_MAX, BG_TASKS_CAP, COMMAND_ID_MAX, DIFF_FILE_BUDGET, DIFF_TURN_BUDGET,
-    PLAN_BLOCKED_CAP, PLAN_DESC_MAX, PLAN_LABEL_MAX, PLAN_TASKS_CAP, SLASH_COMMANDS_CAP,
-    SLASH_DESCRIPTION_MAX, SLASH_NAME_MAX, STATUS_DETAIL_MAX, SUBAGENT_RESULT_MAX,
-    TOOL_SUMMARY_IDS_CAP, TOOL_SUMMARY_MAX, UNHANDLED_REQUESTS_CAP, UNHANDLED_REQUEST_NAME_MAX,
-    WF_AGENTS_CAP, WF_AGENTS_SET_BUDGET, WF_AGENT_LABEL_MAX,
+    cap_head_tail, cap_output, clip_command, fmt_elapsed_secs, truncate_label, AgentCommand,
+    AgentEvent, BackgroundTask, BackgroundTaskClose, ChunkKind, Coalescer, CompactionPhase,
+    ContentBlock, ModeInfo, PermissionOption, PermissionOptionKind, PlanEntry, PlanStatus,
+    SlashCommand, ToolContent, ToolKind, ToolStatus, Usage, UsageWindow, UserMessageState,
+    WorkflowAgent, BG_LABEL_MAX, BG_PATH_MAX, BG_TASKS_CAP, COMMAND_ID_MAX, DIFF_FILE_BUDGET,
+    DIFF_TURN_BUDGET, PLAN_BLOCKED_CAP, PLAN_DESC_MAX, PLAN_LABEL_MAX, PLAN_TASKS_CAP,
+    SLASH_COMMANDS_CAP, SLASH_DESCRIPTION_MAX, SLASH_NAME_MAX, STATUS_DETAIL_MAX,
+    SUBAGENT_RESULT_MAX, TOOL_SUMMARY_IDS_CAP, TOOL_SUMMARY_MAX, UNHANDLED_REQUESTS_CAP,
+    UNHANDLED_REQUEST_NAME_MAX, WF_AGENTS_CAP, WF_AGENTS_SET_BUDGET, WF_AGENT_LABEL_MAX,
 };
 use crate::model::{RemoteControlSnapshot, RemoteControlState};
 use crate::ndjson::{JsonlChild, JsonlSink, JsonlStream};
@@ -1361,6 +1361,7 @@ impl ClaudeMapper {
                             locations: Vec::new(),
                             status: ToolStatus::InProgress,
                             cross_turn: false,
+                            command: None,
                         });
                     }
                 }
@@ -2428,6 +2429,7 @@ impl ClaudeMapper {
             locations: tool_locations(input),
             status: ToolStatus::InProgress,
             cross_turn: false,
+            command: execute_command(name, input),
         });
         if let Some(diff) = edit_diff_content(name, input) {
             step.events.push(AgentEvent::ToolCallUpdate {
@@ -4531,6 +4533,15 @@ fn subagent_stats(usage: &Value) -> Option<String> {
     .flatten()
     .collect();
     (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
+/// The whole command a shell tool runs, for the wire's `command` field —
+/// the title keeps only its first line's worth.
+fn execute_command(name: &str, input: &Value) -> Option<String> {
+    match name {
+        "Bash" | "PowerShell" => input["command"].as_str().map(clip_command),
+        _ => None,
+    }
 }
 
 pub(crate) fn tool_title(name: &str, input: &Value) -> String {

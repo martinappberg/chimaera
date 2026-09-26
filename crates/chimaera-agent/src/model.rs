@@ -234,6 +234,14 @@ pub enum AgentEvent {
         /// old journals and ordinary tools keep their existing semantics.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         cross_turn: bool,
+        /// The full command an execute tool ran (claude Bash/PowerShell,
+        /// codex command executions), clipped to `COMMAND_CAP`. The `title`
+        /// is a one-line label and truncates early; clients that scan the
+        /// command — the turn-end gallery finds the files a script wrote in
+        /// it — need the whole thing, `cd "…/long/path" && …` prefix and
+        /// all. Additive: absent for every other tool and on old journals.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        command: Option<String>,
     },
     ToolCallUpdate {
         id: String,
@@ -1199,6 +1207,29 @@ pub enum ToolContent {
     Batch { diffs: Vec<ToolContent> },
 }
 
+/// Bytes of an execute tool's `command` kept on the wire: head and tail,
+/// so a pathological one-liner (a heredoc, an inlined script) stays bounded
+/// while the paths it names up front and at the end survive.
+pub const COMMAND_CAP: usize = 8 * 1024;
+
+/// `cmd` within `COMMAND_CAP`: whole when it fits, else its head and tail
+/// around an elision marker, cut on char boundaries.
+pub fn clip_command(cmd: &str) -> String {
+    if cmd.len() <= COMMAND_CAP {
+        return cmd.to_string();
+    }
+    let half = COMMAND_CAP / 2;
+    let mut head_end = half;
+    while !cmd.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    let mut tail_start = cmd.len() - half;
+    while !cmd.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    format!("{}\n…\n{}", &cmd[..head_end], &cmd[tail_start..])
+}
+
 /// One plan row. `content` is the display text every source fills (claude's
 /// task `subject`, a TodoWrite `content`, a codex plan `step`); everything
 /// below it is richness only claude's `Task*` family carries, so it is all
@@ -1571,6 +1602,20 @@ mod tests {
     }
 
     #[test]
+    fn clip_command_keeps_head_and_tail_on_char_boundaries() {
+        assert_eq!(clip_command("ls -la"), "ls -la");
+        // A multi-byte char straddles both cut points: neither is split.
+        let long = "é".repeat(COMMAND_CAP);
+        let clipped = clip_command(&long);
+        assert!(clipped.starts_with("éé") && clipped.ends_with("éé"));
+        assert!(clipped.contains("\n…\n"));
+        assert!(clipped.len() <= COMMAND_CAP + "\n…\n".len());
+        let ascii = format!("{}{}", "a".repeat(COMMAND_CAP), "z".repeat(10));
+        let clipped = clip_command(&ascii);
+        assert!(clipped.starts_with("aaaa") && clipped.ends_with("zzzz"));
+    }
+
+    #[test]
     fn event_serde_round_trips_with_stable_tags() {
         let ev = AgentEvent::ToolCall {
             id: "t1".into(),
@@ -1579,6 +1624,7 @@ mod tests {
             locations: vec![],
             status: ToolStatus::InProgress,
             cross_turn: false,
+            command: None,
         };
         let json = serde_json::to_value(&ev).unwrap();
         assert_eq!(json["type"], "tool_call");
@@ -1587,6 +1633,10 @@ mod tests {
         assert!(
             json.get("cross_turn").is_none(),
             "the additive false default stays off old wire shapes"
+        );
+        assert!(
+            json.get("command").is_none(),
+            "no command, no key — old wire shapes are byte-identical"
         );
         let back: AgentEvent = serde_json::from_value(json).unwrap();
         assert_eq!(back, ev);
@@ -1598,6 +1648,7 @@ mod tests {
             locations: vec![],
             status: ToolStatus::InProgress,
             cross_turn: true,
+            command: None,
         };
         assert_eq!(serde_json::to_value(&detached).unwrap()["cross_turn"], true);
     }
