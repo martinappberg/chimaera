@@ -84,6 +84,7 @@
   import Chevron from "../shared/Chevron.svelte";
   import Spinner from "./Spinner.svelte";
   import DocIssues from "./DocIssues.svelte";
+  import PublishButton from "./PublishButton.svelte";
   import { hasUrlScheme, isWebUrl, urlMenuEntries } from "../shared/urlOpen";
   import { contextMenu } from "../shared/contextMenu.svelte";
   import { revealRequest, takeReveal, type Reveal } from "../shared/reveal";
@@ -1362,6 +1363,7 @@
     {/if}
     <span class="md-bar-fill"></span>
     <DocIssues {path} {wsRoot} mtime={entry?.mtime ?? null} />
+    <PublishButton {path} text={docText} links={linkContext} />
     <button
       class="seg"
       class:on={outlineOpen}
