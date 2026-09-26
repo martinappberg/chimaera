@@ -1746,3 +1746,153 @@ async fn driver_stack_end_to_end_against_real_claude() {
 
     manager.kill("s-live");
 }
+
+/// Ultracode at spawn (a resurrected session had it on): the handshake
+/// applies it and the read-back says so, WITHOUT counting as the user's pick
+/// (it must not become a remembered preference). Bills nothing — no turn.
+#[tokio::test]
+#[ignore = "live: spawns real claude, needs auth, no turn"]
+async fn driver_initial_ultracode_applies_without_a_pick() {
+    use std::sync::Arc;
+
+    let dir = tmpdir();
+    let manager = Arc::new(ChatManager::new(
+        dir.path().join("chat"),
+        Box::new(|_, _| {}),
+        Box::new(|_, _| {}),
+    ));
+    let mut argv = vec!["claude".to_string()];
+    argv.extend(chat_args(None, None));
+    let mut spec = SpawnSpec::new("s-ultra", argv, dir.path().to_path_buf());
+    spec.initial_ultracode = true;
+    manager.spawn(&ClaudeAdapter, spec).expect("spawn driver");
+    let mut rx = manager.attach("s-ultra", 0).expect("attach").live;
+
+    let deadline = tokio::time::Instant::now() + HANDSHAKE;
+    loop {
+        let entry = tokio::time::timeout_at(deadline, rx.recv())
+            .await
+            .expect("no ultracode read-back")
+            .expect("broadcast closed");
+        if let AgentEvent::EffortState {
+            ultracode, chosen, ..
+        } = &entry.ev
+        {
+            assert!(!chosen, "a bootstrap apply is not the user's pick");
+            if *ultracode {
+                break;
+            }
+        }
+    }
+    assert!(manager.carryover("s-ultra").expect("live").ultracode);
+    manager.kill("s-ultra");
+}
+
+/// The daemon-restart / chat-close contract (PROTOCOL.md Pass 32): claude
+/// runs its background Bash DETACHED, so only claude itself can end it. The
+/// harness's stop (SIGTERM first, then stdin, grace, SIGKILL) must leave no
+/// background process behind — a bare stdin close left it running (and a
+/// SIGKILL orphans it on the host).
+#[tokio::test]
+#[ignore = "live: spawns real claude, needs auth, bills one tiny turn"]
+async fn driver_stop_ends_claudes_detached_background_work() {
+    use chimaera_agent::model::PermissionOptionKind;
+    use std::sync::Arc;
+
+    // A command line unique to this run, so pgrep only ever sees ours.
+    let marker = format!("sleep {}", 86_000 + std::process::id() % 1000);
+    let running = |pattern: &str| -> bool {
+        std::process::Command::new("pgrep")
+            .args(["-f", &format!("^{pattern}$")])
+            .output()
+            .map(|o| !o.stdout.is_empty())
+            .unwrap_or(false)
+    };
+
+    let dir = tmpdir();
+    let manager = Arc::new(ChatManager::new(
+        dir.path().join("chat"),
+        Box::new(|_, _| {}),
+        Box::new(|_, _| {}),
+    ));
+    let mut argv = vec!["claude".to_string()];
+    argv.extend(chat_args(Some(CLAUDE_TEST_MODEL), None));
+    let spec = SpawnSpec::new("s-bgstop", argv, dir.path().to_path_buf());
+    manager.spawn(&ClaudeAdapter, spec).expect("spawn driver");
+    let mut rx = manager.attach("s-bgstop", 0).expect("attach").live;
+    manager
+        .command(
+            "s-bgstop",
+            AgentCommand::Send {
+                blocks: vec![ContentBlock::Text {
+                    text: format!(
+                        "Run `{marker}` as a BACKGROUND Bash task (run_in_background: true). \
+                         Confirm it started in one word; do not wait for it or poll it."
+                    ),
+                }],
+            },
+        )
+        .await
+        .expect("send");
+
+    let mut listed = false;
+    let mut ended = false;
+    let deadline = tokio::time::Instant::now() + TURN;
+    while !(listed && ended) {
+        let entry = tokio::time::timeout_at(deadline, rx.recv())
+            .await
+            .expect("timed out driving the background turn")
+            .expect("broadcast closed");
+        match &entry.ev {
+            AgentEvent::PermissionRequest {
+                request_id,
+                options,
+                ..
+            } => {
+                let allow = options
+                    .iter()
+                    .find(|o| o.kind == PermissionOptionKind::AllowOnce)
+                    .expect("an allow option");
+                manager
+                    .command(
+                        "s-bgstop",
+                        AgentCommand::Permission {
+                            request_id: request_id.clone(),
+                            option_id: allow.id.clone(),
+                            destination: None,
+                            feedback: None,
+                        },
+                    )
+                    .await
+                    .expect("allow");
+            }
+            AgentEvent::BackgroundTasks { tasks, .. } => listed |= !tasks.is_empty(),
+            AgentEvent::TurnCompleted { .. } => ended = true,
+            AgentEvent::TurnAborted { reason, .. } => panic!("turn aborted: {reason}"),
+            _ => {}
+        }
+    }
+    assert!(running(&marker), "the background `{marker}` is running");
+
+    assert!(manager.kill("s-bgstop"));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let entry = tokio::time::timeout_at(deadline, rx.recv())
+            .await
+            .expect("no Exited after the stop")
+            .expect("broadcast closed");
+        if matches!(entry.ev, AgentEvent::Exited { .. }) {
+            break;
+        }
+    }
+    // Claude signals the task's process group on its way out; give the
+    // group a moment to be reaped.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let survived = running(&marker);
+    if survived {
+        let _ = std::process::Command::new("pkill")
+            .args(["-f", &format!("^{marker}$")])
+            .status();
+    }
+    assert!(!survived, "`{marker}` outlived its stopped agent");
+}

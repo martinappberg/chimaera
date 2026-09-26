@@ -254,6 +254,24 @@ pub struct ChildGuard {
 }
 
 impl ChildGuard {
+    /// Ask the child to stop: SIGTERM, the stop both CLIs handle. Claude's
+    /// handler ends its background tasks (Bash shells and Monitors, which it
+    /// starts DETACHED, in their own sessions) and exits in ~0.3 s; a closed
+    /// stdin alone left its background shell running past the grace, stopped
+    /// only the Monitor, and woke a (billed) turn to react to that stop — and
+    /// the grace's SIGKILL then orphans whatever is left on the host. Codex
+    /// exits 0 either way. Live-probed claude 2.1.281 / codex 0.156.1
+    /// (PROTOCOL.md Pass 32). A no-op once the child has been reaped (tokio
+    /// clears the pid then, so a recycled pid is never signalled).
+    pub fn terminate(&self) {
+        if let Some(pid) = self.child.id() {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid as i32),
+                nix::sys::signal::Signal::SIGTERM,
+            );
+        }
+    }
+
     /// Give the child a grace period after sinks were dropped, then kill. The
     /// harness's only reap path — an unbounded wait can't leak a lingering
     /// child (a normally-exiting one returns its status within the grace).
