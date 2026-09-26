@@ -719,7 +719,7 @@ pub(crate) fn build_chat_command(
 ) -> Vec<String> {
     debug_assert!(
         resume.is_none() || session_uuid.is_none(),
-        "resume forks a new native id; pinning one is contradictory"
+        "a resume takes its native id from system/init; pinning one is contradictory"
     );
     let mut cmd = vec![bin.to_string_lossy().into_owned()];
     cmd.extend(chimaera_agent::claude::chat_args(model, resume));

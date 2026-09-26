@@ -3030,7 +3030,8 @@ pub(crate) async fn spawn_chat_session(
             );
             let pinned = match (&pinned_override, &recipe.resume) {
                 (Some(uuid), _) => Some(uuid.clone()),
-                // Resume forks a NEW native id; it arrives via system/init.
+                // A resume's native id arrives via system/init (older claude
+                // CLIs forked a new one).
                 (None, Some(_)) => None,
                 (None, None) => Some(fresh_native_uuid()),
             };
