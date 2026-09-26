@@ -9,9 +9,18 @@ five copies.
 ## Every merge to `main` MAY cut a release
 
 `release.yml` runs on every push to `main`. `scripts/version-bump.sh` decides the
-next version — or `skip` — from the squash-commit **subject** (which defaults to the
-PR title). The build + publish jobs run only when a release is actually due; a
+next version — or `skip` — from the squash-commit **subjects** (each defaults to its
+PR title) of **every merge since the last `v*` tag**; the largest bump any of them
+asks for wins. The build + publish jobs run only when a release is actually due; a
 `skip` sets `release=false` and they're gated off.
+
+Why every merge since the tag, not just the one that triggered the run: the
+`release` concurrency group keeps one waiting run, and a newer push cancels it. When
+merges land while a release is still building, the waiting runs are replaced, and
+reading only the newest subject lost the rest — after v0.48.1 a `feat:`, a `fix:` and
+a `test:` merged close together, only the `test:` was read, and nothing shipped.
+Whichever run executes now covers every unreleased merge, and a re-run on an
+already-tagged commit finds none and skips.
 
 ## The version mapping (read from the SUBJECT)
 
@@ -21,7 +30,7 @@ PR title). The build + publish jobs run only when a release is actually due; a
 | `fix:` · `perf:` · `revert:` | **patch** (0.3.2 → 0.3.3) | a small change that ships |
 | any `!:` (e.g. `feat!:`) | **major** (0.3.2 → 1.0.0) | a breaking change |
 | `refactor:` · `chore:` · `docs:` · `test:` · `ci:` · `build:` · `style:` | **no release** | rebuilds, but ships no new version |
-| `[skip release]` in the subject | **no release** | explicit opt-out (wins over everything) |
+| `[skip release]` in the subject | **no release** for that merge | explicit opt-out (wins over its own type; its code still ships with the next release) |
 | anything else / no prefix | **patch** | safe default — never a silent skip |
 
 `feat` is reserved for new capability. Don't label a fix, a refactor, or a chore as
@@ -38,7 +47,8 @@ gate is what keeps the Intent sections free of patch-level noise. The
 
 ## Subject-anchored, on purpose
 
-The decision reads only the **subject** (`git log -1 --pretty=%s`), never the body.
+The decision reads only **subjects** (`git log --first-parent --format=%s <tag>..HEAD`),
+never a body.
 On squash-merge GitHub folds the whole PR description into the commit body, so
 reading the type / `!` / `[skip release]` from the entire message would let a stray
 body line flip the bump or skip a release. Put the load-bearing bits in the **PR
@@ -53,7 +63,7 @@ without touching the build.
 
 ## The logic is tested (change the two together)
 
-`scripts/version-bump.sh` is a pure function of `(latest-tag, subject)`. It is pinned
+`scripts/version-bump.sh` is a pure function of `(latest-tag, subjects since it)`. It is pinned
 by `scripts/version-bump.test.sh` (a characterization matrix) which runs in
 `ci.yml`'s `scripts` job. When you change the policy, change the script **and** the
 test in the same commit.

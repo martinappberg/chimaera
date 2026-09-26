@@ -53,5 +53,25 @@ t "v0.3.2" "Merge branch main"           "0.3.3"
 # feat subject stays minor even if the (unseen) body mentions a breaking change.
 t "v0.3.2" "feat: mentions git reset --hard safely" "0.4.0"
 
+# Every merge since the tag (release.yml passes them all): the largest bump wins.
+tm() { # <latest> <expected> <subject>...
+  local latest="$1" exp="$2" got; shift 2
+  got=$(bash "$S" "$latest" "$@")
+  if [ "$got" = "$exp" ]; then pass=$((pass + 1))
+  else fail=$((fail + 1)); printf 'FAIL  latest=%-8s subjects=%-40s exp=%s got=%s\n' "$latest" "$*" "$exp" "$got"; fi
+}
+# The incident: a waiting release run was cancelled by a newer push, and the
+# run that did execute read only the newest subject (a test), so nothing shipped.
+tm "v0.48.1" "0.49.0" "test: race fix" "fix: journal budget" "feat: documents workbench"
+tm "v0.3.2" "0.3.3"  "docs: a" "fix: b" "chore: c"
+tm "v0.3.2" "1.0.0"  "fix: a" "feat!: b" "feat: c"
+tm "v0.3.2" "skip"   "docs: a" "test: b" "ci: c"
+# A merge that opted out doesn't release, but it doesn't hold others back.
+tm "v0.3.2" "0.3.3"  "feat: held back [skip release]" "fix: b"
+tm "v0.3.2" "skip"   "feat: held back [skip release]" "docs: b"
+# No merges since the tag (a re-run on the tagged commit): nothing to ship.
+tm "v0.3.2" "skip"
+tm ""       "0.1.0"  "chore: init" "feat: first"
+
 echo "version-bump.test.sh: pass=$pass fail=$fail"
 [ "$fail" -eq 0 ]
