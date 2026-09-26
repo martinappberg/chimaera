@@ -406,6 +406,8 @@
   }
 
   const note = $derived(deck !== null && hasNotes ? (deck.notes[current] ?? "") : "");
+  /** This slide's notes part was over the reader's cap and never inflated. */
+  const noteSkipped = $derived(deck !== null && hasNotes && deck.notesSkipped.has(current));
   const hiddenSlide = $derived(deck?.presentation.slides[current]?.hidden === true);
 </script>
 
@@ -482,8 +484,12 @@
     {/if}
   </div>
 
-  {#if deck !== null && showNotes && note !== "" && !presenting}
-    <div class="notes" role="note" aria-label="speaker notes">{note}</div>
+  {#if deck !== null && showNotes && (note !== "" || noteSkipped) && !presenting}
+    {#if noteSkipped}
+      <div class="notes skipped" role="note" aria-label="speaker notes">this slide's notes are too large to show here</div>
+    {:else}
+      <div class="notes" role="note" aria-label="speaker notes">{note}</div>
+    {/if}
   {/if}
 
   {#if deck !== null && showThumbs && count > 1}
@@ -735,6 +741,11 @@
     line-height: 1.5;
     white-space: pre-wrap;
     overflow-wrap: anywhere;
+  }
+
+  .notes.skipped {
+    color: var(--muted);
+    font-style: italic;
   }
 
   .strip {

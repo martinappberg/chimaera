@@ -624,7 +624,10 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   drawn by `@aiden0z/pptx-renderer` in the Marp viewer's chrome: arrows / PageUp / PageDown /
   Space / Home / End page the deck, a thumbnail strip jumps, **present** goes full screen,
   `#slide=N` reveals a slide (clamped to the deck), and **speaker notes** (read straight from the
-  package; the renderer doesn't model them) show under the stage. Hidden slides are dimmed and
+  package; the renderer doesn't model them) show under the stage — under the deck's zip entry cap,
+  one part at a time, each inflated only if it declares ≤1 MB (≤32 MB for all notes) and abandoned
+  at 1 MB whatever it declared, so a zip bomb in `notesSlide*.xml` is skipped (that slide's notes
+  say they're too large) instead of exhausting memory. Hidden slides are dimmed and
   tagged. The package is parsed with the renderer's zip limits for untrusted input, media and slide
   nodes decoded lazily, and every external relationship that would load something (a linked
   picture, video or audio) removed before the model is built (`pptxDeck.ts`,
