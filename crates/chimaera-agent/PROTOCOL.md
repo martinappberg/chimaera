@@ -8,7 +8,8 @@ KNOW, how we know it, and what we have not adopted yet. Re-verify with
 Sources:
 - **live**: probed against the real CLIs (claude 2.1.206, codex 0.142.5;
   codex 0.144.2 from Pass 16 on; claude 2.1.259 + codex 0.153.0 from Pass 30
-  on; claude 2.1.280/2.1.281 + codex 0.156.1 from Pass 31 on).
+  on; claude 2.1.280/2.1.281 + codex 0.156.1 from Pass 31 on; claude 2.1.283
+  + codex 0.157.1 from Pass 33 on).
 - **official schema/docs**: Codex's upstream `codex-rs/app-server/README.md`
   and the version-specific output of `codex app-server generate-ts` /
   `generate-json-schema` (the preferred shape inventory for the installed
@@ -112,8 +113,9 @@ extension either), `channel_enable`, `apply_flag_settings`, `reload_skills`,
   `UserPromptSubmit`, which does not fire for stdin `user` messages. Anything
   that hung off that hook (first-prompt capture, `@term:` autolink) must run
   off the protocol's own input path in chat mode.
-- A `--resume` forks a NEW native session id; it arrives via `system/init`
-  (never pin `--session-id` together with `--resume`).
+- A `--resume`'s native session id arrives via `system/init`: older CLIs
+  forked a NEW id, 2.1.283 keeps the resumed one (Pass 33). Never pin
+  `--session-id` together with `--resume`.
 - Bonus stream frames: `rate_limit_event` (adopted — see pass 4),
   `system/thinking_tokens` `{estimated_tokens, estimated_tokens_delta,
   uuid}` (ADOPTED pass 5: fires during thinking even when the display is
@@ -158,14 +160,22 @@ proposedExecpolicyAmendment, availableDecisions:["accept",
 {acceptWithExecpolicyAmendment:{…}}, …]}` — answer by JSON-RPC id with
 `{"decision":"accept"}` / `{"decision":"decline"}`. **Any unrecognized
 decision string is silently treated as a decline** (live: "approved" declined
-the command). File changes have an analogous `requestApproval` (shape TBD —
-capture before mapping).
+the command). File changes have an analogous
+`item/fileChange/requestApproval` (mined in extension pass 2). Every other
+server request is refused with a JSON-RPC error, never shown as a card
+(Pass 34).
 
 ## Cross-agent invariants
 
 - One normalized event model (`model.rs`, ACP-shaped); drivers translate.
 - Caps at event construction, not sinks (login-node budgets).
 - Handshake watchdog + degrade-to-PTY is per-driver mandatory behavior.
+- An agent→client request no handler knows is never shown as a permission
+  card, and the user hears about it once per kind (a Notice; both drivers
+  share `UNHANDLED_REQUESTS_CAP`/`UNHANDLED_REQUEST_NAME_MAX`). Claude's
+  control requests are parked (the CLI's deadline settles them); codex's
+  JSON-RPC requests get a `-32601` error, since nothing else would answer
+  (Pass 34).
 
 ## Version detection (both drivers)
 
@@ -2411,3 +2421,104 @@ Hermetic mapper tests (9 new in codex.rs): the completed marker never re-opens a
 ### Gate (Pass 31)
 
 Hermetic: claude signature classifier pinned to a real narration signature, stream routing (narration → prose, reasoning → thought, hold timeout, frame-decided block, unstreamed frames, teardown release), `tool_use_summary`, the hand-back strip, the subagent close (one finished line, no background notice), importer narration; the `fake-claude showcase` manager test drives every surface through the pipeline (narration prose, three batch labels, one `SubagentFinished` with stats, a clean Agent row, the monitor flag, the CLI's close sentences); wire-contract pins for `ToolSummary`, `SubagentFinished`, `TurnTokens`, `ActivityLine` and the new flags; driver tests for the per-call token sum and the deduped activity line. Codex: see its Gate list above. Web UI: reducer tests for labels, finished rows, turn tokens, activity line and wake markers; the group-title helper's own suite.
+
+## Pass 32 (2026-09-25 — live probes claude 2.1.281 + codex 0.156.1): how to stop an agent that holds background work. ADOPTED.
+
+The trigger: a daemon update resumes a chat's conversation, but the background commands, monitors and workflows its old process was running never come back, and nothing tells the agent. Sources: the 2.1.259 binary's embedded JS, then four paid Haiku probes (about $0.20 total) and two free codex probes. Each claude probe was a stream-json claude that started one `run_in_background` Bash (`sleep N`) and one Monitor (`sleep N+1; echo done`), finished its turn, and was then stopped one way.
+
+- **Claude's Bash tool and Monitor run detached.** The shell provider is `{type: "bash", shellPath, detached: true, stdin: "pipe", …}`. Live: the background `sleep` and the Monitor's `zsh -c …` each lead their own process group (pgid = their own shell), with ppid chains back to claude. Claude stops a task by signalling its group (`process.kill(-pid, …)`).
+- **SIGKILL to claude** (the old daemon-exit path, tokio `kill_on_drop`): both the Bash `sleep` and the Monitor command survive, reparented to init.
+- **stdin EOF** (the harness's old polite stop): claude did not exit within 10 s. It stopped the Monitor (`task_notification {status: "stopped"}`), then **started a new turn** reacting to that stop (`init`, `thinking_tokens`, `post_turn_summary`), which is billed. The background Bash `sleep` was still running when the 10 s SIGKILL came, and survived it. With chimaera's 3 s grace, the same thing happens within the grace. This contradicts the SDK schema text on `perTaskStopAffordance` ("a one-shot run… closes stdin… still kills hold-back tasks at the held-result release"): an idle interactive session holds no result to release.
+- **SIGTERM to claude** (with stdin still open, or closed right after): exit in 0.28 s with status 143, a `task_notification {status: "stopped"}` for each task, and no new turn. Nothing survived.
+- **Codex app-server** (0.156.1, initialize + `thread/start`, free): exits 0 in 0.04 s on stdin EOF and on SIGTERM alike, and no descendants survive either.
+- **Neither agent restarts the work on resume.** `--resume` and `thread/resume` restore the conversation; its processes are gone. The transcript still holds the agent's own tool results (for example "Command running in background with ID: bg-1"), so the agent can restart the work once it is told.
+
+ADOPTED:
+
+- The harness SIGTERMs the child before closing stdin on every stop chimaera initiates (`ChildGuard::terminate`; kill, dead receiver, protocol error), then waits `KILL_GRACE` and SIGKILLs. A child that closed its own output is left to exit and keeps its own status. This covers closing a chat, view switches and rewinds, as well as daemon exit.
+- A graceful daemon stop runs that stop for every live chat driver (`chat::stop_all_for_exit`, after the ledger's final flush) instead of the runtime's drop-time SIGKILL.
+- The pump folds a per-session `Carryover` (bridge on, ultracode, turn in flight, running non-ambient background tasks), and the ledger snapshots it. Resurrection restores the bridge and ultracode through the spawn. When work was cut off, it sends the agent one message listing the tasks with their kinds, labels and ids; the echo carries `UserMessage.origin: "restart"`, stamped by the manager's Send↔echo reservation, so neither driver carries the tag.
+- A pick-up is withheld when the chat's last one (the carryover's `pickup_at_ms`, stamped when the process saw the `origin: "restart"` echo) went out less than 10 minutes earlier, so a daemon crash loop cannot start a billed turn per crash.
+- `SpawnSpec.initial_ultracode` makes the claude handshake apply `apply_flag_settings {ultracode: true}` under `bootstrapping`, after effort and mode (ultracode raises effort itself), so the read-back is not recorded as a pick.
+
+A mid-turn claude was not probed. SIGTERM goes through the same handler, but a claude that ignores it past the grace is SIGKILLed, and its detached shells survive, as before.
+
+End to end on claude 2.1.283 (Haiku, isolated daemon, real HOME for auth): the daemon stopped in 0.84 s and the chat's background `sleep` ended with it (exit 143). After the restart, the pick-up message went out. The first wording ("Restart whichever of these you still need… If none are needed any more, just say so") got "Acknowledged. Background tasks stopped with session restart. Waiting for your next instruction." and nothing was restarted. With restoring as the default ("Restart each of these the same way you started it, unless it is clearly no longer needed (say which you skipped)"), the agent re-ran `sleep` and answered "Restarted." Closing the chat ended that command within 0.4 s.
+
+Observed on 2.1.283, not adopted: on a `--resume`d session, the first user message is answered by a `result` within ~15 ms (duration_ms 15–17, `total_cost_usd` repeating the previous total, no content) before the real turn's frames. The driver maps it to an empty completed turn, followed by the real one. It happened twice, both times on the first send after a resume. Cosmetic; not investigated further.
+
+### Gate (Pass 32)
+
+Hermetic: the `Carryover` fold (bridge through Init snapshots and RemoteControl, ultracode, turn start and end, running and non-ambient filtering, reset on exit), origin stamping pairing only with a Send echo, `carryover_reports_process_state_and_ultracode_restores` (fake-claude: bridge, bootstrapped ultracode read back unchosen, tagged echo, background set, reset on exit), the ledger round trip with carryover (older or malformed entries load as `None`), and the message builder. Live on an isolated daemon with fake-claude, four daemon lives: bridge and ultracode restored, the message listing `bg-0` sent once and the agent restarting the task, a bridge the user had turned off staying off while `chat.remoteControlAtStart` was on, a cut-off turn told to continue, no message with `chat.resumeAfterRestart` off, and a 0.19 s daemon stop with two chats. The real-claude stop probes are above. Live suite: `driver_initial_ultracode_applies_without_a_pick` (free) and `driver_stop_ends_claudes_detached_background_work` (one Haiku turn: the driver stop leaves no `run_in_background` process). `just chat-smoke` on claude 2.1.283 + codex 0.156.1: 23/23 (the codex cases that run real turns first failed on an expired codex login, `workspace routing discovery unauthorized (401)`, and passed after `codex login`).
+
+## Pass 33 (2026-09-25 — drift check claude 2.1.283 + codex 0.157.1): pins bumped, no driver change. ADOPTED.
+
+The installed CLIs had moved past both pins (claude 2.1.281 → 2.1.283, codex 0.156.1 → 0.157.1). Sources: `just chat-smoke` against the real installs, the generated codex app-server schemas of both versions, the SDK schema `.describe()` text of both claude binaries, free control probes, and four small paid probes (about $0.28: one Haiku turn with a Sonnet advisor, and three Haiku resume pairs). The 0.156.1 codex came from `npm install --prefix <scratch> @openai/codex@0.156.1`, the 2.1.281 claude from `npm pack @anthropic-ai/claude-code-darwin-arm64@2.1.281` (the platform package holds the bare binary), so neither global install was touched.
+
+### Live suite
+
+23/23 on claude 2.1.283 + codex 0.157.1 (7 codex, 16 claude and driver cases). The suite never sets `SpawnSpec.agent_version`, so it does not exercise the harness's drift warning; that check now compares whole version tokens (`version_matches_pin`), because a substring test would pass codex 0.157.10 against the 0.157.1 pin. The claude and driver cases ran a second time on their own (16/16), because the advisor probe below left `advisorModel` in the user's settings while the first run was still going, and a claude spawned in that window inherited it. `codex_turn_summary_setting_is_applied` saw one reasoning-summary delta.
+
+### Codex 0.156.1 → 0.157.1: the generated schema
+
+`codex app-server generate-ts --experimental` and `generate-json-schema` on both binaries. The diff is purely additive. New client requests `account/gatewayOAuth/login|read|cancel` and notification `account/gatewayOAuth/changed {authUrl, providerId, status: notReady|started|succeeded|failed, error}`, with `InitializeCapabilities.explicitGatewayOauth`. New optional or nullable fields: `McpResourceReadParams.target {connectorId, linkId}`, `McpServerStatus.httpOrigin`, `PluginSummary.extensions` (entrypoints, icons, quick actions, search providers, settings), `ThreadItemEntry.startedAtMs|completedAtMs` (`thread/items/list`), `ThreadRealtimeStartParams.backendReasoningStatus`. Nothing was removed or renamed. Every method literal in `codex.rs` is still in the unions except three that were already absent from 0.156.1 and are fallbacks: `turn/failed` (the legacy arm, Pass 31), `thread/rollback` (the rewind fallback after any `thread/revert` failure; it is gone from the schema since 0.156.1, so on current binaries that fallback can only fail, and the revert's own error is the one reported) and `item/plan` (a default item id, not a method).
+
+### Claude 2.1.281 → 2.1.283: the SDK schema text
+
+Mostly minifier churn. Substantive changes: `set_max_thinking_tokens` now tells an omitted `max_thinking_tokens` (budget unchanged, for a display-only change) from `null` (reset to the session default); the driver always sends a number (31999 or 0), so it is unaffected. `plugin_errors` is public now, and an entry for a `--plugin-dir` that did not load carries its `path`. New `@internal` fields that reach no mapped frame: a per-send frame timing breakdown, a usage-limit grace signal, an `external_metadata` `artifacts` patch, and `thinking.display` on stream events (live: the `stream_event` wrapper carries `thinking_display: "updates"` on `message_start` and thinking blocks). New settings: `availableModels` prefix matching, `blockedModels` and a match mode. New tool parameters: an attached-machine target and a `taskId` for "the result that moved the command to the background".
+
+### Claude: `--resume` keeps the session id
+
+2.1.283's `system/init` after `--resume <id>` carried the resumed id in all three probes, including one whose session was created with `--session-id`. The Quirks note above said a resume forks a new id; it now says the id comes from `system/init`, which is where the driver already takes it.
+
+### Claude: the empty `result` after a resume (Pass 32), explained
+
+It is not every resume. A clean resume (the previous process finished its turn and exited) answered the first send with one normal turn, twice. It reproduces when the previous process was SIGTERMed while a `run_in_background` Bash was running: the resumed process answers the first send with `system/init`, then a `result` with `num_turns: 0`, `duration_ms: 25`, `duration_api_ms: 0`, `stop_reason: null`, `usage.iterations: []` and the previous `total_cost_usd`, then a second `system/init` and the real turn. The cause is in the on-disk transcript: at resume the CLI finds the background shell has no completion record and queues its own user message, `<task-notification>…<status>stopped</status><summary>Background shell command didn't finish before the previous session ended</summary>…`. The first send drains that notification as a turn without an API call, which is the empty result. The notification never reaches stdout, like the other queue-injected messages (Pass 31). The model sees it in the next turn's context, so after a daemon restart a claude agent learns its background shell died from the CLI too, before chimaera's pick-up message. Only Bash was probed; Monitors were not. Not adopted: the driver still maps the empty result to an empty completed turn before the real one.
+
+### Claude: the advisor server tool (observed, not adopted)
+
+- **Enabling it.** `--advisor <model>`, the `advisorModel` setting, `apply_flag_settings {advisorModel: "sonnet"}` (`null` clears it; live), or `/advisor [fable|opus|sonnet|off]` ("Let Claude consult a stronger model at key moments", in the `initialize` catalog). **`/advisor <model>` sent as a stream-json message persists `advisorModel` to the user's `~/.claude/settings.json`**, as the TUI does, and so changes every Claude Code session on the machine (it did during this pass). Probe it only against a throwaway HOME. `get_settings.applied.advisor` names the resolved model (`sonnet` → `claude-sonnet-5`, `opus` → `claude-opus-5-5`, `null` when none); neither `initialize` nor `system/init` carries it. A feature flag gates it (or `CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL`), `CLAUDE_CODE_DISABLE_ADVISOR_TOOL` turns it off, and the advisor must rank at least as high as the working model (`advisor_rank` in the CLI's model catalog). A bad pairing is `api_error: "advisor_incompatible"`.
+- **Wire** (live; Haiku with a Sonnet advisor, `--include-partial-messages`). `content_block_start {type: "server_tool_use", id: "srvtoolu_…", name: "advisor", input: {}}` and its per-block assistant frame; then about 38 s with nothing but one `ping` stream event; then `content_block_start {type: "advisor_tool_result", tool_use_id, content: {type: "advisor_result", text}}`, with the whole advice in the start event and no deltas, and its per-block assistant frame. The model then continues in the same API response (same `request_id`). The frames carry no advisor model, but the on-disk transcript entries do (`advisorModel: "claude-sonnet-5"`). `result.usage.iterations` lists the advisor's call as `{type: "advisor_message", model, input_tokens, output_tokens}` and `modelUsage` bills its model separately: $0.125 of the turn's $0.151, because the advisor reads the whole context (45k input tokens here). Other result contents, from the schema and the binary: `advisor_redacted_result`, `advisor_tool_result_error {error_code}`, and a refusal (`stop_reason: "refusal"`).
+- **What the TUI shows.** An "Advising using <model>" row with a spinner. When it resolves: "Advisor has reviewed the conversation and will apply the feedback" (the advice text only in verbose or transcript mode), "Advisor unavailable (<code>)", or "Advisor declined to advise on this request".
+- **Chimaera today** drops both blocks: the assistant content loop maps `text`, `thinking` and `tool_use` only. The chat shows nothing while the advisor works and never shows the advice. Supporting it is a follow-up.
+
+### Gate (Pass 33)
+
+`just chat-smoke` 23/23 as above. No driver mapping changed: the pins moved (`TESTED_CLAUDE_VERSION = "2.1.283"`, `TESTED_CODEX_VERSION = "0.157.1"`), the harness's drift check matches whole version tokens (hermetic `driver::tests::version_pin_matches_whole_tokens_only`, plus the existing `version_drift_is_nonfatal_and_never_reaches_the_stream`), and the resume-id notes were corrected.
+||||||| parent of 7887c14 (fix: codex server requests without a handler get an error, not a bogus approval card)
+
+## Pass 34 (2026-09-25 — codex 0.157.1 generated schema + binary + one live probe): server requests without a handler. ADOPTED.
+
+The codex driver built a command-approval card for every server→client request it did not special-case. After `item/tool/requestUserInput`, `mcpServer/elicitation/request` and `item/permissions/requestApproval`, `on_server_request` matched only `item/fileChange/requestApproval` by name. Its `_` arm turned anything else into an Allow/Deny card titled from `command` (or "codex action") and answered with `{decision: …}`. Any request whose params carried `networkApprovalContext.host` became a network card, whatever its method. Sources: the 0.157.1 generated schema (`generate-ts --experimental`, `ServerRequest.ts` and the params/response types), the 0.157.1 binary's strings, and one live probe (two tiny turns on the ChatGPT plan). Pass 33 is the 2.1.283/0.157.1 drift check.
+
+### The 0.157.1 `ServerRequest` union
+
+| method | params → response | when codex sends it | driver |
+|---|---|---|---|
+| `item/commandExecution/requestApproval` | `{kind: command\|writeStdin, threadId, turnId, itemId, command?, cwd?, commandActions?, networkApprovalContext?, proposedExecpolicyAmendment?, proposedNetworkPolicyAmendments?, availableDecisions?, …}` → `{decision}` | shell, stdin and network approvals | card (unchanged; now matched by name) |
+| `item/fileChange/requestApproval` | → `{decision}` | patch approvals | card (unchanged) |
+| `item/tool/requestUserInput` | → `{answers}` | model questions | question card (unchanged) |
+| `mcpServer/elicitation/request` | → `{action, content?}` | MCP tool approvals and forms | card (unchanged) |
+| `item/permissions/requestApproval` | → `{permissions, scope}` | extra sandbox permissions | card (unchanged) |
+| `currentTime/read` | `{threadId}` → `{currentTimeAt}` (whole Unix seconds) | the client's clock for the `current_time_reminder` feature (`codex features list`: under development, off) | **answered from the daemon's clock** |
+| `item/tool/call` | `{threadId, turnId, callId, namespace, tool, arguments}` → `{contentItems, success}` | a client-registered dynamic tool; chimaera registers none | **refused** |
+| `account/chatgptAuthTokens/refresh` | `{reason, previousAccountId?}` → tokens | externally managed ChatGPT auth; chimaera leaves auth to the CLI | **refused** |
+| `attestation/generate` | `{}` → `{token}` | only after `initialize.capabilities.requestAttestation`, which chimaera does not declare | **refused** |
+| `execCommandApproval`, `applyPatchApproval` (v1) | `{conversationId, callId, command: string[], cwd, parsedCmd, …}` / `{conversationId, callId, fileChanges, grantRoot}` → `{decision: ReviewDecision}` | v1-API conversations only; chimaera opens v2 threads | **refused** |
+
+The legacy v1 approvals do not share the v2 shapes. `ReviewDecision` is `"approved" | "approved_for_session" | {denied: {rejection}} | "abort" | "timed_out" | {approved_execpolicy_amendment: …} | …`; the v2 card's `"accept"`/`"decline"` would not deserialize, so they get no card. `currentTime/read`, `item/tool/call`, `account/chatgptAuthTokens/refresh` and `attestation/generate` were already in the 0.156.1 union.
+
+### When `currentTime/read` fires (not reproduced)
+
+The binary has `app-server/src/current_time.rs`, `core/src/tools/handlers/current_time.rs`, the messages "current-time request failed: code= message=", "current-time request was canceled" and "current-time request timed out after …s", and a `nonfatal_clock_read_errors` feature beside `current_time_reminder`. So the app-server times the request out itself, and it logs an error reply as a failure. Live, 0.157.1 with `-c features.current_time_reminder=true` (the app-server warned "Under-development features enabled"): two turns, and no `currentTime/read` arrived. The trigger is unmined, so the answer shape is pinned by the schema alone.
+
+### ADOPTED
+
+- `currentTime/read` is answered at once: `{currentTimeAt: <SystemTime::now() as whole Unix seconds>}`, or a `-32603` error if the clock reads before the epoch. It shows nothing to the user.
+- `item/commandExecution/requestApproval` is an explicit arm (the network variant is its `networkApprovalContext.host` guard). `item/fileChange/requestApproval` stays explicit. Every other method gets `{id, error: {code: -32601, message: "chimaera does not handle <method>"}}` (-32601 is the app-server's own "Method not found" code), plus one `Notice` and one daemon `warn` per method per session. What codex does with the error is its own error path (for `currentTime/read` the binary logs "current-time request failed: code=… message=…"); no refused method was observed live, since none fires for chimaera's thread setup.
+- A server request that arrives while the handshake awaits a response (initialize, thread open, `config/read`, `skills/list`, a revert) used to be dropped, never answered. `HandshakeSideband` now keeps them (in order, up to 16) and replays each through the mapper after the handshake, the way the Remote Control status already was, so it gets a card, an answer or a refusal. None was observed there live; this closes the gap in the same bug class.
+- Symmetry with claude. `claude.rs` parks an unhandled `control_request` on purpose: the CLI settles it at its own deadline, or another attached client does, and an error reply could break flows that rely on that. A codex JSON-RPC request has no other settler, so parking it would only stall the agent until the app-server's timeout, where it has one. What both drivers share: never a card, a Notice and a daemon `warn` once per kind, and the caps `UNHANDLED_REQUESTS_CAP` (64 names remembered) and `UNHANDLED_REQUEST_NAME_MAX` (80 chars in a notice or reply), both in `model.rs`. Claude's notice now caps the subtype name too; before, only the set was bounded.
+
+### Gate (Pass 34)
+
+Hermetic: `current_time_read_is_answered_from_the_clock`; `handshake_sideband_keeps_server_requests_for_replay`; `unhandled_server_requests_are_refused_not_carded` (the four non-approval methods, both v1 approvals, and an unknown method carrying `networkApprovalContext`: each gets exactly one `-32601` reply naming the method, no card, one Notice, and none on a repeat); `unhandled_server_request_notices_are_bounded` and claude's `unknown_control_subtype_notices_are_bounded` (a long name is capped, the set stops at the cap, requests are still refused or parked past it). The existing approval, elicitation, permissions and question tests pin the arms that did not change. Live: `just chat-smoke` 24/24 on claude 2.1.283 + codex 0.157.1, including the new `driver_stack_end_to_end_against_real_codex`. Every other codex case drives the raw `CodexChat` client, so until this case the suite never ran `CodexMapper` against real frames; it pins that an ordinary turn raises no card and no unhandled-request notice, and that Init, the resume index and replay work through the driver.

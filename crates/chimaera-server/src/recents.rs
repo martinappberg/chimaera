@@ -40,8 +40,8 @@ pub(crate) struct RecentEntry {
     /// None = Chimaera can only start a fresh session from this row.
     pub(crate) resume: Option<String>,
     /// Ancestor session ids this conversation absorbed across resume cycles
-    /// (claude forks a new id per resume; the ancestors' transcripts stay on
-    /// disk). The merge must not resurrect them from the transcript scan —
+    /// (older claude CLIs forked a new id per resume, 2.1.283 keeps it; the
+    /// ancestors' transcripts stay on disk). The merge must not resurrect them from the transcript scan —
     /// resuming an ancestor id would fork the conversation from its
     /// pre-resume state.
     pub(crate) supersedes: Vec<String>,
@@ -151,7 +151,7 @@ impl RecentsStore {
     /// Record an ended conversation at the front of its workspace's list.
     /// The same conversation ending again (a resume that re-ended) updates
     /// its existing entry, and `supersedes` — the session id this one was
-    /// resumed FROM (claude forks a new id per resume) — replaces the
+    /// resumed FROM (older claude CLIs forked a new id per resume) — replaces the
     /// ancestor entry instead of duplicating the conversation, inheriting
     /// its ancestor chain so the transcript scan can never resurrect any
     /// generation of it. Handle-less duplicates collapse by (kind, title)
@@ -356,8 +356,8 @@ pub(crate) async fn list_recents(
             .into_response();
     };
     // A conversation is "live" through either identity: the transcript its
-    // hooks report, or the ancestor id it was resumed from (claude forks a
-    // new session id per resume, and hooks may not have fired yet).
+    // hooks report, or the ancestor id it was resumed from (older claude CLIs
+    // forked a new session id per resume, and hooks may not have fired yet).
     let (live, exclude): (std::collections::HashSet<String>, Vec<PathBuf>) = {
         let agents = crate::lock(&state.agents);
         (
