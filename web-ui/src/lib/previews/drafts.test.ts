@@ -31,7 +31,7 @@ const net = vi.hoisted(() => {
   return {
     store,
     sent,
-    fsDraftPut: (path: string, _base: string, text: string, keepalive = false) =>
+    fsDraftPut: (path: string, _base: string, text: string, _updatedMs: number, keepalive = false) =>
       hold({ kind: "put", path, text, keepalive }, () => {
         store.set(path, text);
         return "ok" as const;
