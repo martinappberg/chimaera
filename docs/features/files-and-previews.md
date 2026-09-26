@@ -464,7 +464,10 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   `fetchPage`.
 - **PDF / image / HTML.** Fetched via a short-lived **ticket**: `POST /api/v1/fs/ticket {path}` →
   `GET /raw/{ticket}` (no bearer header — iframes/`<img>`/pdf.js can't send one; ticket TTL 600s,
-  range-aware). HTML is sandboxed (`CSP: sandbox allow-scripts`, no-referrer); SVG is sandboxed too.
+  range-aware). Every `/raw` response says `X-Content-Type-Options: nosniff`. HTML is sandboxed
+  (`CSP: sandbox allow-scripts`, no-referrer); every other type a browser renders as markup (XML,
+  XSL, SVG, MathML, any `+xml` — an XML file's XHTML `<script>` would run in the daemon's origin)
+  gets a script-less `sandbox`.
   **Caching over a tunnel:** a ticket is minted with the file's version token, and minting again
   for the same path + version while it lives answers the *same* ticket (its expiry renewed) — so
   the URL is stable for as long as the file is unchanged, and a re-render, a tab switch or a reload
@@ -482,7 +485,9 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   or `figs/a.png` lands on `GET /raw/{ticket}/{*rest}`, which serves files beside an HTML ticket's
   page — downward only (plain visible components: no `..`, no absolute path, no `.hidden` name),
   every component opened `O_NOFOLLOW` beneath the folder's descriptor (a symlink never leads out),
-  with the same sandbox CSP and cache rules. Only an HTML ticket opens its folder. No CORS header is
+  and every response there is sandboxed whatever its type (HTML with `allow-scripts`, like the
+  report; anything else script-less — inert on a script, style or image the page loads). Only an
+  HTML ticket opens its folder. No CORS header is
   sent on purpose: the origin-less frame can *load* its neighbors (script, style, image, media
   tags) but never *read* them with `fetch`/XHR, so a report cannot read out the files around it —
   a report that fetches its data as JSON still needs it inline. The split live preview (`srcdoc`)

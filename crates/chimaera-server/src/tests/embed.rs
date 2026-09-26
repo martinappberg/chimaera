@@ -378,3 +378,106 @@ async fn raw_asset_serves_a_reports_folder_and_nothing_outside_it() {
     assert_eq!(status, StatusCode::NOT_FOUND);
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// Every `/raw` response says `nosniff`; a report's folder is sandboxed
+/// whatever the type (an `evil.xml` holding an XHTML `<script>` would
+/// otherwise run in the daemon's origin), and markup types are sandboxed on
+/// the plain ticket route too — on 304 and 416 as well as 200.
+#[tokio::test]
+async fn raw_sandboxes_markup_and_every_report_asset() {
+    let state = test_state();
+    let root = test_dir("embed-sandbox");
+    let report = root.join("report");
+    std::fs::create_dir_all(report.join("pages")).unwrap();
+    std::fs::write(report.join("index.html"), "<p>report</p>").unwrap();
+    let evil = r#"<html xmlns="http://www.w3.org/1999/xhtml"><script>alert(document.domain)</script></html>"#;
+    for name in [
+        "evil.xml",
+        "evil.xsl",
+        "evil.svg",
+        "evil.mml",
+        "evil.xhtml",
+        "evil.rss",
+    ] {
+        std::fs::write(report.join(name), evil).unwrap();
+    }
+    std::fs::write(report.join("app.js"), "console.log(1)").unwrap();
+    std::fs::write(report.join("style.css"), "p{}").unwrap();
+    std::fs::write(report.join("a.png"), png(2, 2)).unwrap();
+    std::fs::write(report.join("blob.bin"), "<script>x()</script>").unwrap();
+    std::fs::write(report.join("pages/other.html"), "<p>two</p>").unwrap();
+
+    let ticket = ticket_for(&state, &report.join("index.html")).await;
+    // Under the report's folder: HTML keeps its scripts (in the sandbox's
+    // opaque origin, like the report); everything else is script-less.
+    for (rest, csp) in [
+        ("evil.xml", "sandbox"),
+        ("evil.xsl", "sandbox"),
+        ("evil.svg", "sandbox"),
+        ("evil.mml", "sandbox"),
+        ("evil.rss", "sandbox"),
+        ("app.js", "sandbox"),
+        ("style.css", "sandbox"),
+        ("a.png", "sandbox"),
+        ("blob.bin", "sandbox"),
+        ("evil.xhtml", "sandbox allow-scripts"),
+        ("pages/other.html", "sandbox allow-scripts"),
+        ("index.html", "sandbox allow-scripts"),
+    ] {
+        let uri = format!("/raw/{ticket}/{rest}");
+        let (status, headers, _) = get_with(&state, &uri, &[]).await;
+        assert_eq!(status, StatusCode::OK, "{rest}");
+        assert_eq!(header_str(&headers, "x-content-type-options"), "nosniff");
+        assert_eq!(
+            header_str(&headers, "content-security-policy"),
+            csp,
+            "{rest}"
+        );
+        assert_eq!(header_str(&headers, "referrer-policy"), "no-referrer");
+        // A revalidation and an unsatisfiable range carry the same guard.
+        let etag = header_str(&headers, "etag").to_string();
+        let (status, headers, _) = get_with(&state, &uri, &[("if-none-match", &etag)]).await;
+        assert_eq!(status, StatusCode::NOT_MODIFIED, "{rest}");
+        assert_eq!(header_str(&headers, "x-content-type-options"), "nosniff");
+        assert_eq!(header_str(&headers, "content-security-policy"), csp);
+        let (status, headers, _) = get_with(&state, &uri, &[("range", "bytes=999999-")]).await;
+        assert_eq!(status, StatusCode::RANGE_NOT_SATISFIABLE, "{rest}");
+        assert_eq!(header_str(&headers, "x-content-type-options"), "nosniff");
+        assert_eq!(header_str(&headers, "content-security-policy"), csp);
+    }
+    let (status, headers, _) = get_with(&state, &format!("/raw/{ticket}/nope.js"), &[]).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(header_str(&headers, "x-content-type-options"), "nosniff");
+
+    // The plain ticket route: markup is sandboxed, script-less unless it is
+    // HTML; types that never render as a document only get `nosniff`.
+    for (name, csp) in [
+        ("evil.xml", Some("sandbox")),
+        ("evil.xsl", Some("sandbox")),
+        ("evil.svg", Some("sandbox")),
+        ("evil.mml", Some("sandbox")),
+        ("evil.rss", Some("sandbox")),
+        ("evil.xhtml", Some("sandbox allow-scripts")),
+        ("index.html", Some("sandbox allow-scripts")),
+        ("a.png", None),
+        ("app.js", None),
+        ("blob.bin", None),
+    ] {
+        let ticket = ticket_for(&state, &report.join(name)).await;
+        let (status, headers, _) = get_with(&state, &format!("/raw/{ticket}"), &[]).await;
+        assert_eq!(status, StatusCode::OK, "{name}");
+        assert_eq!(header_str(&headers, "x-content-type-options"), "nosniff");
+        assert_eq!(
+            headers
+                .get("content-security-policy")
+                .map(|v| v.to_str().unwrap()),
+            csp,
+            "{name}"
+        );
+    }
+    let (status, headers, _) =
+        get_with(&state, "/raw/t-00000000000000000000000000000000", &[]).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(header_str(&headers, "x-content-type-options"), "nosniff");
+    std::fs::remove_dir_all(&root).ok();
+}

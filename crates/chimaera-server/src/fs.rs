@@ -4495,10 +4495,12 @@ fn parse_byte_range(value: &str, total: u64) -> Option<Result<(u64, u64), ()>> {
 }
 
 /// GET /raw/{ticket} — the ticketed file's bytes, no bearer auth (mounted
-/// outside the /api auth layer). Content-Type comes from the extension. HTML
-/// is confined with `Content-Security-Policy: sandbox allow-scripts` and no
-/// referrer; SVG gets a script-less sandbox (scripts never run in <img>, but
-/// direct navigation should not run them either). Single byte ranges are
+/// outside the /api auth layer). Content-Type comes from the extension, and
+/// every response says `X-Content-Type-Options: nosniff`. HTML is confined
+/// with `Content-Security-Policy: sandbox allow-scripts` and no referrer;
+/// every other type a browser renders as a document with markup (XML, XSL,
+/// SVG, MathML — an XML file's XHTML `<script>` runs on direct navigation)
+/// gets a script-less sandbox (see [`raw_sandbox`]). Single byte ranges are
 /// honored (206/416; pdf.js fetches pages lazily this way). 404 on unknown
 /// or expired tickets, and on files that vanished since the ticket was minted.
 /// Cacheable for the ticket's remaining life, revalidated by `ETag` (see
@@ -4528,7 +4530,7 @@ pub(crate) async fn raw(
             return raw_not_found();
         }
     };
-    serve_raw(file, &meta, &path, &headers, fresh_for).await
+    serve_raw(file, &meta, &path, &headers, fresh_for, RawRoute::File).await
 }
 
 /// GET /raw/{ticket}/{*rest} — a file beside an HTML report, so the report's
@@ -4539,10 +4541,14 @@ pub(crate) async fn raw(
 /// `..`, no absolute path, no hidden `.name` anywhere), and every component
 /// is opened `O_NOFOLLOW` beneath the folder's descriptor
 /// ([`crate::download::open_beneath`]), so a symlink can never lead out of
-/// the subtree. Same sandbox CSP, range and cache rules as [`raw`]. The
-/// frame has no origin, so its scripts can LOAD these files (script, style,
-/// image, media tags) but never READ them with fetch/XHR — no CORS header is
-/// sent on purpose: a report must not be able to read out its neighbors.
+/// the subtree. Every response here is sandboxed, whatever its type (HTML
+/// with `allow-scripts`, like the report; everything else without): a file
+/// the report names is not trusted to be what its extension says, and a
+/// sandbox header on a script, style or image it loads is inert. Same
+/// range and cache rules as [`raw`]. The frame has no origin, so its scripts
+/// can LOAD these files (script, style, image, media tags) but never READ
+/// them with fetch/XHR — no CORS header is sent on purpose: a report must
+/// not be able to read out its neighbors.
 pub(crate) async fn raw_asset(
     State(state): State<Arc<AppState>>,
     axum::extract::Path((ticket, rest)): axum::extract::Path<(String, String)>,
@@ -4578,12 +4584,70 @@ pub(crate) async fn raw_asset(
         &relative,
         &headers,
         fresh_for,
+        RawRoute::Folder,
     )
     .await
 }
 
 fn raw_not_found() -> Response {
-    (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response()
+    let mut response = (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response();
+    response.headers_mut().insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    response
+}
+
+/// Which `/raw` route a response answers: it decides the sandbox.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RawRoute {
+    /// `/raw/{ticket}`: the ticketed file itself.
+    File,
+    /// `/raw/{ticket}/{*rest}`: a file in an HTML report's folder.
+    Folder,
+}
+
+/// The `Content-Security-Policy` a `/raw` response of type `mime` carries.
+/// HTML and XHTML (the reports) run their scripts in a sandbox, which gives
+/// them an opaque origin — never the daemon's. Every other type a browser
+/// renders as a document with markup, where a `<script>` could run in the
+/// daemon's origin on direct navigation (`text/xml` holding XHTML, XSL, SVG,
+/// MathML, any `+xml`), gets a sandbox with no scripts at all; so does
+/// everything under a report's folder.
+fn raw_sandbox(mime: &mime_guess::Mime, route: RawRoute) -> Option<&'static str> {
+    let sub = mime.subtype().as_str();
+    if sub == "html" || mime.essence_str() == "application/xhtml+xml" {
+        return Some("sandbox allow-scripts");
+    }
+    let markup = sub == "xml"
+        || sub == "xsl"
+        || sub == "mathml"
+        || sub.starts_with("xml-")
+        || mime.suffix() == Some(mime_guess::mime::XML);
+    (markup || route == RawRoute::Folder).then_some("sandbox")
+}
+
+/// The security headers every `/raw` response carries (304 and 416 too:
+/// a revalidation must not strip what the cached copy was served with).
+fn raw_security_headers(
+    mime: &mime_guess::Mime,
+    route: RawRoute,
+) -> Vec<(HeaderName, HeaderValue)> {
+    let mut out = vec![(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    )];
+    if let Some(csp) = raw_sandbox(mime, route) {
+        out.push((
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static(csp),
+        ));
+        out.push((
+            header::REFERRER_POLICY,
+            HeaderValue::from_static("no-referrer"),
+        ));
+    }
+    out
 }
 
 /// Whether a ticket's file opens its folder to [`raw_asset`]: HTML documents
@@ -4672,16 +4736,20 @@ fn etag_matches(headers: &HeaderMap, etag: &str) -> bool {
 /// private, max-age=` the ticket's remaining life — the URL is stable per
 /// file version (see [`TicketStore`]), so within that window the browser
 /// reuses its copy outright and afterwards revalidates to a 304 instead of
-/// re-downloading over the tunnel. `name` decides the content type.
+/// re-downloading over the tunnel. `name` decides the content type, and
+/// with `route` the sandbox ([`raw_security_headers`], on every status).
 async fn serve_raw(
     mut file: tokio::fs::File,
     meta: &std::fs::Metadata,
     name: &Path,
     headers: &HeaderMap,
     fresh_for: Duration,
+    route: RawRoute,
 ) -> Response {
     let total = meta.len();
     let etag = raw_etag(meta);
+    let mime = mime_guess::from_path(name).first_or_octet_stream();
+    let security = raw_security_headers(&mime, route);
     let mut validators: Vec<(HeaderName, HeaderValue)> = vec![
         (header::ETAG, ascii_header(&etag)),
         (
@@ -4698,6 +4766,7 @@ async fn serve_raw(
     if etag_matches(headers, &etag) {
         let mut response = StatusCode::NOT_MODIFIED.into_response();
         response.headers_mut().extend(validators);
+        response.headers_mut().extend(security);
         return response;
     }
 
@@ -4717,6 +4786,7 @@ async fn serve_raw(
             if let Ok(value) = HeaderValue::from_str(&format!("bytes */{total}")) {
                 response.headers_mut().insert(header::CONTENT_RANGE, value);
             }
+            response.headers_mut().extend(security);
             return response;
         }
     };
@@ -4729,7 +4799,6 @@ async fn serve_raw(
         return raw_not_found();
     }
 
-    let mime = mime_guess::from_path(name).first_or_octet_stream();
     // Stream the selected span. The previous `vec![0; len]` loaded an
     // un-ranged file (or attacker-chosen large range) wholly into daemon RSS.
     let body = Body::from_stream(tokio_util::io::ReaderStream::new(file.take(len)));
@@ -4744,25 +4813,11 @@ async fn serve_raw(
     )
         .into_response();
     response.headers_mut().extend(validators);
+    response.headers_mut().extend(security);
     if status == StatusCode::PARTIAL_CONTENT {
         if let Ok(value) = HeaderValue::from_str(&format!("bytes {start}-{end}/{total}")) {
             response.headers_mut().insert(header::CONTENT_RANGE, value);
         }
-    }
-    let sandbox = match mime.essence_str() {
-        "text/html" | "application/xhtml+xml" => {
-            Some(HeaderValue::from_static("sandbox allow-scripts"))
-        }
-        "image/svg+xml" => Some(HeaderValue::from_static("sandbox")),
-        _ => None,
-    };
-    if let Some(csp) = sandbox {
-        let headers = response.headers_mut();
-        headers.insert(header::CONTENT_SECURITY_POLICY, csp);
-        headers.insert(
-            header::REFERRER_POLICY,
-            HeaderValue::from_static("no-referrer"),
-        );
     }
     response
 }
