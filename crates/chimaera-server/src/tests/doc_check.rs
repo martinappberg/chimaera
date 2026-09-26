@@ -270,6 +270,26 @@ See {ref}`intro` for more.
 }
 
 #[test]
+fn prose_that_only_looks_like_syntax_stays_quiet() {
+    let dir = fixture("dc-quiet");
+    // A code span wrapped over two lines hides its `{role}`-like braces; a
+    // comparison is not a tag; lowercase HTML is fine.
+    let doc = "\
+Call `mcp_status {serverName,
+enabled}`, `mcp_reconnect {serverName}` and `x`.
+
+When N sends coalesce into M<N results, the rest are dropped.
+
+It costs $5 and $10 to run, and <b>bold</b> is plain HTML.
+";
+    let issues = check(&dir, doc);
+    assert!(issues.is_empty(), "{issues:#?}");
+    // But a JSX tag wrapped over lines is still one.
+    let issues = check(&dir, "<Chart\n  data={x}\n/>\n");
+    assert_eq!(codes(&issues), [(1, "mdx")]);
+}
+
+#[test]
 fn alerts_must_be_ones_github_renders() {
     let dir = fixture("dc-alert");
     let doc = "\

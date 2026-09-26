@@ -362,6 +362,8 @@ struct Checker<'a> {
     first_unchecked_line: usize,
     checked_targets: usize,
     deadline: Instant,
+    /// (line, from byte, to byte) of code spans that wrap across lines.
+    wrapped_spans: Vec<(usize, usize, usize)>,
     /// This document's own facts (line count and anchors).
     own_lines: usize,
     own_anchors: HashSet<String>,
@@ -389,6 +391,7 @@ pub(crate) fn check_text(text: &str, doc: &Path, root: Option<&Path>) -> Report 
         deadline: Instant::now() + CHECK_BUDGET,
         own_lines: text.lines().count(),
         own_anchors: HashSet::new(),
+        wrapped_spans: Vec::new(),
     };
 
     let input = crate::fs::markdown_parse_input(text);
@@ -448,6 +451,25 @@ pub(crate) fn check_text(text: &str, doc: &Path, root: Option<&Path>) -> Report 
                 }
             }
             NodeValue::HtmlInline(html) => collect_html_ids(html, &mut checker.own_anchors),
+            // A code span that wraps onto the next line: the per-line
+            // backtick pairing cannot see it, so blank it from the AST.
+            NodeValue::Code(_) | NodeValue::Math(_)
+                if data.sourcepos.end.line > data.sourcepos.start.line =>
+            {
+                let end = input.source_line(data.sourcepos.end.line.max(1));
+                if end > line && end - line < 64 {
+                    let spans = &mut checker.wrapped_spans;
+                    spans.push((
+                        line,
+                        data.sourcepos.start.column.saturating_sub(1),
+                        usize::MAX,
+                    ));
+                    for mid in line + 1..end {
+                        spans.push((mid, 0, usize::MAX));
+                    }
+                    spans.push((end, 0, data.sourcepos.end.column));
+                }
+            }
             NodeValue::Heading(_) => {
                 let title = node.collect_text();
                 let base = comrak::Anchorizer::new().anchorize(&title);
@@ -668,6 +690,8 @@ impl Checker<'_> {
                 prev_quote = false;
                 continue;
             }
+            let unwrapped = blank_spans(raw, line_no, &self.wrapped_spans);
+            let raw = unwrapped.as_str();
             let prose = mask_inline(raw);
             let quote_rest = strip_quote(&prose);
             let is_quote = quote_rest.is_some();
@@ -1438,6 +1462,29 @@ fn relative_to(from: &Path, target: &Path) -> PathBuf {
     out
 }
 
+/// `line` with the parts of wrapped code spans on it blanked (byte ranges
+/// widened to char boundaries, so UTF-8 stays intact).
+fn blank_spans(line: &str, line_no: usize, spans: &[(usize, usize, usize)]) -> String {
+    let mut out = line.to_string();
+    for &(at, from, to) in spans {
+        if at != line_no {
+            continue;
+        }
+        let mut from = from.min(line.len());
+        let mut to = to.min(line.len());
+        while !line.is_char_boundary(from) {
+            from -= 1;
+        }
+        while !line.is_char_boundary(to) {
+            to += 1;
+        }
+        if from < to {
+            out.replace_range(from..to, &" ".repeat(to - from));
+        }
+    }
+    out
+}
+
 /// Blank inline code spans and `$…$` math (byte-for-byte spaces, so
 /// positions and UTF-8 stay intact): their contents are never syntax.
 fn mask_inline(line: &str) -> String {
@@ -1586,6 +1633,15 @@ fn component_tag(prose: &str) -> Option<&str> {
             Some(b) => b.is_ascii_whitespace() || *b == b'/' || *b == b'>',
         };
         let name = &prose[start..end];
+        // Only a tag comrak can read as one: closed by a `>` before any
+        // other `<`, or ending the line (JSX wrapped over lines); `M<N
+        // results` is prose.
+        let rest = &prose[end..];
+        let closed =
+            rest.trim().is_empty() || rest.find('>').is_some_and(|gt| !rest[..gt].contains('<'));
+        if !closed {
+            continue;
+        }
         let lower = name.to_ascii_lowercase();
         if terminated && !HTML_ELEMENTS.split_ascii_whitespace().any(|e| e == lower) {
             return Some(name);
