@@ -57,6 +57,9 @@ async_zip = { version = "0.0.18", default-features = false, features = ["tokio",
 tokio-util = { version = "0.7", features = ["io", "compat"] }
 # `Last-Modified` on `/raw` (already in the tree through hyper).
 httpdate = "1.0"
+# Decoding a sent chat image into its saved copy (already in the tree
+# through axum).
+base64 = "0.22"
 
 # macOS-only: foreground-process name/cwd for session display names
 # (proc_pidinfo BSDINFO name / PIDVNODEPATHINFO cwd); Linux reads /proc.

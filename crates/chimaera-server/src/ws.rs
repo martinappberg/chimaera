@@ -795,7 +795,7 @@ async fn handle_chat(mut socket: WebSocket, id: String, state: Arc<AppState>) {
             msg = socket.recv() => match msg {
                 Some(Ok(Message::Text(text))) => {
                     match serde_json::from_str::<chimaera_agent::model::AgentCommand>(&text) {
-                        Ok(cmd) => {
+                        Ok(mut cmd) => {
                             if let Err(err) = cmd.validate_ingress() {
                                 tracing::debug!(%id, %err, "chat command exceeds ingress budget");
                                 // Reject only this command. The authenticated
@@ -809,7 +809,12 @@ async fn handle_chat(mut socket: WebSocket, id: String, state: Arc<AppState>) {
                                 .await;
                                 continue;
                             }
+                            // A send's images get a saved copy the echoed
+                            // message can show after replay.
+                            let saved = crate::upload::save_send_images(&state, &id, &mut cmd).await;
                             if let Err(err) = state.chat.command(&id, cmd).await {
+                                // The send never happened: neither do its copies.
+                                crate::upload::discard_saved_images(saved);
                                 tracing::debug!(%id, %err, "chat command failed");
                                 // code=command_failed: one refused command is
                                 // NOT a dead socket — without the code the
@@ -1312,7 +1317,7 @@ mod tests {
     use chimaera_agent::journal::SeqEvent;
     use chimaera_agent::model::{
         AgentCommand, AgentEvent, ContentBlock, COMMAND_IMAGES_MAX, COMMAND_IMAGE_BASE64_MAX,
-        COMMAND_TEXT_TOTAL_MAX,
+        COMMAND_PATH_MAX, COMMAND_TEXT_TOTAL_MAX,
     };
 
     fn replay_entry(seq: u64, text: &str) -> Arc<SeqEvent> {
@@ -1399,6 +1404,7 @@ mod tests {
         blocks.extend((0..COMMAND_IMAGES_MAX).map(|_| ContentBlock::Image {
             media_type: "image/png".to_string(),
             data: "x".repeat(COMMAND_IMAGE_BASE64_MAX),
+            path: Some("p".repeat(COMMAND_PATH_MAX)),
         }));
         let encoded = serde_json::to_vec(&AgentCommand::Send { blocks }).unwrap();
         assert!(encoded.len() <= MAX_CHAT_COMMAND_MESSAGE);

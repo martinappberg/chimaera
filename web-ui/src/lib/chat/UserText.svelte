@@ -2,7 +2,7 @@
   import { extractFileRefs, revealOf, type FileRef } from "../shared/fileRef";
   import MathText from "./MathText.svelte";
   import { splitUserMath } from "./math";
-  import { menuPoint, reopenResolution, type OpenPathFn, type PathResolver, type Resolution } from "./paths";
+  import { menuPoint, reopenResolution, uploadName, type OpenPathFn, type PathResolver, type Resolution } from "./paths";
 
   /**
    * The user's own message text: plain (never markdown — prompts are not
@@ -87,6 +87,34 @@
     return res?.state === "miss" ? undefined : res;
   }
 
+  /** A mention of an uploaded file reads as its name (`uploadName`) — the
+   *  text after its last folder, so a `:12` suffix stays. Null for any
+   *  other token. */
+  function shortLabel(t: Token): string | null {
+    if (!t.mention || t.ref === null) return null;
+    const name = uploadName(t.ref.path);
+    const at = name === null ? -1 : t.text.lastIndexOf(`/${name}`);
+    return at < 1 ? null : `@${t.text.slice(at + 1)}`;
+  }
+
+  let root = $state<HTMLElement | null>(null);
+
+  /** Copying inside this message copies what was sent: a shortened mention
+   *  goes back to its whole text (`data-full`). A selection reaching past
+   *  the message keeps the browser's own copy. */
+  function onCopy(e: ClipboardEvent): void {
+    const sel = window.getSelection();
+    if (root === null || sel === null || sel.rangeCount === 0 || e.clipboardData === null) return;
+    const range = sel.getRangeAt(0);
+    if (!root.contains(range.commonAncestorContainer)) return;
+    const frag = range.cloneContents();
+    const short = frag.querySelectorAll<HTMLElement>("[data-full]");
+    if (short.length === 0) return;
+    for (const el of short) el.replaceWith(el.dataset.full ?? "");
+    e.clipboardData.setData("text/plain", frag.textContent ?? "");
+    e.preventDefault();
+  }
+
   function titleFor(t: Token, res: Resolution): string {
     if (res.state === "ambiguous") return `${t.text} matches ${res.matches.length} files — choose one`;
     if (res.state === "hit" && res.hit.kind === "dir") return `browse ${t.text} in the finder`;
@@ -113,13 +141,14 @@
 <!-- Whitespace-tight on purpose: the container is pre-wrap, so any template
      newline/indent between blocks would render as literal extra spacing. -->
 <!-- prettier-ignore -->
-<span class="usertext"
+<span class="usertext" bind:this={root} oncopy={onCopy}
   >{#each tokens as t, i (i)}{@const res = resFor(t)}{#if t.math !== null}<MathText source={t.math.source} display={t.math.display} />{:else if res !== undefined}<button
         class="path"
         class:mention={t.mention}
         class:ambiguous={res.state === "ambiguous"}
         title={titleFor(t, res)}
-        onclick={(e) => activate(e, t, res)}>{t.text}</button>{:else}{t.text}{/if}{/each}</span
+        data-full={shortLabel(t) !== null ? t.text : undefined}
+        onclick={(e) => activate(e, t, res)}>{shortLabel(t) ?? t.text}</button>{:else}{t.text}{/if}{/each}</span
 >
 
 <style>

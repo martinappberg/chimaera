@@ -6,6 +6,7 @@
 //! everything a session left behind when it ends.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -57,22 +58,13 @@ fn sanitize_name(raw: &str) -> Option<String> {
 }
 
 /// Current (bytes, file-count) in a session's uploads dir (flat — uploads are
-/// never nested). Missing dir reads as (0, 0). One scan feeds both caps.
+/// never nested). Missing dir reads as (0, 0). One scan feeds both caps; one
+/// blocking-pool hop for the whole scan.
 async fn dir_usage(dir: &Path) -> (u64, usize) {
-    let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
-        return (0, 0);
-    };
-    let mut total = 0u64;
-    let mut count = 0usize;
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        if let Ok(meta) = entry.metadata().await {
-            if meta.is_file() {
-                total += meta.len();
-                count += 1;
-            }
-        }
-    }
-    (total, count)
+    let dir = dir.to_path_buf();
+    tokio::task::spawn_blocking(move || dir_usage_blocking(&dir))
+        .await
+        .unwrap_or((0, 0))
 }
 
 /// POST /api/v1/sessions/{id}/upload?name= — stream the raw request body into
@@ -395,6 +387,176 @@ fn internal(path: &Path, what: &str, err: &anyhow::Error) -> Response {
         Json(json!({"error": format!("{what}: {err}")})),
     )
         .into_response()
+}
+
+/// How long a chat send waits for its images' saved copies (see
+/// `save_send_images`). Local disks take milliseconds; this only bites a
+/// stalled network filesystem.
+const SAVE_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// The saved copy's extension for an image media type; `None` for a type the
+/// daemon does not keep (the pixels still reach the agent).
+fn image_extension(media_type: &str) -> Option<&'static str> {
+    match media_type {
+        "image/png" => Some("png"),
+        "image/jpeg" => Some("jpg"),
+        "image/gif" => Some("gif"),
+        "image/webp" => Some("webp"),
+        _ => None,
+    }
+}
+
+/// Save a chat send's images beside the session's drops and stamp each
+/// block's `path`, so the journaled `UserMessage` can show the pictures
+/// after a reload, in another window, or on replay. A client never names
+/// the copy: whatever `path` it sent is dropped first. The session's byte
+/// and file caps apply as they do to drops; an image that does not fit (or
+/// fails to decode or write) keeps `path: None` and still reaches the
+/// agent — the copy is for display, never a reason to refuse a send.
+///
+/// Decode and writes run on the blocking pool (`~/.chimaera` sits on NFS on
+/// the login nodes this daemon serves). The base64 is cloned into it: at
+/// most `COMMAND_IMAGE_BASE64_TOTAL_MAX`, transient, and the command stays
+/// intact whatever happens to the save. The send waits on the save, so the
+/// save gets `SAVE_BUDGET`: a stalled filesystem costs the message its
+/// pictures, never its delivery — the abandoned save stops before its next
+/// image, and whatever it still finishes is taken back.
+///
+/// Answers the saved paths, so a send the chat manager then refuses can
+/// take its copies back (`discard_saved_images`).
+pub(crate) async fn save_send_images(
+    state: &Arc<AppState>,
+    session_id: &str,
+    cmd: &mut chimaera_agent::model::AgentCommand,
+) -> Vec<String> {
+    use chimaera_agent::model::{AgentCommand, ContentBlock};
+    let AgentCommand::Send { blocks } = cmd else {
+        return Vec::new();
+    };
+    let mut wanted: Vec<(usize, &'static str, String)> = Vec::new();
+    for (index, block) in blocks.iter_mut().enumerate() {
+        if let ContentBlock::Image {
+            media_type,
+            data,
+            path,
+        } = block
+        {
+            *path = None;
+            if let Some(ext) = image_extension(media_type) {
+                wanted.push((index, ext, data.clone()));
+            }
+        }
+    }
+    if wanted.is_empty() {
+        return Vec::new();
+    }
+    let dir = state.uploads_root.join(session_id);
+    let abandoned = Arc::new(AtomicBool::new(false));
+    let flag = abandoned.clone();
+    let mut save = tokio::task::spawn_blocking(move || save_images_blocking(&dir, wanted, &flag));
+    let saved = match tokio::time::timeout(SAVE_BUDGET, &mut save).await {
+        Ok(joined) => joined.unwrap_or_default(),
+        Err(_) => {
+            abandoned.store(true, Ordering::SeqCst);
+            tracing::warn!(
+                session_id,
+                "saving chat images took too long; sent without copies"
+            );
+            // Whatever it still finishes is referenced by nothing.
+            tokio::spawn(async move {
+                if let Ok(late) = save.await {
+                    discard_saved_images(late.into_iter().map(|(_, path)| path).collect());
+                }
+            });
+            Vec::new()
+        }
+    };
+    let mut paths = Vec::with_capacity(saved.len());
+    for (index, saved_path) in saved {
+        if let Some(ContentBlock::Image { path, .. }) = blocks.get_mut(index) {
+            paths.push(saved_path.clone());
+            *path = Some(saved_path);
+        }
+    }
+    paths
+}
+
+/// Remove copies `save_send_images` made for a send that was then refused.
+/// Detached and best-effort, like the prunes.
+pub(crate) fn discard_saved_images(paths: Vec<String>) {
+    if paths.is_empty() {
+        return;
+    }
+    tokio::task::spawn_blocking(move || {
+        for path in paths {
+            let _ = std::fs::remove_file(path);
+        }
+    });
+}
+
+/// `save_send_images`' blocking half: decode, then write each image through
+/// a hidden tmp sibling (never visible half-written), checking the session
+/// caps before every file. Answers `(block index, absolute path)` for each
+/// image saved.
+pub(crate) fn save_images_blocking(
+    dir: &Path,
+    images: Vec<(usize, &'static str, String)>,
+    abandoned: &AtomicBool,
+) -> Vec<(usize, String)> {
+    use base64::Engine as _;
+    if let Err(err) = std::fs::create_dir_all(dir) {
+        tracing::warn!(dir = %dir.display(), %err, "failed to create uploads dir for chat images");
+        return Vec::new();
+    }
+    let (mut bytes_used, mut files_used) = dir_usage_blocking(dir);
+    let mut saved = Vec::new();
+    for (index, ext, data) in images {
+        if abandoned.load(Ordering::SeqCst) {
+            break;
+        }
+        let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data.as_bytes()) else {
+            tracing::debug!("chat image is not valid base64; not saved");
+            continue;
+        };
+        let size = bytes.len() as u64;
+        if files_used >= MAX_SESSION_UPLOAD_FILES
+            || bytes_used.saturating_add(size) > MAX_SESSION_UPLOAD_BYTES
+        {
+            tracing::debug!(dir = %dir.display(), "session upload quota reached; chat image not saved");
+            continue;
+        }
+        let token = &chimaera_core::generate_token()[..8];
+        let target = dir.join(format!("image-{token}.{ext}"));
+        let tmp = dir.join(format!(".image-{token}.{ext}.tmp"));
+        let written = std::fs::write(&tmp, &bytes).and_then(|()| std::fs::rename(&tmp, &target));
+        if let Err(err) = written {
+            let _ = std::fs::remove_file(&tmp);
+            tracing::warn!(path = %target.display(), %err, "failed to save chat image");
+            continue;
+        }
+        bytes_used += size;
+        files_used += 1;
+        saved.push((index, target.to_string_lossy().into_owned()));
+    }
+    saved
+}
+
+/// `dir_usage`'s scan, for callers already on the blocking pool.
+fn dir_usage_blocking(dir: &Path) -> (u64, usize) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return (0, 0);
+    };
+    let mut total = 0u64;
+    let mut count = 0usize;
+    for entry in entries.flatten() {
+        if let Ok(meta) = entry.metadata() {
+            if meta.is_file() {
+                total += meta.len();
+                count += 1;
+            }
+        }
+    }
+    (total, count)
 }
 
 /// Remove everything a session uploaded. Best-effort and detached: deleting

@@ -48,6 +48,7 @@
   import UsagePanel from "./UsagePanel.svelte";
   import McpPanel from "./McpPanel.svelte";
   import RewindDialog from "./RewindDialog.svelte";
+  import AttachmentStrip from "./AttachmentStrip.svelte";
   import ForkDialog from "./ForkDialog.svelte";
   import AgentMessageMeta from "./AgentMessageMeta.svelte";
   import Composer from "./Composer.svelte";
@@ -1144,6 +1145,16 @@
     return () => observer.disconnect();
   });
 
+  /** The images a message shows only as a count: all of them when none has
+   *  a saved copy (old journals, Remote Control), else the ones whose save
+   *  failed. Empty when every picture is shown. */
+  function unsavedImages(m: { attachments: number; attachmentPaths: string[] }): string {
+    const n = m.attachments - m.attachmentPaths.length;
+    if (n <= 0) return "";
+    const noun = `image${n > 1 ? "s" : ""}`;
+    return m.attachmentPaths.length > 0 ? `+${n} ${noun}` : `${n} ${noun}`;
+  }
+
   function sendNow(text: string, images: ImageAttachment[]): boolean {
     const blocks: Record<string, unknown>[] = [];
     if (text.length > 0) blocks.push({ type: "text", text });
@@ -2106,6 +2117,14 @@
         </button>
       {/if}
     {/if}
+    {#snippet sentImages(paths: string[])}
+      <div class="sent-images">
+        <AttachmentStrip
+          {paths}
+          onOpen={(path, e) => openProsePath(path, "file", { split: e.metaKey || e.ctrlKey })}
+        />
+      </div>
+    {/snippet}
     {#snippet activityRow(item: ActivityRow)}
       {#if item.t === "group"}
         <ToolGroup
@@ -2152,7 +2171,11 @@
         {@const block = item.block}
         <!-- Only delivered (sent) user messages render inline; queued/dropped
              ones live in the pending tail below. -->
+        {@const pictureOnly = block.text.length === 0 && block.attachmentPaths.length > 0}
         <div class="msg user" data-block-index={item.index} data-block-uid={block.uid}>
+          {#if block.attachmentPaths.length > 0 && !pictureOnly}
+            {@render sentImages(block.attachmentPaths)}
+          {/if}
           <div class="bubble-row">
             <button
               class="message-action fork-btn"
@@ -2176,15 +2199,19 @@
                 ↺
               </button>
             {/if}
-            <div class="bubble">
-              <UserText
-                text={block.text}
-                onOpenPath={openProsePath}
-                resolvePaths={prosePaths}
-              />
-            </div>
+            {#if pictureOnly}
+              {@render sentImages(block.attachmentPaths)}
+            {:else}
+              <div class="bubble">
+                <UserText
+                  text={block.text}
+                  onOpenPath={openProsePath}
+                  resolvePaths={prosePaths}
+                />
+              </div>
+            {/if}
           </div>
-          {#if block.attachments > 0 || block.origin === "remote" || block.origin === "restart" || block.origin === "worker"}
+          {#if unsavedImages(block) !== "" || block.origin === "remote" || block.origin === "restart" || block.origin === "worker"}
             <span class="bubble-meta">
               {#if block.origin === "remote"}
                 <span class="origin" title="sent from a Remote Control client (the Claude app or claude.ai/code)">via Remote Control</span>
@@ -2193,8 +2220,8 @@
               {:else if block.origin === "worker"}
                 <span class="origin auto" title="a worker in this workspace sent this with tell_mastermind; chimaera delivered it because the Mastermind acts on its own (auto)">from a worker</span>
               {/if}
-              {#if block.attachments > 0}
-                <span class="attach">{block.attachments} image{block.attachments > 1 ? "s" : ""}</span>
+              {#if unsavedImages(block) !== ""}
+                <span class="attach">{unsavedImages(block)}</span>
               {/if}
             </span>
           {/if}
@@ -2390,15 +2417,23 @@
     {#if pinnedSends.length > 0}
       <div class="pending" aria-label="queued messages" aria-live={visible ? "polite" : "off"}>
         {#each pinnedSends as send (send.id)}
+          {@const pictureOnly = send.text.length === 0 && send.attachmentPaths.length > 0}
           <div class="msg user pending-msg" class:dropped={send.state === "dropped"}>
+            {#if send.attachmentPaths.length > 0 && !pictureOnly}
+              {@render sentImages(send.attachmentPaths)}
+            {/if}
             <div class="bubble-row">
-              <div class="bubble">
-                <UserText
-                  text={send.text}
-                  onOpenPath={openProsePath}
-                  resolvePaths={prosePaths}
-                />
-              </div>
+              {#if pictureOnly}
+                {@render sentImages(send.attachmentPaths)}
+              {:else}
+                <div class="bubble">
+                  <UserText
+                    text={send.text}
+                    onOpenPath={openProsePath}
+                    resolvePaths={prosePaths}
+                  />
+                </div>
+              {/if}
               {#if agentKind === "codex" && send.state === "queued" && store.running}
                 <button
                   class="steer-btn"
@@ -2423,10 +2458,8 @@
             <span class="delivery" class:dropped={send.state === "dropped"}>
               {send.state === "dropped" ? "not delivered" : "queued"}
             </span>
-            {#if send.attachments > 0}
-              <span class="attach"
-                >{send.attachments} image{send.attachments > 1 ? "s" : ""}</span
-              >
+            {#if unsavedImages(send) !== ""}
+              <span class="attach">{unsavedImages(send)}</span>
             {/if}
           </div>
         {/each}
@@ -2756,6 +2789,17 @@
     color: var(--muted);
     font-size: var(--text-sm);
     margin-top: 2px;
+  }
+  /* The message's pictures sit above its bubble, on the user's side. */
+  .sent-images {
+    max-width: 100%;
+    margin-bottom: 6px;
+  }
+  .bubble-row > .sent-images {
+    margin-bottom: 0;
+  }
+  .pending-msg .sent-images {
+    opacity: 0.55;
   }
   .bubble-meta {
     display: inline-flex;

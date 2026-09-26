@@ -76,7 +76,10 @@ selection references (see [terminals.md](terminals.md)).
   briefly explain what happened. A two-minute no-progress watchdog turns a dead SSH tunnel or stuck
   destination filesystem into an actionable error instead of an endless spinner. Dropping an **image**
   onto a *chat* pane additionally attaches its pixels to the composer (the model sees it now); the
-  uploaded path stays the durable, host-side artifact the agent can re-read later.
+  uploaded path stays the durable, host-side artifact the agent can re-read later. In a sent chat
+  bubble a mention of a landing-pad file reads as its name (`@report.pdf`, `paths.ts::uploadName`),
+  the whole path in its tooltip and in the text the agent got. The landing pad also holds the saved
+  copies of images sent in chat (see [chat-mode.md](chat-mode.md)), under the same caps.
 - **Where it lives.** `App.svelte` registers **window-level** `dragenter/dragover/dragleave/drop`
   in `onMount` (torn down in the returned cleanup — global listeners must not leak). Every
   `dragover`/`drop` `preventDefault`s **unconditionally** — the browser's default for an unhandled

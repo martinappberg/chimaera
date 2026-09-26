@@ -101,6 +101,7 @@ fn user_message_delivery_fields_are_additive() {
         serde_json::to_value(AgentEvent::UserMessage {
             text: "hi".into(),
             attachments: 0,
+            attachment_paths: Vec::new(),
             id: None,
             queued: false,
             origin: None,
@@ -112,6 +113,7 @@ fn user_message_delivery_fields_are_additive() {
         serde_json::to_value(AgentEvent::UserMessage {
             text: "hi".into(),
             attachments: 0,
+            attachment_paths: Vec::new(),
             id: Some("u1".into()),
             queued: true,
             origin: None,
@@ -127,6 +129,7 @@ fn user_message_delivery_fields_are_additive() {
         AgentEvent::UserMessage {
             text: "hi".into(),
             attachments: 0,
+            attachment_paths: Vec::new(),
             id: None,
             queued: false,
             origin: None,
@@ -568,6 +571,7 @@ fn remote_control_wire_shapes_are_additive() {
         serde_json::to_value(AgentEvent::UserMessage {
             text: "from my phone".into(),
             attachments: 0,
+            attachment_paths: Vec::new(),
             id: None,
             queued: false,
             origin: Some("remote".into()),

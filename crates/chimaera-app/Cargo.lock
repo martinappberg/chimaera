@@ -806,6 +806,7 @@ dependencies = [
  "anyhow",
  "async_zip",
  "axum",
+ "base64 0.22.1",
  "bytes",
  "calamine",
  "chimaera-agent",
