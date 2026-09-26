@@ -4536,7 +4536,7 @@ pub(crate) async fn raw(
             return raw_not_found();
         }
     };
-    serve_raw(file, &meta, &path, &headers, fresh_for, RawRoute::File).await
+    serve_raw(file, &meta, &path, &headers, RawRoute::File { fresh_for }).await
 }
 
 /// GET /raw/{ticket}/{*rest} — a file beside an HTML report, so the report's
@@ -4553,7 +4553,11 @@ pub(crate) async fn raw(
 /// with `allow-scripts`, like the report; everything else without): a file
 /// the report names is not trusted to be what its extension says, and a
 /// sandbox header on a script, style or image it loads is inert. Same
-/// range and cache rules as [`raw`]. The frame has no origin, so its scripts
+/// range rules as [`raw`]; cached as `private, no-cache` with the file's
+/// own `ETag` — revalidated on every load (a 304 while unchanged), since an
+/// asset's URL only changes when the PAGE does, and a regenerated
+/// `figs/umap.png` must not stay cached behind an unchanged report. The
+/// frame has no origin, so its scripts
 /// can LOAD these files (script, style, image, media tags) but never READ
 /// them with fetch/XHR — no CORS header is sent on purpose: a report must
 /// not be able to read out its neighbors.
@@ -4562,7 +4566,7 @@ pub(crate) async fn raw_asset(
     axum::extract::Path((ticket, rest)): axum::extract::Path<(String, String)>,
     headers: HeaderMap,
 ) -> Response {
-    let Some((path, fresh_for)) = crate::lock(&state.tickets).lookup_ttl(&ticket) else {
+    let Some(path) = crate::lock(&state.tickets).lookup(&ticket) else {
         return raw_not_found();
     };
     if !opens_its_folder(&path) {
@@ -4597,7 +4601,6 @@ pub(crate) async fn raw_asset(
         &meta,
         &relative,
         &headers,
-        fresh_for,
         RawRoute::Folder,
     )
     .await
@@ -4612,12 +4615,15 @@ fn raw_not_found() -> Response {
     response
 }
 
-/// Which `/raw` route a response answers: it decides the sandbox.
+/// Which `/raw` route a response answers: it decides the sandbox and the
+/// caching.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum RawRoute {
-    /// `/raw/{ticket}`: the ticketed file itself.
-    File,
-    /// `/raw/{ticket}/{*rest}`: a file in an HTML report's folder.
+    /// `/raw/{ticket}`: the ticketed file itself, whose URL is stable per
+    /// file version — cacheable for the ticket's remaining life.
+    File { fresh_for: Duration },
+    /// `/raw/{ticket}/{*rest}`: a file in an HTML report's folder, whose URL
+    /// outlives its version — revalidated on every load.
     Folder,
 }
 
@@ -4746,30 +4752,32 @@ fn etag_matches(headers: &HeaderMap, etag: &str) -> bool {
 }
 
 /// Stream an opened regular file as a `/raw` response. Caching: a strong
-/// `ETag` (version token + size), `Last-Modified`, and `Cache-Control:
-/// private, max-age=` the ticket's remaining life — the URL is stable per
-/// file version (see [`TicketStore`]), so within that window the browser
-/// reuses its copy outright and afterwards revalidates to a 304 instead of
-/// re-downloading over the tunnel. `name` decides the content type, and
-/// with `route` the sandbox ([`raw_security_headers`], on every status).
+/// `ETag` (version token + size) and `Last-Modified`, with, for the ticketed
+/// file itself, `Cache-Control: private, max-age=` the ticket's remaining
+/// life — the URL is stable per file version (see [`TicketStore`]), so
+/// within that window the browser reuses its copy outright and afterwards
+/// revalidates to a 304 instead of re-downloading over the tunnel. A file
+/// in a report's folder is `private, no-cache`: revalidated every load.
+/// `name` decides the content type, and with `route` the sandbox
+/// ([`raw_security_headers`], on every status).
 async fn serve_raw(
     mut file: tokio::fs::File,
     meta: &std::fs::Metadata,
     name: &Path,
     headers: &HeaderMap,
-    fresh_for: Duration,
     route: RawRoute,
 ) -> Response {
     let total = meta.len();
     let etag = raw_etag(meta);
     let mime = mime_guess::from_path(name).first_or_octet_stream();
     let security = raw_security_headers(&mime, route);
+    let cache_control = match route {
+        RawRoute::File { fresh_for } => format!("private, max-age={}", fresh_for.as_secs()),
+        RawRoute::Folder => "private, no-cache".to_string(),
+    };
     let mut validators: Vec<(HeaderName, HeaderValue)> = vec![
         (header::ETAG, ascii_header(&etag)),
-        (
-            header::CACHE_CONTROL,
-            ascii_header(&format!("private, max-age={}", fresh_for.as_secs())),
-        ),
+        (header::CACHE_CONTROL, ascii_header(&cache_control)),
     ];
     if let Ok(modified) = meta.modified() {
         validators.push((

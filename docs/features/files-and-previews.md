@@ -488,7 +488,10 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   ticket's page — downward only (plain visible components: no `..`, no absolute path, no `.hidden` name),
   every component opened `O_NOFOLLOW` beneath the folder's descriptor (a symlink never leads out),
   and every response there is sandboxed whatever its type (HTML with `allow-scripts`, like the
-  report; anything else script-less — inert on a script, style or image the page loads). Only an
+  report; anything else script-less — inert on a script, style or image the page loads). Those
+  files are `Cache-Control: private, no-cache` with their own `ETag`: revalidated on every load (a
+  304 while unchanged), because their URL only changes when the page does — a rerun that rewrites
+  `figs/umap.png` behind an unchanged report shows the new figure on the next load. Only an
   HTML ticket opens its folder. No CORS header is
   sent on purpose: the origin-less frame can *load* its neighbors (script, style, image, media
   tags) but never *read* them with `fetch`/XHR, so a report cannot read out the files around it —

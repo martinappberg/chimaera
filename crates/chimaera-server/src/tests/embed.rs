@@ -552,3 +552,46 @@ async fn raw_asset_serves_the_tickets_own_file_by_its_canonical_name() {
     }
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// A report's assets revalidate on every load: their URL only changes when
+/// the PAGE does, so a regenerated figure behind an unchanged report must
+/// not stay cached — a 304 while it is unchanged, the new bytes once not.
+#[tokio::test]
+async fn raw_assets_revalidate_every_load() {
+    let state = test_state();
+    let root = test_dir("embed-asset-cache");
+    std::fs::create_dir_all(root.join("figs")).unwrap();
+    std::fs::write(root.join("index.html"), "<img src=figs/umap.png>").unwrap();
+    std::fs::write(root.join("figs/umap.png"), png(8, 8)).unwrap();
+    let ticket = ticket_for(&state, &root.join("index.html")).await;
+    let uri = format!("/raw/{ticket}/figs/umap.png");
+
+    let (status, headers, body) = get_with(&state, &uri, &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(header_str(&headers, "cache-control"), "private, no-cache");
+    assert_eq!(body.len(), 33);
+    let etag = header_str(&headers, "etag").to_string();
+    let (status, headers, body) = get_with(&state, &uri, &[("if-none-match", &etag)]).await;
+    assert_eq!(status, StatusCode::NOT_MODIFIED);
+    assert!(body.is_empty());
+    assert_eq!(header_str(&headers, "cache-control"), "private, no-cache");
+    assert_eq!(header_str(&headers, "etag"), etag);
+
+    // The analysis reruns and rewrites the figure; the report is untouched,
+    // so its ticket (and every asset URL under it) is the same.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    std::fs::write(root.join("figs/umap.png"), png(16, 16)).unwrap();
+    assert_eq!(ticket_for(&state, &root.join("index.html")).await, ticket);
+    let (status, headers, body) = get_with(&state, &uri, &[("if-none-match", &etag)]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_ne!(header_str(&headers, "etag"), etag);
+    assert_eq!(&body[16..24], &png(16, 16)[16..24]);
+
+    // The page itself under its ticket revalidates too; the plain ticket
+    // route keeps its per-version max-age.
+    let (_, headers, _) = get_with(&state, &format!("/raw/{ticket}/index.html"), &[]).await;
+    assert_eq!(header_str(&headers, "cache-control"), "private, no-cache");
+    let (_, headers, _) = get_with(&state, &format!("/raw/{ticket}"), &[]).await;
+    assert!(header_str(&headers, "cache-control").starts_with("private, max-age="));
+    std::fs::remove_dir_all(&root).ok();
+}
