@@ -173,24 +173,37 @@ pub(crate) async fn check_now(state: &Arc<AppState>) {
 }
 
 /// A failed check, in words a user can act on. curl's own diagnosis ("Could
-/// not resolve host: api.github.com") is already that, minus its prefix; an
-/// HTTP 403/429 from GitHub is its unauthenticated rate limit, which a busy
-/// login node's shared address hits — worth naming, since it clears itself.
+/// not resolve host: api.github.com") is already that, minus its prefix. A
+/// 429 is GitHub's unauthenticated rate limit, which a busy login node's
+/// shared address hits; a 403 is that same limit OR a site proxy refusing
+/// the host, so it names both rather than promising it clears itself. Older
+/// curls append the reason phrase ("error: 403 Forbidden").
 fn describe_failure(err: &anyhow::Error) -> String {
     let raw = format!("{err:#}");
     if raw.starts_with("failed to run curl") {
         return "curl is not available on this host".to_string();
     }
+    if raw.starts_with(BAD_RELEASE_JSON) {
+        return "the releases feed answered with something other than a release (a proxy or login page?)"
+            .to_string();
+    }
     let msg = raw
         .strip_prefix("curl: (")
         .and_then(|rest| rest.split_once(") "))
         .map_or(raw.as_str(), |(_, m)| m);
-    if msg.ends_with("error: 403") || msg.ends_with("error: 429") {
+    if msg.contains("returned error: 429") {
         return "GitHub is rate-limiting this address; the next check will retry".to_string();
+    }
+    if msg.contains("returned error: 403") {
+        return "GitHub refused the request (HTTP 403): its rate limit on a shared address, or a proxy blocking it"
+            .to_string();
     }
     // Wire-bounded: a pathological proxy page must not ride every frame.
     msg.chars().take(200).collect()
 }
+
+/// `parse_release`'s context for a body that isn't JSON at all.
+const BAD_RELEASE_JSON: &str = "bad release JSON";
 
 async fn fetch_latest() -> anyhow::Result<Release> {
     let url = releases_api_url().context("no releases endpoint for this build")?;
@@ -202,7 +215,7 @@ async fn fetch_latest() -> anyhow::Result<Release> {
 
 /// Parse a GitHub `releases/latest` payload.
 fn parse_release(body: &[u8]) -> anyhow::Result<Release> {
-    let value: serde_json::Value = serde_json::from_slice(body).context("bad release JSON")?;
+    let value: serde_json::Value = serde_json::from_slice(body).context(BAD_RELEASE_JSON)?;
     let tag = value
         .get("tag_name")
         .and_then(|t| t.as_str())
@@ -343,14 +356,23 @@ mod tests {
             "Could not resolve host: api.github.com"
         );
         assert_eq!(
-            say("curl: (22) The requested URL returned error: 403"),
+            say("curl: (22) The requested URL returned error: 429"),
             "GitHub is rate-limiting this address; the next check will retry"
         );
+        // A 403 may be a proxy, not the rate limit; old curl adds the phrase.
+        for raw in [
+            "curl: (22) The requested URL returned error: 403",
+            "curl: (22) The requested URL returned error: 403 Forbidden",
+        ] {
+            assert!(say(raw).starts_with("GitHub refused the request (HTTP 403)"));
+        }
+        assert!(say("bad release JSON: expected value at line 1 column 1")
+            .starts_with("the releases feed answered with something other than a release"));
         assert_eq!(
             say("failed to run curl: No such file or directory (os error 2)"),
             "curl is not available on this host"
         );
-        assert_eq!(say("bad release JSON"), "bad release JSON");
+        assert_eq!(say("release has no tag_name"), "release has no tag_name");
         assert_eq!(say(&"x".repeat(500)).len(), 200);
     }
 }

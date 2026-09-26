@@ -9,14 +9,32 @@
    * ordinary `update.autoCheck` schema row.
    */
   import { onMount } from "svelte";
-  import { beginUpdate, connectHost, isNativeShell, updateLocalDaemon } from "../net/native";
+  import {
+    appUpdateStatus,
+    beginUpdate,
+    connectHost,
+    isNativeShell,
+    updateLocalDaemon,
+  } from "../net/native";
   import { pageVisible } from "../shared/visibility";
   import { openInSystemBrowser } from "../shared/urlOpen";
-  import { listAgents, relativeAge, type AgentInfo } from "../workspace/launcher";
-  import { checkForUpdates, updateState } from "../workspace/update.svelte";
+  import {
+    listAgents,
+    relativeAge,
+    versionNumber,
+    type AgentInfo,
+  } from "../workspace/launcher";
+  import { applyAppStatus, checkForUpdates, updateState } from "../workspace/update.svelte";
   import { getSetting } from "./store.svelte";
 
-  let { onJump }: { onJump?: (section: string) => void } = $props();
+  let {
+    onJump,
+    visible = true,
+  }: {
+    onJump?: (section: string) => void;
+    /** The Settings tab is showing (a kept-alive tab stops its clock). */
+    visible?: boolean;
+  } = $props();
 
   const native = isNativeShell();
 
@@ -41,10 +59,10 @@
   let actionError = $state<string | null>(null);
   let now = $state(Date.now());
 
-  // "checked 2h ago" stays true while someone is looking; a hidden window
-  // doesn't tick, and this effect's re-run on return is the catch-up.
+  // "checked 2h ago" stays true while someone is looking; a hidden tab or
+  // window doesn't tick, and this effect's re-run on return is the catch-up.
   $effect(() => {
-    if (!$pageVisible) return;
+    if (!visible || !$pageVisible) return;
     now = Date.now();
     const timer = setInterval(() => (now = Date.now()), 30_000);
     return () => clearInterval(timer);
@@ -53,6 +71,14 @@
   onMount(() => {
     void listAgents().then(
       (list) => (agents = list),
+      () => {},
+    );
+    // The shell broadcasts only found updates; a failed or quiet periodic
+    // check lives in its cache, so read it rather than trust the last event.
+    void appUpdateStatus(false).then(
+      (status) => {
+        if (status !== null) applyAppStatus(status);
+      },
       () => {},
     );
   });
@@ -204,9 +230,6 @@
     };
   });
 
-  const versionNumber = (v: string): string =>
-    v.split(" ").find((t) => /^\d/.test(t)) ?? v.split(" ")[0];
-
   /**
    * The agent CLIs as one line: their details live in the Agents section.
    * "Up to date" only when every installed agent's version AND its latest
@@ -268,6 +291,9 @@
         listAgents(false, true).catch(() => null),
       ]);
       if (list !== null) agents = list;
+      if (updateState.askError !== null) {
+        actionError = `couldn't reach the daemon: ${updateState.askError}`;
+      }
     } finally {
       checking = false;
     }

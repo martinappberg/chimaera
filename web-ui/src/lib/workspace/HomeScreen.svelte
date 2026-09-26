@@ -1555,8 +1555,14 @@
     gap: 9px;
   }
 
-  /* Quiet running-version stamp, pinned to the home screen's corner. */
+  /* Quiet running-version stamp, pinned to the home screen's corner — a
+     button (a click checks for updates) reset to plain text. */
   .version-mark {
+    appearance: none;
+    border: none;
+    background: none;
+    padding: 0;
+    cursor: pointer;
     position: fixed;
     bottom: 12px;
     right: 16px;
@@ -1571,15 +1577,6 @@
 
   .version-mark:hover {
     opacity: 0.9;
-  }
-
-  button.version-mark {
-    appearance: none;
-    border: none;
-    background: none;
-    padding: 0;
-    font-family: var(--mono);
-    cursor: pointer;
   }
 
   /* A known newer release lifts the stamp out of its whisper. */

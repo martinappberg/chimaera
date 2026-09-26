@@ -145,8 +145,10 @@ pub fn install(app: &App) -> tauri::Result<()> {
             "quit" => crate::shell::request_quit(app),
             "check-updates" => {
                 // Any window can answer (home or workspace — the toast lives
-                // in both); prefer the focused one. With none open, a home
-                // window's own mount-time check is the answer.
+                // in both); prefer the focused one. With none open, Home opens
+                // and shows an available app update from its own mount-time
+                // check; an "up to date" answer needs a window already loaded
+                // to land in (events aren't queued for a page still booting).
                 let windows = app.webview_windows();
                 let target = windows
                     .values()

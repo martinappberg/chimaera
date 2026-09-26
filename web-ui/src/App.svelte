@@ -1663,17 +1663,24 @@
           () => {},
         );
       }
+      // The broadcast carries only the version; the shell's cache holds the
+      // whole outcome (when it checked), which Settings → Updates shows. A
+      // window opened after a broadcast reads the same cache at mount.
+      const readAppStatus = (): void => {
+        void appUpdateStatus(false).then(
+          (status) => {
+            if (status !== null) applyAppStatus(status);
+          },
+          () => {},
+        );
+      };
       unlistenAppUpdate = asyncDisposer(
-        onAppUpdate((version) => (updateState.appVersion = version)),
+        onAppUpdate((version) => {
+          updateState.appVersion = version;
+          readAppStatus();
+        }),
       );
-      // The broadcast only reaches windows open at the time; a window opened
-      // since reads the shell's last answer instead of waiting for the next.
-      void appUpdateStatus(false).then(
-        (status) => {
-          if (status !== null) applyAppStatus(status);
-        },
-        () => {},
-      );
+      readAppStatus();
       unlistenMenu = asyncDisposer(
         onMenu((action) => {
           switch (action) {

@@ -75,7 +75,7 @@ describe("update awareness", () => {
     const asking = store.checkForUpdates(true);
     expect(store.currentNotice(null)).toEqual({ kind: "checking" });
     await asking;
-    expect(mocks.api).toHaveBeenCalledWith("/update?refresh=true");
+    expect(mocks.api.mock.calls[0][0]).toBe("/update?refresh=true");
     expect(store.currentNotice(null)).toEqual({ kind: "current", version: "0.42.1" });
     store.dismissAnswer();
     expect(store.currentNotice(null)).toBeNull();
@@ -150,6 +150,56 @@ describe("update awareness", () => {
     });
     await store.checkForUpdates(true);
     expect(store.currentNotice(null)).toEqual({ kind: "app", version: "0.43.0", url: null });
+  });
+
+  it("the app answers without waiting on a slow daemon check", async () => {
+    mocks.native = true;
+    const store = await load();
+    let releaseDaemon: (r: Response) => void = () => {};
+    mocks.api.mockReturnValue(new Promise<Response>((resolve) => (releaseDaemon = resolve)));
+    mocks.appUpdateStatus.mockResolvedValue({
+      current: "0.42.1",
+      dev: false,
+      checked_at: 2_000,
+      available: null,
+      error: null,
+      interval_secs: 21_600,
+    });
+    const round = store.checkForUpdates(true);
+    await vi.waitFor(() => expect(store.updateState.asked).toBe("answered"));
+    expect(store.currentNotice(null)).toEqual({ kind: "current", version: "0.42.1", pending: null });
+
+    // An announcing ask that joins the round after that early answer still
+    // gets answered when the round ends.
+    const joined = store.checkForUpdates(true);
+    expect(store.currentNotice(null)).toEqual({ kind: "checking" });
+    releaseDaemon(
+      respond(
+        daemonStatus({
+          state: "available",
+          available: true,
+          latest: { version: "0.43.0", url: "https://example.test/v0.43.0" },
+        }),
+      ),
+    );
+    await round;
+    await joined;
+    // The daemon has seen 0.43.0 that the signed channel doesn't offer yet:
+    // "newest" would be false, so the answer says so.
+    expect(store.currentNotice(null)).toEqual({ kind: "current", version: "0.42.1", pending: "0.43.0" });
+  });
+
+  it("a daemon that never answers fails the check instead of hanging it", async () => {
+    const store = await load();
+    const timeout = new Error("signal timed out");
+    timeout.name = "TimeoutError";
+    mocks.api.mockRejectedValue(timeout);
+    await store.checkForUpdates(true);
+    expect(mocks.api.mock.calls[0][1]?.signal).toBeInstanceOf(AbortSignal);
+    expect(store.currentNotice(null)).toEqual({
+      kind: "failed",
+      error: "the daemon did not answer in time",
+    });
   });
 
   it("a failed re-check keeps the known app offer", async () => {

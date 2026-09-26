@@ -18,6 +18,9 @@
   import { APP_MENU, PINNED } from "../shared/keys";
   import { activeModLabel } from "../shared/keybindings";
 
+  /** The tab is showing (kept-alive tabs stay mounted while hidden). */
+  let { visible: tabVisible = true }: { visible?: boolean } = $props();
+
   /**
    * Nav sections: the schema categories, plus the bespoke Environment section
    * (store-backed via /api/v1/environment — it has no schema rows) slotted
@@ -242,7 +245,7 @@
                  the daemon and the agents (it renders its own <h2> with a
                  "check now"); the auto-check switch is the generic row. -->
             <section data-section={group.category}>
-              <UpdatesStatus onJump={jumpTo} />
+              <UpdatesStatus onJump={jumpTo} visible={tabVisible} />
               {#each group.defs as def (def.id)}
                 <SettingRow {def} />
               {/each}

@@ -61,7 +61,7 @@
       case "checking":
         return "Checking for updates…";
       case "current":
-        return "You're up to date";
+        return notice.pending ? "No update for the app yet" : "You're up to date";
       case "dev":
         return "Development build";
       case "failed":
@@ -82,7 +82,9 @@
       case "checking":
         return "Asking GitHub for the newest chimaera release.";
       case "current":
-        return `chimaera ${notice.version} is the newest release.`;
+        return notice.pending
+          ? `${notice.pending} is published but not offered to the app yet; this app is ${notice.version}.`
+          : `chimaera ${notice.version} is the newest release.`;
       case "dev":
         return "Release updates don't apply to a development build.";
       case "failed":
@@ -163,37 +165,36 @@
   {#if error !== null}
     <p class="error">{error}</p>
   {/if}
-  {#if notice.kind !== "checking"}
-    <div class="actions">
-      {#if action !== null}
-        <button class="primary" disabled={busy} onclick={() => void run()}>
-          {busy ? (notice.kind === "failed" ? "checking…" : "updating…") : action}
-        </button>
-      {/if}
-      {#if releaseUrl !== null}
-        <!-- Through the shell: in the app a _blank navigation is swallowed by
-             the window's origin guard. -->
-        <a
-          class="notes"
-          href={releaseUrl}
-          target="_blank"
-          rel="noreferrer"
-          onclick={(e) => {
-            e.preventDefault();
-            openInSystemBrowser(releaseUrl);
-          }}>release notes</a
-        >
-      {/if}
-      {#if isAnswer}
-        <button class="quiet" disabled={busy} onclick={dismissAnswer}>close</button>
-      {:else}
-        <button class="quiet" disabled={busy} onclick={snoozeUpdate}>later</button>
-      {/if}
-      {#if skippable}
-        <button class="quiet subtle" disabled={busy} onclick={skip}>skip this version</button>
-      {/if}
-    </div>
-  {/if}
+  <div class="actions">
+    {#if action !== null}
+      <button class="primary" disabled={busy} onclick={() => void run()}>
+        {busy ? (notice.kind === "failed" ? "checking…" : "updating…") : action}
+      </button>
+    {/if}
+    {#if releaseUrl !== null}
+      <!-- Through the shell: in the app a _blank navigation is swallowed by
+           the window's origin guard. -->
+      <a
+        class="notes"
+        href={releaseUrl}
+        target="_blank"
+        rel="noreferrer"
+        onclick={(e) => {
+          e.preventDefault();
+          openInSystemBrowser(releaseUrl);
+        }}>release notes</a
+      >
+    {/if}
+    {#if isAnswer}
+      <!-- Never disabled: an answer (even mid-retry) can always be put away. -->
+      <button class="quiet" onclick={dismissAnswer}>close</button>
+    {:else}
+      <button class="quiet" disabled={busy} onclick={snoozeUpdate}>later</button>
+    {/if}
+    {#if skippable}
+      <button class="quiet subtle" disabled={busy} onclick={skip}>skip this version</button>
+    {/if}
+  </div>
 </div>
 
 <style>

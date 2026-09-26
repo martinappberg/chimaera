@@ -54,7 +54,9 @@ export type UpdateOffer =
 /** The answer to an explicit check when there is nothing to offer. */
 export type UpdateAnswer =
   | { kind: "checking" }
-  | { kind: "current"; version: string }
+  /** Nothing to install. `pending`: a newer release the daemon has seen that
+   *  the app's signed channel doesn't offer yet (so "newest" would be false). */
+  | { kind: "current"; version: string; pending?: string | null }
   | { kind: "dev" }
   | { kind: "failed"; error: string };
 
@@ -139,10 +141,21 @@ export function applyAppStatus(status: AppUpdateStatus): void {
   else if (status.error === null) updateState.appVersion = null;
 }
 
+/** The daemon bounds its own fetch (curl, 10s) and may wait out one check
+ *  already running; past this, the tunnel is the problem, not GitHub. */
+const DAEMON_ASK_MS = 30_000;
+
 async function fetchDaemonStatus(refresh: boolean): Promise<UpdateStatus | null> {
-  const res = await api(`/update${refresh ? "?refresh=true" : ""}`);
+  const res = await api(`/update${refresh ? "?refresh=true" : ""}`, {
+    signal: AbortSignal.timeout(DAEMON_ASK_MS),
+  });
   if (!res.ok) throw new Error(`the daemon answered ${res.status}`);
   return parseUpdateStatus(await res.json());
+}
+
+function failureText(e: unknown): string {
+  if (e instanceof Error && e.name === "TimeoutError") return "the daemon did not answer in time";
+  return e instanceof Error ? e.message : String(e);
 }
 
 let inFlight: Promise<void> | null = null;
@@ -159,20 +172,39 @@ export function checkForUpdates(announce: boolean): Promise<void> {
     updateState.askError = null;
   }
   if (inFlight !== null) return inFlight;
-  const round = (async () => {
-    const [daemon, app] = await Promise.allSettled([
-      fetchDaemonStatus(true),
-      isNativeShell() ? appUpdateStatus(true) : Promise.resolve(null),
-    ]);
-    if (daemon.status === "fulfilled") {
-      if (daemon.value !== null) updateState.daemon = daemon.value;
-      updateState.askError = null;
-    } else {
-      updateState.askError =
-        daemon.reason instanceof Error ? daemon.reason.message : String(daemon.reason);
-    }
-    if (app.status === "fulfilled" && app.value !== null) applyAppStatus(app.value);
+  const answer = (): void => {
     if (updateState.asked === "checking") updateState.asked = "answered";
+  };
+  const round = (async () => {
+    const native = isNativeShell();
+    const daemon = fetchDaemonStatus(true).then(
+      (status) => {
+        if (status !== null) updateState.daemon = status;
+        updateState.askError = null;
+      },
+      (e: unknown) => {
+        updateState.askError = failureText(e);
+      },
+    );
+    const app = native
+      ? appUpdateStatus(true).then(
+          (status) => {
+            if (status !== null) applyAppStatus(status);
+          },
+          (e: unknown) => {
+            // Keep what the shell knew, marked as a failed re-check.
+            const known = updateState.app;
+            if (known !== null) applyAppStatus({ ...known, error: failureText(e) });
+          },
+        )
+      : Promise.resolve();
+    // In the app the signed channel decides the answer: don't hold it for
+    // the daemon's release check (a slow curl on an air-gapped host).
+    await (native ? app : daemon);
+    answer();
+    await Promise.all([daemon, app]);
+    // An announcing call that joined after the early answer.
+    answer();
   })();
   inFlight = round.finally(() => {
     inFlight = null;
@@ -269,7 +301,16 @@ function currentAnswer(): UpdateAnswer {
     if (app === null) return { kind: "failed", error: "the app did not answer" };
     if (app.dev) return { kind: "dev" };
     if (app.error !== null) return { kind: "failed", error: app.error };
-    return { kind: "current", version: app.current };
+    const daemon = updateState.daemon;
+    const pending =
+      daemon !== null &&
+      !daemon.dev &&
+      daemon.state === "available" &&
+      daemon.latest !== null &&
+      daemon.latest.version !== app.current
+        ? daemon.latest.version
+        : null;
+    return { kind: "current", version: app.current, pending };
   }
   if (updateState.askError !== null) return { kind: "failed", error: updateState.askError };
   const daemon = updateState.daemon;

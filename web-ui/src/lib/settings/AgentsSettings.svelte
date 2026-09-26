@@ -20,6 +20,7 @@
     relativeAge,
     uninstallAgent,
     updateAgent,
+    versionNumber,
     type AgentInfo,
   } from "../workspace/launcher";
   import SessionGlyph from "../shared/SessionGlyph.svelte";
@@ -182,9 +183,6 @@
       removing = { ...removing, [a.id]: false };
     }
   }
-
-  const versionNumber = (v: string): string =>
-    v.split(" ").find((t) => /^\d/.test(t)) ?? v.split(" ")[0];
 
   /** Version tooltip: the full --version line plus the newest upstream
    *  release the daemon knows (and how fresh that knowledge is) — "am I
