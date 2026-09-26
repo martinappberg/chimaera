@@ -77,8 +77,10 @@ tools ride the per-session MCP endpoint ([linked-terminals.md](linked-terminals.
     auto-installs or auto-updates.
   - **Status: partial.** Browse (a view over the agents' own marketplaces) renders disabled,
     "later". The Plugins tab itself opens only from quick-open (`DashCtx.onOpenPlugins` exists
-    but nothing calls it); the attach sheet is a modal reached from the doors above. LaTeX is
-    the next planned plugin; third-party (declarative-only) manifests are later.
+    but nothing calls it); the attach sheet is a modal reached from the doors above. LaTeX and
+    Typst are the next planned plugins, on a new `build` point
+    ([plan](../latex-reports-plan.md#the-plugin-shape)); third-party (declarative-only)
+    manifests are later.
 
 ## Agent plugins & the Skills view
 

@@ -1,19 +1,32 @@
 # LaTeX and Typst reports: the plan
 
-Dated 2026-09-25. A plan, not a record: nothing here has shipped. It covers
-compiling LaTeX and Typst documents on the host, showing the PDF beside the source,
-jumping between the two, turning compile errors into editor marks an agent can fix,
-teaching agents to write reports here, and turning markdown into a polished PDF. It
-was split out of the documents plan (`docs/document-workbench-plan.md`, still on its
-own branch; its "Out of scope" section hands this effort over) and built from a read
-of the current tree (commit `f44a8b7`) plus a survey of Tectonic, TeX Live, latexmk,
-Typst, SyncTeX, pandoc and the tools that already do this (VS Code's LaTeX Workshop,
-texlab, tinymist, Overleaf's compile limits). Claims about the current code are
-traced in the [appendix](#appendix-what-the-code-does-today); outside facts are in
-[sources](#sources).
+Dated 2026-09-25, revised 2026-09-26. A plan, not a record: nothing here has
+shipped. It covers compiling LaTeX and Typst documents on the host, showing the PDF
+beside the source, jumping between the two, turning compile errors into editor marks
+an agent can fix, teaching agents to write reports here, turning markdown into a
+polished PDF and, later, Word. It was split out of the documents plan
+(`docs/document-workbench-plan.md`, since shipped as martinappberg/chimaera#159; its
+"Out of scope" section hands this effort over) and built from a read of the current
+tree (commit `f44a8b7`, re-checked at `6ae68b9` after the documents work and the
+plugin seam of martinappberg/chimaera#162 landed) plus a survey of Tectonic, TeX
+Live, latexmk, Typst, SyncTeX, pandoc and the tools that already do this (VS Code's
+LaTeX Workshop, texlab, tinymist, Overleaf's compile limits). The revision makes the
+whole effort a pair of [workbench plugins](#the-plugin-shape) on one new
+contribution point, adds [Word](#word-and-editing-what-is-not-markdown), and says
+[how plugins could live in their own
+repositories](#packaging-plugins-in-their-own-repositories). Claims about the
+current code are traced in the [appendix](#appendix-what-the-code-does-today);
+outside facts are in [sources](#sources).
 
 ## The short version
 
+- **Two plugins on one build point.** LaTeX and Typst ship as workbench plugins
+  ([the plugin shape](#the-plugin-shape)): two TOML manifests on a new `build`
+  contribution point, off by default, saying on their card what they add. The
+  runner, the parsers, SyncTeX and the document view are first-party code the
+  manifests name; markdown to PDF and Word export are the third and fourth manifests
+  on the same point. Nothing changes for an agent in a workspace where neither
+  plugin is on.
 - **Compile on the host, never in the browser.** The files, the figures and the
   agents all live on the host. The daemon runs the engine there as a small, limited
   child process. Only the PDF crosses the tunnel, and only the pages you look at.
@@ -41,9 +54,11 @@ traced in the [appendix](#appendix-what-the-code-does-today); outside facts are 
 - **Multi-file projects just work.** The main file comes from a `% !TEX root`
   comment, a `\documentclass`, or the last build's list of inputs. Editing a chapter,
   a `.bib` file or a figure recompiles the main document.
-- **Agents check their own work.** The chimaera MCP server every session loads gains a
-  short documents paragraph, a `document_guide` tool and a `compile_document` tool
-  that returns the errors. Agents compile, fix and compile again before handing over.
+- **Agents check their own work.** The chimaera MCP server every session loads
+  already carries `document_guide` (the portable markdown dialect) and
+  `check_document`. Where a build plugin is on, the guide grows an engines and
+  conventions section and a `compile_document` tool returns the errors. Agents
+  compile, fix and compile again before handing over.
 - **Markdown to PDF through Typst.** The portable markdown dialect becomes a polished
   report PDF through a Typst template. Pandoc is optional, never required.
 - **Safe on a login node.** No unrestricted shell escape, no project Perl without
@@ -74,6 +89,116 @@ traced in the [appendix](#appendix-what-the-code-does-today); outside facts are 
 7. **One pipeline for people and agents.** The agent's `compile_document` and the
    user's save run the same queue, the same limits and the same parser, and update the
    same preview.
+
+## The plugin shape
+
+Since martinappberg/chimaera#162 an opt-in capability is a **workbench plugin**
+([plugins](features/plugins.md), [authoring guide](agent-guides/plugins.md)): a TOML
+manifest embedded in the binary, switched on per workspace, saying on its card in
+words what it adds, with its behaviour in first-party code behind capabilities the
+manifest names. With no plugin active, nothing an agent sees changes, pinned by the
+`agent_view` fixtures. The authoring guide named LaTeX the next plugin and sketched
+it on the specified-but-unbuilt `commands` and `settings` points, where a build is a
+visible terminal session. This plan replaces that sketch: compile-on-save cannot be
+a terminal per save (a new rail entry every time an agent writes a chapter, no time
+or memory limit, no build folder), and a terminal cannot hand back diagnostics, an
+output file and sync data. So the plugin's contribution point is a new one, `build`,
+and sections 1 to 7 describe what that point does.
+
+### One point, four manifests
+
+A `build` section names the files a plugin builds, the tools it needs, the command,
+the output and, by name, the first-party pieces that turn a child process into a
+document view. Everything a third party could reasonably vary is data; everything
+that must be careful on a login node is code.
+
+```toml
+id = "latex"
+name = "LaTeX"
+summary = "Build .tex to PDF and read it beside the source, with errors as editor marks."
+
+[build]
+sources = ["*.tex", "*.ltx"]        # what opens as a document where this plugin is on
+root = "tex"                        # named main-file finder (section 4)
+inputs = "fls"                      # named watch-set source: fls | typst-deps | none
+diagnostics = "latex-log"           # named log parser (section 2)
+sync = "synctex"                    # named source-to-PDF mapping (section 3)
+output = "{build_dir}/{stem}.pdf"
+debounce_ms = 800
+wall_s = 180
+
+[[build.engines]]                   # the ladder, first found wins (section 1)
+name = "latexmk"
+tools = ["latexmk"]
+run = "latexmk -pdf -interaction=nonstopmode -file-line-error -synctex=1 -recorder -outdir={build_dir} -norc {root}"
+env = { max_print_line = "10000", TEXMFOUTPUT = "{build_dir}" }
+
+[[build.engines]]
+name = "tectonic"
+tools = ["tectonic"]
+run = "tectonic -X compile {root} --outdir {build_dir} --synctex --keep-logs"
+env = { TECTONIC_UNTRUSTED_MODE = "1" }
+
+[adds]
+ui = [".tex opens as source | split | PDF · compile on save · errors as editor marks · Cmd-click the PDF to jump to the line"]
+agents = ["1 tool for every agent here: compile_document · document_guide learns this host's engines"]
+```
+
+Typst is the same shape with `sources = ["*.typ"]`, `root = "self"`,
+`inputs = "typst-deps"`, `diagnostics = "file-line-col"`, `sync = "text"`, one engine
+(`typst compile {root} {output} --root {workspace} --diagnostic-format short --jobs 2
+--deps {build_dir}/deps.json --deps-format json`) and `wall_s = 60`. Markdown to PDF
+(section 6) adds one field, `transform = "md-typst"`, a named first-party step that
+writes the Typst source the engine then builds. Word export
+([below](#word-and-editing-what-is-not-markdown)) is `pandoc {root} -o {output}` with
+`output = "{build_dir}/{stem}.docx"`, `diagnostics = "file-line-col"` and no sync.
+That is the guide's rule of two, met four times over by one point.
+
+| In the manifest (data) | In Chimaera (first-party code, named by the manifest) |
+|---|---|
+| which files, which tools, the command and its environment, the output path, timeouts, debounce, the Adds lines | the queue and every limit (section 7), the prelude environment capture and PATH walk, build folders and eviction, the events frame |
+| the engine ladder as an ordered list | the parsers (`latex-log`, `file-line-col`, `json`), main-file finders (`tex`, `self`), watch-set sources (`fls`, `typst-deps`), sync (`synctex`, `text`), transforms (`md-typst`) |
+| the paragraph `document_guide` adds for this plugin | `DocumentView`, the editor marks, the problems list, **Ask agent**, the PDF swap, `compile_document` |
+
+Placeholders (`{root}`, `{build_dir}`, `{output}`, `{stem}`, `{workspace}`) are
+substituted by the daemon and shell-quoted, so a file name can never change the
+command. A project's own config still wins over the manifest (a `Tectonic.toml`, a
+trusted `latexmkrc`), as the guide requires.
+
+### What "on" means for a build plugin
+
+- **On is active.** The manifests carry no `detect` footprint, like Agent notes: an
+  agent should get `document_guide`'s engine facts *before* it writes the first
+  `.tex`, and a glob detect would need a walk. The card's **Here** line instead
+  reports what the quick-open index already knows when it is warm ("12 .tex files ·
+  latexmk 4.88 on sherlock") and never starts a walk of its own.
+- **File kinds follow the switch.** `.tex` opens as a `document` only in a workspace
+  where a build plugin claims it; elsewhere it opens as text, exactly as today.
+  `viewKindFor` consults the active plugins' `build.sources` (the plugin store's
+  reactive `workspacePlugins`), so switching the plugin off returns every `.tex` pane
+  to the plain editor.
+- **The agent tools ride only where the plugin is on.** The first draft of this plan
+  appended the documents paragraph and `compile_document` for every session. The
+  plugin rule is stricter and better: the tool and the paragraph join `tools/list`
+  and `initialize` through the existing `plugins::spawn_allow` and `tools.rs` seam
+  only in workspaces where a build plugin is active, and the `agent_view` fixtures
+  stay byte-identical. An agent in a workspace with the plugin off can still run
+  `latexmk` in a terminal; it just gets no compile tool and no engine facts.
+- **`DocumentView` is core, not a plugin view.** It is the generic view for "a file
+  with a build", parameterized by the manifest, so the specified `provides.views`
+  registry stays unbuilt for now.
+
+### What it installs
+
+Nothing silently, and by default nothing at all:
+
+| Where | What | How |
+|---|---|---|
+| Chimaera | nothing: the runner, parsers, sync and view ship in the binary with the manifests | versions with the daemon |
+| the host toolchain | nothing by default; whatever the prelude provides (`module load texlive`, a `typst` in `~/.local/bin`) | detection through the prelude (section 1) |
+| managed tools (Phase F) | `typst`, `tectonic`, later `pandoc`: official release artifacts, checksums where the release publishes them, a visible shell session, never sudo, under `~/.chimaera/tools/<tool>/<version>/` | the `runtimes.rs` pattern; **Install** on the empty PDF state |
+| the agents | nothing required: the MCP tool and guide reach every agent without an install. Optional: a `report-writing` skill pack (the guide's conventions as an Agent Skill, for agents that run outside Chimaera) as a claude and codex plugin, installed through the agents' own plugin managers in a visible terminal | a new `recommends.agent_plugins` block, the shape of `requires`, shown as optional on the card, so the plugin works with zero installs |
+| the workspace | nothing: build output lives in the cache folder; the repo changes only on **Save PDF beside source** | section 2 |
 
 ## 1. Engines
 
@@ -314,12 +439,11 @@ shows a calm empty state instead of an error:
   `PdfView` gains an in-place reload: open the new document in the background,
   render the visible pages offscreen, swap in one frame, keep the scroll anchored to
   the same page and fraction, then destroy the old document.
-- **Only the pages you look at cross the tunnel.** `PdfView` calls
-  `getDocument({ url })` with defaults today, which streams the whole file. For
-  compiled documents, pass `disableAutoFetch` and `disableStream` so pdf.js fetches
-  byte ranges for visible pages only; `/raw` already serves ranges. A report with
-  heavy figures then costs roughly the visible pages' objects per rebuild instead of
-  the whole file; Phase B measures how much that saves.
+- **Only the pages you look at cross the tunnel.** Since martinappberg/chimaera#159
+  `PdfView` opens every document with `disableAutoFetch` and `disableStream`, so
+  pdf.js fetches byte ranges for visible pages only over `/raw`. A report with heavy
+  figures then costs roughly the visible pages' objects per rebuild instead of the
+  whole file; Phase B measures how much that saves after an in-place swap.
 - **A failed build keeps the last good PDF** with an error bar. LaTeX often produces a
   partial PDF despite errors; **show partial output** switches to it.
 
@@ -528,12 +652,16 @@ A member file shows its main document's PDF, labelled "part of main.tex".
 ## 5. Agent awareness
 
 Every Claude and Codex session Chimaera spawns already loads the chimaera MCP server
-(`mcp.rs`). Its `instructions` today cover linked terminals only. It is the one
-channel that reaches every agent without touching the repository.
+(`mcp.rs`). Since martinappberg/chimaera#159 its `instructions` carry a documents
+paragraph, and every tier has `document_guide` (the portable markdown dialect) and
+`check_document`. It is the one channel that reaches every agent without touching
+the repository. This plan adds to it only where a build plugin is on
+([what "on" means](#what-on-means-for-a-build-plugin)), through the plugin seam
+(`plugins/tools.rs`: `instructions`, `defs`, `call`).
 
 ### A short paragraph in the MCP instructions
 
-Appended for every tier (about 600 characters):
+Appended where a build plugin is active (about 600 characters):
 
 > Chimaera documents: the user reads your reports as PDFs beside their source. For a
 > new polished report, write Typst (.typ) unless LaTeX is required (a journal
@@ -547,7 +675,8 @@ The paragraph is static. The live facts (which engines this host has) come from
 
 ### `document_guide(kind?)`
 
-`kind` is `typst`, `latex` or `markdown`. Returns at most 8 KB of text:
+Extends the tool that exists: with no `kind`, or `markdown`, it returns today's
+guide unchanged; `latex` and `typst` return at most 8 KB of text:
 
 - **This host**: the engines found and their versions, and which one this workspace
   will use (or why none, and how the user can fix it).
@@ -588,7 +717,8 @@ The paragraph is static. The live facts (which engines this host has) come from
 - **Bounded like everything else.** Same queue, same limits, at most one pending rerun
   per document, no shell-escape argument. `copy_to` must resolve inside the workspace
   and may only replace a PDF.
-- **Base tier**, not Mastermind-only: every agent writes reports.
+- **Every tier** where a build plugin is on, not Mastermind-only: every agent writes
+  reports.
 - **Log excerpts are data.** They quote the document, which may come from an untrusted
   repository; the tool text says so.
 
@@ -726,16 +856,19 @@ plain wall-clock limit where it does not.
 
 ## What changes where
 
-### Daemon (`crates/chimaera-server/src/compile/`)
+### Daemon (`crates/chimaera-server/src/build/`, plus the plugin seam)
 
 | File | What |
 |---|---|
-| `mod.rs` | routes, the events frame, the module's map line in the server `AGENTS.md` |
-| `engines.rs` | prelude environment capture, PATH walk, versions, the ladders |
-| `job.rs` | queue, coalescing, single-flight, limits, process groups, build folders and eviction |
-| `root.rs` | main-file detection, `.fls` and Typst dependency lists, the watch set |
-| `latexlog.rs`, `typstdiag.rs` | the parsers, with the fixture corpus |
-| `md2typ.rs` | the comrak-to-Typst writer and the embedded templates (Phase E) |
+| `plugins/manifests/latex.toml`, `typst.toml` | the two manifests, registered in `MANIFESTS`; `md-pdf.toml` (Phase E) and `docx.toml` (Phase G) later |
+| `plugins/mod.rs` | the `[build]` section of `Manifest` (`deny_unknown_fields`), the `recommends` block, the lookups the build module and the UI use |
+| `plugins/tools.rs` | `compile_document` and the guide paragraph, served where a build plugin is active |
+| `build/mod.rs` | routes, the events frame, the module's map line in the server `AGENTS.md` |
+| `build/engines.rs` | prelude environment capture, PATH walk, versions, the ladder from the manifest's engine list |
+| `build/job.rs` | queue, coalescing, single-flight, limits, process groups, build folders and eviction |
+| `build/root.rs` | the named main-file finders, `.fls` and Typst dependency lists, the watch set |
+| `build/latexlog.rs`, `build/typstdiag.rs` | the named parsers, with the fixture corpus |
+| `build/md2typ.rs` | the `md-typst` transform: the comrak-to-Typst writer and the embedded templates (Phase E) |
 
 New routes, all bearer-authed and additive:
 
@@ -752,8 +885,9 @@ New routes, all bearer-authed and additive:
 
 | File | What |
 |---|---|
-| `files.ts` | the `document` view kind |
-| `DocumentView.svelte` | source, split and PDF; toolbar, chip, problems list, empty states |
+| `files.ts` | the `document` view kind, chosen from the active plugins' `build.sources` |
+| `../plugins/store.ts` | the `build` section on the wire types, and which sources are claimed in the active workspace |
+| `DocumentView.svelte` | source, split and PDF; toolbar, chip, problems list, empty states; parameterized by the manifest (core, not a plugin view) |
 | `SplitEditPreview.svelte` | the three-state `show`, both halves always mounted |
 | `PdfView.svelte` | in-place reload, ranged loading, `showBoxes`, Cmd-click and selection hooks |
 | `doc/compile.svelte.ts` | per-document status store, the events frame |
@@ -766,17 +900,21 @@ New routes, all bearer-authed and additive:
 
 ### Phase A: the compile service and agents (daemon only)
 
-Engine detection through the prelude, the job runner with every limit, build folders,
-main-file detection (magic comment, `\documentclass`, picker route), both parsers with
-the fixture corpus, the routes and events frame, and the MCP paragraph,
-`document_guide` and `compile_document`.
+The `build` contribution point in `plugins/mod.rs` and the latex and typst manifests
+(their cards render on the Plugins tab through the generic card, with the Adds
+lines), engine detection through the prelude, the job runner with every limit, build
+folders, main-file detection (magic comment, `\documentclass`, picker route), both
+parsers with the fixture corpus, the routes and events frame, and, where a plugin is
+on, the MCP paragraph, the `document_guide` extension and `compile_document`.
 
 Agents get value before any UI exists: they can build a report and fix it.
 
 **Verification.** Rust tests with stand-in engines (`CHIMAERA_DOC_BINDIR`): the queue,
 coalescing, single-flight, timeouts killing a whole process group, the file-size
-limit, eviction, env scrubbing, the old-LuaTeX gate. Live on a real login node with
-`module load texlive` and a real `typst`: an article, a thesis-shaped `\include`
+limit, eviction, env scrubbing, the old-LuaTeX gate; the `agent_view` fixtures
+unchanged with both plugins off, and `src/tests/plugins.rs` showing
+`compile_document` offered and callable only where one is on. Live on a real login
+node with `module load texlive` and a real `typst`: an article, a thesis-shaped `\include`
 project with biber, an infinite-loop document (the timeout), a Typst document that
 allocates without bound (the memory cap, and whether 4 GB of address space breaks
 normal Typst builds), and an agent running the compile-fix loop through MCP. Record
@@ -813,33 +951,125 @@ The comrak-to-Typst writer, the templates, `mitex` vendored after a license chec
 
 ### Phase F: installs and extras
 
-Managed Typst and Tectonic installs, `render_page`, and, if chosen, the Typst jump
-companion.
+Managed Typst and Tectonic installs, the optional `report-writing` skill pack behind
+`recommends`, `render_page`, and, if chosen, the Typst jump companion.
+
+### Phase G: Word and other outputs
+
+The `docx` manifest (pandoc when present, later a managed install), **Export to
+Word** on markdown documents, **Open as markdown** for a `.docx`, and later a Marp
+deck to `.pptx` on the same point. See
+[Word](#word-and-editing-what-is-not-markdown).
 
 | Phase | What | Size |
 |---|---|---|
-| A | Compile service, parsers, MCP tools | medium |
+| A | The `build` point, compile service, parsers, MCP tools | medium |
 | B | Document view, compile loop, error marks | large |
 | C | SyncTeX both ways, source references | medium |
 | D | Multi-file depth | medium |
 | E | Markdown to PDF through Typst | medium |
-| F | Managed installs, page renders | medium |
+| F | Managed installs, skill pack, page renders | medium |
+| G | Word export and import through pandoc | small |
 
 A comes first; B needs A; C and D need B and can run in parallel. E needs only A (the
-queue) and the documents plan's comrak work. F can land any time after A.
+queue) and the documents plan's comrak work. F can land any time after A. G needs A
+and B (the output opens in the split) and pandoc on the host.
 
 ### How this fits the documents plan
 
-- **Phase 1 there** (open a file at a line) is what the problems list and cross-file
-  inverse search use. Until it lands, they open the file without the jump.
-- **Phase 0 there** (buffers that outlive views) is what lets the split switch member
-  files without losing an unsaved chapter.
-- **Phase 4 there** (embeds): an embed of `report.typ#page=2` can show the compiled
-  page, because the embed card resolves a document to its build PDF.
-- **Phase 5 there** (point at anything): the region box and the reference basket work
-  on compiled PDFs, with source lines attached.
-- **Phase 6 there** (the dialect and `check_document`): `document_guide` extends the
-  same guide rather than starting a second one.
+The documents plan shipped in martinappberg/chimaera#159, so what this plan leans on
+is there:
+
+- **Open a file at a line** (its Phase 1) is what the problems list and cross-file
+  inverse search use.
+- **Buffers that outlive views** (its Phase 0) let the split switch member files
+  without losing an unsaved chapter.
+- **Embeds** (its Phase 4): an embed of `report.typ#page=2` can show the compiled
+  page once the embed card resolves a document to its build PDF (Phase D here).
+- **Point at anything** (its Phase 5): the region box and file references work on
+  compiled PDFs, with source lines attached.
+- **The dialect and `check_document`** (its Phase 6): `document_guide` exists, and
+  this plan extends it rather than starting a second guide.
+
+## Word, and editing what is not markdown
+
+Word documents open read-only today (`DocxView`, drawn by docx-preview inside a
+shadow root after sanitizing). "Editable Word, the way markdown works here" can mean
+three things, and only two of them fit Chimaera:
+
+1. **Editing a `.docx` in place**, every style, comment and tracked change
+   preserved. That needs an OOXML editor in the browser. None fits: the open-source
+   ones are whole servers to run (ONLYOFFICE's document server, Collabora Online:
+   hundreds of MB and a service beside the daemon) or copyleft editors (SuperDoc,
+   AGPL; licence to confirm), and the permissive libraries only read (`mammoth`,
+   docx-preview) or only write (`docx`). This stays out until a library exists that
+   could ship inside a static binary's web UI.
+2. **Editing the content through markdown.** **Open as markdown** runs
+   `pandoc report.docx -t gfm --extract-media=figures -o report.md` through the same
+   runner, when pandoc is present, and opens the copy in the live markdown editor
+   that exists today, beside the original. The card says what did not survive:
+   tracked changes, comments, headers and footers, most layout. Editing from there
+   is the markdown workbench, with agents, references and embeds.
+3. **Word as an output**, like PDF. A `docx` build manifest turns a markdown
+   document into `report.docx` with pandoc, a `--reference-doc` for the house style
+   when the project has one, opened in `DocxView` beside the source and rebuilt on
+   save. Agents write the portable dialect; the collaborator gets Word.
+
+The recommendation is 2 and 3, on the `build` point, with pandoc as an optional
+managed install (a 33 MB static binary, the same pattern as Typst). It is the
+agent-first answer: the source of truth stays a text file an agent can write and a
+diff can show, and Word is a view of it. Bringing a collaborator's edits back (their
+`.docx` to markdown, then a three-way merge against the exported version) is a later
+step on the same tools. Marp decks already render here; `marp --pptx` on the same
+point gives PowerPoint the same way, later.
+
+## Packaging: plugins in their own repositories
+
+Today every manifest is embedded in the binary (`MANIFESTS` in `plugins/mod.rs`),
+and "extensible" means extensible by this repository. The question is whether each
+plugin should be its own repository, found through a marketplace, so that a LaTeX
+plugin, a Word plugin or a Quarto plugin can come from anyone. The answer is yes
+for everything that is data or agent-side, and no for code:
+
+- **No extension host.** Third-party code in the daemon or the UI does not survive
+  the daemon's constraints: a static binary at about 150 MB on a shared login node,
+  bearer auth on every route, no unbounded child processes. An extension host is
+  also what makes an IDE an IDE, and the split above shows it is not needed: the
+  pieces that must be careful (the runner, the parsers, sync, the views) are few,
+  shared by every document plugin, and better written once. Third parties extend
+  Chimaera by writing manifests that name them.
+- **The marketplace exists already.** A claude marketplace is a git repository with
+  `.claude-plugin/marketplace.json`; a codex plugin is the same repository with
+  `.codex-plugin/plugin.json`; mycelium is both at once. A Chimaera plugin
+  repository is that repository plus `.chimaera-plugin/plugin.toml`, the manifest
+  above. Its skills, hooks and MCP servers ride the agents' own plugin managers, as
+  the authoring guide requires; its workbench half is the manifest. The Browse view
+  the plugins plan defers (§6.5) lists the marketplaces the agents already have; a
+  card gains a *workbench* badge when the plugin carries a Chimaera manifest.
+- **Discovery: three sources, one catalog.** Embedded manifests (first-party,
+  versioned with the daemon); manifests inside installed agent plugins
+  (`claude plugin list --json` reports each plugin's `installPath`, which
+  `agent_probe.rs` already reads to scan skills; codex's app-server reports its
+  plugin paths the same way); and `~/.chimaera/plugins/<id>/`, a clone at a pinned
+  commit for a plugin that is not an agent plugin, staged and reviewed the way the
+  skills-manager design stages skill packs. The card shows the source. The same id
+  from two sources is a conflict the card names, never a silent override.
+- **Trust is the manifest, read once.** A third-party manifest is declarative only:
+  it may use `build`, `detect`, `requires`, `recommends`, `setup`, `settings` and
+  `commands`, and name first-party capabilities. Its command templates are shown
+  verbatim when the plugin is first switched on and again whenever the manifest's
+  hash changes, like a project `latexmkrc` and like codex hook trust; the daemon
+  quotes every placeholder. No LLM reviews it and nothing runs before the user has
+  read it. A manifest that names a capability this daemon does not have, or a
+  `requires.chimaera` newer than this build, renders "needs a newer chimaera" and
+  stays off.
+- **Order.** In-tree first: the latex and typst manifests land embedded, because
+  that is the fastest way to prove the `build` point and there is no second home for
+  a manifest yet. The manifest format is designed now so that moving a plugin to its
+  own repository later is a file copy plus the discovery source, not a rewrite. The
+  move earns its keep when a plugin has a life outside this repository: a
+  `chimaera-plugins` repository (or one per plugin) that also ships the skill packs,
+  or the first third-party manifest.
 
 ## Open decisions
 
@@ -867,6 +1097,16 @@ queue) and the documents plan's comrak work. F can land any time after A.
    Tectonic after measuring its cache growth on a real home quota.
 9. **Markdown to PDF.** Chimaera's own comrak-to-Typst writer (recommended), a
    `cmarker` template, or pandoc when present?
+10. **Tools only where a build plugin is on** (recommended, the plugin rule), or the
+    documents paragraph and `compile_document` for every session as first drafted?
+11. **On is active** for build plugins (recommended: no footprint, no walk, the guide
+    before the first `.tex`), or a `detect` glob answered from the quick-open index?
+12. **Packaging.** Embedded manifests first and a plugin repository format
+    (`.chimaera-plugin/plugin.toml` beside `.claude-plugin/` and `.codex-plugin/`)
+    when a plugin has a second home (recommended), or start in a separate repository
+    from day one?
+13. **Word.** Export and import through pandoc on the build point (recommended), or
+    look again for an in-browser `.docx` editor first?
 
 ## Out of scope
 
@@ -875,33 +1115,54 @@ queue) and the documents plan's comrak work. F can land any time after A.
 - **A WASM engine in the browser**, for the reasons above.
 - **Bundling TeX Live** or managing TeX packages (`tlmgr`). The host's admins and the
   user's prelude own the TeX installation.
-- **Word output.** Pandoc can make `.docx` when present; designing that belongs with
-  the documents plan's Office work.
+- **Editing a `.docx` in place**, styles and tracked changes preserved: no library
+  with a fitting licence and footprint
+  ([Word](#word-and-editing-what-is-not-markdown)). Word as an output and as an
+  import is in scope (Phase G).
+- **An extension host**, or any third-party code in the daemon or the UI
+  ([packaging](#packaging-plugins-in-their-own-repositories)).
 - **Collaborative editing** of a report by several people at once.
 
 ## Appendix: what the code does today
 
 - **File kinds.** `.tex` and `.typ` fall through `viewKindFor` to `text` and open in
-  `CodeView` (`web-ui/src/lib/previews/files.ts:597-613`). LaTeX gets highlighting from
-  `@codemirror/language-data`'s lazy `stex` legacy mode; Typst gets none.
+  `CodeView` (`web-ui/src/lib/previews/files.ts:1014`). LaTeX gets highlighting from
+  `@codemirror/language-data`'s lazy `stex` legacy mode; Typst gets none. `.docx`
+  opens read-only in `DocxView.svelte` (docx-preview, sanitized, in a shadow root).
 - **Split view.** `SplitEditPreview.svelte` owns only geometry. The editor is always
   the first child; turning split off unmounts the preview half. `HtmlView.svelte` is
   the only host.
-- **PDF view.** `PdfView.svelte` takes only a `path`, calls `pdfjs.getDocument({ url })`
-  with default options (`:115`), keeps per-path scroll and zoom memory, caps rasters
-  and text layers, and remounts on a new file version. It has no API to scroll to a
-  spot, draw a highlight, or report a click position.
+- **PDF view.** `PdfView.svelte` takes a `path`, opens it with `disableAutoFetch` and
+  `disableStream` (`:291-297`, since martinappberg/chimaera#159), has find, an
+  outline, links and `scrollToPagePoint` (`:236`), keeps per-path scroll and zoom
+  memory, caps rasters and text layers, and remounts on a new file version. It has
+  no API to draw a highlight or report a click position.
 - **Editor hooks.** `CodeView.svelte` accepts host extensions in an `extra`
-  compartment (`:77`, `:104`) and reports the live text through `onDoc`.
-  `@codemirror/lint` is a dependency, used by `SettingsJson.svelte:186-187`.
+  compartment (`:62`, `:99`) and reports the live text through `onDoc`.
+  `@codemirror/lint` is a dependency, used by `SettingsJson.svelte:20`.
 - **References.** `shared/reference.ts` defines `FileSelection {path, startLine,
   endLine, text}` (`:19`) and `composeFileReference`, which produces
-  `@path#Lx-Ly "excerpt" ` and never a newline (`:140`).
-- **MCP.** `mcp.rs` `INSTRUCTIONS` (`:101`) covers linked terminals only; the base tools
-  are `list_terminals`, `run_in_terminal` and `read_terminal` (`:389`); the Mastermind
+  `@path#Lx-Ly "excerpt" ` and never a newline (`:169`).
+- **MCP.** `mcp.rs` `INSTRUCTIONS` (`:121`) covers linked terminals and
+  `DOCUMENTS_INSTRUCTIONS` (`:146`) the portable dialect; the base tools are
+  `list_terminals`, `run_in_terminal`, `read_terminal`, `document_guide` and
+  `check_document` (`:477`), the last two always allowed (`:104`); the Mastermind
   tier adds workspace tools. Claude gets the server through a generated
   `--mcp-config` (`agents.rs`), Codex through `-c mcp_servers.chimaera.url`
   (`launcher.rs`).
+- **Plugins.** `plugins/mod.rs` embeds the manifests (`MANIFESTS`, `:42`), parses
+  them with `deny_unknown_fields`, computes `active` (`:212`, on AND footprint
+  present, empty footprint meaning always) and `spawn_allow` (`:244`);
+  `plugins/tools.rs` serves plugin tools and instruction paragraphs where active
+  (`instructions` `:20`, `defs` `:43`, `call` `:108`). Built contribution points:
+  `detect`, `requires.agent_plugins`, `setup.prompt`, `provides.knowledge`,
+  `provides.mcp_tools`; `views`, `settings` and `commands` are specified only.
+  `agent_probe.rs` reads each installed claude plugin's `installPath` (`:310`,
+  `:794`). The UI renders any manifest generically
+  (`web-ui/src/lib/plugins/InstalledView.svelte`).
+- **Quick-open index.** `quickopen.rs` keeps a bounded, cached file index per
+  workspace, served stale and refreshed behind, with `workspace_index_if_free` for
+  callers that must never start a walk.
 - **Running tools safely.** `compute.rs` has the pattern to copy: `run_checked` with a
   timeout, `kill_on_drop` and capped output (`:678`), a login-shell PATH probe walked
   by `find_on_path` instead of `command -v` (`:340`), and the `CHIMAERA_SLURM_BINDIR`
@@ -912,7 +1173,7 @@ queue) and the documents plan's comrak work. F can land any time after A.
 - **Managed installs.** `runtimes.rs` installs agent CLIs from official artifacts with
   checksums, as a visible shell session, under `~/.chimaera/agents/`.
 - **Watching and serving.** `fs_watch.rs` caps each window at 64 files and 64 folders
-  (`:21-22`). `fs.rs` runs filesystem work behind an eight-permit semaphore (`:82`) and
+  (`:25-26`). `fs.rs` runs filesystem work behind an eight-permit semaphore (`:97`) and
   serves `/raw/{ticket}` with byte ranges and a 600 s ticket life.
 - **Runtime directory.** `chimaera_core::runtime_dir` is `$XDG_RUNTIME_DIR/chimaera`,
   else `/tmp/chimaera-$UID`.

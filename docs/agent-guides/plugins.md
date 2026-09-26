@@ -73,6 +73,8 @@ agents = ["2 read tools for every agent here: knowledge_search · knowledge_get"
 | `provides.views` | **specified, not yet built** | a lazy-loaded first-party Svelte module | add `web-ui/src/lib/plugins/registry.ts` (id → `() => import(...)`) with the first plugin that needs it |
 | `settings` | **specified, not yet built** | typed per-workspace values rendered generically on the card | add with the first plugin that needs it |
 | `commands` | **specified, not yet built** | shell templates run as ORDINARY terminal sessions (env prelude applied, visible in the rail, exit codes flow into the Timeline for free) | add with the first plugin that needs it |
+| `build` | **specified in the LaTeX plan, not yet built** | files → a bounded, quiet child process on the host (queue, limits, build folder, named parsers/sync, output shown beside the source, a `compile_document` tool where on); LaTeX and Typst are its first two manifests | [latex-reports-plan.md](../latex-reports-plan.md#the-plugin-shape) |
+| `recommends.agent_plugins` | **specified in the LaTeX plan, not yet built** | the shape of `requires`, shown as optional: the plugin works with zero installs | with `build` |
 
 "Specified, not yet built" is deliberate (rule of two): the first plugin that
 needs a point adds it, following the shape in the plan (§6.1), with a unit
@@ -94,33 +96,46 @@ test, and updates this table.
 6. Verify live: switch it on in the isolated preview, watch a NEW agent session
    get exactly the advertised tools, switch it off, watch them go.
 
-## Sketch: the LaTeX plugin
+## The LaTeX plugin: the `build` point
+
+An earlier sketch here put LaTeX on `commands` (a visible terminal session per
+build) and `settings`. The [LaTeX and Typst plan](../latex-reports-plan.md#the-plugin-shape)
+replaces it: compile-on-save cannot be a terminal per save (a rail entry every
+time an agent writes a chapter, no time or memory limit, no build folder), and a
+terminal cannot hand back diagnostics, an output file and sync data. So the
+plugin's contribution point is `build` — a bounded, quiet child process run
+through the environment prelude (`module load texlive` for free), with the
+careful pieces (the queue and limits, the log parsers, SyncTeX, the document
+view) as first-party code the manifest names:
 
 ```toml
 id = "latex"
 name = "LaTeX"
-summary = "Build .tex to PDF and read it beside the source."
+summary = "Build .tex to PDF and read it beside the source, with errors as editor marks."
 
-[detect]
-any = ["main.tex"]            # or a glob — answered from the existing file index, never a new walk
+[build]
+sources = ["*.tex", "*.ltx"]   # opens as a document where this plugin is on
+root = "tex"                   # named main-file finder
+inputs = "fls"                 # named watch-set source
+diagnostics = "latex-log"      # named log parser
+sync = "synctex"               # named source-to-PDF mapping
+output = "{build_dir}/{stem}.pdf"
 
-[settings]                    # new contribution point
-engine = { choices = ["pdflatex", "xelatex", "lualatex"], default = "pdflatex" }
-
-[commands.build]              # new contribution point: an ordinary terminal session
-run = "latexmk -{engine} -interaction=nonstopmode -synctex=1 {file}"
-output = "{dir}/{stem}.pdf"   # opened with the existing PdfView
-
-[provides]
-views = ["latex"]             # new: the registry + a lazy Svelte module
-mcp_tools = ["latex_build"]   # returns parsed errors to any agent
+[[build.engines]]              # the ladder, first found wins
+name = "latexmk"
+tools = ["latexmk"]
+run = "latexmk -pdf -interaction=nonstopmode -file-line-error -synctex=1 -recorder -outdir={build_dir} -norc {root}"
 
 [adds]
-ui = ["A build button on .tex files · the PDF beside the source · build errors on the Timeline"]
-agents = ["1 tool for every agent here: latex_build"]
+ui = [".tex opens as source | split | PDF · compile on save · errors as editor marks"]
+agents = ["1 tool for every agent here: compile_document"]
 ```
 
-A project's own config wins over plugin settings (honour an existing
-`latexmkrc` — fill the gap, never fight a choice). On HPC the build runs with
-the workspace's environment prelude (`module load texlive`), for free, because
-commands are ordinary terminal sessions.
+Build plugins carry no `detect` footprint (on = active, so an agent gets the
+engine facts before it writes the first `.tex`). A project's own config wins
+over the manifest (a `Tectonic.toml`, a trusted `latexmkrc` — fill the gap,
+never fight a choice). Typst is the same shape; markdown-to-PDF and Word export
+are the third and fourth manifests on the point. The plan also says how a
+manifest could later live in a plugin's own repository beside its
+`.claude-plugin/` and `.codex-plugin/`
+([packaging](../latex-reports-plan.md#packaging-plugins-in-their-own-repositories)).
