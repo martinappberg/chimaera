@@ -440,8 +440,8 @@ codex launch did not work in the field.
   a handle-less row starts fresh with an honest per-row tooltip rather than claiming the
   agent lacks resume support. A finished Codex chat copies its `ChatInfo` thread id into
   Recents before removing the registry entry. Live
-  conversations never appear; resuming one moves it out (claude forks a new session id
-  per resume — records track `resumed_from`, and a resumed-then-ended conversation
+  conversations never appear; resuming one moves it out (older claude CLIs fork a new
+  session id per resume, 2.1.283 keeps it — records track `resumed_from`, and a resumed-then-ended conversation
   supersedes its ancestor entry). The section order is also the mod+1–9 chord order and
   the focus-mode strip order — what you see is what the numbers mean.
 
@@ -469,7 +469,8 @@ Launcher field notes (2026-07-06, shipped with the build):
      reads as what it is ("Missing OpenAI API key. Set the environment variable…").
   The modern Rust codex CLI has `codex login` (OAuth); the legacy one is API-key only —
   the launcher's pre-typed install command upgrades it.
-- **Recents vs `--resume` identity:** claude forks a NEW session id on every resume. Agent
+- **Recents vs `--resume` identity:** older claude CLIs fork a NEW session id on every resume
+  (2.1.283 keeps it; the logic below handles both). Agent
   records carry `resumed_from`; the live-exclusion set matches either identity, and when a
   resumed session ends it *supersedes* its ancestor's recents entry (one conversation, one
   row, resumable via the newest id). Untitled claude boots never enter recents (nothing

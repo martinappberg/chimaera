@@ -61,6 +61,9 @@ fn main() {
     // Background mode gives each turn its own task id, so a second prompt
     // adds to the live set rather than re-listing the same one.
     let mut turn_count = 0u32;
+    // Session-scoped flag state, so an apply_flag_settings shows up in the
+    // next get_settings read-back like the real CLI's.
+    let mut ultracode = false;
 
     let stdin = std::io::stdin().lock();
     for line in stdin.lines() {
@@ -257,8 +260,23 @@ fn main() {
                     },
                 }));
             }
+        } else if frame["type"] == "control_request"
+            && frame["request"]["subtype"] == "get_settings"
+        {
+            emit(json!({
+                "type": "control_response",
+                "response": {
+                    "subtype": "success",
+                    "request_id": frame["request_id"],
+                    "response": { "applied": { "ultracode": ultracode } },
+                },
+            }));
         } else if frame["type"] == "control_request" {
-            // set_permission_mode / set_model / …: acknowledge.
+            if let Some(on) = frame["request"]["settings"]["ultracode"].as_bool() {
+                ultracode = on;
+            }
+            // set_permission_mode / set_model / apply_flag_settings / …:
+            // acknowledge.
             emit(json!({
                 "type": "control_response",
                 "response": {
