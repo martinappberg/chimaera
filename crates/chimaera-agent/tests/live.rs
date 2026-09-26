@@ -1747,6 +1747,88 @@ async fn driver_stack_end_to_end_against_real_claude() {
     manager.kill("s-live");
 }
 
+/// The codex production path end-to-end: ChatManager + CodexAdapter driver
+/// against the real app-server — handshake Init with the thread id, mapped
+/// turn events, the resume index, journal replay. Every other codex case
+/// drives the raw `CodexChat` client, so this is the one that runs
+/// `CodexMapper` (server-request routing included) against real frames: an
+/// ordinary turn must raise no card and no unhandled-request notice.
+#[tokio::test]
+#[ignore = "live: spawns real codex via the driver, needs auth, bills one tiny turn"]
+async fn driver_stack_end_to_end_against_real_codex() {
+    use chimaera_agent::codex::CodexAdapter;
+    use std::sync::Arc;
+
+    let dir = tmpdir();
+    let manager = Arc::new(ChatManager::new(
+        dir.path().join("chat"),
+        Box::new(|_, _| {}),
+        Box::new(|id, exit| tracing::info!(%id, ?exit, "driver exit")),
+    ));
+    let spec = SpawnSpec::new(
+        "s-codex",
+        vec!["codex".into(), "app-server".into()],
+        dir.path().to_path_buf(),
+    );
+    manager.spawn(&CodexAdapter, spec).expect("spawn driver");
+    let att = manager.attach("s-codex", 0).expect("attach");
+    let mut rx = att.live;
+
+    manager
+        .command(
+            "s-codex",
+            AgentCommand::Send {
+                blocks: vec![ContentBlock::Text {
+                    text: "Reply with exactly: ok".into(),
+                }],
+            },
+        )
+        .await
+        .expect("send");
+
+    let mut saw_message = false;
+    let mut saw_completed = false;
+    let deadline = tokio::time::Instant::now() + TURN;
+    while !(saw_message && saw_completed) {
+        let entry = tokio::time::timeout_at(deadline, rx.recv())
+            .await
+            .expect("timed out waiting for driver events")
+            .expect("broadcast closed");
+        match &entry.ev {
+            AgentEvent::MessageChunk { text, .. } if text.contains("ok") => saw_message = true,
+            AgentEvent::TurnCompleted { .. } => saw_completed = true,
+            AgentEvent::TurnAborted { reason, .. } => panic!("turn aborted: {reason}"),
+            AgentEvent::PermissionRequest { title, .. } => {
+                panic!("an ordinary turn raised a card: {title}")
+            }
+            AgentEvent::Notice { text } if text.contains("doesn't handle") => {
+                panic!("an ordinary turn hit an unhandled server request: {text}")
+            }
+            _ => {}
+        }
+    }
+
+    let info = manager.get("s-codex").expect("info");
+    let thread = info
+        .native_session_id
+        .clone()
+        .expect("Init carried the thread id");
+    assert_eq!(
+        manager.index().lookup(&thread).as_deref(),
+        Some("s-codex"),
+        "resume index recorded"
+    );
+    let replay = manager.attach("s-codex", 0).expect("reattach").replay;
+    assert!(replay
+        .iter()
+        .any(|e| matches!(&e.ev, AgentEvent::UserMessage { text, .. } if text.contains("ok"))));
+    assert!(replay
+        .iter()
+        .any(|e| matches!(e.ev, AgentEvent::TurnCompleted { .. })));
+
+    manager.kill("s-codex");
+}
+
 /// Ultracode at spawn (a resurrected session had it on): the handshake
 /// applies it and the read-back says so, WITHOUT counting as the user's pick
 /// (it must not become a remembered preference). Bills nothing — no turn.

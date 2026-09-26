@@ -160,14 +160,22 @@ proposedExecpolicyAmendment, availableDecisions:["accept",
 {acceptWithExecpolicyAmendment:{…}}, …]}` — answer by JSON-RPC id with
 `{"decision":"accept"}` / `{"decision":"decline"}`. **Any unrecognized
 decision string is silently treated as a decline** (live: "approved" declined
-the command). File changes have an analogous `requestApproval` (shape TBD —
-capture before mapping).
+the command). File changes have an analogous
+`item/fileChange/requestApproval` (mined in extension pass 2). Every other
+server request is refused with a JSON-RPC error, never shown as a card
+(Pass 34).
 
 ## Cross-agent invariants
 
 - One normalized event model (`model.rs`, ACP-shaped); drivers translate.
 - Caps at event construction, not sinks (login-node budgets).
 - Handshake watchdog + degrade-to-PTY is per-driver mandatory behavior.
+- An agent→client request no handler knows is never shown as a permission
+  card, and the user hears about it once per kind (a Notice; both drivers
+  share `UNHANDLED_REQUESTS_CAP`/`UNHANDLED_REQUEST_NAME_MAX`). Claude's
+  control requests are parked (the CLI's deadline settles them); codex's
+  JSON-RPC requests get a `-32601` error, since nothing else would answer
+  (Pass 34).
 
 ## Version detection (both drivers)
 
@@ -2477,3 +2485,40 @@ It is not every resume. A clean resume (the previous process finished its turn a
 ### Gate (Pass 33)
 
 `just chat-smoke` 23/23 as above. No driver mapping changed: the pins moved (`TESTED_CLAUDE_VERSION = "2.1.283"`, `TESTED_CODEX_VERSION = "0.157.1"`), the harness's drift check matches whole version tokens (hermetic `driver::tests::version_pin_matches_whole_tokens_only`, plus the existing `version_drift_is_nonfatal_and_never_reaches_the_stream`), and the resume-id notes were corrected.
+||||||| parent of 7887c14 (fix: codex server requests without a handler get an error, not a bogus approval card)
+
+## Pass 34 (2026-09-25 — codex 0.157.1 generated schema + binary + one live probe): server requests without a handler. ADOPTED.
+
+The codex driver built a command-approval card for every server→client request it did not special-case. After `item/tool/requestUserInput`, `mcpServer/elicitation/request` and `item/permissions/requestApproval`, `on_server_request` matched only `item/fileChange/requestApproval` by name. Its `_` arm turned anything else into an Allow/Deny card titled from `command` (or "codex action") and answered with `{decision: …}`. Any request whose params carried `networkApprovalContext.host` became a network card, whatever its method. Sources: the 0.157.1 generated schema (`generate-ts --experimental`, `ServerRequest.ts` and the params/response types), the 0.157.1 binary's strings, and one live probe (two tiny turns on the ChatGPT plan). Pass 33 is the 2.1.283/0.157.1 drift check.
+
+### The 0.157.1 `ServerRequest` union
+
+| method | params → response | when codex sends it | driver |
+|---|---|---|---|
+| `item/commandExecution/requestApproval` | `{kind: command\|writeStdin, threadId, turnId, itemId, command?, cwd?, commandActions?, networkApprovalContext?, proposedExecpolicyAmendment?, proposedNetworkPolicyAmendments?, availableDecisions?, …}` → `{decision}` | shell, stdin and network approvals | card (unchanged; now matched by name) |
+| `item/fileChange/requestApproval` | → `{decision}` | patch approvals | card (unchanged) |
+| `item/tool/requestUserInput` | → `{answers}` | model questions | question card (unchanged) |
+| `mcpServer/elicitation/request` | → `{action, content?}` | MCP tool approvals and forms | card (unchanged) |
+| `item/permissions/requestApproval` | → `{permissions, scope}` | extra sandbox permissions | card (unchanged) |
+| `currentTime/read` | `{threadId}` → `{currentTimeAt}` (whole Unix seconds) | the client's clock for the `current_time_reminder` feature (`codex features list`: under development, off) | **answered from the daemon's clock** |
+| `item/tool/call` | `{threadId, turnId, callId, namespace, tool, arguments}` → `{contentItems, success}` | a client-registered dynamic tool; chimaera registers none | **refused** |
+| `account/chatgptAuthTokens/refresh` | `{reason, previousAccountId?}` → tokens | externally managed ChatGPT auth; chimaera leaves auth to the CLI | **refused** |
+| `attestation/generate` | `{}` → `{token}` | only after `initialize.capabilities.requestAttestation`, which chimaera does not declare | **refused** |
+| `execCommandApproval`, `applyPatchApproval` (v1) | `{conversationId, callId, command: string[], cwd, parsedCmd, …}` / `{conversationId, callId, fileChanges, grantRoot}` → `{decision: ReviewDecision}` | v1-API conversations only; chimaera opens v2 threads | **refused** |
+
+The legacy v1 approvals do not share the v2 shapes. `ReviewDecision` is `"approved" | "approved_for_session" | {denied: {rejection}} | "abort" | "timed_out" | {approved_execpolicy_amendment: …} | …`; the v2 card's `"accept"`/`"decline"` would not deserialize, so they get no card. `currentTime/read`, `item/tool/call`, `account/chatgptAuthTokens/refresh` and `attestation/generate` were already in the 0.156.1 union.
+
+### When `currentTime/read` fires (not reproduced)
+
+The binary has `app-server/src/current_time.rs`, `core/src/tools/handlers/current_time.rs`, the messages "current-time request failed: code= message=", "current-time request was canceled" and "current-time request timed out after …s", and a `nonfatal_clock_read_errors` feature beside `current_time_reminder`. So the app-server times the request out itself, and it logs an error reply as a failure. Live, 0.157.1 with `-c features.current_time_reminder=true` (the app-server warned "Under-development features enabled"): two turns, and no `currentTime/read` arrived. The trigger is unmined, so the answer shape is pinned by the schema alone.
+
+### ADOPTED
+
+- `currentTime/read` is answered at once: `{currentTimeAt: <SystemTime::now() as whole Unix seconds>}`, or a `-32603` error if the clock reads before the epoch. It shows nothing to the user.
+- `item/commandExecution/requestApproval` is an explicit arm (the network variant is its `networkApprovalContext.host` guard). `item/fileChange/requestApproval` stays explicit. Every other method gets `{id, error: {code: -32601, message: "chimaera does not handle <method>"}}` (-32601 is the app-server's own "Method not found" code), plus one `Notice` and one daemon `warn` per method per session. What codex does with the error is its own error path (for `currentTime/read` the binary logs "current-time request failed: code=… message=…"); no refused method was observed live, since none fires for chimaera's thread setup.
+- A server request that arrives while the handshake awaits a response (initialize, thread open, `config/read`, `skills/list`, a revert) used to be dropped, never answered. `HandshakeSideband` now keeps them (in order, up to 16) and replays each through the mapper after the handshake, the way the Remote Control status already was, so it gets a card, an answer or a refusal. None was observed there live; this closes the gap in the same bug class.
+- Symmetry with claude. `claude.rs` parks an unhandled `control_request` on purpose: the CLI settles it at its own deadline, or another attached client does, and an error reply could break flows that rely on that. A codex JSON-RPC request has no other settler, so parking it would only stall the agent until the app-server's timeout, where it has one. What both drivers share: never a card, a Notice and a daemon `warn` once per kind, and the caps `UNHANDLED_REQUESTS_CAP` (64 names remembered) and `UNHANDLED_REQUEST_NAME_MAX` (80 chars in a notice or reply), both in `model.rs`. Claude's notice now caps the subtype name too; before, only the set was bounded.
+
+### Gate (Pass 34)
+
+Hermetic: `current_time_read_is_answered_from_the_clock`; `handshake_sideband_keeps_server_requests_for_replay`; `unhandled_server_requests_are_refused_not_carded` (the four non-approval methods, both v1 approvals, and an unknown method carrying `networkApprovalContext`: each gets exactly one `-32601` reply naming the method, no card, one Notice, and none on a repeat); `unhandled_server_request_notices_are_bounded` and claude's `unknown_control_subtype_notices_are_bounded` (a long name is capped, the set stops at the cap, requests are still refused or parked past it). The existing approval, elicitation, permissions and question tests pin the arms that did not change. Live: `just chat-smoke` 24/24 on claude 2.1.283 + codex 0.157.1, including the new `driver_stack_end_to_end_against_real_codex`. Every other codex case drives the raw `CodexChat` client, so until this case the suite never ran `CodexMapper` against real frames; it pins that an ordinary turn raises no card and no unhandled-request notice, and that Init, the resume index and replay work through the driver.
