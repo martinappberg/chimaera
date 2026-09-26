@@ -674,6 +674,23 @@ pub(crate) fn build_agent_resume_command(
     argv
 }
 
+/// What every CHAT spawn is told about its host — and only chat spawns: a
+/// TUI session is the agent's own screen, but a chat reply is rendered by
+/// chimaera, and the agent cannot know that a markdown image link to a local
+/// file becomes an inline card unless told. Claude takes it through
+/// `--append-system-prompt`, codex through `developer_instructions`; a
+/// forked branch carries it at the head of its portable context instead
+/// (`chat::portable_context_prompt`), since that context rides the same
+/// channel. Short and cached with the system prompt: a few dozen tokens.
+pub(crate) const CHAT_HOST_PROMPT: &str = "\
+You are running in chimaera's chat, which renders your replies as markdown in a \
+workbench beside the user's files. To show the user a figure, a page of a \
+document, a table or any other file, write a markdown image link to it with a \
+path relative to the working directory — ![UMAP](figs/umap.png), \
+![page 3](paper.pdf#page=3), ![first rows](out/summary.csv) — and it renders \
+inline as a card the user can open. Files you write during a turn are listed \
+under your reply automatically, so name a file only when it helps the reader.";
+
 /// The workspace Mastermind's role frame, appended to its claude chat spawn
 /// via `--append-system-prompt`. Short by design: the MCP server's own
 /// instructions carry the tool mechanics; this pins the ROLE — understand and
@@ -742,9 +759,18 @@ pub(crate) fn build_chat_command(
         cmd.push("--append-system-prompt-file".to_string());
         cmd.push(context.to_string_lossy().into_owned());
     }
+    // One `--append-system-prompt`: the host frame (unless the fork context
+    // file already opens with it), then the Mastermind role when asked.
+    let mut appended: Vec<&str> = Vec::new();
+    if fork_context_file.is_none() {
+        appended.push(CHAT_HOST_PROMPT);
+    }
     if mastermind {
+        appended.push(MASTERMIND_SYSTEM_PROMPT);
+    }
+    if !appended.is_empty() {
         cmd.push("--append-system-prompt".to_string());
-        cmd.push(MASTERMIND_SYSTEM_PROMPT.to_string());
+        cmd.push(appended.join("\n\n"));
     }
     cmd
 }
@@ -824,13 +850,20 @@ pub(crate) fn build_codex_chat_command(
     if let Some(url) = mcp_url {
         cmd.extend(codex_mcp_overrides(url));
     }
-    if mastermind.is_some() {
-        cmd.push("-c".to_string());
-        cmd.push(format!(
-            "developer_instructions=\"{}\"",
-            toml_basic_string(MASTERMIND_SYSTEM_PROMPT)
-        ));
-    }
+    // The host frame on every chat spawn, the Mastermind role after it. A
+    // forked branch's `developerInstructions` (driver `thread/start`)
+    // overrides this whole string with the portable context, which opens
+    // with the same host frame.
+    let instructions = if mastermind.is_some() {
+        format!("{CHAT_HOST_PROMPT}\n\n{MASTERMIND_SYSTEM_PROMPT}")
+    } else {
+        CHAT_HOST_PROMPT.to_string()
+    };
+    cmd.push("-c".to_string());
+    cmd.push(format!(
+        "developer_instructions=\"{}\"",
+        toml_basic_string(&instructions)
+    ));
     cmd
 }
 
@@ -1458,8 +1491,9 @@ mod tests {
         assert_eq!(cmd[3..], ["/usr/bin/claude"]);
     }
 
-    /// The Mastermind flag appends the role prompt (and nothing else changes);
-    /// an ordinary chat spawn carries no `--append-system-prompt` at all.
+    /// Every chat spawn carries the host frame in one `--append-system-prompt`;
+    /// the Mastermind flag appends its role after it (and nothing else
+    /// changes); a forked branch carries the frame in its context file instead.
     #[test]
     fn build_chat_command_appends_mastermind_prompt() {
         let plain = build_chat_command(
@@ -1473,7 +1507,18 @@ mod tests {
             None,
             false,
         );
-        assert!(!plain.iter().any(|a| a == "--append-system-prompt"));
+        let host = plain
+            .iter()
+            .position(|a| a == "--append-system-prompt")
+            .expect("host frame");
+        assert_eq!(plain[host + 1], CHAT_HOST_PROMPT);
+        assert_eq!(
+            plain
+                .iter()
+                .filter(|a| *a == "--append-system-prompt")
+                .count(),
+            1
+        );
 
         let mm = build_chat_command(
             Path::new("/usr/bin/claude"),
@@ -1490,9 +1535,34 @@ mod tests {
             .iter()
             .position(|a| a == "--append-system-prompt")
             .expect("prompt flag");
-        assert_eq!(mm[idx + 1], MASTERMIND_SYSTEM_PROMPT);
+        assert_eq!(
+            mm[idx + 1],
+            format!("{CHAT_HOST_PROMPT}\n\n{MASTERMIND_SYSTEM_PROMPT}")
+        );
+        assert_eq!(
+            mm.iter().filter(|a| *a == "--append-system-prompt").count(),
+            1
+        );
         // Everything before the prompt is the plain argv, unchanged.
-        assert_eq!(mm[..idx], plain[..]);
+        assert_eq!(mm[..idx], plain[..idx]);
+
+        let forked = build_chat_command(
+            Path::new("/usr/bin/claude"),
+            Path::new("/rt/s.json"),
+            Path::new("/rt/m.json"),
+            None,
+            Some("native-1"),
+            None,
+            None,
+            Some(Path::new("/rt/fork.txt")),
+            true,
+        );
+        let idx = forked
+            .iter()
+            .position(|a| a == "--append-system-prompt")
+            .expect("role prompt");
+        assert_eq!(forked[idx + 1], MASTERMIND_SYSTEM_PROMPT);
+        assert!(forked.iter().any(|a| a == "--append-system-prompt-file"));
     }
 
     /// Codex chat MCP injection (verified codex 0.144.2): the per-session
@@ -1502,8 +1572,12 @@ mod tests {
     /// the pre-injection spawn.
     #[test]
     fn build_codex_chat_command_injects_mcp_url() {
+        let host = format!(
+            "developer_instructions=\"{}\"",
+            toml_basic_string(CHAT_HOST_PROMPT)
+        );
         let bare = build_codex_chat_command(Path::new("/usr/bin/codex"), None, None);
-        assert_eq!(bare, ["/usr/bin/codex", "app-server"]);
+        assert_eq!(bare, ["/usr/bin/codex", "app-server", "-c", host.as_str()]);
 
         // The URL must be SECRET-FREE (argv is world-readable in /proc); the
         // key rides the spawn env via bearer_token_env_var instead.
@@ -1518,6 +1592,8 @@ mod tests {
                 "mcp_servers.chimaera.url=\"http://127.0.0.1:4200/api/v1/mcp/s-1a2b3c4d\"",
                 "-c",
                 "mcp_servers.chimaera.bearer_token_env_var=\"CHIMAERA_MCP_KEY\"",
+                "-c",
+                host.as_str(),
             ]
         );
     }
@@ -1551,7 +1627,7 @@ mod tests {
     /// app-server ignores them and elicits every MCP call (Pass 19); the
     /// mode gate is the driver's `SpawnSpec.mcp_auto_approve`.
     #[test]
-    fn build_codex_chat_command_mastermind_carries_only_the_role_prompt() {
+    fn build_codex_chat_command_mastermind_carries_the_host_frame_then_the_role() {
         let url = "http://127.0.0.1:4200/api/v1/mcp/s-1a2b3c4d";
         for mode in [
             crate::workspaces::MastermindMode::Ask,
@@ -1568,7 +1644,12 @@ mod tests {
                     "-c".into(),
                     format!("mcp_servers.chimaera.bearer_token_env_var=\"{CODEX_MCP_KEY_ENV}\""),
                     "-c".into(),
-                    format!("developer_instructions=\"{MASTERMIND_SYSTEM_PROMPT}\""),
+                    format!(
+                        "developer_instructions=\"{}\"",
+                        toml_basic_string(&format!(
+                            "{CHAT_HOST_PROMPT}\n\n{MASTERMIND_SYSTEM_PROMPT}"
+                        ))
+                    ),
                 ]
             );
         }

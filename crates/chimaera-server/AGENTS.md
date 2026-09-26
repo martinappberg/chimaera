@@ -134,7 +134,10 @@ One privileged chat session per workspace (the dashboard plan §6/§7 —
   (`agents.rs::write_settings`): ask pre-allows only the read tools in
   `permissions.allow` (acts raise its native permission prompt); auto
   pre-allows `mcp__chimaera`; the role prompt is argv
-  (`launcher::MASTERMIND_SYSTEM_PROMPT` via `--append-system-prompt`). Codex:
+  (`launcher::MASTERMIND_SYSTEM_PROMPT` via `--append-system-prompt`, after the
+  chat host frame `launcher::CHAT_HOST_PROMPT` every chat spawn carries — never a
+  TUI spawn — which tells the agent that a markdown image link renders inline
+  and that written files are listed under the reply). Codex:
   the app-server elicits EVERY MCP tool call regardless of approval-mode
   config (live-probed — PROTOCOL.md Pass 19), so the mode rides
   `SpawnSpec.mcp_auto_approve` (chat.rs sets it; the driver answers listed

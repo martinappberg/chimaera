@@ -473,7 +473,11 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   slide, a player, a document excerpt, a file card. Click a card's name (or ↗) to open the full
   viewer in a pane at the same spot.
 - **Images in agent prose.** `![alt](figs/plot.png)` renders the file (it used to be a broken
-  image): the target resolves against the session's live directory, then where it started, then
+  image). Agents are told so: every **chat** spawn (never a TUI one) carries a short host frame —
+  claude via `--append-system-prompt`, codex via `developer_instructions`, a forked branch at the
+  head of its portable context — saying that a markdown image link with a workspace-relative path
+  renders inline as a card and that written files are listed under the reply automatically, so
+  the agent shows a figure without being asked to. The frame: the target resolves against the session's live directory, then where it started, then
   the workspace root — strictly, an embed names one file — and any fragment picks the piece
   (`paper.pdf#page=3`, `run.py#L10-L30`, `data.csv#row=2-9`). A file the agent announces before
   writing shows as "not found" and turns into its card when it appears.
@@ -493,9 +497,7 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   chip line, so a turn costs one line. Two files sharing a name show their folders (against
   everything the turn wrote, linked in the prose or not). A chip knows
   its file: gone (struck, not clickable) or changed after this turn (its tooltip says so), kept
-  current by the disk monitor while on screen. The reply's rail (time · copy · fork) signs off
-  after the block — at the end of the chip line, or under the tiles — rather than between the
-  prose and the block; it shows on hover of either. A stopped or failed turn keeps its block. Tiles
+  current by the disk monitor while on screen. A stopped or failed turn keeps its block. Tiles
   stay fresh when a file is overwritten, and say so when one is gone.
 - **How the gallery finds shell-written files.** No structured event names them, so the reducer
   lists the artifact-shaped paths the turn's commands and command outputs *mention*, plus figures
