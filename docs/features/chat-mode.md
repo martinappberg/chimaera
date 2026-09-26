@@ -503,7 +503,7 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   in chat”; a terminal resurrected after daemon restart uses its durable resume handle even before a
   fresh transcript hook arrives. A busy `Running` agent needs `force` (409). **Billing note:**
   the TUI side bills like an interactive session; the chat side drives the structured protocol. This
-  is also the **`/login` recovery** path (see [Composing & sending](#composing-sending)): an
+  is also the **`/login` recovery** path (see [Composing & sending](#composing--sending)): an
   expired-auth session flips to its TUI so claude's native auth flow can run.
 - **Branch at any message, without stopping the source.** Hover an assistant response and choose its
   fork action to create a new idle chat immediately after that response. The composer is empty and no

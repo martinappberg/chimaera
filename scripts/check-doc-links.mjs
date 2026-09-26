@@ -17,7 +17,7 @@ const files = execSync("git ls-files -co --exclude-standard '*.md'", { cwd: root
 // GitHub-flavored heading slug: lowercase, drop anything but word chars/space/hyphen
 // (backticks and punctuation vanish), spaces -> hyphens.
 const slug = (s) =>
-  s.toLowerCase().replace(/[^\w\s-]/g, '').trim().replace(/\s+/g, '-');
+  s.toLowerCase().replace(/[^\w\s-]/g, '').trim().replace(/\s/g, '-');
 
 const anchorsOf = (absPath) => {
   const set = new Set();

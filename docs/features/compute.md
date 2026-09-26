@@ -8,7 +8,7 @@ with the agent dashboard; launching onto compute nodes is the home screen's Mode
 On a laptop (no scheduler) the whole surface is invisible. First slice of the M5 HPC
 layer's *placement axis*; the deep design (Mode 1 login-node job control, Mode 2
 compute-node sessions) lives in the
-[architecture guide](../agent-guides/architecture.md#environment-prelude-compute-node-sessions).
+[architecture guide](../agent-guides/architecture.md#environment-prelude--compute-node-sessions).
 
 **Where it lives (shared):** daemon `crates/chimaera-server/src/compute.rs` (detection +
 snapshot service + route). UI `web-ui/src/lib/workspace/compute.ts` (store/poller) and the
