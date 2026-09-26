@@ -198,11 +198,18 @@
   /** An explicit history page is stable. Ordinary scrolling inside a tail page
    *  keeps streaming until retaining the reader would exceed the DOM cap. */
   let tracksTail = false;
+  /** tracksTail, for the template. A row appended to a tail window lags
+   *  renderEnd by one flush (the windowing effect advances it); reading that
+   *  lag as "newer rows omitted" tore the live chrome out and back in, and a
+   *  layout forced in between shrank the transcript under a pinned reader —
+   *  WebKit clamps scrollTop there, which then reads as scrolling up. */
+  let endsLive = $state(false);
+  const atLiveEdge = $derived(endsLive || renderEnd >= store.blocks.length);
   let rendersLive = false;
   let wasVisible = false;
   let pagingTranscript = false;
   const hasDeferredActivity = $derived(
-    followedVersion !== store.transcriptVersion || renderEnd < store.blocks.length,
+    followedVersion !== store.transcriptVersion || !atLiveEdge,
   );
 
   function markFollowed(version = store.transcriptVersion): void {
@@ -235,6 +242,7 @@
     renderBlocks = options.live ? source : $state.snapshot(source);
     rendersLive = options.live;
     tracksTail = options.tail;
+    endsLive = options.tail;
     renderedVersion = store.transcriptVersion;
     renderedStructural = store.structuralVersion;
     renderedTrim = store.trimmedCount;
@@ -682,6 +690,7 @@
           // preserve the page and make the deferred gap explicit.
           freezeRenderedRange();
           tracksTail = false;
+          endsLive = false;
           saveWindowVirtual(renderStart, renderEnd, false);
         }
       }
@@ -744,13 +753,46 @@
     getSetting("chat.fontFamily").trim() || "var(--ui-font)",
   );
 
+  /** When the reader last did something that scrolls. WebKit dispatches the
+   *  wheel (momentum included), pointer (the scrollbar too), touch, or key
+   *  input ahead of the scroll it causes; a scroll chained to one stays the
+   *  reader's, so a track-click animation or fling tail outlives the input. */
+  let scrollIntentAt = -Infinity;
+  const SCROLL_INTENT_MS = 300;
+  function noteScrollIntent(): void {
+    scrollIntentAt = performance.now();
+  }
+  // Passive by hand: Svelte attaches `onwheel` non-passive, which would pull
+  // WebKit's wheel scrolling off its scrolling thread.
+  $effect(() => {
+    const el = transcriptEl;
+    if (el === null) return;
+    el.addEventListener("wheel", noteScrollIntent, { passive: true });
+    return () => el.removeEventListener("wheel", noteScrollIntent);
+  });
+
   function onScroll() {
     const el = transcriptEl;
     if (el === null) return;
     const top = el.scrollTop;
-    if (top !== lastScrollTop) scrollDirection = top < lastScrollTop ? -1 : 1;
+    const moved = top !== lastScrollTop;
+    const up = top < lastScrollTop;
+    if (moved) scrollDirection = up ? -1 : 1;
     lastScrollTop = top;
-    atBottom = renderEnd >= store.blocks.length && el.scrollHeight - top - el.clientHeight < 40;
+    const now = performance.now();
+    const byReader = now - scrollIntentAt < SCROLL_INTENT_MS;
+    if (byReader) scrollIntentAt = now;
+    const nearEnd = el.scrollHeight - top - el.clientHeight < 40;
+    // A pinned follower leaves the live edge only by its own hand. WebKit
+    // dispatches the follow writer's scroll event a frame late, after rows
+    // that landed in between already grew the transcript (a follower who
+    // never moved), and it clamps scrollTop wherever a streamed re-render
+    // momentarily shrinks the content under the reader (an up-move nobody
+    // made). Idle, geometry alone decides, so a find or focus scroll holds.
+    const held =
+      atBottom && !nearEnd && (!moved || (up && !byReader && store.running));
+    atBottom = renderEnd >= store.blocks.length && (nearEnd || held);
+    if (held && atBottom) queueBottomScroll();
     if (atBottom) {
       // Reaching the actual live edge is an explicit resume signal even after
       // paging history: keep the current range, rebind its live proxies, and
@@ -913,7 +955,7 @@
   // ends inside the viewport produces no scroll event to drive it. Re-created
   // per page (it reads renderEnd), so a sentinel still in view keeps paging;
   // `hasLaterRows` is derived so a live turn's appends don't rebuild it.
-  const hasLaterRows = $derived(renderEnd < store.blocks.length);
+  const hasLaterRows = $derived(!atLiveEdge);
   $effect(() => {
     const root = transcriptEl;
     const sentinel = laterSentinelEl;
@@ -1956,8 +1998,9 @@
   />
 
   <!-- Focusable so keyboard scrolling works in WKWebView (Safari never
-       auto-focuses scrollers); role="log" announces new agent output. -->
-  <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+       auto-focuses scrollers); role="log" announces new agent output. The
+       input listeners only note that the reader is scrolling (onScroll). -->
+  <!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_no_noninteractive_element_interactions -->
   <div
     class="transcript"
     role="log"
@@ -1965,6 +2008,9 @@
     tabindex="0"
     bind:this={transcriptEl}
     onscroll={onScroll}
+    ontouchmove={noteScrollIntent}
+    onpointerdown={noteScrollIntent}
+    onkeydown={noteScrollIntent}
   >
     <!-- Room for earlier history ahead of the rendered window: it absorbs
          every height change above a scrolled-up reader (see "reading
@@ -2184,7 +2230,7 @@
       {/if}
     {/each}
 
-    {#if renderEnd < store.blocks.length}
+    {#if !atLiveEdge}
       {#if canAutoLoadHistory}
         <span class="history-sentinel" bind:this={laterSentinelEl} aria-hidden="true"></span>
       {:else}
@@ -2201,7 +2247,7 @@
     <!-- Live-tail chrome must never be spliced directly after a historical
          page with newer transcript rows omitted in between. Page forward or
          jump first, so chronology remains visually honest. -->
-    {#if !visible || renderEnd >= store.blocks.length}
+    {#if !visible || atLiveEdge}
     {#each pinnedPermissions as request (request.requestId)}
       {#if request.plan !== null}
         <PlanApprovalCard
