@@ -3,17 +3,19 @@
 Browsing and managing the workspace's files. The file tree and the Finder browse, open,
 and — via their right-click context menus — create, rename, delete, and download files
 and folders; the preview service streams file bytes and renders them as code, markdown,
-tables, PDFs, images, video and audio, sandboxed HTML, or a binary info card — plus a light single-file
+tables, PDFs, images, video and audio, sandboxed HTML, Jupyter notebooks, program logs,
+Marp slide decks, mermaid diagrams, or a binary info card — plus a light single-file
 editor. Everything streams (never whole-file loads) to hold the daemon's ~150 MB RSS
 budget on shared login nodes.
 
 **Where it lives (shared):** UI `web-ui/src/lib/previews/` (`files.ts` loaders,
 `fileStore.svelte.ts` the content store, `CodeView`, `MarkdownView` + `mdDoc.ts` /
 `docLinks.ts`, `TableView`, `PdfView`, `ImageView`, `MediaView`, `HtmlView`, `BinaryView`,
-`FinderView`, `cm.ts`) +
+`NotebookView` + `notebook.ts`, `LogView` + `logText.ts`, `SlidesView` + `marp.ts`,
+`MermaidView`, `ansi.ts`, `FinderView`, `cm.ts`) +
 `web-ui/src/lib/workspace/FileTree.svelte` + glyphs in `web-ui/src/lib/shared/`
-(`FileIcon`, `FolderIcon`, `icons.ts`). Daemon: **all preview endpoints are in
-`crates/chimaera-server/src/fs.rs`** (there is no separate previews module). The file diff
+(`FileIcon`, `FolderIcon`, `icons.ts`). Daemon: **the preview endpoints are in
+`crates/chimaera-server/src/fs.rs`**, except the notebook pager (`notebook.rs`). The file diff
 viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
 
 ## The file tree
@@ -310,6 +312,63 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   Vorbis in WebKit) — and gets a card saying so, with try again and, on a remote host, a
   download so it can play locally. A parked pane pauses its video (it doesn't resume by
   itself); audio keeps playing.
+- **Notebooks.** `.ipynb` opens read-only in `NotebookView.svelte`: code cells highlighted
+  (the editor's `--syn-*` palette, parsers from `@codemirror/language-data` via `highlight.ts`)
+  beside their `[n]` execution counts; markdown cells through `marked` + DOMPurify with chat's
+  profile (no `<style>`, web links in a new tab without an opener), math (`$…$`, `$$…$$`,
+  `\(…\)`, `\[…\]`, `\begin{…}` blocks) typeset through the shared KaTeX policy only when a
+  cell has any, `attachment:` images inlined and relative ones through `/raw` tickets, links
+  followed like the markdown view's. Outputs: stdout/stderr and tracebacks in ANSI color
+  (the theme's terminal palette, carriage-return progress bars collapsed to their last state);
+  png/jpeg/gif as data URLs; SVG as an `<img>` (never live markup); `text/html` in an iframe
+  sandboxed with **no** permissions (`sandbox=""`, `srcdoc`, the theme's colors written in),
+  sized from a sanitized offscreen layout, capped at 440px with *show all* and a drag handle;
+  `text/markdown` and `text/latex` rendered. The rail beside a cell's outputs folds them. The
+  daemon pages cells — `GET /fs/notebook?path=&offset=&limit=` → `{cells, offset, total,
+  language, nbformat}` — walking the file with serde's streaming visitor so only the page's
+  cells are ever held: source ≤ 64 MB, ≤ 100 cells a page and ≤ 16 MB of payload (a page can
+  come back short; the next starts at `offset + cells.length`), each output reduced to its
+  richest drawable mime plus `text/plain`, a payload over 8 MB replaced by its size
+  (`omitted`), text over 200 KB cut (`truncated`); one parse at a time. The view shows 24
+  cells, then pages in as the reader nears the end; a disk change re-reads the loaded cells in
+  place; `#cell=N` (a reveal) loads up to the cell, scrolls to it and flashes it. nbformat 3
+  is refused with how to upgrade it.
+- **Logs.** `.log`, `.out`, `.err`, `.stdout`, `.stderr` (so `slurm-*.out` and `.nextflow.log`)
+  open in `LogView.svelte`, read-only and tail-first: one 64 KB read (a small log arrives
+  whole) then the last 256 KB, opened at the bottom. *Load earlier* pages back 256 KB at a
+  time without moving the lines being read; the view keeps a 4 MB window sliding over a file
+  of any size (pages fall off the far end), with *top*, *bottom* and *load later*. ANSI colors
+  map to the theme's terminal palette (256-color and truecolor fold to its 16), other escapes
+  are dropped, progress bars collapse, and error / warning lines are tinted, counted in the bar
+  and jumped between (`logText.ts`: Python exceptions, Slurm cancellations, OOM kills; "0
+  errors" stays quiet). **Follow** (on at open) polls the tail every 2 s — only while the pane
+  and the window are visible — keeps the view pinned, shows a line still being written, and
+  stops when the reader scrolls up (scrolling back to the bottom resumes it). With follow off,
+  a disk change still appends the new lines without moving the view and shows a *new output*
+  pill. Wrap is a per-browser preference; a tail that turns out binary falls back to the
+  info card. A gzipped log stays in the text view (no known size to read a tail from).
+- **Slides (Marp).** A markdown file whose frontmatter says `marp: true` opens in
+  `SlidesView.svelte`, with a **slides | markdown** switch (the markdown side is the normal
+  markdown view). FileView decides once per tab from whichever payload the markdown view
+  fetches first (the reading render's frontmatter or the source chunk), so detection costs no
+  request and an edit never swaps the view out from under the editor. `@marp-team/marp-core`
+  renders in the browser (`html: false`, no script, math as KaTeX MathML, emoji as text — no
+  CDN fetches) with relative images rewritten to `/raw` tickets first; the slides draw in
+  script-less sandboxed iframes, the whole deck at native size in one frame that is moved and
+  scaled to show a slide (instant paging, exact layout at any pane size, no WebKit
+  foreignObject scaling bug). Arrows / PageUp / PageDown / Space / Home / End page the deck, a
+  thumbnail strip jumps, **present** goes full screen (or covers the window where a webview
+  refuses), **print** opens the browser's dialog with one slide per page (save as PDF there),
+  `#slide=N` reveals a slide, and a disk change re-renders in place keeping the slide. Decks
+  over 2 MB of source are refused. The bundle stubs MathJax and the uncommon highlight.js
+  grammars (see `vite.config.ts`), so the chunk is ~730 KB (226 KB gzipped), loaded only by
+  a deck.
+- **Mermaid files.** `.mmd` / `.mermaid` open in `MermaidView.svelte` through the shared,
+  strict renderer (`shared/mermaid.ts`): redrawn when the theme flips or the file changes (the
+  last good drawing stays up, dimmed while redrawing, with the parse error in the bar), fit to
+  the pane without enlarging a small diagram, zoom steps and 1:1, export as SVG or as a 2× PNG
+  (a diagram with HTML labels can't rasterize in every engine; the bar says so). A
+  **diagram | source** switch shows the file in the editor.
 - **Release-safe lazy views.** File and other heavyweight workbench views load from immutable hashed
   chunks. The entry document is never cached and is stamped with the source build that served it,
   so a later health response cannot mistake a replacement daemon for that document's build. Vite's
@@ -318,7 +377,10 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   when the current asset graph is unavailable. Reload waits behind unsaved file edits and chat
   drafts that exist only in memory, with an explicit reload-anyway escape hatch.
 - **Binary / Finder.** Non-text files get an info card (`BinaryView`: name, size, modified time
-  from the parent listing; no hex view yet); `FinderView` is a directory browser surface.
+  from the parent listing; no hex view yet) with **open as text** — a per-tab override that
+  shows the bytes in the editor under a bar warning that saving would rewrite them, *file
+  info* to go back — and, on a remote host (the `host=` window rule the downloads share), a
+  **download** button; `FinderView` is a directory browser surface.
 
 ## Preview keep-alive & live-update
 
