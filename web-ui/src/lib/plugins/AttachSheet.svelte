@@ -155,12 +155,12 @@
         return ev;
     }
   }
-  function matcherWords(m: string | undefined): string {
-    if (m === undefined || m === "" || m === "*") return "always";
+  function matcherWords(m: string | null | undefined): string {
+    if (m == null || m === "" || m === "*") return "always";
     return m.split("|").join(" · ");
   }
-  function basename(cmd: string | undefined): string {
-    if (cmd === undefined) return "";
+  function basename(cmd: string | null | undefined): string {
+    if (cmd == null) return "";
     const first = cmd.trim().split(/\s+/)[0] ?? "";
     return first.slice(first.lastIndexOf("/") + 1);
   }

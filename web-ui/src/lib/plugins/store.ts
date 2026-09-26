@@ -64,9 +64,10 @@ export type HookTrust = "untrusted" | "trusted" | "modified" | "managed";
 export interface AgentHook {
   key: string;
   event: string;
-  matcher?: string;
-  command?: string;
-  plugin_id?: string;
+  /** Absent = the hook fires always (codex reports no matcher). */
+  matcher?: string | null;
+  command?: string | null;
+  plugin_id?: string | null;
   trust: HookTrust;
   hash: string;
 }

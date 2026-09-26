@@ -747,11 +747,14 @@
   /* The chrome row: the scrolling surface + the Mastermind dock (or its edge
      pill) as flex siblings — the dock never overlaps content when docked,
      and only the deliberate narrow-width overlay ever floats above it. */
+  /* Two fixed columns: only .scroll (and the dock's own transcript) scroll.
+     Clip sideways so a too-wide dock child can never pan the whole surface. */
   .body {
     position: absolute;
     inset: 0;
     display: flex;
     min-width: 0;
+    overflow-x: clip;
   }
   .scroll {
     flex: 1;

@@ -195,7 +195,7 @@
               {@const hooks = untrustedHooks(r.agent, r.id)}
               {#if agentState === "unavailable"}
                 <span class="pill neutral">{r.agent} · can't check on this daemon</span>
-              {:else if agentState === "loading" && agentPlugins === null}
+              {:else if (agentState === "loading" || agentState === "idle") && agentPlugins === null}
                 <span class="pill neutral">{r.agent} · checking…</span>
               {:else if ag === null || !ag.available}
                 <span class="pill neutral" title={ag?.error ?? undefined}>{r.agent} · not installed on this host</span>

@@ -180,8 +180,17 @@ export function searchKnowledge(k: Knowledge, query: string): Knowledge {
   const todos = k.todos.filter((t) => has(t.item, q) || has(t.category, q) || has(t.author, q));
   const questions = k.questions.filter((o) => has(o.text, q) || has(o.finding, q));
   const guidance = k.guidance.filter((g) => has(g.label, q) || has(g.description, q) || has(g.path, q));
+  // The handoff is searched too — a query it doesn't match hides it, so an
+  // empty result reads as empty instead of leaving an unrelated card up.
+  const lo = k.left_off;
+  const left_off =
+    lo !== null &&
+    (has(lo.current, q) || has(lo.worked_on, q) || has(lo.decisions, q) || hasAny(lo.next, q) || hasAny(lo.blockers, q))
+      ? lo
+      : null;
   return {
     ...k,
+    left_off,
     topics,
     decisions,
     learnings,

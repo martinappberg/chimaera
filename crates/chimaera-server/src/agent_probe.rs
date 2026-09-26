@@ -430,16 +430,29 @@ fn codex_hooks(raw: &Value) -> Vec<Value> {
                 .map(|h| {
                     let key = h.get("key").and_then(Value::as_str).unwrap_or("");
                     let source = h.get("sourcePath").and_then(Value::as_str).unwrap_or("");
-                    json!({
+                    // Event names in the hooks.json vocabulary (codex reports
+                    // camelCase — `postToolUse`; the section is `PostToolUse`),
+                    // so both agents' hooks read the same.
+                    let event = h.get("eventName").and_then(Value::as_str).map(|e| {
+                        let mut c = e.chars();
+                        c.next()
+                            .map(|f| f.to_uppercase().collect::<String>() + c.as_str())
+                            .unwrap_or_default()
+                    });
+                    let mut row = json!({
                         "key": key,
-                        "event": h.get("eventName"),
-                        "matcher": h.get("matcher"),
+                        "event": event,
                         "plugin_id": h.get("pluginId"),
                         "source": h.get("source"),
                         "trust": h.get("trustStatus"),
                         "hash": h.get("currentHash"),
                         "command": hook_command(source, key),
-                    })
+                    });
+                    // No matcher = fires always; absent, never a JSON null.
+                    if let Some(m) = h.get("matcher").and_then(Value::as_str) {
+                        row["matcher"] = json!(m);
+                    }
+                    row
                 })
                 .collect()
         })
@@ -804,7 +817,12 @@ pub(crate) async fn skills(
     // its handshake (only source for skills with no file).
     let live_catalog = crate::chat::claude_catalog_in_workspace(&state, &id);
     let live = live_catalog.is_some();
-    for (name, description) in live_catalog.unwrap_or_default() {
+    // `_`-prefixed entries are the CLI's internal commands, not skills.
+    for (name, description) in live_catalog
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(name, _)| !name.starts_with('_'))
+    {
         let row = rows.entry(name.clone()).or_default();
         if row.claude.is_none() {
             row.claude = Some(("available".into(), None, None));

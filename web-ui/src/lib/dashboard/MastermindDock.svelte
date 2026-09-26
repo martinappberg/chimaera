@@ -268,7 +268,7 @@
     {#if cfg !== null}
       <BrandMark size={13} title="Mastermind" />
       <span class="title">Mastermind</span>
-      <span class="chip">{boundAgent ?? "…"}</span>
+      <span class="chip agentchip">{boundAgent ?? "…"}</span>
       <!-- The badge IS the control: this is the Mastermind's act gate (ours,
            not the agent's own permission mode) — click to switch it. -->
       <button
@@ -281,19 +281,7 @@
         acts: {modeLabel(cfg.mode)}
       </button>
       <span class="sp"></span>
-      {#if live !== null && live.ui === "chat"}
-        <!-- One click, one turn: the canned brief over the session's socket. -->
-        <button
-          class="brief"
-          disabled={!canPrompt}
-          title={canPrompt
-            ? "one turn: Needs you · Done · Problems · Next — billed to your account"
-            : mm === null || !mm.store.connected
-              ? "not connected"
-              : "the Mastermind is busy"}
-          onclick={() => sendPrompt(BRIEF_PROMPT)}>Brief me</button
-        >
-      {/if}
+
       <!-- Default node.contains inside-test: the button + its menu stay open.
            (Never the .menu-host class — that selector belongs to ChatView's
            own dismiss and would pin a pane chat's open menu on our clicks.) -->
@@ -454,24 +442,35 @@
       <button class="cta quiet" disabled={pending} onclick={retire}>reset</button>
     </div>
   {:else if live !== null}
-    {#if unread.length > 0 || emptyChat}
-      <!-- Suggested prompts while the transcript is empty, and the notes
-           inbox whenever agents left something for the Mastermind — each a
-           user click that starts one turn. -->
+    {#if live.ui === "chat"}
+      <!-- The prompt row: "Brief me" always (one click, one turn — the canned
+           brief over the session's socket), the notes inbox whenever agents
+           left something for the Mastermind, and the other suggestions while
+           the transcript is empty. Each is a user click that starts one turn. -->
       <div class="chips">
+        <button
+          class="sugg primary"
+          disabled={!canPrompt}
+          title={canPrompt
+            ? "one turn: Needs you · Done · Problems · Next — billed to your account"
+            : mm === null || !mm.store.connected
+              ? "not connected"
+              : "the Mastermind is busy"}
+          onclick={() => sendPrompt(BRIEF_PROMPT)}>Brief me</button
+        >
         {#if unread.length > 0}
           <button
-            class="chip inbox"
+            class="sugg inbox"
             disabled={!canPrompt}
             title="hand these notes to the Mastermind — one turn"
             onclick={readInbox}
           >
-            ✉ {unread.length} new note{unread.length === 1 ? "" : "s"} from agents
+            {unread.length} new note{unread.length === 1 ? "" : "s"} from agents
           </button>
         {/if}
         {#if emptyChat}
-          {#each SUGGESTIONS as s (s.label)}
-            <button class="chip" disabled={!canPrompt} onclick={() => sendPrompt(s.text)}>{s.label}</button>
+          {#each SUGGESTIONS.filter((s) => s.text !== BRIEF_PROMPT) as s (s.label)}
+            <button class="sugg" disabled={!canPrompt} onclick={() => sendPrompt(s.text)}>{s.label}</button>
           {/each}
           {#if offerMycelium}
             <button class="quietline" onclick={() => openAttachSheet("mycelium")}>
@@ -517,6 +516,11 @@
     flex-direction: column;
     min-height: 0;
     min-width: 0;
+    /* Nothing inside (a long header, the embedded chat's toolbar) may widen
+       the column and push the dashboard sideways. */
+    overflow-x: clip;
+    /* The header reflows against the dock's own width (resizable to 300px). */
+    container-type: inline-size;
     background: var(--bg);
   }
 
@@ -535,6 +539,13 @@
     letter-spacing: 0.01em;
     white-space: nowrap;
   }
+  /* Narrow dock: the brand mark carries the name; the agent chip may
+     ellipsize before any control is pushed off the edge. */
+  @container (max-width: 380px) {
+    .title {
+      display: none;
+    }
+  }
   .chip {
     flex: none;
     font-family: var(--mono);
@@ -544,6 +555,12 @@
     border-radius: 999px;
     padding: 0 6px;
     white-space: nowrap;
+  }
+  .agentchip {
+    flex: 0 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
   /* The act-gate badge doubles as its own switch. */
   button.modechip {
@@ -559,30 +576,6 @@
     border-color: color-mix(in srgb, var(--accent) 55%, var(--edge));
   }
 
-  /* "Brief me": the header's one primary action — accent-tinted, small. */
-  .brief {
-    flex: none;
-    appearance: none;
-    font: inherit;
-    font-size: var(--text-xs);
-    font-weight: 500;
-    padding: 2px 10px;
-    border-radius: 999px;
-    border: 1px solid color-mix(in srgb, var(--accent) 55%, var(--edge));
-    background: color-mix(in srgb, var(--accent) 14%, transparent);
-    color: var(--fg);
-    cursor: pointer;
-    white-space: nowrap;
-    transition: background-color 0.12s ease;
-  }
-  .brief:hover:not(:disabled) {
-    background: color-mix(in srgb, var(--accent) 24%, transparent);
-  }
-  .brief:disabled {
-    opacity: 0.5;
-    cursor: default;
-  }
-
   /* Suggested prompts + the notes inbox: quiet pills above the chat. */
   .chips {
     flex: none;
@@ -592,7 +585,7 @@
     padding: 10px 12px 6px;
     border-bottom: 1px solid var(--edge);
   }
-  .chip {
+  .sugg {
     appearance: none;
     border: 1px solid var(--edge);
     background: none;
@@ -604,14 +597,23 @@
     cursor: pointer;
     transition: border-color 0.12s ease;
   }
-  .chip:hover:not(:disabled) {
+  .sugg:hover:not(:disabled) {
     border-color: color-mix(in srgb, var(--accent) 55%, var(--edge));
   }
-  .chip:disabled {
+  .sugg:disabled {
     opacity: 0.5;
     cursor: default;
   }
-  .chip.inbox {
+  /* "Brief me": the row's one primary action — accent-tinted. */
+  .sugg.primary {
+    font-weight: 500;
+    border-color: color-mix(in srgb, var(--accent) 55%, var(--edge));
+    background: color-mix(in srgb, var(--accent) 14%, transparent);
+  }
+  .sugg.primary:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--accent) 24%, transparent);
+  }
+  .sugg.inbox {
     border-color: color-mix(in srgb, var(--warn) 55%, var(--edge));
     background: color-mix(in srgb, var(--warn) 10%, transparent);
   }
