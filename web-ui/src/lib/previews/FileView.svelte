@@ -6,7 +6,7 @@
    * with NUL bytes falls through to the info card, so extensionless
    * binaries and .gz never render as garbage.
    */
-  import type { Component } from "svelte";
+  import { untrack, type Component } from "svelte";
   import { looksBinary, midTruncate, viewKindFor, type FileChunk } from "./files";
   import { retain, release, type FileEntry } from "./fileStore.svelte";
   import ImageView from "./ImageView.svelte";
@@ -93,33 +93,18 @@
   // it live. Only the "text" kind reads its first chunk here; the other kinds
   // mount a sub-view that reads its own payload from the same entry.
   let entry = $state<FileEntry | null>(null);
-
-  // The views keyed on `version` below (spreadsheet, PDF, binary card) read
-  // their bytes once at mount, so an overwrite on disk must remount them for
-  // the new ticket and bytes. `version` moves only when the entry's mtime
-  // changes after this tab first knew it, never on the first seed: a cold open
-  // learns the token moments after the view mounts, and keying on the token
-  // itself mounted each of them twice. Written from a plain counter, never
-  // read here (a read would make this effect loop on its own write), and never
-  // reset on a path switch (a reset would itself move the key).
-  let version = $state(0);
-  let changes = 0;
-  let seen: { entry: FileEntry; mtime: string | null } | null = null;
-  $effect(() => {
-    const e = entry;
-    if (e === null || e.path !== path) return;
-    const m = e.mtime;
-    if (seen === null || seen.entry !== e) {
-      seen = { entry: e, mtime: m };
-    } else if (m !== null && m !== seen.mtime) {
-      if (seen.mtime !== null) version = ++changes;
-      seen.mtime = m;
-    }
-  });
-
+  let changesAtBind = $state(0);
+  // The views keyed on this (spreadsheet, PDF, binary card) read their bytes
+  // once at mount, so a change on disk must remount them for the new ticket
+  // and bytes. Not the mtime token itself: a cold open learns that moments
+  // after the view mounts, and keying on it mounted each of them twice.
+  const version = $derived(
+    entry !== null && entry.path === path ? entry.changes - changesAtBind : 0,
+  );
   $effect(() => {
     const p = path;
     const e = retain(p);
+    changesAtBind = untrack(() => e.changes);
     entry = e;
     if (viewKindFor(p) === "text") void e.ensureChunk();
     else void e.ensureMtime();
