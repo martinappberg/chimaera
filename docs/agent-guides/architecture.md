@@ -680,7 +680,13 @@ input — Claude Code's native `@path` mention plus the line range and the quote
 *without submitting*, so you review and press Enter. The workbench knows exactly what you're
 looking at (path, line range), so agents get surgical context instead of pasted mystery text.
 Plain Cmd+C stays untouched (never spooky). Wave 2 of this: selections in *terminal* panes
-reference the session's scrollback.
+reference the session's scrollback. Wave 3 (2026-09, "reference parts of any file, even parts
+of images"): every viewer points — a PDF passage or a box on a page, a box on an image, table
+cells, a media moment, a notebook cell, a slide — as a locator fragment
+(`@paper.pdf#page=3&xywh=… "…"`, one grammar in `shared/locator.ts`, which also makes those
+fragments open at their spot from any link), with the pixels attached in chat or uploaded to
+the session's landing pad for a terminal agent. See
+[pointing at part of a file](../features/files-and-previews.md#pointing-at-part-of-a-file).
 
 **Clickable paths — the bridge's return direction (author, 2026-07-06):** agents produce
 files; opening them should be one click, both ways of detecting them:
