@@ -1,11 +1,15 @@
 <!--
   The update toast: one small, dismissible card, bottom-right, shown when
-  `currentOffer` has something worth saying. One primary action per offer
+  `currentNotice` has something worth saying. One primary action per offer
   kind — the full app+daemon chain (native), a daemon-only restart (skew),
   or a pointer at the release (browser windows, which cannot apply updates
   themselves). The copy states consequences plainly: layouts and sessions
   come back (ledger + handoff + window registry), running terminal programs
   restart. "later" snoozes until tomorrow; "skip" mutes that version.
+
+  An explicit check answers here too: "checking…", then an offer, "you're
+  up to date" (which fades on its own), or "couldn't check" with the reason
+  and a retry — never silence, which is what made the old flow unclear.
 
   Capability note: this UI is embedded in — and served by — the daemon it
   talks to, so a toast can never over-promise resurrection: if the daemon
@@ -13,30 +17,60 @@
   to have this toast.
 -->
 <script lang="ts">
-  import type { UpdateOffer } from "./update.svelte";
-  import { snoozeUpdate, skipUpdateVersion } from "./update.svelte";
+  import type { UpdateNotice } from "./update.svelte";
+  import {
+    checkForUpdates,
+    dismissAnswer,
+    snoozeUpdate,
+    skipUpdateVersion,
+  } from "./update.svelte";
   import { beginUpdate, connectHost, updateLocalDaemon } from "../net/native";
   import { openInSystemBrowser } from "../shared/urlOpen";
 
-  let { offer }: { offer: UpdateOffer } = $props();
+  let { notice }: { notice: UpdateNotice } = $props();
+
+  /** "You're up to date" needs no action; it fades unless hovered. */
+  const ANSWER_MS = 6000;
 
   let busy = $state(false);
   let error = $state<string | null>(null);
+  let hovered = $state(false);
+
+  const isAnswer = $derived(
+    notice.kind === "checking" ||
+      notice.kind === "current" ||
+      notice.kind === "dev" ||
+      notice.kind === "failed",
+  );
+
+  $effect(() => {
+    if ((notice.kind !== "current" && notice.kind !== "dev") || hovered) return;
+    const timer = setTimeout(dismissAnswer, ANSWER_MS);
+    return () => clearTimeout(timer);
+  });
 
   const title = $derived.by(() => {
-    switch (offer.kind) {
+    switch (notice.kind) {
       case "app":
       case "release":
-        return `chimaera ${offer.version} is available`;
+        return `chimaera ${notice.version} is available`;
       case "daemon-local":
         return "daemon is older than this app";
       case "daemon-remote":
-        return `daemon on ${offer.alias} is outdated`;
+        return `daemon on ${notice.alias} is outdated`;
+      case "checking":
+        return "Checking for updates…";
+      case "current":
+        return "You're up to date";
+      case "dev":
+        return "Development build";
+      case "failed":
+        return "Couldn't check for updates";
     }
   });
 
   const body = $derived.by(() => {
-    switch (offer.kind) {
+    switch (notice.kind) {
       case "app":
         return "One click updates the app and daemon. Windows, tabs and sessions come back where they were; running terminal programs restart.";
       case "daemon-local":
@@ -45,29 +79,39 @@
         return "Reconnect and update it. Layouts and sessions there come back; running terminal programs restart.";
       case "release":
         return "Update from the chimaera app, or rerun chimaera connect from your machine.";
+      case "checking":
+        return "Asking GitHub for the newest chimaera release.";
+      case "current":
+        return `chimaera ${notice.version} is the newest release.`;
+      case "dev":
+        return "Release updates don't apply to a development build.";
+      case "failed":
+        return notice.error;
     }
   });
 
   const action = $derived.by(() => {
-    switch (offer.kind) {
+    switch (notice.kind) {
       case "app":
         return "update now";
       case "daemon-local":
         return "update daemon";
       case "daemon-remote":
-        return `update ${offer.alias}`;
-      case "release":
+        return `update ${notice.alias}`;
+      case "failed":
+        return "try again";
+      default:
         return null;
     }
   });
 
-  const skippable = $derived(offer.kind === "app" || offer.kind === "release");
+  const skippable = $derived(notice.kind === "app" || notice.kind === "release");
 
   async function run(): Promise<void> {
     busy = true;
     error = null;
     try {
-      switch (offer.kind) {
+      switch (notice.kind) {
         case "app":
           // Diverges on success: the app relaunches into the new build and
           // this window comes back via the shell's window registry.
@@ -79,9 +123,12 @@
           await updateLocalDaemon();
           break;
         case "daemon-remote":
-          await connectHost(offer.alias, true);
+          await connectHost(notice.alias, true);
           break;
-        case "release":
+        case "failed":
+          await checkForUpdates(true);
+          break;
+        default:
           break;
       }
     } catch (e) {
@@ -92,13 +139,22 @@
   }
 
   function skip(): void {
-    if (offer.kind === "app" || offer.kind === "release") {
-      skipUpdateVersion(offer.version);
+    if (notice.kind === "app" || notice.kind === "release") {
+      skipUpdateVersion(notice.version);
     }
   }
+
+  const releaseUrl = $derived(notice.kind === "release" ? notice.url : null);
 </script>
 
-<div class="update-toast" role="status" aria-live="polite">
+<div
+  class="update-toast"
+  data-kind={notice.kind}
+  role="status"
+  aria-live="polite"
+  onmouseenter={() => (hovered = true)}
+  onmouseleave={() => (hovered = false)}
+>
   <div class="head">
     <span class="dot" aria-hidden="true"></span>
     <span class="title">{title}</span>
@@ -107,31 +163,37 @@
   {#if error !== null}
     <p class="error">{error}</p>
   {/if}
-  <div class="actions">
-    {#if action !== null}
-      <button class="primary" disabled={busy} onclick={() => void run()}>
-        {busy ? "updating…" : action}
-      </button>
-    {/if}
-    {#if offer.kind === "release" && offer.url !== null}
-      <!-- Through the shell: in the app a _blank navigation is swallowed by
-           the window's origin guard. -->
-      <a
-        class="notes"
-        href={offer.url}
-        target="_blank"
-        rel="noreferrer"
-        onclick={(e) => {
-          e.preventDefault();
-          openInSystemBrowser(offer.url ?? "");
-        }}>release notes</a
-      >
-    {/if}
-    <button class="quiet" disabled={busy} onclick={snoozeUpdate}>later</button>
-    {#if skippable}
-      <button class="quiet subtle" disabled={busy} onclick={skip}>skip this version</button>
-    {/if}
-  </div>
+  {#if notice.kind !== "checking"}
+    <div class="actions">
+      {#if action !== null}
+        <button class="primary" disabled={busy} onclick={() => void run()}>
+          {busy ? (notice.kind === "failed" ? "checking…" : "updating…") : action}
+        </button>
+      {/if}
+      {#if releaseUrl !== null}
+        <!-- Through the shell: in the app a _blank navigation is swallowed by
+             the window's origin guard. -->
+        <a
+          class="notes"
+          href={releaseUrl}
+          target="_blank"
+          rel="noreferrer"
+          onclick={(e) => {
+            e.preventDefault();
+            openInSystemBrowser(releaseUrl);
+          }}>release notes</a
+        >
+      {/if}
+      {#if isAnswer}
+        <button class="quiet" disabled={busy} onclick={dismissAnswer}>close</button>
+      {:else}
+        <button class="quiet" disabled={busy} onclick={snoozeUpdate}>later</button>
+      {/if}
+      {#if skippable}
+        <button class="quiet subtle" disabled={busy} onclick={skip}>skip this version</button>
+      {/if}
+    </div>
+  {/if}
 </div>
 
 <style>
@@ -172,6 +234,28 @@
     border-radius: 50%;
     background: var(--accent);
     flex: none;
+  }
+
+  .update-toast[data-kind="current"] .dot,
+  .update-toast[data-kind="dev"] .dot {
+    background: var(--muted);
+  }
+
+  .update-toast[data-kind="failed"] .dot {
+    background: var(--warn);
+  }
+
+  /* The shared app.css pulse; transient (a check lasts seconds), so no
+     app-hidden gate. */
+  .update-toast[data-kind="checking"] .dot {
+    background: var(--muted);
+    animation: pulse 1.1s ease-in-out infinite;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .update-toast[data-kind="checking"] .dot {
+      animation: none;
+    }
   }
 
   .title {

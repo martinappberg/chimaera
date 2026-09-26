@@ -3,7 +3,7 @@ import { nudgeReconnectors, retryDelayMs } from "./reconnect";
 import type { Link } from "../workspace/agentLinks";
 import type { Session } from "../workspace/sessions";
 import type { Notice } from "../workspace/notices";
-import type { UpdateStatus } from "../workspace/update.svelte";
+import { parseUpdateStatus, type UpdateStatus } from "../workspace/update.svelte";
 
 const INITIAL_BACKOFF_MS = 500;
 const MAX_BACKOFF_MS = 10_000;
@@ -77,10 +77,8 @@ interface ServerEventFrame {
   settings?: Record<string, unknown>;
   epochs?: Record<string, number>;
   epoch?: number;
+  /** An `update` frame's discriminator; the rest is `parseUpdateStatus`'s. */
   available?: boolean;
-  current?: string;
-  build?: string;
-  latest?: UpdateStatus["latest"];
   message?: string;
   files?: string[];
   removed?: string[];
@@ -236,12 +234,8 @@ export class EventsSocket {
         this.handlers.onTimeline?.(msg.epochs);
       } else if (msg.type === "update" && typeof msg.available === "boolean") {
         this.backoffMs = INITIAL_BACKOFF_MS;
-        this.handlers.onUpdate?.({
-          current: msg.current ?? "",
-          build: msg.build ?? null,
-          available: msg.available,
-          latest: msg.latest ?? null,
-        });
+        const status = parseUpdateStatus(msg);
+        if (status !== null) this.handlers.onUpdate?.(status);
       } else if (msg.type === "recents" && typeof msg.epoch === "number") {
         this.backoffMs = INITIAL_BACKOFF_MS;
         this.handlers.onRecents?.(msg.epoch);

@@ -48,7 +48,7 @@ in-app SSH askpass, a signed auto-updater). Parent map: repo-root
 | `shell/notices.rs` | Notices → OS notifications: one long-poll watcher per open daemon (`GET /api/v1/notices`), suppression for what the focused window shows (`report_window_view`), one-alert-per-session supersede/withdraw, click routing (`focus-session` + `take_pending_focus`), the Dock badge/bounce and tray counts. Feature: [notifications.md](../../docs/features/notifications.md). |
 | `notify.rs` | The platform notifier: macOS `UNUserNotificationCenter` + click delegate + dock tile (needs a signed `.app` — unbundled dev builds degrade to none), `notify-rust` on Linux/Windows. Identifiers encode the click route. |
 | `windows.rs` | The per-window registry (round-trips window↔workspace). |
-| `update.rs` | The auto-updater intent chain (consume-once, expiry). |
+| `update.rs` | The auto-updater intent chain (consume-once, expiry) + the kept outcome of every signed-update check (`status`/`check`, behind `app_update_status`). |
 | `menu.rs` | The menu bar. |
 | `tray.rs` | The menu-bar / system-tray status item (`tray-icon` feature). |
 

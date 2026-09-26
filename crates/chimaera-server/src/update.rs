@@ -42,11 +42,18 @@ pub(crate) struct Release {
     pub(crate) published_at: Option<String>,
 }
 
-/// What the daemon currently knows about updates.
+/// What the daemon currently knows about updates. A failed check keeps the
+/// last good answer (`latest`, `succeeded_at`) and records why it failed, so
+/// "couldn't check" never reads as "up to date".
 #[derive(Debug, Default)]
 pub(crate) struct UpdateStatus {
+    /// The most recent attempt, successful or not.
     pub(crate) checked_at: Option<u64>,
+    /// The most recent attempt that got an answer from the releases feed.
+    pub(crate) succeeded_at: Option<u64>,
     pub(crate) latest: Option<Release>,
+    /// Why the most recent attempt failed; cleared by the next success.
+    pub(crate) error: Option<String>,
 }
 
 impl UpdateStatus {
@@ -56,11 +63,32 @@ impl UpdateStatus {
             .is_some_and(|r| chimaera_core::release_is_newer(&current_version(), &r.version))
     }
 
+    /// One word for "is there an update?", so every surface answers it the
+    /// same way. A known newer release outranks a later failed check (the
+    /// release did not stop existing); otherwise the last attempt decides.
+    fn state(&self) -> &'static str {
+        if self.available() {
+            "available"
+        } else if self.error.is_some() {
+            "failed"
+        } else if self.latest.is_some() {
+            "current"
+        } else {
+            "unchecked"
+        }
+    }
+
     pub(crate) fn to_json(&self) -> serde_json::Value {
+        let current = current_version();
         json!({
-            "current": chimaera_core::VERSION,
+            "current": current,
             "build": chimaera_core::BUILD_ID,
+            "dev": chimaera_core::version_is_dev(&current),
+            "state": self.state(),
             "checked_at": self.checked_at,
+            "succeeded_at": self.succeeded_at,
+            "error": self.error,
+            "interval_secs": CHECK_INTERVAL.as_secs(),
             "available": self.available(),
             "latest": self.latest.as_ref().map(|r| json!({
                 "version": r.version,
@@ -71,10 +99,10 @@ impl UpdateStatus {
     }
 }
 
-/// The version updates are compared against. `CHIMAERA_UPDATE_CURRENT`
-/// exists so a dev build (whose real version is the never-outdated `0.0.1`
-/// sentinel) can exercise the full popup flow against a fixture; it has no
-/// production meaning.
+/// The version updates are compared against (and reported as `current`).
+/// `CHIMAERA_UPDATE_CURRENT` exists so a dev build (whose real version is the
+/// never-outdated `0.0.1` sentinel) can exercise the full popup flow against
+/// a fixture; it has no production meaning.
 fn current_version() -> String {
     std::env::var("CHIMAERA_UPDATE_CURRENT").unwrap_or_else(|_| chimaera_core::VERSION.to_string())
 }
@@ -108,27 +136,60 @@ pub(crate) async fn run_checker(state: Arc<AppState>) {
     }
 }
 
-/// Fetch and store; on any change the update epoch moves and `/ws/events`
-/// subscribers wake. Failures are logged at debug — an air-gapped cluster
-/// failing an update check four times a day is normal life, not a warning.
+/// Fetch and store, then move the update epoch so `/ws/events` subscribers
+/// see the fresh `checked_at` (four frames a day; the UI's "checked 2h ago"
+/// must not go stale). Failures are logged at debug — an air-gapped cluster
+/// failing an update check four times a day is normal life, not a warning —
+/// and reported in the status, where the user asking can see why.
+///
+/// Checks are serialized: a "check now" landing while another check runs
+/// waits for it and reuses its answer instead of fetching twice.
 pub(crate) async fn check_now(state: &Arc<AppState>) {
-    match fetch_latest().await {
+    // Every finished check moves the epoch (below, before the lock drops),
+    // so a moved epoch after the wait means a check completed after we asked.
+    let seen = state.update_epoch.load(Ordering::Relaxed);
+    let _one_at_a_time = state.update_check.lock().await;
+    if state.update_epoch.load(Ordering::Relaxed) != seen {
+        return;
+    }
+    let result = fetch_latest().await;
+    let now = unix_now();
+    let mut status = crate::lock(&state.update);
+    status.checked_at = Some(now);
+    match result {
         Ok(release) => {
-            let mut status = crate::lock(&state.update);
-            let changed = status.latest.as_ref() != Some(&release);
             status.latest = Some(release);
-            status.checked_at = Some(unix_now());
-            drop(status);
-            if changed {
-                state.update_epoch.fetch_add(1, Ordering::Relaxed);
-                state.changes.notify_waiters();
-            }
+            status.succeeded_at = Some(now);
+            status.error = None;
         }
         Err(err) => {
-            tracing::debug!(%err, "release check failed");
-            crate::lock(&state.update).checked_at = Some(unix_now());
+            tracing::debug!(err = %format!("{err:#}"), "release check failed");
+            status.error = Some(describe_failure(&err));
         }
     }
+    drop(status);
+    state.update_epoch.fetch_add(1, Ordering::Relaxed);
+    state.changes.notify_waiters();
+}
+
+/// A failed check, in words a user can act on. curl's own diagnosis ("Could
+/// not resolve host: api.github.com") is already that, minus its prefix; an
+/// HTTP 403/429 from GitHub is its unauthenticated rate limit, which a busy
+/// login node's shared address hits — worth naming, since it clears itself.
+fn describe_failure(err: &anyhow::Error) -> String {
+    let raw = format!("{err:#}");
+    if raw.starts_with("failed to run curl") {
+        return "curl is not available on this host".to_string();
+    }
+    let msg = raw
+        .strip_prefix("curl: (")
+        .and_then(|rest| rest.split_once(") "))
+        .map_or(raw.as_str(), |(_, m)| m);
+    if msg.ends_with("error: 403") || msg.ends_with("error: 429") {
+        return "GitHub is rate-limiting this address; the next check will retry".to_string();
+    }
+    // Wire-bounded: a pathological proxy page must not ride every frame.
+    msg.chars().take(200).collect()
 }
 
 async fn fetch_latest() -> anyhow::Result<Release> {
@@ -174,7 +235,9 @@ pub(crate) struct UpdateQuery {
 }
 
 /// GET /api/v1/update — the cached answer, instantly; `?refresh=true` checks
-/// first (bounded by curl's own timeout) and returns the fresh truth.
+/// first (bounded by curl's own timeout) and returns the fresh truth — the
+/// UI's "check now". An explicit ask runs even with `update.autoCheck` off
+/// or on a dev build: the setting governs the daemon phoning home on its own.
 pub(crate) async fn get_update(
     State(state): State<Arc<AppState>>,
     Query(query): Query<UpdateQuery>,
@@ -209,25 +272,85 @@ mod tests {
         assert!(parse_release(b"not json").is_err());
     }
 
+    fn release(version: &str) -> Release {
+        Release {
+            version: version.into(),
+            url: "https://example.test/rel".into(),
+            published_at: None,
+        }
+    }
+
     #[test]
     fn status_json_shape() {
         let status = UpdateStatus {
             checked_at: Some(1_000),
-            latest: Some(Release {
-                version: "99.0.0".into(),
-                url: "https://example.test/rel".into(),
-                published_at: None,
-            }),
+            succeeded_at: Some(1_000),
+            latest: Some(release("99.0.0")),
+            error: None,
         };
         let json = status.to_json();
         assert_eq!(json["current"], chimaera_core::VERSION);
         assert_eq!(json["latest"]["version"], "99.0.0");
+        assert_eq!(json["succeeded_at"], 1_000);
+        assert_eq!(json["interval_secs"], 6 * 60 * 60);
         // The workspace dev sentinel is never "outdated" (release_is_newer),
-        // so a dev daemon reports available: false even against 99.0.0.
-        assert_eq!(json["available"], chimaera_core::VERSION != "0.0.1");
+        // so a dev daemon reports available: false even against 99.0.0 — and
+        // says it is a dev build rather than posing as up to date.
+        let dev = chimaera_core::VERSION == "0.0.1";
+        assert_eq!(json["available"], !dev);
+        assert_eq!(json["dev"], dev);
+        assert_eq!(json["state"], if dev { "current" } else { "available" });
         // No check yet = empty status, honestly null.
         let empty = UpdateStatus::default().to_json();
         assert_eq!(empty["latest"], serde_json::Value::Null);
         assert_eq!(empty["available"], false);
+        assert_eq!(empty["state"], "unchecked");
+        assert_eq!(empty["error"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn a_failed_check_never_reads_as_up_to_date() {
+        // Never succeeded: failed, not current.
+        let never = UpdateStatus {
+            checked_at: Some(2_000),
+            error: Some("Could not resolve host: api.github.com".into()),
+            ..UpdateStatus::default()
+        };
+        assert_eq!(never.state(), "failed");
+        assert_eq!(
+            never.to_json()["error"],
+            "Could not resolve host: api.github.com"
+        );
+
+        // Succeeded before, failed since: still failed (the last good answer
+        // rides along with its own timestamp), unless it knew of a release —
+        // a failed re-check doesn't un-publish it.
+        let stale = UpdateStatus {
+            checked_at: Some(3_000),
+            succeeded_at: Some(1_000),
+            latest: Some(release("0.0.1")),
+            error: Some("timed out".into()),
+        };
+        assert_eq!(stale.state(), "failed");
+        assert_eq!(stale.to_json()["succeeded_at"], 1_000);
+    }
+
+    #[test]
+    fn failures_read_as_plain_words() {
+        let say = |raw: &str| describe_failure(&anyhow::anyhow!("{raw}"));
+        assert_eq!(
+            say("curl: (6) Could not resolve host: api.github.com"),
+            "Could not resolve host: api.github.com"
+        );
+        assert_eq!(
+            say("curl: (22) The requested URL returned error: 403"),
+            "GitHub is rate-limiting this address; the next check will retry"
+        );
+        assert_eq!(
+            say("failed to run curl: No such file or directory (os error 2)"),
+            "curl is not available on this host"
+        );
+        assert_eq!(say("bad release JSON"), "bad release JSON");
+        assert_eq!(say(&"x".repeat(500)).len(), 200);
     }
 }

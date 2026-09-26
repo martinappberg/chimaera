@@ -34,11 +34,18 @@ pub fn install(app: &App) -> tauri::Result<()> {
         .accelerator("CmdOrCtrl+Q")
         .build(handle)?;
 
+    // The platform convention beside About: an explicit ask that always
+    // answers — the page checks the app and its daemon and shows the result,
+    // "up to date" included.
+    let check_updates =
+        MenuItemBuilder::with_id("check-updates", "Check for Updates…").build(handle)?;
+
     // The application menu (services/hide/show) is a macOS concept; Windows
     // and Linux menubars start at File, where Quit must live instead.
     #[cfg(target_os = "macos")]
     let app_menu = SubmenuBuilder::new(handle, "Chimaera")
         .item(&PredefinedMenuItem::about(handle, None, None)?)
+        .item(&check_updates)
         .separator()
         .item(&settings)
         .separator()
@@ -110,6 +117,8 @@ pub fn install(app: &App) -> tauri::Result<()> {
     // the only in-app version display, which bug triage depends on.
     #[cfg(not(target_os = "macos"))]
     let help = SubmenuBuilder::new(handle, "Help")
+        .item(&check_updates)
+        .separator()
         .item(&PredefinedMenuItem::about(handle, None, None)?)
         .build()?;
 
@@ -134,6 +143,25 @@ pub fn install(app: &App) -> tauri::Result<()> {
                 let _ = crate::shell::show_local_home(app, None);
             }
             "quit" => crate::shell::request_quit(app),
+            "check-updates" => {
+                // Any window can answer (home or workspace — the toast lives
+                // in both); prefer the focused one. With none open, a home
+                // window's own mount-time check is the answer.
+                let windows = app.webview_windows();
+                let target = windows
+                    .values()
+                    .find(|w| w.is_focused().unwrap_or(false))
+                    .or_else(|| windows.values().next());
+                match target {
+                    Some(window) => {
+                        let _ = window.set_focus();
+                        let _ = app.emit_to(window.label(), "menu", id);
+                    }
+                    None => {
+                        let _ = crate::shell::show_local_home(app, None);
+                    }
+                }
+            }
             "close-view" | "new-terminal" | "new-agent" | "settings" => {
                 // The page knows what "close the focused view" / "open settings"
                 // means; the shell only knows which window is focused. emit_to,
