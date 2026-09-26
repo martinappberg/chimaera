@@ -35,7 +35,7 @@ use wasmtime::component::{Component, HasSelf, Linker, ResourceTable};
 use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder, UpdateDeadline};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
-use super::{Manifest, Source};
+use super::Manifest;
 use crate::AppState;
 
 wasmtime::component::bindgen!({
@@ -122,9 +122,7 @@ fn build_shared() -> wasmtime::Result<Shared> {
 /// The component for `m`, compiled on first use (Cranelift: tens of ms of
 /// CPU, so on the blocking pool) and kept for the daemon's lifetime.
 async fn component(m: &'static Manifest) -> Result<ChimaeraPluginPre<HostState>, String> {
-    let Source::Wasm(bytes) = &m.source else {
-        return Err(format!("{} is not a WASM plugin", m.name));
-    };
+    let bytes = &m.wasm.0;
     let shared = shared()?;
     let mut compiled = shared.compiled.lock().await;
     if let Some(done) = compiled.get(&m.id) {
@@ -712,7 +710,6 @@ impl PluginRuntime {
 
     /// The Knowledge snapshot `(stamp, data)` from a provider plugin, or
     /// None when `known` is still current.
-    #[allow(dead_code)] // P2: knowledge.rs asks the provider plugin through this.
     pub(crate) async fn knowledge(
         &self,
         state: &Arc<AppState>,
@@ -830,15 +827,6 @@ fn check_offer(
     })
 }
 
-/// The WASM plugins active in the session's workspace (none without one).
-async fn active_wasm(state: &AppState, ws: &str) -> Vec<&'static Manifest> {
-    super::active(state, ws)
-        .await
-        .into_iter()
-        .filter(|m| m.is_wasm())
-        .collect()
-}
-
 /// A hook the agent fired (`SessionStart`, `UserPromptSubmit`): each active
 /// plugin may add one line to the hook's context.
 pub(crate) async fn hook(state: &Arc<AppState>, session: &str, event: &str) -> Vec<String> {
@@ -846,7 +834,7 @@ pub(crate) async fn hook(state: &Arc<AppState>, session: &str, event: &str) -> V
         return Vec::new();
     };
     let mut lines = Vec::new();
-    for m in active_wasm(state, &ws).await {
+    for m in super::active(state, &ws).await {
         let ev = wit::Event::Hook(wit::Hook {
             session: session.to_string(),
             name: event.to_string(),
@@ -873,7 +861,7 @@ pub(crate) fn session_ended(state: &Arc<AppState>, session: &str) {
     let state = state.clone();
     let session = session.to_string();
     tokio::spawn(async move {
-        for m in active_wasm(&state, &ws).await {
+        for m in super::active(&state, &ws).await {
             // A plugin that keeps nothing here has nothing to forget; don't
             // instantiate it just to say so.
             if !crate::lock(&state.plugin_state).holds(&m.id, &ws) {

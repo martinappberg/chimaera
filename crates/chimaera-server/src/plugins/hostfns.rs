@@ -154,7 +154,10 @@ fn shown(rel: &Path) -> String {
 }
 
 /// An open that failed: name the symlink when one is in the way (the
-/// `O_NOFOLLOW` walk refuses it with a bare ELOOP/ENOTDIR).
+/// `O_NOFOLLOW` walk refuses it with a bare ELOOP/ENOTDIR). Plugins tell a
+/// refusal from a missing file by these words (" is a symlink — refused"):
+/// the mycelium reader warns about and stamps a refused path, pinned by
+/// `tests/knowledge.rs`.
 fn refused(root: &Path, rel: &Path, err: std::io::Error) -> String {
     let mut at = root.to_path_buf();
     let mut walked = PathBuf::new();

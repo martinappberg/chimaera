@@ -1,6 +1,7 @@
 //! Read-only reader for a workspace's mycelium project knowledge — the
 //! structured provider behind the Knowledge view
-//! (docs/timeline-knowledge-plugins-plan.md §5, §6.3).
+//! (docs/timeline-knowledge-plugins-plan.md §5, §6.3; the plugin it runs
+//! in: docs/plugin-system-plan.md).
 //!
 //! - **Read-only, always.** Agents write knowledge through mycelium's skills
 //!   and hooks; Chimaera only reads it. Nothing here creates, locks, or
@@ -19,19 +20,20 @@
 //!   fence-aware; an example entry in a code block must not become knowledge.
 //! - **Bounded.** A file over [`MAX_FILE_BYTES`] is skipped unread, and every
 //!   collection and text field has a cap (constants below). Symlinks are never
-//!   followed, so the reader cannot leave the workspace.
-//! - **Blocking.** Plain `std::fs`: callers run [`read`] and [`stamp`] under
-//!   `spawn_blocking`, never on the reactor. [`stamp`] is the metadata-only
-//!   check that lets a caller skip a re-parse when nothing changed.
+//!   followed, so the reader cannot leave the workspace. These budgets sit
+//!   under the host's own (8 MiB a read, 4,096 entries a listing).
+//! - **Through [`Fs`].** Every path is workspace-relative and answered by the
+//!   host (or, in native tests, `std::fs` under the host's rules). [`plan`]
+//!   is the metadata-only pass: its [`Plan::stamp`] lets a caller skip a
+//!   re-parse ([`read`]) when nothing changed.
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fs::{File, Metadata};
-use std::io::Read;
-use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
 
+use chimaera_plugin_api::Stat;
 use serde::Serialize;
+
+use crate::fs::{is_symlink_refusal, Fs, NOT_REGULAR};
 
 /// A knowledge file over this size is skipped unread. mycelium's logs are
 /// append-only prose (2 MiB is years of entries), so a bigger file is a
@@ -49,7 +51,7 @@ const MAX_TOPIC_FILES: usize = 200;
 /// append); topic files the first.
 const MAX_SCANNED_ENTRIES: usize = 5000;
 /// Directory entries examined per listing, so a runaway directory can't turn
-/// a cheap [`stamp`] into a crawl.
+/// a cheap [`plan`] into a crawl.
 const MAX_DIR_ENTRIES: usize = 4096;
 /// Items kept per kind (decisions, learnings, findings, todos, questions).
 /// Decisions and learnings keep the newest.
@@ -219,8 +221,11 @@ pub(crate) struct Counts {
 }
 
 /// What [`read`] would read, by metadata: equal stamps mean a cached
-/// [`Knowledge`] is still current.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// [`Knowledge`] is still current. It crosses to the host as the snapshot's
+/// stamp, `{"files": [[path, mtime_ms, len], …], "refused": [path, …]}`:
+/// the host hands it back to ask "changed?", and attributes a new entry to
+/// a turn only when its file's mtime here is after that turn started.
+#[derive(Serialize, Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Stamp {
     /// `(workspace-relative path, mtime_ms, len)` per file.
     files: Vec<(String, u64, u64)>,
@@ -229,41 +234,17 @@ pub(crate) struct Stamp {
     refused: Vec<String>,
 }
 
-impl Stamp {
-    /// mtime (ms) of one stamped file, by workspace-relative path — the
-    /// Timeline attributes a new entry to a turn only when its file changed
-    /// after that turn started.
-    pub(crate) fn mtime_of(&self, rel: &str) -> Option<u64> {
-        self.files
-            .iter()
-            .find(|(path, _, _)| path == rel)
-            .map(|(_, mtime, _)| *mtime)
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Entry points
 // ---------------------------------------------------------------------------
 
-/// Metadata of every file [`read`] would open — no contents read.
-pub(crate) fn stamp(root: &Path) -> Stamp {
-    let plan = plan(root);
-    Stamp {
-        files: plan
-            .sources
-            .iter()
-            .map(|s| (s.rel.clone(), mtime_ms(&s.meta), s.meta.len()))
-            .collect(),
-        refused: plan.refused,
-    }
-}
-
-/// Parse everything mycelium keeps for `root`. Outside a mycelium workspace
-/// (see [`detect`]) nothing is read — a stray `todo/` is not knowledge.
-pub(crate) fn read(root: &Path) -> Knowledge {
+/// Parse everything `plan` found. Outside a mycelium workspace (no `.living/`
+/// and no `MYCELIUM.md`) the plan is empty — a stray `todo/` is not
+/// knowledge.
+pub(crate) fn read(fs: &impl Fs, plan: Plan) -> Knowledge {
     let Plan {
         sources, mut notes, ..
-    } = plan(root);
+    } = plan;
     let mut knowledge = Knowledge::default();
     let mut topics = Vec::new();
     let mut spent = 0u64;
@@ -279,12 +260,12 @@ pub(crate) fn read(root: &Path) -> Knowledge {
             continue;
         }
         // An oversized file is read_source's to report, not the budget's.
-        let len = source.meta.len();
+        let len = source.stat.size;
         if len <= MAX_FILE_BYTES && spent + len > MAX_TOTAL_BYTES {
             over_budget += 1;
             continue;
         }
-        let Some(text) = read_source(source, &mut notes) else {
+        let Some(text) = read_source(fs, source, &mut notes) else {
             continue;
         };
         spent += text.len() as u64;
@@ -417,51 +398,65 @@ struct Source {
     kind: SourceKind,
     /// Workspace-relative, `/`-joined.
     rel: String,
-    abs: PathBuf,
-    /// From `symlink_metadata` — the file itself, never a link target.
-    meta: Metadata,
+    /// The host's stat — the file itself, never a link target.
+    stat: Stat,
 }
 
-/// The file set shared by [`stamp`] and [`read`], so the two can never
-/// disagree about what a read covers.
+/// The file set behind both [`Plan::stamp`] and [`read`], so the two can
+/// never disagree about what a read covers.
 #[derive(Default)]
-struct Plan {
+pub(crate) struct Plan {
     sources: Vec<Source>,
     refused: Vec<String>,
     notes: Notes,
 }
 
 impl Plan {
+    /// Metadata of every file [`read`] would open — no contents read.
+    pub(crate) fn stamp(&self) -> Stamp {
+        Stamp {
+            files: self
+                .sources
+                .iter()
+                .map(|s| (s.rel.clone(), s.stat.mtime_ms, s.stat.size))
+                .collect(),
+            refused: self.refused.clone(),
+        }
+    }
+
     /// Whether `rel` is a real directory; a symlink is refused, not followed.
-    fn dir(&mut self, root: &Path, rel: &str) -> bool {
-        match std::fs::symlink_metadata(root.join(rel)) {
-            Ok(meta) if meta.file_type().is_symlink() => {
-                self.refuse(rel);
+    fn dir(&mut self, fs: &impl Fs, rel: &str) -> bool {
+        match fs.stat(rel) {
+            Ok(stat) => stat.is_dir,
+            Err(err) => {
+                if is_symlink_refusal(&err) {
+                    self.refuse(rel);
+                }
                 false
             }
-            Ok(meta) => meta.is_dir(),
-            Err(_) => false,
         }
     }
 
-    /// A regular file at `rel`, not yet queued.
-    fn probe(&mut self, root: &Path, rel: &str, kind: SourceKind) -> Option<Source> {
-        let abs = root.join(rel);
-        let meta = std::fs::symlink_metadata(&abs).ok()?;
-        if meta.file_type().is_symlink() {
-            self.refuse(rel);
-            return None;
+    /// A file at `rel`, not yet queued. The host's stat can't tell a regular
+    /// file from a FIFO or socket; its read refuses those.
+    fn probe(&mut self, fs: &impl Fs, rel: &str, kind: SourceKind) -> Option<Source> {
+        match fs.stat(rel) {
+            Ok(stat) => (!stat.is_dir).then(|| Source {
+                kind,
+                rel: rel.to_owned(),
+                stat,
+            }),
+            Err(err) => {
+                if is_symlink_refusal(&err) {
+                    self.refuse(rel);
+                }
+                None
+            }
         }
-        meta.is_file().then(|| Source {
-            kind,
-            rel: rel.to_owned(),
-            abs,
-            meta,
-        })
     }
 
-    fn file(&mut self, root: &Path, rel: &str, kind: SourceKind) -> bool {
-        let found = self.probe(root, rel, kind);
+    fn file(&mut self, fs: &impl Fs, rel: &str, kind: SourceKind) -> bool {
+        let found = self.probe(fs, rel, kind);
         let queued = found.is_some();
         self.sources.extend(found);
         queued
@@ -474,71 +469,68 @@ impl Plan {
         ));
     }
 
-    /// Sorted UTF-8 names in `rel`, at most [`MAX_DIR_ENTRIES`] examined.
-    fn list(&mut self, root: &Path, rel: &str) -> Vec<String> {
-        let Ok(entries) = std::fs::read_dir(root.join(rel)) else {
+    /// Sorted names in `rel`, at most [`MAX_DIR_ENTRIES`] examined (the
+    /// host's own listing cap). The host stops at the cap without saying
+    /// whether more remain, so a full listing counts as over it.
+    fn list(&mut self, fs: &impl Fs, rel: &str) -> Vec<String> {
+        let Ok(entries) = fs.list(rel, MAX_DIR_ENTRIES as u32) else {
             return Vec::new();
         };
-        let mut entries = entries.flatten();
-        let mut names: Vec<String> = entries
-            .by_ref()
-            .take(MAX_DIR_ENTRIES)
-            .filter_map(|e| e.file_name().into_string().ok())
-            .collect();
-        if entries.next().is_some() {
+        if entries.len() >= MAX_DIR_ENTRIES {
             self.notes.push(format!(
                 "{rel}: over {MAX_DIR_ENTRIES} entries; only the first {MAX_DIR_ENTRIES} were considered"
             ));
         }
+        let mut names: Vec<String> = entries.into_iter().map(|e| e.name).collect();
         names.sort();
         names
     }
 }
 
-fn plan(root: &Path) -> Plan {
+/// Which files a read covers, by metadata only.
+pub(crate) fn plan(fs: &impl Fs) -> Plan {
     let mut plan = Plan::default();
-    let living = plan.dir(root, LIVING);
-    if !living && !is_regular_file(&root.join(PROTOCOL_FILE)) {
+    let living = plan.dir(fs, LIVING);
+    if !living && !is_file(fs, PROTOCOL_FILE) {
         return plan;
     }
     // Topic files go last: they are the many-file source, so they are what
     // a spent MAX_TOTAL_BYTES budget should drop.
-    plan_handoff(root, &mut plan);
+    plan_handoff(fs, &mut plan);
     if living {
-        plan.file(root, ".living/decisions.md", SourceKind::Decisions);
-        plan.file(root, ".living/learnings.md", SourceKind::Learnings);
+        plan.file(fs, ".living/decisions.md", SourceKind::Decisions);
+        plan.file(fs, ".living/learnings.md", SourceKind::Learnings);
     }
-    if plan.dir(root, "todo") && !plan.file(root, "todo/TODO_REGISTRY.md", SourceKind::TodoRegistry)
-    {
-        plan.file(root, "todo/TODOLIST.md", SourceKind::TodoLegacy);
+    if plan.dir(fs, "todo") && !plan.file(fs, "todo/TODO_REGISTRY.md", SourceKind::TodoRegistry) {
+        plan.file(fs, "todo/TODOLIST.md", SourceKind::TodoLegacy);
     }
     if living {
-        plan_topics(root, &mut plan);
+        plan_topics(fs, &mut plan);
     }
     plan
 }
 
 /// The accepted shared handoff, else the newest in-flight run handoff
 /// (`.mycelium/run/<host>/<session-id>/last-session.md`).
-fn plan_handoff(root: &Path, plan: &mut Plan) {
-    if !plan.dir(root, ".mycelium") {
+fn plan_handoff(fs: &impl Fs, plan: &mut Plan) {
+    if !plan.dir(fs, ".mycelium") {
         return;
     }
     let shared = SourceKind::Handoff {
         session_id: None,
         host: None,
     };
-    if plan.file(root, ".mycelium/last-session.md", shared) || !plan.dir(root, ".mycelium/run") {
+    if plan.file(fs, ".mycelium/last-session.md", shared) || !plan.dir(fs, ".mycelium/run") {
         return;
     }
     let mut best: Option<Source> = None;
     let mut examined = 0usize;
-    'hosts: for host in plan.list(root, ".mycelium/run") {
+    'hosts: for host in plan.list(fs, ".mycelium/run") {
         let host_rel = format!(".mycelium/run/{host}");
-        if !is_run_component(&host) || !plan.dir(root, &host_rel) {
+        if !is_run_component(&host) || !plan.dir(fs, &host_rel) {
             continue;
         }
-        for session in plan.list(root, &host_rel) {
+        for session in plan.list(fs, &host_rel) {
             examined += 1;
             if examined > MAX_RUN_DIRS {
                 plan.notes.push(format!(
@@ -547,19 +539,19 @@ fn plan_handoff(root: &Path, plan: &mut Plan) {
                 break 'hosts;
             }
             let dir_rel = format!("{host_rel}/{session}");
-            if !is_run_component(&session) || !plan.dir(root, &dir_rel) {
+            if !is_run_component(&session) || !plan.dir(fs, &dir_rel) {
                 continue;
             }
             let kind = SourceKind::Handoff {
                 session_id: Some(session.clone()),
                 host: Some(host.clone()),
             };
-            let Some(found) = plan.probe(root, &format!("{dir_rel}/last-session.md"), kind) else {
+            let Some(found) = plan.probe(fs, &format!("{dir_rel}/last-session.md"), kind) else {
                 continue;
             };
             let newer = best
                 .as_ref()
-                .is_none_or(|b| (mtime_ms(&found.meta), &found.rel) > (mtime_ms(&b.meta), &b.rel));
+                .is_none_or(|b| (found.stat.mtime_ms, &found.rel) > (b.stat.mtime_ms, &b.rel));
             if newer {
                 best = Some(found);
             }
@@ -568,13 +560,13 @@ fn plan_handoff(root: &Path, plan: &mut Plan) {
     plan.sources.extend(best);
 }
 
-fn plan_topics(root: &Path, plan: &mut Plan) {
+fn plan_topics(fs: &impl Fs, plan: &mut Plan) {
     const DIR: &str = ".living/findings";
-    if !plan.dir(root, DIR) {
+    if !plan.dir(fs, DIR) {
         return;
     }
     let mut names: Vec<String> = plan
-        .list(root, DIR)
+        .list(fs, DIR)
         .into_iter()
         .filter(|n| {
             let lower = n.to_ascii_lowercase();
@@ -596,7 +588,7 @@ fn plan_topics(root: &Path, plan: &mut Plan) {
     }
     for name in names {
         let slug = name[..name.len() - 3].to_owned();
-        plan.file(root, &format!("{DIR}/{name}"), SourceKind::Topic { slug });
+        plan.file(fs, &format!("{DIR}/{name}"), SourceKind::Topic { slug });
     }
 }
 
@@ -612,49 +604,39 @@ fn is_run_component(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
-fn is_regular_file(path: &Path) -> bool {
-    std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file())
-}
-
-fn mtime_ms(meta: &Metadata) -> u64 {
-    meta.modified()
-        .ok()
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+/// A file (not a directory) at `rel`, never through a symlink.
+fn is_file(fs: &impl Fs, rel: &str) -> bool {
+    fs.stat(rel).is_ok_and(|stat| !stat.is_dir)
 }
 
 /// Bounded read of a planned file. Refuses anything that stopped being the
-/// regular file the plan saw — a swap to a symlink between the `lstat` and
-/// the `open` would otherwise be followed.
-fn read_source(source: &Source, notes: &mut Notes) -> Option<String> {
+/// regular file the plan saw: the host opens every component `O_NOFOLLOW`
+/// and reads only regular files, so a swap to a symlink (or a directory)
+/// between the stat and the read is refused there, never followed.
+fn read_source(fs: &impl Fs, source: &Source, notes: &mut Notes) -> Option<String> {
     let rel = &source.rel;
-    if source.meta.len() > MAX_FILE_BYTES {
+    if source.stat.size > MAX_FILE_BYTES {
         notes.push(format!(
             "{rel}: skipped; {} is over the {} read cap",
-            mib(source.meta.len()),
+            mib(source.stat.size),
             mib(MAX_FILE_BYTES)
         ));
         return None;
     }
-    let file = match File::open(&source.abs) {
-        Ok(file) => file,
+    // One byte past the cap tells a file that grew past it since the plan.
+    let buf = match fs.read(rel, (MAX_FILE_BYTES + 1) as u32) {
+        Ok(buf) => buf,
+        Err(err) if is_symlink_refusal(&err) || err.ends_with(NOT_REGULAR) => {
+            notes.push(format!("{rel}: changed while being read; skipped"));
+            return None;
+        }
         Err(err) => {
-            notes.push(format!("{rel}: unreadable ({err})"));
+            // The host names the path first; the note already does.
+            let why = err.strip_prefix(&format!("{rel}: ")).unwrap_or(&err);
+            notes.push(format!("{rel}: unreadable ({why})"));
             return None;
         }
     };
-    if !file
-        .metadata()
-        .is_ok_and(|m| m.is_file() && same_file(&m, &source.meta))
-    {
-        notes.push(format!("{rel}: changed while being read; skipped"));
-        return None;
-    }
-    let mut buf = Vec::with_capacity(usize::try_from(source.meta.len()).unwrap_or(0));
-    if let Err(err) = file.take(MAX_FILE_BYTES + 1).read_to_end(&mut buf) {
-        notes.push(format!("{rel}: unreadable ({err})"));
-        return None;
-    }
     if buf.len() as u64 > MAX_FILE_BYTES {
         notes.push(format!(
             "{rel}: skipped; grew past the {} read cap",
@@ -670,17 +652,6 @@ fn read_source(source: &Source, notes: &mut Notes) -> Option<String> {
         text.drain(..'\u{feff}'.len_utf8());
     }
     Some(text)
-}
-
-#[cfg(unix)]
-fn same_file(a: &Metadata, b: &Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    (a.dev(), a.ino()) == (b.dev(), b.ino())
-}
-
-#[cfg(not(unix))]
-fn same_file(_a: &Metadata, _b: &Metadata) -> bool {
-    true
 }
 
 /// Rounded up, so a file a few bytes past the cap never reads as "2.0 MiB".
@@ -2345,7 +2316,7 @@ fn parse_handoff(text: &str, source: &Source, notes: &mut Notes) -> Option<LeftO
         blockers: list(&sections[2]),
         current: prose(&sections[3]),
         next: list(&sections[4]),
-        written_ms: mtime_ms(&source.meta),
+        written_ms: source.stat.mtime_ms,
         path: source.rel.clone(),
         session_id: None,
         host: None,
@@ -2539,8 +2510,22 @@ fn legacy_todos(doc: &Doc, rel: &str, notes: &mut Notes) -> Vec<Todo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fs::StdFs;
+    use chimaera_plugin_api::serde_json;
+    use std::fs::File;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, SystemTime};
+
+    /// The reader over a real tree, through `std::fs` under the host's rules.
+    fn read(root: &Path) -> Knowledge {
+        let fs = StdFs::new(root);
+        super::read(&fs, plan(&fs))
+    }
+
+    fn stamp(root: &Path) -> Stamp {
+        plan(&StdFs::new(root)).stamp()
+    }
 
     /// A throwaway workspace root, removed on drop.
     struct Fixture(PathBuf);

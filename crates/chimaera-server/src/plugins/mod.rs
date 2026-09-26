@@ -2,15 +2,13 @@
 //! Design: docs/timeline-knowledge-plugins-plan.md §6; the plugin host:
 //! docs/plugin-system-plan.md.
 //!
-//! A plugin is a small TOML manifest (data, never code) plus its behaviour,
-//! which is one of two sources:
-//! - **WASM** (`Source::Wasm`): a component (`plugin.wasm`) built from
-//!   `plugins/<crate>` by `scripts/build-plugins.sh` and embedded from
-//!   `plugins/dist`, like `web-ui/dist`. It runs in `runtime` (the sandbox)
-//!   and asks the daemon for everything through `hostfns` (bounded).
-//! - **Native** (`Source::Native`): named first-party code in the daemon
-//!   (`provides.knowledge = "mycelium"` → `crate::mycelium`). Mycelium only,
-//!   until it moves to WASM too.
+//! A plugin is a small TOML manifest (data, never code) plus its behaviour:
+//! a WASM component (`plugin.wasm`) built from `plugins/<crate>` by
+//! `scripts/build-plugins.sh` and embedded from `plugins/dist`, like
+//! `web-ui/dist`. It runs in `runtime` (the sandbox) and asks the daemon for
+//! everything through `hostfns` (bounded). No plugin behaviour is daemon
+//! code: the Knowledge provider (mycelium) answers `knowledge.rs` through
+//! its `knowledge` export like any other plugin would.
 //!
 //! State is minimal by design: a plugin is switched on per workspace
 //! (`Workspace.plugins_on` — the Plugins page is per workspace, so is its
@@ -45,10 +43,6 @@ pub(crate) mod tools;
 
 /// How long a workspace's detect result is trusted before a re-stat.
 const DETECT_TTL: Duration = Duration::from_secs(30);
-
-/// The native plugins' manifests (behaviour in the daemon, named by
-/// capability). New plugins are WASM crates under `plugins/`.
-const NATIVE: [&str; 1] = [include_str!("manifests/mycelium.toml")];
 
 /// The WIT version (`chimaera:plugin@0.1.x`) this host serves.
 pub(crate) const API: &str = "0.1";
@@ -87,31 +81,18 @@ pub(crate) struct Manifest {
     pub(crate) provides: Provides,
     #[serde(default)]
     pub(crate) adds: Adds,
-    /// Where the behaviour lives — set by the catalog, never by the TOML.
+    /// The behaviour — set by the catalog, never by the TOML.
     #[serde(skip)]
-    pub(crate) source: Source,
+    pub(crate) wasm: Wasm,
 }
 
-/// A plugin's behaviour: daemon code, or a component the runtime runs.
+/// A plugin's component (`plugin.wasm`), which the runtime runs.
 #[derive(Clone, Default)]
-pub(crate) enum Source {
-    #[default]
-    Native,
-    Wasm(Cow<'static, [u8]>),
-}
+pub(crate) struct Wasm(pub(crate) Cow<'static, [u8]>);
 
-impl std::fmt::Debug for Source {
+impl std::fmt::Debug for Wasm {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Source::Native => f.write_str("Native"),
-            Source::Wasm(bytes) => write!(f, "Wasm({} bytes)", bytes.len()),
-        }
-    }
-}
-
-impl Manifest {
-    pub(crate) fn is_wasm(&self) -> bool {
-        matches!(self.source, Source::Wasm(_))
+        write!(f, "Wasm({} bytes)", self.0.len())
     }
 }
 
@@ -152,7 +133,8 @@ pub(crate) struct Setup {
 #[derive(Deserialize, Debug, Clone, Default)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Provides {
-    /// A named knowledge reader (`"mycelium"`).
+    /// The plugin is a Knowledge provider: its `knowledge` export fills the
+    /// Knowledge view, and this name is the route's `provider` (`"mycelium"`).
     #[serde(default)]
     pub(crate) knowledge: Option<String>,
     /// Named MCP tools served only where the plugin is active.
@@ -212,19 +194,16 @@ fn load_dist<E: RustEmbed>() -> Vec<Manifest> {
                 );
                 return None;
             }
-            m.source = Source::Wasm(wasm.data);
+            m.wasm = Wasm(wasm.data);
             Some(m)
         })
         .collect()
 }
 
-/// What this daemon ships: the native manifests, then the embedded WASM
-/// plugins by id. Loaded once; the order is the Plugins page's.
-static PRODUCTION: LazyLock<Vec<Manifest>> = LazyLock::new(|| {
-    let mut all: Vec<Manifest> = NATIVE.iter().filter_map(|t| parse_manifest(t)).collect();
-    all.extend(load_dist::<Dist>());
-    all
-});
+/// What this daemon ships: the embedded plugins, sorted by id (their folder
+/// names). Loaded once; the order is the Plugins page's, and the order
+/// active plugins' tools and instruction paragraphs reach an agent in.
+static PRODUCTION: LazyLock<Vec<Manifest>> = LazyLock::new(load_dist::<Dist>);
 
 /// The shipped catalog — never the test fixtures.
 pub(crate) fn production_catalog() -> &'static [Manifest] {
@@ -266,7 +245,7 @@ pub(crate) mod test_catalog {
         if let Some(existing) = extra.iter().find(|e| e.id == m.id) {
             return existing;
         }
-        m.source = Source::Wasm(Cow::Owned(wasm));
+        m.wasm = Wasm(Cow::Owned(wasm));
         let leaked: &'static Manifest = Box::leak(Box::new(m));
         extra.push(leaked);
         leaked
@@ -727,17 +706,22 @@ mod tests {
         let embedded = Dist::iter().filter(|p| p.ends_with("/plugin.toml")).count();
         assert_eq!(
             production_catalog().len(),
-            NATIVE.len() + embedded,
+            embedded,
             "a manifest failed to parse or its component was refused"
         );
-        let ids: BTreeSet<&str> = production_catalog().iter().map(|m| m.id.as_str()).collect();
-        assert_eq!(ids.len(), production_catalog().len());
-        let notes = production_catalog()
-            .iter()
-            .find(|m| m.id == "agent-notes")
-            .expect("agent-notes ships (run scripts/build-plugins.sh)");
-        assert!(notes.is_wasm());
-        assert_eq!(notes.api.as_deref(), Some(API));
+        let ids: Vec<&str> = production_catalog().iter().map(|m| m.id.as_str()).collect();
+        assert!(
+            ids.windows(2).all(|pair| pair[0] < pair[1]),
+            "the catalog is sorted by id, each once: {ids:?}"
+        );
+        for id in ["agent-notes", "mycelium"] {
+            let m = production_catalog()
+                .iter()
+                .find(|m| m.id == id)
+                .unwrap_or_else(|| panic!("{id} ships (run scripts/build-plugins.sh)"));
+            assert!(!m.wasm.0.is_empty());
+            assert_eq!(m.api.as_deref(), Some(API));
+        }
         for m in production_catalog() {
             assert!(!m.summary.is_empty(), "{} needs a summary", m.id);
             assert!(

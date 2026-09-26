@@ -1,0 +1,19 @@
+# Mycelium — the Knowledge provider for workspaces that keep mycelium's
+# project memory, plus the agents' two read tools over it. Reads through the
+# host's bounded, symlink-refusing fs; never writes.
+[package]
+name = "chimaera-plugin-mycelium"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+chimaera-plugin-api.workspace = true
+# The snapshot types derive `Serialize` (serde_json comes re-exported by the
+# API crate); already in the graph through it, so nothing new is pulled in.
+serde = { version = "1", features = ["derive"] }

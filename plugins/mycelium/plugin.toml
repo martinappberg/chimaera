@@ -5,6 +5,8 @@ id = "mycelium"
 name = "Mycelium"
 summary = "Project memory your agents record as they work — findings, decisions, learnings."
 homepage = "https://github.com/arjunrajlaboratory/mycelium"
+# The chimaera:plugin WIT version the component targets.
+api = "0.1"
 
 [detect]
 any = [".living/INDEX.md", ".living/learnings.md", ".living/findings", "MYCELIUM.md"]

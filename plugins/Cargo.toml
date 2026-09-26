@@ -6,7 +6,7 @@
 #   cargo test --manifest-path plugins/Cargo.toml
 [workspace]
 resolver = "2"
-members = ["agent-notes", "test-fixture"]
+members = ["agent-notes", "mycelium", "test-fixture"]
 
 [workspace.package]
 version = "0.1.0"
