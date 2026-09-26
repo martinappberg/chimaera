@@ -291,7 +291,8 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   **Links in documents open** (`previews/docLinks.ts`, both modes). A document-relative path
   (`other.md`, `../data/run.csv`, `figs/a%20b.png`, a local `file://` URL) resolves against
   the document's folder, a root-relative `/docs/x.md` also against the workspace root, and
-  the daemon confirms it (`POST /fs/validate`) before anything opens; the file (or folder)
+  the daemon confirms it (`POST /fs/validate`, `strict`: only the exact join, so a broken
+  `b/spec.md` never opens `spec.md`) before anything opens; the file (or folder)
   then opens through the shared opener (`shared/openPath.ts`, registered by the app) —
   Cmd/Ctrl+click or a middle-click opens it beside. `#L12` / `#L12-L20` opens the file at
   those lines (a reveal); `other.md#heading` opens the document and then scrolls to the

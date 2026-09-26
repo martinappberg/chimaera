@@ -99,7 +99,8 @@ export async function revealAnchorInSource(path: string, anchor: string): Promis
 /** Where the workspace-relative fallback for a `/docs/x.md` link comes from. */
 export interface LinkContext {
   wsRoot: string | null;
-  /** Enables the daemon's unique-basename fallback; null when unknown. */
+  /** The workspace, when known. Document links validate strictly, so the
+   *  daemon's index fallbacks never apply to them. */
   workspaceId: string | null;
 }
 
@@ -169,14 +170,15 @@ async function followPath(
   }
   // As written first (the daemon joins it to the document's folder and
   // canonicalizes); a root-relative `/docs/x.md` — GitHub's reading — also
-  // against the workspace root.
+  // against the workspace root. Strict: a document's link names exactly one
+  // file, so no diff-prefix strip or index guess may rescue a broken one.
   const candidates = [rel];
   if (rel.startsWith("/") && host.wsRoot !== null && host.wsRoot !== "/") {
     candidates.push(`${host.wsRoot.replace(/\/+$/, "")}${rel}`);
   }
   let res: Awaited<ReturnType<typeof fsValidate>>;
   try {
-    res = await fsValidate(candidates, dirname(docPath), host.workspaceId);
+    res = await fsValidate(candidates, dirname(docPath), host.workspaceId, [], { strict: true });
   } catch {
     host.hint("couldn't check this link — daemon unreachable");
     return;

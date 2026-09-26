@@ -111,6 +111,68 @@ async fn fs_validate_strips_git_diff_prefixes() {
     assert_eq!(valid["a/"]["kind"], "dir");
 }
 
+/// `strict` (document links) takes only the exact join per base: a broken
+/// `b/spec.md` stays broken instead of opening `spec.md`, and no workspace
+/// index fallback guesses either.
+#[tokio::test]
+async fn fs_validate_strict_takes_only_the_exact_join() {
+    let state = test_state();
+    let root = test_dir("v-strict");
+    let docs = root.join("docs");
+    std::fs::create_dir_all(docs.join("sub")).unwrap();
+    std::fs::write(docs.join("spec.md"), "x").unwrap();
+    std::fs::write(docs.join("sub/deep.md"), "x").unwrap();
+    std::fs::write(root.join("top.md"), "x").unwrap();
+    let ws = workspace_at(&state, &root).await;
+    let candidates = [
+        "spec.md",
+        "b/spec.md",
+        "deep.md",
+        "sub/deep.md",
+        "../top.md",
+    ];
+
+    // Lenient (chat, terminal): the prefix strip and the index both help.
+    let answer = validate(
+        &state,
+        serde_json::json!({
+            "candidates": candidates,
+            "base": docs.to_string_lossy(),
+            "workspace_id": ws,
+        }),
+    )
+    .await;
+    let valid = answer["valid"].as_object().unwrap();
+    let spec = canon(&docs.join("spec.md"));
+    assert_eq!(valid["b/spec.md"]["path"], spec, "{answer}");
+    assert_eq!(
+        valid["deep.md"]["path"],
+        canon(&docs.join("sub/deep.md")),
+        "{answer}"
+    );
+
+    let answer = validate(
+        &state,
+        serde_json::json!({
+            "candidates": candidates,
+            "base": docs.to_string_lossy(),
+            "workspace_id": ws,
+            "strict": true,
+        }),
+    )
+    .await;
+    let valid = answer["valid"].as_object().unwrap();
+    assert_eq!(valid["spec.md"]["path"], spec, "{answer}");
+    assert_eq!(
+        valid["sub/deep.md"]["path"],
+        canon(&docs.join("sub/deep.md"))
+    );
+    assert_eq!(valid["../top.md"]["path"], canon(&root.join("top.md")));
+    assert!(!valid.contains_key("b/spec.md"), "{answer}");
+    assert!(!valid.contains_key("deep.md"), "{answer}");
+    assert_eq!(answer["ambiguous"], serde_json::json!({}));
+}
+
 /// Partial paths match workspace entries by whole trailing components: one
 /// match is `valid`, several are `ambiguous` (shortest first, at most five).
 #[tokio::test]
