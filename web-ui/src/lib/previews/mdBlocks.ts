@@ -1591,10 +1591,7 @@ const renderedEvents = EditorView.domEventHandlers({
       return true;
     }
     const slot = embedIn(hit, t);
-    if (slot !== null && (e.metaKey || e.ctrlKey)) {
-      hydratorFor(view).openEmbed(slot);
-      return true;
-    }
+    if (slot !== null && (e.metaKey || e.ctrlKey) && hydratorFor(view).openEmbed(slot)) return true;
     const cell = t.closest<HTMLTableCellElement>("th, td");
     if (cell !== null && fillCell(view, hit, cell)) return true;
     return false;

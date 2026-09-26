@@ -194,6 +194,34 @@ describe("the document's answers", () => {
     expect(e.answer(ref)).toMatchObject({ ticket: "t-v1" });
   });
 
+  it("acts on a file at once with a fresh answer, and after asking again with an expired one", async () => {
+    const ref = { target: "a.png", byName: false };
+    const gone = { target: "gone.png", byName: false };
+    mocks.resolveTargets.mockResolvedValue({ "a.png": hit("/ws/a.png", "v1"), "gone.png": { missing: true } });
+    const e = new DocEmbeds("/ws/doc.md", ctx);
+    const opened: string[] = [];
+    const open = (a: { path: string }) => void opened.push(a.path);
+    // Never answered: asked, then acted on.
+    expect(e.use(ref, open)).toBe(true);
+    expect(opened).toEqual([]);
+    await vi.advanceTimersByTimeAsync(20);
+    expect(opened).toEqual(["/ws/a.png"]);
+    // Fresh: at once.
+    expect(e.use(ref, open)).toBe(true);
+    expect(opened).toEqual(["/ws/a.png", "/ws/a.png"]);
+    // Expired (the same ticket renewed): asked again, then acted on.
+    await vi.advanceTimersByTimeAsync(9 * 60_000);
+    expect(e.use(ref, open)).toBe(true);
+    expect(opened).toHaveLength(2);
+    await vi.advanceTimersByTimeAsync(20);
+    expect(opened).toEqual(["/ws/a.png", "/ws/a.png", "/ws/a.png"]);
+    // Known missing: nothing to act on, and the caller is told so.
+    void e.ask(gone);
+    await vi.advanceTimersByTimeAsync(20);
+    expect(e.use(gone, open)).toBe(false);
+    expect(opened).toHaveLength(3);
+  });
+
   it("finds an `![[name]]` missing beside the document by name", async () => {
     mocks.resolveTargets
       .mockResolvedValueOnce({ "plot.png": { missing: true }, "gone.png": { missing: true } })

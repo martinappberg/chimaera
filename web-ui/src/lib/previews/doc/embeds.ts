@@ -16,7 +16,14 @@ import type { Tree } from "@lezer/common";
 import { inlineOf, type DocText, type InlineOptions } from "../mdTable";
 import { isMath } from "../mdMath";
 import { dirname, fsValidate, safeDecodeUri } from "../files";
-import { isMissing, pathTarget, resolveTargets, splitTarget, type TargetResult } from "../../shared/embed/embed";
+import {
+  isMissing,
+  pathTarget,
+  resolveTargets,
+  splitTarget,
+  type TargetInfo,
+  type TargetResult,
+} from "../../shared/embed/embed";
 import type { LinkContext } from "../docLinks";
 import { embedSpecOf, type EmbedRef } from "./render";
 
@@ -114,6 +121,23 @@ export class DocEmbeds {
     if (age >= TICKET_MS) return undefined;
     if (age >= REFRESH_MS) void this.ask(ref);
     return a.r;
+  }
+
+  /** Act on the file `ref` names: now, with a fresh answer; else once the
+   *  daemon answers again (an expired answer's ticket may be gone and its
+   *  file moved). False when there is nothing to act on — `ref` is known
+   *  missing — so the caller can let the gesture do what it otherwise does. */
+  use(ref: EmbedRef, fn: (a: TargetInfo) => void): boolean {
+    const a = this.answer(ref);
+    if (a !== undefined) {
+      if (isMissing(a)) return false;
+      fn(a);
+      return true;
+    }
+    void this.ask(ref).then((r) => {
+      if (r !== null && !isMissing(r)) fn(r);
+    });
+    return true;
   }
 
   /** An embed came into view: ask again when its answer is aging. */
