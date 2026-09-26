@@ -152,7 +152,10 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   view.
 - **Closing asks.** Every close of a tab whose file is dirty — ×, middle-click, Close / Close
   Others / Close All, Cmd/Ctrl+W and the close-view chord — opens **Save / Don't save / Cancel**
-  (one dialog for several files). A save that fails keeps its tab open with the reason.
+  (one dialog for several files). A save that fails keeps its tab open with the reason. Save
+  waits at most 15 s (a dead link): past that it reports "not saved" and hands control back
+  while the save carries on in the background. Cancel and Escape stay live while saving and
+  only keep the tabs open.
 - **Saves are verified.** A save sends the base's content hash; success (whose reply carries the
   new hash) marks the buffer clean only if nothing was typed since it was sent (save
   generations). A save gets a 20 s timeout and one automatic retry once the events link is back

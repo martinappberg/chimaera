@@ -175,10 +175,11 @@
   import { setUrlPaneOpener, urlMenuEntries } from "./lib/shared/urlOpen";
   import { basename, fileTabTitles, fsProbe, viewKindFor } from "./lib/previews/files";
   import {
+    CLOSE_SAVE_DEADLINE_MS,
     dirtyFiles,
     discardDirtyFile,
     noteDaemonLink,
-    saveDirtyFile,
+    saveDirtyFiles,
   } from "./lib/shared/editing";
   import {
     activateGitWorkspace,
@@ -708,6 +709,8 @@
   let pendingClose = $state<Tab[]>([]);
   let closeSaving = $state(false);
   let closeError = $state<string | null>(null);
+  /** Bumped by Cancel: a "Save" still waiting then touches nothing. */
+  let closeAttempt = 0;
   /** Element that held focus when the picker opened; restored on close. */
   let pickerRestoreEl: HTMLElement | null = null;
 
@@ -2989,25 +2992,32 @@
     pendingClose.flatMap((t) => (t.surface === "file" ? [t.path] : [])),
   );
 
-  /** "Save": save each file; close those that saved, keep the rest asking. */
+  /**
+   * "Save": save each file; close those that saved, keep the rest asking.
+   * Bounded: past the deadline (a dead link) it reports "not saved" and
+   * hands control back while the save carries on in the background.
+   */
   async function saveAndClose(): Promise<void> {
     if (closeSaving) return;
     closeSaving = true;
     closeError = null;
+    const attempt = ++closeAttempt;
     const batch = pendingClose;
-    const failed: Tab[] = [];
-    for (const t of batch) {
-      if (t.surface !== "file") continue;
-      if (!(await saveDirtyFile(t.path))) failed.push(t);
-      // Saved, but keys landed meanwhile: still dirty, so it keeps asking.
-      else if (get(dirtyFiles).has(t.path)) failed.push(t);
-    }
+    const r = await saveDirtyFiles(
+      batch.flatMap((t) => (t.surface === "file" ? [t.path] : [])),
+      { deadlineMs: CLOSE_SAVE_DEADLINE_MS, cancelled: () => attempt !== closeAttempt },
+    );
+    // Cancelled while waiting: the tabs stay open, the dialog is already gone.
+    if (r === null) return;
     closeSaving = false;
+    const failed = batch.filter((t) => t.surface === "file" && r.unsaved.includes(t.path));
     detachTabs(batch.filter((t) => !failed.includes(t)));
     pendingClose = [...failed, ...pendingClose.filter((t) => !batch.includes(t))];
     if (failed.length > 0) {
       const names = failed.map((t) => (t.surface === "file" ? `“${basename(t.path)}”` : ""));
-      closeError = `couldn't save ${names.join(", ")} — its editor shows why`;
+      closeError = r.timedOut
+        ? `${names.join(", ")} not saved — the daemon isn't answering (it keeps trying in the background)`
+        : `couldn't save ${names.join(", ")} — its editor shows why`;
     }
   }
 
@@ -3019,8 +3029,11 @@
     closeError = null;
   }
 
+  /** Also while saving: the tabs stay open and dirty, and a save already
+   *  sent may still land in the background. */
   function cancelClose(): void {
-    if (closeSaving) return;
+    closeAttempt++;
+    closeSaving = false;
     pendingClose = [];
     closeError = null;
   }
