@@ -76,6 +76,7 @@ import { contextMenu } from "../shared/contextMenu.svelte";
 import { isFollowable, type LinkContext } from "./docLinks";
 import {
   docPath,
+  figureHeldAt,
   followLiveLink,
   frontmatterEnd,
   liveField,
@@ -849,7 +850,9 @@ function buildDecorations(
       const line = doc.lineAt(node.from);
       if (line.to < node.to) return false; // spans lines: replace is illegal from a plugin
       if (active(line.from, line.to)) return false; // show source while editing it
-      if (isFigureLine(line.text)) return false; // its figure is drawn below it (mdBlocks)
+      // Its figure is drawn below it (mdBlocks), unless the line is part of
+      // a larger block, which draws no figure.
+      if (isFigureLine(line.text) && figureHeldAt(state, line.from)) return false;
       const urlNode = node.node.getChild("URL");
       if (urlNode === null) return false; // reference-style: leave as source
       const marks = node.node.getChildren("LinkMark");
@@ -978,7 +981,7 @@ function livePlugin(path: string): Extension {
         // blocks, a reveal): the walk covers a different set of lines.
         const live = u.state.field(liveField, false);
         const was = u.startState.field(liveField, false);
-        const swapped = live?.revealed !== was?.revealed || live?.segs !== was?.segs;
+        const swapped = live?.revealed !== was?.revealed || live?.segs !== was?.segs || live?.held !== was?.held;
         if (!u.docChanged && !u.viewportChanged && !treeChanged && !swapped) {
           if (!u.selectionSet) return;
           // Reveal granularity is whole lines: a cursor move WITHIN the

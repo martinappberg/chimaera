@@ -871,6 +871,16 @@ export function sourceRanges(state: EditorState, from: number, to: number): { fr
   return out;
 }
 
+/** Whether the figure on the source line at `pos` is drawn under it (a
+ *  revealed one-image paragraph, `Held`) — so the line keeps its source
+ *  rather than an inline picture of it too. */
+export function figureHeldAt(state: EditorState, pos: number): boolean {
+  const st = state.field(liveField, false);
+  if (st === undefined || st.held.length === 0) return false;
+  const i = segmentAt(st.segs, pos);
+  return i >= 0 && st.held.some((h) => h.from === st.segs[i].from);
+}
+
 /** Whether `[from, to]` lies in a segment drawn as rendered DOM. */
 export function renderedAt(state: EditorState, from: number): boolean {
   const st = state.field(liveField, false);

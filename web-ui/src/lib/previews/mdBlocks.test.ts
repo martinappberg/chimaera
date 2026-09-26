@@ -3,7 +3,8 @@ import { EditorState, type TransactionSpec } from "@codemirror/state";
 import { ensureSyntaxTree, syntaxTree } from "@codemirror/language";
 import type { WidgetType } from "@codemirror/view";
 import { markdownLanguageExt } from "./mdLive";
-import { liveField, liveFocus } from "./mdBlocks";
+import { isFigureLine } from "./doc/live";
+import { figureHeldAt, liveField, liveFocus } from "./mdBlocks";
 
 const extensions = [markdownLanguageExt, liveField];
 
@@ -202,6 +203,37 @@ describe("the live field's incremental update", () => {
     // Entered again: drawn as it now reads.
     state = state.update({ selection: { anchor: path + 2 } }).state;
     expect(preview(state)).toContain("figs/chart.png");
+  });
+
+  it("holds a figure under its line only for a paragraph that is the one image", () => {
+    const text = [
+      "Text above",
+      "![inline](figs/a.png)",
+      "and below.",
+      "",
+      "- item",
+      "  ![listed](figs/b.png)",
+      "",
+      "![figure](figs/c.png)",
+      "",
+    ].join("\n");
+    const line = (s: EditorState, src: string) => s.doc.line(s.doc.toString().split("\n").indexOf(src) + 1);
+    const at = (s: EditorState, src: string) => line(s, src).from;
+    // Each image line reads as a figure's source on its own…
+    for (const src of ["![inline](figs/a.png)", "  ![listed](figs/b.png)", "![figure](figs/c.png)"])
+      expect(isFigureLine(src)).toBe(true);
+    // …but revealed with the cursor on another line of its block, it is
+    // drawn inline (a larger block holds no figure).
+    let state = fresh(text, at(fresh(text, 0, true), "Text above"), true);
+    expect(figureHeldAt(state, at(state, "![inline](figs/a.png)"))).toBe(false);
+    state = state.update({ selection: { anchor: at(state, "- item") } }).state;
+    expect(figureHeldAt(state, at(state, "  ![listed](figs/b.png)"))).toBe(false);
+    // A one-image paragraph revealed: its figure stays drawn below it.
+    state = state.update({ selection: { anchor: at(state, "![figure](figs/c.png)") + 3 } }).state;
+    expect(figureHeldAt(state, at(state, "![figure](figs/c.png)"))).toBe(true);
+    // Unfocused, nothing is revealed and nothing held.
+    state = state.update({ effects: liveFocus(false) }).state;
+    expect(figureHeldAt(state, at(state, "![figure](figs/c.png)"))).toBe(false);
   });
 
   it("keeps an unchanged block's widget across an edit elsewhere", () => {
