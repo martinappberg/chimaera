@@ -650,15 +650,14 @@ so each new format is one server match-arm + one UI component.
   `/raw/` path into a sandboxed iframe (`sandbox=allow-scripts`, no `allow-same-origin`, strict
   CSP, all external network blocked). MultiQC is self-contained by design, so it just works.
   Nobody else ships this.
-- **CSV/TSV/Parquet**: server-side paging via the arrow-rs `parquet` crate (footer
-  metadata/schema fast path, row-group and page-level reads, projection pushdown — no query
-  engine needed) plus the `csv` crate with byte-offset indexing for TSV/CSV; hard memory caps;
-  paginated slices as Arrow IPC binary frames into a virtualized table. A 50 GB Parquet opens
-  instantly because only the visible page materializes. Verification note: full polars would
-  add 20–40 MB+ to the binary and isn't needed for paging — add it (`default-features =
-  false`) only if server-side filtering/aggregation later becomes a real feature. Scope
-  honestly: row-group-metadata stats and paging, not full-scan sort/global-stats (which would
-  violate the daemon's own resource budget).
+- **CSV/TSV**: server-side paging with a sparse byte-offset row index; hard memory caps;
+  paginated JSON slices into a virtualized table.
+- **Parquet**: read in the *browser* with `hyparquet` over ranged `/raw` requests — footer
+  first, then only the column chunks (or, with an offset index or a walk of the page headers,
+  only the pages) under the visible rows. The daemon streams byte ranges and holds nothing, so
+  a 50 GB file costs it no memory and the binary no Arrow dependency; the tunnel carries only
+  what's on screen. Scope honestly: paging and schema, not full-scan sort or global statistics.
+  Details: [files and previews](../features/files-and-previews.md#rendered-previews).
 - **Compressed reality check (from adversarial review)**: bioinformatics tabular files are
   overwhelmingly `.tsv.gz`/`.csv.gz`/`.vcf.gz`/bgzip. Gzip has no random access — the preview
   layer needs a decompression tier from day one: stream the head immediately, background-spool
