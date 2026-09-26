@@ -50,8 +50,9 @@ core; an addition can change when there's a clear improvement. Don't be too stri
 | [browser-pane.md](browser-pane.md) | Live web apps (Jupyter, marimo, Streamlit) as panes — the daemon's ticketed reverse proxy (HTTP+WS, remote-transparent, compute-node second hop), terminal URL detection, the iframe pane |
 | [drag-drop-and-uploads.md](drag-drop-and-uploads.md) | Drag a file/folder from the tree to reference it in a session, OS-desktop file drops + screenshot paste that stream to the session's owning host (remote-transparent), the size-capped session-scoped upload route, the native-shell drop handler |
 | [git.md](git.md) | Source-control panel (status/diff), worktree create/remove, the session-scoped changes view, git-binary remediation |
-| [linked-terminals.md](linked-terminals.md) | Granting an agent access to specific terminals (the "leash") and the daemon's MCP server (`list_terminals` / `run_in_terminal` / `read_terminal`) |
+| [linked-terminals.md](linked-terminals.md) | Granting an agent access to specific terminals (the "leash") and the daemon's MCP server (`list_terminals` / `run_in_terminal` / `read_terminal`; `notify` lives in [notifications.md](notifications.md)) |
 | [remote-connect.md](remote-connect.md) | `chimaera connect` — SSH orchestration, daemon auto-deploy, tunnels, in-app SSH/2FA auth, remote host management |
+| [notifications.md](notifications.md) | The notice feed (agent finished / awaiting approval / error / agent `notify`), native OS + browser notifications with click-to-session, the approval-only counts and the unread mark |
 | [native-app.md](native-app.md) | The Tauri shell: real OS windows, window restore, the signed app+daemon self-updater, the update toast |
 | [lifecycle-and-persistence.md](lifecycle-and-persistence.md) | "Close the laptop, nothing dies" — daemon-owned sessions, the session ledger + restart handoff, graceful shutdown, update awareness |
 | [environment.md](environment.md) | Environment preludes — per-host/workspace/launch startup commands (`module load`, `conda activate`) run once per session before the shell or agent |

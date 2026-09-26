@@ -1,5 +1,6 @@
 mod agents;
 mod chat;
+mod doc_check;
 mod download;
 mod drafts;
 mod environment;
@@ -10,6 +11,7 @@ mod ledger;
 mod links;
 mod mastermind;
 mod mcp;
+mod notices;
 mod proxy;
 mod recents;
 mod resumables;

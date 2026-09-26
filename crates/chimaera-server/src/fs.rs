@@ -94,7 +94,7 @@ const MAX_TICKETS: usize = 4096;
 /// blocking pool can grow very large under a request burst; on NFS/Lustre that
 /// turns one stalled mount into host-wide thread and syscall pressure. Queued
 /// requests remain asynchronous, so terminals/chat/health stay responsive.
-static FILESYSTEM_WORK: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8);
+pub(crate) static FILESYSTEM_WORK: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8);
 
 /// The daemon user's home directory (`$HOME`).
 fn home_dir() -> anyhow::Result<PathBuf> {
@@ -539,7 +539,8 @@ pub(crate) struct FileQuery {
 /// remain past this slice), and `X-Mtime` (opaque modification token, echoed
 /// back by PUT's `expect_mtime`) headers. `limit` is capped at 2MB. When the
 /// body is the WHOLE raw file (offset 0, nothing left past it, not a gzip
-/// decode) it also carries `X-Content-Hash`: the lowercase hex SHA-256 of
+/// decode) and no write raced the read (the token re-checked after it, one
+/// retry) it also carries `X-Content-Hash`: the lowercase hex SHA-256 of
 /// exactly these bytes, echoed back by PUT's `expect_hash`.
 ///
 /// `.gz`/`.bgz` paths are decompressed transparently: `offset`/`limit` then
@@ -565,9 +566,7 @@ fn read_file_response(raw: &str, offset: u64, limit: u64) -> anyhow::Result<Resp
         (gz_mime(&path), total, bytes, more, mtime_token(&meta), None)
     } else {
         let slice = read_file_slice(&path, offset, limit)?;
-        // Hash only a body that IS the file: a client may echo this as
-        // `expect_hash`, and a slice's hash would never match the disk.
-        let hash = (offset == 0 && slice.eof).then(|| sha256_hex(&slice.bytes));
+        let hash = slice.whole_file_hash(offset);
         let mime = mime_guess::from_path(&path).first_or_octet_stream();
         (
             mime,
@@ -614,19 +613,64 @@ struct FileSlice {
     /// Nothing remains past this slice (observed by reading, not by `stat`).
     eof: bool,
     total: u64,
+    /// The token from BEFORE the read: if a write raced it, the client's
+    /// watch sees the file move past this and reads again.
     mtime: String,
+    /// The token was the same after the read: `bytes` are exactly the
+    /// version `mtime` names.
+    stable: bool,
+}
+
+impl FileSlice {
+    /// `X-Content-Hash`, only for a body that IS the file (a client echoes it
+    /// as `expect_hash`, and a slice's hash would never match the disk) and
+    /// only when no write raced the read (a hash of one version must never
+    /// travel with the token of another). Otherwise the client falls back to
+    /// the token.
+    fn whole_file_hash(&self, offset: u64) -> Option<String> {
+        (offset == 0 && self.eof && self.stable).then(|| sha256_hex(&self.bytes))
+    }
 }
 
 /// Read up to `limit` bytes of the (canonical) file at `path` starting at
 /// `offset`. EOF is judged by reading one byte past the slice rather than by
 /// the size `fstat` reported, so a file that grows or shrinks between the two
-/// can never earn a whole-file hash for a partial body.
+/// can never earn a whole-file hash for a partial body. The token comes from
+/// an fstat before the read, so a second fstat after it checks that no write
+/// landed in between; on a change the read is retried once (reopened: a
+/// rename-replace is a new inode), and a second change leaves the slice
+/// unstable (no content hash).
 fn read_file_slice(path: &Path, offset: u64, limit: u64) -> anyhow::Result<FileSlice> {
+    read_file_slice_racing(path, offset, limit, &mut || {})
+}
+
+/// [`read_file_slice`] with `racer` run between each attempt's first fstat
+/// and its read — the window a concurrent writer can hit (tests use it).
+fn read_file_slice_racing(
+    path: &Path,
+    offset: u64,
+    limit: u64,
+    racer: &mut dyn FnMut(),
+) -> anyhow::Result<FileSlice> {
+    let slice = read_file_slice_once(path, offset, limit, racer)?;
+    if slice.stable {
+        return Ok(slice);
+    }
+    read_file_slice_once(path, offset, limit, racer)
+}
+
+fn read_file_slice_once(
+    path: &Path,
+    offset: u64,
+    limit: u64,
+    racer: &mut dyn FnMut(),
+) -> anyhow::Result<FileSlice> {
     let mut file =
         std::fs::File::open(path).with_context(|| format!("{}: failed to open", path.display()))?;
     let meta = file
         .metadata()
         .with_context(|| format!("{}: failed to stat", path.display()))?;
+    racer();
     let stat_len = meta.len();
     let probe = limit.saturating_add(1);
     let mut bytes = Vec::with_capacity(
@@ -657,11 +701,16 @@ fn read_file_slice(path: &Path, offset: u64, limit: u64) -> anyhow::Result<FileS
     } else {
         stat_len.max(read_end.saturating_add(1))
     };
+    let mtime = mtime_token(&meta);
+    let after = file
+        .metadata()
+        .with_context(|| format!("{}: failed to stat", path.display()))?;
     Ok(FileSlice {
         bytes,
         eof,
         total,
-        mtime: mtime_token(&meta),
+        stable: mtime_token(&after) == mtime,
+        mtime,
     })
 }
 
@@ -1186,6 +1235,76 @@ fn write_in_place(
 }
 
 #[cfg(test)]
+mod slice_tests {
+    use super::*;
+
+    fn temp_file(tag: &str, contents: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "chimaera-slice-{tag}-{}-{}",
+            std::process::id(),
+            &chimaera_core::generate_token()[..8]
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("f.txt");
+        std::fs::write(&file, contents).unwrap();
+        file
+    }
+
+    /// A write landing between the token's fstat and the read is caught by
+    /// the fstat after it; one retry reads a consistent version, whose hash
+    /// and token then travel together.
+    #[test]
+    fn a_raced_read_retries_once_and_pairs_hash_with_token() {
+        let file = temp_file("retry", "one\n");
+        let mut calls = 0;
+        let slice = read_file_slice_racing(&file, 0, 1024, &mut || {
+            calls += 1;
+            if calls == 1 {
+                std::fs::write(&file, "two, longer\n").unwrap();
+            }
+        })
+        .unwrap();
+        assert_eq!(calls, 2);
+        assert!(slice.stable);
+        assert_eq!(slice.bytes, b"two, longer\n");
+        assert_eq!(slice.mtime, mtime_token(&std::fs::metadata(&file).unwrap()));
+        assert_eq!(slice.whole_file_hash(0), Some(sha256_hex(b"two, longer\n")));
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    /// Raced on the retry too: the slice keeps the pre-read token (so the
+    /// client's watch re-reads) and carries no content hash at all.
+    #[test]
+    fn a_read_raced_twice_omits_the_content_hash() {
+        let file = temp_file("twice", "v0\n");
+        let mut calls = 0;
+        let slice = read_file_slice_racing(&file, 0, 1024, &mut || {
+            calls += 1;
+            std::fs::write(&file, "v".repeat(calls + 3)).unwrap();
+        })
+        .unwrap();
+        assert_eq!(calls, 2);
+        assert!(!slice.stable);
+        assert_eq!(slice.whole_file_hash(0), None);
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    #[test]
+    fn an_undisturbed_whole_read_is_hashed_once() {
+        let file = temp_file("calm", "calm\n");
+        let mut calls = 0;
+        let slice = read_file_slice_racing(&file, 0, 1024, &mut || calls += 1).unwrap();
+        assert_eq!(calls, 1);
+        assert!(slice.stable && slice.eof);
+        assert_eq!(slice.whole_file_hash(0), Some(sha256_hex(b"calm\n")));
+        // A partial body is never hashed as the file.
+        let part = read_file_slice(&file, 0, 2).unwrap();
+        assert_eq!(part.whole_file_hash(0), None);
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+}
+
+#[cfg(test)]
 mod write_tests {
     use super::*;
 
@@ -1694,6 +1813,33 @@ impl LineMap {
 
     fn is_identity(&self) -> bool {
         self.anchors.is_empty()
+    }
+}
+
+/// What [`markdown_to_html`] hands comrak, for `doc_check`'s AST walk (the
+/// checker must parse a document exactly as the reading view does): the
+/// `$$`-promoted text, how many leading lines an accepted [`frontmatter`]
+/// block spans (None = no block, so no front-matter option), and the line map.
+pub(crate) struct MarkdownParseInput<'t> {
+    pub(crate) text: Cow<'t, str>,
+    pub(crate) frontmatter_lines: Option<usize>,
+    lines: LineMap,
+}
+
+impl MarkdownParseInput<'_> {
+    /// The source line of line `line` (1-based) of [`Self::text`].
+    pub(crate) fn source_line(&self, line: usize) -> usize {
+        self.lines.source_line(line as u32) as usize
+    }
+}
+
+pub(crate) fn markdown_parse_input(text: &str) -> MarkdownParseInput<'_> {
+    let frontmatter_lines = frontmatter(text).map(|f| f.lines);
+    let (text, lines) = promote_math_blocks_mapped(text);
+    MarkdownParseInput {
+        text,
+        frontmatter_lines,
+        lines,
     }
 }
 
@@ -3019,6 +3165,11 @@ pub(crate) struct ValidateRequest {
     /// workspace-index fallbacks below, scoped to this workspace's index.
     #[serde(default)]
     workspace_id: Option<String>,
+    /// Additive: only the exact join onto each base — no diff-prefix strip,
+    /// no workspace-index fallback. A document's own link names one file; a
+    /// broken `b/spec.md` must stay broken rather than open `spec.md`.
+    #[serde(default)]
+    strict: bool,
 }
 
 /// A candidate eligible for the bare-basename fallback: a single path segment
@@ -3067,9 +3218,13 @@ fn entry_json(path: &Path, kind: &str) -> serde_json::Value {
 }
 
 /// The direct rungs of the ladder: an absolute or `~` candidate as-is; else
-/// joined onto each base in order; else, for a git diff prefix (`a/`, `b/`),
-/// the remainder joined onto each base. First hit wins.
-fn resolve_direct(candidate: &str, bases: &[PathBuf]) -> Option<(PathBuf, &'static str)> {
+/// joined onto each base in order; else (unless `strict`), for a git diff
+/// prefix (`a/`, `b/`), the remainder joined onto each base. First hit wins.
+fn resolve_direct(
+    candidate: &str,
+    bases: &[PathBuf],
+    strict: bool,
+) -> Option<(PathBuf, &'static str)> {
     let expanded = expand_tilde(candidate).ok()?;
     if expanded.is_absolute() {
         return resolve_entry(&expanded);
@@ -3079,6 +3234,9 @@ fn resolve_direct(candidate: &str, bases: &[PathBuf]) -> Option<(PathBuf, &'stat
         .find_map(|base| resolve_entry(&base.join(&expanded)))
     {
         return Some(hit);
+    }
+    if strict {
+        return None;
     }
     let rest = candidate
         .strip_prefix("a/")
@@ -3143,7 +3301,7 @@ fn judge_index_matches(
     }
 }
 
-/// POST /api/v1/fs/validate {candidates, base, bases?, workspace_id?} —
+/// POST /api/v1/fs/validate {candidates, base, bases?, workspace_id?, strict?} —
 /// batched existence check behind the terminal, chat and document link
 /// providers: only path-like strings that resolve to something real get
 /// underlined. Answers `{valid: {[cand]: {path, kind}}, ambiguous: {[cand]:
@@ -3165,6 +3323,9 @@ fn judge_index_matches(
 ///    `results/figs/plot.png`). One match → `valid`; several → `ambiguous`
 ///    (at most [`MAX_AMBIGUOUS`], shortest path first) for the client to
 ///    offer a choice, never an arbitrary pick.
+///
+/// `strict` (document links) stops after rung 2: a link a document spells
+/// out must name exactly that file. Chat and terminal text stay lenient.
 ///
 /// Bounds: the index is the quickopen walk — entry/depth/time-capped,
 /// ignore-respecting (so `target/`, `work/` and symlinked trees are
@@ -3216,8 +3377,11 @@ pub(crate) async fn validate(
             if Instant::now() >= deadline {
                 break;
             }
-            if let Some((path, kind)) = resolve_direct(candidate, &bases) {
+            if let Some((path, kind)) = resolve_direct(candidate, &bases, body.strict) {
                 valid.insert(candidate.clone(), entry_json(&path, kind));
+                continue;
+            }
+            if body.strict {
                 continue;
             }
             let Some(workspace_id) = body.workspace_id.as_deref() else {

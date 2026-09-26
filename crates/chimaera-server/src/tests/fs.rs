@@ -445,6 +445,8 @@ async fn fs_endpoints_without_token_are_401() {
         "/api/v1/fs/markdown?path=/x.md",
         "/api/v1/fs/table?path=/x.csv",
         "/api/v1/fs/quickopen?workspace_id=w-x&q=main",
+        "/api/v1/fs/check_document?path=/x.md",
+        "/api/v1/agent-docs",
     ] {
         let res = app(test_state())
             .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
@@ -463,6 +465,7 @@ async fn fs_endpoints_without_token_are_401() {
         ("/api/v1/fs/create", r#"{"path":"/tmp/x","kind":"file"}"#),
         ("/api/v1/fs/rename", r#"{"from":"/tmp/x","to":"/tmp/y"}"#),
         ("/api/v1/fs/delete", r#"{"path":"/tmp/x"}"#),
+        ("/api/v1/agent-docs/install", r#"{"target":"claude_skill"}"#),
     ] {
         let res = app(test_state())
             .oneshot(

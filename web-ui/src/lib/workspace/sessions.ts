@@ -179,7 +179,6 @@ export function sessionLabel(
   return names.get(id) ?? sessions.get(id)?.name ?? id.slice(0, 8);
 }
 
-/** True when the session is waiting on the user (drives the aggregate count). */
 /**
  * The workspace Mastermind is the observer, not the observed: every roster
  * surface (rail, dashboard roster/lane, home rollups, quick-open) filters
@@ -190,6 +189,22 @@ export function isMastermind(s: Session): boolean {
   return s.mastermind === true;
 }
 
+/**
+ * True when the agent is BLOCKED on the user's decision — a tool permission,
+ * a plan approval, or a structured question. The one state every NUMBER
+ * counts (rail pill, window title, focus strip, Home rollup, the native Dock
+ * badge): a count means "something is waiting for your OK", never "there is
+ * news" — finished and waiting-for-input sessions wear the unread mark.
+ */
+export function needsApproval(s: Session): boolean {
+  return s.agent_state === "needs_permission";
+}
+
+/**
+ * The broader "needs you" set — blocked on approval, waiting for input, or
+ * errored: what the dashboard's attention LANE shows as cards. Never a count
+ * (counts are {@link needsApproval}).
+ */
 export function needsAttention(s: Session): boolean {
   return (
     s.agent_state === "needs_permission" ||

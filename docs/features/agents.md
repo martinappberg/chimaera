@@ -134,11 +134,13 @@ spawn.rs,recents.rs}`. Wire: `POST/GET/DELETE/PATCH /api/v1/sessions*`, `GET /ap
   when quiet; only an old daemon without the field keeps the muted "unk". A claude TUI whose
   "running" claim has gone silent past the daemon's stall window (`stalled: true`, 180s) also
   drops to "unk" (tooltip "agent says working — no output for a while") — the claim is likely
-  stale and the dot says so without touching the record. `needsAttention` =
-  needs_permission | idle_prompt | errored feeds the home-screen amber rollup, the rail pill, and
-  the window-title count — each alive-gated like the dashboard lane, because a crashed chat
-  driver stays registered (alive:false, errored) until deleted: its row keeps the red glyph, but
-  nobody can answer a dead session. Chimaera owns renaming for **all** session kinds (only claude has an
+  stale and the dot says so without touching the record. Every COUNT — the home-screen amber
+  rollup, the rail pill, the focus strip, and the window-title prefix — is `needsApproval`
+  (needs_permission only: a permission, plan approval, or question blocking the agent), alive-gated
+  because a crashed chat driver stays registered (alive:false, errored) until deleted. Finished and
+  waiting-for-input sessions are news, not a number: they wear the unread mark (bold name + accent
+  dot, see [notifications.md](notifications.md)). The dashboard's attention lane stays the broader
+  `needsAttention` (needs_permission | idle_prompt | errored). Chimaera owns renaming for **all** session kinds (only claude has an
   in-TUI `/rename`); the pin outranks every derived name on every surface. Kill drops the row locally
   even if the DELETE fails (already-gone/unreachable), and **tombstones** the id until a daemon
   snapshot no longer lists it: `DELETE` only signals the process and returns while the session is
@@ -190,6 +192,53 @@ spawn.rs,recents.rs}`. Wire: `POST/GET/DELETE/PATCH /api/v1/sessions*`, `GET /ap
   fresh and says so without claiming the agent lacks resume support; Claude handles additionally
   require a real transcript (Claude 2.1.x interactive sessions can persist none). Cap 20/workspace;
   live conversations are hidden at read time (they return when the session ends).
+
+## Documents: the portable dialect, `check_document` and the issues chip
+
+- **What & when.** Agents write reports, READMEs and notes the user reads in the markdown
+  preview. Every session is taught a portable dialect (GFM, GitHub alerts, `$…$` math, mermaid,
+  YAML frontmatter, relative links and embeds with fragments; it also renders on GitHub and in
+  Obsidian) and can check a document before handing it over. The user sees the same findings as
+  a chip on the markdown toolbar.
+- **How it's used.** Nothing to set up for agents launched in Chimaera: the chimaera MCP server's
+  `initialize` instructions carry a six-line documents paragraph, `document_guide` (no args)
+  returns the full guide, and `check_document {path}` returns a readable report (a relative path
+  resolves against the session's cwd, then its workspace root). In the preview, a quiet
+  **"N issues"** chip appears on the markdown toolbar when the document has errors or warnings
+  (red with any error, amber otherwise; notes only appear in its popover); clicking an issue
+  reveals its line in reading, live or source. For agents launched **outside** Chimaera,
+  Settings → **Documents** offers two opt-in writes, each behind a dialog showing the exact
+  text: a delimited `<!-- chimaera:docs:start -->…<!-- chimaera:docs:end -->` section in the
+  workspace's `AGENTS.md` (created if missing; re-running replaces only the block), and a Claude
+  Code skill at `~/.claude/skills/chimaera-docs/SKILL.md`.
+- **Where it lives.** Daemon `crates/chimaera-server/src/doc_check.rs` (the checker, the route,
+  the MCP report), `agent_docs.rs` (the installs and their text), `doc_guide.md` (the guide),
+  `mcp.rs` (`DOCUMENTS_INSTRUCTIONS`, the two tools). UI
+  `web-ui/src/lib/previews/DocIssues.svelte` (mounted in `MarkdownView`'s toolbar),
+  `web-ui/src/lib/settings/{DocumentsSettings.svelte,agentDocs.ts}`. Routes
+  `GET /api/v1/fs/check_document?path=&root=` → `{issues: [{line, severity, code, message, fix}],
+  truncated}`, `GET /api/v1/agent-docs?workspace_id=` (each target's path, state and exact text),
+  `POST /api/v1/agent-docs/install {target: "agents_md"|"claude_skill", workspace_id?}` →
+  `{target, path, changed, created}`; all bearer-authed.
+- **Key behaviors.** The checker parses the document exactly as the reading view does (the same
+  comrak extensions, frontmatter rule and `$$` promotion; lines stay in source numbering), then
+  scans the lines outside code. **Errors:** broken relative links and embeds (with a case-mismatch
+  or root-relative fix when one exists), `#heading` fragments missing from a target `.md` (GitHub
+  slug rule, the nearest slug suggested), `#L` ranges past a file's end, same-document anchors
+  with no heading or footnote, dangling footnote references and unused definitions.
+  **Warnings:** absolute local paths (`/home/`, `/Users/`, `/scratch/`, `/tmp/`, `~`, `file://`,
+  `C:\`; the fix names the relative path), images without alt text or over 10 MB, wikilinks,
+  MDX `import`/`export` lines and capitalized tags, `:::` fenced divs, MyST directives and roles,
+  Markdoc tags, alert types GitHub does not render (with the standard type to use) or a title on
+  the marker line, frontmatter lines that are not `key: value` or list shaped. **Notes:**
+  duplicate heading slugs, plain `http://` links. Viewer locators (`#page=`, `#row=`, `#/json`)
+  are not checked. Bounds: documents ≤ 4 MB, ≤ 500 issues (the least severe dropped first),
+  ≤ 200 target stats, ≤ 20 target reads of ≤ 2 MB, a 10 s budget (the rest reported as one
+  "unchecked" note), all under the shared filesystem limiter, off the reactor. The chip checks
+  only while it can be seen (window visible, its tab's layer active), debounced after a disk
+  change, and stays hidden when a check fails. Installs are atomic (temp, fsync, rename), refuse
+  an existing file over 1 MiB or with an unmatched marker, and are idempotent (`changed: false`).
+  There is no Codex skill install; Codex reads the `AGENTS.md` section.
 
 ## Status: partial
 
@@ -264,6 +313,8 @@ _Captured 2026-07-16 (from the maintainer, in-session)._
 - **Core bet — do not change: never guess `update_available`.** The signal is honest or absent —
   an unparseable version (either side) must never claim an update. Everything else in this area is
   an addition, open to change if improved.
+
+### Agent-first documents (the dialect, `check_document`, the issues chip) — _Intent pending_
 
 ### Busy/idle session status — why it exists
 _Captured 2026-07-11 (from the maintainer)._

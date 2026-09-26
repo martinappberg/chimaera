@@ -24,6 +24,7 @@ use crate::windows::{WindowRecord, WindowRegistry};
 mod commands;
 mod connect;
 mod drag;
+pub(crate) mod notices;
 mod restore;
 
 pub use restore::open_ui_window;
@@ -39,6 +40,13 @@ const DAEMON_UI_CORE_PERMISSIONS: &[&str] = &[
 ];
 
 static DAEMON_CAPABILITY_SEQ: AtomicU64 = AtomicU64::new(0);
+/// Unique ids for test notifications (each must be a new alert, not a
+/// replacement of the last one).
+static TEST_NOTIFICATION_SEQ: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn next_test_notification_id() -> u64 {
+    TEST_NOTIFICATION_SEQ.fetch_add(1, Ordering::Relaxed)
+}
 /// Forces same-origin Home re-homes to be full document navigations instead
 /// of hash-only changes (which do not rerun the SPA's scope bootstrap).
 static HOME_NAV_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -189,6 +197,10 @@ pub struct WindowScope {
     /// creation, the SPA may re-assert it after a restart restore, and
     /// nothing clears it.
     pub detached: bool,
+    /// Session ids on screen in this window (each pane's active tab),
+    /// reported by the page. A notice about one of these is not posted while
+    /// this window has focus — the user is already looking at it.
+    pub(crate) visible: Vec<String>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -226,6 +238,7 @@ impl WindowScope {
             label: String::new(),
             navigation_pending: false,
             detached: false,
+            visible: Vec::new(),
         }
     }
 
@@ -260,6 +273,7 @@ impl WindowScope {
             label: String::new(),
             navigation_pending: false,
             detached: false,
+            visible: Vec::new(),
         }
     }
 
@@ -497,51 +511,79 @@ pub(crate) fn request_quit(app: &AppHandle) {
     app.exit(0);
 }
 
-/// Bring every native window into the app's foreground, preserving the
-/// currently focused window as the frontmost one. macOS emits `Reopen` when
-/// the Dock icon is clicked; the single-instance callback uses the same path
-/// for a repeated launch. Focusing each window once raises the whole window
-/// set above other applications (only one OS window can remain focused).
-pub(crate) fn raise_all_windows(app: &AppHandle) {
+/// Activate the app the way a macOS app conventionally answers a Dock click
+/// or a repeated launch — never by un-minimizing the whole window set:
+///
+/// - some window is on screen → leave the set alone. A Dock click's own
+///   AppKit activation already brings every visible window forward
+///   (`dock_click`); a repeated launch gets no such activation, so it focuses
+///   the most recently used on-screen window.
+/// - every window is minimized or hidden → restore ONLY the most recently
+///   used one; the rest stay in the Dock where the user put them.
+/// - no window at all (a repeated launch racing startup; closing the last
+///   window quits the app) → open Home.
+pub(crate) fn activate_app(app: &AppHandle, dock_click: bool) {
+    let windows: Vec<_> = app
+        .webview_windows()
+        .into_values()
+        // The WSL wizard is its own flow; never count or raise it here.
+        .filter(|w| !w.label().starts_with("wsl-setup"))
+        .collect();
+    let on_screen = |w: &tauri::WebviewWindow| {
+        w.is_visible().unwrap_or(false) && !w.is_minimized().unwrap_or(false)
+    };
+    let any_on_screen = windows.iter().any(on_screen);
+    if any_on_screen && dock_click {
+        return;
+    }
+    // A ⌘H-hidden app has no window on screen: unhide it as a whole (the
+    // way the user hid it) before picking a window to restore.
     #[cfg(target_os = "macos")]
-    let _ = app.show();
-
-    let mut windows: Vec<_> = app.webview_windows().into_values().collect();
-    windows.sort_by(|a, b| a.label().cmp(b.label()));
-    let front = windows
-        .iter()
-        .find(|window| window.is_focused().unwrap_or(false))
-        .map(|window| window.label().to_string())
-        .or_else(|| {
-            app.try_state::<Shell>()
-                .and_then(|shell| lock(&shell.last_focused_window).clone())
-                .filter(|label| app.get_webview_window(label).is_some())
-        })
-        .or_else(|| {
-            app.try_state::<Shell>().and_then(|shell| {
-                lock(&shell.windows)
-                    .iter()
-                    .find(|(_, scope)| scope.home_hub)
-                    .map(|(label, _)| label.clone())
-            })
-        })
-        .or_else(|| windows.last().map(|window| window.label().to_string()));
-
-    for window in windows
-        .iter()
-        .filter(|window| Some(window.label()) != front.as_deref())
-    {
+    if !any_on_screen {
+        let _ = app.show();
+    }
+    if windows.is_empty() {
+        if app.try_state::<Shell>().is_some() {
+            if let Err(e) = show_local_home(app, None) {
+                tracing::warn!("could not open Home on activation: {e}");
+            }
+        }
+        return;
+    }
+    let recent = most_recent_window(app, &windows, |w| !any_on_screen || on_screen(w));
+    if let Some(window) = recent {
         let _ = window.unminimize();
         let _ = window.show();
         let _ = window.set_focus();
     }
-    if let Some(label) = front {
-        if let Some(window) = app.get_webview_window(&label) {
-            let _ = window.unminimize();
-            let _ = window.show();
-            let _ = window.set_focus();
+}
+
+/// The most recently focused window among `windows` that passes `eligible`,
+/// by the shell's focus-recency order; unfocused-since-launch windows fall
+/// back to the Home launcher, then label order.
+fn most_recent_window<'a>(
+    app: &AppHandle,
+    windows: &'a [tauri::WebviewWindow],
+    eligible: impl Fn(&tauri::WebviewWindow) -> bool,
+) -> Option<&'a tauri::WebviewWindow> {
+    let by_label = |label: &str| windows.iter().find(|w| w.label() == label && eligible(w));
+    if let Some(shell) = app.try_state::<Shell>() {
+        let order = lock(&shell.focus_order).clone();
+        if let Some(w) = order.iter().find_map(|label| by_label(label)) {
+            return Some(w);
+        }
+        let hub = lock(&shell.windows)
+            .iter()
+            .find(|(_, scope)| scope.home_hub)
+            .map(|(label, _)| label.clone());
+        if let Some(w) = hub.as_deref().and_then(by_label) {
+            return Some(w);
         }
     }
+    windows
+        .iter()
+        .filter(|w| eligible(w))
+        .max_by(|a, b| a.label().cmp(b.label()))
 }
 
 /// Re-home the singleton navigation window onto the local daemon or one live
@@ -904,6 +946,11 @@ pub(crate) fn finish_startup(handle: &tauri::AppHandle, local: LocalDaemon) -> t
     } else {
         *lock(&handle.state::<Shell>().local) = local;
     }
+    if fresh {
+        // Before any window opens: the watchers start polling right away,
+        // and a window's first scope report may already owe it a focus.
+        notices::start(handle);
+    }
     // Reopen last session's windows. Restore itself registers a home surface
     // before launching any remote ssh that may need askpass, and also covers
     // the empty/failed local restore case so the app never comes up invisible.
@@ -951,10 +998,10 @@ pub fn run() {
         // Must be registered first: the plugin intercepts a second launch
         // before any other plugin or process-global shell resource starts.
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            // Bring the existing instance's complete window set forward.
-            // During early daemon startup there may not be a window yet; the
-            // normal startup path opens Home as soon as the daemon is ready.
-            raise_all_windows(app);
+            // A repeated launch activates the running instance like a Dock
+            // click would. During early daemon startup there may not be a
+            // window yet (and no Shell); startup opens Home on its own then.
+            activate_app(app, false);
         }))
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_clipboard_manager::init())
@@ -993,6 +1040,12 @@ pub fn run() {
             commands::list_askpass,
             commands::cache_appearance,
             commands::report_window_scope,
+            commands::report_window_view,
+            commands::take_pending_focus,
+            commands::notification_permission,
+            commands::request_notification_permission,
+            commands::open_notification_settings,
+            commands::test_notification,
             commands::wsl_status,
             commands::wsl_install,
             commands::wsl_update,
@@ -1030,6 +1083,7 @@ pub fn run() {
                     lock(&shell.transfers)
                         .retain(|_, t| t.source != window.label() && t.target != window.label());
                     lock(&shell.focus_order).retain(|l| l != window.label());
+                    notices::window_gone(window.app_handle(), window.label());
                     let scope = lock(&shell.windows).remove(window.label());
                     if !shell.quitting.load(Ordering::Relaxed) {
                         if let Some(scope) = scope {
@@ -1053,6 +1107,7 @@ pub fn run() {
                         order.insert(0, window.label().to_string());
                     }
                     crate::menu::sync_settings_enabled(window.app_handle());
+                    notices::window_focused(window.app_handle(), window.label());
                 }
                 // Track geometry in memory on every move/resize; a slow tick
                 // (and exit) persists — never a file write per drag event.
@@ -1081,6 +1136,9 @@ pub fn run() {
         })
         .setup(|app| {
             let handle = app.handle().clone();
+            // The notification click delegate must be in place before launch
+            // completes, so a click that launched the app is delivered.
+            crate::notify::init(&handle);
             crate::menu::install(app)?;
             // The menu-bar / system-tray status item. Installed before the
             // daemon is up (its click handlers read Shell.local, populated by
@@ -1148,11 +1206,17 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building chimaera")
         .run(|app, event| match event {
-            // Clicking the macOS Dock icon activates the whole workbench, not
-            // an arbitrary single window. Raise every Chimaera window and
-            // restore focus to whichever one was active before the click.
+            // A Dock click: AppKit's activation already raises every visible
+            // window; the shell only steps in when nothing is on screen.
             #[cfg(target_os = "macos")]
-            tauri::RunEvent::Reopen { .. } => raise_all_windows(app),
+            tauri::RunEvent::Reopen {
+                has_visible_windows,
+                ..
+            } => {
+                if !has_visible_windows {
+                    activate_app(app, true);
+                }
+            }
             // Quit teardown destroys every window; flag it FIRST so those
             // Destroyed events keep the registry intact for the next launch.
             tauri::RunEvent::ExitRequested { .. } => {

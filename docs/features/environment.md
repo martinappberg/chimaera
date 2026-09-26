@@ -6,7 +6,7 @@ the shell prompt or agent takes over. The daemon never parses the text: it is op
 shell run in the user's own login shell, which is why every env tool (lmod, conda, spack,
 venv, nix) works with zero tool-specific code. Slice 1 of the M5 HPC layer's *environment
 axis* — deep design in the
-[architecture guide](../agent-guides/architecture.md#environment-prelude-compute-node-sessions).
+[architecture guide](../agent-guides/architecture.md#environment-prelude--compute-node-sessions).
 
 **Where it lives (shared):** daemon `crates/chimaera-server/src/environment.rs` (store +
 route + per-session materialization) and `crates/chimaera-core/src/shellint.rs`

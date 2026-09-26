@@ -36,7 +36,7 @@
     listSessions,
     listWorkspaces,
     renameSession,
-    needsAttention,
+    needsApproval,
     pollSessions,
     switchingViews,
     switchSessionView,
@@ -161,6 +161,7 @@
     tabCount,
     tabKey,
     toggleZoom,
+    visibleSessionIds,
     type AdoptSpot,
     type FocusDir,
     type Layout,
@@ -174,7 +175,13 @@
   import type { UrlTarget } from "./lib/terminal/urlLinks";
   import { setUrlPaneOpener, urlMenuEntries } from "./lib/shared/urlOpen";
   import { basename, fileTabTitles, fsProbe, viewKindFor } from "./lib/previews/files";
-  import { dirtyFiles } from "./lib/shared/editing";
+  import {
+    CLOSE_SAVE_DEADLINE_MS,
+    dirtyFiles,
+    discardDirtyFile,
+    noteDaemonLink,
+    saveDirtyFiles,
+  } from "./lib/shared/editing";
   import {
     activateGitWorkspace,
     gitEnv,
@@ -231,15 +238,19 @@
     onCaffeinateChanged,
     onHostStatus,
     onLocalDaemonUpdated,
+    onFocusSession,
     onMenu,
     openDetachedPopup,
     openDetachedWindow,
     reportWindowScope,
+    reportWindowView,
     setCaffeinate,
     setNativeWindowTitle,
     shellBuild,
+    takePendingFocus,
     type HostStatusEvent,
   } from "./lib/net/native";
+  import { clearBrowserNotices, deliverBrowserNotices } from "./lib/workspace/notices";
   import UpdateToast from "./lib/workspace/UpdateToast.svelte";
   import { currentOffer, updateState } from "./lib/workspace/update.svelte";
   import * as pool from "./lib/terminal/termPool";
@@ -277,6 +288,7 @@
   import ContextMenuHost from "./lib/shared/ContextMenuHost.svelte";
   import { contextMenu } from "./lib/shared/contextMenu.svelte";
   import ConfirmDialog from "./lib/shared/ConfirmDialog.svelte";
+  import CloseDirtyDialog from "./lib/layout/CloseDirtyDialog.svelte";
   import { fsDeleteOp, lastFsMutation, notifyCreated, pendingDelete } from "./lib/workspace/fsEvents";
   import {
     currentDiskWatches,
@@ -697,6 +709,13 @@
   let treeCreateNonce = 0;
   /** A failed delete's message; keeps the confirm dialog open. */
   let deleteError = $state<string | null>(null);
+  /** File tabs whose close waits on "save changes?" (held by identity — the
+   *  indices shift as other tabs close around them). */
+  let pendingClose = $state<Tab[]>([]);
+  let closeSaving = $state(false);
+  let closeError = $state<string | null>(null);
+  /** Bumped by Cancel: a "Save" still waiting then touches nothing. */
+  let closeAttempt = 0;
   /** Element that held focus when the picker opened; restored on close. */
   let pickerRestoreEl: HTMLElement | null = null;
 
@@ -999,6 +1018,31 @@
   /** terminal session id -> agent session id (one agent per terminal). */
   const linksByTerminal = $derived(new Map(links.map((l) => [l.terminal_id, l.agent_id])));
   const focusedSessionId = $derived(focusedSessionOf(layout));
+  /** Sessions on screen in this window (each pane's active tab). */
+  const visibleSessions = $derived(
+    activeWsId !== null && layoutReady ? visibleSessionIds(layout) : [],
+  );
+  // Tell the notifier what this window shows, so it never alerts about a
+  // session the user is looking at — and clears alerts for ones they now
+  // are. Keyed on the joined ids so a layout write that changes nothing on
+  // screen costs no IPC.
+  const visibleKey = $derived(visibleSessions.join(" "));
+  $effect(() => {
+    const key = visibleKey;
+    const ids = key === "" ? [] : key.split(" ");
+    if (isNativeShell()) {
+      const timer = setTimeout(() => void reportWindowView(ids).catch(() => {}), 120);
+      return () => clearTimeout(timer);
+    }
+    if (document.hasFocus()) clearBrowserNotices(ids);
+  });
+  // Browser: coming back to this tab is looking at what it shows.
+  $effect(() => {
+    if (isNativeShell()) return;
+    const onFocus = (): void => clearBrowserNotices(untrack(() => visibleSessions));
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  });
   const focusedFilePath = $derived(focusedFileOf(layout));
   /** Open file tabs' display titles (basename, disambiguated by parent dir). */
   const fileTitles = $derived(fileTabTitles(allFilePaths(layout)));
@@ -1006,7 +1050,7 @@
     layout.zoomedPaneId !== null ? findPane(layout.root, layout.zoomedPaneId) : null,
   );
 
-  /** Sessions in the active workspace waiting on the user. */
+  /** Sessions in the active workspace blocked on the user's approval. */
   // A detached solo window badges only ITS OWN sessions: workspace-wide
   // attention is the main window's wayfinding, and a torn-off pane wearing
   // the whole roster's badge reads as a false alarm (found live).
@@ -1016,9 +1060,9 @@
   // session, and a pill/title saying 1 while the dashboard says 0 is exactly
   // the stale state this count exists to prevent.
   const needsYou = $derived.by(() => {
-    if (!detachedWindow) return wsSessions.filter((s) => s.alive && needsAttention(s)).length;
+    if (!detachedWindow) return wsSessions.filter((s) => s.alive && needsApproval(s)).length;
     const mine = new Set(allSessionIds(layout));
-    return wsSessions.filter((s) => s.alive && mine.has(s.id) && needsAttention(s)).length;
+    return wsSessions.filter((s) => s.alive && mine.has(s.id) && needsApproval(s)).length;
   });
 
   /** The focused pane is showing the dashboard (its rail row highlights). */
@@ -1405,6 +1449,15 @@
         }
       },
       onFs: notifyDiskChange,
+      // The browser's notification source. The native app ignores these: its
+      // shell consumes the same feed per daemon and posts OS notifications.
+      onNotices: (list) => {
+        if (isNativeShell()) return;
+        deliverBrowserNotices(list, {
+          visible: untrack(() => visibleSessions),
+          onClick: focusFromNotification,
+        });
+      },
       onStatus: (up) => {
         // A recovered events socket often means a re-established tunnel — a
         // different link. Drop the RTT window so the rolling minimum can't
@@ -1412,6 +1465,8 @@
         // health sample, which the recovery kick fetches promptly).
         if (up && !eventsUp) resetLinkRtt();
         eventsUp = up;
+        // A save that died with the link retries once it is back.
+        noteDaemonLink(up);
       },
       onFatal: (message) => {
         if (message === "unauthorized") notifyUnauthorized();
@@ -1438,7 +1493,20 @@
     let unlistenHostStatus: (() => void) | null = null;
     let unlistenAppUpdate: (() => void) | null = null;
     let unlistenCaffeinate: (() => void) | null = null;
+    let unlistenFocusSession: (() => void) | null = null;
     if (isNativeShell()) {
+      // A notification was clicked for a session this window should show.
+      // Listen first, then ask for a focus the shell may already owe us (a
+      // click that OPENED this window can beat the listener).
+      const focusListening = onFocusSession(focusFromNotification);
+      unlistenFocusSession = asyncDisposer(focusListening);
+      void focusListening.then(
+        () =>
+          takePendingFocus().then((id) => {
+            if (id !== null) focusFromNotification(id);
+          }),
+        () => {},
+      );
       // Build-skew + app-update signals for the update toast.
       void shellBuild().then((b) => (appBuild = b));
       // Caffeinate state: attach the cross-window broadcast FIRST, then read
@@ -1528,6 +1596,7 @@
       unlistenHostStatus?.();
       unlistenAppUpdate?.();
       unlistenCaffeinate?.();
+      unlistenFocusSession?.();
       document.removeEventListener("copy", onCopy);
       window.removeEventListener("dragenter", onWindowDragEnter);
       window.removeEventListener("dragover", onWindowDragOver);
@@ -2856,6 +2925,35 @@
     }
   }
 
+  /**
+   * A notification was clicked for `sessionId`: show it here. Works before
+   * this window knows the session (a window a click just opened) — the id
+   * waits for the roster, then for the layout, like a worktree reveal.
+   */
+  function focusFromNotification(sessionId: string): void {
+    const s = sessionsById.get(sessionId);
+    if (s === undefined) {
+      if (!gotSessions) pendingNoticeFocus = sessionId;
+      return;
+    }
+    if (s.workspace_id !== activeWsId) {
+      void revealWorktreeSession(sessionId, s.workspace_id);
+      return;
+    }
+    if (!layoutReady) {
+      pendingReveal = sessionId;
+      return;
+    }
+    openSess(sessionId);
+  }
+  let pendingNoticeFocus = $state<string | null>(null);
+  $effect(() => {
+    if (!gotSessions || pendingNoticeFocus === null) return;
+    const id = pendingNoticeFocus;
+    pendingNoticeFocus = null;
+    untrack(() => focusFromNotification(id));
+  });
+
   // Focus a pending session once the incoming workspace's layout has booted.
   let pendingReveal: string | null = null;
   $effect(() => {
@@ -2927,7 +3025,13 @@
   function closeView(paneId: string): void {
     const p = findPane(layout.root, paneId);
     if (p === null) return;
-    layout = p.tabs.length > 0 ? detachTab(layout, paneId, p.active) : closePane(layout, paneId);
+    const active = p.tabs[p.active];
+    if (active !== undefined) {
+      // A dirty file asks first (and keeps its tab until answered).
+      if (!closeTabs([active])) return;
+    } else {
+      layout = closePane(layout, paneId);
+    }
     const sid = focusedSessionOf(layout);
     const focusedId = layout.focusedPaneId;
     // After the flush: closing a pane restructures the tree, which can
@@ -2936,6 +3040,84 @@
       if (sid !== null) pool.focusTerminal(sid);
       else paneRootEl(focusedId)?.focus();
     });
+  }
+
+  /** Detach these tabs wherever they are now (views only; sessions live on). */
+  function detachTabs(tabs: readonly Tab[]): void {
+    let next = layout;
+    for (const t of tabs) {
+      const loc = paneForTab(next.root, t);
+      if (loc !== null) next = detachTab(next, loc.paneId, loc.index);
+    }
+    layout = next;
+  }
+
+  /**
+   * Close tabs by identity. Clean ones go at once; a file with unsaved edits
+   * joins the "save changes?" dialog and keeps its tab until answered — its
+   * buffer would survive a plain close (the buffer store keeps dirty text),
+   * but a close gesture must never leave edits stranded without asking.
+   * True when everything closed right away.
+   */
+  function closeTabs(tabs: readonly Tab[]): boolean {
+    const dirty = get(dirtyFiles);
+    const held = tabs.filter((t) => t.surface === "file" && dirty.has(t.path));
+    detachTabs(tabs.filter((t) => !held.includes(t)));
+    if (held.length === 0) return true;
+    const known = new Set(pendingClose.map(tabKey));
+    pendingClose = [...pendingClose, ...held.filter((t) => !known.has(tabKey(t)))];
+    closeError = null;
+    return false;
+  }
+
+  const pendingClosePaths = $derived(
+    pendingClose.flatMap((t) => (t.surface === "file" ? [t.path] : [])),
+  );
+
+  /**
+   * "Save": save each file; close those that saved, keep the rest asking.
+   * Bounded: past the deadline (a dead link) it reports "not saved" and
+   * hands control back while the save carries on in the background.
+   */
+  async function saveAndClose(): Promise<void> {
+    if (closeSaving) return;
+    closeSaving = true;
+    closeError = null;
+    const attempt = ++closeAttempt;
+    const batch = pendingClose;
+    const r = await saveDirtyFiles(
+      batch.flatMap((t) => (t.surface === "file" ? [t.path] : [])),
+      { deadlineMs: CLOSE_SAVE_DEADLINE_MS, cancelled: () => attempt !== closeAttempt },
+    );
+    // Cancelled while waiting: the tabs stay open, the dialog is already gone.
+    if (r === null) return;
+    closeSaving = false;
+    const failed = batch.filter((t) => t.surface === "file" && r.unsaved.includes(t.path));
+    detachTabs(batch.filter((t) => !failed.includes(t)));
+    pendingClose = [...failed, ...pendingClose.filter((t) => !batch.includes(t))];
+    if (failed.length > 0) {
+      const names = failed.map((t) => (t.surface === "file" ? `“${basename(t.path)}”` : ""));
+      closeError = r.timedOut
+        ? `${names.join(", ")} not saved — the daemon isn't answering (it keeps trying in the background)`
+        : `couldn't save ${names.join(", ")} — its editor shows why`;
+    }
+  }
+
+  /** "Don't save": drop the edits (and their drafts), then close. */
+  function discardAndClose(): void {
+    for (const t of pendingClose) if (t.surface === "file") discardDirtyFile(t.path);
+    detachTabs(pendingClose);
+    pendingClose = [];
+    closeError = null;
+  }
+
+  /** Also while saving: the tabs stay open and dirty, and a save already
+   *  sent may still land in the background. */
+  function cancelClose(): void {
+    closeAttempt++;
+    closeSaving = false;
+    pendingClose = [];
+    closeError = null;
   }
 
   /**
@@ -3321,8 +3503,10 @@
       if (sid !== null) pool.focusTerminal(sid);
     },
     closeTab(paneId, index) {
-      // Detaches the view only — the session stays alive in the rail.
-      layout = detachTab(layout, paneId, index);
+      // Detaches the view only — the session stays alive in the rail. A file
+      // with unsaved edits asks first.
+      const tab = findPane(layout.root, paneId)?.tabs[index];
+      if (tab !== undefined) closeTabs([tab]);
     },
     setRatio(splitId, ratio) {
       layout = setRatio(layout, splitId, ratio);
@@ -4261,7 +4445,10 @@
           </svg>
         </button>
         {#if needsYou > 0}
-          <span class="needs" title="{needsYou} need{needsYou === 1 ? 's' : ''} you">
+          <span
+            class="needs"
+            title="{needsYou} waiting for your approval — a permission or a question"
+          >
             {needsYou}
           </span>
         {/if}
@@ -4422,6 +4609,10 @@
                 <!-- Which-key discovery: the ⌘1–9 digit for this row, faded in
                      while the modifier is held. Pure teaching chrome. -->
                 <span class="kbd-badge" aria-hidden="true">{chordDigits.get(s.id)}</span>
+              {:else if renamingId !== s.id && isUnread(s.id)}
+                <!-- Unread: the scannable half of the cue (the bold name is
+                     the readable half). Yields to the close button on hover. -->
+                <span class="unread-dot" aria-hidden="true"></span>
               {/if}
               <button
                 class="close"
@@ -5036,6 +5227,9 @@
                 backgrounded={backgrounded(s)}
               />
               <span class="chip-name">{displayNames.get(s.id) ?? displayName(s)}</span>
+              {#if isUnread(s.id)}
+                <span class="chip-unread" aria-hidden="true"></span>
+              {/if}
               {#if hintsActive() && chordDigits.has(s.id)}
                 <span class="chip-badge" aria-hidden="true">{chordDigits.get(s.id)}</span>
               {/if}
@@ -5053,7 +5247,9 @@
         <!-- Scoped upstream: in a detached window this counts only the
              sessions THIS window shows, so it never false-alarms for the
              rest of the workspace. -->
-        <span class="strip-needs">{needsYou} need{needsYou === 1 ? "s" : ""} you</span>
+        <span class="strip-needs" title="a permission or a question is waiting on you"
+          >{needsYou} awaiting approval</span
+        >
       {/if}
       {#if detachedWindow && detachOrigin !== null}
         <!-- Send everything in this solo window back where it came from; the
@@ -5134,6 +5330,18 @@
       pendingDelete.set(null);
       deleteError = null;
     }}
+  />
+{/if}
+
+<!-- Closing tabs whose files hold unsaved edits: save / don't save / cancel. -->
+{#if pendingClosePaths.length > 0}
+  <CloseDirtyDialog
+    paths={pendingClosePaths}
+    saving={closeSaving}
+    error={closeError}
+    onSave={() => void saveAndClose()}
+    onDiscard={discardAndClose}
+    onCancel={cancelClose}
   />
 {/if}
 
@@ -5694,15 +5902,57 @@
     }
   }
 
-  /* Unread output: finished with output you haven't looked at. The quietest
-     cue that still reads — a bolder name (the unread-mail convention), no bar
-     or wash in the dense rail so it never looks like a hover/active state.
-     The dashboard card wears the same bold name over a faint wash. A focused
-     row is never unread, so this never fights the active state. */
+  /* Unread output: an agent finished (or handed back, waiting for input)
+     and you haven't looked yet. Two halves, the unread-mail convention: a
+     bolder full-ink name you READ, and a small accent dot you SCAN for down
+     the rail. Still no bar or wash in the dense rail — those read as hover /
+     active. The same pair marks pane tabs, strip chips, and dashboard cards.
+     A focused row is never unread, so this never fights the active state.
+     Counts are reserved for approvals (see needsApproval): unread never adds
+     a number anywhere. */
   .row.unread .name,
   .chip.unread .chip-name {
     color: var(--fg);
     font-weight: 600;
+  }
+
+  /* Sits in the close button's slot (right edge, like the ⌘-digit badge),
+     so marking never reflows the label; hover hands the slot back to ×. */
+  .unread-dot {
+    position: absolute;
+    right: 11px;
+    top: 50%;
+    width: 6px;
+    height: 6px;
+    margin-top: -3px;
+    border-radius: 50%;
+    background: var(--accent);
+    pointer-events: none;
+    transition: opacity 0.12s ease;
+    animation: unread-in 0.28s ease-out;
+  }
+
+  .row:hover .unread-dot,
+  .row:focus-within .unread-dot {
+    opacity: 0;
+  }
+
+  .chip-unread {
+    flex: none;
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    background: var(--accent);
+    animation: unread-in 0.28s ease-out;
+  }
+
+  /* One-shot arrival (not an infinite presence animation — nothing to pause
+     while hidden). */
+  @keyframes unread-in {
+    from {
+      opacity: 0;
+      transform: scale(0.3);
+    }
   }
 
   .row.new {

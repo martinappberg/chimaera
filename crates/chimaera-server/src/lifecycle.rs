@@ -113,6 +113,9 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
     // Idle sweep for browser-pane proxy sessions (kills their relay children).
     tokio::spawn(proxy::sweeper(state.clone()));
 
+    // The notice feed's edge detector (agent finished / needs you).
+    tokio::spawn(crate::notices::run(state.clone()));
+
     // Uploads left by sessions that ended while no daemon was watching
     // (crashes, unclean stops) — swept once restore has decided which
     // sessions still exist.
@@ -280,6 +283,11 @@ async fn shutdown_signal(state: Arc<AppState>) {
         _ = state.shutdown.notified() => {},
     }
     tracing::info!("shutdown signal received");
+    // Release long-held requests before axum starts draining them.
+    state
+        .stopping
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    state.changes.notify_waiters();
 }
 
 #[cfg(test)]

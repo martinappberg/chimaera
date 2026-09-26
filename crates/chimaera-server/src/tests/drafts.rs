@@ -10,6 +10,13 @@ fn draft_file(state: &Arc<AppState>, path: &str) -> PathBuf {
     state.drafts_root.join(format!("{}.json", &digest[..32]))
 }
 
+fn meta_file(state: &Arc<AppState>, path: &str) -> PathBuf {
+    let digest = crate::fs::sha256_hex(path.as_bytes());
+    state
+        .drafts_root
+        .join(format!("{}.meta.json", &digest[..32]))
+}
+
 async fn put_draft(
     state: &Arc<AppState>,
     path: &str,
@@ -69,6 +76,9 @@ async fn drafts_round_trip_list_newest_first_and_delete_idempotently() {
         let (status, _) = request(&state, Method::DELETE, &draft_uri("/w/a.md"), None).await;
         assert_eq!(status, StatusCode::NO_CONTENT);
     }
+    // Both files go together.
+    assert!(!draft_file(&state, "/w/a.md").exists());
+    assert!(!meta_file(&state, "/w/a.md").exists());
     let (status, body) = request(&state, Method::GET, &draft_uri("/w/a.md"), None).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
     let (_, body) = request(&state, Method::GET, "/api/v1/fs/drafts", None).await;
@@ -80,11 +90,47 @@ async fn drafts_round_trip_list_newest_first_and_delete_idempotently() {
         .permissions()
         .mode();
     assert_eq!(dir_mode & 0o777, 0o700);
-    let file_mode = std::fs::metadata(draft_file(&state, "/w/b.md"))
+    for file in [draft_file(&state, "/w/b.md"), meta_file(&state, "/w/b.md")] {
+        let file_mode = std::fs::metadata(&file).unwrap().permissions().mode();
+        assert_eq!(file_mode & 0o777, 0o600, "{}", file.display());
+    }
+}
+
+/// The listing reads only the small sidecars — never the (up to 1 MiB) draft
+/// files — and skips a draft whose sidecar is missing or corrupt.
+#[tokio::test]
+async fn drafts_list_reads_only_the_sidecars() {
+    let state = test_state();
+    for path in ["/w/one.md", "/w/two.md", "/w/three.md", "/w/four.md"] {
+        let (status, _) = put_draft(&state, path, Some("h"), "text").await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+    // A draft file the listing would choke on if it parsed it: still listed.
+    std::fs::write(draft_file(&state, "/w/one.md"), b"{not json").unwrap();
+    // No sidecar, or a corrupt one: skipped, though the draft itself reads.
+    std::fs::remove_file(meta_file(&state, "/w/two.md")).unwrap();
+    std::fs::write(meta_file(&state, "/w/three.md"), b"{not json").unwrap();
+    // A sidecar naming another path than its file name: skipped.
+    std::fs::copy(
+        meta_file(&state, "/w/one.md"),
+        meta_file(&state, "/w/four.md"),
+    )
+    .unwrap();
+
+    let (status, body) = request(&state, Method::GET, "/api/v1/fs/drafts", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let paths: Vec<&str> = body["drafts"]
+        .as_array()
         .unwrap()
-        .permissions()
-        .mode();
-    assert_eq!(file_mode & 0o777, 0o600);
+        .iter()
+        .map(|d| d["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(paths, ["/w/one.md"], "{body}");
+    assert_eq!(body["drafts"][0]["bytes"], 4);
+    assert_eq!(body["drafts"][0]["base_hash"], "h");
+    let (status, body) = request(&state, Method::GET, &draft_uri("/w/two.md"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["text"], "text");
 }
 
 #[tokio::test]
@@ -126,6 +172,10 @@ async fn drafts_evict_least_recently_updated_past_the_count_cap() {
     assert_eq!(drafts.len(), 64);
     assert!(drafts.iter().all(|d| d["path"] != "/w/7.md"), "{body}");
     assert!(drafts.iter().any(|d| d["path"] == "/w/new.md"));
+    // The evicted draft took its sidecar with it: 64 pairs, nothing else.
+    assert!(!draft_file(&state, "/w/7.md").exists());
+    assert!(!meta_file(&state, "/w/7.md").exists());
+    assert_eq!(std::fs::read_dir(&state.drafts_root).unwrap().count(), 128);
 }
 
 /// Past 16 MiB in total the oldest drafts go, never the one just written.
@@ -138,13 +188,16 @@ async fn drafts_evict_past_the_byte_cap() {
         assert_eq!(status, StatusCode::NO_CONTENT);
         age_file(&draft_file(&state, &format!("/w/{i}.md")), 1000 - i);
     }
+    // Draft files and sidecars count together.
     let total: u64 = std::fs::read_dir(&state.drafts_root)
         .unwrap()
         .map(|e| e.unwrap().metadata().unwrap().len())
         .sum();
     assert!(total <= 16 * 1024 * 1024, "{total}");
     assert!(!draft_file(&state, "/w/0.md").exists());
+    assert!(!meta_file(&state, "/w/0.md").exists());
     assert!(draft_file(&state, "/w/16.md").exists());
+    assert!(meta_file(&state, "/w/16.md").exists());
 }
 
 /// A corrupt draft file is skipped by the listing and reads as no draft.
