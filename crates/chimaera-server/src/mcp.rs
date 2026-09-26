@@ -87,6 +87,13 @@ pub(crate) const MASTERMIND_READ_TOOLS: [&str; 6] = [
     "read_terminal",
 ];
 
+/// Tools every session may call without a prompt: the harness pre-allows
+/// them for workers and Masterminds alike (claude `permissions.allow`, codex
+/// `mcp_auto_approve`). Only side-effect-free-for-the-workspace tools belong
+/// here — `notify` shows the user a notification and nothing else, and a
+/// permission prompt for "may I notify you?" would itself be a notification.
+pub(crate) const ALWAYS_ALLOWED_TOOLS: [&str; 1] = ["notify"];
+
 /// Every Mastermind-tier tool name — the dispatch gate's single source, so
 /// adding a tool means extending THIS list + `mastermind_tool_defs` (a
 /// mismatch fails closed as "unknown tool", never as an open gate).
@@ -117,7 +124,11 @@ run one thing at a time, keep commands short-running, and start long jobs \
 with the shell's own facilities (sbatch, nohup ... &) or a larger \
 timeout_ms. If the shell is busy your exec queues until its prompt \
 returns. State changes (cd, module load, exports) persist in the shell — \
-that is usually why the user linked it.";
+that is usually why the user linked it.\n\
+notify shows the user a desktop notification. They are already notified \
+automatically when your turn ends or you need their input, so use it only \
+for news they asked for (\"ping me when the job finishes\") or would clearly \
+want while away — never for routine progress.";
 
 /// Extra instructions for a WORKER in a workspace that has a Mastermind:
 /// sets the expectation up front, so a relayed message doesn't read as a
@@ -438,6 +449,7 @@ fn mastermind_tool_defs() -> Vec<Value> {
 
 fn tool_defs(mastermind: bool, plugins: &[&'static crate::plugins::Manifest]) -> Value {
     let mut tools = base_tool_defs();
+    tools.push(notify_tool_def());
     if mastermind {
         tools.extend(mastermind_tool_defs());
     }
@@ -519,6 +531,46 @@ fn base_tool_defs() -> Vec<Value> {
     ]
 }
 
+/// The `notify` tool def (base tier — every session has it).
+fn notify_tool_def() -> Value {
+    json!({
+        "name": "notify",
+        "description": "Show the user a Chimaera desktop notification (it reaches them even \
+                        when Chimaera is in the background). Use it when the user asked to be \
+                        told about something (\"ping me when the build is done\", \"let me know \
+                        if the job fails\"), or when long-running work you were watching \
+                        finishes or fails mid-turn. The user is already notified automatically \
+                        when your turn ends or you need permission/input, so do not use it for \
+                        routine progress. Rate-limited per session.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["message"],
+            "properties": {
+                "message": {
+                    "type": "string",
+                    "description": "The notification text: one or two short sentences with the outcome.",
+                },
+                "title": {
+                    "type": "string",
+                    "description": "Optional short headline (defaults to this session's name).",
+                },
+            },
+            "additionalProperties": false,
+        },
+    })
+}
+
+/// `notify`: hand the message to the notice feed (validation, the user's
+/// settings, and the per-session rate limits all live there).
+fn notify(state: &AppState, agent_id: &str, args: &Value) -> Value {
+    let message = args.get("message").and_then(|m| m.as_str()).unwrap_or("");
+    let title = args.get("title").and_then(|t| t.as_str());
+    match crate::notices::push_agent_notice(state, agent_id, title, message) {
+        Ok(text) => tool_text(text),
+        Err(text) => tool_error(text),
+    }
+}
+
 /// Result content for a successful tool call.
 fn tool_text(text: String) -> Value {
     json!({ "content": [{ "type": "text", "text": text }] })
@@ -574,6 +626,7 @@ async fn tools_call(
         "list_terminals" => Ok(list_terminals(state, agent_id).await),
         "run_in_terminal" => Ok(run_in_terminal(state, agent_id, &args).await),
         "read_terminal" => Ok(read_terminal(state, agent_id, &args).await),
+        "notify" => Ok(notify(state, agent_id, &args)),
         "workspace_status" | "read_session" | "list_changed_files" | "read_timeline"
         | "spawn_agent" | "spawn_terminal" | "message_agent" | "interrupt_agent" => {
             let Some(workspace) = workspace_of(state, agent_id) else {

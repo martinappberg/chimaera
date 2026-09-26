@@ -52,7 +52,12 @@ async fn mcp_handshake_auth_and_tool_listing() {
         .collect();
     assert_eq!(
         names,
-        vec!["list_terminals", "run_in_terminal", "read_terminal"]
+        vec![
+            "list_terminals",
+            "run_in_terminal",
+            "read_terminal",
+            "notify"
+        ]
     );
 
     state.sessions.kill(&id).ok();

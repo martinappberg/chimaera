@@ -32,6 +32,7 @@
   import { dirtyFiles } from "../shared/editing";
   import { volatileChatDrafts } from "../chat/drafts";
   import { gitIndex } from "../workspace/git";
+  import { isUnread } from "../workspace/unread.svelte";
   import { decoFor } from "../workspace/gitDeco";
   import { PINNED } from "../shared/keys";
   import { keyHint } from "../shared/keybindings";
@@ -649,9 +650,11 @@
         {@const ts = sid !== null ? (sessions.get(sid) ?? null) : null}
         {@const fEntry = tab.surface === "file" ? $gitIndex.files.get(tab.path) : undefined}
         {@const fDeco = fEntry ? decoFor(fEntry) : null}
+        {@const unread = sid !== null && i !== node.active && isUnread(sid)}
         <div
           class="tab"
           class:active={i === node.active}
+          class:unread
           class:insert={insertIndex === i}
           class:link-target={dropSpot?.kind === "linktab" &&
             dropSpot.paneId === node.id &&
@@ -838,6 +841,7 @@
             <span
               class="tab-name"
               class:preview={tab.surface === "file" && tab.preview === true}
+              class:unread
               data-label={label(tab)}
               style:color={fDeco ? fDeco.color : undefined}>{label(tab)}</span
             >
@@ -1412,6 +1416,15 @@
     font-style: normal;
   }
 
+  /* Unread: an agent in a background tab finished work you haven't looked
+     at — the rail row's cue (a bolder, full-ink name), so the tab that needs
+     a look reads at a glance. The ::after reserve already sizes the name at
+     this weight, so marking never shifts the strip. */
+  .tab-name.unread {
+    color: var(--fg);
+    font-weight: 600;
+  }
+
   /* A VS Code preview tab: italic until it is pinned (dbl-click / edit). */
   .tab-name.preview {
     font-style: italic;
@@ -1435,6 +1448,8 @@
   }
 
   .tab-close {
+    /* Anchors the unread dot drawn in this slot (see .tab.unread below). */
+    position: relative;
     appearance: none;
     border: none;
     background: none;
@@ -1460,6 +1475,26 @@
   .tab-close:hover {
     opacity: 1;
     color: var(--fg);
+  }
+
+  /* Unread's scannable half: an accent dot in the close button's slot that
+     turns back into × under the pointer (the editor "dirty dot" gesture,
+     here meaning "finished — not looked at yet"). No reflow either way. */
+  .tab.unread:not(:hover) .tab-close {
+    opacity: 1;
+    color: transparent;
+  }
+
+  .tab.unread:not(:hover) .tab-close::after {
+    content: "";
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: 6px;
+    height: 6px;
+    margin: -3px 0 0 -3px;
+    border-radius: 50%;
+    background: var(--accent);
   }
 
   /* --- linked-terminal chips ------------------------------------------- */

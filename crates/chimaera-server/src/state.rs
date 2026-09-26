@@ -134,6 +134,12 @@ pub(crate) struct AppState {
     /// only non-signal way to stop the daemon). Awaited alongside SIGINT/
     /// SIGTERM by the server's graceful-shutdown future.
     pub(crate) shutdown: tokio::sync::Notify,
+    /// Set once the shutdown signal has fired (any source), so long-held
+    /// requests — the notices long-poll — return instead of stalling the
+    /// graceful drain.
+    pub(crate) stopping: std::sync::atomic::AtomicBool,
+    /// The notice feed (agent finished / needs you / agent `notify`).
+    pub(crate) notices: crate::notices::Notices,
     /// Agent binaries resolved via the login shell (with `--version`),
     /// cached per agent for the daemon's lifetime;
     /// `GET /api/v1/agents?refresh=true` bypasses and refills it.
@@ -261,6 +267,8 @@ impl AppState {
             sessions_snapshot: crate::session_view::SnapshotCache::new(),
             restored: tokio::sync::watch::channel(true).0,
             shutdown: tokio::sync::Notify::new(),
+            stopping: std::sync::atomic::AtomicBool::new(false),
+            notices: crate::notices::Notices::new(),
             agent_bins: Mutex::new(HashMap::new()),
             claude_projects_dir: home.join(".claude").join("projects"),
             managed_root: data_dir.join("agents"),

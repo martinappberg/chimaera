@@ -9,6 +9,7 @@ import {
   panes,
   tabCount,
   allSessionIds,
+  visibleSessionIds,
   allFilePaths,
   focusedSession,
   focusedFile,
@@ -522,5 +523,21 @@ describe("moveTabDirection (shift+cmd+arrow)", () => {
   it("is a no-op when the focused pane is empty", () => {
     const l = defaultLayout(); // one empty pane
     expect(moveTabDirection(l, "right")).toBe(l);
+  });
+});
+
+describe("visibleSessionIds", () => {
+  it("is each pane's active terminal tab, and only the zoomed pane's", () => {
+    let l = openSession(openSession(defaultLayout(), "s-a"), "s-b");
+    // One pane, two tabs: only the active one is on screen.
+    expect(visibleSessionIds(l)).toEqual(["s-b"]);
+    l = splitPane(l, l.focusedPaneId, "row");
+    l = openSession(l, "s-c");
+    expect(visibleSessionIds(l).sort()).toEqual(["s-b", "s-c"]);
+    // Zoomed: the other pane is hidden behind it.
+    l = toggleZoom(l);
+    expect(visibleSessionIds(l)).toEqual(["s-c"]);
+    // A non-session tab on top hides the session under it.
+    expect(visibleSessionIds(openDashboard(defaultLayout()))).toEqual([]);
   });
 });

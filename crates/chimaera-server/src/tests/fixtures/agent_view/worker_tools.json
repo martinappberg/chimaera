@@ -63,6 +63,27 @@
         "type": "object"
       },
       "name": "read_terminal"
+    },
+    {
+      "description": "Show the user a Chimaera desktop notification (it reaches them even when Chimaera is in the background). Use it when the user asked to be told about something (\"ping me when the build is done\", \"let me know if the job fails\"), or when long-running work you were watching finishes or fails mid-turn. The user is already notified automatically when your turn ends or you need permission/input, so do not use it for routine progress. Rate-limited per session.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "message": {
+            "description": "The notification text: one or two short sentences with the outcome.",
+            "type": "string"
+          },
+          "title": {
+            "description": "Optional short headline (defaults to this session's name).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "message"
+        ],
+        "type": "object"
+      },
+      "name": "notify"
     }
   ]
 }

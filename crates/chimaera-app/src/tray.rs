@@ -26,7 +26,7 @@ pub fn install(app: &App) -> tauri::Result<()> {
     let handle = app.handle();
     let menu = build_menu(handle)?;
     let mut builder = TrayIconBuilder::with_id(TRAY_ID)
-        .tooltip(tooltip(false))
+        .tooltip(tooltip(false, 0))
         .menu(&menu)
         .on_menu_event(|app: &AppHandle, event| match event.id().0.as_str() {
             "quit" => crate::shell::request_quit(app),
@@ -79,14 +79,15 @@ pub fn rebuild(app: &AppHandle) {
             }
             Err(e) => tracing::warn!("tray menu rebuild failed: {e:#}"),
         }
-        // Only macOS shows the caffeinate state IN the bar (template idle/awake
-        // + tooltip); elsewhere the app icon set at install stays put.
+        let armed = crate::shell::caffeinate_armed(&app);
+        let waiting = crate::shell::notices::attention_total(&app);
+        let _ = tray.set_tooltip(Some(tooltip(armed, waiting)));
+        // Only macOS shows the caffeinate state IN the bar (template idle/awake);
+        // elsewhere the app icon set at install stays put.
         #[cfg(target_os = "macos")]
         {
-            let armed = crate::shell::caffeinate_armed(&app);
             let _ = tray.set_icon(Some(icon(armed)));
             let _ = tray.set_icon_as_template(true);
-            let _ = tray.set_tooltip(Some(tooltip(armed)));
         }
     });
 }
@@ -112,7 +113,13 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
     let mut wins = crate::shell::tray_windows(app);
     wins.sort_by_key(|(label, _)| seq_of(label));
     for (label, name) in &wins {
-        let item = MenuItemBuilder::with_id(format!("tray-win:{label}"), name).build(app)?;
+        // Which window needs you: its count of agents blocked on an
+        // approval rides the entry.
+        let text = match crate::shell::notices::window_attention(app, label) {
+            0 => name.clone(),
+            n => format!("{name} — {n} awaiting approval"),
+        };
+        let item = MenuItemBuilder::with_id(format!("tray-win:{label}"), text).build(app)?;
         b = b.item(&item);
     }
     if !wins.is_empty() {
@@ -149,12 +156,17 @@ fn icon(armed: bool) -> Image<'static> {
     }
 }
 
-fn tooltip(armed: bool) -> &'static str {
-    if armed {
-        "Chimaera — keeping this Mac awake"
-    } else {
-        "Chimaera"
+fn tooltip(armed: bool, waiting: usize) -> String {
+    let mut parts = vec!["Chimaera".to_string()];
+    match waiting {
+        0 => {}
+        1 => parts.push("1 agent awaiting approval".to_string()),
+        n => parts.push(format!("{n} agents awaiting approval")),
     }
+    if armed {
+        parts.push("keeping this Mac awake".to_string());
+    }
+    parts.join(" — ")
 }
 
 /// Show + focus a specific window by label (a tray window-list click).

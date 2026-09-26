@@ -959,6 +959,9 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
     let mut last_update_epoch: Option<u64> = None;
     let mut last_recents_epoch: Option<u64> = None;
     let mut last_timeline: Option<String> = None;
+    // Notices start at the head: a (re)connecting window is told about what
+    // happens from now on, never handed old alerts as new.
+    let mut last_notice = state.notices.head();
     // A new window's FIRST settings frame gets one fresh disk read (off the
     // reactor): a hand-edit inside the watcher's poll window must not greet
     // a fresh window with stale settings. Steady-state sends stay cached.
@@ -1073,6 +1076,11 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
             .is_err()
         {
             return;
+        }
+        if let Some(frame) = crate::notices::frame_since(&state, &mut last_notice) {
+            if socket.send(Message::Text(frame.into())).await.is_err() {
+                return;
+            }
         }
         let fs_changes = fs_watch.poll(false).await;
         if send_fs_changes(&mut socket, fs_changes).await.is_err() {

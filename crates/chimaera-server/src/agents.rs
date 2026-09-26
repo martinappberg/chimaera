@@ -29,7 +29,7 @@ use crate::AppState;
 pub(crate) use crate::agent_state::{apply_title_line, truncate_prompt, AgentKind, AgentRecord};
 use crate::agent_state::{
     cleared_by_output, map_event, now_line_update, statusline_usage, subagent_identity,
-    touched_file,
+    touched_file, AgentState,
 };
 
 /// Fresh session id in the same format the PTY engine generates.
@@ -180,26 +180,30 @@ pub(crate) fn write_settings(
     if let Some(theme) = theme {
         settings["theme"] = json!(theme);
     }
-    let mut allow: Vec<String> = match mastermind {
+    // Every session pre-allows the prompt-free tools (`notify`); a
+    // Mastermind adds its tier's gate on top.
+    let mut allow: Vec<String> = crate::mcp::ALWAYS_ALLOWED_TOOLS
+        .iter()
+        .map(|t| format!("mcp__chimaera__{t}"))
+        .collect();
+    match mastermind {
         // The shared read-tool list (mcp.rs) — codex's ask-mode argv is
         // generated from the same one, so the two harness gates agree.
-        Some(crate::workspaces::MastermindMode::Ask) => crate::mcp::MASTERMIND_READ_TOOLS
-            .iter()
-            .map(|t| format!("mcp__chimaera__{t}"))
-            .collect(),
-        Some(crate::workspaces::MastermindMode::Auto) => vec!["mcp__chimaera".to_string()],
-        None => Vec::new(),
-    };
+        Some(crate::workspaces::MastermindMode::Ask) => allow.extend(
+            crate::mcp::MASTERMIND_READ_TOOLS
+                .iter()
+                .map(|t| format!("mcp__chimaera__{t}")),
+        ),
+        Some(crate::workspaces::MastermindMode::Auto) => allow = vec!["mcp__chimaera".into()],
+        None => {}
+    }
     // Tools of workbench plugins active in the session's workspace at spawn
     // (the user switched them on; each card says it adds them). Auto already
-    // allows the whole server. None active ⇒ no block at all — a plugin-free
-    // workspace's settings stay byte-identical.
+    // allows the whole server; none active adds nothing.
     if mastermind != Some(crate::workspaces::MastermindMode::Auto) {
         allow.extend(plugin_tools.iter().map(|t| format!("mcp__chimaera__{t}")));
     }
-    if !allow.is_empty() {
-        settings["permissions"] = json!({ "allow": allow });
-    }
+    settings["permissions"] = json!({ "allow": allow });
     if let Some(passthrough) = statusline_passthrough(user_statusline) {
         let script = write_statusline_script(session_id, key, port, passthrough.as_deref())?;
         // claude runs statusLine commands through a shell: quote the path so
@@ -395,6 +399,44 @@ fn bearer_token(headers: &axum::http::HeaderMap) -> Option<&str> {
         .and_then(|v| v.strip_prefix("Bearer "))
 }
 
+/// Keep the record's notice text current from hook payloads (the TUI path;
+/// chat sessions also receive hooks, but their protocol events carry richer
+/// words, so a generic hook message never overwrites a note already set).
+fn note_for_notices(record: &mut AgentRecord, event: &str, payload: &serde_json::Value) {
+    let text = |key: &str| payload.get(key).and_then(|v| v.as_str()).unwrap_or("");
+    match event {
+        // A new prompt starts a new story; whatever the last edge was about
+        // is history.
+        "UserPromptSubmit" => record.notice_note = None,
+        // A permission prompt is the current fact: its message replaces any
+        // older note. Other notifications (the idle "waiting for your input")
+        // only fill a gap — chat sessions also get these hooks, and their
+        // protocol events carry richer words.
+        "Notification" if map_event(event, payload) == Some(AgentState::NeedsPermission) => {
+            record.set_notice_note(text("message"), false);
+        }
+        "Notification" if record.notice_note.is_none() => {
+            record.set_notice_note(text("message"), false);
+        }
+        // Newer claude builds hand the turn's final prose to the Stop hook;
+        // older ones send none (the notice then says only "Finished").
+        "Stop" => {
+            let reply = text("last_assistant_message");
+            if !reply.trim().is_empty() {
+                record.set_notice_note(reply, false);
+            }
+        }
+        "StopFailure" => {
+            let why = [text("error_message"), text("message"), text("error_type")]
+                .into_iter()
+                .find(|t| !t.trim().is_empty())
+                .unwrap_or("");
+            record.set_notice_note(why, false);
+        }
+        _ => {}
+    }
+}
+
 /// POST /api/v1/agent-events/{id}?key={secret} — Claude Code hook ingestion.
 ///
 /// Not behind bearer auth (claude's hook cannot know the daemon token); the
@@ -556,6 +598,7 @@ pub(crate) async fn ingest(
                 changed = true;
             }
         }
+        note_for_notices(record, event, &payload);
 
         // Compute-session context wants delivering on whichever carrier
         // fires first (see below); the record's flag is only SET once the
@@ -931,8 +974,12 @@ mod tests {
         // No theme requested: the settings stay hooks-only (a user with an
         // explicit theme choice is never overridden).
         assert!(value.get("theme").is_none());
-        // Not a mastermind: no permissions block (the pre-mastermind shape).
-        assert!(value.get("permissions").is_none());
+        // Not a mastermind: only the prompt-free `notify` is pre-allowed —
+        // every other tool (the terminal tools included) still prompts.
+        assert_eq!(
+            value["permissions"]["allow"],
+            json!(["mcp__chimaera__notify"])
+        );
         use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
@@ -987,6 +1034,7 @@ mod tests {
         assert_eq!(
             value["permissions"]["allow"],
             json!([
+                "mcp__chimaera__notify",
                 "mcp__chimaera__workspace_status",
                 "mcp__chimaera__read_session",
                 "mcp__chimaera__list_changed_files",

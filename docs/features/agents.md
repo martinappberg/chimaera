@@ -134,11 +134,13 @@ spawn.rs,recents.rs}`. Wire: `POST/GET/DELETE/PATCH /api/v1/sessions*`, `GET /ap
   when quiet; only an old daemon without the field keeps the muted "unk". A claude TUI whose
   "running" claim has gone silent past the daemon's stall window (`stalled: true`, 180s) also
   drops to "unk" (tooltip "agent says working — no output for a while") — the claim is likely
-  stale and the dot says so without touching the record. `needsAttention` =
-  needs_permission | idle_prompt | errored feeds the home-screen amber rollup, the rail pill, and
-  the window-title count — each alive-gated like the dashboard lane, because a crashed chat
-  driver stays registered (alive:false, errored) until deleted: its row keeps the red glyph, but
-  nobody can answer a dead session. Chimaera owns renaming for **all** session kinds (only claude has an
+  stale and the dot says so without touching the record. Every COUNT — the home-screen amber
+  rollup, the rail pill, the focus strip, and the window-title prefix — is `needsApproval`
+  (needs_permission only: a permission, plan approval, or question blocking the agent), alive-gated
+  because a crashed chat driver stays registered (alive:false, errored) until deleted. Finished and
+  waiting-for-input sessions are news, not a number: they wear the unread mark (bold name + accent
+  dot, see [notifications.md](notifications.md)). The dashboard's attention lane stays the broader
+  `needsAttention` (needs_permission | idle_prompt | errored). Chimaera owns renaming for **all** session kinds (only claude has an
   in-TUI `/rename`); the pin outranks every derived name on every surface. Kill drops the row locally
   even if the DELETE fails (already-gone/unreachable), and **tombstones** the id until a daemon
   snapshot no longer lists it: `DELETE` only signals the process and returns while the session is

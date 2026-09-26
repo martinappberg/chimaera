@@ -111,6 +111,11 @@
       }
     ]
   },
+  "permissions": {
+    "allow": [
+      "mcp__chimaera__notify"
+    ]
+  },
   "statusLine": {
     "command": "'<RUNTIME>/agents/s-agentview-statusline.sh'",
     "type": "command"
