@@ -9,6 +9,13 @@ import { isImagePath } from "../previews/files";
 import { artifactMentions, artifactShape, isArtifactPath, proseCovered, proseEmbedTargets } from "./artifacts";
 import type { AgentEvent, ChatSessionInfo, SeqEvent } from "./chatWs";
 
+/** Names a reply may use that still cover their files (a reply listing
+ *  thirty outputs covers thirty); resolve candidates from shell text and
+ *  un-embedded figures stay capped at `MENTIONS_MAX` (one daemon round trip
+ *  per gallery, `RESOLVE_MAX` server-side). */
+const PROSE_NAMES_MAX = 512;
+const MENTIONS_MAX = 24;
+
 /** The single leading notice a client-side transcript trim leaves behind. */
 const TRIM_NOTICE = "earlier history trimmed";
 
@@ -1903,7 +1910,10 @@ export class ChatStore {
     }
     out.reverse(); // chronological
     const embedded = proseEmbedTargets(prose);
-    const named = artifactMentions(prose);
+    // A reply is short and cheap to scan whole, and a name it uses must
+    // cover its file whatever its position — only resolve candidates
+    // (shell names, un-embedded figures) keep the small cap.
+    const named = artifactMentions(prose, PROSE_NAMES_MAX);
     // A set: a shell-named figure the prose embeds is met twice.
     const covered = new Set<string>();
     /** The remainder of `candidates` once the prose's embeds (any shape) and
@@ -1928,7 +1938,7 @@ export class ChatStore {
     const figuresEmbedded = proseCovered(namedFigures, embedded);
     for (const m of namedFigures) {
       if (figuresEmbedded.has(m)) covered.add(m);
-      else mentioned.push(m);
+      else if (mentioned.length < MENTIONS_MAX) mentioned.push(m);
     }
     return { artifacts, mentioned, covered: [...covered] };
   }

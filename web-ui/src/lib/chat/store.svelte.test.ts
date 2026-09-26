@@ -1736,6 +1736,27 @@ describe("ChatStore turn artifacts (the made-this-turn gallery)", () => {
     });
   });
 
+  it("every name in a long reply covers its file", () => {
+    const n = 40;
+    const tools: [number, Record<string, unknown>][] = [];
+    for (let i = 0; i < n; i++) {
+      tools.push([1020 + i * 2, { type: "tool_call", id: `w${i}`, kind: "edit", title: `Write out/t${i}.csv`, locations: [`/p/out/t${i}.csv`], status: "in_progress" }]);
+      tools.push([1021 + i * 2, { type: "tool_call_update", id: `w${i}`, status: "completed" }]);
+    }
+    const names = Array.from({ length: n }, (_, i) => `out/t${i}.csv`).join(", ");
+    const store = foldAt([
+      [1000, { type: "user_message", text: "split the table", attachments: 0 }],
+      [1010, { type: "turn_started", turn_id: "t1" }],
+      ...tools,
+      [1900, { type: "message_chunk", turn_id: "t1", text: `Wrote ${names}.` }],
+      [2000, { type: "turn_completed", turn_id: "t1", usage: {} }],
+    ]);
+    // Everything was named, so nothing is left for the gallery to show.
+    const end = store.blocks.find((b) => b.kind === "turn_end");
+    expect(end).toMatchObject({ artifacts: [], mentioned: [] });
+    expect(end?.kind === "turn_end" ? end.covered : []).toHaveLength(n);
+  });
+
   it("scans the whole command, not the truncated title", () => {
     const store = foldAt([
       [1000, { type: "user_message", text: "make me a table", attachments: 0 }],

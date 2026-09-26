@@ -2836,6 +2836,7 @@
     color: var(--err);
   }
   .msg.agent {
+    position: relative;
     padding: 2px 0;
   }
   /* A settled message and its hover rail are one inline flow: the rail
@@ -2851,15 +2852,20 @@
   .msg.agent > :global(.md > p:last-child) {
     display: inline;
   }
-  /* On a line of its own — after a code block, a table, a figure the prose
-     embeds — the rail sits at the right edge: a signature under the message,
-     not a stray timestamp between a figure and whatever follows the turn. */
+  /* When the rail cannot follow the last word — the message ends with a
+     code block, a table, a figure the prose embeds — it floats at the
+     message's bottom-right corner on hover and takes no line of its own,
+     so nothing sits between the figure and whatever follows the turn. A
+     page-coloured backing keeps it legible over a full-width block. */
   .msg.agent:not(:has(> :global(.md > p:last-child))) :global(.agent-message-meta),
   .msg.agent:has(> :global(.md > p:last-child > .md-embed)) :global(.agent-message-meta) {
-    display: flex;
-    justify-content: flex-end;
-    width: 100%;
+    position: absolute;
+    right: 0;
+    bottom: 2px;
     margin-left: 0;
+    padding: 0 4px;
+    border-radius: 6px;
+    background: var(--bg);
   }
   .msg.agent.streaming :global(.agent-message-meta) {
     display: none;
