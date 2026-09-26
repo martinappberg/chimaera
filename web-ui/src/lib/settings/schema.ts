@@ -363,11 +363,14 @@ const DEFS = {
     step: 0.05,
     scope: "client",
   },
+  // Keyed `chat.*` from when only the transcript read it; it now caps every
+  // reading column, so it sits with the window-wide Appearance choices. The
+  // key stays: stored values and the wire never see the category.
   "chat.contentWidth": {
-    title: "Content Width",
-    category: "Chat",
+    title: "Reading Width",
+    category: "Appearance",
     description:
-      "The ceiling, in pixels, for the chat transcript (with its composer and live work trays) and for a Markdown document's reading column. Each column is 48em of its own text — about a hundred characters, so a bigger font keeps its line length — and never wider than this. Narrower panes still fit their available space.",
+      "The widest a reading column gets, in pixels: the chat transcript (with its composer and live work trays) and a Markdown document alike. Each column is 48em of its own text — about a hundred characters, so a bigger font keeps its line length — and never wider than this. Narrower panes still fit their available space.",
     type: "integer",
     default: 832,
     min: 480,

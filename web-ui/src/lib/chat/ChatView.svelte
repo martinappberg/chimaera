@@ -2592,7 +2592,7 @@
     --text-md: var(--chat-font-size);
     /* The transcript's column: 48em of the message text — Claude.ai's
        reading measure, ~100 characters — so a bigger font keeps its line
-       length, capped by the Content Width setting (--chat-measure). The
+       length, capped by the Reading Width setting (--chat-measure). The
        document views use the same rule (previews/MarkdownView). */
     --chat-column: min(calc(48 * var(--chat-font-size)), var(--chat-measure));
     --text-lg: calc(var(--chat-font-size) + 2px);

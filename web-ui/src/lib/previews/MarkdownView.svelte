@@ -185,8 +185,8 @@
   /** The rendered document shows — reading, and live until a double-click.
    *  Every display decision reads THIS; `mode` is the tab. */
   const render = $derived(mode === "reading" || (mode === "live" && !editing));
-  /** The reading column's ceiling: the chat transcript's measure (Content
-   *  Width) — a document is never wider than a transcript. The column
+  /** The reading column's ceiling: the chat transcript's measure (Reading
+   *  Width, under Appearance) — a document is never wider than a transcript. The column
    *  itself is 48em of the document font (`.md-body`), so it keeps its
    *  characters per line through A−/A+. */
   const columnCap = $derived(getSetting("chat.contentWidth"));
@@ -1809,7 +1809,7 @@
     /* The text column is 48em of the document font — Claude.ai's reading
        column; ~650px at the 13.5px default, ~100 characters — so A−/A+
        keeps the line length, and it never exceeds the chat transcript's
-       measure (Content Width, --doc-measure on the root): a document reads
+       measure (Reading Width, --doc-measure on the root): a document reads
        like a transcript on a wide pane, not wider. 70ch minus this padding
        was ~460px of text: cramped on a desktop pane. Plus this box's side
        padding. The properties card and the live editor's column match

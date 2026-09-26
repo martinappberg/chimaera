@@ -1274,7 +1274,7 @@ const liveTheme: Extension = EditorView.theme({
     lineHeight: "var(--lp-line-height, 1.6)",
   },
   // The reading view's column (MarkdownView .md-body): 48em of the document
-  // font, capped by the chat transcript's measure (Content Width, set on the
+  // font, capped by the chat transcript's measure (Reading Width, set on the
   // view root as --doc-measure), plus this box's side padding.
   "&.cm-md-live .cm-content": {
     flex: "0 1 auto",
