@@ -57,9 +57,8 @@ tools ride the per-session MCP endpoint ([linked-terminals.md](linked-terminals.
   - **Pre-allowed at spawn:** claude — `mcp__chimaera__<tool>` in the generated settings'
     `permissions.allow` (chat and TUI); codex chat — the driver's `mcp_auto_approve`; codex
     TUI — `-c mcp_servers.chimaera.url=…` + `bearer_token_env_var="CHIMAERA_MCP_KEY"` (the key
-    in the PTY env, never argv) + per-tool `approval_mode="approve"` (live: the TUI connects
-    and lists the tools; that `approve` suppresses its per-call prompt is unconfirmed —
-    PROTOCOL.md Pass 32). **A codex TUI gets the chimaera MCP server at all only while a
+    in the PTY env, never argv) + per-tool `approval_mode="approve"` (live: a pre-approved
+    tool runs with no prompt, a linked-terminal tool still asks — PROTOCOL.md Pass 32). **A codex TUI gets the chimaera MCP server at all only while a
     plugin with tools is active in its workspace** — with none on, its argv is unchanged.
     Pre-allows are baked at spawn: a claude session or codex chat started before the switch
     sees the tools (tools/list is per call) but its agent asks per call, and a codex TUI

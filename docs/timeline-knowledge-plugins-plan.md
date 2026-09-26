@@ -547,8 +547,8 @@ Off by default; turning it on is the opt-in (no separate switch). Its card:
 - **Coverage, honestly:** claude chat/TUI — read, post, hinted, addressable;
   codex chat — read, post, pull-only; codex TUI — read, post, pull-only,
   via a `-c mcp_servers` injection that rides only while a plugin with
-  tools is active (live: `/mcp` lists it; whether the per-tool
-  `approval_mode="approve"` silences the prompt is still unconfirmed); subagents —
+  tools is active (live: the per-tool `approval_mode="approve"` runs
+  those tools with no prompt; other chimaera tools still ask); subagents —
   inherit the parent's tools, attributed to the parent, not addressable (no
   vendor exposes a running subagent to outside messages); shells — none.
 
