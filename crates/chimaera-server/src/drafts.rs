@@ -65,7 +65,14 @@ static DRAFTS_WRITE: Mutex<()> = Mutex::new(());
 struct StoredDraft {
     path: String,
     base_hash: Option<String>,
+    /// When the daemon stored it (its clock): listing order and the fallback
+    /// recency of a draft written without `client_updated_ms`.
     updated_ms: u64,
+    /// When the writer's text last changed, by the writer's clock (the PUT's
+    /// `updated_ms`). The browser compares it with its own IndexedDB copy's
+    /// time — like with like, whatever the skew between the two machines.
+    #[serde(default)]
+    client_updated_ms: Option<u64>,
     /// UTF-8 length of `text`.
     bytes: u64,
     text: String,
@@ -78,6 +85,8 @@ struct DraftMeta {
     path: String,
     base_hash: Option<String>,
     updated_ms: u64,
+    #[serde(default)]
+    client_updated_ms: Option<u64>,
     bytes: u64,
 }
 
@@ -250,13 +259,29 @@ pub(crate) struct PutDraftRequest {
     #[serde(default)]
     base_hash: Option<String>,
     text: String,
+    /// The writer's own time for this text (epoch ms, its clock). Taken as
+    /// any JSON value: a malformed one is dropped, never a 422 that would
+    /// lose the draft.
+    #[serde(default)]
+    updated_ms: Option<serde_json::Value>,
 }
 
-/// PUT /api/v1/fs/drafts {path, base_hash: string|null, text} — store (or
-/// replace) the draft for `path` and its listing sidecar. 204; 413 when
-/// `text` is over 1 MiB (UTF-8 bytes); 400 for an empty or overlong `path` /
-/// `base_hash`. Beyond 64 drafts or 16 MiB in total (both files counted) the
-/// least recently updated drafts are evicted.
+/// A client epoch-ms value, when it is one (a finite, non-negative number
+/// within JavaScript's safe integers).
+fn client_ms(value: Option<&serde_json::Value>) -> Option<u64> {
+    const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
+    value
+        .and_then(serde_json::Value::as_f64)
+        .filter(|v| (0.0..=MAX_SAFE_INTEGER).contains(v))
+        .map(|v| v as u64)
+}
+
+/// PUT /api/v1/fs/drafts {path, base_hash: string|null, text, updated_ms?} —
+/// store (or replace) the draft for `path` and its listing sidecar;
+/// `updated_ms` (the writer's clock) comes back as `client_updated_ms`. 204;
+/// 413 when `text` is over 1 MiB (UTF-8 bytes); 400 for an empty or overlong
+/// `path` / `base_hash`. Beyond 64 drafts or 16 MiB in total (both files
+/// counted) the least recently updated drafts are evicted.
 pub(crate) async fn put_draft(
     State(state): State<Arc<AppState>>,
     Json(body): Json<PutDraftRequest>,
@@ -287,6 +312,7 @@ pub(crate) async fn put_draft(
             path: body.path,
             base_hash: body.base_hash,
             updated_ms: now_ms(),
+            client_updated_ms: client_ms(body.updated_ms.as_ref()),
             text: body.text,
         };
         let contents = serde_json::to_vec(&stored).context("failed to encode draft")?;
@@ -294,6 +320,7 @@ pub(crate) async fn put_draft(
             path: stored.path.clone(),
             base_hash: stored.base_hash.clone(),
             updated_ms: stored.updated_ms,
+            client_updated_ms: stored.client_updated_ms,
             bytes: stored.bytes,
         })
         .context("failed to encode draft metadata")?;
@@ -330,8 +357,8 @@ fn read_meta(file: &Path, id: &str) -> Option<DraftMeta> {
         .ok()
 }
 
-/// GET /api/v1/fs/drafts — `{drafts: [{path, base_hash, updated_ms, bytes}]}`
-/// newest first, without text. Reads only the sidecars; a draft whose
+/// GET /api/v1/fs/drafts — `{drafts: [{path, base_hash, updated_ms,
+/// client_updated_ms, bytes}]}` newest first (by `updated_ms`), without text. Reads only the sidecars; a draft whose
 /// sidecar is missing or corrupt is skipped.
 pub(crate) async fn list_drafts(State(state): State<Arc<AppState>>) -> Response {
     let root = state.drafts_root.clone();
@@ -370,8 +397,9 @@ pub(crate) struct DraftQuery {
     path: String,
 }
 
-/// GET /api/v1/fs/draft?path= — `{path, base_hash, text, updated_ms}`, or 404
-/// when there is no (readable) draft for exactly this path.
+/// GET /api/v1/fs/draft?path= — `{path, base_hash, text, updated_ms,
+/// client_updated_ms}`, or 404 when there is no (readable) draft for exactly
+/// this path. `client_updated_ms` is null for a draft stored without one.
 pub(crate) async fn get_draft(
     State(state): State<Arc<AppState>>,
     Query(query): Query<DraftQuery>,
@@ -396,6 +424,7 @@ pub(crate) async fn get_draft(
                 "base_hash": draft.base_hash,
                 "text": draft.text,
                 "updated_ms": draft.updated_ms,
+                "client_updated_ms": draft.client_updated_ms,
             }))
             .into_response(),
             _ => json_error(StatusCode::NOT_FOUND, "no draft for this path"),

@@ -213,7 +213,7 @@ function reserveKeepalive(rec: DraftRecord): number {
   // UTF-8 never has fewer bytes than UTF-16 code units: skip encoding a
   // body that cannot fit anyway.
   if (rec.text.length > room) return 0;
-  const bytes = new TextEncoder().encode(draftPutBody(rec.path, rec.baseHash, rec.text)).length;
+  const bytes = new TextEncoder().encode(draftPutBody(rec.path, rec.baseHash, rec.text, rec.updatedMs)).length;
   if (bytes > room) return 0;
   keepaliveInFlight += bytes;
   return bytes;
@@ -222,7 +222,9 @@ function reserveKeepalive(rec: DraftRecord): number {
 async function sendPut(rec: DraftRecord, keepalive: boolean): Promise<JournalResult["remote"]> {
   const reserved = keepalive ? reserveKeepalive(rec) : 0;
   try {
-    const r = await mirrorWrite(() => fsDraftPut(rec.path, rec.baseHash, rec.text, reserved > 0));
+    const r = await mirrorWrite(() =>
+      fsDraftPut(rec.path, rec.baseHash, rec.text, rec.updatedMs, reserved > 0),
+    );
     if (r === "unsupported") remoteUnsupported = true;
     return r;
   } catch {
@@ -327,10 +329,16 @@ export async function clear(path: string, keepalive = false): Promise<void> {
 /**
  * The newest journaled draft for `path` across both layers, or null. When
  * both hold the same text the local copy wins (it may carry the base text).
+ * "Newest" compares writer clocks: the local record's `updatedMs` against the
+ * time the mirror's writer sent (`client_updated_ms`) — never the daemon's
+ * arrival stamp, which runs on another machine's clock and lags a queued or
+ * retried PUT. A mirror record without one (an older writer) falls back to
+ * that stamp.
  */
 export async function find(path: string): Promise<DraftRecord | null> {
   const [local, remote] = await Promise.all([localGet(path), remoteFind(path)]);
   if (remote === null) return local;
+  const remoteMs = remote.client_updated_ms ?? remote.updated_ms;
   const fromRemote: DraftRecord = {
     path,
     baseHash: remote.base_hash,
@@ -339,9 +347,9 @@ export async function find(path: string): Promise<DraftRecord | null> {
         ? local.baseText
         : null,
     text: remote.text,
-    updatedMs: remote.updated_ms,
+    updatedMs: remoteMs,
   };
   if (local === null) return fromRemote;
   if (local.text === remote.text) return local;
-  return remote.updated_ms > local.updatedMs ? fromRemote : local;
+  return remoteMs > local.updatedMs ? fromRemote : local;
 }
