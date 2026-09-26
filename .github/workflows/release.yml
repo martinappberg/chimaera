@@ -1,10 +1,11 @@
 name: release
 
 # NOT every merge cuts a release. scripts/version-bump.sh decides from the squash
-# SUBJECT (Conventional Commits): feat -> minor, fix|perf|revert -> patch, `!` ->
-# major, and refactor|chore|docs|test|ci|build|style (and [skip release]) -> NO
-# release. Subject-anchored on purpose, so a folded PR body can't flip the bump or
-# skip a release. Full policy + rationale: docs/agent-guides/releases.md (the single
+# SUBJECTS of every merge since the last v-tag (Conventional Commits): feat ->
+# minor, fix|perf|revert -> patch, `!` -> major, and
+# refactor|chore|docs|test|ci|build|style (and [skip release]) -> NO release; the
+# largest bump wins. Subject-anchored on purpose, so a folded PR body can't flip
+# the bump or skip a release. Full policy + rationale: docs/agent-guides/releases.md (the single
 # source); the bump logic is characterization-tested by scripts/version-bump.test.sh
 # in ci.yml. A single workflow does version + build + publish: a tag pushed by
 # GITHUB_TOKEN cannot trigger a second workflow, so the release cannot be split.
@@ -39,13 +40,19 @@ jobs:
       - id: bump
         run: |
           latest=$(git tag --list 'v*' --sort=-v:refname | head -1)
-          subject=$(git log -1 --pretty=%s)
-          result=$(bash scripts/version-bump.sh "$latest" "$subject")
+          # Every merge since the last release, not just this push: the
+          # `release` group keeps one waiting run and a newer push cancels
+          # it, so a merge that landed mid-release was otherwise never read.
+          if [ -n "$latest" ]; then range="$latest..HEAD"; else range=HEAD; fi
+          mapfile -t subjects < <(git log --first-parent --format=%s "$range")
+          echo "merges since ${latest:-the start}:"
+          printf '  %s\n' "${subjects[@]}"
+          result=$(bash scripts/version-bump.sh "$latest" "${subjects[@]}")
           if [ "$result" = "skip" ]; then
-            echo "no release for: $subject"
+            echo "no release"
             echo "release=false" >> "$GITHUB_OUTPUT"
           else
-            echo "releasing v$result (from: $subject)"
+            echo "releasing v$result"
             echo "release=true" >> "$GITHUB_OUTPUT"
             echo "version=$result" >> "$GITHUB_OUTPUT"
           fi
