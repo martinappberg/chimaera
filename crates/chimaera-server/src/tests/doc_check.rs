@@ -723,3 +723,36 @@ async fn agent_docs_installs_are_idempotent() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
+
+/// An install that wrote is announced like a save (the git panel and open
+/// previews refresh at once); a no-op install announces nothing.
+#[tokio::test]
+async fn agent_docs_install_announces_the_write() {
+    let home = test_dir("dc-home-touch");
+    let state = state_with_home(&home);
+    let ws = make_workspace(&state, "dc-touch-ws").await;
+    let root = lock(&state.workspaces).get(&ws).unwrap().root;
+    let mut touched = state.fs_touched.subscribe();
+    let install = || {
+        request(
+            &state,
+            Method::POST,
+            "/api/v1/agent-docs/install",
+            Some(serde_json::json!({"target": "agents_md", "workspace_id": ws})),
+        )
+    };
+    let (status, body) = install().await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["changed"], true);
+    let paths = touched.try_recv().expect("the write is announced");
+    assert!(
+        paths.iter().any(|p| *p == root.join("AGENTS.md")),
+        "{paths:?}"
+    );
+    let (_, body) = install().await;
+    assert_eq!(body["changed"], false);
+    assert!(
+        touched.try_recv().is_err(),
+        "a no-op install is not a write"
+    );
+}

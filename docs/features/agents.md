@@ -242,6 +242,9 @@ spawn.rs,recents.rs}`. Wire: `POST/GET/DELETE/PATCH /api/v1/sessions*`, `GET /ap
   only while it can be seen (window visible, its tab's layer active), debounced after a disk
   change, and stays hidden when a check fails. Installs are atomic (temp, fsync, rename), refuse
   an existing file over 1 MiB or with an unmatched marker, and are idempotent (`changed: false`).
+  The `AGENTS.md` merge re-reads the file right before its rename, so an edit that landed
+  meanwhile (an agent, the user) is merged once more rather than overwritten, and a file that
+  keeps changing is refused; a write refreshes the git panel and open previews like a save.
   There is no Codex skill install; Codex reads the `AGENTS.md` section.
 
 ## Status: partial
