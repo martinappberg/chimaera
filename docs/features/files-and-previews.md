@@ -180,7 +180,10 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   reuses one for 3 s across opens) — a new tunnel port is a new origin with an empty IndexedDB.
   Opening a file whose draft differs from the disk shows "Recovered unsaved changes from …" with Restore /
   Discard, never a silent restore; a draft typed against an older disk version restores through
-  the merge. A save of exactly that text, or a discard, clears both copies; mirror writes for a
+  the merge. When both copies exist with different text the newer wins by the writers' own
+  clocks (each PUT carries the client's `updated_ms`, answered back as `client_updated_ms`), not
+  the daemon's arrival stamp, which runs on another machine's clock; a mirror copy from an older
+  client falls back to that stamp. A save of exactly that text, or a discard, clears both copies; mirror writes for a
   path land in issue order, so a late journal write never re-creates a cleared draft. A
   hide/pagehide flush sends drafts as keepalive requests only within a shared 56 KiB budget of
   encoded body bytes (the browser's keepalive quota); the rest go as normal requests, with the

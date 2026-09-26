@@ -215,7 +215,11 @@ export interface DraftBody {
   path: string;
   base_hash: string;
   text: string;
+  /** When the daemon stored it, by the DAEMON's clock. */
   updated_ms: number;
+  /** When the writer's text last changed, by the WRITER's clock (what it sent
+   *  as `updated_ms`); null from an older writer or daemon. */
+  client_updated_ms: number | null;
 }
 
 export type DraftPutResult = "ok" | "too-large" | "unsupported";
@@ -227,21 +231,23 @@ function draftsUnsupported(status: number): boolean {
 
 /** The JSON body of a draft PUT (drafts.ts weighs it against the browser's
  *  keepalive quota before asking for `keepalive`). */
-export function draftPutBody(path: string, baseHash: string, text: string): string {
-  return JSON.stringify({ path, base_hash: baseHash, text });
+export function draftPutBody(path: string, baseHash: string, text: string, updatedMs: number): string {
+  return JSON.stringify({ path, base_hash: baseHash, text, updated_ms: updatedMs });
 }
 
-/** Mirror a draft. `keepalive` lets a small body outlive a closing page. */
+/** Mirror a draft; `updatedMs` is this client's time for the text (an older
+ *  daemon ignores it). `keepalive` lets a small body outlive a closing page. */
 export async function fsDraftPut(
   path: string,
   baseHash: string,
   text: string,
+  updatedMs: number,
   keepalive = false,
 ): Promise<DraftPutResult> {
   const res = await api("/fs/drafts", {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
-    body: draftPutBody(path, baseHash, text),
+    body: draftPutBody(path, baseHash, text, updatedMs),
     keepalive,
     signal: AbortSignal.timeout(15_000),
   });
@@ -267,6 +273,7 @@ export async function fsDraftGet(path: string): Promise<DraftBody | null> {
       base_hash: typeof body.base_hash === "string" ? body.base_hash : "",
       text: body.text,
       updated_ms: typeof body.updated_ms === "number" ? body.updated_ms : 0,
+      client_updated_ms: typeof body.client_updated_ms === "number" ? body.client_updated_ms : null,
     };
   } catch {
     return null; // not JSON (an older daemon's fallback), so not a draft
@@ -277,6 +284,7 @@ export interface DraftSummary {
   path: string;
   base_hash: string;
   updated_ms: number;
+  client_updated_ms?: number | null;
   bytes: number;
 }
 

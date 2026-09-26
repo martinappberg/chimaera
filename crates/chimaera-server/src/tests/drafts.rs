@@ -96,6 +96,74 @@ async fn drafts_round_trip_list_newest_first_and_delete_idempotently() {
     }
 }
 
+/// The writer's own clock (the PUT's `updated_ms`) is stored beside the
+/// daemon's arrival time and answered as `client_updated_ms`, so a client
+/// can compare it with its own copy's time. A draft without one (an older
+/// client) or with a malformed one answers null and is still stored.
+#[tokio::test]
+async fn drafts_keep_the_writers_clock_beside_the_daemons() {
+    let state = test_state();
+    let put = |path: &'static str, updated: serde_json::Value| {
+        let state = state.clone();
+        async move {
+            request(
+                &state,
+                Method::PUT,
+                "/api/v1/fs/drafts",
+                Some(serde_json::json!({
+                    "path": path, "base_hash": "h", "text": "t", "updated_ms": updated
+                })),
+            )
+            .await
+            .0
+        }
+    };
+    // A client clock far behind the daemon's.
+    assert_eq!(
+        put("/w/c.md", serde_json::json!(1_000)).await,
+        StatusCode::NO_CONTENT
+    );
+    for (path, bad) in [
+        ("/w/str.md", serde_json::json!("soon")),
+        ("/w/neg.md", serde_json::json!(-5)),
+    ] {
+        assert_eq!(put(path, bad).await, StatusCode::NO_CONTENT, "{path}");
+    }
+    let (status, _) = put_draft(&state, "/w/old.md", None, "t").await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (_, body) = request(&state, Method::GET, &draft_uri("/w/c.md"), None).await;
+    assert_eq!(body["client_updated_ms"], 1_000);
+    assert!(body["updated_ms"].as_u64().unwrap() > 1_000);
+    for path in ["/w/str.md", "/w/neg.md", "/w/old.md"] {
+        let (_, body) = request(&state, Method::GET, &draft_uri(path), None).await;
+        assert_eq!(body["client_updated_ms"], serde_json::Value::Null, "{path}");
+        assert_eq!(body["text"], "t");
+    }
+    let (_, body) = request(&state, Method::GET, "/api/v1/fs/drafts", None).await;
+    let listed: std::collections::HashMap<&str, &serde_json::Value> = body["drafts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| (d["path"].as_str().unwrap(), &d["client_updated_ms"]))
+        .collect();
+    assert_eq!(listed["/w/c.md"], &serde_json::json!(1_000));
+    assert_eq!(listed["/w/old.md"], &serde_json::Value::Null);
+
+    // A sidecar written before the field existed still lists.
+    std::fs::write(
+        meta_file(&state, "/w/old.md"),
+        br#"{"path":"/w/old.md","base_hash":null,"updated_ms":5,"bytes":1}"#,
+    )
+    .unwrap();
+    let (_, body) = request(&state, Method::GET, "/api/v1/fs/drafts", None).await;
+    assert!(body["drafts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|d| d["path"] == "/w/old.md" && d["client_updated_ms"].is_null()));
+}
+
 /// The listing reads only the small sidecars — never the (up to 1 MiB) draft
 /// files — and skips a draft whose sidecar is missing or corrupt.
 #[tokio::test]
