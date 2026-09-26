@@ -231,6 +231,7 @@
 
   const PHASE_LABEL: Record<ConnectProgress["phase"], string> = {
     probing: "probing for a running daemon…",
+    routing: "reaching the daemon's login node…",
     updating: "updating the daemon…",
     downloading: "downloading chimaera…",
     installing: "installing chimaera…",
@@ -283,7 +284,11 @@
     unlisteners.push(
       asyncDisposer(
         onConnectProgress((p) => {
-          phases = new Map(phases).set(p.alias, PHASE_LABEL[p.phase] ?? p.phase);
+          const label =
+            p.phase === "routing" && p.node !== undefined
+              ? `reaching the daemon on ${p.node}…`
+              : (PHASE_LABEL[p.phase] ?? p.phase);
+          phases = new Map(phases).set(p.alias, label);
         }),
       ),
     );
@@ -300,6 +305,9 @@
                   ...h,
                   status: e.status === "connected" ? "connected" : "disconnected",
                   local_port: e.status === "connected" ? (e.local_port ?? h.local_port) : null,
+                  // Authoritative on every connected event: a reconnect this
+                  // window didn't start may have re-routed the alias.
+                  node: e.status === "connected" ? (e.node ?? null) : h.node,
                 }
               : h,
           );
@@ -730,6 +738,11 @@
     if (secs < 86400) return `${Math.floor(secs / 3600)}h ago`;
     if (secs < 14 * 86400) return `${Math.floor(secs / 86400)}d ago`;
     return new Date(unixSecs * 1000).toISOString().slice(0, 10);
+  }
+
+  /** A login node's first label — "sh03-ln06" for "sh03-ln06.stanford.edu". */
+  function shortNode(node: string): string {
+    return node.split(".")[0] || node;
   }
 
   /** Shorten an absolute path with ~ for scanability. */
@@ -1250,6 +1263,12 @@
                       {/if}
                       {#if phase !== undefined}
                         <span class="phase">{phase}</span>
+                      {:else if h.status === "connected" && h.node}
+                        <span
+                          class="phase quiet"
+                          title="{h.alias} spans several login nodes; its daemon runs on {h.node}, so this connection is pinned there"
+                          >online · {shortNode(h.node)} · 127.0.0.1:{h.local_port}</span
+                        >
                       {:else if h.status === "connected"}
                         <span class="phase quiet">online · 127.0.0.1:{h.local_port}</span>
                       {:else}

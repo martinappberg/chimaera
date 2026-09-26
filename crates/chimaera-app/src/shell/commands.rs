@@ -705,6 +705,7 @@ pub(super) async fn connect_compute_session(
             error: None,
             reason: None,
             build: None,
+            node: None,
         },
     );
     Ok(())

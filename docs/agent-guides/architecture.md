@@ -100,10 +100,19 @@ on the alternate screen cannot restore the primary screen's scrollback
 - Claude's own `~/.claude/projects` JSONL transcripts are the agent's source of truth;
   chimaerad stores only an overlay (attention events, tags, Slurm links). Crash recovery is
   nearly free: cold-restart → re-attach every session via `--resume` with preserved cwd.
-- A tiny `~/.chimaera/manifest.json` (hostname, port, 0600 token, pid, version) lets clients
-  landing on a different round-robin login node discover and route to the node actually
-  running the daemon. **Validate this at your own center in week 1** — some sites don't allow
-  addressing individual login nodes.
+- A tiny `~/.chimaera/manifest.json` (hostname, port, 0600 token, pid, version) is the
+  registry. On a login-node pool (one round-robin name over nodes that share `$HOME`) every
+  node sees the same file, but its pid and loopback port mean something only on the node
+  that wrote it — so `connect`'s probe also reports the node it ran on (`uname -n`), and a
+  manifest another node wrote is never judged by that node's `kill -0`. Connect routes the
+  alias to the manifest's node instead (a per-alias `Route` in `chimaera-remote`: the node's
+  own `HostName` with the alias's ssh config when the laptop and the cluster resolve it to the
+  same address, else a `-W` leg through the alias's master), takes the liveness verdict there,
+  and pins every later ssh call for the alias to it (for the life of the process). Nothing is started unless the daemon is provably dead on its
+  node or the node's name no longer resolves inside the cluster; an unreachable node is an
+  honest error. Reaching another login node is a fresh ssh login — on a Duo cluster, one more
+  prompt (verified on Sherlock, 2026-09-25: login→login ssh isn't hostbased there). Sites
+  that don't allow addressing individual login nodes get the error, never a second daemon.
 - Resource discipline is a feature: <1 core steady-state, target ~150 MB RSS, no server-side
   rendering (tmux's CPU model, not zellij's ~4x), hard memory ceilings on preview extraction —
   Arbiter2-class login-node policing kills processes, and a Parquet spike must never take the

@@ -33,6 +33,11 @@ versions). Run `cargo test` in the app workspace too when you touch core deps.
   at mode 0600, then renamed, because it carries the bearer token. `Manifest.build`
   serde-defaults to an ancient sentinel so an
   old manifest still parses.
+- **A manifest's pid means something only on the node that wrote it.** HPC login
+  nodes share `$HOME`, so every node reads the same file: check `written_here()`
+  (`this_node()` vs `hostname`, via `same_node`) before trusting `is_alive()`, and
+  remove with `remove_if_owned()` (same node + pid + start) so a daemon never unlinks
+  another node's live record.
 - **`Handoff` is consume-once, ~120s fresh, 0600**, and is written by the **daemon
   on its own graceful shutdown** (a crash leaves none) — not by "the app/connect".
 - **`CHIMAERA_HOME` moves only the daemon's bookkeeping dirs.** Spawned shells/agents
