@@ -10,7 +10,8 @@ budget on shared login nodes.
 
 **Where it lives (shared):** UI `web-ui/src/lib/previews/` (`files.ts` loaders,
 `fileStore.svelte.ts` the content store, `CodeView`, `MarkdownView` + `mdDoc.ts` /
-`docLinks.ts`, `TableView`, `PdfView`, `ImageView`, `MediaView`, `HtmlView`, `BinaryView`,
+`docLinks.ts` / `mdLive.ts` and the markdown engine in `doc/` (`parser.ts`, `model.ts`,
+`render.ts`, `reader.ts`), `TableView`, `PdfView`, `ImageView`, `MediaView`, `HtmlView`, `BinaryView`,
 `NotebookView` + `notebook.ts`, `LogView` + `logText.ts`, `SlidesView` + `marp.ts`,
 `MermaidView`, `RawTextView`, `ansi.ts`, `FinderView`, `cm.ts`) +
 `web-ui/src/lib/workspace/FileTree.svelte` + glyphs in `web-ui/src/lib/shared/`
@@ -219,12 +220,22 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   `localStorage` (the 300 most recently opened; `mdDoc.ts` `createModeMemory`, every access
   guarded, so a private window just forgets) — else in the **Markdown Default Mode** setting
   (`editor.markdownDefaultMode`: reading, live or source; **reading** by default). Opening in
-  reading costs one request, the render: the source is fetched, and the editor mounted, on the
-  first live/source click. Files over the 1 MB edit cap and binary-content files always open
-  in reading and stay there (an editor click on one says why in the mode bar).
+  reading costs one request, the source (the store's first 256 KB chunk, which the editor
+  modes reuse; a source past it and under the 1 MB edit cap is read whole once): the editor
+  mounts on the first live/source click. Files over the 1 MB edit cap and binary-content
+  files always open in reading and stay there (an editor click on one says why in the mode
+  bar).
+  **One parser for every view** (`previews/doc/parser.ts`): lang-markdown's GFM language plus
+  the document extensions — `$`/`$$` math (`mdMath.ts`), comrak's single-tilde
+  strikethrough (`~x~` strikes like `~~x~~`, flanking by the same rules; three tildes are
+  text), footnote references and definitions (`[^id]`, `[^id]: …`, a definition's
+  continuation lines indented four columns), and Obsidian wikilinks (`[[note]]`,
+  `[[note|alias]]`, `[[note#heading]]`, `![[embed]]`). Live parses with it through
+  lang-markdown, reading through the same configured parser, so the two can't disagree
+  about what a line is.
   - **live** is an *editable reading view* — the shared CodeMirror editor
-    (`CodeView`) carrying the `mdLive.ts` extension set (`@codemirror/lang-markdown`, GFM
-    base): headings sized, emphasis/links/inline code styled, syntax marks hidden on every
+    (`CodeView`) carrying the `mdLive.ts` extension set (the shared parser, above):
+    headings sized, emphasis/links/inline code styled, syntax marks hidden on every
     line the selection doesn't touch, images/task-checkboxes/rules rendered as widgets
     (clicking a checkbox edits the source), blockquotes drawn as the shared quote card, and
     a small always-visible copy affordance on each fence line and quote card. **Equations**
@@ -255,50 +266,102 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
     whole from the `blocks` state field (`mdLive.ts`), built as data from the syntax tree
     (`mdTable.ts`) and turned into elements without any HTML injection; a wide one is a tab
     stop while it overflows, like chat's. Raw HTML and frontmatter stay as mono source, and so
-    does any construct the decorator can't render faithfully (reference links, multi-line
-    image syntax). **Mod+click follows links** (a plain click places the cursor) through the
-    same routing as reading, below — Mod+Shift+click opens a file link beside, and a
-    same-document `#heading` or `#L12` reveals its line in the editor (a heading is mapped to
-    its line through the daemon's render, so the slug is comrak's). Right-click gives the same
-    URL menu as reading.
-  - **reading** is the complete non-editable render: `GET /api/v1/fs/markdown?path=` →
-    `{html, frontmatter}` — server-side comrak GFM (+ `math_dollars`) → **ammonia-sanitized**
-    HTML (source cap 4 MB), fetched on first entry and refreshed in place on saves/agent
-    writes. `data-math-style` on `span` marks each LaTeX literal, which the client typesets
-    under the one KaTeX policy every surface shares (`shared/math.ts`, loaded on demand at the
-    first equation, memoized, time-sliced). The render also carries what the reading view
-    builds on (older daemons omit it, and each piece degrades to the old behavior):
-    - **Properties.** A leading `---` YAML block comes back as raw `frontmatter` text instead
-      of rendering as a rule and a heading, and shows as a compact, collapsible key/value
-      panel above the document (collapsed state remembered in this browser). A tiny tolerant
-      reader (`mdDoc.ts` `parseFrontmatter`, no YAML library) handles `key: value`,
-      `key: [a, b]`, `- item` lists, `|`/`>` blocks and true/false (a check box); a nested
-      value shows as its source, and a block it can't read at all shows whole as source.
-      Every value is text, never markup. Live mode keeps frontmatter as muted source.
+    does any construct the decorator can't render faithfully (reference links, footnotes,
+    wikilinks, multi-line image syntax). **Mod+click follows links** (a plain click places
+    the cursor) through the same routing as reading, below — Mod+Shift+click opens a file link
+    beside, and a same-document `#heading` or `#L12` reveals its line in the editor (the
+    heading is found in the buffer itself, unsaved edits included, with the slugs reading
+    gives it — `doc/render.ts` `anchorSourceLine`). Right-click gives the same URL menu as
+    reading.
+  - **reading** is the complete non-editable render, drawn **in the browser** by the shared
+    renderer (`previews/doc/`) from the document's *current* text: the editor's buffer once
+    the editor holds the file (unsaved edits included — a live keystroke shows the next time
+    reading does), else the file as last read, which the store refreshes on saves and agent
+    writes (`MarkdownView` `currentText`, the one seam). `model.ts` turns the syntax tree into
+    plain blocks with source ranges; `render.ts` draws them through one builder with two
+    targets — real elements (createElement/textContent; the only parsed markup is the
+    document's own raw HTML through DOMPurify, KaTeX and mermaid through their sanitized
+    helpers) and an HTML string for the parity tests. `reader.ts` keeps the article in step
+    **incrementally**: the parse reuses the previous tree (lezer fragments), and each
+    top-level block is keyed by its source plus what it reads from the rest of the document
+    (heading ids, footnote numbers, reference definitions) — a block whose key survives keeps
+    its DOM nodes and only its line numbers shift, so an agent rewriting one paragraph never
+    re-flows, re-decodes an image or re-typesets an equation elsewhere. Measured on a warm
+    tab: a 5,000-line document renders in about 90–120 ms, an edit to one paragraph in 7–15 ms,
+    a line inserted at the top (every block's lines shift) in about 18 ms. A file the client
+    can't hold — over the 1 MB edit cap, binary content, a source that can't be read — falls
+    back to the daemon's render: `GET /api/v1/fs/markdown?path=` → `{html, frontmatter}`,
+    comrak GFM (+ `math_dollars`, alerts, footnotes, heading ids, `sourcepos`) →
+    **ammonia-sanitized** HTML (source cap 4 MB), refreshed in place on saves/agent writes,
+    with the same markup (below), so the view's chrome and logic run on either. Equations
+    arrive as `span[data-math-style]` LaTeX literals in both, typeset under the one KaTeX
+    policy every surface shares (`shared/math.ts`, loaded on demand at the first equation,
+    memoized, time-sliced — the first 8 ms synchronously, the rest at idle).
+    **Parity** is pinned by one case list, `previews/doc/parity.fixture.json` (159 cases,
+    every construct): Vitest runs each through the client renderer's string target and the
+    Rust suite through comrak + ammonia (`fs.rs` `markdown_parity_tests`), under one
+    normalization; the few known divergences are named in the file (wikilinks exist only on
+    the client; the string target can't run DOMPurify, so the sanitizer cases are checked in
+    the browser). What the render carries:
+    - **Properties.** A leading `---` YAML block (`---` alone on line 1, a closer exactly
+      `---` within 200 lines, a `key:` line inside — the daemon's rule, `doc/model.ts`
+      `frontmatterOf`; live uses it too) is never body: it shows as a compact, collapsible
+      key/value panel above the document (collapsed state remembered in this browser). A
+      tiny tolerant reader (`mdDoc.ts` `parseFrontmatter`, no YAML library) handles
+      `key: value`, `key: [a, b]`, `- item` lists, `|`/`>` blocks and true/false (a check
+      box); a nested value shows as its source, and a block it can't read at all shows whole
+      as source. Every value is text, never markup. Live mode keeps frontmatter as muted
+      source.
     - **Alerts.** GitHub's `> [!NOTE]` / `[!TIP]` / `[!IMPORTANT]` / `[!WARNING]` /
-      `[!CAUTION]` arrive with comrak's `markdown-alert-*` classes and render as a tinted card
-      with a colored rule and a title row led by the type's glyph — semantic theme tokens
-      (`--syn-func`, `--syn-string`, `--rate`, `--warn`, `--err`), so every curated theme
-      restyles them.
-    - **Task boxes.** `- [x]` items arrive as `span.md-task[data-task=done|todo]` (the
-      sanitizer drops `<input>`), drawn as live's check box in place of the bullet; a done
-      item's own text is muted and struck through, as in live.
-    - **Anchors.** Heading and footnote ids carry GitHub's `user-content-` prefix, so a
-      document can't clobber the app's own ids; a `#my-heading` or `#fn-1` link finds
-      `user-content-my-heading` inside *this* document (never a global lookup — every open
-      document shares the page) and scrolls there without touching `location.hash`.
-    - **Line mapping.** Every block carries `data-sourcepos` (lines of the original file,
-      frontmatter included — the properties panel stands in for its lines). A selection's
-      reference chip now names the lines its two ends sit in, and a **reveal** (a `#L12`
-      link, `shared/reveal.ts`) scrolls to the tightest block holding the line and flashes
-      it — only while reading shows; in live/source the editor takes the reveal
-      (`acceptReveal` on `CodeView`).
+      `[!CAUTION]` (any case; a custom title after the marker; the marker right after the
+      quote's `> `, as comrak reads it) render as `div.markdown-alert.markdown-alert-<type>`
+      with a `p.markdown-alert-title`: a tinted card with a colored rule and a title row led
+      by the type's glyph — semantic theme tokens (`--syn-func`, `--syn-string`, `--rate`,
+      `--warn`, `--err`), so every curated theme restyles them.
+    - **Task boxes.** `- [x]` items render as `span.md-task[data-task=done|todo]` (never an
+      `<input>`; a raw checkbox becomes the same span), drawn as live's check box in place of
+      the bullet; a done item's own text is muted and struck through, as in live.
+    - **Footnotes.** `[^id]` references number in the order they are first made, as
+      `sup.footnote-ref > a[href="#fn-id"]`; the definitions gather at the end in
+      `section.footnotes`, each with a back-reference per reference; one nobody references is
+      dropped. The jumps work both ways.
+    - **Code.** Fences are highlighted by the same lezer highlighter live and the editor use
+      (`cm.ts` `codeHighlight`, so colors match), the grammar loaded lazily per language,
+      and painted in the same slices as equations (the first 8 ms with the render, so the
+      first screen and an edited fence arrive colored; the rest at idle) — a long document's
+      fences never paint in one task. A ```` ```mermaid ```` fence lays out as a
+      diagram (`shared/mermaid.ts`: its own lazy chunk, strict security level, sanitized
+      SVG), again on a theme change; one that won't parse shows its source under the parser's
+      message.
+    - **Raw HTML** in a document renders through DOMPurify under chat's policy (no `style`
+      tags or attributes; http(s) links open outside with no opener) narrowed to what the
+      daemon's ammonia allows — its tags and per-tag attributes, ids namespaced
+      `user-content-`, classes limited to the render's own, schemes limited to its list. An
+      HTML block that opens a wrapper around markdown (`<details>` ⏎ text ⏎ `</details>`, a
+      README's `<div align="center">`) is sanitized as one run with it, so the markdown lands
+      inside, as on the daemon.
+    - **Wikilinks** (read for Obsidian vaults; the daemon shows them as text) are links
+      carrying `data-wikilink`: `[[note]]` points at `note.md`, `#heading` at its slug, and a
+      click resolves it like any document link, by name in the workspace when it isn't beside
+      the document. `![[plot.png]]` embeds the image (found the same way); any other embed is
+      a file link.
+    - **Anchors.** Heading and footnote ids carry GitHub's `user-content-` prefix (heading
+      slugs GitHub's, `-1`, `-2` on repeats), so a document can't clobber the app's own ids;
+      a `#my-heading` or `#fn-1` link finds `user-content-my-heading` inside *this* document
+      (never a global lookup — every open document shares the page) and scrolls there
+      without touching `location.hash`.
+    - **Line mapping.** Every block element carries `data-sourcepos` (lines of the original
+      file, frontmatter included — the properties panel stands in for its lines; raw HTML
+      gets its block's). A selection's reference chip names the lines its two ends sit in,
+      and a **reveal** (a `#L12` link, `shared/reveal.ts`) scrolls to the tightest block
+      holding the line and flashes it — only while reading shows; in live/source the editor
+      takes the reveal (`acceptReveal` on `CodeView`).
     **Tables scroll, never squeeze** — one recipe shared with the chat transcript and the
     live mode's table widget (`web-ui/src/app.css`, "Markdown tables"; [chat mode](chat-mode.md))
     minus their host wrapper: the `<table>` itself is the horizontal scroller, so a table whose
     columns can't fit the reading column scrolls in place (prose cells still wrap at spaces).
-    GFM `:--:` / `--:` alignment is honoured through the `align` attribute comrak emits and the
-    sanitizer keeps; numerals are tabular. Unlike chat, headers wrap like any cell, and a
+    GFM `:--:` / `--:` alignment is honoured through the `align` attribute both renders write
+    (as comrak does); numerals are tabular. Unlike chat, headers wrap like any cell, and a
     hand-written `<table>` in the file gets the same scroller (the sanitizer still reshapes it:
     no `tfoot`, no `width` / `style`). A table, fence or display equation wider than the column
     is a tab stop while it overflows (`shared/scrollRegion.ts`, re-checked on pane resize, text
@@ -310,11 +373,21 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
     `extra` compartment — never a remount, so the buffer, undo history, and dirty state
     survive every toggle; the file is only written on Cmd/Ctrl+S).
 
+  **The outline** (the mode bar's `outline` toggle, open or closed remembered in this
+  browser) lists the document's headings beside it, in every mode: reading reads them off
+  its render (the fallback's too), live and source off the editor's own syntax tree, with
+  the ids reading gives them (`doc/model.ts` `outlineOf`; frontmatter skipped). The
+  current heading — the one the view's top sits in, the last one in view at the very end —
+  follows the scroll; a click jumps (reading scrolls to it and flashes it, the editor
+  scrolls its line to the top without moving the cursor).
+
   **Links in documents open** (`previews/docLinks.ts`, both modes). A document-relative path
   (`other.md`, `../data/run.csv`, `figs/a%20b.png`, a local `file://` URL) resolves against
   the document's folder, a root-relative `/docs/x.md` also against the workspace root, and
   the daemon confirms it (`POST /fs/validate`, `strict`: only the exact join, so a broken
-  `b/spec.md` never opens `spec.md`) before anything opens; the file (or folder)
+  `b/spec.md` never opens `spec.md`) before anything opens — except a **wikilink**, which
+  names a note, not a path: it validates by name too (the window's workspace index, one
+  unique match; several say so), as Obsidian resolves it. The file (or folder)
   then opens through the shared opener (`shared/openPath.ts`, registered by the app) —
   Cmd/Ctrl+click or a middle-click opens it beside. `#L12` / `#L12-L20` opens the file at
   those lines (a reveal); `other.md#heading` opens the document and then scrolls to the
@@ -326,9 +399,11 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   Rendered documents carry the workbench's reading chrome: fenced code blocks and blockquotes
   get the same hover copy button as the chat transcript (`shared/copyDecor.ts`, one decorator
   for both surfaces), and **document-relative images** (a `figs/plot.png`-style src) resolve
-  against the file's directory through short-lived `/raw/` tickets (`rawTicketUrl`, memoized
-  so re-renders keep the `src` stable) — absolute URLs pass through untouched in reading
-  (the server sanitizer already constrains them), while live's image widgets render only
+  against the file's directory through short-lived `/raw/` tickets (`rawTicketUrl`, plus a
+  synchronous memo in `doc/reader.ts`, so a re-rendered block keeps its `src` and never
+  flashes; a relative src in raw HTML too, never requested from the app's origin first) —
+  http(s) URLs pass through, any scheme the daemon's sanitizer would strip (`data:`,
+  `file:`, `javascript:`) loses its src or href, while live's image widgets render only
   http(s)/`data:image` URLs and leave other schemes as source. The live mode mirrors all of
   it (quote cards, ticketed image widgets, fence + quote copy) inside the editor; raw HTML
   in a document is **never rendered** there — it stays visible source.
@@ -388,15 +463,28 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
 - **PDF / image / HTML.** Fetched via a short-lived **ticket**: `POST /api/v1/fs/ticket {path}` →
   `GET /raw/{ticket}` (no bearer header — iframes/`<img>`/pdf.js can't send one; ticket TTL 600s,
   range-aware). HTML is sandboxed (`CSP: sandbox allow-scripts`, no-referrer); SVG is sandboxed too.
+  **Caching over a tunnel:** a ticket is minted with the file's version token, and minting again
+  for the same path + version while it lives answers the *same* ticket (its expiry renewed) — so
+  the URL is stable for as long as the file is unchanged, and a re-render, a tab switch or a reload
+  reuses the browser's copy instead of re-downloading. `/raw` responses carry a strong `ETag`
+  (version + size), `Last-Modified` and `Cache-Control: private, max-age=<the ticket's remaining
+  life>`; after that the browser revalidates and `If-None-Match` answers **304**. A changed file
+  gets a new version, so a new ticket and a new URL: a cached copy never stands for new bytes.
   `PdfView`/`ImageView`/`HtmlView`. `ImageView` takes png, jpg, gif, webp, svg, bmp, ico and
   avif (formats every supported webview decodes). `HtmlView` carries a **preview | split | edit** toggle
   (`SplitEditPreview.svelte` owns the split geometry; a failed source fetch is retried on the
   next split/edit click);
   its split live-preview is a `sandbox="allow-scripts"` `srcdoc` iframe fed the (debounced) editor
-  buffer — same origin-less isolation. **Relative assets load in neither mode today:** `/raw` is
-  the single-segment `/raw/{ticket}`, so a page's `app.js` or `figs/a.png` 404s or falls through
-  to the app shell; only self-contained HTML (e.g. MultiQC) renders fully. The planned fix is a
-  directory-scoped `/raw/{ticket}/{*path}` ([plan](../document-workbench-plan.md#phase-4-embeds-in-documents-and-in-chat)).
+  buffer — same origin-less isolation. **Relative assets load in preview mode:** the frame loads
+  the page by its own name under its ticket (`/raw/{ticket}/report.html`), so a relative `app.js`
+  or `figs/a.png` lands on `GET /raw/{ticket}/{*rest}`, which serves files beside an HTML ticket's
+  page — downward only (plain visible components: no `..`, no absolute path, no `.hidden` name),
+  every component opened `O_NOFOLLOW` beneath the folder's descriptor (a symlink never leads out),
+  with the same sandbox CSP and cache rules. Only an HTML ticket opens its folder. No CORS header is
+  sent on purpose: the origin-less frame can *load* its neighbors (script, style, image, media
+  tags) but never *read* them with `fetch`/XHR, so a report cannot read out the files around it —
+  a report that fetches its data as JSON still needs it inline. The split live preview (`srcdoc`)
+  has no URL, so its relative assets still do not load.
   **PDF** runs on pdf.js's **legacy** build: the modern build calls `Map.prototype.getOrInsertComputed`
   on every render and range read, which WebKit (the macOS app) and Chromium before 145 lack, so its
   pages stayed blank. pdf.js's standard fonts, CMaps, wasm decoders and ICC profiles ship with our
@@ -618,6 +706,100 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   to 4 MB, *file info* to go back — and, on a remote host (the `host=` window rule the
   downloads share), a **download** button; `FinderView` is a directory browser surface.
 
+## Embed cards
+
+- **What & when.** One card shows any file inside something else — agent prose in chat, a turn's
+  "made this turn" gallery, and (once the document renderer mounts them) markdown documents: a thin
+  header (file icon, name, the piece shown, **open in a pane** at that spot, **download** on a
+  remote host) over the file's own viewer in a compact mode. The target is standard markdown,
+  `![caption](path#fragment)`, with Obsidian's size hint (`![caption|400](plot.png)`).
+- **Bodies by kind.** Image (a `#xywh=x,y,w,h` region — pixels or `percent:` — drawn cropped);
+  PDF page (`#page=N`, one pdf.js page at the card's width, legacy build, ranged reads, a
+  `#page=N&xywh=` region in PDF points); code lines (`#L10-L30`, highlighted like notebook cells,
+  line numbers; a whole file shows its first lines); a table slice (`#row=a-b`, RFC 7111 — row 1 is
+  the header line when the file has one; `#sheet=S&range=A1:F20` for spreadsheets; else the first
+  rows); an HTML report (the sandboxed frame on the folder-scoped raw URL, fixed height, expand);
+  video/audio (`#t=start,end`, the browser seeks natively); a notebook cell (`#cell=N`, else the
+  first cell that drew a figure); a Marp slide (`#slide=N`); a markdown excerpt (`#heading`, else
+  the opening, clipped with a fade and **more**); a plain file or folder card for everything else.
+  Missing files show a dashed card that says so (and looks again when it comes back on screen);
+  failed loads say why, with **try again** — never a blank box.
+- **Remote budget.** `POST /api/v1/fs/resolve_targets {base, bases?, workspace_id?, targets}`
+  answers every target of a document in one round trip: canonical path, kind, size, version (the
+  `X-Mtime` token), `mtime_ms`, mime, image `width`/`height` read from ≤64 KB of header bytes (never
+  decoded; JPEG EXIF rotation honored), and a `/raw` ticket for the kinds loaded through one —
+  `{missing: true}` otherwise. Strict like document links (exact join onto `base`, then `bases`; an
+  absolute path as-is, a root-relative `/x` also under the workspace root); fragments are ignored
+  for resolution. ≤200 targets, 5 s budget, shared filesystem limiter. A card loads only near its
+  scroller's viewport, reserves its box from the answer's dimensions (nothing jumps), and while on
+  screen watches its file (inside the 64-path disk-monitor cap): an overwrite re-resolves it and
+  the new version's new ticket reloads the bytes; an unchanged file keeps its cached copy.
+- **Where.** `web-ui/src/lib/shared/embed/` — `EmbedCard.svelte` + one `*Body.svelte` per kind,
+  `embed.ts` (the resolve client, a per-frame batcher for absolute paths, kinds, raw URLs, crops),
+  `fragment.ts` (the fragment grammar), `mount.svelte.ts` (`mountEmbed(el, props) → {update,
+  destroy}` for renderers that own raw DOM); `crates/chimaera-server/src/embed.rs`.
+
+## Pointing at part of a file
+
+- **What & when.** Point at part of any file — lines, a PDF passage, a box on an image or PDF
+  page, table cells, a media moment, a notebook cell, a slide — and hand exactly that to an agent.
+  The same **reference in agent** chip (and chord, `⇧⌘R` / `Ctrl+Shift+R`) as a code selection,
+  typed into the target agent's input and never submitted.
+- **How it's used.**
+  - **Code, diff, markdown reading:** select text. Markdown sends its source lines plus the heading
+    it sits under.
+  - **PDF:** select text (sends the page and the quote), or turn on the **select area** tool in the
+    bar (or Shift-drag) and draw a box: the page, the box in PDF points, the text under it, and a
+    PNG of it rendered from the page's vectors at 2×. Esc clears the box, then the tool.
+  - **Image:** the same area tool (or Shift-drag; a plain drag still pans): the box in the image's
+    own pixels and a PNG of exactly those pixels (an SVG drawn at 2×). The box and chip follow zoom.
+  - **CSV/TSV and spreadsheets:** select cells (or whole rows from the row numbers); the chip sits
+    under the block. The values go along as TSV, header first.
+  - **Video/audio:** the bar's **@ 0:12** button sends the playhead; **mark range** twice marks a
+    range, which the button (and the chord) then sends.
+  - **Notebook cell / slide:** hover it; its **@** button sends it, with its source or text.
+- **What the agent gets.** One line, `@<path>#<locator> (<context>) "<quote>"`, each part after the
+  path optional:
+
+  | Pointed at | Typed |
+  |---|---|
+  | code lines | `@src/a.py#L40-L58 "def filter(…"` |
+  | markdown lines | `@report.md#L11-L11 (§ Results) "The effect held…"` |
+  | PDF text | `@paper.pdf#page=1 "The effect held across…"` |
+  | PDF area | `@paper.pdf#page=3&xywh=72,272,320,220 "Figure 2: scores by group"` + the crop |
+  | image area | `@figs/umap.png#xywh=380,120,120,100` + the crop |
+  | table cells / rows | `@de.tsv#cell=6,2-10,4 "log2FC\tpadj\n2.05\t0.005…"`, `@de.tsv#row=13-15 "…"` |
+  | spreadsheet | `@book.xlsx#sheet=Q1%20Summary&range=D6:E7 "score\tnote\n2.5\tsecond…"` |
+  | media | `@talk.wav#t=3.5`, `@talk.wav#t=2,6.25` |
+  | notebook cell / slide | `@analysis.ipynb#cell=2 "import pandas…"`, `@deck.md#slide=2 "Results…"` |
+
+  The pixels: a **chat** target gets the crop as an image attachment (the pasted-screenshot
+  pipeline and its caps); a **terminal** agent (Claude, Codex, anything) gets it uploaded to the
+  session's landing pad (`POST /sessions/{id}/upload`, `ref-N.png`) and ` (region image: <path>)`
+  appended, so any agent can open it. A failed upload still types the locator; its chip says why.
+- **Where it lives.** `web-ui/src/lib/shared/locator.ts` (the fragment grammar, both directions,
+  and the TSV quote), `shared/reference.ts` (`FileSelection`'s `fragment` / `quote` / `context` /
+  `crop` / `label`, `composeSelectionReference`, `referenceNow`), `shared/ReferenceChip.svelte` +
+  `ReferenceButton.svelte`, `App.svelte` `referenceSelection` (the one handler: chat attach vs
+  terminal upload), the viewers (`PdfView`, `ImageView`, `TableView` + `XlsxView`, `MediaView`,
+  `NotebookView`, `SlidesView`, `MarkdownView`), region math in `previews/imageRegion.ts`. The
+  daemon's `fs/xlsx` reports the sheet's used-range `origin`, so A1 references are the sheet's own.
+- **Key behaviors.**
+  - **Locators are links too.** The same fragments open at the spot from chat, a terminal, or a
+    document link (`fileRef.ts` via `locator.ts`, `docLinks.ts`): a PDF page and box, an image
+    box (`percent:` too), a media time (a range plays to its end, then pauses), table rows and
+    cells (jump, flash, outline), a sheet and A1 range, a notebook cell, a slide.
+  - **Table rows are RFC 7111's**, as embed cards read them: the header line is row 1, so the
+    grid's rows 5–9 go out as `#row=6-10` (a header-less format such as BED counts from its first
+    record), and a `#row=` link lands back on the grid's own numbers. Spreadsheet A1 follows the
+    sheet: a table whose used range starts at C4 references D6, not B2.
+  - **Quotes are one line and capped.** Text quotes are the usual ~200-character excerpt. A table
+    block's TSV escapes tabs and newlines as `\t` and `\n` (a real one would drive a terminal
+    agent's input) and stops at 50 rows × 20 columns or 8 KB with an honest `…`; rows not loaded
+    say so the same way. Crops cap at 1568 px on the long side.
+  - **One selection at a time.** A newer selection anywhere replaces a box or block's chip; a
+    one-click button (cell, slide, moment) publishes, sends and lets go.
+
 ## Preview keep-alive & live-update
 
 - **What & when.** A pane keeps recently-viewed rendered views alive (hidden, not destroyed) across
@@ -679,8 +861,9 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   while PDF/spreadsheet/binary surfaces remount on the new token. An editor buffer is never
   clobbered: it retains its path (so a dirty buffer stays watched with no view mounted) and
   reconciles a moved token by reading the whole file — reload when clean, merge or conflict when
-  dirty (see *Raw reads & lightweight editing* above). Chat artifact cards memoize their `/raw` ticket (`rawTicketUrl`) so a cached output
-  image doesn't re-fetch and re-decode (the flash) on re-render.
+  dirty (see *Raw reads & lightweight editing* above). Embed cards (below) keep a cached output
+  image from re-fetching and re-decoding (the flash) on re-render: the daemon hands back the same
+  `/raw` ticket for an unchanged file, so the `<img>` URL is stable and the browser's copy answers.
 
 ## File & folder glyphs
 
@@ -795,3 +978,15 @@ _Intent pending — drafted from the maintainer's request, 2026-09-06; questionn
 - **Pending.** The three-level sticky cap, the hover-lit parent guide, and the collapse-all
   placement beside the filter have not been confirmed with the maintainer — capture via
   **capture-feature-intent** when available.
+
+### Pointing at part of a file — why it exists
+_Intent pending — drafted from the maintainer's request, 2026-09-26; questionnaire not yet run._
+
+- **Problem it solves (from the request).** "Reference parts of any file, even parts of images,
+  so it's super easy to interact with." Code selections already reached an agent; a figure, a PDF
+  passage, table cells or a moment in a recording did not, so the user described them in words.
+  Now pointing is the same gesture everywhere and the agent gets the exact spot (and the pixels).
+- **Pending.** The one-selection model (no basket of several spots), crops uploaded rather than
+  pasted into terminal agents, table fragments counting rows the RFC 7111 way (so they differ by
+  one from the grid's row numbers), and the chip-only affordance (no context menu) have not been confirmed
+  with the maintainer — capture via **capture-feature-intent** when available.

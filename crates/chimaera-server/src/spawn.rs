@@ -219,8 +219,9 @@ pub(crate) async fn spawn_session(
             ));
             // Register the record before spawning so no hook can beat it in.
             let mut record = crate::agents::AgentRecord::new(key, agent_kind);
-            // Claude forks a new session id on --resume; remember the ancestor
-            // so recents can hide (and later supersede) the old conversation.
+            // Older claude CLIs fork a new session id on --resume (2.1.283
+            // keeps it); remember the ancestor so recents can hide (and later
+            // supersede) the old conversation either way.
             record.resumed_from = resume.clone();
             // A carried-over title slots in as the provisional first-prompt
             // name: it loses to any real title the agent produces, exactly

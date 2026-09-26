@@ -2200,6 +2200,101 @@ async fn remote_control_at_start_enables_after_the_handshake() {
     assert!(fx2.manager.kill("s-rcu"));
 }
 
+/// What a daemon restart would cut off is readable off the live session
+/// (the ledger snapshots it): the bridge, ultracode, background work, a
+/// running turn. The resurrection side round-trips too — ultracode comes
+/// back through the handshake without reading as a pick, and a daemon-sent
+/// message journals with its origin.
+#[tokio::test]
+async fn carryover_reports_process_state_and_ultracode_restores() {
+    let fx = fixture();
+    let mut s = spec("s-carry", &fx.cwd, "background");
+    s.remote_control = Some("carry".into());
+    s.initial_ultracode = true;
+    fx.manager.spawn(&ClaudeAdapter, s).expect("spawn");
+    let att = fx.manager.attach("s-carry", 0).expect("attach");
+    let mut seen: Vec<Arc<SeqEvent>> = att.replay.clone();
+    let mut rx = att.live;
+    wait_for(&mut rx, &mut seen, "ultracode read-back", |ev| {
+        matches!(
+            ev,
+            AgentEvent::EffortState {
+                ultracode: true,
+                chosen: false,
+                ..
+            }
+        )
+    })
+    .await;
+    // The bridge and the ultracode read-back race after the handshake.
+    let connected = |ev: &AgentEvent| {
+        matches!(
+            ev,
+            AgentEvent::RemoteControl {
+                state: RemoteControlState::Connected,
+                ..
+            }
+        )
+    };
+    if !seen.iter().any(|e| connected(&e.ev)) {
+        wait_for(&mut rx, &mut seen, "RemoteControl connected", connected).await;
+    }
+
+    fx.manager
+        .command_as(
+            "s-carry",
+            AgentCommand::Send {
+                blocks: vec![ContentBlock::Text {
+                    text: "pick your work back up".into(),
+                }],
+            },
+            Some(chimaera_agent::model::ORIGIN_RESTART),
+        )
+        .await
+        .expect("send");
+    wait_for(&mut rx, &mut seen, "tagged echo", |ev| {
+        matches!(
+            ev,
+            AgentEvent::UserMessage { origin: Some(o), .. } if o == "restart"
+        )
+    })
+    .await;
+    wait_for(&mut rx, &mut seen, "TurnStarted", |ev| {
+        matches!(ev, AgentEvent::TurnStarted { .. })
+    })
+    .await;
+    wait_for(
+        &mut rx,
+        &mut seen,
+        "BackgroundTasks",
+        |ev| matches!(ev, AgentEvent::BackgroundTasks { tasks, .. } if tasks.len() == 1),
+    )
+    .await;
+    wait_for(&mut rx, &mut seen, "TurnCompleted", |ev| {
+        matches!(ev, AgentEvent::TurnCompleted { .. })
+    })
+    .await;
+
+    let carry = fx.manager.carryover("s-carry").expect("live session");
+    assert!(carry.remote_control, "{carry:?}");
+    assert!(carry.ultracode, "{carry:?}");
+    assert!(!carry.turn_in_flight, "the turn ended: {carry:?}");
+    assert_eq!(carry.background.len(), 1, "{carry:?}");
+    assert_eq!(carry.background[0].task_type, "local_bash");
+    assert!(carry.interrupted_work());
+
+    assert!(fx.manager.kill("s-carry"));
+    wait_for(&mut rx, &mut seen, "Exited", |ev| {
+        matches!(ev, AgentEvent::Exited { .. })
+    })
+    .await;
+    assert_eq!(
+        fx.manager.carryover("s-carry"),
+        Some(chimaera_agent::Carryover::default()),
+        "nothing outlives the process"
+    );
+}
+
 /// A user's model pick is remembered per agent kind (the daemon's prefs) so
 /// the next chat of that kind starts with it; a reroute (reason present) is
 /// not a pick and must not overwrite it. The store is durable: a fresh

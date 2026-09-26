@@ -80,6 +80,10 @@ pub struct SpawnSpec {
     /// pick when it differs from the agent's opening mode. The daemon's
     /// per-agent prefs feed it; `None` = the agent's own default.
     pub initial_mode: Option<String>,
+    /// Turn claude's session-scoped ultracode on after the handshake, like a
+    /// header pick but not recorded as one (a resurrected session had it on
+    /// when the daemon restarted). Codex has no ultracode and ignores it.
+    pub initial_ultracode: bool,
     /// The binary's `--version` line as the server probed it (`None` when
     /// the probe failed). Neither wire protocol offers a reliable version
     /// handshake (see PROTOCOL.md), so the server-side probe is the source:
@@ -149,6 +153,7 @@ impl SpawnSpec {
             initial_model: None,
             initial_effort: None,
             initial_mode: None,
+            initial_ultracode: false,
             agent_version: None,
             rollback_turns: None,
             fork_at: None,
@@ -310,6 +315,16 @@ async fn deliver(sink: &mut JsonlSink, io: &DriverIo, step: DriverStep) -> Deliv
     Delivery::Ok
 }
 
+/// Whether a `--version` line names exactly the pinned version. The line is
+/// the CLI's own phrasing ("2.1.204 (Claude Code)", "codex-cli 0.142.5"), so
+/// compare whole tokens: a substring test passes 0.157.10 against a 0.157.1
+/// pin.
+fn version_matches_pin(detected: &str, tested: &str) -> bool {
+    detected
+        .split(|c: char| c.is_whitespace() || c == '(' || c == ')')
+        .any(|token| token.strip_prefix('v').unwrap_or(token) == tested)
+}
+
 /// Journal + broadcast the client-visible face of a startup failure, then the
 /// terminal `Exited`. The handshake-failure exit paths previously returned
 /// before any event reached the pump: the reason and stderr tail went only to
@@ -420,11 +435,9 @@ pub async fn run_driver<D: Driver>(driver: D, spec: SpawnSpec, mut io: DriverIo)
     // pinned TESTED_*_VERSION, but most updates stay compatible — refusing to
     // spawn would break every routine update. A daemon log line (never a chat
     // notice — unparsed frames already degrade visibly on their own) is the
-    // ready-made diagnosis when a drifted binary later misbehaves. Substring
-    // match because the probe line is the CLI's own phrasing
-    // ("2.1.204 (Claude Code)", "codex-cli 0.142.5").
+    // ready-made diagnosis when a drifted binary later misbehaves.
     if let Some(detected) = spec.agent_version.as_deref() {
-        if !detected.contains(driver.tested_version()) {
+        if !version_matches_pin(detected, driver.tested_version()) {
             tracing::warn!(
                 agent = driver.kind(),
                 detected,
@@ -525,6 +538,14 @@ pub async fn run_driver<D: Driver>(driver: D, spec: SpawnSpec, mut io: DriverIo)
             break;
         }
     }
+    // A stop WE initiated (kill, dead receiver, protocol error) SIGTERMs the
+    // child first: claude's handler ends its detached background work, where
+    // a bare stdin close leaves it running (see `ChildGuard::terminate`). A
+    // child that closed its own output is already on its way out and keeps
+    // its own exit status for the at-birth classification below.
+    if !matches!(exit, DriverExit::Clean(_)) {
+        guard.terminate();
+    }
     // Close stdin (the polite shutdown both protocols honor) so a child blocked
     // on read wakes, then reap with a bounded wait. A normally-exiting child
     // returns its real status at once; a lingerer is SIGKILLed after the grace.
@@ -552,5 +573,21 @@ pub async fn run_driver<D: Driver>(driver: D, spec: SpawnSpec, mut io: DriverIo)
     match exit {
         DriverExit::Clean(_) => DriverExit::Clean(status),
         other => other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::version_matches_pin;
+
+    #[test]
+    fn version_pin_matches_whole_tokens_only() {
+        assert!(version_matches_pin("2.1.283 (Claude Code)", "2.1.283"));
+        assert!(version_matches_pin("codex-cli 0.157.1", "0.157.1"));
+        assert!(version_matches_pin("codex-cli v0.157.1", "0.157.1"));
+        assert!(!version_matches_pin("codex-cli 0.157.10", "0.157.1"));
+        assert!(!version_matches_pin("codex-cli 0.157.1-alpha.2", "0.157.1"));
+        assert!(!version_matches_pin("12.1.283 (Claude Code)", "2.1.283"));
+        assert!(!version_matches_pin("", "2.1.283"));
     }
 }

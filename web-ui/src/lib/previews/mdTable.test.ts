@@ -1,12 +1,8 @@
-import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
 import { Text } from "@codemirror/state";
 import { describe, expect, it } from "vitest";
 
-import { mathExtension } from "./mdMath";
+import { docParser as parser } from "./doc/parser";
 import { alignments, completeRow, tableModel, type Inline, type TableModel } from "./mdTable";
-
-/** The live preview's grammar: GFM plus the file `$` dialect. */
-const parser = markdown({ base: markdownLanguage, extensions: [mathExtension] }).language.parser;
 
 function tables(src: string): TableModel[] {
   const doc = Text.of(src.split("\n"));
@@ -29,14 +25,18 @@ function flat(inline: Inline[]): string {
       switch (i.kind) {
         case "text":
           return i.text;
-        case "entity":
-          return i.source;
         case "math":
           return `$${i.source}$`;
         case "link":
           return `[${flat(i.children)}](${i.url})`;
         case "image":
           return `![${i.alt}](${i.url})`;
+        case "break":
+          return "\n";
+        case "html":
+        case "footnote":
+        case "wikilink":
+          return `{${i.source}}`;
         default:
           return `<${i.kind}>${flat(i.children)}</${i.kind}>`;
       }
@@ -123,16 +123,35 @@ describe("tableModel", () => {
     expect(cellsOf(t).slice(1)).toEqual([
       ["$E=mc^2$", "plain $5 and $10"],
       ["<code>a|b</code>", "$a | b$"],
-      ["&amp; &#x27;  x", "<b>raw</b>"],
+      // Entities decode into the text; a comment is nothing; a raw tag is
+      // its own node (the widget shows its source, the reader sanitizes).
+      ["& '  x", "{<b>}raw{</b>}"],
       [
         "![alt](fig.png)",
-        "[https://example.com](https://example.com) [www.example.org](www.example.org) [https://x.dev](https://x.dev)",
+        "[https://example.com](https://example.com) [www.example.org](http://www.example.org) [https://x.dev](https://x.dev)",
       ],
       ["[sp](https://e.com/x y)", "![i](a b.png)"],
     ]);
     expect(t.rows[0].cells[0].inline[0]).toEqual({ kind: "math", source: "E=mc^2", display: false });
-    expect(t.rows[2].cells[0].inline[0]).toEqual({ kind: "entity", source: "&amp;" });
+    expect(t.rows[2].cells[0].inline[0]).toEqual({ kind: "text", text: "& '  x" });
     expect(t.rows[3].cells[0].inline[0]).toMatchObject({ kind: "image", alt: "alt", url: "fig.png" });
+  });
+
+  it("resolves reference links through the document's definitions, else keeps their text", () => {
+    const src = "| a | b |\n|---|---|\n| [x][r] | [y] |\n";
+    const doc = Text.of(src.split("\n"));
+    let model: TableModel | null = null;
+    parser.parse(src).iterate({
+      enter: (n) => {
+        if (n.name !== "Table") return;
+        model = tableModel(n.node, doc, {
+          refs: (label) => (label === "R" ? { url: "/r", title: null } : null),
+        });
+        return false;
+      },
+    });
+    expect(model).not.toBeNull();
+    expect(cellsOf(model as unknown as TableModel)[1]).toEqual(["[x](/r)", "[y]"]);
   });
 
   it("keeps a quoted table's cells", () => {

@@ -12,6 +12,8 @@
  * The shapes agents are told to write, and the ones they write anyway:
  *   src/x.rs:12   src/x.rs:12:3   src/x.rs:12-20   src/x.ts(12,3)
  *   src/x.rs#L12  src/x.rs#L12-L20  src/x.rs#L12C3  file:///abs/x.rs
+ *   paper.pdf#page=3&xywh=72,90,200,120  data.csv#row=5-9  demo.mp4#t=12,20
+ *   (a locator: `locator.ts` parses it into the spot the viewer reveals)
  *   @src/x.ts (a Claude mention)  a/src/x.rs (a diff side: sent as written,
  *   the daemon strips the prefix when the path misses)  …/figs/plot.png (a
  *   TUI abbreviation: the tail is sent, the daemon suffix-matches it).
@@ -24,7 +26,8 @@
  * code span.
  */
 
-import type { Reveal } from "./reveal";
+import { isLocatorKey, parseLocator } from "./locator";
+import type { Locator, Reveal } from "./reveal";
 
 /** A parsed reference. Lines and columns are 1-based. */
 export interface FileRef {
@@ -34,6 +37,9 @@ export interface FileRef {
   col?: number;
   /** Last line of a range (`:12-20`, `#L12-L20`); always greater than `line`. */
   endLine?: number;
+  /** A non-line spot from a locator fragment (`#page=3`, `#xywh=…`,
+   *  `#t=…`, `#row=…`, `#sheet=…&range=…`, `#cell=…`, `#slide=…`). */
+  at?: Locator;
 }
 
 /** A reference found inside a longer string. */
@@ -338,6 +344,10 @@ export function findFileRef(text: string, opts: FileRefOptions = {}): FoundRef |
   }
   if (!qualifies(path, bare)) return null;
   ref.path = path;
+  if (anchor !== null && lineAnchor === null && ref.line === undefined) {
+    const at = parseLocator(anchor, path);
+    if (at !== null) ref.at = at;
+  }
   return { ref, start: s, end };
 }
 
@@ -350,14 +360,27 @@ export function parseFileRef(text: string, opts: FileRefOptions = {}): FileRef |
  *  full-width separators and corner quotes CJK prose uses without spaces
  *  (full-width parentheses stay: file names carry them, `資料（1）.pdf`). */
 const TOKEN_RE = /[^\s=|、，；。：「」『』【】〈〉《》]+/gu;
+/** A token that ends in `#page` (or another locator key) before an `=`
+ *  carries a locator: the token runs on through its `=`, `&` and `,`. */
+const LOCATOR_TAIL_RE = /#([A-Za-z]{1,8})$/;
+const LOCATOR_REST_RE = /[^\s|、，；。「」『』【】〈〉《》]*/y;
 /** Python tracebacks: `File "x.py", line 12` carries its line outside. */
 const TRACEBACK_LINE_RE = /^["']?,\s*line\s+(\d{1,7})\b/;
 
 /** Every reference in a run of prose or a terminal line, in order. */
 export function extractFileRefs(text: string, opts: { bare?: boolean } = {}): FoundRef[] {
   const out: FoundRef[] = [];
-  for (const m of text.matchAll(TOKEN_RE)) {
-    const found = findFileRef(m[0], { bare: opts.bare });
+  const re = new RegExp(TOKEN_RE.source, TOKEN_RE.flags);
+  for (let m = re.exec(text); m !== null; m = re.exec(text)) {
+    let token = m[0];
+    const key = LOCATOR_TAIL_RE.exec(token);
+    if (key !== null && text[re.lastIndex] === "=" && isLocatorKey(key[1])) {
+      LOCATOR_REST_RE.lastIndex = re.lastIndex;
+      const rest = LOCATOR_REST_RE.exec(text)?.[0] ?? "";
+      token += rest;
+      re.lastIndex += rest.length;
+    }
+    const found = findFileRef(token, { bare: opts.bare });
     if (found === null) continue;
     const start = m.index + found.start;
     const end = m.index + found.end;
@@ -372,7 +395,8 @@ export function extractFileRefs(text: string, opts: { bare?: boolean } = {}): Fo
 
 /** The spot to reveal once the file opens, when the reference names one. */
 export function revealOf(ref: FileRef | null | undefined): Reveal | undefined {
-  if (ref?.line === undefined) return undefined;
+  // The non-text viewers ignore `line` (1) when they have their own anchor.
+  if (ref?.line === undefined) return ref?.at !== undefined ? { line: 1, ...ref.at } : undefined;
   const r: Reveal = { line: ref.line };
   if (ref.endLine !== undefined) r.endLine = ref.endLine;
   if (ref.col !== undefined) r.col = ref.col;

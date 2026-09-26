@@ -69,11 +69,10 @@ pub(crate) struct ChatRecipe {
     /// native id of the first dropped turn. Preferred over the count —
     /// paginated threads refuse the deprecated rollback.
     pub(crate) revert_before_turn: Option<String>,
-    /// This spawn CREATES a conversation's chimaera session (fresh, resumed
-    /// from recents, resurrected) rather than respawning a live one (view
-    /// switch, rewind) — the only spawns where `chat.remoteControlAtStart`
-    /// applies, so a bridge the user turned off stays off across respawns.
-    pub(crate) remote_control_at_start: bool,
+    /// Whether this spawn turns claude's Remote Control bridge on.
+    pub(crate) remote_control: RemoteControlAtStart,
+    /// Resurrection only: claude's session-scoped ultracode was on.
+    pub(crate) carry_ultracode: bool,
     pub(crate) theme: String,
     /// Launch-scope prelude text (see `environment`). Carried on the recipe
     /// so a view-switch/rewind/degrade respawn keeps the launch scope; not
@@ -94,6 +93,22 @@ pub(crate) struct ChatRecipe {
     /// survives a daemon restart instead of resetting to "now". `None` on a
     /// fresh create / view-switch / rewind — the spawn stamps now.
     pub(crate) created_at_ms: Option<u64>,
+}
+
+/// Whether a chat spawn turns claude's Remote Control bridge on after the
+/// handshake. Codex's bridge lives on its app-server daemon: nothing to set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RemoteControlAtStart {
+    /// Respawning a live session (view switch, rewind): the new process
+    /// starts without a bridge, so one the user turned off stays off.
+    No,
+    /// Creating the chimaera session (fresh, resumed from Recents, or
+    /// resurrected from a ledger that predates the carryover): the user's
+    /// standing choice, `chat.remoteControlAtStart`.
+    Setting,
+    /// Resurrecting a session whose bridge was on when the daemon stopped —
+    /// whatever the setting says (a carried "off" resurrects as `No`).
+    Yes,
 }
 
 /// Signal-channel depth. Bounded (the repo forbids unbounded buffers on the
@@ -449,9 +464,12 @@ fn apply_chat_event(state: &Arc<AppState>, id: &str, ev: &AgentEvent) {
     // not fire under -p stream-json, so this is the chat path for every
     // agent (a hook duplicate would be a no-op — first write wins).
     if record.first_prompt.is_none() {
-        if let AgentEvent::UserMessage { text, .. } = ev {
+        // The daemon's restart note is not the user's words and must not
+        // name the conversation (a Remote Control message is theirs).
+        if let AgentEvent::UserMessage { text, origin, .. } = ev {
             let text = text.trim();
-            if !text.is_empty() {
+            if !text.is_empty() && origin.as_deref() != Some(chimaera_agent::model::ORIGIN_RESTART)
+            {
                 record.first_prompt = Some(text.to_string());
             }
         }
@@ -487,6 +505,13 @@ fn apply_chat_event(state: &Arc<AppState>, id: &str, ev: &AgentEvent) {
 /// session id (one attempt), otherwise retire the session like the PTY
 /// watcher would.
 async fn handle_chat_exit(state: &Arc<AppState>, id: &str, exit: DriverExit) {
+    // A daemon stop ends every live driver on purpose (`stop_all_for_exit`,
+    // after the ledger's final flush): those sessions resurrect on the next
+    // boot, so nothing here may retire, degrade or reroute them. A dead entry
+    // left in the registry this way is the lifecycle's to settle.
+    if state.stopping.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
     // A handshake failure may automatically degrade into a PTY, which is the
     // same non-atomic stop/mutate/respawn lifecycle as a user view switch.
     // Acquire that ownership atomically up front: the old check-then-insert in
@@ -1381,7 +1406,8 @@ async fn perform_switch(
         fork_at: None,
         rollback_turns: None,
         revert_before_turn: None,
-        remote_control_at_start: false,
+        remote_control: RemoteControlAtStart::No,
+        carry_ultracode: false,
         theme,
         prelude: launch_prelude,
         mastermind,
@@ -1768,7 +1794,8 @@ pub(crate) async fn rewind_session(
                 None
             },
             // A rewind respawns a live session: keep the user's bridge choice.
-            remote_control_at_start: false,
+            remote_control: RemoteControlAtStart::No,
+            carry_ultracode: false,
             theme,
             prelude: launch_prelude,
             portable_context,
@@ -2604,7 +2631,8 @@ pub(crate) async fn fork_session(
 
 /// Spawn (or respawn) a chat driver for `id` from a recipe. Shared by
 /// create_session and the view switch. `pinned_override` lets create pass a
-/// fresh --session-id uuid; resumes leave it None (claude forks a new id).
+/// fresh --session-id uuid; resumes leave it None (the id comes from
+/// `system/init`: older claude CLIs forked a new one on --resume).
 /// Seed a resumed session's fresh journal so `attach` replays the whole
 /// conversation before the live `Init` (the agents replay nothing over the
 /// wire). Two sources, in preference order:
@@ -2850,7 +2878,8 @@ pub(crate) async fn spawn_fresh_chat(
         fork_at: native_fork.as_ref().map(|(_, at)| at.clone()),
         rollback_turns: None,
         revert_before_turn: None,
-        remote_control_at_start: true,
+        remote_control: RemoteControlAtStart::Setting,
+        carry_ultracode: false,
         theme: spec.theme,
         prelude: spec.prelude.filter(|p| !p.trim().is_empty()),
         mastermind,
@@ -3001,7 +3030,8 @@ pub(crate) async fn spawn_chat_session(
             );
             let pinned = match (&pinned_override, &recipe.resume) {
                 (Some(uuid), _) => Some(uuid.clone()),
-                // Resume forks a NEW native id; it arrives via system/init.
+                // A resume's native id arrives via system/init (older claude
+                // CLIs forked a new one).
                 (None, Some(_)) => None,
                 (None, None) => Some(fresh_native_uuid()),
             };
@@ -3114,17 +3144,18 @@ pub(crate) async fn spawn_chat_session(
         // events (foreign auto-review threads are filtered in the driver).
         spec.initial_effort = initial_effort;
     }
-    // Remote Control at start (claude): the user's standing choice
-    // (`chat.remoteControlAtStart`), applied only to spawns that CREATE the
-    // chimaera session (`recipe.remote_control_at_start`) — a view-switch or
-    // rewind respawn keeps a bridge the user turned off, off. The driver
-    // enables it right after the handshake, or says why not where the CLI
-    // doesn't offer the bridge. Codex's bridge lives on its app-server
-    // daemon; nothing to set here.
-    if recipe.kind == AgentKind::Claude
-        && recipe.remote_control_at_start
-        && crate::lock(&state.settings).remote_control_at_start()
-    {
+    // Remote Control at start (claude; see `RemoteControlAtStart`). The
+    // driver enables it right after the handshake, or says why not where the
+    // CLI doesn't offer the bridge.
+    let remote_control = match recipe.remote_control {
+        RemoteControlAtStart::No => false,
+        RemoteControlAtStart::Yes => true,
+        RemoteControlAtStart::Setting => crate::lock(&state.settings).remote_control_at_start(),
+    };
+    if recipe.kind == AgentKind::Claude && recipe.carry_ultracode {
+        spec.initial_ultracode = true;
+    }
+    if recipe.kind == AgentKind::Claude && remote_control {
         // The bare name (the driver spells `chimaera · <name>`): the session's
         // display name as the rail shows it, or the workspace directory, plus
         // a short session suffix so concurrent chats in one workspace stay
@@ -3303,6 +3334,11 @@ pub(crate) async fn resurrect_chat(
     crate::lock(&state.session_workspaces).insert(entry.id.clone(), workspace.id.clone());
 
     let portable_context = recover_portable_context_from_disk(state, &entry.id, agent.kind).await;
+    // What the previous process held beyond the conversation (the ledger's
+    // carryover): the bridge and ultracode come back through the spawn; the
+    // work it was doing is reported to the agent once it is up (below).
+    let carry = agent.carryover.clone();
+    let resumed = resume.is_some();
     let recipe = ChatRecipe {
         workspace_root: root,
         workspace_id: workspace.id.clone(),
@@ -3316,7 +3352,12 @@ pub(crate) async fn resurrect_chat(
         fork_at: None,
         rollback_turns: None,
         revert_before_turn: None,
-        remote_control_at_start: true,
+        remote_control: match &carry {
+            Some(c) if c.remote_control => RemoteControlAtStart::Yes,
+            Some(_) => RemoteControlAtStart::No,
+            None => RemoteControlAtStart::Setting,
+        },
+        carry_ultracode: carry.as_ref().is_some_and(|c| c.ultracode),
         theme: entry.theme.clone(),
         // The ledger doesn't persist launch text: a resurrected session
         // re-runs the durable scopes (host ⊕ workspace) only.
@@ -3335,6 +3376,32 @@ pub(crate) async fn resurrect_chat(
             // a degrade-to-TUI that then exits). Without it a resurrected chat
             // would diverge from a created one.
             crate::agents::spawn_agent_watch(state.clone(), entry.id.clone());
+            // The restart ended the process that was running the turn and
+            // the background work, and neither agent restarts them on resume
+            // (the conversation survives, its processes do not). Tell the
+            // agent once, as a message it can act on (see `pickup_message`).
+            let enabled = crate::lock(&state.settings).resume_after_restart();
+            let pick_up = pickup_message(
+                &entry.id,
+                carry.as_ref(),
+                resumed,
+                mastermind_mode.is_some(),
+                enabled,
+                crate::session_view::now_ms(),
+            );
+            if let Some(text) = pick_up {
+                let send = chimaera_agent::model::AgentCommand::Send {
+                    blocks: vec![chimaera_agent::model::ContentBlock::Text { text }],
+                };
+                if let Err(err) = state
+                    .chat
+                    .command_as(&entry.id, send, Some(chimaera_agent::model::ORIGIN_RESTART))
+                    .await
+                {
+                    tracing::warn!(session = %entry.id, %err,
+                        "could not send the restart pick-up message");
+                }
+            }
             Ok(())
         }
         Err(e) => {
@@ -3369,6 +3436,136 @@ fn codex_mcp_auto_approve(
             None => Some(always.collect()),
         },
     }
+}
+
+/// Daemon stop (an update, `chimaera kill`, SIGTERM): end every live chat
+/// driver through the harness's stop — SIGTERM, stdin closed, `KILL_GRACE`,
+/// then SIGKILL — before the process exits, instead of the runtime's
+/// drop-time SIGKILL. The CLI's SIGTERM handler is what ends its background
+/// work: claude starts its shells detached (their own sessions), so a
+/// SIGKILLed claude leaves them running on the host — a dev server holding
+/// its port, a monitor's command that never ends — and the resumed agent
+/// would start each a second time (live-probed, PROTOCOL.md Pass 32). Runs
+/// after the ledger's final flush (so the carryover still says what was
+/// running) and with `stopping` set (so these exits retire nothing). Bounded
+/// by the grace plus a margin; stragglers are left to the runtime's kill.
+pub(crate) async fn stop_all_for_exit(state: &Arc<AppState>) {
+    let live: Vec<String> = state
+        .chat
+        .list()
+        .into_iter()
+        .filter(|c| c.alive)
+        .map(|c| c.id)
+        .collect();
+    if live.is_empty() {
+        return;
+    }
+    for id in &live {
+        state.chat.kill(id);
+    }
+    // Each driver bounds its own stop (SIGKILL after `KILL_GRACE`), so this
+    // wait only outlasts a stalled pump.
+    let stopped = || {
+        live.iter()
+            .all(|id| !state.chat.get(id).is_some_and(|c| c.alive))
+    };
+    match wait_until_freed(stopped, "chat agents still stopping at exit").await {
+        Ok(()) => tracing::info!(
+            stopped = live.len(),
+            "chat agents stopped for the daemon exit"
+        ),
+        Err(msg) => tracing::warn!("{msg}; leaving them to the runtime's kill"),
+    }
+}
+
+/// Pick-up messages closer together than this are a restart LOOP (a daemon
+/// crashing and resurrecting its chats over and over), not a series of
+/// updates — and each one starts a billed turn, so the repeat is withheld.
+const PICKUP_MIN_INTERVAL_MS: u64 = 10 * 60 * 1000;
+
+/// The message a resurrected chat gets about the work the restart cut off,
+/// or `None` when it gets none: nothing was cut off, the user turned the
+/// setting off, the conversation did not actually resume (a fresh boot has
+/// no memory of how that work was started), it is a Mastermind (the daemon
+/// never starts its turns — reactive-only, by design), or the last pick-up
+/// went out moments ago (a restart loop).
+fn pickup_message(
+    session: &str,
+    carry: Option<&chimaera_agent::Carryover>,
+    resumed: bool,
+    mastermind: bool,
+    enabled: bool,
+    now_ms: u64,
+) -> Option<String> {
+    let carry = carry.filter(|c| c.interrupted_work())?;
+    if !(enabled && resumed) || mastermind {
+        return None;
+    }
+    if carry.pickup_at_ms > 0 && now_ms.saturating_sub(carry.pickup_at_ms) < PICKUP_MIN_INTERVAL_MS
+    {
+        tracing::warn!(%session,
+            "restarted again within minutes of the last pick-up message; not sending another");
+        return None;
+    }
+    restart_message(carry)
+}
+
+/// The one message a resurrected chat gets when the restart cut its work
+/// off: what stopped, named the way the agent's own tool results named it
+/// (its labels, its task ids), and what to do about it. `None` when nothing
+/// was cut off — an idle chat just comes back idle.
+fn restart_message(carry: &chimaera_agent::Carryover) -> Option<String> {
+    if !carry.interrupted_work() {
+        return None;
+    }
+    let mut text = String::from(
+        "The Chimaera daemon hosting this session restarted, so this conversation \
+         was resumed in a new agent process.",
+    );
+    if carry.background.is_empty() {
+        text.push_str(
+            " Your last turn was cut off before it finished. Continue where you left off.",
+        );
+        return Some(text);
+    }
+    text.push_str(" Background work the previous process was running stopped with it:\n");
+    for task in &carry.background {
+        let kind = if task.monitor {
+            "Monitor"
+        } else {
+            match task.task_type.as_str() {
+                "local_bash" => "Background command",
+                "local_agent" | "remote_agent" => "Background agent",
+                "local_workflow" => "Workflow",
+                _ => "Background task",
+            }
+        };
+        // Agent-written, already capped at construction (BG_LABEL_MAX); one
+        // line each so the list stays a list.
+        let label = match task.workflow_name.as_deref() {
+            Some(name) if !name.is_empty() && name != task.description => {
+                format!("{name}: {}", task.description)
+            }
+            _ => task.description.clone(),
+        };
+        let label = label.split_whitespace().collect::<Vec<_>>().join(" ");
+        text.push_str(&format!("\n- {kind} \"{label}\" (id {})", task.id));
+    }
+    // Restoring is the default: offered a free choice ("whichever you still
+    // need"), a live Haiku just acknowledged and restarted nothing.
+    if carry.turn_in_flight {
+        text.push_str(
+            "\n\nYour last turn was also cut off before it finished.\n\nRestart each of \
+             these the same way you started it, unless it is clearly no longer needed (say \
+             which you skipped), then continue where you left off.",
+        );
+    } else {
+        text.push_str(
+            "\n\nRestart each of these the same way you started it, unless it is clearly no \
+             longer needed (say which you skipped).",
+        );
+    }
+    Some(text)
 }
 
 #[cfg(test)]
@@ -4290,7 +4487,8 @@ mod tests {
             fork_at: None,
             rollback_turns: None,
             revert_before_turn: None,
-            remote_control_at_start: false,
+            remote_control: RemoteControlAtStart::No,
+            carry_ultracode: false,
             theme: "dark".into(),
             prelude: None,
             mastermind: None,
@@ -4353,6 +4551,112 @@ mod tests {
             terminal_resume_handle(&record).as_deref(),
             Some("live-hook-native-id"),
             "a later hook-derived tip must outrank the ancestor"
+        );
+    }
+
+    /// The restart pick-up message: nothing to say for an idle chat (even
+    /// one whose bridge was on — that comes back by itself), and otherwise
+    /// the work named the way the agent's own tool results named it.
+    #[test]
+    fn restart_message_names_what_stopped() {
+        use chimaera_agent::{CarriedTask, Carryover};
+
+        let idle = Carryover {
+            remote_control: true,
+            ultracode: true,
+            ..Carryover::default()
+        };
+        assert_eq!(restart_message(&idle), None);
+
+        let turn_only = Carryover {
+            turn_in_flight: true,
+            ..Carryover::default()
+        };
+        let text = restart_message(&turn_only).expect("a cut-off turn");
+        assert!(text.contains("Your last turn was cut off"), "{text}");
+        assert!(text.contains("Continue where you left off"), "{text}");
+        assert!(!text.contains("Restart whichever"), "{text}");
+
+        let task = |id: &str, task_type: &str, description: &str| CarriedTask {
+            id: id.into(),
+            task_type: task_type.into(),
+            description: description.into(),
+            workflow_name: None,
+            monitor: false,
+        };
+        let mut watch = task("bm-1", "local_bash", "Watch CI\nfor PR 158");
+        watch.monitor = true;
+        let mut flow = task("wf-1", "local_workflow", "review the diff");
+        flow.workflow_name = Some("review-changes".into());
+        let background = Carryover {
+            background: vec![
+                task("b-1", "local_bash", "npm run dev"),
+                watch,
+                flow,
+                task("a-1", "local_agent", "survey the tests"),
+            ],
+            ..Carryover::default()
+        };
+        let text = restart_message(&background).expect("background work");
+        for line in [
+            "- Background command \"npm run dev\" (id b-1)",
+            "- Monitor \"Watch CI for PR 158\" (id bm-1)",
+            "- Workflow \"review-changes: review the diff\" (id wf-1)",
+            "- Background agent \"survey the tests\" (id a-1)",
+        ] {
+            assert!(text.contains(line), "missing {line:?} in {text}");
+        }
+        assert!(text.contains("Restart each of these"), "{text}");
+        assert!(text.contains("say which you skipped"), "{text}");
+        assert!(!text.contains("last turn"), "{text}");
+
+        let both = Carryover {
+            turn_in_flight: true,
+            ..background
+        };
+        let text = restart_message(&both).expect("both");
+        assert!(text.contains("Your last turn was also cut off"), "{text}");
+        assert!(text.contains("then continue where you left off"), "{text}");
+    }
+
+    /// Who gets a pick-up message: only a chat whose work was cut off, whose
+    /// conversation really resumed, that is not a Mastermind, with the
+    /// setting on — and not a second time within minutes (a restart loop
+    /// would otherwise start a billed turn on every crash).
+    #[test]
+    fn pickup_message_gates_and_withholds_a_restart_loop() {
+        use chimaera_agent::Carryover;
+
+        let now = 100 * PICKUP_MIN_INTERVAL_MS;
+        let cut_off = Carryover {
+            turn_in_flight: true,
+            ..Carryover::default()
+        };
+        let send = |carry: Option<&Carryover>, resumed, mastermind, enabled| {
+            pickup_message("s-1", carry, resumed, mastermind, enabled, now).is_some()
+        };
+        assert!(send(Some(&cut_off), true, false, true));
+        assert!(!send(None, true, false, true), "an older ledger");
+        assert!(
+            !send(Some(&Carryover::default()), true, false, true),
+            "nothing was cut off"
+        );
+        assert!(!send(Some(&cut_off), false, false, true), "booted fresh");
+        assert!(!send(Some(&cut_off), true, true, true), "a Mastermind");
+        assert!(!send(Some(&cut_off), true, false, false), "setting off");
+
+        let looping = Carryover {
+            pickup_at_ms: now - PICKUP_MIN_INTERVAL_MS / 2,
+            ..cut_off.clone()
+        };
+        assert!(!send(Some(&looping), true, false, true), "a restart loop");
+        let hours_later = Carryover {
+            pickup_at_ms: now - 2 * PICKUP_MIN_INTERVAL_MS,
+            ..cut_off
+        };
+        assert!(
+            send(Some(&hours_later), true, false, true),
+            "a later update picks up again"
         );
     }
 

@@ -2,6 +2,7 @@
   import Chevron from "../shared/Chevron.svelte";
   import Markdown from "./Markdown.svelte";
   import type { OpenPathFn, PathResolver } from "./paths";
+  import type { EmbedResolver } from "./embeds";
   import type { ChatBlock } from "./store.svelte";
 
   /**
@@ -17,6 +18,8 @@
     onOpenFile?: (path: string) => void;
     onOpenPath?: OpenPathFn;
     resolvePaths?: PathResolver;
+    /** Local images in the report render as embed cards. */
+    embeds?: EmbedResolver;
     visible?: boolean;
     sourceIndex?: number;
     sourceUid?: number;
@@ -26,6 +29,7 @@
     onOpenFile,
     onOpenPath,
     resolvePaths,
+    embeds,
     visible = true,
     sourceIndex,
     sourceUid,
@@ -111,7 +115,7 @@
   </div>
   {#if open && block.result !== null}
     <div class="report">
-      <Markdown text={block.result} streaming={false} {visible} {onOpenPath} {resolvePaths} />
+      <Markdown text={block.result} streaming={false} {visible} {onOpenPath} {resolvePaths} {embeds} />
     </div>
   {/if}
 </div>

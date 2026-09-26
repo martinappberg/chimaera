@@ -105,7 +105,7 @@ fn home_dir() -> anyhow::Result<PathBuf> {
 }
 
 /// Expand a leading `~` to the user's home directory; other paths pass through.
-fn expand_tilde(raw: &str) -> anyhow::Result<PathBuf> {
+pub(crate) fn expand_tilde(raw: &str) -> anyhow::Result<PathBuf> {
     if raw == "~" {
         return home_dir();
     }
@@ -198,7 +198,7 @@ fn gz_mime(path: &Path) -> mime_guess::Mime {
 /// Clients hold tokens across daemon restarts and upgrades, so the digest must
 /// be stable across Rust releases: SHA-256 over fixed-width little-endian
 /// fields, never `DefaultHasher` (whose algorithm std may change).
-fn mtime_token(meta: &std::fs::Metadata) -> String {
+pub(crate) fn mtime_token(meta: &std::fs::Metadata) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     let modified = meta
@@ -245,7 +245,7 @@ fn ascii_header(value: &str) -> HeaderValue {
 }
 
 /// 400 with a JSON error body.
-fn bad_request(err: &anyhow::Error) -> Response {
+pub(crate) fn bad_request(err: &anyhow::Error) -> Response {
     (
         StatusCode::BAD_REQUEST,
         Json(json!({"error": format!("{err:#}")})),
@@ -287,7 +287,7 @@ pub(crate) async fn dirs(Query(query): Query<DirsQuery>) -> Response {
 /// Run JSON-producing filesystem/preview work on a blocking thread. NFS and
 /// Lustre can stall even a metadata lookup, while gzip/markdown parsing is
 /// CPU-heavy; neither belongs on a Tokio worker.
-async fn blocking_json<F>(work: F) -> Response
+pub(crate) async fn blocking_json<F>(work: F) -> Response
 where
     F: FnOnce() -> anyhow::Result<serde_json::Value> + Send + 'static,
 {
@@ -2452,6 +2452,363 @@ mod markdown_tests {
     }
 }
 
+/// The reading view's parity corpus: every construct the client renderer
+/// (`web-ui/src/lib/previews/doc/`) draws, rendered here through comrak +
+/// ammonia and compared under one normalization — Vitest runs the client
+/// half over the same file with the same steps (`doc/parity.test.ts`).
+#[cfg(test)]
+mod markdown_parity_tests {
+    use super::*;
+
+    const PARITY_FIXTURE: &str =
+        include_str!("../../../web-ui/src/lib/previews/doc/parity.fixture.json");
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Divergence {
+        side: String,
+        reason: String,
+    }
+
+    /// Strict on purpose: a misspelled key would silently drop its pin.
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ParityCase {
+        note: String,
+        md: String,
+        html: String,
+        diverges: Option<Divergence>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ParityFixture {
+        about: Vec<String>,
+        cases: Vec<ParityCase>,
+    }
+
+    /// The only attributes compared: what the reading view's CSS and link,
+    /// anchor and task logic key on. Everything else (`data-sourcepos`,
+    /// `rel`, `title`, the math marker) is dropped.
+    const KEEP_ATTRS: &[&str] = &[
+        "align",
+        "alt",
+        "class",
+        "data-task",
+        "href",
+        "id",
+        "src",
+        "start",
+    ];
+
+    /// Whitespace next to these tags is layout, not content.
+    const BLOCK_TAGS: &[&str] = &[
+        "address",
+        "article",
+        "aside",
+        "blockquote",
+        "br",
+        "dd",
+        "details",
+        "div",
+        "dl",
+        "dt",
+        "figcaption",
+        "figure",
+        "footer",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "header",
+        "hr",
+        "li",
+        "ol",
+        "p",
+        "pre",
+        "section",
+        "summary",
+        "table",
+        "tbody",
+        "td",
+        "tfoot",
+        "th",
+        "thead",
+        "tr",
+        "ul",
+    ];
+
+    /// Named references the normalization decodes (numeric ones always):
+    /// the serializer's own plus the few the corpus writes.
+    const ENTITIES: &[(&str, &str)] = &[
+        ("amp", "&"),
+        ("lt", "<"),
+        ("gt", ">"),
+        ("quot", "\""),
+        ("apos", "'"),
+        ("nbsp", "\u{a0}"),
+        ("copy", "\u{a9}"),
+        ("hellip", "\u{2026}"),
+        ("mdash", "\u{2014}"),
+        ("ndash", "\u{2013}"),
+    ];
+
+    enum Token {
+        Text(String),
+        Tag {
+            name: String,
+            close: bool,
+            attrs: Vec<(String, String)>,
+        },
+    }
+
+    fn decode_entities(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut rest = s;
+        while let Some(i) = rest.find('&') {
+            out.push_str(&rest[..i]);
+            rest = &rest[i..];
+            let decoded = rest.find(';').and_then(|end| {
+                let name = &rest[1..end];
+                let ch = if let Some(num) = name.strip_prefix('#') {
+                    let code = match num.strip_prefix(['x', 'X']) {
+                        Some(hex) => u32::from_str_radix(hex, 16).ok(),
+                        None => num.parse().ok(),
+                    };
+                    code.and_then(char::from_u32).map(String::from)
+                } else {
+                    ENTITIES
+                        .iter()
+                        .find(|(n, _)| *n == name)
+                        .map(|(_, v)| (*v).to_owned())
+                };
+                ch.map(|c| (c, end + 1))
+            });
+            match decoded {
+                Some((text, len)) => {
+                    out.push_str(&text);
+                    rest = &rest[len..];
+                }
+                None => {
+                    out.push('&');
+                    rest = &rest[1..];
+                }
+            }
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// Tags and text; comments are dropped. A `<` that opens no tag is text.
+    fn tokenize(html: &str) -> Vec<Token> {
+        let b = html.as_bytes();
+        let mut tokens = Vec::new();
+        let mut text_from = 0;
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] != b'<' {
+                i += 1;
+                continue;
+            }
+            if html[i..].starts_with("<!--") {
+                tokens.push(Token::Text(html[text_from..i].to_owned()));
+                i = html[i..].find("-->").map_or(b.len(), |e| i + e + 3);
+                text_from = i;
+                continue;
+            }
+            let close = b.get(i + 1) == Some(&b'/');
+            let mut j = i + 1 + usize::from(close);
+            if !b.get(j).is_some_and(u8::is_ascii_alphabetic) {
+                i += 1;
+                continue;
+            }
+            let name_from = j;
+            while b.get(j).is_some_and(u8::is_ascii_alphanumeric) {
+                j += 1;
+            }
+            let name = html[name_from..j].to_ascii_lowercase();
+            let mut attrs = Vec::new();
+            let mut closed = false;
+            while j < b.len() {
+                match b[j] {
+                    b'>' => {
+                        j += 1;
+                        closed = true;
+                        break;
+                    }
+                    b' ' | b'\t' | b'\n' | b'\r' | b'/' => j += 1,
+                    _ => {
+                        let from = j;
+                        while j < b.len() && !b" \t\n\r=>/".contains(&b[j]) {
+                            j += 1;
+                        }
+                        let attr = html[from..j].to_ascii_lowercase();
+                        while j < b.len() && b" \t\n\r".contains(&b[j]) {
+                            j += 1;
+                        }
+                        let mut value = String::new();
+                        if b.get(j) == Some(&b'=') {
+                            j += 1;
+                            while j < b.len() && b" \t\n\r".contains(&b[j]) {
+                                j += 1;
+                            }
+                            let from = j;
+                            match b.get(j) {
+                                Some(&q @ (b'"' | b'\'')) => {
+                                    let end = html[j + 1..]
+                                        .find(q as char)
+                                        .map_or(b.len(), |e| j + 1 + e);
+                                    value = html[j + 1..end].to_owned();
+                                    j = (end + 1).min(b.len());
+                                }
+                                _ => {
+                                    while j < b.len() && !b" \t\n\r>".contains(&b[j]) {
+                                        j += 1;
+                                    }
+                                    value = html[from..j].to_owned();
+                                }
+                            }
+                        }
+                        attrs.push((attr, decode_entities(&value)));
+                    }
+                }
+            }
+            if !closed {
+                break;
+            }
+            tokens.push(Token::Text(html[text_from..i].to_owned()));
+            tokens.push(Token::Tag { name, close, attrs });
+            i = j;
+            text_from = j;
+        }
+        tokens.push(Token::Text(html[text_from..].to_owned()));
+        tokens
+    }
+
+    /// The corpus's normalization: lowercase tags, only [`KEEP_ATTRS`]
+    /// (sorted, `class` whitespace collapsed), entities decoded and
+    /// re-escaped one way, ASCII whitespace collapsed, whitespace beside a
+    /// block tag dropped, comments gone. `doc/parity.test.ts` mirrors it.
+    fn normalize(html: &str) -> String {
+        let is_block = |t: Option<&Token>| matches!(t, Some(Token::Tag { name, .. }) if BLOCK_TAGS.contains(&name.as_str()));
+        let tokens = tokenize(html);
+        let mut out = String::with_capacity(html.len());
+        for (k, token) in tokens.iter().enumerate() {
+            match token {
+                Token::Text(raw) => {
+                    let decoded = decode_entities(raw);
+                    let mut text = String::with_capacity(decoded.len());
+                    let mut space = false;
+                    for c in decoded.chars() {
+                        if matches!(c, ' ' | '\t' | '\n' | '\r' | '\u{c}') {
+                            space = true;
+                            continue;
+                        }
+                        if space {
+                            text.push(' ');
+                            space = false;
+                        }
+                        text.push(c);
+                    }
+                    if space {
+                        text.push(' ');
+                    }
+                    let mut text = text.as_str();
+                    if k == 0 || is_block(k.checked_sub(1).and_then(|p| tokens.get(p))) {
+                        text = text.trim_start_matches(' ');
+                    }
+                    if k + 1 == tokens.len() || is_block(tokens.get(k + 1)) {
+                        text = text.trim_end_matches(' ');
+                    }
+                    for c in text.chars() {
+                        match c {
+                            '&' => out.push_str("&amp;"),
+                            '<' => out.push_str("&lt;"),
+                            '>' => out.push_str("&gt;"),
+                            _ => out.push(c),
+                        }
+                    }
+                }
+                Token::Tag { name, close, attrs } => {
+                    out.push('<');
+                    if *close {
+                        out.push('/');
+                    }
+                    out.push_str(name);
+                    let mut kept: Vec<&(String, String)> = attrs
+                        .iter()
+                        .filter(|(k, _)| KEEP_ATTRS.contains(&k.as_str()))
+                        .collect();
+                    kept.sort_by(|a, b| a.0.cmp(&b.0));
+                    for (attr, value) in kept {
+                        let value = if attr == "class" {
+                            value.split_ascii_whitespace().collect::<Vec<_>>().join(" ")
+                        } else {
+                            value.clone()
+                        };
+                        out.push(' ');
+                        out.push_str(attr);
+                        out.push_str("=\"");
+                        out.push_str(&value.replace('&', "&amp;").replace('"', "&quot;"));
+                        out.push('"');
+                    }
+                    out.push('>');
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn normalization_is_the_documented_one() {
+        assert_eq!(
+            normalize("<P data-sourcepos=\"1:1-1:3\" CLASS=\" a  b \">x\n  y</P>\n<!-- c --><br />\nz &amp; &lt;&#65;&copy;"),
+            "<p class=\"a b\">x y</p><br>z &amp; &lt;A\u{a9}"
+        );
+        assert_eq!(
+            normalize("<a title=\"t\" href=\"/x?a=1&amp;b=2\" rel=\"noopener\">l</a> <em>e</em>"),
+            "<a href=\"/x?a=1&amp;b=2\">l</a> <em>e</em>"
+        );
+    }
+
+    #[test]
+    fn parity_corpus_matches_the_server_render() {
+        let fixture: ParityFixture =
+            serde_json::from_str(PARITY_FIXTURE).expect("the fixture parses");
+        assert!(!fixture.about.is_empty());
+        assert!(
+            fixture.cases.len() >= 80,
+            "the corpus covers every construct"
+        );
+        let mut failures = Vec::new();
+        for c in &fixture.cases {
+            if let Some(d) = &c.diverges {
+                assert!(
+                    matches!(d.side.as_str(), "client" | "server") && !d.reason.is_empty(),
+                    "{}: a divergence names its side and reason",
+                    c.note
+                );
+                if d.side == "server" {
+                    continue;
+                }
+            }
+            // The body only: `markdown_to_html` sets frontmatter aside, as
+            // the reading view's properties panel shows it instead.
+            let got = normalize(&sanitize_markdown(&markdown_to_html(&c.md)));
+            let want = normalize(&c.html);
+            if got != want {
+                failures.push(format!(
+                    "{}\n  md:   {:?}\n  want: {want}\n  got:  {got}",
+                    c.note, c.md
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+}
+
 #[derive(Deserialize)]
 pub(crate) struct TableQuery {
     path: String,
@@ -3064,6 +3421,10 @@ fn read_xlsx(
     Ok(json!({
         "sheets": sheets,
         "sheet": sheet_name,
+        // The used range's first cell (0-based row, column): the header row
+        // need not be row 1, and the UI writes A1 references for the user's
+        // selections from it.
+        "origin": range.start().map(|(row, col)| [row, col]),
         "columns": columns,
         "rows": rows,
         "offset": offset_rows,
@@ -3914,20 +4275,46 @@ pub(crate) async fn move_(
 /// In-memory store of short-lived raw-access tickets. A ticket is bound to
 /// one canonical file path and expires after [`TICKET_TTL`]; expired entries
 /// are purged on every create/lookup.
+///
+/// A ticket minted with a version (the `X-Mtime` token of the file when it
+/// was minted) is shared: minting again for the same path AND version while
+/// that ticket is alive answers the same ticket, its expiry pushed out a full
+/// TTL. The URL therefore stays stable for as long as the file does and
+/// someone keeps asking, which is what lets the browser cache (and the
+/// `ETag` revalidation behind it) work across re-renders and tab switches;
+/// a new version gets a new ticket, so a cached copy can never stand for a
+/// file that changed. A renewal is a bearer-authed request for a capability
+/// the caller could mint fresh anyway.
 #[derive(Default)]
 pub(crate) struct TicketStore {
     tickets: HashMap<String, Ticket>,
+    /// (path, version) -> the live ticket minted for it.
+    by_version: HashMap<(PathBuf, String), String>,
 }
 
 struct Ticket {
     path: PathBuf,
+    version: Option<String>,
     expires: Instant,
 }
 
 impl TicketStore {
-    /// Mint a ticket for `path`, valid for `ttl`.
-    fn create(&mut self, path: PathBuf, ttl: Duration) -> String {
+    /// Mint (or renew) a ticket for `path` at `version`, valid for
+    /// [`TICKET_TTL`]. `None` (the version could not be read) always mints.
+    pub(crate) fn mint(&mut self, path: PathBuf, version: Option<String>) -> String {
+        self.create(path, version, TICKET_TTL)
+    }
+
+    fn create(&mut self, path: PathBuf, version: Option<String>, ttl: Duration) -> String {
         self.purge();
+        if let Some(version) = &version {
+            if let Some(existing) = self.by_version.get(&(path.clone(), version.clone())) {
+                if let Some(ticket) = self.tickets.get_mut(existing) {
+                    ticket.expires = Instant::now() + ttl;
+                    return existing.clone();
+                }
+            }
+        }
         if self.tickets.len() >= MAX_TICKETS {
             // Expiries preserve creation order for a common TTL. Evicting the
             // soonest-to-expire capability keeps the store bounded while
@@ -3938,14 +4325,23 @@ impl TicketStore {
                 .min_by_key(|(_, ticket)| ticket.expires)
                 .map(|(key, _)| key.clone())
             {
-                self.tickets.remove(&oldest);
+                if let Some(evicted) = self.tickets.remove(&oldest) {
+                    if let Some(version) = evicted.version {
+                        self.by_version.remove(&(evicted.path, version));
+                    }
+                }
             }
         }
         let ticket = format!("t-{}", &chimaera_core::generate_token()[..32]);
+        if let Some(version) = &version {
+            self.by_version
+                .insert((path.clone(), version.clone()), ticket.clone());
+        }
         self.tickets.insert(
             ticket.clone(),
             Ticket {
                 path,
+                version,
                 expires: Instant::now() + ttl,
             },
         );
@@ -3955,13 +4351,24 @@ impl TicketStore {
     /// The path bound to `ticket`, if it exists and has not expired.
     /// Shared with the download module — same store, same capability model.
     pub(crate) fn lookup(&mut self, ticket: &str) -> Option<PathBuf> {
+        self.lookup_ttl(ticket).map(|(path, _)| path)
+    }
+
+    /// [`Self::lookup`] plus how long the ticket has left — the `max-age`
+    /// a `/raw` response may be cached for.
+    pub(crate) fn lookup_ttl(&mut self, ticket: &str) -> Option<(PathBuf, Duration)> {
         self.purge();
-        self.tickets.get(ticket).map(|t| t.path.clone())
+        let now = Instant::now();
+        self.tickets
+            .get(ticket)
+            .map(|t| (t.path.clone(), t.expires.saturating_duration_since(now)))
     }
 
     fn purge(&mut self) {
         let now = Instant::now();
         self.tickets.retain(|_, t| t.expires > now);
+        let tickets = &self.tickets;
+        self.by_version.retain(|_, id| tickets.contains_key(id));
     }
 
     /// Force a ticket to be already expired (test hook for the expiry path).
@@ -3980,15 +4387,41 @@ mod ticket_store_tests {
     #[test]
     fn ticket_store_evicts_oldest_at_hard_cap() {
         let mut store = TicketStore::default();
-        let first = store.create(PathBuf::from("/first"), TICKET_TTL);
+        let first = store.create(PathBuf::from("/first"), Some("v".into()), TICKET_TTL);
         for n in 1..=MAX_TICKETS {
-            store.create(PathBuf::from(format!("/{n}")), TICKET_TTL);
+            store.create(PathBuf::from(format!("/{n}")), None, TICKET_TTL);
         }
         assert_eq!(store.tickets.len(), MAX_TICKETS);
         assert!(
             store.lookup(&first).is_none(),
             "oldest ticket was not evicted"
         );
+        // Its version entry went with it: the next mint is a new ticket.
+        assert!(store.by_version.is_empty());
+        let again = store.create(PathBuf::from("/first"), Some("v".into()), TICKET_TTL);
+        assert_ne!(again, first);
+    }
+
+    #[test]
+    fn same_version_shares_a_ticket_and_a_new_version_does_not() {
+        let mut store = TicketStore::default();
+        let path = PathBuf::from("/plot.png");
+        let a = store.create(path.clone(), Some("1".into()), Duration::from_secs(5));
+        let b = store.create(path.clone(), Some("1".into()), TICKET_TTL);
+        assert_eq!(a, b, "an unchanged file keeps its URL");
+        // The renewal pushed the expiry out a full TTL.
+        let (_, left) = store.lookup_ttl(&a).unwrap();
+        assert!(left > Duration::from_secs(60), "{left:?}");
+        let c = store.create(path.clone(), Some("2".into()), TICKET_TTL);
+        assert_ne!(a, c, "a new version is a new URL");
+        // Unversioned mints never share.
+        let d = store.create(path.clone(), None, TICKET_TTL);
+        let e = store.create(path, None, TICKET_TTL);
+        assert_ne!(d, e);
+        // An expired ticket is never renewed.
+        store.expire(&c);
+        let f = store.create(PathBuf::from("/plot.png"), Some("2".into()), TICKET_TTL);
+        assert_ne!(c, f);
     }
 }
 
@@ -4002,13 +4435,20 @@ pub(crate) struct TicketRequest {
 /// (none of which can send Authorization headers) can fetch it via GET
 /// /raw/{ticket} (files only) or GET /download/{ticket}. The bearer token
 /// never appears in a URL. A ticket is a per-path snapshot: renaming the
-/// path afterwards makes the fetch 404, deliberately.
+/// path afterwards makes the fetch 404, deliberately. Minting again for an
+/// unchanged file answers the same ticket (see [`TicketStore`]).
 pub(crate) async fn create_ticket(
     State(state): State<Arc<AppState>>,
     Json(body): Json<TicketRequest>,
 ) -> Response {
-    let path = match tokio::task::spawn_blocking(move || canonical(&body.path)).await {
-        Ok(Ok(path)) => path,
+    let minted = tokio::task::spawn_blocking(move || {
+        let path = canonical(&body.path)?;
+        let version = std::fs::metadata(&path).ok().map(|m| mtime_token(&m));
+        anyhow::Ok((path, version))
+    })
+    .await;
+    let (path, version) = match minted {
+        Ok(Ok(minted)) => minted,
         Ok(Err(err)) => return bad_request(&err),
         Err(join) => {
             return (
@@ -4018,7 +4458,7 @@ pub(crate) async fn create_ticket(
                 .into_response();
         }
     };
-    let ticket = crate::lock(&state.tickets).create(path, TICKET_TTL);
+    let ticket = crate::lock(&state.tickets).mint(path, version);
     Json(json!({"ticket": ticket})).into_response()
 }
 
@@ -4061,32 +4501,205 @@ fn parse_byte_range(value: &str, total: u64) -> Option<Result<(u64, u64), ()>> {
 /// direct navigation should not run them either). Single byte ranges are
 /// honored (206/416; pdf.js fetches pages lazily this way). 404 on unknown
 /// or expired tickets, and on files that vanished since the ticket was minted.
+/// Cacheable for the ticket's remaining life, revalidated by `ETag` (see
+/// [`serve_raw`]).
 pub(crate) async fn raw(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(ticket): axum::extract::Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    let not_found = || (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response();
-    let Some(path) = crate::lock(&state.tickets).lookup(&ticket) else {
-        return not_found();
+    let Some((path, fresh_for)) = crate::lock(&state.tickets).lookup_ttl(&ticket) else {
+        return raw_not_found();
     };
-    let mut file = match tokio::fs::File::open(&path).await {
+    let file = match tokio::fs::File::open(&path).await {
         Ok(file) => file,
         Err(err) => {
             tracing::warn!(path = %path.display(), %err, "ticketed file unreadable");
-            return not_found();
+            return raw_not_found();
         }
     };
-    let total = match file.metadata().await {
+    let meta = match file.metadata().await {
         // Tickets may now name directories (folder downloads); /raw itself
         // stays file-only — a dir ticket here is a 404, not a listing.
-        Ok(meta) if meta.is_file() => meta.len(),
-        Ok(_) => return not_found(),
+        Ok(meta) if meta.is_file() => meta,
+        Ok(_) => return raw_not_found(),
         Err(err) => {
             tracing::warn!(path = %path.display(), %err, "ticketed file unstattable");
-            return not_found();
+            return raw_not_found();
         }
     };
+    serve_raw(file, &meta, &path, &headers, fresh_for).await
+}
+
+/// GET /raw/{ticket}/{*rest} — a file beside an HTML report, so the report's
+/// relative `app.js`, `style.css` or `figs/a.png` load inside its frame (the
+/// previews point the frame at `/raw/{ticket}/{its own name}`, which makes
+/// every relative URL land here). Only a ticket naming an HTML document
+/// opens its folder, and only downward: `rest` must be plain components (no
+/// `..`, no absolute path, no hidden `.name` anywhere), and every component
+/// is opened `O_NOFOLLOW` beneath the folder's descriptor
+/// ([`crate::download::open_beneath`]), so a symlink can never lead out of
+/// the subtree. Same sandbox CSP, range and cache rules as [`raw`]. The
+/// frame has no origin, so its scripts can LOAD these files (script, style,
+/// image, media tags) but never READ them with fetch/XHR — no CORS header is
+/// sent on purpose: a report must not be able to read out its neighbors.
+pub(crate) async fn raw_asset(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path((ticket, rest)): axum::extract::Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    let Some((path, fresh_for)) = crate::lock(&state.tickets).lookup_ttl(&ticket) else {
+        return raw_not_found();
+    };
+    if !opens_its_folder(&path) {
+        return raw_not_found();
+    }
+    let (Some(relative), Some(dir)) = (asset_relative(&rest), path.parent()) else {
+        return raw_not_found();
+    };
+    let dir = dir.to_path_buf();
+    let permit = FILESYSTEM_WORK
+        .acquire()
+        .await
+        .expect("filesystem work semaphore is never closed");
+    let target = relative.clone();
+    let opened = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        open_asset(&dir, &target)
+    })
+    .await;
+    let (file, meta) = match opened {
+        Ok(Ok(opened)) => opened,
+        _ => return raw_not_found(),
+    };
+    serve_raw(
+        tokio::fs::File::from_std(file),
+        &meta,
+        &relative,
+        &headers,
+        fresh_for,
+    )
+    .await
+}
+
+fn raw_not_found() -> Response {
+    (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response()
+}
+
+/// Whether a ticket's file opens its folder to [`raw_asset`]: HTML documents
+/// only (a report's page is what references neighbors by relative URL).
+fn opens_its_folder(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            ["html", "htm", "xhtml"]
+                .iter()
+                .any(|html| ext.eq_ignore_ascii_case(html))
+        })
+}
+
+/// `rest` as a relative path of plain, visible components, or `None`.
+/// Axum has already percent-decoded it, so `%2e%2e` arrives as `..` here.
+fn asset_relative(rest: &str) -> Option<PathBuf> {
+    if rest.is_empty() || rest.starts_with('/') || rest.contains('\0') {
+        return None;
+    }
+    let mut out = PathBuf::new();
+    for part in rest.split('/') {
+        // Empty (`a//b`), `.`, `..` and hidden names are all refused: a
+        // report has no business reaching `.git/` or `.env`.
+        if part.is_empty() || part.starts_with('.') {
+            return None;
+        }
+        out.push(part);
+    }
+    Some(out)
+}
+
+/// Open `relative` beneath `dir` without following any symlink, as a
+/// regular file (O_NONBLOCK: a planted FIFO must not park the worker).
+fn open_asset(dir: &Path, relative: &Path) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
+    let root = std::fs::File::from(rustix::fs::open(
+        dir,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )?);
+    let file = crate::download::open_beneath(
+        &root,
+        relative,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC
+            | rustix::fs::OFlags::NONBLOCK,
+    )?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    Ok((file, meta))
+}
+
+/// The strong `ETag` of a `/raw` response: the file's version token (the
+/// `X-Mtime` fingerprint) and its size.
+fn raw_etag(meta: &std::fs::Metadata) -> String {
+    format!("\"{}-{}\"", mtime_token(meta), meta.len())
+}
+
+/// `If-None-Match` names `etag` (weak comparison, as RFC 9110 asks for
+/// this header) or is `*`.
+fn etag_matches(headers: &HeaderMap, etag: &str) -> bool {
+    let Some(value) = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return false;
+    };
+    let bare = |tag: &str| tag.trim().trim_start_matches("W/").to_string();
+    let want = bare(etag);
+    value
+        .split(',')
+        .any(|tag| tag.trim() == "*" || bare(tag) == want)
+}
+
+/// Stream an opened regular file as a `/raw` response. Caching: a strong
+/// `ETag` (version token + size), `Last-Modified`, and `Cache-Control:
+/// private, max-age=` the ticket's remaining life — the URL is stable per
+/// file version (see [`TicketStore`]), so within that window the browser
+/// reuses its copy outright and afterwards revalidates to a 304 instead of
+/// re-downloading over the tunnel. `name` decides the content type.
+async fn serve_raw(
+    mut file: tokio::fs::File,
+    meta: &std::fs::Metadata,
+    name: &Path,
+    headers: &HeaderMap,
+    fresh_for: Duration,
+) -> Response {
+    let total = meta.len();
+    let etag = raw_etag(meta);
+    let mut validators: Vec<(HeaderName, HeaderValue)> = vec![
+        (header::ETAG, ascii_header(&etag)),
+        (
+            header::CACHE_CONTROL,
+            ascii_header(&format!("private, max-age={}", fresh_for.as_secs())),
+        ),
+    ];
+    if let Ok(modified) = meta.modified() {
+        validators.push((
+            header::LAST_MODIFIED,
+            ascii_header(&httpdate::fmt_http_date(modified)),
+        ));
+    }
+    if etag_matches(headers, &etag) {
+        let mut response = StatusCode::NOT_MODIFIED.into_response();
+        response.headers_mut().extend(validators);
+        return response;
+    }
 
     let range = headers
         .get(header::RANGE)
@@ -4112,11 +4725,11 @@ pub(crate) async fn raw(
     let len = if total == 0 { 0 } else { end - start + 1 };
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
     if let Err(err) = file.seek(SeekFrom::Start(start)).await {
-        tracing::warn!(path = %path.display(), %err, "ticketed file read failed");
-        return not_found();
+        tracing::warn!(path = %name.display(), %err, "ticketed file read failed");
+        return raw_not_found();
     }
 
-    let mime = mime_guess::from_path(&path).first_or_octet_stream();
+    let mime = mime_guess::from_path(name).first_or_octet_stream();
     // Stream the selected span. The previous `vec![0; len]` loaded an
     // un-ranged file (or attacker-chosen large range) wholly into daemon RSS.
     let body = Body::from_stream(tokio_util::io::ReaderStream::new(file.take(len)));
@@ -4130,13 +4743,16 @@ pub(crate) async fn raw(
         body,
     )
         .into_response();
+    response.headers_mut().extend(validators);
     if status == StatusCode::PARTIAL_CONTENT {
         if let Ok(value) = HeaderValue::from_str(&format!("bytes {start}-{end}/{total}")) {
             response.headers_mut().insert(header::CONTENT_RANGE, value);
         }
     }
     let sandbox = match mime.essence_str() {
-        "text/html" => Some(HeaderValue::from_static("sandbox allow-scripts")),
+        "text/html" | "application/xhtml+xml" => {
+            Some(HeaderValue::from_static("sandbox allow-scripts"))
+        }
         "image/svg+xml" => Some(HeaderValue::from_static("sandbox")),
         _ => None,
     };

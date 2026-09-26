@@ -1096,6 +1096,7 @@ async fn fs_xlsx_pages_sheets_of_a_workbook() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json["sheets"], serde_json::json!(["Alpha", "Beta"]));
     assert_eq!(json["sheet"], "Alpha");
+    assert_eq!(json["origin"], serde_json::json!([0, 0]));
     assert_eq!(json["columns"], serde_json::json!(["id", "value"]));
     assert_eq!(json["rows"], serde_json::json!([["a", "1"], ["b", "2"]]));
     assert_eq!(json["truncated"], false);

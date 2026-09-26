@@ -578,6 +578,9 @@ export async function fsTable(path: string, offsetRows = 0, limitRows = 200): Pr
 export interface XlsxPage extends TablePage {
   sheets: string[];
   sheet: string;
+  /** The used range's first cell, 0-based [row, column]: where the header
+   *  row sits in A1 terms. Null for an empty sheet; absent from older daemons. */
+  origin?: [number, number] | null;
 }
 
 /** A page of a spreadsheet (xlsx/xls/xlsm/ods). `sheet` null = the first sheet. */
