@@ -1107,11 +1107,12 @@ impl Checker<'_> {
     ) {
         let embed = t.kind == TargetKind::Embed;
         // The real spelling when only case is wrong: every written component
-        // from `base`, or the last one of an absolute path.
-        let real = match base {
-            Some(base) => self.case_mismatch(base, decoded),
-            None => self.case_variant(resolved),
-        };
+        // from `base`, else (an absolute path, or a directory too large to
+        // list in full — a suggestion needs less proof than a verdict) the
+        // last component alone.
+        let real = base
+            .and_then(|base| self.case_mismatch(base, decoded))
+            .or_else(|| self.case_variant(resolved));
         let mut fix = real.map(|real| self.case_fix(&real));
         if fix.is_none() && spelling == Spelling::Relative {
             if let Some(root) = self.root {
@@ -1226,12 +1227,15 @@ impl Checker<'_> {
         Some(parent.join(variant))
     }
 
+    /// The smallest such name, so several that fold alike (`A.md` and
+    /// `a.md` on a case-sensitive host) give the same fix every check.
     fn case_insensitive<'l>(listing: &'l Listing, name: &str) -> Option<&'l str> {
         let lower = name.to_lowercase();
         listing
             .names
             .iter()
-            .find(|n| n.to_lowercase() == lower)
+            .filter(|n| n.to_lowercase() == lower)
+            .min()
             .map(String::as_str)
     }
 
