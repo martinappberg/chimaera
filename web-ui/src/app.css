@@ -175,9 +175,13 @@
    Deliberately dropped with that: the legacy -webkit-center hint, which also
    centred block children of a raw-HTML cell, and the non-GFM values middle /
    justify — GFM cells are inline-only and unaffected. Numerals are tabular
-   so digit columns line up (in chat, hosted tables only). */
+   so digit columns line up (in chat, hosted tables only).
+
+   An embed card (shared/embed) draws its own tables — a data slice, an
+   excerpt — wherever it is hosted: every table rule skips its insides,
+   without a specificity cost (`:where`). */
 :is(.md, .cm-md-live) .md-table,
-:is(.md-body, .md-doc) table {
+:is(.md-body, .md-doc) table:not(:where(.embed-card *)) {
   display: block;
   overflow-x: auto;
   overscroll-behavior-x: contain;
@@ -185,31 +189,31 @@
   padding: 1px;
 }
 :is(.md, .cm-md-live) .md-table,
-.md table:not(.md-table > table),
-:is(.md-body, .md-doc) table {
+.md table:not(.md-table > table):not(:where(.embed-card *)),
+:is(.md-body, .md-doc) table:not(:where(.embed-card *)) {
   margin: var(--md-table-margin, 1em) 0;
 }
-:is(.md, .md-body, .md-doc, .cm-md-live) table {
+:is(.md, .md-body, .md-doc, .cm-md-live) table:not(:where(.embed-card *)) {
   border-collapse: collapse;
   font-size: var(--md-table-font-size, 0.924em);
 }
-:is(.md, .md-body, .md-doc, .cm-md-live) table :is(th, td) {
+:is(.md, .md-body, .md-doc, .cm-md-live) table:not(:where(.embed-card *)) :is(th, td) {
   border: 1px solid var(--edge);
   padding: var(--md-table-cell-padding, 0.35em 0.7em);
   text-align: left;
 }
-:is(.md, .md-body, .md-doc, .cm-md-live) table :is(th, td)[align="center" i] {
+:is(.md, .md-body, .md-doc, .cm-md-live) table:not(:where(.embed-card *)) :is(th, td)[align="center" i] {
   text-align: center;
 }
-:is(.md, .md-body, .md-doc, .cm-md-live) table :is(th, td)[align="right" i] {
+:is(.md, .md-body, .md-doc, .cm-md-live) table:not(:where(.embed-card *)) :is(th, td)[align="right" i] {
   text-align: right;
 }
-:is(.md, .md-body, .md-doc, .cm-md-live) table th {
+:is(.md, .md-body, .md-doc, .cm-md-live) table:not(:where(.embed-card *)) th {
   font-weight: 600;
   background: color-mix(in srgb, var(--fg) 4%, transparent);
 }
 :is(.md, .cm-md-live) .md-table table :is(th, td),
-:is(.md-body, .md-doc) table :is(th, td) {
+:is(.md-body, .md-doc) table:not(:where(.embed-card *)) :is(th, td) {
   font-variant-numeric: tabular-nums;
 }
 /* Hosted cells wrap like prose, whatever the surface's root inherits into

@@ -159,6 +159,15 @@ export function revealedOf(
   return out;
 }
 
+/** A line that is one image reference and nothing else — `![alt](target)`
+ *  or `![[name]]` — the source of a figure (an image-syntax block). Revealed,
+ *  its figure stays drawn under it rather than collapsing to the line. */
+const FIGURE = /^ {0,3}(!\[(?:[^\]\\\n]|\\.)*\]\((?:[^()\\\n]|\\.)*\)|!\[\[[^\]\n]+\]\])[ \t]*$/;
+
+export function isFigureLine(text: string): boolean {
+  return FIGURE.test(text);
+}
+
 // --- the spacing between rendered blocks -------------------------------------------
 
 /** One element of a block's edge: its tag and the classes its margins

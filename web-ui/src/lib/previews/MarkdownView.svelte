@@ -75,6 +75,7 @@
   import { activeTheme, getSetting } from "../settings/store.svelte";
   import { getActiveWorkspaceId } from "../net/api";
   import { DocReader, MathTypesetter, markTasks, mathSpans } from "./doc/reader";
+  import { DocEmbeds } from "./doc/embeds";
   import { createReadingWindow, type ReadingWindow } from "./readingWindow";
   import { copyText } from "../shared/clipboard";
   import { copyLabel, copyPayload, decorateCopyTargets } from "../shared/copyDecor";
@@ -137,8 +138,27 @@
     }
     return { wsRoot, workspaceId };
   };
+  /** The document's embed answers: every image reference it holds, resolved
+   *  in one round trip that both views draw from. Per path; construction
+   *  asks nothing (the first render does). */
+  const docEmbeds = $derived(new DocEmbeds(filePath, linkContext));
+  $effect(() => {
+    const e = docEmbeds;
+    return () => e.dispose();
+  });
+  // The file changed on disk (an agent's rewrite regenerates its figures
+  // too): its references are asked again, and changed files redraw. The
+  // first version seen is the one the first render already asked about.
+  let embedsSeen: { embeds: DocEmbeds; mtime: string | null } | null = null;
+  $effect(() => {
+    const mtime = entry?.mtime ?? null;
+    const embeds = docEmbeds;
+    const seen = embedsSeen;
+    embedsSeen = { embeds, mtime };
+    if (seen !== null && seen.embeds === embeds && seen.mtime !== null && seen.mtime !== mtime) embeds.refresh();
+  });
   /** What live mode reads at draw time (stable, like the link context). */
-  const liveHost = { theme: (): "light" | "dark" => themeMode };
+  const liveHost = { theme: (): "light" | "dark" => themeMode, embeds: (): DocEmbeds => docEmbeds };
 
   // Prose base size: the pane override, else the Markdown preference. Drives
   // the reading body AND the live editor, so the two views read identically.
@@ -425,6 +445,7 @@
     const r = new DocReader(el, {
       docPath,
       links: linkContext,
+      embeds: untrack(() => docEmbeds),
       theme: untrack(() => themeMode),
       // A wide equation typeset late is a scroller the last pass missed.
       onLayout: () => {
@@ -891,8 +912,10 @@
   });
 
   function onLinkClick(e: MouseEvent): void {
-    // Live mode's rendered blocks handle their own presses (mdBlocks).
+    // Live mode's rendered blocks handle their own presses (mdBlocks), an
+    // embed card its own.
     if (!(e.target instanceof Element) || readingEl?.contains(e.target) !== true) return;
+    if (e.target.closest(".embed-card") !== null) return;
     const box = e.target.closest<HTMLElement>("span.md-task");
     if (box !== null && box.closest(".md-props") === null) {
       e.preventDefault();
@@ -916,7 +939,7 @@
    *  document-relative path, the app origin's 404. A file link opens beside
    *  instead; a web link keeps the browser's own new-tab behavior. */
   function onLinkAuxClick(e: MouseEvent): void {
-    if (e.button !== 1) return;
+    if (e.button !== 1 || (e.target as Element | null)?.closest?.(".embed-card") != null) return;
     const href = (e.target as Element | null)?.closest?.("a[href]")?.getAttribute("href") ?? "";
     if (isWebUrl(href)) return;
     followLink(e, true);
@@ -957,6 +980,7 @@
   }
 
   function onLinkContextMenu(e: MouseEvent): void {
+    if ((e.target as Element | null)?.closest?.(".embed-card") != null) return;
     const anchor = (e.target as Element | null)?.closest?.("a[href]");
     const href = anchor?.getAttribute("href") ?? "";
     if (anchor === null || anchor === undefined || !isWebUrl(href)) return;
@@ -2127,8 +2151,47 @@
     margin: 1.8em 0;
   }
 
-  .md-view :global(.md-doc img) {
+  /* The width and height a resolved picture carries reserve its box before
+     a byte loads; the height follows when the column caps the width. An
+     embed card sizes its own. */
+  .md-view :global(.md-doc img:not(.embed-card *)) {
     max-width: 100%;
+    height: auto;
+  }
+
+  /* An image-syntax block: an embed card (shared/embed) inside its
+     paragraph, which keeps the paragraph's spacing (live's ghosts read it
+     so). */
+  .md-view :global(.md-doc .md-embed) {
+    display: block;
+    max-width: 100%;
+  }
+
+  /* A picture reads as a picture: its card drops the frame and header and
+     keeps the image body — the box reserved from the header dimensions, a
+     region crop, the size hint, a click that opens it. Before the
+     document's answers arrive (one round trip) it takes no room rather
+     than a card's loading state; a missing one keeps the card, which says
+     so. */
+  .md-view :global(.md-doc .md-embed-image > .embed-card[data-embed-kind="image"]) {
+    min-width: 0;
+    margin: 0;
+    border: none;
+    border-radius: 0;
+    background: none;
+  }
+
+  .md-view :global(.md-doc .md-embed-image > .embed-card[data-embed-kind="image"] > .head) {
+    display: none;
+  }
+
+  .md-view :global(.md-doc .md-embed-image > .embed-card[data-embed-kind="image"] .image-body) {
+    padding: 0;
+    background: none;
+  }
+
+  .md-view :global(.md-doc .md-embed-image > .embed-card[data-embed-kind="pending"]:not(.missing)) {
+    display: none;
   }
 
   /* A wikilink reads as a link with a quieter, dotted rule: it resolves by

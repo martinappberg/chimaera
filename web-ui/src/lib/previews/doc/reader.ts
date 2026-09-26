@@ -8,22 +8,27 @@
  * anything else. The parse is incremental too (lezer fragments), so a
  * keystroke-sized edit costs a keystroke-sized parse.
  *
- * It also owns what only a page can do for the DOM target: images resolve
- * beside the document through short-lived `/raw/` tickets (memoized, so a
- * re-rendered block keeps its src and never flashes), `![[embeds]]` by name
- * through `/fs/validate`, fences highlight through the lezer highlighter
- * live mode uses (`codeHighlight`, lazy per language — only that block
- * repaints when its grammar arrives), mermaid lays out per theme, and
- * equations typeset under the shared KaTeX policy, time-sliced.
+ * It also owns what only a page can do for the DOM target: an image-syntax
+ * block becomes an embed card (`shared/embed`) and an inline image points
+ * at its `/raw/` ticket, both from the document's one embed answer set
+ * (`embeds.ts`: a drawn-again block reuses its URL, so it never flashes);
+ * fences highlight through the lezer highlighter live mode uses
+ * (`codeHighlight`, lazy per language — only that block repaints when its
+ * grammar arrives), mermaid lays out per theme, and equations typeset under
+ * the shared KaTeX policy, time-sliced.
  */
 import type { Parser, Tree } from "@lezer/common";
 import { LanguageDescription } from "@codemirror/language";
 import { languages } from "@codemirror/language-data";
 import { highlightCode } from "@lezer/highlight";
 import { codeHighlight } from "../cm";
-import { dirname, fsValidate, lastRawTicketUrl, rawTicketUrl, resolveDocPath, safeDecodeUri } from "../files";
+import { safeDecodeUri } from "../files";
 import { loadMath, mathNow } from "../mathLoad";
 import { renderMermaid } from "../../shared/mermaid";
+import { mountEmbed, type EmbedHandle } from "../../shared/embed/mount.svelte";
+import { embedKind, isMissing, parseSizeHint, rawUrl, splitTarget, type TargetResult } from "../../shared/embed/embed";
+import { fragmentReveal, parseEmbedFragment } from "../../shared/embed/fragment";
+import { openPath } from "../../shared/openPath";
 import type { LinkContext } from "../docLinks";
 import {
   bodyText,
@@ -32,9 +37,11 @@ import {
   htmlRuns,
   documentContext,
   footnotesOf,
+  type DocContext,
   type OutlineEntry,
 } from "./model";
-import { DomTarget, renderFootnotes, renderRun, topLevel, type DomHooks } from "./render";
+import { DomTarget, renderFootnotes, renderRun, topLevel, type DomHooks, type EmbedRef, type EmbedSpec } from "./render";
+import { DocEmbeds, embedTargets, refKey } from "./embeds";
 
 export type ReaderOptions = HydratorOptions;
 
@@ -54,53 +61,38 @@ interface Unit {
   line: number;
 }
 
-// --- images -----------------------------------------------------------------------
+// --- images and embeds ------------------------------------------------------------
 
-/** `![[name]]` resolutions kept (a document rarely names more). */
-const NAMED_MAX = 256;
+const HAS_SCHEME = /^([a-z][a-z0-9+.-]*:|\/\/)/i;
 
-/** Point `img` at `path`'s `/raw/` URL: at once with the last answer, so a
- *  block re-rendered for an edit next to its image keeps its src (no
- *  flash), then with the daemon's current one when that differs — the
- *  image changed on disk since (a new version is a new ticket). */
-function pointAt(img: HTMLImageElement, path: string, stamp: string): void {
-  const last = lastRawTicketUrl(path);
-  if (last !== null) img.src = last;
-  rawTicketUrl(path).then(
-    (url) => {
-      if (img.dataset.mdSrc === stamp && url !== last) img.src = url;
-    },
-    () => {
-      // missing/unreadable target: the alt text shows
-    },
-  );
+/** Point an inline picture at its answer: its box reserved from the header
+ *  dimensions (CSS keeps the height auto), its bytes from the ticket. A
+ *  miss, or a file that is no picture, leaves the alt text showing. */
+function pointImg(img: HTMLImageElement, a: TargetResult): void {
+  if (isMissing(a) || embedKind(a) !== "image") {
+    img.removeAttribute("src");
+    return;
+  }
+  const url = rawUrl(a);
+  if (url === null) return;
+  if (a.width !== undefined && a.height !== undefined && !img.hasAttribute("width") && !img.hasAttribute("height")) {
+    img.width = a.width;
+    img.height = a.height;
+  }
+  if (img.getAttribute("src") !== url) img.src = url;
 }
 
-/** `![[name]]` targets by name, per folder and workspace (the daemon's
- *  resolver: beside the document, then a unique match in the workspace). */
-const named = new Map<string, Promise<string | null>>();
+/** What a card's header names: the file once found, else the target as
+ *  written. */
+function shownPath(a: TargetResult | undefined, path: string): string {
+  return a !== undefined && !isMissing(a) ? a.path : safeDecodeUri(path);
+}
 
-function resolveNamed(name: string, dir: string, ws: string | null): Promise<string | null> {
-  const key = `${ws ?? ""}\u0000${dir}\u0000${name}`;
-  let p = named.get(key);
-  if (p === undefined) {
-    p = fsValidate([name], dir, ws).then(
-      (res) => {
-        const hit = res.valid[name];
-        return hit !== undefined && hit.kind === "file" ? hit.path : null;
-      },
-      () => {
-        named.delete(key); // transient: ask again next render
-        return null;
-      },
-    );
-    named.set(key, p);
-    if (named.size > NAMED_MAX) {
-      const oldest = named.keys().next().value;
-      if (oldest !== undefined) named.delete(oldest);
-    }
-  }
-  return p;
+/** An embed this hydrator drew: a card (an image-syntax block) or an
+ *  inline picture. */
+interface Drawn {
+  ref: EmbedRef;
+  card: EmbedHandle | null;
 }
 
 // --- code highlighting ----------------------------------------------------------------
@@ -349,8 +341,11 @@ export interface HydratorOptions {
   links: () => LinkContext;
   theme: "light" | "dark";
   /** Drawn content changed size after the fact (an equation typeset, a
-   *  diagram laid out). */
+   *  diagram laid out, an embed card loaded). */
   onLayout?: () => void;
+  /** The document's embed answers, shared with its other view so one round
+   *  trip serves both; this hydrator's own when absent. */
+  embeds?: DocEmbeds;
 }
 
 /**
@@ -361,8 +356,11 @@ export interface HydratorOptions {
  * theme — and the time-sliced passes that paint fences and typeset
  * equations once the nodes are in the page.
  *
- * The image hook is where an image becomes something richer: returning a
- * node from `DomHooks.image` puts it in the image's place in both views.
+ * Embeds: an image-syntax block draws as an embed card in a slot this
+ * hydrator makes (`mountEmbed`), an inline image as a picture pointed at
+ * its ticket; both draw from the document's answers and follow them when
+ * they change. A card lives until its block goes away — the host says when
+ * (`release`), or `destroy` takes them all.
  */
 export class Hydrator {
   readonly target: DomTarget;
@@ -380,11 +378,38 @@ export class Hydrator {
       if (this.loaded.push(g) === 1) queueMicrotask(() => this.highlighter.add(this.loaded.splice(0)));
     }),
   );
+  readonly embeds: DocEmbeds;
+  private readonly ownsEmbeds: boolean;
+  private readonly drawn = new Map<HTMLElement, Drawn>();
+  private readonly byKey = new Map<string, Set<HTMLElement>>();
+  private readonly unsubscribe: () => void;
+  /** A card's size changed (mounted, loaded): the host re-measures. */
+  private readonly sizer: ResizeObserver | null;
+  /** A card nearing view: an aging answer is asked again (a new version,
+   *  a renewed ticket) before its body loads. */
+  private readonly nearing: IntersectionObserver | null;
 
   constructor(private readonly opts: HydratorOptions) {
     this.theme = opts.theme;
+    this.ownsEmbeds = opts.embeds === undefined;
+    this.embeds = opts.embeds ?? new DocEmbeds(opts.docPath, opts.links);
+    this.unsubscribe = this.embeds.subscribe((key, a) => this.answered(key, a));
+    this.sizer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(() => this.opts.onLayout?.());
+    this.nearing =
+      typeof IntersectionObserver === "undefined"
+        ? null
+        : new IntersectionObserver(
+            (entries) => {
+              for (const e of entries) {
+                const d = e.isIntersecting ? this.drawn.get(e.target as HTMLElement) : undefined;
+                if (d !== undefined) this.embeds.touch(d.ref);
+              }
+            },
+            { rootMargin: "600px 0px" },
+          );
     const hooks: DomHooks = {
       image: (img, src, wikilink) => this.image(img, src, wikilink),
+      embed: (spec) => this.embed(spec),
       code: (code, lang, text) => {
         this.fences.push({ code, lang, text });
       },
@@ -414,28 +439,130 @@ export class Hydrator {
     }
   }
 
+  /** Resolve every image-shaped reference of the document (its syntax
+   *  tree, from `from` on) in one round trip, when the set changed. */
+  syncEmbeds(cx: Pick<DocContext, "tree" | "doc" | "inline">, from = 0): void {
+    this.embeds.sync(embedTargets(cx.tree, cx.doc, cx.inline, from));
+  }
+
+  /** Cards and pictures drawn from embed answers, still followed. */
+  get embedCount(): number {
+    return this.drawn.size;
+  }
+
+  /** Whether `root` holds a card or picture drawn from embed answers. */
+  holdsEmbeds(root: Element): boolean {
+    if (this.drawn.size === 0) return false;
+    if (this.drawn.has(root as HTMLElement)) return true;
+    for (const el of root.querySelectorAll<HTMLElement>(".md-embed, img[data-md-src]")) if (this.drawn.has(el)) return true;
+    return false;
+  }
+
+  /** `nodes` left for good (their block went away): destroy their cards
+   *  and stop following their answers. */
+  release(nodes: readonly Node[]): void {
+    if (this.drawn.size === 0) return;
+    for (const n of nodes) {
+      if (!(n instanceof Element)) continue;
+      if (n instanceof HTMLElement) this.drop(n);
+      for (const el of n.querySelectorAll<HTMLElement>(".md-embed, img[data-md-src]")) this.drop(el);
+    }
+  }
+
+  /** Open what the card in `slot` shows in a pane, at its fragment. */
+  openEmbed(slot: HTMLElement): boolean {
+    const d = this.drawn.get(slot);
+    const a = d === undefined ? undefined : this.embeds.answer(d.ref);
+    if (d === undefined || a === undefined || isMissing(a)) return false;
+    const reveal = fragmentReveal(parseEmbedFragment(splitTarget(d.ref.target).fragment, a.path));
+    return openPath(a.path, a.kind, reveal !== undefined ? { reveal } : {});
+  }
+
   destroy(): void {
     this.math.stop();
     this.highlighter.stop();
     this.fences = [];
     this.loaded = [];
+    for (const el of [...this.drawn.keys()]) this.drop(el);
+    this.unsubscribe();
+    this.sizer?.disconnect();
+    this.nearing?.disconnect();
+    if (this.ownsEmbeds) this.embeds.dispose();
   }
 
-  private image(img: HTMLImageElement, src: string, wikilink: string | null): void {
-    const { docPath } = this.opts;
-    if (wikilink !== null) {
-      img.dataset.mdSrc = wikilink;
-      void resolveNamed(wikilink, dirname(docPath), this.opts.links().workspaceId).then((path) => {
-        if (path !== null && img.dataset.mdSrc === wikilink) pointAt(img, path, wikilink);
-      });
-      return;
+  private track(el: HTMLElement, ref: EmbedRef, card: EmbedHandle | null): void {
+    this.drawn.set(el, { ref, card });
+    const key = refKey(ref);
+    let set = this.byKey.get(key);
+    if (set === undefined) this.byKey.set(key, (set = new Set()));
+    set.add(el);
+  }
+
+  private drop(el: HTMLElement): void {
+    const d = this.drawn.get(el);
+    if (d === undefined) return;
+    this.drawn.delete(el);
+    const key = refKey(d.ref);
+    const set = this.byKey.get(key);
+    set?.delete(el);
+    if (set?.size === 0) this.byKey.delete(key);
+    if (d.card !== null) {
+      d.card.destroy();
+      this.sizer?.unobserve(el);
+      this.nearing?.unobserve(el);
     }
-    if (/^([a-z][a-z0-9+.-]*:|\/\/)/i.test(src)) {
+  }
+
+  /** A changed answer: every card and picture drawn from it follows. */
+  private answered(key: string, a: TargetResult): void {
+    for (const el of this.byKey.get(key) ?? []) {
+      const d = this.drawn.get(el);
+      if (d === undefined) continue;
+      if (d.card !== null) d.card.update({ info: a, path: shownPath(a, splitTarget(d.ref.target).path) });
+      else if (el instanceof HTMLImageElement) pointImg(el, a);
+    }
+  }
+
+  /** An inline image: its bytes through the document's answers (a web or
+   *  data URL loads as written). */
+  private image(img: HTMLImageElement, src: string, wikilink: string | null): void {
+    if (wikilink === null && HAS_SCHEME.test(src)) {
       img.src = src;
       return;
     }
+    const ref: EmbedRef = { target: src, byName: wikilink !== null };
     img.dataset.mdSrc = src;
-    pointAt(img, resolveDocPath(docPath, safeDecodeUri(src)), src);
+    this.track(img, ref, null);
+    const a = this.embeds.answer(ref);
+    if (a !== undefined) pointImg(img, a);
+    else void this.embeds.ask(ref);
+  }
+
+  /** An image-syntax block: an embed card in a slot of its own, drawn from
+   *  the answer when there is one (so a block drawn again shows at once),
+   *  else as the answer arrives. A picture's slot is marked so the page
+   *  draws it plainly, as an image. */
+  private embed(spec: EmbedSpec): HTMLElement {
+    const slot = document.createElement("div");
+    slot.className = spec.image ? "md-embed md-embed-image" : "md-embed";
+    const ref: EmbedRef = { target: spec.target, byName: spec.byName };
+    const a = this.embeds.answer(ref);
+    const { path, fragment } = splitTarget(spec.target);
+    // `![[x|400]]`: the alias is the size hint itself.
+    const hint = parseSizeHint(spec.byName && /^\d+(\s*x\s*\d+)?$/.test(spec.alt) ? `|${spec.alt}` : spec.alt);
+    const card = mountEmbed(slot, {
+      path: shownPath(a, path),
+      info: a ?? null,
+      fragment,
+      alt: hint.alt,
+      width: hint.width,
+      resolve: () => this.embeds.ask(ref),
+    });
+    if (a === undefined) void this.embeds.ask(ref);
+    this.track(slot, ref, card);
+    this.sizer?.observe(slot);
+    this.nearing?.observe(slot);
+    return slot;
   }
 
   private drawMermaid(box: HTMLElement, source: string): void {
@@ -575,7 +702,11 @@ export class DocReader {
 
     // Drop what no longer renders, then put every kept and fresh node in
     // document order, touching only the nodes that moved.
-    for (const units of pool.values()) for (const u of units) for (const n of u.nodes) n.parentNode?.removeChild(n);
+    for (const units of pool.values())
+      for (const u of units) {
+        this.hydrator.release(u.nodes);
+        for (const n of u.nodes) n.parentNode?.removeChild(n);
+      }
     let cursor: ChildNode | null = this.root.firstChild;
     for (const u of next)
       for (const n of u.nodes) {
@@ -590,6 +721,7 @@ export class DocReader {
     this.units = next;
 
     this.hydrator.settle(fresh);
+    this.hydrator.syncEmbeds(cx);
     return {
       frontmatter: frontmatter?.raw ?? null,
       outline: cx.outline.map((h) => ({ ...h, line: cx.lines.lineOf(h.from) })),

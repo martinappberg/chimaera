@@ -21,7 +21,10 @@ function summary(s: EditorState) {
   const deco: string[] = [];
   st.deco.between(0, s.doc.length, (from, to, value) => {
     const w = value.spec.widget as (WidgetType & { id?: string }) | undefined;
-    deco.push(`${from}-${to}:${w?.id?.replace(/\u0000/g, "|") ?? "?"}`);
+    // A revealed figure's drawing keeps the identity it was entered with
+    // (history the oracle has not seen): compared by place only.
+    const id = w?.id?.startsWith("V\u0000") === true ? "V" : w?.id;
+    deco.push(`${from}-${to}:${id?.replace(/\u0000/g, "|") ?? "?"}`);
   });
   return {
     segs: st.segs.map((g) => `${g.kind}:${g.from}-${g.to}/${g.blockFrom}-${g.blockTo}:${g.names}`),
@@ -74,6 +77,8 @@ const DOC = [
   "$$",
   "",
   "Closing paragraph.",
+  "",
+  "![plot](figs/plot.png)",
   "",
   "[r]: https://example.com",
   "",
@@ -136,6 +141,31 @@ describe("the live field's incremental update", () => {
     }
     // Nearly every step compares.
     expect(treeDiffs).toBeLessThan(steps / 10);
+  });
+
+  it("keeps a revealed figure drawn as entered until the cursor leaves", () => {
+    const figure = DOC.indexOf("![plot]");
+    let state = fresh(DOC, figure + 2, true);
+    const preview = (s: EditorState): string | null => {
+      let id: string | null = null;
+      s.field(liveField).deco.between(0, s.doc.length, (_from, _to, value) => {
+        const w = value.spec.widget as (WidgetType & { id?: string }) | undefined;
+        if (w?.id?.startsWith("V\u0000") === true) id = w.id;
+      });
+      return id;
+    };
+    const entered = preview(state);
+    expect(entered).toContain("![plot](figs/plot.png)");
+    // Retyping the path: the drawing stays the one entered.
+    const path = state.doc.toString().indexOf("plot.png)");
+    state = state.update({ changes: { from: path, to: path + 4, insert: "chart" }, selection: { anchor: path + 5 } }).state;
+    expect(preview(state)).toBe(entered);
+    // Left: the block renders its new text; no drawing is held.
+    state = state.update({ selection: { anchor: 0 } }).state;
+    expect(preview(state)).toBeNull();
+    // Entered again: drawn as it now reads.
+    state = state.update({ selection: { anchor: path + 2 } }).state;
+    expect(preview(state)).toContain("figs/chart.png");
   });
 
   it("keeps an unchanged block's widget across an edit elsewhere", () => {

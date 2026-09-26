@@ -58,17 +58,29 @@ import {
   StateEffect,
   StateField,
   Transaction,
+  type ChangeDesc,
   type Extension,
   type Text as CmText,
 } from "@codemirror/state";
 import type { SyntaxNode } from "@lezer/common";
-import { contextOf, depsOf, footnotesOf, frontmatterOf, refsKey, TextLines, type DocContext } from "./doc/model";
-import { renderFootnotes, renderRun } from "./doc/render";
+import {
+  contextOf,
+  depsOf,
+  documentContext,
+  footnotesOf,
+  frontmatterOf,
+  refsKey,
+  TextLines,
+  type DocContext,
+} from "./doc/model";
+import { renderFootnotes, renderRun, topLevel } from "./doc/render";
 import { Hydrator, markTasks } from "./doc/reader";
+import type { DocEmbeds } from "./doc/embeds";
 import {
   HeightCache,
   SILENT,
   hashString,
+  isFigureLine,
   nodesIn,
   revealedOf,
   runEdges,
@@ -112,6 +124,9 @@ export const linkContext = Facet.define<() => LinkContext, () => LinkContext>({
 export interface LiveHost {
   /** The theme diagrams lay out in. */
   theme(): "light" | "dark";
+  /** The document's embed answers, shared with its reading view (one round
+   *  trip serves both); the view keeps its own without. */
+  embeds?(): DocEmbeds | null;
 }
 const defaultHost: LiveHost = { theme: () => "light" };
 export const liveHost = Facet.define<LiveHost, LiveHost>({ combine: (v) => v[0] ?? defaultHost });
@@ -226,6 +241,49 @@ interface LiveState {
   /** Widgets by identity, kept across states so an unchanged block's
    *  widget is the same object (CodeMirror's comparison is then free). */
   pool: Map<string, LiveWidget>;
+  /** Revealed figures, drawn on under their source line. */
+  held: readonly Held[];
+}
+
+/**
+ * A revealed figure (a paragraph that is one image reference) keeps its
+ * drawing under its source line instead of collapsing to that line, so
+ * stepping through a document of figures moves nothing but a line. It
+ * shows the figure as it was when the block was entered: typing a new
+ * path redraws (and resolves) nothing until the cursor leaves.
+ */
+interface Held {
+  /** The segment's start. */
+  from: number;
+  /** The identity the figure rendered with. */
+  key: string;
+}
+
+/** The revealed figures of a state, each keeping the identity it had in
+ *  `prev` (mapped through `changes`); `prev` itself when nothing moved. */
+function holdFigures(
+  prev: readonly Held[],
+  changes: ChangeDesc | null,
+  segs: readonly Segment[],
+  keys: readonly string[],
+  revealed: readonly boolean[],
+  doc: CmText,
+): readonly Held[] {
+  let kept: Map<number, string> | null = null;
+  for (const h of prev) {
+    const i = segmentAt(segs, changes === null ? h.from : changes.mapPos(h.from, 1));
+    if (i >= 0) (kept ??= new Map()).set(i, h.key);
+  }
+  const out: Held[] = [];
+  for (let i = 0; i < segs.length; i++) {
+    const s = segs[i];
+    if (!revealed[i] || s.kind !== "block" || s.names !== "Paragraph") continue;
+    const line = doc.lineAt(s.blockFrom);
+    if (line.to < s.blockTo || !isFigureLine(line.text)) continue;
+    out.push({ from: s.from, key: kept?.get(i) ?? keys[i] });
+  }
+  const same = out.length === prev.length && out.every((h, k) => h.from === prev[k].from && h.key === prev[k].key);
+  return same ? prev : out;
 }
 
 type Structure = Pick<LiveState, "segs" | "keys" | "edges" | "fmEnd" | "notes" | "defs" | "cx">;
@@ -548,6 +606,7 @@ function decorateRange(
     });
     return hit;
   };
+  const heldAt = st.held.length === 0 ? null : new Map(st.held.map((h) => [h.from, h.key]));
   // The trailing edge the first segment's gap collapses against.
   let prev: readonly Shape[] = [];
   let prevKey = "";
@@ -593,6 +652,26 @@ function decorateRange(
       const id = `G\u0000${prevKey}\u0000${shapeKey(edges.head)}`;
       const w = get(id, (hid, est) => new GapWidget(id, hid, est(() => Math.round(st.layout.line * 0.45)), tail, edges.head));
       ranges.push(Decoration.widget({ widget: w, block: true, side: -1 }).range(s.from));
+      const held = heldAt?.get(s.from);
+      if (held !== undefined) {
+        // Its figure, drawn on below the line: the rendered block's own DOM
+        // (CodeMirror hands it over through updateDOM), so a card stays
+        // mounted and loaded; about the rendered block's height.
+        const vid = `V\u0000${held}`;
+        const rendered = `B\u0000${held}\u0000${prevKey}\u0000false`;
+        const v = get(vid, (hid, est) =>
+          new BlockWidget(
+            vid,
+            hid,
+            est(() => heights.get(heightKey(st.layout, hashString(rendered))) ?? guessHeight(st.layout, doc, s.blockFrom, s.blockTo, s.names)),
+            held,
+            [],
+            false,
+            true,
+          ),
+        );
+        ranges.push(Decoration.widget({ widget: v, block: true, side: 1 }).range(s.blockTo));
+      }
     }
     if (edges.tail.length > 0) {
       prev = edges.tail;
@@ -635,6 +714,7 @@ export const liveField = StateField.define<LiveState>({
       flash: revealFlashRanges(state),
       deco: Decoration.none,
       pool: new Map(),
+      held: [],
     };
     return { ...st, ...decorate(st, state) };
   },
@@ -668,7 +748,8 @@ export const liveField = StateField.define<LiveState>({
       let same = v.pool.size <= 2 * inc.segs.length + 256;
       for (let k = 0; same && k < inc.i0; k++) same = revealed[k] === v.revealed[k];
       for (let k = inc.j1 + 1; same && k < inc.segs.length; k++) same = revealed[k] === v.revealed[k - moved];
-      const st: LiveState = { ...v, ...inc, revealed, focused, collapsed, layout, flash };
+      const held = holdFigures(v.held, tr.changes, inc.segs, inc.keys, revealed, tr.state.doc);
+      const st: LiveState = { ...v, ...inc, revealed, focused, collapsed, layout, flash, held };
       if (!same) return { ...st, ...decorate(st, tr.state) };
       // The region and the segment after it (its gap reads the region's
       // last block), through the end when the footnote section follows.
@@ -690,7 +771,11 @@ export const liveField = StateField.define<LiveState>({
     const base = structural ? structure(tr.state) : v;
     let revealed: readonly boolean[] = revealedOf(base.segs, ranges);
     if (!structural && sameFlags(revealed, v.revealed)) revealed = v.revealed;
-    const st: LiveState = { ...v, ...base, revealed, focused, collapsed, layout, flash };
+    const held =
+      structural || revealed !== v.revealed
+        ? holdFigures(v.held, tr.docChanged ? tr.changes : null, base.segs, base.keys, revealed, tr.state.doc)
+        : v.held;
+    const st: LiveState = { ...v, ...base, revealed, focused, collapsed, layout, flash, held };
     if (!structural && revealed === v.revealed && collapsed === v.collapsed && flash === v.flash) return st;
     if (!structural && collapsed === v.collapsed && flash === v.flash) {
       // Only reveals moved (a click, an arrow key, focus): swap just those
@@ -700,12 +785,15 @@ export const liveField = StateField.define<LiveState>({
       for (let i = 0; i < revealed.length; i++) if (revealed[i] !== v.revealed[i]) changed.push(i);
       if (changed.length <= 64 && v.pool.size <= 2 * st.segs.length + 256) {
         const pool: WidgetPool = { get: (id) => v.pool.get(id), set: (id, w) => void v.pool.set(id, w) };
-        const starts = new Set(changed.map((i) => st.segs[i].from));
+        const spans = changed.map((i) => st.segs[i]);
         const add = changed.flatMap((i) => decorateRange(st, tr.state, pool, i, i, false));
+        // Everything a changed segment had goes (a held figure's drawing
+        // sits at its block's end, not its start).
         const deco = v.deco.update({
-          filter: (from, _to, value) => !starts.has(from) || value.spec.widget instanceof NotesWidget,
-          filterFrom: st.segs[changed[0]].from,
-          filterTo: st.segs[changed[changed.length - 1]].from,
+          filter: (from, _to, value) =>
+            value.spec.widget instanceof NotesWidget || !spans.some((s) => from >= s.from && from <= s.to),
+          filterFrom: spans[0].from,
+          filterTo: spans[spans.length - 1].to,
           add,
           sort: true,
         });
@@ -766,27 +854,46 @@ const hydrators = new WeakMap<EditorView, Hydrator>();
 function hydratorFor(view: EditorView): Hydrator {
   let h = hydrators.get(view);
   if (h === undefined) {
+    const host = view.state.facet(liveHost);
+    const embeds = host.embeds?.() ?? null;
     h = new Hydrator({
       docPath: view.state.facet(docPath),
       links: view.state.facet(linkContext),
-      theme: view.state.facet(liveHost).theme(),
+      theme: host.theme(),
       onLayout: () => view.requestMeasure(),
+      ...(embeds !== null ? { embeds } : {}),
     });
     hydrators.set(view, h);
   }
   return h;
 }
 
+/** Forget the kept blocks of `view` that `drop` picks, releasing their
+ *  embed cards (a displayed one is released when CodeMirror drops it). */
+function forgetDrawn(view: EditorView, drop: (key: string, dom: HTMLElement) => boolean): void {
+  const cache = drawnByView.get(view);
+  const h = hydrators.get(view);
+  if (cache === undefined) return;
+  for (const [key, dom] of [...cache]) {
+    if (!drop(key, dom)) continue;
+    cache.delete(key);
+    if (!dom.isConnected) h?.release([dom]);
+  }
+}
+
 /** Re-lay out a live view's diagrams for a theme change (kept blocks
  *  drawn for the other theme are dropped). */
 export function setLiveTheme(view: EditorView, theme: "light" | "dark"): void {
   hydrators.get(view)?.setTheme(theme, view.contentDOM);
-  drawnByView.delete(view);
+  forgetDrawn(view, () => true);
 }
 
 /** Which content a widget DOM shows (updateDOM reuses it when only the
  *  ghost or the flash changed). */
 const drawn = new WeakMap<HTMLElement, string>();
+/** The view a rendered widget DOM was drawn in (its hydrator owns the
+ *  embed cards in it). */
+const drawnIn = new WeakMap<HTMLElement, EditorView>();
 
 /** Blocks each view drew, by what they render (bounded, least recently
  *  drawn first out). Line numbers in a kept block are the ones it was drawn
@@ -829,6 +936,15 @@ function setGhost(root: HTMLElement, chain: readonly Shape[]): void {
 
 const MOUSE_EVENTS = new Set(["mousedown", "mouseup", "click", "dblclick", "auxclick", "contextmenu"]);
 
+/** An embed card's own controls — its header, a player, an excerpt's
+ *  links, "more" — work as in reading. Its body (a picture, a page, an
+ *  excerpt's text) is the block's content: a press edits it, Mod+press
+ *  opens the file. */
+const CARD_CONTROL =
+  ".embed-card .head, .embed-card button:not(.frame), .embed-card a[href], .embed-card :is(video, audio, iframe, input, select)";
+/** Scrollers inside cards (a table or code slice, an opened excerpt). */
+const CARD_SCROLLER = ".embed-card :is(.scroll, .md-body)";
+
 abstract class LiveWidget extends WidgetType {
   constructor(
     /** Identity: equal ids draw equal DOM. */
@@ -850,11 +966,23 @@ abstract class LiveWidget extends WidgetType {
    *  left to scroll. */
   override ignoreEvent(e: Event): boolean {
     if (!MOUSE_EVENTS.has(e.type)) return true;
-    if (e.type === "mousedown" && e.target instanceof Element) {
-      const scroller = e.target.closest(".md-doc table, .md-doc pre > code, .md-math-display, .md-mermaid-svg");
+    if (!(e.target instanceof Element)) return false;
+    if (e.target.closest(CARD_CONTROL) !== null) return true;
+    if (e.type === "mousedown") {
+      const scroller = e.target.closest(`.md-doc table, .md-doc pre > code, .md-math-display, .md-mermaid-svg, ${CARD_SCROLLER}`);
       if (onScrollbarBand(scroller, e as MouseEvent)) return true;
     }
     return false;
+  }
+  /** A drawn block CodeMirror let go of: its embed cards go with it, unless
+   *  the block is kept to come back (the cursor left it, it scrolled back
+   *  into view) — then they go when it is forgotten. */
+  override destroy(dom: HTMLElement): void {
+    const view = drawnIn.get(dom);
+    if (view === undefined) return;
+    const key = drawn.get(dom);
+    if (key !== undefined && drawnByView.get(view)?.get(key) === dom) return;
+    hydrators.get(view)?.release([dom]);
   }
 }
 
@@ -887,6 +1015,8 @@ class BlockWidget extends LiveWidget {
     readonly block: string,
     readonly prev: readonly Shape[],
     readonly flash: boolean,
+    /** A revealed figure's drawing under its source line (`Held`). */
+    readonly figure = false,
   ) {
     super(id, hid, est);
   }
@@ -906,16 +1036,27 @@ class BlockWidget extends LiveWidget {
     const st = view.state.field(liveField);
     const seg = st.segs[ownerOf(st, this)];
     if (seg === undefined) return root;
-    root.dataset.lpLine = String(view.state.doc.lineAt(seg.blockFrom).number);
     const g = ghost(this.prev, "tail");
     if (g !== null) root.append(g);
-    drawRun(view, root, seg);
+    if (this.figure) {
+      // Never drawn yet (the document opened on this line): drawn from the
+      // text it holds, a paragraph that reads nothing else, at line 1.
+      root.dataset.lpLine = "1";
+      const cx = documentContext(this.block.split("\u0000")[1] ?? "", null);
+      renderRun(root, topLevel(cx), { t: hydratorFor(view).target, cx });
+    } else {
+      root.dataset.lpLine = String(view.state.doc.lineAt(seg.blockFrom).number);
+      drawRun(view, root, seg);
+    }
     finish(view, root);
     drawn.set(root, this.block);
+    drawnIn.set(root, view);
     cache.set(this.block, root);
     if (cache.size > DRAWN_MAX) {
       const oldest = cache.keys().next().value;
+      const dom = oldest === undefined ? undefined : cache.get(oldest);
       if (oldest !== undefined) cache.delete(oldest);
+      if (dom !== undefined && !dom.isConnected) hydratorFor(view).release([dom]);
     }
     return root;
   }
@@ -972,6 +1113,7 @@ class NotesWidget extends LiveWidget {
     const cx = contextFor(view.state);
     renderFootnotes(root, footnotesOf(cx), { t: hydratorFor(view).target, cx });
     finish(view, root);
+    drawnIn.set(root, view);
     return root;
   }
 }
@@ -1165,6 +1307,12 @@ function caretTop(view: EditorView, caret: Caret | null, fallbackY: number): num
   return top - view.documentTop;
 }
 
+/** The embed card a press landed in, within a rendered block. */
+function embedIn(hit: { root: HTMLElement }, target: EventTarget | null): HTMLElement | null {
+  const slot = target instanceof Element ? target.closest<HTMLElement>(".md-embed") : null;
+  return slot !== null && hit.root.contains(slot) ? slot : null;
+}
+
 /** Where a press on rendered content lands in the source. */
 function pressPos(view: EditorView, hit: { root: HTMLElement; seg: number }, e: MouseEvent): number {
   const state = view.state;
@@ -1172,18 +1320,21 @@ function pressPos(view: EditorView, hit: { root: HTMLElement; seg: number }, e: 
   const doc = state.doc;
   const seg = st.segs[hit.seg];
   const fallback = seg?.blockFrom ?? doc.length;
-  const caret = caretAt(e.clientX, e.clientY);
+  // A card's text is not the source's: a press lands after its reference.
+  const slot = embedIn(hit, e.target);
+  const caret = slot === null ? caretAt(e.clientX, e.clientY) : null;
   const at: Element | null =
-    caret === null
+    slot ??
+    (caret === null
       ? e.target instanceof Element
         ? e.target
         : null
       : caret.node instanceof Element
         ? caret.node
-        : caret.node.parentElement;
+        : caret.node.parentElement);
   if (at === null || !hit.root.contains(at)) return fallback;
   if (hit.root.classList.contains("lp-props")) return propsPos(state, at, seg);
-  const cell = at.closest<HTMLTableCellElement>("th, td");
+  const cell = slot === null ? at.closest<HTMLTableCellElement>("th, td") : null;
   if (cell !== null && seg !== undefined) {
     const p = cellPos(state, seg, cell, caret);
     if (p !== null) return p;
@@ -1196,6 +1347,7 @@ function pressPos(view: EditorView, hit: { root: HTMLElement; seg: number }, e: 
   const last = Math.min(Math.max(first, range.end + shift), doc.lines);
   const from = doc.line(first).from;
   const to = doc.line(last).to;
+  if (slot !== null) return to;
   if (caret === null || block === null) return from;
   return sourceOffset(syntaxTree(state), doc, from, to, renderedPrefix(block, caret));
 }
@@ -1258,12 +1410,20 @@ const renderedSelection = EditorView.mouseSelectionStyle.of((view, event) => {
   if (hit === null) return null;
   const st = view.state.field(liveField);
   const start = pressPos(view, hit, event);
-  pendingAnchor.set(view.state, {
-    pos: start,
-    top: caretTop(view, caretAt(event.clientX, event.clientY), event.clientY),
-    text: true,
-    focus: !st.focused,
-  });
+  const seg = st.segs[hit.seg];
+  // A card's source line opens above it: the block's top stays put (the
+  // line under the pointer would drag everything above it along).
+  pendingAnchor.set(
+    view.state,
+    embedIn(hit, event.target) !== null && seg !== undefined
+      ? { pos: seg.from, top: view.lineBlockAt(seg.from).top, text: false, focus: !st.focused }
+      : {
+          pos: start,
+          top: caretTop(view, caretAt(event.clientX, event.clientY), event.clientY),
+          text: true,
+          focus: !st.focused,
+        },
+  );
   lastEntry = { view, at: Date.now() };
   let anchor = start;
   let startSel = view.state.selection;
@@ -1372,6 +1532,11 @@ const renderedEvents = EditorView.domEventHandlers({
     if (a !== null && (e.metaKey || e.ctrlKey)) {
       const href = a.getAttribute("href") ?? "";
       if (isFollowable(href)) followLiveLink(view, href, e, a.hasAttribute("data-wikilink"));
+      return true;
+    }
+    const slot = embedIn(hit, t);
+    if (slot !== null && (e.metaKey || e.ctrlKey)) {
+      hydratorFor(view).openEmbed(slot);
       return true;
     }
     const cell = t.closest<HTMLTableCellElement>("th, td");
@@ -1537,13 +1702,27 @@ function anchorAt(view: EditorView, pos: number, top: number, dropTarget: boolea
 const liveView = ViewPlugin.fromClass(
   class {
     private readonly onFocus = (): void => queueMicrotask(() => this.syncFocus());
+    /** A card's body is the block's content here: its press placed the
+     *  cursor (a revealed figure stays drawn under the pointer), so its
+     *  click must not also open the file — Mod+press does that. Caught on
+     *  the way down, before the card's own handlers. */
+    private readonly onCardClick = (e: MouseEvent): void => {
+      const t = e.target;
+      if (!(t instanceof Element) || t.closest(".embed-card") === null || t.closest(CARD_CONTROL) !== null) return;
+      e.stopPropagation();
+      e.preventDefault();
+    };
     private readonly heightsKey = {};
+    private syncTimer: ReturnType<typeof setTimeout> | null = null;
     constructor(readonly view: EditorView) {
       liveViews.add(view);
       view.dom.addEventListener("focusin", this.onFocus);
       view.dom.addEventListener("focusout", this.onFocus);
+      view.contentDOM.addEventListener("click", this.onCardClick, true);
       this.onFocus();
       view.requestMeasure({ key: this.heightsKey, read: (v) => this.record(v) });
+      // Before the first draw's cards ask one by one: they join this one.
+      this.scheduleSync(0);
     }
     update(u: ViewUpdate): void {
       const st = u.state.field(liveField);
@@ -1552,13 +1731,40 @@ const liveView = ViewPlugin.fromClass(
       if (before !== undefined) this.keepPlace(u, before, st.revealed !== was.revealed || st.segs !== was.segs);
       if (u.geometryChanged || u.heightChanged || u.viewportChanged || u.docChanged)
         this.view.requestMeasure({ key: this.heightsKey, read: (v) => this.record(v) });
+      if (u.docChanged || syntaxTree(u.state) !== syntaxTree(u.startState)) this.scheduleSync(400);
     }
     destroy(): void {
       liveViews.delete(this.view);
       this.view.dom.removeEventListener("focusin", this.onFocus);
       this.view.dom.removeEventListener("focusout", this.onFocus);
-      hydrators.get(this.view)?.destroy();
+      this.view.contentDOM.removeEventListener("click", this.onCardClick, true);
+      if (this.syncTimer !== null) clearTimeout(this.syncTimer);
+      // Kept blocks outlive the plugin (a switch to source and back); their
+      // cards do not.
+      const h = hydrators.get(this.view);
+      if (h !== undefined) forgetDrawn(this.view, (_key, dom) => h.holdsEmbeds(dom));
+      h?.destroy();
       hydrators.delete(this.view);
+    }
+    private scheduleSync(ms: number): void {
+      if (this.syncTimer !== null) clearTimeout(this.syncTimer);
+      this.syncTimer = setTimeout(() => {
+        this.syncTimer = null;
+        this.syncEmbeds();
+      }, ms);
+    }
+    /** The document's image references, resolved together (a changed set
+     *  asks again); kept blocks whose text is gone release their cards. */
+    private syncEmbeds(): void {
+      const view = this.view;
+      if (!liveViews.has(view)) return;
+      const h = hydratorFor(view);
+      const st = view.state.field(liveField);
+      h.syncEmbeds(contextFor(view.state), st.fmEnd);
+      const cache = drawnByView.get(view);
+      if (cache === undefined || h.embedCount === 0) return;
+      const live = new Set(st.keys);
+      forgetDrawn(view, (key, dom) => !dom.isConnected && !live.has(key) && h.holdsEmbeds(dom));
     }
     private syncFocus(): void {
       const view = this.view;

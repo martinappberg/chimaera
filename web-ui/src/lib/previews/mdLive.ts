@@ -87,6 +87,7 @@ import {
   tableAt,
   type LiveHost,
 } from "./mdBlocks";
+import { isFigureLine } from "./doc/live";
 
 export { setLivePropsCollapsed, setLiveTheme } from "./mdBlocks";
 
@@ -222,7 +223,8 @@ function imageWidget(url: string, alt: string, path: string): ImageWidget | null
   if (url.length === 0) return null;
   const remote = hasUrlScheme(url);
   if (remote && !/^(https?:|data:image\/)/i.test(url)) return null;
-  return new ImageWidget(remote ? url : resolveDocPath(path, safeDecodeUri(url)), alt, remote);
+  // A fragment (`#xywh=…`) or query names a spot, not part of the file.
+  return new ImageWidget(remote ? url : resolveDocPath(path, safeDecodeUri(url.split(/[?#]/)[0] ?? "")), alt, remote);
 }
 
 /** An equation as KaTeX MathML — or, at the session's first equation while
@@ -846,6 +848,7 @@ function buildDecorations(
       const line = doc.lineAt(node.from);
       if (line.to < node.to) return false; // spans lines: replace is illegal from a plugin
       if (active(line.from, line.to)) return false; // show source while editing it
+      if (isFigureLine(line.text)) return false; // its figure is drawn below it (mdBlocks)
       const urlNode = node.node.getChild("URL");
       if (urlNode === null) return false; // reference-style: leave as source
       const marks = node.node.getChildren("LinkMark");
