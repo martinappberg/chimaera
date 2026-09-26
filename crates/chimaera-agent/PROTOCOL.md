@@ -2411,3 +2411,23 @@ Hermetic mapper tests (9 new in codex.rs): the completed marker never re-opens a
 ### Gate (Pass 31)
 
 Hermetic: claude signature classifier pinned to a real narration signature, stream routing (narration → prose, reasoning → thought, hold timeout, frame-decided block, unstreamed frames, teardown release), `tool_use_summary`, the hand-back strip, the subagent close (one finished line, no background notice), importer narration; the `fake-claude showcase` manager test drives every surface through the pipeline (narration prose, three batch labels, one `SubagentFinished` with stats, a clean Agent row, the monitor flag, the CLI's close sentences); wire-contract pins for `ToolSummary`, `SubagentFinished`, `TurnTokens`, `ActivityLine` and the new flags; driver tests for the per-call token sum and the deduped activity line. Codex: see its Gate list above. Web UI: reducer tests for labels, finished rows, turn tokens, activity line and wake markers; the group-title helper's own suite.
+
+## Pass 32 (2026-09-25 — live probes codex 0.153.0 + claude 2.1.259): agent-side plugin, skill and hook state for the Plugins tab. ADOPTED (daemon `agent_probe.rs`, not a driver).
+
+These are read by a SHORT-LIVED `codex app-server` the daemon opens for the Plugins tab (initialize → `initialized` → requests; no thread, no model call), and by claude's plugin CLI. No driver changed.
+
+#### Codex
+
+- **`skills/list {cwds:[cwd], forceReload}`** → `{data:[{cwd, skills:[SkillMetadata], errors:[{path, message}]}]}`. `SkillMetadata`: `name`, `description`, `shortDescription?`, `interface?`, `path`, `scope: user|repo|system|admin`, `enabled`, `dependencies?`, **`pluginId?`** (owning plugin id, e.g. `mycelium@mycelium`). Plugin skills are namespaced (`mycelium:core`). After `codex plugin marketplace add <local path|owner/repo>` + `codex plugin add mycelium@mycelium` the ten `mycelium:*` skills list with `scope: "user"`, `enabled: true`, `pluginId: "mycelium@mycelium"`.
+- **`hooks/list {cwds:[cwd]}`** → `{data:[{cwd, hooks:[HookMetadata], warnings:[string], errors:[{path, message}]}]}`. `HookMetadata`: `key` (e.g. `mycelium@mycelium:hooks/hooks.json:post_tool_use:0:1` — `<source>:<event_snake>:<group>:<hook>`), `eventName` (camelCase: `preToolUse`, `postToolUse`, `sessionStart`, `stop`, …), `matcher?`, `source` (`system|user|project|mdm|sessionFlags|plugin|…`), `sourcePath`, `pluginId?`, `currentHash` (`sha256:…`), `trustStatus: managed|untrusted|trusted|modified`, `enabled`, `timeoutSec`, `statusMessage?`, `isManaged`, `displayOrder`. There is NO command field — the daemon reads the command from `sourcePath`'s hooks.json by the key's `<event>:<group>:<hook>` suffix (event → PascalCase section).
+- **Trust is `[hooks.state."<key>"] trusted_hash = "<currentHash>"` in config.toml** (the record `/hooks` writes). **`config/batchWrite {edits:[{keyPath, value, mergeStrategy: replace|upsert}], filePath?, expectedVersion?, reloadUserConfig}`** → `{status:"ok", version, filePath, overriddenMetadata}`. Verified against a throwaway `CODEX_HOME`: `{keyPath:"hooks.state", mergeStrategy:"upsert", value:{"<key>":{"trusted_hash":"<hash>"}}}` MERGES — an unrelated pre-existing `[hooks.state."…"]` record survived — and the next `hooks/list` reports the hooks `trusted`. `replace` would drop every other trust record; never use it there.
+- `plugin/list`, `plugin/installed`, `plugin/install`, `marketplace/*` exist in the 0.153 schema but are NOT used: a plugin's install state is read from `pluginId` on its skills and hooks.
+
+#### Claude
+
+- `claude plugin list --json` → `[{id, version, scope, enabled, installPath, installedAt, lastUpdated}]`; `--available` adds `{installed:[…], available:[{pluginId, name, description, marketplaceName, source}]}` (291 entries on this host). `claude plugin details <id>` is human text (component inventory + "Always-on: ~N tok"); only the totals are read, leniently.
+- The **Stop hook input carries `last_assistant_message`** (2.1.259 binary: `{…, hook_event_name:"Stop", stop_hook_active, last_assistant_message, background_tasks, session_crons}`; SubagentStop adds `agent_id`, `agent_transcript_path`, `agent_type`). ADOPTED as a claude-TUI Timeline episode's result line.
+
+#### Gate
+
+Hermetic: `agent_probe` tests (details totals, hook command summary, SKILL.md frontmatter), `plugins` route/MCP-gate/notes tests, and the `agent_view` fixtures pinning the plugin-free worker view. Live: the throwaway-`CODEX_HOME` trust probe above; the rest in the PR's live verification.
