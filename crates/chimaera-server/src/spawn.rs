@@ -221,10 +221,17 @@ pub(crate) async fn spawn_session(
                 argv.push(mcp.to_string_lossy().into_owned());
             }
             if !codex_plugin_tools.is_empty() {
+                // Pre-approved: the prompt-free tools every session gets
+                // (`notify`) plus the active plugins' own.
+                let approve: Vec<String> = crate::mcp::ALWAYS_ALLOWED_TOOLS
+                    .iter()
+                    .map(|t| t.to_string())
+                    .chain(codex_plugin_tools)
+                    .collect();
                 // `-c` trails `resume <thread>` too, like the theme override.
                 argv.extend(crate::launcher::codex_tui_mcp_args(
                     &crate::agents::mcp_url_bare(&id, state.port),
-                    &codex_plugin_tools,
+                    &approve,
                 ));
                 // The key rides the env, never world-readable argv; env is
                 // applied after env_remove, so nothing strips it.
