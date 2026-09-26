@@ -367,7 +367,7 @@ const DEFS = {
     title: "Content Width",
     category: "Chat",
     description:
-      "Maximum width in pixels of the chat transcript, composer, and live work trays — and of a Markdown document's reading column, so a document reads like a transcript. Narrower panes still fit their available space.",
+      "The ceiling, in pixels, for the chat transcript (with its composer and live work trays) and for a Markdown document's reading column. Each column is 48em of its own text — about a hundred characters, so a bigger font keeps its line length — and never wider than this. Narrower panes still fit their available space.",
     type: "integer",
     default: 832,
     min: 480,

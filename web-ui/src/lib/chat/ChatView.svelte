@@ -2590,9 +2590,12 @@
     --text-xs: max(9px, calc(var(--chat-font-size) - 2px));
     --text-sm: max(10px, calc(var(--chat-font-size) - 1px));
     --text-md: var(--chat-font-size);
+    /* The transcript's column: 48em of the message text — Claude.ai's
+       reading measure, ~100 characters — so a bigger font keeps its line
+       length, capped by the Content Width setting (--chat-measure). The
+       document views use the same rule (previews/MarkdownView). */
+    --chat-column: min(calc(48 * var(--chat-font-size)), var(--chat-measure));
     --text-lg: calc(var(--chat-font-size) + 2px);
-    /* The reading measure (the Claude Desktop proportion) shared by the
-       transcript column, the composer, and their satellites. */
   }
   .chat:not(.visible) .status-spark,
   .chat:not(.visible) .status-label,
@@ -2631,7 +2634,7 @@
     flex-direction: column;
     gap: 3px;
     width: 100%;
-    max-width: var(--chat-measure);
+    max-width: var(--chat-column);
     margin: 0 auto;
   }
   /* Activity lines (tool runs, thoughts, finished work, wakes) are the
@@ -2670,7 +2673,7 @@
      while the plan alone was inset, so the group never lined up. */
   .chat > :global(.tray) {
     width: 100%;
-    max-width: calc(var(--chat-measure) + 36px);
+    max-width: calc(var(--chat-column) + 36px);
     margin-left: auto;
     margin-right: auto;
     box-sizing: border-box;

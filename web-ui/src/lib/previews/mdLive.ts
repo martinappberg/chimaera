@@ -1273,13 +1273,13 @@ const liveTheme: Extension = EditorView.theme({
     fontFamily: "var(--ui-font)",
     lineHeight: "var(--lp-line-height, 1.6)",
   },
-  // The column is the chat transcript's measure (Content Width setting,
-  // set on the view root as --doc-measure): a document reads like a
-  // transcript, and never narrower. Text width plus this box's side padding.
+  // The reading view's column (MarkdownView .md-body): 48em of the document
+  // font, capped by the chat transcript's measure (Content Width, set on the
+  // view root as --doc-measure), plus this box's side padding.
   "&.cm-md-live .cm-content": {
     flex: "0 1 auto",
     width: "100%",
-    maxWidth: "calc(var(--doc-measure, 52rem) + 4rem)",
+    maxWidth: "calc(min(48em, var(--doc-measure, 52rem)) + 4rem)",
     margin: "0 auto",
     boxSizing: "border-box",
     padding: "2.2rem 2rem 3.5rem",

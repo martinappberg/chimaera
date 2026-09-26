@@ -301,6 +301,10 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
     offset go from one mode to the next, so the same block sits at the same height; one
     scrolled partly past the top keeps that share of itself past it (a 90 px figure that is
     one line of source keeps that line in view — `mdDoc.ts` `placeOffset`).
+  - **The column** (reading, the properties card and live's editor alike) is 48em of the
+    document font — Claude.ai's reading measure, ~650 px / ~100 characters at the 13.5 px
+    default — so A−/A+ keeps the line length, capped by the chat **Content Width** setting
+    so a document is never wider than a transcript; a narrower pane fills what it has.
   - **reading** is the complete non-editable render, drawn **in the browser** by the shared
     renderer (`previews/doc/`) from the document's *current* text: the editor's buffer once
     the editor holds the file (unsaved edits included — a live keystroke shows the next time
