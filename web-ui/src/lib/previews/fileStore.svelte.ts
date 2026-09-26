@@ -62,6 +62,9 @@ export class FileEntry {
   mtime = $state<string | null>(null);
   /** The mounted path was reported absent after it was loaded. */
   missing = $state(false);
+  /** Changes on disk seen since `mtime` was first learned; learning it is not
+   *  one. Views that read their bytes once at mount remount on it. */
+  changes = $state(0);
 
   chunk = $state<FileChunk | null>(null);
   chunkError = $state<string | null>(null);
@@ -113,11 +116,15 @@ export class FileEntry {
     this.path = path;
   }
 
-  private adoptMtime(m: string | null): void {
-    if (m !== null) {
-      this.mtime = m;
-      this.missing = false;
-    }
+  /** `changed`: the caller probed because the disk changed (`revalidate`), so
+   *  even a first token may postdate the payloads a view already read. */
+  private adoptMtime(m: string | null, changed = false): void {
+    if (m === null) return;
+    untrack(() => {
+      if (this.mtime !== m && (changed || this.mtime !== null)) this.changes += 1;
+    });
+    this.mtime = m;
+    this.missing = false;
   }
 
   /** Seed the invalidation token for preview kinds whose payload endpoint does
@@ -318,11 +325,10 @@ export class FileEntry {
       const probed = (await fsFile(this.path, 0, 1)).mtime;
       if (probed === null || probed === this.mtime) return;
       await this.refreshPayloads();
-      // Raw-ticket consumers such as PdfView remount on this token. Publish it
+      // Raw-ticket consumers such as PdfView remount on `changes`. Publish it
       // only after refreshed payloads land, so the remount cannot reuse the old
       // still-fresh ticket in the gap between these two operations.
-      this.mtime = probed;
-      this.missing = false;
+      this.adoptMtime(probed, true);
     } catch {
       return; // unreachable/deleted — leave content; the tab-prune path handles death
     } finally {
@@ -338,9 +344,14 @@ export class FileEntry {
    */
   noteWrite(mtime: string | null): void {
     this.missing = false;
+    const known = untrack(() => this.mtime);
     if (mtime !== null) this.mtime = mtime;
     this.writtenMtime = mtime;
-    void this.refreshPayloads();
+    // Count the change only once the saved payloads land, as `revalidate`
+    // does, so a remount cannot reuse the old ticket.
+    void this.refreshPayloads().then(() => {
+      if (mtime !== null && known !== null && mtime !== known) this.changes += 1;
+    });
   }
 
   /** Whether `mtime` is the version this window's own last save wrote —

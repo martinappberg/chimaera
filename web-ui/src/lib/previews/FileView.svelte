@@ -17,7 +17,6 @@
   import { looksBinary, midTruncate, viewKindFor, type FileChunk } from "./files";
   import { retain, release, type FileEntry } from "./fileStore.svelte";
   import { isMarpFrontmatter, isMarpSource } from "./marp";
-  import { nextVersionKey, VERSION_KEY_START } from "./versionKey";
   import ImageView from "./ImageView.svelte";
   import MediaView from "./MediaView.svelte";
   import TableView from "./TableView.svelte";
@@ -205,25 +204,22 @@
   // it live. Only the kinds read as text read their first chunk here; the
   // other kinds mount a sub-view that reads its own payload from the same entry.
   let entry = $state<FileEntry | null>(null);
+  let changesAtBind = $state(0);
+  // The views keyed on this (spreadsheet, PDF, Parquet, binary card) read their bytes
+  // once at mount, so a change on disk must remount them for the new ticket
+  // and bytes. Not the mtime token itself: a cold open learns that moments
+  // after the view mounts, and keying on it mounted each of them twice.
+  const version = $derived(
+    entry !== null && entry.path === path ? entry.changes - changesAtBind : 0,
+  );
   $effect(() => {
     const p = path;
     const e = retain(p);
+    changesAtBind = untrack(() => e.changes);
     entry = e;
     if (readsChunk(viewKindFor(p), false)) void e.ensureChunk();
     else void e.ensureMtime();
     return () => release(p);
-  });
-  // The views that read their whole file again on a new version remount on
-  // this key: it moves when the version token CHANGES, not when it first
-  // lands on a cold open (see versionKey.ts) — that remount read the file
-  // twice and lost a spreadsheet's range reveal.
-  let version = VERSION_KEY_START;
-  let versionKey = $state(0);
-  $effect(() => {
-    const e = entry;
-    if (e === null) return;
-    version = nextVersionKey(version, e.path, e.mtime);
-    if (version.key !== untrack(() => versionKey)) versionKey = version.key;
   });
   // "Open as text" on an extension-known binary, or a board's source: its
   // chunk was never read.
@@ -369,7 +365,7 @@
         <TableView {path} />
       {:else if kind === "xlsx"}
         {#if XlsxView !== null}
-          {#key versionKey}
+          {#key version}
             <XlsxView {path} />
           {/key}
         {:else}
@@ -377,7 +373,7 @@
         {/if}
       {:else if kind === "pdf"}
         {#if PdfView !== null}
-          {#key versionKey}
+          {#key version}
             <PdfView {path} />
           {/key}
         {:else}
@@ -428,14 +424,14 @@
       {:else if kind === "parquet"}
         {#if ParquetView !== null}
           <!-- Keyed on the version: a rewritten file is a new footer and new offsets. -->
-          {#key versionKey}
+          {#key version}
             <ParquetView {path} />
           {/key}
         {:else}
           {@render lazyFallback()}
         {/if}
       {:else if kind === "binary" && !asText}
-        {#key versionKey}
+        {#key version}
           <BinaryView {path} onText={() => (asText = true)} />
         {/key}
       {:else if probe.state === "text" && asText}
@@ -447,7 +443,7 @@
           {@render lazyFallback()}
         {/if}
       {:else if probe.state === "binary"}
-        {#key versionKey}
+        {#key version}
           <BinaryView {path} knownSize={probe.size} onText={() => (asText = true)} />
         {/key}
       {:else if probe.state === "error"}

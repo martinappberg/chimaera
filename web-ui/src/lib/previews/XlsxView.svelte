@@ -114,9 +114,9 @@
   });
 
   // A reveal is held (pendingReveal) until its sheet has loaded, so this
-  // view must outlive a cold open: FileView keys it on a version token that
-  // moves only when the file CHANGES (versionKey.ts), not when the token
-  // first lands. A reveal still pending when the view goes is dropped — the
+  // view must outlive a cold open: FileView keys it on the entry's `changes`
+  // count, which moves only when the file CHANGES, not when the first token
+  // lands. A reveal still pending when the view goes is dropped — the
   // one global slot may hold a newer reveal for another file by then.
 </script>
 

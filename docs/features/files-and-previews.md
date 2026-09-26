@@ -995,10 +995,13 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   an already-dirty file, ignored/non-repo files, and Finder paths outside the workspace; recognized
   agent writes and in-app mutations remain the immediate event-driven fast path. A moved mtime
   refreshes payloads **in place** (never nulling — a null chunk would unmount a live `CodeView`),
-  while PDF/spreadsheet/Parquet/binary surfaces remount on the new token — a CHANGED token only
-  (`versionKey.ts`): the first token landing on a cold open, moments after the view mounted, is
-  not a change, so the file isn't read twice and a spreadsheet keeps the `#sheet=…&range=…` reveal
-  it holds while it switches sheets. An editor buffer is never
+  while PDF/spreadsheet/Parquet/binary surfaces remount on a real change: `FileView` keys them on
+  the entry's `changes` count since the tab bound it (`fileStore.svelte.ts`). Learning the first
+  token on a cold open is not a change, so the file isn't read twice and a spreadsheet keeps the
+  `#sheet=…&range=…` reveal it holds while it switches sheets; moving off a known token is one, and
+  so is any token `revalidate()` publishes (it probes only after the disk changed, so a view whose
+  first probe failed or was still in flight still gets the new bytes). The count moves only after
+  the refreshed payloads land, so a remount never reuses the old ticket. An editor buffer is never
   clobbered: it retains its path (so a dirty buffer stays watched with no view mounted) and
   reconciles a moved token by reading the whole file — reload when clean, merge or conflict when
   dirty (see *Raw reads & lightweight editing* above). Embed cards (below) keep a cached output
