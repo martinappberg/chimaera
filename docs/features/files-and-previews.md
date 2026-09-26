@@ -399,9 +399,11 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   Rendered documents carry the workbench's reading chrome: fenced code blocks and blockquotes
   get the same hover copy button as the chat transcript (`shared/copyDecor.ts`, one decorator
   for both surfaces), and **document-relative images** (a `figs/plot.png`-style src) resolve
-  against the file's directory through short-lived `/raw/` tickets (`rawTicketUrl`, plus a
-  synchronous memo in `doc/reader.ts`, so a re-rendered block keeps its `src` and never
-  flashes; a relative src in raw HTML too, never requested from the app's origin first) —
+  against the file's directory through short-lived `/raw/` tickets (`rawTicketUrl`: the daemon
+  keeps a file's ticket while it is unchanged, so a re-rendered block shows the last answer at
+  once and never flashes, and swaps to the new version's URL when the image was overwritten —
+  the client reuses an answer only for a render's burst; a relative src in raw HTML too, never
+  requested from the app's origin first) —
   http(s) URLs pass through, any scheme the daemon's sanitizer would strip (`data:`,
   `file:`, `javascript:`) loses its src or href, while live's image widgets render only
   http(s)/`data:image` URLs and leave other schemes as source. The live mode mirrors all of

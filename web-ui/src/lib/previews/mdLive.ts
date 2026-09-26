@@ -53,7 +53,7 @@ import {
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
 import { languages } from "@codemirror/language-data";
 import type { SyntaxNode, SyntaxNodeRef, Tree } from "@lezer/common";
-import { rawTicketUrl, resolveDocPath, safeDecodeUri } from "./files";
+import { lastRawTicketUrl, rawTicketUrl, resolveDocPath, safeDecodeUri } from "./files";
 import { MATH_MARK, isDisplayMath, isMath, mathDelimiters, mathSource } from "./mdMath";
 import { docExtensions } from "./doc/parser";
 import { frontmatterOf, outlineOf, type OutlineEntry } from "./doc/model";
@@ -175,8 +175,9 @@ class CheckboxWidget extends WidgetType {
 }
 
 /** Inline image for `![alt](target)` when its line is inactive. Relative
- *  targets ride the same ticketed /raw/ URLs as the reading view (memoized in
- *  files.ts, so decoration rebuilds keep the src stable — no flash). */
+ *  targets ride the same ticketed /raw/ URLs as the reading view: the last
+ *  answer at once (a rebuilt widget keeps its src — no flash), then the
+ *  daemon's current one if the image changed since. */
 class ImageWidget extends WidgetType {
   constructor(
     readonly target: string,
@@ -198,9 +199,11 @@ class ImageWidget extends WidgetType {
     if (this.remote) {
       img.src = this.target;
     } else {
+      const last = lastRawTicketUrl(this.target);
+      if (last !== null) img.src = last;
       void rawTicketUrl(this.target).then(
         (url) => {
-          if (img.isConnected) img.src = url;
+          if (img.isConnected && url !== last) img.src = url;
         },
         () => {
           // missing/unreadable target: the alt text shows
