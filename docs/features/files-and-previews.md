@@ -273,8 +273,8 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
     (heading ids, footnote numbers, reference definitions) — a block whose key survives keeps
     its DOM nodes and only its line numbers shift, so an agent rewriting one paragraph never
     re-flows, re-decodes an image or re-typesets an equation elsewhere. Measured on a warm
-    tab: a 5,000-line document renders in about 115 ms, an edit to one paragraph in 9–13 ms,
-    a line inserted at the top (every block's lines shift) in about 16 ms. A file the client
+    tab: a 5,000-line document renders in about 90–120 ms, an edit to one paragraph in 7–15 ms,
+    a line inserted at the top (every block's lines shift) in about 18 ms. A file the client
     can't hold — over the 1 MB edit cap, binary content, a source that can't be read — falls
     back to the daemon's render: `GET /api/v1/fs/markdown?path=` → `{html, frontmatter}`,
     comrak GFM (+ `math_dollars`, alerts, footnotes, heading ids, `sourcepos`) →
@@ -312,8 +312,10 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
       `section.footnotes`, each with a back-reference per reference; one nobody references is
       dropped. The jumps work both ways.
     - **Code.** Fences are highlighted by the same lezer highlighter live and the editor use
-      (`cm.ts` `codeHighlight`, so colors match), the grammar loaded lazily per language —
-      only that block repaints when it arrives. A ```` ```mermaid ```` fence lays out as a
+      (`cm.ts` `codeHighlight`, so colors match), the grammar loaded lazily per language,
+      and painted in the same slices as equations (the first 8 ms with the render, so the
+      first screen and an edited fence arrive colored; the rest at idle) — a long document's
+      fences never paint in one task. A ```` ```mermaid ```` fence lays out as a
       diagram (`shared/mermaid.ts`: its own lazy chunk, strict security level, sanitized
       SVG), again on a theme change; one that won't parse shows its source under the parser's
       message.

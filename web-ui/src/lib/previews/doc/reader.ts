@@ -176,20 +176,26 @@ function paint(code: HTMLElement, parser: Parser, text: string): void {
   code.replaceChildren(frag);
 }
 
-function highlight(code: HTMLElement, lang: string, text: string): void {
-  if (text.length > HIGHLIGHT_MAX) return;
+interface Fence {
+  code: HTMLElement;
+  lang: string;
+  text: string;
+}
+
+/** Paints `fence` if its grammar is loaded; otherwise loads it (once for
+ *  the page) and hands the fence to `later` — so a first document's fences
+ *  go back through the slices rather than all painting in the load's task. */
+function highlight(fence: Fence, later: (fence: Fence) => void): void {
+  const { code, lang, text } = fence;
+  if (text.length > HIGHLIGHT_MAX || !code.isConnected) return;
   const desc = LanguageDescription.matchLanguageName(languages, lang, true);
   if (desc === null) return;
   if (desc.support !== undefined) {
     paint(code, desc.support.language.parser, text);
     return;
   }
-  // The grammar loads once for the page; only this block repaints — and
-  // only if it still holds the text it was drawn with.
   desc.load().then(
-    (support) => {
-      if (code.textContent === text) paint(code, support.language.parser, text);
-    },
+    () => later(fence),
     () => {
       // grammar failed to load: plain text is fine
     },
@@ -216,46 +222,29 @@ function typesetSpan(span: HTMLElement, math: MathModule): void {
 }
 
 /**
- * Typesets equations (`span[data-math-style]`, the one seam every equation
- * arrives through — the server fallback's too) under the shared KaTeX
- * policy, loaded on demand. Time-sliced: the first 8 ms synchronously (a
- * document's first screen, an edited block), the rest at idle, so lecture
- * notes with thousands of equations never stall the workbench. One queue
- * per view: spans added while a pass runs join it; a span that left the
- * page before its turn is skipped.
+ * Work over a document's blocks, time-sliced: the first 8 ms synchronously
+ * (a document's first screen, an edited block), the rest at idle, so notes
+ * with thousands of equations or fences never stall the workbench. One
+ * queue: items added while a pass is pending join it, in order. Stopping
+ * is final (the view is going away).
  */
-export class MathTypesetter {
-  private queue: HTMLElement[] = [];
+class Slicer<T> {
+  private queue: T[] = [];
   private next = 0;
   private handle: number | null = null;
   private idle = false;
-  private loading = false;
   private stopped = false;
 
-  constructor(private readonly onSlice: () => void) {}
+  constructor(
+    private readonly run: (item: T) => void,
+    private readonly onSlice: () => void = () => {},
+  ) {}
 
-  add(spans: readonly HTMLElement[]): void {
-    if (spans.length === 0 || this.stopped) return;
-    this.queue.push(...spans);
-    if (this.handle !== null || this.loading) return;
-    const math = mathNow();
-    if (math !== null) {
-      this.slice(math);
-      return;
-    }
-    this.loading = true;
-    loadMath().then(
-      (m) => {
-        this.loading = false;
-        if (!this.stopped) this.slice(m);
-      },
-      () => {
-        // KaTeX failed to load: the LaTeX literals stay readable as text.
-        this.loading = false;
-        this.queue = [];
-        this.next = 0;
-      },
-    );
+  add(items: readonly T[]): void {
+    if (items.length === 0 || this.stopped) return;
+    // A loop, not a spread: a spread of tens of thousands of items throws.
+    for (const item of items) this.queue.push(item);
+    if (this.handle === null) this.slice();
   }
 
   stop(): void {
@@ -269,13 +258,10 @@ export class MathTypesetter {
     this.next = 0;
   }
 
-  private slice(math: MathModule): void {
+  private slice(): void {
     this.handle = null;
     const deadline = performance.now() + 8;
-    while (this.next < this.queue.length && performance.now() < deadline) {
-      const s = this.queue[this.next++];
-      if (s.isConnected) typesetSpan(s, math);
-    }
+    while (this.next < this.queue.length && performance.now() < deadline) this.run(this.queue[this.next++]);
     this.onSlice();
     if (this.next >= this.queue.length) {
       this.queue = [];
@@ -286,11 +272,68 @@ export class MathTypesetter {
     // timeout stands in.
     if (typeof requestIdleCallback === "function") {
       this.idle = true;
-      this.handle = requestIdleCallback(() => this.slice(math), { timeout: 500 });
+      this.handle = requestIdleCallback(() => this.slice(), { timeout: 500 });
     } else {
       this.idle = false;
-      this.handle = window.setTimeout(() => this.slice(math), 16);
+      this.handle = window.setTimeout(() => this.slice(), 16);
     }
+  }
+}
+
+/**
+ * Typesets equations (`span[data-math-style]`, the one seam every equation
+ * arrives through — the server fallback's too) under the shared KaTeX
+ * policy, loaded on demand, in slices. A span that left the page before its
+ * turn is skipped.
+ */
+export class MathTypesetter {
+  private pending: HTMLElement[] = [];
+  private slicer: Slicer<HTMLElement> | null = null;
+  private loading = false;
+  private stopped = false;
+
+  constructor(private readonly onSlice: () => void) {}
+
+  add(spans: readonly HTMLElement[]): void {
+    if (spans.length === 0 || this.stopped) return;
+    if (this.slicer !== null) {
+      this.slicer.add(spans);
+      return;
+    }
+    for (const s of spans) this.pending.push(s);
+    if (this.loading) return;
+    const math = mathNow();
+    if (math !== null) {
+      this.start(math);
+      return;
+    }
+    this.loading = true;
+    loadMath().then(
+      (m) => {
+        this.loading = false;
+        if (!this.stopped) this.start(m);
+      },
+      () => {
+        // KaTeX failed to load: the LaTeX literals stay readable as text.
+        this.loading = false;
+        this.pending = [];
+      },
+    );
+  }
+
+  stop(): void {
+    this.stopped = true;
+    this.slicer?.stop();
+    this.pending = [];
+  }
+
+  private start(math: MathModule): void {
+    this.slicer = new Slicer((s) => {
+      if (s.isConnected) typesetSpan(s, math);
+    }, this.onSlice);
+    const spans = this.pending;
+    this.pending = [];
+    this.slicer.add(spans);
   }
 }
 
@@ -300,7 +343,7 @@ export function mathSpans(nodes: readonly Node[]): HTMLElement[] {
   for (const n of nodes) {
     if (!(n instanceof HTMLElement)) continue;
     if (n.matches("span[data-math-style]:not(.md-math)")) out.push(n);
-    out.push(...n.querySelectorAll<HTMLElement>("span[data-math-style]:not(.md-math)"));
+    for (const s of n.querySelectorAll<HTMLElement>("span[data-math-style]:not(.md-math)")) out.push(s);
   }
   return out;
 }
@@ -331,6 +374,18 @@ export class DocReader {
   private readonly target: DomTarget;
   private theme: "light" | "dark";
   private readonly math: MathTypesetter;
+  /** Fences drawn by the pass in progress: painted once they are in the
+   *  article, in slices (a warm grammar would otherwise paint every fence of
+   *  a first render synchronously). */
+  private fences: Fence[] = [];
+  /** Fences whose grammar just loaded, requeued as one batch: a grammar's
+   *  load settles every fence waiting on it in the same microtask run. */
+  private loaded: Fence[] = [];
+  private readonly highlighter = new Slicer<Fence>((f) =>
+    highlight(f, (g) => {
+      if (this.loaded.push(g) === 1) queueMicrotask(() => this.highlighter.add(this.loaded.splice(0)));
+    }),
+  );
 
   constructor(
     private readonly root: HTMLElement,
@@ -339,7 +394,9 @@ export class DocReader {
     this.theme = opts.theme;
     const hooks: DomHooks = {
       image: (img, src, wikilink) => this.image(img, src, wikilink),
-      code: (code, lang, text) => highlight(code, lang, text),
+      code: (code, lang, text) => {
+        this.fences.push({ code, lang, text });
+      },
       mermaid: (box, source) => {
         mermaidSource.set(box, source);
         this.drawMermaid(box, source);
@@ -419,6 +476,7 @@ export class DocReader {
     }
     this.units = next;
 
+    this.highlighter.add(this.fences.splice(0));
     this.math.add(mathSpans(fresh));
     return {
       frontmatter: frontmatter?.raw ?? null,
@@ -439,6 +497,9 @@ export class DocReader {
 
   destroy(): void {
     this.math.stop();
+    this.highlighter.stop();
+    this.fences = [];
+    this.loaded = [];
     this.units = [];
     this.prev = null;
   }
