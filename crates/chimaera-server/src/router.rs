@@ -7,8 +7,8 @@ use tower_http::trace::TraceLayer;
 use crate::AppState;
 use crate::{
     agent_probe, agents, api, chat, compute, compute_jobs, download, environment, fs, git,
-    launcher, links, mcp, plugins, proxy, quickopen, recents, runtimes, settings, timeline, update,
-    upload, view_state, ws,
+    launcher, links, mcp, notices, plugins, proxy, quickopen, recents, runtimes, settings,
+    timeline, update, upload, view_state, ws,
 };
 
 /// Build the axum router (factored out so tests can drive it with `oneshot`).
@@ -39,7 +39,7 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
             post(crate::notes::deliver),
         )
         // Workbench plugins: the catalog, per-workspace status, and the
-        // per-workspace off switch (enabling is the `plugins.enabled` setting).
+        // per-workspace switch (`Workspace.plugins_on`; off by default).
         .route("/plugins", get(plugins::list_plugins))
         .route("/workspaces/{id}/plugins", get(plugins::workspace_plugins))
         .route(
@@ -107,6 +107,8 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         .route("/agents/claude/sessions", get(launcher::claude_resumables))
         .route("/recents", get(recents::list_recents))
         .route("/update", get(update::get_update))
+        // The native shell's notice long-poll (agent finished / needs you).
+        .route("/notices", get(notices::get_notices))
         .route(
             "/view-state/{key}",
             get(view_state::get_view_state).put(view_state::put_view_state),

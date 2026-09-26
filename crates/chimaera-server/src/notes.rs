@@ -236,7 +236,10 @@ pub(crate) async fn deliver(
     let Some(workspace) = crate::lock(&state.workspaces).get(&id) else {
         return fail(StatusCode::NOT_FOUND, "unknown workspace".into());
     };
-    let (page, _) = state.timeline.page(&id, Some(seq + 1), None, 1).await;
+    let (page, _) = state
+        .timeline
+        .page(&id, Some(seq.saturating_add(1)), None, 1)
+        .await;
     let Some(entry) = page.into_iter().find(|e| e.seq == seq) else {
         return fail(StatusCode::NOT_FOUND, format!("no timeline entry #{seq}"));
     };

@@ -131,10 +131,13 @@ impl EndedJobs {
 }
 
 /// Diff two GOOD snapshots: jobs that vanished, and jobs that newly show a
-/// terminal state.
-fn note_transitions(ended: &mut EndedJobs, prev: &[Job], next: &[Job]) {
+/// terminal state. A vanish only means "ended" when `next` lists the whole
+/// queue — past the `MAX_JOBS` cap a still-running job (a big array's
+/// reshuffle) can simply fall off the page, and the Timeline can't retract.
+fn note_transitions(ended: &mut EndedJobs, prev: &[Job], next: &[Job], next_complete: bool) {
     for old in prev {
         match next.iter().find(|j| j.id == old.id) {
+            None if !next_complete => {}
             None => {
                 let state = terminal_state(&old.state).unwrap_or("ENDED");
                 ended.report(old, state);
@@ -331,7 +334,12 @@ impl ComputeService {
         if !snap.degraded {
             if let Some((_, prev)) = &inner.cache {
                 if !prev.degraded {
-                    note_transitions(&mut crate::lock(&self.ended), &prev.jobs, &snap.jobs);
+                    note_transitions(
+                        &mut crate::lock(&self.ended),
+                        &prev.jobs,
+                        &snap.jobs,
+                        !snap.truncated,
+                    );
                 }
             }
         }
@@ -967,7 +975,7 @@ mod tests {
             job("3", "PENDING"),
         ];
         let b = vec![job("2", "COMPLETING"), job("3", "FAILED")];
-        note_transitions(&mut ended, &a, &b);
+        note_transitions(&mut ended, &a, &b, true);
         let states: Vec<(String, String)> = ended
             .queue
             .iter()
@@ -979,9 +987,18 @@ mod tests {
         );
         // 3 vanishing next time must not report twice; 2 finishing does.
         let c: Vec<Job> = Vec::new();
-        note_transitions(&mut ended, &b, &c);
+        note_transitions(&mut ended, &b, &c, true);
         assert_eq!(ended.queue.len(), 3);
         assert_eq!(ended.queue[2].job.id, "2");
+        // A truncated read (past MAX_JOBS) proves nothing about the jobs it
+        // no longer lists — only a reported terminal state still counts.
+        let mut ended = EndedJobs::default();
+        let d = vec![job("7", "RUNNING"), job("8", "RUNNING")];
+        note_transitions(&mut ended, &a, &d, false);
+        assert!(ended.queue.is_empty());
+        note_transitions(&mut ended, &d, &[job("8", "TIMEOUT")], false);
+        assert_eq!(ended.queue.len(), 1);
+        assert_eq!(ended.queue[0].job.id, "8");
     }
 
     #[test]

@@ -144,9 +144,10 @@ workspace/session wire, helpers in `web-ui/src/lib/workspace/sessions.ts`).
     attention-state change worth noticing.
   - **Unread output**: an agent whose whole turn has FINISHED (the main turn handed the
     floor back AND no subagents are still on the wire) while it is NOT the focused session
-    earns a quiet "unread" cue — a bolder name (the unread-mail convention) over a
-    barely-there accent wash on the roster card, and just the bolder name on the dense rail
-    row / focus-strip chip (`workspace/unread.svelte.ts`). It is deliberately NOT triggered by mid-turn output: a
+    earns the "unread" cue — a bolder name plus a small accent dot (the unread-mail
+    convention: the name you read, the dot you scan for), over a barely-there accent wash on
+    the roster card; the rail row, pane tab (dot in the close button's slot), and focus-strip
+    chip wear the same name + dot (`workspace/unread.svelte.ts`). It is deliberately NOT triggered by mid-turn output: a
     paused stream (a hook-less TUI thinking, a gap between tool calls) is still "working",
     so a genuinely busy session never wears the mark. Per-window and in-memory ("unread"
     is about this viewer's eyes, not daemon state); focusing the session clears it. Never

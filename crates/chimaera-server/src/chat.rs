@@ -249,16 +249,28 @@ pub(crate) fn spawn_signal_task(state: Arc<AppState>) {
                     state.changes.notify_waiters();
                 }
                 ChatSignal::Exit(id, exit) => {
-                    // A dead session's un-completed edits will never land.
-                    pending_edits.retain(|(s, _), _| s != &id);
-                    crate::lock(&state.chat_catalogs).remove(&id);
-                    crate::lock(&state.notes).forget_session(&id);
+                    // A view switch / rewind respawns under the same id, and a
+                    // slow driver's reap can land after the successor is up
+                    // (see handle_chat_exit): that exit is the deliberate
+                    // kill, and the live successor's per-session state —
+                    // its open turn, catalog, edits, note cursor — must
+                    // survive it. Only a real death is history.
+                    let successor_chat = state.chat.get(&id).is_some_and(|c| c.alive);
+                    let deliberate = successor_chat
+                        || state.sessions.get(&id).is_some()
+                        || crate::lock(&state.chat_switching).contains_key(&id);
+                    if !successor_chat {
+                        // A dead driver's un-completed edits will never land.
+                        pending_edits.retain(|(s, _), _| s != &id);
+                        crate::lock(&state.chat_catalogs).remove(&id);
+                        if deliberate {
+                            episodes.forget(&id);
+                        }
+                    }
                     // Record the death BEFORE handle_chat_exit: retiring drops
-                    // the workspace mapping the Timeline entry needs. A
-                    // deliberate view switch is not history.
-                    if crate::lock(&state.chat_switching).contains_key(&id) {
-                        episodes.forget(&id);
-                    } else {
+                    // the workspace mapping the Timeline entry needs.
+                    if !deliberate {
+                        crate::lock(&state.notes).forget_session(&id);
                         let now = crate::timeline::now_ms();
                         if let Some(draft) = episodes.flush(&id, now) {
                             crate::episodes::record(&state, &id, draft, "protocol").await;
@@ -347,6 +359,88 @@ async fn nudge_paths(state: &Arc<AppState>, paths: &[String]) {
     }
 }
 
+/// Keep the record's notice text current for the notice feed (`notices`):
+/// the reply draft tracks the turn's latest prose segment, and each attention
+/// edge stashes what it was about. The protocol carries the richest words —
+/// a hook's generic Notification message never overwrites these (see
+/// `agents::ingest`).
+fn note_for_notices(record: &mut crate::agent_state::AgentRecord, ev: &AgentEvent) {
+    match ev {
+        AgentEvent::TurnStarted { .. } => {
+            record.reply_draft.clear();
+            record.notice_note = None;
+        }
+        AgentEvent::MessageChunk { text, .. } => record.append_reply(text),
+        // Prose after a tool call is a new segment; the one a turn ENDS on is
+        // its reply.
+        // Cross-turn (detached) work can be announced after the reply's prose;
+        // it isn't the turn moving on.
+        AgentEvent::ToolCall {
+            cross_turn: false, ..
+        } => record.reply_draft.clear(),
+        AgentEvent::TurnCompleted { .. } => {
+            let reply = std::mem::take(&mut record.reply_draft);
+            record.set_notice_note(&reply, false);
+        }
+        AgentEvent::PermissionRequest {
+            title,
+            input_preview,
+            plan,
+            ..
+        } => {
+            let line = if plan.is_some() {
+                "Plan ready for review".to_string()
+            } else {
+                permission_line(title, input_preview)
+            };
+            record.set_notice_note(&line, false);
+        }
+        AgentEvent::QuestionRequest { questions, .. } => {
+            let text = questions.first().map_or("", |q| q.question.as_str());
+            record.set_notice_note(text, true);
+        }
+        AgentEvent::Error {
+            message,
+            fatal: true,
+        } => record.set_notice_note(message, false),
+        AgentEvent::TurnAborted {
+            reason,
+            interrupted: false,
+            ..
+        } if reason != "interrupted" => record.set_notice_note(reason, false),
+        // The agent's own "where things stand" when it hands back waiting on
+        // the user — better words than the reply opening.
+        AgentEvent::SessionStatus {
+            detail,
+            needs_action: true,
+            ..
+        } if !detail.trim().is_empty() => record.set_notice_note(detail, false),
+        _ => {}
+    }
+}
+
+/// One line naming what a permission request wants: the request's own title
+/// plus the most telling input field (the command, the file), as the chat
+/// card would headline it.
+fn permission_line(title: &str, input: &serde_json::Value) -> String {
+    let detail = [
+        "command",
+        "file_path",
+        "notebook_path",
+        "path",
+        "url",
+        "pattern",
+    ]
+    .iter()
+    .find_map(|key| input.get(key).and_then(|v| v.as_str()))
+    .map(str::trim)
+    .filter(|d| !d.is_empty() && !title.contains(*d));
+    match detail {
+        Some(detail) => format!("{title}: {detail}"),
+        None => title.to_string(),
+    }
+}
+
 /// Fold a protocol event into the AgentRecord state machine.
 ///
 /// In chat mode the protocol is authoritative for the FULL lifecycle, for
@@ -402,6 +496,7 @@ fn apply_chat_event(state: &Arc<AppState>, id: &str, ev: &AgentEvent) {
     if let Some(next) = next {
         record.state = next;
     }
+    note_for_notices(record, ev);
     // Turn end clears the hook-fed activity fields. Tool-adjacent hooks DO
     // fire during claude chat sessions (the files_touched channel) and
     // populate now_line/subagents on the record, but the clearing Stop hook
@@ -3061,36 +3156,30 @@ pub(crate) async fn spawn_chat_session(
     // pre-approves exactly the shared read-tool list (the same one claude's
     // settings pre-allow is generated from — the two vendors' ask modes
     // cannot drift); auto pre-approves the whole chimaera server. Workers
-    // (mastermind: None) keep every prompt.
-    // Active workbench plugins' tools join the pre-approved set (the user
-    // switched the plugin on; its card names the tools) — for workers too.
-    // No plugin active ⇒ workers keep every prompt, exactly as before.
+    // (mastermind: None) keep every prompt except the prompt-free tools
+    // (`notify`) every session pre-approves. Active workbench plugins' tools
+    // join the pre-approved set too (the user switched the plugin on; its
+    // card names the tools) — for workers as well.
     if recipe.kind == AgentKind::Codex {
         let plugin_tools = crate::plugins::spawn_allow(state, &recipe.workspace_id).await;
-        spec.mcp_auto_approve = match recipe.mastermind {
-            Some(crate::workspaces::MastermindMode::Auto) => {
-                Some(chimaera_agent::driver::McpAutoApprove {
-                    server: "chimaera".to_string(),
-                    tools: None,
-                })
-            }
-            Some(crate::workspaces::MastermindMode::Ask) => {
-                Some(chimaera_agent::driver::McpAutoApprove {
-                    server: "chimaera".to_string(),
-                    tools: Some(
-                        crate::mcp::MASTERMIND_READ_TOOLS
-                            .iter()
-                            .map(|t| t.to_string())
-                            .chain(plugin_tools)
-                            .collect(),
-                    ),
-                })
-            }
-            None => (!plugin_tools.is_empty()).then(|| chimaera_agent::driver::McpAutoApprove {
-                server: "chimaera".to_string(),
-                tools: Some(plugin_tools),
-            }),
-        };
+        let always = crate::mcp::ALWAYS_ALLOWED_TOOLS
+            .iter()
+            .map(|t| t.to_string());
+        spec.mcp_auto_approve = Some(chimaera_agent::driver::McpAutoApprove {
+            server: "chimaera".to_string(),
+            tools: match recipe.mastermind {
+                Some(crate::workspaces::MastermindMode::Ask) => Some(
+                    crate::mcp::MASTERMIND_READ_TOOLS
+                        .iter()
+                        .map(|t| t.to_string())
+                        .chain(always)
+                        .chain(plugin_tools)
+                        .collect(),
+                ),
+                Some(crate::workspaces::MastermindMode::Auto) => None,
+                None => Some(always.chain(plugin_tools).collect()),
+            },
+        });
     }
     // Codex selects its create-time model in-protocol at thread open; Claude
     // already received the same recipe value through build_chat_command.

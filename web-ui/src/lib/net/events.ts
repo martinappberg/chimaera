@@ -2,6 +2,7 @@ import { getToken } from "./api";
 import { nudgeReconnectors, retryDelayMs } from "./reconnect";
 import type { Link } from "../workspace/agentLinks";
 import type { Session } from "../workspace/sessions";
+import type { Notice } from "../workspace/notices";
 import type { UpdateStatus } from "../workspace/update.svelte";
 
 const INITIAL_BACKOFF_MS = 500;
@@ -51,6 +52,12 @@ export interface EventsSocketHandlers {
     removedDirs: string[];
   }): void;
   /**
+   * Discrete alerts (an agent finished, needs you, or sent a message) since
+   * this socket connected — the browser's notification source. Never
+   * replayed across reconnects: a reload must not re-alert old news.
+   */
+  onNotices?(notices: Notice[]): void;
+  /**
    * Connection state. While false the caller should fall back to polling;
    * fired only on transitions.
    */
@@ -79,6 +86,7 @@ interface ServerEventFrame {
   removed?: string[];
   dirs?: string[];
   removed_dirs?: string[];
+  notices?: Notice[];
 }
 
 /**
@@ -247,6 +255,9 @@ export class EventsSocket {
             ? msg.removed_dirs.filter(isString)
             : [],
         });
+      } else if (msg.type === "notices" && Array.isArray(msg.notices)) {
+        this.backoffMs = INITIAL_BACKOFF_MS;
+        this.handlers.onNotices?.(msg.notices);
       } else if (msg.type === "error") {
         // Bad auth or a server-side failure; give up and surface it (the
         // app shows the blocking re-auth overlay on "unauthorized").

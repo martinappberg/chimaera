@@ -213,6 +213,7 @@ async fn worker_settings_pre_allow_only_active_plugin_tools() {
     assert_eq!(
         value["permissions"]["allow"],
         serde_json::json!([
+            "mcp__chimaera__notify",
             "mcp__chimaera__knowledge_search",
             "mcp__chimaera__knowledge_get"
         ])

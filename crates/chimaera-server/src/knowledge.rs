@@ -42,15 +42,12 @@ pub(crate) struct KnowledgeState {
     cache: HashMap<String, Cached>,
     /// What the Timeline last saw, per workspace (the diff baseline).
     baseline: HashMap<String, Baseline>,
-    /// entry id (F-003 or a fingerprint) → who recorded it (sid, name).
-    recorded_by: HashMap<String, HashMap<String, (String, String)>>,
 }
 
 impl KnowledgeState {
     pub(crate) fn forget_workspace(&mut self, ws: &str) {
         self.cache.remove(ws);
         self.baseline.remove(ws);
-        self.recorded_by.remove(ws);
     }
 }
 
@@ -147,19 +144,90 @@ fn claim_of(k: &Knowledge, id: &str) -> String {
         .unwrap_or_default()
 }
 
-/// Another agent in the workspace is mid-turn (attribution would be a guess).
-fn another_agent_running(state: &AppState, ws: &str, sid: &str) -> bool {
+/// Whether another agent in the workspace may have written during this turn
+/// (`start_ts`..now) — then crediting this one would be a guess. It may if it
+/// is not settled now (mid-turn, awaiting permission, or untracked: a
+/// hook-less TUI whose turns we never see), or if it finished a turn since
+/// `start_ts` (its episode is on the Timeline). A human editing the files by
+/// hand stays invisible; the mtime gate is all that bounds that.
+async fn another_agent_active_since(
+    state: &AppState,
+    ws: &str,
+    sid: &str,
+    start_ts: Option<u64>,
+) -> bool {
+    use crate::agent_state::AgentState;
     let in_ws: Vec<String> = crate::lock(&state.session_workspaces)
         .iter()
         .filter(|(s, w)| w.as_str() == ws && s.as_str() != sid)
         .map(|(s, _)| s.clone())
         .collect();
-    let agents = crate::lock(&state.agents);
-    in_ws.iter().any(|s| {
-        agents
-            .get(s)
-            .is_some_and(|r| r.state == crate::agent_state::AgentState::Running)
-    })
+    let unsettled = {
+        let agents = crate::lock(&state.agents);
+        in_ws.iter().any(|s| {
+            agents.get(s).is_some_and(|r| {
+                !matches!(
+                    r.state,
+                    AgentState::Finished | AgentState::IdlePrompt | AgentState::Errored
+                )
+            })
+        })
+    };
+    if unsettled {
+        return true;
+    }
+    let Some(start) = start_ts else {
+        return true;
+    };
+    state
+        .timeline
+        .latest(ws, RECENT_EPISODES)
+        .await
+        .iter()
+        .any(|e| {
+            e.kind == timeline::Kind::Episode
+                && e.ts >= start
+                && e.sid.as_deref().is_some_and(|s| s != sid)
+        })
+}
+
+/// How far back the "did anyone else finish a turn" check looks — a turn's
+/// window rarely holds more than a handful of other entries.
+const RECENT_EPISODES: usize = 100;
+
+/// Entry id (F-003 or a fingerprint) → who recorded it (sid, name), read
+/// back from the episodes' own evidence on the Timeline — durable, so the
+/// credits survive a restart — over the newest `RING_CAP` entries (the
+/// newest credit wins).
+async fn recorded_by(state: &AppState, ws: &str) -> HashMap<String, (String, String)> {
+    let mut by = HashMap::new();
+    let mut before = None;
+    let mut seen = 0;
+    while seen < timeline::RING_CAP {
+        let (page, more) = state
+            .timeline
+            .page(ws, before, None, timeline::PAGE_MAX)
+            .await;
+        for e in &page {
+            let (Some(sid), Some(rec)) = (
+                e.sid.as_ref(),
+                e.evidence.as_ref().and_then(|ev| ev.recorded.as_ref()),
+            ) else {
+                continue;
+            };
+            let name = e.name.clone().unwrap_or_else(|| sid.clone());
+            for fp in &rec.fps {
+                by.entry(fp.clone())
+                    .or_insert_with(|| (sid.clone(), name.clone()));
+            }
+        }
+        seen += page.len();
+        match page.last() {
+            Some(last) if more => before = Some(last.seq),
+            _ => break,
+        }
+    }
+    by
 }
 
 /// Take the diff baseline if none exists yet — called when a turn STARTS
@@ -214,7 +282,7 @@ pub(crate) async fn recorded_since_last_check(
         )
     };
     let previous = previous?;
-    let sole = !another_agent_running(state, ws, sid);
+    let sole = !another_agent_active_since(state, ws, sid, start_ts).await;
     let fresh = |file: &str| {
         start_ts.is_some_and(|start| {
             stamp
@@ -241,14 +309,6 @@ pub(crate) async fn recorded_since_last_check(
             unattributed_findings.push(id.clone());
         }
     }
-    if !recorded.fps.is_empty() {
-        let mut st = crate::lock(&state.knowledge);
-        let by = st.recorded_by.entry(ws.to_string()).or_default();
-        for id in &recorded.fps {
-            by.insert(id.clone(), (sid.to_string(), name.clone()));
-        }
-    }
-
     // Confidence moves: their own Timeline entries (never via `unknown`).
     for (id, to) in &statuses {
         let Some(from) = previous.statuses.get(id) else {
@@ -389,11 +449,7 @@ pub(crate) async fn get_knowledge(
     };
     let mut body = serde_json::to_value(k.as_ref()).unwrap_or_else(|_| json!({}));
     // Who recorded what, where the Timeline knows it.
-    let by = crate::lock(&state.knowledge)
-        .recorded_by
-        .get(&id)
-        .cloned()
-        .unwrap_or_default();
+    let by = recorded_by(&state, &id).await;
     let annotate = |v: &mut Value, key: &str| {
         if let Some(id) = v.get(key).and_then(Value::as_str) {
             if let Some((sid, name)) = by.get(id) {

@@ -16,8 +16,8 @@
 import { api, ApiError } from "../net/api";
 
 export type TimelineKind = "episode" | "command" | "job" | "session" | "knowledge" | "note";
-export type EpisodeEnd = "finished" | "interrupted" | "errored" | "exited" | "waiting" | "unknown";
-export type EpisodeTier = "protocol" | "hooks" | "output";
+export type EpisodeEnd = "finished" | "interrupted" | "errored" | "exited" | "unknown";
+export type EpisodeTier = "protocol" | "hooks";
 
 export interface TimelineRecorded {
   findings: string[];
@@ -30,7 +30,6 @@ export interface TimelineEvidence {
   files: string[];
   files_n: number;
   tools: number;
-  turns?: number;
   recorded?: TimelineRecorded;
 }
 
@@ -63,7 +62,6 @@ export interface TimelineNote {
   /** A session id, "mastermind", or absent (everyone). */
   to?: string;
   text: string;
-  delivered?: boolean;
 }
 
 /** One wire entry (crates/chimaera-server/src/timeline.rs `Entry`); only the

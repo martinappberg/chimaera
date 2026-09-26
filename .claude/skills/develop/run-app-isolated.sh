@@ -85,6 +85,12 @@ if [ "$(uname -s)" = "Darwin" ]; then
   plutil -insert CFBundleShortVersionString -string "0.0.1" "$DEV_PLIST"
   plutil -insert CFBundleVersion -string "0.0.1" "$DEV_PLIST"
   plutil -insert NSHighResolutionCapable -bool true "$DEV_PLIST"
+  # Seal the wrapper as a real (ad-hoc) bundle signature. The linker's own
+  # signature covers only the executable ("Info.plist=not bound"), and
+  # macOS's notification center refuses such a bundle outright — no prompt,
+  # no alerts — so native notifications could never be tried in dev.
+  codesign --force --sign - "$DEV_APP" >/dev/null 2>&1 \
+    || echo "warning: could not ad-hoc sign $DEV_APP (notifications won't work)" >&2
 else
   DEV_BIN="$ROOT/crates/chimaera-app/target/debug/chimaera-dev"
   ln -f "$BUILD_BIN" "$DEV_BIN"

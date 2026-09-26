@@ -23,6 +23,7 @@ mod mcp;
 mod mycelium;
 mod naming;
 mod notes;
+mod notices;
 mod persist;
 mod plugins;
 mod proxy;

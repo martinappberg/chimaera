@@ -10,6 +10,7 @@ mod ledger;
 mod links;
 mod mastermind;
 mod mcp;
+mod notices;
 mod plugins;
 mod proxy;
 mod recents;

@@ -298,7 +298,12 @@ async fn mcp_tier_gates_on_the_binding() {
     let worker_tools = tool_names(&state, &worker, "wk").await;
     assert_eq!(
         worker_tools,
-        ["list_terminals", "run_in_terminal", "read_terminal"],
+        [
+            "list_terminals",
+            "run_in_terminal",
+            "read_terminal",
+            "notify"
+        ],
         "workers get the base tier only"
     );
 
@@ -349,7 +354,12 @@ async fn mcp_tier_gates_on_the_binding() {
     let fired = tool_names(&state, &mastermind, "mmk").await;
     assert_eq!(
         fired,
-        ["list_terminals", "run_in_terminal", "read_terminal"]
+        [
+            "list_terminals",
+            "run_in_terminal",
+            "read_terminal",
+            "notify"
+        ]
     );
 
     state.sessions.kill(&mastermind).ok();
