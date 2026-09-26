@@ -3,7 +3,8 @@
  * live editor alike. A file link resolves against the document's folder and
  * is confirmed by the daemon (`fs/validate`) before anything opens, so a dead
  * link says so in place instead of opening an empty tab. `#L12` opens the
- * file at the line (a reveal); `other.md#heading` opens the document and
+ * file at the line and a locator (`#page=4`, `#row=5-9`, `#t=30`) at its
+ * spot (reveals); `other.md#heading` opens the document and
  * then scrolls to the heading — a pending anchor, keyed by path, that the
  * target's view consumes once it has rendered. Same-document anchors never
  * touch `location.hash`: several documents share one page, and the hash is
@@ -13,6 +14,7 @@
 import { writable } from "svelte/store";
 import { dirname, fsMarkdown, fsValidate, resolveDocPath, viewKindFor } from "./files";
 import { openPath } from "../shared/openPath";
+import { parseLocator } from "../shared/locator";
 import { requestReveal, type Reveal } from "../shared/reveal";
 import { activateUrl, webUrl } from "../shared/urlOpen";
 import {
@@ -193,7 +195,10 @@ async function followPath(
     return;
   }
   const isFile = hit.kind === "file";
-  const reveal = isFile && fragment !== null ? parseLineFragment(fragment) : null;
+  // Lines, else a viewer locator (`#page=4`, `#xywh=…`, `#row=5-9`, …).
+  const at = isFile && fragment !== null ? parseLocator(fragment, hit.path) : null;
+  const reveal =
+    isFile && fragment !== null ? (parseLineFragment(fragment) ?? (at !== null ? { line: 1, ...at } : null)) : null;
   const anchor = fragment !== null && reveal === null ? decodeAnchor(fragment) : "";
   const anchored = isFile && anchor !== "" && viewKindFor(hit.path) === "markdown";
   if (anchored) requestAnchor(hit.path, anchor);
