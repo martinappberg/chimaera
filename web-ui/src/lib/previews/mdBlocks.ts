@@ -297,15 +297,18 @@ type Structure = Pick<LiveState, "segs" | "keys" | "edges" | "fmEnd" | "notes" |
 
 /** Heights measured in this session (every live view shares them). */
 const heights = new HeightCache();
-/** A block's edges by its identity (they read only its text). */
+/** A block's edges by a hash of its identity (they read only its text),
+ *  as the heights are: an identity holds the block's whole source, and
+ *  typing in a long fence makes a new one per keystroke. */
 const edgeCache = new Map<string, Edges>();
 
 function edgesFor(key: string, tree: Tree, doc: CmText, seg: Segment): Edges {
-  let e = edgeCache.get(key);
+  const hid = hashString(key);
+  let e = edgeCache.get(hid);
   if (e === undefined) {
     e = runEdges(nodesIn(tree, seg.blockFrom, seg.blockTo), doc);
     if (edgeCache.size > 4000) edgeCache.clear();
-    edgeCache.set(key, e);
+    edgeCache.set(hid, e);
   }
   return e;
 }
