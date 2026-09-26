@@ -162,6 +162,34 @@ fn another_agent_running(state: &AppState, ws: &str, sid: &str) -> bool {
     })
 }
 
+/// Take the diff baseline if none exists yet — called when a turn STARTS
+/// (and when the Knowledge view loads), so the first turn after a daemon
+/// start can still be credited with what it records. A few stats when the
+/// provider is active; nothing otherwise.
+pub(crate) async fn prime(state: &Arc<AppState>, sid: &str) {
+    let Some(ws) = crate::plugins::workspace_of_session(state, sid) else {
+        return;
+    };
+    prime_workspace(state, &ws).await;
+}
+
+async fn prime_workspace(state: &AppState, ws: &str) {
+    if crate::lock(&state.knowledge).baseline.contains_key(ws) {
+        return;
+    }
+    let Some((k, _, _)) = current(state, ws).await else {
+        return;
+    };
+    let (ids, statuses) = ids_of(&k);
+    crate::lock(&state.knowledge)
+        .baseline
+        .entry(ws.to_string())
+        .or_insert(Baseline {
+            ids: ids.into_iter().map(|(id, _, _)| id).collect(),
+            statuses,
+        });
+}
+
 /// Called at an episode end in `sid` (turn started at `start_ts`): diff the
 /// provider against the last check, attribute what is unambiguous to this
 /// turn (the returned `Recorded`), and put status moves (and unattributed
@@ -342,6 +370,7 @@ pub(crate) async fn get_knowledge(
             .await
             .unwrap_or_default()
     };
+    prime_workspace(&state, &id).await;
     let Some((k, _stamp, _)) = current(&state, &id).await else {
         return Json(json!({
             "schema": 1,

@@ -240,6 +240,9 @@ pub(crate) fn spawn_signal_task(state: Arc<AppState>) {
                             crate::lock(&state.chat_catalogs).insert(id.clone(), catalog);
                         }
                     }
+                    if matches!(entry.ev, AgentEvent::TurnStarted { .. }) {
+                        crate::knowledge::prime(&state, &id).await;
+                    }
                     if let Some(draft) = episodes.observe(&id, entry.ts, &entry.ev) {
                         crate::episodes::record(&state, &id, draft, "protocol").await;
                     }

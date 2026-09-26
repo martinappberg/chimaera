@@ -600,6 +600,9 @@ pub(crate) async fn ingest(
                 _ => None,
             }
         };
+        if event == "UserPromptSubmit" {
+            crate::knowledge::prime(&state, &id).await;
+        }
         if let Some(draft) = draft {
             crate::episodes::record(&state, &id, draft, "hooks").await;
         }
