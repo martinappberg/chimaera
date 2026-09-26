@@ -367,6 +367,9 @@
     if (tab.surface === "terminal") return sessionLabel(tab.sessionId);
     if (tab.surface === "settings") return "Settings";
     if (tab.surface === "dashboard") return "Dashboard";
+    if (tab.surface === "timeline") return "Timeline";
+    if (tab.surface === "knowledge") return "Knowledge";
+    if (tab.surface === "plugins") return "Plugins";
     if (tab.surface === "finder") return basename(tab.path) || "Finder";
     if (tab.surface === "git") return "Source Control";
     if (tab.surface === "diff") return `${basename(tab.path)} (diff)`;
@@ -764,6 +767,38 @@
                 fill="none"
                 stroke="currentColor"
                 stroke-width="1.4"
+                stroke-linejoin="round"
+              />
+            </svg>
+          {:else if tab.surface === "timeline"}
+            <!-- A clock face: what happened, when. -->
+            <svg class="glyph" viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
+              <title>timeline</title>
+              <circle cx="8" cy="8" r="5.7" fill="none" stroke="currentColor" stroke-width="1.4" />
+              <path d="M8 4.8V8l2.4 1.6" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" />
+            </svg>
+          {:else if tab.surface === "knowledge"}
+            <!-- An open notebook: what the project knows. -->
+            <svg class="glyph" viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
+              <title>knowledge</title>
+              <path
+                d="M2.5 3.2c1.8-.7 3.6-.6 5.5.5v9c-1.9-1.1-3.7-1.2-5.5-.5zM13.5 3.2c-1.8-.7-3.6-.6-5.5.5v9c1.9-1.1 3.7-1.2 5.5-.5z"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.3"
+                stroke-linejoin="round"
+              />
+            </svg>
+          {:else if tab.surface === "plugins"}
+            <!-- A plug: opt-in add-ons. -->
+            <svg class="glyph" viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
+              <title>plugins</title>
+              <path
+                d="M5.5 2v3M10.5 2v3M4 5h8v2.5a4 4 0 0 1-8 0zM8 11.5V14"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.4"
+                stroke-linecap="round"
                 stroke-linejoin="round"
               />
             </svg>
