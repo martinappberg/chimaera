@@ -12,7 +12,7 @@ budget on shared login nodes.
 `fileStore.svelte.ts` the content store, `CodeView`, `MarkdownView` + `mdDoc.ts` /
 `docLinks.ts`, `TableView`, `PdfView`, `ImageView`, `MediaView`, `HtmlView`, `BinaryView`,
 `NotebookView` + `notebook.ts`, `LogView` + `logText.ts`, `SlidesView` + `marp.ts`,
-`MermaidView`, `ansi.ts`, `FinderView`, `cm.ts`) +
+`MermaidView`, `RawTextView`, `ansi.ts`, `FinderView`, `cm.ts`) +
 `web-ui/src/lib/workspace/FileTree.svelte` + glyphs in `web-ui/src/lib/shared/`
 (`FileIcon`, `FolderIcon`, `icons.ts`). Daemon: **the preview endpoints are in
 `crates/chimaera-server/src/fs.rs`**, except the notebook pager (`notebook.rs`). The file diff
@@ -451,12 +451,12 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   `text/markdown` and `text/latex` rendered. The rail beside a cell's outputs folds them. The
   daemon pages cells — `GET /fs/notebook?path=&offset=&limit=` → `{cells, offset, total,
   language, nbformat}` — walking the file with serde's streaming visitor so only the page's
-  cells are ever held: source ≤ 64 MB, ≤ 100 cells a page and ≤ 16 MB of payload (a page can
+  cells are ever held: source ≤ 64 MB, ≤ 100 cells a page and ≤ 8 MB of payload (a page can
   come back short; the next starts at `offset + cells.length`), each output reduced to its
   richest drawable mime plus `text/plain`, a payload over 8 MB replaced by its size
-  (`omitted`), text over 200 KB cut (`truncated`); one parse at a time. The view shows 24
-  cells, then pages in as the reader nears the end; a disk change re-reads the loaded cells in
-  place; `#cell=N` (a reveal) loads up to the cell, scrolls to it and flashes it. nbformat 3
+  (`omitted`), text over 200 KB cut (`truncated`); one parse at a time. The first open is one
+  page (up to 24 cells), then more page in while the end is within reach; a disk change
+  re-reads the loaded cells in place; `#cell=N` (a reveal) loads up to the cell, scrolls to it and flashes it. nbformat 3
   is refused with how to upgrade it.
 - **Logs.** `.log`, `.out`, `.err`, `.stdout`, `.stderr` (so `slurm-*.out` and `.nextflow.log`)
   open in `LogView.svelte`, read-only and tail-first: one 64 KB read (a small log arrives
@@ -502,10 +502,11 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   when the current asset graph is unavailable. Reload waits behind unsaved file edits and chat
   drafts that exist only in memory, with an explicit reload-anyway escape hatch.
 - **Binary / Finder.** Non-text files get an info card (`BinaryView`: name, size, modified time
-  from the parent listing; no hex view yet) with **open as text** — a per-tab override that
-  shows the bytes in the editor under a bar warning that saving would rewrite them, *file
-  info* to go back — and, on a remote host (the `host=` window rule the downloads share), a
-  **download** button; `FinderView` is a directory browser surface.
+  from the parent listing; no hex view yet) with **open as text** — a per-tab override
+  (`RawTextView`): the bytes decoded read-only (the editor refuses binary content), control
+  bytes drawn as their Unicode control pictures so a NUL stays visible, 256 KB at a time up
+  to 4 MB, *file info* to go back — and, on a remote host (the `host=` window rule the
+  downloads share), a **download** button; `FinderView` is a directory browser surface.
 
 ## Preview keep-alive & live-update
 

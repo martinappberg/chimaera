@@ -20,6 +20,7 @@
   import MediaView from "./MediaView.svelte";
   import TableView from "./TableView.svelte";
   import BinaryView from "./BinaryView.svelte";
+  import RawTextView from "./RawTextView.svelte";
   import Spinner from "./Spinner.svelte";
 
   interface Props {
@@ -65,8 +66,6 @@
 
   /** Kinds whose first chunk this view reads (and sniffs) itself. */
   const readsChunk = (k: string, text: boolean) => k === "text" || k === "mermaid" || text;
-  /** Show the text branch: text files, and binaries opened as text. */
-  const textual = $derived(kind === "text" || (asText && (kind === "binary" || probeBinary())));
 
   // CodeMirror is by far the heaviest dependency in the app; load it only
   // when a text file is actually opened so the terminal-only path stays lean.
@@ -86,7 +85,9 @@
     null,
   );
   let lazyError = $state<string | null>(null);
-  const wantsCode = $derived(textual || (kind === "mermaid" && mermaidMode === "source"));
+  const wantsCode = $derived(
+    (kind === "text" && !asText) || (kind === "mermaid" && mermaidMode === "source"),
+  );
   $effect(() => {
     if (!wantsCode || CodeView !== null) return;
     void import("./CodeView.svelte").then(
@@ -197,11 +198,6 @@
       : { state: "text", chunk };
   });
 
-  function probeBinary(): boolean {
-    const e = entry;
-    return e !== null && e.path === path && e.chunk !== null && looksBinary(e.chunk.bytes);
-  }
-
   // Decide once whether a markdown file is a Marp deck, from whichever of
   // its payloads lands first: the reading render's frontmatter, or the
   // editor's source chunk. No extra request either way.
@@ -267,7 +263,7 @@
     {#if asText && probe.state === "text"}
       <!-- A binary shown as text: say so, and offer the way back. -->
       <div class="alt-bar" role="status">
-        <span class="alt-note">binary file shown as text — saving it from here would rewrite its bytes</span>
+        <span class="alt-note">binary file shown as text</span>
         <span class="spacer"></span>
         <button class="seg" onclick={() => (asText = false)}>file info</button>
       </div>
@@ -338,7 +334,7 @@
         {:else}
           {@render lazyFallback()}
         {/if}
-      {:else if kind === "mermaid" && mermaidMode === "diagram" && probe.state === "text"}
+      {:else if kind === "mermaid" && mermaidMode === "diagram" && probe.state === "text" && !asText}
         {#if MermaidView !== null}
           <MermaidView {path} chunk={probe.chunk} switcher={mermaidSwitch} />
         {:else}
@@ -348,6 +344,8 @@
         {#key entry?.mtime ?? path}
           <BinaryView {path} onText={() => (asText = true)} />
         {/key}
+      {:else if probe.state === "text" && asText}
+        <RawTextView {path} first={probe.chunk} />
       {:else if probe.state === "text"}
         {#if CodeView !== null}
           <CodeView {path} first={probe.chunk} />
