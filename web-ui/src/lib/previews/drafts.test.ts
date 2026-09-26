@@ -40,8 +40,10 @@ const net = vi.hoisted(() => {
       hold({ kind: "delete", path, keepalive }, () => {
         store.delete(path);
       }),
-    fsDraftList: async () => [],
-    fsDraftGet: async () => null,
+    fsDraftList: vi.fn(async () => [...store.keys()].map((path) => ({ path, base_hash: "h0", updated_ms: 1, bytes: 1 }))),
+    fsDraftGet: vi.fn(async (path: string) =>
+      store.has(path) ? { path, base_hash: "h0", text: store.get(path) ?? "", updated_ms: 1 } : null,
+    ),
   };
 });
 
@@ -53,7 +55,7 @@ vi.mock("./files", async (orig) => ({
   fsDraftGet: net.fsDraftGet,
 }));
 
-import { clear, journal, KEEPALIVE_BUDGET_BYTES, type DraftRecord } from "./drafts";
+import { clear, find, journal, KEEPALIVE_BUDGET_BYTES, LIST_TTL_MS, type DraftRecord } from "./drafts";
 
 const rec = (path: string, text: string): DraftRecord => ({
   path,
@@ -73,6 +75,7 @@ function deliver(i: number): void {
 beforeEach(() => {
   net.store.clear();
   net.sent.length = 0;
+  net.fsDraftList.mockClear();
 });
 
 describe("the draft mirror's per-path order", () => {
@@ -190,5 +193,37 @@ describe("the keepalive budget (a pagehide flush sends every dirty buffer at onc
     expect(keepalives()).toEqual({ "/w/euro.md": false });
     net.sent[0].settle();
     await put;
+  });
+});
+
+describe("looking for a draft on open", () => {
+  it("reuses one listing for a few seconds, dropped by this window's own writes", async () => {
+    let now = 1_000_000;
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+    try {
+      net.store.set("/w/g1.md", "kept");
+      // A restored layout opens several files at once: one listing.
+      const [a, b] = await Promise.all([find("/w/g1.md"), find("/w/g2.md")]);
+      expect(a?.text).toBe("kept");
+      expect(b).toBeNull();
+      now += LIST_TTL_MS - 1;
+      await find("/w/g3.md");
+      expect(net.fsDraftList).toHaveBeenCalledTimes(1);
+
+      // This window journals a draft: the next open must see it.
+      const put = journal(rec("/w/g2.md", "mine"));
+      await flush();
+      net.sent[0].settle();
+      await put;
+      expect((await find("/w/g2.md"))?.text).toBe("mine");
+      expect(net.fsDraftList).toHaveBeenCalledTimes(2);
+
+      // Past the TTL (another origin may have written): listed afresh.
+      now += LIST_TTL_MS;
+      await find("/w/g1.md");
+      expect(net.fsDraftList).toHaveBeenCalledTimes(3);
+    } finally {
+      clock.mockRestore();
+    }
   });
 });

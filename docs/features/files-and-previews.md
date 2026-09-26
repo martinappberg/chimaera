@@ -176,8 +176,9 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   compressed files and anything past the cap open **view-only** with a note saying why.
 - **The draft journal.** About a second after typing stops (and on hide/pagehide) dirty text is
   written to IndexedDB and mirrored to the daemon (`PUT /api/v1/fs/drafts`, ≤ 1 MiB, under
-  `~/.chimaera/drafts`) — a new tunnel port is a new origin with an empty IndexedDB. Opening a
-  file whose draft differs from the disk shows "Recovered unsaved changes from …" with Restore /
+  `~/.chimaera/drafts`; a listing reads only each draft's small metadata sidecar, and the client
+  reuses one for 3 s across opens) — a new tunnel port is a new origin with an empty IndexedDB.
+  Opening a file whose draft differs from the disk shows "Recovered unsaved changes from …" with Restore /
   Discard, never a silent restore; a draft typed against an older disk version restores through
   the merge. A save of exactly that text, or a discard, clears both copies; mirror writes for a
   path land in issue order, so a late journal write never re-creates a cleared draft. A

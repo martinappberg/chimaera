@@ -26,6 +26,7 @@ import {
   fsDraftPut,
   type DraftBody,
   type DraftPutResult,
+  type DraftSummary,
 } from "./files";
 
 export interface DraftRecord {
@@ -221,7 +222,7 @@ function reserveKeepalive(rec: DraftRecord): number {
 async function sendPut(rec: DraftRecord, keepalive: boolean): Promise<JournalResult["remote"]> {
   const reserved = keepalive ? reserveKeepalive(rec) : 0;
   try {
-    const r = await fsDraftPut(rec.path, rec.baseHash, rec.text, reserved > 0);
+    const r = await mirrorWrite(() => fsDraftPut(rec.path, rec.baseHash, rec.text, reserved > 0));
     if (r === "unsupported") remoteUnsupported = true;
     return r;
   } catch {
@@ -247,10 +248,45 @@ async function remotePut(rec: DraftRecord, keepalive: boolean): Promise<JournalR
   return again === "superseded" ? first : again;
 }
 
+/**
+ * A listing is reused this long: every editable file open looks for a draft,
+ * and a restored layout opens several at once. Shared while in flight, and
+ * dropped by any mirror write from this window (`mirrorWrite`), so it never
+ * hides this window's own drafts; another origin's show up within seconds.
+ */
+export const LIST_TTL_MS = 3_000;
+let listing: { at: number; gen: number; list: Promise<DraftSummary[] | null> } | null = null;
+/** Bumped as each of this window's mirror writes starts and settles. */
+let writeGen = 0;
+
+function listDrafts(): Promise<DraftSummary[] | null> {
+  const now = Date.now();
+  if (listing !== null && listing.gen === writeGen && now - listing.at < LIST_TTL_MS) {
+    return listing.list;
+  }
+  const entry = { at: now, gen: writeGen, list: fsDraftList() };
+  listing = entry;
+  // A failed listing is never reused.
+  entry.list.catch(() => {
+    if (listing === entry) listing = null;
+  });
+  return entry.list;
+}
+
+/** Run a mirror write, invalidating the cached listing around it. */
+async function mirrorWrite<T>(write: () => Promise<T>): Promise<T> {
+  writeGen++;
+  try {
+    return await write();
+  } finally {
+    writeGen++;
+  }
+}
+
 async function remoteFind(path: string): Promise<DraftBody | null> {
   if (remoteUnsupported) return null;
   try {
-    const list = await fsDraftList();
+    const list = await listDrafts();
     if (list === null) {
       remoteUnsupported = true;
       return null;
@@ -280,7 +316,7 @@ export async function clear(path: string, keepalive = false): Promise<void> {
     remoteUnsupported
       ? undefined
       : inLane(path, () =>
-          fsDraftDelete(path, keepalive).catch(() => {
+          mirrorWrite(() => fsDraftDelete(path, keepalive)).catch(() => {
             // offline or refused: a stale mirror is recognized on reopen (it
             // matches the disk and is dropped then) or offered, never applied
           }),
