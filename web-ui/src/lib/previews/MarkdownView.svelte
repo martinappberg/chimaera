@@ -85,7 +85,7 @@
   import Spinner from "./Spinner.svelte";
   import DocIssues from "./DocIssues.svelte";
   import PublishButton from "./PublishButton.svelte";
-  import { HoverPreviews } from "./doc/hoverPreview.svelte";
+  import { HoverPreviews } from "./doc/hoverController.svelte";
   import { hasUrlScheme, isWebUrl, urlMenuEntries } from "../shared/urlOpen";
   import { contextMenu } from "../shared/contextMenu.svelte";
   import { revealRequest, takeReveal, type Reveal } from "../shared/reveal";

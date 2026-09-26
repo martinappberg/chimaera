@@ -1,6 +1,6 @@
 /**
  * Hover previews on a document's links — the pure pieces (the controller is
- * `hoverPreview.svelte.ts`, the popover `HoverPreview.svelte`): what a link
+ * `hoverController.svelte.ts`, the popover `HoverPreview.svelte`): what a link
  * previews, which part of a markdown target shows, and where the popover
  * sits.
  */

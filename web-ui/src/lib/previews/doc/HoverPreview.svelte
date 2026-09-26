@@ -1,6 +1,6 @@
 <script lang="ts">
   /**
-   * The hover preview's popover (driven by `hoverPreview.svelte.ts`), on the
+   * The hover preview's popover (driven by `hoverController.svelte.ts`), on the
    * app's floating surface: a document's section drawn by the reading
    * renderer under a thin header, or an embed card's compact body, placed
    * beside the link inside the view's content box. Its content is inert — links don't follow, nothing
@@ -8,7 +8,7 @@
    * coming and going, so moving onto it keeps it open.
    */
   import FileIcon from "../../shared/FileIcon.svelte";
-  import type { PreviewState } from "./hoverPreview.svelte";
+  import type { PreviewState } from "./hoverController.svelte";
 
   let { s }: { s: PreviewState } = $props();
 

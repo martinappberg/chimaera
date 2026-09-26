@@ -451,7 +451,7 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   only while visible. Details:
   [agents.md](agents.md#documents-the-portable-dialect-check_document-and-the-issues-chip).
 
-  **Hover previews on links** (`previews/doc/hoverPreview.svelte.ts`, the popover
+  **Hover previews on links** (`previews/doc/hoverController.svelte.ts`, the popover
   `doc/HoverPreview.svelte`, pure pieces in `doc/hover.ts`). In **reading**, rest the pointer
   on a link for 400 ms; in **live**, where a plain hover edits, hold Mod (Cmd or Ctrl) over a
   link — in a rendered block or in the source being edited — and letting go of Mod keeps it
