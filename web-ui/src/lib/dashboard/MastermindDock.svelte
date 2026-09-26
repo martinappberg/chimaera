@@ -16,7 +16,8 @@
   import type { ChatStore } from "../chat/store.svelte";
   import type { ChatSocket } from "../chat/chatWs";
   import { dismiss } from "../shared/dismiss";
-  import { insertIntoComposer } from "../chat/composerBus";
+  import { followToBottom } from "../chat/composerBus";
+  import type { MastermindContext } from "./mastermindPanelState.svelte";
   import { keyHintSuffix } from "../shared/keybindings";
   import { resolvedTheme } from "../settings/store.svelte";
   import { ApiError } from "../net/api";
@@ -45,10 +46,9 @@
     onToggleExpand?: () => void;
     /** False while the host is hidden (gates recurring work). */
     visible?: boolean;
-    /** What the user is looking at in this window (the focused tab), as a
-     *  one-click reference chip — the text lands in the composer, never
-     *  sent on its own. Null when the focused tab isn't referenceable. */
-    context?: { label: string; text: string; title: string } | null;
+    /** What the user is looking at in this window (the focused tab): the
+     *  row's one context question is about it. Null = nothing readable. */
+    context?: MastermindContext | null;
   }
 
   let {
@@ -136,17 +136,59 @@
     "Brief me on this workspace. Use read_timeline and workspace_status (and knowledge_search when you have it) " +
     "before answering. Reply with exactly four headed sections — Needs you · Done · Problems · Next — citing " +
     "sessions by name. Be terse: short lines, no preamble, no repetition of what the dashboard already shows.";
-  const SUGGESTIONS: { label: string; text: string }[] = [
-    { label: "Brief me", text: BRIEF_PROMPT },
-    {
-      label: "What should I do next?",
-      text: "Given the timeline and where things stand, what should I do next? Name the one or two things that unblock the most, and which session each belongs to.",
-    },
-    {
-      label: "Anything conflicting?",
-      text: "Look across the running sessions and recent timeline: is anything conflicting — two agents on the same files, a decision one contradicts, a finding a result undercuts? Say what and where, or say there is nothing.",
+  const NEXT_PROMPT =
+    "Given the timeline and where things stand, what should I do next? Name the one or two things that " +
+    "unblock the most, and which session each belongs to.";
+  const CONFLICT_PROMPT =
+    "Look across the running sessions and recent timeline: is anything conflicting — two agents on the same " +
+    "files, a decision one contradicts, a finding a result undercuts? Say what and where, or say there is nothing.";
+
+  /** The one question about what the user is looking at, phrased as a
+   *  question (the label) with the id/path the Mastermind needs (the text). */
+  const contextAsk = $derived.by((): { label: string; text: string; title: string } | null => {
+    if (context === null || (live !== null && context.ref === live.id)) return null;
+    const { kind, name, ref } = context;
+    switch (kind) {
+      case "session":
+        return {
+          label: `How's ${name} doing?`,
+          title: `ask about the session ${name}`,
+          text:
+            `How is session "${name}" (${ref}) doing? Read it (read_session) and answer in three short lines: ` +
+            "what it is working on, whether it is stuck or needs me, and what comes next.",
+        };
+      case "terminal":
+        return {
+          label: `What happened in ${name}?`,
+          title: `ask about the terminal ${name}`,
+          text:
+            `What happened in terminal "${name}" (${ref})? Read it (read_session) and answer in three short ` +
+            "lines: the last commands, what failed if anything, and what to do about it.",
+        };
+      case "file":
+        return {
+          label: `What changed in ${name}?`,
+          title: `ask about ${ref}`,
+          text:
+            `What changed in ${ref} recently, who changed it, and why? Use list_changed_files and ` +
+            "read_timeline; three short lines.",
+        };
+      case "folder":
+        return {
+          label: `What's happening in ${name}/?`,
+          title: `ask about ${ref}/`,
+          text: `What has been happening in ${ref}/? Use list_changed_files and read_timeline; three short lines.`,
+        };
+      case "changes":
+        return {
+          label: `Review ${name}'s changes`,
+          title: `ask for a review of what ${name} changed`,
+          text:
+            `Review the changes session "${name}" (${ref}) made: what changed, and anything risky or ` +
+            "unfinished. Use list_changed_files and read_session; five short lines at most.",
+        };
     }
-  ];
+  });
 
   /** Send one canned prompt over the bound session's socket — the composer's
    *  own path. Never lose the click: a closed socket surfaces as a notice
@@ -155,6 +197,8 @@
     if (mm === null) return;
     const sent = mm.socket.send({ type: "send", blocks: [{ type: "text", text }] });
     if (!sent) mm.store.notice("not connected — brief not sent, try again", "error");
+    // The user's click is a send: show the question and follow the reply.
+    else if (mmId !== null) followToBottom(mmId);
   }
   /** The chat can take a prompt right now (bound, chat-mode, connected, idle). */
   const canPrompt = $derived(mm !== null && mm.store.connected && !mm.store.running);
@@ -471,18 +515,13 @@
               : "the Mastermind is busy"}
           onclick={() => sendPrompt(BRIEF_PROMPT)}>Brief me</button
         >
-        {#if context !== null && context.text !== "" && !context.text.includes(live.id)}
-          <!-- What you're looking at, as a reference you finish the question
-               around: it lands in the composer, it never sends itself. -->
-          <button
-            class="sugg ctx"
-            title="add {context.title} to your message"
-            onclick={() => insertIntoComposer(live.id, context.text)}
-          >
-            <span class="ctx-plus" aria-hidden="true">+</span>
-            <span class="ctx-label">{context.label}</span>
+        {#if contextAsk !== null}
+          <!-- About what you're looking at: follows the focused tab. -->
+          <button class="sugg ctx" disabled={!canPrompt} title={contextAsk.title} onclick={() => sendPrompt(contextAsk.text)}>
+            {contextAsk.label}
           </button>
         {/if}
+        <button class="sugg" disabled={!canPrompt} onclick={() => sendPrompt(NEXT_PROMPT)}>What's next?</button>
         {#if unread.length > 0}
           <button
             class="sugg inbox"
@@ -494,9 +533,7 @@
           </button>
         {/if}
         {#if emptyChat}
-          {#each SUGGESTIONS.filter((s) => s.text !== BRIEF_PROMPT) as s (s.label)}
-            <button class="sugg" disabled={!canPrompt} onclick={() => sendPrompt(s.text)}>{s.label}</button>
-          {/each}
+          <button class="sugg" disabled={!canPrompt} onclick={() => sendPrompt(CONFLICT_PROMPT)}>Anything conflicting?</button>
           {#if offerMycelium}
             <button class="quietline" onclick={() => openAttachSheet("mycelium")}>
               Use mycelium for Knowledge → gives the Mastermind your project's findings and decisions to read
@@ -642,23 +679,10 @@
     border-color: color-mix(in srgb, var(--warn) 55%, var(--edge));
     background: color-mix(in srgb, var(--warn) 10%, transparent);
   }
-  /* "+ qc/thresholds.R": what you're looking at, dashed like an unfilled
-     slot — it adds to your message rather than asking anything itself. */
+  /* The question about what you're looking at: the one chip whose words
+     change as you move around, so a long name ellipsizes instead of wrapping. */
   .sugg.ctx {
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
     max-width: 100%;
-    min-width: 0;
-    border-style: dashed;
-  }
-  .ctx-plus {
-    color: var(--accent);
-    font-weight: 600;
-  }
-  .ctx-label {
-    font-family: var(--mono);
-    font-size: var(--text-xs);
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;

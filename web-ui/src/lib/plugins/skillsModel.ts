@@ -47,34 +47,29 @@ export interface SkillCounts {
   claude: number;
   codex: number;
   both: number;
-  /** Usable by exactly one agent. */
-  onlyOne: number;
 }
 
 export function skillCounts(skills: readonly Skill[]): SkillCounts {
   let claude = 0;
   let codex = 0;
   let both = 0;
-  let onlyOne = 0;
   for (const s of skills) {
     const c = usable(s, "claude");
     const x = usable(s, "codex");
     if (c) claude += 1;
     if (x) codex += 1;
     if (c && x) both += 1;
-    if (c !== x) onlyOne += 1;
   }
-  return { total: skills.length, claude, codex, both, onlyOne };
+  return { total: skills.length, claude, codex, both };
 }
 
-export type SkillFilter = "all" | "claude" | "codex" | "one";
+export type SkillFilter = "all" | "claude" | "codex";
 
 export function filterSkills(skills: readonly Skill[], filter: SkillFilter, query: string): Skill[] {
   const q = query.trim().toLowerCase();
   return skills.filter((s) => {
     if (filter === "claude" && !usable(s, "claude")) return false;
     if (filter === "codex" && !usable(s, "codex")) return false;
-    if (filter === "one" && usable(s, "claude") === usable(s, "codex")) return false;
     if (q === "") return true;
     return (
       s.name.toLowerCase().includes(q) ||
@@ -114,4 +109,44 @@ export function groupSkills(skills: readonly Skill[], host = ""): SkillGroup[] {
  *  `/name` for claude, `$name` for codex (the daemon's `invoke` wins). */
 export function invokeSyntax(skill: Skill, agent: AgentId): string {
   return skill.agents[agent].invoke ?? (agent === "claude" ? `/${skill.name}` : `$${skill.name}`);
+}
+
+/** The name as the list shows it: under its plugin's own header the plugin
+ *  prefix is noise ("mycelium:analyze" → "analyze", "pdf:pdf" → "pdf"). The
+ *  full name stays the invocation. */
+export function shortName(skill: Skill): string {
+  const colon = skill.name.indexOf(":");
+  if (colon < 0) return skill.name;
+  const prefix = skill.name.slice(0, colon);
+  const rest = skill.name.slice(colon + 1);
+  return rest !== "" && (skill.plugin === undefined || prefix === skill.plugin || prefix === rest)
+    ? rest
+    : skill.name;
+}
+
+export interface PluginSection {
+  plugin: string;
+  skills: Skill[];
+  /** Agents that can use at least one of its skills. */
+  agents: AgentId[];
+}
+
+/** Plugin skills, one section per plugin (by name) — a plugin is the unit
+ *  you install, so it is the unit the list is read by. */
+export function pluginSections(skills: readonly Skill[]): PluginSection[] {
+  const by = new Map<string, Skill[]>();
+  for (const s of skills) {
+    if (groupOf(s.source) !== "plugin") continue;
+    const plugin = s.plugin ?? (s.name.includes(":") ? s.name.slice(0, s.name.indexOf(":")) : "other");
+    const list = by.get(plugin);
+    if (list === undefined) by.set(plugin, [s]);
+    else list.push(s);
+  }
+  return [...by.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([plugin, list]) => ({
+      plugin,
+      skills: list,
+      agents: (["claude", "codex"] as AgentId[]).filter((a) => list.some((s) => usable(s, a))),
+    }));
 }

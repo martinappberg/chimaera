@@ -45,6 +45,27 @@ export function insertIntoComposer(sessionId: string, text: string): boolean {
   return true;
 }
 
+// --- follow the send ------------------------------------------------------------
+// A prompt sent from OUTSIDE the composer (the Mastermind panel's Brief me and
+// suggestion chips go straight over the socket) is still the user's send: the
+// mounted transcript jumps to the bottom exactly as the composer's own submit
+// does. No buffering — a transcript that isn't mounted has nothing to scroll.
+
+const followRegistry = new Map<string, () => void>();
+
+/** A mounted transcript's "the user just sent" handler. Returns the unregister. */
+export function registerFollow(sessionId: string, follow: () => void): () => void {
+  followRegistry.set(sessionId, follow);
+  return () => {
+    if (followRegistry.get(sessionId) === follow) followRegistry.delete(sessionId);
+  };
+}
+
+/** Bring a session's mounted transcript to the bottom and keep it following. */
+export function followToBottom(sessionId: string): void {
+  followRegistry.get(sessionId)?.();
+}
+
 // --- image attachments (OS drops onto a chat pane) ---------------------------
 // Same registry/pending shape as text inserts: the attachment channel exists
 // so an image dropped on a chat pane can ride the composer's existing

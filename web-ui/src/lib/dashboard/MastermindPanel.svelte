@@ -18,6 +18,7 @@
     PANEL_DEFAULT,
     PANEL_MAX,
     PANEL_MIN,
+    type MastermindContext,
   } from "./mastermindPanelState.svelte";
 
   interface Props {
@@ -30,7 +31,7 @@
     /** The pane-tab meaning ("this surface is showing") — an open panel is;
      *  document visibility stays ChatView's own business, as for panes. */
     visible: boolean;
-    context: { label: string; text: string; title: string } | null;
+    context: MastermindContext | null;
     /** The window body's width (rail + stage + this) — docked vs overlay. */
     hostWidth: number;
   }

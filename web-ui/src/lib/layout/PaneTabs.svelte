@@ -713,14 +713,15 @@
           {:else if tab.surface === "settings"}
             <svg class="glyph" viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
               <title>settings</title>
-              <circle cx="8" cy="8" r="2.2" fill="none" stroke="currentColor" stroke-width="1.4" />
+              <!-- A cog: settings. -->
               <path
-                d="M8 1.8v2M8 12.2v2M1.8 8h2M12.2 8h2M3.6 3.6l1.4 1.4M11 11l1.4 1.4M12.4 3.6L11 5M5 11l-1.4 1.4"
+                d="M6.77 3.05L6.98 1.18A6.9 6.9 0 0 1 9.02 1.18L9.23 3.05A5.1 5.1 0 0 1 10.63 3.63L12.10 2.45A6.9 6.9 0 0 1 13.55 3.90L12.37 5.37A5.1 5.1 0 0 1 12.95 6.77L14.82 6.98A6.9 6.9 0 0 1 14.82 9.02L12.95 9.23A5.1 5.1 0 0 1 12.37 10.63L13.55 12.10A6.9 6.9 0 0 1 12.10 13.55L10.63 12.37A5.1 5.1 0 0 1 9.23 12.95L9.02 14.82A6.9 6.9 0 0 1 6.98 14.82L6.77 12.95A5.1 5.1 0 0 1 5.37 12.37L3.90 13.55A6.9 6.9 0 0 1 2.45 12.10L3.63 10.63A5.1 5.1 0 0 1 3.05 9.23L1.18 9.02A6.9 6.9 0 0 1 1.18 6.98L3.05 6.77A5.1 5.1 0 0 1 3.63 5.37L2.45 3.90A6.9 6.9 0 0 1 3.90 2.45L5.37 3.63A5.1 5.1 0 0 1 6.77 3.05Z"
                 fill="none"
                 stroke="currentColor"
-                stroke-width="1.4"
-                stroke-linecap="round"
+                stroke-width="1.3"
+                stroke-linejoin="round"
               />
+              <circle cx="8" cy="8" r="2.2" fill="none" stroke="currentColor" stroke-width="1.3" />
             </svg>
           {:else if tab.surface === "finder"}
             <span class="tab-glyph" class:on={i === node.active}>

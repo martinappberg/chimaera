@@ -12,6 +12,16 @@
  * Runes discipline: state is mutated only through this module's functions.
  */
 
+/** What the window's focused tab is, for the panel's context question. */
+export interface MastermindContext {
+  kind: "session" | "terminal" | "file" | "folder" | "changes";
+  /** What the user sees it called (display name, file name, short path). */
+  name: string;
+  /** What the Mastermind needs to find it: a session id or a
+   *  workspace-relative path. */
+  ref: string;
+}
+
 const OPEN_KEY = "chimaera.mastermind.panelOpen";
 const WIDTH_KEY = "chimaera.mastermind.panelWidth";
 export const PANEL_MIN = 300;

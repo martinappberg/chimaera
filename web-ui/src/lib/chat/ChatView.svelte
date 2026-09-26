@@ -4,7 +4,7 @@
   import { fsValidate } from "../previews/files";
   import { listAgents } from "../workspace/launcher";
   import SessionGlyph from "../shared/SessionGlyph.svelte";
-  import { insertIntoComposer } from "./composerBus";
+  import { insertIntoComposer, registerFollow } from "./composerBus";
   import {
     acquireChat,
     releaseChat,
@@ -1101,6 +1101,15 @@
     }
     return socket.send({ type: "send", blocks });
   }
+
+  // A send made outside the composer (the Mastermind panel's one-click
+  // prompts) follows exactly like onSubmit below.
+  $effect(() =>
+    registerFollow(session.id, () => {
+      atBottom = true;
+      queueBottomScroll(true);
+    }),
+  );
 
   function onSubmit(text: string, images: ImageAttachment[]): boolean {
     // The daemon owns delivery semantics so reconnect/replay stay exact:

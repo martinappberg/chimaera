@@ -1,14 +1,27 @@
 <script lang="ts">
   /**
    * Skills — "what can my agents do here?" (design §6.4): every skill any
-   * agent can use in this workspace on this host, grouped by where it comes
-   * from (that is what says who else gets it), one chip per agent (✓
-   * available · ◌ present but not usable, reason in words · — absent), and a
-   * detail aside with each agent's own invocation syntax. Truth comes from
-   * the agents; codex's load errors are shown, not hidden.
+   * agent can use in this workspace on this host, in the order you'd look
+   * for it — this project's own, then each plugin's (a plugin is what you
+   * install, so it is what the list is read by), then yours, then the
+   * commands built into the agents as one quiet line. Each row names the
+   * skill, says what it does, and carries a badge only for the agents that
+   * can use it; a click opens the row in place: how each agent calls it
+   * (copyable, in the agent's own syntax), its SKILL.md, and any load error.
+   * Truth comes from the agents; codex's load errors are shown, not hidden.
    */
   import { inlineMarkdown } from "../shared/inlineMarkdown";
-  import { filterSkills, groupSkills, invokeSyntax, skillCounts, type SkillFilter } from "./skillsModel";
+  import { copyText } from "../shared/clipboard";
+  import {
+    filterSkills,
+    groupSkills,
+    invokeSyntax,
+    pluginSections,
+    shortName,
+    skillCounts,
+    usable,
+    type SkillFilter,
+  } from "./skillsModel";
   import type { AgentId, Skill, SkillsReport } from "./store";
 
   interface Props {
@@ -25,28 +38,23 @@
 
   let filter = $state<SkillFilter>("all");
   let query = $state("");
-  let selectedName = $state<string | null>(null);
-  /** Built-ins render as a chip flow; the overflow expands on request. */
+  /** The one row opened in place (by skill name). */
+  let openName = $state<string | null>(null);
+  /** "name:agent" of the invocation just copied — the button says so briefly. */
+  let copied = $state<string | null>(null);
+  let copiedTimer: ReturnType<typeof setTimeout> | null = null;
+  $effect(() => () => {
+    if (copiedTimer !== null) clearTimeout(copiedTimer);
+  });
   let builtinsAll = $state(false);
-  const BUILTIN_SHOWN = 12;
+  const BUILTIN_SHOWN = 18;
+
+  const AGENTS: AgentId[] = ["claude", "codex"];
 
   const all = $derived(report?.skills ?? []);
   const counts = $derived(skillCounts(all));
   const shown = $derived(filterSkills(all, filter, query));
   const groups = $derived(groupSkills(shown, host));
-  const selected = $derived(
-    all.find((s) => s.name === selectedName) ?? shown[0] ?? null,
-  );
-
-  const AGENTS: AgentId[] = ["claude", "codex"];
-
-  function chip(s: Skill, agent: AgentId): { text: string; tone: "good" | "warn" | "faint"; title: string } {
-    const st = s.agents[agent];
-    if (st.state === "available") return { text: `${agent} ✓`, tone: "good", title: `usable by ${agent}` };
-    if (st.state === "off")
-      return { text: `${agent} ◌ ${st.reason ?? "off"}`, tone: "warn", title: st.reason ?? "present but not usable" };
-    return { text: `${agent} —`, tone: "faint", title: `not available to ${agent}` };
-  }
 
   function abs(p: string): string {
     return p.startsWith("/") || p.startsWith("~") || wsRoot === null ? p : `${wsRoot}/${p}`;
@@ -63,22 +71,77 @@
       .filter((e) => e.path !== undefined && paths.some((p) => e.path === p || e.path!.startsWith(p)))
       .map((e) => `${e.agent}: ${e.message}`);
   }
-  function sourceLine(s: Skill): string {
-    switch (s.source) {
-      case "project":
-        return "in this project";
-      case "plugin":
-        return `from the ${s.plugin ?? "plugin"} plugin`;
-      case "user":
-        return `yours — user-level on ${host}`;
-      case "builtin":
-      case "system":
-        return "built into the agent";
-      default:
-        return s.source;
+  /** Load errors no listed skill claims (a SKILL.md too broken to list). */
+  const strayErrors = $derived.by(() => {
+    if (report === null) return [];
+    const claimed = all.flatMap((s) => [s.paths.claude, s.paths.codex].filter((p): p is string => !!p));
+    return report.errors.filter(
+      (e) => e.path === undefined || !claimed.some((p) => e.path === p || e.path!.startsWith(p)),
+    );
+  });
+
+  async function copy(s: Skill, agent: AgentId): Promise<void> {
+    if (await copyText(invokeSyntax(s, agent))) {
+      copied = `${s.name}:${agent}`;
+      if (copiedTimer !== null) clearTimeout(copiedTimer);
+      copiedTimer = setTimeout(() => (copied = null), 1400);
     }
   }
 </script>
+
+{#snippet row(s: Skill, name: string)}
+  {@const expanded = openName === s.name}
+  {@const errs = errorsFor(s)}
+  <div class="skill" class:expanded>
+    <button class="shead" aria-expanded={expanded} onclick={() => (openName = expanded ? null : s.name)}>
+      <span class="sname" title={s.name}>{name}</span>
+      <!-- eslint-disable-next-line svelte/no-at-html-tags -- sanitized in inlineMarkdown -->
+      <span class="sdesc">{@html inlineMarkdown(s.description)}</span>
+      <span class="agents">
+        {#if errs.length > 0}<span class="warnmark" title={errs.join("\n")}>!</span>{/if}
+        {#each AGENTS as a (a)}
+          {@const st = s.agents[a]}
+          {#if st.state === "available"}
+            <span class="agent">{a}</span>
+          {:else if st.state === "off"}
+            <span class="agent off" title="{a}: {st.reason ?? 'present but not usable'}">{a}</span>
+          {/if}
+        {/each}
+      </span>
+      <svg class="chev" viewBox="0 0 16 16" width="10" height="10" aria-hidden="true">
+        <path d="M6 3.5L10.5 8 6 12.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
+      </svg>
+    </button>
+    {#if expanded}
+      {@const file = skillFile(s)}
+      <div class="sbody">
+        <div class="uses">
+          {#each AGENTS as a (a)}
+            {@const st = s.agents[a]}
+            {#if st.state === "available"}
+              <button class="use" title="copy — then type it in {a}" onclick={() => copy(s, a)}>
+                <span class="uagent">{a}</span>
+                <span class="uinv">{invokeSyntax(s, a)}</span>
+                <span class="ucopy">{copied === `${s.name}:${a}` ? "copied" : "copy"}</span>
+              </button>
+            {:else if st.state === "off"}
+              <span class="useoff"><span class="uagent">{a}</span>{st.reason ?? "present but not usable"}</span>
+            {/if}
+          {/each}
+        </div>
+        {#if file !== null}
+          <div class="fileline">
+            <button class="link" onclick={() => onOpenFile(abs(file))}>open SKILL.md</button>
+            <span class="fpath" title={abs(file)}>{file}</span>
+          </div>
+        {/if}
+        {#each errs as e, i (i)}
+          <div class="errline">{e}</div>
+        {/each}
+      </div>
+    {/if}
+  </div>
+{/snippet}
 
 {#if status === "unavailable"}
   <p class="empty">This daemon can't list skills yet — update chimaera.</p>
@@ -88,17 +151,22 @@
   <p class="empty">asking claude and codex…</p>
 {:else}
   <div class="bar">
-    <span class="count"><b>{counts.total} skill{counts.total === 1 ? "" : "s"}</b>
-      <span class="muted">· claude {counts.claude} · codex {counts.codex} · both {counts.both}</span></span
-    >
-    <div class="chips" role="group" aria-label="Show">
+    <span class="count">
+      <b>{counts.total}</b> skill{counts.total === 1 ? "" : "s"}
+      <span class="muted">· claude {counts.claude} · codex {counts.codex}</span>
+    </span>
+    <div class="filters" role="group" aria-label="Show skills for">
       {#each [
         { v: "all", l: "All" },
         { v: "claude", l: "claude" },
         { v: "codex", l: "codex" },
-        { v: "one", l: `only one agent · ${counts.onlyOne}` },
       ] as f (f.v)}
-        <button class="fchip" class:on={filter === f.v} aria-pressed={filter === f.v} onclick={() => (filter = f.v as SkillFilter)}>{f.l}</button>
+        <button
+          class="fchip"
+          class:on={filter === f.v}
+          aria-pressed={filter === f.v}
+          onclick={() => (filter = f.v as SkillFilter)}>{f.l}</button
+        >
       {/each}
     </div>
     <label class="search">
@@ -109,99 +177,74 @@
 
   {#if !report.agents.claude.available && !report.agents.codex.available}
     <p class="empty">Neither claude nor codex is installed on {host}, so there are no skills to list.</p>
+  {:else if shown.length === 0}
+    <p class="empty">Nothing matches.</p>
   {/if}
 
-  <div class="grid">
-    <div class="groups">
-      {#if shown.length === 0}
-        <p class="empty">Nothing matches.</p>
-      {/if}
-      {#each groups as g (g.key)}
-        <div class="group">
-          <div class="ghead">
-            <span class="lbl">{g.label}</span>
-            {#if g.hint}<span class="hint">{g.hint}</span>{/if}
-            {#if g.key === "builtin" && !report.agents.claude.live}
-              <span class="hint">— start a claude chat session to see its built-ins</span>
-            {/if}
-          </div>
-          {#if g.key === "builtin"}
-            <div class="flow">
-              {#each builtinsAll ? g.skills : g.skills.slice(0, BUILTIN_SHOWN) as s (s.name)}
-                {@const agent = s.agents.claude.state === "available" ? "claude" : "codex"}
-                <button class="bchip mono" class:on={selected?.name === s.name} onclick={() => (selectedName = s.name)}>
-                  {invokeSyntax(s, agent)} <span class="muted">{agent}</span>
-                </button>
-              {/each}
-              {#if g.skills.length > BUILTIN_SHOWN}
-                <button class="link" onclick={() => (builtinsAll = !builtinsAll)}>
-                  {builtinsAll ? "fewer" : `+ ${g.skills.length - BUILTIN_SHOWN} more`}
-                </button>
-              {/if}
-            </div>
-          {:else}
-            {#each g.skills as s (s.name)}
-              <button class="row" class:on={selected?.name === s.name} onclick={() => (selectedName = s.name)}>
-                <span class="mono sname">{s.name}</span>
-                <!-- eslint-disable-next-line svelte/no-at-html-tags -- sanitized in inlineMarkdown -->
-                <span class="sdesc">{@html inlineMarkdown(s.description)}</span>
-                {#each AGENTS as a (a)}
-                  {@const c = chip(s, a)}
-                  <span class="achip {c.tone}" title={c.title}>{c.text}</span>
-                {/each}
-              </button>
-            {/each}
-          {/if}
-        </div>
-      {/each}
-    </div>
+  {#each groups as g (g.key)}
+    <section class="group">
+      <h3 class="ghead">
+        <span class="lbl">{g.key === "builtin" ? "Built into the agents" : g.label}</span>
+        {#if g.key === "builtin"}
+          <span class="hint"
+            >the commands they ship with{!report.agents.claude.live
+              ? " · start a claude chat session to see claude's"
+              : ""}</span
+          >
+        {:else if g.key !== "plugin" && g.hint}
+          <span class="hint">{g.hint}</span>
+        {/if}
+      </h3>
 
-    {#if selected !== null}
-      {@const file = skillFile(selected)}
-      {@const errs = errorsFor(selected)}
-      <aside class="detail" aria-label="Skill details">
-        <div class="dhead">
-          <span class="mono dname">{selected.name}</span>
-          <span class="dsource">{sourceLine(selected)}</span>
-        </div>
-        {#if selected.description}
-          <!-- eslint-disable-next-line svelte/no-at-html-tags -- sanitized in inlineMarkdown -->
-          <p class="ddesc">{@html inlineMarkdown(selected.description)}</p>
-        {/if}
-        <div class="dgrid">
-          {#each AGENTS as a (a)}
-            {@const st = selected.agents[a]}
-            <span class="muted">{a}</span>
-            <span>
-              {#if st.state === "available"}
-                <span class="good">✓</span> type <span class="mono inv">{invokeSyntax(selected, a)}</span>
-              {:else if st.state === "off"}
-                <span class="warn">◌</span> {st.reason ?? "present but not usable"}
-              {:else}
-                <span class="faint">—</span> not available
-              {/if}
-            </span>
+      {#if g.key === "plugin"}
+        {#each pluginSections(g.skills) as p (p.plugin)}
+          <div class="plugin">
+            <div class="phead">
+              <span class="pname">{p.plugin}</span>
+              <span class="hint"
+                >{p.skills.length} skill{p.skills.length === 1 ? "" : "s"}{p.agents.length > 0
+                  ? ` · ${p.agents.join(" + ")}`
+                  : ""}</span
+              >
+            </div>
+            <div class="list">
+              {#each p.skills as s (s.name)}
+                {@render row(s, shortName(s))}
+              {/each}
+            </div>
+          </div>
+        {/each}
+      {:else if g.key === "builtin"}
+        <!-- One quiet line: the agents' own commands, in their own syntax. -->
+        <div class="flow">
+          {#each builtinsAll ? g.skills : g.skills.slice(0, BUILTIN_SHOWN) as s (s.name)}
+            {@const agent = usable(s, "claude") ? "claude" : "codex"}
+            <span class="bchip" title="{agent}: {s.description}">{invokeSyntax(s, agent)}</span>
           {/each}
-          {#if selected.paths.claude || selected.paths.codex}
-            <span class="muted">files</span>
-            <span class="mono paths">
-              {#if selected.paths.claude}<span title="claude">{selected.paths.claude}</span>{/if}
-              {#if selected.paths.codex && selected.paths.codex !== selected.paths.claude}<span title="codex">{selected.paths.codex}</span>{/if}
-            </span>
+          {#if g.skills.length > BUILTIN_SHOWN}
+            <button class="link" onclick={() => (builtinsAll = !builtinsAll)}>
+              {builtinsAll ? "fewer" : `+ ${g.skills.length - BUILTIN_SHOWN} more`}
+            </button>
           {/if}
         </div>
-        {#if errs.length > 0}
-          <div class="derr">
-            <span class="lbl">Load errors</span>
-            {#each errs as e, i (i)}<div>{e}</div>{/each}
-          </div>
-        {/if}
-        {#if file !== null}
-          <button class="link" onclick={() => onOpenFile(abs(file))}>open SKILL.md</button>
-        {/if}
-      </aside>
-    {/if}
-  </div>
+      {:else}
+        <div class="list">
+          {#each g.skills as s (s.name)}
+            {@render row(s, s.name)}
+          {/each}
+        </div>
+      {/if}
+    </section>
+  {/each}
+
+  {#if strayErrors.length > 0}
+    <section class="group">
+      <h3 class="ghead"><span class="lbl">Couldn't load</span><span class="hint">as the agents report it</span></h3>
+      {#each strayErrors as e, i (i)}
+        <div class="errline">{e.agent}: {e.message}{#if e.path}<span class="fpath"> · {e.path}</span>{/if}</div>
+      {/each}
+    </section>
+  {/if}
 {/if}
 
 <style>
@@ -217,8 +260,13 @@
   .muted {
     color: var(--muted);
   }
-  .mono {
-    font-family: var(--mono);
+  .sr {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
   }
   .lbl {
     font-size: 11px;
@@ -245,23 +293,21 @@
     text-decoration: underline;
   }
 
+  /* --- the bar: count · who · search ---------------------------------------- */
   .bar {
     display: flex;
     align-items: center;
-    gap: 10px;
+    gap: 14px;
     flex-wrap: wrap;
+    margin-bottom: 22px;
   }
   .count {
-    font-size: var(--text-md);
+    font-size: var(--text-sm);
+    white-space: nowrap;
   }
-  .count b {
-    font-weight: 600;
-  }
-  .chips {
-    margin-left: 16px;
+  .filters {
     display: flex;
-    gap: 6px;
-    flex-wrap: wrap;
+    gap: 4px;
   }
   .fchip {
     appearance: none;
@@ -270,227 +316,285 @@
     color: var(--muted);
     font: inherit;
     font-size: var(--text-xs);
-    padding: 3px 11px;
+    padding: 2px 10px;
     border-radius: 999px;
     cursor: pointer;
+    transition:
+      color 0.12s ease,
+      border-color 0.12s ease,
+      background-color 0.12s ease;
   }
   .fchip:hover {
     color: var(--fg);
   }
   .fchip.on {
     color: var(--fg);
-    border-color: var(--fg);
+    border-color: color-mix(in srgb, var(--accent) 55%, var(--edge));
+    background: color-mix(in srgb, var(--accent) 10%, transparent);
   }
   .search {
     margin-left: auto;
-    display: flex;
-  }
-  .sr {
-    position: absolute;
-    width: 1px;
-    height: 1px;
-    overflow: hidden;
-    clip: rect(0 0 0 0);
   }
   .search input {
-    width: 240px;
-    max-width: 50vw;
-    border: 1px solid var(--edge);
-    background: var(--overlay-bg);
-    color: var(--fg);
-    border-radius: 8px;
-    padding: 6px 12px;
+    width: 220px;
+    max-width: 40vw;
     font: inherit;
     font-size: var(--text-sm);
+    color: var(--fg);
+    background: var(--bg);
+    border: 1px solid var(--edge);
+    border-radius: 8px;
+    padding: 5px 10px;
+    outline: none;
+  }
+  .search input:focus {
+    border-color: color-mix(in srgb, var(--accent) 55%, var(--edge));
   }
 
-  .grid {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) 380px;
-    gap: 24px;
-    align-items: start;
-  }
-  @container (max-width: 900px) {
-    .grid {
-      grid-template-columns: minmax(0, 1fr);
-    }
-  }
-  .groups {
-    display: flex;
-    flex-direction: column;
-    gap: 18px;
-    min-width: 0;
-  }
+  /* --- groups ---------------------------------------------------------------- */
   .group {
-    display: flex;
-    flex-direction: column;
+    margin-bottom: 26px;
   }
   .ghead {
     display: flex;
     align-items: baseline;
     gap: 10px;
-    padding-bottom: 6px;
-    flex-wrap: wrap;
+    margin: 0 0 10px;
+    font: inherit;
   }
-  .row {
-    appearance: none;
-    border: none;
+  .plugin {
+    margin-bottom: 14px;
+  }
+  .phead {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    margin: 0 0 6px 2px;
+  }
+  .pname {
+    font-family: var(--mono);
+    font-size: var(--text-sm);
+    font-weight: 600;
+    color: var(--fg);
+  }
+
+  /* --- a skill row ---------------------------------------------------------- */
+  .list {
+    border: 1px solid var(--edge);
+    border-radius: 10px;
+    overflow: hidden;
+    background: var(--bg);
+  }
+  .skill + .skill {
     border-top: 1px solid var(--edge);
+  }
+  .shead {
+    appearance: none;
+    width: 100%;
+    border: none;
     background: none;
     font: inherit;
-    color: var(--fg);
+    color: inherit;
     text-align: left;
     cursor: pointer;
     display: grid;
-    grid-template-columns: 170px minmax(0, 1fr) 92px 92px;
-    column-gap: 14px;
-    align-items: center;
-    padding: 9px 12px;
-    font-size: var(--text-sm);
-    border-radius: 0;
+    grid-template-columns: minmax(120px, 210px) minmax(0, 1fr) auto 12px;
+    align-items: start;
+    gap: 16px;
+    padding: 10px 14px;
     transition: background-color 0.12s ease;
   }
-  .row:hover {
+  .shead:hover {
     background: var(--row-hover);
   }
-  .row.on {
-    background: var(--row-active);
-    border-radius: 8px;
-    border-top-color: transparent;
-  }
-  .row.on + .row {
-    border-top-color: transparent;
-  }
-  @container (max-width: 640px) {
-    .row {
-      grid-template-columns: minmax(0, 1fr) auto auto;
-    }
-    .sdesc {
-      display: none;
-    }
+  .expanded .shead {
+    background: color-mix(in srgb, var(--accent) 5%, transparent);
   }
   .sname {
-    font-size: 12.5px;
-    font-weight: 600;
+    font-family: var(--mono);
+    font-size: var(--text-sm);
+    font-weight: 500;
+    color: var(--fg);
+    min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+    line-height: 1.45;
   }
   .sdesc {
+    font-size: var(--text-sm);
     color: var(--muted);
+    line-height: 1.45;
+    min-width: 0;
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
     overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
   }
-  .sdesc :global(code) {
+  .expanded .sdesc {
+    display: block;
+    color: var(--fg);
+  }
+  .agents {
+    display: flex;
+    gap: 4px;
+    align-items: center;
+    padding-top: 1px;
+  }
+  .agent {
     font-family: var(--mono);
-    font-size: 0.92em;
+    font-size: 10.5px;
+    line-height: 1.6;
+    padding: 0 7px;
+    border-radius: 999px;
+    color: var(--fg);
+    border: 1px solid color-mix(in srgb, var(--accent) 40%, var(--edge));
+    background: color-mix(in srgb, var(--accent) 8%, transparent);
   }
-  .achip {
-    font-size: var(--text-xs);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
+  .agent.off {
+    color: var(--muted);
+    border-style: dashed;
+    border-color: var(--edge);
+    background: none;
+    text-decoration: line-through;
   }
-  .achip.good,
-  .good {
-    color: var(--accent);
-  }
-  .achip.warn,
-  .warn {
+  .warnmark {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 15px;
+    height: 15px;
+    border-radius: 50%;
+    font-size: 10px;
+    font-weight: 700;
     color: var(--warn);
+    border: 1px solid color-mix(in srgb, var(--warn) 55%, var(--edge));
   }
-  .achip.faint,
-  .faint {
-    color: color-mix(in srgb, var(--muted) 65%, transparent);
+  .chev {
+    color: var(--muted);
+    margin-top: 4px;
+    transition: transform 0.15s ease;
+  }
+  .expanded .chev {
+    transform: rotate(90deg);
   }
 
+  /* --- the opened row: how to call it, where it lives ------------------------ */
+  /* Same columns as the row head, so everything lines up under the
+     description. */
+  .sbody {
+    display: grid;
+    grid-template-columns: minmax(120px, 210px) minmax(0, 1fr) auto 12px;
+    column-gap: 16px;
+    row-gap: 8px;
+    padding: 2px 14px 12px;
+    background: color-mix(in srgb, var(--accent) 5%, transparent);
+  }
+  .sbody > :global(*) {
+    grid-column: 2 / 4;
+  }
+  .uses {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .use {
+    appearance: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    font: inherit;
+    font-size: var(--text-sm);
+    color: var(--fg);
+    background: var(--bg);
+    border: 1px solid var(--edge);
+    border-radius: 8px;
+    padding: 4px 6px 4px 10px;
+    cursor: pointer;
+    transition: border-color 0.12s ease;
+  }
+  .use:hover {
+    border-color: color-mix(in srgb, var(--accent) 55%, var(--edge));
+  }
+  .uagent {
+    font-size: var(--text-xs);
+    color: var(--muted);
+    margin-right: 6px;
+  }
+  .use .uagent {
+    margin-right: 0;
+  }
+  .uinv {
+    font-family: var(--mono);
+  }
+  .ucopy {
+    font-size: 10.5px;
+    color: var(--muted);
+    border-left: 1px solid var(--edge);
+    padding-left: 7px;
+  }
+  .use:hover .ucopy {
+    color: var(--accent);
+  }
+  .useoff {
+    display: inline-flex;
+    align-items: center;
+    font-size: var(--text-sm);
+    color: var(--muted);
+    padding: 4px 0;
+  }
+  .fileline {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    min-width: 0;
+  }
+  .fpath {
+    font-family: var(--mono);
+    font-size: var(--text-xs);
+    color: var(--muted);
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .errline {
+    font-size: var(--text-sm);
+    color: var(--warn);
+    line-height: 1.45;
+  }
+
+  /* --- built-ins: one quiet flow -------------------------------------------- */
   .flow {
     display: flex;
     flex-wrap: wrap;
-    gap: 8px;
-    padding: 10px 12px;
-    border-top: 1px solid var(--edge);
-    align-items: center;
-    font-size: var(--text-xs);
+    align-items: baseline;
+    gap: 6px 8px;
   }
   .bchip {
-    appearance: none;
-    border: 1px solid var(--edge);
-    background: none;
-    color: var(--fg);
-    font: inherit;
     font-family: var(--mono);
     font-size: var(--text-xs);
-    padding: 2px 9px;
+    color: var(--muted);
+    padding: 1px 8px;
+    border: 1px solid var(--edge);
     border-radius: 999px;
-    cursor: pointer;
-  }
-  .bchip:hover,
-  .bchip.on {
-    border-color: color-mix(in srgb, var(--accent) 55%, var(--edge));
+    cursor: default;
   }
 
-  .detail {
-    position: sticky;
-    top: 0;
-    background: var(--overlay-bg);
-    border: 1px solid var(--edge);
-    border-radius: 12px;
-    padding: 18px 20px;
-    display: flex;
-    flex-direction: column;
-    gap: 14px;
-    min-width: 0;
-  }
-  .dhead {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-  }
-  .dname {
-    font-size: var(--text-lg);
-    font-weight: 600;
-    overflow-wrap: anywhere;
-  }
-  .dsource {
-    font-size: var(--text-xs);
-    color: var(--muted);
-  }
-  .ddesc {
-    margin: 0;
-    font-size: var(--text-md);
-    line-height: 1.55;
-  }
-  .ddesc :global(code) {
-    font-family: var(--mono);
-    font-size: 0.92em;
-  }
-  .dgrid {
-    display: grid;
-    grid-template-columns: 64px minmax(0, 1fr);
-    row-gap: 8px;
-    column-gap: 12px;
-    font-size: var(--text-sm);
-  }
-  .inv {
-    font-size: 12.5px;
-  }
-  .paths {
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
-    font-size: var(--text-xs);
-    overflow-wrap: anywhere;
-    color: var(--muted);
-  }
-  .derr {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    font-size: var(--text-xs);
-    color: var(--err);
-    border-top: 1px solid var(--edge);
-    padding-top: 12px;
+  @media (max-width: 720px) {
+    .shead {
+      grid-template-columns: minmax(0, 1fr) auto 12px;
+    }
+    .sdesc {
+      grid-column: 1 / -1;
+      grid-row: 2;
+    }
+    .sbody {
+      grid-template-columns: minmax(0, 1fr);
+    }
+    .sbody > :global(*) {
+      grid-column: 1;
+    }
   }
 </style>
