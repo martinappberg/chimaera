@@ -101,8 +101,9 @@ async fn worker_mcp_view_is_unchanged() {
 
 #[test]
 fn worker_generated_settings_and_codex_argv_are_unchanged() {
-    let path = crate::agents::write_settings("s-agentview", "KEY", 4242, Some("dark"), None, None)
-        .expect("write settings");
+    let path =
+        crate::agents::write_settings("s-agentview", "KEY", 4242, Some("dark"), None, None, &[])
+            .expect("write settings");
     let body = std::fs::read_to_string(&path).unwrap();
     // Normalize the per-host bits (the runtime dir) so the fixture is portable.
     let runtime = chimaera_core::runtime_dir();

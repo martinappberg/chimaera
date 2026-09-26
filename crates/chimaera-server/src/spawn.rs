@@ -143,8 +143,9 @@ pub(crate) async fn spawn_session(
                 )
                 .await;
                 let settings_theme = (!theme_set).then_some(spec.theme.as_str());
-                // PTY TUI spawns are never the Mastermind (a chat-only role),
-                // so no permissions block rides these settings.
+                let plugin_tools = crate::plugins::spawn_allow(state, &workspace.id).await;
+                // PTY TUI spawns are never the Mastermind (a chat-only role);
+                // only active plugins' tools may ride a permissions block.
                 match crate::agents::write_settings(
                     &id,
                     &key,
@@ -152,6 +153,7 @@ pub(crate) async fn spawn_session(
                     settings_theme,
                     user_statusline.as_ref(),
                     None,
+                    &plugin_tools,
                 ) {
                     Ok(path) => Some(path),
                     Err(err) => {

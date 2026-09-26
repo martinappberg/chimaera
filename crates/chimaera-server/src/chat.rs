@@ -939,6 +939,7 @@ async fn resolve_respawn_inputs(
                 crate::runtimes::claude_settings_gates(&state.claude_settings_path, workspace_root)
                     .await;
             let settings_theme = (!theme_set).then_some(theme);
+            let plugin_tools = crate::plugins::spawn_allow(state, workspace_id).await;
             let settings = crate::agents::write_settings(
                 id,
                 &key,
@@ -946,6 +947,7 @@ async fn resolve_respawn_inputs(
                 settings_theme,
                 user_statusline.as_ref(),
                 mastermind,
+                &plugin_tools,
             )
             .map_err(|err| err.to_string())?;
             let mcp = crate::agents::write_mcp_config(id, &key, state.port)
@@ -2758,6 +2760,7 @@ pub(crate) async fn spawn_fresh_chat(
             crate::runtimes::claude_settings_gates(&state.claude_settings_path, &workspace.root)
                 .await;
         let settings_theme = (!theme_set).then_some(spec.theme.as_str());
+        let plugin_tools = crate::plugins::spawn_allow(state, &workspace.id).await;
         let s = crate::agents::write_settings(
             &id,
             &key,
@@ -2765,6 +2768,7 @@ pub(crate) async fn spawn_fresh_chat(
             settings_theme,
             user_statusline.as_ref(),
             spec.mastermind,
+            &plugin_tools,
         )
         .map_err(ChatSpawnFailure::Internal)?;
         let m = crate::agents::write_mcp_config(&id, &key, state.port)
@@ -3054,22 +3058,35 @@ pub(crate) async fn spawn_chat_session(
     // settings pre-allow is generated from — the two vendors' ask modes
     // cannot drift); auto pre-approves the whole chimaera server. Workers
     // (mastermind: None) keep every prompt.
+    // Active workbench plugins' tools join the pre-approved set (the user
+    // switched the plugin on; its card names the tools) — for workers too.
+    // No plugin active ⇒ workers keep every prompt, exactly as before.
     if recipe.kind == AgentKind::Codex {
-        spec.mcp_auto_approve =
-            recipe
-                .mastermind
-                .map(|mode| chimaera_agent::driver::McpAutoApprove {
+        let plugin_tools = crate::plugins::spawn_allow(state, &recipe.workspace_id).await;
+        spec.mcp_auto_approve = match recipe.mastermind {
+            Some(crate::workspaces::MastermindMode::Auto) => {
+                Some(chimaera_agent::driver::McpAutoApprove {
                     server: "chimaera".to_string(),
-                    tools: match mode {
-                        crate::workspaces::MastermindMode::Ask => Some(
-                            crate::mcp::MASTERMIND_READ_TOOLS
-                                .iter()
-                                .map(|t| t.to_string())
-                                .collect(),
-                        ),
-                        crate::workspaces::MastermindMode::Auto => None,
-                    },
-                });
+                    tools: None,
+                })
+            }
+            Some(crate::workspaces::MastermindMode::Ask) => {
+                Some(chimaera_agent::driver::McpAutoApprove {
+                    server: "chimaera".to_string(),
+                    tools: Some(
+                        crate::mcp::MASTERMIND_READ_TOOLS
+                            .iter()
+                            .map(|t| t.to_string())
+                            .chain(plugin_tools)
+                            .collect(),
+                    ),
+                })
+            }
+            None => (!plugin_tools.is_empty()).then(|| chimaera_agent::driver::McpAutoApprove {
+                server: "chimaera".to_string(),
+                tools: Some(plugin_tools),
+            }),
+        };
     }
     // Codex selects its create-time model in-protocol at thread open; Claude
     // already received the same recipe value through build_chat_command.
@@ -3222,6 +3239,7 @@ pub(crate) async fn resurrect_chat(
         let (theme_set, user_statusline) =
             crate::runtimes::claude_settings_gates(&state.claude_settings_path, &root).await;
         let settings_theme = (!theme_set).then_some(entry.theme.as_str());
+        let plugin_tools = crate::plugins::spawn_allow(state, &workspace.id).await;
         let s = crate::agents::write_settings(
             &entry.id,
             &key,
@@ -3229,6 +3247,7 @@ pub(crate) async fn resurrect_chat(
             settings_theme,
             user_statusline.as_ref(),
             mastermind_mode,
+            &plugin_tools,
         )?;
         let m = crate::agents::write_mcp_config(&entry.id, &key, state.port)?;
         (Some(s), Some(m))

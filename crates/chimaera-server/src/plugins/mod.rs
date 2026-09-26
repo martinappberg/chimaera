@@ -32,6 +32,8 @@ use serde_json::{json, Value};
 
 use crate::AppState;
 
+pub(crate) mod tools;
+
 /// How long a workspace's detect result is trusted before a re-stat.
 const DETECT_TTL: Duration = Duration::from_secs(30);
 
@@ -234,6 +236,17 @@ pub(crate) async fn active_for_session(state: &AppState, sid: &str) -> Vec<&'sta
         Some(ws) => active(state, &ws).await,
         None => Vec::new(),
     }
+}
+
+/// MCP tools to pre-allow for a session spawned in `ws`: those of every
+/// plugin active there (empty — and so no settings change at all — when
+/// none is).
+pub(crate) async fn spawn_allow(state: &AppState, ws: &str) -> Vec<String> {
+    active(state, ws)
+        .await
+        .iter()
+        .flat_map(|m| m.provides.mcp_tools.iter().cloned())
+        .collect()
 }
 
 /// The workspace a session belongs to, if any.

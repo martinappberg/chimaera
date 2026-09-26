@@ -21,6 +21,7 @@ mod lifecycle;
 mod links;
 mod mcp;
 mod naming;
+mod notes;
 mod persist;
 mod plugins;
 mod proxy;

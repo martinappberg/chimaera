@@ -33,6 +33,11 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
             put(api::put_mastermind).delete(api::delete_mastermind),
         )
         .route("/workspaces/{id}/timeline", get(timeline::get_timeline))
+        // Agent notes: the USER sends a note to its addressee (their click).
+        .route(
+            "/workspaces/{id}/timeline/{seq}/deliver",
+            post(crate::notes::deliver),
+        )
         // Workbench plugins: the catalog, per-workspace status, and the
         // per-workspace off switch (enabling is the `plugins.enabled` setting).
         .route("/plugins", get(plugins::list_plugins))

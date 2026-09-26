@@ -18,3 +18,25 @@ pub(crate) async fn recorded_since_last_check(
 ) -> Option<Recorded> {
     None
 }
+
+fn tool_error(t: String) -> serde_json::Value {
+    serde_json::json!({ "content": [{ "type": "text", "text": t }], "isError": true })
+}
+
+/// knowledge_search {query, limit?} — lands with the mycelium reader.
+pub(crate) async fn tool_search(
+    _state: &Arc<AppState>,
+    _sid: &str,
+    _args: &serde_json::Value,
+) -> serde_json::Value {
+    tool_error("knowledge search is not available yet".into())
+}
+
+/// knowledge_get {id} — lands with the mycelium reader.
+pub(crate) async fn tool_get(
+    _state: &Arc<AppState>,
+    _sid: &str,
+    _args: &serde_json::Value,
+) -> serde_json::Value {
+    tool_error("knowledge reading is not available yet".into())
+}

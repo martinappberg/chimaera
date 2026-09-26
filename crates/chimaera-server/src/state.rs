@@ -5,7 +5,8 @@ use std::time::Instant;
 
 use crate::{
     agent_probe, agent_updates, agents, chat, compute, environment, episodes, fs, git, launcher,
-    ledger, plugins, proxy, quickopen, recents, settings, timeline, update, view_state, workspaces,
+    ledger, notes, plugins, proxy, quickopen, recents, settings, timeline, update, view_state,
+    workspaces,
 };
 
 /// Upper bound on how long a sessions snapshot waits for ledger restore.
@@ -196,6 +197,9 @@ pub(crate) struct AppState {
     /// Init), for the Skills view's "built into the agent" group. Bounded by
     /// live sessions; dropped on exit.
     pub(crate) chat_catalogs: Mutex<HashMap<String, Vec<(String, String)>>>,
+    /// Agent-notes plugin state: per-session post rate windows and read
+    /// cursors (in memory; notes themselves live on the Timeline).
+    pub(crate) notes: Mutex<notes::NotesState>,
 }
 
 impl AppState {
@@ -273,6 +277,7 @@ impl AppState {
             timeline_jobs_started: std::sync::atomic::AtomicBool::new(false),
             probes: agent_probe::ProbeState::default(),
             chat_catalogs: Mutex::new(HashMap::new()),
+            notes: Mutex::new(notes::NotesState::default()),
             data_dir,
         }
     }

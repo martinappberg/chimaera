@@ -326,6 +326,7 @@ async fn spawn_chat_ui(
             crate::runtimes::claude_settings_gates(&state.claude_settings_path, &workspace.root)
                 .await;
         let settings_theme = (!theme_set).then_some(theme);
+        let plugin_tools = crate::plugins::spawn_allow(&state, &workspace.id).await;
         match crate::agents::write_settings(
             &id,
             &key,
@@ -333,6 +334,7 @@ async fn spawn_chat_ui(
             settings_theme,
             user_statusline.as_ref(),
             None,
+            &plugin_tools,
         ) {
             Ok(path) => Some(path),
             Err(err) => return internal(err),
