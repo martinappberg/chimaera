@@ -6,8 +6,14 @@
 use chimaera_plugin_api::serde_json::{json, Value};
 use chimaera_plugin_api::{host, Context, Plugin, ToolDef, ToolResult};
 
-const TOOLS: [&str; 8] = [
+#[cfg(not(feature = "v2"))]
+const TOOLS: &[&str] = &[
     "echo", "loop", "allocate", "panic", "read", "state", "append", "recent",
+];
+/// The `v2` build (the update tests' "next release") offers one more tool.
+#[cfg(feature = "v2")]
+const TOOLS: &[&str] = &[
+    "echo", "loop", "allocate", "panic", "read", "state", "append", "recent", "version",
 ];
 
 struct Fixture;
@@ -118,6 +124,8 @@ impl Plugin for Fixture {
                     Err(err) => ToolResult::error(err),
                 }
             }
+            // Which build answered (only the v2 build offers it).
+            "version" if cfg!(feature = "v2") => ToolResult::text("0.2.0"),
             other => ToolResult::error(format!("unknown tool {other}")),
         }
     }

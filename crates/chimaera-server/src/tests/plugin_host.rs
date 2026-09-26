@@ -351,7 +351,7 @@ async fn five_traps_in_a_minute_fault_the_plugin_until_it_is_switched_off_and_on
 
 #[tokio::test]
 async fn a_component_whose_tools_differ_from_its_manifest_is_refused() {
-    let manifest = "id = \"test-mismatch\"\nname = \"Mismatch\"\nsummary = \"x\"\napi = \"0.1\"\n\
+    let manifest = "id = \"test-mismatch\"\nname = \"Mismatch\"\nversion = \"0.1.0\"\nsummary = \"x\"\napi = \"0.1\"\n\
                     [provides]\nmcp_tools = [\"mismatch_tool\"]\n[adds]\nagents = [\"x\"]\n";
     crate::plugins::test_catalog::add(manifest, crate::plugins::test_catalog::fixture_wasm());
     let state = test_state();

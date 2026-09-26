@@ -13,11 +13,19 @@ use serde_json::{json, Value};
 use super::Manifest;
 use crate::AppState;
 
-/// The plugin that owns an MCP tool name, if any.
-pub(crate) fn owner(tool: &str) -> Option<&'static Manifest> {
-    super::catalog()
-        .into_iter()
-        .find(|m| m.provides.mcp_tools.iter().any(|t| t == tool))
+/// The plugin that owns an MCP tool name, if any: an `active` one first
+/// (two plugins may name the same tool; the one switched on here answers),
+/// else any in the catalog (for the "isn't switched on" refusal).
+pub(crate) fn owner(
+    state: &AppState,
+    active: &[Arc<Manifest>],
+    tool: &str,
+) -> Option<Arc<Manifest>> {
+    let owns = |m: &&Arc<Manifest>| m.provides.mcp_tools.iter().any(|t| t == tool);
+    if let Some(m) = active.iter().find(owns) {
+        return Some(m.clone());
+    }
+    super::catalog(state).iter().find(owns).cloned()
 }
 
 /// What the active `plugins` add to what an agent in `ws` is handed: their
@@ -25,7 +33,7 @@ pub(crate) fn owner(tool: &str) -> Option<&'static Manifest> {
 /// plugin that can't answer (refused, faulted, trapping) adds nothing.
 pub(crate) async fn offered(
     state: &Arc<AppState>,
-    plugins: &[&'static Manifest],
+    plugins: &[Arc<Manifest>],
     ws: &str,
 ) -> (Vec<String>, Vec<Value>) {
     let mut paragraphs = Vec::new();
@@ -46,7 +54,7 @@ pub(crate) async fn offered(
 /// session's workspace).
 pub(crate) async fn call(
     state: &Arc<AppState>,
-    m: &'static Manifest,
+    m: &Manifest,
     agent_id: &str,
     name: &str,
     args: &Value,

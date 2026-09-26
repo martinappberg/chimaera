@@ -87,7 +87,7 @@ impl Stamp {
 /// The provider's current snapshot.
 struct Current {
     /// The provider's name for the route (`provides.knowledge`).
-    provider: &'static str,
+    provider: String,
     knowledge: Arc<Value>,
     files: Arc<Stamp>,
 }
@@ -99,7 +99,7 @@ struct Baseline {
 }
 
 /// The active Knowledge provider plugin in `ws`, if any.
-async fn provider(state: &AppState, ws: &str) -> Option<&'static Manifest> {
+async fn provider(state: &AppState, ws: &str) -> Option<Arc<Manifest>> {
     crate::plugins::active(state, ws)
         .await
         .into_iter()
@@ -112,7 +112,7 @@ async fn provider(state: &AppState, ws: &str) -> Option<&'static Manifest> {
 /// object) answers nothing, and the route says there is no provider.
 async fn current(state: &Arc<AppState>, ws: &str) -> Option<Current> {
     let m = provider(state, ws).await?;
-    let name = m.provides.knowledge.as_deref()?;
+    let name = m.provides.knowledge.clone()?;
     // Twice at most: "unchanged" for a stamp whose cache entry was dropped
     // meanwhile (the workspace forgotten) is asked again without one.
     for _ in 0..2 {
@@ -122,7 +122,7 @@ async fn current(state: &Arc<AppState>, ws: &str) -> Option<Current> {
             .map(|c| c.stamp.clone());
         let answer = state
             .plugin_runtime
-            .knowledge(state, m, ws, held.as_ref())
+            .knowledge(state, &m, ws, held.as_ref())
             .await;
         match answer {
             Ok(None) => {

@@ -2,12 +2,17 @@
 # Mastermind, on the Timeline. Mail, not phone: a note never starts a turn.
 id = "agent-notes"
 name = "Agent notes"
+# The plugin's own version: the crate's (scripts/build-plugins.sh checks).
+version = "0.1.0"
 summary = "Agents leave short notes for each other and for the Mastermind."
 # The chimaera:plugin WIT version the component targets.
 api = "0.1"
 
 [provides]
 mcp_tools = ["post_note", "read_notes"]
+# The hook carries the "N unread notes" line; session-ended drops a read
+# cursor. The host delivers nothing a plugin did not declare.
+events = ["hook", "session-ended"]
 
 [adds]
 ui = ["Notes on the Timeline, each with a deliver button"]

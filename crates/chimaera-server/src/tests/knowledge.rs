@@ -148,11 +148,11 @@ async fn mycelium_knowledge_tools_are_unchanged() {
 async fn the_provider_answers_unchanged_for_its_own_stamp() {
     let state = test_state();
     let ws = mycelium_workspace(&state).await;
-    let m = crate::plugins::manifest("mycelium").expect("mycelium ships");
+    let m = crate::plugins::manifest(&state, "mycelium").expect("mycelium ships");
     let started = std::time::Instant::now();
     let (stamp, data) = state
         .plugin_runtime
-        .knowledge(&state, m, &ws, None)
+        .knowledge(&state, &m, &ws, None)
         .await
         .unwrap()
         .expect("a first snapshot");
@@ -163,7 +163,7 @@ async fn the_provider_answers_unchanged_for_its_own_stamp() {
     let started = std::time::Instant::now();
     let again = state
         .plugin_runtime
-        .knowledge(&state, m, &ws, Some(&stamp))
+        .knowledge(&state, &m, &ws, Some(&stamp))
         .await
         .unwrap();
     eprintln!("knowledge, stamp unchanged: {:?}", started.elapsed());
@@ -173,7 +173,7 @@ async fn the_provider_answers_unchanged_for_its_own_stamp() {
     let started = std::time::Instant::now();
     let first_there = state
         .plugin_runtime
-        .knowledge(&state, m, &other, None)
+        .knowledge(&state, &m, &other, None)
         .await
         .unwrap();
     eprintln!(
@@ -201,7 +201,7 @@ async fn the_provider_answers_unchanged_for_its_own_stamp() {
     std::fs::write(&learnings, body).unwrap();
     let (moved, data) = state
         .plugin_runtime
-        .knowledge(&state, m, &ws, Some(&stamp))
+        .knowledge(&state, &m, &ws, Some(&stamp))
         .await
         .unwrap()
         .expect("a changed tree is re-read");
@@ -393,10 +393,10 @@ async fn a_symlinked_topic_is_refused_warned_about_and_stamped() {
         root.join(".living/findings/linked.md"),
     )
     .unwrap();
-    let m = crate::plugins::manifest("mycelium").unwrap();
+    let m = crate::plugins::manifest(&state, "mycelium").unwrap();
     let (stamp, data) = state
         .plugin_runtime
-        .knowledge(&state, m, &ws, None)
+        .knowledge(&state, &m, &ws, None)
         .await
         .unwrap()
         .expect("a snapshot");

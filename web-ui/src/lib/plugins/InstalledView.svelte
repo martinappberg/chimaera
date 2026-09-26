@@ -1,17 +1,26 @@
 <script lang="ts">
   /**
-   * Installed: the workbench plugins as cards (glyph tile · name · version ·
-   * summary · the on/off switch for THIS workspace · Here / Adds / Needs
-   * lines — the "Adds" line is mandatory, it is what makes opt-in honest),
-   * then what each agent CLI reports about its own plugins. Requirement
-   * state ("Needs") is read from the agents, never guessed.
+   * Installed: the workbench plugins as cards (glyph tile · name · the
+   * plugin's own version · where it came from — "ships with chimaera" or
+   * "installed", "stale", an Update chip when a check found a newer
+   * compatible release · summary · the on/off switch for THIS workspace ·
+   * Here / Adds / Needs lines — the "Adds" line is mandatory, it is what
+   * makes opt-in honest — and, for an installed copy, Use previous / Check
+   * now / Remove; the fault when it can't run), then what each agent CLI
+   * reports about its own plugins. Requirement state ("Needs") is read from
+   * the agents, never guessed; versions and sources from the daemon.
    */
+  import ConfirmDialog from "../shared/ConfirmDialog.svelte";
   import Switch from "../shared/Switch.svelte";
   import { knowledge } from "../workspace/knowledge";
   import { ApiError } from "../net/api";
   import {
+    changeWorkbenchPlugin,
+    daemonVersion,
     installPlugin,
     setWorkspacePluginOn,
+    type PluginChange,
+    type PluginUpdate,
     type AgentHook,
     type AgentId,
     type AgentPlugin,
@@ -100,14 +109,81 @@
     return id.slice(0, 2);
   }
 
-  /** The version the agents report for a plugin's requirement (claude's
-   *  first, then any) — shown beside the name when known. */
-  function version(p: WorkspacePlugin): string | null {
-    for (const r of p.requires) {
-      const v = installed(r.agent, r.id)?.version;
-      if (v) return v;
+  type Change = "update" | "rollback" | "remove" | "check";
+
+  /** One-line outcomes of the last change per plugin (the verified
+   *  checksum after an update). */
+  let notes = $state(new Map<string, string>());
+  /** The plugin whose Remove waits for the confirm dialog. */
+  let removing = $state<WorkspacePlugin | null>(null);
+  let removeError = $state<string | null>(null);
+
+  function without<V>(m: Map<string, V>, key: string): Map<string, V> {
+    return new Map([...m].filter(([k]) => k !== key));
+  }
+
+  /** The outcome line; null when there is no card left to carry it (a
+   *  removed plugin that nothing ships under). */
+  function outcome(
+    kind: Change,
+    p: WorkspacePlugin,
+    res: PluginChange | { update: PluginUpdate | null },
+  ): string | null {
+    if (kind === "check") {
+      const u = (res as { update: PluginUpdate | null }).update;
+      return u !== null ? `${u.version} is available` : `no release newer than ${p.version}`;
     }
-    return null;
+    const c = res as PluginChange;
+    if (kind === "rollback") return `back to ${c.version} — Use previous returns to ${c.previous}`;
+    if (kind === "remove") {
+      return c.plugin ? `installed copy removed — the ${p.embedded_version} that ships with chimaera runs now` : null;
+    }
+    const sha = c.sha256?.["plugin.wasm"];
+    return `updated to ${c.version}${sha ? ` · plugin.wasm sha256 ${sha.slice(0, 16)}… verified` : ""}`;
+  }
+
+  async function change(p: WorkspacePlugin, kind: Change): Promise<boolean> {
+    const key = `${p.id}:change`;
+    busy = new Set(busy).add(key);
+    errors = without(errors, p.id);
+    notes = without(notes, p.id);
+    try {
+      const res = await changeWorkbenchPlugin(kind, p.id);
+      const line = outcome(kind, p, res);
+      if (line !== null) notes = new Map(notes).set(p.id, line);
+      return true;
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      if (kind === "remove") removeError = message;
+      else errors = new Map(errors).set(p.id, message);
+      return false;
+    } finally {
+      const next = new Set(busy);
+      next.delete(key);
+      busy = next;
+    }
+  }
+
+  async function confirmRemove(): Promise<void> {
+    if (removing === null) return;
+    if (await change(removing, "remove")) removing = null;
+  }
+
+  function removeBody(p: WorkspacePlugin): string {
+    const versions = [p.installed_version, p.previous].filter((v) => v !== null).join(" and ");
+    const what = `This deletes the installed ${p.name} (${versions}) from this host.`;
+    return p.embedded_version !== null
+      ? `${what} The ${p.embedded_version} that ships with chimaera runs instead.`
+      : `${what} Workspaces where it is on lose what it adds.`;
+  }
+
+  /** The source chip: where the running copy came from, and — when both
+   *  exist — the other copy too ("installed · 0.3.1 ships with chimaera"). */
+  function source(p: WorkspacePlugin): string {
+    if (p.source === "installed") {
+      return p.embedded_version !== null ? `installed · ${p.embedded_version} ships with chimaera` : "installed";
+    }
+    return $daemonVersion !== null ? `ships with chimaera ${$daemonVersion}` : "ships with chimaera";
   }
 
   const k = $derived($knowledge);
@@ -142,15 +218,33 @@
   {/if}
 
   {#each plugins as p (p.id)}
-    {@const v = version(p)}
     {@const here = hereLine(p)}
+    {@const changing = busy.has(`${p.id}:change`)}
     <article class="card" class:active={p.active}>
       <div class="top">
         <span class="tile mono" class:on={p.active} aria-hidden="true">{tile(p.id)}</span>
         <div class="ident">
           <div class="nameline">
             <span class="name">{p.name}</span>
-            {#if v !== null}<span class="ver mono">{v}</span>{/if}
+            {#if p.version !== ""}<span class="ver mono">{p.version}</span>{/if}
+            <span class="pill neutral small" title={p.path ?? undefined}>{source(p)}</span>
+            {#if p.stale}
+              <span
+                class="pill warn small"
+                title="the installed {p.installed_version} is older than the {p.embedded_version} that ships with chimaera"
+                >stale</span
+              >
+            {/if}
+            {#if p.update !== null}
+              <button
+                class="pill good small chip"
+                disabled={changing}
+                title="download {p.update.version} from its release, verify its checksum, and switch to it"
+                onclick={() => void change(p, "update")}
+              >
+                {changing ? "updating…" : `Update to ${p.update.version}`}
+              </button>
+            {/if}
           </div>
           <div class="summary">{p.summary}</div>
         </div>
@@ -225,6 +319,39 @@
             {/if}
           </span>
         {/if}
+        {#if p.installed_version !== null}
+          <span class="lbl small">Installed</span>
+          <span class="acts">
+            <span class="mono">{p.installed_version}</span>
+            {#if p.stale}
+              <span class="muted">older than the {p.embedded_version} that ships with chimaera</span>
+            {/if}
+            {#if p.previous !== null}
+              <button class="link" disabled={changing} onclick={() => void change(p, "rollback")}>
+                Use previous ({p.previous})
+              </button>
+            {/if}
+            <button class="link" disabled={changing} onclick={() => void change(p, "check")}>
+              {changing ? "working…" : "Check now"}
+            </button>
+            <button
+              class="link danger"
+              disabled={changing}
+              onclick={() => {
+                removeError = null;
+                removing = p;
+              }}>Remove</button
+            >
+          </span>
+        {/if}
+        {#if p.fault !== null}
+          <span class="lbl small">Fault</span>
+          <span class="err">{p.fault}</span>
+        {/if}
+        {#if notes.has(p.id)}
+          <span></span>
+          <span class="muted">{notes.get(p.id)}</span>
+        {/if}
         {#if errors.has(p.id)}
           <span></span>
           <span class="err">{errors.get(p.id)}</span>
@@ -233,6 +360,20 @@
     </article>
   {/each}
 </section>
+
+{#if removing !== null}
+  <ConfirmDialog
+    title="Remove {removing.name}?"
+    body={removeBody(removing)}
+    confirmLabel={busy.has(`${removing.id}:change`) ? "removing…" : "Remove"}
+    danger
+    error={removeError}
+    onConfirm={() => void confirmRemove()}
+    onCancel={() => {
+      if (removing !== null && !busy.has(`${removing.id}:change`)) removing = null;
+    }}
+  />
+{/if}
 
 <section class="ag" aria-labelledby="ag-title">
   <div class="shead">
@@ -396,8 +537,9 @@
   }
   .nameline {
     display: flex;
+    flex-wrap: wrap;
     align-items: baseline;
-    gap: 8px;
+    gap: 4px 8px;
   }
   .name {
     font-size: var(--text-lg);
@@ -469,6 +611,31 @@
     border: 1px solid var(--edge);
     color: var(--muted);
   }
+  .pill.small {
+    font-size: 11px;
+    padding: 1px 8px;
+  }
+  /* The Update chip: a pill that is a button. */
+  .pill.chip {
+    appearance: none;
+    border: none;
+    font-family: inherit;
+    font-weight: 500;
+    cursor: pointer;
+  }
+  .pill.chip:not(:disabled):hover {
+    background: color-mix(in srgb, var(--accent) 20%, transparent);
+  }
+  .pill.chip:disabled {
+    cursor: default;
+    opacity: 0.7;
+  }
+  .acts {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 6px 14px;
+  }
   .link {
     appearance: none;
     border: none;
@@ -481,6 +648,14 @@
   }
   .link:hover {
     text-decoration: underline;
+  }
+  .link:disabled {
+    color: var(--muted);
+    cursor: default;
+    text-decoration: none;
+  }
+  .link.danger {
+    color: var(--err);
   }
   .link.strong {
     font-weight: 500;

@@ -500,6 +500,25 @@ isolated daemon's home, sees it on the card, bumps the fake release, sees
 **Update**, updates, and watches a session's next `tools/list` carry the new
 version's tools.
 
+**Built** (2026-09-26): the manifest's `version`, `api`, `requires.chimaera`,
+`[release] github` and `[provides] events` (a hook reaches only plugins that
+declare `hook`: Agent notes does, Mycelium doesn't), and the build script's
+version and API checks; the catalog on `AppState`, reloaded after each
+change, with the precedence rule and the gates (`plugins/mod.rs`); the
+installed directory with `current` and `previous` links, and the install,
+update, Use previous and Remove routes (`plugins/installed.rs`); the checker
+on the daemon's own release loop, and Check now (`plugins/releases.rs`);
+`chimaera plugin list|add|update|remove`; the card. `previous` is a second
+link rather than "the next lower version", so Use previous is reversible and
+at most two versions stay on disk. Tests in `src/tests/plugin_updates.rs`
+against a fake releases server, with the fixture's `v2` build as the next
+release. The live pass (an isolated daemon, a static fake release): add from
+the CLI, the card, a published 0.2.0 offered by Check now and by the boot
+check, Update from the card (the verified checksum shown), Use previous and
+back, Remove through its dialog, a planted `api = "0.2"` copy listed off with
+its reason; a session's `tools/list` after an update is covered by the tests,
+not yet by a live agent (P4).
+
 ### P4: docs and the live proof
 
 Maps (`crates/chimaera-plugin-api/AGENTS.md`, `plugins/AGENTS.md`, the server

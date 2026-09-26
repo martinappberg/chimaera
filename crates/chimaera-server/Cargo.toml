@@ -35,6 +35,9 @@ csv = "1.4.0"
 # Workbench plugin manifests (`plugin.toml`, embedded): parse + serde only —
 # no editing, no serialization.
 toml = { version = "0.9", default-features = false, features = ["parse", "serde"] }
+# Plugin versions and `requires.chimaera` requirements (`plugins/`): the
+# precedence rule, the release checker's "strictly newer", and the gates.
+semver = "1"
 # The plugin host (`plugins/runtime.rs`): WASM components (the
 # `chimaera:plugin` world) under epoch deadlines and memory caps. Pinned
 # exactly: the embedding API changes between majors. Only what the host

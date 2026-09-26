@@ -5,10 +5,20 @@
 //! A plugin is a small TOML manifest (data, never code) plus its behaviour:
 //! a WASM component (`plugin.wasm`) built from `plugins/<crate>` by
 //! `scripts/build-plugins.sh` and embedded from `plugins/dist`, like
-//! `web-ui/dist`. It runs in `runtime` (the sandbox) and asks the daemon for
-//! everything through `hostfns` (bounded). No plugin behaviour is daemon
-//! code: the Knowledge provider (mycelium) answers `knowledge.rs` through
-//! its `knowledge` export like any other plugin would.
+//! `web-ui/dist`, or installed from a plugin's release into
+//! `<data dir>/plugins/<id>/<version>/` (`installed`). It runs in `runtime`
+//! (the sandbox) and asks the daemon for everything through `hostfns`
+//! (bounded). No plugin behaviour is daemon code: the Knowledge provider
+//! (mycelium) answers `knowledge.rs` through its `knowledge` export like any
+//! other plugin would.
+//!
+//! The catalog (`Catalog`, on `AppState`) merges the embedded plugins with
+//! the installed copies: the same id in both → the higher version loads and
+//! the card names both; equal → the embedded copy; an older installed copy
+//! is `stale`. Gates run before anything loads: a manifest's `api` must be a
+//! WIT version this host serves and its `requires.chimaera` must match this
+//! daemon — a plugin that fails one stays listed, off, with the reason. The
+//! catalog reloads after every install, update, rollback and remove.
 //!
 //! State is minimal by design: a plugin is switched on per workspace
 //! (`Workspace.plugins_on` — the Plugins page is per workspace, so is its
@@ -23,8 +33,8 @@
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::path::Path;
-use std::sync::{Arc, LazyLock};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, RwLock};
 use std::time::{Duration, Instant};
 
 use axum::extract::{Path as AxPath, State};
@@ -38,14 +48,19 @@ use serde_json::{json, Value};
 use crate::AppState;
 
 pub(crate) mod hostfns;
+pub(crate) mod installed;
+pub(crate) mod releases;
 pub(crate) mod runtime;
 pub(crate) mod tools;
 
 /// How long a workspace's detect result is trusted before a re-stat.
 const DETECT_TTL: Duration = Duration::from_secs(30);
 
-/// The WIT version (`chimaera:plugin@0.1.x`) this host serves.
+/// The WIT version (`chimaera:plugin@0.1.x`) first-party plugins target.
 pub(crate) const API: &str = "0.1";
+/// Every WIT version this host serves. A manifest's `api` must be one of
+/// them; an additive WIT bump adds a version here and keeps the old ones.
+pub(crate) const SERVED_APIS: &[&str] = &[API];
 
 /// The first-party WASM plugins, `<id>/{plugin.toml,plugin.wasm}`, built by
 /// `scripts/build-plugins.sh`. Release builds embed the folder; debug builds
@@ -58,19 +73,20 @@ struct Dist;
 #[cfg(test)]
 #[derive(RustEmbed)]
 #[folder = "../../plugins/dist-test"]
-struct DistTest;
+pub(crate) struct DistTest;
 
 #[derive(Deserialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Manifest {
     pub(crate) id: String,
     pub(crate) name: String,
+    /// The plugin's own version, `MAJOR.MINOR.PATCH` (`validate`).
+    pub(crate) version: String,
     pub(crate) summary: String,
     #[serde(default)]
     pub(crate) homepage: Option<String>,
-    /// The WIT version a WASM plugin's component targets (`"0.1"`).
-    #[serde(default)]
-    pub(crate) api: Option<String>,
+    /// The WIT version the component targets (`"0.1"`); a gate.
+    pub(crate) api: String,
     #[serde(default)]
     pub(crate) detect: Detect,
     #[serde(default)]
@@ -81,19 +97,80 @@ pub(crate) struct Manifest {
     pub(crate) provides: Provides,
     #[serde(default)]
     pub(crate) adds: Adds,
+    /// Where newer versions are published (the release checker's source).
+    #[serde(default)]
+    pub(crate) release: Option<ReleaseSource>,
     /// The behaviour — set by the catalog, never by the TOML.
     #[serde(skip)]
     pub(crate) wasm: Wasm,
+    /// Where this copy came from and what the catalog decided about it —
+    /// set by the catalog, never by the TOML.
+    #[serde(skip)]
+    pub(crate) origin: Origin,
 }
 
-/// A plugin's component (`plugin.wasm`), which the runtime runs.
+/// A plugin's component (`plugin.wasm`), which the runtime runs, and its
+/// SHA-256: which build it is (the compile cache and the live instances are
+/// keyed by it, so a moved `current` never runs the old code).
 #[derive(Clone, Default)]
-pub(crate) struct Wasm(pub(crate) Cow<'static, [u8]>);
+pub(crate) struct Wasm {
+    pub(crate) bytes: Arc<Cow<'static, [u8]>>,
+    pub(crate) sha256: Arc<str>,
+}
+
+impl Wasm {
+    pub(crate) fn new(bytes: Cow<'static, [u8]>) -> Self {
+        let sha256 = Arc::from(crate::fs::sha256_hex(&bytes));
+        Wasm {
+            bytes: Arc::new(bytes),
+            sha256,
+        }
+    }
+}
 
 impl std::fmt::Debug for Wasm {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Wasm({} bytes)", self.0.len())
+        write!(f, "Wasm({} bytes)", self.bytes.len())
     }
+}
+
+/// Where a catalog entry came from.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Source {
+    /// Ships inside this chimaera binary (`plugins/dist`).
+    #[default]
+    Embedded,
+    /// Installed from a release into `<data dir>/plugins/<id>/`.
+    Installed,
+}
+
+impl Source {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Source::Embedded => "embedded",
+            Source::Installed => "installed",
+        }
+    }
+}
+
+/// The catalog's decision about one plugin id, carried on the manifest that
+/// loads (or would load) for it.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Origin {
+    pub(crate) source: Source,
+    /// The installed copy's `current` version directory, when it has one.
+    pub(crate) path: Option<PathBuf>,
+    pub(crate) embedded_version: Option<String>,
+    pub(crate) installed_version: Option<String>,
+    /// The installed copy's `previous` version (Use previous).
+    pub(crate) previous: Option<String>,
+    /// An installed copy older than the embedded one (the embedded loads).
+    pub(crate) stale: bool,
+    /// Why this daemon can't run it (a failed gate): listed, never active.
+    pub(crate) gate: Option<String>,
+    /// The installed copy's release source — what the checker asks, even
+    /// when the embedded copy is the one that loads.
+    pub(crate) installed_release: Option<String>,
 }
 
 /// Workspace-relative paths whose presence makes the plugin active here.
@@ -111,6 +188,10 @@ pub(crate) struct Requires {
     /// agent kind ("claude" | "codex") → the agent-native plugin it needs.
     #[serde(default)]
     pub(crate) agent_plugins: BTreeMap<String, AgentPluginReq>,
+    /// A semver requirement on this daemon (`">=0.4.0"`, `"^0.4"`) for a
+    /// plugin that needs a host import a later daemon added; a gate.
+    #[serde(default)]
+    pub(crate) chimaera: Option<String>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -143,6 +224,26 @@ pub(crate) struct Provides {
     /// Named first-party UI modules (lazy-loaded by the web UI).
     #[serde(default)]
     pub(crate) views: Vec<String>,
+    /// The events the host delivers to the plugin's `on-event`: nothing it
+    /// did not declare, so a hook never instantiates a plugin that ignores it.
+    #[serde(default)]
+    pub(crate) events: Vec<EventKind>,
+}
+
+impl Provides {
+    pub(crate) fn hears(&self, event: EventKind) -> bool {
+        self.events.contains(&event)
+    }
+}
+
+/// The `on-event` variants a manifest may declare (`provides.events`).
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum EventKind {
+    Hook,
+    SessionEnded,
+    SwitchedOn,
+    SwitchedOff,
 }
 
 /// The card's "Adds" lines, in words — mandatory honesty, not decoration.
@@ -155,23 +256,151 @@ pub(crate) struct Adds {
     pub(crate) agents: Vec<String>,
 }
 
-fn parse_manifest(text: &str) -> Option<Manifest> {
-    match toml::from_str::<Manifest>(text) {
-        Ok(manifest) => Some(manifest),
-        // Unreachable in a tested build (`every_manifest_parses`); a broken
-        // manifest must not take the daemon down with it.
-        Err(err) => {
-            tracing::error!(%err, "invalid embedded plugin manifest");
-            None
+/// `[release]`: where a plugin's newer versions are published. The GitHub
+/// releases API, tags `v<version>`, assets `plugin.wasm`, `plugin.toml` and
+/// `SHA256SUMS`.
+#[derive(Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ReleaseSource {
+    /// `owner/repo`.
+    pub(crate) github: String,
+}
+
+/// A plugin id: lowercase ASCII letters, digits and dashes, starting with a
+/// letter or digit. It names a directory and a URL segment, so nothing
+/// else; `install` is the install route's own segment.
+pub(crate) fn valid_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id != "install"
+        && id.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && id
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// A GitHub `owner/repo`: what the checker and the install route put in an
+/// API URL, so nothing that could leave that path.
+pub(crate) fn valid_github(slug: &str) -> bool {
+    let mut parts = slug.split('/');
+    let ok = |p: Option<&str>| {
+        p.is_some_and(|p| {
+            !p.is_empty()
+                && p.len() <= 100
+                && !p.starts_with('.')
+                && p.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        })
+    };
+    ok(parts.next()) && ok(parts.next()) && parts.next().is_none()
+}
+
+/// A plugin version: plain `MAJOR.MINOR.PATCH` (no pre-release or build
+/// part — the precedence rule and "strictly newer" compare these).
+pub(crate) fn plugin_version(v: &str) -> Result<semver::Version, String> {
+    match semver::Version::parse(v) {
+        Ok(parsed) if parsed.pre.is_empty() && parsed.build.is_empty() => Ok(parsed),
+        _ => Err(format!("version {v:?} is not MAJOR.MINOR.PATCH")),
+    }
+}
+
+/// The manifest's own consistency, checked wherever one is read: a readable
+/// id, version and release source. (The gates are separate: a manifest can
+/// be well-formed and still not run on this daemon.)
+pub(crate) fn validate(m: &Manifest) -> Result<(), String> {
+    if !valid_id(&m.id) {
+        return Err(format!(
+            "plugin id {:?} must be lowercase letters, digits and dashes",
+            m.id
+        ));
+    }
+    plugin_version(&m.version)?;
+    if let Some(release) = &m.release {
+        if !valid_github(&release.github) {
+            return Err(format!(
+                "release.github {:?} is not owner/repo",
+                release.github
+            ));
         }
     }
+    Ok(())
+}
+
+/// Parse and validate a manifest's text.
+pub(crate) fn parse_manifest(text: &str) -> Result<Manifest, String> {
+    let m = toml::from_str::<Manifest>(text).map_err(|e| format!("plugin.toml: {e}"))?;
+    validate(&m)?;
+    Ok(m)
+}
+
+/// The compatibility gates: `api` must be a WIT version this host serves,
+/// and `requires.chimaera` must match `daemon` (a dev build, the `0.0.1`
+/// sentinel, matches every requirement — as the release check treats it).
+/// `Some(why)` in the card's words when this daemon can't run `m`.
+pub(crate) fn gate(m: &Manifest, daemon: &str) -> Option<String> {
+    if !SERVED_APIS.contains(&m.api.as_str()) {
+        let served = SERVED_APIS.join(", ");
+        let wants = api_parts(&m.api);
+        let newest = SERVED_APIS.iter().filter_map(|a| api_parts(a)).max();
+        return Some(match (wants, newest) {
+            (Some(w), Some(n)) if w > n => format!(
+                "needs a newer chimaera: it targets plugin API {}, this daemon serves {served}",
+                m.api
+            ),
+            (Some(_), _) => format!(
+                "needs a newer plugin: it targets plugin API {}, this daemon serves {served}",
+                m.api
+            ),
+            (None, _) => format!("its api {:?} is not a plugin API version", m.api),
+        });
+    }
+    let req = m.requires.chimaera.as_deref()?;
+    let Ok(parsed) = semver::VersionReq::parse(req) else {
+        return Some(format!(
+            "its requires.chimaera ({req}) is not a version requirement"
+        ));
+    };
+    if chimaera_core::version_is_dev(daemon) {
+        return None;
+    }
+    let Ok(version) = semver::Version::parse(daemon) else {
+        return None;
+    };
+    (!parsed.matches(&version)).then(|| {
+        format!(
+            "needs chimaera {} (this is {daemon})",
+            describe_req(&parsed)
+        )
+    })
+}
+
+/// `"0.1"` → (0, 1).
+fn api_parts(api: &str) -> Option<(u64, u64)> {
+    let (major, minor) = api.split_once('.')?;
+    Some((major.parse().ok()?, minor.parse().ok()?))
+}
+
+/// A requirement in the card's words: `>=0.4.0` reads "≥ 0.4.0".
+fn describe_req(req: &semver::VersionReq) -> String {
+    req.comparators
+        .iter()
+        .map(|c| {
+            let text = c.to_string();
+            match c.op {
+                semver::Op::GreaterEq => format!("≥ {}", text.trim_start_matches(">=")),
+                semver::Op::LessEq => format!("≤ {}", text.trim_start_matches("<=")),
+                _ => text,
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Every `<id>/plugin.toml` + `<id>/plugin.wasm` pair in an embedded dist
 /// folder, by id. A pair that doesn't hold together (no component, an id
-/// that isn't its folder's, a WIT version this host doesn't serve) is left
-/// out, loudly: unreachable for a dist this build's script laid out.
-fn load_dist<E: RustEmbed>() -> Vec<Manifest> {
+/// that isn't its folder's, a manifest that doesn't parse) is left out,
+/// loudly: unreachable for a dist this build's script laid out.
+fn load_dist<E: RustEmbed>() -> Vec<Arc<Manifest>> {
     let mut dirs: Vec<String> = E::iter()
         .filter_map(|path| path.strip_suffix("/plugin.toml").map(str::to_string))
         .collect();
@@ -180,94 +409,271 @@ fn load_dist<E: RustEmbed>() -> Vec<Manifest> {
     dirs.into_iter()
         .filter_map(|dir| {
             let text = E::get(&format!("{dir}/plugin.toml"))?;
-            let mut m = parse_manifest(&String::from_utf8_lossy(&text.data))?;
+            let mut m = match parse_manifest(&String::from_utf8_lossy(&text.data)) {
+                Ok(m) => m,
+                // Unreachable in a tested build (`every_manifest_parses`); a
+                // broken manifest must not take the daemon down with it.
+                Err(err) => {
+                    tracing::error!(plugin = %dir, %err, "invalid embedded plugin manifest");
+                    return None;
+                }
+            };
             let Some(wasm) = E::get(&format!("{dir}/plugin.wasm")) else {
                 tracing::error!(plugin = %dir, "embedded plugin has no plugin.wasm");
                 return None;
             };
-            if m.id != dir || m.api.as_deref() != Some(API) {
+            if m.id != dir {
                 tracing::error!(
                     plugin = %dir,
                     id = %m.id,
-                    api = ?m.api,
-                    "embedded plugin refused: its id must be its folder and its api {API}"
+                    "embedded plugin refused: its id must be its folder"
                 );
                 return None;
             }
-            m.wasm = Wasm(wasm.data);
-            Some(m)
+            m.wasm = Wasm::new(wasm.data);
+            Some(Arc::new(m))
         })
         .collect()
 }
 
 /// What this daemon ships: the embedded plugins, sorted by id (their folder
-/// names). Loaded once; the order is the Plugins page's, and the order
-/// active plugins' tools and instruction paragraphs reach an agent in.
-static PRODUCTION: LazyLock<Vec<Manifest>> = LazyLock::new(load_dist::<Dist>);
+/// names). Loaded once per process.
+static PRODUCTION: LazyLock<Vec<Arc<Manifest>>> = LazyLock::new(load_dist::<Dist>);
 
-/// The shipped catalog — never the test fixtures.
-pub(crate) fn production_catalog() -> &'static [Manifest] {
+/// The shipped catalog — never the test fixtures, never an installed copy.
+pub(crate) fn production_catalog() -> &'static [Arc<Manifest>] {
     &PRODUCTION
 }
 
-/// The catalog every lookup reads: the shipped plugins (plus, in a test
-/// build, whatever `test_catalog` added).
-pub(crate) fn catalog() -> Vec<&'static Manifest> {
+/// The embedded plugins: the shipped ones plus, in a test build, whatever
+/// `test_catalog` added.
+fn embedded() -> Vec<Arc<Manifest>> {
     #[allow(unused_mut)]
-    let mut all: Vec<&'static Manifest> = production_catalog().iter().collect();
+    let mut all: Vec<Arc<Manifest>> = production_catalog().to_vec();
     #[cfg(test)]
     all.extend(test_catalog::extra());
     all
 }
 
-pub(crate) fn manifest(id: &str) -> Option<&'static Manifest> {
-    catalog().into_iter().find(|m| m.id == id)
+/// Merge the embedded plugins with the installed copies, one entry per id,
+/// sorted by id (the Plugins page's order, and the order active plugins'
+/// tools and instruction paragraphs reach an agent in). The same id in
+/// both: the higher version loads and both versions are named; equal
+/// versions: the embedded copy; an older installed copy is `stale`. Then
+/// the gates, on the copy that loads.
+pub(crate) fn resolve(
+    embedded: &[Arc<Manifest>],
+    installed: &[installed::InstalledCopy],
+    daemon: &str,
+) -> Vec<Arc<Manifest>> {
+    let version =
+        |m: &Manifest| plugin_version(&m.version).unwrap_or(semver::Version::new(0, 0, 0));
+    let mut ids: BTreeSet<&str> = embedded.iter().map(|m| m.id.as_str()).collect();
+    ids.extend(installed.iter().map(|c| c.manifest.id.as_str()));
+    ids.into_iter()
+        .map(|id| {
+            let e = embedded.iter().find(|m| m.id == id);
+            let i = installed.iter().find(|c| c.manifest.id == id);
+            let installed_wins = match (e, i) {
+                (Some(e), Some(i)) => version(&i.manifest) > version(e),
+                (None, Some(_)) => true,
+                _ => false,
+            };
+            let mut chosen: Manifest = match (installed_wins, e, i) {
+                (true, _, Some(i)) => i.manifest.clone(),
+                (_, Some(e), _) => (**e).clone(),
+                _ => unreachable!("every id came from one side"),
+            };
+            chosen.origin = Origin {
+                source: if installed_wins {
+                    Source::Installed
+                } else {
+                    Source::Embedded
+                },
+                path: i.map(|c| c.dir.clone()),
+                embedded_version: e.map(|m| m.version.clone()),
+                installed_version: i.map(|c| c.manifest.version.clone()),
+                previous: i.and_then(|c| c.previous.clone()),
+                stale: matches!((e, i), (Some(e), Some(i)) if version(&i.manifest) < version(e)),
+                gate: gate(&chosen, daemon),
+                installed_release: i
+                    .and_then(|c| c.manifest.release.as_ref().map(|r| r.github.clone())),
+            };
+            Arc::new(chosen)
+        })
+        .collect()
 }
 
-/// Test builds only: plugins added to this test process's catalog, beside
-/// the shipped ones (`catalog()` sees them; `production_catalog()` never
-/// does). Leaked on purpose — a test process's catalog lives as long as it.
+/// The catalog every lookup reads (on `AppState`): the embedded plugins
+/// merged with the installed copies under `<data dir>/plugins`. Reloaded
+/// (`reload`, blocking — off the reactor) after an install, update,
+/// rollback or remove, so a change takes effect without a restart.
+pub(crate) struct Catalog {
+    /// `<data dir>/plugins`.
+    pub(crate) root: PathBuf,
+    /// The daemon version the gates compare against (tests pin another).
+    daemon: RwLock<String>,
+    installed: RwLock<Arc<Vec<installed::InstalledCopy>>>,
+    /// The merged catalog, and (test builds) how many `test_catalog` extras
+    /// it was merged with — extras added later trigger a re-merge.
+    merged: RwLock<(usize, Arc<Vec<Arc<Manifest>>>)>,
+}
+
+fn read<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    lock.read().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn write<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    lock.write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+impl Catalog {
+    /// Load the catalog for `root` (blocking: reads the installed copies;
+    /// called once at boot, where the daemon's other stores load too).
+    pub(crate) fn load(root: PathBuf) -> Self {
+        let catalog = Catalog {
+            root,
+            daemon: RwLock::new(chimaera_core::VERSION.to_string()),
+            installed: RwLock::new(Arc::new(Vec::new())),
+            merged: RwLock::new((usize::MAX, Arc::new(Vec::new()))),
+        };
+        catalog.reload();
+        catalog
+    }
+
+    /// Re-read the installed copies and re-merge (blocking fs: callers on
+    /// the reactor go through `spawn_blocking`).
+    pub(crate) fn reload(&self) {
+        let copies = Arc::new(installed::scan(&self.root));
+        *write(&self.installed) = copies;
+        self.remerge();
+    }
+
+    fn remerge(&self) {
+        let embedded = embedded();
+        let copies = read(&self.installed).clone();
+        let daemon = read(&self.daemon).clone();
+        let all = Arc::new(resolve(&embedded, &copies, &daemon));
+        *write(&self.merged) = (extras_len(), all);
+    }
+
+    /// Every plugin, sorted by id.
+    pub(crate) fn all(&self) -> Arc<Vec<Arc<Manifest>>> {
+        {
+            let merged = read(&self.merged);
+            if merged.0 == extras_len() {
+                return merged.1.clone();
+            }
+        }
+        self.remerge();
+        read(&self.merged).1.clone()
+    }
+
+    pub(crate) fn get(&self, id: &str) -> Option<Arc<Manifest>> {
+        self.all().iter().find(|m| m.id == id).cloned()
+    }
+
+    /// The installed copy of `id` as found on disk, if any.
+    pub(crate) fn installed_copy(&self, id: &str) -> Option<installed::InstalledCopy> {
+        read(&self.installed)
+            .iter()
+            .find(|c| c.manifest.id == id)
+            .cloned()
+    }
+
+    /// The version the gates compare against.
+    pub(crate) fn daemon_version(&self) -> String {
+        read(&self.daemon).clone()
+    }
+
+    /// Tests only: gate against another daemon version (a test build is the
+    /// `0.0.1` dev sentinel, which every requirement matches).
+    #[cfg(test)]
+    pub(crate) fn set_daemon_version_for_tests(&self, version: &str) {
+        *write(&self.daemon) = version.to_string();
+        self.remerge();
+    }
+}
+
+#[cfg(test)]
+fn extras_len() -> usize {
+    test_catalog::extra().len()
+}
+
+#[cfg(not(test))]
+fn extras_len() -> usize {
+    0
+}
+
+/// Why a plugin change or check was refused, as its route answers it
+/// (`{"error": message}` with `status`; constructors in `releases`).
+#[derive(Debug)]
+pub(crate) struct Refusal {
+    pub(crate) status: StatusCode,
+    pub(crate) message: String,
+}
+
+/// The catalog every lookup reads.
+pub(crate) fn catalog(state: &AppState) -> Arc<Vec<Arc<Manifest>>> {
+    state.plugin_catalog.all()
+}
+
+pub(crate) fn manifest(state: &AppState, id: &str) -> Option<Arc<Manifest>> {
+    state.plugin_catalog.get(id)
+}
+
+/// Test builds only: plugins added to this test process's catalog as if
+/// embedded, beside the shipped ones (every `Catalog` sees them;
+/// `production_catalog()` never does).
 #[cfg(test)]
 pub(crate) mod test_catalog {
     use super::*;
 
-    static EXTRA: std::sync::Mutex<Vec<&'static Manifest>> = std::sync::Mutex::new(Vec::new());
+    static EXTRA: std::sync::Mutex<Vec<Arc<Manifest>>> = std::sync::Mutex::new(Vec::new());
 
-    pub(crate) fn extra() -> Vec<&'static Manifest> {
+    pub(crate) fn extra() -> Vec<Arc<Manifest>> {
         crate::lock(&EXTRA).clone()
     }
 
     /// Add a WASM plugin (its manifest text + component bytes); idempotent
     /// by id — the first registration wins.
-    pub(crate) fn add(manifest: &str, wasm: Vec<u8>) -> &'static Manifest {
+    pub(crate) fn add(manifest: &str, wasm: Vec<u8>) -> Arc<Manifest> {
         let mut extra = crate::lock(&EXTRA);
-        let mut m: Manifest = toml::from_str(manifest).expect("test manifest parses");
+        let mut m = parse_manifest(manifest).expect("test manifest parses");
         if let Some(existing) = extra.iter().find(|e| e.id == m.id) {
-            return existing;
+            return existing.clone();
         }
-        m.wasm = Wasm(Cow::Owned(wasm));
-        let leaked: &'static Manifest = Box::leak(Box::new(m));
-        extra.push(leaked);
-        leaked
+        m.wasm = Wasm::new(Cow::Owned(wasm));
+        let m = Arc::new(m);
+        extra.push(m.clone());
+        m
     }
 
     /// The host's fixture plugin (`plugins/test-fixture`, built into
     /// `plugins/dist-test`), added to the catalog.
-    pub(crate) fn fixture() -> &'static Manifest {
+    pub(crate) fn fixture() -> Arc<Manifest> {
         add(&fixture_manifest(), fixture_wasm())
     }
 
     pub(crate) fn fixture_manifest() -> String {
-        let file = DistTest::get("test-fixture/plugin.toml")
-            .expect("plugins/dist-test/test-fixture — run scripts/build-plugins.sh");
-        String::from_utf8(file.data.into_owned()).unwrap()
+        dist_test_text("test-fixture/plugin.toml")
     }
 
     pub(crate) fn fixture_wasm() -> Vec<u8> {
-        DistTest::get("test-fixture/plugin.wasm")
-            .expect("plugins/dist-test/test-fixture — run scripts/build-plugins.sh")
+        dist_test_bytes("test-fixture/plugin.wasm")
+    }
+
+    /// A file the build script laid out in `plugins/dist-test`.
+    pub(crate) fn dist_test_bytes(path: &str) -> Vec<u8> {
+        DistTest::get(path)
+            .unwrap_or_else(|| panic!("plugins/dist-test/{path} — run scripts/build-plugins.sh"))
             .data
             .into_owned()
+    }
+
+    pub(crate) fn dist_test_text(path: &str) -> String {
+        String::from_utf8(dist_test_bytes(path)).unwrap()
     }
 }
 
@@ -281,12 +687,18 @@ impl DetectCache {
     pub(crate) fn forget_workspace(&mut self, ws: &str) {
         self.entries.remove(ws);
     }
+
+    /// The catalog changed (a plugin installed, updated, rolled back or
+    /// removed): its detect paths may have too.
+    pub(crate) fn clear(&mut self) {
+        self.entries.clear();
+    }
 }
 
 /// Stat every manifest's detect paths under `root` (blocking).
-fn detect_blocking(root: &Path) -> BTreeSet<String> {
-    catalog()
-        .into_iter()
+fn detect_blocking(root: &Path, catalog: &[Arc<Manifest>]) -> BTreeSet<String> {
+    catalog
+        .iter()
         .filter(|m| {
             m.detect.any.is_empty() || m.detect.any.iter().any(|rel| present_unlinked(root, rel))
         })
@@ -315,7 +727,8 @@ pub(crate) async fn refresh_detect(state: &AppState, ws: &str) -> BTreeSet<Strin
     let Some(root) = crate::lock(&state.workspaces).get(ws).map(|w| w.root) else {
         return BTreeSet::new();
     };
-    let found = tokio::task::spawn_blocking(move || detect_blocking(&root))
+    let catalog = catalog(state);
+    let found = tokio::task::spawn_blocking(move || detect_blocking(&root, &catalog))
         .await
         .unwrap_or_default();
     crate::lock(&state.plugin_detect)
@@ -331,11 +744,12 @@ fn switched_on(state: &AppState, ws: &str) -> BTreeSet<String> {
         .unwrap_or_default()
 }
 
-/// Active plugins in a workspace: switched on AND footprint present. A stale
-/// detect is refreshed first (a few stats, off the reactor) — callers are
-/// routes, MCP connects, spawns and once-per-event paths, never a tight loop.
-/// With nothing switched on this returns before any fs work.
-pub(crate) async fn active(state: &AppState, ws: &str) -> Vec<&'static Manifest> {
+/// Active plugins in a workspace: switched on AND footprint present AND
+/// passing the gates. A stale detect is refreshed first (a few stats, off
+/// the reactor) — callers are routes, MCP connects, spawns and
+/// once-per-event paths, never a tight loop. With nothing switched on this
+/// returns before any fs work.
+pub(crate) async fn active(state: &AppState, ws: &str) -> Vec<Arc<Manifest>> {
     let on = switched_on(state, ws);
     if on.is_empty() {
         return Vec::new();
@@ -349,15 +763,16 @@ pub(crate) async fn active(state: &AppState, ws: &str) -> Vec<&'static Manifest>
         Some(found) => found,
         None => refresh_detect(state, ws).await,
     };
-    catalog()
-        .into_iter()
-        .filter(|m| on.contains(&m.id) && found.contains(&m.id))
+    catalog(state)
+        .iter()
+        .filter(|m| on.contains(&m.id) && found.contains(&m.id) && m.origin.gate.is_none())
+        .cloned()
         .collect()
 }
 
 /// Active plugins in the workspace of session `sid` (empty when the session
 /// has no workspace).
-pub(crate) async fn active_for_session(state: &AppState, sid: &str) -> Vec<&'static Manifest> {
+pub(crate) async fn active_for_session(state: &AppState, sid: &str) -> Vec<Arc<Manifest>> {
     match workspace_of_session(state, sid) {
         Some(ws) => active(state, &ws).await,
         None => Vec::new(),
@@ -390,8 +805,12 @@ pub(crate) fn workspace_of_session(state: &AppState, sid: &str) -> Option<String
     crate::lock(&state.session_workspaces).get(sid).cloned()
 }
 
-fn manifest_json(m: &Manifest) -> Value {
-    json!({
+/// A catalog entry on the wire (`GET /plugins`, `GET /workspaces/{id}/plugins`,
+/// and the install/update/rollback/remove/check answers). The fields after
+/// `detect` say what is running and where it came from; the optional ones
+/// are present only when they hold something.
+pub(crate) fn manifest_json(state: &AppState, m: &Manifest) -> Value {
+    let mut v = json!({
         "id": m.id,
         "name": m.name,
         "summary": m.summary,
@@ -404,16 +823,47 @@ fn manifest_json(m: &Manifest) -> Value {
         },
         "setup": m.setup.as_ref().map(|s| json!({"prompt": s.prompt})),
         "detect": m.detect.any,
-    })
+        "version": m.version,
+        "api": m.api,
+        "source": m.origin.source.as_str(),
+        "stale": m.origin.stale,
+    });
+    let o = &m.origin;
+    if let Some(path) = &o.path {
+        v["path"] = json!(path);
+    }
+    if let Some(version) = &o.embedded_version {
+        v["embedded_version"] = json!(version);
+    }
+    if let Some(version) = &o.installed_version {
+        v["installed_version"] = json!(version);
+    }
+    if let Some(previous) = &o.previous {
+        v["previous"] = json!(previous);
+    }
+    if let Some(update) = releases::offer_for(state, m) {
+        v["update"] = json!({
+            "version": update.version,
+            "url": update.url,
+            "checked_ms": update.checked_ms,
+        });
+    }
+    if let Some(gate) = &o.gate {
+        v["fault"] = json!(gate);
+    }
+    v
 }
 
-fn not_found(what: &str) -> Response {
+pub(crate) fn not_found(what: &str) -> Response {
     (StatusCode::NOT_FOUND, Json(json!({"error": what}))).into_response()
 }
 
 /// GET /plugins — the catalog (what exists on this daemon).
-pub(crate) async fn list_plugins() -> Response {
-    let plugins: Vec<Value> = catalog().into_iter().map(manifest_json).collect();
+pub(crate) async fn list_plugins(State(state): State<Arc<AppState>>) -> Response {
+    let plugins: Vec<Value> = catalog(&state)
+        .iter()
+        .map(|m| manifest_json(&state, m))
+        .collect();
     Json(json!({"schema": 1, "plugins": plugins})).into_response()
 }
 
@@ -429,19 +879,24 @@ pub(crate) async fn workspace_plugins(
     };
     let on: BTreeSet<String> = workspace.plugins_on.iter().cloned().collect();
     let found = refresh_detect(&state, &id).await;
-    let plugins: Vec<Value> = catalog()
-        .into_iter()
+    let plugins: Vec<Value> = catalog(&state)
+        .iter()
         .map(|m| {
-            let mut v = manifest_json(m);
-            let is_on = on.contains(&m.id);
+            let mut v = manifest_json(&state, m);
+            // A plugin that fails a gate is off whatever its switch says:
+            // the switch is kept, and holds again once the gate passes.
+            let is_on = on.contains(&m.id) && m.origin.gate.is_none();
             let detected = found.contains(&m.id);
             v["on"] = json!(is_on);
             v["detected"] = json!(detected);
             v["active"] = json!(is_on && detected);
             // Additive, and only when there is one: why the plugin isn't
-            // answering here (the card shows it).
-            if let Some(fault) = state.plugin_runtime.fault(m, &id) {
-                v["fault"] = json!(fault);
+            // answering here (the card shows it). A failed gate already
+            // said why (`manifest_json`).
+            if m.origin.gate.is_none() {
+                if let Some(fault) = state.plugin_runtime.fault(m, &id) {
+                    v["fault"] = json!(fault);
+                }
             }
             v["requires"] = json!(m
                 .requires
@@ -478,8 +933,17 @@ pub(crate) async fn put_workspace_plugin(
     AxPath((id, pid)): AxPath<(String, String)>,
     Json(body): Json<PutWorkspacePlugin>,
 ) -> Response {
-    if manifest(&pid).is_none() {
+    let Some(m) = manifest(&state, &pid) else {
         return not_found("unknown plugin");
+    };
+    if body.on {
+        if let Some(gate) = &m.origin.gate {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({"error": format!("{} can't run on this daemon: {gate}", m.name)})),
+            )
+                .into_response();
+        }
     }
     let result = crate::lock(&state.workspaces).set_plugin_on(&id, &pid, body.on);
     match result {
@@ -517,7 +981,7 @@ pub(crate) struct AgentBody {
     agent: String,
 }
 
-fn bad_request(msg: impl Into<String>) -> Response {
+pub(crate) fn bad_request(msg: impl Into<String>) -> Response {
     (StatusCode::BAD_REQUEST, Json(json!({"error": msg.into()}))).into_response()
 }
 
@@ -534,7 +998,7 @@ pub(crate) async fn install_requirement(
     let Some(workspace) = crate::lock(&state.workspaces).get(&id) else {
         return not_found("unknown workspace");
     };
-    let Some(m) = manifest(&pid) else {
+    let Some(m) = manifest(&state, &pid) else {
         return not_found("unknown plugin");
     };
     let Some(req) = m.requires.agent_plugins.get(&body.agent) else {
@@ -625,7 +1089,7 @@ pub(crate) async fn setup_workspace(
     let Some(workspace) = crate::lock(&state.workspaces).get(&id) else {
         return not_found("unknown workspace");
     };
-    let Some(m) = manifest(&pid) else {
+    let Some(m) = manifest(&state, &pid) else {
         return not_found("unknown plugin");
     };
     let Some(setup) = &m.setup else {
@@ -719,11 +1183,13 @@ mod tests {
                 .iter()
                 .find(|m| m.id == id)
                 .unwrap_or_else(|| panic!("{id} ships (run scripts/build-plugins.sh)"));
-            assert!(!m.wasm.0.is_empty());
-            assert_eq!(m.api.as_deref(), Some(API));
+            assert!(!m.wasm.bytes.is_empty());
+            assert_eq!(m.api, API);
+            assert_eq!(gate(m, "0.4.1"), None, "{id} runs on a released daemon");
         }
         for m in production_catalog() {
             assert!(!m.summary.is_empty(), "{} needs a summary", m.id);
+            assert_eq!(m.origin.source, Source::Embedded);
             assert!(
                 !m.adds.ui.is_empty() || !m.adds.agents.is_empty(),
                 "{} must say what it adds",
@@ -757,7 +1223,7 @@ mod tests {
     #[test]
     fn the_test_fixture_never_ships() {
         test_catalog::fixture();
-        assert!(catalog().iter().any(|m| m.id == "test-fixture"));
+        assert!(embedded().iter().any(|m| m.id == "test-fixture"));
         assert!(production_catalog().iter().all(|m| m.id != "test-fixture"));
         assert!(Dist::iter().all(|p| !p.starts_with("test-")));
     }
@@ -765,9 +1231,151 @@ mod tests {
     #[test]
     fn unknown_manifest_fields_are_rejected() {
         let err = toml::from_str::<Manifest>(
-            "id='x'\nname='x'\nsummary='x'\n[provides]\nmcp_tool=['typo']",
+            "id='x'\nname='x'\nversion='0.1.0'\nsummary='x'\napi='0.1'\n[provides]\nmcp_tool=['typo']",
         );
         assert!(err.is_err());
+    }
+
+    const BASE: &str = "id = \"demo\"\nname = \"Demo\"\nsummary = \"x\"\n";
+
+    fn demo(extra: &str) -> Result<Manifest, String> {
+        parse_manifest(&format!("{BASE}{extra}"))
+    }
+
+    #[test]
+    fn a_manifest_needs_a_semver_version_and_an_api() {
+        assert!(demo("api = \"0.1\"\n").is_err(), "version is required");
+        assert!(demo("version = \"0.1.0\"\n").is_err(), "api is required");
+        for bad in ["0.1", "v0.1.0", "0.1.0-beta.1", "0.1.0+build", "x"] {
+            let err = demo(&format!("version = \"{bad}\"\napi = \"0.1\"\n")).unwrap_err();
+            assert!(err.contains("MAJOR.MINOR.PATCH"), "{bad}: {err}");
+        }
+        let m = demo(
+            "version = \"1.2.3\"\napi = \"0.1\"\n[requires]\nchimaera = \">=0.4.0\"\n\
+             [provides]\nevents = [\"hook\", \"session-ended\"]\n[release]\ngithub = \"acme/demo\"\n",
+        )
+        .unwrap();
+        assert_eq!(m.version, "1.2.3");
+        assert_eq!(m.requires.chimaera.as_deref(), Some(">=0.4.0"));
+        assert!(m.provides.hears(EventKind::Hook) && m.provides.hears(EventKind::SessionEnded));
+        assert!(!m.provides.hears(EventKind::SwitchedOn));
+        assert_eq!(m.release.unwrap().github, "acme/demo");
+        assert!(
+            demo("version = \"0.1.0\"\napi = \"0.1\"\n[provides]\nevents = [\"tick\"]\n").is_err()
+        );
+        assert!(
+            demo("version = \"0.1.0\"\napi = \"0.1\"\n[release]\ngithub = \"../x\"\n").is_err()
+        );
+        assert!(
+            demo("version = \"0.1.0\"\napi = \"0.1\"\n[release]\nurl = \"https://x\"\n").is_err()
+        );
+    }
+
+    #[test]
+    fn ids_and_github_slugs_are_path_safe() {
+        assert!(valid_id("agent-notes") && valid_id("latex2"));
+        for bad in ["", "-x", "X", "a/b", "a.b", "..", "install", "a b"] {
+            assert!(!valid_id(bad), "{bad}");
+        }
+        assert!(valid_github("arjunrajlaboratory/mycelium") && valid_github("a-b/c_d.e"));
+        for bad in [
+            "a", "a/b/c", "../b", "a/..", "a/.git", "a/b?x", "a /b", "/b",
+        ] {
+            assert!(!valid_github(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_gates_speak_in_the_cards_words() {
+        let with = |api: &str, req: Option<&str>| {
+            let req = req
+                .map(|r| format!("[requires]\nchimaera = \"{r}\"\n"))
+                .unwrap_or_default();
+            demo(&format!("version = \"0.1.0\"\napi = \"{api}\"\n{req}")).unwrap()
+        };
+        assert_eq!(gate(&with("0.1", None), "0.4.1"), None);
+        let newer = gate(&with("0.2", None), "0.4.1").unwrap();
+        assert!(newer.starts_with("needs a newer chimaera"), "{newer}");
+        let older = gate(&with("0.0", None), "0.4.1").unwrap();
+        assert!(older.starts_with("needs a newer plugin"), "{older}");
+        assert!(gate(&with("one", None), "0.4.1").is_some());
+
+        assert_eq!(gate(&with("0.1", Some(">=0.4.0")), "0.4.1"), None);
+        assert_eq!(
+            gate(&with("0.1", Some(">=0.5.0")), "0.4.1").as_deref(),
+            Some("needs chimaera ≥ 0.5.0 (this is 0.4.1)")
+        );
+        assert!(gate(&with("0.1", Some("^0.3")), "0.4.1")
+            .unwrap()
+            .contains("^0.3"));
+        assert_eq!(
+            gate(&with("0.1", Some(">=99.0.0")), "0.0.1"),
+            None,
+            "a dev build matches every requirement"
+        );
+        assert!(gate(&with("0.1", Some("soon")), "0.4.1")
+            .unwrap()
+            .contains("not a version requirement"));
+    }
+
+    fn copy(version: &str, previous: Option<&str>) -> installed::InstalledCopy {
+        let mut m = demo(&format!(
+            "version = \"{version}\"\napi = \"0.1\"\n[release]\ngithub = \"acme/demo\"\n"
+        ))
+        .unwrap();
+        m.origin.source = Source::Installed;
+        installed::InstalledCopy {
+            manifest: m,
+            dir: PathBuf::from(format!("/p/demo/{version}")),
+            previous: previous.map(str::to_string),
+        }
+    }
+
+    fn shipped(version: &str) -> Arc<Manifest> {
+        Arc::new(demo(&format!("version = \"{version}\"\napi = \"0.1\"\n")).unwrap())
+    }
+
+    #[test]
+    fn precedence_is_the_higher_version_and_never_silent() {
+        // Installed higher: it loads, and both versions are named.
+        let all = resolve(
+            &[shipped("0.3.1")],
+            &[copy("0.3.2", Some("0.3.0"))],
+            "0.4.1",
+        );
+        let m = &all[0];
+        assert_eq!(m.version, "0.3.2");
+        assert_eq!(m.origin.source, Source::Installed);
+        assert_eq!(m.origin.embedded_version.as_deref(), Some("0.3.1"));
+        assert_eq!(m.origin.installed_version.as_deref(), Some("0.3.2"));
+        assert_eq!(m.origin.previous.as_deref(), Some("0.3.0"));
+        assert_eq!(m.origin.path, Some(PathBuf::from("/p/demo/0.3.2")));
+        assert!(!m.origin.stale);
+        assert_eq!(m.origin.installed_release.as_deref(), Some("acme/demo"));
+
+        // Equal: the embedded copy loads; the installed one is still named.
+        let m = &resolve(&[shipped("0.3.2")], &[copy("0.3.2", None)], "0.4.1")[0];
+        assert_eq!(m.origin.source, Source::Embedded);
+        assert!(!m.origin.stale);
+        assert_eq!(m.origin.installed_version.as_deref(), Some("0.3.2"));
+
+        // Installed older: the embedded loads and the copy is stale.
+        let m = &resolve(&[shipped("0.3.2")], &[copy("0.3.1", None)], "0.4.1")[0];
+        assert_eq!(m.origin.source, Source::Embedded);
+        assert_eq!(m.version, "0.3.2");
+        assert!(m.origin.stale);
+
+        // Numeric, not lexicographic.
+        let m = &resolve(&[shipped("0.9.0")], &[copy("0.10.0", None)], "0.4.1")[0];
+        assert_eq!(m.origin.source, Source::Installed);
+
+        // One side only.
+        let m = &resolve(&[], &[copy("1.0.0", None)], "0.4.1")[0];
+        assert_eq!(m.origin.source, Source::Installed);
+        assert_eq!(m.origin.embedded_version, None);
+        let m = &resolve(&[shipped("1.0.0")], &[], "0.4.1")[0];
+        assert_eq!(m.origin.source, Source::Embedded);
+        assert_eq!(m.origin.path, None);
     }
 
     #[test]
@@ -778,7 +1386,8 @@ mod tests {
             crate::timeline::now_ms()
         ));
         std::fs::create_dir_all(&root).unwrap();
-        let none = detect_blocking(&root);
+        let catalog = production_catalog();
+        let none = detect_blocking(&root, catalog);
         assert!(!none.contains("mycelium"));
         assert!(
             none.contains("agent-notes"),
@@ -788,9 +1397,9 @@ mod tests {
         std::fs::create_dir_all(elsewhere.join("findings")).unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink(&elsewhere, root.join(".living")).unwrap();
-        assert!(!detect_blocking(&root).contains("mycelium"));
+        assert!(!detect_blocking(&root, catalog).contains("mycelium"));
         std::fs::write(root.join("MYCELIUM.md"), "# protocol").unwrap();
-        assert!(detect_blocking(&root).contains("mycelium"));
+        assert!(detect_blocking(&root, catalog).contains("mycelium"));
         let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -177,12 +177,18 @@ fn agy_platform() -> &'static str {
     }
 }
 
-/// One bounded fetch: 10s wall clock, 1MB body, kill_on_drop. Shared with
-/// `update::fetch_latest` (the daemon's own release check) — one fence for
-/// every phone-home the daemon makes.
-pub(crate) async fn curl(url: &str, headers: &[&str]) -> anyhow::Result<Vec<u8>> {
+/// The one `curl` invocation every phone-home shares: fail on HTTP errors,
+/// follow redirects (release assets live behind one), a wall clock and a
+/// size cap, chimaera's User-Agent.
+fn curl_command(
+    url: &str,
+    headers: &[&str],
+    max_bytes: u64,
+    timeout_secs: u64,
+) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new("curl");
-    cmd.args(["-fsSL", "-m", "10", "--max-filesize", "1048576"]);
+    cmd.args(["-fsSL", "-m", &timeout_secs.to_string()]);
+    cmd.args(["--max-filesize", &max_bytes.to_string()]);
     for header in headers {
         cmd.args(["-H", header]);
     }
@@ -191,8 +197,15 @@ pub(crate) async fn curl(url: &str, headers: &[&str]) -> anyhow::Result<Vec<u8>>
         concat!("User-Agent: chimaera/", env!("CARGO_PKG_VERSION")),
         url,
     ]);
-    let output = cmd
-        .kill_on_drop(true)
+    cmd.kill_on_drop(true);
+    cmd
+}
+
+/// One bounded fetch: 10s wall clock, 1MB body, kill_on_drop. Shared with
+/// `update::fetch_latest` (the daemon's own release check) and the plugin
+/// release checker — one fence for every phone-home the daemon makes.
+pub(crate) async fn curl(url: &str, headers: &[&str]) -> anyhow::Result<Vec<u8>> {
+    let output = curl_command(url, headers, 1 << 20, 10)
         .output()
         .await
         .context("failed to run curl")?;
@@ -204,6 +217,56 @@ pub(crate) async fn curl(url: &str, headers: &[&str]) -> anyhow::Result<Vec<u8>>
         );
     }
     Ok(output.stdout)
+}
+
+/// One bounded download into `dest` (created or truncated): at most
+/// `max_bytes` — curl's own cap, and counted here too, since an old curl
+/// only enforces it when the server announces a length — within
+/// `timeout_secs`, kill_on_drop. The bytes stream to disk, never to memory;
+/// the caller owns `dest`, including removing it after a failure.
+pub(crate) async fn curl_file(
+    url: &str,
+    headers: &[&str],
+    dest: &std::path::Path,
+    max_bytes: u64,
+    timeout_secs: u64,
+) -> anyhow::Result<u64> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut cmd = curl_command(url, headers, max_bytes, timeout_secs);
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().context("failed to run curl")?;
+    let mut out = child.stdout.take().context("curl has no stdout")?;
+    let mut file = tokio::fs::File::create(dest)
+        .await
+        .with_context(|| format!("could not create {}", dest.display()))?;
+    let mut buf = vec![0u8; 64 << 10];
+    let mut total: u64 = 0;
+    loop {
+        let n = out.read(&mut buf).await.context("reading from curl")?;
+        if n == 0 {
+            break;
+        }
+        total += n as u64;
+        if total > max_bytes {
+            // Dropping the child kills curl.
+            anyhow::bail!("the download is larger than its {max_bytes}-byte cap");
+        }
+        file.write_all(&buf[..n])
+            .await
+            .context("writing the download")?;
+    }
+    file.sync_all().await.context("flushing the download")?;
+    let output = child.wait_with_output().await.context("waiting for curl")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "curl exited {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(total)
 }
 
 /// The gate every probed version passes before it is stored: digit-leading,

@@ -25,6 +25,8 @@ is a thin delegation to a sibling library crate. Parent map: repo-root
 | `status.rs` | `status [host]`: local reads `chimaera_core::Manifest`; remote goes through `chimaera_remote`. A manifest another login node wrote is reported as registered there, never as running or stale. |
 | `kill.rs` | `kill`: SIGTERM the manifest pid, poll `is_alive()` ~5s, remove the manifest — only for a manifest written on this node. |
 | `doctor.rs` | `doctor`: probe write access to data/runtime dirs + ssh/claude on PATH. |
+| `compute.rs` | `compute list|launch|connect|cancel <host>`: Mode 2 through the login daemon's routes (curl over ssh via `chimaera_remote`). |
+| `plugin.rs` | `plugin list|add <owner/repo> [--version x]|update <id>|remove <id>`: the daemon's installed-plugin routes (`GET /plugins`, `POST /plugins/install`, `POST /plugins/{id}/update`, `DELETE /plugins/{id}`) against the daemon running on THIS node (the local manifest's port + token), through the system `curl` with the token and body on its stdin config (`--config -`) — never argv. Prints the versions and the checksums the daemon verified. |
 
 (`shell-integration` prints `chimaera_core::shellint::snippet()` — handled inline in `main.rs`.)
 

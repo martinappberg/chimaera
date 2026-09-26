@@ -41,6 +41,20 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         // Workbench plugins: the catalog, per-workspace status, and the
         // per-workspace switch (`Workspace.plugins_on`; off by default).
         .route("/plugins", get(plugins::list_plugins))
+        // Installed plugins (`plugins::installed`): install from a release,
+        // update, Use previous, Remove — each a visible, checksum-verified
+        // change the user asked for — and Check now (`plugins::releases`).
+        .route("/plugins/install", post(plugins::installed::install_route))
+        .route("/plugins/{pid}", delete(plugins::installed::remove_route))
+        .route(
+            "/plugins/{pid}/update",
+            post(plugins::installed::update_route),
+        )
+        .route(
+            "/plugins/{pid}/rollback",
+            post(plugins::installed::rollback_route),
+        )
+        .route("/plugins/{pid}/check", post(plugins::releases::check_route))
         .route("/workspaces/{id}/plugins", get(plugins::workspace_plugins))
         .route(
             "/workspaces/{id}/plugins/{pid}",

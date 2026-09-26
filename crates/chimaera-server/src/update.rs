@@ -92,17 +92,32 @@ fn releases_api_url() -> Option<String> {
     ))
 }
 
-/// Periodic checker. Dev builds stay silent (and off the network) unless
-/// the endpoint is explicitly overridden; users can turn checking off with
-/// the `update.autoCheck` setting.
+/// Periodic checker — the daemon's own releases every `CHECK_INTERVAL`, and
+/// (riding the same loop, no second timer) installed plugins' releases
+/// once after the same boot delay and then every
+/// `plugins::releases::CHECK_INTERVAL`. Dev builds stay silent (and off the
+/// network) for each unless its endpoint is explicitly overridden; users
+/// can turn all of it off with the `update.autoCheck` setting.
 pub(crate) async fn run_checker(state: Arc<AppState>) {
-    if chimaera_core::VERSION == "0.0.1" && std::env::var("CHIMAERA_RELEASES_API").is_err() {
+    let dev = chimaera_core::VERSION == "0.0.1";
+    let own = !dev || std::env::var("CHIMAERA_RELEASES_API").is_ok();
+    let plugins = !dev || std::env::var("CHIMAERA_PLUGIN_RELEASES_API").is_ok();
+    if !own && !plugins {
         return;
     }
     tokio::time::sleep(INITIAL_DELAY).await;
+    let mut plugins_checked: Option<std::time::Instant> = None;
     loop {
         if crate::lock(&state.settings).update_auto_check() {
-            check_now(&state).await;
+            if own {
+                check_now(&state).await;
+            }
+            let due = plugins_checked
+                .is_none_or(|at| at.elapsed() >= crate::plugins::releases::CHECK_INTERVAL);
+            if plugins && due {
+                crate::plugins::releases::check_all(&state).await;
+                plugins_checked = Some(std::time::Instant::now());
+            }
         }
         tokio::time::sleep(CHECK_INTERVAL).await;
     }

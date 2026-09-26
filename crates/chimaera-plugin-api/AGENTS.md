@@ -30,7 +30,9 @@ The host that serves it: `crates/chimaera-server/src/plugins/`
   changing an export (or a record a plugin returns) breaks every built
   plugin. A new host import (`exec`, `watch` in 0.2) does not: a host may
   offer more than a component uses. Bump the package version with any WIT
-  change, and the host's `plugins::API` with it.
+  change, and the host's `plugins::API` with it (adding the new version to
+  `plugins::SERVED_APIS` beside the ones it still serves: a manifest's `api`
+  must be one of them to load).
 - **WIT keywords need `%`.** `%list` is the function `list`; a type and a
   function may not share a name inside one interface (hence
   `stat as file-stat` in `host`).

@@ -697,7 +697,7 @@ async fn tools_call(
     agent_id: &str,
     mastermind: bool,
     supervised: bool,
-    plugins: &[&'static crate::plugins::Manifest],
+    plugins: &[Arc<crate::plugins::Manifest>],
     params: &Value,
 ) -> Result<Value, (i64, String)> {
     let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
@@ -721,7 +721,7 @@ async fn tools_call(
     }
     // Plugin tools: offered only where their plugin is active; the same
     // gate on call (a caller can name a tool it was never offered).
-    if let Some(owner) = crate::plugins::tools::owner(name) {
+    if let Some(owner) = crate::plugins::tools::owner(state, plugins, name) {
         if !plugins.iter().any(|m| m.id == owner.id) {
             return Err((
                 -32602,
@@ -732,7 +732,7 @@ async fn tools_call(
                 ),
             ));
         }
-        return Ok(crate::plugins::tools::call(state, owner, agent_id, name, &args).await);
+        return Ok(crate::plugins::tools::call(state, &owner, agent_id, name, &args).await);
     }
     match name {
         "list_terminals" => Ok(list_terminals(state, agent_id).await),
@@ -925,10 +925,10 @@ async fn workspace_status(
         .into_iter()
         .map(|(window, surfaces)| json!({"window": window, "surfaces": surfaces}))
         .collect();
-    let plugins: Vec<&str> = crate::plugins::active(state, &workspace.id)
+    let plugins: Vec<String> = crate::plugins::active(state, &workspace.id)
         .await
         .iter()
-        .map(|m| m.id.as_str())
+        .map(|m| m.id.clone())
         .collect();
     tool_text(
         json!({

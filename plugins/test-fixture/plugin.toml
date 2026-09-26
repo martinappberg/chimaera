@@ -2,6 +2,7 @@
 # test builds. Each tool pokes one host limit.
 id = "test-fixture"
 name = "Test fixture"
+version = "0.1.0"
 summary = "Pokes the plugin host's limits in the daemon's tests."
 api = "0.1"
 

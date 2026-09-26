@@ -17,6 +17,7 @@ mod mcp;
 mod notebook;
 mod notices;
 mod plugin_host;
+mod plugin_updates;
 mod plugins;
 mod proxy;
 mod recents;

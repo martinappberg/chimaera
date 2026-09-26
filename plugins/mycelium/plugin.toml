@@ -3,6 +3,8 @@
 # and per-project setup are mycelium's own, run by the agents' own CLIs.
 id = "mycelium"
 name = "Mycelium"
+# The plugin's own version: the crate's (scripts/build-plugins.sh checks).
+version = "0.1.0"
 summary = "Project memory your agents record as they work — findings, decisions, learnings."
 homepage = "https://github.com/arjunrajlaboratory/mycelium"
 # The chimaera:plugin WIT version the component targets.

@@ -3,6 +3,7 @@ mod connect;
 mod daemonize;
 mod doctor;
 mod kill;
+mod plugin;
 mod status;
 
 use std::path::PathBuf;
@@ -84,6 +85,30 @@ enum Command {
         #[command(subcommand)]
         cmd: ComputeCmd,
     },
+    /// Workbench plugins on the daemon running here: list them, install one
+    /// from its GitHub release, update or remove an installed one.
+    Plugin {
+        #[command(subcommand)]
+        cmd: PluginCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum PluginCmd {
+    /// Every plugin with its version, where it came from, and any update.
+    List,
+    /// Install a plugin from its GitHub release (checksum-verified).
+    Add {
+        /// The plugin's repository, owner/repo.
+        github: String,
+        /// A release version (default: the latest).
+        #[arg(long)]
+        version: Option<String>,
+    },
+    /// Update an installed plugin to its latest release.
+    Update { id: String },
+    /// Remove an installed plugin (every version of it).
+    Remove { id: String },
 }
 
 #[derive(Subcommand)]
@@ -246,6 +271,12 @@ async fn dispatch(command: Command) -> anyhow::Result<()> {
             } => compute::connect(&host, &job_id, no_open).await,
             ComputeCmd::Cancel { host, job_id } => compute::cancel(&host, &job_id).await,
         },
+        Command::Plugin { cmd } => match cmd {
+            PluginCmd::List => plugin::list().await,
+            PluginCmd::Add { github, version } => plugin::add(&github, version.as_deref()).await,
+            PluginCmd::Update { id } => plugin::update(&id).await,
+            PluginCmd::Remove { id } => plugin::remove(&id).await,
+        },
     }
 }
 
@@ -311,6 +342,36 @@ mod tests {
             Command::Serve { daemonize, .. } => assert!(!daemonize),
             _ => panic!("expected serve"),
         }
+    }
+
+    #[test]
+    fn plugin_subcommands_parse() {
+        let cli = Cli::try_parse_from([
+            "chimaera",
+            "plugin",
+            "add",
+            "acme/latex",
+            "--version",
+            "0.2.0",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Plugin {
+                cmd: PluginCmd::Add { github, version },
+            } => {
+                assert_eq!(github, "acme/latex");
+                assert_eq!(version.as_deref(), Some("0.2.0"));
+            }
+            _ => panic!("expected plugin add"),
+        }
+        for args in [
+            &["chimaera", "plugin", "list"][..],
+            &["chimaera", "plugin", "update", "latex"],
+            &["chimaera", "plugin", "remove", "latex"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_ok(), "{args:?}");
+        }
+        assert!(Cli::try_parse_from(["chimaera", "plugin", "add"]).is_err());
     }
 
     #[test]

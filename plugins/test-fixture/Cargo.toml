@@ -14,3 +14,9 @@ crate-type = ["cdylib"]
 
 [dependencies]
 chimaera-plugin-api.workspace = true
+
+[features]
+# The fixture's "next release" for the daemon's update tests: one more tool
+# (`version`). Built by scripts/build-plugins.sh into
+# plugins/dist-test/test-fixture-v2 with `plugin-v2.toml`.
+v2 = []

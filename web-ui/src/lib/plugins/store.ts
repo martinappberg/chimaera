@@ -8,6 +8,9 @@
  *   POST /workspaces/{id}/plugins/{pid}/install  {agent} → a visible terminal session
  *   POST /workspaces/{id}/plugins/{pid}/setup    {agent} → a chat session with the setup prompt
  *   POST /workspaces/{id}/plugins/{pid}/trust-hooks {hooks:[{key,hash}]}
+ *   POST /plugins/install {github, version?}      install a plugin from its GitHub release
+ *   POST /plugins/{pid}/update | rollback | check   update · Use previous · Check now
+ *   DELETE /plugins/{pid}                          Remove (the installed copy, every version)
  *
  * Only the active workspace's plugin status is held reactively (the rail's
  * knowledge row and the dashboard's attach line read it); agent-plugins and
@@ -16,7 +19,7 @@
  */
 import { derived, writable, type Readable } from "svelte/store";
 
-import { api, ApiError } from "../net/api";
+import { api, ApiError, health } from "../net/api";
 import { refreshKnowledge } from "../workspace/knowledge";
 
 export type AgentId = "claude" | "codex";
@@ -25,6 +28,17 @@ export interface PluginRequirement {
   agent: string;
   id: string;
   marketplace: string;
+}
+
+/** Where the running copy of a plugin came from. */
+export type PluginSource = "embedded" | "installed";
+
+/** A newer, compatible release a check found (the card's Update chip). */
+export interface PluginUpdate {
+  version: string;
+  /** The release's page. */
+  url: string;
+  checked_ms: number;
 }
 
 /** One catalog entry with its status in the active workspace. */
@@ -41,6 +55,35 @@ export interface WorkspacePlugin {
   detected: boolean;
   active: boolean;
   requires: PluginRequirement[];
+  /** The running copy's own version (`""` from daemons that predate it). */
+  version: string;
+  /** The plugin API (WIT) version it targets. */
+  api: string;
+  source: PluginSource;
+  /** The installed copy's version directory, when there is an installed copy. */
+  path: string | null;
+  /** Set when a copy ships with chimaera (the embedded one's version). */
+  embedded_version: string | null;
+  /** Set when there is an installed copy (its current version). */
+  installed_version: string | null;
+  /** The installed copy's previous version (Use previous). */
+  previous: string | null;
+  /** The installed copy is older than the one that ships with chimaera. */
+  stale: boolean;
+  update: PluginUpdate | null;
+  /** Why it can't run on this daemon, or isn't answering here. */
+  fault: string | null;
+}
+
+/** What an install, update, Use previous or Remove did. */
+export interface PluginChange {
+  id: string;
+  version?: string;
+  previous?: string | null;
+  /** The checksums the daemon verified the download against. */
+  sha256?: { "plugin.wasm"?: string; "plugin.toml"?: string };
+  /** The plugin's catalog entry now (null: removed, nothing ships under that id). */
+  plugin?: unknown;
 }
 
 export interface WorkspacePlugins {
@@ -138,8 +181,13 @@ function arr<T>(v: unknown): T[] {
   return Array.isArray(v) ? (v as T[]) : [];
 }
 
+function str(v: unknown): string | null {
+  return typeof v === "string" && v !== "" ? v : null;
+}
+
 function normalizePlugin(raw: WorkspacePlugin): WorkspacePlugin {
   const adds = (raw.adds ?? {}) as Partial<WorkspacePlugin["adds"]>;
+  const update = raw.update as Partial<PluginUpdate> | null | undefined;
   const provides = (raw.provides ?? {}) as Partial<WorkspacePlugin["provides"]>;
   return {
     ...raw,
@@ -155,6 +203,19 @@ function normalizePlugin(raw: WorkspacePlugin): WorkspacePlugin {
     detected: raw.detected === true,
     active: raw.active === true,
     setup: raw.setup ?? null,
+    version: typeof raw.version === "string" ? raw.version : "",
+    api: typeof raw.api === "string" ? raw.api : "",
+    source: raw.source === "installed" ? "installed" : "embedded",
+    path: str(raw.path),
+    embedded_version: str(raw.embedded_version),
+    installed_version: str(raw.installed_version),
+    previous: str(raw.previous),
+    stale: raw.stale === true,
+    update:
+      update && typeof update.version === "string"
+        ? { version: update.version, url: str(update.url) ?? "", checked_ms: Number(update.checked_ms ?? 0) }
+        : null,
+    fault: str(raw.fault),
   };
 }
 
@@ -255,7 +316,55 @@ export async function trustHooks(
   );
 }
 
+const plugin = (pid: string): string => `/plugins/${encodeURIComponent(pid)}`;
+
+/** Install a plugin from its GitHub release (`owner/repo`, the latest or `version`). */
+export async function installFromRelease(github: string, version?: string): Promise<PluginChange> {
+  return json(
+    await api("/plugins/install", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ github, version: version ?? null }),
+    }),
+  );
+}
+
+/** Update an installed plugin to its latest compatible release. */
+export async function updateWorkbenchPlugin(pid: string): Promise<PluginChange> {
+  return json(await api(`${plugin(pid)}/update`, { method: "POST" }));
+}
+
+/** Use previous: swap the installed copy back to its previous version. */
+export async function rollbackWorkbenchPlugin(pid: string): Promise<PluginChange> {
+  return json(await api(`${plugin(pid)}/rollback`, { method: "POST" }));
+}
+
+/** Remove the installed copy (every version of it). */
+export async function removeWorkbenchPlugin(pid: string): Promise<PluginChange> {
+  return json(await api(plugin(pid), { method: "DELETE" }));
+}
+
+/** Check now: ask the installed copy's release source for a newer version. */
+export async function checkWorkbenchPlugin(pid: string): Promise<{ id: string; update: PluginUpdate | null }> {
+  return json(await api(`${plugin(pid)}/check`, { method: "POST" }));
+}
+
 // ---- reactive store (active workspace only) ---------------------------------
+
+const daemonVersionStore = writable<string | null>(null);
+/** The daemon's own version (`/health`): the "ships with chimaera <version>" chip. */
+export const daemonVersion: Readable<string | null> = daemonVersionStore;
+let versionAsked = false;
+
+async function ensureDaemonVersion(): Promise<void> {
+  if (versionAsked) return;
+  versionAsked = true;
+  try {
+    daemonVersionStore.set((await health()).version);
+  } catch {
+    versionAsked = false;
+  }
+}
 
 const pluginsStore = writable<WorkspacePlugins | null>(null);
 /** The active workspace's plugin status (`null` = not loaded / unavailable). */
@@ -291,6 +400,7 @@ export async function activatePluginsWorkspace(wsId: string | null): Promise<voi
 
 async function refresh(wsId: string): Promise<void> {
   const seq = ++refreshSeq;
+  void ensureDaemonVersion();
   try {
     const p = await fetchWorkspacePlugins(wsId);
     if (currentWs !== wsId || seq !== refreshSeq) return;
@@ -306,6 +416,27 @@ async function refresh(wsId: string): Promise<void> {
  *  closing, a view regaining focus — footprints appear without a push). */
 export function refreshWorkspacePlugins(): void {
   if (currentWs !== null) void refresh(currentWs);
+}
+
+/** One installed-plugin change (Update, Use previous, Remove, Check now), then
+ *  the active workspace's cards re-synced — a new version can add or drop a
+ *  knowledge provider, so Knowledge refreshes too. */
+export async function changeWorkbenchPlugin(
+  kind: "update" | "rollback" | "remove" | "check",
+  pid: string,
+): Promise<PluginChange | { id: string; update: PluginUpdate | null }> {
+  const call = {
+    update: updateWorkbenchPlugin,
+    rollback: rollbackWorkbenchPlugin,
+    remove: removeWorkbenchPlugin,
+    check: checkWorkbenchPlugin,
+  }[kind];
+  try {
+    return await call(pid);
+  } finally {
+    if (currentWs !== null) await refresh(currentWs);
+    if (kind !== "check") refreshKnowledge();
+  }
 }
 
 /** Switch a plugin on/off in the active workspace and re-sync. */

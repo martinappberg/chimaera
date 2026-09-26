@@ -17,9 +17,21 @@
 //!   and re-created on the next call (~20 µs). `FAULT_LIMIT` traps within
 //!   `FAULT_WINDOW` mark the plugin faulted in that workspace until the user
 //!   switches it off and on.
+//! - **Traps ride Unix signal handlers on macOS too**
+//!   (`macos_use_mach_ports(false)`): wasmtime's default Mach-port thread
+//!   aborts the whole daemon when a caught signal — SIGCHLD from an ending
+//!   PTY shell — interrupts its `mach_msg`.
 //! - Linear memory is capped per instance (`MEMORY_CAP`); WASI grants
 //!   nothing (no files, env, args, network); the guest's stderr is kept
 //!   (last `STDERR_CAP` bytes) only to log why a call trapped.
+//! - **A build is its SHA-256**: compiled components, offers and live
+//!   instances are keyed by the component's digest, so a plugin whose
+//!   `current` moved (an update, a rollback) never runs the old code — even
+//!   a call that raced the change re-instantiates. `forget_plugin` drops
+//!   the rest at once.
+//! - **Events reach only the plugins that declared them**
+//!   (`provides.events`): a hook never instantiates a plugin that has no
+//!   use for it.
 //!
 //! Every host function the guest may call is in `hostfns.rs`, bounded there.
 
@@ -61,6 +73,9 @@ const MEMORY_CAP: usize = 64 << 20;
 const MAX_INSTANCES: usize = 64;
 const IDLE: Duration = Duration::from_secs(10 * 60);
 const FAULT_LIMIT: usize = 5;
+/// Compiled builds kept per plugin id: the running one and the one before
+/// (a rollback runs it again without a compile). Older builds are dropped.
+const COMPILED_PER_ID: usize = 2;
 const FAULT_WINDOW: Duration = Duration::from_secs(60);
 /// The guest's stderr kept per instance (its tail; a panic message).
 const STDERR_CAP: usize = 4 * 1024;
@@ -73,13 +88,18 @@ const HOOK_LINE_MAX: usize = 1024;
 const EVENTS_KEPT: usize = 64;
 pub(crate) const EVENT_MAX: usize = 16 * 1024;
 
+type Compiled = Result<ChimaeraPluginPre<HostState>, String>;
+/// One plugin's compiled builds by SHA-256, most recently used first.
+type Builds = VecDeque<(Arc<str>, Compiled)>;
+
 /// The process-wide half: engine, linker, compiled components. A test
 /// process builds many `AppState`s; they share this, as one daemon would.
 struct Shared {
     engine: Engine,
     linker: Linker<HostState>,
-    /// plugin id → its pre-instantiated component (or why it can't be).
-    compiled: tokio::sync::Mutex<HashMap<String, Result<ChimaeraPluginPre<HostState>, String>>>,
+    /// plugin id → its pre-instantiated builds by SHA-256 (or why one can't
+    /// be), most recently used first, at most `COMPILED_PER_ID`.
+    compiled: tokio::sync::Mutex<HashMap<String, Builds>>,
 }
 
 static SHARED: OnceLock<Result<Shared, String>> = OnceLock::new();
@@ -99,6 +119,10 @@ fn build_shared() -> wasmtime::Result<Shared> {
     config.memory_reservation(MEMORY_CAP as u64);
     config.memory_guard_size(64 << 10);
     config.memory_reservation_for_growth(0);
+    // Unix signal handlers, not wasmtime's Mach-port thread: that thread
+    // aborts the whole process when a caught signal (a child's SIGCHLD,
+    // which tokio handles) interrupts its mach_msg. No-op off macOS.
+    config.macos_use_mach_ports(false);
     let engine = Engine::new(&config)?;
     let mut linker: Linker<HostState> = Linker::new(&engine);
     wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
@@ -119,33 +143,42 @@ fn build_shared() -> wasmtime::Result<Shared> {
     })
 }
 
-/// The component for `m`, compiled on first use (Cranelift: tens of ms of
-/// CPU, so on the blocking pool) and kept for the daemon's lifetime.
-async fn component(m: &'static Manifest) -> Result<ChimaeraPluginPre<HostState>, String> {
-    let bytes = &m.wasm.0;
+/// The component for `m`'s build, compiled on first use (Cranelift: tens
+/// of ms of CPU, so on the blocking pool) and kept while it is one of the
+/// plugin's last `COMPILED_PER_ID` builds.
+async fn component(m: &Manifest) -> Result<ChimaeraPluginPre<HostState>, String> {
     let shared = shared()?;
     let mut compiled = shared.compiled.lock().await;
-    if let Some(done) = compiled.get(&m.id) {
-        return done.clone();
+    let builds = compiled.entry(m.id.clone()).or_default();
+    if let Some(at) = builds.iter().position(|(sha, _)| *sha == m.wasm.sha256) {
+        let build = builds.remove(at).expect("found above");
+        let done = build.1.clone();
+        builds.push_front(build);
+        return done;
     }
+    let bytes = m.wasm.bytes.clone();
     let engine = shared.engine.clone();
     let linker = shared.linker.clone();
     let name = m.name.clone();
     let started = Instant::now();
     let result = tokio::task::spawn_blocking(move || {
-        let component = Component::new(&engine, bytes)?;
+        let component = Component::new(&engine, &**bytes)?;
         ChimaeraPluginPre::new(linker.instantiate_pre(&component)?)
     })
     .await
     .map_err(|e| format!("{name}: compile task failed: {e}"))
     .and_then(|r| r.map_err(|e| format!("{name} is not a component this host can run: {e:#}")));
     match &result {
-        Ok(_) => {
-            tracing::info!(plugin = %m.id, ms = started.elapsed().as_millis() as u64, "plugin compiled")
-        }
+        Ok(_) => tracing::info!(
+            plugin = %m.id,
+            version = %m.version,
+            ms = started.elapsed().as_millis() as u64,
+            "plugin compiled"
+        ),
         Err(err) => tracing::error!(plugin = %m.id, %err, "plugin refused"),
     }
-    compiled.insert(m.id.clone(), result.clone());
+    builds.push_front((m.wasm.sha256.clone(), result.clone()));
+    builds.truncate(COMPILED_PER_ID);
     result
 }
 
@@ -343,10 +376,12 @@ impl tokio::io::AsyncWrite for StderrTail {
     }
 }
 
-/// A live instance: its store and the bindings into it.
+/// A live instance: its store, the bindings into it, and which build it
+/// runs.
 struct Live {
     store: Store<HostState>,
     plugin: ChimaeraPlugin,
+    sha256: Arc<str>,
 }
 
 /// One (plugin, workspace)'s instance slot. `live` is None until first use
@@ -389,15 +424,17 @@ struct Events {
 }
 
 type Key = (String, String);
+/// (plugin id, the build's SHA-256).
+type BuildKey = (String, Arc<str>);
 
 /// The per-daemon half of the runtime (on `AppState`).
 #[derive(Default)]
 pub(crate) struct PluginRuntime {
     slots: Mutex<HashMap<Key, Arc<Slot>>>,
     faults: Mutex<HashMap<Key, Faults>>,
-    /// plugin id → its offer, or why it is refused everywhere (a component
-    /// whose tools don't match its manifest).
-    offers: Mutex<HashMap<String, Result<Offer, String>>>,
+    /// (plugin id, build) → its offer, or why it is refused everywhere (a
+    /// component whose tools don't match its manifest).
+    offers: Mutex<HashMap<BuildKey, Result<Offer, String>>>,
     events: Mutex<Events>,
     /// Tests only: a shorter call budget, in ms (0 = the real ones).
     budget_override_ms: AtomicU64,
@@ -476,7 +513,7 @@ impl PluginRuntime {
 
     /// Why `m` isn't answering in `ws`, if it isn't (for the card).
     pub(crate) fn fault(&self, m: &Manifest, ws: &str) -> Option<String> {
-        if let Some(Err(refused)) = crate::lock(&self.offers).get(&m.id) {
+        if let Some(Err(refused)) = crate::lock(&self.offers).get(&offer_key(m)) {
             return Some(refused.clone());
         }
         crate::lock(&self.faults)
@@ -490,6 +527,27 @@ impl PluginRuntime {
         let key = (plugin.to_string(), ws.to_string());
         crate::lock(&self.slots).remove(&key);
         crate::lock(&self.faults).remove(&key);
+    }
+
+    /// `plugin`'s `current` moved (installed, updated, rolled back,
+    /// removed): every instance of it goes, everywhere, with its faults and
+    /// offers — the next call instantiates the build that is current now.
+    /// A call in flight finishes on the old instance, which is then dropped.
+    pub(crate) fn forget_plugin(&self, plugin: &str) {
+        crate::lock(&self.slots).retain(|(p, _), _| p != plugin);
+        crate::lock(&self.faults).retain(|(p, _), _| p != plugin);
+        crate::lock(&self.offers).retain(|(p, _), _| p != plugin);
+    }
+
+    /// Tests only: how many live instances `plugin` has.
+    #[cfg(test)]
+    pub(crate) fn live_instances(&self, plugin: &str) -> usize {
+        crate::lock(&self.slots)
+            .iter()
+            .filter(|((p, _), slot)| {
+                p == plugin && slot.live.try_lock().map_or(true, |live| live.is_some())
+            })
+            .count()
     }
 
     /// A deleted workspace: every plugin's instance and fault there.
@@ -559,7 +617,7 @@ impl PluginRuntime {
     async fn run(
         &self,
         state: &Arc<AppState>,
-        m: &'static Manifest,
+        m: &Manifest,
         ws: &str,
         session: Option<&str>,
         call: Call,
@@ -581,6 +639,14 @@ impl PluginRuntime {
         };
         let slot = self.slot(&key);
         let mut guard = slot.live.lock().await;
+        // An instance of another build (the plugin's `current` moved while
+        // this slot lived) is never called again.
+        if guard
+            .as_ref()
+            .is_some_and(|live| live.sha256 != m.wasm.sha256)
+        {
+            *guard = None;
+        }
         if guard.is_none() {
             let mut store = Store::new(&shared()?.engine, HostState::new(&m.id, ws));
             store.limiter(|s| &mut s.limits);
@@ -598,7 +664,13 @@ impl PluginRuntime {
                 tokio::time::timeout(budget + HOST_GRACE, pre.instantiate_async(&mut store)).await;
             store.data_mut().end();
             match made {
-                Ok(Ok(plugin)) => *guard = Some(Live { store, plugin }),
+                Ok(Ok(plugin)) => {
+                    *guard = Some(Live {
+                        store,
+                        plugin,
+                        sha256: m.wasm.sha256.clone(),
+                    })
+                }
                 Ok(Err(err)) => {
                     let why = describe(m, &err, budget, store.data().stderr.last_line());
                     tracing::warn!(plugin = %m.id, workspace = ws, %why, "plugin instantiate failed");
@@ -657,10 +729,10 @@ impl PluginRuntime {
     pub(crate) async fn offer(
         &self,
         state: &Arc<AppState>,
-        m: &'static Manifest,
+        m: &Manifest,
         ws: &str,
     ) -> Result<Offer, String> {
-        if let Some(known) = crate::lock(&self.offers).get(&m.id) {
+        if let Some(known) = crate::lock(&self.offers).get(&offer_key(m)) {
             return known.clone();
         }
         let Reply::Tools(defs) = self.run(state, m, ws, None, Call::Tools).await? else {
@@ -675,7 +747,7 @@ impl PluginRuntime {
         if let Err(refused) = &offer {
             tracing::error!(plugin = %m.id, %refused, "plugin refused");
         }
-        crate::lock(&self.offers).insert(m.id.clone(), offer.clone());
+        crate::lock(&self.offers).insert(offer_key(m), offer.clone());
         offer
     }
 
@@ -684,7 +756,7 @@ impl PluginRuntime {
     pub(crate) async fn call_tool(
         &self,
         state: &Arc<AppState>,
-        m: &'static Manifest,
+        m: &Manifest,
         ws: &str,
         session: &str,
         name: &str,
@@ -713,7 +785,7 @@ impl PluginRuntime {
     pub(crate) async fn knowledge(
         &self,
         state: &Arc<AppState>,
-        m: &'static Manifest,
+        m: &Manifest,
         ws: &str,
         known: Option<&Value>,
     ) -> Result<Option<(Value, Value)>, String> {
@@ -739,7 +811,7 @@ impl PluginRuntime {
     pub(crate) async fn on_event(
         &self,
         state: &Arc<AppState>,
-        m: &'static Manifest,
+        m: &Manifest,
         ws: &str,
         session: Option<&str>,
         event: wit::Event,
@@ -790,6 +862,10 @@ fn tool_error(text: String) -> Value {
     json!({ "content": [{ "type": "text", "text": text }], "isError": true })
 }
 
+fn offer_key(m: &Manifest) -> BuildKey {
+    (m.id.clone(), m.wasm.sha256.clone())
+}
+
 fn check_offer(
     m: &Manifest,
     defs: Vec<wit::ToolDef>,
@@ -828,20 +904,23 @@ fn check_offer(
 }
 
 /// A hook the agent fired (`SessionStart`, `UserPromptSubmit`): each active
-/// plugin may add one line to the hook's context.
+/// plugin that declared `hook` may add one line to the hook's context.
 pub(crate) async fn hook(state: &Arc<AppState>, session: &str, event: &str) -> Vec<String> {
     let Some(ws) = super::workspace_of_session(state, session) else {
         return Vec::new();
     };
     let mut lines = Vec::new();
     for m in super::active(state, &ws).await {
+        if !m.provides.hears(super::EventKind::Hook) {
+            continue;
+        }
         let ev = wit::Event::Hook(wit::Hook {
             session: session.to_string(),
             name: event.to_string(),
         });
         if let Some(line) = state
             .plugin_runtime
-            .on_event(state, m, &ws, Some(session), ev)
+            .on_event(state, &m, &ws, Some(session), ev)
             .await
         {
             lines.push(line);
@@ -850,8 +929,9 @@ pub(crate) async fn hook(state: &Arc<AppState>, session: &str, event: &str) -> V
     lines
 }
 
-/// A session ended for good: the active plugins that keep state in its
-/// workspace hear `session-ended` (so they can drop what they kept for it).
+/// A session ended for good: the active plugins that declared
+/// `session-ended` and keep state in its workspace hear it (so they can
+/// drop what they kept for it).
 /// Resolved now — the caller is about to drop the session's workspace
 /// mapping — and delivered off the caller's path.
 pub(crate) fn session_ended(state: &Arc<AppState>, session: &str) {
@@ -864,13 +944,15 @@ pub(crate) fn session_ended(state: &Arc<AppState>, session: &str) {
         for m in super::active(&state, &ws).await {
             // A plugin that keeps nothing here has nothing to forget; don't
             // instantiate it just to say so.
-            if !crate::lock(&state.plugin_state).holds(&m.id, &ws) {
+            if !m.provides.hears(super::EventKind::SessionEnded)
+                || !crate::lock(&state.plugin_state).holds(&m.id, &ws)
+            {
                 continue;
             }
             let ev = wit::Event::SessionEnded(session.clone());
             state
                 .plugin_runtime
-                .on_event(&state, m, &ws, None, ev)
+                .on_event(&state, &m, &ws, None, ev)
                 .await;
         }
     });
