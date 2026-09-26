@@ -11,6 +11,11 @@
  * Every storage call is guarded: a private window, a blocked database, a
  * quota error or an older daemon degrades to "not journaled", which the
  * editor SHOWS — a failure here must never read as "safe".
+ *
+ * Mirror writes for one path run in issue order (`inLane`): the DELETE that
+ * follows a save waits for the journal PUT before it, which could otherwise
+ * land last and re-create a stale draft. (IndexedDB orders its own
+ * readwrite transactions.)
  */
 
 import {
@@ -35,7 +40,9 @@ export interface DraftRecord {
 
 export interface JournalResult {
   local: boolean;
-  remote: DraftPutResult | "failed";
+  /** "superseded": a newer write or clear for the path was issued before
+   *  this one's turn came, so it was never sent (the newer one counts). */
+  remote: DraftPutResult | "failed" | "superseded";
 }
 
 const DB_NAME = "chimaera-drafts";
@@ -151,8 +158,43 @@ async function localDelete(path: string): Promise<void> {
  */
 let remoteUnsupported = false;
 
-async function remotePut(rec: DraftRecord, keepalive: boolean): Promise<JournalResult["remote"]> {
-  if (remoteUnsupported) return "unsupported";
+/** One path's mirror ops: `tail` settles once every op issued so far has;
+ *  `seq` counts them, so a queued op can tell a newer one was issued. */
+interface Lane {
+  tail: Promise<void>;
+  seq: number;
+}
+
+/** Only paths with an op still pending (a lane is dropped once idle). */
+const lanes = new Map<string, Lane>();
+
+const noop = (): void => {};
+
+/**
+ * Run `op` once every earlier mirror op for `path` has settled — or at once
+ * with `now` (a closing page cannot wait), while later ops still wait for
+ * it. `stale()` turns true as soon as a newer op for the path is issued.
+ */
+function inLane<T>(path: string, op: (stale: () => boolean) => Promise<T>, now = false): Promise<T> {
+  let lane = lanes.get(path);
+  if (lane === undefined) {
+    lane = { tail: Promise.resolve(), seq: 0 };
+    lanes.set(path, lane);
+  }
+  const l = lane;
+  const mine = ++l.seq;
+  const stale = () => l.seq !== mine;
+  const prev = l.tail;
+  const run = now ? op(stale) : prev.then(() => op(stale));
+  const tail = prev.then(() => run.then(noop, noop));
+  l.tail = tail;
+  void tail.then(() => {
+    if (l.tail === tail && lanes.get(path) === l) lanes.delete(path);
+  });
+  return run;
+}
+
+async function sendPut(rec: DraftRecord, keepalive: boolean): Promise<JournalResult["remote"]> {
   try {
     // keepalive bodies are capped (~64 KiB) by the browser; larger ones go
     // as a normal request and may not outlive a closing page.
@@ -163,6 +205,22 @@ async function remotePut(rec: DraftRecord, keepalive: boolean): Promise<JournalR
   } catch {
     return "failed";
   }
+}
+
+async function remotePut(rec: DraftRecord, keepalive: boolean): Promise<JournalResult["remote"]> {
+  if (remoteUnsupported) return "unsupported";
+  // A write still queued when a newer write or a clear is issued is moot.
+  const put = (alive: boolean) => (stale: () => boolean) =>
+    stale() ? Promise.resolve("superseded" as const) : sendPut(rec, alive);
+  if (!keepalive || !lanes.has(rec.path)) return inLane(rec.path, put(keepalive), keepalive);
+  // Hidden or closing with an op still in flight: queued behind it, this
+  // write might never leave a closing page, so send it now — and, if the
+  // page lives on, once more in order (the in-flight op may land after it).
+  const [first, again] = await Promise.all([
+    inLane(rec.path, () => sendPut(rec, true), true),
+    inLane(rec.path, put(false)),
+  ]);
+  return again === "superseded" ? first : again;
 }
 
 async function remoteFind(path: string): Promise<DraftBody | null> {
@@ -190,16 +248,19 @@ export function journaled(r: JournalResult): boolean {
   return r.local || r.remote === "ok";
 }
 
-/** Drop both copies (a save of exactly this text landed, or the user discarded). */
+/** Drop both copies (a save of exactly this text landed, or the user
+ *  discarded). The DELETE waits for any journal PUT issued before it. */
 export async function clear(path: string, keepalive = false): Promise<void> {
   await Promise.all([
     localDelete(path),
     remoteUnsupported
       ? undefined
-      : fsDraftDelete(path, keepalive).catch(() => {
-          // offline or refused: a stale mirror is recognized on reopen (it
-          // matches the disk and is dropped then) or offered, never applied
-        }),
+      : inLane(path, () =>
+          fsDraftDelete(path, keepalive).catch(() => {
+            // offline or refused: a stale mirror is recognized on reopen (it
+            // matches the disk and is dropped then) or offered, never applied
+          }),
+        ),
   ]);
 }
 
