@@ -344,6 +344,195 @@ pub(crate) async fn put_workspace_plugin(
             .into_response(),
     }
 }
+/// Plugin ids / marketplace sources we hand to an agent CLI: first-party
+/// manifest strings, still charset-gated (and never flag-shaped) because they
+/// land in a generated script.
+fn cli_safe(s: &str) -> bool {
+    !s.is_empty()
+        && !s.starts_with('-')
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "@/._:+-".contains(c))
+}
+
+#[derive(Deserialize)]
+pub(crate) struct AgentBody {
+    agent: String,
+}
+
+fn bad_request(msg: impl Into<String>) -> Response {
+    (StatusCode::BAD_REQUEST, Json(json!({"error": msg.into()}))).into_response()
+}
+
+/// POST /workspaces/{id}/plugins/{pid}/install {agent} — install the agent
+/// plugin this workbench plugin requires, with the AGENT's own plugin
+/// manager, in a visible terminal the user watches (chimaera never
+/// reimplements `claude plugin` / `codex plugin`). The session is theirs to
+/// read and close; the probe cache is invalidated when it ends.
+pub(crate) async fn install_requirement(
+    State(state): State<Arc<AppState>>,
+    AxPath((id, pid)): AxPath<(String, String)>,
+    Json(body): Json<AgentBody>,
+) -> Response {
+    let Some(workspace) = crate::lock(&state.workspaces).get(&id) else {
+        return not_found("unknown workspace");
+    };
+    let Some(m) = manifest(&pid) else {
+        return not_found("unknown plugin");
+    };
+    let Some(req) = m.requires.agent_plugins.get(&body.agent) else {
+        return bad_request(format!("{} needs nothing from {}", m.name, body.agent));
+    };
+    let Some(kind) = crate::agents::AgentKind::parse(&body.agent) else {
+        return bad_request("unknown agent");
+    };
+    if !cli_safe(&req.id) || !cli_safe(&req.marketplace) {
+        return bad_request("manifest requirement is not CLI-safe");
+    }
+    let det = crate::launcher::detect(&state, kind, false).await;
+    let bin = match det.path {
+        Ok(bin) => bin,
+        Err(err) => {
+            return (StatusCode::CONFLICT, Json(json!({"error": err}))).into_response();
+        }
+    };
+    let bin = crate::runtimes::sq(&bin.to_string_lossy());
+    let install_verb = if kind == crate::agents::AgentKind::Codex {
+        "add"
+    } else {
+        "install"
+    };
+    let agent = kind.as_str();
+    let script = format!(
+        "echo 'Installing {name} for {agent} with {agent}'\''s own plugin manager.'\n         echo\n         echo '$ {agent} plugin marketplace add {mkt}'\n         {bin} plugin marketplace add {mkt_q} || echo '(already added or unavailable — continuing)'\n         echo\n         echo '$ {agent} plugin {install_verb} {pid_s}'\n         {bin} plugin {install_verb} {pid_q}\n         status=$?\n         echo\n         if [ $status -eq 0 ]; then echo 'Done — you can close this terminal.'; \
+         else echo \"Install failed (exit $status).\"; fi\n         exit $status\n",
+        name = m.name.replace('\'', ""),
+        mkt = req.marketplace,
+        mkt_q = crate::runtimes::sq(&req.marketplace),
+        pid_s = req.id,
+        pid_q = crate::runtimes::sq(&req.id),
+    );
+    let session_id = crate::agents::fresh_session_id();
+    let env = crate::api::session_env(&state, &session_id, "dark", None);
+    let env_remove = crate::api::spawn_env_remove(&env);
+    let opts = chimaera_pty::SpawnOpts {
+        cwd: workspace.root.clone(),
+        name: Some(format!("install {} for {agent}", m.id)),
+        cols: 100,
+        rows: 24,
+        command: Some(vec!["/bin/bash".to_string(), "-c".to_string(), script]),
+        id: Some(session_id.clone()),
+        env,
+        env_remove,
+        scrollback: crate::lock(&state.settings).scrollback_lines(),
+    };
+    match state.sessions.spawn(opts) {
+        Ok(info) => {
+            crate::lock(&state.session_workspaces).insert(info.id.clone(), workspace.id.clone());
+            // When the install ends, the agents' answers changed.
+            let watch_state = state.clone();
+            let sid = info.id.clone();
+            tokio::spawn(async move {
+                while watch_state.sessions.get(&sid).is_some() {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+                watch_state.probes.invalidate();
+                watch_state.changes.notify_waiters();
+            });
+            tracing::info!(workspace = %id, plugin = %pid, agent, "plugin requirement install started");
+            state.changes.notify_waiters();
+            Json(json!({"session_id": info.id})).into_response()
+        }
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": err.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /workspaces/{id}/plugins/{pid}/setup {agent} — a new chat session of
+/// the user's chosen agent, sent the plugin's own documented setup prompt.
+/// The user's click, their billing; the plugin's own tooling does the work.
+pub(crate) async fn setup_workspace(
+    State(state): State<Arc<AppState>>,
+    AxPath((id, pid)): AxPath<(String, String)>,
+    Json(body): Json<AgentBody>,
+) -> Response {
+    let Some(workspace) = crate::lock(&state.workspaces).get(&id) else {
+        return not_found("unknown workspace");
+    };
+    let Some(m) = manifest(&pid) else {
+        return not_found("unknown plugin");
+    };
+    let Some(setup) = &m.setup else {
+        return bad_request(format!("{} has no setup step", m.name));
+    };
+    let Some(kind) = crate::agents::AgentKind::parse(&body.agent) else {
+        return bad_request("unknown agent");
+    };
+    if !kind.chat_capable() {
+        return bad_request(format!("no chat driver for {}", body.agent));
+    }
+    let theme = crate::lock(&state.settings)
+        .map_cached()
+        .get("appearance.theme")
+        .and_then(|v| v.as_str())
+        .filter(|t| *t == "light" || *t == "dark")
+        .unwrap_or("dark")
+        .to_string();
+    let spawned = crate::chat::spawn_fresh_chat(
+        &state,
+        workspace,
+        crate::chat::FreshChat {
+            id: None,
+            kind,
+            model: None,
+            name: Some(format!("{} setup", m.name)),
+            title_hint: None,
+            theme,
+            prelude: None,
+            mastermind: None,
+            fork: None,
+        },
+    )
+    .await;
+    let row = match spawned {
+        Ok(row) => row,
+        Err(crate::chat::ChatSpawnFailure::AgentUnavailable(msg)) => {
+            return (StatusCode::CONFLICT, Json(json!({"error": msg}))).into_response();
+        }
+        Err(crate::chat::ChatSpawnFailure::Internal(err)) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("spawn failed: {err}")})),
+            )
+                .into_response();
+        }
+    };
+    let Some(sid) = row["id"].as_str().map(str::to_owned) else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "spawned session has no id"})),
+        )
+            .into_response();
+    };
+    let command = chimaera_agent::model::AgentCommand::Send {
+        blocks: vec![chimaera_agent::model::ContentBlock::Text {
+            text: setup.prompt.clone(),
+        }],
+    };
+    if let Err(err) = state.chat.command(&sid, command).await {
+        // The session exists; say what didn't happen rather than hiding it.
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"session_id": sid, "error": format!("setup prompt not delivered: {err}")})),
+        )
+            .into_response();
+    }
+    tracing::info!(workspace = %id, plugin = %pid, session = %sid, "plugin setup started");
+    Json(json!({"session_id": sid})).into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -370,6 +559,21 @@ mod tests {
                     "{}: detect paths are workspace-relative",
                     m.id
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn cli_safe_rejects_flags_and_shell_metacharacters() {
+        assert!(cli_safe("mycelium@mycelium"));
+        assert!(cli_safe("arjunrajlaboratory/mycelium"));
+        assert!(!cli_safe("--evil"));
+        assert!(!cli_safe("a;rm -rf"));
+        assert!(!cli_safe("$(x)"));
+        assert!(!cli_safe(""));
+        for m in catalog() {
+            for req in m.requires.agent_plugins.values() {
+                assert!(cli_safe(&req.id) && cli_safe(&req.marketplace), "{}", m.id);
             }
         }
     }

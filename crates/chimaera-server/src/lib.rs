@@ -1,3 +1,4 @@
+mod agent_probe;
 mod agent_state;
 mod agent_updates;
 mod agents;

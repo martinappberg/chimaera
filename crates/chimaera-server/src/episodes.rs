@@ -386,6 +386,220 @@ pub(crate) async fn record_exit(
     state.changes.notify_waiters();
 }
 
+/// Commands worth remembering: a failure that ran ≥10 s, or anything that
+/// ran ≥2 min. A Ctrl-C (exit 130) is the user's own stop, not news.
+const COMMAND_FAIL_MIN_MS: u64 = 10_000;
+const COMMAND_LONG_MIN_MS: u64 = 120_000;
+/// Command-line head persisted to the Timeline (after redaction).
+const COMMAND_HEAD: usize = 120;
+
+/// Programs whose "duration" is a person sitting in them, not work.
+const INTERACTIVE: [&str; 22] = [
+    "ssh", "mosh", "vim", "vi", "nvim", "nano", "emacs", "less", "more", "man", "top", "htop",
+    "btop", "tmux", "screen", "watch", "claude", "codex", "gemini", "jupyter", "tail", "sudo",
+];
+/// Interpreters/shells: interactive only when started bare (a REPL).
+const REPLS: [&str; 10] = [
+    "python", "python3", "ipython", "R", "julia", "node", "bash", "zsh", "fish", "sh",
+];
+
+pub(crate) fn command_is_notable(meta: &chimaera_pty::CommandMeta) -> bool {
+    let ms = meta.ended_at_ms.saturating_sub(meta.started_at_ms);
+    let Some(text) = meta.command.as_deref() else {
+        return false;
+    };
+    if is_interactive(text) {
+        return false;
+    }
+    match meta.exit_code {
+        Some(130) => false,
+        Some(0) | None => ms >= COMMAND_LONG_MIN_MS,
+        Some(_) => ms >= COMMAND_FAIL_MIN_MS,
+    }
+}
+
+fn is_interactive(text: &str) -> bool {
+    let mut words = text
+        .split_whitespace()
+        // Leading VAR=value assignments.
+        .skip_while(|w| w.contains('=') && !w.starts_with('-'));
+    let Some(first) = words.next() else {
+        return true;
+    };
+    let base = first.rsplit('/').next().unwrap_or(first);
+    let rest: Vec<&str> = words.collect();
+    if INTERACTIVE.contains(&base) {
+        return true;
+    }
+    if REPLS.contains(&base) && rest.is_empty() {
+        return true;
+    }
+    // An interactive allocation (`srun --pty bash`, `salloc`) is a session.
+    base == "salloc" || (base == "srun" && rest.contains(&"--pty"))
+}
+
+/// Mask values that look like secrets before a command line is persisted or
+/// shown to a model: `KEY=value` where the key names a credential, the
+/// argument after a credential flag (`--token x`, `-p x`), and anything
+/// after "Bearer"/"Authorization:".
+pub(crate) fn redact_command(text: &str) -> String {
+    const SENSITIVE: [&str; 10] = [
+        "token",
+        "secret",
+        "passw",
+        "pwd",
+        "apikey",
+        "api_key",
+        "api-key",
+        "auth",
+        "credential",
+        "private",
+    ];
+    let sensitive = |w: &str| {
+        let lower = w.to_lowercase();
+        SENSITIVE.iter().any(|s| lower.contains(s))
+    };
+    let bare = |w: &str| w.trim_matches(['\'', '"']).to_lowercase();
+    #[derive(PartialEq)]
+    enum Mask {
+        No,
+        Next,
+        /// After "Authorization:": a scheme word (Bearer/Basic/Token) is
+        /// kept and the credential after it masked.
+        AfterAuth,
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut mask = Mask::No;
+    for tok in text.split_whitespace() {
+        match mask {
+            Mask::AfterAuth if matches!(bare(tok).as_str(), "bearer" | "basic" | "token") => {
+                out.push(tok.to_string());
+                mask = Mask::Next;
+                continue;
+            }
+            Mask::AfterAuth | Mask::Next => {
+                out.push("•••".to_string());
+                mask = Mask::No;
+                continue;
+            }
+            Mask::No => {}
+        }
+        if let Some((key, _)) = tok.split_once('=') {
+            if sensitive(key) {
+                out.push(format!("{key}=•••"));
+                continue;
+            }
+        }
+        let word = bare(tok);
+        if word.starts_with("authorization") {
+            out.push(tok.to_string());
+            mask = Mask::AfterAuth;
+        } else if word == "bearer" {
+            out.push(tok.to_string());
+            mask = Mask::Next;
+        } else if tok.starts_with('-') && (sensitive(tok) || tok == "-p") {
+            out.push(tok.to_string());
+            mask = Mask::Next;
+        } else {
+            out.push(tok.to_string());
+        }
+    }
+    out.join(" ")
+}
+
+/// A notable command in a workspace terminal becomes a Timeline entry.
+pub(crate) async fn record_command(
+    state: &Arc<AppState>,
+    sid: &str,
+    meta: &chimaera_pty::CommandMeta,
+) {
+    if !command_is_notable(meta) {
+        return;
+    }
+    let Some(ws) = crate::plugins::workspace_of_session(state, sid) else {
+        return;
+    };
+    let text = timeline::cap(
+        &redact_command(meta.command.as_deref().unwrap_or_default()),
+        COMMAND_HEAD,
+    );
+    let mut entry = Entry::new(Kind::Command);
+    entry.sid = Some(sid.to_string());
+    entry.name = crate::session_view::display_name_now(state, sid);
+    entry.ts = meta.ended_at_ms;
+    entry.command = Some(timeline::CommandInfo {
+        text,
+        exit: meta.exit_code,
+        ms: meta.ended_at_ms.saturating_sub(meta.started_at_ms),
+        source: match meta.source {
+            chimaera_pty::CommandSource::Agent => "agent".to_string(),
+            chimaera_pty::CommandSource::User => "user".to_string(),
+        },
+    });
+    state.timeline.append(&ws, entry).await;
+    state.changes.notify_waiters();
+}
+
+/// How often the job task looks — and the floor between the queue refreshes
+/// it triggers (scheduler-polite; the UI's own visible poll is separate).
+const JOBS_TICK: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The workspace whose root contains `workdir` (longest root wins).
+fn workspace_for_dir(state: &AppState, workdir: &str) -> Option<String> {
+    if workdir.is_empty() {
+        return None;
+    }
+    let dir = Path::new(workdir);
+    crate::lock(&state.workspaces)
+        .list()
+        .into_iter()
+        .filter(|w| dir.starts_with(&w.root))
+        .max_by_key(|w| w.root.as_os_str().len())
+        .map(|w| w.id)
+}
+
+/// Finished Slurm jobs → Timeline entries. One tick a minute: drain what
+/// the compute service noticed, and — only while a job attributed to some
+/// workspace is still live — refresh the queue so an unattended run still
+/// reports its end. A laptop (no scheduler, no cache) does no work at all.
+pub(crate) fn spawn_jobs_task(state: Arc<AppState>) {
+    if state
+        .timeline_jobs_started
+        .swap(true, std::sync::atomic::Ordering::AcqRel)
+    {
+        return;
+    }
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(JOBS_TICK).await;
+            let live_attributed = state.compute.peek().is_some_and(|(at, snap)| {
+                at.elapsed() >= JOBS_TICK
+                    && snap.jobs.iter().any(|j| {
+                        crate::compute::is_live_state(&j.state)
+                            && workspace_for_dir(&state, &j.workdir).is_some()
+                    })
+            });
+            if live_attributed {
+                state.compute.snapshot(false).await;
+            }
+            for end in state.compute.drain_ended() {
+                let Some(ws) = workspace_for_dir(&state, &end.job.workdir) else {
+                    continue;
+                };
+                let mut entry = Entry::new(Kind::Job);
+                entry.job = Some(timeline::JobInfo {
+                    id: end.job.id.clone(),
+                    name: timeline::cap(&end.job.name, 120),
+                    state: end.state.clone(),
+                    elapsed: (!end.job.elapsed.is_empty()).then(|| end.job.elapsed.clone()),
+                });
+                state.timeline.append(&ws, entry).await;
+                state.changes.notify_waiters();
+            }
+        }
+    });
+}
+
 fn session_kind(state: &AppState, sid: &str) -> (Option<String>, &'static str) {
     let agent = crate::lock(&state.agents)
         .get(sid)
@@ -576,6 +790,73 @@ mod tests {
             tui.stop("p", 10, "finished", None).is_none(),
             "no open turn"
         );
+    }
+
+    fn meta(cmd: &str, exit: Option<i32>, secs: u64) -> chimaera_pty::CommandMeta {
+        chimaera_pty::CommandMeta {
+            seq: 1,
+            command: Some(cmd.into()),
+            source: chimaera_pty::CommandSource::User,
+            exit_code: exit,
+            started_at_ms: 1_000,
+            ended_at_ms: 1_000 + secs * 1000,
+        }
+    }
+
+    #[test]
+    fn only_notable_commands_become_history() {
+        assert!(command_is_notable(&meta(
+            "snakemake -j 32 de_all",
+            Some(1),
+            7980
+        )));
+        assert!(
+            !command_is_notable(&meta("make", Some(2), 3)),
+            "quick failure"
+        );
+        assert!(
+            command_is_notable(&meta("Rscript de.R", Some(0), 300)),
+            "long success"
+        );
+        assert!(!command_is_notable(&meta("ls", Some(0), 1)));
+        assert!(
+            !command_is_notable(&meta("sleep 999", Some(130), 999)),
+            "Ctrl-C"
+        );
+        assert!(!command_is_notable(&meta("vim notes.md", Some(0), 900)));
+        assert!(!command_is_notable(&meta("ssh sherlock", Some(255), 3600)));
+        assert!(
+            !command_is_notable(&meta("python3", Some(0), 600)),
+            "a REPL"
+        );
+        assert!(command_is_notable(&meta("python3 train.py", Some(0), 600)));
+        assert!(!command_is_notable(&meta("srun --pty bash", Some(0), 3600)));
+        assert!(!command_is_notable(&meta("FOO=1 htop", Some(0), 600)));
+    }
+
+    #[test]
+    fn secrets_are_masked_before_persisting() {
+        assert_eq!(
+            redact_command("export GITHUB_TOKEN=ghp_abc123 && make"),
+            "export GITHUB_TOKEN=••• && make"
+        );
+        assert_eq!(
+            redact_command("curl -H 'Authorization: Bearer xyz' https://api"),
+            "curl -H 'Authorization: Bearer ••• https://api"
+        );
+        assert_eq!(
+            redact_command("curl -H \"Authorization: s3cr3t\" x"),
+            "curl -H \"Authorization: ••• x"
+        );
+        assert_eq!(
+            redact_command("mysql -u me -p hunter2"),
+            "mysql -u me -p •••"
+        );
+        assert_eq!(
+            redact_command("tool --api-key=k1 run"),
+            "tool --api-key=••• run"
+        );
+        assert_eq!(redact_command("snakemake -j 32"), "snakemake -j 32");
     }
 
     #[test]

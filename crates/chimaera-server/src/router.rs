@@ -6,9 +6,9 @@ use tower_http::trace::TraceLayer;
 
 use crate::AppState;
 use crate::{
-    agents, api, chat, compute, compute_jobs, download, environment, fs, git, launcher, links, mcp,
-    plugins, proxy, quickopen, recents, runtimes, settings, timeline, update, upload, view_state,
-    ws,
+    agent_probe, agents, api, chat, compute, compute_jobs, download, environment, fs, git,
+    launcher, links, mcp, plugins, proxy, quickopen, recents, runtimes, settings, timeline, update,
+    upload, view_state, ws,
 };
 
 /// Build the axum router (factored out so tests can drive it with `oneshot`).
@@ -16,6 +16,8 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
     // Consumes the chat manager's hook signals for the daemon's lifetime
     // (no-op when already running — tests may build several routers).
     chat::spawn_signal_task(state.clone());
+    // Finished Slurm jobs → the Timeline (idempotent; idle without a queue).
+    crate::episodes::spawn_jobs_task(state.clone());
     let api = Router::new()
         .route("/health", get(api::health))
         .route(
@@ -39,6 +41,24 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
             "/workspaces/{id}/plugins/{pid}",
             put(plugins::put_workspace_plugin),
         )
+        .route(
+            "/workspaces/{id}/plugins/{pid}/trust-hooks",
+            post(agent_probe::trust_hooks),
+        )
+        .route(
+            "/workspaces/{id}/plugins/{pid}/install",
+            post(plugins::install_requirement),
+        )
+        .route(
+            "/workspaces/{id}/plugins/{pid}/setup",
+            post(plugins::setup_workspace),
+        )
+        // What each agent CLI reports it has here (asked of the agents).
+        .route(
+            "/workspaces/{id}/agent-plugins",
+            get(agent_probe::agent_plugins),
+        )
+        .route("/workspaces/{id}/skills", get(agent_probe::skills))
         .route(
             "/sessions",
             get(api::list_sessions)

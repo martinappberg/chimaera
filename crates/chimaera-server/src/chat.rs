@@ -175,6 +175,21 @@ pub(crate) fn new_manager(
     (manager, rx)
 }
 
+/// The catalog of any live claude chat session in workspace `ws` (they all
+/// see the same host-level built-ins); None when none is running.
+pub(crate) fn claude_catalog_in_workspace(
+    state: &AppState,
+    ws: &str,
+) -> Option<Vec<(String, String)>> {
+    let sessions: Vec<String> = crate::lock(&state.session_workspaces)
+        .iter()
+        .filter(|(_, w)| w.as_str() == ws)
+        .map(|(sid, _)| sid.clone())
+        .collect();
+    let catalogs = crate::lock(&state.chat_catalogs);
+    sessions.iter().find_map(|sid| catalogs.get(sid).cloned())
+}
+
 /// Consume chat signals for the daemon's lifetime. Called once from `app()`;
 /// the receiver is stashed in AppState so construction stays sync.
 pub(crate) fn spawn_signal_task(state: Arc<AppState>) {
@@ -209,6 +224,22 @@ pub(crate) fn spawn_signal_task(state: Arc<AppState>) {
                     // apply_chat_event: it is async and the std-mutex agents
                     // guard is already dropped.
                     nudge_on_edit(&state, &mut pending_edits, &id, &entry.ev).await;
+                    // A claude session's catalog (skills + commands, built-ins
+                    // included) for the Skills view — the only source for
+                    // skills that have no file.
+                    if let AgentEvent::Init { slash_commands, .. } = &entry.ev {
+                        let is_claude = crate::lock(&state.agents)
+                            .get(&id)
+                            .is_some_and(|r| r.kind == crate::agents::AgentKind::Claude);
+                        if is_claude && !slash_commands.is_empty() {
+                            let catalog = slash_commands
+                                .iter()
+                                .take(200)
+                                .map(|c| (c.name.clone(), c.description.clone()))
+                                .collect();
+                            crate::lock(&state.chat_catalogs).insert(id.clone(), catalog);
+                        }
+                    }
                     if let Some(draft) = episodes.observe(&id, entry.ts, &entry.ev) {
                         crate::episodes::record(&state, &id, draft, "protocol").await;
                     }
@@ -217,6 +248,7 @@ pub(crate) fn spawn_signal_task(state: Arc<AppState>) {
                 ChatSignal::Exit(id, exit) => {
                     // A dead session's un-completed edits will never land.
                     pending_edits.retain(|(s, _), _| s != &id);
+                    crate::lock(&state.chat_catalogs).remove(&id);
                     // Record the death BEFORE handle_chat_exit: retiring drops
                     // the workspace mapping the Timeline entry needs. A
                     // deliberate view switch is not history.
