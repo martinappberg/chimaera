@@ -11,8 +11,11 @@
 </script>
 
 <script lang="ts">
+  import { untrack } from "svelte";
   import { innerExtension } from "./files";
   import { retain, release, type FileEntry } from "./fileStore.svelte";
+  import { revealRequest, takeReveal } from "../shared/reveal";
+  import { clampRegion, frameRegion, type Region } from "./imageRegion";
   import Spinner from "./Spinner.svelte";
 
   interface Props {
@@ -202,6 +205,43 @@
   });
 
   const gridStep = $derived(showGrid ? scale : 0);
+
+  /** A revealed region (`#xywh=` in image pixels), outlined until cleared. */
+  let region = $state<Region | null>(null);
+  /** Bumped per reveal so a repeat of the same region flashes again. */
+  let regionFlash = $state(0);
+
+  // Take a reveal once the image has a size and the viewport a box; a
+  // request that arrives first waits for both.
+  $effect(() => {
+    void $revealRequest;
+    if (natural === null || vw === 0 || vh === 0) return;
+    const req = takeReveal(path);
+    if (req?.region === undefined) return;
+    const r = req.region;
+    untrack(() => showRegion(r));
+  });
+
+  /** Outline `r` and frame it: centered, zoomed to fill most of the view. */
+  function showRegion(r: Region): void {
+    if (natural === null) return;
+    const clipped = clampRegion(r, natural.w, natural.h);
+    if (clipped === null) return;
+    // Half the view, so the region reads in its context; capped below the
+    // pixel-grid zoom, where a figure stops looking like a figure.
+    const view = frameRegion(clipped, vw, vh, {
+      fill: 0.5,
+      minScale: Math.min(fitScale(), 1),
+      maxScale: GRID_SCALE / 2,
+    });
+    region = clipped;
+    regionFlash += 1;
+    mode = "free";
+    scale = view.scale;
+    tx = view.tx;
+    ty = view.ty;
+    clampPan();
+  }
 </script>
 
 <div class="image-view">
@@ -209,6 +249,28 @@
     <span class="dims" class:dim={natural === null}>
       {#if natural !== null}{natural.w}×{natural.h}{isSvg ? " · svg" : ""}{:else}—{/if}
     </span>
+    {#if region !== null}
+      <span class="region-chip" title="revealed region (image pixels)">
+        <span class="region-text">{Math.round(region.x)},{Math.round(region.y)} · {Math.round(region.w)}×{Math.round(
+            region.h,
+          )}</span>
+        <button class="zbtn ic sm" onclick={() => showRegion(region!)} aria-label="frame the region" title="frame the region">
+          <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"
+            ><path
+              d="M2.5 5.5v-3h3M10.5 2.5h3v3M13.5 10.5v3h-3M5.5 13.5h-3v-3"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.4"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            /></svg
+          >
+        </button>
+        <button class="zbtn ic sm" onclick={() => (region = null)} aria-label="clear the region" title="clear the region"
+          >×</button
+        >
+      </span>
+    {/if}
     <span class="spacer"></span>
     <div class="zoom">
       <button class="zbtn" class:on={mode === "fit"} onclick={applyFit} title="fit to window">fit</button>
@@ -261,6 +323,17 @@
           style:transform={`translate(${tx}px, ${ty}px)`}
           style:background-size={`${gridStep}px ${gridStep}px`}
         ></div>
+      {/if}
+      {#if region !== null && natural !== null}
+        {#key regionFlash}
+          <div
+            class="region-mark"
+            aria-hidden="true"
+            style:transform={`translate(${tx + region.x * scale}px, ${ty + region.y * scale}px)`}
+            style:width={`${region.w * scale}px`}
+            style:height={`${region.h * scale}px`}
+          ></div>
+        {/key}
       {/if}
     {:else}
       <Spinner />
@@ -399,6 +472,56 @@
       linear-gradient(to bottom, color-mix(in srgb, var(--fg) 22%, transparent) 1px, transparent 1px);
   }
 
+  .region-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    padding-left: 0.55rem;
+    border-left: 1px solid var(--edge);
+    font-family: var(--mono);
+    font-variant-numeric: tabular-nums;
+    color: var(--fg);
+  }
+
+  .region-text {
+    margin-right: 0.2rem;
+  }
+
+  .zbtn.ic.sm {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    height: 18px;
+    font-size: var(--text-sm);
+    min-width: 18px;
+  }
+
+  /* The revealed region: an accent frame that stays, and a veil over the
+     rest of the image that fades — the eye lands on it in both themes and on
+     any image, without dimming what you inspect afterwards. */
+  .region-mark {
+    position: absolute;
+    top: 0;
+    left: 0;
+    box-sizing: border-box;
+    pointer-events: none;
+    border: 2px solid var(--accent);
+    border-radius: 2px;
+    box-shadow:
+      0 0 0 1px color-mix(in srgb, var(--term-bg) 70%, transparent),
+      0 0 0 100vmax transparent;
+    animation: region-in 1.6s ease-out;
+  }
+
+  @keyframes region-in {
+    0%,
+    40% {
+      box-shadow:
+        0 0 0 1px color-mix(in srgb, var(--term-bg) 70%, transparent),
+        0 0 0 100vmax color-mix(in srgb, var(--term-bg) 45%, transparent);
+    }
+  }
+
   .file-error {
     margin: auto;
     color: var(--muted);
@@ -410,6 +533,10 @@
   @media (prefers-reduced-motion: reduce) {
     .zbtn {
       transition: none;
+    }
+
+    .region-mark {
+      animation: none;
     }
   }
 </style>

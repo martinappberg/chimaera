@@ -1365,6 +1365,178 @@ async fn fs_table_gz_sniffs_inner_name() {
     assert_eq!(json["columns"], serde_json::json!(["x", "y"]));
 }
 
+/// The additive `comment` / `header=false` / `names` / `quote=false` options
+/// read the bioinformatics formats the UI routes to the table view.
+#[tokio::test]
+async fn fs_table_comment_and_headerless_options_read_bio_formats() {
+    let state = test_state();
+    let root = test_dir("fs-table-bio");
+    let get = |path: &std::path::Path, query: &str| {
+        format!("/api/v1/fs/table?path={}&{query}", path.to_string_lossy())
+    };
+
+    // VCF: `##` meta lines skipped (one quotes a description), `#CHROM` is
+    // the header, and a field opening with `"` stays one field.
+    let vcf = root.join("calls.vcf");
+    std::fs::write(
+        &vcf,
+        "##fileformat=VCFv4.2\n\
+         ##INFO=<ID=DP,Number=1,Type=Integer,Description=\"Total Depth\">\n\
+         #CHROM\tPOS\tID\tREF\tALT\n\
+         chr1\t100\t\"q\tA\tG\n\
+         chr1\t200\t.\tC\tT\n",
+    )
+    .unwrap();
+    let (status, json) = request(
+        &state,
+        Method::GET,
+        &get(&vcf, "comment=%23%23&quote=false"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(
+        json["columns"],
+        serde_json::json!(["#CHROM", "POS", "ID", "REF", "ALT"])
+    );
+    assert_eq!(
+        json["rows"],
+        serde_json::json!([
+            ["chr1", "100", "\"q", "A", "G"],
+            ["chr1", "200", ".", "C", "T"]
+        ])
+    );
+    // Auto-delimiter sniffs the first non-comment line (tabs), not the
+    // comma-laden meta line.
+    assert_eq!(json["total_rows"], 2);
+
+    // The same file gzipped pages through the sequential decoder.
+    let vcf_gz = root.join("calls.vcf.gz");
+    std::fs::write(&vcf_gz, gzip_bytes(&std::fs::read(&vcf).unwrap(), None)).unwrap();
+    let (status, json) = request(
+        &state,
+        Method::GET,
+        &get(&vcf_gz, "comment=%23%23&quote=false&delim=tab"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["columns"][0], "#CHROM");
+    assert_eq!(json["rows"].as_array().unwrap().len(), 2);
+
+    // SAM: `@` header lines skipped, no header row, the mandatory names,
+    // then `colN` for the optional tags.
+    let sam = root.join("reads.sam");
+    std::fs::write(
+        &sam,
+        "@HD\tVN:1.6\n@SQ\tSN:chr1\tLN:1000\n\
+         r1\t0\tchr1\t5\t60\t4M\t*\t0\t0\tACGT\t\"#$%\tNM:i:0\n\
+         r2\t16\tchr1\t9\t60\t4M\t*\t0\t0\tTTGA\tIIII\n",
+    )
+    .unwrap();
+    let names = "QNAME,FLAG,RNAME,POS,MAPQ,CIGAR,RNEXT,PNEXT,TLEN,SEQ,QUAL";
+    let (status, json) = request(
+        &state,
+        Method::GET,
+        &get(
+            &sam,
+            &format!("comment=%40&header=false&quote=false&delim=tab&names={names}"),
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    let columns = json["columns"].as_array().unwrap();
+    assert_eq!(columns.len(), 12);
+    assert_eq!(columns[0], "QNAME");
+    assert_eq!(columns[10], "QUAL");
+    assert_eq!(columns[11], "col12");
+    assert_eq!(json["rows"][0][10], "\"#$%");
+    assert_eq!(json["rows"][1][0], "r2");
+
+    // BED: several prefixes (`#`, `track`, `browser`), fewer names than
+    // fields, and a comment line between records.
+    let bed = root.join("peaks.bed");
+    std::fs::write(
+        &bed,
+        "browser position chr1:1-100\ntrack name=peaks\n# note\n\
+         chr1\t10\t20\tp1\nchr1\t30\t40\tp2\n# mid\nchr2\t5\t9\tp3\n",
+    )
+    .unwrap();
+    let (status, json) = request(
+        &state,
+        Method::GET,
+        &get(
+            &bed,
+            "comment=%23,track,browser&header=false&delim=tab&names=chrom,chromStart,chromEnd",
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(
+        json["columns"],
+        serde_json::json!(["chrom", "chromStart", "chromEnd", "col4"])
+    );
+    assert_eq!(json["rows"].as_array().unwrap().len(), 3);
+    assert_eq!(json["rows"][2][3], "p3");
+    // Paging counts data rows only: the skipped lines never shift offsets.
+    let (_, json) = request(
+        &state,
+        Method::GET,
+        &get(
+            &bed,
+            "comment=%23,track,browser&header=false&delim=tab&offset_rows=2&limit_rows=1",
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(json["rows"], serde_json::json!([["chr2", "5", "9", "p3"]]));
+    assert_eq!(json["columns"][0], "col1");
+
+    // Option ceilings are a clean 400.
+    let (status, err) = request(&state, Method::GET, &get(&bed, "comment=a,b,c,d,e"), None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(err["error"].as_str().unwrap().contains("comment"));
+}
+
+/// Deep pages of a plain file land on the right rows through the row index,
+/// and the answer says how big the file is (estimated, then exact).
+#[tokio::test]
+async fn fs_table_deep_pages_report_totals() {
+    let state = test_state();
+    let root = test_dir("fs-table-deep");
+    let path = root.join("deep.csv");
+    let mut csv = String::from("id,label\n");
+    for i in 0..5_000 {
+        csv.push_str(&format!("{i},\"row, {i}\"\n"));
+    }
+    std::fs::write(&path, csv).unwrap();
+    let path = path.to_string_lossy();
+
+    let uri = format!("/api/v1/fs/table?path={path}&limit_rows=10");
+    let (_, json) = request(&state, Method::GET, &uri, None).await;
+    assert!(json["total_rows"].is_null());
+    let est = json["est_rows"].as_u64().unwrap();
+    // A byte-rate estimate from the first page: the right magnitude, not exact
+    // (early ids are shorter than late ones).
+    assert!((2_500..10_000).contains(&est), "estimate {est}");
+
+    for offset in [4_321usize, 1_000, 2_999, 4_321] {
+        let uri = format!("/api/v1/fs/table?path={path}&offset_rows={offset}&limit_rows=2");
+        let (status, json) = request(&state, Method::GET, &uri, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["rows"][0][0], offset.to_string());
+        assert_eq!(json["rows"][1][1], format!("row, {}", offset + 1));
+        assert_eq!(json["scan_limited"], false);
+    }
+
+    let uri = format!("/api/v1/fs/table?path={path}&offset_rows=4999&limit_rows=5");
+    let (_, json) = request(&state, Method::GET, &uri, None).await;
+    assert_eq!(json["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(json["truncated"], false);
+    assert_eq!(json["total_rows"], 5_000);
+}
 #[tokio::test]
 async fn fs_file_gz_serves_decompressed_slices() {
     let state = test_state();

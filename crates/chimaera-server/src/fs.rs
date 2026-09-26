@@ -25,6 +25,8 @@ use serde_json::json;
 
 use crate::AppState;
 
+mod row_index;
+
 /// Hard cap on a single `fs/file` read.
 const MAX_FILE_CHUNK: u64 = 2 * 1024 * 1024;
 /// Default `fs/file` read size (256KB).
@@ -37,9 +39,9 @@ const MAX_WRITE_BYTES: usize = 1024 * 1024;
 /// bounds that work (and defuses gzip bombs) at the cost of an honest
 /// "truncated" answer for very deep reads.
 const MAX_GZ_DECOMPRESS: u64 = 64 * 1024 * 1024;
-/// Maximum bytes a paged table request scans from the start of a plain file.
-/// CSV has no row index, so a hostile giant `offset_rows` would otherwise tie
-/// up one blocking worker walking an arbitrarily large dataset.
+/// Maximum bytes one paged table request walks in a plain file (from the
+/// nearest row-index checkpoint), so a hostile giant `offset_rows` cannot tie
+/// up a blocking worker walking an arbitrarily large dataset in one go.
 const MAX_TABLE_SCAN_BYTES: u64 = 64 * 1024 * 1024;
 /// Largest markdown source `fs/markdown` will render.
 const MAX_MARKDOWN_BYTES: u64 = 4 * 1024 * 1024;
@@ -2447,6 +2449,98 @@ pub(crate) struct TableQuery {
     limit_rows: Option<usize>,
     #[serde(default)]
     delim: Option<String>,
+    /// Comma-separated line prefixes skipped wherever they appear: `##` for
+    /// VCF meta lines, `@` for SAM headers, `#,track,browser` for BED.
+    #[serde(default)]
+    comment: Option<String>,
+    /// `false`: there is no header row — every line is data, and the columns
+    /// are `names` followed by `colN` for any further field.
+    #[serde(default)]
+    header: Option<bool>,
+    /// Comma-separated column names for a header-less file.
+    #[serde(default)]
+    names: Option<String>,
+    /// `false`: fields are never quoted. SAM qualities and VCF text can open a
+    /// field with `"`, which CSV quoting would read as a quote that swallows
+    /// lines until the next one.
+    #[serde(default)]
+    quote: Option<bool>,
+}
+
+const MAX_COMMENT_PREFIXES: usize = 4;
+const MAX_COMMENT_PREFIX_BYTES: usize = 16;
+const MAX_TABLE_NAMES: usize = 256;
+const MAX_TABLE_NAME_BYTES: usize = 256;
+
+/// The parse options of one `fs/table` read beyond paging.
+struct TableOpts {
+    delim: String,
+    comments: Vec<Vec<u8>>,
+    header: bool,
+    names: Vec<String>,
+    quoting: bool,
+}
+
+impl TableOpts {
+    fn from_query(q: &TableQuery) -> anyhow::Result<Self> {
+        let comments: Vec<Vec<u8>> = q
+            .comment
+            .as_deref()
+            .unwrap_or("")
+            .split(',')
+            .filter(|p| !p.is_empty())
+            .map(|p| p.as_bytes().to_vec())
+            .collect();
+        if comments.len() > MAX_COMMENT_PREFIXES
+            || comments.iter().any(|p| p.len() > MAX_COMMENT_PREFIX_BYTES)
+        {
+            anyhow::bail!(
+                "comment takes at most {MAX_COMMENT_PREFIXES} prefixes of \
+                 {MAX_COMMENT_PREFIX_BYTES} bytes"
+            );
+        }
+        let names: Vec<String> = q
+            .names
+            .as_deref()
+            .filter(|n| !n.is_empty())
+            .map(|n| n.split(',').map(str::to_owned).collect())
+            .unwrap_or_default();
+        if names.len() > MAX_TABLE_NAMES || names.iter().any(|n| n.len() > MAX_TABLE_NAME_BYTES) {
+            anyhow::bail!(
+                "names takes at most {MAX_TABLE_NAMES} names of {MAX_TABLE_NAME_BYTES} bytes"
+            );
+        }
+        Ok(TableOpts {
+            delim: q.delim.clone().unwrap_or_else(|| "auto".into()),
+            comments,
+            header: q.header.unwrap_or(true),
+            names,
+            quoting: q.quote.unwrap_or(true),
+        })
+    }
+
+    fn is_comment(&self, record: &csv::ByteRecord) -> bool {
+        !self.comments.is_empty()
+            && record
+                .get(0)
+                .is_some_and(|first| self.comments.iter().any(|p| first.starts_with(p)))
+    }
+
+    /// Everything that changes which byte a row number lands on — the row
+    /// index is only reusable under the same answer.
+    fn index_key(&self, delimiter: u8) -> String {
+        let comments: Vec<String> = self
+            .comments
+            .iter()
+            .map(|p| String::from_utf8_lossy(p).into_owned())
+            .collect();
+        format!(
+            "{delimiter}|{}|{}|{}",
+            self.quoting,
+            self.header,
+            comments.join("\u{1f}")
+        )
+    }
 }
 
 /// GET /api/v1/fs/table?path=&offset_rows=0&limit_rows=200&delim=auto — a
@@ -2454,24 +2548,183 @@ pub(crate) struct TableQuery {
 /// rows starting at `offset_rows`. All cells are strings. `.gz`/`.bgz` files
 /// (bioinformatics reality: `.tsv.gz` everywhere) page identically via
 /// sequential decode, capped at [`MAX_GZ_DECOMPRESS`] decompressed bytes.
+///
+/// Additive options: `comment` (skipped line prefixes), `header=false` with
+/// optional `names`, and `quote=false` — together they read VCF, BED, GFF and
+/// SAM. Plain files keep a sparse row index ([`row_index`]), so a deep page
+/// seeks instead of re-parsing from byte 0; each request still walks at most
+/// [`MAX_TABLE_SCAN_BYTES`], and one that runs out before `offset_rows`
+/// answers `scan_limited` with how far it got (`scanned_to`) — asking again
+/// resumes from there. The response also carries `total_rows` once a scan has
+/// reached the end, else `est_rows` (a byte-rate estimate, plain files only).
 pub(crate) async fn table(Query(query): Query<TableQuery>) -> Response {
     let limit = query.limit_rows.unwrap_or(200).min(MAX_TABLE_ROWS);
-    let delim = query.delim.as_deref().unwrap_or("auto");
-    let delim = delim.to_string();
-    blocking_json(move || read_table(&query.path, query.offset_rows, limit, &delim)).await
+    let opts = match TableOpts::from_query(&query) {
+        Ok(opts) => opts,
+        Err(err) => return bad_request(&err),
+    };
+    blocking_json(move || {
+        read_table(
+            &query.path,
+            query.offset_rows,
+            limit,
+            &opts,
+            MAX_TABLE_SCAN_BYTES,
+        )
+    })
+    .await
 }
 
-/// Parse one page of the delimited (possibly gzip-compressed) file at `raw`.
+/// One page's scan: the rows, and where the walk stopped.
+struct TableScan {
+    rows: Vec<Vec<String>>,
+    /// More rows remain past the page (or may: a budget or cap stopped us).
+    truncated: bool,
+    eof: bool,
+    /// The scan budget ran out before reaching `offset_rows`.
+    scan_limited: bool,
+    /// The data-row number the walk stopped at.
+    end_row: usize,
+    /// Rows and bytes this request walked (for the row estimate).
+    walked_rows: usize,
+    walked_bytes: u64,
+}
+
+fn lossy_cells(record: &csv::ByteRecord) -> Vec<String> {
+    record
+        .iter()
+        .map(|cell| String::from_utf8_lossy(cell).into_owned())
+        .collect()
+}
+
+/// Read up to the header row: leading comment lines are skipped, and the
+/// first other record is the header — unless the file has none.
+fn read_header<R: Read>(
+    reader: &mut csv::Reader<R>,
+    opts: &TableOpts,
+    path: &Path,
+) -> anyhow::Result<Option<Vec<String>>> {
+    if !opts.header {
+        return Ok(None);
+    }
+    let mut record = csv::ByteRecord::new();
+    loop {
+        let more = reader
+            .read_byte_record(&mut record)
+            .with_context(|| format!("{}: failed to parse header row", path.display()))?;
+        if !more {
+            return Ok(Some(Vec::new()));
+        }
+        if !opts.is_comment(&record) {
+            return Ok(Some(lossy_cells(&record)));
+        }
+    }
+}
+
+/// Where one page walk starts and what bounds it.
+struct Walk<'a> {
+    /// The data-row number the reader is positioned at.
+    first_row: usize,
+    offset_rows: usize,
+    limit_rows: usize,
+    /// Most bytes to walk; `None` when the reader carries its own cap.
+    budget: Option<u64>,
+    /// Learns every checkpoint the walk passes.
+    index: Option<&'a mut row_index::RowIndex>,
+}
+
+/// Walk data rows, collecting `limit_rows` of them from `offset_rows`.
+fn scan_page<R: Read>(
+    reader: &mut csv::Reader<R>,
+    opts: &TableOpts,
+    walk: Walk<'_>,
+    path: &Path,
+) -> anyhow::Result<TableScan> {
+    let Walk {
+        first_row,
+        offset_rows,
+        limit_rows,
+        budget,
+        mut index,
+    } = walk;
+    let mut record = csv::ByteRecord::new();
+    let mut rows = Vec::with_capacity(limit_rows.min(256));
+    let start = reader.position().byte();
+    let mut row = first_row;
+    let mut truncated = false;
+    let mut eof = false;
+    let mut scan_limited = false;
+    loop {
+        let at = reader.position().byte();
+        if budget.is_some_and(|b| at - start > b) {
+            truncated = true;
+            scan_limited = row < offset_rows;
+            break;
+        }
+        let more = reader
+            .read_byte_record(&mut record)
+            .with_context(|| format!("{}: failed to parse row", path.display()))?;
+        if !more {
+            eof = true;
+            break;
+        }
+        if opts.is_comment(&record) {
+            continue;
+        }
+        if let Some(index) = index.as_deref_mut() {
+            index.observe(row, at);
+        }
+        if row >= offset_rows {
+            if rows.len() == limit_rows {
+                truncated = true;
+                break;
+            }
+            rows.push(lossy_cells(&record));
+        }
+        row += 1;
+    }
+    Ok(TableScan {
+        rows,
+        truncated,
+        eof,
+        scan_limited,
+        end_row: row,
+        walked_rows: row - first_row,
+        walked_bytes: reader.position().byte() - start,
+    })
+}
+
+/// Bytes per line in a 32 KB window ending at or after `at` (clamped to the
+/// file), counting only the whole lines inside it; None when it holds none.
+fn window_line_rate(file: &mut std::fs::File, at: u64, len: u64) -> Option<f64> {
+    const WINDOW: u64 = 32 * 1024;
+    let start = at.min(len.saturating_sub(WINDOW));
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut buf = Vec::with_capacity(WINDOW as usize);
+    file.take(WINDOW).read_to_end(&mut buf).ok()?;
+    // The window opens mid-line: measure from the first line break to the last.
+    let first = buf.iter().position(|&b| b == b'\n')?;
+    let last = buf.iter().rposition(|&b| b == b'\n')?;
+    let lines = buf[first + 1..=last]
+        .iter()
+        .filter(|&&b| b == b'\n')
+        .count();
+    (lines > 0).then(|| (last - first) as f64 / lines as f64)
+}
+
+/// Parse one page of the delimited (possibly gzip-compressed) file at `raw`,
+/// walking at most `budget` bytes of a plain file.
 fn read_table(
     raw: &str,
     offset_rows: usize,
     limit_rows: usize,
-    delim: &str,
+    opts: &TableOpts,
+    budget: u64,
 ) -> anyhow::Result<serde_json::Value> {
     let path = canonical_file(raw)?;
     let gz = is_gzip_path(&path);
-    let delimiter = match delim {
-        "auto" => sniff_delimiter(&path, gz)?,
+    let delimiter = match opts.delim.as_str() {
+        "auto" => sniff_delimiter(&path, gz, &opts.comments)?,
         "," | "comma" => b',',
         "\t" | "tab" => b'\t',
         other => anyhow::bail!("unsupported delimiter {other:?} (want auto, comma, or tab)"),
@@ -2479,91 +2732,217 @@ fn read_table(
 
     let file = std::fs::File::open(&path)
         .with_context(|| format!("{}: failed to open", path.display()))?;
-    let (columns, rows, truncated) = if gz {
+    let mut builder = csv::ReaderBuilder::new();
+    // Headers are read by hand (comment lines may precede them), so the csv
+    // reader treats every record as data.
+    builder
+        .delimiter(delimiter)
+        .has_headers(false)
+        .flexible(true)
+        .quoting(opts.quoting);
+
+    let (header, scan, total_rows, est_rows) = if gz {
         // Take caps the decode work so a gzip bomb cannot spin the daemon;
-        // flate2's read decoders buffer their input internally.
-        let decoder = MultiGzDecoder::new(file).take(MAX_GZ_DECOMPRESS);
-        let (columns, rows, mut truncated, rest) =
-            page_records(decoder, delimiter, offset_rows, limit_rows, &path)?;
-        if rest.limit() == 0 {
-            // Cap reached: rows past it are unreachable by sequential decode,
-            // so the page is honestly "truncated" even though we saw EOF.
-            truncated = true;
-        }
-        (columns, rows, truncated)
-    } else {
-        let (columns, rows, mut truncated, rest) = page_records(
-            std::io::BufReader::new(file).take(MAX_TABLE_SCAN_BYTES),
-            delimiter,
+        // flate2's read decoders buffer their input internally. A gzip
+        // stream cannot seek, so there is no index: every read decodes from
+        // the start.
+        let mut reader = builder.from_reader(MultiGzDecoder::new(file).take(MAX_GZ_DECOMPRESS));
+        let header = read_header(&mut reader, opts, &path)?;
+        let walk = Walk {
+            first_row: 0,
             offset_rows,
             limit_rows,
-            &path,
-        )?;
-        if rest.limit() == 0 {
-            truncated = true;
+            budget: None,
+            index: None,
+        };
+        let mut scan = scan_page(&mut reader, opts, walk, &path)?;
+        if reader.get_ref().limit() == 0 {
+            // Cap reached: rows past it are unreachable by sequential decode,
+            // so the page is honestly "truncated" even though we saw EOF.
+            scan.truncated = true;
+            scan.eof = false;
         }
-        (columns, rows, truncated)
+        let total = scan.eof.then_some(scan.end_row);
+        (header, scan, total, None)
+    } else {
+        let meta = file
+            .metadata()
+            .with_context(|| format!("{}: failed to stat", path.display()))?;
+        let key = row_index::IndexKey {
+            path: path.clone(),
+            opts: opts.index_key(delimiter),
+        };
+        let version = mtime_token(&meta);
+        let mut reader = builder.from_reader(std::io::BufReader::new(file));
+        let header = read_header(&mut reader, opts, &path)?;
+        let mut index = row_index::lookup(&key, &version)
+            .unwrap_or_else(|| row_index::RowIndex::new(version, reader.position().byte()));
+        let (start_row, start_byte) = index.seek_point(offset_rows);
+        let mut pos = csv::Position::new();
+        pos.set_byte(start_byte);
+        reader
+            .seek(pos)
+            .with_context(|| format!("{}: failed to seek", path.display()))?;
+        let walk = Walk {
+            first_row: start_row,
+            offset_rows,
+            limit_rows,
+            budget: Some(budget),
+            index: Some(&mut index),
+        };
+        let scan = scan_page(&mut reader, opts, walk, &path)?;
+        if scan.eof {
+            index.total = Some(scan.end_row);
+        }
+        let total = index.total;
+        row_index::store(key, index);
+        let est = match total {
+            Some(_) => None,
+            None if scan.walked_rows > 0 && scan.walked_bytes > 0 => {
+                // Rows often grow down a file (ids get longer), so the walked
+                // rate alone overshoots from the top: average it with the
+                // line rate at the middle and the end of what remains.
+                let walked_to = start_byte + scan.walked_bytes;
+                let mut file = reader.into_inner().into_inner();
+                let rest = meta.len().saturating_sub(walked_to);
+                let rates: Vec<f64> = [
+                    Some(scan.walked_bytes as f64 / scan.walked_rows as f64),
+                    window_line_rate(&mut file, walked_to + rest / 2, meta.len()),
+                    window_line_rate(&mut file, meta.len(), meta.len()),
+                ]
+                .into_iter()
+                .flatten()
+                .collect();
+                let per_row = rates.iter().sum::<f64>() / rates.len() as f64;
+                Some(scan.end_row + (rest as f64 / per_row).round() as usize)
+            }
+            None => None,
+        };
+        (header, scan, total, est)
+    };
+
+    let columns = match header {
+        Some(columns) => columns,
+        None => {
+            // Header-less: as wide as the widest row on the page, named from
+            // `names` where given.
+            let width = scan
+                .rows
+                .iter()
+                .map(Vec::len)
+                .max()
+                .unwrap_or(opts.names.len());
+            (0..width)
+                .map(|i| {
+                    opts.names
+                        .get(i)
+                        .cloned()
+                        .unwrap_or_else(|| format!("col{}", i + 1))
+                })
+                .collect()
+        }
     };
 
     Ok(json!({
         "columns": columns,
-        "rows": rows,
+        "rows": scan.rows,
         "offset": offset_rows,
-        "truncated": truncated,
+        "truncated": scan.truncated,
+        "total_rows": total_rows,
+        "est_rows": est_rows,
+        "scan_limited": scan.scan_limited,
+        "scanned_to": scan.end_row,
     }))
 }
+#[cfg(test)]
+mod table_tests {
+    use super::*;
 
-/// One paged table read: header row, data rows, more-rows-remain, and the
-/// reader handed back (gz callers inspect its remaining `Take` budget to
-/// detect the decode cap).
-type PagedRecords<R> = (Vec<String>, Vec<Vec<String>>, bool, R);
-
-/// Page `limit_rows` records (after skipping `offset_rows`) out of a
-/// delimited byte stream: header row first, then the page. Returns the
-/// exhausted reader so gz callers can check whether the decode cap was hit.
-fn page_records<R: Read>(
-    input: R,
-    delimiter: u8,
-    offset_rows: usize,
-    limit_rows: usize,
-    path: &Path,
-) -> anyhow::Result<PagedRecords<R>> {
-    let mut reader = csv::ReaderBuilder::new()
-        .delimiter(delimiter)
-        .has_headers(true)
-        .flexible(true)
-        .from_reader(input);
-
-    let lossy_cells = |record: &csv::ByteRecord| -> Vec<String> {
-        record
-            .iter()
-            .map(|cell| String::from_utf8_lossy(cell).into_owned())
-            .collect()
-    };
-
-    let columns = lossy_cells(
-        reader
-            .byte_headers()
-            .with_context(|| format!("{}: failed to parse header row", path.display()))?,
-    );
-
-    let mut rows = Vec::with_capacity(limit_rows.min(256));
-    let mut truncated = false;
-    for (index, record) in reader.byte_records().enumerate() {
-        let record = record.with_context(|| format!("{}: failed to parse row", path.display()))?;
-        if index < offset_rows {
-            continue;
+    fn opts(delim: &str) -> TableOpts {
+        TableOpts {
+            delim: delim.into(),
+            comments: Vec::new(),
+            header: true,
+            names: Vec::new(),
+            quoting: true,
         }
-        if rows.len() == limit_rows {
-            truncated = true;
-            break;
-        }
-        rows.push(lossy_cells(&record));
     }
 
-    Ok((columns, rows, truncated, reader.into_inner()))
-}
+    /// A walk that runs out of budget before its target answers
+    /// `scan_limited` with its progress, and the next ask resumes from the
+    /// checkpoints the first one left instead of starting over.
+    #[test]
+    fn scan_budget_resumes_from_the_row_index() {
+        let dir = std::env::temp_dir().join(format!(
+            "chimaera-table-budget-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rows.tsv");
+        let mut text = String::from("n\tsquare\n");
+        for i in 0..20_000 {
+            text.push_str(&format!("{i}\t{}\n", i * i));
+        }
+        std::fs::write(&path, &text).unwrap();
+        let raw = path.to_string_lossy().into_owned();
+        let o = opts("tab");
 
+        // ~16 bytes a row: a 64 KB budget walks ~4k rows per ask.
+        let budget = 64 * 1024;
+        let first = read_table(&raw, 15_000, 5, &o, budget).unwrap();
+        assert_eq!(first["scan_limited"], true);
+        assert_eq!(first["truncated"], true);
+        assert!(first["rows"].as_array().unwrap().is_empty());
+        let mut reached = first["scanned_to"].as_u64().unwrap();
+        assert!(reached > 3_000 && reached < 15_000, "{reached}");
+        assert!(first["est_rows"].as_u64().unwrap() > 15_000);
+
+        let mut page = first;
+        for _ in 0..8 {
+            page = read_table(&raw, 15_000, 5, &o, budget).unwrap();
+            if page["scan_limited"] == false {
+                break;
+            }
+            let next = page["scanned_to"].as_u64().unwrap();
+            assert!(next > reached, "no progress: {next} <= {reached}");
+            reached = next;
+        }
+        assert_eq!(page["scan_limited"], false);
+        assert_eq!(page["rows"][0], serde_json::json!(["15000", "225000000"]));
+        assert_eq!(page["rows"].as_array().unwrap().len(), 5);
+
+        // Once indexed, a deep page is one short seek within the budget.
+        let again = read_table(&raw, 14_990, 3, &o, budget).unwrap();
+        assert_eq!(again["scan_limited"], false);
+        assert_eq!(again["rows"][0][0], "14990");
+
+        // Reading to the end records the total for every later page.
+        let mut end = read_table(&raw, 19_998, 5, &o, budget).unwrap();
+        for _ in 0..8 {
+            if end["scan_limited"] == false {
+                break;
+            }
+            end = read_table(&raw, 19_998, 5, &o, budget).unwrap();
+        }
+        assert_eq!(end["truncated"], false);
+        assert_eq!(end["total_rows"], 20_000);
+        let top = read_table(&raw, 0, 2, &o, budget).unwrap();
+        assert_eq!(top["total_rows"], 20_000);
+        assert!(top["est_rows"].is_null());
+
+        // A rewrite changes the version: the old offsets are not trusted.
+        let mut shorter = String::from("n\tsquare\n");
+        for i in 0..100 {
+            shorter.push_str(&format!("{i}\t-\n"));
+        }
+        std::fs::write(&path, shorter).unwrap();
+        let fresh = read_table(&raw, 98, 5, &o, budget).unwrap();
+        assert_eq!(fresh["rows"][0], serde_json::json!(["98", "-"]));
+        assert_eq!(fresh["total_rows"], 100);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
 #[derive(Deserialize)]
 pub(crate) struct XlsxQuery {
     path: String,
@@ -2734,8 +3113,8 @@ fn delimiter_from_name(name: &str) -> Option<u8> {
 /// Pick the delimiter: the effective file name decides by extension (for gz
 /// that is the path minus its .gz/.bgz suffix — `foo.tsv.gz` -> tsv — then
 /// the gzip member's stored FNAME); with no telling name, sniff the first
-/// (decoded) line: any tab means tab, otherwise comma.
-fn sniff_delimiter(path: &Path, gz: bool) -> anyhow::Result<u8> {
+/// (decoded) line that is not a comment: any tab means tab, otherwise comma.
+fn sniff_delimiter(path: &Path, gz: bool, comments: &[Vec<u8>]) -> anyhow::Result<u8> {
     let effective = if gz {
         gz_inner_from_path(path)
     } else {
@@ -2754,23 +3133,24 @@ fn sniff_delimiter(path: &Path, gz: bool) -> anyhow::Result<u8> {
     }
     let file =
         std::fs::File::open(path).with_context(|| format!("{}: failed to open", path.display()))?;
-    let mut first_line = Vec::new();
-    if gz {
-        std::io::BufReader::new(MultiGzDecoder::new(file))
-            .take(64 * 1024)
-            .read_until(b'\n', &mut first_line)
-            .with_context(|| format!("{}: failed to decompress", path.display()))?;
+    let input: Box<dyn Read> = if gz {
+        Box::new(MultiGzDecoder::new(file))
     } else {
-        std::io::BufReader::new(file)
-            .take(64 * 1024)
-            .read_until(b'\n', &mut first_line)
+        Box::new(file)
+    };
+    // One 64 KB window for the whole sniff, comment lines included.
+    let mut window = std::io::BufReader::new(input).take(64 * 1024);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let n = window
+            .read_until(b'\n', &mut line)
             .with_context(|| format!("{}: failed to read", path.display()))?;
+        if n == 0 || !comments.iter().any(|p| line.starts_with(p)) {
+            break;
+        }
     }
-    Ok(if first_line.contains(&b'\t') {
-        b'\t'
-    } else {
-        b','
-    })
+    Ok(if line.contains(&b'\t') { b'\t' } else { b',' })
 }
 
 #[derive(Deserialize)]
