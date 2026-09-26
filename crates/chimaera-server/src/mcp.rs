@@ -48,6 +48,8 @@ const SCREEN_LINES: usize = 120;
 const STATUS_SESSIONS_CAP: usize = 64;
 /// Trailing `files_touched` entries echoed per session digest.
 const STATUS_FILES_RECENT: usize = 3;
+/// Finished commands echoed per terminal in a `workspace_status` digest.
+const STATUS_COMMANDS: usize = 3;
 /// `read_session` lines/items: default and hard cap.
 const READ_SESSION_DEFAULT: usize = 60;
 const READ_SESSION_MAX: usize = 200;
@@ -289,10 +291,12 @@ fn mastermind_tool_defs() -> Vec<Value> {
     vec![
         json!({
             "name": "workspace_status",
-            "description": "The workspace at a glance: name/root, a git digest (branch, \
-                            ahead/behind, dirty count), and one compact digest per session \
-                            (id, name, kind, state, what it's doing, files touched). Start \
-                            here before answering questions about the workspace.",
+            "description": "The workspace right now: name/root, a git digest, one compact \
+                            digest per session (state, what it's doing, files touched, \
+                            background work, usage; terminals add their last commands and \
+                            exit codes), terminal↔agent links, Slurm jobs (cached), what the \
+                            environment prelude loads, what each open window shows, and the \
+                            active plugins. Start here.",
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false},
         }),
         json!({
@@ -637,14 +641,18 @@ async fn workspace_status(
         .unwrap_or(Value::Null);
     // Reuse the roster builder so the digest can never drift from the wire
     // (same display names, same state machine), then strip to a digest.
-    let sessions: Vec<Value> = crate::session_view::sessions_json(state)
+    let rows: Vec<Value> = crate::session_view::sessions_json(state)
         .into_iter()
         .filter(|row| row["workspace_id"] == json!(workspace.id) && row["id"] != json!(agent_id))
         .take(STATUS_SESSIONS_CAP)
+        .collect();
+    let now = crate::timeline::now_ms();
+    let sessions: Vec<Value> = rows
+        .iter()
         .map(|row| {
             let files = row["files_touched"].as_array().cloned().unwrap_or_default();
             let recent: Vec<&Value> = files.iter().rev().take(STATUS_FILES_RECENT).collect();
-            json!({
+            let mut digest = json!({
                 "id": row["id"],
                 "name": row["display_name"],
                 "kind": row["kind"],
@@ -656,17 +664,140 @@ async fn workspace_status(
                 "stalled": row["stalled"],
                 "files_touched": {"count": files.len(), "recent": recent},
                 "created_at": row["created_at"],
-            })
+            });
+            if !row["background_running"].is_null() {
+                digest["background_running"] = row["background_running"].clone();
+            }
+            if !row["usage"].is_null() {
+                digest["usage"] = row["usage"].clone();
+            }
+            // Terminals: the last few finished commands (metadata only —
+            // redacted heads, never output).
+            if row["kind"] == "shell" {
+                if let Some(marks) = row["id"].as_str().and_then(|id| state.sessions.marks(id)) {
+                    let after = marks
+                        .last_finished_seq()
+                        .saturating_sub(STATUS_COMMANDS as u64);
+                    let recent: Vec<Value> = marks
+                        .finished_since(after, STATUS_COMMANDS)
+                        .iter()
+                        .rev()
+                        .map(|c| {
+                            json!({
+                                "command": crate::timeline::cap(
+                                    &crate::episodes::redact_command(
+                                        c.command.as_deref().unwrap_or("")
+                                    ),
+                                    120
+                                ),
+                                "exit": c.exit_code,
+                                "ago": crate::notes::age(now.saturating_sub(c.ended_at_ms)),
+                            })
+                        })
+                        .collect();
+                    digest["recent_commands"] = json!(recent);
+                }
+            }
+            digest
         })
+        .collect();
+    let session_ids: std::collections::HashSet<String> = rows
+        .iter()
+        .filter_map(|r| r["id"].as_str().map(str::to_owned))
+        .collect();
+    let links: Vec<Value> = crate::links::links_json(state)
+        .into_iter()
+        .filter(|l| {
+            l["terminal_id"]
+                .as_str()
+                .is_some_and(|t| session_ids.contains(t))
+        })
+        .collect();
+    // Slurm: the CACHED snapshot only — never a cold squeue behind a status
+    // answer (a refresh in flight reads as "refreshing").
+    let compute = match state.compute.peek() {
+        Some((at, snap)) if snap.scheduler == "slurm" => json!({
+            "age_seconds": at.elapsed().as_secs(),
+            "jobs": snap.jobs.iter().take(20).map(|j| json!({
+                "id": j.id, "name": j.name, "state": j.state,
+                "time_left": j.time_left, "elapsed": j.elapsed,
+                "in_this_workspace": !j.workdir.is_empty()
+                    && std::path::Path::new(&j.workdir).starts_with(&workspace.root),
+            })).collect::<Vec<_>>(),
+            "this_daemon_allocation": snap.self_alloc,
+        }),
+        Some(_) => Value::Null,
+        None => json!("refreshing or not fetched yet"),
+    };
+    // The environment prelude: WHAT is loaded (module/conda/source lines),
+    // never exported values — preludes can carry secrets.
+    let environment = {
+        let state = state.clone();
+        let ws = workspace.id.clone();
+        tokio::task::spawn_blocking(move || {
+            let text = crate::lock(&state.env_preludes)
+                .current()
+                .effective(&ws, None);
+            prelude_summary(&text)
+        })
+        .await
+        .unwrap_or(Value::Null)
+    };
+    let surfaces: Vec<Value> = crate::lock(&state.view_state)
+        .surfaces_for(&workspace.id)
+        .into_iter()
+        .map(|(window, surfaces)| json!({"window": window, "surfaces": surfaces}))
+        .collect();
+    let plugins: Vec<&str> = crate::plugins::active(state, &workspace.id)
+        .await
+        .iter()
+        .map(|m| m.id.as_str())
         .collect();
     tool_text(
         json!({
             "workspace": {"name": workspace.name, "root": workspace.root},
             "git": git,
             "sessions": sessions,
+            "links": links,
+            "compute": compute,
+            "environment": environment,
+            "open_in_windows": surfaces,
+            "active_plugins": plugins,
+            "timeline_hint": "read_timeline has what happened; this is what is true now",
         })
         .to_string(),
     )
+}
+
+/// The lines of a prelude that say what gets LOADED (module / conda /
+/// mamba / spack / source), capped — never exports or other lines, which
+/// may carry values the Mastermind has no business reading.
+fn prelude_summary(text: &str) -> Value {
+    const LOADERS: [&str; 7] = [
+        "module ",
+        "ml ",
+        "conda activate",
+        "mamba activate",
+        "micromamba activate",
+        "spack load",
+        "source ",
+    ];
+    let mut loads = Vec::new();
+    let mut other = 0usize;
+    for line in text.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if LOADERS.iter().any(|p| line.starts_with(p)) && loads.len() < 12 {
+            loads.push(head(line, 160));
+        } else {
+            other += 1;
+        }
+    }
+    if loads.is_empty() && other == 0 {
+        return Value::Null;
+    }
+    json!({"loads": loads, "other_lines_not_shown": other})
 }
 
 /// read_session — a bounded look at any session in the workspace: PTY
