@@ -5,10 +5,10 @@
  */
 import type { PluginChange, WorkspacePlugin } from "./store";
 
-/** A one-line outcome; `title` carries what the line shortens. */
+/** A one-line outcome. No checksums in it: the daemon verifies every
+ *  download, and only a failure is news (the refusal, or the card's fault). */
 export interface Outcome {
   text: string;
-  title?: string;
 }
 
 /** The version an Install button installs: the one chimaera pins. */
@@ -18,28 +18,18 @@ export function pinnedVersion(p: WorkspacePlugin): string {
 
 /** The Install button's tooltip for a first-party plugin not installed yet. */
 export function installTitle(p: WorkspacePlugin): string {
-  const v = pinnedVersion(p);
-  const from = p.repo !== null ? `github.com/${p.repo}/releases/v${v}` : `its v${v} release`;
-  return `downloads plugin.wasm and plugin.toml from ${from} into ~/.chimaera/plugins on this host, verifies both checksums, runs sandboxed inside chimaera, and does nothing until switched on`;
+  const from = p.repo !== null ? `github.com/${p.repo}` : "its release";
+  return `Downloads it from ${from} into this host's ~/.chimaera/plugins. It does nothing until you switch it on in a workspace.`;
 }
 
-function verifiedSha(c: PluginChange): Outcome {
-  const sha = c.sha256?.["plugin.wasm"];
-  return sha
-    ? { text: ` · plugin.wasm sha256 ${sha.slice(0, 16)}… verified`, title: `plugin.wasm sha256 ${sha}` }
-    : { text: "" };
-}
-
-/** "installed Agent notes 0.1.0 · plugin.wasm sha256 1a2b…… verified". */
+/** "installed Agent notes 0.1.1". */
 export function installedOutcome(c: PluginChange, fallbackName: string): Outcome {
   const raw = (c.plugin as { name?: unknown } | null | undefined)?.name;
   const name = typeof raw === "string" && raw !== "" ? raw : fallbackName;
-  const sha = verifiedSha(c);
-  return { text: `installed ${name}${c.version ? ` ${c.version}` : ""}${sha.text}`, title: sha.title };
+  return { text: `installed ${name}${c.version ? ` ${c.version}` : ""}` };
 }
 
-/** "updated to 0.1.1 · plugin.wasm sha256 …… verified". */
+/** "updated to 0.1.1". */
 export function updatedOutcome(c: PluginChange): Outcome {
-  const sha = verifiedSha(c);
-  return { text: `updated to ${c.version ?? ""}${sha.text}`, title: sha.title };
+  return { text: `updated to ${c.version ?? ""}` };
 }

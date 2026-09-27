@@ -38,30 +38,26 @@ function available(over: Partial<WorkspacePlugin> = {}): WorkspacePlugin {
 }
 
 describe("installCopy", () => {
-  it("the Install tooltip names the pinned release on GitHub", () => {
+  it("the Install tooltip names the repository and says it does nothing until switched on", () => {
     expect(pinnedVersion(available())).toBe("0.1.0");
     expect(installTitle(available())).toBe(
-      "downloads plugin.wasm and plugin.toml from github.com/martinappberg/chimaera-agent-notes/releases/v0.1.0 into ~/.chimaera/plugins on this host, verifies both checksums, runs sandboxed inside chimaera, and does nothing until switched on",
+      "Downloads it from github.com/martinappberg/chimaera-agent-notes into this host's ~/.chimaera/plugins. It does nothing until you switch it on in a workspace.",
     );
-    expect(installTitle(available({ repo: null }))).toContain("from its v0.1.0 release into");
+    expect(installTitle(available({ repo: null }))).toContain("from its release into");
   });
 
-  it("the install outcome shortens the verified sha256 and keeps it whole in the title", () => {
+  it("the install outcome names the plugin and its version, never a checksum", () => {
     const o = installedOutcome(
       { id: "agent-notes", version: "0.1.0", sha256: { "plugin.wasm": SHA }, plugin: { name: "Agent notes" } },
       "agent-notes",
     );
-    expect(o.text).toBe("installed Agent notes 0.1.0 · plugin.wasm sha256 0123456789abcdef… verified");
-    expect(o.title).toBe(`plugin.wasm sha256 ${SHA}`);
+    expect(o).toEqual({ text: "installed Agent notes 0.1.0" });
   });
 
-  it("falls back to the given name, and says nothing about a checksum it wasn't given", () => {
-    expect(installedOutcome({ id: "x", version: "1.0.0", plugin: null }, "x")).toEqual({
-      text: "installed x 1.0.0",
-      title: undefined,
+  it("falls back to the given name, and an update says only the version", () => {
+    expect(installedOutcome({ id: "x", version: "1.0.0", plugin: null }, "x")).toEqual({ text: "installed x 1.0.0" });
+    expect(updatedOutcome({ id: "x", version: "1.1.0", sha256: { "plugin.wasm": SHA } })).toEqual({
+      text: "updated to 1.1.0",
     });
-    expect(updatedOutcome({ id: "x", version: "1.1.0", sha256: { "plugin.wasm": SHA } }).text).toBe(
-      "updated to 1.1.0 · plugin.wasm sha256 0123456789abcdef… verified",
-    );
   });
 });

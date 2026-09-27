@@ -532,8 +532,10 @@ visible, checksum-verified download.
   `repo` and `pinned_version`, `source: "available"`, `installed: false`,
   `first_party: true`, `verified: false`, `api: null` and empty
   contributions. The workspace route adds `on` / `detected` / `active`,
-  `requires` and `recommends`. The card shows `name · version` with the tags
-  `chimaera` and `verified` or `unverified · local`, **Install <pinned>** for
+  `requires` and `recommends`. The card shows the name, a check badge for
+  `first_party` ("Verified by the Chimaera maintainers"), the version and a
+  "local build" note for `local_path` — `verified` stays off the card, its
+  failure shows as the `fault` line — **Install <pinned>** for
   an available plugin, an **Update** chip when one is available, and **Use
   previous** / **Check now** / **Remove** for installed copies. The full
   field list: [features/plugins.md](features/plugins.md#versions-installs--updates).

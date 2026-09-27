@@ -46,17 +46,20 @@ sheet, hosted once in `web-ui/src/App.svelte`. Wire (all under `/api/v1`, bearer
   daemon carries neither: each is listed as *available* until the user installs it on this
   host ([below](#versions-installs--updates)).
 - **How it's used.** Open Extensions from the rail's **Extensions** row or quick-open
-  ("Extensions"; "plugins" and "skills" find it too). The **Plugins** segment ("Plugins add
-  tools for your agents and views for you. Install one, then switch it on per workspace.")
-  shows a card per plugin — name · version · tags ([below](#versions-installs--updates)) ·
+  ("Extensions"; "plugins" and "skills" find it too). Its header stays put across segments —
+  "Extensions" and a chip naming the host ("Plugins are installed per host") on the left, the
+  segments in the far corner (under the title when the tab is narrow) — and each segment
+  scrolls on its own below it, keeping its place when you switch away and back. The **Plugins**
+  segment opens with "Plugins add tools for your agents and views for you. Install one, then
+  switch it on per workspace." and shows, under **Chimaera plugins**, a card per plugin — name
+  · check badge · version ([below](#versions-installs--updates)) ·
   summary · a switch meaning *on in this workspace*, beside its state ("active here", "on ·
   nothing detected yet", "off"; an available plugin shows **Install <version>** instead) ·
   plain sentences: "For agents: …" and "For you: …" (what it adds, from its `[adds]`), the
   detection sentence ("<path> found"; Mycelium's counts what it found), and its agent-side
   plugins — "Requires the <agent> plugin <id>" for a `requires` block, "For <agent>: …" for a
-  `recommends` block (below), with Install and "Review & trust →" where they apply — then what
-  each agent CLI reports (below). A host chip names the host ("Plugins are installed per
-  host"). Mycelium's **attach sheet** ("Use mycelium for Knowledge", also reached from
+  `recommends` block (below), with Install and "Review & trust →" where they apply — then,
+  under **Agent plugins**, what each agent CLI reports (below). Mycelium's **attach sheet** ("Use mycelium for Knowledge", also reached from
   Knowledge's card, the dashboard's "Where things stand", and the Mastermind panel's quiet
   line) runs three live-checked steps: 1 install for your agents (a visible terminal running
   `<agent> plugin marketplace add arjunrajlaboratory/mycelium`, then `claude plugin install
@@ -197,27 +200,30 @@ sheet, hosted once in `web-ui/src/App.svelte`. Wire (all under `/api/v1`, bearer
   installed per host into `~/.chimaera/plugins`: a first-party one from its own repository at
   the version the lock pins, a third-party one from its latest release (or a tag), a local build
   from a directory. Each copy carries its own version and the WIT version it targets, and the
-  card says which version runs, whether it is Chimaera's and whether its bytes are the ones
-  released. An installed copy updates from its repository on its own cadence, goes back to its
-  previous version and is removed — always the user's click; a download is always
-  checksum-verified.
-- **How it's used.** The card's first line: name · version · tags — `chimaera` (first-party;
-  tooltip "Maintained with Chimaera and pinned in its plugins.lock"), `verified` (tooltip "This
-  copy matches its release's SHA256SUMS · plugin.wasm <sha256>") or `unverified · local` — and
-  an **Update to x.y.z** chip when a check found a newer release. A first-party plugin with nothing
-  installed shows **Install 0.1.0** (the pinned version) where the switch would be; its tooltip
-  says what happens: it downloads `plugin.wasm` and `plugin.toml` from
-  `github.com/<repo>/releases/v0.1.0` into `~/.chimaera/plugins` on this host, verifies both
-  checksums, runs sandboxed inside chimaera, and does nothing until switched on. Then the card's
+  card says which version runs and whether the Chimaera maintainers approved the plugin (it is
+  in the curated lock). An installed copy updates from its repository on its own cadence, goes
+  back to its previous version and is removed — always the user's click. The safety mechanism
+  is the daemon's, not the card's: every download is checked against its release's
+  `SHA256SUMS` (and a first-party one against the lock too), and every installed copy again
+  each time the catalog loads it; a copy that fails is never loaded, and only that failure
+  reaches the card, as its fault line.
+- **How it's used.** The card's first line: name · a small check badge when the plugin is in
+  Chimaera's curated list (tooltip "Verified by the Chimaera maintainers"; a plugin from any
+  other repository has none) · version · a quiet "local build" note for a copy installed from a
+  directory — and an **Update to x.y.z** chip when a check found a newer release. A first-party
+  plugin with nothing installed shows **Install 0.1.0** (the pinned version) where the switch
+  would be; its tooltip says what happens: "Downloads it from github.com/<repo> into this
+  host's ~/.chimaera/plugins. It does nothing until you switch it on in a workspace." Then the card's
   sentences ("For agents: …" / "For you: …", the detection sentence, the requires / recommends
   lines — [above](#workbench-plugins)). An installed copy adds the Installed line — "installed
   0.1.1 · 0.1.0 available to go back to" — with **Use previous** · **Check now** · **Remove**
-  (a dialog naming the versions it deletes); each change reports one outcome line (an install
-  or update shows the verified `plugin.wasm` sha256). Under the cards, **Install from a
-  repository** takes `owner/repo` (or its `https://github.com/owner/repo` URL) and **Install**
-  fetches its latest release (a first-party plugin's repository: the pinned version), reporting
-  the plugin, its version and the verified `plugin.wasm` sha256 — or the daemon's refusal — in
-  one outcome line; like any plugin, it runs only where it is switched on. A plugin this daemon
+  (a dialog naming the versions it deletes); each change reports one outcome line, never a
+  checksum ("installed Agent notes 0.1.1", "updated to 0.1.1", "removed"). Under the cards,
+  **Install from a repository** ("Installs the latest release of a plugin repository on this
+  host. It does nothing until you switch it on in a workspace.") takes `owner/repo` (or its
+  `https://github.com/owner/repo` URL) and **Install** fetches its latest release (a first-party
+  plugin's repository: the pinned version), reporting the plugin and its version — or the
+  daemon's refusal — in one outcome line; like any plugin, it runs only where it is switched on. A plugin this daemon
   can't run shows why ("needs chimaera ≥ x (this is y)", "needs a newer chimaera: …", "needs a
   newer plugin: …", "its files do not match its release's SHA256SUMS") and stays off. On the
   daemon's host: `chimaera plugin list` · `add <id>` · `add <owner/repo> [--version x]` ·
@@ -261,11 +267,13 @@ sheet, hosted once in `web-ui/src/App.svelte`. Wire (all under `/api/v1`, bearer
     `<data dir>/plugins/<id>/<version>/`. Only an installed copy loads, can be switched on,
     offers tools or is active. There is no embedded copy, so no precedence between two copies of
     one id.
-  - **`first_party`** (the `chimaera` tag): the id is in the lock AND the installed copy's
-    `[release] github` is the lock's `repo` exactly. An updated first-party copy keeps it; a
-    third-party plugin never gets it, even one that reuses a first-party id from another
-    repository.
-  - **`verified`**, checked every time the catalog loads a copy (off the reactor): both files are
+  - **`first_party`** (the card's check badge, "Verified by the Chimaera maintainers"): the id
+    is in the lock — the maintainers' curated list — AND the installed copy's
+    `[release] github` is the lock's `repo` exactly (an available entry is first-party by
+    definition). An updated first-party copy keeps it; a third-party plugin never gets it, even
+    one that reuses a first-party id from another repository.
+  - **`verified`** — the integrity check, never shown on the card (only a failure is, as the
+    fault line) — checked every time the catalog loads a copy (off the reactor): both files are
     re-hashed against the `SHA256SUMS` kept beside them. A match → `verified`; no `SHA256SUMS`
     (a local build without one, or a copy installed before chimaera kept the file) → unverified,
     no error; a mismatch, or a `SHA256SUMS` that doesn't list both files → listed with the fault
@@ -293,8 +301,8 @@ sheet, hosted once in `web-ui/src/App.svelte`. Wire (all under `/api/v1`, bearer
       usual. Re-installing the same version from a path replaces it — the development loop:
       rebuild, `chimaera plugin add --path <dir>`, and the next `tools/list` is the new build.
       It is also how a host with no network installs. `verified` only with a matching
-      `SHA256SUMS` (and, at a first-party id's pinned version, the lock's sha256s too);
-      otherwise the card says `unverified · local`.
+      `SHA256SUMS` (and, at a first-party id's pinned version, the lock's sha256s too); either
+      way the card notes "local build" (`local_path` is set).
   - **Layout:** `~/.chimaera/plugins/<id>/<version>/{plugin.toml,plugin.wasm,SHA256SUMS[,local-path]}`
     (the daemon's data dir) behind `current` and `previous` links swapped atomically (a symlink
     under a fresh name, renamed over the old). At most two versions stay on disk; **Use
@@ -320,8 +328,8 @@ sheet, hosted once in `web-ui/src/App.svelte`. Wire (all under `/api/v1`, bearer
     `CHIMAERA_PLUGIN_RELEASES_API` is set) and on **Check now**, reads only the release's
     `plugin.toml`, and offers a version only when it is strictly newer than the one that runs
     and passes the gates. Offers live in memory. **Update** installs it through the release path
-    (its `SHA256SUMS` kept). A first-party plugin updated past the pin stays `chimaera` and
-    `verified`; the card names the pin ("chimaera pins 0.1.0") only in a tooltip. What the lock
+    (its `SHA256SUMS` kept). A first-party plugin updated past the pin keeps its check badge
+    (and stays `verified`); the card names the pin ("chimaera pins 0.1.0") only in a tooltip. What the lock
     pins changes only with a chimaera release: a bump is a reviewed change to the lock.
   - **Knobs** (tests and live proofs): `CHIMAERA_PLUGIN_RELEASES_API` replaces the GitHub API
     base the checker and third-party installs ask; `CHIMAERA_PLUGIN_DOWNLOADS` replaces

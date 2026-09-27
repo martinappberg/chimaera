@@ -1,8 +1,8 @@
 <script lang="ts">
   /**
    * The Plugins segment of the Extensions tab: first the chimaera plugins as
-   * cards — glyph tile · name · version · quiet tags (`chimaera` for a
-   * first-party plugin, `verified` / `unverified · local`) · an **Update to
+   * cards — glyph tile · name · the check badge for a plugin in Chimaera's
+   * curated list · version · a quiet "local build" note · an **Update to
    * x.y.z** chip when a check found a newer release · summary · then the
    * state: an **Install x.y.z** button for a first-party plugin not
    * installed on this host, else the on/off switch for THIS workspace.
@@ -13,7 +13,8 @@
    * the fault when it can't run, one outcome line per change. A quiet row
    * installs a plugin from a repository. Then the agent plugins, as each
    * agent CLI reports them. Agent state is read from the agents, never
-   * guessed; versions, sources and verification from the daemon.
+   * guessed; versions, sources and verification from the daemon. The
+   * checksum check stays silent: only its failure shows, as the fault line.
    */
   import ConfirmDialog from "../shared/ConfirmDialog.svelte";
   import Switch from "../shared/Switch.svelte";
@@ -101,8 +102,7 @@
 
   type Change = "install" | "update" | "rollback" | "remove" | "check";
 
-  /** One-line outcomes of the last change per plugin (the verified
-   *  checksum after an install or update, whole in the title). */
+  /** One-line outcome of the last change per plugin. */
   let notes = $state(new Map<string, Outcome>());
   /** The plugin whose Remove waits for the confirm dialog. */
   let removing = $state<WorkspacePlugin | null>(null);
@@ -126,7 +126,7 @@
     const c = res as PluginChange;
     if (kind === "install") return installedOutcome(c, p.name);
     if (kind === "rollback") return { text: `back to ${c.version} — Use previous returns to ${c.previous}` };
-    if (kind === "remove") return c.plugin ? { text: "removed — Install brings it back" } : null;
+    if (kind === "remove") return c.plugin ? { text: "removed" } : null;
     return updatedOutcome(c);
   }
 
@@ -197,11 +197,6 @@
       : undefined;
   }
 
-  function verifiedTitle(p: WorkspacePlugin): string {
-    const base = "This copy matches its release's SHA256SUMS";
-    return p.sha256_wasm !== null ? `${base} · plugin.wasm ${p.sha256_wasm}` : base;
-  }
-
   const k = $derived($knowledge);
 
   /** What the plugin found in this workspace, when it found something. */
@@ -246,10 +241,7 @@
 </script>
 
 <section class="wb" aria-labelledby="wb-title">
-  <div class="shead">
-    <h2 id="wb-title" class="lbl">Chimaera plugins</h2>
-    <span class="hint">sandboxed, inside chimaera</span>
-  </div>
+  <h2 id="wb-title" class="lbl">Chimaera plugins</h2>
 
   {#if plugins.length === 0}
     <p class="empty">No plugins on this host yet — install one from a repository below.</p>
@@ -267,20 +259,24 @@
         <div class="ident">
           <div class="nameline">
             <span class="name">{p.name}</span>
-            {#if p.version !== ""}<span class="ver mono" title={pinTitle(p)}>{p.version}</span>{/if}
+            <!-- `first_party`: in Chimaera's curated list (the lock), available or
+                 installed. The checksum check (`verified`) never shows here. -->
             {#if p.first_party}
-              <span class="pill neutral small" title="Maintained with Chimaera and pinned in its plugins.lock">chimaera</span>
+              <span class="badge" role="img" aria-label="Verified by the Chimaera maintainers" title="Verified by the Chimaera maintainers">
+                <svg viewBox="0 0 16 16" width="10" height="10" aria-hidden="true">
+                  <path d="M3.5 8.5l3 3 6-6.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+                </svg>
+              </span>
             {/if}
-            {#if p.verified}
-              <span class="pill neutral small" title={verifiedTitle(p)}>verified</span>
-            {:else if p.local_path !== null}
-              <span class="pill neutral small" title="installed from {p.local_path}">unverified · local</span>
+            {#if p.version !== ""}<span class="ver mono" title={pinTitle(p)}>{p.version}</span>{/if}
+            {#if p.local_path !== null}
+              <span class="note" title="installed from {p.local_path}">local build</span>
             {/if}
             {#if p.installed && p.update !== null}
               <button
                 class="pill good small chip"
                 disabled={changing}
-                title="download {p.update.version} from its release, verify its checksum, and switch to it"
+                title="Downloads {p.update.version} from its release and switches to it."
                 onclick={() => void change(p, "update")}
               >
                 {changing ? "updating…" : `Update to ${p.update.version}`}
@@ -388,7 +384,7 @@
             <p class="err">{p.fault}</p>
           {/if}
           {#if note !== undefined}
-            <p class="muted" title={note.title}>{note.text}</p>
+            <p class="muted">{note.text}</p>
           {/if}
           {#if errors.has(p.id)}
             <p class="err">{errors.get(p.id)}</p>
@@ -417,22 +413,16 @@
         readonly={adding}
         bind:value={repo}
       />
-      <button
-        type="submit"
-        class="opt"
-        disabled={repo.trim() === "" || adding}
-        title="download the latest release, verify its checksums, and install it on this host"
-      >
+      <button type="submit" class="opt" disabled={repo.trim() === "" || adding}>
         {adding ? "installing…" : "Install"}
       </button>
     </div>
     <p class="hint">
-      Downloads the latest release (<span class="mono">plugin.wasm</span>, <span class="mono">plugin.toml</span>,
-      verified against its <span class="mono">SHA256SUMS</span>) into <span class="mono">~/.chimaera/plugins</span> on
-      this host. It runs sandboxed inside chimaera and does nothing until you switch it on in a workspace.
+      Installs the latest release of a plugin repository on this host. It does nothing until you switch it on in a
+      workspace.
     </p>
     {#if added !== null}
-      <p class={added.error ? "err" : "muted"} title={added.title}>{added.text}</p>
+      <p class={added.error ? "err" : "muted"}>{added.text}</p>
     {/if}
   </form>
 </section>
@@ -452,10 +442,7 @@
 {/if}
 
 <section class="ag" aria-labelledby="ag-title">
-  <div class="shead">
-    <h2 id="ag-title" class="lbl">Agent plugins</h2>
-    <span class="hint">inside each agent, managed with its own plugin manager</span>
-  </div>
+  <h2 id="ag-title" class="lbl">Agent plugins</h2>
   {#if agentState === "unavailable"}
     <p class="empty">This daemon can't ask the agents about their plugins yet — update chimaera.</p>
   {:else if agentState === "error" && agentPlugins === null}
@@ -523,11 +510,6 @@
   .ag {
     display: flex;
     flex-direction: column;
-    gap: 12px;
-  }
-  .shead {
-    display: flex;
-    align-items: baseline;
     gap: 12px;
   }
   .lbl {
@@ -618,6 +600,24 @@
     font-weight: 600;
   }
   .ver {
+    font-size: 11.5px;
+    color: var(--muted);
+  }
+  /* The maintainers' check: AttachSheet's done-step recipe (accent wash,
+     accent check), small, beside the name. */
+  .badge {
+    flex: none;
+    align-self: center;
+    width: 15px;
+    height: 15px;
+    border-radius: 50%;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background: color-mix(in srgb, var(--accent) 14%, transparent);
+    color: var(--accent);
+  }
+  .note {
     font-size: 11.5px;
     color: var(--muted);
   }

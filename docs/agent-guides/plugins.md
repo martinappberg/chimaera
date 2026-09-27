@@ -327,8 +327,7 @@ notes the directory in `local-path`, and gates the manifest like any other.
 Installing the same version again replaces it in place, so the loop is:
 rebuild, copy, `chimaera plugin add --path <dir>`, and a running session's
 next `tools/list` is the new build. Switch the plugin on in a workspace to see
-it; the card tags the copy `unverified · local` unless a matching
-`SHA256SUMS` came with it. A debug daemon has no plugins until one is
+it; the card notes the copy as a "local build". A debug daemon has no plugins until one is
 installed (from the Extensions tab, `chimaera plugin add <id>`, or `--path`),
 and its first call into a plugin is slow (debug Cranelift compiling the
 component: seconds for Mycelium, against about 200 ms in release).
@@ -364,22 +363,22 @@ The integration runs in the daemon's tests:
 
 ## What the card says about a plugin
 
-The card's tags are the daemon's, never the plugin's own claim:
+What the card shows is the daemon's, never the plugin's own claim:
 
-- **`chimaera`** (`first_party` on the wire): the plugin's id is in
-  `plugins/plugins.lock` and the installed copy's `[release] github` is the
-  lock's `repo` exactly — Chimaera maintains it and pins a release of it. An
-  update from that repository keeps the tag; a plugin from any other
-  repository never gets it, even one that reuses a first-party id.
-- **`verified`**: the installed bytes match the release's `SHA256SUMS`, which
-  chimaera keeps beside the installed copy and re-checks every time it loads
-  the catalog; at a first-party plugin's pinned version they must also match
-  the lock's two sha256s. Files that don't match their `SHA256SUMS` are a
-  fault: the copy is listed, never loaded.
-- **`unverified · local`**: no `SHA256SUMS` to check against — a local build
-  installed with `--path` without one (or at a first-party id's pinned
-  version, bytes that aren't the pinned release's), or a copy installed
-  before chimaera kept the file.
+- **The check badge** ("Verified by the Chimaera maintainers"; `first_party`
+  on the wire): the plugin's id is in `plugins/plugins.lock` — the curated
+  list the maintainers review — and the installed copy's `[release] github`
+  is the lock's `repo` exactly. An update from that repository keeps the
+  badge; a plugin from any other repository never gets it, even one that
+  reuses a first-party id.
+- **"local build"**: the copy was installed from a directory (`--path`;
+  `local_path` on the wire).
+- **Nothing about checksums.** The safety mechanism is the daemon's: it
+  checks every download against the release's `SHA256SUMS` (and a
+  first-party one against the lock's two sha256s), keeps that file beside the
+  installed copy and re-checks the copy every time it loads the catalog
+  (`verified` on the wire). Only a failure reaches the card, as its fault
+  line: the copy is listed, never loaded.
 
 ## Shipping it
 
@@ -406,7 +405,7 @@ A first-party bump:
 2. Daemons that have it installed offer it: the checker asks every
    installed plugin whose manifest names `[release]`, and **Update** (or
    `chimaera plugin update <id>`) installs it. A first-party copy updated past
-   the pin keeps its `chimaera` and `verified` tags.
+   the pin keeps its check badge.
 3. In the chimaera repository, set the entry's `version`, `sha256_wasm` and
    `sha256_toml` in `plugins/plugins.lock` from that release's `SHA256SUMS`
    (and `name` / `summary` if they changed), run
@@ -443,9 +442,9 @@ host:
   `SHA256SUMS` and `plugin.toml`, checks the id, the tag's version and the
   gates, streams `plugin.wasm` (16 MiB cap), verifies both checksums, and
   only then makes it current under `~/.chimaera/plugins/<id>/<version>/`,
-  with the release's `SHA256SUMS` beside the two files (the card's
-  `verified`). It then runs under the same host and limits as a first-party
-  plugin, off until switched on. It is never tagged `chimaera`.
+  with the release's `SHA256SUMS` beside the two files (re-checked each time
+  the catalog loads it). It then runs under the same host and limits as a
+  first-party plugin, off until switched on. It never gets the check badge.
 
 ## Versions and updates, from the author's side
 

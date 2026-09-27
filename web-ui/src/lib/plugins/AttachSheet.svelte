@@ -303,8 +303,8 @@
               <div class="stitle">Install {plugin.name}</div>
               {#if notInstalled}
                 <div class="smuted">
-                  Downloads {plugin.name} {pinnedVersion(plugin)} from its release into
-                  <span class="mono">~/.chimaera/plugins</span> on this host and verifies it. It runs sandboxed inside chimaera.
+                  Downloads {plugin.name} {pinnedVersion(plugin)} from its release into this host's
+                  <span class="mono">~/.chimaera/plugins</span>.
                 </div>
                 <div class="pills">
                   <button class="opt" disabled={busy !== null} title={installTitle(plugin)} onclick={() => void installThis()}>
@@ -312,7 +312,7 @@
                   </button>
                 </div>
               {/if}
-              {#if installNote !== null}<div class="smuted" title={installNote.title}>{installNote.text}</div>{/if}
+              {#if installNote !== null}<div class="smuted">{installNote.text}</div>{/if}
               {#if installError !== null}<div class="err">{installError}</div>{/if}
             </div>
           </li>
