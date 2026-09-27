@@ -32,12 +32,18 @@ PTY snapshot-on-attach ([terminals.md](terminals.md)) and the chat seq-journal g
   continuously-reconciled `sessions.json` records each session's *semantic* identity (workspace, cwd,
   agent kind, **surface** (term/chat), native conversation/thread id + transcript path, chat model,
   pinned name, dims, theme, linked-terminal edges). On boot the daemon **resurrects**: shells respawn at
-  their last cwd, claude TUI agents respawn with `--resume`, **chat sessions respawn as chat** — both
+  their last cwd, claude TUI agents respawn with `--resume`, Codex TUIs with a verified rollout
+  respawn with `codex resume <thread-id>`, **chat sessions respawn as chat** — both
   agents, via `chat::resurrect_chat`, resuming the native conversation (claude `--resume`, codex
   `thread/resume`) and replaying the on-disk journal. Sessions Chimaera cannot resurrect live retire
   into Recents; a row resumes when its native handle was captured, otherwise its tooltip honestly
   says that this specific row must start fresh. A finished Codex chat carries its `ChatInfo` thread id
   into Recents before the chat registry entry is removed.
+- **Codex terminal identity.** After the first completed turn, a generated `notify` wrapper captures
+  the native thread id and chains the user's configured notify command with the original payload.
+  The daemon checks the rollout header's id and cwd before recording it and again on restart.
+  A missing rollout retires the row into Recents without promising resumption. The hook has only a
+  completion event, so terminal Codex attention remains unknown. Config and rollouts honor `CODEX_HOME`.
 - **How it's used.** No route — this is boot/shutdown lifecycle, gated by `daemon.restoreSessions`
   (default true). A graceful stop also writes a **handoff** (port + token) so a successor daemon rebinds
   the same port with the same token — ssh forwards stay valid and every client heals with a plain

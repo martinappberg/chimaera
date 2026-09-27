@@ -872,9 +872,19 @@ pub(crate) fn build_codex_chat_command(
 /// The prompt is a compile-time constant without quotes, backslashes, or
 /// control characters today; this keeps a future edit (say, a multi-line
 /// rewrite with real newlines) from silently breaking the config parse —
+/// An argv-only config override; the per-session secret stays inside the shim.
+pub(crate) fn codex_notify_args(path: &Path) -> Vec<String> {
+    vec![
+        "-c".into(),
+        format!(
+            "notify=[\"/bin/sh\",\"{}\"]",
+            toml_basic_string(&path.to_string_lossy())
+        ),
+    ]
+}
+
 /// TOML basic strings forbid raw control characters, and codex's raw-string
-/// fallback would otherwise bake the literal surrounding quotes into the
-/// value.
+/// fallback would otherwise bake the literal surrounding quotes into the value.
 fn toml_basic_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {

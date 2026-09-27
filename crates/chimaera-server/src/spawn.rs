@@ -18,8 +18,7 @@ use crate::AppState;
 pub(crate) enum SpawnKind {
     /// The user's interactive shell, with shell integration when available.
     Shell,
-    /// An agent TUI. `resume` is a claude conversation id (`--resume <id>`);
-    /// callers guarantee it is only set for [`AgentKind::Claude`].
+    /// An agent TUI. `resume` is a Claude conversation id or Codex thread id.
     Agent {
         kind: AgentKind,
         model: Option<String>,
@@ -132,8 +131,8 @@ pub(crate) async fn spawn_session(
                 Err(msg) => return Err(SpawnFailure::AgentUnavailable(msg)),
             };
             let key = crate::agents::fresh_agent_key();
-            // Hook injection is claude-only: other agents have no hook system
-            // to wire, so their sessions stay honestly "unknown". The scheme
+            // Claude's hooks drive attention state. Codex's notify below
+            // captures identity only; its attention stays "unknown". The scheme
             // theme rides in the same settings file — unless the user's own
             // settings already set one (respect the explicit choice).
             let settings = if agent_kind == AgentKind::Claude {
@@ -221,6 +220,9 @@ pub(crate) async fn spawn_session(
                 argv.push("--mcp-config".to_string());
                 argv.push(mcp.to_string_lossy().into_owned());
             }
+            if agent_kind == AgentKind::Codex {
+                argv.extend(crate::codex_notify::args(state, &id, &key).await);
+            }
             if !codex_plugin_tools.is_empty() {
                 // Pre-approved: the prompt-free tools every session gets
                 // (`notify`) plus the active plugins' own.
@@ -252,6 +254,28 @@ pub(crate) async fn spawn_session(
             // keeps it); remember the ancestor so recents can hide (and later
             // supersede) the old conversation either way.
             record.resumed_from = resume.clone();
+            if agent_kind == AgentKind::Codex {
+                if let Some(thread) = resume.clone() {
+                    if let Some(home) = state
+                        .codex_config_path
+                        .parent()
+                        .map(std::path::Path::to_path_buf)
+                    {
+                        let cwd = opts.cwd.clone();
+                        let sought = thread.clone();
+                        let path = tokio::task::spawn_blocking(move || {
+                            crate::codex_notify::find_rollout(&home, &sought, &cwd)
+                        })
+                        .await
+                        .ok()
+                        .flatten();
+                        if let Some(path) = path {
+                            record.codex_thread_id = Some(thread);
+                            record.transcript_path = Some(path);
+                        }
+                    }
+                }
+            }
             // A carried-over title slots in as the provisional first-prompt
             // name: it loses to any real title the agent produces, exactly
             // like a first prompt would.

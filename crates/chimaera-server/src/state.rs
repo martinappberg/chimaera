@@ -292,7 +292,10 @@ impl AppState {
             fs_touched: tokio::sync::broadcast::channel(crate::fs_watch::TOUCHED_CAPACITY).0,
             installs: Mutex::new(HashMap::new()),
             claude_settings_path: home.join(".claude").join("settings.json"),
-            codex_config_path: home.join(".codex").join("config.toml"),
+            codex_config_path: std::env::var_os("CODEX_HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join(".codex"))
+                .join("config.toml"),
             timeline: timeline::TimelineService::new(data_dir.join("workspace")),
             plugin_detect: Mutex::new(plugins::DetectCache::default()),
             tui_episodes: Mutex::new(episodes::TuiEpisodes::default()),

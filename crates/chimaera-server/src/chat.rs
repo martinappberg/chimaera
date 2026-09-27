@@ -791,7 +791,7 @@ async fn degrade_to_pty(
     } else {
         None
     };
-    let argv = crate::launcher::build_agent_resume_command(
+    let mut argv = crate::launcher::build_agent_resume_command(
         recipe.kind,
         &bin,
         recipe.settings.as_deref(),
@@ -802,6 +802,14 @@ async fn degrade_to_pty(
         codex_theme,
         fork_context_file.as_deref(),
     );
+    if recipe.kind == AgentKind::Codex {
+        let key = crate::lock(&state.agents)
+            .get(id)
+            .map(|record| record.key.clone());
+        if let Some(key) = key {
+            argv.extend(crate::codex_notify::args(state, id, &key).await);
+        }
+    }
     // A degrade respawn is a real spawn too — same prelude as the chat
     // process it replaces (the recipe carries the launch scope).
     let prelude = crate::environment::materialize_prelude(

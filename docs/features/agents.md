@@ -192,6 +192,15 @@ spawn.rs,recents.rs}`. Wire: `POST/GET/DELETE/PATCH /api/v1/sessions*`, `GET /ap
   fresh and says so without claiming the agent lacks resume support; Claude handles additionally
   require a real transcript (Claude 2.1.x interactive sessions can persist none). Cap 20/workspace;
   live conversations are hidden at read time (they return when the session ends).
+- **Codex terminal capture.** `codex_notify.rs` injects an argv `notify` wrapper for normal terminal
+  launches and chat-to-terminal switches. It posts to the existing per-session-key hook route and
+  then runs the user's notify argv unchanged. Verified against Codex 0.157.1: the payload has
+  `type:"agent-turn-complete"`, `thread-id`, `turn-id`, `cwd`, `input-messages`, and
+  `last-assistant-message`; the rollout starts with a `session_meta` record carrying `payload.id`
+  and `payload.cwd`. Only matching on-disk rollouts mint terminal resume handles. Reads are capped
+  (64 KiB header; 32,768 directory entries / two-second discovery budget), and the hook key stays
+  in a private header file rather than process arguments. If user notify config cannot be read
+  faithfully, its hook stays in place and capture is skipped with a daemon warning.
 
 ## Documents: the portable dialect, `check_document` and the issues chip
 

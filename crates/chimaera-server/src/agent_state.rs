@@ -155,6 +155,8 @@ pub(crate) struct AgentRecord {
     pub(crate) state: AgentState,
     /// Latest transcript path reported by any hook payload.
     pub(crate) transcript_path: Option<PathBuf>,
+    /// Codex notify's thread-id, captured only after its rollout is verified.
+    pub(crate) codex_thread_id: Option<String>,
     /// Latest `customTitle` transcript record (wins over `ai_title`).
     pub(crate) custom_title: Option<String>,
     /// Latest `{"type":"ai-title"}` transcript record.
@@ -255,6 +257,7 @@ impl AgentRecord {
             kind,
             state: AgentState::Unknown,
             transcript_path: None,
+            codex_thread_id: None,
             custom_title: None,
             ai_title: None,
             first_prompt: None,
@@ -359,6 +362,9 @@ impl AgentRecord {
     /// The session id `claude --resume` accepts: the transcript filename stem
     /// (hooks report the transcript as `<store>/<cwd-key>/<session-id>.jsonl`).
     pub(crate) fn resume_id(&self) -> Option<String> {
+        if self.kind == AgentKind::Codex {
+            return self.codex_thread_id.clone();
+        }
         self.transcript_path
             .as_ref()
             .and_then(|p| p.file_stem())

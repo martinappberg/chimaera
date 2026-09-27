@@ -56,7 +56,7 @@ pub(crate) struct LedgerEntry {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct LedgerAgent {
     pub(crate) kind: AgentKind,
-    /// Claude conversation id (`--resume <id>`), when known. A recorded id
+    /// Claude conversation id or Codex thread id, when known. A recorded id
     /// is a CLAIM, not a promise: claude 2.1.204 interactive sessions do
     /// not persist their transcripts (verified 2026-07-07 — print mode
     /// does; 2.1.19x did), and `--resume` against a conversation with no
@@ -453,14 +453,14 @@ pub(crate) async fn restore(state: &Arc<AppState>, boot: BootLedger) {
                     Ok(()) => respawned += 1,
                     Err(err) => {
                         tracing::warn!(session = %entry.id, %err, "resurrection failed");
-                        if retire_to_recents(state, entry, boot.written_at) {
+                        if retire_to_recents(state, entry, boot.written_at).await {
                             retired += 1;
                         }
                     }
                 }
             }
             RestorePlan::Retire => {
-                if retire_to_recents(state, entry, boot.written_at) {
+                if retire_to_recents(state, entry, boot.written_at).await {
                     retired += 1;
                 }
             }
@@ -503,10 +503,9 @@ enum RestorePlan {
 
 /// Pure restore policy, split out for tests: shells and claude respawn
 /// (claude resumes its conversation; a claude that never got a transcript
-/// has nothing to lose and boots fresh). The ledger does not capture a fresh
-/// Codex TUI's native thread id, so it cannot target `codex resume <id>`
-/// precisely; respawning fresh while pretending continuity would be a lie,
-/// so that entry retires into Recents instead.
+/// has nothing to lose and boots fresh). Codex TUIs respawn only with a captured
+/// thread id; the disk check in respawn refuses a missing rollout rather than
+/// silently replacing its conversation with a fresh one.
 ///
 /// A **chat** session respawns for BOTH agents: the chat drivers resume
 /// in-band (claude `--resume`, codex `thread/resume`) and the on-disk journal
@@ -525,7 +524,11 @@ fn plan_restore(entry: &LedgerEntry, restore_enabled: bool, workspace_exists: bo
             }
         }
         Some(agent) => {
-            if restore_enabled && workspace_exists && agent.kind == AgentKind::Claude {
+            if restore_enabled
+                && workspace_exists
+                && (agent.kind == AgentKind::Claude
+                    || (agent.kind == AgentKind::Codex && agent.resume.is_some()))
+            {
                 RestorePlan::Respawn
             } else {
                 RestorePlan::Retire
@@ -543,6 +546,13 @@ fn plan_restore(entry: &LedgerEntry, restore_enabled: bool, workspace_exists: bo
 fn resolve_resume(claude_projects_dir: &std::path::Path, entry: &LedgerEntry) -> Option<String> {
     let agent = entry.agent.as_ref()?;
     let id = agent.resume.as_deref()?;
+    if agent.kind == AgentKind::Codex {
+        return agent
+            .transcript
+            .as_deref()
+            .filter(|path| crate::codex_notify::verify_rollout(path, id, &entry.cwd))
+            .map(|_| id.to_string());
+    }
     let recorded = agent
         .transcript
         .as_deref()
@@ -582,7 +592,13 @@ async fn respawn(
     let kind = match &entry.agent {
         None => crate::spawn::SpawnKind::Shell,
         Some(agent) => {
-            let resume = resolve_resume(&state.claude_projects_dir, entry);
+            let projects = state.claude_projects_dir.clone();
+            let recorded = entry.clone();
+            let resume =
+                tokio::task::spawn_blocking(move || resolve_resume(&projects, &recorded)).await?;
+            if agent.kind == AgentKind::Codex && resume.is_none() {
+                anyhow::bail!("Codex rollout is missing; retiring without a resume promise");
+            }
             if resume.is_none() && agent.resume.is_some() {
                 tracing::info!(session = %entry.id,
                     "conversation transcript is gone; respawning fresh instead of --resume");
@@ -622,7 +638,7 @@ async fn respawn(
 /// Remember a non-resurrectable agent conversation in its workspace's
 /// Recents, honoring `retire()`'s rules (untitled claude boots carry
 /// nothing recognizable and are skipped). Returns whether a row landed.
-fn retire_to_recents(state: &Arc<AppState>, entry: &LedgerEntry, last_active: u64) -> bool {
+async fn retire_to_recents(state: &Arc<AppState>, entry: &LedgerEntry, last_active: u64) -> bool {
     let Some(agent) = &entry.agent else {
         return false; // shells have no conversation to remember
     };
@@ -634,6 +650,16 @@ fn retire_to_recents(state: &Arc<AppState>, entry: &LedgerEntry, last_active: u6
         return false;
     }
     let is_chat = agent.ui == SessionUi::Chat;
+    let resume = if is_chat && agent.kind == AgentKind::Codex {
+        agent.resume.clone()
+    } else {
+        let projects = state.claude_projects_dir.clone();
+        let recorded = entry.clone();
+        tokio::task::spawn_blocking(move || resolve_resume(&projects, &recorded))
+            .await
+            .ok()
+            .flatten()
+    };
     let recent = crate::recents::RecentEntry {
         kind: agent.kind,
         title,
@@ -642,11 +668,7 @@ fn retire_to_recents(state: &Arc<AppState>, entry: &LedgerEntry, last_active: u6
         // native id passes straight through; claude (chat or TUI) needs the
         // transcript on disk (`resolve_resume`), else the row honestly starts
         // fresh (existing UI rule).
-        resume: if is_chat && agent.kind == AgentKind::Codex {
-            agent.resume.clone()
-        } else {
-            resolve_resume(&state.claude_projects_dir, entry)
-        },
+        resume,
         supersedes: Vec::new(),
         last_active: if last_active > 0 {
             last_active
@@ -765,6 +787,10 @@ mod tests {
             plan_restore(&agent_entry(AgentKind::Codex, None), true, true),
             RestorePlan::Retire
         );
+        assert_eq!(
+            plan_restore(&agent_entry(AgentKind::Codex, Some("thread")), true, true),
+            RestorePlan::Respawn
+        );
         // Chat sessions respawn for BOTH agents (both chat drivers resume
         // in-band; the journal replays regardless) — unlike the TUI codex above.
         assert_eq!(
@@ -793,6 +819,34 @@ mod tests {
             plan_restore(&agent_entry(AgentKind::Claude, Some("abc")), true, false),
             RestorePlan::Retire
         );
+    }
+
+    #[test]
+    fn codex_resume_requires_the_correct_rollout_header() {
+        let id = "01a0e110-de29-75e2-9262-7a8c893b2a3c";
+        let dir = std::env::temp_dir().join(format!(
+            "chimaera-codex-ledger-{}",
+            chimaera_core::generate_token()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rollout.jsonl");
+        let mut entry = agent_entry(AgentKind::Codex, Some(id));
+        entry.cwd = PathBuf::from("/project");
+        entry.agent.as_mut().unwrap().transcript = Some(path.clone());
+        assert_eq!(resolve_resume(&dir, &entry), None);
+        std::fs::write(&path, "{}\n").unwrap();
+        assert_eq!(resolve_resume(&dir, &entry), None);
+        std::fs::write(
+            &path,
+            serde_json::json!({"type":"session_meta", "payload":{"id":id,"cwd":"/project"}})
+                .to_string()
+                + "\n",
+        )
+        .unwrap();
+        assert_eq!(resolve_resume(&dir, &entry), Some(id.into()));
+        entry.cwd = PathBuf::from("/other-project");
+        assert_eq!(resolve_resume(&dir, &entry), None);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

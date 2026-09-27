@@ -6,6 +6,7 @@ mod agents;
 mod api;
 mod assets;
 mod chat;
+mod codex_notify;
 mod compute;
 mod compute_jobs;
 mod doc_check;

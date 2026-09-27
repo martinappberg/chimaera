@@ -259,6 +259,7 @@ pub(crate) fn retire_with_resume(
     // but tidy is tidy).
     crate::environment::remove_prelude_file(session_id);
     crate::agents::remove_fork_context(session_id);
+    crate::codex_notify::remove_shim(session_id);
 
     // A dead Mastermind must not stay bound (the dock would show a ghost),
     // and it never lands in Recents: it is the observer, not a roster
@@ -292,8 +293,15 @@ pub(crate) fn retire_with_resume(
         let workspace_root = crate::lock(&state.workspaces)
             .get(&workspace_id)
             .map(|w| w.root);
-        let resume = if record.kind == AgentKind::Codex {
+        let resume = if record.kind == AgentKind::Codex && ui == SessionUi::Chat {
             resume_hint.or_else(|| record.resumed_from.clone())
+        } else if record.kind == AgentKind::Codex {
+            record.resume_id().filter(|_| {
+                record
+                    .transcript_path
+                    .as_ref()
+                    .is_some_and(|path| path.is_file())
+            })
         } else {
             [resume_hint, record.resume_id(), record.resumed_from.clone()]
                 .into_iter()
