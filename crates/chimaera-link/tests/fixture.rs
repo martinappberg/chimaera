@@ -271,3 +271,242 @@ async fn unassigned_keeper_does_not_block_account_and_devices() {
     assert!(error.contains("no keeper is assigned"));
     task.abort();
 }
+
+#[tokio::test]
+async fn baton_cas_offline_fork_and_mirror_fencing() {
+    let fixture = Fixture::start().await;
+    let first = fixture.client();
+    let second = Client::new(
+        &fixture.keeper.endpoint,
+        Some(fixture.keeper.add_device("other-device").await.unwrap()),
+    )
+    .unwrap();
+    let id = "w-handoff-test";
+    assert_eq!(first.baton(id).await.unwrap().epoch, 0);
+    let lease = first
+        .acquire_baton(
+            id,
+            &AcquireBaton {
+                holder_id: "fake-device".into(),
+                expected_epoch: 0,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(lease.epoch, 1);
+    assert!(!lease.requires_fork);
+    let held = HeldBaton {
+        holder_id: "fake-device".into(),
+        epoch: 1,
+    };
+    first.renew_baton(id, &held).await.unwrap();
+    let conflict = second
+        .acquire_baton(
+            id,
+            &AcquireBaton {
+                holder_id: "other-device".into(),
+                expected_epoch: 1,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        conflict.downcast_ref::<BatonConflict>().unwrap().error,
+        "held"
+    );
+    assert!(
+        second.renew_baton(id, &held).await.is_err(),
+        "holder id cannot impersonate another device"
+    );
+    let credential = first
+        .mirror_credentials(&MirrorRequest {
+            workspace_id: id.into(),
+            epoch: Some(1),
+        })
+        .await
+        .unwrap();
+    assert!(!format!("{credential:?}").contains(&credential.password));
+    let http = reqwest::Client::new();
+    let write = || {
+        http.post(format!("{}/_test/mirror-write", fixture.keeper.endpoint))
+            .bearer_auth(fake::STATIC_TOKEN)
+            .json(&serde_json::json!({"workspace_id":id,"password":credential.password}))
+    };
+    assert_eq!(write().send().await.unwrap().status().as_u16(), 204);
+    first.release_baton(id, &held).await.unwrap();
+    assert_eq!(write().send().await.unwrap().status().as_u16(), 403);
+    let next = second
+        .acquire_baton(
+            id,
+            &AcquireBaton {
+                holder_id: "other-device".into(),
+                expected_epoch: 1,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(next.epoch, 2);
+    assert!(!next.requires_fork);
+    http.post(format!(
+        "{}/_test/baton/{id}/expire",
+        fixture.keeper.endpoint
+    ))
+    .bearer_auth(fake::STATIC_TOKEN)
+    .send()
+    .await
+    .unwrap()
+    .error_for_status()
+    .unwrap();
+    let expired = second
+        .renew_baton(
+            id,
+            &HeldBaton {
+                holder_id: "other-device".into(),
+                epoch: 2,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        expired.downcast_ref::<BatonConflict>().unwrap().error,
+        "expired"
+    );
+    assert_eq!(
+        first.baton(id).await.unwrap().holder_id.as_deref(),
+        Some("other-device")
+    );
+    let offline = first
+        .acquire_baton(
+            id,
+            &AcquireBaton {
+                holder_id: "fake-device".into(),
+                expected_epoch: 2,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(offline.epoch, 3);
+    assert!(offline.requires_fork);
+    let stale = second
+        .release_baton(
+            id,
+            &HeldBaton {
+                holder_id: "other-device".into(),
+                epoch: 2,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        stale.downcast_ref::<BatonConflict>().unwrap().error,
+        "stale_epoch"
+    );
+    let readonly = first
+        .mirror_credentials(&MirrorRequest {
+            workspace_id: id.into(),
+            epoch: None,
+        })
+        .await
+        .unwrap();
+    assert!(readonly.read_only);
+    assert_eq!(
+        http.post(format!("{}/_test/mirror-write", fixture.keeper.endpoint))
+            .bearer_auth(fake::STATIC_TOKEN)
+            .json(&serde_json::json!({"workspace_id":id,"password":readonly.password}))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        403
+    );
+}
+
+#[tokio::test]
+async fn revoked_refresh_clears_client_and_publishes_signout() {
+    let fixture = Fixture::start().await;
+    let client = fixture.client();
+    let mut watch = client.token_updates();
+    fixture.client().sign_out_everywhere().await.unwrap();
+    assert!(client.me().await.is_err());
+    watch.changed().await.unwrap();
+    assert!(watch.borrow().is_none());
+    assert!(client.tokens().await.is_none());
+}
+
+#[tokio::test]
+async fn delegation_is_scoped_replaced_and_revoked_with_device() {
+    let fixture = Fixture::start().await;
+    let client = fixture.client();
+    let first = client.delegate_daemon().await.unwrap();
+    assert_eq!(first.device_id, "fake-device");
+    assert!(!format!("{first:?}").contains(&first.access_token));
+    assert_eq!(
+        client
+            .renew_delegation(&first.access_token)
+            .await
+            .unwrap()
+            .access_token,
+        first.access_token
+    );
+    let http = reqwest::Client::new();
+    for path in [
+        "/v1/me",
+        "/v1/devices",
+        "/v1/sign-out-everywhere",
+        "/v1/delegations",
+    ] {
+        let response = http
+            .request(
+                if path.contains("sign-out") || path == "/v1/delegations" {
+                    reqwest::Method::POST
+                } else {
+                    reqwest::Method::GET
+                },
+                format!("{}{path}", fixture.keeper.endpoint),
+            )
+            .bearer_auth(&first.access_token)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status().as_u16(),
+            401,
+            "delegation must not access {path}"
+        );
+    }
+    let lease: Baton = http
+        .post(format!(
+            "{}/v1/baton/w-delegated/acquire",
+            fixture.keeper.endpoint
+        ))
+        .bearer_auth(&first.access_token)
+        .json(&AcquireBaton {
+            holder_id: first.device_id.clone(),
+            expected_epoch: 0,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(lease.holder_id.as_ref(), Some(&first.device_id));
+    let second = client.delegate_daemon().await.unwrap();
+    assert_ne!(first.access_token, second.access_token);
+    assert!(client.renew_delegation(&first.access_token).await.is_err());
+    client.sign_out_everywhere().await.unwrap();
+    assert!(client.renew_delegation(&second.access_token).await.is_err());
+}
+
+#[tokio::test]
+async fn executable_handoff_conformance() {
+    let fixture = Fixture::start().await;
+    let checks = conformance::handoff(&fixture.keeper.endpoint, fake::STATIC_TOKEN, true)
+        .await
+        .unwrap();
+    assert_eq!(checks.len(), 3);
+}

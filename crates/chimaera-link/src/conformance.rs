@@ -221,3 +221,126 @@ async fn next_event(
     })
     .await?
 }
+
+/// Account-side extension checks. Uses a fresh workspace id and leaves its
+/// baton released. Test-only expiry/mirror authorization hooks are opt-in.
+pub async fn handoff(endpoint: &str, token: &str, test_hooks: bool) -> Result<Vec<String>> {
+    let client = Client::new(
+        endpoint,
+        Some(Tokens {
+            access_token: token.into(),
+            refresh_token: "conformance-no-refresh".into(),
+            token_type: "Bearer".into(),
+            expires_in: 3600,
+        }),
+    )?;
+    let me = client.me().await?;
+    let workspace = format!("w-conformance-{:016x}", rand::random::<u64>());
+    let initial = client.baton(&workspace).await?;
+    ensure!(
+        initial.epoch == 0 && initial.holder_id.is_none(),
+        "initial baton is occupied"
+    );
+    let request = AcquireBaton {
+        holder_id: me.device_id.clone(),
+        expected_epoch: 0,
+    };
+    let acquired = client.acquire_baton(&workspace, &request).await?;
+    ensure!(
+        acquired.epoch == 1 && !acquired.requires_fork,
+        "initial acquisition shape"
+    );
+    let stale = client
+        .acquire_baton(&workspace, &request)
+        .await
+        .expect_err("stale CAS must fail");
+    ensure!(
+        stale
+            .downcast_ref::<BatonConflict>()
+            .is_some_and(|c| c.error == "stale_epoch"),
+        "CAS conflict body absent"
+    );
+    let held = HeldBaton {
+        holder_id: me.device_id.clone(),
+        epoch: 1,
+    };
+    client.renew_baton(&workspace, &held).await?;
+    let credentials = client
+        .mirror_credentials(&MirrorRequest {
+            workspace_id: workspace.clone(),
+            epoch: Some(1),
+        })
+        .await?;
+    let released = client.release_baton(&workspace, &held).await?;
+    ensure!(
+        released.holder_id.is_none() && released.epoch == 1,
+        "release changed epoch"
+    );
+    let reacquired = client
+        .acquire_baton(
+            &workspace,
+            &AcquireBaton {
+                holder_id: me.device_id.clone(),
+                expected_epoch: 1,
+            },
+        )
+        .await?;
+    ensure!(
+        reacquired.epoch == 2 && !reacquired.requires_fork,
+        "clean transfer must not fork"
+    );
+    let mut epoch = 2;
+    let mut report = vec![
+        "baton acquisition, typed CAS conflict, renewal and clean release".into(),
+        "scoped write credentials decoded without embedded URL secrets".into(),
+    ];
+    if test_hooks {
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()?;
+        let base = crate::transport::endpoint(endpoint)?;
+        let rejected = http
+            .post(crate::transport::path(&base, &["_test", "mirror-write"]))
+            .bearer_auth(token)
+            .json(&serde_json::json!({"workspace_id":workspace,"password":credentials.password}))
+            .send()
+            .await?;
+        ensure!(
+            rejected.status().as_u16() == 403,
+            "old mirror credential survived fencing"
+        );
+        http.post(crate::transport::path(
+            &base,
+            &["_test", "baton", &workspace, "expire"],
+        ))
+        .bearer_auth(token)
+        .send()
+        .await?
+        .error_for_status()?;
+        let offline = client
+            .acquire_baton(
+                &workspace,
+                &AcquireBaton {
+                    holder_id: me.device_id.clone(),
+                    expected_epoch: 2,
+                },
+            )
+            .await?;
+        ensure!(
+            offline.epoch == 3 && offline.requires_fork,
+            "offline takeover must fork"
+        );
+        epoch = 3;
+        report.push("expired lease takeover requires fork and old mirror writes are fenced".into());
+    }
+    client
+        .release_baton(
+            &workspace,
+            &HeldBaton {
+                holder_id: me.device_id,
+                epoch,
+            },
+        )
+        .await?;
+    Ok(report)
+}

@@ -1,5 +1,6 @@
 use crate::{
     bridge,
+    handoff::*,
     protocol::*,
     transport::{endpoint, path, Socket},
     websocket_config,
@@ -129,6 +130,12 @@ impl Client {
             })
             .send()
             .await?;
+        if matches!(response.status().as_u16(), 401 | 403) {
+            *guard = None;
+            self.inner.token_updates.send_replace(None);
+            *self.inner.keeper.write().await = None;
+            bail!("device authorization revoked");
+        }
         let tokens: Tokens = json_response(response).await?;
         if tokens.token_type != "Bearer"
             || tokens.access_token.is_empty()
@@ -140,7 +147,7 @@ impl Client {
         self.inner.token_updates.send_replace(Some(tokens));
         Ok(())
     }
-    async fn request(
+    async fn request_raw(
         &self,
         method: Method,
         url: Url,
@@ -159,13 +166,131 @@ impl Client {
             let response = request.send().await?;
             if response.status() == reqwest::StatusCode::UNAUTHORIZED && attempt == 0 {
                 self.refresh_if_current(&token).await?;
-            } else if response.status().is_success() {
-                return Ok(response);
             } else {
-                bail!("account request rejected ({})", response.status().as_u16());
+                return Ok(response);
             }
         }
         bail!("sign in required")
+    }
+    async fn request(
+        &self,
+        method: Method,
+        url: Url,
+        body: Option<serde_json::Value>,
+    ) -> Result<reqwest::Response> {
+        let response = self.request_raw(method, url, body).await?;
+        if !response.status().is_success() {
+            bail!("account request rejected ({})", response.status().as_u16());
+        }
+        Ok(response)
+    }
+    async fn baton_request(
+        &self,
+        method: Method,
+        workspace: &str,
+        action: Option<&str>,
+        body: Option<serde_json::Value>,
+    ) -> Result<Baton> {
+        let mut parts = vec!["v1", "baton", workspace];
+        if let Some(action) = action {
+            parts.push(action);
+        }
+        let response = self
+            .request_raw(method, path(&self.inner.account, &parts), body)
+            .await?;
+        if response.status() == reqwest::StatusCode::CONFLICT {
+            // Preserve CAS state for callers; a generic transport error must
+            // never be interpreted as losing the baton.
+            let conflict: BatonConflict = json_response_body(response).await?;
+            return Err(conflict.into());
+        }
+        json_response(response).await
+    }
+    pub async fn delegate_daemon(&self) -> Result<Delegation> {
+        json_response(
+            self.request(
+                Method::POST,
+                path(&self.inner.account, &["v1", "delegations"]),
+                Some(serde_json::json!({})),
+            )
+            .await?,
+        )
+        .await
+    }
+    /// Renewal uses only the scoped credential, never the device refresh token.
+    pub async fn renew_delegation(&self, token: &str) -> Result<Delegation> {
+        json_response(
+            self.inner
+                .http
+                .post(path(&self.inner.account, &["v1", "delegations", "renew"]))
+                .bearer_auth(token)
+                .json(&serde_json::json!({}))
+                .send()
+                .await?,
+        )
+        .await
+    }
+    pub async fn baton(&self, workspace: &str) -> Result<Baton> {
+        self.baton_request(Method::GET, workspace, None, None).await
+    }
+    pub async fn acquire_baton(&self, workspace: &str, request: &AcquireBaton) -> Result<Baton> {
+        self.baton_request(
+            Method::POST,
+            workspace,
+            Some("acquire"),
+            Some(serde_json::to_value(request)?),
+        )
+        .await
+    }
+    pub async fn renew_baton(&self, workspace: &str, request: &HeldBaton) -> Result<Baton> {
+        self.baton_request(
+            Method::POST,
+            workspace,
+            Some("renew"),
+            Some(serde_json::to_value(request)?),
+        )
+        .await
+    }
+    pub async fn release_baton(&self, workspace: &str, request: &HeldBaton) -> Result<Baton> {
+        self.baton_request(
+            Method::POST,
+            workspace,
+            Some("release"),
+            Some(serde_json::to_value(request)?),
+        )
+        .await
+    }
+    pub async fn mirror_credentials(&self, request: &MirrorRequest) -> Result<MirrorCredentials> {
+        let credentials: MirrorCredentials = json_response(
+            self.request(
+                Method::POST,
+                path(&self.inner.account, &["v1", "mirror", "credentials"]),
+                Some(serde_json::to_value(request)?),
+            )
+            .await?,
+        )
+        .await?;
+        for raw in [&credentials.repository_url, &credentials.working_tree_url] {
+            let url = Url::parse(raw)?;
+            if !url.username().is_empty()
+                || url.password().is_some()
+                || url.query().is_some()
+                || url.fragment().is_some()
+            {
+                bail!("invalid mirror URL");
+            }
+            let loopback = url.scheme() == "http" && url.host_str() == Some("127.0.0.1");
+            if url.scheme() != "https" && (!loopback || self.inner.account.scheme() == "https") {
+                bail!("mirror TLS downgrade");
+            }
+        }
+        if credentials.workspace_id != request.workspace_id
+            || credentials.password.is_empty()
+            || credentials.read_only != request.epoch.is_none()
+        {
+            bail!("invalid mirror credentials");
+        }
+        Ok(credentials)
     }
     pub async fn me(&self) -> Result<Account> {
         let account: Account = json_response(
@@ -541,10 +666,13 @@ fn backoff(attempt: u32) -> Duration {
     let ceiling = (500_u64.saturating_mul(1 << attempt.min(5))).min(10_000);
     Duration::from_millis(ceiling / 2 + rand::random_range(0..=ceiling / 2))
 }
-async fn json_response<T: DeserializeOwned>(mut response: reqwest::Response) -> Result<T> {
+async fn json_response<T: DeserializeOwned>(response: reqwest::Response) -> Result<T> {
     if !response.status().is_success() {
         bail!("request rejected ({})", response.status().as_u16());
     }
+    json_response_body(response).await
+}
+async fn json_response_body<T: DeserializeOwned>(mut response: reqwest::Response) -> Result<T> {
     let mut bytes = Vec::new();
     while let Some(chunk) = response.chunk().await? {
         if bytes.len() + chunk.len() > 1024 * 1024 {

@@ -40,6 +40,7 @@ struct Inner {
     generation: watch::Sender<u64>,
     serve_generation: watch::Sender<u64>,
     streams: Arc<Semaphore>,
+    handoff: crate::fake_handoff::FixtureHandoff,
 }
 struct Data {
     hosts: HashMap<String, Host>,
@@ -71,6 +72,7 @@ impl FakeKeeper {
                 generation,
                 serve_generation,
                 streams: Arc::new(Semaphore::new(MAX_STREAMS)),
+                handoff: Default::default(),
                 state: Mutex::new(Data {
                     hosts: HashMap::new(),
                     targets: HashMap::new(),
@@ -129,8 +131,32 @@ impl FakeKeeper {
         let _ = self.inner.events.send(Event::Host { host: host.clone() });
         Ok(host)
     }
+    pub(crate) fn invalidate_live_transports(&self) {
+        self.inner
+            .generation
+            .send_modify(|generation| *generation += 1);
+    }
+    pub(crate) fn handoff(&self) -> &crate::fake_handoff::FixtureHandoff {
+        &self.inner.handoff
+    }
+    /// Another authenticated device for cross-holder conformance checks.
+    pub async fn add_device(&self, device_id: &str) -> Result<Tokens> {
+        if device_id.is_empty() || device_id.len() > 128 {
+            bail!("invalid fixture device");
+        }
+        let tokens = {
+            let mut state = self.inner.state.lock().await;
+            issue_tokens(&mut state)
+        };
+        self.inner
+            .handoff
+            .bind_device(&tokens.access_token, device_id)
+            .await?;
+        Ok(tokens)
+    }
     pub fn router(&self) -> Router {
         let private = Router::new()
+            .merge(crate::fake_handoff::routes())
             .route("/v1/me", get(me))
             .route("/v1/hosts", get(hosts).post(add_host))
             .route("/v1/hosts/{id}", axum::routing::delete(delete_host))
@@ -186,7 +212,16 @@ async fn auth(
     } else {
         false
     };
-    if authorized {
+    let delegated = if let Some(token) = bearer {
+        keeper
+            .inner
+            .handoff
+            .allows(token, request.uri().path())
+            .await
+    } else {
+        false
+    };
+    if authorized || delegated {
         next.run(request).await
     } else {
         StatusCode::UNAUTHORIZED.into_response()
@@ -279,6 +314,7 @@ async fn revoke(State(keeper): State<FakeKeeper>, Path(id): Path<String>) -> Sta
     sign_out(State(keeper)).await
 }
 async fn sign_out(State(keeper): State<FakeKeeper>) -> StatusCode {
+    keeper.inner.handoff.revoke_all().await;
     let mut state = keeper.inner.state.lock().await;
     state.access.clear();
     state.refresh.clear();

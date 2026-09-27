@@ -251,3 +251,26 @@ version negotiation, host/device decoding, events and reverse binary transfer.
 forward tunnel. Test hooks are opt-in and must never be implemented on production
 services. The reverse probe temporarily advertises the conformance runner as a
 device host; run it with a dedicated test device.
+
+## Additive extensions
+
+[Handoff extension v1](HANDOFF.md) defines the workspace baton and scoped mirror
+credentials. It leaves the Link transport protocol number unchanged.
+
+### Sleeping worker HTTP transport
+
+A worker's TCP WebSocket carries HTTP/1 with complete framing, keep-alive and
+upgrade support. The keeper can answer cached, authenticated GET requests for
+health, sessions, workspaces, journal and view state while the worker sleeps.
+Cached documents are limited to 2 MiB each and 32 MiB in total. Responses carry
+`X-Chimaera-Cache-Age: <seconds>` and `X-Chimaera-Worker-State: sleeping`.
+Inner daemon-token authorization is checked even when a cache answers.
+
+An unavailable worker and cache miss return HTTP 503 JSON
+`{"error":"worker_asleep"}`. Passive reads do not wake the worker. Mutations
+wake it; a deliberate interactive GET or WebSocket request can also use
+`X-Chimaera-Wake: interaction`, or `wake=interaction` for browser WebSockets.
+The keeper strips this intent marker before forwarding. `read_only=true`
+always suppresses wake. Background health checks and viewer attachments must
+never mark interaction. An awake daemon still requires its normal authenticated
+WebSocket first frame.

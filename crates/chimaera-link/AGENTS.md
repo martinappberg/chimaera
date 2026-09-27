@@ -3,6 +3,9 @@
 | File | Responsibility |
 | --- | --- |
 | [PROTOCOL.md](PROTOCOL.md) | Versioned account/keeper contract; change it with code |
+| [HANDOFF.md](HANDOFF.md) | Additive baton, mirror credential and scoped daemon delegation contracts |
+| `src/handoff.rs` | Typed ownership and credential bodies; secrets redact Debug |
+| `src/fake_handoff.rs` | Bounded baton and credential-fencing fixture |
 | `src/protocol.rs` | Serializable wire types and resource ceilings |
 | `src/client.rs` | Account REST, refresh serialization, events reconnect, loopback tunnels, reverse serve |
 | `src/oauth.rs` | PKCE and state validation; caller owns system browser and keychain |
