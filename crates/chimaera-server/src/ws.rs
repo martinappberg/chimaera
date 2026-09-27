@@ -457,6 +457,7 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
             },
             msg = socket.recv() => match msg {
                 Some(Ok(Message::Binary(bytes))) => {
+                    if !bytes.is_empty() { crate::activity::record(&state, &id); }
                     for chunk in bytes.chunks(TERMINAL_INPUT_CHUNK) {
                         if attachment
                             .input
@@ -812,6 +813,7 @@ async fn handle_chat(mut socket: WebSocket, id: String, state: Arc<AppState>) {
                             // A send's images get a saved copy the echoed
                             // message can show after replay.
                             let saved = crate::upload::save_send_images(&state, &id, &mut cmd).await;
+                            let interaction = crate::activity::is_interaction(&cmd);
                             if let Err(err) = state.chat.command(&id, cmd).await {
                                 // The send never happened: neither do its copies.
                                 crate::upload::discard_saved_images(saved);
@@ -836,6 +838,8 @@ async fn handle_chat(mut socket: WebSocket, id: String, state: Arc<AppState>) {
                                             "message": message}),
                                 )
                                 .await;
+                            } else if interaction {
+                                crate::activity::record(&state, &id);
                             }
                         }
                         Err(err) => {

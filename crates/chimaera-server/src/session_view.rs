@@ -268,6 +268,12 @@ pub(crate) fn sessions_json(state: &AppState) -> Vec<serde_json::Value> {
             }),
         ));
     }
+    let activity = crate::lock(&state.activity)
+        .snapshot(rows.iter().filter_map(|(_, row)| row["id"].as_str()));
+    for (_, row) in &mut rows {
+        let at = row["id"].as_str().and_then(|id| activity.get(id)).copied();
+        row["last_input_ms"] = json!(at);
+    }
     rows.sort_by_key(|(created, _)| *created);
     rows.into_iter().map(|(_, row)| row).collect()
 }

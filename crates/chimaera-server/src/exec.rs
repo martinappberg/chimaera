@@ -50,6 +50,9 @@ pub(crate) async fn run_exec(
             loop {
                 let stage = *stage_rx.borrow_and_update();
                 crate::lock(&state.exec_status).insert(id.clone(), stage);
+                if stage == chimaera_pty::ExecStage::Executing {
+                    crate::activity::record(&state, &id);
+                }
                 state.changes.notify_waiters();
                 if stage_rx.changed().await.is_err() {
                     return;

@@ -87,6 +87,7 @@ pub(crate) struct AppState {
     pub(crate) spawn_reservations: Mutex<HashMap<String, usize>>,
     /// session id -> workspace id.
     pub(crate) session_workspaces: Mutex<HashMap<String, String>>,
+    pub(crate) activity: Mutex<crate::activity::Activity>,
     /// session id -> agent wrapper state (kind "agent" sessions only).
     pub(crate) agents: Mutex<HashMap<String, agents::AgentRecord>>,
     /// session id -> polled shell display name (naming rule zero); written
@@ -266,6 +267,7 @@ impl AppState {
             mastermind_switching: Mutex::new(std::collections::HashSet::new()),
             spawn_reservations: Mutex::new(HashMap::new()),
             session_workspaces: Mutex::new(HashMap::new()),
+            activity: Mutex::new(crate::activity::Activity::default()),
             agents: Mutex::new(HashMap::new()),
             display_names: Mutex::new(HashMap::new()),
             current_cwds: Mutex::new(HashMap::new()),
