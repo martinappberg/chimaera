@@ -45,6 +45,8 @@
   import ComputeBanner from "./ComputeBanner.svelte";
   import { getJobContext, isHomeHub, type Health } from "../net/api";
   import { asyncDisposer } from "../shared/asyncDisposer";
+  import { relativeAge } from "./launcher";
+  import { checkForUpdates, updateState } from "./update.svelte";
 
   interface Props {
     workspaces: Workspace[];
@@ -202,6 +204,38 @@
   let localState = $state<LocalDaemonState | null>(null);
   let localUpdating = $state(false);
   let localError = $state<string | null>(null);
+
+  // --- the version stamp: which daemon, and is it current? --------------------
+
+  /** A newer release the daemon knows of (its own check), shown on the stamp. */
+  const stampNewer = $derived(
+    updateState.daemon?.state === "available" ? (updateState.daemon.latest?.version ?? null) : null,
+  );
+  /** Read when the pointer arrives, so "checked 2h ago" is true on hover
+   *  without a ticking clock on the home screen. */
+  let stampNow = $state(Date.now());
+
+  const stampTitle = $derived.by(() => {
+    const v =
+      health?.version === "0.0.1"
+        ? `development daemon (build ${health.build ?? "unknown"})`
+        : `daemon v${health?.version ?? "?"}`;
+    const d = updateState.daemon;
+    if (d === null) return `${v}. Click to check for updates.`;
+    if (d.dev) return `${v}: release updates don't apply. Click to check anyway.`;
+    const checked = d.checked_at === null ? null : relativeAge(d.checked_at, stampNow);
+    const when = checked === null ? "" : checked === "now" ? " (checked just now)" : ` (checked ${checked} ago)`;
+    switch (d.state) {
+      case "available":
+        return `${v}: ${d.latest?.version ?? "a newer release"} is available. Click for details.`;
+      case "failed":
+        return `${v}: couldn't check for updates${when}: ${d.error ?? "unknown error"}. Click to try again.`;
+      case "unchecked":
+        return `${v}: not checked for updates yet. Click to check.`;
+      case "current":
+        return `${v}: up to date${when}. Click to check again.`;
+    }
+  });
 
   // --- app self-update (native shell only) -----------------------------------
 
@@ -792,16 +826,19 @@
     <!-- The mark identifies the DAEMON serving this window (the daemon
          outlives app reinstalls by design, so this is the version that
          actually matters — and a dev daemon must say so instead of posing
-         as an ordinary "v0.0.1"). -->
-    {#if health.version === "0.0.1"}
-      <span
-        class="version-mark"
-        title="this window is served by a development daemon (build {health.build ?? 'unknown'})"
-        >daemon dev·{(health.build ?? "unknown").split(".")[0]}</span
-      >
-    {:else}
-      <span class="version-mark" title="daemon version">v{health.version}</span>
-    {/if}
+         as an ordinary "v0.0.1"). A click is an explicit update check: the
+         toast answers it, "up to date" or "development build" included. -->
+    <button
+      class="version-mark"
+      class:newer={stampNewer !== null}
+      title={stampTitle}
+      onpointerenter={() => (stampNow = Date.now())}
+      onclick={() => void checkForUpdates(true)}
+    >
+      {#if health.version === "0.0.1"}daemon dev·{(health.build ?? "unknown").split(".")[0]}{:else}v{health.version}{/if}{#if stampNewer !== null}<span class="newer-tag"
+          >{` · ${stampNewer} available`}</span
+        >{/if}
+    </button>
   {/if}
   <div class="inner">
     <header class="masthead">
@@ -1518,8 +1555,14 @@
     gap: 9px;
   }
 
-  /* Quiet running-version stamp, pinned to the home screen's corner. */
+  /* Quiet running-version stamp, pinned to the home screen's corner — a
+     button (a click checks for updates) reset to plain text. */
   .version-mark {
+    appearance: none;
+    border: none;
+    background: none;
+    padding: 0;
+    cursor: pointer;
     position: fixed;
     bottom: 12px;
     right: 16px;
@@ -1534,6 +1577,15 @@
 
   .version-mark:hover {
     opacity: 0.9;
+  }
+
+  /* A known newer release lifts the stamp out of its whisper. */
+  .version-mark.newer {
+    opacity: 0.85;
+  }
+
+  .newer-tag {
+    color: var(--accent);
   }
 
   h1 {

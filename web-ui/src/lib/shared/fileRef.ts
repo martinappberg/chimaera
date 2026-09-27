@@ -14,16 +14,18 @@
  *   src/x.rs#L12  src/x.rs#L12-L20  src/x.rs#L12C3  file:///abs/x.rs
  *   paper.pdf#page=3&xywh=72,90,200,120  data.csv#row=5-9  demo.mp4#t=12,20
  *   (a locator: `locator.ts` parses it into the spot the viewer reveals)
- *   @src/x.ts (a Claude mention)  a/src/x.rs (a diff side: sent as written,
- *   the daemon strips the prefix when the path misses)  …/figs/plot.png (a
- *   TUI abbreviation: the tail is sent, the daemon suffix-matches it).
+ *   @src/x.ts (a Claude mention)  @"raw data/qc report.tsv" (Claude's quoted
+ *   mention, what its completion writes for a spaced path)  a/src/x.rs (a
+ *   diff side: sent as written, the daemon strips the prefix when the path
+ *   misses)  …/figs/plot.png (a TUI abbreviation: the tail is sent, the
+ *   daemon suffix-matches it).
  *
  * Wrappers come off either side ((), [], {}, <>, quotes, backticks, bold
  * asterisks, full-width brackets and quotes), and trailing sentence
  * punctuation (ASCII and full-width) too. A closing bracket stays when it is
  * balanced inside the name, so `Screenshot (1).png` survives. Spaces belong
- * to a path only when the text is delimited: a whole link target or a whole
- * code span.
+ * to a path only when the text is delimited: a whole link target, a whole
+ * code span, or the quotes of a quoted mention.
  */
 
 import { isLocatorKey, parseLocator } from "./locator";
@@ -181,12 +183,6 @@ function qualifies(path: string, bare: boolean): boolean {
   if (!/[\p{L}\p{N}]/u.test(path)) return false;
   if (FORBIDDEN_RE.test(path) || path.includes(":")) return false;
   if (path.startsWith("-") || path.startsWith("//")) return false;
-  if (/\s/.test(path)) {
-    // Only a delimited candidate gets here. Flags and a leading command
-    // word mark a command line; its words are offered separately.
-    const words = path.split(/\s+/);
-    if (words.some((w) => w.startsWith("-")) || COMMANDS.has(words[0])) return false;
-  }
   if (path.includes("/")) {
     // Dates and fractions (2024/01/02, 1/2) are not paths.
     return !path.split("/").every((seg) => seg === "" || /^\d+$/.test(seg));
@@ -357,6 +353,13 @@ export function findFileRef(text: string, opts: FileRefOptions = {}): FoundRef |
     }
     path = tail;
   }
+  if (/\s/.test(path)) {
+    // Only a delimited candidate gets here. Flags and a leading command
+    // word mark a command line; its words are offered separately. A lone
+    // `-` is a separator in a name (`draft - final.docx`), not a flag.
+    const words = path.split(/\s+/);
+    if (words.some((w) => w.length > 1 && w.startsWith("-")) || COMMANDS.has(words[0])) return null;
+  }
   if (!qualifies(path, bare)) return null;
   ref.path = path;
   if (anchor !== null && lines === null && ref.line === undefined) {
@@ -381,10 +384,56 @@ const LOCATOR_TAIL_RE = /#([A-Za-z]{1,8})$/;
 const LOCATOR_REST_RE = /[^\s|、，；。「」『』【】〈〉《》]*/y;
 /** Python tracebacks: `File "x.py", line 12` carries its line outside. */
 const TRACEBACK_LINE_RE = /^["']?,\s*line\s+(\d{1,7})\b/;
+/** Claude's quoted mention, `@"raw data/qc report.tsv"`, led in the way its
+ *  prompt-attachment extractor requires (start, whitespace, `。、？！`). Its
+ *  extractor lets the quotes span lines; no path holds a line break, so
+ *  here they don't, and a stray `@"` never swallows the next line. */
+const QUOTED_MENTION_RE = /(^|[\s。、？！])@"([^"\r\n]+)"/gu;
 
-/** Every reference in a run of prose or a terminal line, in order. */
+/**
+ * A quoted mention's body as the reference it names. Claude reads the body
+ * verbatim up to its first `#` (dropping the anchor), so nothing is peeled,
+ * decoded or suffix-parsed, and a leading word like `open` is a name, not a
+ * command. Null when the body is not a plausible path, or names one of
+ * claude's agents (`@"reviewer (agent)"`).
+ */
+function quotedRef(body: string, bare: boolean): FileRef | null {
+  if (body.endsWith(" (agent)")) return null;
+  const hash = body.indexOf("#");
+  const path = hash >= 0 ? body.slice(0, hash) : body;
+  if (!qualifies(path, bare)) return null;
+  if (hash < 0) return { path };
+  const anchor = body.slice(hash + 1);
+  const lines = lineAnchor(anchor);
+  if (lines !== null) return { path, ...lines };
+  const at = parseLocator(anchor, path);
+  return at !== null ? { path, at } : { path };
+}
+
+/**
+ * Every reference in a run of prose or a terminal line, in order. A quoted
+ * mention is one reference or none: its words are pieces of one path, never
+ * candidates of their own.
+ */
 export function extractFileRefs(text: string, opts: { bare?: boolean } = {}): FoundRef[] {
   const out: FoundRef[] = [];
+  const bare = opts.bare === true;
+  let from = 0;
+  for (const q of text.matchAll(QUOTED_MENTION_RE)) {
+    const start = q.index + q[1].length;
+    const end = q.index + q[0].length;
+    tokenRefs(text.slice(from, start), from, bare, out);
+    const ref = quotedRef(q[2], bare);
+    if (ref !== null) out.push({ ref, start, end });
+    from = end;
+  }
+  tokenRefs(text.slice(from), from, bare, out);
+  return out;
+}
+
+/** The whitespace-token pass over `text` (a stretch of a longer string that
+ *  starts at `offset`), pushed onto `out` with offsets into that string. */
+function tokenRefs(text: string, offset: number, bare: boolean, out: FoundRef[]): void {
   const re = new RegExp(TOKEN_RE.source, TOKEN_RE.flags);
   for (let m = re.exec(text); m !== null; m = re.exec(text)) {
     let token = m[0];
@@ -395,7 +444,7 @@ export function extractFileRefs(text: string, opts: { bare?: boolean } = {}): Fo
       token += rest;
       re.lastIndex += rest.length;
     }
-    const found = findFileRef(token, { bare: opts.bare });
+    const found = findFileRef(token, { bare });
     if (found === null) continue;
     const start = m.index + found.start;
     const end = m.index + found.end;
@@ -403,9 +452,8 @@ export function extractFileRefs(text: string, opts: { bare?: boolean } = {}): Fo
       const tb = TRACEBACK_LINE_RE.exec(text.slice(end, end + 40));
       if (tb !== null) Object.assign(found.ref, withLines(found.ref.path, tb[1]));
     }
-    out.push({ ref: found.ref, start, end });
+    out.push({ ref: found.ref, start: offset + start, end: offset + end });
   }
-  return out;
 }
 
 /** The spot to reveal once the file opens, when the reference names one. */

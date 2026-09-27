@@ -183,6 +183,96 @@ async fn upload_dedupes_name_collisions_instead_of_clobbering() {
     assert_eq!(std::fs::read(dir.join(second)).unwrap(), b"second");
 }
 
+/// The shared landing-pad name cases — its `about` documents the fields;
+/// Vitest reads the same file for the UI parser's half.
+const UPLOAD_NAMES_FIXTURE: &str =
+    include_str!("../../../../web-ui/src/lib/net/uploadNames.fixture.json");
+
+/// Strict on purpose: a misspelled key would silently drop its pin.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UploadNameCase {
+    note: String,
+    raw: String,
+    safe: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UploadNamesFixture {
+    about: Vec<String>,
+    cases: Vec<UploadNameCase>,
+}
+
+#[test]
+fn landing_pad_names_follow_the_shared_fixture() {
+    let fixture: UploadNamesFixture = serde_json::from_str(UPLOAD_NAMES_FIXTURE).unwrap();
+    assert!(!fixture.about.is_empty() && !fixture.cases.is_empty());
+    for case in &fixture.cases {
+        assert_eq!(
+            upload::mention_safe_name(&case.raw),
+            case.safe,
+            "{}: {:?}",
+            case.note,
+            case.raw
+        );
+        // A safe name is a fixed point: re-uploading a landed file keeps it.
+        assert_eq!(
+            upload::mention_safe_name(&case.safe),
+            case.safe,
+            "{}: not idempotent",
+            case.note
+        );
+    }
+}
+
+#[tokio::test]
+async fn upload_lands_a_spaced_name_under_its_mention_safe_form() {
+    let state = test_state();
+    let id = plant_session(&state);
+    let uri = format!("/api/v1/sessions/{id}/upload?name=Screenshot%202026-09-26%20at%2012.30.png");
+    let (s1, b1) = post_upload(&state, &uri, Body::from("first")).await;
+    let (s2, b2) = post_upload(&state, &uri, Body::from("second")).await;
+    assert_eq!(s1, StatusCode::OK, "{b1}");
+    assert_eq!(s2, StatusCode::OK, "{b2}");
+
+    let dir = state.uploads_root.join(&id);
+    assert_eq!(b1["name"], "Screenshot-2026-09-26-at-12.30.png");
+    assert_eq!(
+        PathBuf::from(b1["path"].as_str().unwrap()),
+        dir.join("Screenshot-2026-09-26-at-12.30.png")
+    );
+    // The dedupe prefix keeps the name one token too.
+    let second = b2["name"].as_str().unwrap();
+    assert!(
+        second.ends_with("-Screenshot-2026-09-26-at-12.30.png"),
+        "{second}"
+    );
+    for body in [&b1, &b2] {
+        let path = body["path"].as_str().unwrap();
+        assert!(!path.contains(char::is_whitespace), "{path}");
+    }
+    assert_eq!(
+        std::fs::read(dir.join("Screenshot-2026-09-26-at-12.30.png")).unwrap(),
+        b"first"
+    );
+    assert_eq!(std::fs::read(dir.join(second)).unwrap(), b"second");
+}
+
+#[tokio::test]
+async fn folder_upload_keeps_the_users_name_verbatim() {
+    let state = test_state();
+    let dir = test_dir("folder-upload-verbatim");
+    let uri = format!(
+        "/api/v1/fs/upload?dir={}&name=my%20notes%20(1).txt",
+        dir.to_string_lossy()
+    );
+    let (status, body) = post_upload(&state, &uri, Body::from("hi")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["name"], "my notes (1).txt");
+    assert_eq!(std::fs::read(dir.join("my notes (1).txt")).unwrap(), b"hi");
+}
+
 #[tokio::test]
 async fn deleting_a_session_prunes_its_uploads() {
     let state = test_state();
@@ -216,4 +306,114 @@ async fn deleting_a_session_prunes_its_uploads() {
         );
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
+}
+
+/// One image block as the browser builds it (plus an optional client path).
+fn image_block(data: &str, path: Option<&str>) -> chimaera_agent::model::ContentBlock {
+    chimaera_agent::model::ContentBlock::Image {
+        media_type: "image/png".into(),
+        data: data.into(),
+        path: path.map(str::to_string),
+    }
+}
+
+fn block_paths(cmd: &chimaera_agent::model::AgentCommand) -> Vec<Option<String>> {
+    let chimaera_agent::model::AgentCommand::Send { blocks } = cmd else {
+        panic!("expected Send, got {cmd:?}");
+    };
+    blocks
+        .iter()
+        .filter_map(|b| match b {
+            chimaera_agent::model::ContentBlock::Image { path, .. } => Some(path.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn sent_chat_images_get_a_saved_copy_and_a_client_path_is_never_trusted() {
+    let state = test_state();
+    let id = plant_session(&state);
+    let mut cmd = chimaera_agent::model::AgentCommand::Send {
+        blocks: vec![
+            chimaera_agent::model::ContentBlock::Text { text: "see".into() },
+            // "ABC" — and a forged path the daemon must replace.
+            image_block("QUJD", Some("/etc/passwd")),
+            // Not base64: still reaches the agent, just not saved.
+            image_block("not base64!", Some("/etc/hosts")),
+        ],
+    };
+    let returned = upload::save_send_images(&state, &id, &mut cmd).await;
+    let paths = block_paths(&cmd);
+    assert_eq!(returned, vec![paths[0].clone().expect("a saved copy")]);
+    let saved = PathBuf::from(paths[0].as_deref().expect("a saved copy"));
+    assert_eq!(saved.parent().unwrap(), state.uploads_root.join(&id));
+    let name = saved.file_name().unwrap().to_string_lossy().into_owned();
+    assert!(
+        name.starts_with("image-") && name.ends_with(".png"),
+        "{name}"
+    );
+    assert_eq!(std::fs::read(&saved).unwrap(), b"ABC");
+    assert_eq!(
+        paths[1], None,
+        "an undecodable image drops the forged path too"
+    );
+    let leftovers: Vec<_> = std::fs::read_dir(state.uploads_root.join(&id))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name())
+        .collect();
+    assert_eq!(
+        leftovers.len(),
+        1,
+        "no tmp files left behind: {leftovers:?}"
+    );
+}
+
+#[tokio::test]
+async fn sent_chat_images_respect_the_session_file_cap() {
+    let state = test_state();
+    let id = plant_session(&state);
+    let dir = state.uploads_root.join(&id);
+    std::fs::create_dir_all(&dir).unwrap();
+    for i in 0..upload::MAX_SESSION_UPLOAD_FILES {
+        std::fs::write(dir.join(format!("drop-{i}.txt")), b"x").unwrap();
+    }
+    let mut cmd = chimaera_agent::model::AgentCommand::Send {
+        blocks: vec![image_block("QUJD", None)],
+    };
+    upload::save_send_images(&state, &id, &mut cmd).await;
+    assert_eq!(block_paths(&cmd), vec![None]);
+    assert_eq!(
+        std::fs::read_dir(&dir).unwrap().count(),
+        upload::MAX_SESSION_UPLOAD_FILES
+    );
+}
+
+#[tokio::test]
+async fn a_refused_send_takes_its_saved_images_back() {
+    let state = test_state();
+    let id = plant_session(&state);
+    let mut cmd = chimaera_agent::model::AgentCommand::Send {
+        blocks: vec![image_block("QUJD", None), image_block("REVG", None)],
+    };
+    let saved = upload::save_send_images(&state, &id, &mut cmd).await;
+    assert_eq!(saved.len(), 2);
+    upload::discard_saved_images(saved.clone());
+    for _ in 0..200 {
+        if saved.iter().all(|p| !std::path::Path::new(p).exists()) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("saved copies still on disk: {saved:?}");
+}
+
+#[test]
+fn an_abandoned_save_writes_nothing_more() {
+    let dir = test_dir("abandoned-chat-images");
+    let abandoned = std::sync::atomic::AtomicBool::new(true);
+    let saved = upload::save_images_blocking(&dir, vec![(0, "png", "QUJD".into())], &abandoned);
+    assert!(saved.is_empty());
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
 }

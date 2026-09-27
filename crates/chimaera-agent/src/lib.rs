@@ -1135,6 +1135,7 @@ mod tests {
             locations: Vec::new(),
             status: model::ToolStatus::InProgress,
             cross_turn: true,
+            command: None,
         };
         assert_eq!(work.observe(&opened), 1);
         assert_eq!(work.observe(&opened), 1, "a row upsert never double-counts");
@@ -1166,6 +1167,7 @@ mod tests {
         budget.observe(&mut AgentEvent::UserMessage {
             text: "queued".to_string(),
             attachments: 0,
+            attachment_paths: Vec::new(),
             id: Some("q1".to_string()),
             queued: true,
             origin: None,
@@ -1203,6 +1205,7 @@ mod tests {
         budget.observe(&mut AgentEvent::UserMessage {
             text: "try a dry run first".to_string(),
             attachments: 0,
+            attachment_paths: Vec::new(),
             id: None,
             queued: false,
             origin: None,
@@ -1213,6 +1216,7 @@ mod tests {
         budget.observe(&mut AgentEvent::UserMessage {
             text: "the actual send".to_string(),
             attachments: 0,
+            attachment_paths: Vec::new(),
             id: Some("q1".to_string()),
             queued: true,
             origin: None,
@@ -1253,6 +1257,7 @@ mod tests {
         let mut feedback = AgentEvent::UserMessage {
             text: "feedback".to_string(),
             attachments: 0,
+            attachment_paths: Vec::new(),
             id: None,
             queued: false,
             origin: None,
@@ -1266,6 +1271,7 @@ mod tests {
         let echo = |id: &str| AgentEvent::UserMessage {
             text: "sent".to_string(),
             attachments: 0,
+            attachment_paths: Vec::new(),
             id: Some(id.to_string()),
             queued: false,
             origin: None,
@@ -1373,6 +1379,7 @@ mod tests {
         carry.observe(&AgentEvent::UserMessage {
             text: "pick up".into(),
             attachments: 0,
+            attachment_paths: Vec::new(),
             id: Some("m1".into()),
             queued: false,
             origin: Some(model::ORIGIN_RESTART.into()),

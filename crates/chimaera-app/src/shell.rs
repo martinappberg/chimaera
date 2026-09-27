@@ -1050,6 +1050,7 @@ pub fn run() {
             commands::adopt_tab,
             commands::list_scope_windows,
             commands::check_app_update,
+            commands::app_update_status,
             commands::begin_update,
             commands::shell_build,
             commands::write_clipboard,

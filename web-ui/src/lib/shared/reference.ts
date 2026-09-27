@@ -161,6 +161,21 @@ export function shellEscapePath(path: string): string {
 }
 
 /**
+ * An agent's `@mention` of `path` (with an optional `#` locator). Claude
+ * reads a bare `@path` up to whitespace and then back to an ASCII word
+ * boundary (`@([^\s]+)\b`), so anything that would not survive that is
+ * written in its quoted form `@"…"` — what claude's own completion writes
+ * for a spaced path; the locator parses inside the quotes. A trailing `/`
+ * stays bare (claude resolves the folder either way). Its grammar has no
+ * escape, so a path holding `"` stays bare.
+ */
+export function agentMention(path: string, locator = ""): string {
+  const target = locator === "" ? path : `${path}#${locator}`;
+  const bare = !/\s/.test(target) && /[A-Za-z0-9_/]$/.test(target);
+  return bare || target.includes('"') ? `@${target}` : `@"${target}"`;
+}
+
+/**
  * A file-selection reference for a claude agent:
  * `@<rel-path>#L<start>-L<end> "<excerpt>" ` — trailing space, no newline
  * (NEVER submits). The `#L` range is omitted when the view has no line
@@ -172,8 +187,8 @@ export function composeFileReference(
   endLine: number | null,
   selection: string,
 ): string {
-  const lines = startLine !== null && endLine !== null ? `#L${startLine}-L${endLine}` : "";
-  return `@${relPath}${lines} "${truncateSelection(selection)}" `;
+  const lines = startLine !== null && endLine !== null ? `L${startLine}-L${endLine}` : "";
+  return `${agentMention(relPath, lines)} "${truncateSelection(selection)}" `;
 }
 
 /**
@@ -220,7 +235,7 @@ export function composeSelectionReference(
   cropPath: string | null = null,
 ): string {
   const loc = selectionLocator(sel);
-  let out = `@${relPath}${loc === "" ? "" : `#${loc}`}`;
+  let out = agentMention(relPath, loc);
   const context = sel.context !== undefined ? truncateSelection(sel.context, 80) : "";
   if (context !== "") out += ` (${context})`;
   const quote = sel.quote !== undefined ? oneLine(sel.quote, QUOTE_MAX) : truncateSelection(sel.text);
@@ -237,9 +252,15 @@ export function needsCropUpload(sel: SelectionSource, target: ReferenceTargetKin
   return sel.kind === "file" && sel.crop !== undefined && target === "terminal";
 }
 
-/** A bare path mention for a claude agent (drag-to-reference): `@<rel-path> `. */
+/**
+ * A path mention for an agent (drag-to-reference, an uploaded file):
+ * `@<rel-path> `, quoted when a bare mention would not read the whole path
+ * (`agentMention`). Uploads land under space-free names; the quoting covers
+ * a spaced directory above them, a non-ASCII name ending, and workspace
+ * files.
+ */
 export function composeAgentPathReference(relPath: string): string {
-  return `@${relPath} `;
+  return `${agentMention(relPath)} `;
 }
 
 /**
@@ -256,7 +277,7 @@ export function composeProvenanceSuffix(
   if (source.kind === "file") {
     const path = relPath ?? source.path;
     const loc = selectionLocator(source);
-    return ` [from @${path}${loc === "" ? "" : `#${loc}`}] `;
+    return ` [from ${agentMention(path, loc)}] `;
   }
   return ` [from ${terminalName ?? "terminal"} output] `;
 }
@@ -318,6 +339,7 @@ if (import.meta.env.DEV) {
     "terminal reference format",
   );
   ok(composeAgentPathReference("src/a.ts") === "@src/a.ts ", "agent path mention");
+  ok(composeAgentPathReference("my dir/a.ts") === '@"my dir/a.ts" ', "a spaced path mention quotes");
   ok(
     composeProvenanceSuffix(
       { kind: "file", path: "/w/src/a.ts", startLine: 3, endLine: 9, text: "" },

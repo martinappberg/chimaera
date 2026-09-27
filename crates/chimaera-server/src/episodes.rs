@@ -691,6 +691,7 @@ mod tests {
         AgentEvent::UserMessage {
             text: text.into(),
             attachments: 0,
+            attachment_paths: Vec::new(),
             id: id.map(Into::into),
             queued,
             origin: None,
@@ -715,6 +716,7 @@ mod tests {
             locations: vec![path.into()],
             status,
             cross_turn: false,
+            command: None,
         }
     }
     fn done(id: &str, status: ToolStatus) -> AgentEvent {

@@ -32,15 +32,15 @@ use crate::driver::{
     SpawnSpec, INTERRUPT_GRACE_TICKS,
 };
 use crate::model::{
-    cap_head_tail, cap_output, fmt_elapsed_secs, truncate_label, AgentCommand, AgentEvent,
-    BackgroundTask, BackgroundTaskClose, ChunkKind, Coalescer, CompactionPhase, ContentBlock,
-    ModeInfo, PermissionOption, PermissionOptionKind, PlanEntry, PlanStatus, SlashCommand,
-    ToolContent, ToolKind, ToolStatus, Usage, UsageWindow, UserMessageState, WorkflowAgent,
-    BG_LABEL_MAX, BG_PATH_MAX, BG_TASKS_CAP, COMMAND_ID_MAX, DIFF_FILE_BUDGET, DIFF_TURN_BUDGET,
-    PLAN_BLOCKED_CAP, PLAN_DESC_MAX, PLAN_LABEL_MAX, PLAN_TASKS_CAP, SLASH_COMMANDS_CAP,
-    SLASH_DESCRIPTION_MAX, SLASH_NAME_MAX, STATUS_DETAIL_MAX, SUBAGENT_RESULT_MAX,
-    TOOL_SUMMARY_IDS_CAP, TOOL_SUMMARY_MAX, UNHANDLED_REQUESTS_CAP, UNHANDLED_REQUEST_NAME_MAX,
-    WF_AGENTS_CAP, WF_AGENTS_SET_BUDGET, WF_AGENT_LABEL_MAX,
+    cap_head_tail, cap_output, clip_command, fmt_elapsed_secs, truncate_label, AgentCommand,
+    AgentEvent, BackgroundTask, BackgroundTaskClose, ChunkKind, Coalescer, CompactionPhase,
+    ContentBlock, ModeInfo, PermissionOption, PermissionOptionKind, PlanEntry, PlanStatus,
+    SlashCommand, ToolContent, ToolKind, ToolStatus, Usage, UsageWindow, UserMessageState,
+    WorkflowAgent, BG_LABEL_MAX, BG_PATH_MAX, BG_TASKS_CAP, COMMAND_ID_MAX, DIFF_FILE_BUDGET,
+    DIFF_TURN_BUDGET, PLAN_BLOCKED_CAP, PLAN_DESC_MAX, PLAN_LABEL_MAX, PLAN_TASKS_CAP,
+    SLASH_COMMANDS_CAP, SLASH_DESCRIPTION_MAX, SLASH_NAME_MAX, STATUS_DETAIL_MAX,
+    SUBAGENT_RESULT_MAX, TOOL_SUMMARY_IDS_CAP, TOOL_SUMMARY_MAX, UNHANDLED_REQUESTS_CAP,
+    UNHANDLED_REQUEST_NAME_MAX, WF_AGENTS_CAP, WF_AGENTS_SET_BUDGET, WF_AGENT_LABEL_MAX,
 };
 use crate::model::{RemoteControlSnapshot, RemoteControlState};
 use crate::ndjson::{JsonlChild, JsonlSink, JsonlStream};
@@ -1361,6 +1361,7 @@ impl ClaudeMapper {
                             locations: Vec::new(),
                             status: ToolStatus::InProgress,
                             cross_turn: false,
+                            command: None,
                         });
                     }
                 }
@@ -2110,6 +2111,7 @@ impl ClaudeMapper {
         step.events.push(AgentEvent::UserMessage {
             text,
             attachments,
+            attachment_paths: Vec::new(),
             id: None,
             queued: false,
             origin: Some("remote".into()),
@@ -2428,6 +2430,7 @@ impl ClaudeMapper {
             locations: tool_locations(input),
             status: ToolStatus::InProgress,
             cross_turn: false,
+            command: execute_command(name, input),
         });
         if let Some(diff) = edit_diff_content(name, input) {
             step.events.push(AgentEvent::ToolCallUpdate {
@@ -3145,7 +3148,9 @@ impl ClaudeMapper {
             .iter()
             .filter_map(|b| match b {
                 ContentBlock::Text { text } => Some(json!({ "type": "text", "text": text })),
-                ContentBlock::Image { media_type, data } => Some(json!({
+                ContentBlock::Image {
+                    media_type, data, ..
+                } => Some(json!({
                     "type": "image",
                     "source": { "type": "base64", "media_type": media_type, "data": data },
                 })),
@@ -3164,6 +3169,7 @@ impl ClaudeMapper {
         step.events.push(AgentEvent::UserMessage {
             text: text.clone(),
             attachments,
+            attachment_paths: crate::model::image_paths(&blocks),
             id: Some(uuid.clone()),
             queued: self.turn_active,
             origin: None,
@@ -3348,6 +3354,7 @@ impl ClaudeMapper {
                     step.events.push(AgentEvent::UserMessage {
                         text: fb,
                         attachments: 0,
+                        attachment_paths: Vec::new(),
                         id: None,
                         queued: false,
                         origin: None,
@@ -4533,6 +4540,15 @@ fn subagent_stats(usage: &Value) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join(" · "))
 }
 
+/// The whole command a shell tool runs, for the wire's `command` field —
+/// the title keeps only its first line's worth.
+fn execute_command(name: &str, input: &Value) -> Option<String> {
+    match name {
+        "Bash" | "PowerShell" => input["command"].as_str().map(clip_command),
+        _ => None,
+    }
+}
+
 pub(crate) fn tool_title(name: &str, input: &Value) -> String {
     // Composed titles first (they don't fit the `name: detail` mould).
     let owned: Option<String> = match name {
@@ -4840,6 +4856,50 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn send_echo_carries_saved_image_paths_but_the_cli_gets_only_pixels() {
+        let mut m = mapper();
+        let step = m.on_command(AgentCommand::Send {
+            blocks: vec![
+                ContentBlock::Text {
+                    text: "look".into(),
+                },
+                ContentBlock::Image {
+                    media_type: "image/png".into(),
+                    data: "QUJD".into(),
+                    path: Some("/uploads/s-1/image-ab12cd34.png".into()),
+                },
+                // A save that failed: counted, not listed.
+                ContentBlock::Image {
+                    media_type: "image/png".into(),
+                    data: "REVG".into(),
+                    path: None,
+                },
+            ],
+        });
+        match &step.events[0] {
+            AgentEvent::UserMessage {
+                attachments,
+                attachment_paths,
+                ..
+            } => {
+                assert_eq!(*attachments, 2);
+                assert_eq!(
+                    attachment_paths,
+                    &vec!["/uploads/s-1/image-ab12cd34.png".to_string()]
+                );
+            }
+            other => panic!("expected UserMessage, got {other:?}"),
+        }
+        let content = &step.outbound[0]["message"]["content"];
+        assert_eq!(content[1]["type"], "image");
+        assert_eq!(content[1]["source"]["data"], "QUJD");
+        assert!(
+            content[1].get("path").is_none() && content[1]["source"].get("path").is_none(),
+            "the saved copy is display metadata, never agent input"
+        );
+    }
+
+    #[test]
     fn send_command_emits_user_message_checkpoint_and_turn_start() {
         let mut m = mapper();
         let step = m.on_command(AgentCommand::Send {
@@ -4851,6 +4911,7 @@ pub(crate) mod tests {
             AgentEvent::UserMessage {
                 text,
                 attachments,
+                attachment_paths: _,
                 id,
                 queued,
                 origin: _,
@@ -6183,6 +6244,7 @@ pub(crate) mod tests {
             AgentEvent::UserMessage {
                 text: "use `just clean` instead".into(),
                 attachments: 0,
+                attachment_paths: Vec::new(),
                 id: None,
                 queued: false,
                 origin: None,
@@ -8269,6 +8331,7 @@ pub(crate) mod tests {
             AgentEvent::UserMessage {
                 text: "from my phone".into(),
                 attachments: 1,
+                attachment_paths: Vec::new(),
                 id: None,
                 queued: false,
                 origin: Some("remote".into()),

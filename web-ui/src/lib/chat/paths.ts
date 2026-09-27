@@ -63,15 +63,37 @@ export function chatLinkContext(sessionId: string): LinkContext | null {
 
 // --- candidates a rendered element offers ------------------------------------------
 
+/** A file the daemon's upload landing pad holds (`<uploads>/<session-id>/<name>`
+ *  — OS drops, reference crops): its name, else null. The path is machine-made
+ *  and ~100 characters of noise in a message, so a mention of one reads as
+ *  its name; the whole path stays in the text the agent got and in the
+ *  tooltip. */
+export function uploadName(path: string): string | null {
+  const m = /\/uploads\/s-[0-9a-f]{8}\/([^/]+)$/.exec(path);
+  return m === null ? null : m[1];
+}
+
+/** How a mention of an upload-pad file reads (`@<name>` and any suffix
+ *  after it, `:12`), from `text`, the mention exactly as linked; null when
+ *  `path` is not an upload. A quoted mention (`@"…"`, an upload under a
+ *  spaced home dir) drops its closing quote: the name is mention-safe. */
+export function uploadMentionLabel(text: string, path: string): string | null {
+  const name = uploadName(path);
+  const at = name === null ? -1 : text.lastIndexOf(`/${name}`);
+  if (at < 1) return null;
+  const tail = text.slice(at + 1);
+  return `@${text.startsWith('@"') && tail.endsWith('"') ? tail.slice(0, -1) : tail}`;
+}
+
 /**
  * An inline code span's references: the whole span when it is one
  * (`src/x.rs:12`, `Screenshot (1).png`) and, when it holds several words
- * (`cat results/x.csv`), each reference inside it — offered in case the
- * whole misses.
+ * (`cat results/x.csv`) or a quoted mention (`@"src/x.ts"`, which the whole
+ * never is), each reference inside it — offered in case the whole misses.
  */
 export function codeSpanRefs(text: string): { whole: FileRef | null; parts: FoundRef[] } {
   const whole = parseFileRef(text, { delimited: true });
-  const parts = /\s/.test(text.trim()) ? extractFileRefs(text) : [];
+  const parts = /\s/.test(text.trim()) || text.includes('@"') ? extractFileRefs(text) : [];
   return { whole, parts };
 }
 

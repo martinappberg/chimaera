@@ -197,6 +197,31 @@ export async function checkAppUpdate(): Promise<string | null> {
   return t.core.invoke<string | null>("check_app_update");
 }
 
+/** The shell's signed-update knowledge (`app_update_status`). */
+export interface AppUpdateStatus {
+  /** This app's own version. */
+  current: string;
+  /** A dev build never checks (an "update" would swap the build under test). */
+  dev: boolean;
+  /** Last check attempt, unix seconds (null = never). */
+  checked_at: number | null;
+  /** A newer signed version, when the last good answer had one. */
+  available: string | null;
+  /** Why the last attempt failed; null after a success. */
+  error: string | null;
+  interval_secs: number;
+}
+
+/**
+ * The shell's answer to "is there an app update?" — cached instantly, or
+ * `refresh` to check first. Null in a browser.
+ */
+export async function appUpdateStatus(refresh: boolean): Promise<AppUpdateStatus | null> {
+  const t = tauri();
+  if (t === null) return null;
+  return t.core.invoke<AppUpdateStatus>("app_update_status", { refresh });
+}
+
 /**
  * The one-click update chain: install the signed app update and relaunch;
  * the new process finishes by updating the local daemon (sessions resurrect

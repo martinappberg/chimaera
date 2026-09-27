@@ -240,6 +240,7 @@ impl Translator {
         out.push(AgentEvent::UserMessage {
             text,
             attachments,
+            attachment_paths: Vec::new(),
             id: None,
             queued: false,
             origin: None,
@@ -346,6 +347,7 @@ impl Translator {
             locations: tool_locations(input),
             status: ToolStatus::Completed,
             cross_turn: false,
+            command: None,
         });
         if let Some(diff) = edit_diff_content(name, input) {
             out.push(AgentEvent::ToolCallUpdate {
@@ -533,6 +535,7 @@ mod tests {
             AgentEvent::UserMessage {
                 text: "fix the bug".into(),
                 attachments: 0,
+                attachment_paths: Vec::new(),
                 id: None,
                 queued: false,
                 origin: None,

@@ -1264,26 +1264,29 @@ pub(super) fn adopt_tab(
 /// updater work runs in Rust; the web UI can only ask, never drive the
 /// download — and the download is verified against the embedded minisign
 /// pubkey regardless, so only a validly-signed release can ever install.
+/// A dev build answers `None` without asking: offering a release to it would
+/// swap the build under test (and the daemon it spawns) for a download.
 #[tauri::command]
 pub(super) async fn check_app_update(app: AppHandle) -> Result<Option<String>, String> {
-    use tauri_plugin_updater::UpdaterExt;
-    // Dev is dev: offering a release to a dev build would swap the build
-    // under test (and the daemon it spawns) for a download — never an
-    // "update". The signed-release channel is for stamped builds only.
-    if chimaera_core::is_dev_build() {
-        return Ok(None);
-    }
-    let updater = app.updater().map_err(|e| e.to_string())?;
-    match updater.check().await {
-        Ok(Some(update)) => Ok(Some(update.version)),
-        Ok(None) => Ok(None),
-        // A missing/unreachable endpoint (no releases yet) is "no update",
-        // not an error the user should see on every launch.
-        Err(e) => {
-            tracing::debug!("update check unavailable: {e}");
-            Ok(None)
-        }
-    }
+    // An unreachable endpoint is "no update" here (the home screen's quiet
+    // line); `app_update_status` is where a failure is reported as one.
+    Ok(crate::update::check(&app).await.available)
+}
+
+/// "Is there an app update?" with the whole answer: this version, what the
+/// last check found, when, and why it failed if it did. `refresh` checks
+/// first (a "check now"); otherwise the cached outcome answers instantly —
+/// how a window opened after the periodic `app-update` broadcast learns of it.
+#[tauri::command]
+pub(super) async fn app_update_status(
+    app: AppHandle,
+    refresh: bool,
+) -> Result<crate::update::AppUpdateStatus, String> {
+    Ok(if refresh {
+        crate::update::check(&app).await
+    } else {
+        crate::update::status(&app)
+    })
 }
 
 /// Answer an in-flight SSH auth prompt (see `askpass`): `secret` None means

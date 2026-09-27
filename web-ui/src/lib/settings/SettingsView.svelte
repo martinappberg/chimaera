@@ -14,8 +14,12 @@
   import EnvironmentSettings from "./EnvironmentSettings.svelte";
   import DocumentsSettings from "./DocumentsSettings.svelte";
   import NotificationStatus from "./NotificationStatus.svelte";
+  import UpdatesStatus from "./UpdatesStatus.svelte";
   import { APP_MENU, PINNED } from "../shared/keys";
   import { activeModLabel } from "../shared/keybindings";
+
+  /** The tab is showing (kept-alive tabs stay mounted while hidden). */
+  let { visible: tabVisible = true }: { visible?: boolean } = $props();
 
   /**
    * Nav sections: the schema categories, plus the bespoke Environment section
@@ -232,6 +236,16 @@
             <section data-section={group.category}>
               <h2 class="cat">{group.category}</h2>
               <NotificationStatus />
+              {#each group.defs as def (def.id)}
+                <SettingRow {def} />
+              {/each}
+            </section>
+          {:else if group.category === "Updates"}
+            <!-- The status block answers "is there an update?" for the app,
+                 the daemon and the agents (it renders its own <h2> with a
+                 "check now"); the auto-check switch is the generic row. -->
+            <section data-section={group.category}>
+              <UpdatesStatus onJump={jumpTo} visible={tabVisible} />
               {#each group.defs as def (def.id)}
                 <SettingRow {def} />
               {/each}

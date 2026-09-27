@@ -117,14 +117,21 @@ app-build` (never the root `cargo`).
 - **What & when.** One-click update: download/verify/install the signed app bundle (it relaunches),
   then — in the new process's startup — replace the local daemon. Because the daemon binary *is* the
   app binary, the daemon must go second.
-- **Where it lives.** `update.rs` (`begin_update`/`consume_intent`/`spawn_update_watch`, `CHECK_INTERVAL
-  6h`, `INTENT_MAX_AGE 10m`), `commands.rs` (`check_app_update`), `daemon.rs::update_local_daemon`.
+- **Where it lives.** `update.rs` (`begin_update`/`consume_intent`/`spawn_update_watch`, `check`/`status`,
+  `CHECK_INTERVAL 6h`, `INTENT_MAX_AGE 10m`), `commands.rs` (`check_app_update`, `app_update_status`),
+  `daemon.rs::update_local_daemon`, `menu.rs` ("Check for Updates…").
 - **Key behaviors.** The download is verified against the embedded **minisign** pubkey regardless — only
   a validly-signed release installs; the web UI can only *ask*, never drive. `begin_update` writes a
   consume-once intent file (10-min expiry) so the new process finishes the daemon swap without a second
   ask. The daemon's restart handoff + session ledger make that swap state-safe — windows/tabs/sessions
   survive. Version stamping matches the literal `0.0.1` sentinel via `sed`; a pre-bumped value silently
   no-ops and ships the wrong version. Signing is release-only.
+- **Every check's outcome is kept** (`update::status`: this version, `checked_at`, `available`, the
+  failure's `error`, `dev`): `app_update_status(refresh)` answers from it instantly, so a window opened
+  after the 6-hourly `app-update` broadcast still learns of the update, and `refresh` is the explicit
+  check. A dev build never polls and answers `dev` (its "update" would swap the build under test).
+- **"Check for Updates…"** — the app menu (macOS, under About) / Help menu (Windows/Linux) forwards
+  `check-updates` to the focused window (else any window), whose toast answers it.
 
 ## Update toast
 
@@ -137,6 +144,11 @@ app-build` (never the root `cargo`).
   here (full app+daemon chain > daemon-only restart > "a release exists" notice — a browser window can't
   self-apply). Body copy states the consequence plainly (layouts/tabs/sessions come back; running terminal
   programs restart). "later" snoozes ~20h; "skip this version" mutes it — both origin-wide in localStorage.
+- **An explicit check always answers** (`checkForUpdates(true)`: the menu item, the home screen's version
+  stamp): "Checking for updates…", then the offer (snooze/skip don't hide what you asked for), "You're up
+  to date" (fades after ~6s unless hovered), "Development build", or "Couldn't check for updates" with the
+  reason and "try again". The deciding source is what can update this window: the app's signed channel in
+  the native shell, the daemon's release check in a browser.
 
 ## Windows: the WSL2 engine (beta)
 
