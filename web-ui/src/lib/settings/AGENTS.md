@@ -44,7 +44,7 @@ Credentials stay in the app's keychain, never in the schema or this UI.
 | `environment.ts` | Wire types + `getEnvironment`/`putEnvironment` for the prelude map. |
 | `CloudSetup.svelte` | Cloud wake, native agent/GitHub login terminals, SSH public key and repository clone controls. |
 | `MirrorSettings.svelte` | Native laptop-daemon mirror status, privacy, setup profile and persistent session pins; visibility-gated 15-second status refresh. |
-| `ProSettings.svelte` | Native account, kept hosts, devices and sign-out controls (app IPC-backed). |
+| `ProSettings.svelte` | Native account identity card with the shared plan badge, kept hosts, devices and sign-out controls (app IPC-backed). |
 | `DocumentsSettings.svelte` | The Documents panel: the opt-in AGENTS.md / Claude skill installs (see the exception above). |
 | `agentDocs.ts` | Wire types + `getAgentDocs`/`installAgentDocs` for `/api/v1/agent-docs`. |
 | `UpdatesStatus.svelte` | The Updates section's status block: app / daemon / agents, each up to date, available, or couldn't check (with why), plus "check now". Reads `workspace/update.svelte.ts`; the auto-check switch below it is a schema row. |

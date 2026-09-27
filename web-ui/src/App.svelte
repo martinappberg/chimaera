@@ -1,5 +1,7 @@
 <script lang="ts">
   import { onMount, tick, untrack } from "svelte";
+  import PlanBadge from "./lib/shared/PlanBadge.svelte";
+  import { paidPlan } from "./lib/net/plan";
   import { runStallDrive, stallDriveSpec } from "./lib/perf/tabSwitchDrive";
   import {
     ApiError,
@@ -4728,6 +4730,7 @@
             />
           </svg>
         </button>
+        <PlanBadge plan={$paidPlan} compact />
         {#if needsYou > 0}
           <span
             class="needs"

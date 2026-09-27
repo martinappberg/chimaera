@@ -1,6 +1,8 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import BrandMark from "../shared/BrandMark.svelte";
+  import PlanBadge from "../shared/PlanBadge.svelte";
+  import { paidPlan } from "../net/plan";
   import ComputeLaunchDialog from "./ComputeLaunchDialog.svelte";
   import { keyHint } from "../shared/keybindings";
   import { isBusy, needsApproval, type Session, type Workspace } from "./sessions";
@@ -866,6 +868,7 @@
         <div class="brand">
           <BrandMark size={24} draw title="chimaera" />
           <h1>chimaera</h1>
+          <PlanBadge plan={$paidPlan} />
         </div>
       </div>
       <div class="where" title={health?.hostname}>

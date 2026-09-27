@@ -1,5 +1,7 @@
 <script lang="ts">
   import CloudSetup from "./CloudSetup.svelte";
+  import BrandMark from "../shared/BrandMark.svelte";
+  import PlanBadge from "../shared/PlanBadge.svelte";
   import { onMount, untrack } from "svelte";
   import MirrorSettings from "./MirrorSettings.svelte";
   import { asyncDisposer } from "../shared/asyncDisposer";
@@ -92,9 +94,16 @@
       </button>
     </div>
   {:else if status?.signed_in}
-    <div class="account">
-      <span class="email">{status.email}</span>
-      <span class="plan">{status.plan === "max" ? "Max" : status.plan === "pro" ? "Pro" : "No active plan"}</span>
+    <div class="account" class:subscribed={status.plan === "pro" || status.plan === "max"}>
+      <BrandMark size={32} />
+      <div class="account-identity">
+        <div class="account-brand">
+          <span class="wordmark">chimaera</span>
+          <PlanBadge plan={status.plan === "pro" || status.plan === "max" ? status.plan : null} />
+          {#if status.plan !== "pro" && status.plan !== "max"}<span class="plan">No active plan</span>{/if}
+        </div>
+        <span class="email">{status.email}</span>
+      </div>
     </div>
 
     <div class="group">
@@ -166,10 +175,13 @@
   .pro { display: flex; flex-direction: column; padding-bottom: 14px; }
   .cat { margin: 18px 0 4px; padding: 0 14px; font-size: var(--text-xs); font-weight: 600; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); }
   .intro, .state { margin: 0; padding: 8px 14px; font-size: var(--text-sm); line-height: 1.5; color: var(--muted); max-width: 64ch; }
-  .account { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; padding: 12px 14px; }
-  .email { font-size: var(--text-md); font-weight: 600; overflow-wrap: anywhere; }
+  .account { display: flex; gap: 12px; align-items: center; margin: 10px 14px; padding: 16px; border: 1px solid var(--edge); border-radius: 10px; }
+  .account.subscribed { border-color: color-mix(in srgb, var(--accent) 24%, var(--edge)); background: linear-gradient(115deg, color-mix(in srgb, var(--accent) 7%, transparent), transparent 80%); }
+  .account-identity { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+  .account-brand { display: flex; flex-wrap: wrap; align-items: center; gap: 9px; }
+  .wordmark { font-size: var(--text-lg); font-weight: 600; letter-spacing: .01em; }
+  .email { font-size: var(--text-sm); color: var(--muted); overflow-wrap: anywhere; }
   .plan, .current { font-size: var(--text-xs); color: var(--muted); flex: none; }
-  .plan { border: 1px solid var(--edge); border-radius: 5px; padding: 2px 7px; }
   .group { padding: 10px 14px; }
   h3 { margin: 0 0 8px; font-size: var(--text-sm); font-weight: 600; }
   .rows { list-style: none; margin: 0; padding: 0; border: 1px solid var(--edge); border-radius: 8px; overflow: hidden; }

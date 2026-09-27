@@ -33,6 +33,14 @@ starts. Tokens never belong in this file. Use the
 [loopback fixture](../../crates/chimaera-link/PROTOCOL.md#fixture-and-conformance)
 for a local integration run.
 
+## Subscriber branding
+
+An active Pro or Max account wears a small plan badge beside the Home wordmark and in the workspace header. The native account panel uses the same badge in its identity card. The styling follows the current theme, and an unknown, signed-out or inactive plan shows no paid badge.
+
+The shared `web-ui/src/lib/net/plan.ts` store reads native `pro_status` and refreshes on `pro-changed` and visibility return. Account-browser windows instead make a bounded, same-origin `HEAD` request to their existing `/app/{host}/` index. Its optional `X-Chimaera-Plan` response header is `none`, `pro` or `max`, derived from the authenticated account's active or trialing subscription; an absent header or failed request leaves branding neutral. Index responses remain `Cache-Control: no-store`. The browser refreshes once per minute while visible and when returning to the page, without requesting or waking a keeper or worker. Ordinary daemon browser windows make no account request. The badge is presentation only and grants no capabilities.
+
+`web-ui/src/lib/shared/PlanBadge.svelte` supplies the common visual treatment used by Home, the workspace header and `ProSettings.svelte`.
+
 ## Cloud setup
 
 In the signed-in panel, **Set up cloud machine** explicitly requests a worker.
