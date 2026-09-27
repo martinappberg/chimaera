@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { extractFileRefs } from "../shared/fileRef";
-import { composeAgentPathReference } from "../shared/reference";
+import { composeAgentPathReference, composeProvenanceSuffix, composeSelectionReference } from "../shared/reference";
 import fixture from "./uploadNames.fixture.json";
 
 // The @mention typed after an upload must name the whole landed path, for the
@@ -62,6 +62,22 @@ describe("the mention an upload types", () => {
     const typed = composeAgentPathReference(path);
     expect(typed).toBe(`@"${path}" `);
     expect(claudeMentions(typed)).toEqual([path]);
+  });
+
+  it("a name ending in a non-ASCII character quotes (claude's \\b would cut it)", () => {
+    const path = `${PAD}\u5831\u544a`;
+    expect(claudeMentions(`@${path} `)).not.toEqual([path]);
+    const typed = composeAgentPathReference(path);
+    expect(typed).toBe(`@"${path}" `);
+    expect(claudeMentions(typed)).toEqual([path]);
+  });
+
+  it("a spaced selection reference and provenance keep their lines inside the quotes", () => {
+    const sel = { kind: "file" as const, path: "/w/raw data/qc.tsv", startLine: 3, endLine: 9, text: "x" };
+    expect(claudeMentions(composeSelectionReference("raw data/qc.tsv", sel, "terminal"))).toEqual(["raw data/qc.tsv"]);
+    expect(claudeMentions(`pasted${composeProvenanceSuffix(sel, "raw data/qc.tsv", null)}`)).toEqual([
+      "raw data/qc.tsv",
+    ]);
   });
 
   it("a folder mention quotes with its trailing slash inside", () => {

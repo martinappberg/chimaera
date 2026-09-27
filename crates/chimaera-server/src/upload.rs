@@ -59,26 +59,31 @@ fn sanitize_name(raw: &str) -> Option<String> {
 
 /// Whether `c` ends or splits an `@mention` of a landed path on the way to
 /// the agent. Whitespace ends claude's bare `@path`, a codex prose path and
-/// the UI's token; claude reads `#` as a line anchor and `:` as an MCP
-/// resource, and its trailing `\b` drops closing punctuation; the UI parser
-/// (`shared/fileRef.ts`) splits on `=`, `|` and its CJK separators, rejects
-/// quotes, globs and `$`, and reads `…` as an abbreviation. Non-ASCII letters
-/// and marks stay (NFD names too).
+/// the UI's token (JS `\s` also counts U+FEFF, which Rust's does not); claude
+/// reads `#` as a line anchor and `:` as an MCP resource, and its trailing
+/// `\b` drops closing punctuation; the UI parser (`shared/fileRef.ts`) splits
+/// on `=`, `|` and its CJK separators, rejects quotes, globs and `$`, and
+/// reads `…` as an abbreviation. Non-ASCII letters and marks stay (NFD names
+/// too).
 fn ends_mention(c: char) -> bool {
     c.is_whitespace()
         || (c.is_ascii() && !c.is_ascii_alphanumeric() && !matches!(c, '.' | '_' | '-'))
-        || "…、，；。：「」『』【】〈〉《》".contains(c)
+        || "\u{feff}…、，；。：「」『』【】〈〉《》".contains(c)
 }
 
-/// The landing-pad name for a sanitized upload name: one token every mention
-/// parser reads whole, so the @mention typed after a drop resolves
+/// The landing-pad name for a sanitized upload name: one token the mention
+/// parsers read whole, so the @mention typed after a drop resolves
 /// (`Screenshot 2026-09-26 at 12.30.png` → `Screenshot-2026-09-26-at-12.30.png`).
 /// Each run of mention-ending characters becomes one `-` (none beside an
-/// existing `-`, `_` or `.`, none at either end), a dot run becomes one dot
-/// (`...` is an abbreviation too), and a trailing `.`/`-` goes (claude's `\b`
-/// would cut it). The cases live in `web-ui/src/lib/net/uploadNames.fixture.json`,
-/// shared with the UI's parser test. Landing-pad names are machine-owned;
-/// `/fs/upload` keeps the user's name verbatim.
+/// existing `-`, `_` or `.`), a dot run becomes one dot (`...` is an
+/// abbreviation too), a trailing `.`/`-` goes (claude's `\b` would cut it), and
+/// so does a leading `-` (a shell reads it as a flag). A name whose stem was
+/// all separators gets `upload` rather than becoming a dotfile (`???.png` →
+/// `upload.png`). A name that still ends in a non-ASCII character is quoted
+/// by the client's composer (`composeAgentPathReference`). The cases live in
+/// `web-ui/src/lib/net/uploadNames.fixture.json`, shared with the UI's parser
+/// test. Landing-pad names are machine-owned; `/fs/upload` keeps the user's
+/// name verbatim.
 pub(crate) fn mention_safe_name(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     let mut gap = false;
@@ -96,9 +101,11 @@ pub(crate) fn mention_safe_name(name: &str) -> String {
             out.push(c);
         }
     }
-    let out = out.trim_end_matches(['.', '-']);
+    let out = out.trim_end_matches(['.', '-']).trim_start_matches('-');
     if out.is_empty() {
         "upload".to_string()
+    } else if out.starts_with('.') && !name.starts_with('.') {
+        format!("upload{out}")
     } else {
         out.to_string()
     }

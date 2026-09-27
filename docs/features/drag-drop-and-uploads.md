@@ -39,9 +39,12 @@ selection references (see [terminals.md](terminals.md)).
   explicitly; both file and finder payloads set it) instead of hard-coding a surface.
   `referenceFileDrop` composes the text.
 - **Key behaviors.** Directory `@mentions` carry a **trailing slash** (`@src/lib/`) — reads
-  unambiguously as "this folder"; shell paths stay bare (what a command expects). A path holding
-  whitespace is mentioned in claude's quoted form, `@"raw data/"` (what claude's own completion
-  writes — a bare mention ends at the first space); shells get it single-quoted. Relativity is
+  unambiguously as "this folder"; shell paths stay bare (what a command expects). A path claude's
+  bare `@path` would not read whole — whitespace, or an ending its word boundary cuts (`notes(1)`,
+  a non-ASCII last letter) — is mentioned in claude's quoted form, `@"raw data/"` (what claude's
+  own completion writes for a spaced path); every agent mention the app composes (drops, uploads,
+  selection references, paste provenance) goes through one writer, `reference.ts` `agentMention`.
+  Shells get such a path single-quoted. Relativity is
   per-target: workspace-relative for agents, live-cwd-relative for shells, absolute fallback
   outside either root — identical to file references. Each dir drag mints a fresh Finder id, so
   dropping the same folder onto a zone twice opens two Finder tabs (files dedupe by path); a
@@ -106,7 +109,9 @@ selection references (see [terminals.md](terminals.md)).
   form, quotes, brackets, globs, the UI parser's separators, `…`) collapse to one `-`, so
   `Screenshot 2026-09-26 at 12.30.png` lands as `Screenshot-2026-09-26-at-12.30.png` and the typed
   mention names the whole file for claude (TUI and chat), codex, and the UI's own link parser.
-  Non-ASCII letters stay. The cases live in one fixture both sides test
+  Non-ASCII letters stay (a name that still ends in one is typed in claude's quoted form); a
+  leading `-` goes, and a stem of nothing but separators becomes `upload` (`???.png` →
+  `upload.png`, never a dotfile). The cases live in one fixture both sides test
   (`web-ui/src/lib/net/uploadNames.fixture.json`: the Rust test pins the rename, the Vitest suite
   reads each result back through `extractFileRefs` and a pinned copy of claude's extractor). A
   taken name dedupes with a short random prefix instead of clobbering. Uploads land
