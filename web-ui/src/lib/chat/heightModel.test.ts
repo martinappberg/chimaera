@@ -24,6 +24,12 @@ describe("block height model", () => {
     expect(blockWeight(turnEnd([]), null, 100)).toBe(0);
     expect(blockWeight(turnEnd(["/a.png"]), null, 100)).toBe(12);
   });
+
+  it("adds a picture row to a user message with saved images", () => {
+    const user = (attachmentPaths: string[]): ChatBlock =>
+      ({ uid: 5, kind: "user", text: "look", attachments: attachmentPaths.length, attachmentPaths, checkpoint: null, id: null, origin: null, forkSeq: 0 }) as ChatBlock;
+    expect(blockWeight(user(["/u/image-1.png"]), null, 100) - blockWeight(user([]), null, 100)).toBe(5.5);
+  });
 });
 
 describe("history weights", () => {

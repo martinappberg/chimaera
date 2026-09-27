@@ -4051,7 +4051,9 @@ impl CodexMapper {
         let mut attachments = 0u32;
         for b in &blocks {
             match b {
-                ContentBlock::Image { media_type, data } => {
+                ContentBlock::Image {
+                    media_type, data, ..
+                } => {
                     attachments += 1;
                     input.push(json!({
                         "type": "image",
@@ -4085,6 +4087,7 @@ impl CodexMapper {
         step.events.push(AgentEvent::UserMessage {
             text,
             attachments,
+            attachment_paths: crate::model::image_paths(&blocks),
             id: Some(client_msg_id.clone()),
             queued,
             origin: None,
@@ -4165,6 +4168,7 @@ impl CodexMapper {
                         step.events.push(AgentEvent::UserMessage {
                             text: fb.clone(),
                             attachments: 0,
+                            attachment_paths: Vec::new(),
                             id: None,
                             queued: false,
                             origin: None,
@@ -5726,6 +5730,7 @@ mod tests {
                 ContentBlock::Image {
                     media_type: "image/png".into(),
                     data: "QUJD".into(),
+                    path: Some("/uploads/s-1/image-ab12cd34.png".into()),
                 },
                 ContentBlock::Skill {
                     name: "review".into(),
@@ -5745,12 +5750,18 @@ mod tests {
             AgentEvent::UserMessage {
                 text,
                 attachments,
+                attachment_paths,
                 id,
                 queued,
                 origin: _,
             } => {
                 assert_eq!(text, "see");
                 assert_eq!(*attachments, 1);
+                assert_eq!(
+                    attachment_paths,
+                    &vec!["/uploads/s-1/image-ab12cd34.png".to_string()],
+                    "the echo carries the daemon's saved copy"
+                );
                 assert!(id.is_some(), "sends carry a delivery id");
                 assert!(!queued, "a fresh-turn send is not queued");
             }
@@ -5760,6 +5771,10 @@ mod tests {
         assert_eq!(input[0]["type"], "text");
         assert_eq!(input[1]["type"], "image");
         assert_eq!(input[1]["url"], "data:image/png;base64,QUJD");
+        assert!(
+            input[1].get("path").is_none(),
+            "the saved copy is display metadata, never agent input"
+        );
         assert_eq!(input[2]["type"], "skill");
         assert_eq!(input[2]["name"], "review");
         assert_eq!(input[2]["path"], "/skills/review/SKILL.md");

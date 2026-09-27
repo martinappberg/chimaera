@@ -217,3 +217,113 @@ async fn deleting_a_session_prunes_its_uploads() {
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
 }
+
+/// One image block as the browser builds it (plus an optional client path).
+fn image_block(data: &str, path: Option<&str>) -> chimaera_agent::model::ContentBlock {
+    chimaera_agent::model::ContentBlock::Image {
+        media_type: "image/png".into(),
+        data: data.into(),
+        path: path.map(str::to_string),
+    }
+}
+
+fn block_paths(cmd: &chimaera_agent::model::AgentCommand) -> Vec<Option<String>> {
+    let chimaera_agent::model::AgentCommand::Send { blocks } = cmd else {
+        panic!("expected Send, got {cmd:?}");
+    };
+    blocks
+        .iter()
+        .filter_map(|b| match b {
+            chimaera_agent::model::ContentBlock::Image { path, .. } => Some(path.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn sent_chat_images_get_a_saved_copy_and_a_client_path_is_never_trusted() {
+    let state = test_state();
+    let id = plant_session(&state);
+    let mut cmd = chimaera_agent::model::AgentCommand::Send {
+        blocks: vec![
+            chimaera_agent::model::ContentBlock::Text { text: "see".into() },
+            // "ABC" — and a forged path the daemon must replace.
+            image_block("QUJD", Some("/etc/passwd")),
+            // Not base64: still reaches the agent, just not saved.
+            image_block("not base64!", Some("/etc/hosts")),
+        ],
+    };
+    let returned = upload::save_send_images(&state, &id, &mut cmd).await;
+    let paths = block_paths(&cmd);
+    assert_eq!(returned, vec![paths[0].clone().expect("a saved copy")]);
+    let saved = PathBuf::from(paths[0].as_deref().expect("a saved copy"));
+    assert_eq!(saved.parent().unwrap(), state.uploads_root.join(&id));
+    let name = saved.file_name().unwrap().to_string_lossy().into_owned();
+    assert!(
+        name.starts_with("image-") && name.ends_with(".png"),
+        "{name}"
+    );
+    assert_eq!(std::fs::read(&saved).unwrap(), b"ABC");
+    assert_eq!(
+        paths[1], None,
+        "an undecodable image drops the forged path too"
+    );
+    let leftovers: Vec<_> = std::fs::read_dir(state.uploads_root.join(&id))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name())
+        .collect();
+    assert_eq!(
+        leftovers.len(),
+        1,
+        "no tmp files left behind: {leftovers:?}"
+    );
+}
+
+#[tokio::test]
+async fn sent_chat_images_respect_the_session_file_cap() {
+    let state = test_state();
+    let id = plant_session(&state);
+    let dir = state.uploads_root.join(&id);
+    std::fs::create_dir_all(&dir).unwrap();
+    for i in 0..upload::MAX_SESSION_UPLOAD_FILES {
+        std::fs::write(dir.join(format!("drop-{i}.txt")), b"x").unwrap();
+    }
+    let mut cmd = chimaera_agent::model::AgentCommand::Send {
+        blocks: vec![image_block("QUJD", None)],
+    };
+    upload::save_send_images(&state, &id, &mut cmd).await;
+    assert_eq!(block_paths(&cmd), vec![None]);
+    assert_eq!(
+        std::fs::read_dir(&dir).unwrap().count(),
+        upload::MAX_SESSION_UPLOAD_FILES
+    );
+}
+
+#[tokio::test]
+async fn a_refused_send_takes_its_saved_images_back() {
+    let state = test_state();
+    let id = plant_session(&state);
+    let mut cmd = chimaera_agent::model::AgentCommand::Send {
+        blocks: vec![image_block("QUJD", None), image_block("REVG", None)],
+    };
+    let saved = upload::save_send_images(&state, &id, &mut cmd).await;
+    assert_eq!(saved.len(), 2);
+    upload::discard_saved_images(saved.clone());
+    for _ in 0..200 {
+        if saved.iter().all(|p| !std::path::Path::new(p).exists()) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("saved copies still on disk: {saved:?}");
+}
+
+#[test]
+fn an_abandoned_save_writes_nothing_more() {
+    let dir = test_dir("abandoned-chat-images");
+    let abandoned = std::sync::atomic::AtomicBool::new(true);
+    let saved = upload::save_images_blocking(&dir, vec![(0, "png", "QUJD".into())], &abandoned);
+    assert!(saved.is_empty());
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+}
