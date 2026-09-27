@@ -6,7 +6,8 @@
    * compatible release · summary · the on/off switch for THIS workspace ·
    * Here / Adds / Needs lines — the "Adds" line is mandatory, it is what
    * makes opt-in honest — and, for an installed copy, Use previous / Check
-   * now / Remove; the fault when it can't run), then what each agent CLI
+   * now / Remove; the fault when it can't run), a quiet row that installs
+   * a plugin from its repository's release, then what each agent CLI
    * reports about its own plugins. Requirement state ("Needs") is read from
    * the agents, never guessed; versions and sources from the daemon.
    */
@@ -18,6 +19,7 @@
     changeWorkbenchPlugin,
     daemonVersion,
     installPlugin,
+    installWorkbenchPlugin,
     setWorkspacePluginOn,
     type PluginChange,
     type PluginUpdate,
@@ -161,6 +163,43 @@
       const next = new Set(busy);
       next.delete(key);
       busy = next;
+    }
+  }
+
+  /** The add-from-a-repository row: what was typed, whether its install is
+   *  in flight, and its one outcome line (the error flag picks the style). */
+  let repo = $state("");
+  let adding = $state(false);
+  let added = $state<{ text: string; error: boolean; title?: string } | null>(null);
+
+  async function addFromRepository(): Promise<void> {
+    const github = repo.trim();
+    if (github === "" || adding) return;
+    adding = true;
+    added = null;
+    try {
+      const res = await installWorkbenchPlugin(github);
+      const raw = (res.plugin as { name?: unknown } | null | undefined)?.name;
+      const name = typeof raw === "string" && raw !== "" ? raw : res.id;
+      const sha = res.sha256?.["plugin.wasm"];
+      added = {
+        text: `installed ${name} ${res.version ?? ""}${sha ? ` · plugin.wasm sha256 ${sha.slice(0, 16)}… verified` : ""}`,
+        error: false,
+        title: sha ? `plugin.wasm sha256 ${sha}` : undefined,
+      };
+      repo = "";
+    } catch (e) {
+      added = {
+        text:
+          e instanceof ApiError && e.status === 404
+            ? "this daemon can't install plugins yet — update chimaera"
+            : e instanceof Error
+              ? e.message
+              : String(e),
+        error: true,
+      };
+    } finally {
+      adding = false;
     }
   }
 
@@ -359,6 +398,44 @@
       </div>
     </article>
   {/each}
+
+  <form
+    class="add"
+    onsubmit={(e) => {
+      e.preventDefault();
+      void addFromRepository();
+    }}
+  >
+    <div class="addrow">
+      <label class="addlabel" for="wb-add-repo">Add a plugin from a repository</label>
+      <input
+        id="wb-add-repo"
+        type="text"
+        placeholder="owner/repo"
+        spellcheck="false"
+        autocomplete="off"
+        autocapitalize="off"
+        readonly={adding}
+        bind:value={repo}
+      />
+      <button
+        type="submit"
+        class="opt"
+        disabled={repo.trim() === "" || adding}
+        title="download the latest release, verify its checksums, and install it on this host"
+      >
+        {adding ? "installing…" : "Install"}
+      </button>
+    </div>
+    <p class="hint">
+      A plugin repository publishes each version as a GitHub release with <span class="mono">plugin.wasm</span>,
+      <span class="mono">plugin.toml</span> and <span class="mono">SHA256SUMS</span>, and nothing it installs runs
+      until you switch it on in a workspace.
+    </p>
+    {#if added !== null}
+      <p class={added.error ? "err" : "muted"} title={added.title}>{added.text}</p>
+    {/if}
+  </form>
 </section>
 
 {#if removing !== null}
@@ -659,6 +736,56 @@
   }
   .link.strong {
     font-weight: 500;
+  }
+
+  /* Add from a repository: a quiet row under the cards, not another card.
+     The field and its button share padding, radius and line-height so they
+     stand the same height side by side. */
+  .add {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 4px 2px 0;
+    font-size: var(--text-sm);
+    line-height: 1.45;
+  }
+  /* A refusal can carry a 64-hex checksum or a URL: break it rather than
+     widen the page at phone width. */
+  .add p {
+    margin: 0;
+    overflow-wrap: anywhere;
+  }
+  .addrow {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px 12px;
+  }
+  .addlabel {
+    color: var(--fg);
+  }
+  .addrow input {
+    flex: 1 1 200px;
+    min-width: 0;
+    max-width: 320px;
+    font: inherit;
+    font-family: var(--mono);
+    color: var(--fg);
+    background: var(--bg);
+    border: 1px solid var(--edge);
+    border-radius: 6px;
+    padding: 4px 10px;
+    outline: none;
+  }
+  .addrow input:focus {
+    border-color: color-mix(in srgb, var(--accent) 55%, var(--edge));
+  }
+  .addrow input::placeholder {
+    color: var(--muted);
+  }
+  .addrow .opt {
+    padding: 4px 14px;
+    border-radius: 6px;
   }
 
   .agents {

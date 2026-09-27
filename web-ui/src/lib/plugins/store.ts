@@ -439,6 +439,19 @@ export async function changeWorkbenchPlugin(
   }
 }
 
+/** Install a plugin from its repository's latest release (`owner/repo` or its
+ *  github.com URL — the daemon normalizes both), then re-sync like any other
+ *  change: a switch left on under that id comes back active, and a 409 for a
+ *  version already installed (say, by the CLI) still brings its card up. */
+export async function installWorkbenchPlugin(github: string): Promise<PluginChange> {
+  try {
+    return await installFromRelease(github);
+  } finally {
+    if (currentWs !== null) await refresh(currentWs);
+    refreshKnowledge();
+  }
+}
+
 /** Switch a plugin on/off in the active workspace and re-sync. */
 export async function setWorkspacePluginOn(pluginId: string, on: boolean): Promise<void> {
   if (currentWs === null) return;
