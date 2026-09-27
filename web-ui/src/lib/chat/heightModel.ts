@@ -29,8 +29,13 @@ export function blockWeight(
     case "message":
       return textLines(block.text, charsPerLine) + 1;
     case "user":
-      // Bubbles wrap narrower than the column and carry padding.
-      return textLines(block.text, charsPerLine * 0.75) + 1.5;
+      // Bubbles wrap narrower than the column and carry padding; a row of
+      // picture tiles (AttachmentStrip, 112px) sits above one with images.
+      return (
+        textLines(block.text, charsPerLine * 0.75) +
+        1.5 +
+        (block.attachmentPaths.length > 0 ? 5.5 : 0)
+      );
     case "tool":
       return previous?.kind === "tool" ? 0 : 1;
     case "question":

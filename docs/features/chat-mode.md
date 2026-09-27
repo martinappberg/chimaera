@@ -38,13 +38,24 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   back a queued item or dismisses a dropped one. This is driven by the single `pendingSends` reducer
   and journaled via `user_message` `id`/`queued` + `user_message_update`, so replay rebuilds the same
   order and delivery truth (see PROTOCOL.md passes 8 and 21).
-- **Image paste.** Paste an image → a removable chip; sent as base64 blocks. Downscaled to
-  1568px max dim, 2 MiB post-encode cap, at most four images (8 MiB total); oversized images
-  are silently dropped. The daemon independently enforces those image budgets plus 256 KiB of
-  text, a 10 MiB pre-deserialization WebSocket envelope, and a per-session 32 MiB / 64-message
-  aggregate across the manager channel and driver-held send queue. A refused command raises a
-  visible, nonfatal notice; the socket stays healthy. The journal stores a placeholder, never the
-  bytes.
+- **Image attachments.** Paste (or drop) an image → a picture tile above the composer
+  (`AttachmentStrip`): one 56px row, each tile as wide as its picture's aspect ratio, a small
+  always-visible ✕, and a click that shows it large (`ImagePreview`: Esc / backdrop / ✕ close,
+  "remove" drops it). Sent as base64 blocks. Downscaled to 1568px max dim, 2 MiB post-encode cap,
+  at most four images (8 MiB total); oversized images are silently dropped. The daemon
+  independently enforces those image budgets plus 256 KiB of text, a 10 MiB pre-deserialization
+  WebSocket envelope, and a per-session 32 MiB / 64-message aggregate across the manager channel
+  and driver-held send queue. A refused command raises a visible, nonfatal notice; the socket stays
+  healthy.
+- **Your pictures stay in your message.** At WebSocket ingress the daemon saves each sent image
+  into the session's upload landing pad (`upload::save_send_images`: same per-session caps as OS
+  drops, a client-supplied `path` is always discarded, a failed save never refuses the send) and
+  the `user_message` echo carries their paths as `attachment_paths` (PROTOCOL.md Pass 37) — both
+  drivers, Claude and Codex. The sent (or queued) bubble shows them as the same tiles, a 112px row
+  above the text on the user's side; a click opens the picture in a pane, as an agent's figure
+  does. So reloads, other windows and replay show the pictures too. The journal still never holds
+  the bytes. Old journals, Remote Control messages and seeded history carry only a count and keep
+  the "N images" line; a copy gone with its session's uploads shows a dashed empty tile.
 - **Long drafts.** The composer grows upward with wrapped text to a pane-conscious cap, then scrolls
   internally. Its subtle top-edge grip can expand or contract it manually (drag for a precise size;
   click to toggle expanded/content-fit; Up/Down resize from the keyboard and Home returns to
@@ -801,3 +812,11 @@ _Captured 2026-09-23 (from the maintainer, in-session)._
 - **Deliberate choices voiced while building it:** the new rows must not "take over the actual messages" — prose leads and the activity lines stay quiet (balance is the goal, the exact styling is not). A finished turn's duration was judged unnecessary on the page ("It is just important to know how long the current turn has been going on"), so only the live elapsed shows. The "wakes on each event" hint was dropped as unnecessary. The thought and tool lines above a reply fold into one once the reply has come ("To not clutter, and can be expanded if the user wants to").
 - **Open / known limits:** Claude never puts a monitor event's text on stdout, so a monitor-woken turn names the watch, not the event.
 - **Do not change (or: open to change):** open to change.
+
+### Your image attachments, shown as pictures — why they exist
+_Captured 2026-09-26 (from the maintainer, in-session, PR #174)._
+
+- **Problem it solves (verbatim):** "when you upload a file (such as screenshot) or something, it is nice to see your attachments etc. in the same way as the agent presents them (but for your message) and similarily that you can remove or something." Asked to think of it "in a VERY UI / UX friendly way", and: "uploads etc., we don't want them to take insane amount of space".
+- **How settled it is (intended vs provisional):** **all provisional** — an addition. The tile sizes, the preview overlay, the short upload names and how the daemon keeps the copies are all free to change if improved.
+- **Keep (the two design goals the maintainer marked):** attachments stay **compact** (they must not take a lot of space in the composer or the transcript), and your attachments keep reading **like the agent's files** (the figure-strip language of the turn-end block). These are goals, not a locked implementation: any look that meets them is fine.
+- **Deliberately open:** nothing further stated.

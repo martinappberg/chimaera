@@ -2111,6 +2111,7 @@ impl ClaudeMapper {
         step.events.push(AgentEvent::UserMessage {
             text,
             attachments,
+            attachment_paths: Vec::new(),
             id: None,
             queued: false,
             origin: Some("remote".into()),
@@ -3147,7 +3148,9 @@ impl ClaudeMapper {
             .iter()
             .filter_map(|b| match b {
                 ContentBlock::Text { text } => Some(json!({ "type": "text", "text": text })),
-                ContentBlock::Image { media_type, data } => Some(json!({
+                ContentBlock::Image {
+                    media_type, data, ..
+                } => Some(json!({
                     "type": "image",
                     "source": { "type": "base64", "media_type": media_type, "data": data },
                 })),
@@ -3166,6 +3169,7 @@ impl ClaudeMapper {
         step.events.push(AgentEvent::UserMessage {
             text: text.clone(),
             attachments,
+            attachment_paths: crate::model::image_paths(&blocks),
             id: Some(uuid.clone()),
             queued: self.turn_active,
             origin: None,
@@ -3350,6 +3354,7 @@ impl ClaudeMapper {
                     step.events.push(AgentEvent::UserMessage {
                         text: fb,
                         attachments: 0,
+                        attachment_paths: Vec::new(),
                         id: None,
                         queued: false,
                         origin: None,
@@ -4851,6 +4856,50 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn send_echo_carries_saved_image_paths_but_the_cli_gets_only_pixels() {
+        let mut m = mapper();
+        let step = m.on_command(AgentCommand::Send {
+            blocks: vec![
+                ContentBlock::Text {
+                    text: "look".into(),
+                },
+                ContentBlock::Image {
+                    media_type: "image/png".into(),
+                    data: "QUJD".into(),
+                    path: Some("/uploads/s-1/image-ab12cd34.png".into()),
+                },
+                // A save that failed: counted, not listed.
+                ContentBlock::Image {
+                    media_type: "image/png".into(),
+                    data: "REVG".into(),
+                    path: None,
+                },
+            ],
+        });
+        match &step.events[0] {
+            AgentEvent::UserMessage {
+                attachments,
+                attachment_paths,
+                ..
+            } => {
+                assert_eq!(*attachments, 2);
+                assert_eq!(
+                    attachment_paths,
+                    &vec!["/uploads/s-1/image-ab12cd34.png".to_string()]
+                );
+            }
+            other => panic!("expected UserMessage, got {other:?}"),
+        }
+        let content = &step.outbound[0]["message"]["content"];
+        assert_eq!(content[1]["type"], "image");
+        assert_eq!(content[1]["source"]["data"], "QUJD");
+        assert!(
+            content[1].get("path").is_none() && content[1]["source"].get("path").is_none(),
+            "the saved copy is display metadata, never agent input"
+        );
+    }
+
+    #[test]
     fn send_command_emits_user_message_checkpoint_and_turn_start() {
         let mut m = mapper();
         let step = m.on_command(AgentCommand::Send {
@@ -4862,6 +4911,7 @@ pub(crate) mod tests {
             AgentEvent::UserMessage {
                 text,
                 attachments,
+                attachment_paths: _,
                 id,
                 queued,
                 origin: _,
@@ -6194,6 +6244,7 @@ pub(crate) mod tests {
             AgentEvent::UserMessage {
                 text: "use `just clean` instead".into(),
                 attachments: 0,
+                attachment_paths: Vec::new(),
                 id: None,
                 queued: false,
                 origin: None,
@@ -8280,6 +8331,7 @@ pub(crate) mod tests {
             AgentEvent::UserMessage {
                 text: "from my phone".into(),
                 attachments: 1,
+                attachment_paths: Vec::new(),
                 id: None,
                 queued: false,
                 origin: Some("remote".into()),

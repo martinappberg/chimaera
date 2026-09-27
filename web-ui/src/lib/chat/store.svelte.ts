@@ -211,6 +211,8 @@ export interface PendingSend {
   id: string;
   text: string;
   attachments: number;
+  /** The daemon's saved copies of the images (see the user block). */
+  attachmentPaths: string[];
   /** Its checkpoint anchor arrives (claude) right after the queued echo; kept
    *  here so it rides along when the send is promoted into `blocks`. */
   checkpoint: CheckpointRef | null;
@@ -247,6 +249,11 @@ export type ChatBlock = BlockIdentity &
       kind: "user";
       text: string;
       attachments: number;
+      /** The daemon's saved copies of the image attachments (absolute paths
+       *  on the session's host, in order) — the bubble's thumbnails. Can be
+       *  shorter than `attachments` (a failed save; old journals, Remote
+       *  Control and seeded history carry none), and the rest stay a count. */
+      attachmentPaths: string[];
       checkpoint: CheckpointRef | null;
       /** Delivery key (the wire's client-minted uuid); null on old journals,
        *  transcript-seeded messages, and permission-feedback echoes. */
@@ -858,12 +865,22 @@ export class ChatStore {
         const id = (ev.id as string) ?? null;
         const text = ev.text as string;
         const attachments = (ev.attachments as number) ?? 0;
+        const attachmentPaths = Array.isArray(ev.attachment_paths)
+          ? (ev.attachment_paths as unknown[]).filter((p): p is string => typeof p === "string")
+          : [];
         const origin = typeof ev.origin === "string" ? ev.origin : null;
         if (ev.queued === true && id !== null) {
           // Queued: park it in the pending stack, NOT in the transcript at its
           // mid-turn send position (that splice would split the agent's live
           // message in two). It enters `blocks` only once delivery resolves.
-          this.pendingSends.push({ id, text, attachments, checkpoint: null, state: "queued" });
+          this.pendingSends.push({
+            id,
+            text,
+            attachments,
+            attachmentPaths,
+            checkpoint: null,
+            state: "queued",
+          });
         } else {
           // A fresh (turn-opening) send, or a permission-feedback echo — it was
           // received, so it goes straight into history.
@@ -872,6 +889,7 @@ export class ChatStore {
               kind: "user",
               text,
               attachments,
+              attachmentPaths,
               checkpoint: null,
               id,
               origin,
@@ -977,6 +995,7 @@ export class ChatStore {
               kind: "user",
               text: pending.text,
               attachments: pending.attachments,
+              attachmentPaths: pending.attachmentPaths,
               origin: null,
               checkpoint: pending.checkpoint,
               id: pending.id,

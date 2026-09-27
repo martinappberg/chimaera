@@ -11,6 +11,7 @@ import {
   type PathHit,
   type Resolution,
   type ValidateAnswer,
+  uploadName,
 } from "./paths";
 
 describe("codeSpanRefs", () => {
@@ -314,5 +315,18 @@ describe("reopenResolution (a click on a stamped reference)", () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(await done).toBe(stamped);
     expect(open).toHaveBeenCalledWith("/w/old/plan.md", "file", { split: undefined, reveal: undefined });
+  });
+});
+
+describe("uploadName", () => {
+  it("names a file in a session's upload landing pad", () => {
+    expect(uploadName("/home/u/.chimaera/uploads/s-10705a93/quarterly-report.pdf")).toBe("quarterly-report.pdf");
+    expect(uploadName("/scratch/u/.chimaera-dev/data/uploads/s-0a1b2c3d/Screenshot (1).png")).toBe("Screenshot (1).png");
+  });
+
+  it("leaves every other path alone", () => {
+    expect(uploadName("/repo/uploads/report.pdf")).toBeNull();
+    expect(uploadName("/home/u/.chimaera/uploads/s-10705a93/nested/x.png")).toBeNull();
+    expect(uploadName("src/uploads/s-10705a93")).toBeNull();
   });
 });

@@ -111,6 +111,9 @@ pub const COMMAND_TEXT_TOTAL_MAX: usize = 256 * 1024;
 pub const COMMAND_IMAGE_BASE64_MAX: usize = 2 * 1024 * 1024;
 pub const COMMAND_IMAGE_BASE64_TOTAL_MAX: usize = 8 * 1024 * 1024;
 pub const COMMAND_MEDIA_TYPE_MAX: usize = 64;
+/// An image block's saved-copy path (daemon-stamped; bounded for callers
+/// that build commands programmatically).
+pub const COMMAND_PATH_MAX: usize = 4096;
 pub const COMMAND_ID_MAX: usize = 1024;
 pub const COMMAND_SELECTOR_MAX: usize = 256;
 pub const COMMAND_DESTINATION_MAX: usize = 64;
@@ -200,6 +203,13 @@ pub enum AgentEvent {
         text: String,
         #[serde(default, skip_serializing_if = "is_zero")]
         attachments: u32,
+        /// The daemon's saved copies of the image attachments (absolute paths
+        /// on the session's host, in attachment order) — what a client draws
+        /// as the message's thumbnails. May be shorter than `attachments`: a
+        /// save can fail, and old journals, Remote Control messages and
+        /// transcript-seeded history carry none. Additive.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachment_paths: Vec<String>,
         /// Client-minted delivery key (claude checkpoint uuid / codex
         /// clientUserMessageId) — what a later `UserMessageUpdate` resolves.
         /// Absent on pre-upgrade journals and transcript-seeded messages.
@@ -878,8 +888,15 @@ impl AgentCommand {
                             check_command_len("text block", text.len(), COMMAND_TEXT_BLOCK_MAX)?;
                             text_total = text_total.saturating_add(text.len());
                         }
-                        ContentBlock::Image { media_type, data } => {
+                        ContentBlock::Image {
+                            media_type,
+                            data,
+                            path,
+                        } => {
                             images = images.saturating_add(1);
+                            if let Some(path) = path {
+                                check_command_len("image path", path.len(), COMMAND_PATH_MAX)?;
+                            }
                             check_command_len(
                                 "image media_type",
                                 media_type.len(),
@@ -1001,9 +1018,14 @@ impl AgentCommand {
         for block in blocks {
             bytes = bytes.saturating_add(match block {
                 ContentBlock::Text { text } => text.len(),
-                ContentBlock::Image { media_type, data } => {
-                    media_type.len().saturating_add(data.len())
-                }
+                ContentBlock::Image {
+                    media_type,
+                    data,
+                    path,
+                } => media_type
+                    .len()
+                    .saturating_add(data.len())
+                    .saturating_add(path.as_ref().map_or(0, String::len)),
                 ContentBlock::Skill { name, path } => name.len().saturating_add(path.len()),
             });
         }
@@ -1031,6 +1053,13 @@ pub enum ContentBlock {
     Image {
         media_type: String,
         data: String,
+        /// Where the daemon saved a copy of this image on the session's host
+        /// (its uploads landing pad), so the echoed `UserMessage` can show the
+        /// picture after replay. Display metadata only: drivers never hand it
+        /// to the agent, and the daemon's WebSocket ingress replaces whatever
+        /// a client put here with its own save (or nothing).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
     },
     /// Codex `skills/list` selection. The text block retains the user's
     /// visible `/skill-name` token; this companion block is the app-server's
@@ -1053,6 +1082,19 @@ pub fn blocks_text(blocks: &[ContentBlock]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// The saved copies of a send's images, in order — what the `UserMessage`
+/// echo carries as `attachment_paths`. Shared so the two `Send` handlers
+/// can't drift.
+pub fn image_paths(blocks: &[ContentBlock]) -> Vec<String> {
+    blocks
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::Image { path, .. } => path.clone(),
+            _ => None,
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1654,6 +1696,74 @@ mod tests {
     }
 
     #[test]
+    fn saved_image_paths_are_additive_on_both_wire_directions() {
+        // An old client's image block (no path) still deserializes, and a
+        // pathless block serializes exactly as before.
+        let cmd: AgentCommand = serde_json::from_str(
+            r#"{"type":"send","blocks":[{"type":"image","media_type":"image/png","data":"QUJD"}]}"#,
+        )
+        .unwrap();
+        let AgentCommand::Send { blocks } = &cmd else {
+            panic!("expected Send, got {cmd:?}");
+        };
+        assert_eq!(
+            blocks[0],
+            ContentBlock::Image {
+                media_type: "image/png".into(),
+                data: "QUJD".into(),
+                path: None,
+            }
+        );
+        assert!(serde_json::to_value(&blocks[0])
+            .unwrap()
+            .get("path")
+            .is_none());
+
+        // An old journal's user message replays with no paths, and a message
+        // without them keeps its old shape.
+        let old: AgentEvent =
+            serde_json::from_str(r#"{"type":"user_message","text":"hi","attachments":1}"#).unwrap();
+        let AgentEvent::UserMessage {
+            attachment_paths, ..
+        } = &old
+        else {
+            panic!("expected UserMessage, got {old:?}");
+        };
+        assert!(attachment_paths.is_empty());
+        assert!(serde_json::to_value(&old)
+            .unwrap()
+            .get("attachment_paths")
+            .is_none());
+
+        let with = AgentEvent::UserMessage {
+            text: "hi".into(),
+            attachments: 1,
+            attachment_paths: vec!["/u/image-1.png".into()],
+            id: None,
+            queued: false,
+            origin: None,
+        };
+        let json = serde_json::to_value(&with).unwrap();
+        assert_eq!(
+            json["attachment_paths"],
+            serde_json::json!(["/u/image-1.png"])
+        );
+        assert_eq!(serde_json::from_value::<AgentEvent>(json).unwrap(), with);
+    }
+
+    #[test]
+    fn image_path_counts_against_the_ingress_budget() {
+        let cmd = AgentCommand::Send {
+            blocks: vec![ContentBlock::Image {
+                media_type: "image/png".into(),
+                data: "QUJD".into(),
+                path: Some("p".repeat(COMMAND_PATH_MAX + 1)),
+            }],
+        };
+        assert!(cmd.validate_ingress().is_err());
+    }
+
+    #[test]
     fn command_deserializes_from_ws_frame_shape() {
         // The optional fields are strictly additive: an old client's bare
         // frame must keep deserializing (the wire is a public contract).
@@ -1699,6 +1809,7 @@ mod tests {
         blocks.extend((0..COMMAND_IMAGES_MAX).map(|_| ContentBlock::Image {
             media_type: "image/png".to_string(),
             data: "x".repeat(COMMAND_IMAGE_BASE64_MAX),
+            path: None,
         }));
         blocks.extend((0..COMMAND_SKILLS_MAX).map(|i| ContentBlock::Skill {
             name: format!("skill-{i}"),
@@ -1713,6 +1824,7 @@ mod tests {
             blocks: vec![ContentBlock::Image {
                 media_type: "image/png".to_string(),
                 data: "x".repeat(COMMAND_IMAGE_BASE64_MAX + 1),
+                path: None,
             }],
         };
         assert!(oversized_image.validate_ingress().is_err());
@@ -1784,6 +1896,7 @@ mod tests {
                 ContentBlock::Image {
                     media_type: "image/png".to_string(),
                     data: "base64".to_string(),
+                    path: None,
                 },
                 ContentBlock::Skill {
                     name: "review".to_string(),
