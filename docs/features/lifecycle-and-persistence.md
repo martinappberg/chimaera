@@ -195,3 +195,17 @@ _Captured 2026-09-25 (from the maintainer)._
 - **Do not change (or: open to change):** open to change — *"this can change."* Grade: an
   **addition**; improve it toward a smoother update freely. The one thing it serves is the core bet
   above: a restart never silently loses a chat.
+
+### Update status — why it exists
+_Captured 2026-09-26 (from the maintainer)._
+
+- **Problem it solves:** *"just so that it makes it more clear whether there is an update"* — of the
+  chimaera binary and the rest (the app, the agents). A failed check used to look exactly like "no
+  update", and nothing ever said "you're up to date".
+- **How settled it is:** only the honesty is settled — the status must be honest. The surfaces
+  (Settings → Updates, the toast's copy, the clickable version stamp, the Check for Updates… menu
+  item) are **additions**, free to improve.
+- **Deliberately open / where it may go:** nothing specific — open to improvement in any direction.
+- **Do not change (core bets):** *asking always answers* — an explicit check always gets a visible
+  answer, "You're up to date" included; and *asking beats snooze/skip* — an explicit check shows what
+  it found even when that version was snoozed or skipped. Everything else here is an addition.
