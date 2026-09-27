@@ -53,6 +53,7 @@ use crate::AppState;
 
 pub(crate) mod hostfns;
 pub(crate) mod installed;
+pub(crate) mod preview;
 pub(crate) mod releases;
 pub(crate) mod runtime;
 pub(crate) mod tools;
@@ -379,11 +380,13 @@ pub(crate) struct ReleaseSource {
 
 /// A plugin id: lowercase ASCII letters, digits and dashes, starting with a
 /// letter or digit. It names a directory and a URL segment, so nothing
-/// else; `install` is the install route's own segment.
+/// else; `install` and `preview` are routes' own segments (`/plugins/install`,
+/// `/plugins/preview`).
 pub(crate) fn valid_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 64
         && id != "install"
+        && id != "preview"
         && id.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
         && id
             .chars()
@@ -916,30 +919,12 @@ pub(crate) fn workspace_of_session(state: &AppState, sid: &str) -> Option<String
 /// something.
 pub(crate) fn manifest_json(state: &AppState, m: &Manifest) -> Value {
     let o = &m.origin;
-    let mut v = json!({
-        "id": m.id,
-        "name": m.name,
-        "summary": m.summary,
-        "description": text_or_null(m.description.as_deref()),
-        "homepage": m.homepage,
-        "adds": {"ui": m.adds.ui, "agents": m.adds.agents},
-        "provides": {
-            "knowledge": m.provides.knowledge,
-            "mcp_tools": m.provides.mcp_tools,
-            "views": m.provides.views,
-        },
-        "setup": m.setup.as_ref().map(|s| json!({"prompt": s.prompt})),
-        "detect": m.detect.any,
-        "requires_summary": text_or_null(m.requires.summary.as_deref()),
-        "recommends_summary": text_or_null(m.recommends.summary.as_deref()),
-        "version": m.version,
-        "api": m.api,
-        "source": "installed",
-        "installed": true,
-        "first_party": o.first_party,
-        "verified": o.verified,
-        "sha256_wasm": &*m.wasm.sha256,
-    });
+    let mut v = manifest_fields(m);
+    v["source"] = json!("installed");
+    v["installed"] = json!(true);
+    v["first_party"] = json!(o.first_party);
+    v["verified"] = json!(o.verified);
+    v["sha256_wasm"] = json!(&*m.wasm.sha256);
     if let Some(path) = &o.path {
         v["path"] = json!(path);
     }
@@ -968,6 +953,32 @@ pub(crate) fn manifest_json(state: &AppState, m: &Manifest) -> Value {
         v["fault"] = json!(fault);
     }
     v
+}
+
+/// What a manifest itself says, on the wire: the author's words, what the
+/// plugin adds and provides, its version and WIT version. An installed entry
+/// (`manifest_json`) and a release described before install
+/// (`preview::describe`) both start from it, so the two can't drift.
+fn manifest_fields(m: &Manifest) -> Value {
+    json!({
+        "id": m.id,
+        "name": m.name,
+        "summary": m.summary,
+        "description": text_or_null(m.description.as_deref()),
+        "homepage": m.homepage,
+        "adds": {"ui": m.adds.ui, "agents": m.adds.agents},
+        "provides": {
+            "knowledge": m.provides.knowledge,
+            "mcp_tools": m.provides.mcp_tools,
+            "views": m.provides.views,
+        },
+        "setup": m.setup.as_ref().map(|s| json!({"prompt": s.prompt})),
+        "detect": m.detect.any,
+        "requires_summary": text_or_null(m.requires.summary.as_deref()),
+        "recommends_summary": text_or_null(m.recommends.summary.as_deref()),
+        "version": m.version,
+        "api": m.api,
+    })
 }
 
 /// An author's optional prose on the wire: trimmed, and `null` when blank
@@ -1591,7 +1602,9 @@ mod tests {
     #[test]
     fn ids_and_github_slugs_are_path_safe() {
         assert!(valid_id("agent-notes") && valid_id("latex2"));
-        for bad in ["", "-x", "X", "a/b", "a.b", "..", "install", "a b"] {
+        for bad in [
+            "", "-x", "X", "a/b", "a.b", "..", "install", "preview", "a b",
+        ] {
             assert!(!valid_id(bad), "{bad}");
         }
         assert!(valid_github("arjunrajlaboratory/mycelium") && valid_github("a-b/c_d.e"));

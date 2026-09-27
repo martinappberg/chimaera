@@ -21,18 +21,22 @@ type Files = Arc<std::sync::Mutex<HashMap<String, Vec<u8>>>>;
 
 /// A releases API on 127.0.0.1: `{api}/{owner}/{repo}/releases/latest`, the
 /// `…/releases/tags/v{version}` of every published version, and the assets
-/// under `/dl/`.
+/// under `/dl/`. It counts every request it answers (`hits`).
 struct FakeReleases {
     base: String,
     files: Files,
+    hits: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl FakeReleases {
     async fn start() -> Self {
         let files: Files = Arc::default();
+        let hits: Arc<std::sync::atomic::AtomicUsize> = Arc::default();
         let served = files.clone();
+        let counted = hits.clone();
         let app = axum::Router::new().fallback(move |uri: axum::http::Uri| {
             let files = served.clone();
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             async move {
                 match lock(&files).get(uri.path()).cloned() {
                     Some(body) => (StatusCode::OK, body).into_response(),
@@ -43,7 +47,12 @@ impl FakeReleases {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        FakeReleases { base, files }
+        FakeReleases { base, files, hits }
+    }
+
+    /// Requests answered so far.
+    fn hits(&self) -> usize {
+        self.hits.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     fn api(&self) -> String {
@@ -66,11 +75,16 @@ impl FakeReleases {
 
     fn publish_with_sums(&self, github: &str, version: &str, toml: &str, wasm: &[u8], sums: &str) {
         let dl = format!("/dl/{github}/{version}");
-        let asset = |name: &str| json!({"name": name, "browser_download_url": format!("{}{dl}/{name}", self.base)});
+        // The API lists each asset's size, as GitHub does.
+        let asset = |name: &str, size: usize| json!({"name": name, "size": size, "browser_download_url": format!("{}{dl}/{name}", self.base)});
         let release = json!({
             "tag_name": format!("v{version}"),
             "html_url": format!("https://github.com/{github}/releases/tag/v{version}"),
-            "assets": [asset("plugin.wasm"), asset("plugin.toml"), asset("SHA256SUMS")],
+            "assets": [
+                asset("plugin.wasm", wasm.len()),
+                asset("plugin.toml", toml.len()),
+                asset("SHA256SUMS", sums.len()),
+            ],
         })
         .to_string()
         .into_bytes();
@@ -154,14 +168,19 @@ fn local_build(src: &std::path::Path, toml: &str, wasm: &[u8], sums: Option<&str
     }
 }
 
-/// The first-party release the lock pins for Agent notes, as the build
-/// script laid it out: its lock entry, manifest, component and SHA256SUMS.
+/// The first-party release the lock pins for Agent notes.
 fn agent_notes_release() -> (&'static crate::plugins::Locked, String, Vec<u8>, String) {
+    locked_release("agent-notes")
+}
+
+/// A first-party release the lock pins, as the build script laid it out:
+/// its lock entry, manifest, component and SHA256SUMS.
+fn locked_release(id: &str) -> (&'static crate::plugins::Locked, String, Vec<u8>, String) {
     (
-        crate::plugins::lock_entry("agent-notes").unwrap(),
-        test_catalog::dist_test_text("agent-notes/plugin.toml"),
-        test_catalog::dist_test_bytes("agent-notes/plugin.wasm"),
-        test_catalog::dist_test_text("agent-notes/SHA256SUMS"),
+        crate::plugins::lock_entry(id).unwrap(),
+        test_catalog::dist_test_text(&format!("{id}/plugin.toml")),
+        test_catalog::dist_test_bytes(&format!("{id}/plugin.wasm")),
+        test_catalog::dist_test_text(&format!("{id}/SHA256SUMS")),
     )
 }
 
@@ -381,6 +400,8 @@ async fn the_change_routes_are_bearer_authed() {
         (Method::POST, "/api/v1/plugins/x/rollback"),
         (Method::POST, "/api/v1/plugins/x/check"),
         (Method::DELETE, "/api/v1/plugins/x"),
+        (Method::GET, "/api/v1/plugins/x/details"),
+        (Method::POST, "/api/v1/plugins/preview"),
     ] {
         let res = crate::app(state.clone())
             .oneshot(
@@ -1243,4 +1264,227 @@ async fn events_reach_only_the_plugins_that_declared_them() {
     for sid in [a, b] {
         state.sessions.kill(&sid).ok();
     }
+}
+
+async fn details(state: &Arc<AppState>, id: &str) -> (StatusCode, Value) {
+    request(
+        state,
+        Method::GET,
+        &format!("/api/v1/plugins/{id}/details"),
+        None,
+    )
+    .await
+}
+
+async fn preview(state: &Arc<AppState>, github: &str) -> (StatusCode, Value) {
+    request(
+        state,
+        Method::POST,
+        "/api/v1/plugins/preview",
+        Some(json!({"github": github})),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn details_describe_an_available_plugin_from_its_pinned_release_once() {
+    let fake = FakeReleases::start().await;
+    let state = state_for(&fake);
+    let (l, toml, wasm, sums) = locked_release("mycelium");
+    fake.publish_with_sums(&l.repo, &l.version, &toml, &wasm, &sums);
+    assert_eq!(fake.hits(), 0, "nothing is fetched before a card asks");
+
+    let (status, d) = details(&state, "mycelium").await;
+    assert_eq!(status, StatusCode::OK, "{d}");
+    let m = crate::plugins::parse_manifest(&toml).unwrap();
+    assert_eq!(d["id"], "mycelium");
+    assert_eq!(d["source"], "available");
+    assert_eq!(d["installed"], false);
+    assert_eq!(d["first_party"], true);
+    assert_eq!(d["verified"], false);
+    assert_eq!(d["version"], l.version.as_str());
+    assert_eq!(d["pinned_version"], l.version.as_str());
+    assert_eq!(d["repo"], l.repo.as_str());
+    assert_eq!(d["api"], "0.1");
+    assert_eq!(d["description"], m.description.as_deref().unwrap().trim());
+    assert_eq!(
+        d["recommends_summary"],
+        m.recommends.summary.as_deref().unwrap().trim()
+    );
+    assert_eq!(d["homepage"], m.homepage.as_deref().unwrap());
+    assert_eq!(d["adds"]["agents"], json!(m.adds.agents));
+    assert_eq!(d["provides"]["knowledge"], "mycelium");
+    assert_eq!(
+        d["recommends"],
+        json!([
+            {"agent": "claude", "id": "mycelium@mycelium", "marketplace": "arjunrajlaboratory/mycelium"},
+            {"agent": "codex", "id": "mycelium@mycelium", "marketplace": "arjunrajlaboratory/mycelium"},
+        ])
+    );
+    assert_eq!(d["requires"], json!([]));
+    assert_eq!(
+        d["release_url"],
+        format!("https://github.com/{}/releases/tag/v{}", l.repo, l.version)
+    );
+    assert_eq!(d["download"]["wasm_bytes"], wasm.len());
+    assert!(d.get("fault").is_none(), "{d}");
+    assert!(d.get("sha256_wasm").is_none() && d.get("path").is_none());
+
+    // Cached for the daemon's lifetime: the second ask fetches nothing.
+    let asked = fake.hits();
+    assert!(asked >= 1);
+    let (status, again) = details(&state, "mycelium").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(again, d);
+    assert_eq!(fake.hits(), asked, "served from memory");
+    // …and nothing was installed: the catalog still lists it available.
+    assert_eq!(listed(&state, "mycelium").await["source"], "available");
+    assert!(!plugin_dir(&state, "mycelium").exists());
+
+    // Once installed, the details are the installed entry.
+    let (status, body) = post(&state, "/api/v1/plugins/mycelium/install").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, d) = details(&state, "mycelium").await;
+    assert_eq!(status, StatusCode::OK, "{d}");
+    assert_eq!(d["source"], "installed");
+    assert_eq!(d["installed"], true);
+    assert_eq!(d["recommends"].as_array().unwrap().len(), 2);
+    assert!(d.get("release_url").is_none());
+
+    let (status, body) = details(&state, "no-such-plugin").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+}
+
+#[tokio::test]
+async fn details_refuse_a_plugin_toml_that_is_not_the_one_the_lock_pins() {
+    let fake = FakeReleases::start().await;
+    let state = state_for(&fake);
+    let (l, toml, wasm, sums) = agent_notes_release();
+    let changed = toml.replacen(
+        "summary = \"",
+        "summary = \"Not what the maintainers approved. ",
+        1,
+    );
+    fake.publish_with_sums(&l.repo, &l.version, &changed, &wasm, &sums);
+    let (status, body) = details(&state, "agent-notes").await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(
+        body["error"],
+        "Agent notes's description on GitHub isn't the one chimaera approved"
+    );
+    // Never cached: the approved file answers the next ask.
+    fake.publish_with_sums(&l.repo, &l.version, &toml, &wasm, &sums);
+    let (status, body) = details(&state, "agent-notes").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["summary"], l.summary.as_str());
+}
+
+#[tokio::test]
+async fn a_preview_describes_a_repository_without_installing_it() {
+    let fake = FakeReleases::start().await;
+    let state = state_for(&fake);
+    let gh = "acme/up-preview";
+    let toml = manifest(false, "up-preview", "0.3.0", "");
+    fake.publish(gh, "0.3.0", &toml, &v1_wasm());
+
+    let (status, p) = preview(&state, "https://github.com/acme/up-preview/").await;
+    assert_eq!(status, StatusCode::OK, "{p}");
+    assert_eq!(p["id"], "up-preview");
+    assert_eq!(p["version"], "0.3.0");
+    assert_eq!(p["source"], "available");
+    assert_eq!(p["installed"], false);
+    assert_eq!(p["first_party"], false, "not the lock's repository");
+    assert_eq!(p["repo"], gh);
+    assert!(p["description"]
+        .as_str()
+        .unwrap()
+        .contains("only for chimaera's own tests"));
+    assert!(p["recommends_summary"].as_str().is_some());
+    assert_eq!(p["recommends"][0]["agent"], "claude");
+    assert_eq!(
+        p["release_url"],
+        format!("https://github.com/{gh}/releases/tag/v0.3.0")
+    );
+    assert_eq!(p["download"]["wasm_bytes"], v1_wasm().len());
+    assert!(p.get("pinned_version").is_none());
+    assert!(
+        !plugin_dir(&state, "up-preview").exists(),
+        "nothing written"
+    );
+    assert_eq!(listed(&state, "up-preview").await, Value::Null);
+
+    // The same tag again: only the releases API is asked (the tag could
+    // have moved); the manifest comes from memory.
+    let before = fake.hits();
+    let (status, again) = preview(&state, gh).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(again, p);
+    assert_eq!(fake.hits(), before + 1);
+
+    // A newer release is a new tag: described afresh.
+    fake.publish(
+        gh,
+        "0.4.0",
+        &manifest(true, "up-preview", "0.4.0", ""),
+        &v2_wasm(),
+    );
+    let (status, newer) = preview(&state, gh).await;
+    assert_eq!(status, StatusCode::OK, "{newer}");
+    assert_eq!(newer["version"], "0.4.0");
+
+    // A plugin.toml that isn't what its SHA256SUMS lists is refused.
+    let lying = "acme/up-preview-lie";
+    let good = manifest(false, "up-preview-lie", "0.1.0", "");
+    fake.publish_with_sums(
+        lying,
+        "0.1.0",
+        &good,
+        &v1_wasm(),
+        &sums_of(&v1_wasm(), &format!("{good}\n# other")),
+    );
+    let (status, body) = preview(&state, lying).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+
+    // The lock's repository: first-party, and the release Install installs
+    // from it — the pinned one.
+    let (l, toml, wasm, sums) = agent_notes_release();
+    fake.publish_with_sums(&l.repo, &l.version, &toml, &wasm, &sums);
+    let (status, p) = preview(&state, &l.repo.to_uppercase()).await;
+    assert_eq!(status, StatusCode::OK, "{p}");
+    assert_eq!(p["id"], "agent-notes");
+    assert_eq!(p["first_party"], true);
+    assert_eq!(p["version"], l.version.as_str());
+    assert_eq!(p["pinned_version"], l.version.as_str());
+    assert_eq!(p["repo"], l.repo.as_str());
+    assert_eq!(listed(&state, "agent-notes").await["source"], "available");
+
+    for bad in ["", "   ", "../etc", "a/b/c"] {
+        let (status, body) = preview(&state, bad).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad:?}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn an_unreachable_release_source_answers_502_in_plain_words() {
+    // A port nothing listens on.
+    let dead = {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        format!("http://{}", listener.local_addr().unwrap())
+    };
+    let state = test_state();
+    state.plugin_releases.set_api_for_tests(&dead);
+    state.plugin_releases.set_downloads_for_tests(&dead);
+
+    let (status, body) = details(&state, "mycelium").await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert_eq!(
+        body["error"],
+        "couldn't reach github.com — the summary above is all we know for now"
+    );
+    let (status, body) = preview(&state, "acme/anything").await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert_eq!(
+        body["error"],
+        "couldn't read acme/anything's releases on github.com — check the name, or try again later"
+    );
 }

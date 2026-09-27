@@ -30,7 +30,8 @@ sheet, hosted once in `web-ui/src/App.svelte`. Wire (all under `/api/v1`, bearer
 `detected` / `active` + `requires` / `recommends`) · `PUT /workspaces/{id}/plugins/{pid} {on}` ·
 `POST /plugins/install {github, version?}` or `{path}` · `POST /plugins/{pid}/install` ·
 `POST /plugins/{pid}/update` · `POST /plugins/{pid}/rollback` · `POST /plugins/{pid}/check` ·
-`DELETE /plugins/{pid}` · `POST /workspaces/{id}/plugins/{pid}/install {agent}` ·
+`DELETE /plugins/{pid}` · `GET /plugins/{pid}/details` · `POST /plugins/preview {github}` ·
+`POST /workspaces/{id}/plugins/{pid}/install {agent}` ·
 `POST …/{pid}/setup {agent}` · `POST …/{pid}/trust-hooks {hooks:[{key,hash}]}` ·
 `GET /workspaces/{id}/agent-plugins?refresh=` · `GET /workspaces/{id}/skills?refresh=` ·
 `POST /workspaces/{id}/timeline/{seq}/deliver`; plugin tools ride the per-session MCP endpoint
@@ -64,8 +65,11 @@ sheet, hosted once in `web-ui/src/App.svelte`. Wire (all under `/api/v1`, bearer
   ("using .living/ in this workspace · 4 findings · 4 decisions", "found .living/ in this
   workspace — switch it on to use it", "not set up in this workspace yet — Set it up"); the
   **Agent-side plugin** box (below); an update callout; a fault callout; one outcome line.
-  Then a small form, **Install from a repository**, and under **Agent plugins** what each agent
-  CLI reports (below). Mycelium's **attach sheet** ("Use Mycelium for Knowledge", reached from
+  A plugin not installed yet shows its head and summary, and opens in place — a click anywhere
+  on its top, or Enter / Space on its chevron — to that same body, read from its release before
+  anything is installed ([below](#versions-installs--updates)). Then a small form, **Install
+  from a repository** (with **Preview**), and under **Agent plugins** what each agent CLI
+  reports (below). Mycelium's **attach sheet** ("Use Mycelium for Knowledge", reached from
   the card's menu, Knowledge's card and the Mastermind panel's quiet line) runs three
   live-checked steps: 1 install for your agents (a visible terminal running
   `<agent> plugin marketplace add arjunrajlaboratory/mycelium`, then `claude plugin install
@@ -227,7 +231,17 @@ sheet, hosted once in `web-ui/src/App.svelte`. Wire (all under `/api/v1`, bearer
   plugin with nothing installed shows **Install** (it installs the version shown, the one
   chimaera pins) where the switch would be; its tooltip says what happens: "Downloads it from
   github.com/<repo> into this host's ~/.chimaera/plugins. It does nothing until you switch it
-  on in a workspace." Then the rest of the card ([above](#workbench-plugins)). When a check
+  on in a workspace." Its whole top is one button (a small chevron right of the summary shows
+  it; `aria-expanded`, Enter / Space; Install and **…** keep their own clicks) that opens the
+  card in place — several can stay open, and they stay open while the page lives: a quiet
+  "loading…", then everything an installed card shows, from the release chimaera pins — the
+  author's description in full, **For you** / **For agents**, the **Agent-side plugin** box with
+  each agent's state (no actions until the plugin is installed) — then "Installing downloads it
+  from github.com/<repo> (≈ 305 KB) into this host's ~/.chimaera/plugins. It does nothing until
+  you switch it on in a workspace." (the size when GitHub gives it) and a second **Install**, so
+  the reader needn't scroll back up. When GitHub can't be reached the body is one line: "couldn't
+  reach github.com — the summary above is all we know for now". Then the rest of the card
+  ([above](#workbench-plugins)). When a check
   found a newer release, a calm callout inside the card says "0.1.2 is available" with a
   "what changed" link (the release page) and a small **Update**. The **…** menu holds **Check
   for updates** (afterwards a muted "No newer version · checked just now" line, which ages —
@@ -240,11 +254,16 @@ sheet, hosted once in `web-ui/src/App.svelte`. Wire (all under `/api/v1`, bearer
   reinstall it", with **Reinstall** for that one) and stays off, its switch disabled; a plugin
   that failed five times in a minute here adds "Switching it off and on starts it again."
   Under the cards, the small **Install from a repository** form (label, an `owner/repo` field,
-  **Install**, and "The latest release of a plugin's GitHub repository, installed on this host.
-  It does nothing until you switch it on in a workspace.") takes `owner/repo` (or its
-  `https://github.com/owner/repo` URL) and fetches its latest release (a first-party plugin's
-  repository: the pinned version), reporting the plugin and its version — or the daemon's
-  refusal — in one outcome line; like any plugin, it runs only where it is switched on. On the
+  **Preview** and **Install**, both enabled once something is typed, and "The latest release of a
+  plugin's GitHub repository: Preview shows what it adds, Install puts it on this host. It does
+  nothing until you switch it on in a workspace.") takes `owner/repo` (or its
+  `https://github.com/owner/repo` URL). **Preview** shows that release as a card under the form —
+  the opened body above, the check badge only for a first-party repository, "not installed"
+  where the switch would be, a close button, and its own **Install** — without installing
+  anything; **Install** (the form's or the preview's) fetches the latest release (a first-party
+  plugin's repository: the pinned version), reporting the plugin and its version — or the
+  daemon's refusal, as a failed Preview does — in one outcome line, and a preview installed from
+  gives way to the new card; like any plugin, it runs only where it is switched on. On the
   daemon's host: `chimaera plugin list` · `add <id>` · `add <owner/repo> [--version x]` ·
   `add --path <dir>` · `update <id>` · `remove <id>` — the same routes, one line per change
   ("installed agent-notes 0.1.2") and a leading ✓ in the list for Chimaera's own plugins
@@ -254,7 +273,8 @@ sheet, hosted once in `web-ui/src/App.svelte`. Wire (all under `/api/v1`, bearer
   `plugins/installed.rs` (`scan`, which reads each copy and checks its files; `install_route`
   — a release or `{path}` —, `pinned_install_route`, `update_route`, `rollback_route`,
   `remove_route`), `plugins/releases.rs` (`check`, `check_all`,
-  `check_route`; run from `update.rs::run_checker`), `crates/chimaera/src/plugin.rs`; UI
+  `check_route`; run from `update.rs::run_checker`), `plugins/preview.rs` (`details_route`,
+  `preview_route`, the `Previews` caches), `crates/chimaera/src/plugin.rs`; UI
   `PluginCard.svelte`, `InstalledView.svelte`, `store.ts`. Tests: `crates/chimaera-server/src/tests/plugin_updates.rs`,
   against a fake releases server and the locked releases in `plugins/dist-test`. The wire — one
   entry shape (`manifest_json`) on `GET /plugins`, `GET /workspaces/{id}/plugins` and in the
@@ -279,12 +299,35 @@ sheet, hosted once in `web-ui/src/App.svelte`. Wire (all under `/api/v1`, bearer
     `first_party: true`, `verified: false`, `repo` and `pinned_version` (the lock's).
   - `GET /workspaces/{id}/plugins` adds per entry `on`, `detected`, `active` (all false for an
     available entry), `requires` and `recommends` (lists of `{agent, id, marketplace}`).
+  - **Before an install** — `GET /plugins/{pid}/details` (an installed plugin: its entry plus
+    `requires` / `recommends`; 404 for an id that is neither installed nor in the lock) and
+    `POST /plugins/preview {github}` answer a release's manifest in the installed entry's shape —
+    `description`, `homepage`, `adds`, `provides`, `setup`, `detect`, `requires_summary` /
+    `recommends_summary`, `requires` / `recommends`, `version`, `api` — with `source:
+    "available"`, `installed: false`, `verified: false`, `first_party` (a lock entry, or the
+    lock's repository), `repo`, `pinned_version` (first-party only), `release_url` (the release
+    page), `download: {wasm_bytes}` when the releases API gives the component's size, and `fault`
+    when this daemon's gates would refuse it. Refusals: 400 (not `owner/repo`), 422 (a
+    `plugin.toml` that isn't what the lock or the release's `SHA256SUMS` lists — "<name>'s
+    description on GitHub isn't the one chimaera approved" — or doesn't parse), 502 ("couldn't
+    reach github.com — the summary above is all we know for now"; a preview: "couldn't read
+    <repo>'s releases on github.com — check the name, or try again later").
   - **Change answers:** install (all three kinds) and update →
     `{id, version, previous, sha256: {"plugin.wasm", "plugin.toml"}, plugin}`; rollback →
     `{id, version, previous, plugin}`; remove → `{id, removed: true, plugin}` (the available
     entry for a lock id, else null); check → `{id, update, plugin}`. Refusals are `{error}` with
     400 / 404 / 409 / 422 / 502.
 - **Key behaviors.**
+  - **Seeing a plugin before installing it writes nothing.** `/details` of a first-party plugin
+    with nothing installed reads its pinned release's `plugin.toml` (the direct download Install
+    uses; its sha256 must be the lock's `sha256_toml`) and, alongside, the release's asset list
+    for the component's size; the answer is kept in memory per (id, version) for the daemon's
+    life, so a second open fetches nothing. `/preview` asks the repository's latest release,
+    checks its `plugin.toml` against that release's `SHA256SUMS`, and keeps the last 32
+    repositories per (repo, tag) — the releases API is still asked each time, since the latest
+    tag can move; the lock's own repository previews its pinned release, which is what Install
+    installs from it. Nothing is fetched at boot or by the daily checker, a failure is never
+    kept, and each fetch rides the same 10 s / 1 MiB fence (the manifest capped again at 64 KiB).
   - **The catalog is the lock's entries plus the installed copies.** A lock entry with no copy
     installed is listed `available`; everything else is an installed copy under
     `<data dir>/plugins/<id>/<version>/`. Only an installed copy loads, can be switched on,

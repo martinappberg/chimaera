@@ -12,6 +12,8 @@
  *   POST /plugins/{pid}/install                    install a first-party plugin at the version chimaera pins
  *   POST /plugins/{pid}/update | rollback | check   Update · Use previous · Check for updates
  *   DELETE /plugins/{pid}                          Remove (the installed copy, every version)
+ *   GET  /plugins/{pid}/details                    everything a card shows, before install too
+ *   POST /plugins/preview {github}                 a repository's plugin, described, nothing written
  *
  * The user-facing surface is called Extensions; the wire, the routes and this
  * module keep the name "plugins".
@@ -21,7 +23,7 @@
  * skills are fetched on demand by the views that show them — the daemon
  * asks the agents' own CLIs, which is bounded but not free.
  */
-import { derived, writable, type Readable } from "svelte/store";
+import { derived, get, writable, type Readable } from "svelte/store";
 
 import { api, ApiError } from "../net/api";
 import { refreshKnowledge } from "../workspace/knowledge";
@@ -102,6 +104,15 @@ export interface WorkspacePlugin {
   update: PluginUpdate | null;
   /** Why it can't run on this daemon, or isn't answering here. */
   fault: string | null;
+}
+
+/** A plugin as its release describes it before install (`/details` of an
+ *  available entry, `/preview`) — or, for an installed one, its entry. */
+export interface PluginDetails extends WorkspacePlugin {
+  /** The release's page (null for an installed entry). */
+  release_url: string | null;
+  /** What Install downloads, when the releases API said. */
+  download: { wasm_bytes: number } | null;
 }
 
 /** What an install, update, Use previous or Remove did. */
@@ -265,6 +276,16 @@ function normalizePlugin(raw: WorkspacePlugin): WorkspacePlugin {
   };
 }
 
+function normalizeDetails(raw: PluginDetails): PluginDetails {
+  const d = raw.download as Partial<{ wasm_bytes: number }> | null | undefined;
+  const bytes = d !== null && d !== undefined ? Number(d.wasm_bytes) : NaN;
+  return {
+    ...normalizePlugin(raw),
+    release_url: str(raw.release_url),
+    download: Number.isFinite(bytes) && bytes > 0 ? { wasm_bytes: bytes } : null,
+  };
+}
+
 export async function fetchWorkspacePlugins(workspaceId: string): Promise<WorkspacePlugins> {
   const body = await json<WorkspacePlugins>(await api(`${ws(workspaceId)}/plugins`));
   return { ...body, plugins: arr<WorkspacePlugin>(body.plugins).map(normalizePlugin) };
@@ -408,6 +429,26 @@ export async function checkWorkbenchPlugin(pid: string): Promise<{ id: string; u
   return json(await api(`${plugin(pid)}/check`, { method: "POST" }));
 }
 
+/** Everything a card shows about `pid` — for a plugin not installed yet,
+ *  what its pinned release says (the daemon fetches it once and keeps it). */
+export async function fetchPluginDetails(pid: string): Promise<PluginDetails> {
+  return normalizeDetails(await json<PluginDetails>(await api(`${plugin(pid)}/details`)));
+}
+
+/** A repository's plugin as its latest release describes it (`owner/repo` or
+ *  its github.com URL, passed through as typed); nothing is installed. */
+export async function previewPlugin(github: string): Promise<PluginDetails> {
+  return normalizeDetails(
+    await json<PluginDetails>(
+      await api("/plugins/preview", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ github }),
+      }),
+    ),
+  );
+}
+
 // ---- reactive store (active workspace only) ---------------------------------
 
 const pluginsStore = writable<WorkspacePlugins | null>(null);
@@ -435,6 +476,51 @@ const checkedStore = writable<ReadonlyMap<string, number>>(new Map());
  *  updates), by plugin id — the card's quiet "checked just now" line. Only
  *  the user's own checks: the daemon's daily check says nothing here. */
 export const checkedAt: Readable<ReadonlyMap<string, number>> = checkedStore;
+
+// ---- available cards opened in place (this page's session only) -------------
+
+const expandedStore = writable<ReadonlySet<string>>(new Set());
+/** The available cards the user opened, by plugin id — kept while this page
+ *  lives (a tab switch or a re-render keeps them open), never persisted. */
+export const expandedPlugins: Readable<ReadonlySet<string>> = expandedStore;
+
+/** A card's fetched details: in flight, answered, or the daemon's refusal. */
+export type DetailsState =
+  | { state: "loading" }
+  | { state: "ok"; plugin: PluginDetails }
+  | { state: "error"; message: string; missingRoute: boolean };
+
+const detailsStore = writable<ReadonlyMap<string, DetailsState>>(new Map());
+/** Details by `detailsKey` (id + the version the card shows). */
+export const pluginDetails: Readable<ReadonlyMap<string, DetailsState>> = detailsStore;
+
+export const detailsKey = (pid: string, version: string): string => `${pid}@${version}`;
+
+/** Open or close an available card; opening fetches its details once (an
+ *  earlier refusal is asked again). */
+export function toggleExpanded(pid: string, version: string): void {
+  let opened = false;
+  expandedStore.update((set) => {
+    const next = new Set(set);
+    opened = !next.delete(pid);
+    if (opened) next.add(pid);
+    return next;
+  });
+  if (opened) void loadPluginDetails(pid, version);
+}
+
+async function loadPluginDetails(pid: string, version: string): Promise<void> {
+  const key = detailsKey(pid, version);
+  const known = get(detailsStore).get(key);
+  if (known !== undefined && known.state !== "error") return;
+  const put = (s: DetailsState) => detailsStore.update((m) => new Map(m).set(key, s));
+  put({ state: "loading" });
+  try {
+    put({ state: "ok", plugin: await fetchPluginDetails(pid) });
+  } catch (e) {
+    put({ state: "error", message: e instanceof Error ? e.message : String(e), missingRoute: isMissingRoute(e) });
+  }
+}
 
 let currentWs: string | null = null;
 let refreshSeq = 0;

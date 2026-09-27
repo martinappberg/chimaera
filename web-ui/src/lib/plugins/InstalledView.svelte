@@ -2,7 +2,8 @@
   /**
    * The Plugins segment of the Extensions tab: the chimaera plugins as cards
    * (PluginCard.svelte — one primary control each, everything secondary in
-   * its "…" menu), a small form that installs a plugin from a repository,
+   * its "…" menu), a small form that previews or installs a plugin from a
+   * repository (the preview is a PluginCard of its own under the form),
    * then the agent plugins, as each agent CLI reports them. Agent state is
    * read from the agents, never guessed; versions, sources and verification
    * from the daemon.
@@ -18,9 +19,12 @@
     checkedAt,
     installWorkbenchPlugin,
     isMissingRoute,
+    previewPlugin,
     type AgentHook,
     type AgentPlugin,
     type AgentPlugins,
+    type PluginChange,
+    type PluginDetails,
     type WorkspacePlugin,
   } from "./store";
 
@@ -89,17 +93,22 @@
 
   let repo = $state("");
   let adding = $state(false);
+  let looking = $state(false);
   let added = $state<(Outcome & { error: boolean }) | null>(null);
+  /** The repository last previewed (as typed) and what its release says. */
+  let previewed = $state<{ github: string; plugin: PluginDetails } | null>(null);
+  const formBusy = $derived(adding || looking);
 
   async function addFromRepository(): Promise<void> {
     const github = repo.trim();
-    if (github === "" || adding) return;
+    if (github === "" || formBusy) return;
     adding = true;
     added = null;
     try {
       const res = await installWorkbenchPlugin(github);
       added = { ...installedOutcome(res, res.id), error: false };
       repo = "";
+      previewed = null;
     } catch (e) {
       added = {
         text: isMissingRoute(e) ? "this daemon can't install plugins yet — update chimaera" : e instanceof Error ? e.message : String(e),
@@ -108,6 +117,39 @@
     } finally {
       adding = false;
     }
+  }
+
+  /** Preview: what the repository's release says, in a card under the form;
+   *  nothing is installed. A refusal is the outcome line, as for Install. */
+  async function previewRepository(): Promise<void> {
+    const github = repo.trim();
+    if (github === "" || formBusy) return;
+    looking = true;
+    added = null;
+    try {
+      previewed = { github, plugin: await previewPlugin(github) };
+    } catch (e) {
+      previewed = null;
+      added = {
+        text: isMissingRoute(e) ? "this daemon can't preview plugins yet — update chimaera" : e instanceof Error ? e.message : String(e),
+        error: true,
+      };
+    } finally {
+      looking = false;
+    }
+  }
+
+  /** The preview's own Install: the repository it previewed. Done, the
+   *  preview gives way to the new card and the outcome line; a refusal
+   *  stays on the preview (the card shows it). */
+  async function installPreviewed(): Promise<PluginChange> {
+    if (previewed === null) throw new Error("nothing previewed");
+    const github = previewed.github;
+    const res = await installWorkbenchPlugin(github);
+    added = { ...installedOutcome(res, res.id), error: false };
+    previewed = null;
+    if (repo.trim() === github) repo = "";
+    return res;
   }
 
   // --- agent plugins ------------------------------------------------------------
@@ -200,21 +242,43 @@
         autocomplete="off"
         autocapitalize="off"
         aria-describedby="wb-add-help"
-        readonly={adding}
+        readonly={formBusy}
         bind:value={repo}
       />
-      <button type="submit" class="opt" disabled={repo.trim() === "" || adding}>
+      <button type="button" class="opt" disabled={repo.trim() === "" || formBusy} onclick={() => void previewRepository()}>
+        {looking ? "Looking…" : "Preview"}
+      </button>
+      <button type="submit" class="opt primary" disabled={repo.trim() === "" || formBusy}>
         {adding ? "Installing…" : "Install"}
       </button>
     </div>
     <p id="wb-add-help" class="help">
-      The latest release of a plugin's GitHub repository, installed on this host. It does nothing until you switch it on
-      in a workspace.
+      The latest release of a plugin's GitHub repository: Preview shows what it adds, Install puts it on this host. It
+      does nothing until you switch it on in a workspace.
     </p>
     {#if added !== null}
       <p class="outcome" class:err={added.error} role={added.error ? "alert" : "status"}>{added.text}</p>
     {/if}
   </form>
+
+  {#if previewed !== null}
+    {@const pv = previewed}
+    {#key `${pv.github}@${pv.plugin.version}`}
+      <PluginCard
+        plugin={pv.plugin}
+        {agentPlugins}
+        {agentState}
+        {agentError}
+        {counts}
+        {wsId}
+        {now}
+        {onAttach}
+        {onOpenSession}
+        {onRefresh}
+        preview={{ install: installPreviewed, close: () => (previewed = null) }}
+      />
+    {/key}
+  {/if}
 </section>
 
 {#if removing !== null}

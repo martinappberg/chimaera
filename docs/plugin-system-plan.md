@@ -93,6 +93,11 @@ describe what shipped; the phases below remain the design record.
     dashboard's quiet state says what Agent notes and Mycelium do, linking
     Extensions. agent-notes 0.1.2 in the lock (its own wording for the
     instruction paragraph; the daemon test now checks it names both tools).
+  - See it before installing it (2026-09-27): an available card opens in place to its pinned
+    release's manifest (`GET /plugins/{pid}/details`, checked against the lock's `sha256_toml`,
+    cached per id and version) and the repository form's **Preview** shows a repository's
+    latest release the same way (`POST /plugins/preview`, checked against its `SHA256SUMS`,
+    the last 32 cached); nothing is written, nothing is fetched at boot or by the checker.
 - **Proven live** on the isolated debug daemon, with a fake claude binary
   standing in for the agent so nothing was billed (the 2026-09-26 runs below
   predate decision 6, so their first-party plugins were still embedded):

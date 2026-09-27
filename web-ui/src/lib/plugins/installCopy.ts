@@ -24,6 +24,23 @@ export function installTitle(p: WorkspacePlugin): string {
   return `Downloads it from ${from} into this host's ~/.chimaera/plugins. It does nothing until you switch it on in a workspace.`;
 }
 
+/** A download's size as a person reads it: "≈ 130 KB", "≈ 1.2 MB" — with
+ *  no-break spaces, so a narrow card never wraps the "≈" away from it. */
+export function approxSize(bytes: number): string {
+  const nb = "\u00a0";
+  if (bytes < 1000 * 1000) return `≈${nb}${Math.max(1, Math.round(bytes / 1000))}${nb}KB`;
+  const mb = bytes / (1000 * 1000);
+  return `≈${nb}${mb < 10 ? mb.toFixed(1).replace(/\.0$/, "") : Math.round(mb)}${nb}MB`;
+}
+
+/** The line under a card opened before install: where Install downloads
+ *  from (and how much, when the daemon knows), and that it stays off. */
+export function installLine(repo: string | null, wasmBytes: number | null): string {
+  const from = repo !== null ? `github.com/${repo}` : "its release";
+  const size = wasmBytes !== null ? ` (${approxSize(wasmBytes)})` : "";
+  return `Installing downloads it from ${from}${size} into this host's ~/.chimaera/plugins. It does nothing until you switch it on in a workspace.`;
+}
+
 /** "installed Agent notes 0.1.1". */
 export function installedOutcome(c: PluginChange, fallbackName: string): Outcome {
   const raw = (c.plugin as { name?: unknown } | null | undefined)?.name;

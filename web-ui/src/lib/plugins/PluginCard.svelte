@@ -14,6 +14,15 @@
    *    installed on this host, each row one state and at most one action;
    *  - an update, a fault (with Reinstall when that mends it), then one
    *    outcome line and the quiet "checked …" after a check.
+   * A plugin not installed yet is the head and its summary, and the whole
+   * top of the card is one button (a chevron beside the summary shows it)
+   * that opens it in place: the same body, from what its release says
+   * (`/details`, fetched once), the description in full, the agent-side
+   * box with each agent's state but no actions (they need the plugin
+   * installed), then where Install downloads from and a second Install. A
+   * repository previewed from the form (`preview`) is that opened body in
+   * a card of its own: "not installed" where the switch would be, its own
+   * Install at the bottom, a close button.
    * Plain words throughout; anything technical is a tooltip on a button.
    * Versions and verification come from the daemon; agent state from the
    * agents.
@@ -26,6 +35,7 @@
     checkedWords,
     hereLine,
     installedOutcome,
+    installLine,
     installTitle,
     repoUrl,
     stateWords,
@@ -37,20 +47,25 @@
   import {
     changeWorkbenchPlugin,
     checkedAt,
+    detailsKey,
+    expandedPlugins,
     installFirstPartyPlugin,
     installPlugin,
     installWorkbenchPlugin,
     isMissingRoute,
+    pluginDetails,
     setWorkspacePluginOn,
+    toggleExpanded,
     type AgentId,
     type AgentPlugins,
     type PluginChange,
+    type PluginDetails,
     type PluginUpdate,
     type WorkspacePlugin,
   } from "./store";
 
   interface Props {
-    plugin: WorkspacePlugin;
+    plugin: WorkspacePlugin | PluginDetails;
     agentPlugins: AgentPlugins | null;
     agentState: AgentsState;
     agentError: string | null;
@@ -62,9 +77,12 @@
     onAttach: (pluginId: string) => void;
     onOpenSession: (id: string) => void;
     onRefresh: () => void;
-    onRemove: (p: WorkspacePlugin) => void;
+    onRemove?: (p: WorkspacePlugin) => void;
     /** A change is in flight elsewhere (the Remove dialog). */
     removing?: boolean;
+    /** A release previewed from the repository form (`plugin` is what it
+     *  described): its own Install, and closing it. */
+    preview?: { install: () => Promise<PluginChange>; close: () => void } | null;
   }
 
   let {
@@ -78,8 +96,9 @@
     onAttach,
     onOpenSession,
     onRefresh,
-    onRemove,
+    onRemove = () => {},
     removing = false,
+    preview = null,
   }: Props = $props();
 
   type Change = "install" | "update" | "rollback" | "check" | "reinstall";
@@ -90,33 +109,49 @@
   let agentBusy = $state<string | null>(null);
   let note = $state<Outcome | null>(null);
   let error = $state<string | null>(null);
-  let expanded = $state(false);
+  /** The installed card's description, unclamped ("more"). */
+  let descOpen = $state(false);
   let overflowing = $state(false);
   let moreBtn = $state<HTMLButtonElement | null>(null);
 
+  const previewing = $derived(preview !== null);
   const available = $derived(p.source === "available");
+  /** An available card in the list (not a preview): it opens in place. */
+  const opens = $derived(available && !previewing);
+  const open = $derived(previewing || (opens && $expandedPlugins.has(p.id)));
+  const fetched = $derived(opens ? $pluginDetails.get(detailsKey(p.id, p.version)) : undefined);
+  /** What the body describes: an installed card its own entry, a preview
+   *  what its release said, an opened card its fetched details (null while
+   *  they come, or when they couldn't be read). */
+  const shown = $derived<WorkspacePlugin | PluginDetails | null>(
+    !available || previewing ? p : fetched?.state === "ok" ? fetched.plugin : null,
+  );
+  const described = $derived(shown !== null && "download" in shown ? shown : null);
   const busy = $derived(working !== null || removing);
-  const home = $derived(p.homepage !== null && isWebUrl(p.homepage) ? p.homepage : null);
+  const homepage = $derived((shown ?? p).homepage);
+  const home = $derived(homepage !== null && isWebUrl(homepage) ? homepage : null);
   const here = $derived(hereLine(p, counts));
-  const model = $derived(
-    requirementsModel({
-      requires: p.requires,
-      recommends: p.recommends,
-      knowledge: p.provides.knowledge,
+  const model = $derived.by(() => {
+    const x = shown ?? p;
+    return requirementsModel({
+      requires: x.requires,
+      recommends: x.recommends,
+      knowledge: x.provides.knowledge,
       report: agentPlugins,
       state: agentState,
-    }),
-  );
-  const blocks = $derived(
-    agentSideBlocks(model, {
-      name: p.name,
-      requires: p.requires,
-      recommends: p.recommends,
-      requires_summary: p.requires_summary,
-      recommends_summary: p.recommends_summary,
-      knowledge: p.provides.knowledge,
-    }),
-  );
+    });
+  });
+  const blocks = $derived.by(() => {
+    const x = shown ?? p;
+    return agentSideBlocks(model, {
+      name: x.name,
+      requires: x.requires,
+      recommends: x.recommends,
+      requires_summary: x.requires_summary,
+      recommends_summary: x.recommends_summary,
+      knowledge: x.provides.knowledge,
+    });
+  });
   const checked = $derived($checkedAt.get(p.id));
   /** A plugin that can't run here: the switch can't turn it on (the daemon
    *  refuses) until the fault is gone. A fault while on is the plugin
@@ -164,7 +199,7 @@
     try {
       const res =
         kind === "install"
-          ? await installFirstPartyPlugin(p.id)
+          ? await (preview !== null ? preview.install() : installFirstPartyPlugin(p.id))
           : kind === "reinstall"
             ? await installWorkbenchPlugin(p.repo ?? "", p.version)
             : await changeWorkbenchPlugin(kind, p.id);
@@ -233,10 +268,10 @@
   }
 
   /** Whether the clamped description hides anything (re-measured on
-   *  resize; while expanded the answer is kept, so "less" stays). */
+   *  resize; while open the answer is kept, so "less" stays). */
   function clampWatch(node: HTMLElement) {
     const measure = () => {
-      if (!expanded) overflowing = node.scrollHeight > node.clientHeight + 1;
+      if (!descOpen) overflowing = node.scrollHeight > node.clientHeight + 1;
     };
     const ro = new ResizeObserver(measure);
     ro.observe(node);
@@ -245,11 +280,11 @@
   }
 </script>
 
-<article class="card" class:active={p.active} class:available aria-labelledby="pc-{p.id}">
+{#snippet head()}
   <header class="head">
     <span class="tile" class:on={p.active} aria-hidden="true">{tileLetters(p.id)}</span>
     <div class="ident">
-      <h3 class="name" id="pc-{p.id}">
+      <h3 class="name" id="pc-{p.id}{previewing ? '-preview' : ''}">
         {#if home !== null}
           <a
             href={home}
@@ -283,183 +318,289 @@
         <span class="tag" title="Installed from {p.local_path}">local build</span>
       {/if}
     </div>
-    {#if !available}
+    {#if previewing}
+      <span class="state">not installed</span>
+    {:else if !available}
       <span class="state" class:good={p.active}>
         {#if p.active}<span class="dot" aria-hidden="true"></span>{/if}{stateWords(p)}
       </span>
     {/if}
     <div class="ctrl">
-      {#if available}
-        <button class="opt primary" disabled={busy} title={installTitle(p)} onclick={() => void change("install")}>
-          {working === "install" ? "Installing…" : "Install"}
+      {#if preview !== null}
+        {@const close = preview.close}
+        <button class="more" aria-label="Close the preview of {p.name}" title="Close" onclick={close}>
+          <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
+            <path d="M4 4l8 8M12 4l-8 8" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
+          </svg>
         </button>
       {:else}
-        <span title={blocked ? "It can't run until the problem below is fixed" : undefined}>
-          <Switch
-            on={p.on}
-            label="{p.name} {p.on ? 'on' : 'off'} in this workspace"
-            disabled={switching || blocked}
-            onToggle={(next) => void toggle(next)}
-          />
-        </span>
-      {/if}
-      <button
-        class="more"
-        bind:this={moreBtn}
-        aria-haspopup="menu"
-        aria-label="More for {p.name}"
-        title="More"
-        onclick={openMenu}
-      >
-        <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
-          <circle cx="3.5" cy="8" r="1.3" fill="currentColor" />
-          <circle cx="8" cy="8" r="1.3" fill="currentColor" />
-          <circle cx="12.5" cy="8" r="1.3" fill="currentColor" />
-        </svg>
-      </button>
-    </div>
-  </header>
-
-  <div class="body">
-    <div class="prose">
-      <p class="summary">{p.summary}</p>
-      {#if p.description !== null}
-        <p class="desc" class:clamped={!expanded} use:clampWatch>{p.description}</p>
-        {#if overflowing}
-          <button class="toggle-more" aria-expanded={expanded} onclick={() => (expanded = !expanded)}>
-            {expanded ? "less" : "more"}
+        {#if available}
+          <button class="opt primary" disabled={busy} title={installTitle(p)} onclick={() => void change("install")}>
+            {working === "install" ? "Installing…" : "Install"}
           </button>
-        {/if}
-      {/if}
-    </div>
-
-    {#if p.adds.ui.length > 0 || p.adds.agents.length > 0 || here !== null}
-      <dl class="facts">
-        {#if p.adds.ui.length > 0}
-          <dt>For you</dt>
-          <dd>{#each p.adds.ui as line, i (i)}<span>{line}</span>{/each}</dd>
-        {/if}
-        {#if p.adds.agents.length > 0}
-          <dt>For agents</dt>
-          <dd>{#each p.adds.agents as line, i (i)}<span>{line}</span>{/each}</dd>
-        {/if}
-        {#if here !== null}
-          <dt>Here</dt>
-          <dd>
-            <span class:muted={here.kind !== "using"}
-              >{here.text}{#if here.kind === "setup"}{" "}— <button class="link" onclick={() => onAttach(p.id)}>Set it up</button
-                >{/if}</span
-            >
-          </dd>
-        {/if}
-      </dl>
-    {/if}
-
-    {#each blocks as b (b.kind)}
-      <section class="side" aria-label={b.title}>
-        <div class="side-head">
-          <span class="side-title">{b.title}</span>
-          {#if b.link !== null}
-            {@const link = b.link}
-            <a class="side-link" href={link.url} target="_blank" rel="noopener noreferrer" onclick={(e) => external(e, link.url)}
-              >{link.label}<span aria-hidden="true"> ↗</span></a
-            >
-          {/if}
-        </div>
-        <p class="side-sum">{b.summary}</p>
-        {#if b.notice !== null}
-          <p class="side-note">{b.notice}</p>
-        {/if}
-        {#if b.rows.length > 0}
-          <ul class="arows">
-            {#each b.rows as r (`${r.agent}:${r.id}`)}
-              <li class="arow">
-                <span class="aname">{r.agent}</span>
-                <span class="astate {r.tone}" title={r.scope !== null ? `${r.id} · ${r.scope} scope` : r.id}>{r.state}</span>
-                {#if r.action === "install"}
-                  <button
-                    class="opt small"
-                    disabled={agentBusy !== null}
-                    title="Runs {r.agent}'s own plugin install in a terminal you can watch"
-                    onclick={() => void installForAgent(r)}
-                  >
-                    {agentBusy === r.agent ? "Starting…" : "Install"}
-                  </button>
-                {:else if r.action === "review"}
-                  <button class="opt small" title="See exactly what {r.agent} will run, then trust it" onclick={() => onAttach(p.id)}
-                    >Review</button
-                  >
-                {/if}
-              </li>
-            {/each}
-          </ul>
-        {/if}
-        {#if model.phase === "error" && agentError !== null}
-          <p class="side-note err">
-            Couldn't ask the agents: {agentError}
-            <button class="link" onclick={onRefresh}>Try again</button>
-          </p>
-        {/if}
-      </section>
-    {/each}
-
-    {#if p.installed && p.update !== null}
-      {@const u = p.update}
-      <div class="callout update">
-        <span class="ctext"><b>{u.version}</b> is available</span>
-        {#if u.url !== "" && isWebUrl(u.url)}
-          <a class="link" href={u.url} target="_blank" rel="noopener noreferrer" onclick={(e) => external(e, u.url)}>what changed</a>
+        {:else}
+          <span title={blocked ? "It can't run until the problem below is fixed" : undefined}>
+            <Switch
+              on={p.on}
+              label="{p.name} {p.on ? 'on' : 'off'} in this workspace"
+              disabled={switching || blocked}
+              onToggle={(next) => void toggle(next)}
+            />
+          </span>
         {/if}
         <button
-          class="opt primary small"
-          disabled={busy}
-          title="Downloads {u.version} from its release and switches to it; the version you have now stays as the previous one"
-          onclick={() => void change("update")}
+          class="more"
+          bind:this={moreBtn}
+          aria-haspopup="menu"
+          aria-label="More for {p.name}"
+          title="More"
+          onclick={openMenu}
         >
-          {working === "update" ? "Updating…" : "Update"}
+          <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+            <circle cx="3.5" cy="8" r="1.3" fill="currentColor" />
+            <circle cx="8" cy="8" r="1.3" fill="currentColor" />
+            <circle cx="12.5" cy="8" r="1.3" fill="currentColor" />
+          </svg>
         </button>
-      </div>
-    {/if}
+      {/if}
+    </div>
+  </header>
+{/snippet}
 
-    {#if p.fault !== null}
-      <div class="callout fault" role="note">
-        <span class="ctext">
-          {p.fault}{#if p.on}{" "}Switching it off and on starts it again.{/if}
-        </span>
-        {#if canReinstall(p)}
-          <button
-            class="opt small"
-            disabled={busy}
-            title="Downloads {p.name} {p.version} again from its release"
-            onclick={() => void change("reinstall")}
+<!-- What it adds and what it found here: the same list on every card. -->
+{#snippet facts(x: WorkspacePlugin, found: ReturnType<typeof hereLine>)}
+  {#if x.adds.ui.length > 0 || x.adds.agents.length > 0 || found !== null}
+    <dl class="facts">
+      {#if x.adds.ui.length > 0}
+        <dt>For you</dt>
+        <dd>{#each x.adds.ui as line, i (i)}<span>{line}</span>{/each}</dd>
+      {/if}
+      {#if x.adds.agents.length > 0}
+        <dt>For agents</dt>
+        <dd>{#each x.adds.agents as line, i (i)}<span>{line}</span>{/each}</dd>
+      {/if}
+      {#if found !== null}
+        <dt>Here</dt>
+        <dd>
+          <span class:muted={found.kind !== "using"}
+            >{found.text}{#if found.kind === "setup"}{" "}— <button class="link" onclick={() => onAttach(p.id)}>Set it up</button
+              >{/if}</span
           >
-            {working === "reinstall" ? "Reinstalling…" : "Reinstall"}
-          </button>
+        </dd>
+      {/if}
+    </dl>
+  {/if}
+{/snippet}
+
+<!-- The agent-side plugin box: each agent's state, and — once the plugin is
+     installed — at most one action per row. -->
+{#snippet sides(actions: boolean)}
+  {#each blocks as b (b.kind)}
+    <section class="side" aria-label={b.title}>
+      <div class="side-head">
+        <span class="side-title">{b.title}</span>
+        {#if b.link !== null}
+          {@const link = b.link}
+          <a class="side-link" href={link.url} target="_blank" rel="noopener noreferrer" onclick={(e) => external(e, link.url)}
+            >{link.label}<span aria-hidden="true"> ↗</span></a
+          >
         {/if}
       </div>
-    {/if}
+      <p class="side-sum">{b.summary}</p>
+      {#if b.notice !== null}
+        <p class="side-note">{b.notice}</p>
+      {/if}
+      {#if b.rows.length > 0}
+        <ul class="arows">
+          {#each b.rows as r (`${r.agent}:${r.id}`)}
+            <li class="arow">
+              <span class="aname">{r.agent}</span>
+              <span class="astate {r.tone}" title={r.scope !== null ? `${r.id} · ${r.scope} scope` : r.id}>{r.state}</span>
+              {#if actions && r.action === "install"}
+                <button
+                  class="opt small"
+                  disabled={agentBusy !== null}
+                  title="Runs {r.agent}'s own plugin install in a terminal you can watch"
+                  onclick={() => void installForAgent(r)}
+                >
+                  {agentBusy === r.agent ? "Starting…" : "Install"}
+                </button>
+              {:else if actions && r.action === "review"}
+                <button class="opt small" title="See exactly what {r.agent} will run, then trust it" onclick={() => onAttach(p.id)}
+                  >Review</button
+                >
+              {/if}
+            </li>
+          {/each}
+        </ul>
+      {/if}
+      {#if model.phase === "error" && agentError !== null}
+        <p class="side-note err">
+          Couldn't ask the agents: {agentError}
+          <button class="link" onclick={onRefresh}>Try again</button>
+        </p>
+      {/if}
+    </section>
+  {/each}
+{/snippet}
 
-    {#if working !== null && working !== "install" && working !== "update" && working !== "reinstall"}
-      <p class="status" role="status">{WORKING[working]}</p>
-    {:else if error !== null}
-      <p class="status err" role="alert">{error}</p>
-    {:else if note !== null}
-      <p class="status" role="status">{note.text}</p>
-    {/if}
-    {#if checked !== undefined && working !== "check"}
-      <p class="status">{p.update === null ? "No newer version · " : ""}{checkedWords(checked, now)}</p>
-    {/if}
+{#snippet faultCallout(x: WorkspacePlugin, reinstall: boolean)}
+  {#if x.fault !== null}
+    <div class="callout fault" role="note">
+      <span class="ctext">
+        {x.fault}{#if x.on}{" "}Switching it off and on starts it again.{/if}
+      </span>
+      {#if reinstall && canReinstall(x)}
+        <button
+          class="opt small"
+          disabled={busy}
+          title="Downloads {x.name} {x.version} again from its release"
+          onclick={() => void change("reinstall")}
+        >
+          {working === "reinstall" ? "Reinstalling…" : "Reinstall"}
+        </button>
+      {/if}
+    </div>
+  {/if}
+{/snippet}
+
+<!-- A plugin not installed yet, opened: everything an installed card shows,
+     from its release, then where Install downloads from and Install again. -->
+{#snippet beforeInstall(x: WorkspacePlugin | PluginDetails)}
+  {@render facts(x, null)}
+  {@render sides(false)}
+  {@render faultCallout(x, false)}
+  <div class="install-again">
+    <p class="install-line">
+      {installLine(x.repo, described?.download?.wasm_bytes ?? null)}
+    </p>
+    <button class="opt primary" disabled={busy} onclick={() => void change("install")}>
+      {working === "install" ? "Installing…" : "Install"}
+    </button>
   </div>
+{/snippet}
+
+{#snippet statusLines()}
+  {#if working !== null && working !== "install" && working !== "update" && working !== "reinstall"}
+    <p class="status" role="status">{WORKING[working]}</p>
+  {:else if error !== null}
+    <p class="status err" role="alert">{error}</p>
+  {:else if note !== null}
+    <p class="status" role="status">{note.text}</p>
+  {/if}
+  {#if checked !== undefined && working !== "check"}
+    <p class="status">{p.update === null ? "No newer version · " : ""}{checkedWords(checked, now)}</p>
+  {/if}
+{/snippet}
+
+<article
+  class="card"
+  class:active={p.active}
+  class:available
+  class:preview={previewing}
+  aria-labelledby="pc-{p.id}{previewing ? '-preview' : ''}"
+>
+  {#if opens}
+    <!-- The whole top is one button: the chevron's `::before` covers it, the
+         Install and "…" buttons (and the name's link) sit above that. -->
+    <div class="top" class:open class:follows={open || error !== null || note !== null}>
+      {@render head()}
+      <div class="lead">
+        <p class="summary">{p.summary}</p>
+        <button
+          class="expander"
+          aria-expanded={open}
+          aria-controls="pc-more-{p.id}"
+          aria-label="More about {p.name}"
+          title={open ? "Show less" : "See what it adds before you install it"}
+          onclick={() => toggleExpanded(p.id, p.version)}
+        >
+          <svg class="chev" viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
+            <path d="M4 6l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
+          </svg>
+        </button>
+      </div>
+    </div>
+    {#if open}
+      <div class="body" class:tight={shown !== null && shown.description !== null} id="pc-more-{p.id}">
+        {#if fetched === undefined || fetched.state === "loading"}
+          <p class="status" role="status">loading…</p>
+        {:else if fetched.state === "error"}
+          <p class="status err" role="alert">
+            {fetched.missingRoute ? "this daemon can't show more yet — update chimaera" : fetched.message}
+          </p>
+        {:else if shown !== null}
+          {#if shown.description !== null}
+            <p class="desc">{shown.description}</p>
+          {/if}
+          {@render beforeInstall(shown)}
+        {/if}
+        {@render statusLines()}
+      </div>
+    {:else if error !== null || note !== null}
+      <div class="body">{@render statusLines()}</div>
+    {/if}
+  {:else}
+    {@render head()}
+    <div class="body">
+      <div class="prose">
+        <p class="summary">{p.summary}</p>
+        {#if p.description !== null}
+          {#if previewing}
+            <p class="desc">{p.description}</p>
+          {:else}
+            <p class="desc" class:clamped={!descOpen} use:clampWatch>{p.description}</p>
+            {#if overflowing}
+              <button class="toggle-more" aria-expanded={descOpen} onclick={() => (descOpen = !descOpen)}>
+                {descOpen ? "less" : "more"}
+              </button>
+            {/if}
+          {/if}
+        {/if}
+      </div>
+
+      {#if previewing}
+        {@render beforeInstall(p)}
+      {:else}
+        {@render facts(p, here)}
+        {@render sides(true)}
+
+        {#if p.installed && p.update !== null}
+          {@const u = p.update}
+          <div class="callout update">
+            <span class="ctext"><b>{u.version}</b> is available</span>
+            {#if u.url !== "" && isWebUrl(u.url)}
+              <a class="link" href={u.url} target="_blank" rel="noopener noreferrer" onclick={(e) => external(e, u.url)}>what changed</a>
+            {/if}
+            <button
+              class="opt primary small"
+              disabled={busy}
+              title="Downloads {u.version} from its release and switches to it; the version you have now stays as the previous one"
+              onclick={() => void change("update")}
+            >
+              {working === "update" ? "Updating…" : "Update"}
+            </button>
+          </div>
+        {/if}
+
+        {@render faultCallout(p, true)}
+      {/if}
+
+      {@render statusLines()}
+    </div>
+  {/if}
 </article>
 
 <style>
   /* Its layout follows the view's width (PluginsView's scroller is the
      container), not the window's, so a split pane gets the narrow layout. */
   .card {
+    --pad-y: 18px;
+    --pad-x: 20px;
     background: var(--overlay-bg);
     border: 1px solid var(--edge);
     border-radius: 12px;
-    padding: 18px 20px;
+    padding: var(--pad-y) var(--pad-x);
     display: flex;
     flex-direction: column;
     gap: 12px;
@@ -765,6 +906,114 @@
     padding: 2px 10px;
   }
 
+  /* --- a plugin not installed yet: its top opens it in place -------------- */
+  .top {
+    position: relative;
+    isolation: isolate;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    min-width: 0;
+  }
+  /* Above the expander's cover: the controls, the name's link, and the
+     badge (for its tooltip). */
+  .top .ctrl,
+  .top .name a,
+  .top .badge {
+    position: relative;
+    z-index: 1;
+  }
+  .lead {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    padding-left: 46px;
+    min-width: 0;
+  }
+  .lead .summary {
+    flex: 1 1 auto;
+    min-width: 0;
+    margin: 0;
+  }
+  .expander {
+    flex: none;
+    appearance: none;
+    border: none;
+    background: none;
+    padding: 0;
+    width: 22px;
+    height: 20px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--muted);
+    cursor: pointer;
+    border-radius: 5px;
+    transition: color 0.12s ease;
+  }
+  /* The cover: the card's whole top, out to its padded edge (to half the
+     gap when something follows). It is the button, so a click anywhere up
+     there opens the card, and the focus ring rings all of it. */
+  .expander::before {
+    content: "";
+    position: absolute;
+    top: calc(-1 * var(--pad-y));
+    left: calc(-1 * var(--pad-x));
+    right: calc(-1 * var(--pad-x));
+    bottom: calc(-1 * var(--pad-y));
+    border-radius: 11px;
+  }
+  .top.follows .expander::before {
+    bottom: -6px;
+    border-radius: 11px 11px 0 0;
+  }
+  .expander:hover,
+  .expander:focus-visible {
+    color: var(--fg);
+  }
+  .expander:focus-visible {
+    outline: none;
+  }
+  .expander:focus-visible::before {
+    outline: 2px solid var(--focus-ring);
+    outline-offset: -3px;
+  }
+  .chev {
+    transition: transform 0.15s ease;
+  }
+  .top.open .chev {
+    transform: rotate(180deg);
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .chev {
+      transition: none;
+    }
+  }
+  /* The description sits under the summary as it does on an installed card. */
+  .body.tight {
+    margin-top: -9px;
+  }
+  .install-again {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px 16px;
+    padding-top: 12px;
+    border-top: 1px solid var(--edge);
+  }
+  .install-line {
+    flex: 1 1 260px;
+    min-width: 0;
+    font-size: var(--text-xs);
+    line-height: 1.5;
+    color: var(--muted);
+    overflow-wrap: anywhere;
+  }
+  .install-again .opt {
+    margin-left: auto;
+    white-space: nowrap;
+  }
+
   /* --- an update, a fault ------------------------------------------------- */
   .callout {
     display: flex;
@@ -834,7 +1083,8 @@
      edge), the body uses the full width. */
   @container (max-width: 600px) {
     .card {
-      padding: 16px;
+      --pad-y: 16px;
+      --pad-x: 16px;
     }
     .head {
       grid-template-columns: auto minmax(0, 1fr) auto;
@@ -845,7 +1095,8 @@
     .state {
       justify-self: start;
     }
-    .body {
+    .body,
+    .lead {
       padding-left: 0;
     }
   }

@@ -61,6 +61,13 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
             post(plugins::installed::rollback_route),
         )
         .route("/plugins/{pid}/check", post(plugins::releases::check_route))
+        // What a plugin's release says before it is installed
+        // (`plugins::preview`): nothing is written.
+        .route(
+            "/plugins/{pid}/details",
+            get(plugins::preview::details_route),
+        )
+        .route("/plugins/preview", post(plugins::preview::preview_route))
         .route("/workspaces/{id}/plugins", get(plugins::workspace_plugins))
         .route(
             "/workspaces/{id}/plugins/{pid}",

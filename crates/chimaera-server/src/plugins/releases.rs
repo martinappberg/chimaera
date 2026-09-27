@@ -15,7 +15,9 @@
 //! live in memory.
 //!
 //! A first-party plugin's pinned release needs no API call: its assets are
-//! fetched by their direct download URLs (`pinned_release`).
+//! fetched by their direct download URLs (`pinned_release`). What a release
+//! says before anything is installed (the card's expanded body, the
+//! repository form's Preview) is `preview`'s, cached in `Releases::previews`.
 //!
 //! Every fetch here is `agent_updates::curl` (10 s, 1 MiB): the fence every
 //! phone-home the daemon makes shares. `CHIMAERA_PLUGIN_RELEASES_API`
@@ -57,6 +59,8 @@ pub(crate) struct Releases {
     /// One install, update, rollback or remove at a time, daemon-wide: they
     /// move links under one directory and reload one catalog.
     pub(crate) changing: tokio::sync::Mutex<()>,
+    /// Releases described before install (`preview`), bounded.
+    pub(crate) previews: super::preview::Previews,
 }
 
 /// A newer release a check found (the card's Update chip).
@@ -77,6 +81,9 @@ pub(crate) struct Release {
     pub(crate) wasm_url: String,
     pub(crate) toml_url: String,
     pub(crate) sums_url: String,
+    /// `plugin.wasm`'s size in bytes, when the releases API gives it (the
+    /// card's "≈ 130 KB"; a pinned release's direct URLs don't).
+    pub(crate) wasm_size: Option<u64>,
 }
 
 impl Releases {
@@ -156,7 +163,14 @@ pub(crate) async fn fetch_release(
     };
     let body = crate::agent_updates::curl(&url, &[ACCEPT_GITHUB])
         .await
-        .map_err(|e| Refusal::upstream(format!("could not read {github}'s releases: {e:#}")))?;
+        .map_err(|e| {
+            // curl can't say "no such repository" apart from "no network"
+            // in words a person reads: the detail goes to the log.
+            tracing::debug!(%github, error = %format!("{e:#}"), "plugin releases unreadable");
+            Refusal::upstream(format!(
+                "couldn't read {github}'s releases on github.com — check the name, or try again later"
+            ))
+        })?;
     let release = parse_release(&body, github).map_err(Refusal::upstream)?;
     if let Some(v) = version {
         if release.version != v {
@@ -182,6 +196,7 @@ pub(crate) fn pinned_release(state: &AppState, l: &super::Locked) -> Release {
         wasm_url: asset("plugin.wasm"),
         toml_url: asset("plugin.toml"),
         sums_url: asset("SHA256SUMS"),
+        wasm_size: None,
     }
 }
 
@@ -209,10 +224,13 @@ pub(crate) fn parse_release(body: &[u8], github: &str) -> Result<Release, String
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let asset = |name: &str| -> Result<String, String> {
+    let named = |name: &str| {
         assets
             .iter()
             .find(|a| a.get("name").and_then(Value::as_str) == Some(name))
+    };
+    let asset = |name: &str| -> Result<String, String> {
+        named(name)
             .and_then(|a| a.get("browser_download_url").and_then(Value::as_str))
             .filter(|u| web_url(u))
             .map(str::to_string)
@@ -224,6 +242,7 @@ pub(crate) fn parse_release(body: &[u8], github: &str) -> Result<Release, String
         wasm_url: asset("plugin.wasm")?,
         toml_url: asset("plugin.toml")?,
         sums_url: asset("SHA256SUMS")?,
+        wasm_size: named("plugin.wasm").and_then(|a| a.get("size").and_then(Value::as_u64)),
     })
 }
 
@@ -436,6 +455,15 @@ mod tests {
         assert!(r.url.ends_with("/tag/v0.3.2"));
         assert_eq!(r.wasm_url, "https://x/plugin.wasm");
         assert_eq!(r.sums_url, "https://x/SHA256SUMS");
+        assert_eq!(r.wasm_size, None, "no size given");
+        let sized = br#"{"tag_name": "v1.0.0", "assets": [
+            {"name": "plugin.wasm", "size": 133120, "browser_download_url": "https://x/w"},
+            {"name": "plugin.toml", "size": 900, "browser_download_url": "https://x/t"},
+            {"name": "SHA256SUMS", "browser_download_url": "https://x/s"}]}"#;
+        assert_eq!(
+            parse_release(sized, "acme/demo").unwrap().wasm_size,
+            Some(133120)
+        );
 
         let no_sums = br#"{"tag_name": "v0.3.2", "assets": [
             {"name": "plugin.wasm", "browser_download_url": "https://x/w"},

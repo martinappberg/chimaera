@@ -51,8 +51,9 @@ use crate::AppState;
 
 /// A component's size cap, on download and on load.
 pub(crate) const WASM_MAX: u64 = 16 << 20;
-/// A manifest's size cap on load (downloads ride curl's 1 MiB fence).
-const TOML_MAX: u64 = 64 << 10;
+/// A manifest's size cap on load and on preview (downloads ride curl's
+/// 1 MiB fence).
+pub(crate) const TOML_MAX: u64 = 64 << 10;
 /// The kept `SHA256SUMS`: whatever the release published, which the
 /// download's own 1 MiB fence already bounded.
 const SUMS_MAX: u64 = 1 << 20;
@@ -65,7 +66,7 @@ pub(crate) const SUMS_MISMATCH: &str =
     "the downloaded files don't match what the release published — reinstall it";
 /// A download that doesn't hash to what its release lists (the refusal's
 /// words; the log line carries both hashes).
-const DOWNLOAD_MISMATCH: &str =
+pub(crate) const DOWNLOAD_MISMATCH: &str =
     "the downloaded files don't match what the release published — try again";
 /// A component download's wall clock: 16 MiB through a slow site proxy.
 const DOWNLOAD_SECS: u64 = 120;
@@ -687,6 +688,17 @@ pub(crate) struct InstallBody {
     path: Option<PathBuf>,
 }
 
+/// What was typed for a repository, as the install route and Preview read
+/// it: `owner/repo`, or its `https://github.com/owner/repo` URL (trimmed;
+/// `valid_github` judges the rest).
+pub(crate) fn normalize_github(typed: &str) -> &str {
+    let typed = typed.trim();
+    typed
+        .strip_prefix("https://github.com/")
+        .unwrap_or(typed)
+        .trim_end_matches('/')
+}
+
 /// POST /plugins/install {github, version?} | {path} — install a plugin
 /// from its GitHub release, or a local build from a directory (the user's
 /// click, or `chimaera plugin add`). A first-party plugin's repository
@@ -699,11 +711,7 @@ pub(crate) async fn install_route(
     let result = match (body.github.as_deref(), body.path) {
         (None, Some(path)) => install_path(&state, path).await,
         (Some(github), None) => {
-            let github = github.trim();
-            let github = github
-                .strip_prefix("https://github.com/")
-                .unwrap_or(github)
-                .trim_end_matches('/');
+            let github = normalize_github(github);
             let version = body
                 .version
                 .as_deref()

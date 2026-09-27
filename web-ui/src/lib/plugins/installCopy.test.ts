@@ -1,11 +1,13 @@
 import { describe, expect, it } from "vitest";
 import type { WorkspacePlugin } from "./store";
 import {
+  approxSize,
   canReinstall,
   checkedWords,
   footprint,
   hereLine,
   installedOutcome,
+  installLine,
   installTitle,
   pinnedVersion,
   stateWords,
@@ -131,5 +133,28 @@ describe("the card's words", () => {
     expect(tileLetters("mycelium")).toBe("my");
     expect(tileLetters("test-fixture")).toBe("te");
     expect(tileLetters("x-ray")).toBe("xr");
+  });
+});
+
+describe("the line under a card opened before install", () => {
+  // No-break spaces: "≈ 305 KB" never wraps apart.
+  const nb = (s: string) => s.replace(/ /g, "\u00a0");
+
+  it("rounds a download to what a person reads", () => {
+    expect(approxSize(134_947)).toBe(nb("≈ 135 KB"));
+    expect(approxSize(304_940)).toBe(nb("≈ 305 KB"));
+    expect(approxSize(120)).toBe(nb("≈ 1 KB"));
+    expect(approxSize(1_234_567)).toBe(nb("≈ 1.2 MB"));
+    expect(approxSize(2_000_000)).toBe(nb("≈ 2 MB"));
+    expect(approxSize(16_700_000)).toBe(nb("≈ 17 MB"));
+  });
+
+  it("names the repository and the size, and says it stays off", () => {
+    expect(installLine("martinappberg/chimaera-plugin-mycelium", 304_940)).toBe(
+      `Installing downloads it from github.com/martinappberg/chimaera-plugin-mycelium (${nb("≈ 305 KB")}) into this host's ~/.chimaera/plugins. It does nothing until you switch it on in a workspace.`,
+    );
+    expect(installLine("acme/demo", null)).toBe(
+      "Installing downloads it from github.com/acme/demo into this host's ~/.chimaera/plugins. It does nothing until you switch it on in a workspace.",
+    );
   });
 });

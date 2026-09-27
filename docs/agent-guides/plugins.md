@@ -117,7 +117,7 @@ What each part does, and what exists today:
 
 | Part | What it does | Where the host reads it |
 |---|---|---|
-| `id`, `name`, `summary`, `homepage` | the card; `id` names a directory and a URL segment, so it is charset-gated; the name links to `homepage` (an http(s) URL; opened in the system browser) | `plugins::validate`, `manifest_json` |
+| `id`, `name`, `summary`, `homepage` | the card; `id` names a directory and a URL segment, so it is charset-gated (and `install` / `preview`, routes' own segments, are taken); the name links to `homepage` (an http(s) URL; opened in the system browser) | `plugins::validate`, `manifest_json` |
 | `description` | optional: a few plain sentences from the author — what the plugin is and why a person would switch it on — shown under the summary, clamped to two lines with "more"; blank is omitted (`description: null` on the wire) | `manifest_json` |
 | `version`, `api` | which build runs, and the WIT it needs; `api` is a gate | `plugins::gate`, `resolve` |
 | `detect.any` | footprint → "active here" (no path component may be a symlink) | `plugins::detect_blocking` |
@@ -132,6 +132,13 @@ What each part does, and what exists today:
 | `provides.views` | parses and rides the wire; nothing renders it | none yet |
 | `[adds]` | the card's "For you: …" (`ui`) and "For agents: …" (`agents`) sentences | the UI |
 | `[release] github` | where the checker and Update look for newer versions; for an id in `plugins/plugins.lock`, it must be the lock's `repo` for the copy to be first-party | `plugins/releases.rs`, `plugins/installed.rs`, `plugins/mod.rs` |
+
+What a manifest says is read before anything is installed, too: a card
+opened before Install, and a repository previewed from the Extensions tab's
+form, show the `description`, `[adds]` and the `[requires]` / `[recommends]`
+summaries from the release's own `plugin.toml`, fetched and checksum-verified
+by the daemon (`GET /plugins/{pid}/details`, `POST /plugins/preview`) — so
+write them for someone deciding whether to install.
 
 `settings` and `commands`, sketched in the earlier plan, are not manifest
 keys; the first plugin that needs one adds it with a test and a row here.
