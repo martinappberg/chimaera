@@ -812,3 +812,11 @@ _Captured 2026-09-23 (from the maintainer, in-session)._
 - **Deliberate choices voiced while building it:** the new rows must not "take over the actual messages" — prose leads and the activity lines stay quiet (balance is the goal, the exact styling is not). A finished turn's duration was judged unnecessary on the page ("It is just important to know how long the current turn has been going on"), so only the live elapsed shows. The "wakes on each event" hint was dropped as unnecessary. The thought and tool lines above a reply fold into one once the reply has come ("To not clutter, and can be expanded if the user wants to").
 - **Open / known limits:** Claude never puts a monitor event's text on stdout, so a monitor-woken turn names the watch, not the event.
 - **Do not change (or: open to change):** open to change.
+
+### Your image attachments, shown as pictures — why they exist
+_Captured 2026-09-26 (from the maintainer, in-session, PR #174)._
+
+- **Problem it solves (verbatim):** "when you upload a file (such as screenshot) or something, it is nice to see your attachments etc. in the same way as the agent presents them (but for your message) and similarily that you can remove or something." Asked to think of it "in a VERY UI / UX friendly way", and: "uploads etc., we don't want them to take insane amount of space".
+- **How settled it is (intended vs provisional):** **all provisional** — an addition. The tile sizes, the preview overlay, the short upload names and how the daemon keeps the copies are all free to change if improved.
+- **Keep (the two design goals the maintainer marked):** attachments stay **compact** (they must not take a lot of space in the composer or the transcript), and your attachments keep reading **like the agent's files** (the figure-strip language of the turn-end block). These are goals, not a locked implementation: any look that meets them is fine.
+- **Deliberately open:** nothing further stated.
