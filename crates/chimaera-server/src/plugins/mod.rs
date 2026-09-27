@@ -429,6 +429,25 @@ pub(crate) fn validate(m: &Manifest) -> Result<(), String> {
         ));
     }
     plugin_version(&m.version)?;
+    let mut tools = BTreeSet::new();
+    for tool in &m.provides.mcp_tools {
+        if tool.is_empty()
+            || tool.len() > 64
+            || !tool
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
+        {
+            return Err(format!(
+                "MCP tool {tool:?} must be 1–64 letters, digits, underscores, dots or dashes"
+            ));
+        }
+        if crate::mcp::is_core_tool(tool) {
+            return Err(format!("MCP tool {tool:?} is reserved by chimaera"));
+        }
+        if !tools.insert(tool) {
+            return Err(format!("MCP tool {tool:?} is listed twice"));
+        }
+    }
     if let Some(release) = &m.release {
         if !valid_github(&release.github) {
             return Err(format!(
@@ -442,6 +461,9 @@ pub(crate) fn validate(m: &Manifest) -> Result<(), String> {
 
 /// Parse and validate a manifest's text.
 pub(crate) fn parse_manifest(text: &str) -> Result<Manifest, String> {
+    if text.len() as u64 > installed::TOML_MAX {
+        return Err("plugin.toml exceeds the 64 KiB manifest limit".into());
+    }
     let m = toml::from_str::<Manifest>(text).map_err(|e| format!("plugin.toml: {e}"))?;
     validate(&m)?;
     Ok(m)
@@ -1562,6 +1584,35 @@ mod tests {
             "id='x'\nname='x'\nversion='0.1.0'\nsummary='x'\napi='0.1'\n[provides]\nmcp_tool=['typo']",
         );
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn tool_names_cannot_claim_core_tools_or_permission_wildcards() {
+        for name in [
+            "document_guide",
+            "notify",
+            "run_in_terminal",
+            "spawn_agent",
+            "tell_mastermind",
+            "*",
+            "echo(*)",
+            "",
+            "echo echo",
+        ] {
+            assert!(
+                demo(&format!(
+                    "version='0.1.0'\napi='0.1'\n[provides]\nmcp_tools=['{name}']"
+                ))
+                .is_err(),
+                "{name}"
+            );
+        }
+        assert!(
+            demo("version='0.1.0'\napi='0.1'\n[provides]\nmcp_tools=['echo', 'echo']").is_err()
+        );
+        assert!(
+            demo("version='0.1.0'\napi='0.1'\n[provides]\nmcp_tools=['my_plugin.echo-v2']").is_ok()
+        );
     }
 
     const BASE: &str = "id = \"demo\"\nname = \"Demo\"\nsummary = \"x\"\n";

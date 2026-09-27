@@ -4,7 +4,7 @@
 //! daemon's test builds embed.
 
 use chimaera_plugin_api::serde_json::{json, Value};
-use chimaera_plugin_api::{host, Context, Plugin, ToolDef, ToolResult};
+use chimaera_plugin_api::{host, Context, Plugin, Snapshot, ToolDef, ToolResult};
 
 #[cfg(not(feature = "v2"))]
 const TOOLS: &[&str] = &[
@@ -19,6 +19,18 @@ const TOOLS: &[&str] = &[
 struct Fixture;
 
 impl Plugin for Fixture {
+    fn knowledge(_cx: Context, known: Option<Value>) -> Result<Option<Snapshot>, String> {
+        let stamp = json!({"files": []});
+        if known.as_ref() == Some(&stamp) {
+            return Ok(None);
+        }
+        Ok(Some(Snapshot::new(
+            &stamp,
+            &json!({"topics": [], "decisions": [], "learnings": [],
+                "fixture_version": if cfg!(feature = "v2") { "0.2.0" } else { "0.1.0" }}),
+        )))
+    }
+
     fn tools() -> Vec<ToolDef> {
         TOOLS
             .iter()

@@ -500,6 +500,20 @@ fn tool_defs(mastermind: bool, supervised: bool, plugin_tools: Vec<Value>) -> Va
     Value::Array(tools)
 }
 
+/// Plugin manifests cannot claim a core name, including tools gated by role.
+pub(crate) fn is_core_tool(name: &str) -> bool {
+    static NAMES: std::sync::LazyLock<std::collections::HashSet<String>> =
+        std::sync::LazyLock::new(|| {
+            tool_defs(true, true, Vec::new())
+                .as_array()
+                .expect("tool definitions are an array")
+                .iter()
+                .filter_map(|t| t["name"].as_str().map(str::to_owned))
+                .collect()
+        });
+    NAMES.contains(name)
+}
+
 fn base_tool_defs() -> Vec<Value> {
     vec![
         json!({

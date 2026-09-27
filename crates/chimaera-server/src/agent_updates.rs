@@ -207,10 +207,29 @@ fn curl_command(
 /// `update::fetch_latest` (the daemon's own release check) and the plugin
 /// release checker — one fence for every phone-home the daemon makes.
 pub(crate) async fn curl(url: &str, headers: &[&str]) -> anyhow::Result<Vec<u8>> {
-    let output = curl_command(url, headers, 1 << 20, 10)
-        .output()
-        .await
+    use tokio::io::AsyncReadExt;
+    const CAP: u64 = 1 << 20;
+    let mut child = curl_command(url, headers, CAP, 10)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .context("failed to run curl")?;
+    // Older curl versions don't enforce max-filesize for chunked bodies.
+    // Bound the pipe before allocating, just as curl_file counts its bytes.
+    let mut body = Vec::new();
+    child
+        .stdout
+        .take()
+        .context("curl has no stdout")?
+        .take(CAP + 1)
+        .read_to_end(&mut body)
+        .await
+        .context("reading from curl")?;
+    if body.len() as u64 > CAP {
+        anyhow::bail!("the download is larger than its {CAP}-byte cap");
+    }
+    let output = child.wait_with_output().await.context("waiting for curl")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         match stderr.lines().rev().map(str::trim).find(|l| !l.is_empty()) {
@@ -218,7 +237,7 @@ pub(crate) async fn curl(url: &str, headers: &[&str]) -> anyhow::Result<Vec<u8>>
             None => anyhow::bail!("curl exited {}", output.status),
         }
     }
-    Ok(output.stdout)
+    Ok(body)
 }
 
 /// One bounded download into `dest` (created or truncated): at most
@@ -328,6 +347,26 @@ fn parse_npm_latest(body: &[u8]) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn downloads_without_a_content_length_still_have_a_body_cap() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let serving = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            // The client may close as soon as it reads past the cap.
+            let _ = socket.write_all(&vec![b'x'; (1 << 20) + 1]).await;
+        });
+        assert!(curl(&url, &[]).await.is_err());
+        serving.await.unwrap();
+    }
 
     #[test]
     fn parses_the_official_payload_shapes() {

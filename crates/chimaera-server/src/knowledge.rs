@@ -58,6 +58,7 @@ impl KnowledgeState {
 }
 
 struct Cached {
+    build: (String, Arc<str>),
     /// The provider's stamp, handed back so it can answer "unchanged".
     stamp: Value,
     files: Arc<Stamp>,
@@ -86,6 +87,7 @@ impl Stamp {
 
 /// The provider's current snapshot.
 struct Current {
+    build: (String, Arc<str>),
     /// The provider's name for the route (`provides.knowledge`).
     provider: String,
     knowledge: Arc<Value>,
@@ -94,6 +96,7 @@ struct Current {
 
 #[derive(Default)]
 struct Baseline {
+    build: (String, Arc<str>),
     ids: HashSet<String>,
     statuses: HashMap<String, String>,
 }
@@ -113,12 +116,16 @@ async fn provider(state: &AppState, ws: &str) -> Option<Arc<Manifest>> {
 async fn current(state: &Arc<AppState>, ws: &str) -> Option<Current> {
     let m = provider(state, ws).await?;
     let name = m.provides.knowledge.clone()?;
+    // Stamps belong to one provider build; another build may interpret the
+    // same files differently, even when none of their mtimes changed.
+    let build = (m.id.clone(), m.wasm.sha256.clone());
     // Twice at most: "unchanged" for a stamp whose cache entry was dropped
     // meanwhile (the workspace forgotten) is asked again without one.
     for _ in 0..2 {
         let held = crate::lock(&state.knowledge)
             .cache
             .get(ws)
+            .filter(|c| c.build == build)
             .map(|c| c.stamp.clone());
         let answer = state
             .plugin_runtime
@@ -127,8 +134,13 @@ async fn current(state: &Arc<AppState>, ws: &str) -> Option<Current> {
         match answer {
             Ok(None) => {
                 let st = crate::lock(&state.knowledge);
-                if let Some(c) = st.cache.get(ws).filter(|c| Some(&c.stamp) == held.as_ref()) {
+                if let Some(c) = st
+                    .cache
+                    .get(ws)
+                    .filter(|c| c.build == build && Some(&c.stamp) == held.as_ref())
+                {
                     return Some(Current {
+                        build,
                         provider: name,
                         knowledge: c.knowledge.clone(),
                         files: c.files.clone(),
@@ -145,12 +157,14 @@ async fn current(state: &Arc<AppState>, ws: &str) -> Option<Current> {
                 crate::lock(&state.knowledge).cache.insert(
                     ws.to_string(),
                     Cached {
+                        build: build.clone(),
                         stamp,
                         files: files.clone(),
                         knowledge: knowledge.clone(),
                     },
                 );
                 return Some(Current {
+                    build,
                     provider: name,
                     knowledge,
                     files,
@@ -320,6 +334,7 @@ async fn prime_workspace(state: &Arc<AppState>, ws: &str) {
         .baseline
         .entry(ws.to_string())
         .or_insert(Baseline {
+            build: now.build,
             ids: ids.into_iter().map(|(id, _, _)| id).collect(),
             statuses,
         });
@@ -337,6 +352,7 @@ pub(crate) async fn recorded_since_last_check(
     start_ts: Option<u64>,
 ) -> Option<Recorded> {
     let Current {
+        build,
         knowledge: k,
         files: stamp,
         ..
@@ -347,12 +363,13 @@ pub(crate) async fn recorded_since_last_check(
         st.baseline.insert(
             ws.to_string(),
             Baseline {
+                build: build.clone(),
                 ids: ids.iter().map(|(id, _, _)| id.clone()).collect(),
                 statuses: statuses.clone(),
             },
         )
     };
-    let previous = previous?;
+    let previous = previous.filter(|p| p.build == build)?;
     let sole = !another_agent_active_since(state, ws, sid, start_ts).await;
     let fresh = |file: &str| {
         start_ts.is_some_and(|start| {

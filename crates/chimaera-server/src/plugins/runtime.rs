@@ -5,13 +5,13 @@
 //! - **One engine per process**, built on first use (Cranelift, epoch
 //!   interruption, a 64 MiB virtual reservation per memory instead of 4 GiB:
 //!   login nodes run under `ulimit -v`). Each component compiles once per
-//!   daemon lifetime, off the reactor, and stays in memory.
+//!   cache lifetime, off the reactor (two builds per id, 32 ids).
 //! - **One ticker thread** bumps the engine's epoch every 100 ms; a store's
 //!   deadline callback yields to tokio on each tick and interrupts the guest
 //!   once the call's wall-clock budget is spent. The deadline starts at 0, so
 //!   it is armed before every call (an unarmed store traps at once).
 //! - **Instances** are created lazily, one call at a time each (an async
-//!   mutex), at most `MAX_INSTANCES` daemon-wide (least recently used goes),
+//!   mutex), at most `MAX_INSTANCES` daemon-wide (least recently used idle slot goes),
 //!   and dropped after `IDLE` (swept on access — no polling task).
 //! - **A trap costs the instance, never the daemon**: the store is dropped
 //!   and re-created on the next call (~20 µs). `FAULT_LIMIT` traps within
@@ -44,7 +44,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use wasmtime::component::{Component, HasSelf, Linker, ResourceTable};
-use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder, UpdateDeadline};
+use wasmtime::{Config, Engine, ResourceLimiter, Store, UpdateDeadline};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 use super::Manifest;
@@ -70,12 +70,14 @@ const HOST_GRACE: Duration = Duration::from_secs(2);
 const TICK: Duration = Duration::from_millis(100);
 /// Linear memory per instance.
 const MEMORY_CAP: usize = 64 << 20;
+const TABLE_ELEMENTS_CAP: usize = 65_536;
 const MAX_INSTANCES: usize = 64;
 const IDLE: Duration = Duration::from_secs(10 * 60);
 const FAULT_LIMIT: usize = 5;
 /// Compiled builds kept per plugin id: the running one and the one before
 /// (a rollback runs it again without a compile). Older builds are dropped.
 const COMPILED_PER_ID: usize = 2;
+const COMPILED_IDS: usize = 32;
 const FAULT_WINDOW: Duration = Duration::from_secs(60);
 /// The guest's stderr kept per instance (its tail; a panic message).
 const STDERR_CAP: usize = 4 * 1024;
@@ -99,7 +101,7 @@ struct Shared {
     linker: Linker<HostState>,
     /// plugin id → its pre-instantiated builds by SHA-256 (or why one can't
     /// be), most recently used first, at most `COMPILED_PER_ID`.
-    compiled: tokio::sync::Mutex<HashMap<String, Builds>>,
+    compiled: tokio::sync::Mutex<VecDeque<(String, Builds)>>,
 }
 
 static SHARED: OnceLock<Result<Shared, String>> = OnceLock::new();
@@ -139,7 +141,7 @@ fn build_shared() -> wasmtime::Result<Shared> {
     Ok(Shared {
         engine,
         linker,
-        compiled: tokio::sync::Mutex::new(HashMap::new()),
+        compiled: tokio::sync::Mutex::new(VecDeque::new()),
     })
 }
 
@@ -149,11 +151,17 @@ fn build_shared() -> wasmtime::Result<Shared> {
 async fn component(m: &Manifest) -> Result<ChimaeraPluginPre<HostState>, String> {
     let shared = shared()?;
     let mut compiled = shared.compiled.lock().await;
-    let builds = compiled.entry(m.id.clone()).or_default();
+    let mut builds = compiled
+        .iter()
+        .position(|(id, _)| id == &m.id)
+        .and_then(|at| compiled.remove(at))
+        .map(|(_, builds)| builds)
+        .unwrap_or_default();
     if let Some(at) = builds.iter().position(|(sha, _)| *sha == m.wasm.sha256) {
         let build = builds.remove(at).expect("found above");
         let done = build.1.clone();
         builds.push_front(build);
+        compiled.push_front((m.id.clone(), builds));
         return done;
     }
     let bytes = m.wasm.bytes.clone();
@@ -179,7 +187,82 @@ async fn component(m: &Manifest) -> Result<ChimaeraPluginPre<HostState>, String>
     }
     builds.push_front((m.wasm.sha256.clone(), result.clone()));
     builds.truncate(COMPILED_PER_ID);
+    compiled.push_front((m.id.clone(), builds));
+    compiled.truncate(COMPILED_IDS);
     result
+}
+
+/// A component can contain several core memories and tables. Account for
+/// their combined allocations; wasmtime's StoreLimits caps each separately.
+#[derive(Default)]
+struct AllocationBudget {
+    used: usize,
+    pending: usize,
+}
+
+impl AllocationBudget {
+    fn grow(&mut self, current: usize, desired: usize, maximum: Option<usize>, cap: usize) -> bool {
+        self.pending = 0;
+        let delta = desired.saturating_sub(current);
+        if maximum.is_some_and(|max| desired > max) || delta > cap.saturating_sub(self.used) {
+            return false;
+        }
+        self.used += delta;
+        self.pending = delta;
+        true
+    }
+
+    fn failed(&mut self) {
+        self.used -= std::mem::take(&mut self.pending);
+    }
+}
+
+#[derive(Default)]
+struct InstanceLimits {
+    memory: AllocationBudget,
+    table: AllocationBudget,
+}
+
+impl ResourceLimiter for InstanceLimits {
+    fn memory_growing(
+        &mut self,
+        current: usize,
+        desired: usize,
+        maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        Ok(self.memory.grow(current, desired, maximum, MEMORY_CAP))
+    }
+
+    fn memory_grow_failed(&mut self, _error: wasmtime::Error) -> wasmtime::Result<()> {
+        self.memory.failed();
+        Ok(())
+    }
+
+    fn table_growing(
+        &mut self,
+        current: usize,
+        desired: usize,
+        maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        Ok(self
+            .table
+            .grow(current, desired, maximum, TABLE_ELEMENTS_CAP))
+    }
+
+    fn table_grow_failed(&mut self, _error: wasmtime::Error) -> wasmtime::Result<()> {
+        self.table.failed();
+        Ok(())
+    }
+
+    fn instances(&self) -> usize {
+        64
+    }
+    fn memories(&self) -> usize {
+        16
+    }
+    fn tables(&self) -> usize {
+        16
+    }
 }
 
 /// A store's data: WASI (nothing granted), the limits, and — for the length
@@ -187,7 +270,7 @@ async fn component(m: &Manifest) -> Result<ChimaeraPluginPre<HostState>, String>
 pub(crate) struct HostState {
     wasi: WasiCtx,
     table: ResourceTable,
-    limits: StoreLimits,
+    limits: InstanceLimits,
     stderr: StderrTail,
     deadline: Instant,
     pub(super) plugin: String,
@@ -228,7 +311,7 @@ impl HostState {
         HostState {
             wasi: wasi.build(),
             table: ResourceTable::new(),
-            limits: StoreLimitsBuilder::new().memory_size(MEMORY_CAP).build(),
+            limits: InstanceLimits::default(),
             stderr,
             deadline: Instant::now(),
             plugin: plugin.to_string(),
@@ -382,6 +465,17 @@ struct Live {
     store: Store<HostState>,
     plugin: ChimaeraPlugin,
     sha256: Arc<str>,
+    // A reset can detach a running slot. Its allocation still counts until
+    // that call finishes and drops the store.
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+struct InstanceBudget(Arc<tokio::sync::Semaphore>);
+
+impl Default for InstanceBudget {
+    fn default() -> Self {
+        Self(Arc::new(tokio::sync::Semaphore::new(MAX_INSTANCES)))
+    }
 }
 
 /// One (plugin, workspace)'s instance slot. `live` is None until first use
@@ -430,6 +524,7 @@ type BuildKey = (String, Arc<str>);
 /// The per-daemon half of the runtime (on `AppState`).
 #[derive(Default)]
 pub(crate) struct PluginRuntime {
+    instances: InstanceBudget,
     slots: Mutex<HashMap<Key, Arc<Slot>>>,
     faults: Mutex<HashMap<Key, Faults>>,
     /// (plugin id, build) → its offer, or why it is refused everywhere (a
@@ -558,22 +653,25 @@ impl PluginRuntime {
 
     /// The instance slot for `key`, making room: idle slots go (the sweep
     /// runs on every access, so no timer is needed), then — at the cap —
-    /// the least recently used one. A slot with a call in flight is held by
-    /// that call too and finishes it before its store is dropped.
-    fn slot(&self, key: &Key) -> Arc<Slot> {
+    /// the least recently used unused one. In-flight and queued calls keep
+    /// their slot, so they always serialize against the same instance.
+    fn slot(&self, key: &Key) -> Result<Arc<Slot>, String> {
         let mut slots = crate::lock(&self.slots);
-        slots.retain(|_, s| s.idle_for() < IDLE);
+        slots.retain(|_, s| Arc::strong_count(s) > 1 || s.idle_for() < IDLE);
         if let Some(slot) = slots.get(key) {
             slot.touch();
-            return slot.clone();
+            return Ok(slot.clone());
         }
         if slots.len() >= MAX_INSTANCES {
             let lru = slots
                 .iter()
+                .filter(|(_, s)| Arc::strong_count(s) == 1)
                 .max_by_key(|(_, s)| s.idle_for())
                 .map(|(k, _)| k.clone());
             if let Some(lru) = lru {
                 slots.remove(&lru);
+            } else {
+                return Err("all plugin instances are busy — retry shortly".into());
             }
         }
         let slot = Arc::new(Slot {
@@ -581,7 +679,7 @@ impl PluginRuntime {
             last_used: Mutex::new(Instant::now()),
         });
         slots.insert(key.clone(), slot.clone());
-        slot
+        Ok(slot)
     }
 
     fn faulted(&self, key: &Key) -> Option<String> {
@@ -637,7 +735,7 @@ impl PluginRuntime {
             session: session.map(str::to_string),
             mastermind: session.is_some_and(|s| crate::mcp::mastermind_of(state, s)),
         };
-        let slot = self.slot(&key);
+        let slot = self.slot(&key)?;
         let mut guard = slot.live.lock().await;
         // An instance of another build (the plugin's `current` moved while
         // this slot lived) is never called again.
@@ -648,6 +746,12 @@ impl PluginRuntime {
             *guard = None;
         }
         if guard.is_none() {
+            let permit = self
+                .instances
+                .0
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| "all plugin instances are busy — retry shortly".to_string())?;
             let mut store = Store::new(&shared()?.engine, HostState::new(&m.id, ws));
             store.limiter(|s| &mut s.limits);
             // Yield to tokio on every tick; stop the guest past its budget.
@@ -669,6 +773,7 @@ impl PluginRuntime {
                         store,
                         plugin,
                         sha256: m.wasm.sha256.clone(),
+                        _permit: permit,
                     })
                 }
                 Ok(Err(err)) => {
@@ -956,4 +1061,62 @@ pub(crate) fn session_ended(state: &Arc<AppState>, session: &str) {
                 .await;
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn review_busy_slots_keep_the_same_instance_for_queued_calls() {
+        let runtime = PluginRuntime::default();
+        let key = ("test".into(), "0".into());
+        let first = runtime.slot(&key).unwrap();
+        let held: Vec<_> = (1..MAX_INSTANCES)
+            .map(|i| runtime.slot(&("test".into(), i.to_string())).unwrap())
+            .collect();
+        assert!(runtime.slot(&("test".into(), "overflow".into())).is_err());
+        let again = runtime.slot(&key).unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &again),
+            "an in-flight slot must not be evicted"
+        );
+        drop(held);
+        assert!(runtime.slot(&("test".into(), "overflow".into())).is_ok());
+    }
+
+    #[test]
+    fn review_memory_budget_is_shared_by_all_memories_in_a_store() {
+        let mut store = Store::new(&shared().unwrap().engine, HostState::new("test", "ws"));
+        store.limiter(|s| &mut s.limits);
+        let forty_mb = wasmtime::MemoryType::new(640, None);
+        assert!(wasmtime::Memory::new(&mut store, forty_mb.clone()).is_ok());
+        assert!(
+            wasmtime::Memory::new(&mut store, forty_mb).is_err(),
+            "two memories must not bypass the 64 MiB budget"
+        );
+    }
+
+    #[test]
+    fn review_table_budget_is_shared_by_all_tables_in_a_store() {
+        let mut store = Store::new(&shared().unwrap().engine, HostState::new("test", "ws"));
+        store.limiter(|s| &mut s.limits);
+        let table = wasmtime::TableType::new(wasmtime::RefType::FUNCREF, 40_000, None);
+        assert!(wasmtime::Table::new(&mut store, table.clone(), wasmtime::Ref::Func(None)).is_ok());
+        assert!(wasmtime::Table::new(&mut store, table, wasmtime::Ref::Func(None)).is_err());
+    }
+
+    #[test]
+    fn review_failed_allocations_refund_only_their_own_budget() {
+        let mut budget = AllocationBudget::default();
+        assert!(budget.grow(0, 10, None, 64));
+        assert!(budget.grow(0, 20, None, 64));
+        budget.failed();
+        assert_eq!(budget.used, 10);
+        assert!(!budget.grow(0, 20, Some(15), 64));
+        budget.failed();
+        assert_eq!(budget.used, 10);
+        assert!(budget.grow(10, 64, None, 64));
+        assert!(!budget.grow(0, 1, None, 64));
+    }
 }

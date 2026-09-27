@@ -107,7 +107,8 @@ github = "owner/repo"
 
 (Real manifests: the `plugin.toml` at the root of each first-party
 repository; both name their own repository in `[release]`, which is where
-chimaera installs them from and what makes an installed copy first-party.
+chimaera installs them from. The host records that source; a manifest alone cannot
+grant a copy the maintainer badge.
 `[requires] chimaera` above is an illustration; neither carries it.
 Mycelium v0.1.1 moves its agent plugin from `requires` to `recommends`: the
 Knowledge reader works with no agent plugin at all; v0.1.2 adds its
@@ -127,11 +128,11 @@ What each part does, and what exists today:
 | `requires.chimaera` | a gate: this daemon's version must match | `plugins::gate` |
 | `setup.prompt` | a new chat session of the user's chosen agent, sent this prompt | `plugins::setup_workspace` |
 | `provides.knowledge` | the plugin is the Knowledge provider; its `knowledge` export feeds the view and `GET /workspaces/{id}/knowledge` | `knowledge.rs`, `runtime::knowledge` |
-| `provides.mcp_tools` | tools served by the chimaera MCP where active, plus the `instructions` paragraph; pre-allowed at spawn | `plugins/tools.rs`, `runtime::offer` |
+| `provides.mcp_tools` | tools served by the chimaera MCP where active, plus the `instructions` paragraph; pre-allowed at spawn. Unique names, 1–64 ASCII letters, digits, underscores, dots or dashes; built-in names are reserved | `plugins/tools.rs`, `runtime::offer` |
 | `provides.events` | which `on-event` variants the host delivers (none by default); `hook` and `session-ended` are delivered, `switched-on` / `switched-off` are declarable but not delivered yet | `runtime::hook`, `runtime::session_ended` |
 | `provides.views` | parses and rides the wire; nothing renders it | none yet |
 | `[adds]` | the card's "For you: …" (`ui`) and "For agents: …" (`agents`) sentences | the UI |
-| `[release] github` | where the checker and Update look for newer versions; for an id in `plugins/plugins.lock`, it must be the lock's `repo` for the copy to be first-party | `plugins/releases.rs`, `plugins/installed.rs`, `plugins/mod.rs` |
+| `[release] github` | where the checker and Update look for newer versions; required for release installs and must match the repository being fetched; the maintainer badge additionally requires a recorded official source or pinned bytes | `plugins/releases.rs`, `plugins/installed.rs`, `plugins/mod.rs` |
 
 What a manifest says is read before anything is installed, too: a card
 opened before Install, and a repository previewed from the Extensions tab's
@@ -304,7 +305,9 @@ return the host's reason as a `String`). The limits are in
 | `host::log(level, message)` | a daemon log line tagged with the plugin | 64 lines per call, 2 KiB each |
 
 And around every call (`crates/chimaera-server/src/plugins/runtime.rs`): a
-deadline of 5 s (30 s for `knowledge`), 64 MiB of linear memory, WASI with
+deadline of 5 s (30 s for `knowledge`), 64 MiB of linear memory across all
+memories, 65,536 table elements in total, at most 16 memories, 16 tables and
+64 core instances per component, WASI with
 nothing granted (no files, env, args or network; stderr kept, 4 KiB, only to
 explain a trap), one call at a time per (plugin, workspace) instance. A trap
 costs the instance, not the daemon; five traps in a minute mark the plugin
@@ -312,6 +315,10 @@ faulted in that workspace until the user switches it off and on. What a
 plugin returns is capped too: a tool result at 256 KiB, the instruction
 paragraph at 8 KiB, a hook line at 1 KiB. A component whose `tools()` names
 differ from its manifest's `provides.mcp_tools` is refused.
+
+Knowledge stamps and Timeline baselines are scoped to the provider id and
+component digest: an update, rollback or provider change gets a fresh snapshot
+even when its input files are unchanged.
 
 ## Build and test
 
@@ -382,9 +389,10 @@ What the card shows is the daemon's, never the plugin's own claim:
 - **The check badge** ("Verified by the Chimaera maintainers"; `first_party`
   on the wire): the plugin's id is in `plugins/plugins.lock` — the curated
   list the maintainers review — and the installed copy's `[release] github`
-  is the lock's `repo` exactly. An update from that repository keeps the
-  badge; a plugin from any other repository never gets it, even one that
-  reuses a first-party id.
+  matches the lock's `repo` (case-insensitive). The bytes must also match the
+  lock or come from a release install whose source the host recorded in
+  `source-github`. An update from that repository keeps the badge. Local
+  installs do not copy that marker, so a rebuilt copy cannot assert the badge.
 - **"local build"**: the copy was installed from a directory (`--path`;
   `local_path` on the wire).
 - **Nothing about checksums.** The safety mechanism is the daemon's: it

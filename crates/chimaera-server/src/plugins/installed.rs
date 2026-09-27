@@ -60,6 +60,8 @@ const SUMS_MAX: u64 = 1 << 20;
 const SUMS: &str = "SHA256SUMS";
 /// A local install's marker: the directory it was copied from.
 const LOCAL_PATH: &str = "local-path";
+/// Written by release installs only, never copied from a local build.
+const SOURCE_GITHUB: &str = "source-github";
 /// Why a copy whose files don't match its checksums never loads — the
 /// card's words (the log line says which file and which list).
 pub(crate) const SUMS_MISMATCH: &str =
@@ -157,7 +159,14 @@ pub(crate) fn load_version(dir: &Path, id: &str, version: &str) -> Result<Manife
     let wasm = read_capped(&vdir.join("plugin.wasm"), WASM_MAX)?;
     m.wasm = Wasm::new(Cow::Owned(wasm));
     let sums = read_optional(&vdir.join(SUMS), SUMS_MAX)?;
-    check_files(&mut m, &crate::fs::sha256_hex(&toml), sums.as_deref());
+    let source = read_optional(&vdir.join(SOURCE_GITHUB), 512)?;
+    let source = source.as_deref().and_then(|s| std::str::from_utf8(s).ok());
+    check_files(
+        &mut m,
+        &crate::fs::sha256_hex(&toml),
+        sums.as_deref(),
+        source,
+    );
     m.origin.local_path = read_optional(&vdir.join(LOCAL_PATH), 4 << 10)?
         .map(|bytes| PathBuf::from(String::from_utf8_lossy(&bytes).trim()))
         .filter(|p| p.is_absolute());
@@ -167,9 +176,17 @@ pub(crate) fn load_version(dir: &Path, id: &str, version: &str) -> Result<Manife
 /// Decide `first_party`, `verified` and the checksum fault for a copy whose
 /// component `m.wasm` holds and whose `plugin.toml` hashes to `toml_sha256`,
 /// against the `SHA256SUMS` kept beside them (`None`: there is none).
-fn check_files(m: &mut Manifest, toml_sha256: &str, sums: Option<&[u8]>) {
+fn check_files(m: &mut Manifest, toml_sha256: &str, sums: Option<&[u8]>, source: Option<&str>) {
     let lock = super::lock_entry(&m.id);
-    let first_party = lock.is_some_and(|l| m.release.as_ref().is_some_and(|r| r.github == l.repo));
+    let first_party = lock.is_some_and(|l| {
+        m.release
+            .as_ref()
+            .is_some_and(|r| r.github.eq_ignore_ascii_case(&l.repo))
+            && (source.is_some_and(|s| s.eq_ignore_ascii_case(&l.repo))
+                || (m.version == l.version
+                    && *m.wasm.sha256 == l.sha256_wasm
+                    && toml_sha256 == l.sha256_toml))
+    });
     let mut verified = false;
     if let Some(sums) = sums {
         let sums = releases::parse_sums(&String::from_utf8_lossy(sums));
@@ -190,7 +207,11 @@ fn check_files(m: &mut Manifest, toml_sha256: &str, sums: Option<&[u8]>) {
     // At the version the lock pins, a first-party copy is the pinned
     // release only if it is byte for byte what the lock names (a local
     // build of that version is not, and says so by not being verified).
-    if let (true, Some(l)) = (first_party, lock) {
+    if let Some(l) = lock.filter(|l| {
+        m.release
+            .as_ref()
+            .is_some_and(|r| r.github.eq_ignore_ascii_case(&l.repo))
+    }) {
         if l.version == m.version
             && (l.sha256_wasm != *m.wasm.sha256 || l.sha256_toml != toml_sha256)
         {
@@ -470,6 +491,28 @@ async fn install(
     let m =
         super::parse_manifest(text).map_err(|e| Refusal::invalid(format!("the release's {e}")))?;
     let id = m.id.clone();
+    if !m
+        .release
+        .as_ref()
+        .is_some_and(|r| r.github.eq_ignore_ascii_case(&source))
+    {
+        return Err(Refusal::invalid(format!(
+            "{source}'s plugin.toml must name that repository in release.github"
+        )));
+    }
+    if let Some(copy) = state.plugin_catalog.installed_copy(&id) {
+        if !copy
+            .manifest
+            .release
+            .as_ref()
+            .is_some_and(|r| r.github.eq_ignore_ascii_case(&source))
+        {
+            return Err(Refusal::conflict(format!(
+                "{} is already installed from another source — remove it before changing publishers",
+                m.name
+            )));
+        }
+    }
     if let Some(running) = update_of {
         if running.id != id {
             return Err(Refusal::invalid(format!(
@@ -514,7 +557,8 @@ async fn install(
     let dir = state.plugin_catalog.root.join(&id);
     let staging = dir.clone();
     let tmp = blocking(move || stage(&staging)).await?;
-    let fetched = fetch_and_activate(&release, &dir, &tmp, &want_wasm, toml, sums_file).await;
+    let fetched =
+        fetch_and_activate(&release, &dir, &tmp, &want_wasm, toml, sums_file, &source).await;
     if fetched.is_err() {
         let tmp = tmp.clone();
         let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(tmp)).await;
@@ -549,6 +593,7 @@ async fn fetch_and_activate(
     want_wasm: &str,
     toml: Vec<u8>,
     sums: Vec<u8>,
+    source: &str,
 ) -> Result<Option<String>, Refusal> {
     let wasm = tmp.join("plugin.wasm");
     crate::agent_updates::curl_file(&release.wasm_url, &[], &wasm, WASM_MAX, DOWNLOAD_SECS)
@@ -560,6 +605,7 @@ async fn fetch_and_activate(
         want_wasm.to_string(),
         release.version.clone(),
     );
+    let source = source.to_owned();
     blocking(move || {
         let got = sha256_file(&wasm).map_err(io("could not read the download"))?;
         if got != want {
@@ -569,6 +615,7 @@ async fn fetch_and_activate(
         std::fs::write(tmp.join("plugin.toml"), &toml)
             .map_err(io("could not write plugin.toml"))?;
         std::fs::write(tmp.join(SUMS), &sums).map_err(io("could not write SHA256SUMS"))?;
+        std::fs::write(tmp.join(SOURCE_GITHUB), source).map_err(io("could not write source-github"))?;
         activate(&dir, &tmp, &version)
     })
     .await
@@ -1015,7 +1062,7 @@ mod tests {
     }
 
     #[test]
-    fn first_party_is_the_lock_id_released_from_the_lock_repo() {
+    fn first_party_requires_the_lock_bytes_or_the_recorded_release_source() {
         let l = crate::plugins::lock_entry("agent-notes").unwrap();
         let text = |version: &str, github: &str| {
             format!(
@@ -1023,7 +1070,7 @@ mod tests {
                  summary = \"x\"\napi = \"0.1\"\n[release]\ngithub = \"{github}\"\n"
             )
         };
-        let checked = |toml: &str, sums_of: Option<&str>| {
+        let checked = |toml: &str, sums_of: Option<&str>, source: Option<&str>| {
             let mut m = crate::plugins::parse_manifest(toml).unwrap();
             m.wasm = Wasm::new(Cow::Borrowed(b"\0asm"));
             let kept = sums_of.map(|t| sums(b"\0asm", t));
@@ -1031,23 +1078,29 @@ mod tests {
                 &mut m,
                 &crate::fs::sha256_hex(toml.as_bytes()),
                 kept.as_deref().map(str::as_bytes),
+                source,
             );
             m.origin
         };
         // Released from the lock's repository, past the pin: first-party and
         // verified by its own SHA256SUMS.
         let newer = text("9.0.0", &l.repo);
-        let o = checked(&newer, Some(&newer));
+        let o = checked(&newer, Some(&newer), Some(&l.repo));
         assert!(o.first_party && o.verified, "{o:?}");
         // The same id from another repository never is.
         let other = text("9.0.0", "acme/agent-notes");
-        let o = checked(&other, Some(&other));
+        let o = checked(&other, Some(&other), Some("acme/agent-notes"));
         assert!(!o.first_party && o.verified, "{o:?}");
         // At the pinned version, bytes that aren't the lock's are not the
         // pinned release: unverified, no fault (a local build of it).
         let pinned = text(&l.version, &l.repo);
-        let o = checked(&pinned, Some(&pinned));
-        assert!(o.first_party && !o.verified && o.fault.is_none(), "{o:?}");
+        let o = checked(&pinned, Some(&pinned), None);
+        assert!(!o.first_party && !o.verified && o.fault.is_none(), "{o:?}");
+        let o = checked(&newer, Some(&newer), None);
+        assert!(
+            !o.first_party && o.verified,
+            "a local build cannot grant itself the badge: {o:?}"
+        );
     }
 
     #[test]

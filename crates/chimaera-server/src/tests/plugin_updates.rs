@@ -1095,15 +1095,16 @@ async fn a_local_build_installs_from_a_directory_and_replaces_itself() {
     no_temp_left(&state, "up-local");
 
     // A local build of a first-party plugin at the pinned version, with
-    // other bytes than the lock's: first-party, installed, not verified.
+    // other bytes than the lock's: installed, no maintainer badge, not verified.
     let (l, toml, _, _) = agent_notes_release();
     let fp = test_dir("fp-local");
     local_build(&fp, &toml, &v1_wasm(), Some(&sums_of(&v1_wasm(), &toml)));
+    std::fs::write(fp.join("source-github"), &l.repo).unwrap();
     let (status, body) = path_install(json!(fp)).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let e = &body["plugin"];
     assert_eq!(e["version"], l.version.as_str());
-    assert_eq!(e["first_party"], true);
+    assert_eq!(e["first_party"], false);
     assert_eq!(e["verified"], false, "{e}");
     assert!(e.get("fault").is_none());
 
@@ -1487,4 +1488,155 @@ async fn an_unreachable_release_source_answers_502_in_plain_words() {
         body["error"],
         "couldn't read acme/anything's releases on github.com — check the name, or try again later"
     );
+}
+
+#[tokio::test]
+async fn review_release_cannot_claim_another_repository() {
+    let fake = FakeReleases::start().await;
+    let state = state_for(&fake);
+    let l = crate::plugins::lock_entry("agent-notes").unwrap();
+    let toml = manifest(false, "agent-notes", "9.0.0", "").replace("acme/agent-notes", &l.repo);
+    fake.publish("unrelated/plugin", "9.0.0", &toml, &v1_wasm());
+    let (status, body) = install(&state, "unrelated/plugin", None).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(listed(&state, "agent-notes").await["source"], "available");
+}
+
+#[tokio::test]
+async fn review_release_cannot_replace_another_publishers_active_plugin() {
+    let fake = FakeReleases::start().await;
+    let state = state_for(&fake);
+    let id = "up-identity";
+    fake.publish(
+        "acme/up-identity",
+        "0.1.0",
+        &manifest(false, id, "0.1.0", ""),
+        &v1_wasm(),
+    );
+    assert_eq!(
+        install(&state, "acme/up-identity", None).await.0,
+        StatusCode::OK
+    );
+    let (ws, sid) = workspace_with(&state, "up-identity", "identity-key", &[id]).await;
+    let other = manifest(false, id, "0.2.0", "").replace("acme/up-identity", "unrelated/plugin");
+    fake.publish("unrelated/plugin", "0.2.0", &other, &v1_wasm());
+    let (status, body) = install(&state, "unrelated/plugin", None).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(link(&state, id, "current").as_deref(), Some("0.1.0"));
+    assert!(crate::plugins::active(&state, &ws)
+        .await
+        .iter()
+        .any(|m| m.id == id));
+    state.sessions.kill(&sid).ok();
+}
+
+#[tokio::test]
+async fn review_oversized_release_manifest_preserves_the_running_version() {
+    let fake = FakeReleases::start().await;
+    let state = state_for(&fake);
+    let id = "up-large-manifest";
+    let repo = "acme/up-large-manifest";
+    fake.publish(repo, "0.1.0", &manifest(false, id, "0.1.0", ""), &v1_wasm());
+    assert_eq!(install(&state, repo, None).await.0, StatusCode::OK);
+    let huge = manifest(false, id, "0.2.0", "")
+        .lines()
+        .map(|line| {
+            if line.starts_with("description = ") {
+                format!("description = \"{}\"", "x".repeat(70_000))
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    fake.publish(repo, "0.2.0", &huge, &v1_wasm());
+    let (status, body) = post(&state, &format!("/api/v1/plugins/{id}/update")).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(link(&state, id, "current").as_deref(), Some("0.1.0"));
+    assert_eq!(listed(&state, id).await["version"], "0.1.0");
+}
+
+#[tokio::test]
+async fn review_disabled_plugin_cannot_shadow_a_core_tool() {
+    let fake = FakeReleases::start().await;
+    let state = state_for(&fake);
+    let id = "up-core-tool";
+    let toml = manifest(false, id, "0.1.0", "").replace("\"echo\"", "\"document_guide\"");
+    fake.publish("acme/up-core-tool", "0.1.0", &toml, &v1_wasm());
+    let (status, _) = install(&state, "acme/up-core-tool", None).await;
+    let (_ws, sid) = workspace_with(&state, "up-core-tool", "core-tool-key", &[]).await;
+    let (_, answer) =
+        mcp_tool_call(&state, &sid, "core-tool-key", "document_guide", json!({})).await;
+    assert!(
+        answer.contains("markdown") || answer.contains("Markdown"),
+        "{answer}"
+    );
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    state.sessions.kill(&sid).ok();
+}
+
+#[tokio::test]
+async fn review_knowledge_cache_changes_with_the_provider_build() {
+    let fake = FakeReleases::start().await;
+    let state = state_for(&fake);
+    let id = "up-knowledge-cache";
+    let repo = "acme/up-knowledge-cache";
+    let manifest_for = |v2, v| {
+        manifest(v2, id, v, "").replace("[provides]", "[provides]\nknowledge = \"fixture\"")
+    };
+    fake.publish(repo, "0.1.0", &manifest_for(false, "0.1.0"), &v1_wasm());
+    assert_eq!(install(&state, repo, None).await.0, StatusCode::OK);
+    let (ws, sid) = workspace_with(&state, "up-knowledge-cache", "knowledge-key", &[id]).await;
+    let route = format!("/api/v1/workspaces/{ws}/knowledge");
+    let (_, before) = request(&state, Method::GET, &route, None).await;
+    assert_eq!(before["fixture_version"], "0.1.0", "{before}");
+    fake.publish(repo, "0.2.0", &manifest_for(true, "0.2.0"), &v2_wasm());
+    let (status, body) = post(&state, &format!("/api/v1/plugins/{id}/update")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, after) = request(&state, Method::GET, &route, None).await;
+    assert_eq!(after["fixture_version"], "0.2.0", "{after}");
+    assert_eq!(
+        post(&state, &format!("/api/v1/plugins/{id}/rollback"))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let (_, back) = request(&state, Method::GET, &route, None).await;
+    assert_eq!(back["fixture_version"], "0.1.0", "{back}");
+    state.sessions.kill(&sid).ok();
+}
+
+#[tokio::test]
+async fn overlapping_active_plugins_offer_each_tool_once() {
+    let fake = FakeReleases::start().await;
+    let state = state_for(&fake);
+    for id in ["up-overlap-a", "up-overlap-b"] {
+        let repo = format!("acme/{id}");
+        fake.publish(
+            &repo,
+            "0.1.0",
+            &manifest(false, id, "0.1.0", ""),
+            &v1_wasm(),
+        );
+        assert_eq!(install(&state, &repo, None).await.0, StatusCode::OK);
+    }
+    let (_, sid) = workspace_with(
+        &state,
+        "overlap",
+        "overlap-key",
+        &["up-overlap-a", "up-overlap-b"],
+    )
+    .await;
+    let names = tool_names(&state, &sid, "overlap-key").await;
+    assert_eq!(names.iter().filter(|name| *name == "echo").count(), 1);
+    let (error, reply) = mcp_tool_call(
+        &state,
+        &sid,
+        "overlap-key",
+        "echo",
+        json!({"value": "hello"}),
+    )
+    .await;
+    assert!(!error && reply.contains("hello"), "{reply}");
+    state.sessions.kill(&sid).ok();
 }

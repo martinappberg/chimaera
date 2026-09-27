@@ -42,7 +42,13 @@ pub(crate) async fn offered(
         match state.plugin_runtime.offer(state, m, ws).await {
             Ok(offer) => {
                 paragraphs.extend(offer.instructions);
-                tools.extend(offer.tools);
+                // The call gate selects the first active owner. Offer only
+                // that owner's definition too, including when it is faulted.
+                tools.extend(offer.tools.into_iter().filter(|tool| {
+                    tool["name"].as_str().is_some_and(|name| {
+                        owner(state, plugins, name).is_some_and(|owner| owner.id == m.id)
+                    })
+                }));
             }
             Err(err) => tracing::warn!(plugin = %m.id, %err, "plugin offers nothing"),
         }

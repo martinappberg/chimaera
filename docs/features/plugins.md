@@ -87,6 +87,9 @@ sheet, hosted once in `web-ui/src/App.svelte`. Wire (all under `/api/v1`, bearer
   `AttachSheet.svelte`. Tests:
   `crates/chimaera-server/src/tests/plugins.rs`.
 - **Key behaviors.**
+  - Release manifests must name the repository they were fetched from in `[release] github`.
+    Installing the same id from a different publisher is refused until the existing copy is
+    removed. Manifests over 64 KiB are refused before activation.
   - **Active = installed AND switched on here AND the footprint is present AND the plugin
     passes its gates** (`detect.any`, workspace-relative; no path component may be a symlink;
     empty = always present, as for Agent notes). An available plugin is never active: switching
@@ -175,14 +178,17 @@ sheet, hosted once in `web-ui/src/App.svelte`. Wire (all under `/api/v1`, bearer
 - **Key behaviors** (every limit is the host's, so no plugin can forget one):
   - **One engine per process** (wasmtime, Cranelift, epoch interruption), built on first use: a
     daemon whose user never switches a plugin on never builds it. Each build compiles once, off
-    the reactor, and stays in memory (the last two per plugin, keyed by SHA-256, so a moved
+    the reactor, and stays in memory (the last two per plugin across the 32 most recently used plugin ids, keyed by SHA-256, so a moved
     `current` never runs old code).
   - **One instance per (plugin, workspace)**, created lazily, one call at a time, at most 64
-    daemon-wide (least recently used goes), dropped after 10 min idle or when the switch flips.
+    daemon-wide (the least recently used idle slot goes), dropped after 10 min idle or when the
+    switch flips. In-flight and queued calls retain their slot; when every slot is busy, new
+    instances are refused until one is free. A reset instance still counts until its call ends.
   - **Per-call deadlines:** 5 s (30 s for `knowledge`), enforced on a 100 ms epoch tick, plus an
     outer timeout for a host call stuck on a slow filesystem. **Memory:** 64 MiB of linear
-    memory and a 64 MiB virtual reservation per instance, not wasmtime's 4 GiB (login nodes run
-    under `ulimit -v`). **WASI grants nothing:** no files, env, args or network; the guest's
+    memory across all memories in an instance, 65,536 table elements across its tables,
+    and at most 16 memories, 16 tables and 64 core instances. Each memory reserves 64 MiB
+    of virtual address space instead of wasmtime's 4 GiB (login nodes run under `ulimit -v`). **WASI grants nothing:** no files, env, args or network; the guest's
     stderr is kept (4 KiB) only to explain a trap.
   - **A trap costs the instance, never the daemon**; five in a minute mark the plugin *faulted*
     in that workspace (the card says why) until the user switches it off and on. Traps ride Unix
@@ -199,7 +205,9 @@ sheet, hosted once in `web-ui/src/App.svelte`. Wire (all under `/api/v1`, bearer
   - **What a plugin hands back is capped too** — a tool result at 256 KiB, the instruction
     paragraph at 8 KiB, a hook line at 1 KiB — and a component whose `tools()` names differ
     from its manifest's `provides.mcp_tools` is refused everywhere (the card's Adds line and the
-    call gate come from the manifest).
+    call gate come from the manifest). Tool names are unique within a manifest, 1–64 ASCII
+    letters, digits, underscores, dots or dashes; built-in tool names are reserved. If active
+    plugins share a tool name, the first in catalog order both advertises and handles it.
   - **Events reach only the plugins that declare them** (`provides.events`): a hook never
     instantiates a plugin that ignores hooks.
   - **Measured** (2026-09-26, macOS arm64): the release binary 26.8 → 38.4 MB (Cranelift); a
@@ -335,9 +343,10 @@ sheet, hosted once in `web-ui/src/App.svelte`. Wire (all under `/api/v1`, bearer
     one id.
   - **`first_party`** (the card's check badge, "Verified by the Chimaera maintainers"): the id
     is in the lock — the maintainers' curated list — AND the installed copy's
-    `[release] github` is the lock's `repo` exactly (an available entry is first-party by
-    definition). An updated first-party copy keeps it; a third-party plugin never gets it, even
-    one that reuses a first-party id from another repository.
+    `[release] github` matches the lock's `repo` (case-insensitive), with either exact pinned
+    bytes or a `source-github` marker recorded by the host when installing from that repository.
+    A local build cannot grant itself the badge through its manifest or copied marker. Available
+    lock entries are first-party by definition; updates from the official repository keep it.
   - **`verified`** — the integrity check, never shown on the card (only a failure is, as the
     fault line) — checked every time the catalog loads a copy (off the reactor): both files are
     re-hashed against the `SHA256SUMS` kept beside them. A match → `verified`; no `SHA256SUMS`
