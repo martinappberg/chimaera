@@ -25,6 +25,9 @@
     { "note": "CJK corner brackets split the UI's tokens", "raw": "会議「最終」資料.pdf", "safe": "会議-最終-資料.pdf" },
     { "note": "no extension: a closing bracket at the end goes", "raw": "notes (draft)", "safe": "notes-draft" },
     { "note": "a trailing dot goes (claude's word boundary cuts it)", "raw": "v1.", "safe": "v1" },
+    { "note": "a zero-width no-break space is whitespace to JS", "raw": "notes\ufeffv2.txt", "safe": "notes-v2.txt" },
+    { "note": "a leading dash goes (a shell reads it as a flag)", "raw": "- draft.txt", "safe": "draft.txt" },
+    { "note": "a stem of separators gets a name instead of becoming a dotfile", "raw": "???.png", "safe": "upload.png" },
     { "note": "nothing mention-safe left", "raw": "???", "safe": "upload" }
   ]
 }

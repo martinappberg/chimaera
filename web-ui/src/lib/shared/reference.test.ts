@@ -2,6 +2,8 @@ import { get } from "svelte/store";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   activeSelection,
+  agentMention,
+  composeAgentPathReference,
   composeProvenanceSuffix,
   composeSelectionReference,
   needsCropUpload,
@@ -106,5 +108,36 @@ describe("provenance and one-click references", () => {
     referenceNow("nb", sel);
     expect(seen).toEqual([sel]);
     expect(get(activeSelection)).toBeNull();
+  });
+});
+
+describe("agentMention: a mention claude reads whole", () => {
+  it("stays bare when claude's bare form reads the whole path", () => {
+    expect(agentMention("src/a.ts")).toBe("@src/a.ts");
+    expect(agentMention("src/lib/")).toBe("@src/lib/");
+    expect(agentMention("/pad/Screenshot-2026-09-26-at-12.30.png")).toBe("@/pad/Screenshot-2026-09-26-at-12.30.png");
+    expect(agentMention("\u5831\u544a", "L3-L9")).toBe("@\u5831\u544a#L3-L9");
+  });
+  it("quotes whitespace, keeping the locator inside the quotes", () => {
+    expect(agentMention("raw data/qc.tsv")).toBe('@"raw data/qc.tsv"');
+    expect(agentMention("raw data/qc.tsv", "L3-L9")).toBe('@"raw data/qc.tsv#L3-L9"');
+    expect(agentMention("raw data/")).toBe('@"raw data/"');
+  });
+  it("quotes a tail claude's word boundary would cut", () => {
+    expect(agentMention("/pad/\u5831\u544a")).toBe('@"/pad/\u5831\u544a"');
+    expect(agentMention("notes(1)")).toBe('@"notes(1)"');
+    expect(agentMention("v1.")).toBe('@"v1."');
+  });
+  it("leaves a path holding a double quote bare (no escape exists)", () => {
+    expect(agentMention('my "final" notes.md')).toBe('@my "final" notes.md');
+  });
+  it("every composer writes mentions through it", () => {
+    expect(composeAgentPathReference("raw data/qc.tsv")).toBe('@"raw data/qc.tsv" ');
+    expect(composeSelectionReference("raw data/qc.tsv", file({ startLine: 3, endLine: 9, text: "x" }), "terminal")).toBe(
+      '@"raw data/qc.tsv#L3-L9" "x" ',
+    );
+    expect(composeProvenanceSuffix(file({ startLine: 3, endLine: 9 }), "raw data/qc.tsv", null)).toBe(
+      ' [from @"raw data/qc.tsv#L3-L9"] ',
+    );
   });
 });
