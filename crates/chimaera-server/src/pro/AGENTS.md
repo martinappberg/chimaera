@@ -13,6 +13,7 @@ revocable delegation over the authenticated local API.
 | `transport.rs` | Bounded external curl/git children; credentials only in memory, never argv or Git config. |
 | `policy.rs` | Mirrored-path policy, credential filtering, size budgets and cloud-profile classification. |
 | `mirror.rs` | Separate shadow and repository Git directories, incremental transfer and conservative hand-back. |
+| `repository.rs` | Portable remote/tracking allowlist; bounded ref import, compare-and-swap adoption and index/ref-lock cancellation cleanup. |
 | `config.rs` | Agent configuration export with credential fields removed and missing names recorded. |
 
 One recorded holder and epoch controls shared writes. Failure to reach the service
@@ -27,3 +28,13 @@ credential helpers, or secret-bearing structs. Filesystem work runs off the
 reactor. Every directory walk, child output, transfer, queue and state map is
 bounded. Shadow commits never touch the user's index or branch. Hand-back never
 resets a dirty worktree or rewrites a divergent branch.
+
+Hand-back fetches never overwrite `FETCH_HEAD`. Active-branch fast-forward holds
+the real index reservation and a prepared Git ref transaction before touching
+the working tree. Its bounded finalizer survives caller cancellation and installs
+the matching index after a committed ref; ambiguous failures retain the prepared
+index. Prepared transactions serialize so their helper cannot deadlock on the
+two-child transport budget. Another worktree's branch is retained separately. Unsupported
+transaction support preserves a cloud ref instead. Network Git has a finite
+16-minute deadline; ordinary helpers retain short deadlines. Repository and
+shadow histories are quota-bound and retained, never silently rewritten/pruned.

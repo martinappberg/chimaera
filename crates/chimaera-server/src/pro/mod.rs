@@ -4,6 +4,7 @@ mod engine;
 mod mirror;
 mod policy;
 mod protocol;
+mod repository;
 mod routes;
 mod transport;
 pub(crate) use routes::*;
@@ -54,6 +55,8 @@ struct Preference {
     never_mirror: bool,
     #[serde(default)]
     privacy_pending: bool,
+    #[serde(default)]
+    git_branches: Vec<String>,
     #[serde(default)]
     profile: policy::CloudProfile,
 }

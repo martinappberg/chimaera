@@ -20,6 +20,8 @@ pub(super) struct Manifest {
     branch: Option<String>,
     #[serde(default)]
     repository_origin: Option<String>,
+    #[serde(default)]
+    repository: Option<super::repository::Snapshot>,
     workspace_id: String,
     pub root: PathBuf,
     name: String,
@@ -386,7 +388,8 @@ pub(super) async fn snapshot(
         }
         let branch=transport::git_output(transport::git(&workspace.root,None),&["symbolic-ref","-q","HEAD"],vec![]).await.ok().and_then(|bytes|String::from_utf8(bytes).ok()).map(|text|text.trim().to_string());
         let repository_origin=mirror::repository_origin(&workspace.root).await;
-        let manifest = Manifest {version:1,branch,repository_origin,workspace_id:workspace.id.clone(),root:workspace.root.clone(),name:workspace.name.clone(),epoch,clean,profile:profile.clone(),sessions:archives};
+        let repository=super::repository::capture(&workspace.root).await?;
+        let manifest = Manifest {version:1,branch,repository_origin,repository,workspace_id:workspace.id.clone(),root:workspace.root.clone(),name:workspace.name.clone(),epoch,clean,profile:profile.clone(),sessions:archives};
         tokio::fs::write(handoff.join("manifest.json"), serde_json::to_vec(&manifest)?).await?;
         mirror::mirror_repository(&workspace.root, &root.join("repository.git"), &grant).await?;
         mirror::commit_tree(&shadow, &staging.join("tree"), "main").await?;
@@ -569,7 +572,7 @@ pub(super) async fn hydrate(
             )
             .await?;
         }
-        mirror::receive_repository(
+        let git_branches = super::repository::receive(
             &destination_root,
             &state
                 .pro
@@ -579,6 +582,7 @@ pub(super) async fn hydrate(
             &read_grant,
             manifest.branch.as_deref(),
             manifest.repository_origin.as_deref(),
+            manifest.repository.as_ref(),
         )
         .await?;
         let baseline = stage.join("baseline");
@@ -661,10 +665,12 @@ pub(super) async fn hydrate(
             )
             .await?;
         }
-        lock(&state.pro.preferences)
-            .entry(workspace.into())
-            .or_default()
-            .profile = manifest.profile;
+        {
+            let mut preferences = lock(&state.pro.preferences);
+            let preference = preferences.entry(workspace.into()).or_default();
+            preference.profile = manifest.profile;
+            preference.git_branches = git_branches;
+        }
         lock(&state.pro.ownership)
             .insert(workspace.into(), Ownership::Local { epoch: grant.epoch });
         super::persist(state).await?;

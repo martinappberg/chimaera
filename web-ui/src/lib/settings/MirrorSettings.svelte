@@ -68,6 +68,7 @@
         <p class="path">{workspace.root}</p>
         <label class="check"><input type="checkbox" checked={workspace.never_mirror} disabled={busy !== null} onchange={(event) => privacy(workspace,event.currentTarget)} />Never mirror this project</label>
         {#if workspace.privacy_pending}<p class="error" role="status">Copying from this laptop has stopped. Cloud privacy is still pending; retry to disable it everywhere.</p><button class="btn" disabled={busy !== null} onclick={() => void act(workspace.workspace_id, () => proSetNeverMirror(workspace.workspace_id, true))}>Retry cloud privacy</button>{/if}
+        {#if workspace.git_branches?.length}<p class="hint">Cloud changes are saved in {workspace.git_branches.join(", ")} for you to merge.</p>{/if}
         {#if workspace.mirror}
           <p class="hint">{workspace.mirror.files} files · {bytes(workspace.mirror.bytes)} working files · {bytes(workspace.mirror.storage_limit_bytes)} storage limit · {workspace.mirror.excluded} private files excluded{#if workspace.mirror.too_large} · {workspace.mirror.too_large} files exceed the size limit{/if}</p>
           {#if workspace.mirror.last_mirrored_at}<p class="hint">Last copied {new Date(workspace.mirror.last_mirrored_at * 1000).toLocaleString()}</p>{/if}

@@ -956,6 +956,7 @@ export interface MirrorWorkspace {
   ownership: { state: "awaiting_verification" | "local" | "remote" | "transferring" | "hydrating" | "privacy_disabled"; epoch: number; holder?: string } | null;
   mirror: { files: number; bytes: number; excluded: number; too_large: number; last_mirrored_at: number | null; storage_limit_bytes: number; error: string | null } | null;
   profile: MirrorProfile | null;
+  git_branches?: string[] | null;
 }
 export interface MirrorStatus {
   configured: boolean; projects_root: string; projects_root_confirmed: boolean; workspaces: MirrorWorkspace[];

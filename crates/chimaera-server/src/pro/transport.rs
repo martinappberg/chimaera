@@ -50,6 +50,10 @@ fn clean_command(binary: &str) -> Command {
     command
 }
 
+pub(super) async fn child_permit() -> Result<tokio::sync::SemaphorePermit<'static>> {
+    Ok(CHILDREN.acquire().await?)
+}
+
 pub(super) async fn run(
     mut command: Command,
     input: Vec<u8>,

@@ -108,7 +108,7 @@ pub(crate) async fn status(State(state): State<Arc<AppState>>) -> Json<serde_jso
     let ownership = lock(&state.pro.ownership).clone();
     let statuses = lock(&state.pro.status).clone();
     Json(
-        json!({"configured":state.pro.configured.load(Ordering::Acquire),"projects_root":super::projects_root(&state),"projects_root_confirmed":lock(&state.pro.projects_root).is_some(),"sessions":sessions,"workspaces":workspaces.into_iter().take(128).map(|workspace|json!({"workspace_id":workspace.id,"name":workspace.name,"root":workspace.root,"never_mirror":preferences.get(&workspace.id).is_some_and(|p|p.never_mirror),"privacy_pending":preferences.get(&workspace.id).is_some_and(|p|p.privacy_pending),"ownership":ownership.get(&workspace.id),"mirror":statuses.get(&workspace.id),"profile":preferences.get(&workspace.id).map(|p|&p.profile)})).collect::<Vec<_>>()}),
+        json!({"configured":state.pro.configured.load(Ordering::Acquire),"projects_root":super::projects_root(&state),"projects_root_confirmed":lock(&state.pro.projects_root).is_some(),"sessions":sessions,"workspaces":workspaces.into_iter().take(128).map(|workspace|json!({"workspace_id":workspace.id,"name":workspace.name,"root":workspace.root,"never_mirror":preferences.get(&workspace.id).is_some_and(|p|p.never_mirror),"privacy_pending":preferences.get(&workspace.id).is_some_and(|p|p.privacy_pending),"ownership":ownership.get(&workspace.id),"mirror":statuses.get(&workspace.id),"git_branches":preferences.get(&workspace.id).map(|p|&p.git_branches),"profile":preferences.get(&workspace.id).map(|p|&p.profile)})).collect::<Vec<_>>()}),
     )
 }
 pub(crate) async fn privacy(

@@ -354,15 +354,19 @@ pub(super) fn import(source: &Path, home: &Path) -> Result<()> {
                 } else {
                     if relative == Path::new(".gitconfig") {
                         bytes = git_identity(&bytes);
-                    }
-                    ensure!(
-                        !policy::contains_credential(&bytes),
-                        "configuration overlay contains a credential"
-                    );
-                    // Native history and independently edited instructions are
-                    // append-only/local authority; active sessions use bundles.
-                    if cursor.exists() {
-                        continue;
+                        if cursor.exists() {
+                            bytes = merge_git_preferences(&read_regular(&cursor)?, &bytes)?;
+                        }
+                    } else {
+                        ensure!(
+                            !policy::contains_credential(&bytes),
+                            "configuration overlay contains a credential"
+                        );
+                        // Native history and independently edited instructions are
+                        // append-only/local authority; active sessions use bundles.
+                        if cursor.exists() {
+                            continue;
+                        }
                     }
                 }
                 ensure!(
@@ -442,44 +446,151 @@ fn merge_config(existing: &mut serde_json::Value, incoming: serde_json::Value) {
         (existing, incoming) => *existing = incoming,
     }
 }
+fn merge_git_preferences(existing: &[u8], incoming: &[u8]) -> Result<Vec<u8>> {
+    const START: &str = "# chimaera portable Git preferences begin";
+    const END: &str = "# chimaera portable Git preferences end";
+    let text = std::str::from_utf8(existing)?;
+    let mut output = String::new();
+    let mut managed = false;
+    for line in text.lines() {
+        if line == START {
+            ensure!(!managed, "nested portable Git preferences");
+            managed = true;
+            continue;
+        }
+        if line == END {
+            ensure!(managed, "unmatched portable Git preferences");
+            managed = false;
+            continue;
+        }
+        if !managed {
+            output.push_str(line);
+            output.push('\n');
+        }
+    }
+    ensure!(!managed, "unterminated portable Git preferences");
+    output.push_str(START);
+    output.push('\n');
+    output.push_str(std::str::from_utf8(incoming)?);
+    output.push_str(END);
+    output.push('\n');
+    ensure!(
+        output.len() as u64 <= policy::MAX_CONFIG_FILE,
+        "Git preferences exceed limit"
+    );
+    Ok(output.into_bytes())
+}
+
 fn git_identity(bytes: &[u8]) -> Vec<u8> {
     let text = String::from_utf8_lossy(bytes);
-    let mut user = false;
+    let mut section = "";
     let mut identity = String::new();
+    let mut aliases = String::new();
     for line in text.lines() {
         let line = line.trim();
         if line.starts_with('[') {
-            user = line.eq_ignore_ascii_case("[user]");
-            continue;
-        }
-        if !user {
+            section = if line.eq_ignore_ascii_case("[user]") {
+                "user"
+            } else if line.eq_ignore_ascii_case("[alias]") {
+                "alias"
+            } else {
+                ""
+            };
             continue;
         }
         if let Some((key, value)) = line.split_once('=') {
-            if ["name", "email"]
-                .iter()
-                .any(|name| key.trim().eq_ignore_ascii_case(name))
+            let key = key.trim().to_ascii_lowercase();
+            let value = value.trim();
+            if value.len() > 2048
+                || value.chars().any(char::is_control)
+                || value.contains(['\\', ';', '#'])
+                || policy::contains_credential(value.as_bytes())
             {
-                let value = value.trim();
-                if value.len() <= 512
-                    && !value.chars().any(char::is_control)
-                    && !value.contains(['\\', ';', '#'])
-                    && !policy::contains_credential(value.as_bytes())
+                continue;
+            }
+            if section == "user" && matches!(key.as_str(), "name" | "email") {
+                identity.push_str(&format!("\t{key} = {value}\n"));
+            } else if section == "alias"
+                && key.len() <= 64
+                && key
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b"_-".contains(&c))
+            {
+                // Only simple command/flag aliases travel. Free-form arguments
+                // can contain credentials even without a recognizable prefix.
+                let literal = value.trim_matches('"');
+                let mut words = literal.split_whitespace();
+                let command = words.next().unwrap_or_default();
+                let simple_flags = words.all(|flag| {
+                    matches!(
+                        flag,
+                        "-s" | "-sb"
+                            | "--short"
+                            | "--branch"
+                            | "--oneline"
+                            | "--graph"
+                            | "--decorate"
+                            | "--all"
+                            | "-a"
+                            | "-v"
+                            | "-vv"
+                            | "--stat"
+                            | "--cached"
+                            | "--staged"
+                            | "--color=auto"
+                            | "--rebase"
+                            | "--ff-only"
+                            | "--amend"
+                            | "--no-edit"
+                            | "--verbose"
+                            | "--prune"
+                            | "--tags"
+                    )
+                });
+                if simple_flags
+                    && matches!(
+                        command,
+                        "status"
+                            | "log"
+                            | "show"
+                            | "diff"
+                            | "branch"
+                            | "checkout"
+                            | "switch"
+                            | "fetch"
+                            | "pull"
+                            | "push"
+                            | "commit"
+                            | "merge"
+                            | "rebase"
+                            | "worktree"
+                            | "stash"
+                            | "reset"
+                            | "restore"
+                            | "add"
+                            | "rm"
+                            | "cherry-pick"
+                    )
                 {
-                    identity.push_str(&format!(
-                        "\t{} = {}\n",
-                        key.trim().to_ascii_lowercase(),
-                        value
-                    ));
+                    aliases.push_str(&format!("\t{key} = {value}\n"));
                 }
             }
         }
     }
-    if identity.is_empty() {
-        Vec::new()
-    } else {
-        format!("[user]\n{identity}").into_bytes()
-    }
+    format!(
+        "{}{}",
+        if identity.is_empty() {
+            String::new()
+        } else {
+            format!("[user]\n{identity}")
+        },
+        if aliases.is_empty() {
+            String::new()
+        } else {
+            format!("[alias]\n{aliases}")
+        }
+    )
+    .into_bytes()
 }
 
 #[cfg(test)]
@@ -495,9 +606,20 @@ mod tests {
         assert_eq!(existing["env"]["SECRET_TOKEN"], "cloud-only");
         assert_eq!(existing["env"]["PATH"], "/new");
         assert_eq!(existing["password"], "local-only");
-        let identity = String::from_utf8(git_identity(b"[user]\nname = Dev\nemail = dev@example.invalid\nsigningkey = private\n[credential]\nhelper = secret\n[include]\npath = /private\n")).unwrap();
+        let identity = String::from_utf8(git_identity(b"[user]\nname = Dev\nemail = dev@example.invalid\nsigningkey = private\n[credential]\nhelper = secret\n[alias]\nst = status --short\nunsafe = !curl private\nup = fetch https://alice:plain-password@example.test/private.git\nsecret = fetch --token plain-password\n[include]\npath = /private\n")).unwrap();
         assert!(identity.contains("Dev"));
+        assert!(identity.contains("st = status --short"));
+        assert!(!identity.contains("unsafe") && !identity.contains("plain-password"));
         assert!(!identity.contains("private") && !identity.contains("secret"));
+        let host = b"[credential]\nhelper = host-login-helper\n";
+        let merged = merge_git_preferences(host, identity.as_bytes()).unwrap();
+        assert_eq!(
+            merge_git_preferences(&merged, identity.as_bytes()).unwrap(),
+            merged
+        );
+        assert!(String::from_utf8(merged)
+            .unwrap()
+            .contains("helper = host-login-helper"));
     }
     #[test]
     fn sanitized_toml_retains_nested_servers_and_types() {

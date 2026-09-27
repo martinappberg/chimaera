@@ -86,8 +86,10 @@ Repository history and working files are separate Git mirrors. Snapshot commits
 use an independent index under the daemon's data directory; they never make WIP
 commits on the user's branches. `.gitignore` and `.chimaeraignore` restrict the
 working snapshot. Credential filenames, private keys, agent login stores and
-secret configuration fields are excluded. Git configuration carries only the
-user's name and email. Conversations are complete native archives: text the user
+secret configuration fields are excluded. Git configuration carries the
+user's name, email and simple Git aliases with known flags. Free-form or shell
+aliases, helpers, hooks, includes and signing credentials stay on their host.
+Safe remote URLs, refspecs and branch tracking follow the repository. Conversations are complete native archives: text the user
 or agent put in a conversation remains part of that archive.
 
 The daemon renews a workspace ownership lease independently of mirror jobs.
@@ -104,11 +106,20 @@ projects can return at an agent pause. Busy or unobservable agent states stay on
 the cloud. Plain shells become paused placeholders in the cloud; arbitrary
 foreground programs are not automatically relaunched.
 
-Hand-back fast-forwards a clean Git branch when possible. Diverged branch tips
-are retained as a separate cloud branch. If a file changed on both machines,
+Hand-back restores new branches and fast-forwards unchanged local branches. The
+current checkout uses Git's index and ref locks; branches checked out in another
+worktree are preserved separately. Diverged branch tips remain as
+`<branch>@cloud-<commit>`, and Project mirrors lists them for merging. Existing
+remote configuration and `FETCH_HEAD` stay intact. If a file changed on both machines,
 the local file and a sibling cloud copy both remain. Saved setup commands run in
 a visible **Cloud setup** terminal. Deferred steps run in a **Deferred laptop
 steps** terminal when the project returns; failed steps stay listed for attention.
+
+Projects first created in the cloud return to the folder confirmed once in
+Project mirrors (default `~/chimaera`). Native conversation identifiers survive
+when the local folder differs. Both repository and shadow histories are retained
+within the account quota; source history is never silently pruned. Initial Git
+transfers have a bounded 16-minute deadline and remain cancelable.
 
 Implementation: [`pro/`](../../crates/chimaera-server/src/pro/AGENTS.md),
 [`MirrorSettings.svelte`](../../web-ui/src/lib/settings/MirrorSettings.svelte),

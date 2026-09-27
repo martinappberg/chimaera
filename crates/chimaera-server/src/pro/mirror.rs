@@ -340,6 +340,7 @@ pub(super) async fn mirror_repository(
         vec![],
     )
     .await?;
+    super::repository::keep_source_head(root, cache).await?;
     let objects = transport::git_output(
         transport::git(cache, None),
         &["rev-list", "--objects", "--all"],
@@ -425,164 +426,6 @@ pub(super) async fn validate_tree(
     Ok(())
 }
 
-pub(super) async fn receive_repository(
-    root: &Path,
-    cache: &Path,
-    credentials: &MirrorCredentials,
-    branch: Option<&str>,
-    origin: Option<&str>,
-) -> Result<()> {
-    let Some(branch) = branch else {
-        return Ok(());
-    };
-    ensure!(
-        branch.starts_with("refs/heads/")
-            && !branch.contains(['\n', '\r', ' ', ':', '~', '^', '?', '*', '[', '\\'])
-            && !branch.contains(".."),
-        "invalid project branch"
-    );
-    initialize(cache).await?;
-    let url = transport::endpoint(&credentials.repository_url)?;
-    transport::git_output(
-        transport::git(cache, Some((&credentials.username, &credentials.password))),
-        &["fetch", "--prune", "--no-tags", &url, "+refs/*:refs/*"],
-        vec![],
-    )
-    .await?;
-    let mut detect = transport::git(root, None);
-    detect.args(["rev-parse", "--git-dir"]);
-    let existing = transport::run(detect, vec![], std::time::Duration::from_secs(5), 4096)
-        .await?
-        .success;
-    if !existing {
-        transport::git_output(
-            transport::git(root, None),
-            &["init", "--quiet", "."],
-            vec![],
-        )
-        .await?;
-        transport::git_output(
-            transport::git(root, None),
-            &[
-                "fetch",
-                "--no-tags",
-                cache.to_str().context("invalid repository cache")?,
-                "+refs/*:refs/*",
-            ],
-            vec![],
-        )
-        .await?;
-        transport::git_output(
-            transport::git(root, None),
-            &["symbolic-ref", "HEAD", branch],
-            vec![],
-        )
-        .await?;
-        transport::git_output(transport::git(root, None), &["read-tree", branch], vec![]).await?;
-        if let Some(origin) = origin.filter(|origin| safe_origin(origin)) {
-            transport::git_output(
-                transport::git(root, None),
-                &["remote", "add", "origin", origin],
-                vec![],
-            )
-            .await?;
-        }
-    } else {
-        let remote = format!(
-            "refs/remotes/chimaera-cloud/{}",
-            branch.trim_start_matches("refs/heads/")
-        );
-        transport::git_output(
-            transport::git(root, None),
-            &[
-                "fetch",
-                "--no-tags",
-                cache.to_str().context("invalid repository cache")?,
-                &format!("+{branch}:{remote}"),
-            ],
-            vec![],
-        )
-        .await?;
-        let status = transport::git_output(
-            transport::git(root, None),
-            &["status", "--porcelain", "--untracked-files=no"],
-            vec![],
-        )
-        .await?;
-        let head = transport::git_output(
-            transport::git(root, None),
-            &["symbolic-ref", "-q", "HEAD"],
-            vec![],
-        )
-        .await
-        .unwrap_or_default();
-        let mut ancestor = transport::git(root, None);
-        ancestor.args(["merge-base", "--is-ancestor", branch, &remote]);
-        if status.is_empty()
-            && head == format!("{branch}\n").as_bytes()
-            && transport::run(ancestor, vec![], std::time::Duration::from_secs(5), 256)
-                .await?
-                .success
-        {
-            transport::git_output(
-                transport::git(root, None),
-                &["merge", "--ff-only", &remote],
-                vec![],
-            )
-            .await?;
-        } else {
-            let target = String::from_utf8(
-                transport::git_output(transport::git(root, None), &["rev-parse", &remote], vec![])
-                    .await?,
-            )?;
-            let preserved = format!("{branch}@cloud-{}", super::now());
-            transport::git_output(
-                transport::git(root, None),
-                &[
-                    "update-ref",
-                    &preserved,
-                    target.trim(),
-                    "0000000000000000000000000000000000000000",
-                ],
-                vec![],
-            )
-            .await?;
-        }
-    }
-    Ok(())
-}
-
-fn safe_origin(value: &str) -> bool {
-    if value.len() > 2048
-        || value.chars().any(char::is_control)
-        || policy::contains_credential(value.as_bytes())
-    {
-        return false;
-    }
-    if let Ok(uri) = value.parse::<axum::http::Uri>() {
-        if uri.scheme_str() == Some("https")
-            && uri.authority().is_some_and(|a| !a.as_str().contains('@'))
-            && uri.query().is_none()
-            && !value.contains('#')
-        {
-            return true;
-        }
-    }
-    value
-        .strip_prefix("git@")
-        .and_then(|v| v.split_once(':'))
-        .is_some_and(|(host, path)| {
-            !host.is_empty()
-                && host
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b".-".contains(&b))
-                && !path.is_empty()
-                && path
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"/._-".contains(&b))
-                && !path.contains("..")
-        })
-}
 pub(super) async fn repository_origin(root: &Path) -> Option<String> {
     let bytes = transport::git_output(
         transport::git(root, None),
@@ -592,7 +435,7 @@ pub(super) async fn repository_origin(root: &Path) -> Option<String> {
     .await
     .ok()?;
     let origin = String::from_utf8(bytes).ok()?.trim().to_string();
-    safe_origin(&origin).then_some(origin)
+    super::repository::safe_url(&origin).then_some(origin)
 }
 
 #[cfg(test)]
