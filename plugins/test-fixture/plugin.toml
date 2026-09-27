@@ -11,3 +11,9 @@ mcp_tools = ["echo", "loop", "allocate", "panic", "read", "state", "append", "re
 
 [adds]
 agents = ["8 test tools: echo · loop · allocate · panic · read · state · append · recent"]
+
+# An agent-side plugin it recommends (never needs): the tests read it back
+# on the card's wire and through the install-requirement route.
+[recommends.agent_plugins.claude]
+id = "fixture-helper@fixture"
+marketplace = "acme/fixture-helper"

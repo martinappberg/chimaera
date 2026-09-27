@@ -1,14 +1,12 @@
 /target
 node_modules/
 web-ui/dist/
-# Plugin layouts (scripts/build-plugins.sh); the plugins workspace has its own
-# target dir. The cache holds the locked releases' downloads; the local
-# override points the build at a plugin checkout on this machine.
-plugins/dist/
+# The daemon tests' plugin layout (scripts/build-plugins.sh: the fixture and
+# the locked releases, and its staging dir); the plugins workspace has its
+# own target dir.
 plugins/dist-test/
+plugins/.dist-test.stage/
 plugins/target/
-plugins/cache/
-plugins/plugins.local.toml
 # The native shell is a standalone cargo workspace (Tauri stays out of the
 # daemon workspace), so it has its own target dir.
 crates/chimaera-app/target/

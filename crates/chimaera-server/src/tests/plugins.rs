@@ -1,6 +1,9 @@
-//! Workbench plugins over the wire: the per-workspace switch, footprint
+//! Workbench plugins over the wire: the first-party plugins listed as
+//! available until installed, the per-workspace switch, footprint
 //! detection, the MCP tools a plugin adds (offered AND gated only where it is
-//! active), and Agent notes end to end.
+//! active), and Agent notes end to end. The daemon carries no plugin, so
+//! each test installs the first-party ones it uses by path, from the
+//! releases `scripts/build-plugins.sh` laid out in `plugins/dist-test`.
 
 use super::support::*;
 use crate::{lock, AppState};
@@ -41,6 +44,8 @@ fn root_of(state: &Arc<AppState>, ws: &str) -> PathBuf {
 #[tokio::test]
 async fn plugin_tools_appear_only_where_switched_on_and_present() {
     let state = test_state();
+    install_first_party(&state, "mycelium").await;
+    install_first_party(&state, "agent-notes").await;
     let ws = make_workspace(&state, "plugins-gate").await;
     let worker = inject_agent(&state, "wk");
     lock(&state.session_workspaces).insert(worker.clone(), ws.clone());
@@ -98,6 +103,7 @@ async fn plugin_tools_appear_only_where_switched_on_and_present() {
 #[tokio::test]
 async fn workspace_plugins_route_reports_on_detected_active() {
     let state = test_state();
+    install_first_party(&state, "mycelium").await;
     let ws = make_workspace(&state, "plugins-route").await;
     std::fs::write(root_of(&state, &ws).join("MYCELIUM.md"), "# protocol").unwrap();
     lock(&state.workspaces)
@@ -122,6 +128,9 @@ async fn workspace_plugins_route_reports_on_detected_active() {
     assert_eq!(myc["detected"], true);
     assert_eq!(myc["active"], true);
     assert!(!myc["adds"]["agents"].as_array().unwrap().is_empty());
+    assert_eq!(myc["source"], "installed");
+    assert_eq!(myc["first_party"], true);
+    assert_eq!(myc["verified"], true, "{myc}");
     let notes = out["plugins"]
         .as_array()
         .unwrap()
@@ -129,12 +138,159 @@ async fn workspace_plugins_route_reports_on_detected_active() {
         .find(|p| p["id"] == "agent-notes")
         .unwrap()
         .clone();
-    assert_eq!(notes["active"], false, "not switched on");
+    assert_eq!(notes["source"], "available", "not installed here: {notes}");
+    assert_eq!(notes["active"], false);
+    assert_eq!(notes["requires"], serde_json::json!([]));
+    assert_eq!(notes["recommends"], serde_json::json!([]));
+}
+
+/// Nothing ships inside the daemon: each first-party plugin is listed as
+/// available (the lock's name, summary, pinned version and repository),
+/// can't be switched on, and becomes an ordinary installed plugin when
+/// installed — and available again when removed.
+#[tokio::test]
+async fn first_party_plugins_are_available_until_installed() {
+    let state = test_state();
+    let ws = make_workspace(&state, "plugins-available").await;
+    let worker = inject_agent(&state, "kav");
+    lock(&state.session_workspaces).insert(worker.clone(), ws.clone());
+    let base = tools(&state, &worker, "kav").await;
+    let entry = |state: &Arc<AppState>, id: &'static str| {
+        let state = state.clone();
+        async move {
+            let (status, out) = request(&state, Method::GET, "/api/v1/plugins", None).await;
+            assert_eq!(status, StatusCode::OK);
+            out["plugins"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| p["id"] == id)
+                .cloned()
+                .unwrap()
+        }
+    };
+    for l in crate::plugins::lock_entries() {
+        let id = l.id.as_str();
+        let (_, out) = request(&state, Method::GET, "/api/v1/plugins", None).await;
+        let e = out["plugins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["id"] == id)
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            e,
+            serde_json::json!({
+                "id": id,
+                "name": l.name,
+                "summary": l.summary,
+                "homepage": null,
+                "adds": {"ui": [], "agents": []},
+                "provides": {"knowledge": null, "mcp_tools": [], "views": []},
+                "setup": null,
+                "detect": [],
+                "version": l.version,
+                "api": null,
+                "source": "available",
+                "installed": false,
+                "first_party": true,
+                "verified": false,
+                "repo": l.repo,
+                "pinned_version": l.version,
+            })
+        );
+    }
+
+    // Nothing to switch on yet; switching off is harmless.
+    let put = |on: bool| {
+        let (state, ws) = (state.clone(), ws.clone());
+        async move {
+            request(
+                &state,
+                Method::PUT,
+                &format!("/api/v1/workspaces/{ws}/plugins/agent-notes"),
+                Some(serde_json::json!({"on": on})),
+            )
+            .await
+        }
+    };
+    let (status, body) = put(true).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(
+        body["error"],
+        "Agent notes isn't installed — install it first"
+    );
+    assert_eq!(put(false).await.0, StatusCode::OK);
+    for route in ["update", "check", "rollback"] {
+        let (status, body) = request(
+            &state,
+            Method::POST,
+            &format!("/api/v1/plugins/agent-notes/{route}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{route}: {body}");
+    }
+    let (status, _) = request(&state, Method::DELETE, "/api/v1/plugins/agent-notes", None).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let (status, _) = request(&state, Method::POST, "/api/v1/plugins/nothing/check", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(tools(&state, &worker, "kav").await, base);
+
+    // Installed (by path, with the release's SHA256SUMS): an ordinary
+    // plugin, first-party and verified, whose switch now holds.
+    install_first_party(&state, "agent-notes").await;
+    let e = entry(&state, "agent-notes").await;
+    let l = crate::plugins::lock_entry("agent-notes").unwrap();
+    assert_eq!(e["source"], "installed");
+    assert_eq!(e["installed"], true);
+    assert_eq!(e["first_party"], true);
+    assert_eq!(e["verified"], true, "{e}");
+    assert_eq!(e["sha256_wasm"], l.sha256_wasm.as_str());
+    assert_eq!(e["pinned_version"], l.version.as_str());
+    assert_eq!(e["repo"], l.repo.as_str());
+    assert!(e["local_path"]
+        .as_str()
+        .unwrap()
+        .ends_with("dist-test/agent-notes"));
+    let dir = state
+        .plugin_catalog
+        .root
+        .join("agent-notes")
+        .join(&l.version);
+    for file in ["plugin.toml", "plugin.wasm", "SHA256SUMS", "local-path"] {
+        assert!(dir.join(file).is_file(), "{file}");
+    }
+    assert_eq!(put(true).await.0, StatusCode::OK);
+    let with = tools(&state, &worker, "kav").await;
+    assert!(with.contains(&"post_note".to_string()), "{with:?}");
+
+    // Removed: available again, its tools gone, its switch kept for later.
+    let (status, body) = request(&state, Method::DELETE, "/api/v1/plugins/agent-notes", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["plugin"]["source"], "available");
+    assert_eq!(entry(&state, "agent-notes").await["source"], "available");
+    assert_eq!(tools(&state, &worker, "kav").await, base);
+    assert!(lock(&state.workspaces)
+        .get(&ws)
+        .unwrap()
+        .plugins_on
+        .contains(&"agent-notes".to_string()));
+    install_first_party(&state, "agent-notes").await;
+    assert!(
+        tools(&state, &worker, "kav")
+            .await
+            .contains(&"post_note".to_string()),
+        "reinstalled, a plugin left on is active again"
+    );
+    state.sessions.kill(&worker).ok();
 }
 
 #[tokio::test]
 async fn agent_notes_post_read_and_stay_in_their_workspace() {
     let state = test_state();
+    install_first_party(&state, "agent-notes").await;
     let ws = make_workspace(&state, "notes-ws").await;
     let other_ws = make_workspace(&state, "notes-other").await;
     let a = inject_agent(&state, "ka");
@@ -228,6 +384,7 @@ async fn worker_settings_pre_allow_only_active_plugin_tools() {
 #[tokio::test]
 async fn agent_notes_offers_exactly_what_it_always_did() {
     let state = test_state();
+    install_first_party(&state, "agent-notes").await;
     let ws = make_workspace(&state, "notes-offer").await;
     let a = inject_agent(&state, "koa");
     lock(&state.session_workspaces).insert(a.clone(), ws.clone());
@@ -298,6 +455,7 @@ async fn agent_notes_offers_exactly_what_it_always_did() {
 #[tokio::test]
 async fn agent_notes_hint_rides_the_hook_and_clears_on_read() {
     let state = test_state();
+    install_first_party(&state, "agent-notes").await;
     let ws = make_workspace(&state, "notes-hint").await;
     let a = inject_agent(&state, "kha");
     let b = inject_agent(&state, "khb");

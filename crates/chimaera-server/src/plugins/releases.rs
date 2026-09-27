@@ -4,21 +4,24 @@
 //!
 //! A plugin's manifest may name `[release] github = "owner/repo"`: the
 //! GitHub releases API, tags `v<version>`, assets `plugin.wasm`,
-//! `plugin.toml` and `SHA256SUMS`. Embedded plugins included: each
-//! first-party plugin's manifest names its own repository, so the one that
-//! ships with chimaera is checked against the version that runs, and Update
-//! installs the newer release as an installed copy, which the precedence
-//! rule then loads. The checker asks each such source for its latest
-//! release, reads that release's `plugin.toml` (small) and offers the
-//! version only when it is strictly newer than what runs here AND passes
-//! this daemon's gates. It never downloads a component on its own: that is
-//! the user's click (`installed`). Cadence: the daemon's own release checker
-//! (`update::run_checker`) runs `check_all` once after boot and then daily;
-//! `POST /plugins/{pid}/check` asks at once. Offers live in memory.
+//! `plugin.toml` and `SHA256SUMS` (each first-party plugin's manifest names
+//! its own repository). For every installed plugin that names one, the
+//! checker asks for the latest release, reads that release's `plugin.toml`
+//! (small) and offers the version only when it is strictly newer than what
+//! runs here AND passes this daemon's gates. It never downloads a component
+//! on its own: that is the user's click (`installed`). Cadence: the daemon's
+//! own release checker (`update::run_checker`) runs `check_all` once after
+//! boot and then daily; `POST /plugins/{pid}/check` asks at once. Offers
+//! live in memory.
+//!
+//! A first-party plugin's pinned release needs no API call: its assets are
+//! fetched by their direct download URLs (`pinned_release`).
 //!
 //! Every fetch here is `agent_updates::curl` (10 s, 1 MiB): the fence every
 //! phone-home the daemon makes shares. `CHIMAERA_PLUGIN_RELEASES_API`
-//! replaces the API base (`{base}/{owner}/{repo}/releases/latest`).
+//! replaces the API base (`{base}/{owner}/{repo}/releases/latest`), and
+//! `CHIMAERA_PLUGIN_DOWNLOADS` the download base
+//! (`{base}/{owner}/{repo}/releases/download/v{version}/{asset}`).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -38,6 +41,8 @@ use crate::AppState;
 pub(crate) const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 /// The GitHub API's repos base; `CHIMAERA_PLUGIN_RELEASES_API` replaces it.
 const GITHUB_API: &str = "https://api.github.com/repos";
+/// Where release assets download from; `CHIMAERA_PLUGIN_DOWNLOADS` replaces it.
+const GITHUB_DOWNLOADS: &str = "https://github.com";
 const ACCEPT_GITHUB: &str = "Accept: application/vnd.github+json";
 
 /// The daemon's plugin-release knowledge (on `AppState`). Hot state.
@@ -45,9 +50,10 @@ const ACCEPT_GITHUB: &str = "Accept: application/vnd.github+json";
 pub(crate) struct Releases {
     /// plugin id → the newer, gate-passing release a check found.
     offers: Mutex<HashMap<String, Offer>>,
-    /// Tests only: the API base (the env knob is process-wide, and tests
-    /// run in parallel).
+    /// Tests only: the API and download bases (the env knobs are
+    /// process-wide, and tests run in parallel).
     api_override: Mutex<Option<String>>,
+    downloads_override: Mutex<Option<String>>,
     /// One install, update, rollback or remove at a time, daemon-wide: they
     /// move links under one directory and reload one catalog.
     pub(crate) changing: tokio::sync::Mutex<()>,
@@ -80,11 +86,24 @@ impl Releases {
         *crate::lock(&self.api_override) = Some(base.to_string());
     }
 
+    /// Tests only: fetch pinned releases' assets from `base`.
+    #[cfg(test)]
+    pub(crate) fn set_downloads_for_tests(&self, base: &str) {
+        *crate::lock(&self.downloads_override) = Some(base.to_string());
+    }
+
     fn api_base(&self) -> String {
         if let Some(base) = crate::lock(&self.api_override).clone() {
             return base;
         }
         std::env::var("CHIMAERA_PLUGIN_RELEASES_API").unwrap_or_else(|_| GITHUB_API.to_string())
+    }
+
+    fn downloads_base(&self) -> String {
+        if let Some(base) = crate::lock(&self.downloads_override).clone() {
+            return base;
+        }
+        std::env::var("CHIMAERA_PLUGIN_DOWNLOADS").unwrap_or_else(|_| GITHUB_DOWNLOADS.to_string())
     }
 
     /// Drop what is known about `id` (it was removed).
@@ -148,6 +167,22 @@ pub(crate) async fn fetch_release(
         }
     }
     Ok(release)
+}
+
+/// A first-party plugin's pinned release, by its direct download URLs (no
+/// API call: the lock already says which release, and what its files hash
+/// to).
+pub(crate) fn pinned_release(state: &AppState, l: &super::Locked) -> Release {
+    let base = state.plugin_releases.downloads_base();
+    let base = base.trim_end_matches('/');
+    let asset = |name: &str| format!("{base}/{}/releases/download/v{}/{name}", l.repo, l.version);
+    Release {
+        version: l.version.clone(),
+        url: format!("https://github.com/{}/releases/tag/v{}", l.repo, l.version),
+        wasm_url: asset("plugin.wasm"),
+        toml_url: asset("plugin.toml"),
+        sums_url: asset("SHA256SUMS"),
+    }
 }
 
 /// Parse a releases-API payload: the tag (`v<MAJOR.MINOR.PATCH>`), the page,
@@ -219,28 +254,21 @@ pub(crate) fn parse_sums(text: &str) -> HashMap<String, String> {
         .collect()
 }
 
-/// Why `m` has nowhere to check or update from: no copy of it names a
+/// Why `m` has nowhere to check or update from: its manifest names no
 /// `[release]` source.
 pub(crate) fn no_source(m: &Manifest) -> Refusal {
-    Refusal::conflict(if m.origin.installed_version.is_none() {
-        format!(
-            "{} ships with chimaera and names no release source — it updates with chimaera itself",
-            m.name
-        )
-    } else {
-        format!(
-            "{} names no release source ([release] in its plugin.toml)",
-            m.name
-        )
-    })
+    Refusal::conflict(format!(
+        "{} names no release source ([release] in its plugin.toml)",
+        m.name
+    ))
 }
 
 /// Ask `id`'s release source whether a version newer than the one that runs
-/// (embedded or installed) exists, and remember the answer. `Ok(None)`:
-/// nothing newer that this daemon can run.
+/// exists, and remember the answer. `Ok(None)`: nothing newer that this
+/// daemon can run.
 pub(crate) async fn check(state: &Arc<AppState>, id: &str) -> Result<Option<Offer>, Refusal> {
     let Some(m) = super::manifest(state, id) else {
-        return Err(Refusal::not_found("unknown plugin"));
+        return Err(super::not_installed(id));
     };
     let Some(github) = m.origin.release.clone() else {
         return Err(no_source(&m));
@@ -306,8 +334,8 @@ pub(crate) fn compatible(
     }
 }
 
-/// Every plugin with a release source, embedded or installed, asked once
-/// (sequentially: a handful of small requests a day). Failures are
+/// Every installed plugin with a release source, asked once (sequentially:
+/// a handful of small requests a day). Failures are
 /// debug-logged — an air-gapped cluster failing a check is normal life.
 pub(crate) async fn check_all(state: &Arc<AppState>) {
     let ids: Vec<String> = super::catalog(state)
@@ -330,7 +358,7 @@ pub(crate) async fn check_route(
 ) -> Response {
     match check(&state, &pid).await {
         Ok(offer) => {
-            let plugin = super::manifest(&state, &pid).map(|m| super::manifest_json(&state, &m));
+            let plugin = super::entry_json(&state, &pid);
             Json(json!({
                 "id": pid,
                 "update": offer.map(|o| json!({

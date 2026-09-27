@@ -38,10 +38,12 @@ if [ ! -f web-ui/dist/index.html ]; then
   npm --prefix web-ui run build >>"$log" 2>&1 \
     || note "web-ui build failed (see $log); cargo builds will fail until it exists."
 fi
-# Same for the first-party WASM plugins (plugins/dist, plugins/dist-test).
-if [ ! -d plugins/dist ] || [ ! -d plugins/dist-test ]; then
+# The daemon's TEST build embeds plugins/dist-test (the fixture, and the
+# first-party releases the lock pins, which tests install by path); the
+# daemon itself carries no plugins.
+if [ ! -d plugins/dist-test ]; then
   bash scripts/build-plugins.sh >>"$log" 2>&1 \
-    || note "plugin build failed (see $log); cargo builds will fail until plugins/dist exists."
+    || note "plugin test layout failed (see $log); cargo test/clippy --all-targets will fail until plugins/dist-test exists."
 fi
 
 # A cold workspace compile is the slowest part of a cloud session, so start the
@@ -51,7 +53,7 @@ fi
 # concurrent cargo command wait ("Blocking waiting for file lock") and then reuse
 # this work. Opt out with CHIMAERA_CLOUD_WARM=0 in the environment variables.
 if [ "${CHIMAERA_CLOUD_WARM:-1}" != "0" ] && [ -f web-ui/dist/index.html ] \
-   && [ -d plugins/dist ] && [ "$warming" = 0 ]; then
+   && [ -d plugins/dist-test ] && [ "$warming" = 0 ]; then
   detach=""
   command -v setsid >/dev/null 2>&1 && detach="setsid"
   $detach nohup nice -n 10 bash -c ': cargo-warm-chimaera;
@@ -60,8 +62,8 @@ if [ "${CHIMAERA_CLOUD_WARM:-1}" != "0" ] && [ -f web-ui/dist/index.html ] \
   note "warming the \`just check\` builds in the background (log: $log); a cargo command may wait on its lock."
 fi
 
-state="web-ui deps + dist ready; plugins built."
-[ -d plugins/dist ] || state="plugins/dist is MISSING."
+state="web-ui deps + dist ready; plugins/dist-test built."
+[ -d plugins/dist-test ] || state="plugins/dist-test is MISSING."
 [ -f web-ui/dist/index.html ] || state="web-ui/dist is MISSING."
 echo "Cloud session bootstrap (.claude/hooks/cloud-bootstrap.sh): ${state}${notes}"
 echo "- Cloud limits (no browser pane, no chat-smoke, no HPC hosts): docs/agent-guides/cloud-sessions.md."

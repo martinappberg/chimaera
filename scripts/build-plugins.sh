@@ -1,43 +1,32 @@
 #!/usr/bin/env bash
 #
-# Lay out the plugins the daemon embeds, like web-ui/dist (a debug daemon
-# reads them from disk instead):
+# Lay out what the daemon's TESTS need in plugins/dist-test (gitignored).
+# Nothing here goes into a chimaera binary: the daemon carries no plugin
+# bytes (it embeds only plugins/plugins.lock) and installs plugins at
+# runtime. Building or running the daemon does not need this script.
 #
-#   plugins/dist/<id>/{plugin.wasm,plugin.toml}       the first-party plugins
-#   plugins/dist-test/<id>/{plugin.wasm,plugin.toml}  the host's test fixture
+#   plugins/dist-test/<id>/{plugin.wasm,plugin.toml,SHA256SUMS}
+#       each first-party release plugins/plugins.lock pins, downloaded from
+#       https://github.com/<repo>/releases/download/v<version>/<file>, both
+#       files verified against the lock's sha256s, the manifest's id,
+#       version, name and [release] github checked against the lock. Tests
+#       install these by path, as `chimaera plugin add --path` would. A
+#       second run re-verifies what is already there and fetches nothing;
+#       a run without network needs them there already.
+#   plugins/dist-test/test-fixture/{plugin.wasm,plugin.toml}
+#   plugins/dist-test/test-fixture-v2/{plugin.wasm,plugin.toml}
+#       plugins/test-fixture, the one crate of the plugins/ cargo workspace,
+#       and its `v2` build (the "next release" the update tests serve).
 #
-# 1. The first-party plugins live in their own repositories, pinned by
-#    plugins/plugins.lock. For each [[plugin]] there, the release's
-#    plugin.wasm and plugin.toml are downloaded
-#    (https://github.com/<repo>/releases/download/v<version>/<file>), both
-#    verified against the lock's sha256s, and the manifest's version checked
-#    against the lock's. Downloads are kept in plugins/cache/<id>-<version>/
-#    (gitignored), so a second build never refetches; a cached file is
-#    re-verified against the lock on every run, never trusted.
-#    A build without network needs that cache, or an override (below), for
-#    every locked plugin.
-# 2. A local override, for developing a plugin against the daemon:
-#    plugins/plugins.local.toml (gitignored), one table per plugin,
-#        [[plugin]]
-#        id = "agent-notes"
-#        path = "../../chimaera-plugin-agent-notes"   # absolute, ~/..., or relative to plugins/
-#    builds that checkout (`cargo build --release --target wasm32-wasip2`, on
-#    the checkout's own toolchain) and lays out its component and its
-#    plugin.toml instead of the locked release, with no version check against
-#    the lock. An id the lock doesn't name is laid out too (a new plugin).
-# 3. plugins/test-fixture, the one crate of the plugins/ cargo workspace, is
-#    built here into plugins/dist-test, with its v2 variant for the update
-#    tests.
-#
-# Run before any build of chimaera-server (CI and release do; `just plugins`).
+# Run before `cargo test` / `cargo clippy --all-targets` of chimaera-server
+# (its test build embeds plugins/dist-test; CI and `just check` do).
 # Works with sha256sum (Linux) or shasum (macOS), and bash 3.2.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PLUGINS="$ROOT/plugins"
 LOCK="$PLUGINS/plugins.lock"
-LOCAL="$PLUGINS/plugins.local.toml"
-CACHE="$PLUGINS/cache"
+DIST="$PLUGINS/dist-test"
 TARGET=wasm32-wasip2
 # A component's size cap: the daemon's own (plugins::installed::WASM_MAX).
 MAX_BYTES=16777216
@@ -121,149 +110,101 @@ fetch() { # url dest
 
 size() { wc -c <"$1" | tr -d ' '; }
 
-# A locked plugin: its release's two files, from the cache when they are
-# there and still match the lock, else downloaded and verified; then its
-# manifest checked against the lock and both laid out in `dest/<id>`.
-lay_out_locked() { # id version repo sha256_wasm sha256_toml dest
-  local id="$1" version="$2" repo="$3" dest="$6"
-  local cache="$CACHE/$id-$version"
+# The sha256 a SHA256SUMS file lists for `name` (empty when it lists none).
+listed() { # sums-file name
+  awk -v f="$2" '{ n = $2; sub(/^\*/, "", n); sub(/^\.\//, "", n); if (n == f) { print tolower($1); exit } }' "$1"; }
+
+# A locked release into `stage/<id>`: plugin.wasm, plugin.toml and
+# SHA256SUMS, taken from the last run's plugins/dist-test/<id>/ when they
+# still match the lock, else downloaded; then verified and checked.
+lay_out_locked() { # id name version repo sha256_wasm sha256_toml stage
+  local id="$1" name="$2" version="$3" repo="$4" stage="$7/$1"
   local base="https://github.com/$repo/releases/download/v$version"
   local file want got fetched=0
-  mkdir -p "$cache"
-  for file in plugin.wasm plugin.toml; do
+  mkdir -p "$stage"
+  for file in plugin.wasm plugin.toml SHA256SUMS; do
     case "$file" in
-      plugin.wasm) want="$4" ;;
-      *) want="$5" ;;
+      plugin.wasm) want="$5" ;;
+      plugin.toml) want="$6" ;;
+      *) want="" ;;
     esac
-    if [ -f "$cache/$file" ]; then
-      got="$(sha256 "$cache/$file")"
-      [ "$got" = "$want" ] && continue
-      # Kept until a verified download replaces it: a wrong lock must not
-      # cost an offline machine its cache.
-      say "$id $version: the cached $file does not match plugins/plugins.lock (expected sha256 $want, got $got); downloading it again"
+    if [ -f "$DIST/$id/$file" ]; then
+      if [ -z "$want" ]; then
+        # The lock doesn't pin SHA256SUMS itself: it must list the pinned
+        # sha256 of both files.
+        if [ "$(listed "$DIST/$id/$file" plugin.wasm)" = "$5" ] &&
+          [ "$(listed "$DIST/$id/$file" plugin.toml)" = "$6" ]; then
+          cp "$DIST/$id/$file" "$stage/$file"
+          continue
+        fi
+      elif [ "$(sha256 "$DIST/$id/$file")" = "$want" ]; then
+        cp "$DIST/$id/$file" "$stage/$file"
+        continue
+      fi
     fi
     say "$id $version: downloading $base/$file"
-    if ! fetch "$base/$file" "$cache/.$file.part"; then
-      rm -f "$cache/.$file.part"
-      die "$id $version: could not download $base/$file (a build without network needs $(rel "$cache")/ or an override in plugins/plugins.local.toml)"
+    if ! fetch "$base/$file" "$stage/$file"; then
+      rm -f "$stage/$file"
+      die "$id $version: could not download $base/$file (a run without network needs $(rel "$DIST")/$id/ from an earlier run)"
     fi
-    got="$(sha256 "$cache/.$file.part")"
-    if [ "$got" != "$want" ]; then
-      rm -f "$cache/.$file.part"
-      die "$id $version: $file from $base does not match plugins/plugins.lock: expected sha256 $want, got $got"
-    fi
-    mv "$cache/.$file.part" "$cache/$file"
     fetched=$((fetched + 1))
+    if [ -n "$want" ]; then
+      got="$(sha256 "$stage/$file")"
+      [ "$got" = "$want" ] ||
+        die "$id $version: $file from $base does not match plugins/plugins.lock: expected sha256 $want, got $got"
+    fi
   done
-  local mid mversion mrepo
-  mid="$(toml_top "$cache/plugin.toml" id)"
-  mversion="$(toml_top "$cache/plugin.toml" version)"
-  mrepo="$(toml_release "$cache/plugin.toml")"
+  [ "$(listed "$stage/SHA256SUMS" plugin.wasm)" = "$5" ] && [ "$(listed "$stage/SHA256SUMS" plugin.toml)" = "$6" ] ||
+    die "$id $version: the release's SHA256SUMS does not list the sha256s plugins/plugins.lock pins"
+  local mid mversion mname mrepo
+  mid="$(toml_top "$stage/plugin.toml" id)"
+  mversion="$(toml_top "$stage/plugin.toml" version)"
+  mname="$(toml_top "$stage/plugin.toml" name)"
+  mrepo="$(toml_release "$stage/plugin.toml")"
   [ "$mid" = "$id" ] || die "$id $version: the release's plugin.toml is for id \"$mid\", not \"$id\""
   [ "$mversion" = "$version" ] ||
     die "$id $version: the release's plugin.toml says version \"$mversion\", plugins/plugins.lock says $version"
-  if [ -n "$mrepo" ] && [ "$mrepo" != "$repo" ]; then
+  [ "$mname" = "$name" ] ||
+    die "$id $version: the release's plugin.toml names it \"$mname\", plugins/plugins.lock \"$name\""
+  [ "$mrepo" = "$repo" ] ||
     die "$id $version: the release's plugin.toml names [release] github = \"$mrepo\", plugins/plugins.lock says $repo"
-  fi
-  mkdir -p "$dest/$id"
-  cp "$cache/plugin.wasm" "$dest/$id/plugin.wasm"
-  cp "$cache/plugin.toml" "$dest/$id/plugin.toml"
   if [ "$fetched" = 0 ]; then
-    say "$id $version -> plugins/dist/$id ($(size "$cache/plugin.wasm") bytes; from $(rel "$cache")/, sha256s re-verified against the lock, nothing fetched)"
+    say "$id $version -> $(rel "$DIST")/$id ($(size "$stage/plugin.wasm") bytes; already there, re-verified against the lock)"
   else
-    say "$id $version -> plugins/dist/$id ($(size "$cache/plugin.wasm") bytes; downloaded from $repo, sha256s verified against the lock)"
-  fi
-}
-
-# An override: build the checkout at `path` and lay out its component and its
-# plugin.toml in `dest/<id>`. `locked` is the lock's version for the id
-# (empty when the lock doesn't name it).
-lay_out_override() { # id path dest locked
-  local id="$1" path="$2" dest="$3" locked="$4"
-  case "$path" in
-    /*) ;;
-    "~/"*) path="$HOME/${path#"~/"}" ;;
-    *) path="$PLUGINS/$path" ;;
-  esac
-  if [ ! -f "$path/Cargo.toml" ] || [ ! -f "$path/plugin.toml" ]; then
-    die "$id: the override's path $path has no Cargo.toml and plugin.toml (plugins/plugins.local.toml)"
-  fi
-  say "$id: building the local override at $path (plugins/plugins.local.toml), not the locked release"
-  local out wasm mid mversion
-  # The checkout's own directory, so rustup picks its rust-toolchain.toml.
-  out="$(cd "$path" && cargo build --release --target "$TARGET" --message-format=json-render-diagnostics)" ||
-    die "$id: cargo build failed in $path"
-  wasm="$(printf '%s\n' "$out" | grep '"reason":"compiler-artifact"' | grep -o '"[^"]*\.wasm"' | tail -n 1 | tr -d '"' || true)"
-  if [ -z "$wasm" ] || [ ! -f "$wasm" ]; then
-    die "$id: the build in $path produced no .wasm (a plugin crate is a cdylib)"
-  fi
-  mid="$(toml_top "$path/plugin.toml" id)"
-  mversion="$(toml_top "$path/plugin.toml" version)"
-  [ "$mid" = "$id" ] || die "$id: $path/plugin.toml is for id \"$mid\", not \"$id\""
-  mkdir -p "$dest/$id"
-  cp "$wasm" "$dest/$id/plugin.wasm"
-  cp "$path/plugin.toml" "$dest/$id/plugin.toml"
-  say "$id $mversion -> plugins/dist/$id ($(size "$wasm") bytes; built from $path)"
-  if [ -n "$locked" ]; then
-    say "$id: an override: the version check against plugins/plugins.lock ($locked) is skipped"
-  else
-    say "$id: not in plugins/plugins.lock: laid out from the override only"
+    say "$id $version -> $(rel "$DIST")/$id ($(size "$stage/plugin.wasm") bytes; downloaded from $repo, verified against the lock)"
   fi
 }
 
 # Staged, then swapped in at the end: a failed run keeps the last good layout.
-STAGE="$CACHE/.stage"
+STAGE="$PLUGINS/.dist-test.stage"
 rm -rf "$STAGE"
 trap 'rm -rf "$STAGE"' EXIT
-mkdir -p "$STAGE/dist" "$STAGE/dist-test"
+mkdir -p "$STAGE"
+
+# Build outputs of this script before the daemon stopped embedding plugins.
+for old in "$PLUGINS/dist" "$PLUGINS/cache"; do
+  if [ -d "$old" ]; then
+    say "removing $(rel "$old") (the daemon no longer embeds plugins)"
+    rm -rf "$old"
+  fi
+done
 
 [ -f "$LOCK" ] || die "plugins/plugins.lock is missing"
-LOCKED="$(read_tables "$LOCK" id version repo sha256_wasm sha256_toml)"
-OVERRIDES=""
-if [ -f "$LOCAL" ]; then
-  OVERRIDES="$(read_tables "$LOCAL" id path)"
-fi
-
-# The override for `id`, if plugins.local.toml names one.
-override_for() {
-  local oid opath
-  while IFS="$SEP" read -r oid opath; do
-    if [ -n "$oid" ] && [ "$oid" = "$1" ]; then
-      printf '%s\n' "$opath"
-      return 0
-    fi
-  done <<<"$OVERRIDES"
-  return 1
-}
+LOCKED="$(read_tables "$LOCK" id name summary version repo sha256_wasm sha256_toml)"
 
 seen=" "
-while IFS="$SEP" read -r id version repo sha_wasm sha_toml <&3; do
+while IFS="$SEP" read -r id name _summary version repo sha_wasm sha_toml <&3; do
   [ -n "$id" ] || continue
-  sha_wasm="$(printf '%s' "$sha_wasm" | tr 'A-F' 'a-f')"
-  sha_toml="$(printf '%s' "$sha_toml" | tr 'A-F' 'a-f')"
   [[ $id =~ $ID_RE ]] || die "plugins/plugins.lock: id \"$id\" is not lowercase letters, digits and dashes"
   [[ $version =~ $VERSION_RE ]] || die "plugins/plugins.lock: $id: version \"$version\" is not MAJOR.MINOR.PATCH"
   [[ $repo =~ $REPO_RE ]] || die "plugins/plugins.lock: $id: repo \"$repo\" is not owner/name"
-  [[ $sha_wasm =~ $SHA_RE ]] || die "plugins/plugins.lock: $id: sha256_wasm is not 64 hex digits"
-  [[ $sha_toml =~ $SHA_RE ]] || die "plugins/plugins.lock: $id: sha256_toml is not 64 hex digits"
+  [[ $sha_wasm =~ $SHA_RE ]] || die "plugins/plugins.lock: $id: sha256_wasm is not 64 lowercase hex digits"
+  [[ $sha_toml =~ $SHA_RE ]] || die "plugins/plugins.lock: $id: sha256_toml is not 64 lowercase hex digits"
+  case "$id" in test-*) die "plugins/plugins.lock: $id: test-* ids are the fixture's" ;; esac
   case "$seen" in *" $id "*) die "plugins/plugins.lock names $id twice" ;; esac
   seen="$seen$id "
-  if opath="$(override_for "$id")"; then
-    lay_out_override "$id" "$opath" "$STAGE/dist" "$version"
-  else
-    lay_out_locked "$id" "$version" "$repo" "$sha_wasm" "$sha_toml" "$STAGE/dist"
-  fi
+  lay_out_locked "$id" "$name" "$version" "$repo" "$sha_wasm" "$sha_toml" "$STAGE"
 done 3<<<"$LOCKED"
-
-overridden=" "
-while IFS="$SEP" read -r id opath <&3; do
-  [ -n "$id" ] || continue
-  [[ $id =~ $ID_RE ]] || die "plugins/plugins.local.toml: id \"$id\" is not lowercase letters, digits and dashes"
-  case "$overridden" in *" $id "*) die "plugins/plugins.local.toml names $id twice" ;; esac
-  overridden="$overridden$id "
-  case "$seen" in *" $id "*) continue ;; esac
-  lay_out_override "$id" "$opath" "$STAGE/dist" ""
-done 3<<<"$OVERRIDES"
 
 # The test fixture. Its manifest is the one source of truth for its version
 # and API, so it must agree with the crate and the WIT rather than have them
@@ -302,9 +243,9 @@ for manifest in "$PLUGINS"/*/plugin.toml; do
   if [ -z "$id" ] || [ -z "$lib" ] || [ ! -f "$OUT/$lib.wasm" ]; then
     die "$crate: no id, crate name, or $lib.wasm"
   fi
-  mkdir -p "$STAGE/dist-test/$id"
-  cp "$OUT/$lib.wasm" "$STAGE/dist-test/$id/plugin.wasm"
-  cp "$manifest" "$STAGE/dist-test/$id/plugin.toml"
+  mkdir -p "$STAGE/$id"
+  cp "$OUT/$lib.wasm" "$STAGE/$id/plugin.wasm"
+  cp "$manifest" "$STAGE/$id/plugin.toml"
   say "$id -> plugins/dist-test/$id ($(size "$OUT/$lib.wasm") bytes)"
 done
 
@@ -314,11 +255,10 @@ done
 # releases server.
 cargo +"$TOOLCHAIN" build --manifest-path "$PLUGINS/Cargo.toml" --target "$TARGET" --release \
   -p chimaera-plugin-test-fixture --features v2
-mkdir -p "$STAGE/dist-test/test-fixture-v2"
-cp "$OUT/chimaera_plugin_test_fixture.wasm" "$STAGE/dist-test/test-fixture-v2/plugin.wasm"
-cp "$PLUGINS/test-fixture/plugin-v2.toml" "$STAGE/dist-test/test-fixture-v2/plugin.toml"
+mkdir -p "$STAGE/test-fixture-v2"
+cp "$OUT/chimaera_plugin_test_fixture.wasm" "$STAGE/test-fixture-v2/plugin.wasm"
+cp "$PLUGINS/test-fixture/plugin-v2.toml" "$STAGE/test-fixture-v2/plugin.toml"
 say "test-fixture 0.2.0 -> plugins/dist-test/test-fixture-v2 ($(size "$OUT/chimaera_plugin_test_fixture.wasm") bytes)"
 
-rm -rf "$PLUGINS/dist" "$PLUGINS/dist-test"
-mv "$STAGE/dist" "$PLUGINS/dist"
-mv "$STAGE/dist-test" "$PLUGINS/dist-test"
+rm -rf "$DIST"
+mv "$STAGE" "$DIST"

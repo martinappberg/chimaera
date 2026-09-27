@@ -220,6 +220,7 @@
     closeAttachSheet,
     knowledgeProviderActive,
   } from "./lib/plugins/store";
+  import { EXTENSIONS_GLYPH, EXTENSIONS_STROKE } from "./lib/plugins/glyph";
   import ComputeStrip from "./lib/workspace/ComputeStrip.svelte";
   import {
     dropSpotAt,
@@ -3183,7 +3184,8 @@
     if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
   }
 
-  /** Open/focus the Plugins tab (quick-open, the attach affordances). */
+  /** Open/focus the Extensions tab (the `plugins` surface: quick-open, the
+   *  dock row, the attach affordances). */
   function openPluginsSurface(): void {
     if (activeWsId === null || !layoutReady) return;
     layout = openPlugins(layout);
@@ -3191,11 +3193,18 @@
   }
 
   /** Quick-open commands: the workspace surfaces that have no file or session
-   *  to match on ("Timeline", "Knowledge", "Plugins"). */
+   *  to match on ("Timeline", "Knowledge", "Extensions" — which "plugins" and
+   *  "skills" still find). */
   const quickOpenCommands = [
     { id: "timeline", label: "Timeline", hint: "what happened", run: openTimelineSurface },
     { id: "knowledge", label: "Knowledge", hint: "what we know", run: openKnowledgeSurface },
-    { id: "plugins", label: "Plugins", hint: "add-ons for this workspace", run: openPluginsSurface },
+    {
+      id: "plugins",
+      label: "Extensions",
+      aliases: ["plugins", "skills"],
+      hint: "plugins and skills",
+      run: openPluginsSurface,
+    },
     {
       id: "mastermind",
       label: "Mastermind",
@@ -4331,7 +4340,7 @@
                     : tab.surface === "knowledge"
                       ? "Knowledge"
                       : tab.surface === "plugins"
-                        ? "Plugins"
+                        ? "Extensions"
                         : tab.surface === "browser"
                           ? (tab.host || "Browser")
                           : "Settings";
@@ -4892,26 +4901,26 @@
           </button>
         {/if}
 
-        <!-- Plugins (Installed · Skills): always a row — it is where a
-             plugin gets added in the first place. -->
+        <!-- Extensions (Plugins · Skills): always a row — it is where a
+             plugin gets installed in the first place. -->
         <button
           class="row dash-row"
           class:dash-active={pluginsOpen}
-          title="plugins & skills — add-ons for this workspace, and every skill your agents can use"
+          title="extensions — install plugins, and see every skill your agents can use"
           onclick={openPluginsSurface}
         >
           <svg class="dash-glyph" viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
-            <!-- The plugins tab's own plug (PaneTabs): one glyph per surface. -->
+            <!-- The Extensions tab's own glyph (PaneTabs): one glyph per surface. -->
             <path
-              d="M5.5 2v3M10.5 2v3M4 5h8v2.5a4 4 0 0 1-8 0zM8 11.5V14"
+              d={EXTENSIONS_GLYPH}
               fill="none"
               stroke="currentColor"
-              stroke-width="1.4"
+              stroke-width={EXTENSIONS_STROKE}
               stroke-linecap="round"
               stroke-linejoin="round"
             />
           </svg>
-          <span class="dash-label">plugins</span>
+          <span class="dash-label">extensions</span>
         </button>
 
         <!-- Terminals first (there are few), agents below (there are many);

@@ -192,6 +192,26 @@ pub(super) async fn session_entry(state: &Arc<AppState>, id: &str) -> serde_json
         .unwrap_or_else(|| panic!("session {id} not listed in {list}"))
 }
 
+/// Install a first-party plugin as `chimaera plugin add --path` would: the
+/// release the lock pins, which `scripts/build-plugins.sh` laid out in
+/// `plugins/dist-test/<id>` (its SHA256SUMS included, so the copy is
+/// verified). The daemon carries no plugin of its own. Already installed:
+/// nothing to do.
+pub(super) async fn install_first_party(state: &Arc<AppState>, id: &str) {
+    if state.plugin_catalog.installed_copy(id).is_some() {
+        return;
+    }
+    let dir = crate::plugins::test_catalog::dist_test_dir(id);
+    let (status, body) = request(
+        state,
+        Method::POST,
+        "/api/v1/plugins/install",
+        Some(serde_json::json!({"path": dir})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{id}: {body}");
+}
+
 /// Register a workspace and return its id.
 pub(super) async fn make_workspace(state: &Arc<AppState>, label: &str) -> String {
     let root = test_dir(label);

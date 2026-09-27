@@ -1,40 +1,43 @@
 <script lang="ts">
   /**
-   * Installed: the workbench plugins as cards (glyph tile · name · the
-   * plugin's own version · where it came from — "ships with chimaera" or
-   * "installed", "stale", an Update chip when a check found a newer
-   * compatible release · summary · the on/off switch for THIS workspace ·
-   * Here / Adds / Needs lines — the "Adds" line is mandatory, it is what
-   * makes opt-in honest — and, for an installed copy, Use previous / Check
-   * now / Remove; the fault when it can't run), a quiet row that installs
-   * a plugin from its repository's release, then what each agent CLI
-   * reports about its own plugins. Requirement state ("Needs") is read from
-   * the agents, never guessed; versions and sources from the daemon.
+   * The Plugins segment of the Extensions tab: first the chimaera plugins as
+   * cards — glyph tile · name · version · quiet tags (`chimaera` for a
+   * first-party plugin, `verified` / `unverified · local`) · an **Update to
+   * x.y.z** chip when a check found a newer release · summary · then the
+   * state: an **Install x.y.z** button for a first-party plugin not
+   * installed on this host, else the on/off switch for THIS workspace.
+   * Below it, plain sentences: what it found here, what it adds "For
+   * agents" and "For you" (what makes opt-in honest), the agent plugins it
+   * requires or recommends (requirementsModel.ts — only agents installed on
+   * this host), the installed line with Use previous / Check now / Remove,
+   * the fault when it can't run, one outcome line per change. A quiet row
+   * installs a plugin from a repository. Then the agent plugins, as each
+   * agent CLI reports them. Agent state is read from the agents, never
+   * guessed; versions, sources and verification from the daemon.
    */
   import ConfirmDialog from "../shared/ConfirmDialog.svelte";
   import Switch from "../shared/Switch.svelte";
   import { knowledge } from "../workspace/knowledge";
-  import { ApiError } from "../net/api";
+  import { installedOutcome, installTitle, pinnedVersion, updatedOutcome, type Outcome } from "./installCopy";
+  import { requirementsModel, type AgentsState, type PillTone } from "./requirementsModel";
   import {
     changeWorkbenchPlugin,
-    daemonVersion,
+    installFirstPartyPlugin,
     installPlugin,
     installWorkbenchPlugin,
+    isMissingRoute,
     setWorkspacePluginOn,
     type PluginChange,
     type PluginUpdate,
-    type AgentHook,
     type AgentId,
-    type AgentPlugin,
     type AgentPlugins,
-    type AgentPluginsEntry,
     type WorkspacePlugin,
   } from "./store";
 
   interface Props {
     plugins: WorkspacePlugin[];
     agentPlugins: AgentPlugins | null;
-    agentState: "idle" | "loading" | "ok" | "unavailable" | "error";
+    agentState: AgentsState;
     agentError: string | null;
     wsId: string | null;
     onAttach: (pluginId: string) => void;
@@ -49,13 +52,17 @@
   let busy = $state(new Set<string>());
   let errors = $state(new Map<string, string>());
 
+  function message(e: unknown): string {
+    return e instanceof Error ? e.message : String(e);
+  }
+
   async function toggle(p: WorkspacePlugin, on: boolean): Promise<void> {
     busy = new Set(busy).add(p.id);
-    errors = new Map([...errors].filter(([k]) => k !== p.id));
+    errors = without(errors, p.id);
     try {
       await setWorkspacePluginOn(p.id, on);
     } catch (e) {
-      errors = new Map(errors).set(p.id, e instanceof Error ? e.message : String(e));
+      errors = new Map(errors).set(p.id, message(e));
     } finally {
       const next = new Set(busy);
       next.delete(p.id);
@@ -63,6 +70,7 @@
     }
   }
 
+  /** The agent's own install of an agent plugin, in a visible terminal. */
   async function install(p: WorkspacePlugin, agent: AgentId): Promise<void> {
     if (wsId === null) return;
     const key = `${p.id}:${agent}`;
@@ -73,33 +81,13 @@
     } catch (e) {
       errors = new Map(errors).set(
         p.id,
-        e instanceof ApiError && e.status === 404
-          ? "this daemon can't run installs yet — use the agent's own plugin manager"
-          : e instanceof Error
-            ? e.message
-            : String(e),
+        isMissingRoute(e) ? "this daemon can't run installs yet — use the agent's own plugin manager" : message(e),
       );
     } finally {
       const next = new Set(busy);
       next.delete(key);
       busy = next;
     }
-  }
-
-  function entry(agent: string): AgentPluginsEntry | null {
-    return agentPlugins?.agents.find((a) => a.agent === agent) ?? null;
-  }
-  function installed(agent: string, id: string): AgentPlugin | null {
-    return entry(agent)?.plugins.find((p) => p.id === id || p.id === id.split("@")[0]) ?? null;
-  }
-  /** Codex hooks of a plugin that still wait for the user's trust. */
-  function untrustedHooks(agent: string, id: string): AgentHook[] {
-    const hooks = entry(agent)?.hooks ?? [];
-    const base = id.split("@")[0];
-    return hooks.filter(
-      (h) =>
-        (h.plugin_id === id || h.plugin_id === base) && (h.trust === "untrusted" || h.trust === "modified"),
-    );
   }
 
   /** The tile's two letters: a fixed pair for the first-party ids, else
@@ -111,11 +99,11 @@
     return id.slice(0, 2);
   }
 
-  type Change = "update" | "rollback" | "remove" | "check";
+  type Change = "install" | "update" | "rollback" | "remove" | "check";
 
   /** One-line outcomes of the last change per plugin (the verified
-   *  checksum after an update). */
-  let notes = $state(new Map<string, string>());
+   *  checksum after an install or update, whole in the title). */
+  let notes = $state(new Map<string, Outcome>());
   /** The plugin whose Remove waits for the confirm dialog. */
   let removing = $state<WorkspacePlugin | null>(null);
   let removeError = $state<string | null>(null);
@@ -125,23 +113,21 @@
   }
 
   /** The outcome line; null when there is no card left to carry it (a
-   *  removed plugin that nothing ships under). */
+   *  removed plugin that chimaera doesn't pin). */
   function outcome(
     kind: Change,
     p: WorkspacePlugin,
     res: PluginChange | { update: PluginUpdate | null },
-  ): string | null {
+  ): Outcome | null {
     if (kind === "check") {
       const u = (res as { update: PluginUpdate | null }).update;
-      return u !== null ? `${u.version} is available` : `no release newer than ${p.version}`;
+      return { text: u !== null ? `${u.version} is available` : `no release newer than ${p.version}` };
     }
     const c = res as PluginChange;
-    if (kind === "rollback") return `back to ${c.version} — Use previous returns to ${c.previous}`;
-    if (kind === "remove") {
-      return c.plugin ? `installed copy removed — the ${p.embedded_version} that ships with chimaera runs now` : null;
-    }
-    const sha = c.sha256?.["plugin.wasm"];
-    return `updated to ${c.version}${sha ? ` · plugin.wasm sha256 ${sha.slice(0, 16)}… verified` : ""}`;
+    if (kind === "install") return installedOutcome(c, p.name);
+    if (kind === "rollback") return { text: `back to ${c.version} — Use previous returns to ${c.previous}` };
+    if (kind === "remove") return c.plugin ? { text: "removed — Install brings it back" } : null;
+    return updatedOutcome(c);
   }
 
   async function change(p: WorkspacePlugin, kind: Change): Promise<boolean> {
@@ -150,14 +136,15 @@
     errors = without(errors, p.id);
     notes = without(notes, p.id);
     try {
-      const res = await changeWorkbenchPlugin(kind, p.id);
+      const res = kind === "install" ? await installFirstPartyPlugin(p.id) : await changeWorkbenchPlugin(kind, p.id);
       const line = outcome(kind, p, res);
       if (line !== null) notes = new Map(notes).set(p.id, line);
       return true;
     } catch (e) {
-      const message = e instanceof Error ? e.message : String(e);
-      if (kind === "remove") removeError = message;
-      else errors = new Map(errors).set(p.id, message);
+      const text =
+        kind === "install" && isMissingRoute(e) ? "this daemon can't install plugins yet — update chimaera" : message(e);
+      if (kind === "remove") removeError = text;
+      else errors = new Map(errors).set(p.id, text);
       return false;
     } finally {
       const next = new Set(busy);
@@ -166,11 +153,11 @@
     }
   }
 
-  /** The add-from-a-repository row: what was typed, whether its install is
-   *  in flight, and its one outcome line (the error flag picks the style). */
+  /** The install-from-a-repository row: what was typed, whether its install
+   *  is in flight, and its one outcome line (the error flag picks the style). */
   let repo = $state("");
   let adding = $state(false);
-  let added = $state<{ text: string; error: boolean; title?: string } | null>(null);
+  let added = $state<(Outcome & { error: boolean }) | null>(null);
 
   async function addFromRepository(): Promise<void> {
     const github = repo.trim();
@@ -179,23 +166,11 @@
     added = null;
     try {
       const res = await installWorkbenchPlugin(github);
-      const raw = (res.plugin as { name?: unknown } | null | undefined)?.name;
-      const name = typeof raw === "string" && raw !== "" ? raw : res.id;
-      const sha = res.sha256?.["plugin.wasm"];
-      added = {
-        text: `installed ${name} ${res.version ?? ""}${sha ? ` · plugin.wasm sha256 ${sha.slice(0, 16)}… verified` : ""}`,
-        error: false,
-        title: sha ? `plugin.wasm sha256 ${sha}` : undefined,
-      };
+      added = { ...installedOutcome(res, res.id), error: false };
       repo = "";
     } catch (e) {
       added = {
-        text:
-          e instanceof ApiError && e.status === 404
-            ? "this daemon can't install plugins yet — update chimaera"
-            : e instanceof Error
-              ? e.message
-              : String(e),
+        text: isMissingRoute(e) ? "this daemon can't install plugins yet — update chimaera" : message(e),
         error: true,
       };
     } finally {
@@ -209,24 +184,27 @@
   }
 
   function removeBody(p: WorkspacePlugin): string {
-    const versions = [p.installed_version, p.previous].filter((v) => v !== null).join(" and ");
-    const what = `This deletes the installed ${p.name} (${versions}) from this host.`;
-    return p.embedded_version !== null
-      ? `${what} The ${p.embedded_version} that ships with chimaera runs instead.`
-      : `${what} Workspaces where it is on lose what it adds.`;
+    const versions = [p.version, p.previous].filter((v) => v !== null && v !== "").join(" and ");
+    const what = `This deletes ${p.name} ${versions} from this host.`;
+    return p.first_party ? `${what} You can install it again from here.` : `${what} Workspaces where it is on lose what it adds.`;
   }
 
-  /** The source chip: where the running copy came from, and — when both
-   *  exist — the other copy too ("installed · 0.3.1 ships with chimaera"). */
-  function source(p: WorkspacePlugin): string {
-    if (p.source === "installed") {
-      return p.embedded_version !== null ? `installed · ${p.embedded_version} ships with chimaera` : "installed";
-    }
-    return $daemonVersion !== null ? `ships with chimaera ${$daemonVersion}` : "ships with chimaera";
+  /** The version's tooltip: an installed first-party copy running another
+   *  version than the one chimaera pins says which one that is. */
+  function pinTitle(p: WorkspacePlugin): string | undefined {
+    return p.installed && p.first_party && p.pinned_version !== null && p.pinned_version !== p.version
+      ? `chimaera pins ${p.pinned_version}`
+      : undefined;
+  }
+
+  function verifiedTitle(p: WorkspacePlugin): string {
+    const base = "This copy matches its release's SHA256SUMS";
+    return p.sha256_wasm !== null ? `${base} · plugin.wasm ${p.sha256_wasm}` : base;
   }
 
   const k = $derived($knowledge);
 
+  /** What the plugin found in this workspace, when it found something. */
   function hereLine(p: WorkspacePlugin): string | null {
     if (typeof p.provides.knowledge === "string" && p.active && k !== null && k.provider !== null) {
       const c = k.counts;
@@ -237,8 +215,29 @@
     return null;
   }
 
-  function adds(p: WorkspacePlugin): string {
-    return [...p.adds.ui, ...p.adds.agents].join(" · ");
+  function reqModel(p: WorkspacePlugin) {
+    return requirementsModel({
+      requires: p.requires,
+      recommends: p.recommends,
+      knowledge: p.provides.knowledge,
+      report: agentPlugins,
+      state: agentState,
+    });
+  }
+
+  function toneClass(t: PillTone): string {
+    return `pill ${t}`;
+  }
+
+  /** The workbench plugin whose agent plugin `id` (as `agent` lists it) is
+   *  required or recommended — the agent card's "review hooks" link. */
+  function wantedBy(agent: string, id: string): WorkspacePlugin | undefined {
+    const base = id.split("@")[0];
+    return plugins.find((p) =>
+      [...p.requires, ...p.recommends].some(
+        (r) => r.agent === agent && (r.id === id || r.id.split("@")[0] === base),
+      ),
+    );
   }
 
   function fmtTokens(n: number): string {
@@ -248,33 +247,36 @@
 
 <section class="wb" aria-labelledby="wb-title">
   <div class="shead">
-    <h2 id="wb-title" class="lbl">Workbench</h2>
-    <span class="hint">run inside chimaera</span>
+    <h2 id="wb-title" class="lbl">Chimaera plugins</h2>
+    <span class="hint">sandboxed, inside chimaera</span>
   </div>
 
   {#if plugins.length === 0}
-    <p class="empty">No workbench plugins on this daemon.</p>
+    <p class="empty">No plugins on this host yet — install one from a repository below.</p>
   {/if}
 
   {#each plugins as p (p.id)}
     {@const here = hereLine(p)}
     {@const changing = busy.has(`${p.id}:change`)}
+    {@const available = p.source === "available"}
+    {@const req = reqModel(p)}
+    {@const note = notes.get(p.id)}
     <article class="card" class:active={p.active}>
       <div class="top">
         <span class="tile mono" class:on={p.active} aria-hidden="true">{tile(p.id)}</span>
         <div class="ident">
           <div class="nameline">
             <span class="name">{p.name}</span>
-            {#if p.version !== ""}<span class="ver mono">{p.version}</span>{/if}
-            <span class="pill neutral small" title={p.path ?? undefined}>{source(p)}</span>
-            {#if p.stale}
-              <span
-                class="pill warn small"
-                title="the installed {p.installed_version} is older than the {p.embedded_version} that ships with chimaera"
-                >stale</span
-              >
+            {#if p.version !== ""}<span class="ver mono" title={pinTitle(p)}>{p.version}</span>{/if}
+            {#if p.first_party}
+              <span class="pill neutral small" title="Maintained with Chimaera and pinned in its plugins.lock">chimaera</span>
             {/if}
-            {#if p.update !== null}
+            {#if p.verified}
+              <span class="pill neutral small" title={verifiedTitle(p)}>verified</span>
+            {:else if p.local_path !== null}
+              <span class="pill neutral small" title="installed from {p.local_path}">unverified · local</span>
+            {/if}
+            {#if p.installed && p.update !== null}
               <button
                 class="pill good small chip"
                 disabled={changing}
@@ -287,115 +289,112 @@
           </div>
           <div class="summary">{p.summary}</div>
         </div>
-        <span class="state" class:good={p.active}>
-          {#if p.active}
-            <span class="dot"></span>active here
-          {:else if p.on}
-            on · nothing detected yet
-          {:else if p.detected && p.detect.length > 0}
-            off · {p.detect[0]} found
-          {:else}
-            off
-          {/if}
-        </span>
-        <Switch
-          on={p.on}
-          label="{p.name} {p.on ? 'on' : 'off'} in this workspace"
-          disabled={busy.has(p.id)}
-          onToggle={(next) => void toggle(p, next)}
-        />
+        {#if available}
+          <button class="opt primary install" disabled={changing} title={installTitle(p)} onclick={() => void change(p, "install")}>
+            {changing ? "installing…" : `Install ${pinnedVersion(p)}`}
+          </button>
+        {:else}
+          <span class="state" class:good={p.active}>
+            {#if p.active}
+              <span class="dot"></span>active here
+            {:else if p.on}
+              on · nothing detected yet
+            {:else if p.detected && p.detect.length > 0}
+              off · {p.detect[0]} found
+            {:else}
+              off
+            {/if}
+          </span>
+          <Switch
+            on={p.on}
+            label="{p.name} {p.on ? 'on' : 'off'} in this workspace"
+            disabled={busy.has(p.id)}
+            onToggle={(next) => void toggle(p, next)}
+          />
+        {/if}
       </div>
 
-      <div class="lines">
-        {#if here !== null}
-          <span class="lbl small">Here</span>
-          <span>{here}</span>
-        {:else if p.on && !p.detected && p.setup !== null}
-          <span class="lbl small">Here</span>
-          <span class="muted">
-            nothing detected yet —
-            <button class="link" onclick={() => onAttach(p.id)}>set it up →</button>
-          </span>
-        {/if}
-        <span class="lbl small">{p.on ? "Adds" : "Would add"}</span>
-        <span>{adds(p)}</span>
-        {#if p.requires.length > 0}
-          <span class="lbl small needs">Needs</span>
-          <span class="needs-row">
-            {#each p.requires as r (r.agent)}
-              {@const ag = entry(r.agent)}
-              {@const got = installed(r.agent, r.id)}
-              {@const hooks = untrustedHooks(r.agent, r.id)}
-              {#if agentState === "unavailable"}
-                <span class="pill neutral">{r.agent} · can't check on this daemon</span>
-              {:else if (agentState === "loading" || agentState === "idle") && agentPlugins === null}
-                <span class="pill neutral">{r.agent} · checking…</span>
-              {:else if ag === null || !ag.available}
-                <span class="pill neutral" title={ag?.error ?? undefined}>{r.agent} · not installed on this host</span>
-              {:else if got !== null}
-                <span class="pill good" class:warn={!got.enabled}>
-                  {r.agent} · plugin {got.version ?? ""} {got.enabled ? "✓" : "· disabled"}
-                </span>
-                {#if hooks.length > 0}
-                  <span class="pill warn">{r.agent} · {hooks.length} hook{hooks.length === 1 ? "" : "s"} not trusted</span>
-                  <button class="link strong" onclick={() => onAttach(p.id)}>Review &amp; trust →</button>
-                {/if}
-              {:else}
-                <span class="pill warn">{r.agent} · plugin not installed</span>
+      {#if !available || note !== undefined || errors.has(p.id) || req.rows.length > 0 || req.notice !== null}
+        <div class="lines">
+          {#if here !== null}
+            <p>{here}</p>
+          {:else if p.on && !p.detected && p.setup !== null}
+            <p class="muted">
+              nothing detected yet —
+              <button class="link" onclick={() => onAttach(p.id)}>set it up →</button>
+            </p>
+          {/if}
+          {#if p.adds.agents.length > 0}
+            <p><span class="muted">For agents:</span> {p.adds.agents.join(" · ")}</p>
+          {/if}
+          {#if p.adds.ui.length > 0}
+            <p><span class="muted">For you:</span> {p.adds.ui.join(" · ")}</p>
+          {/if}
+          {#if req.notice !== null}
+            <p class="muted">{req.notice}</p>
+          {/if}
+          {#each req.rows as r (`${r.kind}:${r.agent}:${r.id}`)}
+            <div class="req">
+              <span class:muted={r.kind === "recommends" && r.status === "missing"} class:warn-text={r.status === "disabled" && r.kind === "recommends"}
+                >{r.text}</span
+              >
+              {#if r.pill !== null}
+                <span class={toneClass(r.pill.tone)} title={r.scope ?? undefined}>{r.pill.text}</span>
+              {/if}
+              {#if r.untrustedHooks.length > 0}
+                <span class="pill warn"
+                  >{r.agent} · {r.untrustedHooks.length} hook{r.untrustedHooks.length === 1 ? "" : "s"} not trusted</span
+                >
+                <button class="link strong" onclick={() => onAttach(p.id)}>Review &amp; trust →</button>
+              {/if}
+              {#if r.offerInstall}
                 <button
                   class="opt"
                   disabled={busy.has(`${p.id}:${r.agent}`)}
                   title="runs {r.agent}'s own plugin manager in a visible terminal"
                   onclick={() => void install(p, r.agent as AgentId)}
                 >
-                  {busy.has(`${p.id}:${r.agent}`) ? "starting…" : `Install for ${r.agent}`}
+                  {busy.has(`${p.id}:${r.agent}`) ? "starting…" : r.kind === "requires" ? `Install for ${r.agent}` : "Install"}
                 </button>
               {/if}
-            {/each}
-            {#if agentState === "error" && agentError !== null}
-              <span class="err">{agentError}</span>
-              <button class="link" onclick={onRefresh}>retry</button>
-            {/if}
-          </span>
-        {/if}
-        {#if p.installed_version !== null}
-          <span class="lbl small">Installed</span>
-          <span class="acts">
-            <span class="mono">{p.installed_version}</span>
-            {#if p.stale}
-              <span class="muted">older than the {p.embedded_version} that ships with chimaera</span>
-            {/if}
-            {#if p.previous !== null}
-              <button class="link" disabled={changing} onclick={() => void change(p, "rollback")}>
-                Use previous ({p.previous})
+            </div>
+          {/each}
+          {#if agentState === "error" && agentError !== null && req.phase !== "none"}
+            <p><span class="err">{agentError}</span> <button class="link" onclick={onRefresh}>retry</button></p>
+          {/if}
+          {#if p.installed}
+            <div class="acts">
+              <span class="muted">
+                <span title={p.path ?? undefined}>installed <span class="mono">{p.version}</span></span
+                >{#if p.previous !== null}{" "}· <span class="mono">{p.previous}</span> available to go back to{/if}
+              </span>
+              {#if p.previous !== null}
+                <button class="link" disabled={changing} onclick={() => void change(p, "rollback")}>Use previous</button>
+              {/if}
+              <button class="link" disabled={changing} onclick={() => void change(p, "check")}>
+                {changing ? "working…" : "Check now"}
               </button>
-            {/if}
-            <button class="link" disabled={changing} onclick={() => void change(p, "check")}>
-              {changing ? "working…" : "Check now"}
-            </button>
-            <button
-              class="link danger"
-              disabled={changing}
-              onclick={() => {
-                removeError = null;
-                removing = p;
-              }}>Remove</button
-            >
-          </span>
-        {/if}
-        {#if p.fault !== null}
-          <span class="lbl small">Fault</span>
-          <span class="err">{p.fault}</span>
-        {/if}
-        {#if notes.has(p.id)}
-          <span></span>
-          <span class="muted">{notes.get(p.id)}</span>
-        {/if}
-        {#if errors.has(p.id)}
-          <span></span>
-          <span class="err">{errors.get(p.id)}</span>
-        {/if}
-      </div>
+              <button
+                class="link danger"
+                disabled={changing}
+                onclick={() => {
+                  removeError = null;
+                  removing = p;
+                }}>Remove</button
+              >
+            </div>
+          {/if}
+          {#if p.fault !== null}
+            <p class="err">{p.fault}</p>
+          {/if}
+          {#if note !== undefined}
+            <p class="muted" title={note.title}>{note.text}</p>
+          {/if}
+          {#if errors.has(p.id)}
+            <p class="err">{errors.get(p.id)}</p>
+          {/if}
+        </div>
+      {/if}
     </article>
   {/each}
 
@@ -407,7 +406,7 @@
     }}
   >
     <div class="addrow">
-      <label class="addlabel" for="wb-add-repo">Add a plugin from a repository</label>
+      <label class="addlabel" for="wb-add-repo">Install from a repository</label>
       <input
         id="wb-add-repo"
         type="text"
@@ -428,9 +427,9 @@
       </button>
     </div>
     <p class="hint">
-      A plugin repository publishes each version as a GitHub release with <span class="mono">plugin.wasm</span>,
-      <span class="mono">plugin.toml</span> and <span class="mono">SHA256SUMS</span>, and nothing it installs runs
-      until you switch it on in a workspace.
+      Downloads the latest release (<span class="mono">plugin.wasm</span>, <span class="mono">plugin.toml</span>,
+      verified against its <span class="mono">SHA256SUMS</span>) into <span class="mono">~/.chimaera/plugins</span> on
+      this host. It runs sandboxed inside chimaera and does nothing until you switch it on in a workspace.
     </p>
     {#if added !== null}
       <p class={added.error ? "err" : "muted"} title={added.title}>{added.text}</p>
@@ -454,8 +453,8 @@
 
 <section class="ag" aria-labelledby="ag-title">
   <div class="shead">
-    <h2 id="ag-title" class="lbl">Agents</h2>
-    <span class="hint">run inside each agent — managed with its own plugin manager</span>
+    <h2 id="ag-title" class="lbl">Agent plugins</h2>
+    <span class="hint">inside each agent, managed with its own plugin manager</span>
   </div>
   {#if agentState === "unavailable"}
     <p class="empty">This daemon can't ask the agents about their plugins yet — update chimaera.</p>
@@ -505,7 +504,7 @@
                   </div>
                 {/if}
                 {#if waiting > 0}
-                  {@const wb = plugins.find((p) => p.requires.some((r) => r.agent === a.agent && (r.id === pl.id || r.id.split("@")[0] === pl.id.split("@")[0])))}
+                  {@const wb = wantedBy(a.agent, pl.id)}
                   {#if wb !== undefined}
                     <div class="plinks"><button class="link" onclick={() => onAttach(wb.id)}>review hooks</button></div>
                   {/if}
@@ -538,10 +537,6 @@
     text-transform: uppercase;
     color: var(--muted);
     font-weight: 600;
-  }
-  .lbl.small {
-    font-size: 10.5px;
-    padding-top: 3px;
   }
   .hint {
     font-size: var(--text-xs);
@@ -643,6 +638,12 @@
   .state.good {
     color: var(--accent);
   }
+  /* Install x.y.z stands where the switch stands on an installed card. */
+  .install {
+    margin-left: auto;
+    flex: none;
+    white-space: nowrap;
+  }
   .dot {
     width: 7px;
     height: 7px;
@@ -650,24 +651,31 @@
     background: var(--accent);
   }
 
+  /* Plain sentences under the name, aligned with it (past the tile). */
   .lines {
-    display: grid;
-    grid-template-columns: 76px minmax(0, 1fr);
-    row-gap: 8px;
-    column-gap: 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
     font-size: var(--text-sm);
     padding-left: 46px;
     line-height: 1.45;
+    min-width: 0;
+  }
+  /* A fault or refusal can carry a 64-hex checksum or a path. */
+  .lines p {
+    margin: 0;
+    overflow-wrap: anywhere;
   }
   @container (max-width: 640px) {
     .lines {
       padding-left: 0;
     }
   }
-  .needs-row {
+  /* One agent plugin: its sentence, then the pill / trust / install. */
+  .req {
     display: flex;
     flex-wrap: wrap;
-    gap: 8px;
+    gap: 6px 10px;
     align-items: center;
   }
   .pill {

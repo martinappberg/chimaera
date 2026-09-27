@@ -33,7 +33,9 @@ the unmerged Loadout plan (`docs/skills-manager-plan.md` on branch
   Without mycelium there is no "latest episodes" fallback for *Where we
   left off*.
 - The Plugins tab opens from quick-open; the dashboard, dock and Knowledge
-  open the attach sheet directly.
+  open the attach sheet directly. (Since 2026-09-27 users see it as the
+  **Extensions** tab, segments Plugins · Skills · Browse —
+  [plugin system plan](plugin-system-plan.md), decision 7.)
 - The Mastermind reads knowledge through the mycelium plugin's
   `knowledge_search` / `knowledge_get` (offered whenever it is active), not
   a separate `knowledge` tool.
@@ -51,6 +53,10 @@ the unmerged Loadout plan (`docs/skills-manager-plan.md` on branch
   compiled to WASM, run by a small host through a pinned WIT interface, with
   Mycelium and Agent notes ported first as the proof. Manifests, per-workspace
   switches, the cards and the agent-side rules stand.
+- **Superseded (2026-09-27):** "first-party plugins ship inside the binary"
+  (§6.1's lifecycle): the daemon ships only `plugins/plugins.lock`, and every
+  plugin installs from its release or a local directory
+  ([plugin system plan](plugin-system-plan.md), decision 6).
 
 ## Decisions (maintainer, 2026-09-25)
 

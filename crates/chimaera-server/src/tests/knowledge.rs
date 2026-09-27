@@ -56,6 +56,7 @@ fn copy_tree(src: &std::path::Path, dst: &std::path::Path) {
 /// A workspace holding the fixture tree, with the mycelium plugin switched
 /// on through its route (which also re-detects the footprint).
 async fn mycelium_workspace(state: &Arc<AppState>) -> String {
+    install_first_party(state, "mycelium").await;
     let ws = make_workspace(state, "knowledge-fixture").await;
     let root = lock(&state.workspaces).get(&ws).unwrap().root;
     copy_tree(std::path::Path::new(TREE), &root);
@@ -148,7 +149,7 @@ async fn mycelium_knowledge_tools_are_unchanged() {
 async fn the_provider_answers_unchanged_for_its_own_stamp() {
     let state = test_state();
     let ws = mycelium_workspace(&state).await;
-    let m = crate::plugins::manifest(&state, "mycelium").expect("mycelium ships");
+    let m = crate::plugins::manifest(&state, "mycelium").expect("mycelium is installed");
     let started = std::time::Instant::now();
     let (stamp, data) = state
         .plugin_runtime

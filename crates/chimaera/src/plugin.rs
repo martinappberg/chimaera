@@ -1,9 +1,10 @@
-//! `chimaera plugin list|add|update|remove` — the daemon's installed-plugin
-//! routes from the command line, against the daemon running on this node
-//! (its manifest names the port and the token). Thin by design: the daemon
-//! downloads, verifies the checksums and swaps `current`; this prints what
-//! it did, checksums included.
+//! `chimaera plugin list|add|update|remove` — the daemon's plugin routes
+//! from the command line, against the daemon running on this node (its
+//! manifest names the port and the token). Thin by design: the daemon
+//! downloads (or copies a local build), verifies the checksums and swaps
+//! `current`; this prints what it did, checksums included.
 
+use std::path::Path;
 use std::process::Stdio;
 
 use anyhow::{bail, Context};
@@ -79,25 +80,62 @@ fn s<'a>(v: &'a Value, key: &str) -> &'a str {
     v.get(key).and_then(Value::as_str).unwrap_or("")
 }
 
-/// Where a catalog entry comes from, as the card says it.
-fn source_line(p: &Value) -> String {
-    let mut line = match s(p, "source") {
-        "installed" => match p.get("embedded_version").and_then(Value::as_str) {
-            Some(e) => format!("installed · {e} ships with chimaera"),
-            None => "installed".to_string(),
-        },
-        _ => match p.get("installed_version").and_then(Value::as_str) {
-            Some(i) if p["stale"] == true => {
-                format!("ships with chimaera · installed {i} is older (stale)")
-            }
-            Some(i) => format!("ships with chimaera · installed {i} too"),
-            None => "ships with chimaera".to_string(),
-        },
-    };
-    if let Some(prev) = p.get("previous").and_then(Value::as_str) {
-        line.push_str(&format!(" · previous {prev}"));
+/// A plugin id as a URL segment: what the daemon's ids are (lowercase
+/// letters, digits, dashes), so nothing else reaches the URL.
+fn id_segment(id: &str) -> anyhow::Result<&str> {
+    let ok = !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+    if !ok {
+        bail!("{id:?} is not a plugin id (lowercase letters, digits and dashes)");
     }
-    line
+    Ok(id)
+}
+
+/// What the card says about a copy: `chimaera` for a Chimaera plugin,
+/// `verified` when its files match its release's checksums, `unverified ·
+/// local` for a local build without them.
+fn tags(p: &Value) -> Vec<String> {
+    let mut tags = Vec::new();
+    if p["first_party"] == true && p["source"] != "available" {
+        tags.push("chimaera".to_string());
+    }
+    if p["verified"] == true {
+        tags.push("verified".to_string());
+    } else if p.get("local_path").is_some_and(Value::is_string) {
+        tags.push("unverified · local".to_string());
+    }
+    tags
+}
+
+/// A catalog entry after its version, as the card says it: its tags, then
+/// where it stands.
+fn list_line(p: &Value) -> String {
+    let mut parts = tags(p);
+    let id = s(p, "id");
+    let pinned = p.get("pinned_version").and_then(Value::as_str);
+    match s(p, "source") {
+        "available" => {
+            parts.push("available".to_string());
+            if let Some(pinned) = pinned {
+                parts.push(format!("chimaera pins {pinned}"));
+            }
+            parts.push(format!("install with: chimaera plugin add {id}"));
+        }
+        "installed" => {
+            parts.push("installed".to_string());
+            if let Some(prev) = p.get("previous").and_then(Value::as_str) {
+                parts.push(format!("previous {prev}"));
+            }
+            if let Some(pinned) = pinned.filter(|v| *v != s(p, "version")) {
+                parts.push(format!("chimaera pins {pinned}"));
+            }
+        }
+        // A daemon from before this CLI: say what it said.
+        other => parts.push(other.to_string()),
+    }
+    parts.join(" · ")
 }
 
 pub async fn list() -> anyhow::Result<()> {
@@ -112,12 +150,7 @@ pub async fn list() -> anyhow::Result<()> {
         return Ok(());
     }
     for p in &plugins {
-        println!(
-            "{:<18} {:<9} {}",
-            s(p, "id"),
-            s(p, "version"),
-            source_line(p)
-        );
+        println!("{:<18} {:<9} {}", s(p, "id"), s(p, "version"), list_line(p));
         if let Some(update) = p.get("update").and_then(|u| u.get("version")) {
             println!(
                 "{:<28} update available: {} (`chimaera plugin update {}`)",
@@ -133,8 +166,8 @@ pub async fn list() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// What an install or update printed: the version and the checksums the
-/// daemon verified the download against.
+/// What an install or update printed: the version, the checksums the daemon
+/// verified the download against, and what the card now says.
 fn print_installed(verb: &str, body: &Value) {
     let previous = body
         .get("previous")
@@ -148,52 +181,77 @@ fn print_installed(verb: &str, body: &Value) {
             body["sha256"][file].as_str().unwrap_or("?")
         );
     }
+    let tags = tags(&body["plugin"]);
+    if !tags.is_empty() {
+        println!("  {}", tags.join(" · "));
+    }
 }
 
-pub async fn add(github: &str, version: Option<&str>) -> anyhow::Result<()> {
-    let body = call(
-        "POST",
-        "/plugins/install",
-        Some(&json!({"github": github, "version": version})),
-    )
-    .await?;
+/// `chimaera plugin add <id | owner/repo> [--version x]` or `--path <dir>`.
+pub async fn add(
+    plugin: Option<&str>,
+    version: Option<&str>,
+    path: Option<&Path>,
+) -> anyhow::Result<()> {
+    let body = match (plugin, path) {
+        (_, Some(dir)) => {
+            // The daemon runs on this node: the same filesystem, an
+            // absolute path.
+            let dir = std::path::absolute(dir).with_context(|| format!("{}", dir.display()))?;
+            call("POST", "/plugins/install", Some(&json!({"path": dir}))).await?
+        }
+        (Some(repo), None) if repo.contains('/') => {
+            call(
+                "POST",
+                "/plugins/install",
+                Some(&json!({"github": repo, "version": version})),
+            )
+            .await?
+        }
+        (Some(id), None) => {
+            if version.is_some() {
+                bail!(
+                    "--version needs a repository (owner/repo): `chimaera plugin add {id}` installs the release chimaera pins"
+                );
+            }
+            call(
+                "POST",
+                &format!("/plugins/{}/install", id_segment(id)?),
+                None,
+            )
+            .await?
+        }
+        (None, None) => bail!("name a plugin (an id, or owner/repo) or --path <dir>"),
+    };
     print_installed("installed", &body);
-    println!("  switch it on per workspace from the Plugins tab");
+    println!("  switch it on per workspace from the Extensions tab");
     Ok(())
 }
 
 pub async fn update(id: &str) -> anyhow::Result<()> {
-    let body = call("POST", &format!("/plugins/{id}/update"), None).await?;
+    let body = call(
+        "POST",
+        &format!("/plugins/{}/update", id_segment(id)?),
+        None,
+    )
+    .await?;
     print_installed("updated", &body);
-    if let Some(line) = over_embedded(&body) {
-        println!("  {line}");
-    }
     Ok(())
-}
-
-/// An update of a plugin that only shipped with chimaera: the release is now
-/// its installed copy, which runs instead.
-fn over_embedded(body: &Value) -> Option<String> {
-    if !body["previous"].is_null() {
-        return None;
-    }
-    let embedded = body["plugin"].get("embedded_version")?.as_str()?;
-    Some(format!(
-        "installed over the {embedded} that ships with chimaera (`chimaera plugin remove {}` goes back to it)",
-        s(body, "id")
-    ))
 }
 
 pub async fn remove(id: &str) -> anyhow::Result<()> {
-    let body = call("DELETE", &format!("/plugins/{id}"), None).await?;
-    match body.get("plugin").filter(|p| !p.is_null()) {
-        Some(p) => println!(
-            "removed the installed {id} — the {} that ships with chimaera runs now",
-            s(p, "version")
-        ),
-        None => println!("removed {id}"),
-    }
+    let body = call("DELETE", &format!("/plugins/{}", id_segment(id)?), None).await?;
+    println!("{}", removed_line(id, &body));
     Ok(())
+}
+
+/// What Remove says: a Chimaera plugin can be installed again by its id.
+fn removed_line(id: &str, body: &Value) -> String {
+    if body["plugin"]["source"] == "available" {
+        format!("removed {id} — `chimaera plugin add {id}` installs it again")
+    } else {
+        format!("removed {id}")
+    }
 }
 
 #[cfg(test)]
@@ -211,37 +269,63 @@ mod tests {
     }
 
     #[test]
-    fn an_update_over_the_embedded_copy_says_so() {
-        let body = json!({"id": "agent-notes", "version": "0.1.1", "previous": null,
-            "plugin": {"source": "installed", "embedded_version": "0.1.0"}});
-        assert_eq!(
-            over_embedded(&body).as_deref(),
-            Some("installed over the 0.1.0 that ships with chimaera (`chimaera plugin remove agent-notes` goes back to it)")
-        );
-        let again = json!({"id": "agent-notes", "version": "0.1.2", "previous": "0.1.1",
-            "plugin": {"source": "installed", "embedded_version": "0.1.0"}});
-        assert_eq!(over_embedded(&again), None);
-        let third_party = json!({"id": "x", "version": "0.2.0", "previous": null, "plugin": {}});
-        assert_eq!(over_embedded(&third_party), None);
+    fn ids_are_the_only_url_segments() {
+        assert_eq!(id_segment("agent-notes").unwrap(), "agent-notes");
+        for bad in ["", "Agent", "a/b", "x?y", "a b", "../x"] {
+            assert!(id_segment(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]
-    fn the_source_line_says_what_the_card_says() {
+    fn the_list_line_says_what_the_card_says() {
         assert_eq!(
-            source_line(&json!({"source": "embedded"})),
-            "ships with chimaera"
-        );
-        assert_eq!(
-            source_line(
-                &json!({"source": "installed", "embedded_version": "0.3.1", "previous": "0.3.0"})
+            list_line(
+                &json!({"id": "agent-notes", "version": "0.1.0", "source": "installed",
+                "first_party": true, "verified": true, "pinned_version": "0.1.0"})
             ),
-            "installed · 0.3.1 ships with chimaera · previous 0.3.0"
+            "chimaera · verified · installed"
         );
         assert_eq!(
-            source_line(
-                &json!({"source": "embedded", "installed_version": "0.2.0", "stale": true})
+            list_line(
+                &json!({"id": "agent-notes", "version": "0.1.1", "source": "installed",
+                "first_party": true, "verified": true, "pinned_version": "0.1.0",
+                "previous": "0.1.0"})
             ),
-            "ships with chimaera · installed 0.2.0 is older (stale)"
+            "chimaera · verified · installed · previous 0.1.0 · chimaera pins 0.1.0"
         );
+        assert_eq!(
+            list_line(
+                &json!({"id": "mycelium", "version": "0.1.0", "source": "available",
+                "first_party": true, "verified": false, "pinned_version": "0.1.0"})
+            ),
+            "available · chimaera pins 0.1.0 · install with: chimaera plugin add mycelium"
+        );
+        assert_eq!(
+            list_line(
+                &json!({"id": "dev", "version": "0.2.0", "source": "installed",
+                "first_party": false, "verified": false, "local_path": "/home/me/dev"})
+            ),
+            "unverified · local · installed"
+        );
+        assert_eq!(
+            list_line(
+                &json!({"id": "x", "version": "1.0.0", "source": "installed",
+                "first_party": false, "verified": false})
+            ),
+            "installed",
+            "a copy installed before SHA256SUMS were kept"
+        );
+    }
+
+    #[test]
+    fn remove_says_how_a_chimaera_plugin_comes_back() {
+        let body = json!({"id": "agent-notes", "removed": true,
+            "plugin": {"source": "available"}});
+        assert_eq!(
+            removed_line("agent-notes", &body),
+            "removed agent-notes — `chimaera plugin add agent-notes` installs it again"
+        );
+        let body = json!({"id": "x", "removed": true, "plugin": null});
+        assert_eq!(removed_line("x", &body), "removed x");
     }
 }

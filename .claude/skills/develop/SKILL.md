@@ -58,23 +58,27 @@ no Node needed at run time.
 ```sh
 nvm use 22 && npm --prefix web-ui ci \
   && npm --prefix web-ui run build            # Node 22 — the nvm default (16) errors
-bash scripts/build-plugins.sh                 # plugins/dist (WASM plugins); needs the wasm32-wasip2 target
-cargo build -p chimaera                       # rust-embed requires both dists to exist first
+cargo build -p chimaera                       # rust-embed requires web-ui/dist to exist first
 ```
 
-The plugin step downloads the first-party plugins' releases that
-`plugins/plugins.lock` pins (checksum-verified, cached in `plugins/cache/` so
-later and offline runs don't refetch); to run a local checkout of a plugin
-instead, name it in a gitignored `plugins/plugins.local.toml` (see
-[plugins/AGENTS.md](../../../plugins/AGENTS.md)).
+No plugin build: the daemon embeds only `plugins/plugins.lock`, never a
+plugin's bytes, so a fresh debug daemon has **no plugins** until you install
+one — from the Extensions tab, with `chimaera plugin add <id>` (a first-party
+plugin at the lock's version), or with `chimaera plugin add --path <dir>` for a
+local build (a directory holding `plugin.wasm` and `plugin.toml`; the same
+version again replaces it, and a running session's next `tools/list` is the new
+build). From a shell, point the CLI at this worktree's isolated daemon with
+`CHIMAERA_HOME="$PWD/.chimaera-dev" target/debug/chimaera plugin …`.
+`bash scripts/build-plugins.sh` is for the tests only (`just check` runs it):
+it builds the fixture and downloads the locked releases into
+`plugins/dist-test` (see [plugins/AGENTS.md](../../../plugins/AGENTS.md)).
 
 Then `preview_start chimaerad-isolated`, read the printed
 `http://127.0.0.1:<port>/#token=…` from `preview_logs`, and navigate the preview
 there (serve mode has no `/dev/manifest` auto-auth — the token rides the URL
 fragment). A **debug** daemon reads `web-ui/dist` from disk per request, so after
-a UI change just rebuild the UI and reload the page — no daemon restart. It reads
-`plugins/dist` from disk once, when its plugin catalog loads: after
-`bash scripts/build-plugins.sh`, restart the daemon (no cargo rebuild needed).
+a UI change just rebuild the UI and reload the page — no daemon restart.
+Plugin installs take effect at once, with no restart either.
 
 To reset this worktree's isolated daemon state, delete `.chimaera-dev/`.
 

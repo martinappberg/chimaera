@@ -1,11 +1,12 @@
-//! Versions, the installed directory and updates, over the wire and against
-//! a local fake releases server (the GitHub releases API shape: a release's
-//! JSON plus its `plugin.wasm`, `plugin.toml` and `SHA256SUMS`). The
+//! Installs, versions and updates, over the wire and against a local fake
+//! releases server (the GitHub releases API shape: a release's JSON plus its
+//! `plugin.wasm`, `plugin.toml` and `SHA256SUMS`, and the same assets at
+//! their direct download URLs, which a first-party install uses). The
 //! components are the host's fixture (`plugins/test-fixture`) and its "next
 //! release" — the same crate built with its `v2` feature, one more tool
-//! (`version`) — both laid out in `plugins/dist-test` by
-//! `scripts/build-plugins.sh`. Every test installs under its own id, so the
-//! process-wide test catalog never makes one test's precedence another's.
+//! (`version`) — and the first-party releases the lock pins, all laid out in
+//! `plugins/dist-test` by `scripts/build-plugins.sh`. Every test installs
+//! under its own id (or its own state), so no test sees another's copies.
 
 use std::collections::HashMap;
 
@@ -49,6 +50,10 @@ impl FakeReleases {
         format!("{}/api", self.base)
     }
 
+    fn downloads(&self) -> String {
+        format!("{}/gh", self.base)
+    }
+
     /// Publish `version` of `github` as its latest release.
     fn publish(&self, github: &str, version: &str, toml: &str, wasm: &[u8]) {
         let sums = format!(
@@ -70,9 +75,14 @@ impl FakeReleases {
         .to_string()
         .into_bytes();
         let mut files = lock(&self.files);
-        files.insert(format!("{dl}/plugin.wasm"), wasm.to_vec());
-        files.insert(format!("{dl}/plugin.toml"), toml.as_bytes().to_vec());
-        files.insert(format!("{dl}/SHA256SUMS"), sums.as_bytes().to_vec());
+        // The API's asset URLs, and the direct download URLs
+        // (`{base}/{owner}/{repo}/releases/download/v{version}/{asset}`).
+        let direct = format!("/gh/{github}/releases/download/v{version}");
+        for dir in [&dl, &direct] {
+            files.insert(format!("{dir}/plugin.wasm"), wasm.to_vec());
+            files.insert(format!("{dir}/plugin.toml"), toml.as_bytes().to_vec());
+            files.insert(format!("{dir}/SHA256SUMS"), sums.as_bytes().to_vec());
+        }
         files.insert(
             format!("/api/{github}/releases/tags/v{version}"),
             release.clone(),
@@ -117,10 +127,42 @@ fn manifest(v2: bool, id: &str, version: &str, extra: &str) -> String {
 
 /// `manifest` without its `[release]` section: a plugin with nowhere to
 /// check or update from.
-fn unreleased(id: &str, version: &str) -> String {
-    let full = manifest(false, id, version, "");
+fn unreleased(v2: bool, id: &str, version: &str) -> String {
+    let full = manifest(v2, id, version, "");
     let cut = full.find("\n[release]").expect("manifest names a release");
     full[..cut].to_string()
+}
+
+fn sums_of(wasm: &[u8], toml: &str) -> String {
+    format!(
+        "{}  plugin.wasm\n{}  plugin.toml\n",
+        crate::fs::sha256_hex(wasm),
+        crate::fs::sha256_hex(toml.as_bytes())
+    )
+}
+
+/// A local build's directory: its manifest, its component and, when given,
+/// a `SHA256SUMS`.
+fn local_build(src: &std::path::Path, toml: &str, wasm: &[u8], sums: Option<&str>) {
+    std::fs::write(src.join("plugin.toml"), toml).unwrap();
+    std::fs::write(src.join("plugin.wasm"), wasm).unwrap();
+    match sums {
+        Some(sums) => std::fs::write(src.join("SHA256SUMS"), sums).unwrap(),
+        None => {
+            let _ = std::fs::remove_file(src.join("SHA256SUMS"));
+        }
+    }
+}
+
+/// The first-party release the lock pins for Agent notes, as the build
+/// script laid it out: its lock entry, manifest, component and SHA256SUMS.
+fn agent_notes_release() -> (&'static crate::plugins::Locked, String, Vec<u8>, String) {
+    (
+        crate::plugins::lock_entry("agent-notes").unwrap(),
+        test_catalog::dist_test_text("agent-notes/plugin.toml"),
+        test_catalog::dist_test_bytes("agent-notes/plugin.wasm"),
+        test_catalog::dist_test_text("agent-notes/SHA256SUMS"),
+    )
 }
 
 /// A test daemon whose plugin release fetches go to `fake`.
@@ -128,6 +170,17 @@ fn state_for(fake: &FakeReleases) -> Arc<AppState> {
     let state = test_state();
     state.plugin_releases.set_api_for_tests(&fake.api());
     state
+        .plugin_releases
+        .set_downloads_for_tests(&fake.downloads());
+    state
+}
+
+/// Re-read the installed copies, as the catalog does after a change.
+async fn reload(state: &Arc<AppState>) {
+    let reloading = state.clone();
+    tokio::task::spawn_blocking(move || reloading.plugin_catalog.reload())
+        .await
+        .unwrap();
 }
 
 async fn install(
@@ -258,21 +311,51 @@ async fn install_writes_the_version_dir_and_current_and_lists_it_installed() {
     assert_eq!(link(&state, "up-install", "previous"), None);
     no_temp_left(&state, "up-install");
 
+    // The release's SHA256SUMS is kept beside the two files.
+    assert_eq!(
+        std::fs::read_to_string(dir.join("0.1.0/SHA256SUMS")).unwrap(),
+        sums_of(&v1_wasm(), &toml)
+    );
+    assert!(!dir.join("0.1.0/local-path").exists());
+
     let entry = listed(&state, "up-install").await;
     assert_eq!(entry["version"], "0.1.0");
     assert_eq!(entry["api"], "0.1");
     assert_eq!(entry["source"], "installed");
-    assert_eq!(entry["installed_version"], "0.1.0");
-    assert_eq!(entry["stale"], false);
+    assert_eq!(entry["installed"], true);
+    assert_eq!(entry["first_party"], false, "not in the lock");
+    assert_eq!(
+        entry["verified"], true,
+        "its files match the kept SHA256SUMS"
+    );
+    assert_eq!(entry["sha256_wasm"], crate::fs::sha256_hex(&v1_wasm()));
+    assert_eq!(entry["repo"], "acme/up-install");
     assert_eq!(entry["path"], json!(dir.join("0.1.0")));
-    for absent in ["embedded_version", "previous", "update", "fault"] {
+    for absent in [
+        "pinned_version",
+        "local_path",
+        "previous",
+        "update",
+        "fault",
+        "embedded_version",
+        "installed_version",
+        "stale",
+    ] {
         assert!(entry.get(absent).is_none(), "{absent}: {entry}");
     }
-    // The shipped plugins say where they came from too.
+    // The first-party plugins, nothing installed for them: available.
     let notes = listed(&state, "agent-notes").await;
-    assert_eq!(notes["source"], "embedded");
-    assert_eq!(notes["version"], "0.1.0");
-    assert!(notes.get("path").is_none());
+    assert_eq!(notes["source"], "available");
+    assert_eq!(notes["installed"], false);
+    assert_eq!(notes["first_party"], true);
+    assert_eq!(
+        notes["pinned_version"],
+        crate::plugins::lock_entry("agent-notes")
+            .unwrap()
+            .version
+            .as_str()
+    );
+    assert!(notes.get("path").is_none() && notes.get("sha256_wasm").is_none());
 
     let (status, body) = install(&state, "acme/up-install", Some("0.1.0")).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
@@ -293,6 +376,7 @@ async fn the_change_routes_are_bearer_authed() {
     let state = test_state();
     for (method, uri) in [
         (Method::POST, "/api/v1/plugins/install"),
+        (Method::POST, "/api/v1/plugins/x/install"),
         (Method::POST, "/api/v1/plugins/x/update"),
         (Method::POST, "/api/v1/plugins/x/rollback"),
         (Method::POST, "/api/v1/plugins/x/check"),
@@ -390,118 +474,155 @@ async fn a_newer_compatible_release_is_offered_and_an_older_or_incompatible_one_
     fake.publish(gh, "0.3.0", &req, &v2_wasm());
     assert_eq!(check().await["update"]["version"], "0.3.0");
 
-    // A plugin that ships with chimaera and names no release source updates
-    // with chimaera: nothing to check, nothing to update from.
-    test_catalog::add(&unreleased("up-norel", "0.1.0"), v1_wasm());
+    // A plugin whose manifest names no release source (a local build):
+    // nothing to check, nothing to update from.
+    let src = test_dir("up-norel");
+    local_build(
+        &src,
+        &unreleased(false, "up-norel", "0.1.0"),
+        &v1_wasm(),
+        None,
+    );
+    let (status, body) = request(
+        &state,
+        Method::POST,
+        "/api/v1/plugins/install",
+        Some(json!({"path": src})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
     let (status, body) = post(&state, "/api/v1/plugins/up-norel/check").await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert!(body["error"]
-        .as_str()
-        .unwrap()
-        .contains("ships with chimaera and names no release source"));
+    assert_eq!(
+        body["error"],
+        "Test fixture names no release source ([release] in its plugin.toml)"
+    );
     let (status, body) = post(&state, "/api/v1/plugins/up-norel/update").await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert!(!plugin_dir(&state, "up-norel").exists());
+    assert_eq!(
+        link(&state, "up-norel", "current").as_deref(),
+        Some("0.1.0")
+    );
 }
 
 #[tokio::test]
-async fn an_embedded_plugin_updates_from_its_repository_and_remove_goes_back_to_it() {
+async fn a_first_party_plugin_installs_the_pinned_release_checked_twice() {
     let fake = FakeReleases::start().await;
     let state = state_for(&fake);
-    // "Embedded" at 0.1.0 (a test build's catalog extra) whose manifest
-    // names its repository, as every first-party plugin's does.
-    test_catalog::add(&manifest(false, "emb-up", "0.1.0", ""), v1_wasm());
-    let gh = "acme/emb-up";
-    fake.publish(
-        gh,
-        "0.1.0",
-        &manifest(false, "emb-up", "0.1.0", ""),
-        &v1_wasm(),
-    );
-    let (_ws, sid) = workspace_with(&state, "emb-up", "keu1", &["emb-up"]).await;
-    let before = tool_names(&state, &sid, "keu1").await;
-    assert!(before.contains(&"echo".to_string()), "{before:?}");
-    assert!(!before.contains(&"version".to_string()), "{before:?}");
-    let (is_err, text) = mcp_tool_call(&state, &sid, "keu1", "echo", json!({})).await;
-    assert!(!is_err, "{text}");
+    let (l, toml, wasm, sums) = agent_notes_release();
+    fake.publish_with_sums(&l.repo, &l.version, &toml, &wasm, &sums);
+    let before = listed(&state, "agent-notes").await;
+    assert_eq!(before["source"], "available");
 
-    // Its latest release is the version that ships: nothing to offer, and
-    // Update says it is up to date.
-    let (status, body) = post(&state, "/api/v1/plugins/emb-up/check").await;
+    let (status, body) = post(&state, "/api/v1/plugins/agent-notes/install").await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["update"], Value::Null);
-    let (status, body) = post(&state, "/api/v1/plugins/emb-up/update").await;
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert!(body["error"].as_str().unwrap().contains("up to date"));
-
-    // A newer release: offered on the embedded plugin's card, compared with
-    // the version that runs, and nothing downloaded.
-    fake.publish(
-        gh,
-        "0.2.0",
-        &manifest(true, "emb-up", "0.2.0", ""),
-        &v2_wasm(),
-    );
-    let (status, body) = post(&state, "/api/v1/plugins/emb-up/check").await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["update"]["version"], "0.2.0");
-    let entry = listed(&state, "emb-up").await;
-    assert_eq!(entry["source"], "embedded");
-    assert_eq!(entry["version"], "0.1.0");
-    assert_eq!(entry["update"]["version"], "0.2.0");
-    assert!(entry.get("installed_version").is_none(), "{entry}");
-    assert!(
-        !plugin_dir(&state, "emb-up").exists(),
-        "the checker never downloads"
-    );
-
-    // Update installs the release as the installed copy, which loads over
-    // the embedded one; the card names both.
-    let (status, body) = post(&state, "/api/v1/plugins/emb-up/update").await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["version"], "0.2.0");
-    assert_eq!(body["previous"], Value::Null, "no installed copy before");
+    assert_eq!(body["version"], l.version.as_str());
+    assert_eq!(body["previous"], Value::Null);
+    assert_eq!(body["sha256"]["plugin.wasm"], l.sha256_wasm.as_str());
+    assert_eq!(body["sha256"]["plugin.toml"], l.sha256_toml.as_str());
+    let e = &body["plugin"];
+    assert_eq!(e["source"], "installed");
+    assert_eq!(e["first_party"], true);
+    assert_eq!(e["verified"], true, "{e}");
+    assert_eq!(e["sha256_wasm"], l.sha256_wasm.as_str());
+    assert_eq!(e["pinned_version"], l.version.as_str());
+    assert_eq!(e["repo"], l.repo.as_str());
+    assert!(e.get("local_path").is_none());
+    let vdir = plugin_dir(&state, "agent-notes").join(&l.version);
+    assert_eq!(std::fs::read(vdir.join("plugin.wasm")).unwrap(), wasm);
     assert_eq!(
-        body["sha256"]["plugin.wasm"],
-        crate::fs::sha256_hex(&v2_wasm())
+        std::fs::read_to_string(vdir.join("SHA256SUMS")).unwrap(),
+        sums
     );
-    assert_eq!(body["plugin"]["source"], "installed");
-    assert_eq!(body["plugin"]["embedded_version"], "0.1.0");
-    assert_eq!(body["plugin"]["installed_version"], "0.2.0");
-    assert_eq!(link(&state, "emb-up", "current").as_deref(), Some("0.2.0"));
-    assert_eq!(link(&state, "emb-up", "previous"), None);
-    no_temp_left(&state, "emb-up");
-    assert_eq!(state.plugin_runtime.live_instances("emb-up"), 0);
-
-    // The daemon serves the installed version's tools, in the same session.
-    let after = tool_names(&state, &sid, "keu1").await;
-    assert!(after.contains(&"version".to_string()), "{after:?}");
-    let (is_err, text) = mcp_tool_call(&state, &sid, "keu1", "version", json!({})).await;
-    assert!(!is_err, "{text}");
-    assert_eq!(text, "0.2.0", "the installed build answers");
-    let entry = listed(&state, "emb-up").await;
-    assert_eq!(entry["version"], "0.2.0");
-    assert!(entry.get("update").is_none(), "caught up: {entry}");
-    let (status, body) = post(&state, "/api/v1/plugins/emb-up/update").await;
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert!(body["error"].as_str().unwrap().contains("up to date"));
-
-    // Remove drops the installed copy: the embedded one runs again, and
-    // removing that one stays refused.
-    let (status, body) = request(&state, Method::DELETE, "/api/v1/plugins/emb-up", None).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["plugin"]["source"], "embedded");
-    assert_eq!(body["plugin"]["version"], "0.1.0");
-    assert!(!tool_names(&state, &sid, "keu1")
-        .await
-        .contains(&"version".to_string()));
-    let (status, body) = request(&state, Method::DELETE, "/api/v1/plugins/emb-up", None).await;
+    no_temp_left(&state, "agent-notes");
+    let (status, body) = post(&state, "/api/v1/plugins/agent-notes/install").await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert!(body["error"]
         .as_str()
         .unwrap()
-        .contains("ships with chimaera"));
+        .contains("already installed"));
+
+    // An ordinary plugin now: switched on, its tools are offered.
+    let (_ws, sid) = workspace_with(&state, "fp-install", "kfp1", &["agent-notes"]).await;
+    assert!(tool_names(&state, &sid, "kfp1")
+        .await
+        .contains(&"post_note".to_string()));
+
+    // A newer release from the same repository: offered and installed like
+    // any update, and still first-party and verified past the pin.
+    let newer = toml.replacen(
+        &format!("version = \"{}\"", l.version),
+        "version = \"9.0.0\"",
+        1,
+    );
+    fake.publish(&l.repo, "9.0.0", &newer, &wasm);
+    let (_, body) = post(&state, "/api/v1/plugins/agent-notes/check").await;
+    assert_eq!(body["update"]["version"], "9.0.0", "{body}");
+    let (status, body) = post(&state, "/api/v1/plugins/agent-notes/update").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let e = listed(&state, "agent-notes").await;
+    assert_eq!(e["version"], "9.0.0");
+    assert_eq!(e["first_party"], true);
+    assert_eq!(e["verified"], true);
+    assert_eq!(
+        e["pinned_version"],
+        l.version.as_str(),
+        "the pin is still named"
+    );
+    assert_eq!(e["previous"], l.version.as_str());
+
+    // Removed: available again.
+    let (status, body) = request(&state, Method::DELETE, "/api/v1/plugins/agent-notes", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["plugin"]["source"], "available");
+    assert!(!plugin_dir(&state, "agent-notes").exists());
+
+    // Installing by its repository is the pinned release too, whatever the
+    // latest is.
+    let (status, body) = install(&state, &l.repo, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["version"], l.version.as_str());
+    assert_eq!(body["plugin"]["verified"], true);
+    // …unless another version is asked for by name.
+    let (status, body) = install(&state, &l.repo, Some("9.0.0")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["version"], "9.0.0");
+    assert_eq!(body["plugin"]["first_party"], true);
     state.sessions.kill(&sid).ok();
+}
+
+#[tokio::test]
+async fn a_release_that_is_not_what_the_lock_pins_is_refused() {
+    let fake = FakeReleases::start().await;
+    let state = state_for(&fake);
+    let (l, toml, _wasm, sums) = agent_notes_release();
+
+    // The release lists other bytes than the lock: nothing is downloaded.
+    fake.publish(&l.repo, &l.version, &toml, &v1_wasm());
+    let (status, body) = post(&state, "/api/v1/plugins/agent-notes/install").await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let error = body["error"].as_str().unwrap();
+    assert!(
+        error.contains("does not match what chimaera pins"),
+        "{error}"
+    );
+    assert!(error.contains(&l.sha256_wasm), "{error}");
+
+    // It lists the lock's sha256s, but serves another component.
+    fake.publish_with_sums(&l.repo, &l.version, &toml, &v1_wasm(), &sums);
+    let (status, body) = post(&state, "/api/v1/plugins/agent-notes/install").await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(body["error"]
+        .as_str()
+        .unwrap()
+        .contains("plugin.wasm does not match the release's SHA256SUMS"));
+    assert!(!plugin_dir(&state, "agent-notes").join(&l.version).exists());
+    no_temp_left(&state, "agent-notes");
+    assert_eq!(listed(&state, "agent-notes").await["source"], "available");
+
+    // Only a plugin the lock names installs by id.
+    let (status, body) = post(&state, "/api/v1/plugins/test-fixture/install").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
 }
 
 #[tokio::test]
@@ -550,6 +671,9 @@ async fn an_update_swaps_current_drops_instances_and_the_next_tools_list_is_the_
         Some("0.1.0")
     );
     no_temp_left(&state, "up-swap");
+    assert!(plugin_dir(&state, "up-swap")
+        .join("0.2.0/SHA256SUMS")
+        .is_file());
 
     let after = tool_names(&state, &sid, "ks1").await;
     assert!(after.contains(&"version".to_string()), "{after:?}");
@@ -731,88 +855,216 @@ async fn remove_deletes_the_plugins_directory() {
     assert_eq!(status, StatusCode::NOT_FOUND);
     let (status, body) = request(&state, Method::DELETE, "/api/v1/plugins/agent-notes", None).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert!(body["error"]
-        .as_str()
-        .unwrap()
-        .contains("ships with chimaera"));
+    assert_eq!(
+        body["error"],
+        "Agent notes isn't installed — install it first"
+    );
     state.sessions.kill(&sid).ok();
 }
 
 #[tokio::test]
-async fn precedence_picks_the_higher_version_and_names_both() {
+async fn a_first_party_id_from_another_repository_is_not_first_party() {
     let fake = FakeReleases::start().await;
     let state = state_for(&fake);
-    // "Embedded" at 0.1.0 (a test build's catalog extra), installed at 0.2.0.
-    test_catalog::add(&manifest(false, "prec-high", "0.1.0", ""), v1_wasm());
-    let gh = "acme/prec-high";
+    // `manifest` releases it from `acme/<id>`, not the lock's repository.
     fake.publish(
-        gh,
-        "0.2.0",
-        &manifest(true, "prec-high", "0.2.0", ""),
-        &v2_wasm(),
-    );
-    assert_eq!(install(&state, gh, None).await.0, StatusCode::OK);
-    let entry = listed(&state, "prec-high").await;
-    assert_eq!(entry["version"], "0.2.0");
-    assert_eq!(entry["source"], "installed");
-    assert_eq!(entry["embedded_version"], "0.1.0");
-    assert_eq!(entry["installed_version"], "0.2.0");
-    assert_eq!(entry["stale"], false);
-
-    // Removed: the embedded copy takes over.
-    let (status, body) = request(&state, Method::DELETE, "/api/v1/plugins/prec-high", None).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["plugin"]["source"], "embedded");
-    assert_eq!(body["plugin"]["version"], "0.1.0");
-    assert!(body["plugin"].get("installed_version").is_none());
-
-    // Equal versions: the embedded copy loads; the installed one is named.
-    test_catalog::add(&manifest(false, "prec-equal", "0.1.0", ""), v1_wasm());
-    let gh = "acme/prec-equal";
-    fake.publish(
-        gh,
-        "0.1.0",
-        &manifest(false, "prec-equal", "0.1.0", ""),
+        "acme/agent-notes",
+        "9.0.0",
+        &manifest(false, "agent-notes", "9.0.0", ""),
         &v1_wasm(),
     );
-    assert_eq!(install(&state, gh, None).await.0, StatusCode::OK);
-    let entry = listed(&state, "prec-equal").await;
-    assert_eq!(entry["source"], "embedded");
-    assert_eq!(entry["installed_version"], "0.1.0");
-    assert_eq!(entry["stale"], false);
+    let (status, body) = install(&state, "acme/agent-notes", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let e = listed(&state, "agent-notes").await;
+    assert_eq!(e["source"], "installed");
+    assert_eq!(e["version"], "9.0.0");
+    assert_eq!(e["first_party"], false, "{e}");
+    assert_eq!(e["verified"], true, "it is what its own release lists");
+    assert!(e.get("pinned_version").is_none());
+    assert_eq!(e["repo"], "acme/agent-notes");
 }
 
 #[tokio::test]
-async fn an_older_installed_copy_is_flagged_stale() {
+async fn the_kept_sums_are_checked_at_every_load() {
     let fake = FakeReleases::start().await;
     let state = state_for(&fake);
-    test_catalog::add(&manifest(false, "stale-copy", "0.3.0", ""), v1_wasm());
-    let gh = "acme/stale-copy";
+    let gh = "acme/up-tamper";
     fake.publish(
         gh,
-        "0.2.0",
-        &manifest(false, "stale-copy", "0.2.0", ""),
+        "0.1.0",
+        &manifest(false, "up-tamper", "0.1.0", ""),
         &v1_wasm(),
     );
     assert_eq!(install(&state, gh, None).await.0, StatusCode::OK);
-    let entry = listed(&state, "stale-copy").await;
-    assert_eq!(entry["version"], "0.3.0");
-    assert_eq!(entry["source"], "embedded");
-    assert_eq!(entry["stale"], true);
-    assert_eq!(entry["installed_version"], "0.2.0");
+    assert_eq!(listed(&state, "up-tamper").await["verified"], true);
+    let ws = make_workspace(&state, "up-tamper").await;
+    let v1 = plugin_dir(&state, "up-tamper").join("0.1.0");
+
+    // A byte of the component changed after the install: listed with the
+    // fault, never loaded, its switch refused.
+    std::fs::write(v1.join("plugin.wasm"), v2_wasm()).unwrap();
+    reload(&state).await;
+    let e = listed(&state, "up-tamper").await;
     assert_eq!(
-        entry["path"],
-        json!(plugin_dir(&state, "stale-copy").join("0.2.0"))
+        e["fault"],
+        "its files do not match its release's SHA256SUMS"
     );
-    // Its release is still asked: something newer than what runs is offered.
+    assert_eq!(e["verified"], false);
+    let (status, body) = request(
+        &state,
+        Method::PUT,
+        &format!("/api/v1/workspaces/{ws}/plugins/up-tamper"),
+        Some(json!({"on": true})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(crate::plugins::active(&state, &ws).await.is_empty());
+
+    // Use previous never goes back to such a copy.
     fake.publish(
         gh,
-        "0.4.0",
-        &manifest(false, "stale-copy", "0.4.0", ""),
-        &v1_wasm(),
+        "0.2.0",
+        &manifest(true, "up-tamper", "0.2.0", ""),
+        &v2_wasm(),
     );
-    let (_, body) = post(&state, "/api/v1/plugins/stale-copy/check").await;
-    assert_eq!(body["update"]["version"], "0.4.0");
+    assert_eq!(
+        post(&state, "/api/v1/plugins/up-tamper/update").await.0,
+        StatusCode::OK
+    );
+    let (status, body) = post(&state, "/api/v1/plugins/up-tamper/rollback").await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(body["error"]
+        .as_str()
+        .unwrap()
+        .contains("its files do not match its release's SHA256SUMS"));
+    assert_eq!(
+        link(&state, "up-tamper", "current").as_deref(),
+        Some("0.2.0")
+    );
+
+    // No SHA256SUMS beside it (a copy installed before they were kept):
+    // loads, unverified, no fault.
+    let v2 = plugin_dir(&state, "up-tamper").join("0.2.0");
+    std::fs::remove_file(v2.join("SHA256SUMS")).unwrap();
+    reload(&state).await;
+    let e = listed(&state, "up-tamper").await;
+    assert_eq!(e["verified"], false);
+    assert!(e.get("fault").is_none(), "{e}");
+}
+
+#[tokio::test]
+async fn a_local_build_installs_from_a_directory_and_replaces_itself() {
+    let fake = FakeReleases::start().await;
+    let state = state_for(&fake);
+    let path_install = |src: serde_json::Value| {
+        let state = state.clone();
+        async move {
+            request(
+                &state,
+                Method::POST,
+                "/api/v1/plugins/install",
+                Some(json!({"path": src})),
+            )
+            .await
+        }
+    };
+    let src = test_dir("up-local");
+    local_build(
+        &src,
+        &unreleased(false, "up-local", "0.1.0"),
+        &v1_wasm(),
+        None,
+    );
+    let (status, body) = path_install(json!(src)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let canonical = src.canonicalize().unwrap();
+    let e = &body["plugin"];
+    assert_eq!(e["local_path"], json!(canonical));
+    assert_eq!(e["verified"], false, "no SHA256SUMS beside it");
+    assert_eq!(e["first_party"], false);
+    assert_eq!(
+        body["sha256"]["plugin.wasm"],
+        crate::fs::sha256_hex(&v1_wasm())
+    );
+    let vdir = plugin_dir(&state, "up-local").join("0.1.0");
+    assert_eq!(
+        std::fs::read_to_string(vdir.join("local-path")).unwrap(),
+        canonical.to_string_lossy()
+    );
+    assert!(!vdir.join("SHA256SUMS").exists());
+    let (_ws, sid) = workspace_with(&state, "up-local", "kl1", &["up-local"]).await;
+    assert!(!tool_names(&state, &sid, "kl1")
+        .await
+        .contains(&"version".to_string()));
+
+    // Rebuilt at the same version and installed again: replaced in place,
+    // and the same session's next tools/list is the new build.
+    let rebuilt = unreleased(true, "up-local", "0.1.0");
+    local_build(
+        &src,
+        &rebuilt,
+        &v2_wasm(),
+        Some(&sums_of(&v2_wasm(), &rebuilt)),
+    );
+    let (status, body) = path_install(json!(src)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["previous"], Value::Null, "the same version, replaced");
+    assert_eq!(body["plugin"]["verified"], true, "its SHA256SUMS matches");
+    assert!(vdir.join("SHA256SUMS").is_file());
+    assert!(tool_names(&state, &sid, "kl1")
+        .await
+        .contains(&"version".to_string()));
+    no_temp_left(&state, "up-local");
+
+    // A SHA256SUMS that doesn't match refuses the install; the copy stays.
+    local_build(
+        &src,
+        &rebuilt,
+        &v1_wasm(),
+        Some(&sums_of(&v2_wasm(), &rebuilt)),
+    );
+    let (status, body) = path_install(json!(src)).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(body["error"]
+        .as_str()
+        .unwrap()
+        .contains("plugin.wasm does not match the SHA256SUMS beside it"));
+    assert_eq!(std::fs::read(vdir.join("plugin.wasm")).unwrap(), v2_wasm());
+    no_temp_left(&state, "up-local");
+
+    // A local build of a first-party plugin at the pinned version, with
+    // other bytes than the lock's: first-party, installed, not verified.
+    let (l, toml, _, _) = agent_notes_release();
+    let fp = test_dir("fp-local");
+    local_build(&fp, &toml, &v1_wasm(), Some(&sums_of(&v1_wasm(), &toml)));
+    let (status, body) = path_install(json!(fp)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let e = &body["plugin"];
+    assert_eq!(e["version"], l.version.as_str());
+    assert_eq!(e["first_party"], true);
+    assert_eq!(e["verified"], false, "{e}");
+    assert!(e.get("fault").is_none());
+
+    // What a path install refuses.
+    for bad in [
+        json!("relative/dir"),
+        json!("/nonexistent/chimaera-plugin"),
+        json!(vdir.join("plugin.toml")),
+    ] {
+        let (status, body) = path_install(bad.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {body}");
+    }
+    for body in [json!({}), json!({"github": "a/b", "path": "/tmp"})] {
+        let (status, _) = request(
+            &state,
+            Method::POST,
+            "/api/v1/plugins/install",
+            Some(body.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    }
+    state.sessions.kill(&sid).ok();
 }
 
 #[tokio::test]
@@ -911,6 +1163,7 @@ async fn events_reach_only_the_plugins_that_declared_them() {
         &v1_wasm(),
     );
     assert_eq!(install(&state, gh, None).await.0, StatusCode::OK);
+    install_first_party(&state, "agent-notes").await;
     let (ws, a) = workspace_with(&state, "up-events", "ke1", &["agent-notes", "up-events"]).await;
     let b = inject_agent(&state, "ke2");
     lock(&state.session_workspaces).insert(b.clone(), ws.clone());

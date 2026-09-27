@@ -3,24 +3,27 @@
 //! docs/plugin-system-plan.md.
 //!
 //! A plugin is a small TOML manifest (data, never code) plus its behaviour:
-//! a WASM component (`plugin.wasm`). The first-party plugins live in their
-//! own repositories; `plugins/plugins.lock` pins the release of each that
-//! this binary ships, which `scripts/build-plugins.sh` downloads, verifies
-//! and lays out in `plugins/dist`, embedded like `web-ui/dist`. Any plugin
-//! (a first-party one included) can also be installed from a release into
-//! `<data dir>/plugins/<id>/<version>/` (`installed`). It runs in `runtime`
-//! (the sandbox) and asks the daemon for everything through `hostfns`
-//! (bounded). No plugin behaviour is daemon code: the Knowledge provider
-//! (mycelium) answers `knowledge.rs` through its `knowledge` export like any
-//! other plugin would.
+//! a WASM component (`plugin.wasm`). Every plugin lives in its own
+//! repository and is installed into `<data dir>/plugins/<id>/<version>/`
+//! (`installed`) from a release, checksum-verified, or from a local
+//! directory. This binary carries no plugin bytes: it embeds only
+//! `plugins/plugins.lock`, the curated list of first-party plugins (each
+//! with the release this daemon installs and that release's sha256s). A
+//! plugin runs in `runtime` (the sandbox) and asks the daemon for everything
+//! through `hostfns` (bounded). No plugin behaviour is daemon code: the
+//! Knowledge provider (mycelium) answers `knowledge.rs` through its
+//! `knowledge` export like any other plugin would.
 //!
-//! The catalog (`Catalog`, on `AppState`) merges the embedded plugins with
-//! the installed copies: the same id in both → the higher version loads and
-//! the card names both; equal → the embedded copy; an older installed copy
-//! is `stale`. Gates run before anything loads: a manifest's `api` must be a
-//! WIT version this host serves and its `requires.chimaera` must match this
-//! daemon — a plugin that fails one stays listed, off, with the reason. The
-//! catalog reloads after every install, update, rollback and remove.
+//! The catalog (`Catalog`, on `AppState`) is the installed copies; the
+//! wire adds each first-party plugin of the lock that has none, as
+//! `available` (never active, nothing to load). Reading an installed copy
+//! checks its files against the `SHA256SUMS` kept beside them (and a
+//! first-party copy at the pinned version against the lock): a mismatch
+//! lists it with a fault and it never loads. Gates run before anything
+//! loads: a manifest's `api` must be a WIT version this host serves and its
+//! `requires.chimaera` must match this daemon — a plugin that fails one
+//! stays listed, off, with the reason. The catalog reloads after every
+//! install, update, rollback and remove.
 //!
 //! State is minimal by design: a plugin is switched on per workspace
 //! (`Workspace.plugins_on` — the Plugins page is per workspace, so is its
@@ -43,7 +46,6 @@ use axum::extract::{Path as AxPath, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use rust_embed::RustEmbed;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -64,19 +66,98 @@ pub(crate) const API: &str = "0.1";
 /// them; an additive WIT bump adds a version here and keeps the old ones.
 pub(crate) const SERVED_APIS: &[&str] = &[API];
 
-/// The first-party WASM plugins, `<id>/{plugin.toml,plugin.wasm}`: the
-/// releases `plugins/plugins.lock` pins, laid out (checksum-verified) by
-/// `scripts/build-plugins.sh`. Release builds embed the folder; debug builds
-/// read it from disk when the catalog loads (rust-embed's debug mode).
-#[derive(RustEmbed)]
-#[folder = "../../plugins/dist"]
-struct Dist;
-
-/// The test-only plugins (the host's fixture): embedded by test builds only.
+/// The test-only plugins (the host's fixture, and the first-party releases
+/// the lock pins, which tests install by path): embedded by test builds
+/// only, laid out by `scripts/build-plugins.sh`.
 #[cfg(test)]
-#[derive(RustEmbed)]
+#[derive(rust_embed::RustEmbed)]
 #[folder = "../../plugins/dist-test"]
 pub(crate) struct DistTest;
+
+/// `plugins/plugins.lock`: the first-party plugins, the release of each this
+/// daemon installs, and that release's checksums. The only plugin data this
+/// binary carries.
+const LOCK: &str = include_str!("../../../../plugins/plugins.lock");
+
+/// One `[[plugin]]` of the lock.
+#[derive(Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Locked {
+    pub(crate) id: String,
+    /// What the card shows before any copy is installed.
+    pub(crate) name: String,
+    pub(crate) summary: String,
+    /// The release Install fetches (`v<version>`).
+    pub(crate) version: String,
+    /// `owner/repo`: where it is released, and what an installed copy's
+    /// `[release] github` must name to be first-party.
+    pub(crate) repo: String,
+    /// That release's `SHA256SUMS` entries, lowercase hex.
+    pub(crate) sha256_wasm: String,
+    pub(crate) sha256_toml: String,
+}
+
+/// Parse and check a lock: ids, versions, repos and sha256s well-formed,
+/// each id once; sorted by id.
+pub(crate) fn parse_lock(text: &str) -> Result<Vec<Locked>, String> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Lock {
+        #[serde(default)]
+        plugin: Vec<Locked>,
+    }
+    let mut entries = toml::from_str::<Lock>(text)
+        .map_err(|e| format!("plugins.lock: {e}"))?
+        .plugin;
+    for l in &entries {
+        let id = &l.id;
+        if !valid_id(id) {
+            return Err(format!("plugins.lock: id {id:?} is not a plugin id"));
+        }
+        plugin_version(&l.version).map_err(|e| format!("plugins.lock: {id}: {e}"))?;
+        if !valid_github(&l.repo) {
+            return Err(format!(
+                "plugins.lock: {id}: repo {:?} is not owner/repo",
+                l.repo
+            ));
+        }
+        if l.name.trim().is_empty() || l.summary.trim().is_empty() {
+            return Err(format!("plugins.lock: {id}: name and summary are required"));
+        }
+        for sha in [&l.sha256_wasm, &l.sha256_toml] {
+            if sha.len() != 64 || !sha.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+                return Err(format!(
+                    "plugins.lock: {id}: a sha256 is not 64 lowercase hex digits"
+                ));
+            }
+        }
+    }
+    entries.sort_by(|a, b| a.id.cmp(&b.id));
+    if let Some(pair) = entries.windows(2).find(|p| p[0].id == p[1].id) {
+        return Err(format!("plugins.lock names {} twice", pair[0].id));
+    }
+    Ok(entries)
+}
+
+/// The lock, parsed once. A lock that doesn't parse is a build bug (a test
+/// fails on it); the daemon then lists no first-party plugin rather than
+/// refusing to start.
+static LOCKED: LazyLock<Vec<Locked>> = LazyLock::new(|| {
+    parse_lock(LOCK).unwrap_or_else(|err| {
+        tracing::error!(%err, "no first-party plugins: the embedded plugins.lock is invalid");
+        Vec::new()
+    })
+});
+
+/// Every first-party plugin, sorted by id.
+pub(crate) fn lock_entries() -> &'static [Locked] {
+    &LOCKED
+}
+
+/// The lock's entry for `id`, if it is a first-party plugin.
+pub(crate) fn lock_entry(id: &str) -> Option<&'static Locked> {
+    lock_entries().iter().find(|l| l.id == id)
+}
 
 #[derive(Deserialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
@@ -94,6 +175,8 @@ pub(crate) struct Manifest {
     pub(crate) detect: Detect,
     #[serde(default)]
     pub(crate) requires: Requires,
+    #[serde(default)]
+    pub(crate) recommends: Recommends,
     #[serde(default)]
     pub(crate) setup: Option<Setup>,
     #[serde(default)]
@@ -137,45 +220,32 @@ impl std::fmt::Debug for Wasm {
     }
 }
 
-/// Where a catalog entry came from.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum Source {
-    /// Ships inside this chimaera binary (`plugins/dist`).
-    #[default]
-    Embedded,
-    /// Installed from a release into `<data dir>/plugins/<id>/`.
-    Installed,
-}
-
-impl Source {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Source::Embedded => "embedded",
-            Source::Installed => "installed",
-        }
-    }
-}
-
-/// The catalog's decision about one plugin id, carried on the manifest that
-/// loads (or would load) for it.
+/// What the catalog knows about a loaded copy beyond its manifest: where it
+/// lives, what it goes back to, whether its bytes are the ones released,
+/// and why it can't run, if it can't.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Origin {
-    pub(crate) source: Source,
-    /// The installed copy's `current` version directory, when it has one.
+    /// The installed copy's `current` version directory (`None`: a test
+    /// build's catalog extra, which has no directory).
     pub(crate) path: Option<PathBuf>,
-    pub(crate) embedded_version: Option<String>,
-    pub(crate) installed_version: Option<String>,
     /// The installed copy's `previous` version (Use previous).
     pub(crate) previous: Option<String>,
-    /// An installed copy older than the embedded one (the embedded loads).
-    pub(crate) stale: bool,
-    /// Why this daemon can't run it (a failed gate): listed, never active.
-    pub(crate) gate: Option<String>,
-    /// Where the checker and Update look for a newer version: the loading
-    /// copy's `[release]` (an embedded plugin's included), else the
-    /// installed copy's — asked even when the embedded copy is the one that
-    /// loads.
+    /// Why this copy can't run here: a failed gate, or its files not
+    /// matching the `SHA256SUMS` kept beside them. Listed, never active.
+    pub(crate) fault: Option<String>,
+    /// Where the checker and Update look for a newer version: its
+    /// `[release] github`.
     pub(crate) release: Option<String>,
+    /// A Chimaera plugin: its id is in the lock and its `[release] github`
+    /// is the lock's repository (an update keeps it; a third-party plugin
+    /// reusing a first-party id never has it).
+    pub(crate) first_party: bool,
+    /// Its files match the release's `SHA256SUMS` kept beside them — and,
+    /// a first-party copy at the pinned version, the lock's sha256s too.
+    pub(crate) verified: bool,
+    /// Installed from a local directory (`POST /plugins/install {path}`):
+    /// that directory.
+    pub(crate) local_path: Option<PathBuf>,
 }
 
 /// Workspace-relative paths whose presence makes the plugin active here.
@@ -191,12 +261,37 @@ pub(crate) struct Detect {
 #[serde(deny_unknown_fields)]
 pub(crate) struct Requires {
     /// agent kind ("claude" | "codex") → the agent-native plugin it needs.
+    /// A genuine hard requirement (none today; a recommendation is
+    /// `recommends`).
     #[serde(default)]
     pub(crate) agent_plugins: BTreeMap<String, AgentPluginReq>,
     /// A semver requirement on this daemon (`">=0.4.0"`, `"^0.4"`) for a
     /// plugin that needs a host import a later daemon added; a gate.
     #[serde(default)]
     pub(crate) chimaera: Option<String>,
+}
+
+/// `[recommends.agent_plugins.<agent>]`: an agent-side plugin that makes
+/// this plugin more useful to the agents the user runs, never needed for it
+/// to work (mycelium's, which lets an agent record knowledge the Knowledge
+/// reader then shows). The card offers it only for agents installed here.
+#[derive(Deserialize, Debug, Clone, Default)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Recommends {
+    #[serde(default)]
+    pub(crate) agent_plugins: BTreeMap<String, AgentPluginReq>,
+}
+
+impl Manifest {
+    /// The agent-side plugin this plugin names for `agent`: a requirement
+    /// first, else a recommendation (the install route and codex hook trust
+    /// serve both).
+    pub(crate) fn agent_plugin(&self, agent: &str) -> Option<&AgentPluginReq> {
+        self.requires
+            .agent_plugins
+            .get(agent)
+            .or_else(|| self.recommends.agent_plugins.get(agent))
+    }
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -401,121 +496,55 @@ fn describe_req(req: &semver::VersionReq) -> String {
         .join(", ")
 }
 
-/// Every `<id>/plugin.toml` + `<id>/plugin.wasm` pair in an embedded dist
-/// folder, by id. A pair that doesn't hold together (no component, an id
-/// that isn't its folder's, a manifest that doesn't parse) is left out,
-/// loudly: unreachable for a dist this build's script laid out.
-fn load_dist<E: RustEmbed>() -> Vec<Arc<Manifest>> {
-    let mut dirs: Vec<String> = E::iter()
-        .filter_map(|path| path.strip_suffix("/plugin.toml").map(str::to_string))
-        .collect();
-    dirs.sort();
-    dirs.dedup();
-    dirs.into_iter()
-        .filter_map(|dir| {
-            let text = E::get(&format!("{dir}/plugin.toml"))?;
-            let mut m = match parse_manifest(&String::from_utf8_lossy(&text.data)) {
-                Ok(m) => m,
-                // Unreachable in a tested build (`every_manifest_parses`); a
-                // broken manifest must not take the daemon down with it.
-                Err(err) => {
-                    tracing::error!(plugin = %dir, %err, "invalid embedded plugin manifest");
-                    return None;
-                }
-            };
-            let Some(wasm) = E::get(&format!("{dir}/plugin.wasm")) else {
-                tracing::error!(plugin = %dir, "embedded plugin has no plugin.wasm");
-                return None;
-            };
-            if m.id != dir {
-                tracing::error!(
-                    plugin = %dir,
-                    id = %m.id,
-                    "embedded plugin refused: its id must be its folder"
-                );
-                return None;
-            }
-            m.wasm = Wasm::new(wasm.data);
-            Some(Arc::new(m))
-        })
-        .collect()
-}
-
-/// What this daemon ships: the embedded plugins, sorted by id (their folder
-/// names). Loaded once per process.
-static PRODUCTION: LazyLock<Vec<Arc<Manifest>>> = LazyLock::new(load_dist::<Dist>);
-
-/// The shipped catalog — never the test fixtures, never an installed copy.
-pub(crate) fn production_catalog() -> &'static [Arc<Manifest>] {
-    &PRODUCTION
-}
-
-/// The embedded plugins: the shipped ones plus, in a test build, whatever
-/// `test_catalog` added.
-fn embedded() -> Vec<Arc<Manifest>> {
-    #[allow(unused_mut)]
-    let mut all: Vec<Arc<Manifest>> = production_catalog().to_vec();
-    #[cfg(test)]
-    all.extend(test_catalog::extra());
-    all
-}
-
-/// Merge the embedded plugins with the installed copies, one entry per id,
-/// sorted by id (the Plugins page's order, and the order active plugins'
-/// tools and instruction paragraphs reach an agent in). The same id in
-/// both: the higher version loads and both versions are named; equal
-/// versions: the embedded copy; an older installed copy is `stale`. Then
-/// the gates, on the copy that loads.
+/// The loadable plugins, one entry per id, sorted by id (the Extensions
+/// tab's order, and the order active plugins' tools and instruction
+/// paragraphs reach an agent in): every installed copy, and (test builds)
+/// the catalog extras no installed copy shadows. Then the gates, on each —
+/// after the fault reading the copy already found (its files not matching
+/// its `SHA256SUMS`), which wins.
 pub(crate) fn resolve(
-    embedded: &[Arc<Manifest>],
+    extras: &[Arc<Manifest>],
     installed: &[installed::InstalledCopy],
     daemon: &str,
 ) -> Vec<Arc<Manifest>> {
-    let version =
-        |m: &Manifest| plugin_version(&m.version).unwrap_or(semver::Version::new(0, 0, 0));
-    let mut ids: BTreeSet<&str> = embedded.iter().map(|m| m.id.as_str()).collect();
-    ids.extend(installed.iter().map(|c| c.manifest.id.as_str()));
-    ids.into_iter()
-        .map(|id| {
-            let e = embedded.iter().find(|m| m.id == id);
-            let i = installed.iter().find(|c| c.manifest.id == id);
-            let installed_wins = match (e, i) {
-                (Some(e), Some(i)) => version(&i.manifest) > version(e),
-                (None, Some(_)) => true,
-                _ => false,
-            };
-            let mut chosen: Manifest = match (installed_wins, e, i) {
-                (true, _, Some(i)) => i.manifest.clone(),
-                (_, Some(e), _) => (**e).clone(),
-                _ => unreachable!("every id came from one side"),
-            };
-            chosen.origin = Origin {
-                source: if installed_wins {
-                    Source::Installed
-                } else {
-                    Source::Embedded
-                },
-                path: i.map(|c| c.dir.clone()),
-                embedded_version: e.map(|m| m.version.clone()),
-                installed_version: i.map(|c| c.manifest.version.clone()),
-                previous: i.and_then(|c| c.previous.clone()),
-                stale: matches!((e, i), (Some(e), Some(i)) if version(&i.manifest) < version(e)),
-                gate: gate(&chosen, daemon),
-                release: chosen
-                    .release
-                    .as_ref()
-                    .or_else(|| i.and_then(|c| c.manifest.release.as_ref()))
-                    .map(|r| r.github.clone()),
-            };
-            Arc::new(chosen)
+    let mut all: Vec<Arc<Manifest>> = installed
+        .iter()
+        .map(|c| {
+            let mut m = c.manifest.clone();
+            m.origin.path = Some(c.dir.clone());
+            m.origin.previous = c.previous.clone();
+            m
         })
-        .collect()
+        .chain(
+            extras
+                .iter()
+                .filter(|e| installed.iter().all(|c| c.manifest.id != e.id))
+                .map(|e| (**e).clone()),
+        )
+        .map(|mut m| {
+            m.origin.release = m.release.as_ref().map(|r| r.github.clone());
+            m.origin.fault = m.origin.fault.take().or_else(|| gate(&m, daemon));
+            Arc::new(m)
+        })
+        .collect();
+    all.sort_by(|a, b| a.id.cmp(&b.id));
+    all
 }
 
-/// The catalog every lookup reads (on `AppState`): the embedded plugins
-/// merged with the installed copies under `<data dir>/plugins`. Reloaded
+/// The test build's catalog extras (none in a real build).
+fn extras() -> Vec<Arc<Manifest>> {
+    #[cfg(test)]
+    return test_catalog::extra();
+    #[cfg(not(test))]
+    Vec::new()
+}
+
+/// The catalog every lookup reads (on `AppState`): the installed copies
+/// under `<data dir>/plugins` (and a test build's extras). Reloaded
 /// (`reload`, blocking — off the reactor) after an install, update,
-/// rollback or remove, so a change takes effect without a restart.
+/// rollback or remove, so a change takes effect without a restart. The
+/// first-party plugins nothing is installed for are not in it: they have no
+/// component to load, and the wire lists them as `available` (`listing`).
 pub(crate) struct Catalog {
     /// `<data dir>/plugins`.
     pub(crate) root: PathBuf,
@@ -559,18 +588,18 @@ impl Catalog {
     }
 
     fn remerge(&self) {
-        let embedded = embedded();
+        let extras = extras();
         let copies = read(&self.installed).clone();
         let daemon = read(&self.daemon).clone();
-        let all = Arc::new(resolve(&embedded, &copies, &daemon));
-        *write(&self.merged) = (extras_len(), all);
+        let all = Arc::new(resolve(&extras, &copies, &daemon));
+        *write(&self.merged) = (extras.len(), all);
     }
 
-    /// Every plugin, sorted by id.
+    /// Every loadable plugin, sorted by id.
     pub(crate) fn all(&self) -> Arc<Vec<Arc<Manifest>>> {
         {
             let merged = read(&self.merged);
-            if merged.0 == extras_len() {
+            if merged.0 == extras().len() {
                 return merged.1.clone();
             }
         }
@@ -604,16 +633,6 @@ impl Catalog {
     }
 }
 
-#[cfg(test)]
-fn extras_len() -> usize {
-    test_catalog::extra().len()
-}
-
-#[cfg(not(test))]
-fn extras_len() -> usize {
-    0
-}
-
 /// Why a plugin change or check was refused, as its route answers it
 /// (`{"error": message}` with `status`; constructors in `releases`).
 #[derive(Debug)]
@@ -622,7 +641,7 @@ pub(crate) struct Refusal {
     pub(crate) message: String,
 }
 
-/// The catalog every lookup reads.
+/// The catalog every lookup reads: the loadable plugins.
 pub(crate) fn catalog(state: &AppState) -> Arc<Vec<Arc<Manifest>>> {
     state.plugin_catalog.all()
 }
@@ -631,9 +650,61 @@ pub(crate) fn manifest(state: &AppState, id: &str) -> Option<Arc<Manifest>> {
     state.plugin_catalog.get(id)
 }
 
+/// Why a change to `pid` needs an installed copy it doesn't have: a
+/// first-party plugin that isn't installed (409), or no plugin at all (404).
+pub(crate) fn not_installed(pid: &str) -> Refusal {
+    match lock_entry(pid) {
+        Some(l) => Refusal::conflict(format!("{} isn't installed — install it first", l.name)),
+        None => Refusal::not_found("unknown plugin"),
+    }
+}
+
+/// One row of the Extensions tab.
+pub(crate) enum Entry {
+    /// A loadable plugin (an installed copy).
+    Loaded(Arc<Manifest>),
+    /// A first-party plugin of the lock with no installed copy.
+    Available(&'static Locked),
+}
+
+/// What the Extensions tab lists, sorted by id: every loadable plugin, and
+/// each first-party plugin nothing is installed for.
+pub(crate) fn listing(state: &AppState) -> Vec<Entry> {
+    let loaded = catalog(state);
+    let mut all: Vec<Entry> = loaded.iter().cloned().map(Entry::Loaded).collect();
+    all.extend(
+        lock_entries()
+            .iter()
+            .filter(|l| loaded.iter().all(|m| m.id != l.id))
+            .map(Entry::Available),
+    );
+    all.sort_by(|a, b| a.id().cmp(b.id()));
+    all
+}
+
+impl Entry {
+    fn id(&self) -> &str {
+        match self {
+            Entry::Loaded(m) => &m.id,
+            Entry::Available(l) => &l.id,
+        }
+    }
+}
+
+/// `id`'s entry on the wire: its loaded copy, else the first-party plugin
+/// it names as `available`; `None` when neither (a removed third-party one).
+pub(crate) fn entry_json(state: &AppState, id: &str) -> Option<Value> {
+    match (manifest(state, id), lock_entry(id)) {
+        (Some(m), _) => Some(manifest_json(state, &m)),
+        (None, Some(l)) => Some(available_json(l)),
+        (None, None) => None,
+    }
+}
+
 /// Test builds only: plugins added to this test process's catalog as if
-/// embedded, beside the shipped ones (every `Catalog` sees them;
-/// `production_catalog()` never does).
+/// installed (every `Catalog` sees them; an installed copy of the same id
+/// shadows one). They have no directory, so Remove and Use previous don't
+/// apply to them.
 #[cfg(test)]
 pub(crate) mod test_catalog {
     use super::*;
@@ -682,6 +753,20 @@ pub(crate) mod test_catalog {
 
     pub(crate) fn dist_test_text(path: &str) -> String {
         String::from_utf8(dist_test_bytes(path)).unwrap()
+    }
+
+    /// `plugins/dist-test/<dir>` on disk: what a test installs by path (the
+    /// first-party releases the build script downloads there, the fixture).
+    pub(crate) fn dist_test_dir(dir: &str) -> PathBuf {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../plugins/dist-test")
+            .join(dir);
+        assert!(
+            path.join("plugin.wasm").is_file(),
+            "{} — run scripts/build-plugins.sh",
+            path.display()
+        );
+        path
     }
 }
 
@@ -773,7 +858,7 @@ pub(crate) async fn active(state: &AppState, ws: &str) -> Vec<Arc<Manifest>> {
     };
     catalog(state)
         .iter()
-        .filter(|m| on.contains(&m.id) && found.contains(&m.id) && m.origin.gate.is_none())
+        .filter(|m| on.contains(&m.id) && found.contains(&m.id) && m.origin.fault.is_none())
         .cloned()
         .collect()
 }
@@ -813,11 +898,13 @@ pub(crate) fn workspace_of_session(state: &AppState, sid: &str) -> Option<String
     crate::lock(&state.session_workspaces).get(sid).cloned()
 }
 
-/// A catalog entry on the wire (`GET /plugins`, `GET /workspaces/{id}/plugins`,
+/// A loaded plugin on the wire (`GET /plugins`, `GET /workspaces/{id}/plugins`,
 /// and the install/update/rollback/remove/check answers). The fields after
-/// `detect` say what is running and where it came from; the optional ones
-/// are present only when they hold something.
+/// `detect` say what is running, where it came from and whether its bytes
+/// are the released ones; the optional ones are present only when they hold
+/// something.
 pub(crate) fn manifest_json(state: &AppState, m: &Manifest) -> Value {
+    let o = &m.origin;
     let mut v = json!({
         "id": m.id,
         "name": m.name,
@@ -833,18 +920,25 @@ pub(crate) fn manifest_json(state: &AppState, m: &Manifest) -> Value {
         "detect": m.detect.any,
         "version": m.version,
         "api": m.api,
-        "source": m.origin.source.as_str(),
-        "stale": m.origin.stale,
+        "source": "installed",
+        "installed": true,
+        "first_party": o.first_party,
+        "verified": o.verified,
+        "sha256_wasm": &*m.wasm.sha256,
     });
-    let o = &m.origin;
     if let Some(path) = &o.path {
         v["path"] = json!(path);
     }
-    if let Some(version) = &o.embedded_version {
-        v["embedded_version"] = json!(version);
+    if let Some(repo) = &o.release {
+        v["repo"] = json!(repo);
     }
-    if let Some(version) = &o.installed_version {
-        v["installed_version"] = json!(version);
+    if o.first_party {
+        if let Some(l) = lock_entry(&m.id) {
+            v["pinned_version"] = json!(l.version);
+        }
+    }
+    if let Some(dir) = &o.local_path {
+        v["local_path"] = json!(dir);
     }
     if let Some(previous) = &o.previous {
         v["previous"] = json!(previous);
@@ -856,28 +950,68 @@ pub(crate) fn manifest_json(state: &AppState, m: &Manifest) -> Value {
             "checked_ms": update.checked_ms,
         });
     }
-    if let Some(gate) = &o.gate {
-        v["fault"] = json!(gate);
+    if let Some(fault) = &o.fault {
+        v["fault"] = json!(fault);
     }
     v
+}
+
+/// A first-party plugin with nothing installed, on the wire: the lock's
+/// name, summary, pinned version and repository — what Install fetches —
+/// and nothing a manifest would say (there is none on this host yet).
+pub(crate) fn available_json(l: &Locked) -> Value {
+    json!({
+        "id": l.id,
+        "name": l.name,
+        "summary": l.summary,
+        "homepage": null,
+        "adds": {"ui": [], "agents": []},
+        "provides": {"knowledge": null, "mcp_tools": [], "views": []},
+        "setup": null,
+        "detect": [],
+        "version": l.version,
+        "api": null,
+        "source": "available",
+        "installed": false,
+        "first_party": true,
+        "verified": false,
+        "repo": l.repo,
+        "pinned_version": l.version,
+    })
 }
 
 pub(crate) fn not_found(what: &str) -> Response {
     (StatusCode::NOT_FOUND, Json(json!({"error": what}))).into_response()
 }
 
-/// GET /plugins — the catalog (what exists on this daemon).
+/// GET /plugins — the catalog (what exists on this daemon, and the
+/// first-party plugins it can install).
 pub(crate) async fn list_plugins(State(state): State<Arc<AppState>>) -> Response {
-    let plugins: Vec<Value> = catalog(&state)
+    let plugins: Vec<Value> = listing(&state)
         .iter()
-        .map(|m| manifest_json(&state, m))
+        .map(|e| match e {
+            Entry::Loaded(m) => manifest_json(&state, m),
+            Entry::Available(l) => available_json(l),
+        })
         .collect();
     Json(json!({"schema": 1, "plugins": plugins})).into_response()
 }
 
+/// An agent-plugin map on the wire: `[{agent, id, marketplace}]`.
+fn agent_plugins_json(map: &BTreeMap<String, AgentPluginReq>) -> Value {
+    json!(map
+        .iter()
+        .map(|(agent, req)| json!({
+            "agent": agent,
+            "id": req.id,
+            "marketplace": req.marketplace,
+        }))
+        .collect::<Vec<_>>())
+}
+
 /// GET /workspaces/{id}/plugins — per-plugin status in one workspace: on /
-/// footprint detected / active. Agent-plugin requirement state (asked of the
-/// agents themselves) rides `GET /workspaces/{id}/agent-plugins`.
+/// footprint detected / active. Agent-plugin state (asked of the agents
+/// themselves) rides `GET /workspaces/{id}/agent-plugins`.
 pub(crate) async fn workspace_plugins(
     State(state): State<Arc<AppState>>,
     AxPath(id): AxPath<String>,
@@ -887,35 +1021,41 @@ pub(crate) async fn workspace_plugins(
     };
     let on: BTreeSet<String> = workspace.plugins_on.iter().cloned().collect();
     let found = refresh_detect(&state, &id).await;
-    let plugins: Vec<Value> = catalog(&state)
+    let plugins: Vec<Value> = listing(&state)
         .iter()
-        .map(|m| {
+        .map(|e| {
+            let m = match e {
+                Entry::Loaded(m) => m,
+                // Nothing to switch on until it is installed; a switch kept
+                // from before a Remove holds again after the next install.
+                Entry::Available(l) => {
+                    let mut v = available_json(l);
+                    for key in ["on", "detected", "active"] {
+                        v[key] = json!(false);
+                    }
+                    v["requires"] = json!([]);
+                    v["recommends"] = json!([]);
+                    return v;
+                }
+            };
             let mut v = manifest_json(&state, m);
-            // A plugin that fails a gate is off whatever its switch says:
-            // the switch is kept, and holds again once the gate passes.
-            let is_on = on.contains(&m.id) && m.origin.gate.is_none();
+            // A plugin that can't run is off whatever its switch says: the
+            // switch is kept, and holds again once the fault is gone.
+            let is_on = on.contains(&m.id) && m.origin.fault.is_none();
             let detected = found.contains(&m.id);
             v["on"] = json!(is_on);
             v["detected"] = json!(detected);
             v["active"] = json!(is_on && detected);
             // Additive, and only when there is one: why the plugin isn't
-            // answering here (the card shows it). A failed gate already
+            // answering here (the card shows it). A catalog fault already
             // said why (`manifest_json`).
-            if m.origin.gate.is_none() {
+            if m.origin.fault.is_none() {
                 if let Some(fault) = state.plugin_runtime.fault(m, &id) {
                     v["fault"] = json!(fault);
                 }
             }
-            v["requires"] = json!(m
-                .requires
-                .agent_plugins
-                .iter()
-                .map(|(agent, req)| json!({
-                    "agent": agent,
-                    "id": req.id,
-                    "marketplace": req.marketplace,
-                }))
-                .collect::<Vec<_>>());
+            v["requires"] = agent_plugins_json(&m.requires.agent_plugins);
+            v["recommends"] = agent_plugins_json(&m.recommends.agent_plugins);
             v
         })
         .collect();
@@ -941,17 +1081,24 @@ pub(crate) async fn put_workspace_plugin(
     AxPath((id, pid)): AxPath<(String, String)>,
     Json(body): Json<PutWorkspacePlugin>,
 ) -> Response {
-    let Some(m) = manifest(&state, &pid) else {
-        return not_found("unknown plugin");
-    };
-    if body.on {
-        if let Some(gate) = &m.origin.gate {
-            return (
-                StatusCode::CONFLICT,
-                Json(json!({"error": format!("{} can't run on this daemon: {gate}", m.name)})),
-            )
-                .into_response();
+    match manifest(&state, &pid) {
+        Some(m) if body.on => {
+            if let Some(fault) = &m.origin.fault {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(json!({"error": format!("{} can't run on this daemon: {fault}", m.name)})),
+                )
+                    .into_response();
+            }
         }
+        Some(_) => {}
+        // A first-party plugin with no installed copy has nothing to run;
+        // switching it off is still fine (it clears a switch kept from
+        // before a Remove).
+        None if body.on || lock_entry(&pid).is_none() => {
+            return not_installed(&pid).into_response();
+        }
+        None => {}
     }
     let result = crate::lock(&state.workspaces).set_plugin_on(&id, &pid, body.on);
     match result {
@@ -994,8 +1141,8 @@ pub(crate) fn bad_request(msg: impl Into<String>) -> Response {
 }
 
 /// POST /workspaces/{id}/plugins/{pid}/install {agent} — install the agent
-/// plugin this workbench plugin requires, with the AGENT's own plugin
-/// manager, in a visible terminal the user watches (chimaera never
+/// plugin this workbench plugin requires or recommends, with the AGENT's own
+/// plugin manager, in a visible terminal the user watches (chimaera never
 /// reimplements `claude plugin` / `codex plugin`). The session is theirs to
 /// read and close; the probe cache is invalidated when it ends.
 pub(crate) async fn install_requirement(
@@ -1009,8 +1156,8 @@ pub(crate) async fn install_requirement(
     let Some(m) = manifest(&state, &pid) else {
         return not_found("unknown plugin");
     };
-    let Some(req) = m.requires.agent_plugins.get(&body.agent) else {
-        return bad_request(format!("{} needs nothing from {}", m.name, body.agent));
+    let Some(req) = m.agent_plugin(&body.agent) else {
+        return bad_request(format!("{} names no {} plugin", m.name, body.agent));
     };
     let Some(kind) = crate::agents::AgentKind::parse(&body.agent) else {
         return bad_request("unknown agent");
@@ -1173,82 +1320,110 @@ pub(crate) async fn setup_workspace(
 mod tests {
     use super::*;
 
-    /// One `[[plugin]]` of `plugins/plugins.lock`: a release this build
-    /// ships (`scripts/build-plugins.sh` lays it out in `plugins/dist`).
-    #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct Locked {
-        id: String,
-        version: String,
-        repo: String,
-        sha256_wasm: String,
-        sha256_toml: String,
-    }
-
-    fn locked() -> Vec<Locked> {
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Lock {
-            plugin: Vec<Locked>,
-        }
-        toml::from_str::<Lock>(include_str!("../../../../plugins/plugins.lock"))
-            .expect("plugins/plugins.lock parses")
-            .plugin
+    /// Each first-party release the lock pins, as the build script laid it
+    /// out in `plugins/dist-test/<id>/` for the tests: its manifest parsed,
+    /// and the raw bytes of both files.
+    fn locked_releases() -> Vec<(&'static Locked, Manifest, Vec<u8>, Vec<u8>)> {
+        lock_entries()
+            .iter()
+            .map(|l| {
+                let toml = test_catalog::dist_test_bytes(&format!("{}/plugin.toml", l.id));
+                let wasm = test_catalog::dist_test_bytes(&format!("{}/plugin.wasm", l.id));
+                let m = parse_manifest(std::str::from_utf8(&toml).unwrap())
+                    .unwrap_or_else(|e| panic!("{}: {e}", l.id));
+                (l, m, toml, wasm)
+            })
+            .collect()
     }
 
     #[test]
-    fn every_manifest_parses_and_ids_are_unique() {
-        let embedded = Dist::iter().filter(|p| p.ends_with("/plugin.toml")).count();
-        assert_eq!(
-            production_catalog().len(),
-            embedded,
-            "a manifest failed to parse or its component was refused"
-        );
-        let ids: Vec<&str> = production_catalog().iter().map(|m| m.id.as_str()).collect();
-        assert!(
-            ids.windows(2).all(|pair| pair[0] < pair[1]),
-            "the catalog is sorted by id, each once: {ids:?}"
-        );
-        let lock = locked();
+    fn the_embedded_lock_parses_and_names_well_formed_releases() {
+        let lock = parse_lock(LOCK).expect("plugins/plugins.lock parses");
         assert!(!lock.is_empty(), "plugins/plugins.lock names no plugin");
-        for entry in &lock {
-            let id = &entry.id;
-            assert!(plugin_version(&entry.version).is_ok(), "{id}: lock version");
-            assert!(valid_github(&entry.repo), "{id}: lock repo");
-            for sha in [&entry.sha256_wasm, &entry.sha256_toml] {
-                assert!(
-                    sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_hexdigit()),
-                    "{id}: a lock sha256 is 64 hex digits"
-                );
-            }
-            // Versions and bytes are the script's check: a local override
-            // (plugins/plugins.local.toml) lays out another build on purpose.
-            let m = production_catalog()
-                .iter()
-                .find(|m| m.id == *id)
-                .unwrap_or_else(|| panic!("{id} ships (run scripts/build-plugins.sh)"));
-            assert!(!m.wasm.bytes.is_empty());
-            assert_eq!(m.api, API);
-            assert_eq!(gate(m, "0.4.1"), None, "{id} runs on a released daemon");
-            assert_eq!(
-                m.release.as_ref().map(|r| r.github.as_str()),
-                Some(entry.repo.as_str()),
-                "{id}: its updates come from the repository the lock pins"
+        assert_eq!(
+            lock_entries().len(),
+            lock.len(),
+            "the daemon reads the same lock"
+        );
+        let ids: Vec<&str> = lock.iter().map(|l| l.id.as_str()).collect();
+        assert!(
+            ids.windows(2).all(|p| p[0] < p[1]),
+            "sorted, each once: {ids:?}"
+        );
+        assert!(lock_entry("agent-notes").is_some() && lock_entry("mycelium").is_some());
+        assert!(
+            lock_entry("test-fixture").is_none(),
+            "the fixture is never first-party"
+        );
+
+        // What parse_lock refuses.
+        let entry = |extra: &str| {
+            format!(
+                "[[plugin]]\nid = \"x\"\nname = \"X\"\nsummary = \"x\"\nversion = \"0.1.0\"\n\
+                 repo = \"a/b\"\nsha256_wasm = \"{0}\"\nsha256_toml = \"{0}\"\n{extra}",
+                "a".repeat(64)
+            )
+        };
+        assert!(parse_lock(&entry("")).is_ok());
+        assert!(parse_lock(&entry("url = \"x\"\n")).is_err(), "unknown keys");
+        assert!(
+            parse_lock(&format!("{}{}", entry(""), entry(""))).is_err(),
+            "twice"
+        );
+        for (from, to) in [
+            ("id = \"x\"", "id = \"X\""),
+            ("version = \"0.1.0\"", "version = \"0.1\""),
+            ("repo = \"a/b\"", "repo = \"../b\""),
+            ("summary = \"x\"", "summary = \" \""),
+        ] {
+            assert!(
+                parse_lock(&entry("").replacen(from, to, 1)).is_err(),
+                "{to}"
             );
         }
-        for m in production_catalog() {
-            assert!(!m.summary.is_empty(), "{} needs a summary", m.id);
-            assert_eq!(m.origin.source, Source::Embedded);
+        let upper = entry("").replacen(&"a".repeat(64), &"A".repeat(64), 1);
+        assert!(
+            parse_lock(&upper).is_err(),
+            "lowercase hex, as SHA256SUMS writes it"
+        );
+    }
+
+    #[test]
+    fn every_locked_release_is_what_the_lock_says() {
+        for (l, m, toml, wasm) in locked_releases() {
+            let id = &l.id;
+            assert_eq!(
+                crate::fs::sha256_hex(&wasm),
+                l.sha256_wasm,
+                "{id}: plugin.wasm"
+            );
+            assert_eq!(
+                crate::fs::sha256_hex(&toml),
+                l.sha256_toml,
+                "{id}: plugin.toml"
+            );
+            assert_eq!(m.id, *id);
+            assert_eq!(
+                m.version, l.version,
+                "{id}: the lock pins its manifest's version"
+            );
+            assert_eq!(m.name, l.name, "{id}: the lock's name is its manifest's");
+            assert_eq!(
+                m.release.as_ref().map(|r| r.github.as_str()),
+                Some(l.repo.as_str()),
+                "{id}: it updates from the repository the lock pins"
+            );
+            assert_eq!(m.api, API);
+            assert_eq!(gate(&m, "0.4.1"), None, "{id} runs on a released daemon");
+            assert!(!m.summary.is_empty());
             assert!(
                 !m.adds.ui.is_empty() || !m.adds.agents.is_empty(),
-                "{} must say what it adds",
-                m.id
+                "{id} must say what it adds"
             );
             for rel in &m.detect.any {
                 assert!(
                     !rel.starts_with('/') && !rel.contains(".."),
-                    "{}: detect paths are workspace-relative",
-                    m.id
+                    "{id}: detect paths are workspace-relative"
                 );
             }
         }
@@ -1262,19 +1437,37 @@ mod tests {
         assert!(!cli_safe("a;rm -rf"));
         assert!(!cli_safe("$(x)"));
         assert!(!cli_safe(""));
-        for m in production_catalog() {
-            for req in m.requires.agent_plugins.values() {
-                assert!(cli_safe(&req.id) && cli_safe(&req.marketplace), "{}", m.id);
+        for (l, m, _, _) in locked_releases() {
+            let named = m
+                .requires
+                .agent_plugins
+                .values()
+                .chain(m.recommends.agent_plugins.values());
+            for req in named {
+                assert!(cli_safe(&req.id) && cli_safe(&req.marketplace), "{}", l.id);
             }
         }
     }
 
     #[test]
-    fn the_test_fixture_never_ships() {
-        test_catalog::fixture();
-        assert!(embedded().iter().any(|m| m.id == "test-fixture"));
-        assert!(production_catalog().iter().all(|m| m.id != "test-fixture"));
-        assert!(Dist::iter().all(|p| !p.starts_with("test-")));
+    fn requires_and_recommends_both_name_an_agent_plugin() {
+        let m = demo(
+            "version = \"0.1.0\"\napi = \"0.1\"\n\
+             [requires.agent_plugins.codex]\nid = \"need@x\"\nmarketplace = \"x/need\"\n\
+             [recommends.agent_plugins.claude]\nid = \"nice@x\"\nmarketplace = \"x/nice\"\n\
+             [recommends.agent_plugins.codex]\nid = \"also@x\"\nmarketplace = \"x/also\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            m.agent_plugin("codex").unwrap().id,
+            "need@x",
+            "a requirement wins"
+        );
+        assert_eq!(m.agent_plugin("claude").unwrap().id, "nice@x");
+        assert!(m.agent_plugin("agy").is_none());
+        assert!(
+            demo("version = \"0.1.0\"\napi = \"0.1\"\n[recommends]\nchimaera = \">=1\"\n").is_err()
+        );
     }
 
     #[test]
@@ -1367,77 +1560,70 @@ mod tests {
             .contains("not a version requirement"));
     }
 
-    fn copy(version: &str, previous: Option<&str>) -> installed::InstalledCopy {
-        let mut m = demo(&format!(
-            "version = \"{version}\"\napi = \"0.1\"\n[release]\ngithub = \"acme/demo\"\n"
+    fn copy(id: &str, version: &str, previous: Option<&str>) -> installed::InstalledCopy {
+        let mut m = parse_manifest(&format!(
+            "id = \"{id}\"\nname = \"Demo\"\nsummary = \"x\"\nversion = \"{version}\"\n\
+             api = \"0.1\"\n[release]\ngithub = \"acme/{id}\"\n"
         ))
         .unwrap();
-        m.origin.source = Source::Installed;
+        m.origin.verified = true;
         installed::InstalledCopy {
             manifest: m,
-            dir: PathBuf::from(format!("/p/demo/{version}")),
+            dir: PathBuf::from(format!("/p/{id}/{version}")),
             previous: previous.map(str::to_string),
         }
     }
 
-    fn shipped(version: &str) -> Arc<Manifest> {
-        Arc::new(demo(&format!("version = \"{version}\"\napi = \"0.1\"\n")).unwrap())
-    }
-
     #[test]
-    fn precedence_is_the_higher_version_and_never_silent() {
-        // Installed higher: it loads, and both versions are named.
+    fn the_catalog_is_the_installed_copies_each_gated() {
+        let extra = Arc::new(demo("version = \"9.0.0\"\napi = \"0.1\"\n").unwrap());
+        let mut faulted = copy("zeta", "0.1.0", None);
+        faulted.manifest.origin.fault = Some("its files do not match".into());
+        faulted.manifest.api = "0.9".into();
         let all = resolve(
-            &[shipped("0.3.1")],
-            &[copy("0.3.2", Some("0.3.0"))],
+            &[extra],
+            &[
+                copy("demo", "0.3.2", Some("0.3.0")),
+                copy("api-new", "1.0.0", None),
+                faulted,
+            ],
             "0.4.1",
         );
-        let m = &all[0];
-        assert_eq!(m.version, "0.3.2");
-        assert_eq!(m.origin.source, Source::Installed);
-        assert_eq!(m.origin.embedded_version.as_deref(), Some("0.3.1"));
-        assert_eq!(m.origin.installed_version.as_deref(), Some("0.3.2"));
+        let ids: Vec<&str> = all.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["api-new", "demo", "zeta"],
+            "sorted; an installed copy shadows an extra"
+        );
+        let m = &all[1];
+        assert_eq!(m.version, "0.3.2", "the installed copy, not the extra");
         assert_eq!(m.origin.previous.as_deref(), Some("0.3.0"));
         assert_eq!(m.origin.path, Some(PathBuf::from("/p/demo/0.3.2")));
-        assert!(!m.origin.stale);
         assert_eq!(m.origin.release.as_deref(), Some("acme/demo"));
+        assert!(m.origin.verified, "what reading the copy found is kept");
+        assert_eq!(m.origin.fault, None);
+        assert_eq!(
+            all[2].origin.fault.as_deref(),
+            Some("its files do not match"),
+            "a fault found reading the copy wins over the gates"
+        );
 
-        // Equal: the embedded copy loads; the installed one is still named.
-        let m = &resolve(&[shipped("0.3.2")], &[copy("0.3.2", None)], "0.4.1")[0];
-        assert_eq!(m.origin.source, Source::Embedded);
-        assert!(!m.origin.stale);
-        assert_eq!(m.origin.installed_version.as_deref(), Some("0.3.2"));
+        // A gate fails: listed, with why.
+        let mut newer = copy("demo", "0.4.0", None);
+        newer.manifest.api = "0.2".into();
+        let m = &resolve(&[], &[newer], "0.4.1")[0];
+        assert!(m
+            .origin
+            .fault
+            .as_deref()
+            .unwrap()
+            .starts_with("needs a newer chimaera"));
 
-        // Installed older: the embedded loads and the copy is stale.
-        let m = &resolve(&[shipped("0.3.2")], &[copy("0.3.1", None)], "0.4.1")[0];
-        assert_eq!(m.origin.source, Source::Embedded);
-        assert_eq!(m.version, "0.3.2");
-        assert!(m.origin.stale);
-
-        // Numeric, not lexicographic.
-        let m = &resolve(&[shipped("0.9.0")], &[copy("0.10.0", None)], "0.4.1")[0];
-        assert_eq!(m.origin.source, Source::Installed);
-
-        // One side only.
-        let m = &resolve(&[], &[copy("1.0.0", None)], "0.4.1")[0];
-        assert_eq!(m.origin.source, Source::Installed);
-        assert_eq!(m.origin.embedded_version, None);
-        let m = &resolve(&[shipped("1.0.0")], &[], "0.4.1")[0];
-        assert_eq!(m.origin.source, Source::Embedded);
+        // A test extra alone: listed with no directory and no release.
+        let extra = Arc::new(demo("version = \"1.0.0\"\napi = \"0.1\"\n").unwrap());
+        let m = &resolve(&[extra], &[], "0.4.1")[0];
         assert_eq!(m.origin.path, None);
         assert_eq!(m.origin.release, None, "nothing names a release source");
-
-        // The release source: the loading copy's, an embedded one's included…
-        let released = Arc::new(
-            demo("version = \"1.0.0\"\napi = \"0.1\"\n[release]\ngithub = \"acme/shipped\"\n")
-                .unwrap(),
-        );
-        let m = &resolve(&[released], &[], "0.4.1")[0];
-        assert_eq!(m.origin.release.as_deref(), Some("acme/shipped"));
-        // …else the installed copy's, even while the embedded one loads.
-        let m = &resolve(&[shipped("0.3.2")], &[copy("0.3.1", None)], "0.4.1")[0];
-        assert_eq!(m.origin.source, Source::Embedded);
-        assert_eq!(m.origin.release.as_deref(), Some("acme/demo"));
     }
 
     #[test]
@@ -1448,7 +1634,11 @@ mod tests {
             crate::timeline::now_ms()
         ));
         std::fs::create_dir_all(&root).unwrap();
-        let catalog = production_catalog();
+        let catalog: Vec<Arc<Manifest>> = locked_releases()
+            .into_iter()
+            .map(|(_, m, _, _)| Arc::new(m))
+            .collect();
+        let catalog = &catalog;
         let none = detect_blocking(&root, catalog);
         assert!(!none.contains("mycelium"));
         assert!(

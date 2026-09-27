@@ -593,7 +593,7 @@ pub(crate) async fn trust_hooks(
         return not_found();
     };
     let Some(codex_plugin) = crate::plugins::manifest(&state, &pid)
-        .and_then(|m| m.requires.agent_plugins.get("codex").map(|r| r.id.clone()))
+        .and_then(|m| m.agent_plugin("codex").map(|r| r.id.clone()))
     else {
         return (
             StatusCode::BAD_REQUEST,

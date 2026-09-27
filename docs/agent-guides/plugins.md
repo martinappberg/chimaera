@@ -49,8 +49,8 @@ plugins, each its own repository and the worked examples here: [chimaera-plugin-
   `crates/chimaera-server/src/tests/agent_view.rs`; if that test fails, you
   changed core.
 - **It says what it adds.** Every manifest carries `[adds] ui = […]` and/or
-  `agents = […]`, the card's "Adds / Would add" lines in plain words. A test
-  fails a shipped manifest that adds nothing.
+  `agents = […]`, the card's "For you: …" / "For agents: …" sentences in
+  plain words. A test fails a locked first-party release that adds nothing.
 - **Versions are required.** Every manifest carries `version` (the plugin's
   own, plain `MAJOR.MINOR.PATCH`, equal to its crate's) and `api` (the WIT
   version it targets). A new version tolerates whatever an older one stored.
@@ -69,7 +69,7 @@ release source.
 ```toml
 id = "mycelium"                 # stable; lowercase letters, digits, dashes; ≤ 64; not "install"
 name = "Mycelium"
-version = "0.1.0"               # the plugin's own, MAJOR.MINOR.PATCH; must equal the crate's
+version = "0.1.1"               # the plugin's own, MAJOR.MINOR.PATCH; must equal the crate's
 summary = "Project memory your agents record as they work — findings, decisions, learnings."
 homepage = "https://github.com/arjunrajlaboratory/mycelium"   # optional
 api = "0.1"                     # the chimaera:plugin WIT version it targets (MAJOR.MINOR)
@@ -80,9 +80,10 @@ any = [".living/INDEX.md", "MYCELIUM.md"]   # empty/omitted ⇒ always present (
 [requires]
 chimaera = ">=0.4.0"            # optional: a semver requirement on the daemon
 
-[requires.agent_plugins.claude] # agent-native plugins it needs, per agent
+[recommends.agent_plugins.claude]   # an agent-side plugin that helps, per agent; never needed
 id = "mycelium@mycelium"
 marketplace = "arjunrajlaboratory/mycelium"
+# [requires.agent_plugins.<agent>] has the same shape, for a genuine hard requirement
 
 [setup]                         # the plugin's OWN documented setup prompt
 prompt = "Set up Mycelium in this repository."
@@ -100,10 +101,12 @@ agents = ["2 read tools for every agent here: knowledge_search · knowledge_get"
 github = "owner/repo"
 ```
 
-(Shipped manifests: the `plugin.toml` at the root of each first-party
-repository; both name their own repository in `[release]`, so the copy that
-ships with chimaera can be updated from it. `[requires] chimaera` above is an
-illustration; neither ships it.)
+(Real manifests: the `plugin.toml` at the root of each first-party
+repository; both name their own repository in `[release]`, which is where
+chimaera installs them from and what makes an installed copy first-party.
+`[requires] chimaera` above is an illustration; neither carries it.
+Mycelium v0.1.1 moves its agent plugin from `requires` to `recommends`: the
+Knowledge reader works with no agent plugin at all.)
 
 What each part does, and what exists today:
 
@@ -112,15 +115,16 @@ What each part does, and what exists today:
 | `id`, `name`, `summary`, `homepage` | the card; `id` names a directory and a URL segment, so it is charset-gated | `plugins::validate`, `manifest_json` |
 | `version`, `api` | which build runs, and the WIT it needs; `api` is a gate | `plugins::gate`, `resolve` |
 | `detect.any` | footprint → "active here" (no path component may be a symlink) | `plugins::detect_blocking` |
-| `requires.agent_plugins` | per-agent install state (asked of the agents) and an install button running the agent's own `plugin marketplace add` + `install`/`add` in a visible terminal | `agent_probe.rs`, `plugins::install_requirement` |
+| `requires.agent_plugins` | a genuine hard requirement (no plugin has one today): per-agent install state (asked of the agents), "Requires the <agent> plugin <id>" on the card for agents installed here, and an install button running the agent's own `plugin marketplace add` + `install`/`add` in a visible terminal; the attach sheet's step 1; codex hook trust | `agent_probe.rs`, `plugins::install_requirement` |
+| `recommends.agent_plugins` | the same shape and the same install route, attach-sheet step and hook trust, for an agent-side plugin that makes this one more useful to the agents the user runs but is never needed: "For <agent>: …" on the card, only for agents installed here | `agent_probe.rs`, `plugins::install_requirement` |
 | `requires.chimaera` | a gate: this daemon's version must match | `plugins::gate` |
 | `setup.prompt` | a new chat session of the user's chosen agent, sent this prompt | `plugins::setup_workspace` |
 | `provides.knowledge` | the plugin is the Knowledge provider; its `knowledge` export feeds the view and `GET /workspaces/{id}/knowledge` | `knowledge.rs`, `runtime::knowledge` |
 | `provides.mcp_tools` | tools served by the chimaera MCP where active, plus the `instructions` paragraph; pre-allowed at spawn | `plugins/tools.rs`, `runtime::offer` |
 | `provides.events` | which `on-event` variants the host delivers (none by default); `hook` and `session-ended` are delivered, `switched-on` / `switched-off` are declarable but not delivered yet | `runtime::hook`, `runtime::session_ended` |
 | `provides.views` | parses and rides the wire; nothing renders it | none yet |
-| `[adds]` | the card's Adds lines | the UI |
-| `[release] github` | where the checker and Update look for newer versions | `plugins/releases.rs`, `plugins/installed.rs` |
+| `[adds]` | the card's "For you: …" (`ui`) and "For agents: …" (`agents`) sentences | the UI |
+| `[release] github` | where the checker and Update look for newer versions; for an id in `plugins/plugins.lock`, it must be the lock's `repo` for the copy to be first-party | `plugins/releases.rs`, `plugins/installed.rs`, `plugins/mod.rs` |
 
 `settings` and `commands`, sketched in the earlier plan, are not manifest
 keys; the first plugin that needs one adds it with a test and a row here.
@@ -306,35 +310,42 @@ cargo test                                     # the plugin's own native unit te
 cargo fmt --all
 ```
 
-In the chimaera repository:
+To run a build in a daemon before it has a release, put `plugin.wasm` (the
+component, renamed) and `plugin.toml` in a directory and install it from there
+on the daemon's host:
 
 ```sh
-bash scripts/build-plugins.sh      # or `just plugins`: the locked releases → plugins/dist, the fixture → plugins/dist-test
-just check                         # the daemon workspace and the fixture's
+mkdir -p /tmp/agent-notes-dev
+cp target/wasm32-wasip2/release/chimaera_plugin_agent_notes.wasm /tmp/agent-notes-dev/plugin.wasm
+cp plugin.toml /tmp/agent-notes-dev/plugin.toml
+chimaera plugin add --path /tmp/agent-notes-dev   # or POST /api/v1/plugins/install {"path": "/tmp/agent-notes-dev"}
 ```
 
-To run a checkout of a plugin in a daemon before it has a release, name it in
-`plugins/plugins.local.toml` (gitignored) and run the script:
+The daemon copies both files (and a `SHA256SUMS`, when the directory has one:
+both files must then match it) into `~/.chimaera/plugins/<id>/<version>/`,
+notes the directory in `local-path`, and gates the manifest like any other.
+Installing the same version again replaces it in place, so the loop is:
+rebuild, copy, `chimaera plugin add --path <dir>`, and a running session's
+next `tools/list` is the new build. Switch the plugin on in a workspace to see
+it; the card tags the copy `unverified · local` unless a matching
+`SHA256SUMS` came with it. A debug daemon has no plugins until one is
+installed (from the Extensions tab, `chimaera plugin add <id>`, or `--path`),
+and its first call into a plugin is slow (debug Cranelift compiling the
+component: seconds for Mycelium, against about 200 ms in release).
 
-```toml
-[[plugin]]
-id = "agent-notes"
-path = "../../chimaera-plugin-agent-notes"   # absolute, ~/…, or relative to plugins/
+In the chimaera repository, only the tests need plugin builds:
+
+```sh
+bash scripts/build-plugins.sh      # or `just plugins`: the fixture (and its v2) and the locked releases → plugins/dist-test
+just check                         # the daemon workspace and the fixture's; runs the script first
 ```
 
-The script then builds that checkout (`cargo build --release --target
-wasm32-wasip2` in its directory, on its own toolchain) and lays out its
-component and `plugin.toml` instead of the locked release, saying so; the
-version check against the lock is skipped for it, and a new id is laid out
-too. Delete the file (and rerun the script) to go back to the lock.
-Otherwise the script downloads each locked release (cached under
-`plugins/cache/`, re-verified on every run), so a build without network needs
-that cache or an override. Build the plugins before any build of
-`chimaera-server`: its embed of `plugins/dist` fails to compile without them.
-A debug daemon reads `plugins/dist` from disk once, when its catalog loads, so
-after a rebuild restart the daemon (no cargo rebuild needed). A debug build's
-first call into a plugin is slow (debug Cranelift compiling the component:
-seconds for Mycelium, against about 200 ms in release).
+The script builds the test fixture into `plugins/dist-test/`, and downloads
+each locked release's `plugin.wasm`, `plugin.toml` and `SHA256SUMS` into
+`plugins/dist-test/<id>/`, verified against the lock and kept there (a second
+run re-verifies them and fetches nothing). The daemon's tests install those by
+path. Building or running the daemon doesn't need the script: the daemon
+embeds no plugin bytes, only `plugins/plugins.lock`.
 
 The integration runs in the daemon's tests:
 
@@ -342,50 +353,76 @@ The integration runs in the daemon's tests:
   deadline trap, the memory cap, panic survival, refused symlinks and `..`,
   the state cap, the append caps and kind allowlist, the fault counter, the
   manifest/tools mismatch refusal, emit frames. It runs against
-  `plugins/test-fixture` (one tool per host limit), which the script lays out
-  in `plugins/dist-test/`; only the daemon's test builds embed it, and a test
-  proves it never reaches the shipped catalog.
+  `plugins/test-fixture` (one tool per host limit), which the script builds
+  into `plugins/dist-test/`; only the daemon's test builds embed it.
 - `tests/plugins.rs` (Agent notes: tools only where on, posts and reads stay
   in their workspace, the hook hint, the texts byte for byte),
   `tests/knowledge.rs` (Mycelium: the route JSON and tool texts against
-  fixtures), `tests/plugin_updates.rs` (install, update, rollback, remove and
-  the checker, against a fake releases server), `tests/agent_view.rs` (the
-  plugin-free view, unchanged).
+  fixtures), `tests/plugin_updates.rs` (the three install kinds, update,
+  rollback, remove and the checker, against a fake releases server),
+  `tests/agent_view.rs` (the plugin-free view, unchanged).
+
+## What the card says about a plugin
+
+The card's tags are the daemon's, never the plugin's own claim:
+
+- **`chimaera`** (`first_party` on the wire): the plugin's id is in
+  `plugins/plugins.lock` and the installed copy's `[release] github` is the
+  lock's `repo` exactly — Chimaera maintains it and pins a release of it. An
+  update from that repository keeps the tag; a plugin from any other
+  repository never gets it, even one that reuses a first-party id.
+- **`verified`**: the installed bytes match the release's `SHA256SUMS`, which
+  chimaera keeps beside the installed copy and re-checks every time it loads
+  the catalog; at a first-party plugin's pinned version they must also match
+  the lock's two sha256s. Files that don't match their `SHA256SUMS` are a
+  fault: the copy is listed, never loaded.
+- **`unverified · local`**: no `SHA256SUMS` to check against — a local build
+  installed with `--path` without one (or at a first-party id's pinned
+  version, bytes that aren't the pinned release's), or a copy installed
+  before chimaera kept the file.
 
 ## Shipping it
 
-**First-party** plugins live in their own repositories and ship inside the
-daemon binary, pinned by `plugins/plugins.lock`. The two that exist are the
+**First-party** plugins live in their own repositories and are named, with
+one pinned release each, in `plugins/plugins.lock`. The two that exist are the
 worked example: [chimaera-plugin-agent-notes](https://github.com/martinappberg/chimaera-plugin-agent-notes) and [chimaera-plugin-mycelium](https://github.com/martinappberg/chimaera-plugin-mycelium). Each is the crate and its `plugin.toml` (naming
 the repository as `[release] github`), a CI workflow (fmt, clippy, tests, the
 wasm build) and a release workflow that, on a `v<version>` tag whose version
 equals `Cargo.toml`'s and `plugin.toml`'s, builds `plugin.wasm` and publishes
 it with `plugin.toml` and `SHA256SUMS`. The lock names, per plugin, `id`,
-`version`, `repo` and the release's two sha256s; the script downloads exactly
-those files, refuses any other bytes, and the daemon embeds `plugins/dist`
-with rust-embed exactly as it embeds `web-ui/dist`.
+`name` and `summary` (what the card shows before anything is installed), the
+pinned `version`, `repo`, and the release's two sha256s (`sha256_wasm`,
+`sha256_toml`). The daemon embeds the lock, never a plugin's bytes: it lists
+each lock entry as available, and **Install** (or `chimaera plugin add <id>`)
+downloads that release from `https://github.com/<repo>/releases/download/v<version>/`
+and checks both files twice, against the release's `SHA256SUMS` and against
+the lock, refusing any other bytes.
 
 A first-party bump:
 
 1. In the plugin's repository, bump `version` in `Cargo.toml` and
    `plugin.toml` together, merge, and push the tag `v<version>`: the release
    workflow publishes the three assets.
-2. Daemons already running offer it: the checker asks every plugin whose
-   manifest names `[release]`, the embedded ones included, and **Update**
-   (or `chimaera plugin update <id>`) installs it as an installed copy that
-   loads over the embedded one.
+2. Daemons that have it installed offer it: the checker asks every
+   installed plugin whose manifest names `[release]`, and **Update** (or
+   `chimaera plugin update <id>`) installs it. A first-party copy updated past
+   the pin keeps its `chimaera` and `verified` tags.
 3. In the chimaera repository, set the entry's `version`, `sha256_wasm` and
-   `sha256_toml` in `plugins/plugins.lock` from that release's `SHA256SUMS`,
-   run `bash scripts/build-plugins.sh` and `just check`, and review the change
-   like code: the next chimaera release embeds exactly those bytes.
+   `sha256_toml` in `plugins/plugins.lock` from that release's `SHA256SUMS`
+   (and `name` / `summary` if they changed), run
+   `bash scripts/build-plugins.sh` (it downloads the new release into
+   `plugins/dist-test/`) and `just check`, and review the change like code:
+   from the next chimaera release, **Install** fetches that version.
 
 To add one: a repository shaped like those two, its first release, a
 `[[plugin]]` in the lock, the daemon-side tests (above), a feature page and
-this guide if it adds a manifest part, and a live check (switch it on in the
-isolated preview, watch a new session get exactly the advertised tools,
-switch it off, watch them go).
-`plugins::tests::every_manifest_parses_and_ids_are_unique` checks that every
-locked plugin ships and names its lock `repo` as its release source.
+this guide if it adds a manifest part, and a live check (install it in the
+isolated preview, switch it on, watch a new session get exactly the
+advertised tools, switch it off, watch them go).
+`plugins::tests::every_locked_release_is_what_the_lock_says` checks each
+locked release the script downloaded against the lock: both sha256s, the id,
+the version, the name, `[release] github` equal to the lock's `repo`, the
+gates, and that it says what it adds.
 
 **Third-party** plugins live in their own repository and install on a daemon's
 host:
@@ -401,19 +438,21 @@ host:
   `plugin.toml` (that version's manifest; its `version` must equal the tag),
   and `SHA256SUMS` in `sha256sum` format listing both.
 - The user installs it with `chimaera plugin add owner/repo [--version x]` on
-  the daemon's host (or `POST /api/v1/plugins/install {github, version?}`).
-  The daemon fetches `SHA256SUMS` and `plugin.toml`, checks the id, the tag's
-  version and the gates, streams `plugin.wasm` (16 MiB cap), verifies both
-  checksums, and only then makes it current under
-  `~/.chimaera/plugins/<id>/<version>/`. It then runs under the same host and
-  limits as a first-party plugin, off until switched on.
+  the daemon's host, **Install from a repository** in the Extensions tab, or
+  `POST /api/v1/plugins/install {github, version?}`. The daemon fetches
+  `SHA256SUMS` and `plugin.toml`, checks the id, the tag's version and the
+  gates, streams `plugin.wasm` (16 MiB cap), verifies both checksums, and
+  only then makes it current under `~/.chimaera/plugins/<id>/<version>/`,
+  with the release's `SHA256SUMS` beside the two files (the card's
+  `verified`). It then runs under the same host and limits as a first-party
+  plugin, off until switched on. It is never tagged `chimaera`.
 
 ## Versions and updates, from the author's side
 
 - **Bump `version` in `Cargo.toml` and `plugin.toml` together**, and tag
   that version; the first-party release workflow refuses a tag, crate and
-  manifest that disagree rather than injecting one, and chimaera's build
-  script refuses a release whose manifest isn't the lock's version.
+  manifest that disagree rather than injecting one, and chimaera refuses to
+  install a first-party release whose manifest isn't the lock's version.
 - **Tolerate old state.** Host state and the per-workspace switch follow the
   plugin id, not the version: a new version reads what an older one stored
   (Agent notes' read cursors are the example). A plugin that wants a clean
@@ -424,15 +463,15 @@ host:
   that stops passing is listed off with its reason ("needs a newer chimaera",
   "needs a newer plugin", "needs chimaera ≥ x"). Set `requires.chimaera` when
   the plugin needs a host import a later daemon added.
-- **Updates are never automatic.** The daemon checks each plugin's release
-  source (a plugin that ships with chimaera included, when its manifest names
-  `[release]`) once after boot and daily (and on **Check now**), reads only
-  the release's `plugin.toml`, and offers a version only when it is strictly
-  newer than the one that runs and passes the gates. Installing it is the
-  user's click (or `chimaera plugin update <id>`); for a plugin that only
-  shipped with chimaera, that writes its first installed copy, and Remove
-  goes back to the embedded one. The old version stays as `previous` for
-  **Use previous**; at most two versions stay on disk.
+- **Updates are never automatic.** The daemon checks the release source of
+  each installed plugin whose manifest names `[release]` once after boot and
+  daily (and on **Check now**), reads only the release's `plugin.toml`, and
+  offers a version only when it is strictly newer than the one that runs and
+  passes the gates. Installing it is the user's click (or
+  `chimaera plugin update <id>`). The old version stays as `previous` for
+  **Use previous**; at most two versions stay on disk. **Remove** deletes
+  every installed version; a first-party plugin is then listed as available
+  again.
 - **Changing the interface.** The WIT package version is the contract. Adding
   a host import is a minor bump (0.2 adds `exec` and `watch`); changing or
   removing an export is a new major with a new world, served beside the old

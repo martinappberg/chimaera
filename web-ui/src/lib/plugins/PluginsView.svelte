@@ -1,11 +1,12 @@
 <script lang="ts">
   /**
-   * The Plugins tab (design §6): one tab, three views — Installed (workbench
-   * plugins with their switch and "Adds / Needs" lines, then what each agent
-   * CLI reports), Skills (every skill each agent can use here), Browse
-   * (later — rendered disabled, honestly). Per workspace, naming the host,
-   * because installs are per host. Agent state always comes from the agents
-   * themselves (the daemon's probes), never re-derived here.
+   * The Extensions tab (design §6; the layout surface, wire and store keep
+   * the id "plugins"): three equal segments — Plugins (chimaera's own
+   * plugins with Install / the switch and plain sentences, then the agent
+   * plugins each CLI reports), Skills (every skill each agent can use here),
+   * Browse (later — rendered disabled, honestly). Per workspace, naming the
+   * host, because plugins are installed per host. Agent state always comes
+   * from the agents themselves (the daemon's probes), never re-derived here.
    */
   import Segmented from "../shared/Segmented.svelte";
   import { pageVisible } from "../shared/visibility";
@@ -38,7 +39,7 @@
 
   let { dash, wsId, wsRoot, paneId, ctrl, visible = true }: Props = $props();
 
-  let view = $state<"installed" | "skills" | "browse">("installed");
+  let view = $state<"plugins" | "skills" | "browse">("plugins");
 
   type Fetch<T> = { state: "idle" | "loading" | "ok" | "unavailable" | "error"; data: T | null; error: string | null };
   let agentPlugins = $state<Fetch<AgentPlugins>>({ state: "idle", data: null, error: null });
@@ -93,7 +94,7 @@
     if (key === lastShown) return;
     lastShown = key;
     refreshWorkspacePlugins();
-    if (view === "installed") void loadAgentPlugins();
+    if (view === "plugins") void loadAgentPlugins();
     if (view === "skills") void loadSkills();
   });
 
@@ -105,33 +106,42 @@
   <div class="inner">
     <header class="head">
       <div class="titles">
-        <h1>Plugins</h1>
+        <h1>Extensions</h1>
         <p class="sub">
           {#if view === "skills"}
             What each agent can do in this workspace — as the agents themselves report it.
           {:else}
-            Add-ons for this workspace. Each says what it adds; nothing is on until you turn it on.
+            Plugins add tools for your agents and views for you. Install one, then switch it on per workspace.
           {/if}
         </p>
       </div>
       <div class="tools">
-        <Segmented
-          label="Plugin views"
-          value={view}
-          options={[
-            { value: "installed", label: "Installed" },
-            { value: "skills", label: "Skills" },
-            { value: "browse", label: "Browse", disabled: true, hint: "later", title: "the agents' marketplaces — coming later" },
-          ]}
-          onChange={(v) => (view = v as typeof view)}
-        />
-        <span class="chip mono" title="installs are per host">on {host}</span>
+        <!-- Three equal segments: the wrapper sizes each to the widest. -->
+        <div class="segs">
+          <Segmented
+            label="Extensions sections"
+            value={view}
+            options={[
+              { value: "plugins", label: "Plugins" },
+              { value: "skills", label: "Skills" },
+              {
+                value: "browse",
+                label: "Browse",
+                disabled: true,
+                hint: "later",
+                title: "search plugins and skills from the marketplaces your agents already have",
+              },
+            ]}
+            onChange={(v) => (view = v as typeof view)}
+          />
+        </div>
+        <span class="chip mono" title="Plugins are installed per host">on {host}</span>
       </div>
     </header>
 
     {#if $pluginsAvailable === false}
-      <p class="empty">This daemon has no plugins yet — update chimaera to add workbench plugins here.</p>
-    {:else if view === "installed"}
+      <p class="empty">This daemon can't install plugins yet — update chimaera to add them here.</p>
+    {:else if view === "plugins"}
       <InstalledView
         {plugins}
         agentPlugins={agentPlugins.data}
@@ -203,6 +213,13 @@
     display: flex;
     align-items: center;
     gap: 14px;
+  }
+  /* Equal-width segments: a grid of 1fr columns sized to the widest
+     label (Segmented stays the shared flex recipe everywhere else). */
+  .segs :global(.seg) {
+    display: grid;
+    grid-auto-flow: column;
+    grid-auto-columns: 1fr;
   }
   .chip {
     font-size: 11.5px;

@@ -1,7 +1,7 @@
 <script lang="ts">
   /**
    * The on/off switch — lifted out of settings/SettingRow.svelte's boolean
-   * control so the Plugins cards and the settings form share ONE recipe
+   * control so the plugin cards and the settings form share ONE recipe
    * (accent wash + accent knob when on, muted knob on the row-hover ground
    * when off). A `role="switch"` button; the label is the caller's.
    */

@@ -43,6 +43,7 @@
   import FileIcon from "../shared/FileIcon.svelte";
   import FolderIcon from "../shared/FolderIcon.svelte";
   import { browserTitles, targetLabel } from "../browser/proxy";
+  import { EXTENSIONS_GLYPH, EXTENSIONS_STROKE } from "../plugins/glyph";
 
   interface Props {
     node: PaneNode;
@@ -372,7 +373,7 @@
     if (tab.surface === "dashboard") return "Dashboard";
     if (tab.surface === "timeline") return "Timeline";
     if (tab.surface === "knowledge") return "Knowledge";
-    if (tab.surface === "plugins") return "Plugins";
+    if (tab.surface === "plugins") return "Extensions";
     if (tab.surface === "finder") return basename(tab.path) || "Finder";
     if (tab.surface === "git") return "Source Control";
     if (tab.surface === "diff") return `${basename(tab.path)} (diff)`;
@@ -803,14 +804,14 @@
               />
             </svg>
           {:else if tab.surface === "plugins"}
-            <!-- A plug: opt-in add-ons. -->
+            <!-- Extensions: three cells and a plus (plugins/glyph.ts). -->
             <svg class="glyph" viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
-              <title>plugins</title>
+              <title>extensions</title>
               <path
-                d="M5.5 2v3M10.5 2v3M4 5h8v2.5a4 4 0 0 1-8 0zM8 11.5V14"
+                d={EXTENSIONS_GLYPH}
                 fill="none"
                 stroke="currentColor"
-                stroke-width="1.4"
+                stroke-width={EXTENSIONS_STROKE}
                 stroke-linecap="round"
                 stroke-linejoin="round"
               />

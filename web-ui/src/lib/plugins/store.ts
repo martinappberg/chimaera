@@ -9,8 +9,12 @@
  *   POST /workspaces/{id}/plugins/{pid}/setup    {agent} → a chat session with the setup prompt
  *   POST /workspaces/{id}/plugins/{pid}/trust-hooks {hooks:[{key,hash}]}
  *   POST /plugins/install {github, version?}      install a plugin from its GitHub release
+ *   POST /plugins/{pid}/install                    install a first-party plugin at the version chimaera pins
  *   POST /plugins/{pid}/update | rollback | check   update · Use previous · Check now
  *   DELETE /plugins/{pid}                          Remove (the installed copy, every version)
+ *
+ * The user-facing surface is called Extensions; the wire, the routes and this
+ * module keep the name "plugins".
  *
  * Only the active workspace's plugin status is held reactively (the rail's
  * knowledge row and the dashboard's attach line read it); agent-plugins and
@@ -19,7 +23,7 @@
  */
 import { derived, writable, type Readable } from "svelte/store";
 
-import { api, ApiError, health } from "../net/api";
+import { api, ApiError } from "../net/api";
 import { refreshKnowledge } from "../workspace/knowledge";
 
 export type AgentId = "claude" | "codex";
@@ -30,8 +34,9 @@ export interface PluginRequirement {
   marketplace: string;
 }
 
-/** Where the running copy of a plugin came from. */
-export type PluginSource = "embedded" | "installed";
+/** An installed copy on this host, or a first-party plugin chimaera pins
+ *  (its `plugins.lock` entry) with nothing installed yet. */
+export type PluginSource = "installed" | "available";
 
 /** A newer, compatible release a check found (the card's Update chip). */
 export interface PluginUpdate {
@@ -54,22 +59,37 @@ export interface WorkspacePlugin {
   on: boolean;
   detected: boolean;
   active: boolean;
+  /** Agent plugins it can't work without, per agent. */
   requires: PluginRequirement[];
-  /** The running copy's own version (`""` from daemons that predate it). */
+  /** Agent plugins that make it more useful for the agents that run them —
+   *  never needed for it to work. */
+  recommends: PluginRequirement[];
+  /** The installed copy's version; for an available entry, the version
+   *  chimaera pins (`""` from daemons that predate versions). */
   version: string;
-  /** The plugin API (WIT) version it targets. */
+  /** The plugin API (WIT) version it targets (`""` for an available entry). */
   api: string;
   source: PluginSource;
-  /** The installed copy's version directory, when there is an installed copy. */
+  /** A copy is installed on this host (only installed copies can be on). */
+  installed: boolean;
+  /** Listed in chimaera's `plugins.lock` and updating from the repository
+   *  it names there. */
+  first_party: boolean;
+  /** Its files match its release's SHA256SUMS (and, at the pinned version
+   *  of a first-party plugin, the checksums chimaera pins). */
+  verified: boolean;
+  /** The loaded copy's `plugin.wasm` sha256 (installed copies only). */
+  sha256_wasm: string | null;
+  /** The GitHub `owner/repo` it installs and updates from, when it names one. */
+  repo: string | null;
+  /** First-party only: the version chimaera pins in its `plugins.lock`. */
+  pinned_version: string | null;
+  /** A local install: the directory it was copied from. */
+  local_path: string | null;
+  /** The installed copy's version directory. */
   path: string | null;
-  /** Set when a copy ships with chimaera (the embedded one's version). */
-  embedded_version: string | null;
-  /** Set when there is an installed copy (its current version). */
-  installed_version: string | null;
   /** The installed copy's previous version (Use previous). */
   previous: string | null;
-  /** The installed copy is older than the one that ships with chimaera. */
-  stale: boolean;
   update: PluginUpdate | null;
   /** Why it can't run on this daemon, or isn't answering here. */
   fault: string | null;
@@ -82,7 +102,8 @@ export interface PluginChange {
   previous?: string | null;
   /** The checksums the daemon verified the download against. */
   sha256?: { "plugin.wasm"?: string; "plugin.toml"?: string };
-  /** The plugin's catalog entry now (null: removed, nothing ships under that id). */
+  /** The plugin's catalog entry now (after a Remove: the available entry
+   *  for a first-party id, else null — nothing is left under that id). */
   plugin?: unknown;
 }
 
@@ -161,9 +182,12 @@ export interface SkillsReport {
   errors: { agent: string; path?: string; message: string }[];
 }
 
+/** The message of a refusal that carried no `{error}` body. */
+const generic = (status: number): string => `request failed with status ${status}`;
+
 async function json<T>(res: Response): Promise<T> {
   if (!res.ok) {
-    let message = `request failed with status ${res.status}`;
+    let message = generic(res.status);
     try {
       const body = (await res.json()) as { error?: string };
       if (body.error) message = body.error;
@@ -185,10 +209,14 @@ function str(v: unknown): string | null {
   return typeof v === "string" && v !== "" ? v : null;
 }
 
+/** Defensive: an older daemon omits the newer fields (and says `"embedded"`
+ *  for what is now simply installed), and an available entry sends
+ *  `api: null`. */
 function normalizePlugin(raw: WorkspacePlugin): WorkspacePlugin {
   const adds = (raw.adds ?? {}) as Partial<WorkspacePlugin["adds"]>;
   const update = raw.update as Partial<PluginUpdate> | null | undefined;
   const provides = (raw.provides ?? {}) as Partial<WorkspacePlugin["provides"]>;
+  const source: PluginSource = raw.source === "available" ? "available" : "installed";
   return {
     ...raw,
     adds: { ui: arr<string>(adds.ui), agents: arr<string>(adds.agents) },
@@ -199,18 +227,23 @@ function normalizePlugin(raw: WorkspacePlugin): WorkspacePlugin {
     },
     detect: arr<string>(raw.detect),
     requires: arr<PluginRequirement>(raw.requires),
+    recommends: arr<PluginRequirement>(raw.recommends),
     on: raw.on === true,
     detected: raw.detected === true,
     active: raw.active === true,
     setup: raw.setup ?? null,
     version: typeof raw.version === "string" ? raw.version : "",
     api: typeof raw.api === "string" ? raw.api : "",
-    source: raw.source === "installed" ? "installed" : "embedded",
+    source,
+    installed: typeof raw.installed === "boolean" ? raw.installed : source !== "available",
+    first_party: raw.first_party === true,
+    verified: raw.verified === true,
+    sha256_wasm: str(raw.sha256_wasm),
+    repo: str(raw.repo),
+    pinned_version: str(raw.pinned_version),
+    local_path: str(raw.local_path),
     path: str(raw.path),
-    embedded_version: str(raw.embedded_version),
-    installed_version: str(raw.installed_version),
     previous: str(raw.previous),
-    stale: raw.stale === true,
     update:
       update && typeof update.version === "string"
         ? { version: update.version, url: str(update.url) ?? "", checked_ms: Number(update.checked_ms ?? 0) }
@@ -318,6 +351,19 @@ export async function trustHooks(
 
 const plugin = (pid: string): string => `/plugins/${encodeURIComponent(pid)}`;
 
+/** A route this daemon doesn't have — a bare 404 with no `{error}` body —
+ *  as opposed to a refusal the daemon explains ("unknown plugin"). */
+export function isMissingRoute(e: unknown): boolean {
+  return e instanceof ApiError && e.status === 404 && e.message === generic(404);
+}
+
+/** Install a first-party plugin at the version chimaera pins in its
+ *  `plugins.lock` (downloaded from its release, checked against both the
+ *  release's SHA256SUMS and the pinned checksums). */
+export async function installPinnedRelease(pid: string): Promise<PluginChange> {
+  return json(await api(`${plugin(pid)}/install`, { method: "POST" }));
+}
+
 /** Install a plugin from its GitHub release (`owner/repo`, the latest or `version`). */
 export async function installFromRelease(github: string, version?: string): Promise<PluginChange> {
   return json(
@@ -350,21 +396,6 @@ export async function checkWorkbenchPlugin(pid: string): Promise<{ id: string; u
 }
 
 // ---- reactive store (active workspace only) ---------------------------------
-
-const daemonVersionStore = writable<string | null>(null);
-/** The daemon's own version (`/health`): the "ships with chimaera <version>" chip. */
-export const daemonVersion: Readable<string | null> = daemonVersionStore;
-let versionAsked = false;
-
-async function ensureDaemonVersion(): Promise<void> {
-  if (versionAsked) return;
-  versionAsked = true;
-  try {
-    daemonVersionStore.set((await health()).version);
-  } catch {
-    versionAsked = false;
-  }
-}
 
 const pluginsStore = writable<WorkspacePlugins | null>(null);
 /** The active workspace's plugin status (`null` = not loaded / unavailable). */
@@ -400,7 +431,6 @@ export async function activatePluginsWorkspace(wsId: string | null): Promise<voi
 
 async function refresh(wsId: string): Promise<void> {
   const seq = ++refreshSeq;
-  void ensureDaemonVersion();
   try {
     const p = await fetchWorkspacePlugins(wsId);
     if (currentWs !== wsId || seq !== refreshSeq) return;
@@ -446,6 +476,18 @@ export async function changeWorkbenchPlugin(
 export async function installWorkbenchPlugin(github: string): Promise<PluginChange> {
   try {
     return await installFromRelease(github);
+  } finally {
+    if (currentWs !== null) await refresh(currentWs);
+    refreshKnowledge();
+  }
+}
+
+/** Install a first-party plugin at the version chimaera pins, then re-sync
+ *  like an install from a repository (a switch left on under that id comes
+ *  back active; Knowledge may gain a provider). */
+export async function installFirstPartyPlugin(pid: string): Promise<PluginChange> {
+  try {
+    return await installPinnedRelease(pid);
   } finally {
     if (currentWs !== null) await refresh(currentWs);
     refreshKnowledge();

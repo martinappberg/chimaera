@@ -77,7 +77,7 @@ export interface TimelineTab {
 export interface KnowledgeTab {
   surface: "knowledge";
 }
-/** Plugins (Installed · Skills · Browse) — a singleton view. */
+/** Extensions (Plugins · Skills · Browse) — a singleton view. */
 export interface PluginsTab {
   surface: "plugins";
 }

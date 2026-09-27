@@ -1,19 +1,28 @@
-//! Installed plugins: `<data dir>/plugins/<id>/<version>/{plugin.toml,plugin.wasm}`,
+//! Installed plugins: `<data dir>/plugins/<id>/<version>/{plugin.toml,plugin.wasm,SHA256SUMS}`,
 //! a `current` link naming the version that loads and a `previous` link
 //! naming the one Use previous goes back to. Written only by a visible
-//! install or update (the user's click, or `chimaera plugin add|update`),
-//! checksum-verified against the release's `SHA256SUMS`. Updating a plugin
-//! that only ships with chimaera writes its first installed copy, which then
-//! loads over the embedded one (the higher version wins). Design:
-//! docs/plugin-system-plan.md ("Versions and updates").
+//! install or update (the user's click, or `chimaera plugin add|update`).
+//! Design: docs/plugin-system-plan.md ("Versions and updates").
 //!
-//! - **Install and update are one path** (`install`): the release's
-//!   `SHA256SUMS` and `plugin.toml` come first (small, into memory), and the
-//!   manifest is checked (its id, the tag's version, the gates) before the
-//!   component is fetched; `plugin.wasm` streams to a temp dir under the
-//!   plugin's directory (`WASM_MAX`) and is verified; only then is the temp
-//!   dir renamed to `<version>/` and `current` swapped. Any failure leaves
-//!   the old version current and removes the temp dir.
+//! - **Three ways in, one layout.** A first-party plugin installs the
+//!   release the lock pins (`POST /plugins/{pid}/install`), fetched by
+//!   direct download and checked against the release's `SHA256SUMS` AND the
+//!   lock; any other plugin installs from its GitHub release (the latest, or
+//!   a tag) against its `SHA256SUMS`; a local build is copied from a
+//!   directory (`{path}`), checked against the `SHA256SUMS` there when it has
+//!   one, and marked with a `local-path` file. The release's `SHA256SUMS` is
+//!   kept beside the two files.
+//! - **Releases** (`install`): `SHA256SUMS` and `plugin.toml` come first
+//!   (small, into memory), and the manifest is checked (its id, the tag's
+//!   version, the gates) before the component is fetched; `plugin.wasm`
+//!   streams to a temp dir under the plugin's directory (`WASM_MAX`) and is
+//!   verified; only then is the temp dir renamed to `<version>/` and
+//!   `current` swapped. Any failure leaves the old version current and
+//!   removes the temp dir.
+//! - **Every read re-checks** (`load_version`, from the catalog's reload):
+//!   both files are hashed against the `SHA256SUMS` beside them — a match is
+//!   `verified`, none (a copy installed before it was kept, or a local build
+//!   without one) is not, a mismatch is a fault and the copy never loads.
 //! - **Links move atomically**: a symlink under a fresh name, then rename(2)
 //!   over the old one — `runtimes.rs`'s idiom for the managed agent CLIs.
 //!   An update never touches the version in use; the version it replaced
@@ -36,13 +45,21 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::releases::{self, Release};
-use super::{Manifest, Refusal, Source, Wasm};
+use super::{Locked, Manifest, Refusal, Wasm};
 use crate::AppState;
 
 /// A component's size cap, on download and on load.
 pub(crate) const WASM_MAX: u64 = 16 << 20;
 /// A manifest's size cap on load (downloads ride curl's 1 MiB fence).
 const TOML_MAX: u64 = 64 << 10;
+/// The kept `SHA256SUMS`: whatever the release published, which the
+/// download's own 1 MiB fence already bounded.
+const SUMS_MAX: u64 = 1 << 20;
+const SUMS: &str = "SHA256SUMS";
+/// A local install's marker: the directory it was copied from.
+const LOCAL_PATH: &str = "local-path";
+/// Why a copy whose files don't match its checksums never loads.
+pub(crate) const SUMS_MISMATCH: &str = "its files do not match its release's SHA256SUMS";
 /// A component download's wall clock: 16 MiB through a slow site proxy.
 const DOWNLOAD_SECS: u64 = 120;
 const CURRENT: &str = "current";
@@ -113,12 +130,13 @@ fn load_current(root: &Path, id: &str) -> Result<Option<InstalledCopy>, String> 
 }
 
 /// Read `<dir>/<version>/`: its manifest must be `id`'s at `version`, and
-/// its component within the cap (blocking).
+/// its component within the cap; then what the catalog knows about the
+/// bytes (`check_files`) and whether it was a local install (blocking).
 pub(crate) fn load_version(dir: &Path, id: &str, version: &str) -> Result<Manifest, String> {
     let vdir = dir.join(version);
-    let text = read_capped(&vdir.join("plugin.toml"), TOML_MAX)?;
-    let text = String::from_utf8(text).map_err(|_| "plugin.toml is not UTF-8".to_string())?;
-    let mut m = super::parse_manifest(&text)?;
+    let toml = read_capped(&vdir.join("plugin.toml"), TOML_MAX)?;
+    let text = std::str::from_utf8(&toml).map_err(|_| "plugin.toml is not UTF-8".to_string())?;
+    let mut m = super::parse_manifest(text)?;
     if m.id != id {
         return Err(format!("its plugin.toml is for {:?}", m.id));
     }
@@ -130,8 +148,53 @@ pub(crate) fn load_version(dir: &Path, id: &str, version: &str) -> Result<Manife
     }
     let wasm = read_capped(&vdir.join("plugin.wasm"), WASM_MAX)?;
     m.wasm = Wasm::new(Cow::Owned(wasm));
-    m.origin.source = Source::Installed;
+    let sums = read_optional(&vdir.join(SUMS), SUMS_MAX)?;
+    check_files(&mut m, &crate::fs::sha256_hex(&toml), sums.as_deref());
+    m.origin.local_path = read_optional(&vdir.join(LOCAL_PATH), 4 << 10)?
+        .map(|bytes| PathBuf::from(String::from_utf8_lossy(&bytes).trim()))
+        .filter(|p| p.is_absolute());
     Ok(m)
+}
+
+/// Decide `first_party`, `verified` and the checksum fault for a copy whose
+/// component `m.wasm` holds and whose `plugin.toml` hashes to `toml_sha256`,
+/// against the `SHA256SUMS` kept beside them (`None`: there is none).
+fn check_files(m: &mut Manifest, toml_sha256: &str, sums: Option<&[u8]>) {
+    let lock = super::lock_entry(&m.id);
+    let first_party = lock.is_some_and(|l| m.release.as_ref().is_some_and(|r| r.github == l.repo));
+    let mut verified = false;
+    if let Some(sums) = sums {
+        let sums = releases::parse_sums(&String::from_utf8_lossy(sums));
+        let listed = |name: &str| sums.get(name).map(String::as_str);
+        if listed("plugin.wasm") == Some(&*m.wasm.sha256)
+            && listed("plugin.toml") == Some(toml_sha256)
+        {
+            verified = true;
+        } else {
+            tracing::error!(plugin = %m.id, version = %m.version, "installed plugin refused: {SUMS_MISMATCH}");
+            m.origin.fault = Some(SUMS_MISMATCH.to_string());
+        }
+    }
+    // At the version the lock pins, a first-party copy is the pinned
+    // release only if it is byte for byte what the lock names (a local
+    // build of that version is not, and says so by not being verified).
+    if let (true, Some(l)) = (first_party, lock) {
+        if l.version == m.version
+            && (l.sha256_wasm != *m.wasm.sha256 || l.sha256_toml != toml_sha256)
+        {
+            verified = false;
+        }
+    }
+    m.origin.first_party = first_party;
+    m.origin.verified = verified;
+}
+
+/// `read_capped`, with a missing file as `None`.
+fn read_optional(path: &Path, cap: u64) -> Result<Option<Vec<u8>>, String> {
+    match std::fs::symlink_metadata(path) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        _ => read_capped(path, cap).map(Some),
+    }
 }
 
 /// A regular file's bytes, refused past `cap`.
@@ -312,17 +375,36 @@ struct Installed {
     toml_sha256: String,
 }
 
-/// Install `github`'s release (the latest, or `version`), or — with
-/// `update_of` — update that plugin to its latest release. One path: see
-/// the module header.
+/// Where a release install's files come from.
+enum Fetch<'a> {
+    /// `github`'s latest release, or the one tagged `v{version}`, as the
+    /// releases API describes it.
+    Release {
+        github: &'a str,
+        version: Option<&'a str>,
+    },
+    /// A first-party plugin's pinned release: direct downloads, and every
+    /// checksum compared with the lock's too.
+    Pinned(&'static Locked),
+}
+
+/// Install a release — `github`'s (the latest, or `version`), or a
+/// first-party plugin's pinned one — or, with `update_of`, update that
+/// plugin to its latest release. One path: see the module header.
 async fn install(
     state: &Arc<AppState>,
-    github: &str,
-    version: Option<&str>,
+    from: Fetch<'_>,
     update_of: Option<&Manifest>,
 ) -> Result<Installed, Refusal> {
     let _change = state.plugin_releases.changing.lock().await;
-    let release = releases::fetch_release(state, github, version).await?;
+    let (release, pin, source) = match from {
+        Fetch::Release { github, version } => (
+            releases::fetch_release(state, github, version).await?,
+            None,
+            github.to_string(),
+        ),
+        Fetch::Pinned(l) => (releases::pinned_release(state, l), Some(l), l.repo.clone()),
+    };
     if let Some(running) = update_of {
         if !releases::newer(&release.version, &running.version) {
             return Err(Refusal::conflict(format!(
@@ -331,8 +413,8 @@ async fn install(
             )));
         }
     }
-    let sums = releases::fetch_small(&release.sums_url, "SHA256SUMS").await?;
-    let sums = releases::parse_sums(&String::from_utf8_lossy(&sums));
+    let sums_file = releases::fetch_small(&release.sums_url, "SHA256SUMS").await?;
+    let sums = releases::parse_sums(&String::from_utf8_lossy(&sums_file));
     let (Some(want_wasm), Some(want_toml)) = (
         sums.get("plugin.wasm").cloned(),
         sums.get("plugin.toml").cloned(),
@@ -341,6 +423,22 @@ async fn install(
             "the release's SHA256SUMS does not list plugin.wasm and plugin.toml",
         ));
     };
+    if let Some(l) = pin {
+        // The release's own list must already be what the lock names:
+        // nothing is downloaded for a release chimaera doesn't pin.
+        for (file, want, pinned) in [
+            ("plugin.wasm", &want_wasm, &l.sha256_wasm),
+            ("plugin.toml", &want_toml, &l.sha256_toml),
+        ] {
+            if want != pinned {
+                return Err(Refusal::invalid(format!(
+                    "{} {}: the release's {file} does not match what chimaera pins \
+                     (plugins.lock: {pinned}, the release's SHA256SUMS: {want})",
+                    l.id, l.version
+                )));
+            }
+        }
+    }
     let toml = releases::fetch_small(&release.toml_url, "the release's plugin.toml").await?;
     let got_toml = crate::fs::sha256_hex(&toml);
     if got_toml != want_toml {
@@ -356,8 +454,22 @@ async fn install(
     if let Some(running) = update_of {
         if running.id != id {
             return Err(Refusal::invalid(format!(
-                "{github}'s release is the plugin {id:?}, not {:?}",
+                "{source}'s release is the plugin {id:?}, not {:?}",
                 running.id
+            )));
+        }
+    }
+    if let Some(l) = pin {
+        let names = m.release.as_ref().map(|r| r.github.as_str());
+        if id != l.id || names != Some(l.repo.as_str()) {
+            return Err(Refusal::invalid(format!(
+                "{} {}: its plugin.toml is {id:?} released from {}, not what chimaera pins \
+                 ({:?} from {})",
+                l.id,
+                l.version,
+                names.unwrap_or("nowhere"),
+                l.id,
+                l.repo
             )));
         }
     }
@@ -380,7 +492,7 @@ async fn install(
     let dir = state.plugin_catalog.root.join(&id);
     let staging = dir.clone();
     let tmp = blocking(move || stage(&staging)).await?;
-    let fetched = fetch_and_activate(&release, &dir, &tmp, &want_wasm, toml).await;
+    let fetched = fetch_and_activate(&release, &dir, &tmp, &want_wasm, toml, sums_file).await;
     if fetched.is_err() {
         let tmp = tmp.clone();
         let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(tmp)).await;
@@ -391,7 +503,8 @@ async fn install(
         plugin = %id,
         version = %release.version,
         replaced = ?replaced,
-        source = %github,
+        source = %source,
+        pinned = pin.is_some(),
         sha256 = %want_wasm,
         "plugin {}",
         if update_of.is_some() { "updated" } else { "installed" }
@@ -405,14 +518,15 @@ async fn install(
     })
 }
 
-/// The component into the temp dir, verified, then the whole version made
-/// current.
+/// The component into the temp dir, verified, the manifest and the
+/// release's `SHA256SUMS` beside it, then the whole version made current.
 async fn fetch_and_activate(
     release: &Release,
     dir: &Path,
     tmp: &Path,
     want_wasm: &str,
     toml: Vec<u8>,
+    sums: Vec<u8>,
 ) -> Result<Option<String>, Refusal> {
     let wasm = tmp.join("plugin.wasm");
     crate::agent_updates::curl_file(&release.wasm_url, &[], &wasm, WASM_MAX, DOWNLOAD_SECS)
@@ -433,54 +547,197 @@ async fn fetch_and_activate(
         }
         std::fs::write(tmp.join("plugin.toml"), &toml)
             .map_err(io("could not write plugin.toml"))?;
+        std::fs::write(tmp.join(SUMS), &sums).map_err(io("could not write SHA256SUMS"))?;
         activate(&dir, &tmp, &version)
     })
     .await
 }
 
+/// Install a local build: `plugin.toml`, `plugin.wasm` and, when there is
+/// one, `SHA256SUMS` copied from `src` (an absolute directory) into
+/// `<id>/<version>/`, with a `local-path` naming `src`. The same version
+/// installed again replaces the copy (the loop of developing a plugin); a
+/// `SHA256SUMS` there must match both files.
+async fn install_path(state: &Arc<AppState>, src: PathBuf) -> Result<Installed, Refusal> {
+    if !src.is_absolute() {
+        return Err(Refusal::bad_request(format!(
+            "{} is not an absolute path",
+            src.display()
+        )));
+    }
+    let _change = state.plugin_releases.changing.lock().await;
+    let root = state.plugin_catalog.root.clone();
+    let daemon = state.plugin_catalog.daemon_version();
+    let (done, from) = blocking(move || {
+        let src = src
+            .canonicalize()
+            .map_err(|e| Refusal::bad_request(format!("{}: {e}", src.display())))?;
+        if !src.is_dir() {
+            return Err(Refusal::bad_request(format!(
+                "{} is not a directory",
+                src.display()
+            )));
+        }
+        let invalid = |e: String| Refusal::invalid(format!("{}: {e}", src.display()));
+        let toml = read_capped(&src.join("plugin.toml"), TOML_MAX).map_err(invalid)?;
+        let wasm = read_capped(&src.join("plugin.wasm"), WASM_MAX).map_err(invalid)?;
+        let sums = read_optional(&src.join(SUMS), SUMS_MAX).map_err(invalid)?;
+        let text = std::str::from_utf8(&toml)
+            .map_err(|_| Refusal::invalid("its plugin.toml is not UTF-8"))?;
+        let m = super::parse_manifest(text).map_err(|e| Refusal::invalid(format!("its {e}")))?;
+        if let Some(why) = super::gate(&m, &daemon) {
+            return Err(Refusal::invalid(format!(
+                "{} {} can't be installed: {why}",
+                m.name, m.version
+            )));
+        }
+        let (wasm_sha256, toml_sha256) =
+            (crate::fs::sha256_hex(&wasm), crate::fs::sha256_hex(&toml));
+        if let Some(sums) = &sums {
+            let sums = releases::parse_sums(&String::from_utf8_lossy(sums));
+            for (file, got) in [("plugin.wasm", &wasm_sha256), ("plugin.toml", &toml_sha256)] {
+                match sums.get(file) {
+                    Some(want) if want == got => {}
+                    Some(want) => {
+                        return Err(Refusal::invalid(format!(
+                            "{file} does not match the SHA256SUMS beside it (expected {want}, got {got})"
+                        )))
+                    }
+                    None => {
+                        return Err(Refusal::invalid(format!(
+                            "the SHA256SUMS beside it does not list {file}"
+                        )))
+                    }
+                }
+            }
+        }
+        let dir = root.join(&m.id);
+        let tmp = stage(&dir)?;
+        let written = (|| {
+            std::fs::write(tmp.join("plugin.toml"), &toml)
+                .map_err(io("could not write plugin.toml"))?;
+            std::fs::write(tmp.join("plugin.wasm"), &wasm)
+                .map_err(io("could not write plugin.wasm"))?;
+            if let Some(sums) = &sums {
+                std::fs::write(tmp.join(SUMS), sums).map_err(io("could not write SHA256SUMS"))?;
+            }
+            std::fs::write(tmp.join(LOCAL_PATH), src.to_string_lossy().as_bytes())
+                .map_err(io("could not write local-path"))?;
+            activate(&dir, &tmp, &m.version)
+        })();
+        let replaced = match written {
+            Ok(replaced) => replaced,
+            Err(refusal) => {
+                let _ = std::fs::remove_dir_all(&tmp);
+                return Err(refusal);
+            }
+        };
+        let done = Installed {
+            id: m.id,
+            version: m.version,
+            replaced,
+            wasm_sha256,
+            toml_sha256,
+        };
+        Ok((done, src))
+    })
+    .await?;
+    after_change(state, &done.id).await;
+    tracing::info!(
+        plugin = %done.id,
+        version = %done.version,
+        replaced = ?done.replaced,
+        from = %from.display(),
+        sha256 = %done.wasm_sha256,
+        "plugin installed from a local directory"
+    );
+    Ok(done)
+}
+
 #[derive(Deserialize)]
 pub(crate) struct InstallBody {
     /// `owner/repo` (a `https://github.com/owner/repo` URL is read as one).
-    github: String,
+    #[serde(default)]
+    github: Option<String>,
     /// A release version; the latest when absent.
     #[serde(default)]
     version: Option<String>,
+    /// Instead of a release: an absolute directory holding a local build.
+    #[serde(default)]
+    path: Option<PathBuf>,
 }
 
-/// POST /plugins/install {github, version?} — install a plugin from its
-/// GitHub release (the user's click, or `chimaera plugin add`).
+/// POST /plugins/install {github, version?} | {path} — install a plugin
+/// from its GitHub release, or a local build from a directory (the user's
+/// click, or `chimaera plugin add`). A first-party plugin's repository
+/// installs the release the lock pins (unless another `version` is asked
+/// for).
 pub(crate) async fn install_route(
     State(state): State<Arc<AppState>>,
     Json(body): Json<InstallBody>,
 ) -> Response {
-    let github = body.github.trim();
-    let github = github
-        .strip_prefix("https://github.com/")
-        .unwrap_or(github)
-        .trim_end_matches('/');
-    let version = body
-        .version
-        .as_deref()
-        .map(|v| v.trim().trim_start_matches('v'));
-    installed_reply(&state, install(&state, github, version, None).await)
+    let result = match (body.github.as_deref(), body.path) {
+        (None, Some(path)) => install_path(&state, path).await,
+        (Some(github), None) => {
+            let github = github.trim();
+            let github = github
+                .strip_prefix("https://github.com/")
+                .unwrap_or(github)
+                .trim_end_matches('/');
+            let version = body
+                .version
+                .as_deref()
+                .map(|v| v.trim().trim_start_matches('v'));
+            let pinned = super::lock_entries()
+                .iter()
+                .find(|l| l.repo.eq_ignore_ascii_case(github))
+                .filter(|l| version.is_none_or(|v| v == l.version));
+            let from = match pinned {
+                Some(l) => Fetch::Pinned(l),
+                None => Fetch::Release { github, version },
+            };
+            install(&state, from, None).await
+        }
+        _ => Err(Refusal::bad_request(
+            "name a repository (github) or a local directory (path)",
+        )),
+    };
+    installed_reply(&state, result)
+}
+
+/// POST /plugins/{pid}/install — install a first-party plugin: the release
+/// `plugins/plugins.lock` pins for it, checked against that release's
+/// `SHA256SUMS` and the lock.
+pub(crate) async fn pinned_install_route(
+    State(state): State<Arc<AppState>>,
+    AxPath(pid): AxPath<String>,
+) -> Response {
+    let Some(l) = super::lock_entry(&pid) else {
+        return Refusal::not_found(format!(
+            "{pid:?} is not a plugin chimaera pins — install it from its repository"
+        ))
+        .into_response();
+    };
+    installed_reply(&state, install(&state, Fetch::Pinned(l), None).await)
 }
 
 /// POST /plugins/{pid}/update — install the plugin's latest release, when
-/// it is newer than what runs and this daemon can run it. For a plugin that
-/// only ships with chimaera, the release becomes its installed copy (the
-/// same install path), which the catalog then loads as the higher version;
-/// Remove goes back to the embedded one.
+/// it is newer than what runs and this daemon can run it.
 pub(crate) async fn update_route(
     State(state): State<Arc<AppState>>,
     AxPath(pid): AxPath<String>,
 ) -> Response {
     let Some(m) = super::manifest(&state, &pid) else {
-        return Refusal::not_found("unknown plugin").into_response();
+        return super::not_installed(&pid).into_response();
     };
     let Some(github) = m.origin.release.clone() else {
         return releases::no_source(&m).into_response();
     };
-    installed_reply(&state, install(&state, &github, None, Some(&m)).await)
+    let from = Fetch::Release {
+        github: &github,
+        version: None,
+    };
+    installed_reply(&state, install(&state, from, Some(&m)).await)
 }
 
 fn installed_reply(state: &AppState, result: Result<Installed, Refusal>) -> Response {
@@ -490,22 +747,10 @@ fn installed_reply(state: &AppState, result: Result<Installed, Refusal>) -> Resp
             "version": done.version,
             "previous": done.replaced,
             "sha256": {"plugin.wasm": done.wasm_sha256, "plugin.toml": done.toml_sha256},
-            "plugin": super::manifest(state, &done.id).map(|m| super::manifest_json(state, &m)),
+            "plugin": super::entry_json(state, &done.id),
         }))
         .into_response(),
         Err(refusal) => refusal.into_response(),
-    }
-}
-
-/// Nothing installed for `pid`: a plugin that only ships with chimaera, or
-/// none at all.
-fn not_installed(state: &AppState, pid: &str, doing: &str) -> Refusal {
-    match super::manifest(state, pid) {
-        Some(m) => Refusal::conflict(format!(
-            "{} ships with chimaera and has no installed copy to {doing}",
-            m.name
-        )),
-        None => Refusal::not_found("unknown plugin"),
     }
 }
 
@@ -521,7 +766,7 @@ pub(crate) async fn rollback_route(
             "id": pid,
             "version": version,
             "previous": previous,
-            "plugin": super::manifest(&state, &pid).map(|m| super::manifest_json(&state, &m)),
+            "plugin": super::entry_json(&state, &pid),
         }))
         .into_response(),
         Err(refusal) => refusal.into_response(),
@@ -531,7 +776,7 @@ pub(crate) async fn rollback_route(
 async fn rollback(state: &Arc<AppState>, pid: &str) -> Result<(String, String), Refusal> {
     let _change = state.plugin_releases.changing.lock().await;
     let Some(copy) = state.plugin_catalog.installed_copy(pid) else {
-        return Err(not_installed(state, pid, "roll back"));
+        return Err(super::not_installed(pid));
     };
     let Some(previous) = copy.previous.clone() else {
         return Err(Refusal::conflict(format!(
@@ -546,7 +791,7 @@ async fn rollback(state: &Arc<AppState>, pid: &str) -> Result<(String, String), 
     blocking(move || {
         let m = load_version(&dir, &id, &back_to)
             .map_err(|e| Refusal::invalid(format!("{id} {back_to} can't be loaded: {e}")))?;
-        if let Some(why) = super::gate(&m, &daemon) {
+        if let Some(why) = m.origin.fault.clone().or_else(|| super::gate(&m, &daemon)) {
             return Err(Refusal::invalid(format!(
                 "{} {back_to} can't run on this daemon: {why}",
                 m.name
@@ -563,8 +808,7 @@ async fn rollback(state: &Arc<AppState>, pid: &str) -> Result<(String, String), 
 }
 
 /// DELETE /plugins/{pid} — Remove: the installed copy's whole directory
-/// (every version). Refused for a plugin that only ships with chimaera; an
-/// embedded copy of the same id takes over.
+/// (every version). A first-party plugin is listed as available again.
 pub(crate) async fn remove_route(
     State(state): State<Arc<AppState>>,
     AxPath(pid): AxPath<String>,
@@ -573,7 +817,7 @@ pub(crate) async fn remove_route(
         Ok(()) => Json(json!({
             "id": pid,
             "removed": true,
-            "plugin": super::manifest(&state, &pid).map(|m| super::manifest_json(&state, &m)),
+            "plugin": super::entry_json(&state, &pid),
         }))
         .into_response(),
         Err(refusal) => refusal.into_response(),
@@ -601,7 +845,7 @@ async fn remove(state: &Arc<AppState>, pid: &str) -> Result<(), Refusal> {
     })
     .await?;
     if !removed {
-        return Err(not_installed(state, pid, "remove"));
+        return Err(super::not_installed(pid));
     }
     state.plugin_releases.forget(pid);
     after_change(state, pid).await;
@@ -666,8 +910,9 @@ mod tests {
         assert_eq!(c.manifest.version, "0.2.0");
         assert_eq!(c.previous.as_deref(), Some("0.1.0"));
         assert_eq!(c.dir, root.join("demo/0.2.0"));
-        assert_eq!(c.manifest.origin.source, Source::Installed);
         assert_eq!(&**c.manifest.wasm.bytes, b"\0asm");
+        assert!(!c.manifest.origin.verified, "no SHA256SUMS beside it");
+        assert_eq!(c.manifest.origin.fault, None);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -693,6 +938,88 @@ mod tests {
             .collect();
         assert!(left.is_empty(), "no staging left: {left:?}");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn sums(wasm: &[u8], toml: &str) -> String {
+        format!(
+            "{}  plugin.wasm\n{}  plugin.toml\n",
+            crate::fs::sha256_hex(wasm),
+            crate::fs::sha256_hex(toml.as_bytes())
+        )
+    }
+
+    #[test]
+    fn a_read_checks_the_files_against_the_sums_kept_beside_them() {
+        let root = dir("sums");
+        let load = |root: &Path| load_version(&root.join("demo"), "demo", "0.1.0").unwrap();
+        plant(&root, "demo", "0.1.0");
+        let v = root.join("demo/0.1.0");
+        let m = load(&root);
+        assert!(
+            !m.origin.verified && m.origin.fault.is_none(),
+            "none kept: unverified"
+        );
+        assert!(!m.origin.first_party, "not in the lock");
+
+        std::fs::write(v.join(SUMS), sums(b"\0asm", &manifest("demo", "0.1.0"))).unwrap();
+        let m = load(&root);
+        assert!(m.origin.verified, "{:?}", m.origin);
+        assert_eq!(m.origin.fault, None);
+        assert_eq!(m.origin.local_path, None);
+
+        // A byte changed after the install: listed with the fault.
+        std::fs::write(v.join("plugin.wasm"), b"\0asn").unwrap();
+        let m = load(&root);
+        assert!(!m.origin.verified);
+        assert_eq!(m.origin.fault.as_deref(), Some(SUMS_MISMATCH));
+        // A list that doesn't name both files is a mismatch too.
+        std::fs::write(v.join("plugin.wasm"), b"\0asm").unwrap();
+        std::fs::write(v.join(SUMS), "").unwrap();
+        assert_eq!(load(&root).origin.fault.as_deref(), Some(SUMS_MISMATCH));
+
+        std::fs::remove_file(v.join(SUMS)).unwrap();
+        std::fs::write(v.join(LOCAL_PATH), "/home/me/demo\n").unwrap();
+        assert_eq!(
+            load(&root).origin.local_path,
+            Some(PathBuf::from("/home/me/demo"))
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn first_party_is_the_lock_id_released_from_the_lock_repo() {
+        let l = crate::plugins::lock_entry("agent-notes").unwrap();
+        let text = |version: &str, github: &str| {
+            format!(
+                "id = \"agent-notes\"\nname = \"Agent notes\"\nversion = \"{version}\"\n\
+                 summary = \"x\"\napi = \"0.1\"\n[release]\ngithub = \"{github}\"\n"
+            )
+        };
+        let checked = |toml: &str, sums_of: Option<&str>| {
+            let mut m = crate::plugins::parse_manifest(toml).unwrap();
+            m.wasm = Wasm::new(Cow::Borrowed(b"\0asm"));
+            let kept = sums_of.map(|t| sums(b"\0asm", t));
+            check_files(
+                &mut m,
+                &crate::fs::sha256_hex(toml.as_bytes()),
+                kept.as_deref().map(str::as_bytes),
+            );
+            m.origin
+        };
+        // Released from the lock's repository, past the pin: first-party and
+        // verified by its own SHA256SUMS.
+        let newer = text("9.0.0", &l.repo);
+        let o = checked(&newer, Some(&newer));
+        assert!(o.first_party && o.verified, "{o:?}");
+        // The same id from another repository never is.
+        let other = text("9.0.0", "acme/agent-notes");
+        let o = checked(&other, Some(&other));
+        assert!(!o.first_party && o.verified, "{o:?}");
+        // At the pinned version, bytes that aren't the lock's are not the
+        // pinned release: unverified, no fault (a local build of it).
+        let pinned = text(&l.version, &l.repo);
+        let o = checked(&pinned, Some(&pinned));
+        assert!(o.first_party && !o.verified && o.fault.is_none(), "{o:?}");
     }
 
     #[test]

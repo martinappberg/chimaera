@@ -22,10 +22,12 @@
   }
 
   /** A workspace surface with no file or session to match on (Timeline,
-   *  Knowledge, Plugins): reachable from the palette by name. */
+   *  Knowledge, Extensions): reachable from the palette by name. */
   interface QuickOpenCommand {
     id: string;
     label: string;
+    /** Other names that find it too (Extensions: "plugins", "skills"). */
+    aliases?: string[];
     /** The quiet trailing hint ("what happened"). */
     hint?: string;
     run: () => void;
@@ -87,10 +89,13 @@
   );
 
   /** Commands match only a NON-empty query (they'd otherwise crowd the
-   *  file-first empty palette). Same fuzzy rule as sessions. */
-  const matchedCommands = $derived(
-    input.trim() === "" ? [] : commands.filter((c) => subseq(input.trim(), c.label)),
-  );
+   *  file-first empty palette). Same fuzzy rule as sessions, against the
+   *  label or any alias. */
+  const matchedCommands = $derived.by(() => {
+    const q = input.trim();
+    if (q === "") return [];
+    return commands.filter((c) => subseq(q, c.label) || (c.aliases ?? []).some((a) => subseq(q, a)));
+  });
 
   type Row =
     | { kind: "session"; session: Session }

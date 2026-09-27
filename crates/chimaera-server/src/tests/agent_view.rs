@@ -86,7 +86,9 @@ async fn worker_mcp_view_is_unchanged() {
         init["instructions"].as_str().unwrap(),
     );
 
-    // A plugin switched on WITHOUT its footprint present changes nothing.
+    // A plugin installed and switched on WITHOUT its footprint present
+    // changes nothing.
+    install_first_party(&state, "mycelium").await;
     lock(&state.workspaces)
         .set_plugin_on(&ws, "mycelium", true)
         .unwrap();

@@ -1,27 +1,34 @@
-# The first-party plugins this repository ships inside the chimaera binary.
-# Each lives in its own repository and publishes a release per version
-# (tag v<version>: plugin.wasm, plugin.toml, SHA256SUMS). For every
-# [[plugin]] here, scripts/build-plugins.sh downloads
-#   https://github.com/<repo>/releases/download/v<version>/{plugin.wasm,plugin.toml}
-# verifies both against the sha256s below (the release's SHA256SUMS), checks
-# that the manifest's version is this one, and lays them out in
-# plugins/dist/<id>/, which the daemon embeds: it ships exactly these bytes.
+# The first-party plugins: the curated list chimaera embeds (the daemon
+# carries no plugin bytes). Each lives in its own repository and publishes a
+# release per version (tag v<version>: plugin.wasm, plugin.toml, SHA256SUMS).
+# For every [[plugin]] here the Extensions tab lists the plugin (`name`,
+# `summary`) with an Install button, and Install (or
+# `chimaera plugin add <id>`) fetches
+#   https://github.com/<repo>/releases/download/v<version>/{SHA256SUMS,plugin.toml,plugin.wasm}
+# into ~/.chimaera/plugins/<id>/<version>/, refusing any file whose sha256
+# is not the one below (the release's SHA256SUMS) — so the card can say the
+# copy is exactly the release chimaera pins. scripts/build-plugins.sh
+# downloads the same releases into plugins/dist-test for the daemon's tests.
 #
 # A first-party bump is a reviewed change to this file: the new version and
-# the two sha256s from that release's SHA256SUMS, nothing else. To develop a
-# plugin against the daemon without a release, see plugins.local.toml in
-# plugins/AGENTS.md.
+# the two sha256s from that release's SHA256SUMS (and `name` / `summary`
+# when the plugin's own changed). To run a local build of a plugin against
+# the daemon: `chimaera plugin add --path <dir>` (see plugins/AGENTS.md).
 
 [[plugin]]
 id = "agent-notes"
-version = "0.1.0"
+name = "Agent notes"
+summary = "Agents leave short notes for each other and for the Mastermind."
+version = "0.1.1"
 repo = "martinappberg/chimaera-plugin-agent-notes"
 sha256_wasm = "fd75d0ef0ba2581c5c39f74a8ef6e5547c4f78ae4c0c85c804e554f8708cca1d"
-sha256_toml = "897b0cbbd29b4a7da6b06a2b82938b03b536ccc634408ede88e1d69c61665550"
+sha256_toml = "3c4923344225683f874c3411cf30df695ecb6a41878e278a73d0490b0570589d"
 
 [[plugin]]
 id = "mycelium"
-version = "0.1.0"
+name = "Mycelium"
+summary = "Project memory your agents record as they work — findings, decisions, learnings."
+version = "0.1.1"
 repo = "martinappberg/chimaera-plugin-mycelium"
-sha256_wasm = "307ee4fbef5420be811939d85dc38b887a72ce9dc3457c82387b4f185e2b3141"
-sha256_toml = "4d6cd532d87d3e4bc2c1b2d80130b19be8c7aea15b24654f5eaf5270984810d0"
+sha256_wasm = "9007d85a44c5178ca455550116e34ee0b42dd984a8367650af463b4c50703827"
+sha256_toml = "b6ef7b8113a9c7c8d103604032e1615d30d42163afc5fa12d785f7db8877e124"

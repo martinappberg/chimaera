@@ -1,74 +1,87 @@
 # Plugins, skills & agent notes
 
-One **Plugins** tab for two kinds of add-on, different in who runs them: **workbench plugins**
-run in Chimaera (each a WebAssembly component the daemon runs in a sandbox, opt-in per
-workspace, saying in words what it adds) and **agent plugins** run inside claude / codex (read
-from the agents themselves, installed only through their own plugin managers). Beside them: a
-**Skills** view of every skill each agent can use here, in-app **codex hook trust**, and
-**Agent notes** — agents talking, itself a workbench plugin. Design: the WASM host, versions and
-updates in [docs/plugin-system-plan.md](../plugin-system-plan.md); the seam, the tab and notes
-in [docs/timeline-knowledge-plugins-plan.md](../timeline-knowledge-plugins-plan.md) §6–§7.
-Writing a plugin: [docs/agent-guides/plugins.md](../agent-guides/plugins.md).
+One **Extensions** tab, in three segments — **Plugins** · **Skills** · **Browse** — for two kinds
+of add-on, different in who runs them: **workbench plugins** run in Chimaera (each a WebAssembly
+component the daemon runs in a sandbox, installed per host, opt-in per workspace, saying in words
+what it adds) and **agent plugins** run inside claude / codex (read from the agents themselves,
+installed only through their own plugin managers). Beside them: the **Skills** segment (every
+skill each agent can use here), in-app **codex hook trust**, and **Agent notes** — agents
+talking, itself a workbench plugin. **Browse** (searching the marketplaces the agents already
+have) renders disabled, "later". Design: the WASM host, versions and updates in
+[docs/plugin-system-plan.md](../plugin-system-plan.md); the seam, the tab and notes in
+[docs/timeline-knowledge-plugins-plan.md](../timeline-knowledge-plugins-plan.md) §6–§7. Writing a
+plugin: [docs/agent-guides/plugins.md](../agent-guides/plugins.md).
 
 **Where it lives (shared):** daemon `crates/chimaera-server/src/plugins/` — `mod.rs` (the
-manifest, the catalog and its gates, detect, the workspace routes), `runtime.rs` (the wasmtime
-host), `hostfns.rs` (every host function, bounded), `tools.rs` (plugin MCP tools through the
-runtime), `installed.rs` (the installed directory; install, update, rollback, remove),
-`releases.rs` (the release checker) — plus `agent_probe.rs` and `notes.rs`; the interface
-`crates/chimaera-plugin-api` (the WIT world and its Rust bindings,
+manifest, the embedded lock, the catalog and its gates, detect, the workspace routes),
+`runtime.rs` (the wasmtime host), `hostfns.rs` (every host function, bounded), `tools.rs` (plugin
+MCP tools through the runtime), `installed.rs` (the installed directory; install, update,
+rollback, remove), `releases.rs` (the release checker) — plus `agent_probe.rs` and `notes.rs`;
+the interface `crates/chimaera-plugin-api` (the WIT world and its Rust bindings,
 [map](../../crates/chimaera-plugin-api/AGENTS.md)); the first-party plugins in their own
-repositories, [chimaera-plugin-agent-notes](https://github.com/martinappberg/chimaera-plugin-agent-notes) and [chimaera-plugin-mycelium](https://github.com/martinappberg/chimaera-plugin-mycelium), whose releases `plugins/plugins.lock` pins and
-`scripts/build-plugins.sh` downloads, verifies and lays out in `plugins/dist`
-([map](../../plugins/AGENTS.md)); the CLI `crates/chimaera/src/plugin.rs`; UI `web-ui/src/lib/plugins/`
-([map](../../web-ui/src/lib/plugins/AGENTS.md)) — the `plugins` singleton tab (`{v:"plugins"}` in
-`web-ui/src/lib/layout/layout.ts`) and the attach sheet, hosted once in `web-ui/src/App.svelte`.
-Wire (all under `/api/v1`, bearer-authed): `GET /plugins` (the catalog) ·
-`GET /workspaces/{id}/plugins` (the same entries plus `on` / `detected` / `active` +
-requirements) · `PUT /workspaces/{id}/plugins/{pid} {on}` ·
-`POST /plugins/install {github, version?}` · `POST /plugins/{pid}/update` ·
-`POST /plugins/{pid}/rollback` · `POST /plugins/{pid}/check` · `DELETE /plugins/{pid}` ·
-`POST /workspaces/{id}/plugins/{pid}/install {agent}` · `POST …/{pid}/setup {agent}` ·
-`POST …/{pid}/trust-hooks {hooks:[{key,hash}]}` · `GET /workspaces/{id}/agent-plugins?refresh=` ·
-`GET /workspaces/{id}/skills?refresh=` · `POST /workspaces/{id}/timeline/{seq}/deliver`; plugin
-tools ride the per-session MCP endpoint ([linked-terminals.md](linked-terminals.md#the-mcp-server));
-a plugin's `emit` reaches `/ws/events` as a `{"type":"plugin","plugin":…,"workspace":…}` frame
-(no UI reads one yet).
+repositories, [chimaera-plugin-agent-notes](https://github.com/martinappberg/chimaera-plugin-agent-notes) and [chimaera-plugin-mycelium](https://github.com/martinappberg/chimaera-plugin-mycelium), whose releases
+`plugins/plugins.lock` pins — the lock is all the daemon carries of them
+([map](../../plugins/AGENTS.md)); the CLI `crates/chimaera/src/plugin.rs`; UI
+`web-ui/src/lib/plugins/` ([map](../../web-ui/src/lib/plugins/AGENTS.md)) — the `plugins`
+singleton tab (`{v:"plugins"}` in `web-ui/src/lib/layout/layout.ts`; the user sees
+**Extensions**, while ids, the wire, the store and the file names stay "plugins") and the attach
+sheet, hosted once in `web-ui/src/App.svelte`. Wire (all under `/api/v1`, bearer-authed):
+`GET /plugins` (the catalog) · `GET /workspaces/{id}/plugins` (the same entries plus `on` /
+`detected` / `active` + `requires` / `recommends`) · `PUT /workspaces/{id}/plugins/{pid} {on}` ·
+`POST /plugins/install {github, version?}` or `{path}` · `POST /plugins/{pid}/install` ·
+`POST /plugins/{pid}/update` · `POST /plugins/{pid}/rollback` · `POST /plugins/{pid}/check` ·
+`DELETE /plugins/{pid}` · `POST /workspaces/{id}/plugins/{pid}/install {agent}` ·
+`POST …/{pid}/setup {agent}` · `POST …/{pid}/trust-hooks {hooks:[{key,hash}]}` ·
+`GET /workspaces/{id}/agent-plugins?refresh=` · `GET /workspaces/{id}/skills?refresh=` ·
+`POST /workspaces/{id}/timeline/{seq}/deliver`; plugin tools ride the per-session MCP endpoint
+([linked-terminals.md](linked-terminals.md#the-mcp-server)); a plugin's `emit` reaches
+`/ws/events` as a `{"type":"plugin","plugin":…,"workspace":…}` frame (no UI reads one yet).
 
 ## Workbench plugins
 
 - **What & when.** Opt-in capabilities that change what the UI or the agents get, off by
-  default. Two ship, both WASM plugins that live in their own repositories and are embedded in
-  the binary at the release `plugins/plugins.lock` pins: **Mycelium** (fills Knowledge and
-  "Where things stand"; adds `knowledge_search` · `knowledge_get` for every agent here) and
-  **Agent notes** (below).
-- **How it's used.** Open Plugins from the rail's `plugins` row or quick-open ("Plugins").
-  **Installed** shows a card per plugin — name · its own version and where it came from
-  ([below](#versions-installs--updates)) · summary · a switch meaning *on in this workspace* · a
-  **Here** line · an **Adds** line ("Would add" while off) · a **Needs** line with per-agent
-  requirement chips (Install, "Review & trust →") — then what each agent CLI reports (below). A
-  host chip names the host, since installs are per host. Mycelium's **attach sheet** ("Use
-  mycelium for Knowledge", also reached from Knowledge's card, the dashboard's "Where things
-  stand", and the Mastermind panel's quiet line) runs three live-checked steps: 1 install for
-  your agents (a visible terminal running `<agent> plugin marketplace add
-  arjunrajlaboratory/mycelium`, then `claude plugin install mycelium@mycelium` or `codex plugin
-  add mycelium@mycelium`) · 2 trust codex's hooks (see below) · 3 set up this workspace (the
-  plugin's own prompt, "Set up Mycelium in this repository.", sent to a new chat session of the
-  agent the user picks — their click, their billing). Completing also switches the plugin on
-  here.
-- **Where it lives.** `plugins/mod.rs` (`Manifest`, `Catalog` / `resolve` / `gate`, `active`,
-  `spawn_allow`, `manifest_json`, `workspace_plugins`, `put_workspace_plugin`,
-  `install_requirement`, `setup_workspace`), `plugins/tools.rs` (`owner` / `offered` / `call`),
-  the switch on `Workspace.plugins_on` (`workspaces.rs`). UI `store.ts`, `PluginsView.svelte`,
-  `InstalledView.svelte`, `AttachSheet.svelte`. Tests:
+  default. Two are first-party, both WASM plugins in their own repositories at the releases
+  `plugins/plugins.lock` pins: **Mycelium** (fills Knowledge and "Where things stand"; adds
+  `knowledge_search` · `knowledge_get` for every agent here) and **Agent notes** (below). The
+  daemon carries neither: each is listed as *available* until the user installs it on this
+  host ([below](#versions-installs--updates)).
+- **How it's used.** Open Extensions from the rail's **Extensions** row or quick-open
+  ("Extensions"; "plugins" and "skills" find it too). The **Plugins** segment ("Plugins add
+  tools for your agents and views for you. Install one, then switch it on per workspace.")
+  shows a card per plugin — name · version · tags ([below](#versions-installs--updates)) ·
+  summary · a switch meaning *on in this workspace*, beside its state ("active here", "on ·
+  nothing detected yet", "off"; an available plugin shows **Install <version>** instead) ·
+  plain sentences: "For agents: …" and "For you: …" (what it adds, from its `[adds]`), the
+  detection sentence ("<path> found"; Mycelium's counts what it found), and its agent-side
+  plugins — "Requires the <agent> plugin <id>" for a `requires` block, "For <agent>: …" for a
+  `recommends` block (below), with Install and "Review & trust →" where they apply — then what
+  each agent CLI reports (below). A host chip names the host ("Plugins are installed per
+  host"). Mycelium's **attach sheet** ("Use mycelium for Knowledge", also reached from
+  Knowledge's card, the dashboard's "Where things stand", and the Mastermind panel's quiet
+  line) runs three live-checked steps: 1 install for your agents (a visible terminal running
+  `<agent> plugin marketplace add arjunrajlaboratory/mycelium`, then `claude plugin install
+  mycelium@mycelium` or `codex plugin add mycelium@mycelium`) · 2 trust codex's hooks (see
+  below) · 3 set up this workspace (the plugin's own prompt, "Set up Mycelium in this
+  repository.", sent to a new chat session of the agent the user picks — their click, their
+  billing). Completing also switches the plugin on here.
+- **Where it lives.** `plugins/mod.rs` (`Manifest`, the lock — `Locked` / `lock_entries` —,
+  `Catalog` / `resolve` / `gate`, `listing`, `active`, `spawn_allow`, `manifest_json` /
+  `available_json`, `workspace_plugins`, `put_workspace_plugin`, `install_requirement`,
+  `setup_workspace`), `plugins/tools.rs` (`owner` / `offered` / `call`), the switch on
+  `Workspace.plugins_on` (`workspaces.rs`). UI `store.ts`, `PluginsView.svelte`,
+  `InstalledView.svelte`, `requirementsModel.ts` (the requires / recommends sentences),
+  `AttachSheet.svelte`. Tests:
   `crates/chimaera-server/src/tests/plugins.rs`.
 - **Key behaviors.**
-  - **Active = switched on here AND the footprint is present AND the plugin passes its gates**
-    (`detect.any`, workspace-relative; no path component may be a symlink; empty = always
-    present, as for Agent notes). The switch persists in `workspaces.json` — durable or refused,
-    since a forgotten toggle would silently change what agents see — and flipping it drops the
-    plugin's instance there and clears a fault. Detection is a few `stat`s off the reactor,
-    cached 30 s per workspace, re-run on every switch and before any answer that decides what an
-    agent sees.
+  - **Active = installed AND switched on here AND the footprint is present AND the plugin
+    passes its gates** (`detect.any`, workspace-relative; no path component may be a symlink;
+    empty = always present, as for Agent notes). An available plugin is never active: switching
+    it on answers 409 "<name> isn't installed — install it first". The switch persists in
+    `workspaces.json` by plugin id — durable or refused, since a forgotten toggle would silently
+    change what agents see — so reinstalling a plugin that was on here makes it active again;
+    flipping it drops the plugin's instance there and clears a fault. Detection is a few
+    `stat`s off the reactor, cached 30 s per workspace, re-run on every switch and before any
+    answer that decides what an agent sees.
   - **Core never changes what agents see; a plugin changes it only where active.** With none
     active, MCP `tools/list`, the `initialize` instructions, generated claude settings and codex
     argv are byte-identical — pinned by `crates/chimaera-server/src/tests/agent_view.rs`. Where
@@ -88,12 +101,26 @@ a plugin's `emit` reaches `/ws/events` as a `{"type":"plugin","plugin":…,"work
     started before it has no chimaera server until respawned; switching off gates calls at
     once.
   - **A plugin is a manifest plus a sandboxed component.** The manifest (`plugin.toml`) is TOML
-    parsed `deny_unknown_fields`; a test fails a shipped one that doesn't say what it adds. The
-    behaviour is the plugin's `plugin.wasm`, never daemon code ([the host](#the-plugin-host)).
-    Built manifest points: `detect`, `requires.agent_plugins`, `requires.chimaera`,
-    `setup.prompt`, `provides.knowledge`, `provides.mcp_tools`, `provides.events`,
-    `[release] github`; `provides.views` parses and rides the wire but nothing renders it, and
-    `settings` / `commands` are specified in the plan only.
+    parsed `deny_unknown_fields`; a test fails a locked release that doesn't say what it adds.
+    The behaviour is the plugin's `plugin.wasm`, never daemon code
+    ([the host](#the-plugin-host)). Built manifest points: `detect`, `requires.agent_plugins`,
+    `recommends.agent_plugins`, `requires.chimaera`, `setup.prompt`, `provides.knowledge`,
+    `provides.mcp_tools`, `provides.events`, `[release] github`; `provides.views` parses and
+    rides the wire but nothing renders it, and `settings` / `commands` are specified in the plan
+    only.
+  - **Requires and recommends** name agent-side plugins in
+    the same shape, `[requires.agent_plugins.<agent>]` / `[recommends.agent_plugins.<agent>]`
+    `{id, marketplace}`, and both feed the agent-plugin install route, the attach sheet's
+    step 1 and codex hook trust. `requires` is a genuine hard requirement (no plugin has one
+    today): the card says "Requires the <agent> plugin <id>" with the install state and
+    Install, only for agents installed on this host, and "Requires claude or codex with plugin
+    <id>; neither is installed on this host" when none is. `recommends` helps the agents the
+    user runs but is never needed — mycelium's `mycelium@mycelium` is the example: the Knowledge
+    reader works with no agent plugin at all. The card says "For <agent>: mycelium ✓ 0.7.2"
+    once installed for that agent, or "For <agent>: install the <id> plugin so it can record
+    knowledge" (that clause only for a plugin that provides knowledge) with Install, and nothing
+    for an agent that isn't installed here. Both ride `GET /workspaces/{id}/plugins` as lists of
+    `{agent, id, marketplace}`.
   - **Agent-plugin installs are the agent's own CLI** in a visible `install <plugin> for
     <agent>` terminal (ids and marketplace sources charset-gated, never flag-shaped); 409 when
     the agent binary is missing; the probe cache is invalidated when that terminal ends. Setup
@@ -101,12 +128,13 @@ a plugin's `emit` reaches `/ws/events` as a `{"type":"plugin","plugin":…,"work
     Chimaera never installs or updates anything on its own.
   - **Status: partial.** Built and proven live on an isolated daemon (2026-09-26, a stand-in
     agent, nothing billed): the WASM host, both plugins as components, versions, installs,
-    updates, Use previous and Remove ([plan status](../plugin-system-plan.md#status-2026-09-26)).
-    Since then both plugins moved to their own repositories, pinned by `plugins/plugins.lock`.
-    Later: Browse renders disabled, "later"; the `switched-on` / `switched-off` events (declarable, never
-    delivered); the UI-facing `query` route (the export exists, no route calls it); the `exec`
-    and `watch` host imports (WIT 0.2), which the LaTeX and Typst plugins' `build` point waits
-    for ([plan](../latex-reports-plan.md#the-plugin-shape)).
+    updates, Use previous and Remove ([plan status](../plugin-system-plan.md#status-2026-09-27)).
+    Since then both plugins moved to their own repositories, and (2026-09-27) the daemon stopped
+    carrying plugin bytes: the lock is the curated list, and first-party plugins install from
+    their releases like any plugin. Later: Browse renders disabled, "later"; the `switched-on` /
+    `switched-off` events (declarable, never delivered); the UI-facing `query` route (the export
+    exists, no route calls it); the `exec` and `watch` host imports (WIT 0.2), which the LaTeX
+    and Typst plugins' `build` point waits for ([plan](../latex-reports-plan.md#the-plugin-shape)).
 
 ## The plugin host
 
@@ -114,17 +142,16 @@ a plugin's `emit` reaches `/ws/events` as a `{"type":"plugin","plugin":…,"work
   portable `plugin.wasm` (the same file on a Mac, an x86 login node or an ARM box) beside its
   `plugin.toml`, run by the daemon's host through the pinned WIT world `chimaera:plugin@0.1.0`.
   It exports `tools`, `instructions`, `call-tool`, `knowledge`, `query` and `on-event`, and
-  reaches nothing but the host's imports. First-party plugins are embedded from `plugins/dist`
-  (rust-embed, like `web-ui/dist`; a debug daemon reads the folder once, when its catalog loads,
-  so a rebuilt plugin needs a daemon restart), which the build lays out from the releases
-  `plugins/plugins.lock` pins; any plugin, a first-party one included, can also install under
-  `~/.chimaera/plugins/<id>/<version>/` ([below](#versions-installs--updates)).
+  reaches nothing but the host's imports. Every plugin, a first-party one included, runs from
+  an installed copy under `~/.chimaera/plugins/<id>/<version>/`
+  ([below](#versions-installs--updates)); the daemon binary carries no plugin bytes, so a daemon
+  with nothing installed has nothing to load.
 - **Where it lives.** `plugins/runtime.rs` (engine, instances, deadlines, faults; the entry
   points `offer` / `call_tool` / `knowledge` / `on_event`, `hook`, `session_ended`),
   `plugins/hostfns.rs` (the WIT `host` interface), `crates/chimaera-plugin-api/wit/chimaera.wit`
   (the world; the daemon's `bindgen!` reads the same file). Tests:
   `crates/chimaera-server/src/tests/plugin_host.rs`, against `plugins/test-fixture` (embedded
-  only by test builds, never shipped).
+  only by test builds, from `plugins/dist-test`, never shipped).
 - **Key behaviors** (every limit is the host's, so no plugin can forget one):
   - **One engine per process** (wasmtime, Cranelift, epoch interruption), built on first use: a
     daemon whose user never switches a plugin on never builds it. Each build compiles once, off
@@ -164,84 +191,155 @@ a plugin's `emit` reaches `/ws/events` as a `{"type":"plugin","plugin":…,"work
 
 ## Versions, installs & updates
 
-- **What & when.** Every plugin carries its own version and the WIT version it targets, and
-  the card says which version runs and where it came from. A plugin whose manifest names its
-  repository updates from it on its own cadence — one that ships with chimaera included — and an
-  installed copy also rolls back and is removed: always the user's click, always a
-  checksum-verified download.
-- **How it's used.** The card's first line: name · version · a source chip — "ships with
-  chimaera x.y.z" (embedded), "installed", or "installed · x ships with chimaera" when both
-  copies exist — a **stale** chip when an installed copy is older than the embedded one, and an
-  **Update to x.y.z** chip when a check found a newer release (on a plugin that ships with
-  chimaera too: updating it installs the release, and the chip then reads "installed · x ships
-  with chimaera"). An installed copy adds a line
-  with **Use previous (x)** · **Check now** · **Remove** (a dialog naming the versions it
-  deletes); each change reports one outcome line (an update shows the verified `plugin.wasm`
-  sha256). Under the cards, **Add a plugin from a repository** takes `owner/repo` (or its
-  `https://github.com/owner/repo` URL) and **Install** fetches its latest release, reporting the
-  plugin, its version and the verified `plugin.wasm` sha256 — or the daemon's refusal — in one
-  outcome line; like any plugin, it runs only where it is switched on. A plugin this daemon
+- **What & when.** The daemon ships no plugin bytes. It embeds `plugins/plugins.lock`, the
+  curated list of first-party plugins (per plugin: `id`, `name`, `summary`, the pinned
+  `version`, `repo` and that release's two sha256s), and every plugin — first-party or not — is
+  installed per host into `~/.chimaera/plugins`: a first-party one from its own repository at
+  the version the lock pins, a third-party one from its latest release (or a tag), a local build
+  from a directory. Each copy carries its own version and the WIT version it targets, and the
+  card says which version runs, whether it is Chimaera's and whether its bytes are the ones
+  released. An installed copy updates from its repository on its own cadence, goes back to its
+  previous version and is removed — always the user's click; a download is always
+  checksum-verified.
+- **How it's used.** The card's first line: name · version · tags — `chimaera` (first-party;
+  tooltip "Maintained with Chimaera and pinned in its plugins.lock"), `verified` (tooltip "This
+  copy matches its release's SHA256SUMS · plugin.wasm <sha256>") or `unverified · local` — and
+  an **Update to x.y.z** chip when a check found a newer release. A first-party plugin with nothing
+  installed shows **Install 0.1.0** (the pinned version) where the switch would be; its tooltip
+  says what happens: it downloads `plugin.wasm` and `plugin.toml` from
+  `github.com/<repo>/releases/v0.1.0` into `~/.chimaera/plugins` on this host, verifies both
+  checksums, runs sandboxed inside chimaera, and does nothing until switched on. Then the card's
+  sentences ("For agents: …" / "For you: …", the detection sentence, the requires / recommends
+  lines — [above](#workbench-plugins)). An installed copy adds the Installed line — "installed
+  0.1.1 · 0.1.0 available to go back to" — with **Use previous** · **Check now** · **Remove**
+  (a dialog naming the versions it deletes); each change reports one outcome line (an install
+  or update shows the verified `plugin.wasm` sha256). Under the cards, **Install from a
+  repository** takes `owner/repo` (or its `https://github.com/owner/repo` URL) and **Install**
+  fetches its latest release (a first-party plugin's repository: the pinned version), reporting
+  the plugin, its version and the verified `plugin.wasm` sha256 — or the daemon's refusal — in
+  one outcome line; like any plugin, it runs only where it is switched on. A plugin this daemon
   can't run shows why ("needs chimaera ≥ x (this is y)", "needs a newer chimaera: …", "needs a
-  newer plugin: …") and stays off. On the daemon's host: `chimaera plugin list` ·
-  `add <owner/repo> [--version x]` · `update <id>` · `remove <id>` — the same routes, printing
-  the versions and the checksums the daemon verified (the CLI alone installs a pinned
-  `--version`).
-- **Where it lives.** `plugins/mod.rs` (`resolve`, `gate`, `Catalog`, `manifest_json`),
-  `plugins/installed.rs` (`scan`, `install_route` / `update_route` / `rollback_route` /
-  `remove_route`), `plugins/releases.rs` (`check`, `check_all`, `check_route`; run from
-  `update.rs::run_checker`), `crates/chimaera/src/plugin.rs`; UI `InstalledView.svelte`,
-  `store.ts` (`changeWorkbenchPlugin`, `installWorkbenchPlugin`, `daemonVersion`). Wire: each
-  catalog entry gains `version`, `api`, `source` (`embedded` | `installed`), `stale`, and — only
-  when set — `path`, `embedded_version`, `installed_version`, `previous`, `update`
-  (`{version, url, checked_ms}`) and `fault`. Tests:
-  `crates/chimaera-server/src/tests/plugin_updates.rs`, against a fake releases server.
+  newer plugin: …", "its files do not match its release's SHA256SUMS") and stays off. On the
+  daemon's host: `chimaera plugin list` · `add <id>` · `add <owner/repo> [--version x]` ·
+  `add --path <dir>` · `update <id>` · `remove <id>` — the same routes, printing the versions
+  and the checksums the daemon verified ([cli.md](cli.md)).
+- **Where it lives.** `plugins/mod.rs` (the lock — `Locked`, `parse_lock`, `lock_entries` —,
+  `resolve`, `gate`, `Catalog`, `listing`, `manifest_json` / `available_json`),
+  `plugins/installed.rs` (`scan`, which reads each copy and checks its files; `install_route`
+  — a release or `{path}` —, `pinned_install_route`, `update_route`, `rollback_route`,
+  `remove_route`), `plugins/releases.rs` (`check`, `check_all`,
+  `check_route`; run from `update.rs::run_checker`), `crates/chimaera/src/plugin.rs`; UI
+  `InstalledView.svelte`, `store.ts`. Tests: `crates/chimaera-server/src/tests/plugin_updates.rs`,
+  against a fake releases server and the locked releases in `plugins/dist-test`. The wire — one
+  entry shape (`manifest_json`) on `GET /plugins`, `GET /workspaces/{id}/plugins` and in the
+  `plugin` field of every change answer:
+  - **An installed entry:** `id`, `name`, `summary`, `homepage`, `adds {ui, agents}`,
+    `provides {knowledge, mcp_tools, views}`, `setup`, `detect`, then `version` (the installed
+    copy's), `api` (the WIT version it targets, `"0.1"`), `source: "installed"`,
+    `installed: true`, `first_party`, `verified`, `sha256_wasm` (the loaded copy's
+    `plugin.wasm`), `path` (the version directory), and only when they hold something: `repo`
+    (the `owner/repo` it updates from, its `[release] github`), `pinned_version` (first-party
+    only: the lock's version), `local_path` (a local install's source directory), `previous`
+    (what Use previous goes back to), `update` (`{version, url, checked_ms}`, when a check found
+    a newer release) and `fault` (why it can't run: a gate, the `SHA256SUMS` mismatch, or the
+    runtime's fault in a workspace).
+  - **An available entry** (a lock id with nothing installed): `id`, `name`, `summary` from the
+    lock; `homepage: null`, `adds {ui: [], agents: []}`,
+    `provides {knowledge: null, mcp_tools: [], views: []}`, `setup: null`, `detect: []`;
+    `version` (the pinned one), `api: null`, `source: "available"`, `installed: false`,
+    `first_party: true`, `verified: false`, `repo` and `pinned_version` (the lock's).
+  - `GET /workspaces/{id}/plugins` adds per entry `on`, `detected`, `active` (all false for an
+    available entry), `requires` and `recommends` (lists of `{agent, id, marketplace}`).
+  - **Change answers:** install (all three kinds) and update →
+    `{id, version, previous, sha256: {"plugin.wasm", "plugin.toml"}, plugin}`; rollback →
+    `{id, version, previous, plugin}`; remove → `{id, removed: true, plugin}` (the available
+    entry for a lock id, else null); check → `{id, update, plugin}`. Refusals are `{error}` with
+    400 / 404 / 409 / 422 / 502.
 - **Key behaviors.**
-  - **Layout:** `~/.chimaera/plugins/<id>/<version>/{plugin.toml,plugin.wasm}` (the daemon's
-    data dir) behind `current` and `previous` links swapped atomically (a symlink under a fresh
-    name, renamed over the old). At most two versions stay on disk; **Use previous** swaps the
-    two links, so it is reversible; **Remove** deletes the id's directory (409 for a plugin that
-    only ships with chimaera; after an update installed over one, Remove goes back to it).
-  - **Precedence, never silent:** the same id embedded and installed → the higher version loads
-    and the card names both; equal → the embedded copy; an older installed copy is flagged
-    stale and the embedded one runs.
+  - **The catalog is the lock's entries plus the installed copies.** A lock entry with no copy
+    installed is listed `available`; everything else is an installed copy under
+    `<data dir>/plugins/<id>/<version>/`. Only an installed copy loads, can be switched on,
+    offers tools or is active. There is no embedded copy, so no precedence between two copies of
+    one id.
+  - **`first_party`** (the `chimaera` tag): the id is in the lock AND the installed copy's
+    `[release] github` is the lock's `repo` exactly. An updated first-party copy keeps it; a
+    third-party plugin never gets it, even one that reuses a first-party id from another
+    repository.
+  - **`verified`**, checked every time the catalog loads a copy (off the reactor): both files are
+    re-hashed against the `SHA256SUMS` kept beside them. A match → `verified`; no `SHA256SUMS`
+    (a local build without one, or a copy installed before chimaera kept the file) → unverified,
+    no error; a mismatch, or a `SHA256SUMS` that doesn't list both files → listed with the fault
+    "its files do not match its release's SHA256SUMS": it never loads, its switch refuses on,
+    and Use previous to that version is refused. A first-party copy at the lock's pinned version
+    is `verified` only when its bytes also equal the lock's two sha256s, so a local build at the
+    pinned version is unverified, without a fault.
+  - **Three install kinds:**
+    - **First-party** — `POST /plugins/{pid}/install` for a lock id, or
+      `POST /plugins/install {github}` naming the lock's repository (with no `version`, or the
+      pinned one): the lock's version, fetched from
+      `https://github.com/<repo>/releases/download/v<version>/{SHA256SUMS,plugin.toml,plugin.wasm}`
+      (direct download URLs, no API call). Both files must match the release's `SHA256SUMS` AND
+      the lock's sha256s (a mismatch with the lock is a 422, "… does not match what chimaera
+      pins"); the manifest's id must be the lock's, its version the pinned one and its
+      `[release] github` the lock's repo, and it must pass the gates. The copy is `verified` and
+      `first_party`. 409 when that version is already installed.
+    - **Third-party** — `POST /plugins/install {github, version?}`: the latest release, or the
+      tag `v<version>`, found through the GitHub releases API and verified against its
+      `SHA256SUMS`.
+    - **A local build** — `POST /plugins/install {path}` (an absolute directory) or
+      `chimaera plugin add --path <dir>`: copies `plugin.toml`, `plugin.wasm` and, when present,
+      `SHA256SUMS` (both files must then match it, else 422) into `<id>/<version>/` and records
+      the source directory in `local-path`. The manifest is parsed, validated and gated as
+      usual. Re-installing the same version from a path replaces it — the development loop:
+      rebuild, `chimaera plugin add --path <dir>`, and the next `tools/list` is the new build.
+      It is also how a host with no network installs. `verified` only with a matching
+      `SHA256SUMS` (and, at a first-party id's pinned version, the lock's sha256s too);
+      otherwise the card says `unverified · local`.
+  - **Layout:** `~/.chimaera/plugins/<id>/<version>/{plugin.toml,plugin.wasm,SHA256SUMS[,local-path]}`
+    (the daemon's data dir) behind `current` and `previous` links swapped atomically (a symlink
+    under a fresh name, renamed over the old). At most two versions stay on disk; **Use
+    previous** swaps the two links, so it is reversible; **Remove** deletes the id's directory,
+    and a first-party plugin then shows as available again.
   - **Gates before anything loads:** `api` must be a WIT version this host serves (`0.1`) and
     `requires.chimaera` must match this daemon (a dev build matches every requirement). A plugin
     failing one stays listed, off, with its reason; its switch refuses on (409), and a switch
     already on is kept for when the gate passes again.
-  - **Install and update are one path:** the release's `SHA256SUMS` and `plugin.toml` first;
-    the manifest's id, the tag's version and the gates checked; then `plugin.wasm` streamed to a
-    temp dir under a 16 MiB cap, verified, renamed into `<version>/`, links swapped. Any failure
-    leaves the old version current. One change at a time daemon-wide, an audit log line each;
-    after it the catalog reloads and the plugin's instances go, so a running session's next
-    `tools/list` carries the new version's tools.
-  - **What "ships with chimaera" is:** the plugins `plugins/plugins.lock` pins, one release of
-    each plugin's own repository (`id`, `version`, `repo` and the release's two sha256s). The
-    build downloads exactly those files, refuses any other bytes, and embeds them; a bump is a
-    reviewed change to the lock, shipped by the next chimaera release.
-  - **The checker never downloads.** For each plugin whose manifest names `[release] github` —
-    embedded ones included, since the first-party manifests name their own repositories — it
-    asks the GitHub releases API once after boot and then daily (riding
+  - **A release install and an update are one path:** the release's `SHA256SUMS` and
+    `plugin.toml` first; the manifest's id, the tag's version and the gates checked; then
+    `plugin.wasm` streamed to a temp dir under a 16 MiB cap, verified, renamed into
+    `<version>/` with the release's `SHA256SUMS` beside it, links swapped. Any failure leaves the
+    old version current. One change at a time daemon-wide, an audit log line each; after it the
+    catalog reloads and the plugin's instances go, so a running session's next `tools/list`
+    carries the new version's tools.
+  - **Update, rollback, check and remove need an installed copy:** on a plugin that isn't
+    installed they answer 409 "<name> isn't installed — install it first" (a lock id) or 404
+    "unknown plugin".
+  - **The checker never downloads.** For each installed plugin whose manifest names
+    `[release] github`, it asks the GitHub releases API once after boot and then daily (riding
     the daemon's own update loop, off with `update.autoCheck`; a dev build skips it unless
     `CHIMAERA_PLUGIN_RELEASES_API` is set) and on **Check now**, reads only the release's
     `plugin.toml`, and offers a version only when it is strictly newer than the one that runs
-    and passes the gates. Offers live in memory. **Update** of a plugin that only ships with
-    chimaera installs the release as its installed copy through the same path, and the
-    precedence rule then loads it; a later chimaera release still carries whatever the lock
-    pins then.
+    and passes the gates. Offers live in memory. **Update** installs it through the release path
+    (its `SHA256SUMS` kept). A first-party plugin updated past the pin stays `chimaera` and
+    `verified`; the card names the pin ("chimaera pins 0.1.0") only in a tooltip. What the lock
+    pins changes only with a chimaera release: a bump is a reviewed change to the lock.
+  - **Knobs** (tests and live proofs): `CHIMAERA_PLUGIN_RELEASES_API` replaces the GitHub API
+    base the checker and third-party installs ask; `CHIMAERA_PLUGIN_DOWNLOADS` replaces
+    `https://github.com` in the first-party download URLs.
   - A release is a tag `v<version>` with three assets: `plugin.wasm`, `plugin.toml` (that
     version's manifest) and `SHA256SUMS`. A plugin's state and its per-workspace switch follow
-    its id across versions.
+    its id across versions, and the switch survives a remove and a reinstall.
 
 ## Agent plugins & the Skills view
 
 - **What & when.** "What can my agents do here?" — answered by asking each agent CLI, never by
   re-deriving its discovery rules.
-- **How it's used.** Installed's agent section lists each CLI's plugins: claude from
+- **How it's used.** The Plugins segment's agent section lists each CLI's plugins: claude from
   `claude plugin list --json` (id, version, scope, enabled) plus `claude plugin details` totals
   (skills, hooks, always-on tokens — for the first 12); codex from a short-lived
   `codex app-server` (`skills/list`, `hooks/list` for the workspace cwd — no thread, no model
   call), a codex plugin being whatever `pluginId` codex attributes skills and hooks to. The
-  **Skills** view lists every skill once per name, grouped by origin — this project
+  **Skills** segment lists every skill once per name, grouped by origin — this project
   (`<root>/.claude/skills`; codex `repo` scope) · from plugins (enabled claude plugins'
   `skills/`; codex `pluginId`) · yours (`~/.claude/skills`; codex `user`) · built into the agent
   (claude's catalog from a *live* claude chat session's handshake in this workspace — present

@@ -429,9 +429,7 @@ async fn an_emitted_event_is_a_plugin_frame_for_the_ui() {
 }
 
 #[test]
-fn the_fixture_is_never_in_the_shipped_catalog() {
+fn the_fixture_is_never_a_first_party_plugin() {
     crate::plugins::test_catalog::fixture();
-    assert!(crate::plugins::production_catalog()
-        .iter()
-        .all(|m| m.id != "test-fixture"));
+    assert!(crate::plugins::lock_entry("test-fixture").is_none());
 }

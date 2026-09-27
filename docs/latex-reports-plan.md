@@ -98,8 +98,9 @@ words what it adds, with nothing changing for an agent where it is off (pinned b
 the `agent_view` fixtures). The [plugin system plan](plugin-system-plan.md)
 (maintainer decisions of 2026-09-26) makes a plugin a Rust crate compiled to one
 portable `plugin.wasm`, run by a small host in the daemon through a pinned WIT
-interface, with first-party plugins embedded in the binary and every host call
-bounded. LaTeX and Typst are the first new plugins on it, after Agent notes and
+interface, with first-party plugins installed from their own releases (pinned by
+`plugins/plugins.lock`) and every host call bounded. LaTeX and Typst are the first
+new plugins on it, after Agent notes and
 Mycelium prove the model. The authoring guide's earlier sketch put LaTeX on
 `commands` and `settings`, where a build is a visible terminal session; this plan
 replaces that: compile-on-save cannot be a terminal per save (a new rail entry every
@@ -200,7 +201,7 @@ Nothing silently, and by default nothing at all:
 
 | Where | What | How |
 |---|---|---|
-| Chimaera | nothing to fetch: the host, `exec`, the build runner and the document view ship in the daemon; the LaTeX logic ships as the plugin's `plugin.wasm`, embedded in the binary for first-party plugins | versions with the daemon; a plugin's own version on its card |
+| Chimaera | the host, `exec`, the build runner and the document view ship in the daemon; the LaTeX logic is the plugin's `plugin.wasm`, installed on the user's click from its own release (a first-party plugin at the version `plugins/plugins.lock` pins) | the host versions with the daemon; a plugin's own version on its card |
 | the host toolchain | nothing by default; whatever the prelude provides (`module load texlive`, a `typst` in `~/.local/bin`) | detection through the prelude (section 1) |
 | managed tools (Phase F) | `typst`, `tectonic`, later `pandoc`: official release artifacts, checksums where the release publishes them, a visible shell session, never sudo, under `~/.chimaera/tools/<tool>/<version>/` | the `runtimes.rs` pattern; **Install** on the empty PDF state |
 | the agents | nothing required: the MCP tool and guide reach every agent without an install. Optional: a `report-writing` skill pack (the guide's conventions as an Agent Skill, for agents that run outside Chimaera) as a claude and codex plugin, installed through the agents' own plugin managers in a visible terminal | a new `recommends.agent_plugins` block, the shape of `requires`, shown as optional on the card, so the plugin works with zero installs |
@@ -874,7 +875,7 @@ plain wall-clock limit where it does not.
 
 | File | What |
 |---|---|
-| `plugins/latex/`, `plugins/typst/` | the two plugin crates (Rust, built to WASM by `scripts/build-plugins.sh`), each with its `plugin.toml`, embedded from `plugins/dist`; the markdown-to-PDF (Phase E) and Word (Phase G) plugins later |
+| `plugins/latex/`, `plugins/typst/` | the two plugin crates (Rust, built to WASM), each with its `plugin.toml`; first-party plugins install from their own releases, pinned by `plugins/plugins.lock`, and a build in development installs with `chimaera plugin add --path`; the markdown-to-PDF (Phase E) and Word (Phase G) plugins later |
 | `plugins/mod.rs` | the `[build]` section of `Manifest` (`deny_unknown_fields`), the `recommends` block, the lookups the build module and the UI use |
 | `plugins/tools.rs` | nothing new: `compile_document` and the guide paragraph are the plugins' own `tools` and `instructions` exports, served through this generic seam where a build plugin is active |
 | `build/mod.rs` | routes, the events frame, the module's map line in the server `AGENTS.md` |
@@ -915,7 +916,7 @@ New routes, all bearer-authed and additive:
 ### Phase A: the compile service and agents (daemon only)
 
 The `build` contribution point in `plugins/mod.rs` and the latex and typst manifests
-(their cards render on the Plugins tab through the generic card, with the Adds
+(their cards render on the Extensions tab through the generic card, with the Adds
 lines), engine detection through the prelude, the job runner with every limit, build
 folders, main-file detection (magic comment, `\documentclass`, picker route), both
 parsers with the fixture corpus, the routes and events frame, and, where a plugin is
@@ -1043,12 +1044,15 @@ Decided in the [plugin system plan](plugin-system-plan.md#packaging-and-third-pa
 a plugin is a Rust crate in its own repository, built to one portable
 `plugin.wasm` beside its `plugin.toml`, with its agent-side pieces (skills, hooks)
 in the same repository's `.claude-plugin/` and `.codex-plugin/` so they install
-through the agents' own plugin managers. First-party plugins are embedded in the
-daemon; third-party plugins install into `~/.chimaera/plugins/` through the same
-host and limits. What that means here: the LaTeX and Typst crates start under
-`plugins/` in this repository (embedded, off by default) and move to their own
-repositories when they have a life outside it, a file copy plus a pinned release
-artifact in the build script. Still no code in the daemon or the UI that is not the
+through the agents' own plugin managers. First-party plugins install from their
+own releases at the versions `plugins/plugins.lock` pins, and third-party plugins
+from theirs, into `~/.chimaera/plugins/` through the same host and limits. What
+that means here: the LaTeX and Typst plugins are their own repositories from the
+start (`chimaera-plugin-latex`, `chimaera-plugin-typst`), released like the two
+that exist, listed in `plugins/plugins.lock` so the Extensions tab offers them, and
+installed on a host only when the user asks; while one is being written it runs
+from a local build (`chimaera plugin add --path`). Nothing LaTeX-shaped lives in
+this repository. Still no code in the daemon or the UI that is not the
 host's own: a plugin cannot open a file, run a process or reach the network except
 through host calls the host bounds, and the sandbox, not a manifest review, is what
 makes a third-party plugin safe to switch on.
@@ -1143,9 +1147,10 @@ makes a third-party plugin safe to switch on.
   `:794`). The UI renders any manifest generically
   (`web-ui/src/lib/plugins/InstalledView.svelte`). (That was the tree at
   `6ae68b9`. Since then the plugin system has replaced `MANIFESTS` and the
-  named built-ins with WASM components embedded from `plugins/dist` or
-  installed, and `plugins/tools.rs` is generic:
-  [plugin-system-plan.md](plugin-system-plan.md#status-2026-09-26).)
+  named built-ins with WASM components installed under `~/.chimaera/plugins`
+  (first-party ones from the releases `plugins/plugins.lock` pins), and
+  `plugins/tools.rs` is generic:
+  [plugin-system-plan.md](plugin-system-plan.md#status-2026-09-27).)
 - **Quick-open index.** `quickopen.rs` keeps a bounded, cached file index per
   workspace, served stale and refreshed behind, with `workspace_index_if_free` for
   callers that must never start a walk.

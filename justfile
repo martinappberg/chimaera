@@ -6,9 +6,9 @@ default: check
 ui:
     cd web-ui && npm install && npm run build
 
-# Lay out the first-party plugins (the releases plugins/plugins.lock pins) in
-# plugins/dist and build the test fixture into plugins/dist-test — required
-# before any build of chimaera-server
+# Lay out what the daemon's tests install and embed in plugins/dist-test: the
+# test fixture, and the releases plugins/plugins.lock pins (downloaded once,
+# verified against the lock). Tests only: the daemon itself carries no plugins.
 plugins:
     bash scripts/build-plugins.sh
 
@@ -32,7 +32,7 @@ chat-smoke:
     cargo test -p chimaera-agent --test live -- --ignored --test-threads=1 --nocapture
 
 # Run the daemon locally (foreground)
-serve: ui plugins
+serve: ui
     cargo run -p chimaera -- serve
 
 # Vite dev server with proxy to a running daemon
