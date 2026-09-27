@@ -43,8 +43,9 @@ selection references (see [terminals.md](terminals.md)).
   bare `@path` would not read whole — whitespace, or an ending its word boundary cuts (`notes(1)`,
   a non-ASCII last letter) — is mentioned in claude's quoted form, `@"raw data/"` (what claude's
   own completion writes for a spaced path); every agent mention the app composes (drops, uploads,
-  selection references, paste provenance) goes through one writer, `reference.ts` `agentMention`.
-  Shells get such a path single-quoted. Relativity is
+  selection references, paste provenance, the composer's `@` picks) goes through one writer,
+  `reference.ts` `agentMention`, and the chat's link parser reads the quoted form back as one link
+  (`extractFileRefs`). Shells get such a path single-quoted. Relativity is
   per-target: workspace-relative for agents, live-cwd-relative for shells, absolute fallback
   outside either root — identical to file references. Each dir drag mints a fresh Finder id, so
   dropping the same folder onto a zone twice opens two Finder tabs (files dedupe by path); a

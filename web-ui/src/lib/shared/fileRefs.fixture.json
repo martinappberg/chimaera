@@ -2,7 +2,7 @@
   "about": [
     "File references as Claude, Codex and Gemini write them (chat prose, TUI tool lines, diffs, compiler and grep output), with what `shared/fileRef.ts` must make of each. `fileRef.test.ts` runs every case; the daemon's resolver tests may read the same file.",
     "refs — one reference: `input` is a token (or, with `delimited: true`, a whole markdown link target or code span, where spaces belong to the path). `expect` is the parse — path plus 1-based line/col/endLine when present — or null when the input is not a path candidate. `bare: true` parses the way the terminal's hover does (single-segment names admitted).",
-    "text — a run of prose or a terminal line: `expect` lists every reference found, in order, as `text` (the exact span a link underlines) plus the parse.",
+    "text — a run of prose or a terminal line: `expect` lists every reference found, in order, as `text` (the exact span a link underlines) plus the parse. Claude's quoted mention (`@\"raw data/x.tsv\"`, what its completion writes for a spaced path) is one reference: the quotes delimit the path, read verbatim up to a `#` anchor.",
     "The client only proposes candidates: `and/or` or `a/src/x.rs` are candidates because only the daemon knows whether they exist (it strips a diff prefix when the path misses, and suffix-matches an abbreviated tail).",
     "`at` is a locator fragment's spot (`shared/locator.ts`): PDF page, image or page region, media time, a CSV/TSV block (RFC 7111 rows: the header line is row 1), a spreadsheet sheet and A1 range, a notebook cell, a slide. Style `chimaera` is what the workbench itself types when the user points at part of a file."
   ],
@@ -327,6 +327,12 @@
       "input": "my notes/plan draft.md",
       "delimited": true,
       "expect": { "path": "my notes/plan draft.md" }
+    },
+    {
+      "style": "claude",
+      "input": "reports/draft - final.docx",
+      "delimited": true,
+      "expect": { "path": "reports/draft - final.docx" }
     },
     {
       "style": "claude",
@@ -665,6 +671,61 @@
         { "text": "docs/plan.md", "path": "docs/plan.md" },
         { "text": "@src/old.ts", "path": "src/old.ts" },
         { "text": "src/new.ts", "path": "src/new.ts" }
+      ]
+    },
+    {
+      "style": "claude",
+      "input": "Please look at @\"raw data/qc report.tsv\" and summarize it.",
+      "expect": [
+        {
+          "text": "@\"raw data/qc report.tsv\"",
+          "path": "raw data/qc report.tsv"
+        }
+      ]
+    },
+    {
+      "style": "claude",
+      "input": "@\"/Users/Jo Smith/.chimaera/uploads/s-1/Screenshot-2026-09-26-at-12.30.png\" what's wrong here?",
+      "expect": [
+        {
+          "text": "@\"/Users/Jo Smith/.chimaera/uploads/s-1/Screenshot-2026-09-26-at-12.30.png\"",
+          "path": "/Users/Jo Smith/.chimaera/uploads/s-1/Screenshot-2026-09-26-at-12.30.png"
+        }
+      ]
+    },
+    {
+      "style": "claude",
+      "input": "Summarize everything in @\"raw data/\" first.",
+      "expect": [{ "text": "@\"raw data/\"", "path": "raw data/" }]
+    },
+    {
+      "style": "claude",
+      "input": "Why does @\"raw data/qc report.tsv#L3-L9\" have NaNs?",
+      "expect": [
+        {
+          "text": "@\"raw data/qc report.tsv#L3-L9\"",
+          "path": "raw data/qc report.tsv",
+          "line": 3,
+          "endLine": 9
+        }
+      ]
+    },
+    {
+      "style": "claude",
+      "input": "Compare @\"open questions.md\" with @notes/todo.md.",
+      "expect": [
+        { "text": "@\"open questions.md\"", "path": "open questions.md" },
+        { "text": "@notes/todo.md", "path": "notes/todo.md" }
+      ]
+    },
+    {
+      "style": "claude",
+      "input": "この表を見て？@\"raw data/qc report.tsv\"",
+      "expect": [
+        {
+          "text": "@\"raw data/qc report.tsv\"",
+          "path": "raw data/qc report.tsv"
+        }
       ]
     },
     {

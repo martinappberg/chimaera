@@ -62,6 +62,10 @@ describe("the mention an upload types", () => {
     const typed = composeAgentPathReference(path);
     expect(typed).toBe(`@"${path}" `);
     expect(claudeMentions(typed)).toEqual([path]);
+
+    const refs = extractFileRefs(typed);
+    expect(refs.map((f) => f.ref.path)).toEqual([path]);
+    expect(typed.slice(refs[0].start, refs[0].end)).toBe(`@"${path}"`);
   });
 
   it("a name ending in a non-ASCII character quotes (claude's \\b would cut it)", () => {
@@ -70,18 +74,26 @@ describe("the mention an upload types", () => {
     const typed = composeAgentPathReference(path);
     expect(typed).toBe(`@"${path}" `);
     expect(claudeMentions(typed)).toEqual([path]);
+    expect(extractFileRefs(typed).map((f) => f.ref.path)).toEqual([path]);
   });
 
   it("a spaced selection reference and provenance keep their lines inside the quotes", () => {
     const sel = { kind: "file" as const, path: "/w/raw data/qc.tsv", startLine: 3, endLine: 9, text: "x" };
-    expect(claudeMentions(composeSelectionReference("raw data/qc.tsv", sel, "terminal"))).toEqual(["raw data/qc.tsv"]);
-    expect(claudeMentions(`pasted${composeProvenanceSuffix(sel, "raw data/qc.tsv", null)}`)).toEqual([
-      "raw data/qc.tsv",
-    ]);
+    const selection = composeSelectionReference("raw data/qc.tsv", sel, "terminal");
+    const provenance = `pasted${composeProvenanceSuffix(sel, "raw data/qc.tsv", null)}`;
+    expect(claudeMentions(selection)).toEqual(["raw data/qc.tsv"]);
+    expect(claudeMentions(provenance)).toEqual(["raw data/qc.tsv"]);
+    for (const typed of [selection, provenance]) {
+      expect(extractFileRefs(typed).map((f) => ({ path: f.ref.path, line: f.ref.line, endLine: f.ref.endLine }))).toEqual([
+        { path: "raw data/qc.tsv", line: 3, endLine: 9 },
+      ]);
+    }
   });
 
   it("a folder mention quotes with its trailing slash inside", () => {
-    expect(composeAgentPathReference("raw data/")).toBe('@"raw data/" ');
-    expect(claudeMentions(composeAgentPathReference("raw data/"))).toEqual(["raw data/"]);
+    const typed = composeAgentPathReference("raw data/");
+    expect(typed).toBe('@"raw data/" ');
+    expect(claudeMentions(typed)).toEqual(["raw data/"]);
+    expect(extractFileRefs(typed).map((f) => f.ref.path)).toEqual(["raw data/"]);
   });
 });

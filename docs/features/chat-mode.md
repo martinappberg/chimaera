@@ -195,7 +195,8 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   paths inside a command like `cat results/x.csv`), in a markdown link target
   (`[x](src/a.rs#L10)`, `%20` escapes), or in your own message becomes a link once the daemon
   confirms it. The parser is the terminal's (`shared/fileRef.ts`: `:12`, `:12:3`, `#L12-L20`,
-  `@mentions`, `a/`/`b/` diff sides, `…/` tails, `file://`, wrappers and punctuation, Unicode), and
+  `@mentions` and claude's quoted `@"raw data/qc report.tsv"` — one link, spaces and all —
+  `a/`/`b/` diff sides, `…/` tails, `file://`, wrappers and punctuation, Unicode), and
   the candidates resolve against the session's live cwd, its spawn cwd and the workspace root,
   then the workspace index (unique basename or path suffix). Click opens the file at the line, or
   at a locator's spot (`paper.pdf#page=3&xywh=…`, `de.tsv#row=5-9`, `demo.mp4#t=30`);
