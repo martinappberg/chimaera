@@ -1,11 +1,15 @@
-//! Plugin releases: where a newer version of an installed plugin comes from,
-//! and whether one exists. Design: docs/plugin-system-plan.md ("Versions and
+//! Plugin releases: where a newer version of a plugin comes from, and
+//! whether one exists. Design: docs/plugin-system-plan.md ("Versions and
 //! updates").
 //!
-//! An installed plugin's manifest may name `[release] github = "owner/repo"`:
-//! the GitHub releases API, tags `v<version>`, assets `plugin.wasm`,
-//! `plugin.toml` and `SHA256SUMS`. The checker asks each such source for its
-//! latest release, reads that release's `plugin.toml` (small) and offers the
+//! A plugin's manifest may name `[release] github = "owner/repo"`: the
+//! GitHub releases API, tags `v<version>`, assets `plugin.wasm`,
+//! `plugin.toml` and `SHA256SUMS`. Embedded plugins included: each
+//! first-party plugin's manifest names its own repository, so the one that
+//! ships with chimaera is checked against the version that runs, and Update
+//! installs the newer release as an installed copy, which the precedence
+//! rule then loads. The checker asks each such source for its latest
+//! release, reads that release's `plugin.toml` (small) and offers the
 //! version only when it is strictly newer than what runs here AND passes
 //! this daemon's gates. It never downloads a component on its own: that is
 //! the user's click (`installed`). Cadence: the daemon's own release checker
@@ -29,7 +33,7 @@ use serde_json::{json, Value};
 use super::{Manifest, Refusal};
 use crate::AppState;
 
-/// How often an installed plugin's source is asked, at most (Check now
+/// How often a plugin's release source is asked, at most (Check now
 /// aside): plugins release on their own cadence, a day is fresh enough.
 pub(crate) const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 /// The GitHub API's repos base; `CHIMAERA_PLUGIN_RELEASES_API` replaces it.
@@ -215,24 +219,31 @@ pub(crate) fn parse_sums(text: &str) -> HashMap<String, String> {
         .collect()
 }
 
-/// Ask `id`'s release source whether a newer version exists, and remember
-/// the answer. `Ok(None)`: nothing newer that this daemon can run.
+/// Why `m` has nowhere to check or update from: no copy of it names a
+/// `[release]` source.
+pub(crate) fn no_source(m: &Manifest) -> Refusal {
+    Refusal::conflict(if m.origin.installed_version.is_none() {
+        format!(
+            "{} ships with chimaera and names no release source — it updates with chimaera itself",
+            m.name
+        )
+    } else {
+        format!(
+            "{} names no release source ([release] in its plugin.toml)",
+            m.name
+        )
+    })
+}
+
+/// Ask `id`'s release source whether a version newer than the one that runs
+/// (embedded or installed) exists, and remember the answer. `Ok(None)`:
+/// nothing newer that this daemon can run.
 pub(crate) async fn check(state: &Arc<AppState>, id: &str) -> Result<Option<Offer>, Refusal> {
     let Some(m) = super::manifest(state, id) else {
         return Err(Refusal::not_found("unknown plugin"));
     };
-    let Some(github) = m.origin.installed_release.clone() else {
-        return Err(Refusal::conflict(if m.origin.installed_version.is_none() {
-            format!(
-                "{} ships with chimaera — it updates with chimaera itself",
-                m.name
-            )
-        } else {
-            format!(
-                "{} names no release source ([release] in its plugin.toml)",
-                m.name
-            )
-        }));
+    let Some(github) = m.origin.release.clone() else {
+        return Err(no_source(&m));
     };
     let release = fetch_release(state, &github, None).await?;
     let offer = if newer(&release.version, &m.version) {
@@ -295,13 +306,13 @@ pub(crate) fn compatible(
     }
 }
 
-/// Every installed plugin with a release source, asked once (sequentially:
-/// a handful of small requests a day). Failures are debug-logged — an
-/// air-gapped cluster failing a check is normal life.
+/// Every plugin with a release source, embedded or installed, asked once
+/// (sequentially: a handful of small requests a day). Failures are
+/// debug-logged — an air-gapped cluster failing a check is normal life.
 pub(crate) async fn check_all(state: &Arc<AppState>) {
     let ids: Vec<String> = super::catalog(state)
         .iter()
-        .filter(|m| m.origin.installed_release.is_some())
+        .filter(|m| m.origin.release.is_some())
         .map(|m| m.id.clone())
         .collect();
     for id in ids {

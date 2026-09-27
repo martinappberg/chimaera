@@ -2,7 +2,9 @@
 //! a `current` link naming the version that loads and a `previous` link
 //! naming the one Use previous goes back to. Written only by a visible
 //! install or update (the user's click, or `chimaera plugin add|update`),
-//! checksum-verified against the release's `SHA256SUMS`. Design:
+//! checksum-verified against the release's `SHA256SUMS`. Updating a plugin
+//! that only ships with chimaera writes its first installed copy, which then
+//! loads over the embedded one (the higher version wins). Design:
 //! docs/plugin-system-plan.md ("Versions and updates").
 //!
 //! - **Install and update are one path** (`install`): the release's
@@ -464,7 +466,10 @@ pub(crate) async fn install_route(
 }
 
 /// POST /plugins/{pid}/update — install the plugin's latest release, when
-/// it is newer than what runs and this daemon can run it.
+/// it is newer than what runs and this daemon can run it. For a plugin that
+/// only ships with chimaera, the release becomes its installed copy (the
+/// same install path), which the catalog then loads as the higher version;
+/// Remove goes back to the embedded one.
 pub(crate) async fn update_route(
     State(state): State<Arc<AppState>>,
     AxPath(pid): AxPath<String>,
@@ -472,19 +477,8 @@ pub(crate) async fn update_route(
     let Some(m) = super::manifest(&state, &pid) else {
         return Refusal::not_found("unknown plugin").into_response();
     };
-    let Some(github) = m.origin.installed_release.clone() else {
-        return Refusal::conflict(if m.origin.installed_version.is_none() {
-            format!(
-                "{} ships with chimaera — it updates with chimaera itself",
-                m.name
-            )
-        } else {
-            format!(
-                "{} names no release source ([release] in its plugin.toml)",
-                m.name
-            )
-        })
-        .into_response();
+    let Some(github) = m.origin.release.clone() else {
+        return releases::no_source(&m).into_response();
     };
     installed_reply(&state, install(&state, &github, None, Some(&m)).await)
 }
@@ -508,7 +502,7 @@ fn installed_reply(state: &AppState, result: Result<Installed, Refusal>) -> Resp
 fn not_installed(state: &AppState, pid: &str, doing: &str) -> Refusal {
     match super::manifest(state, pid) {
         Some(m) => Refusal::conflict(format!(
-            "{} ships with chimaera and has no installed copy to {doing} — it updates with chimaera itself",
+            "{} ships with chimaera and has no installed copy to {doing}",
             m.name
         )),
         None => Refusal::not_found("unknown plugin"),

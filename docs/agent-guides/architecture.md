@@ -856,8 +856,9 @@ Opt-in capabilities beyond the core (Mycelium's Knowledge reader, Agent notes, l
 Typst) are **workbench plugins**, and none of their behaviour is daemon code. A plugin is a
 Rust crate compiled to one portable WebAssembly component (`plugin.wasm`, `wasm32-wasip2`)
 beside a `plugin.toml` manifest; the same file runs on a laptop, an x86 login node and an ARM
-box, so the one-static-binary model survives (first-party plugins are embedded in the binary
-from `plugins/dist`, like `web-ui/dist`; third-party ones install under
+box, so the one-static-binary model survives (first-party plugins live in their own
+repositories and are embedded in the binary from `plugins/dist`, like `web-ui/dist`, at the
+releases `plugins/plugins.lock` pins; any plugin, a first-party one included, can also install under
 `~/.chimaera/plugins/<id>/<version>/` from a checksum-verified release, only on the user's
 click). The daemon's host (`crates/chimaera-server/src/plugins/`) runs each under wasmtime
 through a pinned WIT world, `chimaera:plugin` (`crates/chimaera-plugin-api`) — the third

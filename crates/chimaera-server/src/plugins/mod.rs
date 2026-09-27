@@ -3,9 +3,11 @@
 //! docs/plugin-system-plan.md.
 //!
 //! A plugin is a small TOML manifest (data, never code) plus its behaviour:
-//! a WASM component (`plugin.wasm`) built from `plugins/<crate>` by
-//! `scripts/build-plugins.sh` and embedded from `plugins/dist`, like
-//! `web-ui/dist`, or installed from a plugin's release into
+//! a WASM component (`plugin.wasm`). The first-party plugins live in their
+//! own repositories; `plugins/plugins.lock` pins the release of each that
+//! this binary ships, which `scripts/build-plugins.sh` downloads, verifies
+//! and lays out in `plugins/dist`, embedded like `web-ui/dist`. Any plugin
+//! (a first-party one included) can also be installed from a release into
 //! `<data dir>/plugins/<id>/<version>/` (`installed`). It runs in `runtime`
 //! (the sandbox) and asks the daemon for everything through `hostfns`
 //! (bounded). No plugin behaviour is daemon code: the Knowledge provider
@@ -62,7 +64,8 @@ pub(crate) const API: &str = "0.1";
 /// them; an additive WIT bump adds a version here and keeps the old ones.
 pub(crate) const SERVED_APIS: &[&str] = &[API];
 
-/// The first-party WASM plugins, `<id>/{plugin.toml,plugin.wasm}`, built by
+/// The first-party WASM plugins, `<id>/{plugin.toml,plugin.wasm}`: the
+/// releases `plugins/plugins.lock` pins, laid out (checksum-verified) by
 /// `scripts/build-plugins.sh`. Release builds embed the folder; debug builds
 /// read it from disk when the catalog loads (rust-embed's debug mode).
 #[derive(RustEmbed)]
@@ -168,9 +171,11 @@ pub(crate) struct Origin {
     pub(crate) stale: bool,
     /// Why this daemon can't run it (a failed gate): listed, never active.
     pub(crate) gate: Option<String>,
-    /// The installed copy's release source — what the checker asks, even
-    /// when the embedded copy is the one that loads.
-    pub(crate) installed_release: Option<String>,
+    /// Where the checker and Update look for a newer version: the loading
+    /// copy's `[release]` (an embedded plugin's included), else the
+    /// installed copy's — asked even when the embedded copy is the one that
+    /// loads.
+    pub(crate) release: Option<String>,
 }
 
 /// Workspace-relative paths whose presence makes the plugin active here.
@@ -496,8 +501,11 @@ pub(crate) fn resolve(
                 previous: i.and_then(|c| c.previous.clone()),
                 stale: matches!((e, i), (Some(e), Some(i)) if version(&i.manifest) < version(e)),
                 gate: gate(&chosen, daemon),
-                installed_release: i
-                    .and_then(|c| c.manifest.release.as_ref().map(|r| r.github.clone())),
+                release: chosen
+                    .release
+                    .as_ref()
+                    .or_else(|| i.and_then(|c| c.manifest.release.as_ref()))
+                    .map(|r| r.github.clone()),
             };
             Arc::new(chosen)
         })
@@ -1165,6 +1173,29 @@ pub(crate) async fn setup_workspace(
 mod tests {
     use super::*;
 
+    /// One `[[plugin]]` of `plugins/plugins.lock`: a release this build
+    /// ships (`scripts/build-plugins.sh` lays it out in `plugins/dist`).
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Locked {
+        id: String,
+        version: String,
+        repo: String,
+        sha256_wasm: String,
+        sha256_toml: String,
+    }
+
+    fn locked() -> Vec<Locked> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Lock {
+            plugin: Vec<Locked>,
+        }
+        toml::from_str::<Lock>(include_str!("../../../../plugins/plugins.lock"))
+            .expect("plugins/plugins.lock parses")
+            .plugin
+    }
+
     #[test]
     fn every_manifest_parses_and_ids_are_unique() {
         let embedded = Dist::iter().filter(|p| p.ends_with("/plugin.toml")).count();
@@ -1178,14 +1209,32 @@ mod tests {
             ids.windows(2).all(|pair| pair[0] < pair[1]),
             "the catalog is sorted by id, each once: {ids:?}"
         );
-        for id in ["agent-notes", "mycelium"] {
+        let lock = locked();
+        assert!(!lock.is_empty(), "plugins/plugins.lock names no plugin");
+        for entry in &lock {
+            let id = &entry.id;
+            assert!(plugin_version(&entry.version).is_ok(), "{id}: lock version");
+            assert!(valid_github(&entry.repo), "{id}: lock repo");
+            for sha in [&entry.sha256_wasm, &entry.sha256_toml] {
+                assert!(
+                    sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_hexdigit()),
+                    "{id}: a lock sha256 is 64 hex digits"
+                );
+            }
+            // Versions and bytes are the script's check: a local override
+            // (plugins/plugins.local.toml) lays out another build on purpose.
             let m = production_catalog()
                 .iter()
-                .find(|m| m.id == id)
+                .find(|m| m.id == *id)
                 .unwrap_or_else(|| panic!("{id} ships (run scripts/build-plugins.sh)"));
             assert!(!m.wasm.bytes.is_empty());
             assert_eq!(m.api, API);
             assert_eq!(gate(m, "0.4.1"), None, "{id} runs on a released daemon");
+            assert_eq!(
+                m.release.as_ref().map(|r| r.github.as_str()),
+                Some(entry.repo.as_str()),
+                "{id}: its updates come from the repository the lock pins"
+            );
         }
         for m in production_catalog() {
             assert!(!m.summary.is_empty(), "{} needs a summary", m.id);
@@ -1351,7 +1400,7 @@ mod tests {
         assert_eq!(m.origin.previous.as_deref(), Some("0.3.0"));
         assert_eq!(m.origin.path, Some(PathBuf::from("/p/demo/0.3.2")));
         assert!(!m.origin.stale);
-        assert_eq!(m.origin.installed_release.as_deref(), Some("acme/demo"));
+        assert_eq!(m.origin.release.as_deref(), Some("acme/demo"));
 
         // Equal: the embedded copy loads; the installed one is still named.
         let m = &resolve(&[shipped("0.3.2")], &[copy("0.3.2", None)], "0.4.1")[0];
@@ -1376,6 +1425,19 @@ mod tests {
         let m = &resolve(&[shipped("1.0.0")], &[], "0.4.1")[0];
         assert_eq!(m.origin.source, Source::Embedded);
         assert_eq!(m.origin.path, None);
+        assert_eq!(m.origin.release, None, "nothing names a release source");
+
+        // The release source: the loading copy's, an embedded one's included…
+        let released = Arc::new(
+            demo("version = \"1.0.0\"\napi = \"0.1\"\n[release]\ngithub = \"acme/shipped\"\n")
+                .unwrap(),
+        );
+        let m = &resolve(&[released], &[], "0.4.1")[0];
+        assert_eq!(m.origin.release.as_deref(), Some("acme/shipped"));
+        // …else the installed copy's, even while the embedded one loads.
+        let m = &resolve(&[shipped("0.3.2")], &[copy("0.3.1", None)], "0.4.1")[0];
+        assert_eq!(m.origin.source, Source::Embedded);
+        assert_eq!(m.origin.release.as_deref(), Some("acme/demo"));
     }
 
     #[test]

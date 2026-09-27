@@ -62,6 +62,12 @@ bash scripts/build-plugins.sh                 # plugins/dist (WASM plugins); nee
 cargo build -p chimaera                       # rust-embed requires both dists to exist first
 ```
 
+The plugin step downloads the first-party plugins' releases that
+`plugins/plugins.lock` pins (checksum-verified, cached in `plugins/cache/` so
+later and offline runs don't refetch); to run a local checkout of a plugin
+instead, name it in a gitignored `plugins/plugins.local.toml` (see
+[plugins/AGENTS.md](../../../plugins/AGENTS.md)).
+
 Then `preview_start chimaerad-isolated`, read the printed
 `http://127.0.0.1:<port>/#token=…` from `preview_logs`, and navigate the preview
 there (serve mode has no `/dev/manifest` auto-auth — the token rides the URL

@@ -16,9 +16,10 @@ host), `hostfns.rs` (every host function, bounded), `tools.rs` (plugin MCP tools
 runtime), `installed.rs` (the installed directory; install, update, rollback, remove),
 `releases.rs` (the release checker) — plus `agent_probe.rs` and `notes.rs`; the interface
 `crates/chimaera-plugin-api` (the WIT world and its Rust bindings,
-[map](../../crates/chimaera-plugin-api/AGENTS.md)); the first-party plugin crates in the
-`plugins/` cargo workspace ([map](../../plugins/AGENTS.md)), built by `scripts/build-plugins.sh`
-into `plugins/dist`; the CLI `crates/chimaera/src/plugin.rs`; UI `web-ui/src/lib/plugins/`
+[map](../../crates/chimaera-plugin-api/AGENTS.md)); the first-party plugins in their own
+repositories, [chimaera-plugin-agent-notes](https://github.com/martinappberg/chimaera-plugin-agent-notes) and [chimaera-plugin-mycelium](https://github.com/martinappberg/chimaera-plugin-mycelium), whose releases `plugins/plugins.lock` pins and
+`scripts/build-plugins.sh` downloads, verifies and lays out in `plugins/dist`
+([map](../../plugins/AGENTS.md)); the CLI `crates/chimaera/src/plugin.rs`; UI `web-ui/src/lib/plugins/`
 ([map](../../web-ui/src/lib/plugins/AGENTS.md)) — the `plugins` singleton tab (`{v:"plugins"}` in
 `web-ui/src/lib/layout/layout.ts`) and the attach sheet, hosted once in `web-ui/src/App.svelte`.
 Wire (all under `/api/v1`, bearer-authed): `GET /plugins` (the catalog) ·
@@ -36,7 +37,8 @@ a plugin's `emit` reaches `/ws/events` as a `{"type":"plugin","plugin":…,"work
 ## Workbench plugins
 
 - **What & when.** Opt-in capabilities that change what the UI or the agents get, off by
-  default. Two ship, both WASM plugins embedded in the binary: **Mycelium** (fills Knowledge and
+  default. Two ship, both WASM plugins that live in their own repositories and are embedded in
+  the binary at the release `plugins/plugins.lock` pins: **Mycelium** (fills Knowledge and
   "Where things stand"; adds `knowledge_search` · `knowledge_get` for every agent here) and
   **Agent notes** (below).
 - **How it's used.** Open Plugins from the rail's `plugins` row or quick-open ("Plugins").
@@ -100,12 +102,11 @@ a plugin's `emit` reaches `/ws/events` as a `{"type":"plugin","plugin":…,"work
   - **Status: partial.** Built and proven live on an isolated daemon (2026-09-26, a stand-in
     agent, nothing billed): the WASM host, both plugins as components, versions, installs,
     updates, Use previous and Remove ([plan status](../plugin-system-plan.md#status-2026-09-26)).
-    Later: Browse renders disabled, "later"; adding a third-party plugin is the CLI or the route
-    only (no card field for it); `plugins/plugins.lock` (first-party plugins pinned from their
-    own repositories); the `switched-on` / `switched-off` events (declarable, never delivered);
-    the UI-facing `query` route (the export exists, no route calls it); the `exec` and `watch`
-    host imports (WIT 0.2), which the LaTeX and Typst plugins' `build` point waits for
-    ([plan](../latex-reports-plan.md#the-plugin-shape)).
+    Since then both plugins moved to their own repositories, pinned by `plugins/plugins.lock`.
+    Later: Browse renders disabled, "later"; the `switched-on` / `switched-off` events (declarable, never
+    delivered); the UI-facing `query` route (the export exists, no route calls it); the `exec`
+    and `watch` host imports (WIT 0.2), which the LaTeX and Typst plugins' `build` point waits
+    for ([plan](../latex-reports-plan.md#the-plugin-shape)).
 
 ## The plugin host
 
@@ -115,7 +116,8 @@ a plugin's `emit` reaches `/ws/events` as a `{"type":"plugin","plugin":…,"work
   It exports `tools`, `instructions`, `call-tool`, `knowledge`, `query` and `on-event`, and
   reaches nothing but the host's imports. First-party plugins are embedded from `plugins/dist`
   (rust-embed, like `web-ui/dist`; a debug daemon reads the folder once, when its catalog loads,
-  so a rebuilt plugin needs a daemon restart); third-party ones install under
+  so a rebuilt plugin needs a daemon restart), which the build lays out from the releases
+  `plugins/plugins.lock` pins; any plugin, a first-party one included, can also install under
   `~/.chimaera/plugins/<id>/<version>/` ([below](#versions-installs--updates)).
 - **Where it lives.** `plugins/runtime.rs` (engine, instances, deadlines, faults; the entry
   points `offer` / `call_tool` / `knowledge` / `on_event`, `hook`, `session_ended`),
@@ -163,34 +165,42 @@ a plugin's `emit` reaches `/ws/events` as a `{"type":"plugin","plugin":…,"work
 ## Versions, installs & updates
 
 - **What & when.** Every plugin carries its own version and the WIT version it targets, and
-  the card says which version runs and where it came from. An installed plugin updates, rolls
-  back and is removed on its own cadence — always the user's click, always a checksum-verified
-  download.
+  the card says which version runs and where it came from. A plugin whose manifest names its
+  repository updates from it on its own cadence — one that ships with chimaera included — and an
+  installed copy also rolls back and is removed: always the user's click, always a
+  checksum-verified download.
 - **How it's used.** The card's first line: name · version · a source chip — "ships with
   chimaera x.y.z" (embedded), "installed", or "installed · x ships with chimaera" when both
   copies exist — a **stale** chip when an installed copy is older than the embedded one, and an
-  **Update to x.y.z** chip when a check found a newer release. An installed copy adds a line
+  **Update to x.y.z** chip when a check found a newer release (on a plugin that ships with
+  chimaera too: updating it installs the release, and the chip then reads "installed · x ships
+  with chimaera"). An installed copy adds a line
   with **Use previous (x)** · **Check now** · **Remove** (a dialog naming the versions it
   deletes); each change reports one outcome line (an update shows the verified `plugin.wasm`
-  sha256). A plugin this daemon can't run shows why ("needs chimaera ≥ x (this is y)", "needs a
-  newer chimaera: …", "needs a newer plugin: …") and stays off. On the daemon's host:
-  `chimaera plugin list` · `add <owner/repo> [--version x]` · `update <id>` · `remove <id>` —
-  the same routes, printing the versions and the checksums the daemon verified.
+  sha256). Under the cards, **Add a plugin from a repository** takes `owner/repo` (or its
+  `https://github.com/owner/repo` URL) and **Install** fetches its latest release, reporting the
+  plugin, its version and the verified `plugin.wasm` sha256 — or the daemon's refusal — in one
+  outcome line; like any plugin, it runs only where it is switched on. A plugin this daemon
+  can't run shows why ("needs chimaera ≥ x (this is y)", "needs a newer chimaera: …", "needs a
+  newer plugin: …") and stays off. On the daemon's host: `chimaera plugin list` ·
+  `add <owner/repo> [--version x]` · `update <id>` · `remove <id>` — the same routes, printing
+  the versions and the checksums the daemon verified (the CLI alone installs a pinned
+  `--version`).
 - **Where it lives.** `plugins/mod.rs` (`resolve`, `gate`, `Catalog`, `manifest_json`),
   `plugins/installed.rs` (`scan`, `install_route` / `update_route` / `rollback_route` /
   `remove_route`), `plugins/releases.rs` (`check`, `check_all`, `check_route`; run from
   `update.rs::run_checker`), `crates/chimaera/src/plugin.rs`; UI `InstalledView.svelte`,
-  `store.ts` (`changeWorkbenchPlugin`, `daemonVersion`). Wire: each catalog entry gains
-  `version`, `api`, `source` (`embedded` | `installed`), `stale`, and — only when set — `path`,
-  `embedded_version`, `installed_version`, `previous`, `update` (`{version, url, checked_ms}`)
-  and `fault`. Tests: `crates/chimaera-server/src/tests/plugin_updates.rs`, against a fake
-  releases server.
+  `store.ts` (`changeWorkbenchPlugin`, `installWorkbenchPlugin`, `daemonVersion`). Wire: each
+  catalog entry gains `version`, `api`, `source` (`embedded` | `installed`), `stale`, and — only
+  when set — `path`, `embedded_version`, `installed_version`, `previous`, `update`
+  (`{version, url, checked_ms}`) and `fault`. Tests:
+  `crates/chimaera-server/src/tests/plugin_updates.rs`, against a fake releases server.
 - **Key behaviors.**
   - **Layout:** `~/.chimaera/plugins/<id>/<version>/{plugin.toml,plugin.wasm}` (the daemon's
     data dir) behind `current` and `previous` links swapped atomically (a symlink under a fresh
     name, renamed over the old). At most two versions stay on disk; **Use previous** swaps the
     two links, so it is reversible; **Remove** deletes the id's directory (409 for a plugin that
-    only ships with chimaera — it updates with chimaera).
+    only ships with chimaera; after an update installed over one, Remove goes back to it).
   - **Precedence, never silent:** the same id embedded and installed → the higher version loads
     and the card names both; equal → the embedded copy; an older installed copy is flagged
     stale and the embedded one runs.
@@ -204,12 +214,20 @@ a plugin's `emit` reaches `/ws/events` as a `{"type":"plugin","plugin":…,"work
     leaves the old version current. One change at a time daemon-wide, an audit log line each;
     after it the catalog reloads and the plugin's instances go, so a running session's next
     `tools/list` carries the new version's tools.
-  - **The checker never downloads.** For each installed copy whose manifest names
-    `[release] github`, it asks the GitHub releases API once after boot and then daily (riding
+  - **What "ships with chimaera" is:** the plugins `plugins/plugins.lock` pins, one release of
+    each plugin's own repository (`id`, `version`, `repo` and the release's two sha256s). The
+    build downloads exactly those files, refuses any other bytes, and embeds them; a bump is a
+    reviewed change to the lock, shipped by the next chimaera release.
+  - **The checker never downloads.** For each plugin whose manifest names `[release] github` —
+    embedded ones included, since the first-party manifests name their own repositories — it
+    asks the GitHub releases API once after boot and then daily (riding
     the daemon's own update loop, off with `update.autoCheck`; a dev build skips it unless
     `CHIMAERA_PLUGIN_RELEASES_API` is set) and on **Check now**, reads only the release's
-    `plugin.toml`, and offers a version only when it is strictly newer and passes the gates.
-    Offers live in memory. Embedded plugins update with chimaera itself.
+    `plugin.toml`, and offers a version only when it is strictly newer than the one that runs
+    and passes the gates. Offers live in memory. **Update** of a plugin that only ships with
+    chimaera installs the release as its installed copy through the same path, and the
+    precedence rule then loads it; a later chimaera release still carries whatever the lock
+    pins then.
   - A release is a tag `v<version>` with three assets: `plugin.wasm`, `plugin.toml` (that
     version's manifest) and `SHA256SUMS`. A plugin's state and its per-workspace switch follow
     its id across versions.
@@ -282,7 +300,7 @@ a plugin's `emit` reaches `/ws/events` as a `{"type":"plugin","plugin":…,"work
   tools); shells — none. Any session in the workspace can be a `to`; **deliver** needs a
   running chat session (a terminal agent gets 409 — "open it and paste"; chimaera never types
   into a TUI).
-- **Where it lives.** The WASM plugin `plugins/agent-notes` — `src/lib.rs` (the exports:
+- **Where it lives.** The WASM plugin in its own repository, [chimaera-plugin-agent-notes](https://github.com/martinappberg/chimaera-plugin-agent-notes) — `src/lib.rs` (the exports:
   `post_note`, `read_notes`, the hook line, read cursors in host state), `src/notes.rs` (the
   addressing rule, unread, the texts agents read; unit-tested natively), `plugin.toml`
   (declares the `hook` and `session-ended` events). What stays in core, `notes.rs`: `deliver`,

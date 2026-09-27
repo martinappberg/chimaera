@@ -10,7 +10,9 @@ versions and updates) and
 [timeline-knowledge-plugins-plan.md §6](../timeline-knowledge-plugins-plan.md)
 (the seam and the card). What users see: [features/plugins.md](../features/plugins.md).
 The maps: the API crate [chimaera-plugin-api](../../crates/chimaera-plugin-api/AGENTS.md),
-the first-party crates [plugins/](../../plugins/AGENTS.md).
+the lock and the test fixture [plugins/](../../plugins/AGENTS.md). The first-party
+plugins, each its own repository and the worked examples here: [chimaera-plugin-agent-notes](https://github.com/martinappberg/chimaera-plugin-agent-notes) and
+[chimaera-plugin-mycelium](https://github.com/martinappberg/chimaera-plugin-mycelium).
 
 ## The rules that don't bend
 
@@ -32,8 +34,8 @@ the first-party crates [plugins/](../../plugins/AGENTS.md).
   `watch` without breaking a 0.1 plugin.
 - **No host call in a native test.** Built natively (tests, clippy), every
   host import is a wit-bindgen stub that aborts the whole test binary. Keep
-  pure logic in functions that take data (`plugins/agent-notes/src/notes.rs`)
-  or behind a trait the test implements (`plugins/mycelium/src/fs.rs`); the
+  pure logic in functions that take data (Agent notes' `src/notes.rs`) or
+  behind a trait the test implements (Mycelium's `src/fs.rs`); the
   integration runs in the daemon's tests.
 - **JSON for open-ended payloads.** Tool arguments and results, Timeline
   entries, the Knowledge snapshot, UI events and state values cross as JSON
@@ -98,9 +100,10 @@ agents = ["2 read tools for every agent here: knowledge_search · knowledge_get"
 github = "owner/repo"
 ```
 
-(Shipped manifests: `plugins/agent-notes/plugin.toml`, `plugins/mycelium/plugin.toml`;
-`[requires] chimaera` and `[release]` above are illustrations, neither ships
-them.)
+(Shipped manifests: the `plugin.toml` at the root of each first-party
+repository; both name their own repository in `[release]`, so the copy that
+ships with chimaera can be updated from it. `[requires] chimaera` above is an
+illustration; neither ships it.)
 
 What each part does, and what exists today:
 
@@ -125,33 +128,35 @@ keys; the first plugin that needs one adds it with a test and a row here.
 ## The crate
 
 ```
-plugins/agent-notes/
-  Cargo.toml        [lib] crate-type = ["cdylib"]; depends on chimaera-plugin-api
-  plugin.toml       the manifest
-  src/lib.rs        impl Plugin for AgentNotes { … } + chimaera_plugin_api::export!(AgentNotes)
-  src/notes.rs      the pure logic (addressing, unread, the texts), unit-tested natively
+chimaera-plugin-agent-notes/      its own repository
+  Cargo.toml          [lib] crate-type = ["cdylib"]; depends on chimaera-plugin-api
+  plugin.toml         the manifest
+  rust-toolchain.toml the pinned toolchain, with the wasm32-wasip2 target
+  src/lib.rs          impl Plugin for AgentNotes { … } + chimaera_plugin_api::export!(AgentNotes)
+  src/notes.rs        the pure logic (addressing, unread, the texts), unit-tested natively
+  .github/workflows/  ci.yml (fmt, clippy, tests, the wasm build) · release.yml (the three assets)
 ```
 
 ```toml
 [package]
 name = "chimaera-plugin-agent-notes"
-version.workspace = true        # plugin.toml's `version` must equal this
+version = "0.1.0"               # plugin.toml's `version` must equal this (and the tag)
 
 [lib]
 crate-type = ["cdylib"]
 
 [dependencies]
-chimaera-plugin-api.workspace = true   # path = "../crates/chimaera-plugin-api" in plugins/Cargo.toml
+chimaera-plugin-api = { git = "https://github.com/martinappberg/chimaera.git", rev = "<commit>" }
 ```
 
-A first-party crate is a member of the `plugins/` cargo workspace, never the
-daemon's: a component `cdylib` does not link for the native target on macOS
-(its export names contain `#`, which Apple's linker reads as a comment), and
-the daemon's lockfile stays free of the guest-side tooling. `cargo check`,
-clippy and `cargo test` are fine natively, since the test harness links the
-rlib. Nothing publishes `chimaera-plugin-api` to crates.io yet: a crate
-outside this repository takes it as a git dependency on the chimaera
-repository.
+A plugin crate is its own cargo workspace, never a member of the daemon's: a
+component `cdylib` does not link for the native target on macOS (its export
+names contain `#`, which Apple's linker reads as a comment), and the daemon's
+lockfile stays free of the guest-side tooling. `cargo check`, clippy and
+`cargo test` are fine natively, since the test harness links the rlib.
+Nothing publishes `chimaera-plugin-api` to crates.io yet: a plugin takes it as
+a git dependency on the chimaera repository, pinned to a commit so a release
+is reproducible.
 
 ## The `Plugin` trait and `export!`
 
@@ -160,7 +165,7 @@ unit struct, override only what the plugin offers (`tools`, `instructions`,
 `call_tool`, `knowledge`, `query`, `on_event`; each has a default), and wire
 it with `export!` once at the crate root. JSON arrives parsed
 (`serde_json::Value`), and `serde_json` is re-exported. From
-`plugins/agent-notes/src/lib.rs`, trimmed to one tool:
+Agent notes' `src/lib.rs`, trimmed to one tool:
 
 ```rust
 use chimaera_plugin_api::serde_json::{json, Value};
@@ -254,7 +259,7 @@ text server-side or fill in who posted. The host does.
 
 The other exports: `knowledge(cx, known)` returns `Ok(None)` when `known` (the
 stamp the host holds) is still current, else `Snapshot::new(&stamp, &data)`
-(`plugins/mycelium/src/lib.rs` is the example); `query` has no caller yet.
+(Mycelium's `src/lib.rs` is the example); `query` has no caller yet.
 `Context` carries `workspace`, `session` (absent for workspace-level asks such
 as `knowledge`) and `mastermind`. The host ignores the `cx` a plugin passes
 back and serves the workspace and session of the call in flight, so a plugin
@@ -292,18 +297,39 @@ differ from its manifest's `provides.mcp_tools` is refused.
 
 ## Build and test
 
+In the plugin's repository:
+
 ```sh
-bash scripts/build-plugins.sh      # or `just plugins`: every plugins/* crate → plugins/dist/<id>/{plugin.wasm,plugin.toml}
-cargo clippy --manifest-path plugins/Cargo.toml --all-targets -- -D warnings
-cargo test --manifest-path plugins/Cargo.toml          # the plugins' own native unit tests
-cargo fmt --all --manifest-path plugins/Cargo.toml
-just check                         # all of the above plus the daemon workspace
+cargo build --release --target wasm32-wasip2   # the component, target/wasm32-wasip2/release/<crate>.wasm
+cargo clippy --all-targets -- -D warnings
+cargo test                                     # the plugin's own native unit tests
+cargo fmt --all
 ```
 
-The script needs the `wasm32-wasip2` target (`rust-toolchain.toml` lists it)
-and first checks every `plugin.toml` against its crate and the WIT: `version`
-must equal the crate's resolved version and `api` the WIT package's
-MAJOR.MINOR, or nothing is laid out. Build the plugins before any build of
+In the chimaera repository:
+
+```sh
+bash scripts/build-plugins.sh      # or `just plugins`: the locked releases → plugins/dist, the fixture → plugins/dist-test
+just check                         # the daemon workspace and the fixture's
+```
+
+To run a checkout of a plugin in a daemon before it has a release, name it in
+`plugins/plugins.local.toml` (gitignored) and run the script:
+
+```toml
+[[plugin]]
+id = "agent-notes"
+path = "../../chimaera-plugin-agent-notes"   # absolute, ~/…, or relative to plugins/
+```
+
+The script then builds that checkout (`cargo build --release --target
+wasm32-wasip2` in its directory, on its own toolchain) and lays out its
+component and `plugin.toml` instead of the locked release, saying so; the
+version check against the lock is skipped for it, and a new id is laid out
+too. Delete the file (and rerun the script) to go back to the lock.
+Otherwise the script downloads each locked release (cached under
+`plugins/cache/`, re-verified on every run), so a build without network needs
+that cache or an override. Build the plugins before any build of
 `chimaera-server`: its embed of `plugins/dist` fails to compile without them.
 A debug daemon reads `plugins/dist` from disk once, when its catalog loads, so
 after a rebuild restart the daemon (no cargo rebuild needed). A debug build's
@@ -328,15 +354,38 @@ The integration runs in the daemon's tests:
 
 ## Shipping it
 
-**First-party** plugins live under `plugins/` and ship inside the daemon
-binary: the script builds them, the daemon embeds `plugins/dist` with
-rust-embed exactly as it embeds `web-ui/dist`, and they update with chimaera.
-To add one: the crate and its `plugin.toml`, a member line in
-`plugins/Cargo.toml`, tests as above, a feature page and this guide if it
-adds a manifest part, and a live check (switch it on in the isolated preview,
-watch a new session get exactly the advertised tools, switch it off, watch
-them go). `plugins::tests::every_manifest_parses_and_ids_are_unique` covers
-every shipped manifest.
+**First-party** plugins live in their own repositories and ship inside the
+daemon binary, pinned by `plugins/plugins.lock`. The two that exist are the
+worked example: [chimaera-plugin-agent-notes](https://github.com/martinappberg/chimaera-plugin-agent-notes) and [chimaera-plugin-mycelium](https://github.com/martinappberg/chimaera-plugin-mycelium). Each is the crate and its `plugin.toml` (naming
+the repository as `[release] github`), a CI workflow (fmt, clippy, tests, the
+wasm build) and a release workflow that, on a `v<version>` tag whose version
+equals `Cargo.toml`'s and `plugin.toml`'s, builds `plugin.wasm` and publishes
+it with `plugin.toml` and `SHA256SUMS`. The lock names, per plugin, `id`,
+`version`, `repo` and the release's two sha256s; the script downloads exactly
+those files, refuses any other bytes, and the daemon embeds `plugins/dist`
+with rust-embed exactly as it embeds `web-ui/dist`.
+
+A first-party bump:
+
+1. In the plugin's repository, bump `version` in `Cargo.toml` and
+   `plugin.toml` together, merge, and push the tag `v<version>`: the release
+   workflow publishes the three assets.
+2. Daemons already running offer it: the checker asks every plugin whose
+   manifest names `[release]`, the embedded ones included, and **Update**
+   (or `chimaera plugin update <id>`) installs it as an installed copy that
+   loads over the embedded one.
+3. In the chimaera repository, set the entry's `version`, `sha256_wasm` and
+   `sha256_toml` in `plugins/plugins.lock` from that release's `SHA256SUMS`,
+   run `bash scripts/build-plugins.sh` and `just check`, and review the change
+   like code: the next chimaera release embeds exactly those bytes.
+
+To add one: a repository shaped like those two, its first release, a
+`[[plugin]]` in the lock, the daemon-side tests (above), a feature page and
+this guide if it adds a manifest part, and a live check (switch it on in the
+isolated preview, watch a new session get exactly the advertised tools,
+switch it off, watch them go).
+`plugins::tests::every_manifest_parses_and_ids_are_unique` checks that every
+locked plugin ships and names its lock `repo` as its release source.
 
 **Third-party** plugins live in their own repository and install on a daemon's
 host:
@@ -361,9 +410,10 @@ host:
 
 ## Versions and updates, from the author's side
 
-- **Bump `version` in `Cargo.toml` and `plugin.toml` together** (first-party
-  crates share the `plugins/` workspace version); the build script refuses a
-  mismatch rather than injecting one.
+- **Bump `version` in `Cargo.toml` and `plugin.toml` together**, and tag
+  that version; the first-party release workflow refuses a tag, crate and
+  manifest that disagree rather than injecting one, and chimaera's build
+  script refuses a release whose manifest isn't the lock's version.
 - **Tolerate old state.** Host state and the per-workspace switch follow the
   plugin id, not the version: a new version reads what an older one stored
   (Agent notes' read cursors are the example). A plugin that wants a clean
@@ -374,11 +424,14 @@ host:
   that stops passing is listed off with its reason ("needs a newer chimaera",
   "needs a newer plugin", "needs chimaera ≥ x"). Set `requires.chimaera` when
   the plugin needs a host import a later daemon added.
-- **Updates are never automatic.** The daemon checks each installed plugin's
-  release source once after boot and daily (and on **Check now**), reads only
+- **Updates are never automatic.** The daemon checks each plugin's release
+  source (a plugin that ships with chimaera included, when its manifest names
+  `[release]`) once after boot and daily (and on **Check now**), reads only
   the release's `plugin.toml`, and offers a version only when it is strictly
-  newer and passes the gates. Installing it is the user's click (or
-  `chimaera plugin update <id>`). The old version stays as `previous` for
+  newer than the one that runs and passes the gates. Installing it is the
+  user's click (or `chimaera plugin update <id>`); for a plugin that only
+  shipped with chimaera, that writes its first installed copy, and Remove
+  goes back to the embedded one. The old version stays as `previous` for
   **Use previous**; at most two versions stay on disk.
 - **Changing the interface.** The WIT package version is the contract. Adding
   a host import is a minor bump (0.2 adds `exec` and `watch`); changing or

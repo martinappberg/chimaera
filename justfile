@@ -6,8 +6,9 @@ default: check
 ui:
     cd web-ui && npm install && npm run build
 
-# Build the first-party plugins (WASM components) into plugins/dist and
-# plugins/dist-test — required before any build of chimaera-server
+# Lay out the first-party plugins (the releases plugins/plugins.lock pins) in
+# plugins/dist and build the test fixture into plugins/dist-test — required
+# before any build of chimaera-server
 plugins:
     bash scripts/build-plugins.sh
 

@@ -89,9 +89,10 @@ jobs:
         # unchecked it evicts the very main entries this job exists to prime.
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      # The first-party plugins (their own cargo workspace, built to WASM):
-      # chimaera-server embeds plugins/dist (and, in tests, plugins/dist-test)
-      # at compile time, like web-ui/dist.
+      # The plugins chimaera-server embeds at compile time, like web-ui/dist:
+      # plugins/dist from the releases plugins/plugins.lock pins (downloaded
+      # and checksum-verified) and, in tests, plugins/dist-test (the fixture,
+      # built from the plugins/ cargo workspace).
       - run: bash scripts/build-plugins.sh
       - run: cargo fmt --all --check
       - run: cargo fmt --all --manifest-path plugins/Cargo.toml --check

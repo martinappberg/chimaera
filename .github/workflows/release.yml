@@ -81,7 +81,8 @@ jobs:
       - run: cargo install cargo-zigbuild
       # Stamp the release version so the daemon reports it (health / manifest).
       - run: sed -i "s/^version = \"0.0.1\"/version = \"${{ needs.version.outputs.version }}\"/" Cargo.toml
-      # The first-party WASM plugins the daemon embeds (plugins/dist).
+      # The first-party WASM plugins the daemon embeds (plugins/dist): the
+      # releases plugins/plugins.lock pins, downloaded and checksum-verified.
       - run: bash scripts/build-plugins.sh
       - run: cargo zigbuild --release --target ${{ matrix.target }} -p chimaera
       - run: cp target/${{ matrix.target }}/release/chimaera chimaera-${{ matrix.target }}

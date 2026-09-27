@@ -115,6 +115,14 @@ fn manifest(v2: bool, id: &str, version: &str, extra: &str) -> String {
     )
 }
 
+/// `manifest` without its `[release]` section: a plugin with nowhere to
+/// check or update from.
+fn unreleased(id: &str, version: &str) -> String {
+    let full = manifest(false, id, version, "");
+    let cut = full.find("\n[release]").expect("manifest names a release");
+    full[..cut].to_string()
+}
+
 /// A test daemon whose plugin release fetches go to `fake`.
 fn state_for(fake: &FakeReleases) -> Arc<AppState> {
     let state = test_state();
@@ -382,15 +390,118 @@ async fn a_newer_compatible_release_is_offered_and_an_older_or_incompatible_one_
     fake.publish(gh, "0.3.0", &req, &v2_wasm());
     assert_eq!(check().await["update"]["version"], "0.3.0");
 
-    // A plugin that only ships with chimaera updates with chimaera.
-    let (status, body) = post(&state, "/api/v1/plugins/agent-notes/check").await;
+    // A plugin that ships with chimaera and names no release source updates
+    // with chimaera: nothing to check, nothing to update from.
+    test_catalog::add(&unreleased("up-norel", "0.1.0"), v1_wasm());
+    let (status, body) = post(&state, "/api/v1/plugins/up-norel/check").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body["error"]
+        .as_str()
+        .unwrap()
+        .contains("ships with chimaera and names no release source"));
+    let (status, body) = post(&state, "/api/v1/plugins/up-norel/update").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(!plugin_dir(&state, "up-norel").exists());
+}
+
+#[tokio::test]
+async fn an_embedded_plugin_updates_from_its_repository_and_remove_goes_back_to_it() {
+    let fake = FakeReleases::start().await;
+    let state = state_for(&fake);
+    // "Embedded" at 0.1.0 (a test build's catalog extra) whose manifest
+    // names its repository, as every first-party plugin's does.
+    test_catalog::add(&manifest(false, "emb-up", "0.1.0", ""), v1_wasm());
+    let gh = "acme/emb-up";
+    fake.publish(
+        gh,
+        "0.1.0",
+        &manifest(false, "emb-up", "0.1.0", ""),
+        &v1_wasm(),
+    );
+    let (_ws, sid) = workspace_with(&state, "emb-up", "keu1", &["emb-up"]).await;
+    let before = tool_names(&state, &sid, "keu1").await;
+    assert!(before.contains(&"echo".to_string()), "{before:?}");
+    assert!(!before.contains(&"version".to_string()), "{before:?}");
+    let (is_err, text) = mcp_tool_call(&state, &sid, "keu1", "echo", json!({})).await;
+    assert!(!is_err, "{text}");
+
+    // Its latest release is the version that ships: nothing to offer, and
+    // Update says it is up to date.
+    let (status, body) = post(&state, "/api/v1/plugins/emb-up/check").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["update"], Value::Null);
+    let (status, body) = post(&state, "/api/v1/plugins/emb-up/update").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body["error"].as_str().unwrap().contains("up to date"));
+
+    // A newer release: offered on the embedded plugin's card, compared with
+    // the version that runs, and nothing downloaded.
+    fake.publish(
+        gh,
+        "0.2.0",
+        &manifest(true, "emb-up", "0.2.0", ""),
+        &v2_wasm(),
+    );
+    let (status, body) = post(&state, "/api/v1/plugins/emb-up/check").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["update"]["version"], "0.2.0");
+    let entry = listed(&state, "emb-up").await;
+    assert_eq!(entry["source"], "embedded");
+    assert_eq!(entry["version"], "0.1.0");
+    assert_eq!(entry["update"]["version"], "0.2.0");
+    assert!(entry.get("installed_version").is_none(), "{entry}");
+    assert!(
+        !plugin_dir(&state, "emb-up").exists(),
+        "the checker never downloads"
+    );
+
+    // Update installs the release as the installed copy, which loads over
+    // the embedded one; the card names both.
+    let (status, body) = post(&state, "/api/v1/plugins/emb-up/update").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["version"], "0.2.0");
+    assert_eq!(body["previous"], Value::Null, "no installed copy before");
+    assert_eq!(
+        body["sha256"]["plugin.wasm"],
+        crate::fs::sha256_hex(&v2_wasm())
+    );
+    assert_eq!(body["plugin"]["source"], "installed");
+    assert_eq!(body["plugin"]["embedded_version"], "0.1.0");
+    assert_eq!(body["plugin"]["installed_version"], "0.2.0");
+    assert_eq!(link(&state, "emb-up", "current").as_deref(), Some("0.2.0"));
+    assert_eq!(link(&state, "emb-up", "previous"), None);
+    no_temp_left(&state, "emb-up");
+    assert_eq!(state.plugin_runtime.live_instances("emb-up"), 0);
+
+    // The daemon serves the installed version's tools, in the same session.
+    let after = tool_names(&state, &sid, "keu1").await;
+    assert!(after.contains(&"version".to_string()), "{after:?}");
+    let (is_err, text) = mcp_tool_call(&state, &sid, "keu1", "version", json!({})).await;
+    assert!(!is_err, "{text}");
+    assert_eq!(text, "0.2.0", "the installed build answers");
+    let entry = listed(&state, "emb-up").await;
+    assert_eq!(entry["version"], "0.2.0");
+    assert!(entry.get("update").is_none(), "caught up: {entry}");
+    let (status, body) = post(&state, "/api/v1/plugins/emb-up/update").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body["error"].as_str().unwrap().contains("up to date"));
+
+    // Remove drops the installed copy: the embedded one runs again, and
+    // removing that one stays refused.
+    let (status, body) = request(&state, Method::DELETE, "/api/v1/plugins/emb-up", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["plugin"]["source"], "embedded");
+    assert_eq!(body["plugin"]["version"], "0.1.0");
+    assert!(!tool_names(&state, &sid, "keu1")
+        .await
+        .contains(&"version".to_string()));
+    let (status, body) = request(&state, Method::DELETE, "/api/v1/plugins/emb-up", None).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert!(body["error"]
         .as_str()
         .unwrap()
         .contains("ships with chimaera"));
-    let (status, _) = post(&state, "/api/v1/plugins/agent-notes/update").await;
-    assert_eq!(status, StatusCode::CONFLICT);
+    state.sessions.kill(&sid).ok();
 }
 
 #[tokio::test]

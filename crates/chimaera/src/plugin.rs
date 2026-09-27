@@ -165,7 +165,23 @@ pub async fn add(github: &str, version: Option<&str>) -> anyhow::Result<()> {
 pub async fn update(id: &str) -> anyhow::Result<()> {
     let body = call("POST", &format!("/plugins/{id}/update"), None).await?;
     print_installed("updated", &body);
+    if let Some(line) = over_embedded(&body) {
+        println!("  {line}");
+    }
     Ok(())
+}
+
+/// An update of a plugin that only shipped with chimaera: the release is now
+/// its installed copy, which runs instead.
+fn over_embedded(body: &Value) -> Option<String> {
+    if !body["previous"].is_null() {
+        return None;
+    }
+    let embedded = body["plugin"].get("embedded_version")?.as_str()?;
+    Some(format!(
+        "installed over the {embedded} that ships with chimaera (`chimaera plugin remove {}` goes back to it)",
+        s(body, "id")
+    ))
 }
 
 pub async fn remove(id: &str) -> anyhow::Result<()> {
@@ -192,6 +208,21 @@ mod tests {
         // curl's config unquoting reverses exactly these two escapes.
         let back = quoted.replace("\\\"", "\"").replace("\\\\", "\\");
         assert_eq!(back, body);
+    }
+
+    #[test]
+    fn an_update_over_the_embedded_copy_says_so() {
+        let body = json!({"id": "agent-notes", "version": "0.1.1", "previous": null,
+            "plugin": {"source": "installed", "embedded_version": "0.1.0"}});
+        assert_eq!(
+            over_embedded(&body).as_deref(),
+            Some("installed over the 0.1.0 that ships with chimaera (`chimaera plugin remove agent-notes` goes back to it)")
+        );
+        let again = json!({"id": "agent-notes", "version": "0.1.2", "previous": "0.1.1",
+            "plugin": {"source": "installed", "embedded_version": "0.1.0"}});
+        assert_eq!(over_embedded(&again), None);
+        let third_party = json!({"id": "x", "version": "0.2.0", "previous": null, "plugin": {}});
+        assert_eq!(over_embedded(&third_party), None);
     }
 
     #[test]

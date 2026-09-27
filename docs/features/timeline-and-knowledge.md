@@ -107,7 +107,9 @@ and the Mastermind-tier MCP tool `read_timeline`.
   "Use mycelium for Knowledge →", opening the attach sheet.
 - **Where it lives.** Core `knowledge.rs` keeps guidance, attribution and the route
   (`get_knowledge`, `prime`, `recorded_since_last_check`); it never parses the provider's
-  files. The provider is the WASM plugin `plugins/mycelium` — `src/reader.rs` (plan, parse,
+  files. The provider is the WASM plugin Mycelium, its own repository
+  ([martinappberg/chimaera-plugin-mycelium](https://github.com/martinappberg/chimaera-plugin-mycelium),
+  pinned by `plugins/plugins.lock`) — `src/reader.rs` (plan, parse,
   stamp, fingerprint, the `Knowledge` wire shape), `src/tools.rs` (`knowledge_search` /
   `knowledge_get`), `src/lib.rs` (the `knowledge` export) — asked through
   `plugins::runtime::knowledge` with the stamp the daemon holds. Route:

@@ -1,5 +1,6 @@
 //! Notes in core: what stays in the daemon now that Agent notes is a WASM
-//! plugin (`plugins/agent-notes`; design docs/plugin-system-plan.md).
+//! plugin (its own repository, martinappberg/chimaera-plugin-agent-notes,
+//! pinned by plugins/plugins.lock; design docs/plugin-system-plan.md).
 //!
 //! - `deliver` — the USER sends a Timeline note to its addressee as a real,
 //!   attributed message (a route; chat targets only).
