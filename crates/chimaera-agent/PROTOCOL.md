@@ -2551,3 +2551,42 @@ An execute `ToolCall` (claude `Bash`/`PowerShell`, codex command executions) now
 ## Pass 37 (2026-09-26 — daemon-side, no CLI wire change; one live turn each on claude 2.1.283 and codex 0.157.1): a sent image's saved copy rides the echo. ADOPTED.
 
 `ContentBlock::Image` gains an additive `path: Option<String>` and `UserMessage` an additive `attachment_paths: Vec<String>`. The daemon's `/ws/chat` ingress (`upload::save_send_images`) saves each image of a `Send` into the session's upload landing pad and stamps `path` (a client-supplied value is always discarded first; `validate_ingress` bounds it at `COMMAND_PATH_MAX` for programmatic callers). Both drivers copy the stamped paths into the echo through the shared `model::image_paths` and never hand `path` to the agent: claude's stream-json `image` block and codex's `data:` URL input are byte-identical to before (pinned by `send_echo_carries_saved_image_paths_but_the_cli_gets_only_pixels` and `idle_send_starts_turn_with_images_and_native_skills`). `None` / empty is skipped on serialization, so old clients' frames and old journals are unchanged (`saved_image_paths_are_additive_on_both_wire_directions`). `attachment_paths` can be shorter than `attachments` (a failed save; Remote Control and transcript-seeded messages carry none). Live: one image + "reply with one word: the background color" per agent through the isolated daemon — claude answered "Blue", codex "Red", and both bubbles showed the saved copy. Consumer: the web UI's `AttachmentStrip`.
+
+
+## Pass 38 (2026-09-26 — Claude 2.1.283 and Codex 0.157.1): native head forks and transfer origins. ADOPTED.
+
+An offline workspace takeover must preserve the imported native history while
+creating a different native conversation. Codex's generated `ThreadForkParams`
+requires `threadId` and permits omission of `lastTurnId`; `thread/fork` with
+`{threadId,cwd,ephemeral:false}` forks at the current head. The driver uses this
+only when `SpawnSpec.fork_head` is set and no explicit rewind boundary was given.
+The existing rewind fork still sends its pinned boundary. The TUI launcher uses
+`codex fork <id>` and Claude's `--resume <id> --fork-session` equivalents.
+
+The daemon stamps its single visible transfer context message with
+`UserMessage.origin: "moved" | "home"`; the manager reserves and matches the
+Send echo exactly as for `restart`. These origins update the carryover pick-up
+clock too. Transfer messages name the changed host context and any stopped
+background tasks. Mastermind remains reactive and receives no automatic turn.
+Historical journal sequence numbers and public session IDs are not rewritten.
+
+Gate: local CLI help and generated JSON schema; native two-daemon transfers
+using one real conversation per CLI, clean move and return preserving the native
+ID, then offline head forks yielding a distinct native ID with the same public
+session ID. Both moved/home echoes were observed through the daemon chat socket.
+`just chat-smoke`: 24/24 passed on these CLI versions. PTY argv has hermetic
+coverage; this gate exercised the real native forks through chat mode.
+
+
+Directory-remap probe: both CLIs resumed the same isolated native conversation
+under a different working directory, reported the new absolute cwd and retained
+the earlier transfer marker. Claude's byte-identical transcript was installed
+under the destination project's encoded store directory. Codex's initial
+`session_meta.cwd` remains historical: the daemon records that original header
+cwd separately from its launch cwd rather than modifying native transcript
+records. Future verified native forks receive their own provenance.
+
+Native TUI gate: imported the same fixture histories with the terminal surface,
+observed the transfer context in each real CLI and its acknowledgment through
+the daemon PTY. Local CLI help pins positional `[PROMPT]` support for Claude and
+Codex resume/fork; the launcher bounds it and places it after `--`.

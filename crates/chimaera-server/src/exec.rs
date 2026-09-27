@@ -36,6 +36,14 @@ pub(crate) async fn run_exec(
     timeout_ms: Option<u64>,
     queue_timeout_ms: Option<u64>,
 ) -> Result<chimaera_pty::ExecOutcome, chimaera_pty::ExecError> {
+    if crate::pro::defer_command(state, id, &command)
+        .await
+        .map_err(|error| chimaera_pty::ExecError::Busy(error.to_string()))?
+    {
+        return Err(chimaera_pty::ExecError::Busy(
+            "This step needs the laptop and is queued to run when the project returns home.".into(),
+        ));
+    }
     let allow_sentinel_over_running = state
         .sessions
         .foreground_pid(id)

@@ -260,6 +260,48 @@ impl Client {
         )
         .await
     }
+    pub async fn wake_worker(&self) -> Result<WorkerWake> {
+        json_response(
+            self.request(
+                Method::POST,
+                path(&self.inner.account, &["v1", "worker", "wake"]),
+                Some(serde_json::json!({})),
+            )
+            .await?,
+        )
+        .await
+    }
+    pub async fn set_handoff_policy(&self, workspace: &str, policy: &HandoffPolicy) -> Result<()> {
+        self.request(
+            Method::PUT,
+            path(&self.inner.account, &["v1", "baton", workspace, "policy"]),
+            Some(serde_json::to_value(policy)?),
+        )
+        .await?;
+        Ok(())
+    }
+    pub async fn disable_handoff_policy(&self, workspace: &str) -> Result<()> {
+        self.request(
+            Method::DELETE,
+            path(&self.inner.account, &["v1", "baton", workspace, "policy"]),
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+    /// Re-enable grants after an explicit account-device privacy choice.
+    pub async fn enable_mirror(&self, workspace: &str) -> Result<()> {
+        self.request(
+            Method::POST,
+            path(
+                &self.inner.account,
+                &["v1", "baton", workspace, "enable-mirror"],
+            ),
+            Some(serde_json::json!({})),
+        )
+        .await?;
+        Ok(())
+    }
     pub async fn mirror_credentials(&self, request: &MirrorRequest) -> Result<MirrorCredentials> {
         let credentials: MirrorCredentials = json_response(
             self.request(

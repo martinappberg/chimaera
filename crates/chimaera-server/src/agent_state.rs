@@ -155,6 +155,8 @@ pub(crate) struct AgentRecord {
     pub(crate) state: AgentState,
     /// Latest transcript path reported by any hook payload.
     pub(crate) transcript_path: Option<PathBuf>,
+    /// Original immutable native header cwd after an authenticated path remap.
+    pub(crate) native_cwd: Option<PathBuf>,
     /// Codex notify's thread-id, captured only after its rollout is verified.
     pub(crate) codex_thread_id: Option<String>,
     /// Latest `customTitle` transcript record (wins over `ai_title`).
@@ -251,12 +253,18 @@ pub(crate) fn notice_line(text: &str) -> String {
 }
 
 impl AgentRecord {
+    pub(crate) fn native_cwd_for(&self, native_id: &str) -> Option<PathBuf> {
+        (self.resumed_from.as_deref() == Some(native_id))
+            .then(|| self.native_cwd.clone())
+            .flatten()
+    }
     pub(crate) fn new(key: String, kind: AgentKind) -> Self {
         AgentRecord {
             key,
             kind,
             state: AgentState::Unknown,
             transcript_path: None,
+            native_cwd: None,
             codex_thread_id: None,
             custom_title: None,
             ai_title: None,
@@ -621,6 +629,14 @@ pub(crate) fn apply_title_line(line: &str, record: &mut AgentRecord) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn imported_native_cwd_only_applies_to_the_verified_parent_conversation() {
+        let mut record = super::AgentRecord::new("fixture".into(), super::AgentKind::Codex);
+        record.resumed_from = Some("parent".into());
+        record.native_cwd = Some(std::path::PathBuf::from("/original/project"));
+        assert_eq!(record.native_cwd_for("parent"), record.native_cwd);
+        assert_eq!(record.native_cwd_for("new-fork"), None);
+    }
     #[test]
     fn notice_line_drops_markup_but_keeps_issue_refs() {
         assert_eq!(

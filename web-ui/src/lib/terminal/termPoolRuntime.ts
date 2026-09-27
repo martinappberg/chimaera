@@ -27,6 +27,7 @@
  * setDragging(false) flushes the deferred fits once the drag ends.
  */
 
+import { isWatching } from "./viewerMode.svelte";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
@@ -244,6 +245,7 @@ function adoptParked(entry: PoolEntry): void {
  * good. A constructor throw marks WebGL unavailable immediately.
  */
 function loadWebgl(entry: PoolEntry): void {
+  if (isWatching(entry.id) || matchMedia("(max-width: 700px)").matches) return;
   if (entry.webgl !== null || entry.webglFailed || entry.webglLosses >= WEBGL_MAX_LOSSES) {
     return;
   }
@@ -266,7 +268,7 @@ function loadWebgl(entry: PoolEntry): void {
 }
 
 function fitEntry(entry: PoolEntry): void {
-  if (!isVisible(entry)) return;
+  if (!isVisible(entry) || isWatching(entry.id)) return;
   // Never resize to degenerate dimensions (hidden or mid-layout element):
   // a tiny resize destroys buffer content client- and server-side.
   const dims = entry.fit.proposeDimensions();
@@ -354,6 +356,7 @@ function createEntry(id: string, parent: HTMLElement, fontOverride: number | und
 
   const term = new Terminal({
     ...settingsOptions(),
+    disableStdin: isWatching(id),
     fontSize,
     fontWeight: "400",
     fontWeightBold: "600",
@@ -406,7 +409,7 @@ function createEntry(id: string, parent: HTMLElement, fontOverride: number | und
     buf: new ParkedBuffer(PARKED_BUFFER_MAX_BYTES),
     // Ghosting a keystroke the closed socket silently dropped would show
     // input that was never delivered — the socket gate is non-negotiable.
-    echo: createLocalEcho(term, () => entry.socket.isOpen && (handlers?.echoArmed?.(id) ?? false)),
+    echo: createLocalEcho(term, () => !isWatching(id) && entry.socket.isOpen && (handlers?.echoArmed?.(id) ?? false)),
     webgl: null,
     webglFailed: false,
     webglLosses: 0,
@@ -419,6 +422,7 @@ function createEntry(id: string, parent: HTMLElement, fontOverride: number | und
   // Connect only after the terminal is open, visible, and fitted, so the
   // snapshot frame lands in a fully initialized terminal.
   entry.socket = new SessionSocket(id, {
+    readOnly: () => isWatching(id),
     onBinary: (data) => {
       // Parked terminals buffer, don't parse (see the module header) — the
       // one exception is the snapshot write-through after a reset.
@@ -493,6 +497,7 @@ function createEntry(id: string, parent: HTMLElement, fontOverride: number | und
   });
 
   term.onData((data) => {
+    if (isWatching(id)) return;
     // Send first: the ghost's DOM work (layout read + style writes) must
     // never sit between the keystroke and the wire — both run in the same
     // task, so the prediction still paints in the same frame.
@@ -593,7 +598,7 @@ function attach(id: string, host: HTMLElement, fontOverride: number | undefined)
   // Hand focus over synchronously — the element is attached and xterm's
   // textarea exists; waiting for a rAF drops keystrokes typed in the gap
   // (and throttled rAFs can delay it indefinitely).
-  if (pendingFocusId === id) {
+  if (pendingFocusId === id && !isWatching(id)) {
     pendingFocusId = null;
     e.term.focus();
   }
@@ -688,6 +693,7 @@ export function release(id: string, host: HTMLElement): void {
 
 /** Focus the session's terminal, deferring until it is attached if needed. */
 export function focusTerminal(id: string): void {
+  if (isWatching(id)) return;
   const entry = pool.get(id);
   if (entry !== undefined && isVisible(entry)) {
     entry.term.focus();
@@ -751,4 +757,15 @@ export function getSize(id: string): { cols: number; rows: number } | null {
   const entry = pool.get(id);
   if (entry === undefined || !isVisible(entry)) return null;
   return { cols: entry.term.cols, rows: entry.term.rows };
+}
+
+export function refreshAccess(id: string): void {
+  const entry = pool.get(id); if (entry === undefined) return;
+  entry.term.options.disableStdin = isWatching(id);
+  entry.echo.clear();
+  // A clipped grid must render at native cell size. WebGL's viewport can shrink
+  // with the pane while the authoritative grid remains wide; DOM is stable.
+  if (isWatching(id)) { entry.webgl?.dispose(); entry.webgl = null; }
+  else { loadWebgl(entry); fitEntry(entry); }
+  entry.socket.accessChanged();
 }

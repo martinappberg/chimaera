@@ -216,3 +216,11 @@ _Captured 2026-07-09 — drafted from DESIGN.md + code, confirmed live with the 
 - **Do not change:** server-side terminal state and the vanish-on-exit semantic.
 - **Incidental (not intent).** The bell being ignored is an implementation detail, not a decision —
   don't treat it as a promise either way.
+
+## Watching without taking control
+
+The terminal toolbar offers **Just watch** and **Take control**. Narrow screens
+start in **Just watching** mode: they show the daemon’s existing grid and scroll
+horizontally without resizing it or accepting input. Taking control reconnects
+with an explicit interaction and fits the terminal to the current pane. Passive
+reconnects and watchers do not wake a sleeping cloud host.

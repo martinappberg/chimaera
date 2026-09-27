@@ -60,6 +60,7 @@ pub(crate) struct ChatRecipe {
     /// `--fork-session --resume-session-at`; Codex passes it as
     /// `thread/fork.lastTurnId`. Rewind and non-destructive branch both use it.
     pub(crate) fork_at: Option<String>,
+    pub(crate) fork_head: bool,
     /// Rewind rollback count: respawn resumes the thread and drops this many
     /// trailing turns via `thread/rollback` (codex only — its thread id
     /// survives, so the conversation truncates in place instead of forking).
@@ -202,6 +203,7 @@ pub(crate) async fn prune_journals(state: &Arc<AppState>, spawning: Option<&str>
     }
     let mut keep: HashSet<String> = crate::lock(&state.agents).keys().cloned().collect();
     keep.extend(spawning.map(str::to_string));
+    keep.extend(crate::lock(&state.deferred_sessions).keys().cloned());
     // Stats every journal (and may unlink some) on a possibly-NFS dir.
     let manager = Arc::clone(&state.chat);
     if let Err(err) = tokio::task::spawn_blocking(move || manager.prune_journal_dir(keep)).await {
@@ -817,7 +819,10 @@ async fn degrade_to_pty(
                     .parent()
                     .map(std::path::Path::to_path_buf)
                 {
-                    let cwd = recipe.workspace_root.clone();
+                    let cwd = crate::lock(&state.agents)
+                        .get(id)
+                        .and_then(|r| r.native_cwd_for(&thread))
+                        .unwrap_or_else(|| recipe.workspace_root.clone());
                     let sought = thread.clone();
                     let rollout = tokio::task::spawn_blocking(move || {
                         crate::codex_notify::find_rollout(&home, &sought, &cwd)
@@ -995,14 +1000,14 @@ const STOP_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 /// and a chat driver alive under the same id, or let two rewinds race the same
 /// journal rewrite. Drop-based cleanup keeps every early-return/error path from
 /// stranding the session in a permanent "switching" state.
-struct ChatSwitchGuard {
+pub(crate) struct ChatSwitchGuard {
     state: Arc<AppState>,
     id: String,
     target: String,
 }
 
 impl ChatSwitchGuard {
-    fn acquire(state: &Arc<AppState>, id: &str, target: &str) -> Option<Self> {
+    pub(crate) fn acquire(state: &Arc<AppState>, id: &str, target: &str) -> Option<Self> {
         use std::collections::hash_map::Entry;
 
         let mut switching = crate::lock(&state.chat_switching);
@@ -1527,6 +1532,7 @@ async fn perform_switch(
         model: None,
         resume,
         fork_at: None,
+        fork_head: false,
         rollback_turns: None,
         revert_before_turn: None,
         remote_control: RemoteControlAtStart::No,
@@ -1906,6 +1912,7 @@ pub(crate) async fn rewind_session(
             model: None,
             resume: Some(native),
             fork_at: (!is_codex).then(|| body.resume_at.clone()),
+            fork_head: false,
             rollback_turns: if is_codex {
                 dropped_turns.as_ref().map(|d| d.count)
             } else {
@@ -3005,6 +3012,7 @@ pub(crate) async fn spawn_fresh_chat(
         model: spec.model,
         resume: native_fork.as_ref().map(|(source, _)| source.clone()),
         fork_at: native_fork.as_ref().map(|(_, at)| at.clone()),
+        fork_head: false,
         rollback_turns: None,
         revert_before_turn: None,
         remote_control: RemoteControlAtStart::Setting,
@@ -3166,17 +3174,23 @@ pub(crate) async fn spawn_chat_session(
                 (None, None) => Some(fresh_native_uuid()),
             };
             (
-                crate::launcher::build_chat_command(
-                    &recipe.bin,
-                    settings,
-                    mcp,
-                    model.as_deref(),
-                    recipe.resume.as_deref(),
-                    pinned.as_deref(),
-                    recipe.fork_at.as_deref(),
-                    fork_context_file.as_deref(),
-                    recipe.mastermind.is_some(),
-                ),
+                {
+                    let mut argv = crate::launcher::build_chat_command(
+                        &recipe.bin,
+                        settings,
+                        mcp,
+                        model.as_deref(),
+                        recipe.resume.as_deref(),
+                        pinned.as_deref(),
+                        recipe.fork_at.as_deref(),
+                        fork_context_file.as_deref(),
+                        recipe.mastermind.is_some(),
+                    );
+                    if recipe.fork_head {
+                        crate::launcher::fork_native_head(recipe.kind, &mut argv)?;
+                    }
+                    argv
+                },
                 pinned,
             )
         }
@@ -3329,6 +3343,7 @@ pub(crate) async fn spawn_chat_session(
     // Same-agent native branch: Claude already receives this through argv;
     // Codex consumes it during the handshake as thread/fork lastTurnId.
     spec.fork_at = recipe.fork_at.clone();
+    spec.fork_head = recipe.fork_head;
     spec.portable_context = recipe.portable_context.clone();
     // Resurrection carries the original creation time so age survives the
     // restart; every other path leaves it None → the spawn stamps now.
@@ -3377,6 +3392,19 @@ pub(crate) async fn resurrect_chat(
     entry: &crate::ledger::LedgerEntry,
     workspace: crate::workspaces::Workspace,
 ) -> anyhow::Result<()> {
+    resurrect_chat_transfer(state, entry, workspace, false, None).await
+}
+
+pub(crate) async fn resurrect_chat_transfer(
+    state: &Arc<AppState>,
+    entry: &crate::ledger::LedgerEntry,
+    workspace: crate::workspaces::Workspace,
+    fork_head: bool,
+    origin: Option<&'static str>,
+) -> anyhow::Result<()> {
+    if !crate::pro::may_write(state, &workspace.id) {
+        anyhow::bail!("workspace owned elsewhere");
+    }
     let agent = entry
         .agent
         .as_ref()
@@ -3454,6 +3482,8 @@ pub(crate) async fn resurrect_chat(
     // chat is dropped from the following snapshot and lost on the NEXT restart.
     let mut record = crate::agents::AgentRecord::new(key, agent.kind);
     record.resumed_from = resume.clone();
+    record.native_cwd = agent.native_cwd.clone();
+    record.transcript_path = agent.transcript.clone();
     record.custom_title = entry.pinned_name.clone();
     if record.custom_title.is_none() && agent.title != agent.kind.as_str() {
         record.ai_title = Some(crate::agents::truncate_prompt(&agent.title));
@@ -3485,6 +3515,7 @@ pub(crate) async fn resurrect_chat(
         model: agent.model.clone(),
         resume,
         fork_at: None,
+        fork_head,
         rollback_turns: None,
         revert_before_turn: None,
         remote_control: match &carry {
@@ -3516,21 +3547,31 @@ pub(crate) async fn resurrect_chat(
             // (the conversation survives, its processes do not). Tell the
             // agent once, as a message it can act on (see `pickup_message`).
             let enabled = crate::lock(&state.settings).resume_after_restart();
-            let pick_up = pickup_message(
-                &entry.id,
-                carry.as_ref(),
-                resumed,
-                mastermind_mode.is_some(),
-                enabled,
-                crate::session_view::now_ms(),
-            );
+            let pick_up = if mastermind_mode.is_some() {
+                None
+            } else if let Some(origin) = origin {
+                Some(handoff_message(origin, carry.as_ref()))
+            } else {
+                pickup_message(
+                    &entry.id,
+                    carry.as_ref(),
+                    resumed,
+                    mastermind_mode.is_some(),
+                    enabled,
+                    crate::session_view::now_ms(),
+                )
+            };
             if let Some(text) = pick_up {
                 let send = chimaera_agent::model::AgentCommand::Send {
                     blocks: vec![chimaera_agent::model::ContentBlock::Text { text }],
                 };
                 if let Err(err) = state
                     .chat
-                    .command_as(&entry.id, send, Some(chimaera_agent::model::ORIGIN_RESTART))
+                    .command_as(
+                        &entry.id,
+                        send,
+                        Some(origin.unwrap_or(chimaera_agent::model::ORIGIN_RESTART)),
+                    )
                     .await
                 {
                     tracing::warn!(session = %entry.id, %err,
@@ -3705,6 +3746,24 @@ fn restart_message(carry: &chimaera_agent::Carryover) -> Option<String> {
         );
     }
     Some(text)
+}
+
+/// A transfer always states the new host context; the native conversation and
+/// historical journal remain intact, and this is the one visible new turn.
+pub(crate) fn handoff_message(origin: &str, carry: Option<&chimaera_agent::Carryover>) -> String {
+    let place = if origin == "home" {
+        "back on the laptop"
+    } else {
+        "on another host"
+    };
+    let mut text = format!("This Chimaera session is now {place}. Your native conversation and project files were transferred. Re-check tools and paths before using host-specific resources.");
+    if let Some(carry) = carry.filter(|c| c.interrupted_work()) {
+        text.push_str(" The previous agent process and its background work stopped during transfer. Continue the interrupted task; recreate needed background processes on this host.");
+        for task in carry.background.iter().take(32) {
+            text.push_str(&format!("\nBackground task: {}", task.description));
+        }
+    }
+    text
 }
 
 #[cfg(test)]
@@ -4638,6 +4697,7 @@ mod tests {
             model: None,
             resume: Some(native_id.into()),
             fork_at: None,
+            fork_head: false,
             rollback_turns: None,
             revert_before_turn: None,
             remote_control: RemoteControlAtStart::No,

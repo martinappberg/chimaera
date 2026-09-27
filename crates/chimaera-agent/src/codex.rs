@@ -663,6 +663,10 @@ fn thread_open_request(spec: &SpawnSpec, id: u64, effort: Option<&str>) -> Value
                 "ephemeral": false,
             },
         }),
+        (Some(thread_id), None) if spec.fork_head => json!({
+            "id": id, "method": "thread/fork",
+            "params": { "threadId": thread_id, "cwd": spec.cwd, "ephemeral": false },
+        }),
         (Some(thread_id), None) => json!({
             "id": id, "method": "thread/resume",
             "params": { "threadId": thread_id, "cwd": spec.cwd },
@@ -6088,6 +6092,13 @@ mod tests {
         assert_eq!(fork["params"]["model"], "gpt-test");
         assert_eq!(fork["params"]["effort"], "xhigh");
         assert_eq!(fork["params"]["approvalsReviewer"], "auto_review");
+
+        spec.fork_at = None;
+        spec.fork_head = true;
+        let head = thread_open_request(&spec, 10, spec.initial_effort.as_deref());
+        assert_eq!(head["method"], "thread/fork");
+        assert!(head["params"].get("lastTurnId").is_none());
+        assert_eq!(head["params"]["threadId"], "thread-old");
 
         spec.portable_context = Some("quiet imported transcript".into());
         let contextual = thread_open_request(&spec, 10, spec.initial_effort.as_deref());

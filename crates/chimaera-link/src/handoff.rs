@@ -81,3 +81,20 @@ impl std::fmt::Debug for Delegation {
             .finish_non_exhaustive()
     }
 }
+
+/// Automatic takeover is published only after a successful mirror snapshot.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HandoffPolicy {
+    pub holder_id: String,
+    pub epoch: u64,
+    pub handoff_enabled: bool,
+    pub offline_takeover: bool,
+    pub has_agents: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorkerWake {
+    pub worker_id: Option<String>,
+    pub state: String,
+    pub keeper_url: String,
+}

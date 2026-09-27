@@ -1,7 +1,8 @@
 <script lang="ts">
   import { untrack } from "svelte";
   import { pastedImageName, uploadAndInsert } from "../net/uploads";
-  import { focusTerminal, release, show } from "./termPool";
+  import { isWatching, setWatching } from "./viewerMode.svelte";
+  import { focusTerminal, release, show, refreshAccess } from "./termPool";
 
   interface Props {
     /** Session whose pooled terminal this pane shows. */
@@ -10,9 +11,14 @@
     focused: boolean;
     /** The pane's terminal font-size override (px); undefined = default. */
     fontSize?: number;
+    remote?: boolean;
+    available?: boolean;
   }
 
-  let { sessionId, focused, fontSize = undefined }: Props = $props();
+  let { sessionId, focused, fontSize = undefined, remote = false, available = true }: Props = $props();
+
+  const watching = $derived(isWatching(sessionId));
+  function toggleAccess(): void { setWatching(sessionId, !watching); refreshAccess(sessionId); }
 
   let host = $state<HTMLDivElement | null>(null);
 
@@ -47,6 +53,7 @@
    * paste must keep flowing to the PTY untouched.
    */
   function onPasteCapture(e: ClipboardEvent): void {
+    if (watching) { e.preventDefault(); return; }
     const dt = e.clipboardData;
     if (dt == null || dt.types.includes("text/plain")) return;
     const items = [...dt.items].filter((i) => i.type.startsWith("image/"));
@@ -60,11 +67,22 @@
   }
 </script>
 
-<div class="term-view" bind:this={host} onpastecapture={onPasteCapture}></div>
+<div class="terminal-access" role="toolbar" aria-label="Terminal access">
+  {#if remote}<span class="cloud-chip">Cloud{available ? "" : " · unavailable"}</span>{/if}
+  <span>{watching ? "Just watching" : "Terminal control"}</span>
+  {#if remote && !available && !watching}<button type="button" onclick={() => refreshAccess(sessionId)}>Reconnect and wake</button>{/if}
+  <button type="button" aria-pressed={!watching} onclick={toggleAccess}>{watching ? "Take control" : "Just watch"}</button>
+</div>
+<div class="term-view" class:watching bind:this={host} onpastecapture={onPasteCapture}></div>
 
 <style>
   .term-view {
     position: absolute;
-    inset: 0;
+    inset: 34px 0 0;
+    overflow: auto;
   }
+  .terminal-access { position: absolute; inset: 0 0 auto; height: 34px; display: flex; align-items: center; justify-content: flex-end; gap: 10px; padding: 0 10px; color: var(--muted); background: var(--rail-bg); font-size: 11px; border-bottom: 1px solid var(--edge); }
+  .cloud-chip { margin-right: auto; color: var(--accent); }
+  .terminal-access button { min-height: 28px; padding: 3px 9px; border: 1px solid var(--edge); border-radius: 5px; color: var(--fg); background: var(--bg); cursor: pointer; }
+  @media (max-width: 700px) { .terminal-access { height: 44px; } .terminal-access button { min-height: 36px; } .term-view { top: 44px; } }
 </style>

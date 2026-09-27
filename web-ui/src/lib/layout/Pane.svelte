@@ -334,6 +334,8 @@
       <!-- The session is gone (mid-teardown, before pruneSessions drops the
            tab): render nothing, never a fresh TerminalView against a dead id. -->
       <div class="hint"><span>closing…</span></div>
+    {:else if s.suspended}
+      <div class="hint"><span>{s.kind === "shell" ? "Paused on your laptop" : "Waiting for workspace ownership"}</span><small>{s.kind === "shell" ? "This terminal stays with its original machine. It returns when the workspace is back on your laptop." : "Your session history is saved. It will resume after the workspace is ready on this host."}</small></div>
     {:else if s.ui === "chat"}
       {@const ChatView = views.chat}
       {#if ChatView !== undefined}
@@ -358,7 +360,7 @@
     {:else}
       {@const TerminalView = views.terminal}
       {#if TerminalView !== undefined}
-        <TerminalView sessionId={tab.sessionId} focused={focused && active} fontSize={node.fontSize} />
+        <TerminalView sessionId={tab.sessionId} focused={focused && active} fontSize={node.fontSize} remote={typeof s.placement === "object"} available={s.placement_available !== false} />
       {:else if viewErrors.terminal}
         {@render loadFailure("terminal", "terminal view")}
       {:else}

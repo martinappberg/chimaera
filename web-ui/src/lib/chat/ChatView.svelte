@@ -2046,6 +2046,9 @@
     keepOpenWithin: ".menu-host",
   }}
 >
+  {#if typeof session.placement === "object"}
+    <div class="placement-note">Cloud{session.placement_available === false ? " · host unavailable" : ""}</div>
+  {/if}
   <ChatHeader
     {store}
     {agentKind}
@@ -2211,12 +2214,14 @@
               </div>
             {/if}
           </div>
-          {#if unsavedImages(block) !== "" || block.origin === "remote" || block.origin === "restart" || block.origin === "worker"}
+          {#if unsavedImages(block) !== "" || block.origin === "remote" || block.origin === "restart" || block.origin === "moved" || block.origin === "home" || block.origin === "worker"}
             <span class="bubble-meta">
               {#if block.origin === "remote"}
                 <span class="origin" title="sent from a Remote Control client (the Claude app or claude.ai/code)">via Remote Control</span>
               {:else if block.origin === "restart"}
                 <span class="origin auto" title="chimaera sent this itself: the daemon restarted while this chat had work running, so it asked the resumed agent to pick that work back up (setting: Pick Up Interrupted Work After a Restart)">sent by chimaera after a restart</span>
+              {:else if block.origin === "moved" || block.origin === "home"}
+                <span class="origin auto" title="chimaera sent this context after transferring the session between hosts">{block.origin === "home" ? "back on your laptop" : "session moved to another host"}</span>
               {:else if block.origin === "worker"}
                 <span class="origin auto" title="a worker in this workspace sent this with tell_mastermind; chimaera delivered it because the Mastermind acts on its own (auto)">from a worker</span>
               {/if}
@@ -2594,6 +2599,9 @@
     </div>
   {/if}
 
+  {#if !store.connected && store.exited === null && !store.degraded}
+    <div class="connection-action"><span>Waiting for this session’s host</span><button type="button" onclick={() => socket.wake()}>Reconnect and wake</button></div>
+  {/if}
   <Composer
     sessionId={session.id}
     running={agentBusy}
@@ -2612,6 +2620,9 @@
 </div>
 
 <style>
+  .placement-note { color: var(--accent); font-size: 11px; padding: 5px 12px; border-bottom: 1px solid var(--edge); }
+  .connection-action { display: flex; align-items: center; justify-content: center; flex-wrap: wrap; gap: 10px; padding: 8px 12px; color: var(--muted); font-size: 12px; }
+  .connection-action button { min-height: 36px; border: 1px solid var(--edge); border-radius: 6px; background: var(--rail-bg); color: var(--fg); padding: 6px 10px; cursor: pointer; }
   .chat {
     position: relative; /* anchors the rewind dialog + /mcp panel overlays */
     height: 100%;

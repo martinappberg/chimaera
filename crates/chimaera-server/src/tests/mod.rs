@@ -1,5 +1,6 @@
 mod agent_view;
 mod agents;
+mod bundle;
 mod chat;
 mod doc_check;
 mod download;
@@ -21,6 +22,7 @@ mod recents;
 mod resumables;
 mod router;
 mod save;
+mod session_proxy;
 mod sessions;
 mod settings;
 mod shell;

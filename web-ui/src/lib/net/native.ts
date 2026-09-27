@@ -8,6 +8,7 @@
  * with crates/chimaera-app — change them in lockstep.
  */
 
+import { workbenchPath } from "./base";
 import { writable } from "svelte/store";
 import { getHostLabel, getJobContext, getToken } from "./api";
 import type { Workspace } from "../workspace/sessions";
@@ -689,7 +690,7 @@ export async function openWindow(
   const hash = params.size > 0 ? `#${params.toString()}` : "";
   // The hash now carries every piece of per-window state, so severing opener
   // access is safe and avoids coupling the two app tabs.
-  window.open(`${location.origin}/${hash}`, "_blank", "noopener");
+  window.open(`${location.origin}${workbenchPath()}${hash}`, "_blank", "noopener");
 }
 
 /**
@@ -861,7 +862,7 @@ export function openDetachedPopup(
     `left=${Math.round(at.x)}`,
     `top=${Math.round(at.y)}`,
   ].join(",");
-  const popup = window.open(`${location.origin}/#${params.toString()}`, "_blank", features);
+  const popup = window.open(`${location.origin}${workbenchPath()}#${params.toString()}`, "_blank", features);
   if (popup === null) return false;
   popup.opener = null;
   return true;
@@ -926,4 +927,49 @@ export async function proDevices(): Promise<ProDevice[]> {
 
 export function onProChanged(handler: () => void): Promise<() => void> {
   return tauri()?.event.listen<null>("pro-changed", () => handler()) ?? Promise.resolve(() => {});
+}
+
+export interface CloudSetupInfo {
+  available?: boolean;
+  host_alias?: string;
+  ssh_public_key?: string | null;
+  claude_installed?: boolean;
+  codex_installed?: boolean;
+  workspace_id?: string;
+  session_id?: string;
+}
+export type CloudSetupRequest = { operation: "info" | "start" } | { operation: "onboard"; agent: "claude" | "codex" | "github" } | { operation: "project"; url: string; name?: string };
+export async function proCloudRequest(request: CloudSetupRequest): Promise<CloudSetupInfo> {
+  const t = tauri();
+  if (t === null) throw new Error("Cloud account setup requires the native app");
+  return t.core.invoke<CloudSetupInfo>("pro_cloud_request", { request });
+}
+
+export interface MirrorProfile {
+  setup_command: string | null;
+  laptop_only: string[];
+  deferred: string[];
+  missing_environment: string[];
+}
+export interface MirrorWorkspace {
+  workspace_id: string; name: string; root: string; never_mirror: boolean; privacy_pending?: boolean;
+  ownership: { state: "awaiting_verification" | "local" | "remote" | "transferring" | "hydrating" | "privacy_disabled"; epoch: number; holder?: string } | null;
+  mirror: { files: number; bytes: number; excluded: number; too_large: number; last_mirrored_at: number | null; storage_limit_bytes: number; error: string | null } | null;
+  profile: MirrorProfile | null;
+}
+export interface MirrorStatus {
+  configured: boolean; projects_root: string; projects_root_confirmed: boolean; workspaces: MirrorWorkspace[];
+  sessions: { id: string; workspace_id: string; display_name?: string; name: string; keep_running?: boolean }[];
+}
+export async function proMirrorStatus(): Promise<MirrorStatus> {
+  const t = tauri(); if (t === null) throw new Error("Mirror settings require the native app");
+  return t.core.invoke<MirrorStatus>("pro_mirror_status");
+}
+export async function proSetNeverMirror(workspaceId: string, neverMirror: boolean): Promise<void> {
+  const t = tauri(); if (t === null) throw new Error("Mirror settings require the native app");
+  await t.core.invoke("pro_set_never_mirror", { workspaceId, neverMirror });
+}
+export async function proMirrorPreference(request: { operation: "projects"; root: string } | { operation: "profile"; workspace_id: string; profile: MirrorProfile } | { operation: "pin"; session_id: string; keep_running: boolean }): Promise<void> {
+  const t = tauri(); if (t === null) throw new Error("Mirror settings require the native app");
+  await t.core.invoke("pro_mirror_preference", { request });
 }

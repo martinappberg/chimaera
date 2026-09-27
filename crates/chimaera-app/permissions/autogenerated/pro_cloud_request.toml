@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-pro-cloud-request"
+description = "Enables the pro_cloud_request command without any pre-configured scope."
+commands.allow = ["pro_cloud_request"]
+
+[[permission]]
+identifier = "deny-pro-cloud-request"
+description = "Denies the pro_cloud_request command without any pre-configured scope."
+commands.deny = ["pro_cloud_request"]

@@ -8,7 +8,10 @@ use axum::{
     Json, Router,
 };
 use serde::Deserialize;
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    time::Duration,
+};
 use tokio::{sync::Mutex, time::Instant};
 
 #[derive(Default)]
@@ -21,6 +24,8 @@ struct Data {
     devices: HashMap<String, String>,
     credentials: HashMap<String, Credential>,
     delegations: HashMap<String, Scoped>,
+    policies: HashMap<String, HandoffPolicy>,
+    mirror_disabled: HashSet<String>,
 }
 struct Scoped {
     device: String,
@@ -69,6 +74,11 @@ pub(crate) fn routes() -> Router<FakeKeeper> {
         .route("/v1/delegations", post(delegate))
         .route("/v1/delegations/renew", post(renew_delegation))
         .route("/v1/baton/{id}", get(read))
+        .route(
+            "/v1/baton/{id}/policy",
+            axum::routing::put(policy).delete(disable_policy),
+        )
+        .route("/v1/baton/{id}/enable-mirror", post(enable_mirror))
         .route("/v1/baton/{id}/acquire", post(acquire))
         .route("/v1/baton/{id}/renew", post(renew))
         .route("/v1/baton/{id}/release", post(release))
@@ -240,6 +250,9 @@ async fn credentials(
         return StatusCode::BAD_REQUEST.into_response();
     }
     let mut data = keeper.handoff().state.lock().await;
+    if data.mirror_disabled.contains(&request.workspace_id) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     let holder = holder(&data, &headers);
     if let Some(epoch) = request.epoch {
         let baton = current(&data, &request.workspace_id);
@@ -378,4 +391,72 @@ async fn renew_delegation(State(keeper): State<FakeKeeper>, headers: HeaderMap) 
         delegation.deadline.duration_since(now).as_secs() as i64,
     )
     .into_response()
+}
+
+async fn policy(
+    State(keeper): State<FakeKeeper>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(policy): Json<HandoffPolicy>,
+) -> Response {
+    let mut data = keeper.handoff().state.lock().await;
+    let baton = current(&data, &id);
+    if holder(&data, &headers) != policy.holder_id {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    if !data.batons.get(&id).is_some_and(|lease| {
+        lease.deadline > Instant::now()
+            && lease.baton.holder_id.as_deref() == Some(&policy.holder_id)
+            && lease.baton.epoch == policy.epoch
+    }) {
+        return conflict("stale_epoch", baton);
+    }
+    data.policies.insert(id, policy);
+    StatusCode::NO_CONTENT.into_response()
+}
+async fn disable_policy(
+    State(keeper): State<FakeKeeper>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> StatusCode {
+    let mut data = keeper.handoff().state.lock().await;
+    let token = headers
+        .get("authorization")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .unwrap_or("");
+    if data.delegations.contains_key(token) {
+        return StatusCode::FORBIDDEN;
+    }
+    if !valid_id(&id) {
+        return StatusCode::BAD_REQUEST;
+    }
+    if data.mirror_disabled.len() >= 128 && !data.mirror_disabled.contains(&id) {
+        return StatusCode::TOO_MANY_REQUESTS;
+    }
+    data.credentials.retain(|_, c| c.workspace != id);
+    data.mirror_disabled.insert(id.clone());
+    data.policies.remove(&id);
+    StatusCode::NO_CONTENT
+}
+
+async fn enable_mirror(
+    State(keeper): State<FakeKeeper>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> StatusCode {
+    let mut data = keeper.handoff().state.lock().await;
+    let token = headers
+        .get("authorization")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .unwrap_or("");
+    if data.delegations.contains_key(token) {
+        return StatusCode::FORBIDDEN;
+    }
+    if !valid_id(&id) {
+        return StatusCode::BAD_REQUEST;
+    }
+    data.mirror_disabled.remove(&id);
+    StatusCode::NO_CONTENT
 }

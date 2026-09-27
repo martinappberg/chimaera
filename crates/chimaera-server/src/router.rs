@@ -16,10 +16,46 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
     // Consumes the chat manager's hook signals for the daemon's lifetime
     // (no-op when already running — tests may build several routers).
     chat::spawn_signal_task(state.clone());
+    crate::session_proxy::start(state.clone());
     // Finished Slurm jobs → the Timeline (idempotent; idle without a queue).
     crate::episodes::spawn_jobs_task(state.clone());
     let api = Router::new()
         .route("/health", get(api::health))
+        .route(
+            "/pro/configure",
+            post(crate::pro::configure).delete(crate::pro::disconnect),
+        )
+        .route("/pro/status", get(crate::pro::status))
+        .route("/pro/keep-running", put(crate::pro::pin))
+        .route("/pro/privacy", put(crate::pro::privacy))
+        .route("/pro/projects", put(crate::pro::projects))
+        .route(
+            "/pro/profile",
+            get(crate::pro::profile).put(crate::pro::put_profile),
+        )
+        .route("/pro/sleep", post(crate::pro::sleep))
+        .route("/pro/wake", post(crate::pro::wake))
+        .route("/pro/power", put(crate::pro::power))
+        .route("/pro/handoff", post(crate::pro::handoff))
+        .route("/pro/hydrate", post(crate::pro::hydrate))
+        .route("/pro/cloud", get(crate::cloud::info))
+        .route("/pro/cloud/onboard", post(crate::cloud::onboard))
+        .route("/pro/cloud/project", post(crate::cloud::project))
+        .route("/pro/bundles/{id}", get(crate::bundle::snapshot_route))
+        .route(
+            "/pro/bundles/{id}/export",
+            post(crate::bundle::export_route),
+        )
+        .route(
+            "/pro/bundles",
+            post(crate::bundle::import_route).layer(axum::extract::DefaultBodyLimit::max(
+                crate::bundle::MAX_ARCHIVE as usize,
+            )),
+        )
+        .route(
+            "/pro/placements",
+            post(crate::session_proxy::register).delete(crate::session_proxy::remove),
+        )
         .route(
             "/workspaces",
             get(api::list_workspaces).post(api::create_workspace),
@@ -188,6 +224,10 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         .route("/proxy", get(proxy::list_proxies).post(proxy::create_proxy))
         .route("/proxy/{id}", delete(proxy::delete_proxy))
         .route("/proxy/{id}/health", get(proxy::proxy_health))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::session_proxy::api_proxy,
+        ))
         .route_layer(middleware::from_fn_with_state(state.clone(), api::auth))
         // Registered after route_layer, so hook ingestion is NOT behind bearer
         // auth: claude's hooks cannot know the daemon token, so the random

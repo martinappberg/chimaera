@@ -364,7 +364,13 @@ impl Carryover {
             AgentEvent::UserMessage {
                 origin: Some(origin),
                 ..
-            } if origin == model::ORIGIN_RESTART => self.pickup_at_ms = now_ms(),
+            } if matches!(
+                origin.as_str(),
+                model::ORIGIN_RESTART | model::ORIGIN_MOVED | model::ORIGIN_HOME
+            ) =>
+            {
+                self.pickup_at_ms = now_ms()
+            }
             AgentEvent::TurnStarted { .. } => self.turn_in_flight = true,
             AgentEvent::TurnCompleted { .. } | AgentEvent::TurnAborted { .. } => {
                 self.turn_in_flight = false;

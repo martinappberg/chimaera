@@ -300,6 +300,38 @@ async fn baton_cas_offline_fork_and_mirror_fencing() {
         epoch: 1,
     };
     first.renew_baton(id, &held).await.unwrap();
+    let policy = HandoffPolicy {
+        holder_id: "fake-device".into(),
+        epoch: 1,
+        handoff_enabled: true,
+        offline_takeover: true,
+        has_agents: true,
+    };
+    first.set_handoff_policy(id, &policy).await.unwrap();
+    assert!(second.set_handoff_policy(id, &policy).await.is_err());
+    second.disable_handoff_policy(id).await.unwrap();
+    assert!(
+        first
+            .mirror_credentials(&MirrorRequest {
+                workspace_id: id.into(),
+                epoch: None
+            })
+            .await
+            .is_err(),
+        "privacy revocation denies new read grants too"
+    );
+    first.set_handoff_policy(id, &policy).await.unwrap();
+    assert!(
+        first
+            .mirror_credentials(&MirrorRequest {
+                workspace_id: id.into(),
+                epoch: None
+            })
+            .await
+            .is_err(),
+        "worker policy publication cannot re-enable mirroring"
+    );
+    second.enable_mirror(id).await.unwrap();
     let conflict = second
         .acquire_baton(
             id,

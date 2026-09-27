@@ -31,6 +31,11 @@ export type AgentState =
   | "unknown";
 
 export interface Session {
+  placement?: "here" | { remote: string };
+  placement_available?: boolean;
+  suspended?: boolean;
+  keep_running?: boolean;
+  last_input_ms?: number | null;
   id: string;
   name: string;
   cwd: string;

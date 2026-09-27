@@ -505,9 +505,16 @@ pub(crate) async fn ingest(
         else {
             return Json(json!({})).into_response();
         };
-        let known = crate::lock(&state.agents)
+        let (known, native_cwd) = crate::lock(&state.agents)
             .get(&id)
-            .and_then(|record| record.transcript_path.clone());
+            .map(|record| {
+                (
+                    record.transcript_path.clone(),
+                    record.native_cwd_for(thread),
+                )
+            })
+            .unwrap_or_default();
+        let cwd = native_cwd.unwrap_or(cwd);
         let Ok(_permit) = crate::codex_notify::ROLLOUT_WORK.try_acquire() else {
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         };

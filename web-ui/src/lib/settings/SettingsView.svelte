@@ -14,6 +14,8 @@
   import EnvironmentSettings from "./EnvironmentSettings.svelte";
   import DocumentsSettings from "./DocumentsSettings.svelte";
   import ProSettings from "./ProSettings.svelte";
+  import CloudSetup from "./CloudSetup.svelte";
+  import { isBrowserGateway } from "../net/base";
   import { isNativeShell } from "../net/native";
   import NotificationStatus from "./NotificationStatus.svelte";
   import UpdatesStatus from "./UpdatesStatus.svelte";
@@ -34,6 +36,7 @@
     const at = out.indexOf("Agents");
     out.splice(at >= 0 ? at + 1 : out.length, 0, "Environment", "Documents");
     if (isNativeShell()) out.splice(out.indexOf("Keyboard"), 0, "Chimaera Pro");
+    else if (isBrowserGateway()) out.splice(out.indexOf("Keyboard"), 0, "Cloud machine");
     return out;
   })();
 
@@ -75,7 +78,7 @@
   const DOC_KEYWORDS = ["documents", "markdown", "agents.md", "skill", "claude", "teach", "check"];
   const docsVisible = $derived(q === "" || DOC_KEYWORDS.some((k) => k.includes(q)));
 
-  const PRO_KEYWORDS = ["chimaera pro", "account", "sign in", "plan", "kept", "connected", "devices", "sign out"];
+  const PRO_KEYWORDS = ["chimaera pro", "account", "sign in", "plan", "kept", "connected", "devices", "sign out", "cloud machine", "github", "repository", "ssh public key"];
   const proVisible = $derived(q === "" || PRO_KEYWORDS.some((keyword) => keyword.includes(q)));
 
   /** Rows grouped by category, registry order, empty groups dropped. */
@@ -90,7 +93,7 @@
         if (docsVisible) out.push({ category: cat, defs: [] });
         continue;
       }
-      if (cat === "Chimaera Pro") {
+      if (cat === "Chimaera Pro" || cat === "Cloud machine") {
         if (proVisible) out.push({ category: cat, defs: [] });
         continue;
       }
@@ -243,6 +246,10 @@
           {:else if group.category === "Chimaera Pro"}
             <section data-section={group.category}>
               <ProSettings visible={tabVisible} />
+            </section>
+          {:else if group.category === "Cloud machine"}
+            <section data-section={group.category}>
+              <CloudSetup visible={tabVisible} />
             </section>
           {:else if group.category === "Notifications"}
             <!-- Generic rows plus a status line: whether the OS/browser will

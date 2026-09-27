@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::response::Response;
 use bytes::Bytes;
 use serde::Deserialize;
@@ -160,18 +160,29 @@ enum ClientMessage {
     },
 }
 
+pub(crate) fn session_writable(state: &AppState, id: &str) -> bool {
+    let workspace = crate::lock(&state.session_workspaces).get(id).cloned();
+    workspace.is_none_or(|workspace| crate::pro::may_write(state, &workspace))
+}
+
 /// GET /ws/sessions/{id}
 pub(crate) async fn session_ws(
     ws: WebSocketUpgrade,
     Path(id): Path<String>,
     State(state): State<Arc<AppState>>,
+    Query(options): Query<crate::session_proxy::SocketOptions>,
 ) -> Response {
     ws.max_message_size(MAX_TERMINAL_INPUT_MESSAGE)
         .max_frame_size(MAX_TERMINAL_INPUT_MESSAGE)
-        .on_upgrade(move |socket| handle(socket, id, state))
+        .on_upgrade(move |socket| handle(socket, id, state, options))
 }
 
-async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
+async fn handle(
+    mut socket: WebSocket,
+    id: String,
+    state: Arc<AppState>,
+    options: crate::session_proxy::SocketOptions,
+) {
     let auth = match authenticate(&mut socket, &state).await {
         Some(auth) => auth,
         None => {
@@ -183,7 +194,17 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
             return;
         }
     };
-    let auth_dims = if auth.parked { None } else { auth.dims };
+    let remote_auth = json!({"type":"auth", "token":"", "cols":auth.dims.map(|d| d.0), "rows":auth.dims.map(|d| d.1), "parked":auth.parked});
+    if crate::session_proxy::socket(&state, &id, "sessions", &options, remote_auth, &mut socket)
+        .await
+    {
+        return;
+    }
+    let auth_dims = if auth.parked || options.read_only || !session_writable(&state, &id) {
+        None
+    } else {
+        auth.dims
+    };
 
     // Adopt the client's grid BEFORE attaching so the snapshot below is
     // rendered at the size the client will actually display it. A parked
@@ -457,6 +478,10 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
             },
             msg = socket.recv() => match msg {
                 Some(Ok(Message::Binary(bytes))) => {
+                    if options.read_only || !session_writable(&state, &id) {
+                        let _ = send_ordered_json(&mut socket, &mut batch, &json!({"type":"error","code":"read_only","message":"This session is read only on this host"})).await;
+                        continue;
+                    }
                     if !bytes.is_empty() { crate::activity::record(&state, &id); }
                     for chunk in bytes.chunks(TERMINAL_INPUT_CHUNK) {
                         if attachment
@@ -480,6 +505,7 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
                 Some(Ok(Message::Text(text))) => {
                     match serde_json::from_str::<ClientMessage>(&text) {
                         Ok(ClientMessage::Resize { cols, rows }) => {
+                            if options.read_only || !session_writable(&state, &id) { continue; }
                             client_dims = Some((cols, rows));
                             // Flush output rendered at the old width before
                             // the grid reflows under it — the initiator is
@@ -666,10 +692,11 @@ pub(crate) async fn chat_ws(
     ws: WebSocketUpgrade,
     Path(id): Path<String>,
     State(state): State<Arc<AppState>>,
+    Query(options): Query<crate::session_proxy::SocketOptions>,
 ) -> Response {
     ws.max_message_size(MAX_CHAT_COMMAND_MESSAGE)
         .max_frame_size(MAX_CHAT_COMMAND_MESSAGE)
-        .on_upgrade(move |socket| handle_chat(socket, id, state))
+        .on_upgrade(move |socket| handle_chat(socket, id, state, options))
 }
 
 /// Chat replay batch size: bounds per-frame size without flooding the socket
@@ -681,7 +708,12 @@ const CHAT_BATCH: usize = 128;
 /// the journal's 256 KiB cap; otherwise frames stay near this ceiling.
 const CHAT_BATCH_BYTES: usize = 512 * 1024;
 
-async fn handle_chat(mut socket: WebSocket, id: String, state: Arc<AppState>) {
+async fn handle_chat(
+    mut socket: WebSocket,
+    id: String,
+    state: Arc<AppState>,
+    options: crate::session_proxy::SocketOptions,
+) {
     let Some(last_seq) = chat_authenticate(&mut socket, &state).await else {
         let _ = send_json(
             &mut socket,
@@ -690,6 +722,19 @@ async fn handle_chat(mut socket: WebSocket, id: String, state: Arc<AppState>) {
         .await;
         return;
     };
+
+    if crate::session_proxy::socket(
+        &state,
+        &id,
+        "chat",
+        &options,
+        json!({"type":"auth","token":"","last_seq":last_seq}),
+        &mut socket,
+    )
+    .await
+    {
+        return;
+    }
 
     // Replay may read the journal file — keep it off the reactor.
     let attachment = {
@@ -797,6 +842,10 @@ async fn handle_chat(mut socket: WebSocket, id: String, state: Arc<AppState>) {
                 Some(Ok(Message::Text(text))) => {
                     match serde_json::from_str::<chimaera_agent::model::AgentCommand>(&text) {
                         Ok(mut cmd) => {
+                            if options.read_only || !session_writable(&state, &id) {
+                                let _ = send_json(&mut socket, &json!({"type":"error","code":"read_only","message":"This session is read only"})).await;
+                                continue;
+                            }
                             if let Err(err) = cmd.validate_ingress() {
                                 tracing::debug!(%id, %err, "chat command exceeds ingress budget");
                                 // Reject only this command. The authenticated

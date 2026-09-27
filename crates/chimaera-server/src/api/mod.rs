@@ -48,7 +48,7 @@ pub(crate) async fn auth(State(state): State<Arc<AppState>>, req: Request, next:
 
 /// GET /api/v1/health
 pub(crate) async fn health(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    Json(json!({
+    let mut value = json!({
         "name": "chimaera",
         "version": chimaera_core::VERSION,
         // The build id lets clients spot daemon/client skew (semver is the
@@ -57,5 +57,10 @@ pub(crate) async fn health(State(state): State<Arc<AppState>>) -> Json<serde_jso
         "hostname": state.hostname,
         "pid": state.pid,
         "uptime_secs": state.started.elapsed().as_secs(),
-    }))
+    });
+    if crate::cloud::enabled() {
+        value["pro_cloud_operations"] =
+            json!(crate::cloud::active_operations() + crate::pro::active_operations(&state));
+    }
+    Json(value)
 }

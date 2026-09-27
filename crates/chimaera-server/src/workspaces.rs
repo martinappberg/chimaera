@@ -113,6 +113,26 @@ impl WorkspaceStore {
         Ok(workspace)
     }
 
+    /// Transfer preserves IDs; a conflicting root/ID is never silently merged.
+    pub(crate) fn import_exact(&mut self, workspace: Workspace) -> anyhow::Result<()> {
+        if let Some(existing) = self
+            .items
+            .iter()
+            .find(|entry| entry.id == workspace.id || entry.root == workspace.root)
+        {
+            if existing.id != workspace.id || existing.root != workspace.root {
+                anyhow::bail!("workspace identity conflicts with an existing workspace");
+            }
+            return Ok(());
+        }
+        self.items.push(workspace);
+        if let Err(error) = self.save() {
+            self.items.pop();
+            return Err(error);
+        }
+        Ok(())
+    }
+
     /// Stamp `id` as freshly opened. Returns the workspace, or None if
     /// unknown.
     pub(crate) fn touch(&mut self, id: &str) -> Option<Workspace> {

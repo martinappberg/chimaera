@@ -127,6 +127,8 @@ const MARP_HLJS_KEEP = [
 ];
 
 export default defineConfig({
+  // The same bundle runs directly or below a per-tab browser gateway prefix.
+  base: "./",
   plugins: [svelte(), devManifest(), entryBundleBudget(), pdfjsAssets(), marpSharesKatex()],
   resolve: {
     // Marp (the slides view, its own lazy chunk) imports all of MathJax and

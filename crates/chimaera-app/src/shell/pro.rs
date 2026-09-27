@@ -25,6 +25,9 @@ pub(super) struct Pro {
     pub hosts: Mutex<HashMap<String, Host>>,
     device_aliases: Mutex<HashSet<String>>,
     error: Mutex<Option<String>>,
+    delegation: Mutex<Option<chimaera_link::Delegation>>,
+    daemon_stamp: Mutex<Option<(u16, String, bool)>>,
+    worker_links: tokio::sync::Mutex<HashMap<String, chimaera_link::LinkTunnel>>,
     runtime: tokio::sync::Mutex<Option<Runtime>>,
     operation: tokio::sync::Mutex<()>,
     ready: tokio::sync::watch::Sender<bool>,
@@ -66,6 +69,9 @@ impl Pro {
             hosts: Mutex::new(HashMap::new()),
             device_aliases: Mutex::new(HashSet::new()),
             error: Mutex::new(None),
+            delegation: Mutex::new(None),
+            daemon_stamp: Mutex::new(None),
+            worker_links: tokio::sync::Mutex::new(HashMap::new()),
             runtime: tokio::sync::Mutex::new(None),
             operation: tokio::sync::Mutex::new(()),
             ready: tokio::sync::watch::channel(ready).0,
@@ -75,13 +81,13 @@ impl Pro {
 
     pub fn is_device(&self, alias: &str) -> bool {
         if let Some(host) = lock(&self.hosts).values().find(|host| host.alias == alias) {
-            return host.kind == HostKind::Device;
+            return host.kind != HostKind::Ssh;
         }
         lock(&self.device_aliases).contains(alias)
     }
 
     fn remember_device(&self, host: &Host) {
-        if host.kind == HostKind::Device {
+        if host.kind != HostKind::Ssh {
             let mut devices = lock(&self.device_aliases);
             if devices.len() < 256 {
                 devices.insert(host.alias.clone());
@@ -94,9 +100,7 @@ impl Pro {
     }
 
     fn has_keeper(&self) -> bool {
-        lock(&self.account)
-            .as_ref()
-            .is_some_and(|account| !account.keeper_url.is_empty())
+        lock(&self.account).as_ref().is_some_and(keeper_available)
     }
 
     pub async fn client(&self) -> Option<Client> {
@@ -109,6 +113,10 @@ impl Pro {
         let client = lock(&self.client);
         client.clone().map(|client| (client, self.generation()))
     }
+}
+
+fn keeper_available(account: &Account) -> bool {
+    account.plan != chimaera_link::Plan::None && !account.keeper_url.is_empty()
 }
 
 fn read_endpoint() -> Option<String> {
@@ -195,7 +203,7 @@ async fn activate(app: &AppHandle, client: Client) -> Result<()> {
     let mut updates = client.token_updates();
     let snapshot = async {
         let account = client.me().await?;
-        let hosts = if account.keeper_url.is_empty() {
+        let hosts = if !keeper_available(&account) {
             Vec::new()
         } else {
             client.hosts().await?
@@ -217,6 +225,8 @@ async fn activate(app: &AppHandle, client: Client) -> Result<()> {
             current.take()
         };
         stop(&state).await;
+        *lock(&state.pro.delegation) = None;
+        *lock(&state.pro.daemon_stamp) = None;
         if let Some(previous) = previous {
             previous.clear_tokens().await;
         }
@@ -226,7 +236,7 @@ async fn activate(app: &AppHandle, client: Client) -> Result<()> {
     tokio::task::spawn_blocking(move || save_tokens(&stored_endpoint, tokens.as_ref())).await??;
     let (account, hosts) = snapshot?;
     anyhow::ensure!(authenticated, "sign in required");
-    let has_keeper = !account.keeper_url.is_empty();
+    let has_keeper = keeper_available(&account);
     *lock(&state.pro.account) = Some(account);
     for host in &hosts {
         state.pro.remember_device(host);
@@ -275,6 +285,10 @@ async fn activate(app: &AppHandle, client: Client) -> Result<()> {
         }
     });
 
+    super::power::install(app);
+    if let Err(error) = configure_daemon(&state, &client).await {
+        *lock(&state.pro.error) = Some(error.to_string());
+    }
     let (events, serve) = if has_keeper {
         let (events, serve) = start_keeper(app, client.clone());
         (Some(events), Some(serve))
@@ -376,21 +390,28 @@ fn start_keeper(
     (events, serve)
 }
 
-async fn reconcile_account(app: &AppHandle, client: &Client, generation: u64) -> Result<()> {
+pub(super) async fn reconcile_account(
+    app: &AppHandle,
+    client: &Client,
+    generation: u64,
+) -> Result<()> {
     let account = client.me().await?;
-    let hosts = if account.keeper_url.is_empty() {
+    let hosts = if !keeper_available(&account) {
         Vec::new()
     } else {
         client.hosts().await?
     };
     let state = app.state::<Shell>();
+    // Blocking HTTP requests cannot be cancelled by aborting the reconcile task.
+    // Serialize mutations through completion so sign-out's final DELETE wins.
+    let _operation = state.pro.operation.lock().await;
     let mut runtime = state.pro.runtime.lock().await;
     if state.pro.generation() != generation {
         return Ok(());
     }
-    let changed = lock(&state.pro.account)
-        .as_ref()
-        .is_none_or(|old| old.keeper_url != account.keeper_url);
+    let changed = lock(&state.pro.account).as_ref().is_none_or(|old| {
+        old.keeper_url != account.keeper_url || keeper_available(old) != keeper_available(&account)
+    });
     if let Some(runtime) = runtime.as_mut() {
         if changed {
             if let Some(events) = runtime.events.take() {
@@ -401,7 +422,7 @@ async fn reconcile_account(app: &AppHandle, client: &Client, generation: u64) ->
             }
             crate::askpass::close_keeper(app, None);
         }
-        if !account.keeper_url.is_empty() && runtime.events.is_none() {
+        if keeper_available(&account) && runtime.events.is_none() {
             let (events, serve) = start_keeper(app, client.clone());
             runtime.events = Some(events);
             runtime.serve = Some(serve);
@@ -409,6 +430,9 @@ async fn reconcile_account(app: &AppHandle, client: &Client, generation: u64) ->
     }
     *lock(&state.pro.account) = Some(account);
     replace_hosts(app, hosts).await;
+    drop(runtime);
+    configure_daemon(&state, client).await?;
+    reconcile_placements(&state, client).await?;
     *lock(&state.pro.error) = None;
     let _ = app.emit("pro-changed", ());
     Ok(())
@@ -440,7 +464,7 @@ fn machine_name() -> String {
     chimaera_core::this_node().unwrap_or_else(|| "My computer".into())
 }
 
-async fn apply_host(app: &AppHandle, host: Host) {
+pub(super) async fn apply_host(app: &AppHandle, host: Host) {
     let state = app.state::<Shell>();
     state.pro.remember_device(&host);
     {
@@ -494,6 +518,17 @@ async fn host_signal(app: &AppHandle, host: &Host) {
 }
 
 pub(super) async fn stop(state: &Shell) {
+    let links = std::mem::take(&mut *state.pro.worker_links.lock().await);
+    for (host, link) in links {
+        let _ = daemon_request(
+            state,
+            "DELETE",
+            &format!("/pro/placements?host_id={host}"),
+            None,
+        )
+        .await;
+        link.close();
+    }
     if let Some(runtime) = state.pro.runtime.lock().await.take() {
         if let Some(events) = runtime.events {
             events.abort();
@@ -730,6 +765,9 @@ async fn sign_out(app: &AppHandle, everywhere: bool, expected: Option<u64>) -> R
             previous
         };
         stop(&state).await;
+        let _ = daemon_request(&state, "DELETE", "/pro/configure", None).await;
+        *lock(&state.pro.delegation) = None;
+        *lock(&state.pro.daemon_stamp) = None;
         crate::askpass::close_keeper(app, None);
         if let Some(client) = client {
             client.clear_tokens().await;
@@ -806,10 +844,10 @@ pub async fn pro_hosts(state: tauri::State<'_, Shell>) -> Result<Vec<KeptHost>, 
                 alias: host.alias,
                 kept: true,
                 status: status_name(&host.status).into(),
-                kind: if host.kind == HostKind::Device {
-                    "device"
-                } else {
-                    "ssh"
+                kind: match host.kind {
+                    HostKind::Device => "device",
+                    HostKind::Worker => "worker",
+                    HostKind::Ssh => "ssh",
                 }
                 .into(),
             });
@@ -936,4 +974,317 @@ pub async fn pro_devices(state: tauri::State<'_, Shell>) -> Result<Vec<Device>, 
         .devices()
         .await
         .map_err(|error| error.to_string())
+}
+
+/// The native account panel always targets the laptop daemon, including when
+/// it is opened from a workspace currently displayed through another host.
+pub(super) async fn daemon_request(
+    state: &Shell,
+    method: &str,
+    suffix: &str,
+    body: Option<serde_json::Value>,
+) -> Result<serde_json::Value> {
+    anyhow::ensure!(
+        suffix.starts_with("/pro/") && !suffix.contains(['\r', '\n']),
+        "invalid local Pro route"
+    );
+    let local = lock(&state.local).clone();
+    let method = method.to_string();
+    let suffix = suffix.to_string();
+    tokio::task::spawn_blocking(move || {
+        let url = format!("http://127.0.0.1:{}/api/v1{suffix}", local.port);
+        let authorization = format!("Bearer {}", local.token);
+        let mut response = match method.as_str() {
+            "GET" => crate::http::agent()
+                .get(&url)
+                .header("Authorization", &authorization)
+                .config()
+                .timeout_global(Some(Duration::from_secs(15)))
+                .max_redirects(0)
+                .build()
+                .call()?,
+            "DELETE" => crate::http::agent()
+                .delete(&url)
+                .header("Authorization", &authorization)
+                .config()
+                .timeout_global(Some(Duration::from_secs(15)))
+                .max_redirects(0)
+                .build()
+                .call()?,
+            "PUT" => crate::http::agent()
+                .put(&url)
+                .header("Authorization", &authorization)
+                .config()
+                .timeout_global(Some(Duration::from_secs(30)))
+                .max_redirects(0)
+                .build()
+                .send_json(body.unwrap_or(serde_json::Value::Null))?,
+            "POST" => crate::http::agent()
+                .post(&url)
+                .header("Authorization", &authorization)
+                .config()
+                .timeout_global(Some(Duration::from_secs(30)))
+                .max_redirects(0)
+                .build()
+                .send_json(body.unwrap_or(serde_json::Value::Null))?,
+            _ => anyhow::bail!("invalid local Pro method"),
+        };
+        let mut bytes = Vec::new();
+        response
+            .body_mut()
+            .as_reader()
+            .take(2 * 1024 * 1024 + 1)
+            .read_to_end(&mut bytes)?;
+        anyhow::ensure!(
+            bytes.len() <= 2 * 1024 * 1024,
+            "local Pro response exceeds limit"
+        );
+        if bytes.is_empty() {
+            Ok(serde_json::Value::Null)
+        } else {
+            Ok(serde_json::from_slice(&bytes)?)
+        }
+    })
+    .await?
+}
+async fn configure_daemon(state: &Shell, client: &Client) -> Result<()> {
+    let Some(account) = lock(&state.pro.account).clone() else {
+        return Ok(());
+    };
+    let suitable = tokio::task::spawn_blocking(super::power::suitable).await?;
+    daemon_request(
+        state,
+        "PUT",
+        "/pro/power",
+        Some(serde_json::json!({"suitable":suitable})),
+    )
+    .await?;
+    if account.keeper_url.is_empty() || account.plan == chimaera_link::Plan::None {
+        let cleared = (lock(&state.local).port, String::new(), false);
+        if lock(&state.pro.daemon_stamp).as_ref() != Some(&cleared) {
+            // The daemon outlives the GUI. A downgrade must revoke its local
+            // runtime even when this app process never configured that runtime.
+            // Keep the stamp unchanged on failure so reconciliation retries.
+            daemon_request(state, "DELETE", "/pro/configure", None).await?;
+            let mut links = state.pro.worker_links.lock().await;
+            for link in links.values() {
+                link.close();
+            }
+            let ids: Vec<_> = links.keys().cloned().collect();
+            for id in ids {
+                daemon_request(
+                    state,
+                    "DELETE",
+                    &format!("/pro/placements?host_id={id}"),
+                    None,
+                )
+                .await?;
+                links.remove(&id);
+            }
+            *lock(&state.pro.delegation) = None;
+            *lock(&state.pro.daemon_stamp) = Some(cleared);
+        }
+        return Ok(());
+    }
+    let local = lock(&state.local).clone();
+    let stamp = (
+        local.port,
+        account.keeper_url.clone(),
+        account.hours_exhausted,
+    );
+    if lock(&state.pro.daemon_stamp).as_ref() == Some(&stamp) {
+        return Ok(());
+    }
+    let cached = lock(&state.pro.delegation).clone();
+    let delegation = if let Some(delegation) = cached {
+        delegation
+    } else {
+        client.delegate_daemon().await?
+    };
+    let endpoint = state
+        .pro
+        .endpoint
+        .clone()
+        .context("Pro endpoint unavailable")?;
+    daemon_request(state,"POST","/pro/configure",Some(serde_json::json!({"endpoint":endpoint,"keeper_url":account.keeper_url,"delegation":delegation,"role":"device","hours_exhausted":account.hours_exhausted}))).await?;
+    *lock(&state.pro.delegation) = Some(delegation);
+    *lock(&state.pro.daemon_stamp) = Some(stamp);
+    Ok(())
+}
+async fn reconcile_placements(state: &Shell, client: &Client) -> Result<()> {
+    if lock(&state.pro.account).as_ref().is_none_or(|account| {
+        account.plan == chimaera_link::Plan::None || account.keeper_url.is_empty()
+    }) {
+        return Ok(());
+    }
+    let status = daemon_request(state, "GET", "/pro/status", None).await?;
+    let hosts: Vec<_> = lock(&state.pro.hosts)
+        .values()
+        .filter(|host| host.kind == HostKind::Worker)
+        .cloned()
+        .collect();
+    let mut links = state.pro.worker_links.lock().await;
+    let retired: Vec<_> = links
+        .keys()
+        .filter(|id| !hosts.iter().any(|host| &host.id == *id))
+        .cloned()
+        .collect();
+    for id in retired {
+        if let Some(link) = links.remove(&id) {
+            daemon_request(
+                state,
+                "DELETE",
+                &format!("/pro/placements?host_id={id}"),
+                None,
+            )
+            .await?;
+            link.close();
+        }
+    }
+    for host in hosts {
+        let Some(daemon) = host.daemon.as_ref() else {
+            continue;
+        };
+        if !links.contains_key(&host.id) {
+            links.insert(
+                host.id.clone(),
+                chimaera_link::LinkTunnel::bind(client.clone(), host.id.clone()).await?,
+            );
+        }
+        let port = links
+            .get(&host.id)
+            .expect("inserted worker link")
+            .local_port;
+        for workspace in status["workspaces"].as_array().into_iter().flatten() {
+            if workspace["ownership"]["state"] != "remote"
+                || workspace["ownership"]["holder"] != host.id
+            {
+                continue;
+            }
+            daemon_request(state,"POST","/pro/placements",Some(serde_json::json!({"host_id":host.id,"endpoint":format!("http://127.0.0.1:{port}"),"token":daemon.token,"workspace_id":workspace["workspace_id"],"epoch":workspace["ownership"]["epoch"]}))).await?;
+        }
+    }
+    Ok(())
+}
+#[tauri::command]
+pub async fn pro_mirror_status(
+    state: tauri::State<'_, Shell>,
+) -> Result<serde_json::Value, String> {
+    daemon_request(&state, "GET", "/pro/status", None)
+        .await
+        .map_err(|error| error.to_string())
+}
+#[tauri::command]
+pub async fn pro_set_never_mirror(
+    state: tauri::State<'_, Shell>,
+    workspace_id: String,
+    never_mirror: bool,
+) -> Result<(), String> {
+    async {
+        anyhow::ensure!(
+            !workspace_id.is_empty()
+                && workspace_id.len() <= 128
+                && workspace_id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b)),
+            "invalid workspace"
+        );
+        let _operation = state.pro.operation.lock().await;
+        if !never_mirror {
+            state
+                .pro
+                .client()
+                .await
+                .context("Sign in to enable the cloud mirror")?
+                .enable_mirror(&workspace_id)
+                .await?;
+        }
+        // Stop local publishing first. If account deletion fails, the local
+        // privacy flag remains true and the UI reports that cloud policy could
+        // not yet be disabled; it must never silently re-enable local copying.
+        daemon_request(
+            &state,
+            "PUT",
+            "/pro/privacy",
+            Some(serde_json::json!({"workspace_id":workspace_id,"never_mirror":never_mirror})),
+        )
+        .await?;
+        if never_mirror {
+            state
+                .pro
+                .client()
+                .await
+                .context("Sign in to disable the cloud mirror")?
+                .disable_handoff_policy(&workspace_id)
+                .await?;
+            daemon_request(&state, "PUT", "/pro/privacy", Some(serde_json::json!({"workspace_id":workspace_id,"never_mirror":true,"confirmed":true}))).await?;
+        }
+        Ok::<_, anyhow::Error>(())
+    }
+    .await
+    .map_err(|error| error.to_string())
+}
+
+#[derive(serde::Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+pub enum MirrorPreference {
+    Projects {
+        root: String,
+    },
+    Profile {
+        workspace_id: String,
+        profile: serde_json::Value,
+    },
+    Pin {
+        session_id: String,
+        keep_running: bool,
+    },
+}
+#[tauri::command]
+pub async fn pro_mirror_preference(
+    state: tauri::State<'_, Shell>,
+    request: MirrorPreference,
+) -> Result<(), String> {
+    async {
+        if let MirrorPreference::Projects { root } = &request {
+            daemon_request(
+                &state,
+                "PUT",
+                "/pro/projects",
+                Some(serde_json::json!({"root":root})),
+            )
+            .await?;
+            return Ok(());
+        }
+        let (id, path, body) = match request {
+            MirrorPreference::Projects { .. } => unreachable!("projects handled above"),
+            MirrorPreference::Profile {
+                workspace_id,
+                profile,
+            } => {
+                let path = format!("/pro/profile?workspace_id={workspace_id}");
+                (workspace_id, path, profile)
+            }
+            MirrorPreference::Pin {
+                session_id,
+                keep_running,
+            } => (
+                session_id.clone(),
+                "/pro/keep-running".into(),
+                serde_json::json!({"session_id":session_id,"keep_running":keep_running}),
+            ),
+        };
+        anyhow::ensure!(
+            !id.is_empty()
+                && id.len() <= 128
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b)),
+            "invalid mirror identity"
+        );
+        daemon_request(&state, "PUT", &path, Some(body)).await?;
+        Ok::<_, anyhow::Error>(())
+    }
+    .await
+    .map_err(|error| error.to_string())
 }

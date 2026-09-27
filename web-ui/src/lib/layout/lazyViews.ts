@@ -84,7 +84,7 @@ export function failedAssetUrls(
       continue;
     }
     const wanted = extension === "css" ? url.pathname.endsWith(".css") : /\.m?js$/.test(url.pathname);
-    if (url.origin !== origin || !url.pathname.startsWith("/assets/") || !wanted) continue;
+    if (url.origin !== origin || !/^\/(?:app\/[A-Za-z0-9_-]{1,128}\/)?assets\//.test(url.pathname) || !wanted) continue;
     url.hash = "";
     if (seen.has(url.href)) continue;
     seen.add(url.href);

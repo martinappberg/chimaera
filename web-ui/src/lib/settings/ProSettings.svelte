@@ -1,5 +1,7 @@
 <script lang="ts">
+  import CloudSetup from "./CloudSetup.svelte";
   import { onMount, untrack } from "svelte";
+  import MirrorSettings from "./MirrorSettings.svelte";
   import { asyncDisposer } from "../shared/asyncDisposer";
   import { pageVisible } from "../shared/visibility";
   import {
@@ -137,6 +139,10 @@
         {/each}
       </ul>
     </div>
+
+    <CloudSetup {visible} />
+
+    <MirrorSettings {visible} />
 
     <div class="actions">
       <button class="btn" disabled={busy !== null} onclick={() => void act("sign-out", proSignOut)}>

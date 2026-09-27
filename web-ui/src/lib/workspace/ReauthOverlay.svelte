@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { isBrowserGateway } from "../net/base";
+  const browserGateway = isBrowserGateway();
   import {
     health as fetchHealth,
     refreshTokenFromHash,
@@ -50,8 +52,12 @@
     >
       <div class="auth-title">disconnected — unauthorized</div>
       <p class="auth-body">
-        The daemon rejected this window's token (it likely restarted). Paste a fresh URL from
-        <code>chimaera connect</code> into the address bar, then retry.
+        {#if browserGateway}
+          Your browser session has expired or was signed out. <a href="/login">Sign in again</a> to reopen your workbench.
+        {:else}
+          The daemon rejected this window's token (it likely restarted). Paste a fresh URL from
+          <code>chimaera connect</code> into the address bar, then retry.
+        {/if}
       </p>
       <button class="auth-retry" use:focusOnMount disabled={authRetrying} onclick={() => void retryAuth()}>
         {authRetrying ? "retrying…" : "retry"}

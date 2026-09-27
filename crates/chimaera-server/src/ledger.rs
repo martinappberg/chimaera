@@ -35,6 +35,9 @@ use chimaera_agent::model::SessionUi;
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct LedgerEntry {
     pub(crate) id: String,
+    /// A handoff or unverified owner retains identity without resurrecting.
+    pub(crate) suspended: bool,
+    pub(crate) handoff: Option<crate::bundle::HandoffResume>,
     pub(crate) workspace_id: String,
     /// Last polled cwd (shells) or spawn cwd (agents).
     pub(crate) cwd: PathBuf,
@@ -66,6 +69,8 @@ pub(crate) struct LedgerAgent {
     /// The transcript path claude's hooks reported, when any — the exact
     /// file `--resume` needs to exist.
     pub(crate) transcript: Option<PathBuf>,
+    /// Header provenance; launch cwd may move while native bytes stay intact.
+    pub(crate) native_cwd: Option<PathBuf>,
     /// Current display title — carried onto the successor session (or a
     /// Recents row) so the conversation stays recognizable either way.
     pub(crate) title: String,
@@ -96,9 +101,11 @@ pub(crate) struct BootLedger {
 }
 
 impl LedgerEntry {
-    fn to_json(&self) -> serde_json::Value {
+    pub(crate) fn to_json(&self) -> serde_json::Value {
         json!({
             "id": self.id,
+            "suspended": self.suspended,
+            "handoff": self.handoff,
             "workspace_id": self.workspace_id,
             "cwd": self.cwd,
             "pinned_name": self.pinned_name,
@@ -110,6 +117,7 @@ impl LedgerEntry {
                 "kind": a.kind.as_str(),
                 "resume": a.resume,
                 "transcript": a.transcript,
+                "native_cwd": a.native_cwd,
                 "title": a.title,
                 "ui": a.ui,
                 "model": a.model,
@@ -118,11 +126,15 @@ impl LedgerEntry {
         })
     }
 
-    fn from_json(value: &serde_json::Value) -> Option<LedgerEntry> {
+    pub(crate) fn from_json(value: &serde_json::Value) -> Option<LedgerEntry> {
         let agent = match value.get("agent") {
             None | Some(serde_json::Value::Null) => None,
             Some(a) => Some(LedgerAgent {
                 kind: AgentKind::parse(a.get("kind")?.as_str()?)?,
+                native_cwd: a
+                    .get("native_cwd")
+                    .and_then(|v| v.as_str())
+                    .map(PathBuf::from),
                 resume: a.get("resume").and_then(|r| r.as_str()).map(str::to_string),
                 transcript: a
                     .get("transcript")
@@ -143,6 +155,10 @@ impl LedgerEntry {
             }),
         };
         Some(LedgerEntry {
+            suspended: value["suspended"].as_bool().unwrap_or(false),
+            handoff: value
+                .get("handoff")
+                .and_then(|v| serde_json::from_value(v.clone()).ok()),
             id: value.get("id")?.as_str()?.to_string(),
             workspace_id: value.get("workspace_id")?.as_str()?.to_string(),
             cwd: PathBuf::from(value.get("cwd")?.as_str()?),
@@ -231,6 +247,15 @@ impl LedgerStore {
         entries: &[LedgerEntry],
         links: &HashMap<String, String>,
     ) {
+        if let Err(error) = self.write_checked(entries, links) {
+            tracing::error!(%error, "failed to persist session ledger");
+        }
+    }
+    pub(crate) fn write_checked(
+        &mut self,
+        entries: &[LedgerEntry],
+        links: &HashMap<String, String>,
+    ) -> anyhow::Result<()> {
         // BTreeMap orders the links so an unchanged snapshot compares equal.
         let links: std::collections::BTreeMap<&String, &String> = links.iter().collect();
         let body = json!({
@@ -239,13 +264,11 @@ impl LedgerStore {
         })
         .to_string();
         if self.last_written.as_deref() == Some(body.as_str()) {
-            return;
+            return Ok(());
         }
-        if let Err(err) = self.save(&body) {
-            tracing::error!(%err, "failed to persist session ledger");
-            return;
-        }
+        self.save(&body)?;
         self.last_written = Some(body);
+        Ok(())
     }
 
     fn save(&self, body: &str) -> anyhow::Result<()> {
@@ -346,12 +369,18 @@ pub(crate) fn snapshot(state: &AppState) -> (Vec<LedgerEntry>, HashMap<String, S
                 kind: record.kind,
                 resume: record.resume_id().or_else(|| record.resumed_from.clone()),
                 transcript: record.transcript_path.clone(),
+                native_cwd: record
+                    .resume_id()
+                    .or_else(|| record.resumed_from.clone())
+                    .and_then(|id| record.native_cwd_for(&id)),
                 title: record.display_name(info.title.as_deref()),
                 ui: SessionUi::Term,
                 model: None,
                 carryover: None,
             });
             Some(LedgerEntry {
+                suspended: false,
+                handoff: None,
                 id: info.id.clone(),
                 workspace_id,
                 cwd: cwds
@@ -388,6 +417,8 @@ pub(crate) fn snapshot(state: &AppState) -> (Vec<LedgerEntry>, HashMap<String, S
                 .map(|r| r.display_name(None))
                 .unwrap_or_else(|| kind.as_str().to_string());
             Some(LedgerEntry {
+                suspended: false,
+                handoff: None,
                 id: c.id.clone(),
                 workspace_id,
                 cwd: cwds.get(&c.id).cloned().unwrap_or_else(|| c.cwd.clone()),
@@ -399,7 +430,11 @@ pub(crate) fn snapshot(state: &AppState) -> (Vec<LedgerEntry>, HashMap<String, S
                 agent: Some(LedgerAgent {
                     kind,
                     resume: c.native_session_id.clone(),
-                    transcript: None,
+                    transcript: record.and_then(|r| r.transcript_path.clone()),
+                    native_cwd: c
+                        .native_session_id
+                        .as_deref()
+                        .and_then(|id| record.and_then(|r| r.native_cwd_for(id))),
                     title,
                     ui: SessionUi::Chat,
                     model: c.model.clone(),
@@ -410,10 +445,23 @@ pub(crate) fn snapshot(state: &AppState) -> (Vec<LedgerEntry>, HashMap<String, S
         .collect();
     drop(pty_ids);
     entries.extend(chat_entries);
+    drop(themes);
+    drop(cwds);
+    drop(agents);
+    drop(workspaces);
+    for entry in crate::lock(&state.deferred_sessions).values() {
+        if let Some(live) = entries.iter_mut().find(|live| live.id == entry.id) {
+            live.suspended = entry.suspended;
+        } else {
+            entries.push(entry.clone());
+        }
+    }
 
+    let retained_ids: std::collections::HashSet<_> =
+        entries.iter().map(|entry| entry.id.as_str()).collect();
     let links = crate::lock(&state.links)
         .iter()
-        .filter(|(t, a)| live_ids.contains(t.as_str()) && live_ids.contains(a.as_str()))
+        .filter(|(t, a)| retained_ids.contains(t.as_str()) && retained_ids.contains(a.as_str()))
         .map(|(t, a)| (t.clone(), a.clone()))
         .collect();
     (entries, links)
@@ -444,6 +492,14 @@ pub(crate) async fn restore(state: &Arc<AppState>, boot: BootLedger) {
     let mut respawned = 0usize;
     let mut retired = 0usize;
     for entry in &boot.sessions {
+        if entry.suspended || !crate::pro::may_write(state, &entry.workspace_id) {
+            let mut deferred = entry.clone();
+            deferred.suspended = true;
+            if let Err(error) = defer(state, deferred) {
+                tracing::error!(session=%entry.id,%error,"deferred ledger capacity reached");
+            }
+            continue;
+        }
         let workspace = crate::lock(&state.workspaces).get(&entry.workspace_id);
         let plan = plan_restore(entry, restore, workspace.is_some());
         match plan {
@@ -469,8 +525,14 @@ pub(crate) async fn restore(state: &Arc<AppState>, boot: BootLedger) {
     }
     // Linked-terminal edges survive only when both endpoints did.
     {
-        let live: std::collections::HashSet<String> =
-            state.sessions.list().into_iter().map(|i| i.id).collect();
+        let mut live: std::collections::HashSet<String> = state
+            .sessions
+            .list()
+            .into_iter()
+            .map(|i| i.id)
+            .chain(state.chat.list().into_iter().map(|i| i.id))
+            .collect();
+        live.extend(crate::lock(&state.deferred_sessions).keys().cloned());
         let mut links = crate::lock(&state.links);
         for (terminal, agent) in &boot.links {
             if live.contains(terminal) && live.contains(agent) {
@@ -550,7 +612,13 @@ fn resolve_resume(claude_projects_dir: &std::path::Path, entry: &LedgerEntry) ->
         return agent
             .transcript
             .as_deref()
-            .filter(|path| crate::codex_notify::verify_rollout(path, id, &entry.cwd))
+            .filter(|path| {
+                crate::codex_notify::verify_rollout(
+                    path,
+                    id,
+                    agent.native_cwd.as_deref().unwrap_or(&entry.cwd),
+                )
+            })
             .map(|_| id.to_string());
     }
     let recorded = agent
@@ -565,10 +633,29 @@ fn resolve_resume(claude_projects_dir: &std::path::Path, entry: &LedgerEntry) ->
     (recorded || derived).then(|| id.to_string())
 }
 
-async fn respawn(
+pub(crate) async fn respawn(
     state: &Arc<AppState>,
     entry: &LedgerEntry,
     workspace: crate::workspaces::Workspace,
+) -> anyhow::Result<()> {
+    let (fork, origin) = entry.handoff.as_ref().map_or((false, None), |handoff| {
+        (handoff.fork, Some(handoff.origin.as_str()))
+    });
+    if entry.handoff.as_ref().is_some_and(|handoff| {
+        crate::pro::owned_epoch(state, &entry.workspace_id)
+            .is_some_and(|epoch| epoch != handoff.epoch)
+    }) {
+        anyhow::bail!("deferred bundle epoch is stale");
+    }
+    respawn_transfer(state, entry, workspace, fork, origin).await
+}
+
+pub(crate) async fn respawn_transfer(
+    state: &Arc<AppState>,
+    entry: &LedgerEntry,
+    workspace: crate::workspaces::Workspace,
+    fork_head: bool,
+    origin: Option<&'static str>,
 ) -> anyhow::Result<()> {
     // Chat sessions resurrect through the chat spawn path (regenerate the
     // per-session settings/mcp files against THIS daemon, resume the native
@@ -579,7 +666,11 @@ async fn respawn(
         .as_ref()
         .is_some_and(|a| a.ui == SessionUi::Chat)
     {
-        return crate::chat::resurrect_chat(state, entry, workspace).await;
+        return if origin.is_some() || fork_head {
+            crate::chat::resurrect_chat_transfer(state, entry, workspace, fork_head, origin).await
+        } else {
+            crate::chat::resurrect_chat(state, entry, workspace).await
+        };
     }
     // A cwd deleted while the daemon was down falls back to the workspace
     // root — a shell somewhere beats no shell.
@@ -615,6 +706,8 @@ async fn respawn(
         }
     };
     let spec = crate::spawn::SpawnSpec {
+        native_cwd: entry.agent.as_ref().and_then(|a| a.native_cwd.clone()),
+        fork_head,
         workspace,
         id: Some(entry.id.clone()),
         name: entry.pinned_name.clone(),
@@ -686,12 +779,68 @@ async fn retire_to_recents(state: &Arc<AppState>, entry: &LedgerEntry, last_acti
     true
 }
 
+/// A verified local grant is the only path that resumes restart-deferred work.
+pub(crate) async fn resume_deferred_workspace(
+    state: &Arc<AppState>,
+    workspace_id: &str,
+) -> anyhow::Result<()> {
+    if !crate::pro::may_write(state, workspace_id) {
+        anyhow::bail!("workspace ownership has not been verified");
+    }
+    let workspace = crate::lock(&state.workspaces)
+        .get(workspace_id)
+        .ok_or_else(|| anyhow::anyhow!("unknown workspace"))?;
+    let entries: Vec<_> = crate::lock(&state.deferred_sessions)
+        .values()
+        .filter(|entry| entry.workspace_id == workspace_id)
+        .cloned()
+        .collect();
+    state.session_proxy.clear_workspace(workspace_id);
+    for entry in entries {
+        if entry.agent.is_none()
+            && entry
+                .handoff
+                .as_ref()
+                .is_some_and(|handoff| handoff.origin == crate::bundle::Origin::Moved)
+        {
+            continue;
+        }
+        if state
+            .chat
+            .get(&entry.id)
+            .is_some_and(|session| session.alive)
+            || state
+                .sessions
+                .get(&entry.id)
+                .is_some_and(|session| session.alive)
+        {
+            continue;
+        }
+        respawn(state, &entry, workspace.clone()).await?;
+        crate::lock(&state.deferred_sessions).remove(&entry.id);
+    }
+    state.changes.notify_waiters();
+    Ok(())
+}
+
+/// Imported/remote histories are bounded just like the live session roster.
+pub(crate) fn defer(state: &AppState, entry: LedgerEntry) -> anyhow::Result<()> {
+    let mut deferred = crate::lock(&state.deferred_sessions);
+    if !deferred.contains_key(&entry.id) && deferred.len() >= 512 {
+        anyhow::bail!("suspended session limit reached");
+    }
+    deferred.insert(entry.id.clone(), entry);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn shell_entry() -> LedgerEntry {
         LedgerEntry {
+            suspended: false,
+            handoff: None,
             id: "s-1".into(),
             workspace_id: "w1".into(),
             cwd: PathBuf::from("/tmp"),
@@ -710,6 +859,7 @@ mod tests {
                 kind,
                 resume: resume.map(str::to_string),
                 transcript: None,
+                native_cwd: None,
                 title: "fix the tests".into(),
                 ui: SessionUi::Term,
                 model: None,
@@ -846,6 +996,10 @@ mod tests {
         assert_eq!(resolve_resume(&dir, &entry), Some(id.into()));
         entry.cwd = PathBuf::from("/other-project");
         assert_eq!(resolve_resume(&dir, &entry), None);
+        entry.agent.as_mut().unwrap().native_cwd = Some(PathBuf::from("/project"));
+        assert_eq!(resolve_resume(&dir, &entry), Some(id.into()));
+        let restored = LedgerEntry::from_json(&entry.to_json()).unwrap();
+        assert_eq!(resolve_resume(&dir, &restored), Some(id.into()));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

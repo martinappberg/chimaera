@@ -273,6 +273,29 @@ pub(crate) fn sessions_json(state: &AppState) -> Vec<serde_json::Value> {
     for (_, row) in &mut rows {
         let at = row["id"].as_str().and_then(|id| activity.get(id)).copied();
         row["last_input_ms"] = json!(at);
+        row["placement"] = json!("here");
+        row["keep_running"] = json!(row["id"]
+            .as_str()
+            .is_some_and(|id| crate::pro::keep_running(state, id)));
+    }
+    drop(execs);
+    drop(cwds);
+    drop(names);
+    drop(agents);
+    drop(workspaces);
+    for entry in crate::lock(&state.deferred_sessions).values() {
+        if !rows.iter().any(|(_, row)| row["id"] == entry.id) {
+            let mut row = crate::bundle::paused_row(entry);
+            row["keep_running"] = json!(crate::pro::keep_running(state, &entry.id));
+            rows.push((entry.created_at, row));
+        }
+    }
+    for remote in state.session_proxy.rows() {
+        // The app registers only a verified remote epoch; an old local row
+        // must not shadow the current owner after a handoff.
+        rows.retain(|(_, row)| row["id"] != remote["id"]);
+        let created = remote["created_at"].as_u64().unwrap_or(0);
+        rows.push((created, remote));
     }
     rows.sort_by_key(|(created, _)| *created);
     rows.into_iter().map(|(_, row)| row).collect()

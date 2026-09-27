@@ -1496,6 +1496,8 @@ async fn spawn_terminal(
     tracing::info!(mastermind = %agent_id, workspace = %workspace.id,
         "mastermind act: spawn_terminal");
     let spec = crate::spawn::SpawnSpec {
+        native_cwd: None,
+        fork_head: false,
         workspace,
         id: None,
         name,

@@ -20,7 +20,7 @@ tracing.workspace = true
 rust-embed.workspace = true
 mime_guess.workspace = true
 hostname.workspace = true
-rustix.workspace = true
+rustix = { workspace = true, features = ["process"] }
 chimaera-agent.workspace = true
 chimaera-core.workspace = true
 chimaera-pty.workspace = true
@@ -60,6 +60,8 @@ httpdate = "1.0"
 # Decoding a sent chat image into its saved copy (already in the tree
 # through axum).
 base64 = "0.22"
+# Loopback daemon forwarding shares axum's existing WebSocket codec; no TLS.
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake"] }
 
 # macOS-only: foreground-process name/cwd for session display names
 # (proc_pidinfo BSDINFO name / PIDVNODEPATHINFO cwd); Linux reads /proc.
@@ -69,4 +71,3 @@ libproc = "0.14"
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
-tokio-tungstenite = "0.30"

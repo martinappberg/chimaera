@@ -1,3 +1,5 @@
+import { daemonPath, gatewayPrefix, isBrowserGateway } from "./base";
+
 import { writable } from "svelte/store";
 
 import { healthPollDelayMs, startVisibilityPoll, type PollHandle } from "./poll";
@@ -28,8 +30,16 @@ const DETACHED_KEY = "chimaera.dt";
  * SAME window, layout and all.
  */
 function initFromHash(): string | null {
+  if (isBrowserGateway()) {
+    const host = gatewayPrefix();
+    if (sessionStorage.getItem("chimaera.gatewayHost") !== host) {
+      for (const key of [TOKEN_KEY, WS_KEY, HOST_KEY, WIN_KEY, HOME_HUB_KEY, JOB_KEY, NODE_KEY, DETACHED_KEY]) sessionStorage.removeItem(key);
+      sessionStorage.setItem("chimaera.gatewayHost", host);
+    }
+    // Workspace/window fragments remain useful; only credentials are ignored.
+  }
   const params = new URLSearchParams(location.hash.slice(1));
-  const tokenFromHash = params.get("token");
+  const tokenFromHash = isBrowserGateway() ? null : params.get("token");
   const wsFromHash = params.get("ws");
   const hostFromHash = params.get("host");
   const winFromHash = params.get("win");
@@ -93,7 +103,7 @@ function initFromHash(): string | null {
     sessionStorage.setItem(NODE_KEY, nodeFromHash);
   }
   if (
-    tokenFromHash !== null ||
+    params.has("token") ||
     wsFromHash !== null ||
     hostFromHash !== null ||
     winFromHash !== null ||
@@ -103,7 +113,7 @@ function initFromHash(): string | null {
   ) {
     history.replaceState(null, "", location.pathname + location.search);
   }
-  return tokenFromHash ?? sessionStorage.getItem(TOKEN_KEY);
+  return isBrowserGateway() ? null : tokenFromHash ?? sessionStorage.getItem(TOKEN_KEY);
 }
 
 let token = initFromHash();
@@ -170,6 +180,7 @@ export function clearUnauthorized(): void {
  * true when a new token was picked up.
  */
 export function refreshTokenFromHash(): boolean {
+  if (isBrowserGateway()) return false;
   const params = new URLSearchParams(location.hash.slice(1));
   const fresh = params.get("token");
   if (fresh === null || fresh === token) return false;
@@ -185,7 +196,7 @@ export function refreshTokenFromHash(): boolean {
  * reached without a tunnel. The raw hostname stays available as hover detail.
  */
 export function getHostLabel(): string {
-  return sessionStorage.getItem(HOST_KEY) ?? "local";
+  return sessionStorage.getItem(HOST_KEY) ?? (isBrowserGateway() ? "connected host" : "local");
 }
 
 /**
@@ -246,7 +257,8 @@ export async function api(path: string, init: RequestInit = {}): Promise<Respons
   if (token) {
     headers.set("Authorization", `Bearer ${token}`);
   }
-  const res = await fetch(`/api/v1${path}`, { ...init, headers });
+  if (isBrowserGateway()) headers.set("X-Chimaera-Browser", "1");
+  const res = await fetch(daemonPath(`/api/v1${path}`), { ...init, headers });
   if (res.status === 401) notifyUnauthorized();
   return res;
 }

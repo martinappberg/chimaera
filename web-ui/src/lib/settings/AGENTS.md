@@ -25,8 +25,10 @@ the opt-in "teach agents the document dialect" installs over
 owns the text; the confirm dialog shows it verbatim before anything is written.
 
 **Exception — Chimaera Pro.** Native-shell account state, not daemon settings:
-`ProSettings.svelte` invokes the seven `pro_*` app commands in `net/native.ts`.
-The category is omitted in a browser; an unset endpoint shows only availability.
+`ProSettings.svelte` invokes the `pro_*` app commands in `net/native.ts`.
+An ordinary browser omits the category; an unset endpoint shows only availability.
+An account browser gateway instead exposes Cloud machine, using its host-pinned
+daemon API and HttpOnly browser session for login terminals and repository clones.
 `pro-changed` refreshes visible settings, with a catch-up on visibility return.
 Credentials stay in the app's keychain, never in the schema or this UI.
 
@@ -40,6 +42,8 @@ Credentials stay in the app's keychain, never in the schema or this UI.
 | `AgentsSettings.svelte` | Per-agent binary/model settings (paths, managed installs). |
 | `EnvironmentSettings.svelte` | The Environment prelude panel (bespoke, `/api/v1/environment`-backed — see the exception above). |
 | `environment.ts` | Wire types + `getEnvironment`/`putEnvironment` for the prelude map. |
+| `CloudSetup.svelte` | Cloud wake, native agent/GitHub login terminals, SSH public key and repository clone controls. |
+| `MirrorSettings.svelte` | Native laptop-daemon mirror status, privacy, setup profile and persistent session pins; visibility-gated 15-second status refresh. |
 | `ProSettings.svelte` | Native account, kept hosts, devices and sign-out controls (app IPC-backed). |
 | `DocumentsSettings.svelte` | The Documents panel: the opt-in AGENTS.md / Claude skill installs (see the exception above). |
 | `agentDocs.ts` | Wire types + `getAgentDocs`/`installAgentDocs` for `/api/v1/agent-docs`. |

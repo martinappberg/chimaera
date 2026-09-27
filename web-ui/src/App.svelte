@@ -2429,6 +2429,8 @@
       // an old dt window can't come up stranded rail-open, stripless.
       if (detachedWindow && !layout.focusMode) layout = { ...layout, focusMode: true };
     }
+    // A phone opens the work itself; the bottom strip can reveal navigation.
+    if (matchMedia("(max-width: 700px)").matches) layout = { ...layout, focusMode: true };
     layoutReady = true;
     pruneAndAutoOpen();
     pruneDeadFiles();

@@ -140,3 +140,36 @@ scope. Parent device revocation and sign-out-everywhere invalidate it and close
 its keeper transport. Servers store only a token hash. The app passes this
 credential only to its authenticated local daemon; it never persists the value
 in configuration, logs, bundles or mirrors.
+
+## Automatic takeover policy
+
+After publishing a usable mirror, the current holder may PUT
+`/v1/baton/{workspace}/policy` with
+`{holder_id, epoch, handoff_enabled, offline_takeover, has_agents}`. It requires
+an unexpired owned epoch and returns 204. Delegation credentials may publish the
+same policy. A full device may DELETE that path to disable all three flags even
+when another device holds the baton; scoped delegations cannot disable policy.
+
+Policy survives ownership changes. Automatic worker wake considers an expired
+**device** holder only, and requires all three flags, a published mirror, and
+current entitlement and budget. An expired worker lease alone never wakes a
+worker. These flags do not change the lease compare-and-swap rules or permit
+active-owner takeover.
+
+## Explicit worker wake
+
+A full device may POST `/v1/worker/wake` with `{}` for a deliberate cloud action.
+It returns 202 with `{worker_id, state, keeper_url}`: `worker_id` is nullable,
+`keeper_url` is empty until assigned, and state is `pending`, `starting`,
+`started`, `suspended`, `stopped`, or `retry`. Provisioning unavailable returns
+503; entitlement or budget refusal returns 403 with a stable error code. The
+account is derived from the device credential. Delegations cannot invoke it.
+Directory/health polling must not call this endpoint.
+
+
+Deleting the handoff policy also disables mirroring for that workspace account-wide:
+existing derived Git grants stop working, and new read/write grants are denied.
+Publishing another policy does not clear this privacy choice. Only an explicit
+full-device POST `/v1/baton/{workspace}/enable-mirror` with `{}` may re-enable
+credential issuance (204); daemon delegations and worker credentials cannot call
+it. Re-enabling does not restore the automatic handoff flags.

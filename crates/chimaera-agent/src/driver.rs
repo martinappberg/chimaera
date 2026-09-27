@@ -98,6 +98,9 @@ pub struct SpawnSpec {
     /// argv (`--fork-session --resume-session-at`); Codex opens with
     /// `thread/fork {threadId,lastTurnId}` instead of `thread/resume`.
     pub fork_at: Option<String>,
+    /// Fork the complete native conversation when a disconnected owner may
+    /// still be writing the source. Mutually exclusive with `fork_at`.
+    pub fork_head: bool,
     /// Quiet portable-fork context. Codex passes it as thread-open developer
     /// instructions; Claude receives the same text through the launcher's
     /// `--append-system-prompt-file`. It initializes context without creating
@@ -157,6 +160,7 @@ impl SpawnSpec {
             agent_version: None,
             rollback_turns: None,
             fork_at: None,
+            fork_head: false,
             portable_context: None,
             mcp_auto_approve: None,
             remote_control: None,

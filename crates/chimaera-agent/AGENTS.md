@@ -132,3 +132,7 @@ gap-replay idea as the PTY transport, realized for structured streams.
 - `DriverExit::ProtocolError` sessions are kept in the registry *dead* so the UI
   can show the failure — remove them deliberately, don't assume `contains(id)`
   means alive.
+
+Transfer imports set `SpawnSpec.fork_head` only for an offline native head fork.
+Codex omits the rewind boundary for that operation; see PROTOCOL Pass 38. The
+manager stamps `moved`/`home` pick-up origins at the matching Send echo.

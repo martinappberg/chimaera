@@ -274,3 +274,65 @@ The keeper strips this intent marker before forwarding. `read_only=true`
 always suppresses wake. Background health checks and viewer attachments must
 never mark interaction. An awake daemon still requires its normal authenticated
 WebSocket first frame.
+
+### Background handoff HTTP adapter
+
+`/v1/hosts/{host_id}/http/{path}` accepts a device or daemon-delegation bearer and
+forwards a narrow set of daemon HTTP routes. This lets a daemon perform background
+handoff over ordinary HTTPS without depending on an app-owned local tunnel. The
+keeper injects its in-memory daemon bearer, removes other caller headers except
+Content-Type and the explicit wake marker, and never accepts a destination URL.
+
+Allowed method/path pairs after `/http/` are `GET api/v1/sessions`,
+`GET|POST api/v1/workspaces`, `GET api/v1/pro/bundles/{session_id}`,
+`POST api/v1/pro/bundles/{session_id}/export`, `POST api/v1/pro/bundles`, and
+`GET|PUT api/v1/pro/profile`. Bundle import accepts only `fork=true|false`,
+`origin=moved|home`, and unsigned `epoch` query parameters; profile accepts only
+`workspace_id`. Session and workspace identifiers use letters, digits, `_` and
+`-`, up to 128 bytes. Other routes, methods and query keys are rejected.
+
+Bodies stream with a 128 MiB ceiling; response preparation is bounded to two
+minutes. Authentication and host-generation revocation close in-flight streams.
+Worker reads retain the sleeping-cache policy above; mutations and explicit wake
+requests may start the worker. Direct SSH targets can use the same adapter.
+Reverse-served device hosts return 409 when no direct target is available; they
+remain accessible through the full TCP WebSocket transport.
+
+The background HTTP adapter also permits `POST /api/v1/pro/handoff` with
+`{workspace_id,expected_epoch}` for a paused worker to flush and release ownership.
+Cloud setup uses the ordinary authenticated worker daemon: `GET /api/v1/pro/cloud`,
+`POST /api/v1/pro/cloud/onboard` with `{agent:"claude"|"codex"|"github"}`, and
+`POST /api/v1/pro/cloud/project` with `{url,name?}`. A worker health response may
+include `pro_cloud_operations` so an in-progress clone counts as awake work.
+
+### Isolated browser previews
+
+An account browser workbench is served under `/app/{host_id}/` with an HttpOnly
+browser session. It never exposes an account or daemon bearer to JavaScript.
+Previewed applications use the separate per-account keeper origin.
+
+`POST /app/{host_id}/browser/lease` requires that browser session, the account
+Origin, and `X-Chimaera-Browser`; JSON `{proxy_id}` names an already-created,
+target-pinned daemon preview. The response is
+`{claim_url,grant,proxy_id,expires_at}`. The grant is single use, expires within
+60 seconds, and is posted in a form to the keeper's `/browser/claim`, never put
+in a URL. Optional form `path` is an origin-relative app path; the keeper may
+redirect only under `/proxy/{proxy_id}/`.
+Optional form `mode=refresh` renews the cookie and returns 204 without redirecting
+or reloading the running app. Other mode values are rejected. A visible parent
+may exchange another grant before expiry; a hidden preview is allowed to expire.
+
+The keeper redeems it with service-authenticated
+`POST /internal/v1/browser/claim {grant}`. The account returns
+`{lease_token,host_id,proxy_id,expires_at}` and retains only hashes. The keeper
+sets a Secure HttpOnly cookie named for that proxy ID. Its fixed lifetime is at
+most 15 minutes. `POST /internal/v1/browser/validate {lease_token,proxy_id}`
+returns `{host_id,proxy_id,expires_at}` only while the same account, device,
+browser session and entitlement remain valid. Requests validate individually;
+upgraded streams revalidate within ten seconds. Grants are capped at eight per
+browser session. Wrong-account, expired, revoked and consumed grants return 401.
+
+The preview cookie authorizes only its exact host and proxy ID. An absolute app
+resource may use a same-origin Referer that names that ID; ambiguous cookie-only
+routing is forbidden. Upstream cookies never become account/keeper credentials.
+Browsers that block third-party cookies can open the preview in a separate tab.

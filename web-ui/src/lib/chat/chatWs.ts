@@ -1,3 +1,4 @@
+import { daemonSocketUrl } from "../net/base";
 import { getToken } from "../net/api";
 import { Reconnector, UNKNOWN_SESSION_RETRIES } from "../net/reconnect";
 import { CooperativeQueue } from "./cooperativeQueue";
@@ -121,10 +122,9 @@ export class ChatSocket {
     }
   }
 
-  private connect(): void {
+  private connect(interaction = false): void {
     if (this.closed) return;
-    const proto = location.protocol === "https:" ? "wss" : "ws";
-    const ws = new WebSocket(`${proto}://${location.host}/ws/chat/${this.sessionId}`);
+    const ws = new WebSocket(daemonSocketUrl(`/ws/chat/${this.sessionId}${interaction ? "?wake=interaction" : ""}`));
     this.ws = ws;
 
     ws.onopen = () => {
@@ -186,6 +186,7 @@ export class ChatSocket {
           });
           break;
         case "error":
+          if (msg.code === "remote_unavailable" || msg.code === "worker_asleep") break;
           // Mid view-switch the driver may not be registered yet — the
           // normal onclose reconnect path retries before this goes fatal.
           if (
@@ -199,7 +200,7 @@ export class ChatSocket {
           // healthy and the session may come back (respawn, toggle). Going
           // fatal here permanently stopped reconnects after a single answer
           // sent into a dead driver.
-          if (msg.code === "command_failed" || msg.code === "invalid_command") {
+          if (msg.code === "command_failed" || msg.code === "invalid_command" || msg.code === "read_only") {
             this.deliveries.push({
               kind: "command_failed",
               message: (msg.message as string) ?? "command failed",
@@ -245,6 +246,14 @@ export class ChatSocket {
     if (this.ws?.readyState !== WebSocket.OPEN) return false;
     this.ws.send(JSON.stringify(command));
     return true;
+  }
+
+  /** User-requested reconnect carries wake intent once. Background retry never does. */
+  wake(): void {
+    if (this.closed) return;
+    this.fatal = false; this.ended = false; this.recon.cancel();
+    if (this.ws !== null) { this.ws.onclose = null; this.ws.close(); }
+    this.connect(true);
   }
 
   close(): void {

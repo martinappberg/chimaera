@@ -86,6 +86,13 @@ pub(crate) async fn create_session(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CreateSession>,
 ) -> Response {
+    if !crate::pro::may_write(&state, &body.workspace_id) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error":"workspace_owned_elsewhere"})),
+        )
+            .into_response();
+    }
     // Touch doubles as the lookup: activity in a workspace is what "recently
     // used" means on the home screen.
     let Some(workspace) = crate::lock(&state.workspaces).touch(&body.workspace_id) else {
@@ -193,6 +200,8 @@ pub(crate) async fn create_session(
     };
 
     let spec = crate::spawn::SpawnSpec {
+        native_cwd: None,
+        fork_head: false,
         workspace,
         id: None,
         name: body.name,
@@ -391,6 +400,7 @@ async fn spawn_chat_ui(
         model: body.model.clone(),
         resume: body.resume.clone(),
         fork_at: None,
+        fork_head: false,
         rollback_turns: None,
         revert_before_turn: None,
         remote_control: crate::chat::RemoteControlAtStart::Setting,
@@ -425,6 +435,8 @@ async fn spawn_chat_ui(
             let _ = std::fs::remove_file(path);
         }
         let spec = crate::spawn::SpawnSpec {
+            native_cwd: None,
+            fork_head: false,
             workspace,
             id: None,
             name: body.name,

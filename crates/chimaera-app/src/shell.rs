@@ -21,10 +21,12 @@ use tauri::{AppHandle, Emitter, Manager};
 use crate::daemon::LocalDaemon;
 use crate::windows::{WindowRecord, WindowRegistry};
 
+mod cloud;
 mod commands;
 mod connect;
 mod drag;
 pub(crate) mod notices;
+mod power;
 mod pro;
 mod restore;
 mod tunnel;
@@ -1032,7 +1034,11 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_clipboard_manager::init())
         .invoke_handler(tauri::generate_handler![
+            cloud::pro_cloud_request,
             pro::pro_status,
+            pro::pro_mirror_status,
+            pro::pro_mirror_preference,
+            pro::pro_set_never_mirror,
             pro::pro_sign_in,
             pro::pro_sign_out,
             pro::pro_sign_out_everywhere,

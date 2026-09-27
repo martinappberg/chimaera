@@ -1,3 +1,4 @@
+import { daemonSocketUrl } from "./base";
 import { getToken } from "./api";
 import { nudgeReconnectors, retryDelayMs } from "./reconnect";
 import type { Link } from "../workspace/agentLinks";
@@ -186,8 +187,7 @@ export class EventsSocket {
 
   private connect(): void {
     if (this.closed) return;
-    const proto = location.protocol === "https:" ? "wss" : "ws";
-    const ws = new WebSocket(`${proto}://${location.host}/ws/events`);
+    const ws = new WebSocket(daemonSocketUrl("/ws/events"));
     this.ws = ws;
 
     ws.onopen = () => {

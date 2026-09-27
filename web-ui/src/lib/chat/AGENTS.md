@@ -280,3 +280,7 @@ per-chunk work proportional to the TRAILING OPEN SEGMENT, not the message:
 - Keep `ChatView.svelte` from growing without bound. The overlays/panels (header,
   rewind dialog, `/mcp`, usage, effort) are already their own components — add new
   chrome the same way rather than inlining it into the host.
+
+Remote chat reconnects are passive. Only the explicit reconnect/wake action
+adds `wake=interaction`; browser sockets use `net/base` to preserve gateway
+prefixes. Transfer context echoes render the additive `moved` and `home` origins.

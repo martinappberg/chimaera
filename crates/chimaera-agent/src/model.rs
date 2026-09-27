@@ -41,6 +41,9 @@ pub const UNHANDLED_REQUEST_NAME_MAX: usize = 80;
 /// `UserMessage.origin` for the message the daemon sends a resurrected
 /// session when a restart cut its work off (see `ChatManager::command_as`).
 pub const ORIGIN_RESTART: &str = "restart";
+/// Host transfer context is a visible, daemon-authored message.
+pub const ORIGIN_MOVED: &str = "moved";
+pub const ORIGIN_HOME: &str = "home";
 /// `UserMessage.origin` for a worker's `tell_mastermind` message the daemon
 /// delivers to an auto-mode Mastermind (a wake the user didn't type).
 pub const ORIGIN_WORKER: &str = "worker";

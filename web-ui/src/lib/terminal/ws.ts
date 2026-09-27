@@ -1,7 +1,9 @@
+import { daemonSocketUrl } from "../net/base";
 import { getToken } from "../net/api";
 import { Reconnector, UNKNOWN_SESSION_RETRIES } from "../net/reconnect";
 
 export interface SessionSocketHandlers {
+  readOnly?(): boolean;
   /** Raw PTY output (including the initial snapshot). Feed to term.write(). */
   onBinary(data: Uint8Array): void;
   /**
@@ -88,13 +90,14 @@ export class SessionSocket {
     private readonly sessionId: string,
     private readonly handlers: SessionSocketHandlers,
   ) {
-    this.connect();
+    this.connect(true);
   }
 
-  private connect(): void {
+  private connect(interaction = false): void {
     if (this.closed) return;
-    const proto = location.protocol === "https:" ? "wss" : "ws";
-    const ws = new WebSocket(`${proto}://${location.host}/ws/sessions/${this.sessionId}`);
+    const readOnly = this.handlers.readOnly?.() ?? false;
+    const query = readOnly ? "?read_only=true" : interaction && !this.handlers.parked?.() ? "?wake=interaction" : "";
+    const ws = new WebSocket(daemonSocketUrl(`/ws/sessions/${this.sessionId}${query}`));
     ws.binaryType = "arraybuffer";
     this.ws = ws;
 
@@ -105,7 +108,7 @@ export class SessionSocket {
       this.sentParkedAuth = parked;
       // Carry the client grid so the server resizes BEFORE rendering the
       // snapshot; the frame then always matches what the terminal displays.
-      const dims = parked ? null : (this.handlers.dims?.() ?? null);
+      const dims = parked || readOnly ? null : (this.handlers.dims?.() ?? null);
       ws.send(
         JSON.stringify({ type: "auth", token: getToken() ?? "", parked, ...(dims ?? {}) }),
       );
@@ -157,7 +160,7 @@ export class SessionSocket {
         // the server already adopted the auth-frame grid, and for a dead
         // session's last-words replay these are the death-time dims the
         // final screen must parse at — so adopt them like a resync's.
-        if (this.everReady) this.handlers.onReset(msg.cols, msg.rows);
+        if (this.everReady || this.handlers.readOnly?.()) this.handlers.onReset(msg.cols, msg.rows);
         this.everReady = true;
         // Reconcile grids: resizes are silently dropped while the socket is
         // down or mid-handshake (the first fit often lands during CONNECTING),
@@ -191,6 +194,8 @@ export class SessionSocket {
         this.handlers.onExited(msg.status ?? null);
         break;
       case "error":
+        if (msg.code === "read_only") { this.handlers.onError(msg.message ?? "Just watching"); break; }
+        if (msg.code === "remote_unavailable" || msg.code === "worker_asleep") { break; }
         if (msg.code === "unknown_session") {
           // After a witnessed exit, "unknown" means even the session's
           // last words are gone (bounded server-side memory) — terminal-
@@ -222,7 +227,7 @@ export class SessionSocket {
 
   /** Send raw keyboard input (from term.onData) as a binary frame. */
   sendInput(data: string): void {
-    if (this.ws?.readyState === WebSocket.OPEN) {
+    if (!this.handlers.readOnly?.() && this.ws?.readyState === WebSocket.OPEN) {
       this.ws.send(this.encoder.encode(data));
     }
   }
@@ -238,7 +243,7 @@ export class SessionSocket {
 
   /** Send a resize request as a text frame. */
   sendResize(cols: number, rows: number): void {
-    this.sendJson({ type: "resize", cols, rows });
+    if (!this.handlers.readOnly?.()) this.sendJson({ type: "resize", cols, rows });
   }
 
   /**
@@ -274,6 +279,13 @@ export class SessionSocket {
     this.recon.cancel();
     this.connect();
     return true;
+  }
+
+  /** A deliberate access-mode change can wake the worker; automatic retries cannot. */
+  accessChanged(): void {
+    if (this.closed) return;
+    this.fatal = false; this.exited = false;
+    this.dropSocket(); this.recon.cancel(); this.connect(true);
   }
 
   /** Permanently close the socket (no reconnect). */

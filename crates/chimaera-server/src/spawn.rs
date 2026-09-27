@@ -53,6 +53,8 @@ pub(crate) struct SpawnSpec {
     /// scopes only.
     pub(crate) prelude: Option<String>,
     pub(crate) kind: SpawnKind,
+    pub(crate) fork_head: bool,
+    pub(crate) native_cwd: Option<PathBuf>,
 }
 
 /// Why a spawn could not happen.
@@ -71,6 +73,11 @@ pub(crate) async fn spawn_session(
     spec: SpawnSpec,
 ) -> Result<serde_json::Value, SpawnFailure> {
     let workspace = spec.workspace;
+    if !crate::pro::may_write(state, &workspace.id) {
+        return Err(SpawnFailure::Internal(anyhow::anyhow!(
+            "workspace owned elsewhere"
+        )));
+    }
     // Every session gets a pre-picked id: it rides in the spawn env as
     // CHIMAERA_SESSION (shells too — typed agents need their session
     // context) and, for claude, in the hook URL.
@@ -216,6 +223,16 @@ pub(crate) async fn spawn_session(
                     codex_theme,
                 )
             };
+            if spec.fork_head {
+                if resume.is_none() {
+                    return Err(SpawnFailure::Internal(anyhow::anyhow!(
+                        "native fork requires resume"
+                    )));
+                }
+                if let Err(error) = crate::launcher::fork_native_head(agent_kind, &mut argv) {
+                    return Err(SpawnFailure::Internal(error));
+                }
+            }
             if let Some(mcp) = &mcp_config {
                 argv.push("--mcp-config".to_string());
                 argv.push(mcp.to_string_lossy().into_owned());
@@ -241,6 +258,16 @@ pub(crate) async fn spawn_session(
                 opts.env
                     .push((crate::launcher::CODEX_MCP_KEY_ENV.to_string(), key.clone()));
             }
+            let transferred = crate::lock(&state.deferred_sessions).get(&id).cloned();
+            if let Some(entry) = transferred.filter(|entry| entry.workspace_id == workspace.id) {
+                if let Some(handoff) = entry.handoff {
+                    let context = crate::chat::handoff_message(
+                        handoff.origin.as_str(),
+                        entry.agent.as_ref().and_then(|a| a.carryover.as_ref()),
+                    );
+                    crate::launcher::append_transfer_prompt(&mut argv, &context);
+                }
+            }
             // Login-shell wrap: agents must see the user's terminal environment
             // (exported API keys, nvm PATHs) — the daemon's own env never
             // sourced their profile.
@@ -254,6 +281,7 @@ pub(crate) async fn spawn_session(
             // keeps it); remember the ancestor so recents can hide (and later
             // supersede) the old conversation either way.
             record.resumed_from = resume.clone();
+            record.native_cwd = spec.native_cwd.clone();
             if agent_kind == AgentKind::Codex {
                 if let Some(thread) = resume.clone() {
                     if let Some(home) = state
@@ -261,7 +289,9 @@ pub(crate) async fn spawn_session(
                         .parent()
                         .map(std::path::Path::to_path_buf)
                     {
-                        let cwd = opts.cwd.clone();
+                        let cwd = record
+                            .native_cwd_for(&thread)
+                            .unwrap_or_else(|| opts.cwd.clone());
                         let sought = thread.clone();
                         let path = tokio::task::spawn_blocking(move || {
                             crate::codex_notify::find_rollout(&home, &sought, &cwd)

@@ -53,6 +53,8 @@ async fn ledger_resurrects_sessions_across_restart() {
     let mut boot = lock(&state2.ledger).load_boot();
     assert_eq!(boot.sessions.len(), 1);
     boot.sessions.push(ledger::LedgerEntry {
+        suspended: false,
+        handoff: None,
         id: "s-dead-codex".to_string(),
         workspace_id: workspace_id.clone(),
         cwd: root.clone(),
@@ -65,6 +67,7 @@ async fn ledger_resurrects_sessions_across_restart() {
             kind: agents::AgentKind::Codex,
             resume: None,
             transcript: None,
+            native_cwd: None,
             title: "port the parser".to_string(),
             ui: chimaera_agent::model::SessionUi::Term,
             model: None,
@@ -142,6 +145,8 @@ async fn ledger_restore_disabled_still_lands_recents() {
     let boot = ledger::BootLedger {
         sessions: vec![
             ledger::LedgerEntry {
+                suspended: false,
+                handoff: None,
                 id: "s-shell".to_string(),
                 workspace_id: workspace_id.clone(),
                 cwd: root.clone(),
@@ -153,6 +158,8 @@ async fn ledger_restore_disabled_still_lands_recents() {
                 agent: None,
             },
             ledger::LedgerEntry {
+                suspended: false,
+                handoff: None,
                 id: "s-claude".to_string(),
                 workspace_id: workspace_id.clone(),
                 cwd: root.clone(),
@@ -165,6 +172,7 @@ async fn ledger_restore_disabled_still_lands_recents() {
                     kind: agents::AgentKind::Claude,
                     resume: Some("conv-1".to_string()),
                     transcript: Some(transcript),
+                    native_cwd: None,
                     title: "fix the flaky tests".to_string(),
                     ui: chimaera_agent::model::SessionUi::Term,
                     model: None,
@@ -249,6 +257,8 @@ async fn journal_budget_spares_chats_the_ledger_resurrects() {
         Some("9.9.9-fake"),
     );
     let chat_entry = |id: &str| ledger::LedgerEntry {
+        suspended: false,
+        handoff: None,
         id: id.to_string(),
         workspace_id: workspace_id.clone(),
         cwd: root.clone(),
@@ -261,6 +271,7 @@ async fn journal_budget_spares_chats_the_ledger_resurrects() {
             kind: agents::AgentKind::Claude,
             resume: None,
             transcript: None,
+            native_cwd: None,
             title: "claude".to_string(),
             ui: chimaera_agent::model::SessionUi::Chat,
             model: None,

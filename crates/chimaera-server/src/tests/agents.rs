@@ -119,6 +119,7 @@ async fn chat_handshake_failure_degrades_to_pty_on_same_id() {
             model: None,
             resume: None,
             fork_at: None,
+            fork_head: false,
             rollback_turns: None,
             revert_before_turn: None,
             remote_control: crate::chat::RemoteControlAtStart::No,

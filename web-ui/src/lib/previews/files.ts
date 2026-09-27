@@ -1,3 +1,4 @@
+import { daemonPath } from "../net/base";
 /**
  * Client for the daemon's file service (M3 wave 1):
  *   GET  /fs/list?path=&hidden=      directory listing (dirs first, sorted)
@@ -631,7 +632,7 @@ export async function fsRawTicket(path: string): Promise<{ url: string; name: st
       body: JSON.stringify({ path }),
     }),
   );
-  return { url: `/raw/${body.ticket}`, name: typeof body.name === "string" ? body.name : null };
+  return { url: daemonPath(`/raw/${body.ticket}`), name: typeof body.name === "string" ? body.name : null };
 }
 
 /**

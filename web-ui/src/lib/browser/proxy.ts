@@ -1,3 +1,4 @@
+import { daemonPath, isBrowserGateway } from "../net/base";
 /**
  * Client half of the browser-pane reverse proxy: mint/refresh proxy sessions
  * on the daemon, poll health, and carry per-tab page titles for the tab bar.
@@ -53,7 +54,29 @@ export async function mintProxy(
       typeof record.error === "string" ? record.error : `proxy mint failed (${res.status})`,
     );
   }
-  return { id: record.id, base: `/proxy/${record.id}` };
+  return { id: record.id, base: daemonPath(`/proxy/${record.id}`) };
+}
+
+export interface BrowserPreviewLease { claim_url: string; grant: string; proxy_id: string; expires_at: string }
+/** A one-use POST grant isolates arbitrary app scripts from account cookies. */
+export async function browserPreviewLease(proxyId: string): Promise<BrowserPreviewLease> {
+  if (!isBrowserGateway()) throw new Error("preview leases require the browser gateway");
+  const response = await fetch(daemonPath("/browser/lease"), {
+    method: "POST", headers: { "Content-Type": "application/json", "X-Chimaera-Browser": "1" },
+    body: JSON.stringify({ proxy_id: proxyId }), signal: AbortSignal.timeout(15000),
+  });
+  if (!response.ok) throw new Error(`preview connection failed (${response.status})`);
+  const lease = await response.json() as BrowserPreviewLease;
+  const url = new URL(lease.claim_url);
+  if ((url.protocol !== "https:" && !(url.protocol === "http:" && url.hostname === "127.0.0.1")) || url.origin === location.origin || url.pathname !== "/browser/claim" || url.username || url.password || url.search || url.hash || lease.proxy_id !== proxyId || typeof lease.grant !== "string") throw new Error("invalid isolated preview origin");
+  return lease;
+}
+export function claimBrowserPreview(target: string, lease: BrowserPreviewLease, path: string, refresh = false): void {
+  const form = document.createElement("form"); form.method = "POST"; form.action = lease.claim_url; form.target = target; form.hidden = true;
+  for (const [name,value] of Object.entries({ grant: lease.grant, path: path.startsWith("/") && !path.startsWith("//") ? path : "/", ...(refresh ? { mode: "refresh" } : {}) })) {
+    const input = document.createElement("input"); input.type = "hidden"; input.name = name; input.value = value; form.append(input);
+  }
+  document.body.append(form); form.submit(); form.remove();
 }
 
 export interface ProxyHealth {

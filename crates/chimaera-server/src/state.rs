@@ -88,6 +88,9 @@ pub(crate) struct AppState {
     /// session id -> workspace id.
     pub(crate) session_workspaces: Mutex<HashMap<String, String>>,
     pub(crate) activity: Mutex<crate::activity::Activity>,
+    pub(crate) pro: crate::pro::ProState,
+    pub(crate) deferred_sessions: Mutex<HashMap<String, crate::ledger::LedgerEntry>>,
+    pub(crate) session_proxy: crate::session_proxy::Store,
     /// session id -> agent wrapper state (kind "agent" sessions only).
     pub(crate) agents: Mutex<HashMap<String, agents::AgentRecord>>,
     /// session id -> polled shell display name (naming rule zero); written
@@ -268,6 +271,9 @@ impl AppState {
             spawn_reservations: Mutex::new(HashMap::new()),
             session_workspaces: Mutex::new(HashMap::new()),
             activity: Mutex::new(crate::activity::Activity::default()),
+            pro: crate::pro::ProState::new(data_dir.join("pro")),
+            deferred_sessions: Mutex::new(HashMap::new()),
+            session_proxy: crate::session_proxy::Store::default(),
             agents: Mutex::new(HashMap::new()),
             display_names: Mutex::new(HashMap::new()),
             current_cwds: Mutex::new(HashMap::new()),
