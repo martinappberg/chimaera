@@ -57,6 +57,53 @@ fn sanitize_name(raw: &str) -> Option<String> {
     Some(name.to_string())
 }
 
+/// Whether `c` ends or splits an `@mention` of a landed path on the way to
+/// the agent. Whitespace ends claude's bare `@path`, a codex prose path and
+/// the UI's token; claude reads `#` as a line anchor and `:` as an MCP
+/// resource, and its trailing `\b` drops closing punctuation; the UI parser
+/// (`shared/fileRef.ts`) splits on `=`, `|` and its CJK separators, rejects
+/// quotes, globs and `$`, and reads `…` as an abbreviation. Non-ASCII letters
+/// and marks stay (NFD names too).
+fn ends_mention(c: char) -> bool {
+    c.is_whitespace()
+        || (c.is_ascii() && !c.is_ascii_alphanumeric() && !matches!(c, '.' | '_' | '-'))
+        || "…、，；。：「」『』【】〈〉《》".contains(c)
+}
+
+/// The landing-pad name for a sanitized upload name: one token every mention
+/// parser reads whole, so the @mention typed after a drop resolves
+/// (`Screenshot 2026-09-26 at 12.30.png` → `Screenshot-2026-09-26-at-12.30.png`).
+/// Each run of mention-ending characters becomes one `-` (none beside an
+/// existing `-`, `_` or `.`, none at either end), a dot run becomes one dot
+/// (`...` is an abbreviation too), and a trailing `.`/`-` goes (claude's `\b`
+/// would cut it). The cases live in `web-ui/src/lib/net/uploadNames.fixture.json`,
+/// shared with the UI's parser test. Landing-pad names are machine-owned;
+/// `/fs/upload` keeps the user's name verbatim.
+pub(crate) fn mention_safe_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut gap = false;
+    for c in name.chars() {
+        if ends_mention(c) {
+            gap = true;
+            continue;
+        }
+        let joiner = matches!(c, '-' | '_' | '.');
+        if gap && !joiner && !out.is_empty() && !out.ends_with(['-', '_', '.']) {
+            out.push('-');
+        }
+        gap = false;
+        if !(c == '.' && out.ends_with('.')) {
+            out.push(c);
+        }
+    }
+    let out = out.trim_end_matches(['.', '-']);
+    if out.is_empty() {
+        "upload".to_string()
+    } else {
+        out.to_string()
+    }
+}
+
 /// Current (bytes, file-count) in a session's uploads dir (flat — uploads are
 /// never nested). Missing dir reads as (0, 0). One scan feeds both caps; one
 /// blocking-pool hop for the whole scan.
@@ -71,8 +118,10 @@ async fn dir_usage(dir: &Path) -> (u64, usize) {
 /// the session's uploads dir and answer `{path, name, size}` with the
 /// absolute path on THIS host (for remote sessions the request already rode
 /// the tunnel to the daemon that owns the session, so the path is valid where
-/// the session runs). 404 for unknown sessions, 400 for bad names, 413 past
-/// the per-file or per-session cap. Bearer-authed like every REST route.
+/// the session runs). The file lands under a mention-safe form of `name`
+/// (`mention_safe_name`), which `name` in the answer reports. 404 for unknown
+/// sessions, 400 for bad names, 413 past the per-file or per-session cap.
+/// Bearer-authed like every REST route.
 pub(crate) async fn upload(
     State(state): State<Arc<AppState>>,
     UrlPath(id): UrlPath<String>,
@@ -99,6 +148,7 @@ pub(crate) async fn upload(
         )
             .into_response();
     };
+    let name = mention_safe_name(&name);
 
     let dir = state.uploads_root.join(&id);
     if let Err(err) = tokio::fs::create_dir_all(&dir).await {
@@ -187,7 +237,7 @@ pub(crate) async fn upload(
             .into_response();
     }
 
-    // Keep the dropped file's own name when free; a taken name gets a short
+    // Keep the (mention-safe) dropped name when free; a taken name gets a short
     // random prefix instead of clobbering. The exists→rename window is racy
     // only against the same user re-dropping the same name in the same
     // instant — an accepted, self-inflicted overwrite.

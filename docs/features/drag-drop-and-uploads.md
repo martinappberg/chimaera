@@ -39,7 +39,9 @@ selection references (see [terminals.md](terminals.md)).
   explicitly; both file and finder payloads set it) instead of hard-coding a surface.
   `referenceFileDrop` composes the text.
 - **Key behaviors.** Directory `@mentions` carry a **trailing slash** (`@src/lib/`) — reads
-  unambiguously as "this folder"; shell paths stay bare (what a command expects). Relativity is
+  unambiguously as "this folder"; shell paths stay bare (what a command expects). A path holding
+  whitespace is mentioned in claude's quoted form, `@"raw data/"` (what claude's own completion
+  writes — a bare mention ends at the first space); shells get it single-quoted. Relativity is
   per-target: workspace-relative for agents, live-cwd-relative for shells, absolute fallback
   outside either root — identical to file references. Each dir drag mints a fresh Finder id, so
   dropping the same folder onto a zone twice opens two Finder tabs (files dedupe by path); a
@@ -99,17 +101,26 @@ selection references (see [terminals.md](terminals.md)).
   per session dir**; completion rechecks those aggregate quotas including in-flight temp files,
   and overflow aborts, deletes the tmp, and answers `413`. Filenames sanitize to a strict
   basename (no separators, no control bytes, no dot-dirs, ≤200 chars) before becoming a path on a
-  shared host; a taken name dedupes with a short random prefix instead of clobbering. Uploads land
+  shared host, then land under a **mention-safe** form (`upload::mention_safe_name`): whitespace
+  and the punctuation that ends or splits an `@mention` (claude's `#` line anchor and `:` resource
+  form, quotes, brackets, globs, the UI parser's separators, `…`) collapse to one `-`, so
+  `Screenshot 2026-09-26 at 12.30.png` lands as `Screenshot-2026-09-26-at-12.30.png` and the typed
+  mention names the whole file for claude (TUI and chat), codex, and the UI's own link parser.
+  Non-ASCII letters stay. The cases live in one fixture both sides test
+  (`web-ui/src/lib/net/uploadNames.fixture.json`: the Rust test pins the rename, the Vitest suite
+  reads each result back through `extractFileRefs` and a pinned copy of claude's extractor). A
+  taken name dedupes with a short random prefix instead of clobbering. Uploads land
   in `~/.chimaera/uploads/<session-id>/` and are **session-lifetime**: pruned on `DELETE`
   (`sessions.rs` + `recents::retire`), on close-all/shutdown (`shutdown.rs`), and swept at boot for
   sessions that died unwatched (`spawn_boot_prune`). Temp names use exclusive creation and
   exhausted collision retries fail instead of falling back to a known name. Bearer-authed like every REST route; an unknown
   session id `404`s and never mints a directory. A drop caps at **8 files**; **folders** dropped
   from the OS are rejected with a toast (recursive upload is a follow-up). User-chosen Finder/tree
-  uploads are distinct: they land outside daemon-owned state, stay constant-memory and atomic, and
-  accept up to **2 GB per file**. The browser/webview Blob stream is deliberately the common
-  transport rather than `rsync`: it works without extra host tools and is remote-correct in both the
-  native app and an ordinary browser, where the source file's local path is not available.
+  uploads are distinct: they land outside daemon-owned state, keep the user's name **verbatim**,
+  stay constant-memory and atomic, and accept up to **2 GB per file**. The browser/webview Blob
+  stream is deliberately the common transport rather than `rsync`: it works without extra host
+  tools and is remote-correct in both the native app and an ordinary browser, where the source
+  file's local path is not available.
 
 ## Screenshot / clipboard-image paste into a terminal
 

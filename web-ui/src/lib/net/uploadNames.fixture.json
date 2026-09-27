@@ -1,0 +1,30 @@
+{
+  "about": [
+    "Session landing-pad names, one case list for both halves of the promise that an uploaded file's @mention resolves. The daemon renames (crates/chimaera-server/src/upload.rs mention_safe_name; tests/upload.rs include_str!s this file and asserts `raw` → `safe`). The UI half (net/uploadNames.test.ts) types each `safe` name the way insertUploadedPath does, `@<uploads dir>/<safe> `, and asserts the UI's own path parser (shared/fileRef.ts extractFileRefs) and claude's @-mention extractor (a pinned copy) both read the whole path. A case added here runs on both sides.",
+    "raw — the name the browser sends (File.name: a basename, already free of separators and control bytes). safe — the name the file lands under."
+  ],
+  "cases": [
+    { "note": "a macOS screenshot", "raw": "Screenshot 2026-09-26 at 12.30.png", "safe": "Screenshot-2026-09-26-at-12.30.png" },
+    { "note": "a 12-hour screenshot: a narrow no-break space before PM", "raw": "Screenshot 2026-09-26 at 12.30.45 PM.png", "safe": "Screenshot-2026-09-26-at-12.30.45-PM.png" },
+    { "note": "a Finder duplicate's parentheses", "raw": "Screenshot 2026-09-26 at 12.30 (2).png", "safe": "Screenshot-2026-09-26-at-12.30-2.png" },
+    { "note": "an already-safe name is kept as dropped", "raw": "qc_report-v2.tsv", "safe": "qc_report-v2.tsv" },
+    { "note": "a pasted image keeps its stamp", "raw": "pasted-20260926-123000.png", "safe": "pasted-20260926-123000.png" },
+    { "note": "a hidden file stays hidden", "raw": ".env", "safe": ".env" },
+    { "note": "a spaced dash merges into the dash", "raw": "draft - final.docx", "safe": "draft-final.docx" },
+    { "note": "runs of spaces are one separator", "raw": "a   b.txt", "safe": "a-b.txt" },
+    { "note": "no separator lands beside the extension dot", "raw": "notes (draft).md", "safe": "notes-draft.md" },
+    { "note": "claude's line anchor and MCP-resource colon", "raw": "run#3: results.csv", "safe": "run-3-results.csv" },
+    { "note": "quotes, globs and shell syntax", "raw": "it's \"final\" $HOME*.txt", "safe": "it-s-final-HOME.txt" },
+    { "note": "the UI's token boundaries and query mark", "raw": "a=b|c?.log", "safe": "a-b-c.log" },
+    { "note": "a percent sign never reads as an escape", "raw": "growth 50%.csv", "safe": "growth-50.csv" },
+    { "note": "at and plus signs", "raw": "icon@2x + dark.png", "safe": "icon-2x-dark.png" },
+    { "note": "an ellipsis is an abbreviation to the UI parser", "raw": "wait… what.png", "safe": "wait-what.png" },
+    { "note": "three dots are too, so dot runs become one dot", "raw": "a...b.txt", "safe": "a.b.txt" },
+    { "note": "non-ASCII letters are kept", "raw": "Figur 3 översikt.pdf", "safe": "Figur-3-översikt.pdf" },
+    { "note": "decomposed (NFD) marks stay on their letter", "raw": "översikt.pdf", "safe": "översikt.pdf" },
+    { "note": "CJK corner brackets split the UI's tokens", "raw": "会議「最終」資料.pdf", "safe": "会議-最終-資料.pdf" },
+    { "note": "no extension: a closing bracket at the end goes", "raw": "notes (draft)", "safe": "notes-draft" },
+    { "note": "a trailing dot goes (claude's word boundary cuts it)", "raw": "v1.", "safe": "v1" },
+    { "note": "nothing mention-safe left", "raw": "???", "safe": "upload" }
+  ]
+}

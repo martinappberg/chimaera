@@ -237,9 +237,15 @@ export function needsCropUpload(sel: SelectionSource, target: ReferenceTargetKin
   return sel.kind === "file" && sel.crop !== undefined && target === "terminal";
 }
 
-/** A bare path mention for a claude agent (drag-to-reference): `@<rel-path> `. */
+/**
+ * A path mention for an agent (drag-to-reference, an uploaded file):
+ * `@<rel-path> `, or claude's quoted `@"<rel-path>" ` when the path holds
+ * whitespace — what claude's own completion writes, since a bare mention
+ * ends at the first space. (Uploads land under space-free names; this
+ * covers a spaced directory above them and workspace files.)
+ */
 export function composeAgentPathReference(relPath: string): string {
-  return `@${relPath} `;
+  return /\s/.test(relPath) ? `@"${relPath}" ` : `@${relPath} `;
 }
 
 /**
@@ -318,6 +324,7 @@ if (import.meta.env.DEV) {
     "terminal reference format",
   );
   ok(composeAgentPathReference("src/a.ts") === "@src/a.ts ", "agent path mention");
+  ok(composeAgentPathReference("my dir/a.ts") === '@"my dir/a.ts" ', "a spaced path mention quotes");
   ok(
     composeProvenanceSuffix(
       { kind: "file", path: "/w/src/a.ts", startLine: 3, endLine: 9, text: "" },
