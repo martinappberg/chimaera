@@ -3,9 +3,10 @@
    * "Where things stand" — the top of Knowledge on the dashboard (design
    * §3): the contradiction first, then the strongest recent findings with
    * the confidence ladder, the handoff's next steps, and a warn-toned
-   * blocker line. With no structured provider it is one quiet line and the
-   * single action that fills it (attach mycelium). Never a curated summary —
-   * everything here is what the agents recorded.
+   * blocker line. With no structured provider it is one calm block of plain
+   * sentences — what Agent notes and Mycelium would do for this project —
+   * and one link, Extensions, where both are switched on. Never a curated
+   * summary — everything here is what the agents recorded.
    */
   import { inlineMarkdown } from "../shared/inlineMarkdown";
   import type { Knowledge } from "../workspace/knowledge";
@@ -16,12 +17,14 @@
     knowledge: Knowledge | null;
     /** A structured provider (mycelium) is active in this workspace. */
     providerActive: boolean;
+    /** Agent notes is active here (its sentence would be news to no one). */
+    notesActive: boolean;
     onOpenKnowledge: () => void;
-    /** Open the "Use mycelium for Knowledge" sheet. */
-    onAttach: () => void;
+    /** Open the Extensions tab. */
+    onOpenExtensions: () => void;
   }
 
-  let { knowledge, providerActive, onOpenKnowledge, onAttach }: Props = $props();
+  let { knowledge, providerActive, notesActive, onOpenKnowledge, onOpenExtensions }: Props = $props();
 
   const picks = $derived(knowledge !== null ? whereThingsStand(knowledge, 3) : []);
   const next = $derived(knowledge?.left_off?.next.slice(0, 3) ?? []);
@@ -39,9 +42,10 @@
   </div>
 
   {#if !providerActive}
-    <p class="attach">
-      Your agents can record findings and decisions as they work.
-      <button class="link inline" onclick={onAttach}>Use mycelium →</button>
+    <p class="quiet">
+      {#if !notesActive}Agent notes lets your agents leave each other findings and blockers on the Timeline.{" "}{/if}Mycelium
+      lets this project remember what was learned and why. {notesActive ? "It is" : "Both are"} optional, in
+      <button class="link inline" onclick={onOpenExtensions}>Extensions</button>.
     </p>
   {:else if knowledge === null}
     <p class="empty">loading…</p>
@@ -123,11 +127,19 @@
     text-decoration: underline;
   }
   .link.inline {
-    margin-left: 6px;
-    font-size: var(--text-sm);
+    margin-left: 0;
+    font-size: inherit;
   }
 
-  .attach,
+  /* Never in the way: body-size muted prose, a readable measure. */
+  .quiet {
+    margin: 0;
+    max-width: 68ch;
+    font-size: var(--text-sm);
+    color: var(--muted);
+    line-height: 1.55;
+  }
+
   .empty {
     margin: 0;
     font-size: var(--text-sm);

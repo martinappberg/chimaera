@@ -1,0 +1,345 @@
+{
+  "counts": {
+    "decisions": 4,
+    "findings": 4,
+    "learnings": 4,
+    "open": 6
+  },
+  "decisions": [
+    {
+      "alternatives": [
+        "Keep S14 with a batch covariate — it still dominated PC1"
+      ],
+      "consequences": "The cohort is n=23.",
+      "context": "S14 failed QC in both batches.",
+      "date": "2026-09-12",
+      "decision": "Exclude S14 from all downstream analyses.",
+      "fp": "D-d69260ddbe89",
+      "line": 31,
+      "rationale": "38% mitochondrial reads; no rescue possible.",
+      "tags": [
+        "qc",
+        "exclusion"
+      ],
+      "title": "Drop sample S14 from the atlas"
+    },
+    {
+      "alternatives": [
+        "CPM — ignores composition bias",
+        "SCTransform — too slow on 200k cells"
+      ],
+      "consequences": "Normalisation now needs a quick clustering pass first.",
+      "context": "Library sizes vary ten-fold across the two sequencing batches.",
+      "date": "2026-08-02",
+      "decision": "Normalise with scran pooled size factors.",
+      "fp": "D-8dbedeae346a",
+      "line": 15,
+      "rationale": "scran corrects composition bias and scales to the atlas.",
+      "tags": [
+        "normalisation",
+        "scran"
+      ],
+      "title": "Use scran size factors over CPM"
+    },
+    {
+      "alternatives": [],
+      "consequences": "",
+      "context": "Home quota is 15G; the atlas object alone is 11G.",
+      "date": "2026-07-28",
+      "decision": "Write `.h5ad` files under `$SCRATCH/atlas/`.",
+      "fp": "D-bba3ba23d889",
+      "line": 7,
+      "rationale": "",
+      "tags": [
+        "storage"
+      ],
+      "title": "Keep the atlas objects on scratch"
+    },
+    {
+      "alternatives": [],
+      "consequences": "",
+      "context": "Normalised matrices overwrote `adata.X` twice.",
+      "date": "",
+      "decision": "Store raw counts in `adata.layers[\"counts\"]` before any transform.",
+      "fp": "D-e2912cc172c5",
+      "line": 45,
+      "rationale": "Every downstream tool finds the raw matrix by name.",
+      "tags": [
+        "anndata",
+        "provenance"
+      ],
+      "title": "Keep raw counts in their own layer"
+    }
+  ],
+  "guidance": [
+    {
+      "description": "How agents record knowledge here",
+      "label": "MYCELIUM.md",
+      "path": "MYCELIUM.md"
+    }
+  ],
+  "learnings": [
+    {
+      "category": "edge-case",
+      "date": "2026-08-11",
+      "fp": "L-8b5579f003db",
+      "line": 48,
+      "resolution": "Run EmptyDrops per lane.",
+      "tags": [
+        "droplets",
+        "qc"
+      ],
+      "title": "Empty droplets in lane 3",
+      "what": "Lane 3 had 40% empty droplets that passed the UMI floor.",
+      "why": "They cluster together and look like a novel population."
+    },
+    {
+      "category": "failure",
+      "date": "2026-08-04",
+      "fp": "L-d68f5335321b",
+      "line": 35,
+      "resolution": "Request 128G for arrays above 150k cells.",
+      "tags": [
+        "slurm",
+        "memory"
+      ],
+      "title": "Slurm array OOM at 64G",
+      "what": "The doublet step ran out of memory on the 200k-cell object.\nIt died building the kNN graph.",
+      "why": "Re-runs cost a day of queue time."
+    },
+    {
+      "category": "gotcha",
+      "date": "2026-08-02",
+      "fp": "L-d407379e8c29",
+      "line": 13,
+      "resolution": "Filter after subsetting the marker panel.",
+      "tags": [
+        "scanpy",
+        "filtering"
+      ],
+      "title": "Scanpy drops genes with zero counts",
+      "what": "`sc.pp.filter_genes` silently removed 1,204 genes before HVG selection.",
+      "why": "Marker panels lose genes without any warning."
+    },
+    {
+      "category": "tip",
+      "date": "",
+      "fp": "L-e8e451d5b3a3",
+      "line": 60,
+      "resolution": "Persist `obsp` between sweeps.",
+      "tags": [
+        "performance"
+      ],
+      "title": "Cache the kNN graph between sweeps",
+      "what": "Rebuilding the graph took 40 minutes per run.",
+      "why": "Parameter sweeps were dominated by it."
+    }
+  ],
+  "left_off": {
+    "blockers": [
+      "Unresolved: batch 3 FASTQs still not delivered"
+    ],
+    "current": "- Branch: `qc-mad` | Tests: 42 passing",
+    "decisions": "- Dropped S14: 38% mitochondrial reads (see .living/decisions.md for full context)",
+    "next": [
+      "Request batch 3 from the sequencing core",
+      "Regress out batch before mito QC"
+    ],
+    "path": ".mycelium/last-session.md",
+    "worked_on": "- Re-ran QC on batches 1-2 with MAD cutoffs\n- Drafted the methods section",
+    "written_ms": 1789000000000
+  },
+  "provider": "mycelium",
+  "questions": [
+    {
+      "finding": "F-003",
+      "text": "Is batch 2 confounded with tissue source?"
+    },
+    {
+      "finding": "F-001",
+      "text": "Does the cluster persist after checkpoint therapy?"
+    },
+    {
+      "finding": "F-002",
+      "text": "Is the melanoma association a cohort artefact?"
+    }
+  ],
+  "schema": 1,
+  "todos": [
+    {
+      "author": "Martin",
+      "category": "validation",
+      "date": "2026-08-01",
+      "file": "todo/compare-public-data.md",
+      "item": "Compare with public datasets",
+      "priority": "idea",
+      "status": "open"
+    },
+    {
+      "author": "Martin",
+      "category": "analysis",
+      "date": "2026-08-21",
+      "file": "todo/rerun-qc.md",
+      "item": "Re-run QC with MAD cutoffs",
+      "priority": "high",
+      "status": "in-progress"
+    },
+    {
+      "author": "Martin",
+      "category": "data",
+      "date": "2026-09-02",
+      "file": "",
+      "item": "Get batch 3 FASTQs",
+      "priority": "critical",
+      "status": "blocked"
+    },
+    {
+      "author": "Martin",
+      "category": "writing",
+      "date": "2026-09-15",
+      "file": "todo/methods.md",
+      "item": "Write methods section",
+      "priority": "medium",
+      "status": "complete"
+    }
+  ],
+  "topics": [
+    {
+      "description": "How sequencing batch shifts expression estimates across runs.",
+      "findings": [
+        {
+          "claim": "Batch 2 inflates the mitochondrial fraction",
+          "id": "F-003",
+          "implications": "Regress out batch before comparing mito-based QC across runs.",
+          "ledger": [
+            {
+              "dataset": "pbmc-10k",
+              "date": "2026-08-14",
+              "direction": "supports",
+              "project": "atlas",
+              "result": "+4.1% mito in batch 2",
+              "run": "run-17"
+            },
+            {
+              "dataset": "pbmc-20k",
+              "date": "2026-09-10",
+              "direction": "supports",
+              "project": "atlas",
+              "result": "+3.8% mito in batch 2",
+              "run": "run-22"
+            }
+          ],
+          "line": 11,
+          "questions": [
+            "Is batch 2 confounded with tissue source?"
+          ],
+          "status": "supported",
+          "tags": [
+            "qc",
+            "batch",
+            "mitochondria"
+          ],
+          "updated": "2026-09-10"
+        },
+        {
+          "claim": "Doublet rate scales with loading density",
+          "id": "F-004",
+          "implications": "",
+          "ledger": [],
+          "line": 27,
+          "questions": [],
+          "status": "preliminary",
+          "tags": [
+            "doublets",
+            "qc"
+          ],
+          "updated": "2026-09-10"
+        }
+      ],
+      "path": ".living/findings/batch-effects.md",
+      "slug": "batch-effects"
+    },
+    {
+      "description": "T-cell exhaustion signatures in tumour infiltrates.",
+      "findings": [
+        {
+          "claim": "TOX marks terminal exhaustion",
+          "id": "F-001",
+          "implications": "Call terminal exhaustion on TOX, not PD1 alone.",
+          "ledger": [
+            {
+              "dataset": "melanoma",
+              "date": "2026-07-02",
+              "direction": "supports",
+              "project": "tumour",
+              "result": "TOX+ PD1hi cluster",
+              "run": "run-3"
+            },
+            {
+              "dataset": "nsclc",
+              "date": "2026-07-20",
+              "direction": "supports",
+              "project": "tumour",
+              "result": "same cluster",
+              "run": "run-8"
+            },
+            {
+              "dataset": "crc",
+              "date": "2026-08-05",
+              "direction": "refines",
+              "project": "colon",
+              "result": "only in MSI-high",
+              "run": "run-12"
+            }
+          ],
+          "line": 11,
+          "questions": [
+            "Does the cluster persist after checkpoint therapy?"
+          ],
+          "status": "robust",
+          "tags": [
+            "tcell",
+            "exhaustion"
+          ],
+          "updated": "2026-08-05"
+        },
+        {
+          "claim": "TCF7 predicts response",
+          "id": "F-002",
+          "implications": "",
+          "ledger": [
+            {
+              "dataset": "melanoma",
+              "date": "2026-07-05",
+              "direction": "supports",
+              "project": "tumour",
+              "result": "TCF7+ enriched in responders",
+              "run": "run-4"
+            },
+            {
+              "dataset": "nsclc",
+              "date": "2026-08-30",
+              "direction": "contradicts",
+              "project": "tumour",
+              "result": "no association",
+              "run": "run-15"
+            }
+          ],
+          "line": 28,
+          "questions": [
+            "Is the melanoma association a cohort artefact?",
+            "Is batch 2 confounded with tissue source?"
+          ],
+          "status": "contradicted",
+          "tags": [],
+          "updated": "2026-08-30"
+        }
+      ],
+      "path": ".living/findings/exhaustion.md",
+      "slug": "exhaustion"
+    }
+  ],
+  "warnings": [
+    ".living/decisions.md: 1 entry uses ## headings (mycelium 0.7 expects ###)"
+  ]
+}

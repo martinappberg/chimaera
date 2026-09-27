@@ -6,7 +6,7 @@
  */
 import type { AgentId, Skill, SkillSource } from "./store";
 
-export type SkillGroupKey = "project" | "plugin" | "user" | "builtin";
+export type SkillGroupKey = "project" | "plugin" | "user" | "builtin-claude" | "builtin-codex";
 
 export interface SkillGroup {
   key: SkillGroupKey;
@@ -16,16 +16,19 @@ export interface SkillGroup {
   skills: Skill[];
 }
 
-const GROUP_ORDER: SkillGroupKey[] = ["project", "plugin", "user", "builtin"];
+const GROUP_ORDER: SkillGroupKey[] = ["project", "plugin", "user", "builtin-claude", "builtin-codex"];
 
 const GROUP_LABELS: Record<SkillGroupKey, { label: string; hint: string }> = {
-  project: { label: "This project", hint: "travels with the repo" },
+  project: { label: "This project", hint: "travels with the repository" },
   plugin: { label: "From plugins", hint: "" },
-  user: { label: "Yours", hint: "user-level on this host — every project here sees these" },
-  builtin: { label: "Built into the agent", hint: "seen in a running session" },
+  user: { label: "Yours", hint: "every project on this host sees these" },
+  "builtin-claude": { label: "Built into claude", hint: "" },
+  "builtin-codex": { label: "Built into codex", hint: "" },
 };
 
-export function groupOf(source: SkillSource | string): SkillGroupKey {
+/** Where a skill comes from: this project, a plugin, the user, or the agent
+ *  itself (claude's live catalog, codex's system skills). */
+export function groupOf(source: SkillSource | string): "project" | "plugin" | "user" | "builtin" {
   switch (source) {
     case "project":
       return "project";
@@ -80,14 +83,27 @@ export function filterSkills(skills: readonly Skill[], filter: SkillFilter, quer
 }
 
 /** Grouped in a fixed order; empty groups don't render. Within a group the
- *  daemon's order holds (it already sorts by name). */
+ *  daemon's order holds (it already sorts by name). A built-in skill sits
+ *  under each agent it is built into (the one that lists it), so `/name`
+ *  chips stay under claude and `$name` under codex. */
 export function groupSkills(skills: readonly Skill[], host = ""): SkillGroup[] {
   const buckets = new Map<SkillGroupKey, Skill[]>();
-  for (const s of skills) {
-    const k = groupOf(s.source);
+  const put = (k: SkillGroupKey, s: Skill) => {
     const list = buckets.get(k);
     if (list === undefined) buckets.set(k, [s]);
     else list.push(s);
+  };
+  for (const s of skills) {
+    const g = groupOf(s.source);
+    if (g !== "builtin") {
+      put(g, s);
+      continue;
+    }
+    const claude = s.agents.claude.state !== "absent";
+    const codex = s.agents.codex.state !== "absent";
+    if (claude) put("builtin-claude", s);
+    if (codex) put("builtin-codex", s);
+    if (!claude && !codex) put(s.source === "builtin" ? "builtin-claude" : "builtin-codex", s);
   }
   const out: SkillGroup[] = [];
   for (const key of GROUP_ORDER) {
@@ -95,7 +111,7 @@ export function groupSkills(skills: readonly Skill[], host = ""): SkillGroup[] {
     if (list === undefined || list.length === 0) continue;
     const base = GROUP_LABELS[key];
     let hint = base.hint;
-    if (key === "user" && host !== "") hint = `user-level on ${host} — every project here sees these`;
+    if (key === "user" && host !== "") hint = `every project on ${host} sees these`;
     if (key === "plugin") {
       const plugins = [...new Set(list.map((s) => s.plugin).filter((p): p is string => !!p))];
       hint = plugins.join(" · ");

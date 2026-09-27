@@ -693,23 +693,11 @@ pub(crate) async fn ingest(
         }
     }
 
-    // Agent notes (a plugin the user switched on): mail waits to be read —
-    // a one-line hint on a carrier that already fires, never a new turn.
-    if matches!(event, "SessionStart" | "UserPromptSubmit")
-        && crate::plugins::active_for_session(&state, &id)
-            .await
-            .iter()
-            .any(|m| m.id == "agent-notes")
-    {
-        let unread = crate::notes::unread_count(&state, &id).await;
-        if unread > 0 {
-            context.push(format!(
-                "{unread} unread note{} from other sessions in this workspace — \
-                 read_notes shows {}.",
-                if unread == 1 { "" } else { "s" },
-                if unread == 1 { "it" } else { "them" },
-            ));
-        }
+    // Active plugins (Agent notes' "N unread notes"): each may add one line
+    // on a carrier that already fires — never a new turn. Nothing switched
+    // on returns before any work.
+    if matches!(event, "SessionStart" | "UserPromptSubmit") {
+        context.extend(crate::plugins::runtime::hook(&state, &id, event).await);
     }
 
     // `context` is only ever non-empty for SessionStart/UserPromptSubmit,
@@ -768,6 +756,7 @@ pub(crate) fn spawn_agent_watch(state: Arc<AppState>, session_id: String) {
                 // A hook turn still open at death never gets its Stop.
                 crate::lock(&state.tui_episodes).forget(&session_id);
                 crate::lock(&state.notes).forget_session(&session_id);
+                crate::plugins::runtime::session_ended(&state, &session_id);
                 crate::recents::retire(
                     &state,
                     &session_id,

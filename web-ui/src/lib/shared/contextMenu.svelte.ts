@@ -26,6 +26,9 @@ export type ContextMenuEntry = ContextMenuItem | "separator";
 let open = $state(false);
 let x = $state(0);
 let y = $state(0);
+/** `x` is the menu's right edge (a menu hanging under a button at the
+ *  right of its row), not its left. */
+let alignRight = $state(false);
 let items = $state<ContextMenuEntry[]>([]);
 
 export const contextMenu = {
@@ -41,18 +44,23 @@ export const contextMenu = {
   get items(): ContextMenuEntry[] {
     return items;
   },
+  get alignRight(): boolean {
+    return alignRight;
+  },
   /** Open (or retarget, when already open) at the event's pointer position. */
   openAt(e: MouseEvent, entries: ContextMenuEntry[]): void {
     e.preventDefault();
     e.stopPropagation();
     this.openAtPoint(e.clientX, e.clientY, entries);
   },
-  /** Open at a viewport point — a control's bottom-left corner, so a menu can
-   *  hang under the button that opened it (keyboard-opened too), without
-   *  fabricating a pointer event. */
-  openAtPoint(px: number, py: number, entries: ContextMenuEntry[]): void {
+  /** Open at a viewport point — a control's bottom-left corner (or, with
+   *  `alignRight`, its bottom-right), so a menu can hang under the button
+   *  that opened it (keyboard-opened too), without fabricating a pointer
+   *  event. */
+  openAtPoint(px: number, py: number, entries: ContextMenuEntry[], opts: { alignRight?: boolean } = {}): void {
     x = px;
     y = py;
+    alignRight = opts.alignRight === true;
     items = entries;
     open = true;
   },

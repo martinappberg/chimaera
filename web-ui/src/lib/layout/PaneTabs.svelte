@@ -43,6 +43,7 @@
   import FileIcon from "../shared/FileIcon.svelte";
   import FolderIcon from "../shared/FolderIcon.svelte";
   import { browserTitles, targetLabel } from "../browser/proxy";
+  import ExtensionsGlyph from "../plugins/ExtensionsGlyph.svelte";
 
   interface Props {
     node: PaneNode;
@@ -372,7 +373,7 @@
     if (tab.surface === "dashboard") return "Dashboard";
     if (tab.surface === "timeline") return "Timeline";
     if (tab.surface === "knowledge") return "Knowledge";
-    if (tab.surface === "plugins") return "Plugins";
+    if (tab.surface === "plugins") return "Extensions";
     if (tab.surface === "finder") return basename(tab.path) || "Finder";
     if (tab.surface === "git") return "Source Control";
     if (tab.surface === "diff") return `${basename(tab.path)} (diff)`;
@@ -803,18 +804,9 @@
               />
             </svg>
           {:else if tab.surface === "plugins"}
-            <!-- A plug: opt-in add-ons. -->
-            <svg class="glyph" viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
-              <title>plugins</title>
-              <path
-                d="M5.5 2v3M10.5 2v3M4 5h8v2.5a4 4 0 0 1-8 0zM8 11.5V14"
-                fill="none"
-                stroke="currentColor"
-                stroke-width="1.4"
-                stroke-linecap="round"
-                stroke-linejoin="round"
-              />
-            </svg>
+            <!-- Extensions: three cells and a plus (plugins/glyph.ts), at its
+                 own 12px pixel grid. -->
+            <ExtensionsGlyph class="glyph" title="extensions" />
           {:else if tab.surface === "browser"}
             <svg class="glyph" viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
               <title>browser</title>
@@ -1348,6 +1340,13 @@
 
   .tab:hover {
     color: var(--fg);
+  }
+
+  /* The Extensions glyph is drawn for whole pixels at 12px; centred in the
+     25px tab it would sit on a half pixel. One pixel down lands it on the
+     grid, level with the 11px glyphs beside it. */
+  .tab :global(.ext-glyph) {
+    margin-top: 1px;
   }
 
   /* Active-tab emphasis via weight, not color — the bar stays quiet; a thin

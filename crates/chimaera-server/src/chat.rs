@@ -305,6 +305,7 @@ pub(crate) fn spawn_signal_task(state: Arc<AppState>) {
                     // the workspace mapping the Timeline entry needs.
                     if !deliberate {
                         crate::lock(&state.notes).forget_session(&id);
+                        crate::plugins::runtime::session_ended(&state, &id);
                         let now = crate::timeline::now_ms();
                         if let Some(draft) = episodes.flush(&id, now) {
                             crate::episodes::record(&state, &id, draft, "protocol").await;

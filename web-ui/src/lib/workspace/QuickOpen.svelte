@@ -14,6 +14,7 @@
   import { modalFocus } from "../shared/modalFocus";
   import FileIcon from "../shared/FileIcon.svelte";
   import SessionGlyph from "../shared/SessionGlyph.svelte";
+  import ExtensionsGlyph from "../plugins/ExtensionsGlyph.svelte";
 
   /** Parent directory of a workspace-relative path ("" for a root file). */
   function dirnameOf(rel: string): string {
@@ -22,12 +23,16 @@
   }
 
   /** A workspace surface with no file or session to match on (Timeline,
-   *  Knowledge, Plugins): reachable from the palette by name. */
+   *  Knowledge, Extensions): reachable from the palette by name. */
   interface QuickOpenCommand {
     id: string;
     label: string;
+    /** Other names that find it too (Extensions: "plugins", "skills"). */
+    aliases?: string[];
     /** The quiet trailing hint ("what happened"). */
     hint?: string;
+    /** The surface's own glyph in place of the "›" (Extensions). */
+    glyph?: "extensions";
     run: () => void;
   }
 
@@ -87,10 +92,13 @@
   );
 
   /** Commands match only a NON-empty query (they'd otherwise crowd the
-   *  file-first empty palette). Same fuzzy rule as sessions. */
-  const matchedCommands = $derived(
-    input.trim() === "" ? [] : commands.filter((c) => subseq(input.trim(), c.label)),
-  );
+   *  file-first empty palette). Same fuzzy rule as sessions, against the
+   *  label or any alias. */
+  const matchedCommands = $derived.by(() => {
+    const q = input.trim();
+    if (q === "") return [];
+    return commands.filter((c) => subseq(q, c.label) || (c.aliases ?? []).some((a) => subseq(q, a)));
+  });
 
   type Row =
     | { kind: "session"; session: Session }
@@ -234,7 +242,11 @@
           >
             {#if row.kind === "command"}
               {@const c = row.command}
-              <span class="glyph-slot cmd-glyph" aria-hidden="true">›</span>
+              {#if c.glyph === "extensions"}
+                <span class="glyph-slot cmd-glyph" aria-hidden="true"><ExtensionsGlyph /></span>
+              {:else}
+                <span class="glyph-slot cmd-glyph" aria-hidden="true">›</span>
+              {/if}
               <span class="name">{c.label}</span>
               {#if c.hint}<span class="meta">{c.hint}</span>{/if}
             {:else if row.kind === "session"}

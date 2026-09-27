@@ -463,7 +463,7 @@
     {#if PluginsView !== undefined}
       <PluginsView {dash} {wsId} {wsRoot} paneId={node.id} {ctrl} visible={active} />
     {:else if viewErrors.plugins}
-      {@render loadFailure("plugins", "plugins")}
+      {@render loadFailure("plugins", "extensions")}
     {:else}
       <Spinner />
     {/if}

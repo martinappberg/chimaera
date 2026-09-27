@@ -1,7 +1,7 @@
 <script lang="ts">
   /**
    * The segmented control — lifted out of settings/SettingRow.svelte's enum
-   * control so the Plugins tab's Installed · Skills · Browse switcher and the
+   * control so the Extensions tab's Plugins · Skills · Browse switcher and the
    * settings form share ONE recipe: a hairline pill group, the chosen segment
    * on an accent wash. A disabled option renders quietly with its own hint
    * (Browse "later") instead of vanishing.
