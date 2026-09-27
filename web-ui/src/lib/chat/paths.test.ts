@@ -11,6 +11,7 @@ import {
   type PathHit,
   type Resolution,
   type ValidateAnswer,
+  uploadMentionLabel,
   uploadName,
 } from "./paths";
 
@@ -31,6 +32,10 @@ describe("codeSpanRefs", () => {
   });
   it("offers nothing for a plain command", () => {
     expect(codeSpanRefs("npm run check")).toEqual({ whole: null, parts: [] });
+  });
+  it("offers a quoted mention inside the span, spaced or not", () => {
+    expect(codeSpanRefs('@"src/x.ts"').parts.map((p) => p.ref.path)).toEqual(["src/x.ts"]);
+    expect(codeSpanRefs('@"raw data/qc report.tsv"').parts.map((p) => p.ref.path)).toEqual(["raw data/qc report.tsv"]);
   });
 });
 
@@ -328,5 +333,21 @@ describe("uploadName", () => {
     expect(uploadName("/repo/uploads/report.pdf")).toBeNull();
     expect(uploadName("/home/u/.chimaera/uploads/s-10705a93/nested/x.png")).toBeNull();
     expect(uploadName("src/uploads/s-10705a93")).toBeNull();
+  });
+});
+
+describe("uploadMentionLabel", () => {
+  const pad = "/home/u/.chimaera/uploads/s-10705a93";
+  it("reads a mention of an upload as its name, keeping a suffix", () => {
+    expect(uploadMentionLabel(`@${pad}/plot.png`, `${pad}/plot.png`)).toBe("@plot.png");
+    expect(uploadMentionLabel(`@${pad}/notes.md:12`, `${pad}/notes.md`)).toBe("@notes.md:12");
+  });
+  it("drops a quoted mention's closing quote (an upload under a spaced home dir)", () => {
+    const spaced = "/Users/Jo Smith/.chimaera/uploads/s-10705a93";
+    expect(uploadMentionLabel(`@"${spaced}/plot.png"`, `${spaced}/plot.png`)).toBe("@plot.png");
+    expect(uploadMentionLabel(`@"${spaced}/notes.md#L3-L9"`, `${spaced}/notes.md`)).toBe("@notes.md#L3-L9");
+  });
+  it("leaves any other mention alone", () => {
+    expect(uploadMentionLabel("@src/plot.png", "src/plot.png")).toBeNull();
   });
 });

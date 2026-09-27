@@ -74,8 +74,13 @@ describe("quoted mentions", () => {
     expect(extractFileRefs('> @"code-reviewer (agent)"', { bare: true })).toEqual([]);
     expect(extractFileRefs('> @"raw data"', { bare: true }).map((f) => f.ref.path)).toEqual(["raw data"]);
   });
-  it("offers nothing from inside one that is not a path", () => {
+  it("offers nothing from inside one that is not a path, and its neighbours keep their spans", () => {
     expect(extractFileRefs('@"a b.rs:12" is broken')).toEqual([]);
+    const t = 'src/a.ts @"a b.rs:12" src/b.ts:4';
+    expect(extractFileRefs(t).map((f) => [t.slice(f.start, f.end), f.ref.path])).toEqual([
+      ["src/a.ts", "src/a.ts"],
+      ["src/b.ts:4", "src/b.ts"],
+    ]);
   });
 });
 

@@ -355,9 +355,10 @@ export function findFileRef(text: string, opts: FileRefOptions = {}): FoundRef |
   }
   if (/\s/.test(path)) {
     // Only a delimited candidate gets here. Flags and a leading command
-    // word mark a command line; its words are offered separately.
+    // word mark a command line; its words are offered separately. A lone
+    // `-` is a separator in a name (`draft - final.docx`), not a flag.
     const words = path.split(/\s+/);
-    if (words.some((w) => w.startsWith("-")) || COMMANDS.has(words[0])) return null;
+    if (words.some((w) => w.length > 1 && w.startsWith("-")) || COMMANDS.has(words[0])) return null;
   }
   if (!qualifies(path, bare)) return null;
   ref.path = path;

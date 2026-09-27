@@ -3,6 +3,7 @@
   import { fsQuickOpen, parentName, type QuickOpenEntry } from "../previews/files";
   import FileIcon from "../shared/FileIcon.svelte";
   import FolderIcon from "../shared/FolderIcon.svelte";
+  import { composeAgentPathReference } from "../shared/reference";
   import {
     composerHeightForContent,
     type ManualComposerHeight,
@@ -452,8 +453,9 @@
 
   function pickFile(entry: QuickOpenEntry) {
     // Directories mention with a trailing slash (the TUI's own convention —
-    // it also reads unambiguously as "this folder" in the prompt).
-    replaceToken(entry.kind === "dir" ? `@${entry.rel}/ ` : `@${entry.rel} `);
+    // it also reads unambiguously as "this folder" in the prompt); a spaced
+    // path takes claude's quoted form, like a drag-to-reference drop.
+    replaceToken(composeAgentPathReference(entry.kind === "dir" ? `${entry.rel}/` : entry.rel));
   }
 
   function pickTerm(t: TerminalOption) {

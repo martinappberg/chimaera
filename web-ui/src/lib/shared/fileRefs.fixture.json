@@ -330,6 +330,12 @@
     },
     {
       "style": "claude",
+      "input": "reports/draft - final.docx",
+      "delimited": true,
+      "expect": { "path": "reports/draft - final.docx" }
+    },
+    {
+      "style": "claude",
       "input": "cat results/x.csv",
       "delimited": true,
       "expect": null

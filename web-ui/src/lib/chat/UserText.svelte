@@ -2,7 +2,14 @@
   import { extractFileRefs, revealOf, type FileRef } from "../shared/fileRef";
   import MathText from "./MathText.svelte";
   import { splitUserMath } from "./math";
-  import { menuPoint, reopenResolution, uploadName, type OpenPathFn, type PathResolver, type Resolution } from "./paths";
+  import {
+    menuPoint,
+    reopenResolution,
+    uploadMentionLabel,
+    type OpenPathFn,
+    type PathResolver,
+    type Resolution,
+  } from "./paths";
 
   /**
    * The user's own message text: plain (never markdown — prompts are not
@@ -87,14 +94,12 @@
     return res?.state === "miss" ? undefined : res;
   }
 
-  /** A mention of an uploaded file reads as its name (`uploadName`) — the
-   *  text after its last folder, so a `:12` suffix stays. Null for any
-   *  other token. */
+  /** A mention of an uploaded file reads as its name (`uploadMentionLabel`)
+   *  — the text after its last folder, so a `:12` suffix stays. Null for
+   *  any other token. */
   function shortLabel(t: Token): string | null {
     if (!t.mention || t.ref === null) return null;
-    const name = uploadName(t.ref.path);
-    const at = name === null ? -1 : t.text.lastIndexOf(`/${name}`);
-    return at < 1 ? null : `@${t.text.slice(at + 1)}`;
+    return uploadMentionLabel(t.text, t.ref.path);
   }
 
   let root = $state<HTMLElement | null>(null);
