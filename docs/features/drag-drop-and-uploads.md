@@ -41,7 +41,8 @@ selection references (see [terminals.md](terminals.md)).
 - **Key behaviors.** Directory `@mentions` carry a **trailing slash** (`@src/lib/`) — reads
   unambiguously as "this folder"; shell paths stay bare (what a command expects). A path holding
   whitespace is mentioned in claude's quoted form, `@"raw data/"` (what claude's own completion
-  writes — a bare mention ends at the first space); shells get it single-quoted. Relativity is
+  writes — a bare mention ends at the first space), which the chat's link parser reads back as
+  one link (`extractFileRefs`); shells get it single-quoted. Relativity is
   per-target: workspace-relative for agents, live-cwd-relative for shells, absolute fallback
   outside either root — identical to file references. Each dir drag mints a fresh Finder id, so
   dropping the same folder onto a zone twice opens two Finder tabs (files dedupe by path); a

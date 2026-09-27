@@ -69,6 +69,16 @@ describe("findFileRef offsets", () => {
   });
 });
 
+describe("quoted mentions", () => {
+  it("never offers claude's agent mention, even to the terminal's bare hover", () => {
+    expect(extractFileRefs('> @"code-reviewer (agent)"', { bare: true })).toEqual([]);
+    expect(extractFileRefs('> @"raw data"', { bare: true }).map((f) => f.ref.path)).toEqual(["raw data"]);
+  });
+  it("offers nothing from inside one that is not a path", () => {
+    expect(extractFileRefs('@"a b.rs:12" is broken')).toEqual([]);
+  });
+});
+
 describe("length ceiling", () => {
   it("admits a path up to the daemon's byte cap", () => {
     const long = `${"a/".repeat(509)}x.md`; // 1022 bytes

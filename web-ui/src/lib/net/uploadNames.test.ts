@@ -62,10 +62,16 @@ describe("the mention an upload types", () => {
     const typed = composeAgentPathReference(path);
     expect(typed).toBe(`@"${path}" `);
     expect(claudeMentions(typed)).toEqual([path]);
+
+    const refs = extractFileRefs(typed);
+    expect(refs.map((f) => f.ref.path)).toEqual([path]);
+    expect(typed.slice(refs[0].start, refs[0].end)).toBe(`@"${path}"`);
   });
 
   it("a folder mention quotes with its trailing slash inside", () => {
-    expect(composeAgentPathReference("raw data/")).toBe('@"raw data/" ');
-    expect(claudeMentions(composeAgentPathReference("raw data/"))).toEqual(["raw data/"]);
+    const typed = composeAgentPathReference("raw data/");
+    expect(typed).toBe('@"raw data/" ');
+    expect(claudeMentions(typed)).toEqual(["raw data/"]);
+    expect(extractFileRefs(typed).map((f) => f.ref.path)).toEqual(["raw data/"]);
   });
 });
