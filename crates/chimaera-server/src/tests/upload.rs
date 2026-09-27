@@ -183,6 +183,96 @@ async fn upload_dedupes_name_collisions_instead_of_clobbering() {
     assert_eq!(std::fs::read(dir.join(second)).unwrap(), b"second");
 }
 
+/// The shared landing-pad name cases — its `about` documents the fields;
+/// Vitest reads the same file for the UI parser's half.
+const UPLOAD_NAMES_FIXTURE: &str =
+    include_str!("../../../../web-ui/src/lib/net/uploadNames.fixture.json");
+
+/// Strict on purpose: a misspelled key would silently drop its pin.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UploadNameCase {
+    note: String,
+    raw: String,
+    safe: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UploadNamesFixture {
+    about: Vec<String>,
+    cases: Vec<UploadNameCase>,
+}
+
+#[test]
+fn landing_pad_names_follow_the_shared_fixture() {
+    let fixture: UploadNamesFixture = serde_json::from_str(UPLOAD_NAMES_FIXTURE).unwrap();
+    assert!(!fixture.about.is_empty() && !fixture.cases.is_empty());
+    for case in &fixture.cases {
+        assert_eq!(
+            upload::mention_safe_name(&case.raw),
+            case.safe,
+            "{}: {:?}",
+            case.note,
+            case.raw
+        );
+        // A safe name is a fixed point: re-uploading a landed file keeps it.
+        assert_eq!(
+            upload::mention_safe_name(&case.safe),
+            case.safe,
+            "{}: not idempotent",
+            case.note
+        );
+    }
+}
+
+#[tokio::test]
+async fn upload_lands_a_spaced_name_under_its_mention_safe_form() {
+    let state = test_state();
+    let id = plant_session(&state);
+    let uri = format!("/api/v1/sessions/{id}/upload?name=Screenshot%202026-09-26%20at%2012.30.png");
+    let (s1, b1) = post_upload(&state, &uri, Body::from("first")).await;
+    let (s2, b2) = post_upload(&state, &uri, Body::from("second")).await;
+    assert_eq!(s1, StatusCode::OK, "{b1}");
+    assert_eq!(s2, StatusCode::OK, "{b2}");
+
+    let dir = state.uploads_root.join(&id);
+    assert_eq!(b1["name"], "Screenshot-2026-09-26-at-12.30.png");
+    assert_eq!(
+        PathBuf::from(b1["path"].as_str().unwrap()),
+        dir.join("Screenshot-2026-09-26-at-12.30.png")
+    );
+    // The dedupe prefix keeps the name one token too.
+    let second = b2["name"].as_str().unwrap();
+    assert!(
+        second.ends_with("-Screenshot-2026-09-26-at-12.30.png"),
+        "{second}"
+    );
+    for body in [&b1, &b2] {
+        let path = body["path"].as_str().unwrap();
+        assert!(!path.contains(char::is_whitespace), "{path}");
+    }
+    assert_eq!(
+        std::fs::read(dir.join("Screenshot-2026-09-26-at-12.30.png")).unwrap(),
+        b"first"
+    );
+    assert_eq!(std::fs::read(dir.join(second)).unwrap(), b"second");
+}
+
+#[tokio::test]
+async fn folder_upload_keeps_the_users_name_verbatim() {
+    let state = test_state();
+    let dir = test_dir("folder-upload-verbatim");
+    let uri = format!(
+        "/api/v1/fs/upload?dir={}&name=my%20notes%20(1).txt",
+        dir.to_string_lossy()
+    );
+    let (status, body) = post_upload(&state, &uri, Body::from("hi")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["name"], "my notes (1).txt");
+    assert_eq!(std::fs::read(dir.join("my notes (1).txt")).unwrap(), b"hi");
+}
+
 #[tokio::test]
 async fn deleting_a_session_prunes_its_uploads() {
     let state = test_state();
