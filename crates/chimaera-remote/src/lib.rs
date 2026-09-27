@@ -72,6 +72,14 @@ pub struct WslTransport {
 }
 
 static WSL_TRANSPORT: std::sync::RwLock<Option<WslTransport>> = std::sync::RwLock::new(None);
+static SSH_CONFIG: std::sync::RwLock<Option<PathBuf>> = std::sync::RwLock::new(None);
+
+/// Select a process-owned SSH config for a sandbox. Ordinary clients leave this
+/// unset and inherit their own config; a single-account service can supply only
+/// explicitly approved host metadata without reading an operator's SSH config.
+pub fn set_ssh_config(path: Option<PathBuf>) {
+    *SSH_CONFIG.write().unwrap_or_else(|p| p.into_inner()) = path;
+}
 
 pub fn set_wsl_transport(t: Option<WslTransport>) {
     *WSL_TRANSPORT.write().unwrap_or_else(|p| p.into_inner()) = t;
@@ -97,7 +105,7 @@ pub fn wsl_transport_ready() -> bool {
 /// pinned with `-u` so a later change of the distro's default user (Ubuntu
 /// OOBE) can never silently re-home ssh's config/keys/sockets mid-flight.
 fn transport_command(program: &str) -> Command {
-    match wsl_transport() {
+    let mut command = match wsl_transport() {
         Some(t) => {
             let mut c = Command::new("wsl.exe");
             c.args(["-d", &t.distro, "-u", &t.user, "--exec", program]);
@@ -110,7 +118,17 @@ fn transport_command(program: &str) -> Command {
             c
         }
         None => Command::new(program),
+    };
+    if matches!(program, "ssh" | "scp") {
+        if let Some(path) = SSH_CONFIG
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+        {
+            command.arg("-F").arg(path);
+        }
     }
+    command
 }
 
 /// A `curl` invocation with the same no-console discipline as every other
@@ -760,6 +778,24 @@ pub async fn clear_wedged_master(host: &str, session_bound_secs: u64) -> bool {
         cleared |= clear_wedged_master_via(host, &Route::Alias, session_bound_secs).await;
     }
     cleared
+}
+
+/// Close the authenticated SSH logins owned by this state directory for a host.
+/// Closing a forward alone intentionally preserves ControlPersist; account-wide
+/// revocation must also terminate both legs of a routed login.
+pub async fn close_master(host: &str) -> anyhow::Result<()> {
+    let host = hosts::normalize_alias(host)?;
+    let route = route_of(&host);
+    let closed = bounded_mux_ssh(&host, &route, &["-O", "exit"], &[], 5).await;
+    let alias_closed = if route != Route::Alias {
+        bounded_mux_ssh(&host, &Route::Alias, &["-O", "exit"], &[], 5).await
+    } else {
+        Some(true)
+    };
+    if closed.is_none() || alias_closed.is_none() {
+        bail!("SSH login did not acknowledge closure within the deadline");
+    }
+    Ok(())
 }
 
 async fn clear_wedged_master_via(host: &str, route: &Route, session_bound_secs: u64) -> bool {
@@ -2724,6 +2760,40 @@ async fn node_target(host: &str, node: &str) -> String {
         Some(user) if !user.is_empty() => format!("{user}@{node}"),
         _ => node.to_string(),
     }
+}
+
+/// Resolve only the portable destination from the user's local SSH config.
+/// Private keys, proxy commands and every other executable option stay local.
+/// The app uses this when asking its optional account service to keep an alias
+/// connected; on Windows resolution runs inside the configured WSL transport.
+pub async fn ssh_destination(host: &str) -> anyhow::Result<(String, Option<String>, u16)> {
+    let alias = hosts::normalize_alias(host)?;
+    let mut command = transport_command("ssh");
+    command.arg("-G").arg(&alias);
+    let output = output_bounded(&mut command, 15, "ssh configuration resolution").await?;
+    if !output.status.success() {
+        bail!("could not resolve SSH destination for {alias}");
+    }
+    parse_ssh_destination(&String::from_utf8(output.stdout)?)
+}
+
+fn parse_ssh_destination(config: &str) -> anyhow::Result<(String, Option<String>, u16)> {
+    let value = |key: &str| {
+        config
+            .lines()
+            .find_map(|line| line.strip_prefix(key).map(str::trim))
+    };
+    let hostname = value("hostname ")
+        .filter(|value| !value.is_empty())
+        .context("SSH destination has no hostname")?;
+    let user = value("user ")
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let port = value("port ").unwrap_or("22").parse::<u16>()?;
+    if port == 0 || hostname.starts_with('-') || hostname.chars().any(char::is_whitespace) {
+        bail!("invalid SSH destination");
+    }
+    Ok((hostname.to_string(), user, port))
 }
 
 fn spawn_node_tunnel(

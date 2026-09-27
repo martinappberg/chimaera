@@ -1,0 +1,573 @@
+use crate::{
+    bridge,
+    protocol::*,
+    transport::{endpoint, path, Socket},
+    websocket_config,
+};
+use anyhow::{anyhow, bail, Context, Result};
+use futures::{SinkExt, StreamExt};
+use reqwest::Method;
+use serde::{de::DeserializeOwned, Serialize};
+use std::{
+    net::{Ipv4Addr, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
+use tokio::{
+    net::{TcpListener, TcpStream},
+    sync::{mpsc, watch, Mutex, RwLock, Semaphore},
+    task::{JoinHandle, JoinSet},
+    time::Instant,
+};
+use tokio_tungstenite::{
+    connect_async_tls_with_config,
+    tungstenite::{client::IntoClientRequest, http::HeaderValue, Message},
+    Connector,
+};
+use url::Url;
+
+#[derive(Clone)]
+pub struct Client {
+    inner: Arc<Inner>,
+}
+struct Inner {
+    account: Url,
+    keeper: RwLock<Option<Url>>,
+    http: reqwest::Client,
+    tls: Arc<rustls::ClientConfig>,
+    tokens: Mutex<Option<Tokens>>,
+    token_updates: watch::Sender<Option<Tokens>>,
+}
+impl Client {
+    /// Does not contact the endpoint. No background work starts before the
+    /// caller explicitly signs in or requests an operation.
+    pub fn new(base: &str, tokens: Option<Tokens>) -> Result<Self> {
+        let account = endpoint(base)?;
+        let (token_updates, _) = watch::channel(tokens.clone());
+        let roots =
+            rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        Ok(Self {
+            inner: Arc::new(Inner {
+                account,
+                keeper: RwLock::new(None),
+                http: reqwest::Client::builder()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .tls_backend_preconfigured(tls.clone())
+                    .connect_timeout(Duration::from_secs(10))
+                    .timeout(Duration::from_secs(30))
+                    .build()?,
+                tls: Arc::new(tls),
+                tokens: Mutex::new(tokens),
+                token_updates,
+            }),
+        })
+    }
+    /// Persist each replacement token pair in the OS keychain, including refresh
+    /// rotations. Consumers must never write these values to application state.
+    pub fn token_updates(&self) -> watch::Receiver<Option<Tokens>> {
+        self.inner.token_updates.subscribe()
+    }
+    pub async fn tokens(&self) -> Option<Tokens> {
+        self.inner.tokens.lock().await.clone()
+    }
+    pub async fn clear_tokens(&self) {
+        *self.inner.tokens.lock().await = None;
+        self.inner.token_updates.send_replace(None);
+        *self.inner.keeper.write().await = None;
+    }
+    async fn install_tokens(&self, tokens: Tokens) -> Result<Tokens> {
+        if tokens.token_type != "Bearer"
+            || tokens.access_token.is_empty()
+            || tokens.refresh_token.is_empty()
+        {
+            bail!("invalid token response");
+        }
+        *self.inner.tokens.lock().await = Some(tokens.clone());
+        self.inner.token_updates.send_replace(Some(tokens.clone()));
+        Ok(tokens)
+    }
+    pub async fn exchange_code(&self, request: TokenRequest) -> Result<Tokens> {
+        crate::oauth::validate_redirect(&request.redirect_uri)?;
+        let response = self
+            .inner
+            .http
+            .post(path(&self.inner.account, &["v1", "oauth", "token"]))
+            .json(&request)
+            .send()
+            .await?;
+        self.install_tokens(json_response(response).await?).await
+    }
+    async fn access_token(&self) -> Result<String> {
+        self.inner
+            .tokens
+            .lock()
+            .await
+            .as_ref()
+            .map(|t| t.access_token.clone())
+            .context("sign in required")
+    }
+    async fn refresh_if_current(&self, rejected: &str) -> Result<()> {
+        // One refresh can rotate the token for all sockets: concurrent 401s must
+        // never reuse an already-consumed refresh token.
+        let mut guard = self.inner.tokens.lock().await;
+        let old = guard.as_ref().context("sign in required")?;
+        if old.access_token != rejected {
+            return Ok(());
+        }
+        let response = self
+            .inner
+            .http
+            .post(path(&self.inner.account, &["v1", "oauth", "refresh"]))
+            .json(&RefreshRequest {
+                refresh_token: old.refresh_token.clone(),
+            })
+            .send()
+            .await?;
+        let tokens: Tokens = json_response(response).await?;
+        if tokens.token_type != "Bearer"
+            || tokens.access_token.is_empty()
+            || tokens.refresh_token.is_empty()
+        {
+            bail!("invalid refresh response");
+        }
+        *guard = Some(tokens.clone());
+        self.inner.token_updates.send_replace(Some(tokens));
+        Ok(())
+    }
+    async fn request(
+        &self,
+        method: Method,
+        url: Url,
+        body: Option<serde_json::Value>,
+    ) -> Result<reqwest::Response> {
+        for attempt in 0..2 {
+            let token = self.access_token().await?;
+            let mut request = self
+                .inner
+                .http
+                .request(method.clone(), url.clone())
+                .bearer_auth(&token);
+            if let Some(body) = &body {
+                request = request.json(body);
+            }
+            let response = request.send().await?;
+            if response.status() == reqwest::StatusCode::UNAUTHORIZED && attempt == 0 {
+                self.refresh_if_current(&token).await?;
+            } else if response.status().is_success() {
+                return Ok(response);
+            } else {
+                bail!("account request rejected ({})", response.status().as_u16());
+            }
+        }
+        bail!("sign in required")
+    }
+    pub async fn me(&self) -> Result<Account> {
+        let account: Account = json_response(
+            self.request(Method::GET, path(&self.inner.account, &["v1", "me"]), None)
+                .await?,
+        )
+        .await?;
+        if account.protocol != PROTOCOL_VERSION {
+            bail!("unsupported link protocol {}", account.protocol);
+        }
+        let keeper = if account.keeper_url.is_empty() {
+            None
+        } else {
+            Some(endpoint(&account.keeper_url)?)
+        };
+        // A TLS account must never downgrade its bearer to a cleartext keeper.
+        if self.inner.account.scheme() == "https"
+            && keeper
+                .as_ref()
+                .is_some_and(|keeper| keeper.scheme() != "https")
+        {
+            bail!("keeper TLS downgrade");
+        }
+        *self.inner.keeper.write().await = keeper;
+        Ok(account)
+    }
+    async fn keeper(&self) -> Result<Url> {
+        if let Some(keeper) = self.inner.keeper.read().await.clone() {
+            return Ok(keeper);
+        }
+        self.me().await?;
+        self.inner
+            .keeper
+            .read()
+            .await
+            .clone()
+            .context("Your connection is being prepared; no keeper is assigned yet")
+    }
+    pub async fn hosts(&self) -> Result<Vec<Host>> {
+        json_response(
+            self.request(
+                Method::GET,
+                path(&self.keeper().await?, &["v1", "hosts"]),
+                None,
+            )
+            .await?,
+        )
+        .await
+    }
+    pub async fn add_host(&self, alias: &str) -> Result<Host> {
+        self.add_host_with_ssh(alias, None).await
+    }
+    pub async fn add_host_with_ssh(&self, alias: &str, ssh: Option<SshTarget>) -> Result<Host> {
+        json_response(
+            self.request(
+                Method::POST,
+                path(&self.keeper().await?, &["v1", "hosts"]),
+                Some(serde_json::to_value(AddHost {
+                    alias: alias.into(),
+                    ssh,
+                })?),
+            )
+            .await?,
+        )
+        .await
+    }
+    pub async fn delete_host(&self, id: &str) -> Result<()> {
+        self.request(
+            Method::DELETE,
+            path(&self.keeper().await?, &["v1", "hosts", id]),
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+    pub async fn reconnect_host(&self, id: &str) -> Result<()> {
+        self.request(
+            Method::POST,
+            path(&self.keeper().await?, &["v1", "hosts", id, "reconnect"]),
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+    pub async fn devices(&self) -> Result<Vec<Device>> {
+        json_response(
+            self.request(
+                Method::GET,
+                path(&self.inner.account, &["v1", "devices"]),
+                None,
+            )
+            .await?,
+        )
+        .await
+    }
+    pub async fn revoke_device(&self, id: &str) -> Result<()> {
+        self.request(
+            Method::DELETE,
+            path(&self.inner.account, &["v1", "devices", id]),
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+    pub async fn sign_out_everywhere(&self) -> Result<()> {
+        self.request(
+            Method::POST,
+            path(&self.inner.account, &["v1", "sign-out-everywhere"]),
+            None,
+        )
+        .await?;
+        self.clear_tokens().await;
+        Ok(())
+    }
+    pub async fn open_socket(&self, segments: &[&str], control: bool) -> Result<Socket> {
+        let mut url = path(&self.keeper().await?, segments);
+        url.set_scheme(if url.scheme() == "https" { "wss" } else { "ws" })
+            .map_err(|_| anyhow!("invalid websocket URL"))?;
+        for attempt in 0..2 {
+            let token = self.access_token().await?;
+            let mut request = url.as_str().into_client_request()?;
+            request.headers_mut().insert(
+                "Authorization",
+                HeaderValue::from_str(&format!("Bearer {token}"))?,
+            );
+            match tokio::time::timeout(
+                Duration::from_secs(15),
+                connect_async_tls_with_config(
+                    request,
+                    Some(websocket_config(control)),
+                    false,
+                    Some(Connector::Rustls(self.inner.tls.clone())),
+                ),
+            )
+            .await?
+            {
+                Ok((socket, _)) => return Ok(socket),
+                Err(tokio_tungstenite::tungstenite::Error::Http(response))
+                    if response.status().as_u16() == 401 && attempt == 0 =>
+                {
+                    self.refresh_if_current(&token).await?
+                }
+                // Handshake error bodies may include echoed credentials: report
+                // only the status, never the response headers or body.
+                Err(tokio_tungstenite::tungstenite::Error::Http(response)) => bail!(
+                    "websocket upgrade rejected ({})",
+                    response.status().as_u16()
+                ),
+                Err(_) => bail!("websocket connection failed"),
+            }
+        }
+        bail!("sign in required")
+    }
+    pub async fn tcp(&self, host_id: &str) -> Result<Socket> {
+        self.open_socket(&["v1", "hosts", host_id, "tcp"], false)
+            .await
+    }
+    pub fn events(&self) -> EventConnection {
+        let (out, events) = mpsc::channel(64);
+        let (commands, mut incoming) = mpsc::channel(16);
+        let client = self.clone();
+        let task = tokio::spawn(async move {
+            let mut attempts = 0;
+            loop {
+                if out.is_closed() {
+                    break;
+                }
+                let result = async {
+                    let socket = client.open_socket(&["v1", "events"], true).await?;
+                    let (mut tx, mut rx) = socket.split();
+                    let mut ping = tokio::time::interval_at(Instant::now() + Duration::from_secs(20), Duration::from_secs(20));
+                    let mut last_pong = Instant::now();
+                    let connected = Instant::now();
+                    loop {
+                        tokio::select! {
+                            _ = out.closed() => return Ok(()),
+                            command = incoming.recv() => match command {
+                                Some(command) => send_json(&mut tx, &command).await?,
+                                None => return Ok(()),
+                            },
+                            message = rx.next() => match message {
+                                Some(Ok(Message::Text(text))) => {
+                                    if let Ok(event) = serde_json::from_str::<Event>(&text) {
+                                        tokio::time::timeout(Duration::from_secs(10), out.send(Ok(event))).await?.map_err(|_| anyhow!("events consumer closed"))?;
+                                    }
+                                }
+                                Some(Ok(Message::Ping(data))) => { tokio::time::timeout(Duration::from_secs(10), tx.send(Message::Pong(data))).await??; }
+                                Some(Ok(Message::Pong(_))) => { last_pong = Instant::now(); }
+                                Some(Ok(Message::Close(_))) | None => bail!("events disconnected"),
+                                Some(Ok(_)) => bail!("invalid events frame"),
+                                Some(Err(_)) => bail!("events read failed"),
+                            },
+                            _ = ping.tick() => {
+                                if last_pong.elapsed() >= Duration::from_secs(60) { bail!("events pong timeout"); }
+                                tokio::time::timeout(Duration::from_secs(10), tx.send(Message::Ping(Vec::new().into()))).await??;
+                            }
+                        }
+                        if connected.elapsed() >= Duration::from_secs(20) { attempts = 0; }
+                    }
+                }.await;
+                if out.is_closed() {
+                    break;
+                }
+                if let Err(error) = result {
+                    if !matches!(
+                        tokio::time::timeout(
+                            Duration::from_secs(10),
+                            out.send(Err(error.to_string()))
+                        )
+                        .await,
+                        Ok(Ok(()))
+                    ) {
+                        break;
+                    }
+                }
+                // Password answers belong to their connection, never to a later
+                // prompt with a reused identifier after a reconnect.
+                while incoming.try_recv().is_ok() {}
+                tokio::select! { _ = out.closed() => break, _ = tokio::time::sleep(backoff(attempts)) => {} }
+                attempts = attempts.saturating_add(1);
+            }
+        });
+        EventConnection {
+            events,
+            commands,
+            task,
+        }
+    }
+}
+
+pub struct EventConnection {
+    pub events: mpsc::Receiver<Result<Event, String>>,
+    pub commands: mpsc::Sender<EventCommand>,
+    task: JoinHandle<()>,
+}
+impl EventConnection {
+    pub async fn answer(&self, id: String, value: Option<String>) -> Result<()> {
+        self.commands
+            .send(EventCommand::Answer { id, value })
+            .await
+            .context("events closed")
+    }
+    pub fn close(&self) {
+        self.task.abort();
+    }
+}
+impl Drop for EventConnection {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// A stable loopback listener; per-request socket failures never change its port.
+pub struct LinkTunnel {
+    pub local_port: u16,
+    task: JoinHandle<()>,
+}
+impl LinkTunnel {
+    pub async fn bind(client: Client, host_id: String) -> Result<Self> {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let local_port = listener.local_addr()?.port();
+        let task = tokio::spawn(async move {
+            let limits = Arc::new(Semaphore::new(MAX_STREAMS));
+            let mut streams = JoinSet::new();
+            loop {
+                tokio::select! {
+                    result = listener.accept() => {
+                        let Ok((tcp, _)) = result else { break; };
+                        let Ok(permit) = limits.clone().try_acquire_owned() else { drop(tcp); continue; };
+                        let client = client.clone(); let host_id = host_id.clone();
+                        streams.spawn(async move {
+                            let _permit = permit;
+                            if let Ok(socket) = client.tcp(&host_id).await { let _ = bridge(tcp, socket).await; }
+                        });
+                    }
+                    _ = streams.join_next(), if !streams.is_empty() => {}
+                }
+            }
+        });
+        Ok(Self { local_port, task })
+    }
+    pub fn close(&self) {
+        self.task.abort();
+    }
+}
+impl Drop for LinkTunnel {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+pub struct Serve {
+    task: JoinHandle<()>,
+}
+impl Serve {
+    pub fn start(client: Client, local_port: u16, alias: String, daemon: Daemon) -> Self {
+        let task = tokio::spawn(async move {
+            let mut attempts = 0;
+            loop {
+                let started = Instant::now();
+                let _ = serve_connection(&client, local_port, &alias, &daemon).await;
+                if started.elapsed() >= Duration::from_secs(20) {
+                    attempts = 0;
+                }
+                tokio::time::sleep(backoff(attempts)).await;
+                attempts = attempts.saturating_add(1);
+            }
+        });
+        Self { task }
+    }
+    pub fn close(&self) {
+        self.task.abort();
+    }
+}
+impl Drop for Serve {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+async fn serve_connection(client: &Client, port: u16, alias: &str, daemon: &Daemon) -> Result<()> {
+    let mut socket = client.open_socket(&["v1", "serve"], true).await?;
+    send_json(
+        &mut socket,
+        &ServeCommand::Register {
+            alias: alias.to_string(),
+            daemon: daemon.clone(),
+        },
+    )
+    .await?;
+    let mut streams = JoinSet::new();
+    let mut active = std::collections::HashMap::new();
+    let mut ping = tokio::time::interval_at(
+        Instant::now() + Duration::from_secs(20),
+        Duration::from_secs(20),
+    );
+    let mut last_pong = Instant::now();
+    loop {
+        tokio::select! {
+            message = socket.next() => match message {
+                Some(Ok(Message::Text(text))) => match serde_json::from_str::<ServeEvent>(&text)? {
+                    ServeEvent::Open { stream_id } => {
+                        if active.len() >= MAX_STREAMS || active.contains_key(&stream_id) { bail!("serve stream limit or duplicate id"); }
+                        let client = client.clone(); let key = stream_id.clone();
+                        let abort = streams.spawn(async move {
+                            let result = async {
+                                let socket = client.open_socket(&["v1", "serve", &stream_id], false).await?;
+                                let tcp = tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))).await??;
+                                bridge(tcp, socket).await
+                            }.await;
+                            (stream_id, result)
+                        });
+                        active.insert(key, abort);
+                    }
+                    ServeEvent::Close { stream_id } => { if let Some(task) = active.remove(&stream_id) { task.abort(); } }
+                    ServeEvent::Registered { .. } => {}
+                },
+                Some(Ok(Message::Ping(data))) => { tokio::time::timeout(Duration::from_secs(10), socket.send(Message::Pong(data))).await??; }
+                Some(Ok(Message::Pong(_))) => { last_pong = Instant::now(); }
+                Some(Ok(Message::Close(_))) | None => return Ok(()),
+                _ => bail!("serve disconnected"),
+            },
+            Some(result) = streams.join_next(), if !streams.is_empty() => {
+                if let Ok((id, _)) = result { active.remove(&id); }
+            }
+            _ = ping.tick() => {
+                if last_pong.elapsed() >= Duration::from_secs(60) { bail!("serve pong timeout"); }
+                tokio::time::timeout(Duration::from_secs(10), socket.send(Message::Ping(Vec::new().into()))).await??;
+            }
+        }
+    }
+}
+fn backoff(attempt: u32) -> Duration {
+    let ceiling = (500_u64.saturating_mul(1 << attempt.min(5))).min(10_000);
+    Duration::from_millis(ceiling / 2 + rand::random_range(0..=ceiling / 2))
+}
+async fn json_response<T: DeserializeOwned>(mut response: reqwest::Response) -> Result<T> {
+    if !response.status().is_success() {
+        bail!("request rejected ({})", response.status().as_u16());
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if bytes.len() + chunk.len() > 1024 * 1024 {
+            bail!("REST response exceeds 1 MiB");
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&bytes).context("invalid JSON response")
+}
+async fn send_json<S, T>(socket: &mut S, value: &T) -> Result<()>
+where
+    S: futures::Sink<Message> + Unpin,
+    S::Error: std::fmt::Display,
+    T: Serialize,
+{
+    let json = serde_json::to_string(value)?;
+    if json.len() > MAX_CONTROL_FRAME {
+        bail!("control frame too large");
+    }
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        socket.send(Message::Text(json.into())),
+    )
+    .await?
+    .map_err(|_| anyhow!("websocket send failed"))
+}

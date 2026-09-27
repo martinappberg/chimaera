@@ -92,6 +92,7 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      - run: cargo test -p chimaera-link --all-features
 
   musl:
     needs: ui
