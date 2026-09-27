@@ -51,17 +51,23 @@ sheet, hosted once in `web-ui/src/App.svelte`. Wire (all under `/api/v1`, bearer
   segments in the far corner (under the title when the tab is narrow) — and each segment
   scrolls on its own below it, keeping its place when you switch away and back. The **Plugins**
   segment opens with "Plugins add tools for your agents and views for you. Install one, then
-  switch it on per workspace." and shows, under **Chimaera plugins**, a card per plugin — name
-  · check badge · version ([below](#versions-installs--updates)) ·
-  summary · a switch meaning *on in this workspace*, beside its state ("active here", "on ·
-  nothing detected yet", "off"; an available plugin shows **Install <version>** instead) ·
-  plain sentences: "For agents: …" and "For you: …" (what it adds, from its `[adds]`), the
-  detection sentence ("<path> found"; Mycelium's counts what it found), and its agent-side
-  plugins — "Requires the <agent> plugin <id>" for a `requires` block, "For <agent>: …" for a
-  `recommends` block (below), with Install and "Review & trust →" where they apply — then,
-  under **Agent plugins**, what each agent CLI reports (below). Mycelium's **attach sheet** ("Use mycelium for Knowledge", also reached from
-  Knowledge's card, the dashboard's "Where things stand", and the Mastermind panel's quiet
-  line) runs three live-checked steps: 1 install for your agents (a visible terminal running
+  switch it on per workspace." and shows, under **Chimaera plugins** (Chimaera's own first), a
+  card per plugin with one primary control. Its head: a two-letter tile · the name (a link to
+  the plugin's `homepage`, opened in the system browser) · the check badge · version
+  ([below](#versions-installs--updates)) · on the right **Install** for a plugin not on this
+  host, else the switch meaning *on in this workspace* with its state in words beside it
+  ("active here", "on · not set up here yet", "off") · and a quiet **…** menu (click or
+  keyboard) holding everything secondary: Check for updates, Use previous version (x), Set up
+  in this workspace…, Open on GitHub, Remove…. Under it: the summary, then the author's
+  `description` clamped to two lines with a quiet "more"; a small definition list — **For
+  you** and **For agents** (from its `[adds]`) and **Here**, only when it means something
+  ("using .living/ in this workspace · 4 findings · 4 decisions", "found .living/ in this
+  workspace — switch it on to use it", "not set up in this workspace yet — Set it up"); the
+  **Agent-side plugin** box (below); an update callout; a fault callout; one outcome line.
+  Then a small form, **Install from a repository**, and under **Agent plugins** what each agent
+  CLI reports (below). Mycelium's **attach sheet** ("Use Mycelium for Knowledge", reached from
+  the card's menu, Knowledge's card and the Mastermind panel's quiet line) runs three
+  live-checked steps: 1 install for your agents (a visible terminal running
   `<agent> plugin marketplace add arjunrajlaboratory/mycelium`, then `claude plugin install
   mycelium@mycelium` or `codex plugin add mycelium@mycelium`) · 2 trust codex's hooks (see
   below) · 3 set up this workspace (the plugin's own prompt, "Set up Mycelium in this
@@ -72,7 +78,8 @@ sheet, hosted once in `web-ui/src/App.svelte`. Wire (all under `/api/v1`, bearer
   `available_json`, `workspace_plugins`, `put_workspace_plugin`, `install_requirement`,
   `setup_workspace`), `plugins/tools.rs` (`owner` / `offered` / `call`), the switch on
   `Workspace.plugins_on` (`workspaces.rs`). UI `store.ts`, `PluginsView.svelte`,
-  `InstalledView.svelte`, `requirementsModel.ts` (the requires / recommends sentences),
+  `InstalledView.svelte` (the list, the repository form, the agent plugins), `PluginCard.svelte`
+  (one card), `installCopy.ts` (the card's words), `requirementsModel.ts` (the agent-side box),
   `AttachSheet.svelte`. Tests:
   `crates/chimaera-server/src/tests/plugins.rs`.
 - **Key behaviors.**
@@ -107,23 +114,29 @@ sheet, hosted once in `web-ui/src/App.svelte`. Wire (all under `/api/v1`, bearer
     parsed `deny_unknown_fields`; a test fails a locked release that doesn't say what it adds.
     The behaviour is the plugin's `plugin.wasm`, never daemon code
     ([the host](#the-plugin-host)). Built manifest points: `detect`, `requires.agent_plugins`,
-    `recommends.agent_plugins`, `requires.chimaera`, `setup.prompt`, `provides.knowledge`,
+    `recommends.agent_plugins`, `requires.summary` / `recommends.summary` (the author's one
+    sentence about the agent-side plugin), `requires.chimaera`, `description` (a few plain
+    sentences from the author, shown under the summary), `setup.prompt`, `provides.knowledge`,
     `provides.mcp_tools`, `provides.events`, `[release] github`; `provides.views` parses and
     rides the wire but nothing renders it, and `settings` / `commands` are specified in the plan
     only.
   - **Requires and recommends** name agent-side plugins in
     the same shape, `[requires.agent_plugins.<agent>]` / `[recommends.agent_plugins.<agent>]`
     `{id, marketplace}`, and both feed the agent-plugin install route, the attach sheet's
-    step 1 and codex hook trust. `requires` is a genuine hard requirement (no plugin has one
-    today): the card says "Requires the <agent> plugin <id>" with the install state and
-    Install, only for agents installed on this host, and "Requires claude or codex with plugin
-    <id>; neither is installed on this host" when none is. `recommends` helps the agents the
-    user runs but is never needed — mycelium's `mycelium@mycelium` is the example: the Knowledge
-    reader works with no agent plugin at all. The card says "For <agent>: mycelium ✓ 0.7.2"
-    once installed for that agent, or "For <agent>: install the <id> plugin so it can record
-    knowledge" (that clause only for a plugin that provides knowledge) with Install, and nothing
-    for an agent that isn't installed here. Both ride `GET /workspaces/{id}/plugins` as lists of
-    `{agent, id, marketplace}`.
+    step 1 and codex hook trust. On the card each is a small titled box, **Agent-side plugin**
+    (**· needed** for a requirement), shown only when an agent that could use it is installed on
+    this host (or, for a requirement, to say none is): the author's sentence
+    (`requires.summary` / `recommends.summary`, or a plain fallback), a link to the agent
+    plugin's page ("mycelium on GitHub", from a marketplace that names `owner/repo`), then one
+    line per installed agent with its state in words and at most one action — "claude ·
+    installed 0.7.2", "codex · not installed [Install]", "codex · 2 hooks not trusted
+    [Review]", "claude · installed, disabled"; "asking claude and codex…" while the agents are
+    asked. `requires` is a genuine hard requirement (no plugin has one today; "It needs claude
+    or codex, and neither is installed on this host." when none is). `recommends` helps the
+    agents the user runs but is never needed — mycelium's `mycelium@mycelium` is the example:
+    the Knowledge reader works with no agent plugin at all. Both ride
+    `GET /workspaces/{id}/plugins` as lists of `{agent, id, marketplace}`, beside
+    `requires_summary` / `recommends_summary`.
   - **Agent-plugin installs are the agent's own CLI** in a visible `install <plugin> for
     <agent>` terminal (ids and marketplace sources charset-gated, never flag-shaped); 409 when
     the agent binary is missing; the probe cache is invalidated when that terminal ends. Setup
@@ -207,51 +220,61 @@ sheet, hosted once in `web-ui/src/App.svelte`. Wire (all under `/api/v1`, bearer
   `SHA256SUMS` (and a first-party one against the lock too), and every installed copy again
   each time the catalog loads it; a copy that fails is never loaded, and only that failure
   reaches the card, as its fault line.
-- **How it's used.** The card's first line: name · a small check badge when the plugin is in
+- **How it's used.** The card's head: name · a small check badge when the plugin is in
   Chimaera's curated list (tooltip "Verified by the Chimaera maintainers"; a plugin from any
-  other repository has none) · version · a quiet "local build" note for a copy installed from a
-  directory — and an **Update to x.y.z** chip when a check found a newer release. A first-party
-  plugin with nothing installed shows **Install 0.1.0** (the pinned version) where the switch
-  would be; its tooltip says what happens: "Downloads it from github.com/<repo> into this
-  host's ~/.chimaera/plugins. It does nothing until you switch it on in a workspace." Then the card's
-  sentences ("For agents: …" / "For you: …", the detection sentence, the requires / recommends
-  lines — [above](#workbench-plugins)). An installed copy adds the Installed line — "installed
-  0.1.1 · 0.1.0 available to go back to" — with **Use previous** · **Check now** · **Remove**
-  (a dialog naming the versions it deletes); each change reports one outcome line, never a
-  checksum ("installed Agent notes 0.1.1", "updated to 0.1.1", "removed"). Under the cards,
-  **Install from a repository** ("Installs the latest release of a plugin repository on this
-  host. It does nothing until you switch it on in a workspace.") takes `owner/repo` (or its
-  `https://github.com/owner/repo` URL) and **Install** fetches its latest release (a first-party
-  plugin's repository: the pinned version), reporting the plugin and its version — or the
-  daemon's refusal — in one outcome line; like any plugin, it runs only where it is switched on. A plugin this daemon
-  can't run shows why ("needs chimaera ≥ x (this is y)", "needs a newer chimaera: …", "needs a
-  newer plugin: …", "its files do not match its release's SHA256SUMS") and stays off. On the
+  other repository has none) · version (tooltip "chimaera pins x" when a first-party copy runs
+  another) · a quiet "local build" tag for a copy installed from a directory. A first-party
+  plugin with nothing installed shows **Install** (it installs the version shown, the one
+  chimaera pins) where the switch would be; its tooltip says what happens: "Downloads it from
+  github.com/<repo> into this host's ~/.chimaera/plugins. It does nothing until you switch it
+  on in a workspace." Then the rest of the card ([above](#workbench-plugins)). When a check
+  found a newer release, a calm callout inside the card says "0.1.2 is available" with a
+  "what changed" link (the release page) and a small **Update**. The **…** menu holds **Check
+  for updates** (afterwards a muted "No newer version · checked just now" line, which ages —
+  "checked 2 hours ago"), **Use previous version (0.1.1)**, **Open on GitHub** (the repository
+  it installs from) and **Remove…** (a dialog naming the versions it deletes). Each change
+  reports one outcome line, never a checksum ("installed Agent notes 0.1.2", "updated to
+  0.1.2", "back to 0.1.1 — Use previous returns to 0.1.2"). A plugin this daemon can't run
+  shows why in a callout ("needs chimaera ≥ x (this is y)", "needs a newer chimaera: …",
+  "needs a newer plugin: …", "The downloaded files don't match what the release published —
+  reinstall it", with **Reinstall** for that one) and stays off, its switch disabled; a plugin
+  that failed five times in a minute here adds "Switching it off and on starts it again."
+  Under the cards, the small **Install from a repository** form (label, an `owner/repo` field,
+  **Install**, and "The latest release of a plugin's GitHub repository, installed on this host.
+  It does nothing until you switch it on in a workspace.") takes `owner/repo` (or its
+  `https://github.com/owner/repo` URL) and fetches its latest release (a first-party plugin's
+  repository: the pinned version), reporting the plugin and its version — or the daemon's
+  refusal — in one outcome line; like any plugin, it runs only where it is switched on. On the
   daemon's host: `chimaera plugin list` · `add <id>` · `add <owner/repo> [--version x]` ·
-  `add --path <dir>` · `update <id>` · `remove <id>` — the same routes, printing the versions
-  and the checksums the daemon verified ([cli.md](cli.md)).
+  `add --path <dir>` · `update <id>` · `remove <id>` — the same routes, one line per change
+  ("installed agent-notes 0.1.2") and a leading ✓ in the list for Chimaera's own plugins
+  ([cli.md](cli.md)).
 - **Where it lives.** `plugins/mod.rs` (the lock — `Locked`, `parse_lock`, `lock_entries` —,
   `resolve`, `gate`, `Catalog`, `listing`, `manifest_json` / `available_json`),
   `plugins/installed.rs` (`scan`, which reads each copy and checks its files; `install_route`
   — a release or `{path}` —, `pinned_install_route`, `update_route`, `rollback_route`,
   `remove_route`), `plugins/releases.rs` (`check`, `check_all`,
   `check_route`; run from `update.rs::run_checker`), `crates/chimaera/src/plugin.rs`; UI
-  `InstalledView.svelte`, `store.ts`. Tests: `crates/chimaera-server/src/tests/plugin_updates.rs`,
+  `PluginCard.svelte`, `InstalledView.svelte`, `store.ts`. Tests: `crates/chimaera-server/src/tests/plugin_updates.rs`,
   against a fake releases server and the locked releases in `plugins/dist-test`. The wire — one
   entry shape (`manifest_json`) on `GET /plugins`, `GET /workspaces/{id}/plugins` and in the
   `plugin` field of every change answer:
-  - **An installed entry:** `id`, `name`, `summary`, `homepage`, `adds {ui, agents}`,
-    `provides {knowledge, mcp_tools, views}`, `setup`, `detect`, then `version` (the installed
+  - **An installed entry:** `id`, `name`, `summary`, `description` (the author's prose, null
+    when none), `homepage`, `adds {ui, agents}`, `provides {knowledge, mcp_tools, views}`,
+    `setup`, `detect`, `requires_summary` / `recommends_summary` (the author's sentence about
+    the agent-side plugin, null when none), then `version` (the installed
     copy's), `api` (the WIT version it targets, `"0.1"`), `source: "installed"`,
     `installed: true`, `first_party`, `verified`, `sha256_wasm` (the loaded copy's
     `plugin.wasm`), `path` (the version directory), and only when they hold something: `repo`
     (the `owner/repo` it updates from, its `[release] github`), `pinned_version` (first-party
     only: the lock's version), `local_path` (a local install's source directory), `previous`
     (what Use previous goes back to), `update` (`{version, url, checked_ms}`, when a check found
-    a newer release) and `fault` (why it can't run: a gate, the `SHA256SUMS` mismatch, or the
-    runtime's fault in a workspace).
+    a newer release) and `fault` (why it can't run, in the card's words: a gate, files that
+    don't match their release, or the runtime's fault in a workspace).
   - **An available entry** (a lock id with nothing installed): `id`, `name`, `summary` from the
-    lock; `homepage: null`, `adds {ui: [], agents: []}`,
-    `provides {knowledge: null, mcp_tools: [], views: []}`, `setup: null`, `detect: []`;
+    lock; `description: null`, `homepage: null`, `adds {ui: [], agents: []}`,
+    `provides {knowledge: null, mcp_tools: [], views: []}`, `setup: null`, `detect: []`,
+    `requires_summary: null`, `recommends_summary: null`;
     `version` (the pinned one), `api: null`, `source: "available"`, `installed: false`,
     `first_party: true`, `verified: false`, `repo` and `pinned_version` (the lock's).
   - `GET /workspaces/{id}/plugins` adds per entry `on`, `detected`, `active` (all false for an
@@ -277,8 +300,10 @@ sheet, hosted once in `web-ui/src/App.svelte`. Wire (all under `/api/v1`, bearer
     re-hashed against the `SHA256SUMS` kept beside them. A match → `verified`; no `SHA256SUMS`
     (a local build without one, or a copy installed before chimaera kept the file) → unverified,
     no error; a mismatch, or a `SHA256SUMS` that doesn't list both files → listed with the fault
-    "its files do not match its release's SHA256SUMS": it never loads, its switch refuses on,
-    and Use previous to that version is refused. A first-party copy at the lock's pinned version
+    "the downloaded files don't match what the release published — reinstall it" (the log line
+    names the file): it never loads, its switch refuses on, and Use previous to that version is
+    refused. **Reinstall** — installing that same version again from its repository — replaces
+    such a copy in place (an intact copy at that version still answers 409). A first-party copy at the lock's pinned version
     is `verified` only when its bytes also equal the lock's two sha256s, so a local build at the
     pinned version is unverified, without a fault.
   - **Three install kinds:**
@@ -287,8 +312,10 @@ sheet, hosted once in `web-ui/src/App.svelte`. Wire (all under `/api/v1`, bearer
       pinned one): the lock's version, fetched from
       `https://github.com/<repo>/releases/download/v<version>/{SHA256SUMS,plugin.toml,plugin.wasm}`
       (direct download URLs, no API call). Both files must match the release's `SHA256SUMS` AND
-      the lock's sha256s (a mismatch with the lock is a 422, "… does not match what chimaera
-      pins"); the manifest's id must be the lock's, its version the pinned one and its
+      the lock's sha256s (a mismatch with the lock is a 422, "<name> <version> on GitHub isn't
+      the release chimaera approved, so it wasn't installed", with the hashes in the log); a
+      download that doesn't match its release's list is a 422, "the downloaded files don't
+      match what the release published — try again"; the manifest's id must be the lock's, its version the pinned one and its
       `[release] github` the lock's repo, and it must pass the gates. The copy is `verified` and
       `first_party`. 409 when that version is already installed.
     - **Third-party** — `POST /plugins/install {github, version?}`: the latest release, or the
@@ -325,7 +352,7 @@ sheet, hosted once in `web-ui/src/App.svelte`. Wire (all under `/api/v1`, bearer
   - **The checker never downloads.** For each installed plugin whose manifest names
     `[release] github`, it asks the GitHub releases API once after boot and then daily (riding
     the daemon's own update loop, off with `update.autoCheck`; a dev build skips it unless
-    `CHIMAERA_PLUGIN_RELEASES_API` is set) and on **Check now**, reads only the release's
+    `CHIMAERA_PLUGIN_RELEASES_API` is set) and on **Check for updates**, reads only the release's
     `plugin.toml`, and offers a version only when it is strictly newer than the one that runs
     and passes the gates. Offers live in memory. **Update** installs it through the release path
     (its `SHA256SUMS` kept). A first-party plugin updated past the pin keeps its check badge
@@ -351,11 +378,16 @@ sheet, hosted once in `web-ui/src/App.svelte`. Wire (all under `/api/v1`, bearer
   (`<root>/.claude/skills`; codex `repo` scope) · from plugins (enabled claude plugins'
   `skills/`; codex `pluginId`) · yours (`~/.claude/skills`; codex `user`) · built into the agent
   (claude's catalog from a *live* claude chat session's handshake in this workspace — present
-  only while one runs, `_`-prefixed internals dropped). Each row carries one chip per agent —
+  only while one runs, `_`-prefixed internals dropped) — split as **Built into claude** (`/name`
+  chips; without a running claude chat a muted "claude lists its built-in skills only while a
+  claude chat runs.") and **Built into codex** (codex's system skills as `$name` chips), each
+  chip copying its invocation. Each row carries one chip per agent —
   available ✓ · off ◌ ("disabled in codex's config") · absent, with the reason in words ("codex
   is not installed here", "the plugin is not installed for claude") — and the invocation in each
   agent's own syntax (`/name` claude, `$name` codex). Codex's skill load errors are listed.
-  Filter chips (All · claude · codex · only one agent), search, a detail aside.
+  The controls follow Settings' recipes — the segmented All · claude · codex, a search field,
+  the counts — and a row opens in place into a small definition list: **Use it** (each
+  agent's invocation, copyable), **File** (open SKILL.md), **Problems** (load errors).
 - **Where it lives.** `agent_probe.rs` (`claude_state`, `codex_raw` / `codex_state`,
   `CodexRpc`, `agent_plugins`, `skills`, `scan_skills`); UI `SkillsView.svelte`,
   `skillsModel.ts`. Wire facts: [PROTOCOL.md Pass 35](../../crates/chimaera-agent/PROTOCOL.md).
@@ -414,7 +446,9 @@ sheet, hosted once in `web-ui/src/App.svelte`. Wire (all under `/api/v1`, bearer
   share), `append_note`, `age`; the hint reaches claude through `plugins::runtime::hook` from
   `agents.rs::ingest`. UI `TimelineRow.svelte` / `TimelineView.svelte` (deliver) and
   `MastermindDock.svelte` (the inbox chip). Tests: `crates/chimaera-server/src/tests/plugins.rs`
-  pins the tool definitions, the paragraph and the texts byte for byte.
+  pins the tool definitions and the texts byte for byte; the instruction paragraph is the
+  plugin's own wording (0.1.2 rewrote it), so the test checks it names `post_note` and
+  `read_notes`.
 - **Key behaviors.** ≤10 posts per session per minute and ≤2 KiB a note (the host's caps, not
   the plugin's); notes never cross workspaces; a note for everyone has no single recipient to
   deliver to. Read cursors (host state, per workspace) and rate windows live in daemon memory

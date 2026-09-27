@@ -220,7 +220,7 @@
     closeAttachSheet,
     knowledgeProviderActive,
   } from "./lib/plugins/store";
-  import { EXTENSIONS_GLYPH, EXTENSIONS_STROKE } from "./lib/plugins/glyph";
+  import ExtensionsGlyph from "./lib/plugins/ExtensionsGlyph.svelte";
   import ComputeStrip from "./lib/workspace/ComputeStrip.svelte";
   import {
     dropSpotAt,
@@ -1227,6 +1227,7 @@
     onOpenSession: openSess,
     onOpenTimeline: openTimelineSurface,
     onOpenKnowledge: openKnowledgeSurface,
+    onOpenExtensions: openPluginsSurface,
   });
 
   /**
@@ -3203,6 +3204,7 @@
       label: "Extensions",
       aliases: ["plugins", "skills"],
       hint: "plugins and skills",
+      glyph: "extensions" as const,
       run: openPluginsSurface,
     },
     {
@@ -4909,17 +4911,8 @@
           title="extensions — install plugins, and see every skill your agents can use"
           onclick={openPluginsSurface}
         >
-          <svg class="dash-glyph" viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
-            <!-- The Extensions tab's own glyph (PaneTabs): one glyph per surface. -->
-            <path
-              d={EXTENSIONS_GLYPH}
-              fill="none"
-              stroke="currentColor"
-              stroke-width={EXTENSIONS_STROKE}
-              stroke-linecap="round"
-              stroke-linejoin="round"
-            />
-          </svg>
+          <!-- The Extensions tab's own glyph (plugins/glyph.ts): one glyph per surface. -->
+          <ExtensionsGlyph class="dash-glyph" />
           <span class="dash-label">extensions</span>
         </button>
 

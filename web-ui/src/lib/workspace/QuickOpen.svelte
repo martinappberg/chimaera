@@ -14,6 +14,7 @@
   import { modalFocus } from "../shared/modalFocus";
   import FileIcon from "../shared/FileIcon.svelte";
   import SessionGlyph from "../shared/SessionGlyph.svelte";
+  import ExtensionsGlyph from "../plugins/ExtensionsGlyph.svelte";
 
   /** Parent directory of a workspace-relative path ("" for a root file). */
   function dirnameOf(rel: string): string {
@@ -30,6 +31,8 @@
     aliases?: string[];
     /** The quiet trailing hint ("what happened"). */
     hint?: string;
+    /** The surface's own glyph in place of the "›" (Extensions). */
+    glyph?: "extensions";
     run: () => void;
   }
 
@@ -239,7 +242,11 @@
           >
             {#if row.kind === "command"}
               {@const c = row.command}
-              <span class="glyph-slot cmd-glyph" aria-hidden="true">›</span>
+              {#if c.glyph === "extensions"}
+                <span class="glyph-slot cmd-glyph" aria-hidden="true"><ExtensionsGlyph /></span>
+              {:else}
+                <span class="glyph-slot cmd-glyph" aria-hidden="true">›</span>
+              {/if}
               <span class="name">{c.label}</span>
               {#if c.hint}<span class="meta">{c.hint}</span>{/if}
             {:else if row.kind === "session"}

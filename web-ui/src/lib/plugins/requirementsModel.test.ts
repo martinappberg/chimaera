@@ -1,6 +1,15 @@
 import { describe, expect, it } from "vitest";
 import type { AgentHook, AgentPlugin, AgentPlugins, PluginRequirement } from "./store";
-import { CHECKING, hooksAwaitingTrust, requirementsModel, sheetText, type RequirementsInput } from "./requirementsModel";
+import {
+  CHECKING,
+  agentSideBlocks,
+  hooksAwaitingTrust,
+  marketplaceUrl,
+  requirementsModel,
+  sheetText,
+  type BlockInput,
+  type RequirementsInput,
+} from "./requirementsModel";
 
 const myc = (agent: string): PluginRequirement => ({ agent, id: "mycelium@mycelium", marketplace: "mycelium" });
 
@@ -24,7 +33,7 @@ describe("requirementsModel · requires", () => {
     expect(m).toEqual({ phase: "none", notice: null, rows: [] });
   });
 
-  it("an installed requirement: the sentence plus the ✓ pill with its version", () => {
+  it("an installed requirement: installed and its version, no action", () => {
     const m = requirementsModel(
       input({ requires: [myc("claude")], report: report([{ agent: "claude", plugins: [mycelium()] }]) }),
     );
@@ -34,8 +43,9 @@ describe("requirementsModel · requires", () => {
     expect(m.rows[0]).toMatchObject({
       kind: "requires",
       status: "installed",
-      text: "Requires the claude plugin mycelium@mycelium",
-      pill: { text: "claude · plugin 0.7.2 ✓", tone: "good" },
+      state: "installed 0.7.2",
+      tone: "good",
+      action: null,
       offerInstall: false,
     });
   });
@@ -51,7 +61,9 @@ describe("requirementsModel · requires", () => {
     const m = requirementsModel(input({ requires: [myc("claude")], report: report([{ agent: "claude" }]) }));
     expect(m.rows[0]).toMatchObject({
       status: "missing",
-      pill: { text: "claude · plugin not installed", tone: "warn" },
+      state: "not installed",
+      tone: "warn",
+      action: "install",
       offerInstall: true,
     });
   });
@@ -62,7 +74,9 @@ describe("requirementsModel · requires", () => {
     );
     expect(m.rows[0]).toMatchObject({
       status: "disabled",
-      pill: { text: "claude · plugin 0.7.2 · disabled", tone: "warn" },
+      state: "installed, disabled",
+      tone: "warn",
+      action: null,
       offerInstall: false,
     });
   });
@@ -86,24 +100,22 @@ describe("requirementsModel · requires", () => {
       }),
     );
     expect(m.rows).toEqual([]);
-    expect(m.notice).toBe("Requires claude or codex with plugin mycelium@mycelium; neither is installed on this host");
+    expect(m.notice).toBe("It needs claude or codex, and neither is installed on this host.");
   });
 
   it("names the one agent a lone requirement lists", () => {
     const m = requirementsModel(input({ requires: [myc("codex")], report: report([{ agent: "claude" }]) }));
-    expect(m.notice).toBe("Requires codex with plugin mycelium@mycelium; codex isn't installed on this host");
+    expect(m.notice).toBe("It needs codex, which isn't installed on this host.");
   });
 
-  it("names each agent's plugin when the ids differ", () => {
+  it("names three agents with none of them installed", () => {
     const m = requirementsModel(
       input({
-        requires: [myc("claude"), { agent: "codex", id: "notes", marketplace: "x" }],
+        requires: [myc("claude"), { agent: "codex", id: "notes", marketplace: "x" }, myc("gemini")],
         report: report([]),
       }),
     );
-    expect(m.notice).toBe(
-      "Requires claude with plugin mycelium@mycelium or codex with plugin notes; neither is installed on this host",
-    );
+    expect(m.notice).toBe("It needs claude, codex or gemini, and none of them is installed on this host.");
   });
 
   it("while loading, one line for the whole block", () => {
@@ -121,28 +133,28 @@ describe("requirementsModel · requires", () => {
     expect(m.rows[0].status).toBe("installed");
   });
 
-  it("when the daemon can't ask the agents, requirements keep the honest pill", () => {
+  it("when the daemon can't ask the agents, requirements say so honestly", () => {
     const m = requirementsModel(
       input({ requires: [myc("claude"), myc("codex")], recommends: [myc("claude")], state: "unavailable" }),
     );
     expect(m.phase).toBe("unavailable");
     expect(m.notice).toBeNull();
-    expect(m.rows.map((r) => [r.kind, r.status, r.text, r.pill?.text])).toEqual([
-      ["requires", "unknown", "Requires the claude plugin mycelium@mycelium", "claude · can't check on this daemon"],
-      ["requires", "unknown", "Requires the codex plugin mycelium@mycelium", "codex · can't check on this daemon"],
+    expect(m.rows.map((r) => [r.kind, r.agent, r.status, r.state, r.action])).toEqual([
+      ["requires", "claude", "unknown", "can't check on this daemon", null],
+      ["requires", "codex", "unknown", "can't check on this daemon", null],
     ]);
   });
 
-  it("a failed first report keeps the sentences, without pills (the caller shows the error once)", () => {
+  it("a failed first report keeps the rows, without actions (the caller shows the error once)", () => {
     const m = requirementsModel(input({ requires: [myc("claude")], state: "error" }));
     expect(m.phase).toBe("error");
     expect(m.rows).toHaveLength(1);
-    expect(m.rows[0]).toMatchObject({ status: "unknown", pill: null, offerInstall: false });
+    expect(m.rows[0]).toMatchObject({ status: "unknown", state: "couldn't ask", action: null, offerInstall: false });
   });
 });
 
 describe("requirementsModel · recommends", () => {
-  it("an installed recommendation: the name before @, ✓, its version", () => {
+  it("an installed recommendation: installed and its version", () => {
     const m = requirementsModel(
       input({ recommends: [myc("claude")], report: report([{ agent: "claude", plugins: [mycelium()] }]) }),
     );
@@ -150,8 +162,9 @@ describe("requirementsModel · recommends", () => {
     expect(m.rows[0]).toMatchObject({
       kind: "recommends",
       status: "installed",
-      text: "For claude: mycelium ✓ 0.7.2",
-      pill: null,
+      state: "installed 0.7.2",
+      tone: "good",
+      action: null,
       offerInstall: false,
     });
   });
@@ -160,23 +173,39 @@ describe("requirementsModel · recommends", () => {
     const m = requirementsModel(
       input({ recommends: [myc("claude")], report: report([{ agent: "claude", plugins: [mycelium(false)] }]) }),
     );
-    expect(m.rows[0].text).toBe("For claude: mycelium 0.7.2 is installed but disabled");
+    expect(m.rows[0].state).toBe("installed, disabled");
   });
 
-  it("offers the install, saying why when the plugin provides knowledge", () => {
+  it("a missing recommendation offers the install, calmly", () => {
     const m = requirementsModel(
       input({ recommends: [myc("claude")], knowledge: "mycelium", report: report([{ agent: "claude" }]) }),
     );
     expect(m.rows[0]).toMatchObject({
       status: "missing",
-      text: "For claude: install the mycelium@mycelium plugin so it can record knowledge",
+      state: "not installed",
+      tone: "neutral",
+      action: "install",
       offerInstall: true,
     });
   });
 
-  it("offers the install without the knowledge clause otherwise", () => {
-    const m = requirementsModel(input({ recommends: [myc("codex")], report: report([{ agent: "codex" }]) }));
-    expect(m.rows[0].text).toBe("For codex: install the mycelium@mycelium plugin");
+  it("untrusted codex hooks are the row's one action", () => {
+    const m = requirementsModel(
+      input({
+        recommends: [myc("codex")],
+        report: report([
+          {
+            agent: "codex",
+            plugins: [mycelium(true, "mycelium")],
+            hooks: [
+              { key: "a", event: "Stop", plugin_id: "mycelium", trust: "untrusted", hash: "h" },
+              { key: "b", event: "SessionStart", plugin_id: "mycelium", trust: "modified", hash: "h" },
+            ],
+          },
+        ]),
+      }),
+    );
+    expect(m.rows[0]).toMatchObject({ state: "2 hooks not trusted", tone: "warn", action: "review" });
   });
 
   it("says nothing at all for an agent that isn't installed here", () => {
@@ -251,5 +280,85 @@ describe("hooks and the sheet's wording", () => {
     expect(sheetText(rec.rows[0], null)).toBe("optional: the mycelium@mycelium plugin for claude");
     const unk = requirementsModel(input({ requires: [myc("claude")], state: "unavailable" })).rows[0];
     expect(sheetText(unk, null)).toBe("claude needs the mycelium@mycelium plugin — can't check on this daemon");
+  });
+});
+
+describe("agentSideBlocks", () => {
+  const mk = (agent: string): PluginRequirement => ({
+    agent,
+    id: "mycelium@mycelium",
+    marketplace: "arjunrajlaboratory/mycelium",
+  });
+  const p = (over: Partial<BlockInput> = {}): BlockInput => ({
+    name: "Mycelium",
+    requires: [],
+    recommends: [mk("claude"), mk("codex")],
+    requires_summary: null,
+    recommends_summary: "Mycelium's own agent plugin gives claude and codex the skills that record findings.",
+    knowledge: "mycelium",
+    ...over,
+  });
+
+  it("a box with the author's sentence, the plugin's page and one row per agent here", () => {
+    const input_ = p();
+    const m = requirementsModel(
+      input({
+        recommends: input_.recommends,
+        report: report([{ agent: "claude", plugins: [mycelium()] }, { agent: "codex" }]),
+      }),
+    );
+    const blocks = agentSideBlocks(m, input_);
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0]).toMatchObject({
+      kind: "recommends",
+      title: "Agent-side plugin",
+      summary: "Mycelium's own agent plugin gives claude and codex the skills that record findings.",
+      link: { label: "mycelium on GitHub", url: "https://github.com/arjunrajlaboratory/mycelium" },
+      notice: null,
+    });
+    expect(blocks[0].rows.map((r) => [r.agent, r.state, r.action])).toEqual([
+      ["claude", "installed 0.7.2", null],
+      ["codex", "not installed", "install"],
+    ]);
+  });
+
+  it("no box when no agent that could use it is installed here", () => {
+    const m = requirementsModel(input({ recommends: p().recommends, report: report([]) }));
+    expect(agentSideBlocks(m, p())).toEqual([]);
+  });
+
+  it("while asking, one line naming the agents", () => {
+    const m = requirementsModel(input({ recommends: p().recommends, state: "loading" }));
+    const blocks = agentSideBlocks(m, p());
+    expect(blocks.map((b) => [b.notice, b.rows.length])).toEqual([["asking claude and codex…", 0]]);
+  });
+
+  it("a requirement no agent here can meet keeps its box, with the notice", () => {
+    const input_ = p({ requires: [myc("codex")], recommends: [], requires_summary: null });
+    const m = requirementsModel(input({ requires: input_.requires, report: report([{ agent: "claude" }]) }));
+    const blocks = agentSideBlocks(m, input_);
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0]).toMatchObject({
+      title: "Agent-side plugin · needed",
+      notice: "It needs codex, which isn't installed on this host.",
+      rows: [],
+    });
+    expect(blocks[0].summary).toContain("Mycelium works only when");
+  });
+
+  it("the plain sentence when the author wrote none", () => {
+    const m = requirementsModel(input({ recommends: [myc("claude")], report: report([{ agent: "claude" }]) }));
+    const blocks = agentSideBlocks(m, p({ recommends: [myc("claude")], recommends_summary: null }));
+    expect(blocks[0].summary).toBe(
+      "With their own plugin, your agents can record what they learn as they work; Mycelium works without it.",
+    );
+  });
+
+  it("links a marketplace only when it names a page", () => {
+    expect(marketplaceUrl("arjunrajlaboratory/mycelium")).toBe("https://github.com/arjunrajlaboratory/mycelium");
+    expect(marketplaceUrl("https://example.org/market")).toBe("https://example.org/market");
+    expect(marketplaceUrl("mycelium")).toBeNull();
+    expect(marketplaceUrl("../x")).toBeNull();
+    expect(marketplaceUrl("javascript:alert(1)")).toBeNull();
   });
 });

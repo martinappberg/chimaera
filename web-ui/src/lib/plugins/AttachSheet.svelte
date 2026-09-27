@@ -332,6 +332,8 @@
             {:else if model.phase === "none"}
               <div class="smuted">nothing to install — this plugin needs no agent plugin</div>
             {:else}
+              {@const said = plugin.requires_summary ?? plugin.recommends_summary}
+              {#if said !== null}<div class="smuted">{said}</div>{/if}
               {#if model.notice !== null}<div class="smuted warn-text">{model.notice}</div>{/if}
               {#if rows.length === 0 && model.notice === null}
                 <div class="smuted">

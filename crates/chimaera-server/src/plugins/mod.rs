@@ -167,6 +167,10 @@ pub(crate) struct Manifest {
     /// The plugin's own version, `MAJOR.MINOR.PATCH` (`validate`).
     pub(crate) version: String,
     pub(crate) summary: String,
+    /// A few plain sentences from the plugin's author: what it is and why a
+    /// person would switch it on. The card shows it under the summary.
+    #[serde(default)]
+    pub(crate) description: Option<String>,
     #[serde(default)]
     pub(crate) homepage: Option<String>,
     /// The WIT version the component targets (`"0.1"`); a gate.
@@ -269,6 +273,10 @@ pub(crate) struct Requires {
     /// plugin that needs a host import a later daemon added; a gate.
     #[serde(default)]
     pub(crate) chimaera: Option<String>,
+    /// One plain sentence: what the required agent-side plugin is for (the
+    /// card's "Agent-side plugin" box says it above the agents' rows).
+    #[serde(default)]
+    pub(crate) summary: Option<String>,
 }
 
 /// `[recommends.agent_plugins.<agent>]`: an agent-side plugin that makes
@@ -280,6 +288,9 @@ pub(crate) struct Requires {
 pub(crate) struct Recommends {
     #[serde(default)]
     pub(crate) agent_plugins: BTreeMap<String, AgentPluginReq>,
+    /// One plain sentence: what the recommended agent-side plugin is for.
+    #[serde(default)]
+    pub(crate) summary: Option<String>,
 }
 
 impl Manifest {
@@ -909,6 +920,7 @@ pub(crate) fn manifest_json(state: &AppState, m: &Manifest) -> Value {
         "id": m.id,
         "name": m.name,
         "summary": m.summary,
+        "description": text_or_null(m.description.as_deref()),
         "homepage": m.homepage,
         "adds": {"ui": m.adds.ui, "agents": m.adds.agents},
         "provides": {
@@ -918,6 +930,8 @@ pub(crate) fn manifest_json(state: &AppState, m: &Manifest) -> Value {
         },
         "setup": m.setup.as_ref().map(|s| json!({"prompt": s.prompt})),
         "detect": m.detect.any,
+        "requires_summary": text_or_null(m.requires.summary.as_deref()),
+        "recommends_summary": text_or_null(m.recommends.summary.as_deref()),
         "version": m.version,
         "api": m.api,
         "source": "installed",
@@ -956,6 +970,15 @@ pub(crate) fn manifest_json(state: &AppState, m: &Manifest) -> Value {
     v
 }
 
+/// An author's optional prose on the wire: trimmed, and `null` when blank
+/// (the card then shows nothing rather than an empty paragraph).
+fn text_or_null(text: Option<&str>) -> Value {
+    match text.map(str::trim) {
+        Some(t) if !t.is_empty() => json!(t),
+        _ => Value::Null,
+    }
+}
+
 /// A first-party plugin with nothing installed, on the wire: the lock's
 /// name, summary, pinned version and repository — what Install fetches —
 /// and nothing a manifest would say (there is none on this host yet).
@@ -964,11 +987,14 @@ pub(crate) fn available_json(l: &Locked) -> Value {
         "id": l.id,
         "name": l.name,
         "summary": l.summary,
+        "description": null,
         "homepage": null,
         "adds": {"ui": [], "agents": []},
         "provides": {"knowledge": null, "mcp_tools": [], "views": []},
         "setup": null,
         "detect": [],
+        "requires_summary": null,
+        "recommends_summary": null,
         "version": l.version,
         "api": null,
         "source": "available",
@@ -1467,6 +1493,55 @@ mod tests {
         assert!(m.agent_plugin("agy").is_none());
         assert!(
             demo("version = \"0.1.0\"\napi = \"0.1\"\n[recommends]\nchimaera = \">=1\"\n").is_err()
+        );
+    }
+
+    /// Mycelium 0.1.2's shape: the author's description, and the sentence
+    /// the card says about its recommended agent-side plugin.
+    #[test]
+    fn a_manifest_carries_its_authors_words_for_the_card() {
+        let m = demo(
+            "version = \"0.1.2\"\napi = \"0.1\"\n\
+             description = \"Mycelium is the Arjun Raj lab's living-repository framework: \
+             agents record what they find as they work.\"\n\
+             [recommends]\nsummary = \"Mycelium's own agent plugin gives claude and codex the \
+             skills that record findings, decisions and learnings as they work. Install it for \
+             the agents you use; the Knowledge view reads .living/ either way.\"\n\
+             [recommends.agent_plugins.claude]\nid = \"mycelium@mycelium\"\n\
+             marketplace = \"arjunrajlaboratory/mycelium\"\n\
+             [recommends.agent_plugins.codex]\nid = \"mycelium@mycelium\"\n\
+             marketplace = \"arjunrajlaboratory/mycelium\"\n",
+        )
+        .unwrap();
+        assert!(m
+            .description
+            .as_deref()
+            .unwrap()
+            .starts_with("Mycelium is the Arjun Raj lab's"));
+        assert!(m
+            .recommends
+            .summary
+            .as_deref()
+            .unwrap()
+            .ends_with("reads .living/ either way."));
+        assert_eq!(m.recommends.agent_plugins.len(), 2);
+        assert_eq!(m.requires.summary, None);
+
+        let m = demo(
+            "version = \"0.1.0\"\napi = \"0.1\"\n[requires]\nsummary = \"Needed.\"\n\
+             [requires.agent_plugins.codex]\nid = \"need@x\"\nmarketplace = \"x/need\"\n",
+        )
+        .unwrap();
+        assert_eq!(m.requires.summary.as_deref(), Some("Needed."));
+        assert_eq!(m.description, None, "optional");
+
+        // Blank prose never reaches the card as an empty paragraph.
+        assert_eq!(text_or_null(Some("  ")), Value::Null);
+        assert_eq!(text_or_null(None), Value::Null);
+        assert_eq!(text_or_null(Some(" Hi. ")), json!("Hi."));
+        assert!(
+            demo("version = \"0.1.0\"\napi = \"0.1\"\n[recommends]\nsummaries = \"x\"\n").is_err(),
+            "a typo is an error"
         );
     }
 

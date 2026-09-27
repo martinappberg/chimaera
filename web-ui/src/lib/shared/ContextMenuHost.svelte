@@ -14,6 +14,10 @@
   import { dismiss } from "./dismiss";
 
   let menuEl = $state<HTMLElement | null>(null);
+  /** The menu button that opened this menu (`aria-haspopup="menu"`), which
+   *  gets focus back when the menu closes by a pick or Escape — so a
+   *  keyboard user lands where they were. A right-click menu has none. */
+  let opener: HTMLElement | null = null;
   let left = $state(0);
   let top = $state(0);
   let activeIndex = $state(-1);
@@ -37,14 +41,20 @@
     if (!contextMenu.open) return;
     const px = contextMenu.x;
     const py = contextMenu.y;
-    left = px;
+    const alignRight = contextMenu.alignRight;
+    const active = document.activeElement;
+    opener = active instanceof HTMLElement && active.getAttribute("aria-haspopup") === "menu" ? active : null;
+    // Right-aligned: land at the menu's minimum width left of the anchor, so
+    // the first frame doesn't hang off the button's right edge.
+    left = alignRight ? Math.max(4, px - 172) : px;
     top = py;
     activeIndex = -1;
     void tick().then(() => {
       const el = menuEl;
       if (el === null) return;
       const rect = el.getBoundingClientRect();
-      left = Math.max(4, Math.min(px, window.innerWidth - rect.width - 4));
+      const x = alignRight ? px - rect.width : px;
+      left = Math.max(4, Math.min(x, window.innerWidth - rect.width - 4));
       top = py + rect.height > window.innerHeight - 4 ? Math.max(4, py - rect.height) : py;
       el.focus();
       // A pick list opens ON its checked row: it is revealed, and the roving
@@ -66,9 +76,18 @@
     };
   });
 
+  /** Focus back to the menu button, before a pick runs (a dialog the pick
+   *  opens then takes focus from there). */
+  function refocus(): void {
+    const el = opener;
+    opener = null;
+    if (el !== null && el.isConnected) el.focus();
+  }
+
   function select(item: ContextMenuItem): void {
     if (item.disabled === true) return;
     contextMenu.close();
+    refocus();
     item.onSelect();
   }
 
@@ -122,7 +141,7 @@
       const entry = contextMenu.items[activeIndex];
       if (entry !== undefined && entry !== "separator") select(entry);
     }
-    // Escape is handled by the dismiss action.
+    // Escape is handled by the dismiss action (which also refocuses).
   }
 </script>
 
@@ -134,7 +153,13 @@
     bind:this={menuEl}
     style:left={`${left}px`}
     style:top={`${top}px`}
-    use:dismiss={{ enabled: contextMenu.open, onDismiss: () => contextMenu.close() }}
+    use:dismiss={{
+      enabled: contextMenu.open,
+      onDismiss: () => {
+        contextMenu.close();
+        refocus();
+      },
+    }}
     onkeydown={onKeydown}
     oncontextmenu={(e) => e.preventDefault()}
   >

@@ -71,7 +71,8 @@ id = "mycelium"                 # stable; lowercase letters, digits, dashes; ≤
 name = "Mycelium"
 version = "0.1.1"               # the plugin's own, MAJOR.MINOR.PATCH; must equal the crate's
 summary = "Project memory your agents record as they work — findings, decisions, learnings."
-homepage = "https://github.com/arjunrajlaboratory/mycelium"   # optional
+description = "Mycelium is the Arjun Raj lab's living-repository framework: …"   # optional: a few plain sentences
+homepage = "https://github.com/arjunrajlaboratory/mycelium"   # optional; the card's name links here
 api = "0.1"                     # the chimaera:plugin WIT version it targets (MAJOR.MINOR)
 
 [detect]                        # workspace-relative; ANY present ⇒ detected
@@ -80,10 +81,13 @@ any = [".living/INDEX.md", "MYCELIUM.md"]   # empty/omitted ⇒ always present (
 [requires]
 chimaera = ">=0.4.0"            # optional: a semver requirement on the daemon
 
+[recommends]
+summary = "Mycelium's own agent plugin gives claude and codex the skills that record findings, decisions and learnings as they work. Install it for the agents you use; the Knowledge view reads .living/ either way."   # optional: one plain sentence
+
 [recommends.agent_plugins.claude]   # an agent-side plugin that helps, per agent; never needed
 id = "mycelium@mycelium"
 marketplace = "arjunrajlaboratory/mycelium"
-# [requires.agent_plugins.<agent>] has the same shape, for a genuine hard requirement
+# [requires] summary and [requires.agent_plugins.<agent>] have the same shape, for a genuine hard requirement
 
 [setup]                         # the plugin's OWN documented setup prompt
 prompt = "Set up Mycelium in this repository."
@@ -106,17 +110,20 @@ repository; both name their own repository in `[release]`, which is where
 chimaera installs them from and what makes an installed copy first-party.
 `[requires] chimaera` above is an illustration; neither carries it.
 Mycelium v0.1.1 moves its agent plugin from `requires` to `recommends`: the
-Knowledge reader works with no agent plugin at all.)
+Knowledge reader works with no agent plugin at all; v0.1.2 adds its
+`description` and `[recommends] summary`, the shape above.)
 
 What each part does, and what exists today:
 
 | Part | What it does | Where the host reads it |
 |---|---|---|
-| `id`, `name`, `summary`, `homepage` | the card; `id` names a directory and a URL segment, so it is charset-gated | `plugins::validate`, `manifest_json` |
+| `id`, `name`, `summary`, `homepage` | the card; `id` names a directory and a URL segment, so it is charset-gated; the name links to `homepage` (an http(s) URL; opened in the system browser) | `plugins::validate`, `manifest_json` |
+| `description` | optional: a few plain sentences from the author — what the plugin is and why a person would switch it on — shown under the summary, clamped to two lines with "more"; blank is omitted (`description: null` on the wire) | `manifest_json` |
 | `version`, `api` | which build runs, and the WIT it needs; `api` is a gate | `plugins::gate`, `resolve` |
 | `detect.any` | footprint → "active here" (no path component may be a symlink) | `plugins::detect_blocking` |
 | `requires.agent_plugins` | a genuine hard requirement (no plugin has one today): per-agent install state (asked of the agents), "Requires the <agent> plugin <id>" on the card for agents installed here, and an install button running the agent's own `plugin marketplace add` + `install`/`add` in a visible terminal; the attach sheet's step 1; codex hook trust | `agent_probe.rs`, `plugins::install_requirement` |
-| `recommends.agent_plugins` | the same shape and the same install route, attach-sheet step and hook trust, for an agent-side plugin that makes this one more useful to the agents the user runs but is never needed: "For <agent>: …" on the card, only for agents installed here | `agent_probe.rs`, `plugins::install_requirement` |
+| `recommends.agent_plugins` | the same shape and the same install route, attach-sheet step and hook trust, for an agent-side plugin that makes this one more useful to the agents the user runs but is never needed: the card's **Agent-side plugin** box, one row per agent installed here ("claude · installed 0.7.2", "codex · not installed [Install]") | `agent_probe.rs`, `plugins::install_requirement` |
+| `requires.summary`, `recommends.summary` | optional: one plain sentence saying what the agent-side plugin is for; the box and the attach sheet's step 1 say it above the agents' rows (`requires_summary` / `recommends_summary` on the wire; a plain fallback when absent) | `manifest_json` |
 | `requires.chimaera` | a gate: this daemon's version must match | `plugins::gate` |
 | `setup.prompt` | a new chat session of the user's chosen agent, sent this prompt | `plugins::setup_workspace` |
 | `provides.knowledge` | the plugin is the Knowledge provider; its `knowledge` export feeds the view and `GET /workspaces/{id}/knowledge` | `knowledge.rs`, `runtime::knowledge` |
@@ -464,7 +471,7 @@ host:
   the plugin needs a host import a later daemon added.
 - **Updates are never automatic.** The daemon checks the release source of
   each installed plugin whose manifest names `[release]` once after boot and
-  daily (and on **Check now**), reads only the release's `plugin.toml`, and
+  daily (and on **Check for updates**), reads only the release's `plugin.toml`, and
   offers a version only when it is strictly newer than the one that runs and
   passes the gates. Installing it is the user's click (or
   `chimaera plugin update <id>`). The old version stays as `previous` for

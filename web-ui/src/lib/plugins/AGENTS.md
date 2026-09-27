@@ -10,23 +10,24 @@ quick-open entry — "plugins" and "skills" still find it — and the dock row),
 with three equal segments: **Plugins** · **Skills** · **Browse** (disabled,
 "later"). Only the words changed: the layout surface id, the wire
 (`{v:"plugins"}`, `/api/v1/plugins`), the store and these file names stay
-"plugins". Its glyph (2×2 cells, the top-right a plus) is `glyph.ts`, drawn by
-PaneTabs and App's dock row — not in `shared/icons.ts`, which `prebuild`
-regenerates from Tabler.
+"plugins". Its glyph (2×2 cells, the top-right a plus) is `glyph.ts`, drawn
+only through `ExtensionsGlyph.svelte` by PaneTabs, App's rail row and
+QuickOpen — not in `shared/icons.ts`, which `prebuild` regenerates from Tabler.
 
 ## File map
 
 | File | What it owns |
 |---|---|
-| `store.ts` | Wire types + fetchers for every plugin route (workspace plugins, `PUT …/{pid} {on}`, agent-plugins, skills, install / setup / trust-hooks; the plugin routes `POST /plugins/install`, `POST /plugins/{pid}/install` (a first-party plugin at the version chimaera pins), `/plugins/{pid}/update` · `rollback` · `check`, `DELETE /plugins/{pid}`), the active workspace's reactive plugin status (`workspacePlugins`, `knowledgeProviderActive`, `myceliumPlugin`; `changeWorkbenchPlugin` runs one change, `installWorkbenchPlugin` one install from a repository and `installFirstPartyPlugin` one pinned install, each re-syncing the cards and Knowledge), `isMissingRoute` (a bare 404 — the daemon predates the route — vs a refusal it explains), and the attach-sheet request (`attachRequest` / `openAttachSheet` / `closeAttachSheet`) that App.svelte hosts as ONE modal for every surface. `WorkspacePlugin` carries the catalog wire: `version` (installed, or the pinned one for an available entry), `api` (`""` when null), `source` (`installed` / `available`), `installed`, `first_party`, `verified`, `requires` + `recommends`, and — null when absent — `sha256_wasm`, `repo`, `pinned_version`, `local_path`, `path`, `previous`, `update`, `fault`. `normalizePlugin` defaults all of it for an older daemon (`installed` = `source !== "available"`). |
+| `store.ts` | Wire types + fetchers for every plugin route (workspace plugins, `PUT …/{pid} {on}`, agent-plugins, skills, install / setup / trust-hooks; the plugin routes `POST /plugins/install`, `POST /plugins/{pid}/install` (a first-party plugin at the version chimaera pins), `/plugins/{pid}/update` · `rollback` · `check`, `DELETE /plugins/{pid}`), the active workspace's reactive plugin status (`workspacePlugins`, `knowledgeProviderActive`, `myceliumPlugin`; `changeWorkbenchPlugin` runs one change, `installWorkbenchPlugin` one install from a repository (a `version` too: the card's Reinstall) and `installFirstPartyPlugin` one pinned install, each re-syncing the cards and Knowledge; `checkedAt` — when this page last ran Check for updates per plugin), `isMissingRoute` (a bare 404 — the daemon predates the route — vs a refusal it explains), and the attach-sheet request (`attachRequest` / `openAttachSheet` / `closeAttachSheet`) that App.svelte hosts as ONE modal for every surface. `WorkspacePlugin` carries the catalog wire: `version` (installed, or the pinned one for an available entry), `api` (`""` when null), `source` (`installed` / `available`), `installed`, `first_party`, `verified`, `requires` + `recommends`, and — null when absent — `description`, `homepage`, `requires_summary`, `recommends_summary`, `sha256_wasm`, `repo`, `pinned_version`, `local_path`, `path`, `previous`, `update`, `fault`. `normalizePlugin` defaults all of it for an older daemon (`installed` = `source !== "available"`). |
 | `PluginsView.svelte` | The tab shell: a fixed header — "Extensions" and the "on <host>" chip ("Plugins are installed per host"; a long name ellipsizes) on the left, the `Segmented` Plugins · Skills · Browse in the far corner (equal widths via a `:global(.seg)` grid sized by "Browse later"; Browse disabled "later"); at a tab width ≤ 720px the bar drops under the title — then one scroller per view below it, each view's lead line at the top of its own body; fetches agent-plugins / skills for the shown segment on show and on return. |
-| `InstalledView.svelte` | The Plugins segment. **Chimaera plugins** (no hint — the heading says it): a card per catalog entry — glyph tile · name · the check badge when `first_party` (tooltip "Verified by the Chimaera maintainers": in the curated lock, available or installed) · version (tooltip "chimaera pins x" when an installed first-party copy runs another) · a muted "local build" note when `local_path` is set (tooltip naming the directory) · an **Update to x.y.z** chip · summary · then the state: **Install x.y.z** for an available entry (the pinned version; outcome "installed Agent notes 0.1.1") instead of the `Switch` = on in THIS workspace. Under it, plain sentences, no labels: what it found here (or "nothing detected yet — set it up →"), "For agents: …" / "For you: …", the requirement rows from `requirementsModel.ts` (pills, **Install for <agent>** / **Install**, the hook-trust pill + "Review & trust →"), the installed line ("installed 0.1.1 · 0.1.0 available to go back to" + **Use previous**, **Check now**, **Remove** behind a `ConfirmDialog`), the `fault`, one outcome line per change. Then the **Install from a repository** row (`owner/repo` or its github.com URL → **Install**; the outcome line or the daemon's refusal). **Agent plugins** (no hint): what each CLI reports about its own plugins. |
-| `requirementsModel.ts` | Pure: a plugin's `requires` / `recommends` × the agents report (+ its fetch state) → the rows and sentences the card and the sheet render ("Requires the claude plugin x" + pill; "For claude: mycelium ✓ 0.7.2"; "For claude: install the x plugin so it can record knowledge"; "checking the agents…" once; the "neither is installed on this host" notice; the "can't check on this daemon" pill), `sheetText` (the sheet's required-vs-optional wording) and `hooksAwaitingTrust`. Vitest: `requirementsModel.test.ts`. |
-| `installCopy.ts` | Pure: the Install button's version + tooltip and the install / update outcome lines ("installed <name> <version>", "updated to <version>" — never a checksum), shared by the card and the sheet. Vitest: `installCopy.test.ts`. |
-| `glyph.ts` | The Extensions glyph's path + stroke width (16×16, the hand-made surface glyphs' grid). |
-| `SkillsView.svelte` | Every skill each agent can use here: counts, filter chips (All · claude · codex · only one agent), search, groups by origin (this project · from plugins · yours · built into the agent), per-agent chips (✓ · ◌ + reason · —), the detail aside with each agent's own invocation syntax and codex's load errors. |
-| `skillsModel.ts` | Pure grouping/counting/filtering + `invokeSyntax`. Vitest: `skillsModel.test.ts`. |
-| `AttachSheet.svelte` | "Use mycelium for Knowledge": (when the plugin is only available) install it first — the card's Install flow · the agent plugins it requires or recommends, for the agents installed here (the model's rows; a recommendation reads "optional: …"; Install → a visible terminal, opened as a session) · trust codex's hooks (each in plain words; the Stop hook's caveat; exactly the `{key, hash}` pairs shown are posted; hooks of required and recommended agent plugins alike) · set up this workspace (agent select → the plugin's own setup prompt in a new chat session, "billed to your <agent> account"). Completing also switches the plugin on here. Re-checks on every open and after the install. |
+| `InstalledView.svelte` | The Plugins segment's list: **Chimaera plugins** (first-party first, then the daemon's order) as `PluginCard`s — "looking for plugins…" while the first list loads, "Nothing installed yet — pick one above." when nothing is installed — then the **Install from a repository** form (label, an `owner/repo` field and **Install**, one help sentence, the outcome line or the daemon's refusal), the one Remove `ConfirmDialog`, and **Agent plugins**: one quiet group per agent (name + its version, cleaned of "(Claude Code)" / "codex-cli"; "claude has no plugins"; "codex isn't installed on this host"), each plugin one row in fixed columns — name + version · scope, what it brings (skills · hooks · tokens) or "2 hooks not trusted" + **Review** (the attach sheet of the chimaera plugin that asks for it), enabled / disabled. Owns the minute tick for the "checked …" lines (only while shown and after a check). |
+| `PluginCard.svelte` | One card. Head: tile · name (a link to `homepage`, via `openInSystemBrowser`) · the check badge when `first_party` ("Verified by the Chimaera maintainers") · version (tooltip "chimaera pins x" when a first-party copy runs another) · "local build" tag · on the right ONE primary control — **Install** (available) or the `Switch` with its state in words ("active here" / "on · not set up here yet" / "off"; disabled while a catalog fault keeps it off) — and the **…** menu (the shared context menu, right-aligned under the button, keyboard-openable): Check for updates · Use previous version (x) · Set up in this workspace… · Open on GitHub · Remove…. Body: summary; the `description` clamped to two lines with "more" (only when it overflows); a `<dl>` — For you / For agents / Here (`hereLine`); the **Agent-side plugin** box per `agentSideBlocks` (the author's sentence, the marketplace page link, one row per agent: state words + at most one action, Install or Review); the update callout ("0.1.2 is available" · "what changed" · **Update**); the fault callout (**Reinstall** when `canReinstall`; "Switching it off and on starts it again." when the fault struck while on); one status line (in-flight words, the outcome, or the error) and "No newer version · checked just now" after a check. |
+| `requirementsModel.ts` | Pure: a plugin's `requires` / `recommends` × the agents report (+ its fetch state) → per-agent rows (`state` words, `tone`, one `action`: "installed 0.7.2", "not installed" + install, "2 hooks not trusted" + review, "installed, disabled", "can't check on this daemon", "couldn't ask"), the unmet-requirement notice ("It needs claude or codex, and neither is installed on this host."), `agentSideBlocks` (the card's boxes: title, the author's or a fallback sentence, `marketplaceUrl`, rows, "asking claude and codex…"), `sheetText` (the sheet's required-vs-optional wording) and `hooksAwaitingTrust`. Vitest: `requirementsModel.test.ts`. |
+| `installCopy.ts` | Pure: the card's words — the Install tooltip, the install / update outcome lines ("installed <name> <version>", "updated to <version>" — never a checksum), `stateWords`, `hereLine` ("using .living/ in this workspace · 4 findings · 4 decisions", "found … — switch it on to use it", "not set up in this workspace yet"), `checkedWords` ("checked 2 hours ago"), `canReinstall`, `repoUrl`, `tileLetters`; shared by the card and the sheet. Vitest: `installCopy.test.ts`. |
+| `glyph.ts` · `ExtensionsGlyph.svelte` | The Extensions glyph, drawn for the pixel grid: a 12-unit box at exactly 12 CSS px (never scaled), 1 px strokes on half-unit centre lines, 5 px cells with 2 px gaps, the plus down column 9 / along row 2 of its cell. The component is the only way it is drawn; its caller places the box on whole pixels (PaneTabs nudges it 1 px down in the 25 px tab). |
+| `SkillsView.svelte` | Every skill each agent can use here: the controls in Settings' recipes (`Segmented` All · claude · codex, a search field, the counts), groups in plain words — This project · From plugins (a section per plugin) · Yours · Built into claude · Built into codex (copyable `/name` and `$name` chips; "claude lists its built-in skills only while a claude chat runs." where claude's would be, only when no claude chat runs) — per-agent badges, and a row opened in place as a small list: Use it (each agent's invocation, copyable) · File · Problems. Its blocks sit straight in PluginsView's column, which spaces them. |
+| `skillsModel.ts` | Pure grouping (built-ins split per agent by who lists them) / counting / filtering + `invokeSyntax`. Vitest: `skillsModel.test.ts`. |
+| `AttachSheet.svelte` | "Use Mycelium for Knowledge" (opened from the card's "Set up in this workspace…", a hook row's Review, Knowledge's card, the Mastermind panel): (when the plugin is only available) install it first — the card's Install flow · the agent plugins it requires or recommends, for the agents installed here (the author's `requires_summary` / `recommends_summary` first, then the model's rows; a recommendation reads "optional: …"; Install → a visible terminal, opened as a session) · trust codex's hooks (each in plain words; the Stop hook's caveat; exactly the `{key, hash}` pairs shown are posted; hooks of required and recommended agent plugins alike) · set up this workspace (agent select → the plugin's own setup prompt in a new chat session, "billed to your <agent> account"). Completing also switches the plugin on here. Re-checks on every open and after the install. |
 
 ## Invariants / gotchas
 
@@ -41,8 +42,12 @@ regenerates from Tabler.
   can't shift the columns. Measure a change with the bounding boxes of
   `.head` and `.seg` in each view.
 - **Plain words on the card.** Section headings carry their meaning without
-  hints; no hashes, `SHA256SUMS`, "sandboxed" or file names in visible text
-  (a tooltip may explain what a button does).
+  hints; no hashes, `SHA256SUMS`, "sandboxed", "manifest", "catalog" or file
+  names in visible text (a tooltip on a button may explain what it does).
+  One primary control per card state (Install, the switch, Update in its
+  callout, Reinstall in the fault's); everything secondary lives in the "…"
+  menu — no rows of bare links. The author's own words (`description`, the
+  agent-side `summary`) are shown as given, as text, never as HTML.
 - **Agent state comes from the agents** (the daemon's probes of `claude
   plugin list` / codex `app-server`), never re-derived here. A 404 from a
   route the daemon doesn't have yet renders an honest line, not a spinner.
@@ -53,6 +58,14 @@ regenerates from Tabler.
 - **What a plugin adds is on every installed card** ("For agents" / "For
   you") — it is what makes opt-in honest. An available entry has no
   manifest yet, so it shows its summary and its Install button only.
+- **External links** (the name → `homepage`, "what changed", the agent
+  plugin's page, Open on GitHub) go through `openInSystemBrowser` and render
+  only for http(s) URLs (`isWebUrl` / `marketplaceUrl`), with
+  `rel="noopener noreferrer"`.
+- **Keyboard:** every control is a real button or link with the global
+  focus ring; the "…" menu opens on Enter, walks with the arrows, and the
+  shared context menu hands focus back to the "…" button on a pick or
+  Escape (any `aria-haspopup="menu"` opener gets that).
 - **Hook trust is never automated.** The sheet lists what codex will run and
   posts only the hashes the user saw; the daemon writes only those whose
   current hash still matches.
@@ -62,10 +75,12 @@ regenerates from Tabler.
   as the agents report them.
 - **Versions, sources and verification come from the daemon** (the lock, the
   installed copies, the SHA256SUMS checks); the card never compares versions
-  itself beyond showing `pinned_version` in a tooltip. The check badge is
+  itself beyond showing `pinned_version` in a tooltip (the "checked …" line is
+  the only client-side time: when THIS page last asked, `checkedAt`). The check badge is
   `first_party` — approved by the Chimaera maintainers (the curated lock) —
-  and nothing else; the checksum check (`verified`) stays silent on the card
-  and only its failure shows, as the daemon's `fault` line. An available entry
+  and nothing else; the integrity check (`verified`) stays silent on the card
+  and only its failure shows, as the daemon's `fault` in the fault callout
+  (with Reinstall). An available entry
   installs the version chimaera pins — never "the latest". The daemon never
   downloads on its own: Install, Update, Use previous and Remove are the
   user's clicks, each re-syncing the cards. The add row passes what was

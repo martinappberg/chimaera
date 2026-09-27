@@ -105,7 +105,7 @@
   });
 
   const host = $derived(agentPlugins.data?.host || skills.data?.host || getHostLabel());
-  const plugins = $derived($workspacePlugins?.plugins ?? []);
+  const plugins = $derived($workspacePlugins?.plugins ?? null);
 </script>
 
 <div class="plugins">
@@ -159,6 +159,7 @@
           <p class="lead">Plugins add tools for your agents and views for you. Install one, then switch it on per workspace.</p>
           <InstalledView
             {plugins}
+            visible={visible && view === "plugins"}
             agentPlugins={agentPlugins.data}
             agentState={agentPlugins.state}
             agentError={agentPlugins.error}
@@ -175,7 +176,7 @@
       <div class="view" class:parked={view !== "skills"} inert={view !== "skills"}>
         {#if skillsMounted}
           <div class="inner">
-            <p class="lead">What each agent can do in this workspace — as the agents themselves report it.</p>
+            <p class="lead">Every skill your agents can use in this workspace, as the agents themselves report it.</p>
             <SkillsView
               report={skills.data}
               status={skills.state}
@@ -272,6 +273,10 @@
       align-items: flex-start;
       gap: 14px;
     }
+    /* A phone-width tab keeps a 16px gutter (the views match below). */
+    .head {
+      padding: 20px 16px 14px;
+    }
     .titles,
     .segs {
       max-width: 100%;
@@ -311,7 +316,14 @@
   .lead {
     margin: 0;
     font-size: var(--text-sm);
+    line-height: 1.5;
     color: var(--muted);
+  }
+  @container (max-width: 720px) {
+    .inner {
+      padding: 18px 16px 40px;
+      gap: 22px;
+    }
   }
   .empty {
     margin: 0;

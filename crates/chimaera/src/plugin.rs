@@ -2,7 +2,8 @@
 //! from the command line, against the daemon running on this node (its
 //! manifest names the port and the token). Thin by design: the daemon
 //! downloads (or copies a local build), verifies the checksums and swaps
-//! `current`; this prints what it did, checksums included.
+//! `current`; this prints what it did in one line, as the card would say it
+//! (no hashes: only a failed check is news, and the daemon refuses it).
 
 use std::path::Path;
 use std::process::Stdio;
@@ -93,38 +94,31 @@ fn id_segment(id: &str) -> anyhow::Result<&str> {
     Ok(id)
 }
 
-/// What the card says about a copy: `chimaera` for a Chimaera plugin,
-/// `verified` when its files match its release's checksums, `unverified ·
-/// local` for a local build without them.
-fn tags(p: &Value) -> Vec<String> {
-    let mut tags = Vec::new();
-    if p["first_party"] == true && p["source"] != "available" {
-        tags.push("chimaera".to_string());
+/// The list's leading mark: `✓` for a Chimaera plugin (the curated lock
+/// names it), as the card's badge; blank otherwise.
+fn mark(p: &Value) -> &'static str {
+    if p["first_party"] == true {
+        "✓"
+    } else {
+        " "
     }
-    if p["verified"] == true {
-        tags.push("verified".to_string());
-    } else if p.get("local_path").is_some_and(Value::is_string) {
-        tags.push("unverified · local".to_string());
-    }
-    tags
 }
 
-/// A catalog entry after its version, as the card says it: its tags, then
-/// where it stands.
+/// A catalog entry after its version, as the card says it: where it stands.
 fn list_line(p: &Value) -> String {
-    let mut parts = tags(p);
+    let mut parts = Vec::new();
     let id = s(p, "id");
     let pinned = p.get("pinned_version").and_then(Value::as_str);
     match s(p, "source") {
         "available" => {
             parts.push("available".to_string());
-            if let Some(pinned) = pinned {
-                parts.push(format!("chimaera pins {pinned}"));
-            }
             parts.push(format!("install with: chimaera plugin add {id}"));
         }
         "installed" => {
             parts.push("installed".to_string());
+            if p.get("local_path").is_some_and(Value::is_string) {
+                parts.push("local build".to_string());
+            }
             if let Some(prev) = p.get("previous").and_then(Value::as_str) {
                 parts.push(format!("previous {prev}"));
             }
@@ -150,41 +144,51 @@ pub async fn list() -> anyhow::Result<()> {
         return Ok(());
     }
     for p in &plugins {
-        println!("{:<18} {:<9} {}", s(p, "id"), s(p, "version"), list_line(p));
+        println!(
+            "{} {:<18} {:<9} {}",
+            mark(p),
+            s(p, "id"),
+            s(p, "version"),
+            list_line(p)
+        );
         if let Some(update) = p.get("update").and_then(|u| u.get("version")) {
             println!(
-                "{:<28} update available: {} (`chimaera plugin update {}`)",
+                "{:<30} update available: {} (`chimaera plugin update {}`)",
                 "",
                 update.as_str().unwrap_or(""),
                 s(p, "id")
             );
         }
         if let Some(fault) = p.get("fault").and_then(Value::as_str) {
-            println!("{:<28} off: {fault}", "");
+            println!("{:<30} off: {fault}", "");
         }
     }
     Ok(())
 }
 
-/// What an install or update printed: the version, the checksums the daemon
-/// verified the download against, and what the card now says.
-fn print_installed(verb: &str, body: &Value) {
-    let previous = body
+/// What an install or update printed: one line, "installed agent-notes
+/// 0.1.2" (a local build says so; an update names the version it replaced,
+/// which the daemon keeps for Use previous).
+fn installed_line(verb: &str, body: &Value) -> String {
+    let local = if body["plugin"]
+        .get("local_path")
+        .is_some_and(Value::is_string)
+    {
+        " (local build)"
+    } else {
+        ""
+    };
+    let was = body
         .get("previous")
         .and_then(Value::as_str)
-        .map(|p| format!(" (was {p}; the daemon keeps it for Use previous)"))
+        .filter(|_| verb == "updated")
+        .map(|p| format!(" (was {p})"))
         .unwrap_or_default();
-    println!("{verb} {} {}{previous}", s(body, "id"), s(body, "version"));
-    for file in ["plugin.wasm", "plugin.toml"] {
-        println!(
-            "  {file:<12} sha256 {}",
-            body["sha256"][file].as_str().unwrap_or("?")
-        );
-    }
-    let tags = tags(&body["plugin"]);
-    if !tags.is_empty() {
-        println!("  {}", tags.join(" · "));
-    }
+    format!(
+        "{verb} {} {}{local}{was}",
+        s(body, "id"),
+        s(body, "version")
+    )
 }
 
 /// `chimaera plugin add <id | owner/repo> [--version x]` or `--path <dir>`.
@@ -223,8 +227,7 @@ pub async fn add(
         }
         (None, None) => bail!("name a plugin (an id, or owner/repo) or --path <dir>"),
     };
-    print_installed("installed", &body);
-    println!("  switch it on per workspace from the Extensions tab");
+    println!("{}", installed_line("installed", &body));
     Ok(())
 }
 
@@ -235,7 +238,7 @@ pub async fn update(id: &str) -> anyhow::Result<()> {
         None,
     )
     .await?;
-    print_installed("updated", &body);
+    println!("{}", installed_line("updated", &body));
     Ok(())
 }
 
@@ -278,42 +281,63 @@ mod tests {
 
     #[test]
     fn the_list_line_says_what_the_card_says() {
+        let first_party = json!({"id": "agent-notes", "version": "0.1.2", "source": "installed",
+            "first_party": true, "verified": true, "pinned_version": "0.1.2"});
+        assert_eq!(mark(&first_party), "✓");
+        assert_eq!(list_line(&first_party), "installed");
         assert_eq!(
             list_line(
-                &json!({"id": "agent-notes", "version": "0.1.0", "source": "installed",
-                "first_party": true, "verified": true, "pinned_version": "0.1.0"})
+                &json!({"id": "agent-notes", "version": "0.1.3", "source": "installed",
+                "first_party": true, "verified": true, "pinned_version": "0.1.2",
+                "previous": "0.1.2"})
             ),
-            "chimaera · verified · installed"
+            "installed · previous 0.1.2 · chimaera pins 0.1.2"
+        );
+        let available = json!({"id": "mycelium", "version": "0.1.1", "source": "available",
+            "first_party": true, "verified": false, "pinned_version": "0.1.1"});
+        assert_eq!(
+            mark(&available),
+            "✓",
+            "the badge holds before the install too"
         );
         assert_eq!(
-            list_line(
-                &json!({"id": "agent-notes", "version": "0.1.1", "source": "installed",
-                "first_party": true, "verified": true, "pinned_version": "0.1.0",
-                "previous": "0.1.0"})
-            ),
-            "chimaera · verified · installed · previous 0.1.0 · chimaera pins 0.1.0"
+            list_line(&available),
+            "available · install with: chimaera plugin add mycelium"
         );
-        assert_eq!(
-            list_line(
-                &json!({"id": "mycelium", "version": "0.1.0", "source": "available",
-                "first_party": true, "verified": false, "pinned_version": "0.1.0"})
-            ),
-            "available · chimaera pins 0.1.0 · install with: chimaera plugin add mycelium"
-        );
-        assert_eq!(
-            list_line(
-                &json!({"id": "dev", "version": "0.2.0", "source": "installed",
-                "first_party": false, "verified": false, "local_path": "/home/me/dev"})
-            ),
-            "unverified · local · installed"
-        );
+        let local = json!({"id": "dev", "version": "0.2.0", "source": "installed",
+            "first_party": false, "verified": false, "local_path": "/home/me/dev"});
+        assert_eq!(mark(&local), " ");
+        assert_eq!(list_line(&local), "installed · local build");
         assert_eq!(
             list_line(
                 &json!({"id": "x", "version": "1.0.0", "source": "installed",
-                "first_party": false, "verified": false})
+                "first_party": false, "verified": true})
             ),
             "installed",
-            "a copy installed before SHA256SUMS were kept"
+            "a third-party copy: no badge, no tags"
+        );
+    }
+
+    #[test]
+    fn an_install_is_one_line_without_hashes() {
+        let body = json!({"id": "agent-notes", "version": "0.1.2", "previous": null,
+            "sha256": {"plugin.wasm": "a".repeat(64), "plugin.toml": "b".repeat(64)},
+            "plugin": {"id": "agent-notes", "first_party": true}});
+        assert_eq!(
+            installed_line("installed", &body),
+            "installed agent-notes 0.1.2"
+        );
+        let body = json!({"id": "agent-notes", "version": "0.1.3", "previous": "0.1.2",
+            "plugin": {"id": "agent-notes"}});
+        assert_eq!(
+            installed_line("updated", &body),
+            "updated agent-notes 0.1.3 (was 0.1.2)"
+        );
+        let body = json!({"id": "dev", "version": "0.2.0", "previous": "0.1.0",
+            "plugin": {"local_path": "/home/me/dev"}});
+        assert_eq!(
+            installed_line("installed", &body),
+            "installed dev 0.2.0 (local build)"
         );
     }
 

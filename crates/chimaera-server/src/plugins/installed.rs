@@ -22,7 +22,8 @@
 //! - **Every read re-checks** (`load_version`, from the catalog's reload):
 //!   both files are hashed against the `SHA256SUMS` beside them — a match is
 //!   `verified`, none (a copy installed before it was kept, or a local build
-//!   without one) is not, a mismatch is a fault and the copy never loads.
+//!   without one) is not, a mismatch is a fault and the copy never loads
+//!   until the same version is installed again (the card's Reinstall).
 //! - **Links move atomically**: a symlink under a fresh name, then rename(2)
 //!   over the old one — `runtimes.rs`'s idiom for the managed agent CLIs.
 //!   An update never touches the version in use; the version it replaced
@@ -58,8 +59,14 @@ const SUMS_MAX: u64 = 1 << 20;
 const SUMS: &str = "SHA256SUMS";
 /// A local install's marker: the directory it was copied from.
 const LOCAL_PATH: &str = "local-path";
-/// Why a copy whose files don't match its checksums never loads.
-pub(crate) const SUMS_MISMATCH: &str = "its files do not match its release's SHA256SUMS";
+/// Why a copy whose files don't match its checksums never loads — the
+/// card's words (the log line says which file and which list).
+pub(crate) const SUMS_MISMATCH: &str =
+    "the downloaded files don't match what the release published — reinstall it";
+/// A download that doesn't hash to what its release lists (the refusal's
+/// words; the log line carries both hashes).
+const DOWNLOAD_MISMATCH: &str =
+    "the downloaded files don't match what the release published — try again";
 /// A component download's wall clock: 16 MiB through a slow site proxy.
 const DOWNLOAD_SECS: u64 = 120;
 const CURRENT: &str = "current";
@@ -171,7 +178,11 @@ fn check_files(m: &mut Manifest, toml_sha256: &str, sums: Option<&[u8]>) {
         {
             verified = true;
         } else {
-            tracing::error!(plugin = %m.id, version = %m.version, "installed plugin refused: {SUMS_MISMATCH}");
+            tracing::error!(
+                plugin = %m.id,
+                version = %m.version,
+                "installed plugin refused: its files do not match the SHA256SUMS kept beside them"
+            );
             m.origin.fault = Some(SUMS_MISMATCH.to_string());
         }
     }
@@ -419,8 +430,9 @@ async fn install(
         sums.get("plugin.wasm").cloned(),
         sums.get("plugin.toml").cloned(),
     ) else {
+        tracing::warn!(%source, version = %release.version, "plugin release refused: its SHA256SUMS does not list plugin.wasm and plugin.toml");
         return Err(Refusal::invalid(
-            "the release's SHA256SUMS does not list plugin.wasm and plugin.toml",
+            "that release doesn't list its plugin files, so it can't be checked or installed",
         ));
     };
     if let Some(l) = pin {
@@ -431,10 +443,17 @@ async fn install(
             ("plugin.toml", &want_toml, &l.sha256_toml),
         ] {
             if want != pinned {
+                tracing::error!(
+                    plugin = %l.id,
+                    version = %l.version,
+                    file,
+                    pinned = %pinned,
+                    listed = %want,
+                    "plugin release refused: its SHA256SUMS does not match what chimaera pins (plugins.lock)"
+                );
                 return Err(Refusal::invalid(format!(
-                    "{} {}: the release's {file} does not match what chimaera pins \
-                     (plugins.lock: {pinned}, the release's SHA256SUMS: {want})",
-                    l.id, l.version
+                    "{} {} on GitHub isn't the release chimaera approved, so it wasn't installed",
+                    l.name, l.version
                 )));
             }
         }
@@ -442,9 +461,8 @@ async fn install(
     let toml = releases::fetch_small(&release.toml_url, "the release's plugin.toml").await?;
     let got_toml = crate::fs::sha256_hex(&toml);
     if got_toml != want_toml {
-        return Err(Refusal::invalid(format!(
-            "plugin.toml does not match the release's SHA256SUMS (expected {want_toml}, got {got_toml})"
-        )));
+        tracing::error!(%source, version = %release.version, expected = %want_toml, got = %got_toml, "plugin download refused: plugin.toml does not match the release's SHA256SUMS");
+        return Err(Refusal::invalid(DOWNLOAD_MISMATCH));
     }
     let text = std::str::from_utf8(&toml)
         .map_err(|_| Refusal::invalid("the release's plugin.toml is not UTF-8"))?;
@@ -479,10 +497,13 @@ async fn install(
             m.name, release.version
         ))
     })?;
+    // The same version again is refused — unless that copy's files no longer
+    // match its release (the card's Reinstall): the fresh, verified download
+    // replaces it in place (`activate`), keeping `previous`.
     if state
         .plugin_catalog
         .installed_copy(&id)
-        .is_some_and(|c| c.manifest.version == release.version)
+        .is_some_and(|c| c.manifest.version == release.version && c.manifest.origin.fault.is_none())
     {
         return Err(Refusal::conflict(format!(
             "{} {} is already installed",
@@ -541,9 +562,8 @@ async fn fetch_and_activate(
     blocking(move || {
         let got = sha256_file(&wasm).map_err(io("could not read the download"))?;
         if got != want {
-            return Err(Refusal::invalid(format!(
-                "plugin.wasm does not match the release's SHA256SUMS (expected {want}, got {got})"
-            )));
+            tracing::error!(%version, expected = %want, %got, "plugin download refused: plugin.wasm does not match the release's SHA256SUMS");
+            return Err(Refusal::invalid(DOWNLOAD_MISMATCH));
         }
         std::fs::write(tmp.join("plugin.toml"), &toml)
             .map_err(io("could not write plugin.toml"))?;

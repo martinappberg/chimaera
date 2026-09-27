@@ -43,7 +43,7 @@
   import FileIcon from "../shared/FileIcon.svelte";
   import FolderIcon from "../shared/FolderIcon.svelte";
   import { browserTitles, targetLabel } from "../browser/proxy";
-  import { EXTENSIONS_GLYPH, EXTENSIONS_STROKE } from "../plugins/glyph";
+  import ExtensionsGlyph from "../plugins/ExtensionsGlyph.svelte";
 
   interface Props {
     node: PaneNode;
@@ -804,18 +804,9 @@
               />
             </svg>
           {:else if tab.surface === "plugins"}
-            <!-- Extensions: three cells and a plus (plugins/glyph.ts). -->
-            <svg class="glyph" viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
-              <title>extensions</title>
-              <path
-                d={EXTENSIONS_GLYPH}
-                fill="none"
-                stroke="currentColor"
-                stroke-width={EXTENSIONS_STROKE}
-                stroke-linecap="round"
-                stroke-linejoin="round"
-              />
-            </svg>
+            <!-- Extensions: three cells and a plus (plugins/glyph.ts), at its
+                 own 12px pixel grid. -->
+            <ExtensionsGlyph class="glyph" title="extensions" />
           {:else if tab.surface === "browser"}
             <svg class="glyph" viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
               <title>browser</title>
@@ -1349,6 +1340,13 @@
 
   .tab:hover {
     color: var(--fg);
+  }
+
+  /* The Extensions glyph is drawn for whole pixels at 12px; centred in the
+     25px tab it would sit on a half pixel. One pixel down lands it on the
+     grid, level with the 11px glyphs beside it. */
+  .tab :global(.ext-glyph) {
+    margin-top: 1px;
   }
 
   /* Active-tab emphasis via weight, not color — the bar stays quiet; a thin

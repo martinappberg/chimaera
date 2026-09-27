@@ -1,5 +1,5 @@
 /**
- * The agent-plugin rows of a plugin card and of the attach sheet's first
+ * The agent-side plugin of a plugin card and of the attach sheet's first
  * step: what the plugin's manifest `requires` (it can't work without) and
  * `recommends` (it is more useful with) from each agent, matched against
  * what the agents themselves report on this host. Pure — no store, no DOM —
@@ -8,9 +8,12 @@
  * The rules:
  *  - an agent that isn't installed on this host is never listed; a
  *    requirement none of the listed agents here can meet says so once;
- *  - while the first report is in flight the whole block is one line;
- *  - when the daemon can't ask the agents, a requirement keeps the honest
- *    "can't check" pill (a recommendation, being optional, says nothing).
+ *  - while the first report is in flight the whole box is one line;
+ *  - when the daemon can't ask the agents, a requirement says so honestly
+ *    (a recommendation, being optional, says nothing);
+ *  - each agent's row is its state in words and at most one action:
+ *    "installed 0.7.2" · "not installed" [Install] · "2 hooks not trusted"
+ *    [Review] · "installed, disabled".
  */
 import type { AgentHook, AgentPlugins, PluginRequirement } from "./store";
 
@@ -22,7 +25,11 @@ export type RowKind = "requires" | "recommends";
 /** `unknown`: the daemon couldn't ask the agents. */
 export type RowStatus = "installed" | "disabled" | "missing" | "unknown";
 
-export type PillTone = "good" | "warn" | "neutral";
+export type Tone = "good" | "warn" | "neutral";
+
+/** The one thing a row offers: the agent's own install, or reviewing the
+ *  codex hooks that wait for the user's trust. */
+export type RowAction = "install" | "review" | null;
 
 export interface RequirementRow {
   kind: RowKind;
@@ -36,11 +43,10 @@ export interface RequirementRow {
   /** What the agent reports for its installed copy. */
   version: string | null;
   scope: string | null;
-  /** The card's sentence for this row. */
-  text: string;
-  /** The status pill beside a `requires` sentence; null for a
-   *  `recommends` row, whose sentence says it all. */
-  pill: { text: string; tone: PillTone } | null;
+  /** The card's words for this agent's state ("installed 0.7.2"). */
+  state: string;
+  tone: Tone;
+  action: RowAction;
   /** The agent is here and its plugin isn't: offer the agent's own install. */
   offerInstall: boolean;
   /** Codex hooks of this agent plugin still waiting for the user's trust. */
@@ -52,7 +58,7 @@ export interface RequirementsModel {
    *  report is in flight; `unavailable`: the daemon can't ask the agents;
    *  `error`: asking failed and there is no earlier report to show. */
   phase: "none" | "checking" | "unavailable" | "error" | "ready";
-  /** One line in place of (or beside) the rows: "checking the agents…", or
+  /** One line in place of (or beside) the rows: "asking the agents…", or
    *  the requirement no agent on this host can meet. */
   notice: string | null;
   rows: RequirementRow[];
@@ -67,7 +73,7 @@ export interface RequirementsInput {
   state: AgentsState;
 }
 
-export const CHECKING = "checking the agents…";
+export const CHECKING = "asking the agents…";
 
 /** The id's part before `@` (how the agents list a marketplace plugin). */
 export function baseId(id: string): string {
@@ -75,31 +81,22 @@ export function baseId(id: string): string {
 }
 
 /** "claude" · "claude or codex" · "claude, codex or gemini". */
-function orList(items: string[]): string {
+function joinList(items: string[], word: "or" | "and"): string {
   if (items.length <= 1) return items.join("");
-  return `${items.slice(0, -1).join(", ")} or ${items[items.length - 1]}`;
+  return `${items.slice(0, -1).join(", ")} ${word} ${items[items.length - 1]}`;
 }
 
 function unique(items: string[]): string[] {
   return [...new Set(items)];
 }
 
-/** The sentence for a requirement no agent on this host can meet, naming
- *  the agents the manifest lists. */
+/** The sentence for a requirement no agent on this host can meet. */
 function unmetNotice(requires: PluginRequirement[]): string {
   const agents = unique(requires.map((r) => r.agent));
-  const ids = unique(requires.map((r) => r.id));
-  const what =
-    ids.length === 1
-      ? `Requires ${orList(agents)} with plugin ${ids[0]}`
-      : `Requires ${orList(requires.map((r) => `${r.agent} with plugin ${r.id}`))}`;
-  const none =
-    agents.length === 1
-      ? `${agents[0]} isn't installed on this host`
-      : agents.length === 2
-        ? "neither is installed on this host"
-        : "none of them is installed on this host";
-  return `${what}; ${none}`;
+  if (agents.length === 1) return `It needs ${agents[0]}, which isn't installed on this host.`;
+  return agents.length === 2
+    ? `It needs ${agents[0]} or ${agents[1]}, and neither is installed on this host.`
+    : `It needs ${joinList(agents, "or")}, and none of them is installed on this host.`;
 }
 
 function blankRow(kind: RowKind, r: PluginRequirement): RequirementRow {
@@ -112,15 +109,16 @@ function blankRow(kind: RowKind, r: PluginRequirement): RequirementRow {
     status: "unknown",
     version: null,
     scope: null,
-    text: kind === "requires" ? `Requires the ${r.agent} plugin ${r.id}` : `For ${r.agent}: ${baseId(r.id)}`,
-    pill: null,
+    state: "",
+    tone: "neutral",
+    action: null,
     offerInstall: false,
     untrustedHooks: [],
   };
 }
 
 export function requirementsModel(input: RequirementsInput): RequirementsModel {
-  const { requires, recommends, knowledge, report, state } = input;
+  const { requires, recommends, report, state } = input;
   if (requires.length === 0 && recommends.length === 0) return { phase: "none", notice: null, rows: [] };
 
   if (report === null) {
@@ -128,15 +126,16 @@ export function requirementsModel(input: RequirementsInput): RequirementsModel {
       return {
         phase: "unavailable",
         notice: null,
-        rows: requires.map((r) => ({
-          ...blankRow("requires", r),
-          pill: { text: `${r.agent} · can't check on this daemon`, tone: "neutral" },
-        })),
+        rows: requires.map((r) => ({ ...blankRow("requires", r), state: "can't check on this daemon" })),
       };
     }
     if (state === "error") {
       // The caller shows the error with its retry once, beside these.
-      return { phase: "error", notice: null, rows: requires.map((r) => blankRow("requires", r)) };
+      return {
+        phase: "error",
+        notice: null,
+        rows: requires.map((r) => ({ ...blankRow("requires", r), state: "couldn't ask" })),
+      };
     }
     return { phase: "checking", notice: CHECKING, rows: [] };
   }
@@ -152,29 +151,28 @@ export function requirementsModel(input: RequirementsInput): RequirementsModel {
     if (got === null) {
       out.status = "missing";
       out.offerInstall = true;
-    } else {
-      out.status = got.enabled ? "installed" : "disabled";
-      out.version = got.version ?? null;
-      out.scope = got.scope ?? null;
-      out.untrustedHooks = (entry.hooks ?? []).filter(
-        (h) => (h.plugin_id === r.id || h.plugin_id === base) && (h.trust === "untrusted" || h.trust === "modified"),
-      );
+      out.state = "not installed";
+      out.tone = kind === "requires" ? "warn" : "neutral";
+      out.action = "install";
+      return out;
     }
-    const v = out.version !== null ? ` ${out.version}` : "";
-    if (kind === "requires") {
-      out.pill =
-        out.status === "missing"
-          ? { text: `${r.agent} · plugin not installed`, tone: "warn" }
-          : out.status === "installed"
-            ? { text: `${r.agent} · plugin${v} ✓`, tone: "good" }
-            : { text: `${r.agent} · plugin${v} · disabled`, tone: "warn" };
+    out.status = got.enabled ? "installed" : "disabled";
+    out.version = got.version ?? null;
+    out.scope = got.scope ?? null;
+    out.untrustedHooks = (entry.hooks ?? []).filter(
+      (h) => (h.plugin_id === r.id || h.plugin_id === base) && (h.trust === "untrusted" || h.trust === "modified"),
+    );
+    const n = out.untrustedHooks.length;
+    if (!got.enabled) {
+      out.state = "installed, disabled";
+      out.tone = "warn";
+    } else if (n > 0) {
+      out.state = `${n} hook${n === 1 ? "" : "s"} not trusted`;
+      out.tone = "warn";
+      out.action = "review";
     } else {
-      out.text =
-        out.status === "missing"
-          ? `For ${r.agent}: install the ${r.id} plugin${typeof knowledge === "string" ? " so it can record knowledge" : ""}`
-          : out.status === "installed"
-            ? `For ${r.agent}: ${base} ✓${v}`
-            : `For ${r.agent}: ${base}${v} is installed but disabled`;
+      out.state = out.version !== null ? `installed ${out.version}` : "installed";
+      out.tone = "good";
     }
     return out;
   }
@@ -192,6 +190,83 @@ export function requirementsModel(input: RequirementsInput): RequirementsModel {
   return { phase: "ready", notice, rows };
 }
 
+/** The card's "Agent-side plugin" box: one per kind the manifest names. */
+export interface AgentSideBlock {
+  kind: RowKind;
+  /** "Agent-side plugin", or "… · needed" for a requirement. */
+  title: string;
+  /** The author's sentence (`requires_summary` / `recommends_summary`), or
+   *  a plain one when the manifest has none. */
+  summary: string;
+  /** The agent plugin's own page, when its marketplace names one. */
+  link: { label: string; url: string } | null;
+  rows: RequirementRow[];
+  /** One line in place of the rows ("asking claude and codex…", or a
+   *  requirement no agent here can meet). */
+  notice: string | null;
+}
+
+export interface BlockInput {
+  name: string;
+  requires: PluginRequirement[];
+  recommends: PluginRequirement[];
+  requires_summary: string | null;
+  recommends_summary: string | null;
+  knowledge: string | null | undefined;
+}
+
+const GITHUB_SLUG = /^[A-Za-z0-9][A-Za-z0-9_.-]*\/[A-Za-z0-9_.-]+$/;
+
+/** The page an agent marketplace names: `owner/repo` is a GitHub
+ *  repository; an http(s) URL is itself. */
+export function marketplaceUrl(marketplace: string): string | null {
+  const m = marketplace.trim();
+  if (GITHUB_SLUG.test(m) && !m.includes("..")) return `https://github.com/${m.replace(/\.git$/, "")}`;
+  if (/^https?:\/\/[^\s]+$/i.test(m)) return m;
+  return null;
+}
+
+/** The box per kind, only when there is something to say: while asking,
+ *  when a requirement can't be met, or when an agent that could use the
+ *  plugin is installed here. */
+export function agentSideBlocks(model: RequirementsModel, p: BlockInput): AgentSideBlock[] {
+  if (model.phase === "none") return [];
+  const out: AgentSideBlock[] = [];
+  for (const kind of ["requires", "recommends"] as const) {
+    const named = kind === "requires" ? p.requires : p.recommends;
+    if (named.length === 0) continue;
+    const rows = model.rows.filter((r) => r.kind === kind);
+    let notice: string | null = null;
+    if (model.phase === "checking") {
+      notice = `asking ${joinList(unique(named.map((r) => r.agent)), "and")}…`;
+    } else if (kind === "requires" && model.notice !== null) {
+      notice = model.notice;
+    }
+    if (rows.length === 0 && notice === null) continue;
+    const pages = unique(named.map((r) => r.marketplace))
+      .map((m) => marketplaceUrl(m))
+      .filter((u): u is string => u !== null);
+    const names = unique(named.map((r) => baseId(r.id)));
+    const authored = kind === "requires" ? p.requires_summary : p.recommends_summary;
+    out.push({
+      kind,
+      title: kind === "requires" ? "Agent-side plugin · needed" : "Agent-side plugin",
+      summary: authored ?? fallbackSummary(kind, p),
+      link: pages.length > 0 ? { label: `${names[0]} on GitHub`, url: pages[0] } : null,
+      rows,
+      notice,
+    });
+  }
+  return out;
+}
+
+function fallbackSummary(kind: RowKind, p: BlockInput): string {
+  if (kind === "requires") return `${p.name} works only when the agents you use have their own plugin for it.`;
+  return typeof p.knowledge === "string"
+    ? `With their own plugin, your agents can record what they learn as they work; ${p.name} works without it.`
+    : `An optional plugin for your agents that makes ${p.name} more useful; ${p.name} works without it.`;
+}
+
 /** The attach sheet's wording for a row: a requirement reads as needed, a
  *  recommendation as optional. */
 export function sheetText(row: RequirementRow, knowledge: string | null | undefined): string {
@@ -199,7 +274,7 @@ export function sheetText(row: RequirementRow, knowledge: string | null | undefi
   if (row.status === "installed") return `${row.agent} has ${row.name}${v} ✓`;
   if (row.status === "disabled") return `${row.agent} has ${row.name}${v}, but it is disabled`;
   if (row.kind === "requires") {
-    return row.status === "unknown" && row.pill !== null
+    return row.status === "unknown" && row.state === "can't check on this daemon"
       ? `${row.agent} needs the ${row.id} plugin — can't check on this daemon`
       : `${row.agent} needs the ${row.id} plugin`;
   }

@@ -10,7 +10,7 @@
  *   POST /workspaces/{id}/plugins/{pid}/trust-hooks {hooks:[{key,hash}]}
  *   POST /plugins/install {github, version?}      install a plugin from its GitHub release
  *   POST /plugins/{pid}/install                    install a first-party plugin at the version chimaera pins
- *   POST /plugins/{pid}/update | rollback | check   update · Use previous · Check now
+ *   POST /plugins/{pid}/update | rollback | check   Update · Use previous · Check for updates
  *   DELETE /plugins/{pid}                          Remove (the installed copy, every version)
  *
  * The user-facing surface is called Extensions; the wire, the routes and this
@@ -51,7 +51,12 @@ export interface WorkspacePlugin {
   id: string;
   name: string;
   summary: string;
-  homepage?: string | null;
+  /** A few plain sentences from the plugin's author (null when it has none,
+   *  and for an available entry, which has no manifest yet). */
+  description: string | null;
+  /** The plugin's own page (the card's name links to it); an http(s) URL
+   *  or null. */
+  homepage: string | null;
   adds: { ui: string[]; agents: string[] };
   provides: { knowledge?: string | null; mcp_tools: string[]; views: string[] };
   setup: { prompt: string } | null;
@@ -64,6 +69,10 @@ export interface WorkspacePlugin {
   /** Agent plugins that make it more useful for the agents that run them —
    *  never needed for it to work. */
   recommends: PluginRequirement[];
+  /** The author's one sentence about what the required / recommended
+   *  agent-side plugin is for (the card's "Agent-side plugin" box). */
+  requires_summary: string | null;
+  recommends_summary: string | null;
   /** The installed copy's version; for an available entry, the version
    *  chimaera pins (`""` from daemons that predate versions). */
   version: string;
@@ -228,6 +237,10 @@ function normalizePlugin(raw: WorkspacePlugin): WorkspacePlugin {
     detect: arr<string>(raw.detect),
     requires: arr<PluginRequirement>(raw.requires),
     recommends: arr<PluginRequirement>(raw.recommends),
+    description: str(raw.description),
+    homepage: str(raw.homepage),
+    requires_summary: str(raw.requires_summary),
+    recommends_summary: str(raw.recommends_summary),
     on: raw.on === true,
     detected: raw.detected === true,
     active: raw.active === true,
@@ -390,7 +403,7 @@ export async function removeWorkbenchPlugin(pid: string): Promise<PluginChange> 
   return json(await api(plugin(pid), { method: "DELETE" }));
 }
 
-/** Check now: ask the installed copy's release source for a newer version. */
+/** Check for updates: ask the installed copy's release source for a newer version. */
 export async function checkWorkbenchPlugin(pid: string): Promise<{ id: string; update: PluginUpdate | null }> {
   return json(await api(`${plugin(pid)}/check`, { method: "POST" }));
 }
@@ -416,6 +429,12 @@ export const myceliumPlugin: Readable<WorkspacePlugin | null> = derived(
   pluginsStore,
   (p) => p?.plugins.find((x) => x.id === "mycelium") ?? null,
 );
+
+const checkedStore = writable<ReadonlyMap<string, number>>(new Map());
+/** When this page last asked each plugin's release source (Check for
+ *  updates), by plugin id — the card's quiet "checked just now" line. Only
+ *  the user's own checks: the daemon's daily check says nothing here. */
+export const checkedAt: Readable<ReadonlyMap<string, number>> = checkedStore;
 
 let currentWs: string | null = null;
 let refreshSeq = 0;
@@ -448,7 +467,7 @@ export function refreshWorkspacePlugins(): void {
   if (currentWs !== null) void refresh(currentWs);
 }
 
-/** One installed-plugin change (Update, Use previous, Remove, Check now), then
+/** One installed-plugin change (Update, Use previous, Remove, Check for updates), then
  *  the active workspace's cards re-synced — a new version can add or drop a
  *  knowledge provider, so Knowledge refreshes too. */
 export async function changeWorkbenchPlugin(
@@ -462,7 +481,9 @@ export async function changeWorkbenchPlugin(
     check: checkWorkbenchPlugin,
   }[kind];
   try {
-    return await call(pid);
+    const res = await call(pid);
+    if (kind === "check") checkedStore.update((m) => new Map(m).set(pid, Date.now()));
+    return res;
   } finally {
     if (currentWs !== null) await refresh(currentWs);
     if (kind !== "check") refreshKnowledge();
@@ -473,9 +494,9 @@ export async function changeWorkbenchPlugin(
  *  github.com URL — the daemon normalizes both), then re-sync like any other
  *  change: a switch left on under that id comes back active, and a 409 for a
  *  version already installed (say, by the CLI) still brings its card up. */
-export async function installWorkbenchPlugin(github: string): Promise<PluginChange> {
+export async function installWorkbenchPlugin(github: string, version?: string): Promise<PluginChange> {
   try {
-    return await installFromRelease(github);
+    return await installFromRelease(github, version);
   } finally {
     if (currentWs !== null) await refresh(currentWs);
     refreshKnowledge();

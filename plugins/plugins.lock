@@ -19,10 +19,10 @@
 id = "agent-notes"
 name = "Agent notes"
 summary = "Agents leave short notes for each other and for the Mastermind."
-version = "0.1.1"
+version = "0.1.2"
 repo = "martinappberg/chimaera-plugin-agent-notes"
-sha256_wasm = "fd75d0ef0ba2581c5c39f74a8ef6e5547c4f78ae4c0c85c804e554f8708cca1d"
-sha256_toml = "3c4923344225683f874c3411cf30df695ecb6a41878e278a73d0490b0570589d"
+sha256_wasm = "a7c9d6c597466e22a378e63b730d6729e988aaa773c03c69b1306c17cb716b95"
+sha256_toml = "999306cae2d9dc7b4f60d0ba7cecadc33317367e554709d0334f3cb9d444c68b"
 
 [[plugin]]
 id = "mycelium"

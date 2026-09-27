@@ -603,10 +603,13 @@ async fn a_release_that_is_not_what_the_lock_pins_is_refused() {
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
     let error = body["error"].as_str().unwrap();
     assert!(
-        error.contains("does not match what chimaera pins"),
+        error.contains("isn't the release chimaera approved"),
         "{error}"
     );
-    assert!(error.contains(&l.sha256_wasm), "{error}");
+    assert!(
+        !error.contains(&l.sha256_wasm),
+        "no hashes in the words: {error}"
+    );
 
     // It lists the lock's sha256s, but serves another component.
     fake.publish_with_sums(&l.repo, &l.version, &toml, &v1_wasm(), &sums);
@@ -615,7 +618,7 @@ async fn a_release_that_is_not_what_the_lock_pins_is_refused() {
     assert!(body["error"]
         .as_str()
         .unwrap()
-        .contains("plugin.wasm does not match the release's SHA256SUMS"));
+        .contains("don't match what the release published"));
     assert!(!plugin_dir(&state, "agent-notes").join(&l.version).exists());
     no_temp_left(&state, "agent-notes");
     assert_eq!(listed(&state, "agent-notes").await["source"], "available");
@@ -716,8 +719,9 @@ async fn a_bad_checksum_leaves_the_old_version_current() {
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
     let error = body["error"].as_str().unwrap();
     assert!(
-        error.contains("plugin.wasm does not match") && error.contains(&"0".repeat(64)),
-        "{error}"
+        error.contains("don't match what the release published")
+            && !error.contains(&"0".repeat(64)),
+        "plain words, the hashes left to the log: {error}"
     );
     assert_eq!(link(&state, "up-sum", "current").as_deref(), Some("0.1.0"));
     assert!(!plugin_dir(&state, "up-sum").join("0.2.0").exists());
@@ -736,7 +740,7 @@ async fn a_bad_checksum_leaves_the_old_version_current() {
     assert!(body["error"]
         .as_str()
         .unwrap()
-        .contains("plugin.toml does not match"));
+        .contains("don't match what the release published"));
 
     // No checksum for it at all.
     fake.publish_with_sums(gh, "0.2.0", &toml, &v2_wasm(), "");
@@ -907,7 +911,7 @@ async fn the_kept_sums_are_checked_at_every_load() {
     let e = listed(&state, "up-tamper").await;
     assert_eq!(
         e["fault"],
-        "its files do not match its release's SHA256SUMS"
+        "the downloaded files don't match what the release published — reinstall it"
     );
     assert_eq!(e["verified"], false);
     let (status, body) = request(
@@ -936,7 +940,7 @@ async fn the_kept_sums_are_checked_at_every_load() {
     assert!(body["error"]
         .as_str()
         .unwrap()
-        .contains("its files do not match its release's SHA256SUMS"));
+        .contains("don't match what the release published"));
     assert_eq!(
         link(&state, "up-tamper", "current").as_deref(),
         Some("0.2.0")
@@ -950,6 +954,43 @@ async fn the_kept_sums_are_checked_at_every_load() {
     let e = listed(&state, "up-tamper").await;
     assert_eq!(e["verified"], false);
     assert!(e.get("fault").is_none(), "{e}");
+}
+
+/// Reinstall: a copy whose files no longer match its release installs
+/// again at the same version, replacing it in place; an intact copy at that
+/// version still refuses a second install.
+#[tokio::test]
+async fn a_copy_whose_files_changed_reinstalls_at_the_same_version() {
+    let fake = FakeReleases::start().await;
+    let state = state_for(&fake);
+    let gh = "acme/up-reinstall";
+    fake.publish(
+        gh,
+        "0.1.0",
+        &manifest(false, "up-reinstall", "0.1.0", ""),
+        &v1_wasm(),
+    );
+    assert_eq!(install(&state, gh, None).await.0, StatusCode::OK);
+    let (status, body) = install(&state, gh, Some("0.1.0")).await;
+    assert_eq!(status, StatusCode::CONFLICT, "intact: {body}");
+
+    let v1 = plugin_dir(&state, "up-reinstall").join("0.1.0");
+    std::fs::write(v1.join("plugin.wasm"), v2_wasm()).unwrap();
+    reload(&state).await;
+    assert!(listed(&state, "up-reinstall").await["fault"].is_string());
+
+    let (status, body) = install(&state, gh, Some("0.1.0")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let e = listed(&state, "up-reinstall").await;
+    assert!(e.get("fault").is_none(), "{e}");
+    assert_eq!(e["verified"], true);
+    assert_eq!(e["version"], "0.1.0");
+    assert_eq!(std::fs::read(v1.join("plugin.wasm")).unwrap(), v1_wasm());
+    assert_eq!(
+        link(&state, "up-reinstall", "current").as_deref(),
+        Some("0.1.0")
+    );
+    no_temp_left(&state, "up-reinstall");
 }
 
 #[tokio::test]

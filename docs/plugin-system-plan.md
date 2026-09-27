@@ -76,6 +76,23 @@ describe what shipped; the phases below remain the design record.
     and the locked releases into `plugins/dist-test`); the release jobs, the
     musl CI job and the Tauri build no longer run it. The user-facing tab is
     **Extensions** (Plugins · Skills · Browse).
+  - The Extensions tab's design pass (2026-09-27): the manifest gained
+    optional `description` and `[requires]` / `[recommends]` `summary` (on the
+    wire as `description`, `requires_summary`, `recommends_summary`); each card
+    has one primary control (Install, or the switch with its state in words),
+    everything secondary in a "…" menu (Check for updates — was "Check now" —,
+    Use previous, Set up, Open on GitHub, Remove), the author's description,
+    a For you / For agents / Here list, an **Agent-side plugin** box with one
+    row per installed agent, an update callout and a fault callout with
+    **Reinstall** (the daemon now replaces a same-version copy whose files no
+    longer match its release). Fault and download refusals speak plain words,
+    the hashes left to the log; `chimaera plugin list` marks first-party
+    plugins with `✓`, and add / update print one line. The Skills segment
+    splits the built-ins per agent; the glyph is drawn for the pixel grid
+    (12 px, one definition for the tab, the rail and quick-open); the
+    dashboard's quiet state says what Agent notes and Mycelium do, linking
+    Extensions. agent-notes 0.1.2 in the lock (its own wording for the
+    instruction paragraph; the daemon test now checks it names both tools).
 - **Proven live** on the isolated debug daemon, with a fake claude binary
   standing in for the agent so nothing was billed (the 2026-09-26 runs below
   predate decision 6, so their first-party plugins were still embedded):
