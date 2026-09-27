@@ -289,6 +289,12 @@ export function setAgentDefault(d: AgentDefault): void {
 }
 
 /** Compact relative age for resume rows ("now", "5m", "3h", "2d"). */
+/** The bare version number, wherever the CLI buried it ("codex-cli 0.52.0",
+ *  "2.1.202 (Claude Code)"). Shared by the launcher and both settings panels. */
+export function versionNumber(version: string): string {
+  return version.split(" ").find((t) => /^\d/.test(t)) ?? version.split(" ")[0];
+}
+
 export function relativeAge(mtimeSecs: number, nowMs = Date.now()): string {
   const s = Math.max(0, Math.floor(nowMs / 1000) - mtimeSecs);
   if (s < 60) return "now";

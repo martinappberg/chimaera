@@ -256,6 +256,7 @@
     modifierSetting,
   } from "./lib/shared/keybindings";
   import {
+    appUpdateStatus,
     askpassActive,
     caffeinateState,
     closeThisWindow,
@@ -283,7 +284,12 @@
   } from "./lib/net/native";
   import { clearBrowserNotices, deliverBrowserNotices } from "./lib/workspace/notices";
   import UpdateToast from "./lib/workspace/UpdateToast.svelte";
-  import { currentOffer, updateState } from "./lib/workspace/update.svelte";
+  import {
+    applyAppStatus,
+    checkForUpdates,
+    currentNotice,
+    updateState,
+  } from "./lib/workspace/update.svelte";
   import * as pool from "./lib/terminal/termPool";
   import * as chatPool from "./lib/chat/chatPool";
   import {
@@ -1441,8 +1447,10 @@
       health.build.split(".")[0] !== appBuild.split(".")[0];
   });
 
-  /** The one update worth offering in this window right now. */
-  const updateOffer = $derived(currentOffer(scopeAlias));
+  /** The one update worth offering in this window right now — or, after an
+   *  explicit check, its answer. */
+  const updateNotice = $derived(currentNotice(scopeAlias));
+  updateState.scope = scopeAlias;
 
   // /ws/events pushes full session snapshots; the 5s poll only runs as a
   // fallback while the socket is down (including before the first frame).
@@ -1655,9 +1663,24 @@
           () => {},
         );
       }
+      // The broadcast carries only the version; the shell's cache holds the
+      // whole outcome (when it checked), which Settings → Updates shows. A
+      // window opened after a broadcast reads the same cache at mount.
+      const readAppStatus = (): void => {
+        void appUpdateStatus(false).then(
+          (status) => {
+            if (status !== null) applyAppStatus(status);
+          },
+          () => {},
+        );
+      };
       unlistenAppUpdate = asyncDisposer(
-        onAppUpdate((version) => (updateState.appVersion = version)),
+        onAppUpdate((version) => {
+          updateState.appVersion = version;
+          readAppStatus();
+        }),
       );
+      readAppStatus();
       unlistenMenu = asyncDisposer(
         onMenu((action) => {
           switch (action) {
@@ -1673,6 +1696,9 @@
               break;
             case "settings":
               openSettingsSurface();
+              break;
+            case "check-updates":
+              void checkForUpdates(true);
               break;
           }
         }),
@@ -5655,7 +5681,8 @@
 {/if}
 
 <!-- Ambient update offer (small, snoozable): a newer release, or a daemon
-     older than this app. One per window; dismissals are origin-wide. -->
+     older than this app. One per window; dismissals are origin-wide. An
+     explicit check (menu, version stamp) answers here too, even "up to date". -->
 {#if $assetTransition !== null}
   <AssetTransitionNotice
     transition={$assetTransition}
@@ -5666,8 +5693,8 @@
   />
 {/if}
 
-{#if updateOffer !== null && $assetTransition === null}
-  <UpdateToast offer={updateOffer} />
+{#if updateNotice !== null && $assetTransition === null}
+  <UpdateToast notice={updateNotice} />
 {/if}
 
 <!-- Transient outcome chip: an action that would otherwise fail in silence

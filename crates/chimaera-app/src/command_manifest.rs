@@ -36,6 +36,7 @@ pub const DAEMON_UI_COMMANDS: &[&str] = &[
     "open_notification_settings",
     "test_notification",
     "check_app_update",
+    "app_update_status",
     "begin_update",
     "shell_build",
     "write_clipboard",

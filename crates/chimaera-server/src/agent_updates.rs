@@ -182,7 +182,9 @@ fn agy_platform() -> &'static str {
 /// every phone-home the daemon makes.
 pub(crate) async fn curl(url: &str, headers: &[&str]) -> anyhow::Result<Vec<u8>> {
     let mut cmd = tokio::process::Command::new("curl");
-    cmd.args(["-fsSL", "-m", "10", "--max-filesize", "1048576"]);
+    // -S keeps curl's own one-line diagnosis on stderr under -s: it is the
+    // part of a failed check a user can act on ("Could not resolve host").
+    cmd.args(["-fsSL", "-S", "-m", "10", "--max-filesize", "1048576"]);
     for header in headers {
         cmd.args(["-H", header]);
     }
@@ -197,11 +199,11 @@ pub(crate) async fn curl(url: &str, headers: &[&str]) -> anyhow::Result<Vec<u8>>
         .await
         .context("failed to run curl")?;
     if !output.status.success() {
-        anyhow::bail!(
-            "curl exited {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        match stderr.lines().rev().map(str::trim).find(|l| !l.is_empty()) {
+            Some(line) => anyhow::bail!("{line}"),
+            None => anyhow::bail!("curl exited {}", output.status),
+        }
     }
     Ok(output.stdout)
 }

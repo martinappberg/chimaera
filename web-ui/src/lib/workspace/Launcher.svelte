@@ -28,7 +28,13 @@
    * install), Escape closes.
    */
   import { onMount } from "svelte";
-  import { getAgentDefault, listAgents, type AgentInfo, type LaunchPick } from "./launcher";
+  import {
+    getAgentDefault,
+    listAgents,
+    versionNumber,
+    type AgentInfo,
+    type LaunchPick,
+  } from "./launcher";
   import { isMac } from "../shared/keys";
   import { openInSystemBrowser } from "../shared/urlOpen";
   import SessionGlyph from "../shared/SessionGlyph.svelte";
@@ -61,12 +67,6 @@
 
   let hl = $state(0);
   let rootEl = $state<HTMLElement | null>(null);
-
-  /** The bare version number, wherever the CLI buried it ("codex-cli 0.52.0",
-   *  "2.1.202 (Claude Code)"). */
-  function versionNumber(version: string): string {
-    return version.split(" ").find((t) => /^\d/.test(t)) ?? version.split(" ")[0];
-  }
 
   /** Version-tag tooltip: whose binary this is and where it resolves — the
    *  answer to "chimaera's install or mine?" the rail alone can't give. */
