@@ -13,6 +13,8 @@
   import AgentsSettings from "./AgentsSettings.svelte";
   import EnvironmentSettings from "./EnvironmentSettings.svelte";
   import DocumentsSettings from "./DocumentsSettings.svelte";
+  import ProSettings from "./ProSettings.svelte";
+  import { isNativeShell } from "../net/native";
   import NotificationStatus from "./NotificationStatus.svelte";
   import UpdatesStatus from "./UpdatesStatus.svelte";
   import { APP_MENU, PINNED } from "../shared/keys";
@@ -31,6 +33,7 @@
     const out = [...CATEGORIES];
     const at = out.indexOf("Agents");
     out.splice(at >= 0 ? at + 1 : out.length, 0, "Environment", "Documents");
+    if (isNativeShell()) out.splice(out.indexOf("Keyboard"), 0, "Chimaera Pro");
     return out;
   })();
 
@@ -72,6 +75,9 @@
   const DOC_KEYWORDS = ["documents", "markdown", "agents.md", "skill", "claude", "teach", "check"];
   const docsVisible = $derived(q === "" || DOC_KEYWORDS.some((k) => k.includes(q)));
 
+  const PRO_KEYWORDS = ["chimaera pro", "account", "sign in", "plan", "kept", "connected", "devices", "sign out"];
+  const proVisible = $derived(q === "" || PRO_KEYWORDS.some((keyword) => keyword.includes(q)));
+
   /** Rows grouped by category, registry order, empty groups dropped. */
   const groups = $derived.by(() => {
     const out: { category: string; defs: SettingDef[] }[] = [];
@@ -82,6 +88,10 @@
       }
       if (cat === "Documents") {
         if (docsVisible) out.push({ category: cat, defs: [] });
+        continue;
+      }
+      if (cat === "Chimaera Pro") {
+        if (proVisible) out.push({ category: cat, defs: [] });
         continue;
       }
       const defs = visible.filter((d) => d.category === cat);
@@ -229,6 +239,10 @@
                  /api/v1/agent-docs. It renders its own <h2>. -->
             <section data-section={group.category}>
               <DocumentsSettings />
+            </section>
+          {:else if group.category === "Chimaera Pro"}
+            <section data-section={group.category}>
+              <ProSettings visible={tabVisible} />
             </section>
           {:else if group.category === "Notifications"}
             <!-- Generic rows plus a status line: whether the OS/browser will

@@ -51,6 +51,9 @@ export type HostStatus = "disconnected" | "connecting" | "connected" | "error";
 
 export interface HostState {
   alias: string;
+  /** Optional when attached to a shell predating the link transport. */
+  via_pro?: boolean;
+  kept?: boolean;
   status: HostStatus;
   /** Local end of the tunnel while connected. */
   local_port: number | null;
@@ -568,6 +571,7 @@ export async function testNotification(): Promise<void> {
  */
 export interface AskpassPrompt {
   id: number;
+  source?: { type: "local" } | { type: "keeper"; host_id: string; keeper_prompt_id: string };
   /** SSH alias of the child that raised this prompt. Null only for legacy or
    *  unscoped helpers, which remain available from the home window. */
   alias?: string | null;
@@ -861,4 +865,65 @@ export function openDetachedPopup(
   if (popup === null) return false;
   popup.opener = null;
   return true;
+}
+
+/** Account controls are native-shell state, separate from daemon settings. */
+export interface ProStatus {
+  available: boolean;
+  signed_in: boolean;
+  email: string | null;
+  plan: "pro" | "max" | "none" | null;
+  error: string | null;
+}
+
+export interface ProHost {
+  alias: string;
+  kept: boolean;
+  status: "connected" | "connecting" | "prompting" | "offline";
+  kind: "ssh" | "device" | "worker";
+}
+
+export interface ProDevice {
+  id: string;
+  name: string;
+  last_seen: string;
+  this: boolean;
+}
+
+export async function proStatus(): Promise<ProStatus> {
+  const t = tauri();
+  if (t === null) return { available: false, signed_in: false, email: null, plan: null, error: null };
+  return t.core.invoke<ProStatus>("pro_status");
+}
+
+export async function proSignIn(): Promise<void> {
+  const t = tauri();
+  if (t === null) throw new Error("not running in the native shell");
+  await t.core.invoke<void>("pro_sign_in");
+}
+
+export async function proSignOut(): Promise<void> {
+  await tauri()?.core.invoke<void>("pro_sign_out");
+}
+
+export async function proSignOutEverywhere(): Promise<void> {
+  await tauri()?.core.invoke<void>("pro_sign_out_everywhere");
+}
+
+export async function proHosts(): Promise<ProHost[]> {
+  return (await tauri()?.core.invoke<ProHost[]>("pro_hosts")) ?? [];
+}
+
+export async function proSetHostKept(alias: string, kept: boolean): Promise<void> {
+  const t = tauri();
+  if (t === null) throw new Error("not running in the native shell");
+  await t.core.invoke<void>("pro_set_host_kept", { alias, kept });
+}
+
+export async function proDevices(): Promise<ProDevice[]> {
+  return (await tauri()?.core.invoke<ProDevice[]>("pro_devices")) ?? [];
+}
+
+export function onProChanged(handler: () => void): Promise<() => void> {
+  return tauri()?.event.listen<null>("pro-changed", () => handler()) ?? Promise.resolve(() => {});
 }

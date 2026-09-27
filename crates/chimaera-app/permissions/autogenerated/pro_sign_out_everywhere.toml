@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-pro-sign-out-everywhere"
+description = "Enables the pro_sign_out_everywhere command without any pre-configured scope."
+commands.allow = ["pro_sign_out_everywhere"]
+
+[[permission]]
+identifier = "deny-pro-sign-out-everywhere"
+description = "Denies the pro_sign_out_everywhere command without any pre-configured scope."
+commands.deny = ["pro_sign_out_everywhere"]

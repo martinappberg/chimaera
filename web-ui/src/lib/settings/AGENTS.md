@@ -24,6 +24,12 @@ the opt-in "teach agents the document dialect" installs over
 `/api/v1/agent-docs` (an `AGENTS.md` block, a Claude Code skill). The daemon
 owns the text; the confirm dialog shows it verbatim before anything is written.
 
+**Exception — Chimaera Pro.** Native-shell account state, not daemon settings:
+`ProSettings.svelte` invokes the seven `pro_*` app commands in `net/native.ts`.
+The category is omitted in a browser; an unset endpoint shows only availability.
+`pro-changed` refreshes visible settings, with a catch-up on visibility return.
+Credentials stay in the app's keychain, never in the schema or this UI.
+
 ## File map
 
 | File | What it owns |
@@ -34,6 +40,7 @@ owns the text; the confirm dialog shows it verbatim before anything is written.
 | `AgentsSettings.svelte` | Per-agent binary/model settings (paths, managed installs). |
 | `EnvironmentSettings.svelte` | The Environment prelude panel (bespoke, `/api/v1/environment`-backed — see the exception above). |
 | `environment.ts` | Wire types + `getEnvironment`/`putEnvironment` for the prelude map. |
+| `ProSettings.svelte` | Native account, kept hosts, devices and sign-out controls (app IPC-backed). |
 | `DocumentsSettings.svelte` | The Documents panel: the opt-in AGENTS.md / Claude skill installs (see the exception above). |
 | `agentDocs.ts` | Wire types + `getAgentDocs`/`installAgentDocs` for `/api/v1/agent-docs`. |
 | `UpdatesStatus.svelte` | The Updates section's status block: app / daemon / agents, each up to date, available, or couldn't check (with why), plus "check now". Reads `workspace/update.svelte.ts`; the auto-check switch below it is a schema row. |

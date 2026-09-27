@@ -55,6 +55,14 @@ a `settings` frame on `/ws/events`. Map: [settings/AGENTS.md](../../web-ui/src/l
   agent/mode are workspace state edited in its setup card, while Environment preludes remain scoped
   records rather than being flattened into global preferences.
 
+## Native account settings
+
+The native app adds a **Chimaera Pro** category for sign-in, plan, kept hosts,
+devices and sign-out. It is absent in a plain browser and shows only availability
+when no endpoint is configured. This is app-owned state, accessed through native
+IPC; neither credentials nor the endpoint enter the daemon settings schema.
+See [Pro connections](pro.md) for the connection and token lifecycle.
+
 ## Updates status
 
 - **Updates section** (`UpdatesStatus.svelte`, above the `update.autoCheck` switch) — the one place that

@@ -118,6 +118,9 @@
           authenticate{askpass.alias != null ? ` · ${askpass.alias}` : ""}
         </span>
       </div>
+      {#if askpass.source?.type === "keeper"}
+        <p class="askpass-source">Asked by your Pro connection</p>
+      {/if}
       <pre class="askpass-prompt">{askpass.prompt}</pre>
       <div class="askpass-field">
         <input
@@ -155,6 +158,12 @@
 {/if}
 
 <style>
+  .askpass-source {
+    margin: -4px 0 12px;
+    color: var(--muted);
+    font-size: var(--text-sm);
+  }
+
   .askpass-backdrop {
     position: fixed;
     inset: 0;

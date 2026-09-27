@@ -3170,6 +3170,28 @@ pub async fn compute_cancel(host: &str, manifest: &Manifest, job_id: &str) -> an
 mod tests {
     use super::*;
 
+    #[test]
+    fn keeper_ssh_destination_retains_only_address_user_and_port() {
+        let config = "host work\nhostname login.example.test\nuser scientist\nport 2202\nidentityfile /secret/key\nproxycommand sensitive command\n";
+        assert_eq!(
+            parse_ssh_destination(config).unwrap(),
+            ("login.example.test".into(), Some("scientist".into()), 2202)
+        );
+        assert_eq!(
+            parse_ssh_destination("hostname localhost\n").unwrap(),
+            ("localhost".into(), None, 22)
+        );
+        for config in [
+            "user only",
+            "hostname -option",
+            "hostname bad host",
+            "hostname okay\nport 0",
+            "hostname okay\nport 65536",
+        ] {
+            assert!(parse_ssh_destination(config).is_err());
+        }
+    }
+
     /// The probe and start-wait frame the manifest on BOTH sides and print
     /// the pid they tested: noise around the frame (an echoing ~/.bashrc) is
     /// ignored, a cut-off frame, a pid that disagrees with the manifest, or a

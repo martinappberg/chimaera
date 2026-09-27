@@ -51,6 +51,10 @@ tauri-plugin-clipboard-manager = "2"
 open = "5"
 ureq = { version = "3", features = ["json"] }
 urlencoding = "2"
+url = "2"
+chimaera-link = { path = "../chimaera-link" }
+# Native credential stores only: account tokens must never enter app JSON.
+keyring = { version = "3", default-features = false, features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
 
 chimaera-core = { path = "../chimaera-core" }
 chimaera-remote = { path = "../chimaera-remote" }

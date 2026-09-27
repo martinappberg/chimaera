@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
-use chimaera_remote::Tunnel;
+use self::tunnel::Tunnel;
 use tauri::ipc::CapabilityBuilder;
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -25,7 +25,9 @@ mod commands;
 mod connect;
 mod drag;
 pub(crate) mod notices;
+mod pro;
 mod restore;
+mod tunnel;
 mod unsaved;
 
 pub use restore::open_ui_window;
@@ -61,6 +63,7 @@ type ConnectFlight = tokio::sync::watch::Receiver<Option<Result<(), String>>>;
 pub struct Shell {
     /// The local daemon (mutable: the update affordance replaces it).
     pub local: Mutex<LocalDaemon>,
+    pro: pro::Pro,
     /// Live tunnels by host alias.
     tunnels: tokio::sync::Mutex<HashMap<String, Tunnel>>,
     /// Tunnels that still have an owned forward but missed enough
@@ -738,7 +741,10 @@ pub(crate) fn navigate_home_hub(
         return Err(error);
     }
     if ws.is_some() && !stable_id.is_empty() {
-        lock(&shell.registry).set_scope(&stable_id, alias.clone(), ws);
+        let link_device = alias
+            .as_deref()
+            .is_some_and(|alias| shell.pro.is_device(alias));
+        lock(&shell.registry).set_scope(&stable_id, alias.clone(), ws, link_device);
     }
 
     let title = alias.map_or_else(
@@ -806,11 +812,9 @@ pub(crate) fn show_local_home(
     Ok(())
 }
 
-/// Whether the currently-focused window has a workspace open (vs the home
-/// screen or no window focused). Drives the menu's Settings item, which is
-/// workspace/daemon-scoped. Reads the scope map (populated by `open_ui_window`
-/// and `report_window_scope`); false before startup or for the WSL wizard.
-pub(crate) fn focused_ws_open(app: &AppHandle) -> bool {
+/// Whether focus belongs to a managed daemon window. The setup wizard has no
+/// scope-map entry and cannot show the daemon-served Settings surface.
+pub(crate) fn focused_daemon_open(app: &AppHandle) -> bool {
     let Some(focused) = app
         .webview_windows()
         .into_values()
@@ -819,11 +823,7 @@ pub(crate) fn focused_ws_open(app: &AppHandle) -> bool {
         return false;
     };
     app.try_state::<Shell>()
-        .map(|shell| {
-            lock(&shell.windows)
-                .get(focused.label())
-                .is_some_and(|s| s.ws.is_some())
-        })
+        .map(|shell| lock(&shell.windows).contains_key(focused.label()))
         .unwrap_or(false)
 }
 
@@ -940,6 +940,7 @@ pub(crate) fn finish_startup(handle: &tauri::AppHandle, local: LocalDaemon) -> t
     if fresh {
         handle.manage(Shell {
             local: Mutex::new(local),
+            pro: pro::Pro::load(),
             tunnels: tokio::sync::Mutex::new(HashMap::new()),
             unhealthy_tunnels: Mutex::new(HashSet::new()),
             wedge_suspects: Mutex::new(HashSet::new()),
@@ -965,11 +966,16 @@ pub(crate) fn finish_startup(handle: &tauri::AppHandle, local: LocalDaemon) -> t
         });
     } else {
         *lock(&handle.state::<Shell>().local) = local;
+        let app = handle.clone();
+        tauri::async_runtime::spawn(async move {
+            pro::refresh_serve(&app.state::<Shell>()).await;
+        });
     }
     if fresh {
         // Before any window opens: the watchers start polling right away,
         // and a window's first scope report may already owe it a focus.
         notices::start(handle);
+        pro::start(handle.clone());
     }
     // Reopen last session's windows. Restore itself registers a home surface
     // before launching any remote ssh that may need askpass, and also covers
@@ -1026,6 +1032,13 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_clipboard_manager::init())
         .invoke_handler(tauri::generate_handler![
+            pro::pro_status,
+            pro::pro_sign_in,
+            pro::pro_sign_out,
+            pro::pro_sign_out_everywhere,
+            pro::pro_hosts,
+            pro::pro_set_host_kept,
+            pro::pro_devices,
             commands::list_hosts,
             commands::add_host,
             commands::remove_host,
@@ -1277,6 +1290,7 @@ pub fn run() {
                 if let Some(state) = app.try_state::<Shell>() {
                     lock(&state.registry).save_if_dirty();
                     tauri::async_runtime::block_on(async {
+                        pro::stop(&state).await;
                         let tunnels: Vec<_> =
                             state.tunnels.lock().await.drain().map(|(_, t)| t).collect();
                         for tunnel in tunnels {

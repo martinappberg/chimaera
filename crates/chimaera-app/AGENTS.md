@@ -37,11 +37,13 @@ in-app SSH askpass, a signed auto-updater). Parent map: repo-root
 | `shell.rs` | Module root: app-global `Shell` state, `WindowScope`, `lock`, and the Tauri `Builder` assembly (`run`). Re-exports `open_ui_window`. |
 | `shell/commands.rs` | The IPC command surface (`#[tauri::command]` fns wired into `generate_handler!`) — thin delegators. |
 | `shell/connect.rs` | The `connect` flight state machine (one coalesced ssh attempt per host; a flight for a wedge suspect — or with no live tunnel — first clears a wedged ControlMaster, before the old tunnel's teardown — both masters for an alias routed to its daemon's login node) + the host-row wire vocabulary (`HostState` — incl. `node`, the login node a pool alias is pinned to — /`HostStatus`, and the `routing` progress phase) + `with_hosts`, the app's single path to hosts.json (serialized, off the reactor via `spawn_blocking`; the CLI writes it directly in crates/chimaera/src/connect.rs). |
+| `shell/pro.rs` | Optional account runtime: endpoint in app.json, OS-keychain tokens, PKCE loopback sign-in, bounded keeper cache/events, reverse local-daemon sharing, and account IPC. No endpoint means no keychain access or network work. |
+| `shell/tunnel.rs` | App-only SSH / keeper transport wrapper. Both expose one loopback daemon endpoint; keep chimaera-link out of the daemon dependency graph. |
 | `shell/restore.rs` | `open_ui_window`, the tunnel health monitor (a 3 s `interval` tick — a down host's probe burns its 2 s timeout inside it; 3-miss hysteresis; confirmed-down keys back off per miss up to 10 ticks, compute keys 2; a `down` edge files a wedge suspect), and launch-time window restore. |
 | `daemon.rs` | Launch/adopt the local daemon; version/parity policy (unix: spawn-self; windows: delegates to `wsl.rs`). |
 | `wsl.rs` | The WSL2 engine: registry-first detection + version gate, hardened wsl.exe spawns, the persisted target (distro + PINNED `-u` user — wsl.json), provision/replace/spawn/probe/stop, connect wiring (pure parts unit-tested on any host; e2e via wsl-smoke). Startup only ADOPTS; anything that provisions runs in the wizard, visibly. |
 | `assets/setup.html` | The Windows first-run wizard (shell-local page — no daemon origin exists yet to serve the real UI). |
-| `askpass.rs` | The `SSH_ASKPASS` ↔ shell wire protocol (in-app password/Duo prompts). Transport: unix socket (unix) / token-gated loopback TCP fed through a WSL-interop wrapper (windows, installed by `wsl::wire_connect`). |
+| `askpass.rs` | The `SSH_ASKPASS` ↔ shell wire protocol (in-app password/Duo prompts). Keeper prompts use the same host/window scope and bounded pending table, with an explicit source and replies confined to the original events connection. Local transport: unix socket (unix) / token-gated loopback TCP fed through a WSL-interop wrapper (windows, installed by `wsl::wire_connect`). |
 | `appearance.rs` | Bounded per-host first-paint palette cache outside volatile daemon origins; persisted atomically and carried in native window URLs. |
 | `shell/commands.rs::open_external` | The ONLY route a rendered link has to the user's real browser: the navigation guard admits just the daemon origin and nothing receives a `target="_blank"`, so an external link is otherwise swallowed. **http/https only** — hrefs are agent-authored and the platform opener would act on `file:`/app schemes. |
 | `shell/unsaved.rs` | Window close / app quit never drop unsaved editor text: the page pushes its unsaved count (`report_unsaved`), so `CloseRequested`/quit decide synchronously; a held one asks the window (`unsaved-prompt` → `reply_unsaved`). Pure `Guard` (unit-tested) + glue; a 4 s hung-page timeout and a third-ask escape keep it from ever trapping the user. Also the macOS `applicationShouldTerminate:` hook (Dock › Quit, logout never reach `ExitRequested`). |
@@ -53,6 +55,19 @@ in-app SSH askpass, a signed auto-updater). Parent map: repo-root
 | `tray.rs` | The menu-bar / system-tray status item (`tray-icon` feature). |
 
 ## Invariants / gotchas
+
+- Account credentials belong only in the OS keychain (macOS Keychain, Windows
+  Credential Manager, Linux Secret Service). app.json stores only the endpoint;
+  hosts.json stores only the additive `kept` preference. Keeper host rows are
+  authoritative while signed in. A 30 s bounded reconciliation discovers new
+  provisioning and removals missed during an events outage; sign-out cancels
+  every account-owned task and listener. The generation fence prevents pending
+  refresh writes and connect flights from restoring a signed-out account.
+  Device-only aliases never fall back to SSH: open windows retain that source in
+  windows.json, including across sign-out/restart; only SSH hosts have that fallback.
+- System-browser sign-in binds an ephemeral IPv4-loopback callback, verifies
+  PKCE state, bounds requests and expires after 180 s. Remote prompt, daemon
+  bearer and account-token data must never appear in Settings host rows or logs.
 
 - **The command list is a lockstep** the type system does NOT fully enforce, so a
   drift only surfaces at runtime: `shell.rs` `generate_handler!` ↔

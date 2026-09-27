@@ -67,6 +67,17 @@ struct PendingPrompt {
     alias: Option<String>,
     prompt: String,
     tx: oneshot::Sender<Option<String>>,
+    source: PromptSource,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PromptSource {
+    Local,
+    Keeper {
+        host_id: String,
+        keeper_prompt_id: String,
+    },
 }
 
 #[derive(Debug, PartialEq)]
@@ -82,6 +93,7 @@ pub struct PromptEvent {
     id: u64,
     alias: Option<String>,
     prompt: String,
+    source: PromptSource,
 }
 
 impl PromptEvent {
@@ -101,8 +113,26 @@ impl Askpass {
         prompt: String,
         tx: oneshot::Sender<Option<String>>,
     ) -> u64 {
+        self.register_source(alias, prompt, tx, PromptSource::Local)
+    }
+
+    fn register_source(
+        &self,
+        alias: Option<String>,
+        prompt: String,
+        tx: oneshot::Sender<Option<String>>,
+        source: PromptSource,
+    ) -> u64 {
         let id = self.seq.fetch_add(1, Ordering::Relaxed);
-        lock(&self.pending).insert(id, PendingPrompt { alias, prompt, tx });
+        lock(&self.pending).insert(
+            id,
+            PendingPrompt {
+                alias,
+                prompt,
+                tx,
+                source,
+            },
+        );
         id
     }
 
@@ -142,10 +172,82 @@ impl Askpass {
                 id: *id,
                 alias: p.alias.clone(),
                 prompt: p.prompt.clone(),
+                source: p.source.clone(),
             })
             .collect();
         prompts.sort_by_key(|p| p.id);
         prompts
+    }
+}
+
+/// Keeper prompts share local SSH's scope and timeout, but answers travel only
+/// on their original events connection. Dropping it cancels every pending input.
+pub(crate) fn relay_keeper(
+    app: &AppHandle,
+    alias: String,
+    host_id: String,
+    keeper_prompt_id: String,
+    prompt: String,
+    commands: tokio::sync::mpsc::Sender<chimaera_link::EventCommand>,
+) {
+    let askpass = app.state::<Askpass>();
+    // The remote peer cannot grow the prompt table without bound.
+    if lock(&askpass.pending).len() >= 64 {
+        return;
+    }
+    let (tx, rx) = oneshot::channel();
+    let source = PromptSource::Keeper {
+        host_id,
+        keeper_prompt_id: keeper_prompt_id.clone(),
+    };
+    let id = askpass.register_source(Some(alias.clone()), prompt.clone(), tx, source.clone());
+    let event = PromptEvent {
+        id,
+        alias: Some(alias.clone()),
+        prompt,
+        source,
+    };
+    emit_scoped(app, "ssh-askpass", event, Some(&alias));
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let answer = tokio::time::timeout(PROMPT_TIMEOUT, rx).await;
+        app.state::<Askpass>().discard(id);
+        emit_done(&app, id, Some(&alias));
+        let value = match answer {
+            Ok(Ok(value)) => value,
+            Err(_) => None,
+            Ok(Err(_)) => return,
+        };
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            commands.send(chimaera_link::EventCommand::Answer {
+                id: keeper_prompt_id,
+                value,
+            }),
+        )
+        .await;
+    });
+}
+
+pub(crate) fn close_keeper(app: &AppHandle, keeper_id: Option<&str>) {
+    let askpass = app.state::<Askpass>();
+    let closed: Vec<_> = {
+        let mut pending = lock(&askpass.pending);
+        let ids: Vec<_> = pending
+            .iter()
+            .filter_map(|(id, prompt)| match &prompt.source {
+                PromptSource::Keeper {
+                    keeper_prompt_id, ..
+                } if keeper_id.is_none_or(|wanted| wanted == keeper_prompt_id) => Some(*id),
+                _ => None,
+            })
+            .collect();
+        ids.into_iter()
+            .filter_map(|id| pending.remove(&id).map(|prompt| (id, prompt.alias)))
+            .collect()
+    };
+    for (id, alias) in closed {
+        emit_done(app, id, alias.as_deref());
     }
 }
 
@@ -429,7 +531,12 @@ async fn resolve_prompt(app: &AppHandle, alias: Option<String>, prompt: String) 
     let (tx, rx) = oneshot::channel();
     let prompt = prompt.trim_end().to_string();
     let id = state.register(alias.clone(), prompt.clone(), tx);
-    let event = PromptEvent { id, alias, prompt };
+    let event = PromptEvent {
+        id,
+        alias,
+        prompt,
+        source: PromptSource::Local,
+    };
     // Emit only to matching windows that are ALREADY listening. Windows that
     // mount later find this prompt through the equally scoped list command;
     // zero targets at emit time is fine during startup restore.
@@ -633,6 +740,45 @@ mod tests {
             AnswerResult::Answered(Some("remote-2".into()))
         );
         assert_eq!(rx.blocking_recv().unwrap(), Some("secret".into()));
+    }
+
+    #[test]
+    fn keeper_prompts_use_the_same_host_scope_and_preserve_source() {
+        let askpass = Askpass::default();
+        let (tx, rx) = oneshot::channel();
+        let id = askpass.register_source(
+            Some("cluster".into()),
+            "Duo code:".into(),
+            tx,
+            PromptSource::Keeper {
+                host_id: "host-1".into(),
+                keeper_prompt_id: "prompt-1".into(),
+            },
+        );
+        let foreign = crate::shell::WindowScope::new(
+            Some("other".into()),
+            Some("work".into()),
+            "other-window".into(),
+        );
+        assert!(askpass.pending_scoped(&foreign).is_empty());
+        assert_eq!(
+            askpass.answer_scoped(id, Some("wrong".into()), &foreign),
+            AnswerResult::Forbidden
+        );
+        let scope = crate::shell::WindowScope::new(
+            Some("cluster".into()),
+            Some("work".into()),
+            "cluster-window".into(),
+        );
+        let pending = askpass.pending_scoped(&scope);
+        assert!(
+            matches!(&pending[0].source, PromptSource::Keeper { keeper_prompt_id, .. } if keeper_prompt_id == "prompt-1")
+        );
+        assert_eq!(
+            askpass.answer_scoped(id, None, &scope),
+            AnswerResult::Answered(Some("cluster".into()))
+        );
+        assert_eq!(rx.blocking_recv().unwrap(), None);
     }
 
     #[test]

@@ -346,7 +346,12 @@ fn open_shell_window(
     // Shell before opening any window, so every daemon window registered
     // above has an authoritative scope before its first native command.
     if let Some(shell) = app.try_state::<Shell>() {
-        lock(&shell.registry).upsert(record.clone());
+        let mut persisted = record.clone();
+        persisted.link_device |= record
+            .alias
+            .as_deref()
+            .is_some_and(|alias| shell.pro.is_device(alias));
+        lock(&shell.registry).upsert(persisted);
     }
     // A new window changes the tray's open-windows list.
     crate::tray::rebuild(app);
@@ -396,7 +401,7 @@ pub(super) fn spawn_health_monitor(handle: AppHandle) {
                         port: tunnel.local_port,
                         token: tunnel.manifest.token.clone(),
                         is_compute: false,
-                        node: tunnel.route.node().map(str::to_string),
+                        node: tunnel.node().map(str::to_string),
                     })
                     .collect()
             };

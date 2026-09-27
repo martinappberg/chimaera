@@ -19,6 +19,7 @@
     navigateHome,
     onConnectProgress,
     onHostStatus,
+    onProChanged,
     openWindow,
     remoteComputeSessions,
     remoteWorkspaces,
@@ -63,6 +64,7 @@
     onStop: (w: Workspace) => void;
     /** Open the folder picker (browse/register a new folder). */
     onOpenFolder: () => void;
+    onSettings: () => void;
   }
 
   let {
@@ -75,6 +77,7 @@
     onRemove,
     onStop,
     onOpenFolder,
+    onSettings,
   }: Props = $props();
 
   const native = isNativeShell();
@@ -302,12 +305,13 @@
     if (hostLabel === "local") {
       void checkAppUpdate().then((v) => (appUpdate = v));
     }
-    const unlisteners: Array<() => void> = [];
+    const unlisteners: Array<() => void> = [asyncDisposer(onProChanged(() => { if (document.visibilityState === "visible") void refreshHosts(); }))];
     // Local home: pause the compute-indicator refresh while hidden, and
     // catch up the moment the page is visible again.
     const onVis = (): void => {
       docVisible = document.visibilityState === "visible";
       if (docVisible) {
+        void refreshHosts();
         for (const h of hosts) {
           if (h.status === "connected") void refreshCompute(h.alias);
         }
@@ -840,6 +844,7 @@
         >{/if}
     </button>
   {/if}
+  <button class="home-settings" onclick={onSettings} title="Settings ({keyHint("settings")})">Settings</button>
   <div class="inner">
     <header class="masthead">
       <div class="masthead-leading">
@@ -1291,6 +1296,9 @@
                             : "not connected"}
                       ></span>
                       <span class="name">{h.alias}</span>
+                      {#if h.via_pro}
+                        <span class="via-pro" title="Connected through Chimaera Pro">via Pro</span>
+                      {/if}
                       {#if localState?.dev_build}
                         <span
                           class="pill-dev"
@@ -1444,6 +1452,25 @@
 </div>
 
 <style>
+  .home-settings {
+    position: absolute;
+    right: 20px;
+    bottom: 18px;
+    border: 0;
+    background: transparent;
+    color: var(--muted);
+    font: inherit;
+    cursor: pointer;
+  }
+  .home-settings:hover { color: var(--fg); }
+
+  .via-pro {
+    flex: none;
+    font-size: var(--text-xs);
+    color: var(--muted);
+    white-space: nowrap;
+  }
+
   .home {
     position: absolute;
     inset: 0;

@@ -321,6 +321,7 @@
   import { hintsActive, initChordHints } from "./lib/shared/chordHints.svelte";
   import FolderPicker from "./lib/workspace/FolderPicker.svelte";
   import HomeScreen from "./lib/workspace/HomeScreen.svelte";
+  import { loadPaneView } from "./lib/layout/lazyViews";
   import AskpassModal from "./lib/workspace/AskpassModal.svelte";
   import ContextMenuHost from "./lib/shared/ContextMenuHost.svelte";
   import { contextMenu } from "./lib/shared/contextMenu.svelte";
@@ -1685,7 +1686,8 @@
         onMenu((action) => {
           switch (action) {
             case "close-view":
-              if (activeWsId === null) closeThisWindow();
+              if (homeSettingsOpen) homeSettingsOpen = false;
+              else if (activeWsId === null) closeThisWindow();
               else if (layoutReady) closeView(layout.focusedPaneId);
               break;
             case "new-terminal":
@@ -2514,6 +2516,16 @@
       return;
     }
     if (pickerOpen) return;
+    if (homeSettingsOpen && e.key === "Escape") {
+      intercept();
+      homeSettingsOpen = false;
+      return;
+    }
+    if (hit?.id === "settings" && activeWsId === null) {
+      intercept();
+      openSettingsSurface();
+      return;
+    }
     if (activeWsId === null || !layoutReady) return;
 
     if (hit?.id === "quickOpen") {
@@ -2814,6 +2826,7 @@
       ? workspaces.map((x) => (x.id === w.id ? w : x))
       : [w, ...workspaces];
     closePicker();
+    homeSettingsOpen = false;
     createError = null;
     // Stamp recency for the home screen (fire-and-forget; old daemons 404).
     void touchWorkspace(w.id).catch(() => {});
@@ -3179,10 +3192,17 @@
     if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
   }
 
-  /** Open/focus the settings surface (gear button, ⌘,). Needs a workspace —
-   *  the settings tab lives in the layout like any other surface. */
+  let homeSettingsOpen = $state(false);
+  let homeSettingsLoad = $state<ReturnType<typeof loadPaneView> | null>(null);
+
+  /** Account settings are useful before the first workspace exists. */
   function openSettingsSurface(): void {
-    if (activeWsId === null || !layoutReady) return;
+    if (activeWsId === null) {
+      homeSettingsLoad = loadPaneView("settings");
+      homeSettingsOpen = true;
+      return;
+    }
+    if (!layoutReady) return;
     layout = openSettings(layout);
     if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
   }
@@ -4647,6 +4667,21 @@
     <!-- Home: a real launcher, not an empty IDE. The rail and stage only
          exist once a workspace scopes this window. A Mastermind is never a
          worker: keep it out of the per-workspace live/attention rollups. -->
+    {#if homeSettingsOpen}
+      <div class="home-settings-surface">
+        <button class="home-settings-back" onclick={() => (homeSettingsOpen = false)}>← Home</button>
+        <div class="home-settings-content">
+          {#await homeSettingsLoad}
+            <p>Loading settings…</p>
+          {:then SettingsView}
+            {#if SettingsView}<SettingsView />{/if}
+          {:catch error}
+            <p role="alert">Couldn't load settings: {String(error)}</p>
+            <button onclick={openSettingsSurface}>Retry</button>
+          {/await}
+        </div>
+      </div>
+    {:else}
     <HomeScreen
       {workspaces}
       sessions={sessions.filter((s) => !isMastermind(s))}
@@ -4657,7 +4692,9 @@
       onRemove={removeWorkspace}
       onStop={stopWorkspace}
       onOpenFolder={openPicker}
+      onSettings={openSettingsSurface}
     />
+    {/if}
   {:else}
   <div class="body" bind:clientWidth={bodyWidth}>
     <aside
@@ -5809,6 +5846,31 @@
 {/if}
 
 <style>
+  .home-settings-surface {
+    position: absolute;
+    inset: 38px 16px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+  .home-settings-back {
+    align-self: flex-start;
+    color: var(--fg);
+    background: transparent;
+    border: 0;
+    padding: 4px 8px;
+    font: inherit;
+    cursor: pointer;
+  }
+  .home-settings-content {
+    position: relative;
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+    border: 1px solid var(--edge);
+    border-radius: 8px;
+  }
+
   .shell {
     display: flex;
     flex-direction: column;

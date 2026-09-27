@@ -68,6 +68,9 @@ pub struct HostEntry {
     pub added_at: u64,
     #[serde(default)]
     pub last_connected_at: Option<u64>,
+    /// Cached account preference; a signed-out client can still use ordinary ssh.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub kept: bool,
 }
 
 /// In-memory host list backed by a JSON file (save-on-change).
@@ -164,10 +167,26 @@ impl HostsStore {
             binary,
             added_at: unix_now(),
             last_connected_at: None,
+            kept: false,
         };
         self.items.push(entry.clone());
         self.save()?;
         Ok(entry)
+    }
+
+    /// Cache the keeper's preference without storing account or daemon tokens.
+    pub fn set_kept(&mut self, alias: &str, kept: bool) -> anyhow::Result<HostEntry> {
+        let alias = normalize_alias(alias)?;
+        self.add(&alias, None)?;
+        let entry = self
+            .items
+            .iter_mut()
+            .find(|entry| entry.alias == alias)
+            .context("host missing after add")?;
+        entry.kept = kept;
+        let result = entry.clone();
+        self.save()?;
+        Ok(result)
     }
 
     /// Forget `alias`. Returns whether it existed.
@@ -195,6 +214,7 @@ impl HostsStore {
                     binary: None,
                     added_at: unix_now(),
                     last_connected_at: Some(unix_now()),
+                    kept: false,
                 };
                 self.items.push(entry.clone());
                 entry
@@ -399,5 +419,28 @@ mod tests {
         );
         assert_eq!(aliases.iter().filter(|a| *a == "cluster").count(), 1);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn kept_preference_is_additive_and_contains_no_credentials() {
+        let (mut store, dir) = tmp_store("kept");
+        let entry = store.add("cluster", None).unwrap();
+        assert!(!entry.kept);
+        assert!(store.set_kept("ssh cluster", true).unwrap().kept);
+        let saved = HostsStore::load(dir.join("hosts.json"));
+        assert!(saved.get("cluster").unwrap().kept);
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("hosts.json")).unwrap())
+                .unwrap();
+        assert!(json[0].get("token").is_none());
+        assert!(json[0].get("refresh_token").is_none());
+        store.set_kept("cluster", false).unwrap();
+        assert!(
+            !HostsStore::load(dir.join("hosts.json"))
+                .get("cluster")
+                .unwrap()
+                .kept
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

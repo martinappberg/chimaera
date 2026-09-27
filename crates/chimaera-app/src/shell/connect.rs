@@ -5,11 +5,12 @@
 use std::collections::HashSet;
 
 use chimaera_remote::hosts::{HostEntry, HostsStore};
-use chimaera_remote::{ComputeTunnel, ConnectOpts, Phase, Tunnel};
+use chimaera_remote::{ComputeTunnel, ConnectOpts, Phase};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 
 use super::restore::open_ui_window;
+use super::tunnel::Tunnel;
 use super::{authorize_scope_origin, lock, ConnectFlight, Shell};
 use crate::windows::WindowRecord;
 
@@ -50,6 +51,8 @@ pub struct HostState {
     /// login nodes and the connection is pinned to one other than where a
     /// new ssh connection lands (`None` = wherever the alias lands).
     node: Option<String>,
+    via_pro: bool,
+    kept: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -136,7 +139,9 @@ pub(super) fn state_for(
         outdated: tunnel.is_some_and(|t| t.outdated),
         remote_build: tunnel.and_then(|t| t.remote_build.clone()),
         live_sessions: tunnel.and_then(|t| t.live_sessions),
-        node: tunnel.and_then(|t| t.route.node().map(str::to_string)),
+        node: tunnel.and_then(|t| t.node().map(str::to_string)),
+        via_pro: tunnel.is_some_and(|t| t.link_id().is_some()),
+        kept: entry.kept,
     }
 }
 
@@ -163,7 +168,7 @@ async fn publish_connected_state(app: &AppHandle, state: &Shell, alias: &str) ->
                 tunnel.local_port,
                 &tunnel.manifest.token,
                 tunnel.manifest.build.as_deref(),
-                tunnel.route.node(),
+                tunnel.node(),
             ),
         )
     };
@@ -210,6 +215,7 @@ async fn run_connect(
         emit_progress_at(&progress_app, &progress_alias, phase, node);
     })
     .await
+    .map(Tunnel::from)
 }
 
 /// One `connect-progress` event: the phase label a host row shows.
@@ -284,6 +290,10 @@ pub(super) async fn do_connect(
         let reused = if update_daemon {
             None
         } else {
+            let via_pro = state.pro.client().await.is_some()
+                && lock(&state.pro.hosts)
+                    .values()
+                    .any(|host| host.alias == alias);
             // Probe liveness WITHOUT holding the tunnels lock: this is a ~2s
             // HTTP round-trip, and holding the map locked across it would
             // stall every other tunnel op. A 401 from a stale/foreign daemon
@@ -293,6 +303,7 @@ pub(super) async fn do_connect(
                 .lock()
                 .await
                 .get(&alias)
+                .filter(|tunnel| tunnel.link_id().is_some() == via_pro)
                 .map(|t| (t.local_port, t.manifest.token.clone()));
             if let Some((port, token)) = endpoint {
                 if chimaera_remote::http_alive_authed(port, &token).await {
@@ -351,6 +362,9 @@ async fn run_flight(
     // tunnel's teardown below — to the row's "probing" label (the same one
     // `connect` re-emits when it starts).
     emit_progress(app, alias, "probing");
+    if let Some((client, host, generation)) = super::pro::connection(&state, alias).await? {
+        return run_link_flight(app, client, host, generation, update_daemon).await;
+    }
     // Remove under the map lock, then do process/network teardown without it.
     // `Tunnel::close` is bounded but still asynchronous; holding this lock made
     // one dead host freeze health checks and commands for every other host.
@@ -443,6 +457,124 @@ async fn run_flight(
     Ok(host_state)
 }
 
+async fn run_link_flight(
+    app: &AppHandle,
+    client: chimaera_link::Client,
+    mut host: chimaera_link::Host,
+    generation: u64,
+    reconnect: bool,
+) -> Result<HostState, String> {
+    let state = app.state::<Shell>();
+    let alias = host.alias.clone();
+    if state.pro.generation() != generation {
+        return Err("Account changed while connecting".into());
+    }
+    if reconnect || host.status != chimaera_link::HostStatus::Connected {
+        client
+            .reconnect_host(&host.id)
+            .await
+            .map_err(|error| error.to_string())?;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(180);
+        loop {
+            if state.pro.generation() != generation {
+                return Err("Account changed while connecting".into());
+            }
+            let hosts = client.hosts().await.map_err(|error| error.to_string())?;
+            host = hosts
+                .into_iter()
+                .find(|candidate| candidate.id == host.id)
+                .ok_or("Host is no longer kept connected")?;
+            if host.status == chimaera_link::HostStatus::Connected && host.daemon.is_some() {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(host
+                    .error
+                    .unwrap_or_else(|| "Pro connection timed out".into()));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    }
+    let existing = {
+        let mut tunnels = state.tunnels.lock().await;
+        tunnels
+            .get_mut(&alias)
+            .filter(|tunnel| tunnel.link_id() == Some(host.id.as_str()))
+            .map(|tunnel| {
+                tunnel.update_link(&host);
+                (tunnel.local_port, tunnel.manifest.token.clone())
+            })
+    };
+    let new = if existing.is_none() {
+        let link = chimaera_link::LinkTunnel::bind(client, host.id.clone())
+            .await
+            .map_err(|error| error.to_string())?;
+        Some(Tunnel::link(&host, link).map_err(|error| error.to_string())?)
+    } else {
+        None
+    };
+    let (port, token) = existing
+        .or_else(|| {
+            new.as_ref()
+                .map(|tunnel| (tunnel.local_port, tunnel.manifest.token.clone()))
+        })
+        .ok_or("Host is unavailable")?;
+    if !chimaera_remote::http_alive_authed(port, &token).await {
+        return Err("Pro connected, but the host daemon did not answer".into());
+    }
+    authorize_scope_origin(app, Some(&alias), port).map_err(|error| error.to_string())?;
+    let old = {
+        let mut tunnels = state.tunnels.lock().await;
+        // Sign-out drains under the same map lock after advancing this epoch.
+        // An in-flight health check must never reinstall its old account.
+        if state.pro.generation() != generation {
+            return Err("Account changed while connecting".into());
+        }
+        new.and_then(|tunnel| tunnels.insert(alias.clone(), tunnel))
+    };
+    if let Some(old) = old {
+        old.close().await;
+    }
+    let mut entry = if host.kind == chimaera_link::HostKind::Ssh {
+        let saved_alias = alias.clone();
+        with_hosts(move |hosts| {
+            hosts.set_kept(&saved_alias, true)?;
+            hosts.record_connected(&saved_alias)
+        })
+        .await?
+    } else {
+        host_entry(&alias).await
+    };
+    entry.kept = true;
+    lock(&state.host_entries).insert(alias.clone(), entry);
+    let reply = publish_connected_state(app, &state, &alias)
+        .await
+        .ok_or("Host disconnected while connecting")?;
+    reopen_windows(app, &alias, port, &token);
+    Ok(reply)
+}
+
+pub(super) fn keeper_state(host: &chimaera_link::Host, tunnel: Option<&Tunnel>) -> HostState {
+    let entry = HostEntry {
+        alias: host.alias.clone(),
+        binary: None,
+        added_at: 0,
+        last_connected_at: None,
+        kept: true,
+    };
+    let status = match host.status {
+        chimaera_link::HostStatus::Connecting | chimaera_link::HostStatus::Prompting => {
+            "connecting"
+        }
+        chimaera_link::HostStatus::Connected if tunnel.is_some() => "connected",
+        _ => "disconnected",
+    };
+    let mut state = state_for(&entry, status, tunnel);
+    state.via_pro = tunnel.is_none_or(|tunnel| tunnel.link_id().is_some());
+    state.error = host.error.clone();
+    state
+}
+
 /// Open every persisted window record for `alias` without a live window
 /// (matched on the record's stable id — an open window re-homes in place
 /// and must not be duplicated).
@@ -524,6 +656,7 @@ async fn host_entry(alias: &str) -> HostEntry {
             binary: None,
             added_at: 0,
             last_connected_at: None,
+            kept: false,
         })
 }
 

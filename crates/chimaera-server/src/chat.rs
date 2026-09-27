@@ -808,6 +808,34 @@ async fn degrade_to_pty(
             .map(|record| record.key.clone());
         if let Some(key) = key {
             argv.extend(crate::codex_notify::args(state, id, &key).await);
+            // A chat->terminal switch can be closed or restarted before its
+            // first TUI turn. Carry its already-existing rollout now rather
+            // than relying on a notify that may never arrive.
+            if let Some(thread) = recipe.resume.clone() {
+                if let Some(home) = state
+                    .codex_config_path
+                    .parent()
+                    .map(std::path::Path::to_path_buf)
+                {
+                    let cwd = recipe.workspace_root.clone();
+                    let sought = thread.clone();
+                    let rollout = tokio::task::spawn_blocking(move || {
+                        crate::codex_notify::find_rollout(&home, &sought, &cwd)
+                    })
+                    .await
+                    .ok()
+                    .flatten();
+                    if let Some(path) = rollout {
+                        if let Some(record) = crate::lock(&state.agents)
+                            .get_mut(id)
+                            .filter(|record| record.key == key)
+                        {
+                            record.codex_thread_id = Some(thread);
+                            record.transcript_path = Some(path);
+                        }
+                    }
+                }
+            }
         }
     }
     // A degrade respawn is a real spawn too — same prelude as the chat

@@ -46,6 +46,13 @@ pub const DAEMON_UI_COMMANDS: &[&str] = &[
     "answer_askpass",
     "list_askpass",
     "cache_appearance",
+    "pro_status",
+    "pro_sign_in",
+    "pro_sign_out",
+    "pro_sign_out_everywhere",
+    "pro_hosts",
+    "pro_set_host_kept",
+    "pro_devices",
 ];
 
 // The application crate consumes only the daemon list at runtime; this list is

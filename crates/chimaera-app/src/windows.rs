@@ -35,6 +35,10 @@ pub struct WindowRecord {
     pub id: String,
     /// Host alias; `None` = the local daemon.
     pub alias: Option<String>,
+    /// A reverse-connected device has no implied SSH destination. Preserve this
+    /// routing boundary across sign-out and app restart.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub link_device: bool,
     /// Workspace id; `None` = the home screen.
     pub ws: Option<String>,
     /// Present on a compute-node window (never reopened at launch). The
@@ -64,6 +68,7 @@ impl WindowRecord {
             // Matches the view-state key alphabet ([A-Za-z0-9_-]{1,64}).
             id: format!("w-{}", &chimaera_core::generate_token()[..16]),
             alias,
+            link_device: false,
             ws,
             compute: None,
             detached: false,
@@ -129,14 +134,28 @@ impl WindowRegistry {
     }
 
     /// Update what a window shows (the SPA swaps workspaces client-side).
-    pub fn set_scope(&mut self, id: &str, alias: Option<String>, ws: Option<String>) {
+    pub fn set_scope(
+        &mut self,
+        id: &str,
+        alias: Option<String>,
+        ws: Option<String>,
+        link_device: bool,
+    ) {
         if let Some(record) = self.items.iter_mut().find(|r| r.id == id) {
-            if record.alias != alias || record.ws != ws {
+            let link_device = link_device || (record.alias == alias && record.link_device);
+            if record.alias != alias || record.ws != ws || record.link_device != link_device {
+                record.link_device = link_device;
                 record.alias = alias;
                 record.ws = ws;
                 self.persist();
             }
         }
+    }
+
+    pub fn is_link_device(&self, alias: &str) -> bool {
+        self.items
+            .iter()
+            .any(|record| record.alias.as_deref() == Some(alias) && record.link_device)
     }
 
     /// Update a window's detachedness (a torn-off pane re-attaching, or a
@@ -213,6 +232,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn device_routing_survives_restart_and_workspace_changes() {
+        let dir = std::env::temp_dir().join(format!(
+            "chimaera-device-routing-{}",
+            chimaera_core::generate_token()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("windows.json");
+        let mut registry = WindowRegistry::load(path.clone());
+        let mut device = WindowRecord::new(Some("other-laptop".into()), Some("ws-1".into()));
+        device.link_device = true;
+        let id = device.id.clone();
+        registry.upsert(device);
+        let mut restored = WindowRegistry::load(path.clone());
+        assert!(restored.is_link_device("other-laptop"));
+        restored.set_scope(&id, Some("other-laptop".into()), Some("ws-2".into()), false);
+        assert!(WindowRegistry::load(path.clone()).is_link_device("other-laptop"));
+        restored.set_scope(&id, None, None, false);
+        assert!(!WindowRegistry::load(path).is_link_device("other-laptop"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn registry_round_trips_and_removes() {
         let dir =
             std::env::temp_dir().join(format!("chimaera-windows-test-{}", std::process::id()));
@@ -228,7 +269,7 @@ mod tests {
         reg.set_geometry(&id, 10.0, 20.0, 1280.0, 840.0);
         reg.save_if_dirty();
         record.ws = Some("ws-2".into());
-        reg.set_scope(&id, record.alias.clone(), record.ws.clone());
+        reg.set_scope(&id, record.alias.clone(), record.ws.clone(), false);
 
         let loaded = WindowRegistry::load(path.clone());
         let rows = loaded.list();

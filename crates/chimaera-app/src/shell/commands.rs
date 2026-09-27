@@ -83,9 +83,18 @@ pub(super) async fn list_hosts(state: State<'_, Shell>) -> Result<Vec<HostState>
     let tunnels = state.tunnels.lock().await;
     let connecting: HashSet<String> = lock(&state.connecting).keys().cloned().collect();
     let unhealthy = lock(&state.unhealthy_tunnels).clone();
-    Ok(hosts
+    let keeper = lock(&state.pro.hosts).clone();
+    let mut out: Vec<_> = hosts
         .iter()
         .map(|h| {
+            if let Some(host) = keeper.values().find(|host| host.alias == h.alias) {
+                return super::connect::keeper_state(
+                    host,
+                    tunnels
+                        .get(&h.alias)
+                        .filter(|_| !unhealthy.contains(&h.alias)),
+                );
+            }
             if connecting.contains(&h.alias) {
                 state_for(h, "connecting", None)
             } else if let Some(t) = tunnels
@@ -97,7 +106,18 @@ pub(super) async fn list_hosts(state: State<'_, Shell>) -> Result<Vec<HostState>
                 state_for(h, "disconnected", None)
             }
         })
-        .collect())
+        .collect();
+    for host in keeper.values() {
+        if !hosts.iter().any(|entry| entry.alias == host.alias) {
+            out.push(super::connect::keeper_state(
+                host,
+                tunnels
+                    .get(&host.alias)
+                    .filter(|_| !unhealthy.contains(&host.alias)),
+            ));
+        }
+    }
+    Ok(out)
 }
 
 /// Which home a connect targets is the BUILD's property (a dev build always
@@ -261,6 +281,7 @@ pub(super) async fn update_local_daemon(
     authorize_scope_origin(&app, None, fresh.port)
         .map_err(|e| format!("could not authorize the updated daemon origin: {e}"))?;
     *lock(&state.local) = fresh;
+    super::pro::refresh_serve(&state).await;
     let _ = app.emit("local-daemon-updated", moved);
     Ok(())
 }
@@ -1492,7 +1513,10 @@ pub(super) fn report_window_scope(
     super::notices::window_scoped(webview.app_handle(), webview.label(), &alias, &ws);
     if (!home_hub || reclaimed_home) && !stable_id.is_empty() {
         let mut registry = lock(&state.registry);
-        registry.set_scope(&stable_id, registered_alias, ws);
+        let link_device = registered_alias
+            .as_deref()
+            .is_some_and(|alias| state.pro.is_device(alias));
+        registry.set_scope(&stable_id, registered_alias, ws, link_device);
         // Detachedness follows into the record so the NEXT launch reopens
         // the window in the mode it actually ended up in.
         if detached_changed {
