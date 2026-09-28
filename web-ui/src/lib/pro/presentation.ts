@@ -32,6 +32,8 @@ export function cloudCopy(state: string, reason: string | null, _phase?: CloudPr
 }
 export function friendlyError(reason: unknown, fallback: string): string {
   const text = reason instanceof Error ? reason.message : String(reason);
+  if (text === "account_restore_locked") return "Chimaera couldn’t read your saved sign-in. Unlock your computer’s credential store, then choose Check again.";
+  if (text === "account_restore_unavailable") return "Chimaera couldn’t confirm your saved sign-in yet. Check your connection, then choose Check again. Your local work remains available.";
   if (text === "account_credentials_unsaved") return "You’re signed in, but Chimaera couldn’t save your session securely. Check your computer’s credential store and free disk space, then choose Check again. You may need to sign in again after restarting the app.";
   if (/expired|sign.in required|sign in first|authorization revoked/i.test(text)) return "Your sign-in has expired. Sign in again to continue.";
   if (/Could not open.*browser/i.test(text)) return "Your browser couldn't open. Please try again.";
@@ -85,4 +87,8 @@ export function cloudProjectStatus(projects: MirrorStatus | null, workspaceId?: 
   const copied = rows.filter(p => p.mirror?.last_mirrored_at != null).length;
   if (copied) return { title: "Cloud copies saved", detail: `${copied} ${copied === 1 ? "project has" : "projects have"} a completed cloud copy.${copied < rows.length ? " Other projects have not reported a completed copy yet." : ""}`, state: "quiet" };
   return { title: "Waiting for a project copy", detail: "Chimaera is watching your registered projects. No completed cloud copy has been reported yet.", state: "quiet" };
+}
+
+export function recoverableAccountRestore(error: unknown): boolean {
+  return error === "account_restore_locked" || error === "account_restore_unavailable";
 }

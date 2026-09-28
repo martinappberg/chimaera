@@ -43,6 +43,7 @@ in-app SSH askpass, a signed auto-updater). Parent map: repo-root
 | `shell/pro/billing.rs` | Native-owned checkout/portal attempts, exact provider-origin validation, cancellation, and authenticated plan confirmation independent of page visibility. |
 | `shell/pro/billing/callback.rs` | One-use billing return: literal loopback Host, exact nonce/outcome query, bounded request/response and credential-free browser page. |
 | `shell/pro/projects.rs` | Passive cloud project listing and per-project native destination selection; cancellation creates no import request. |
+| `shell/pro/recovery.rs` | Generation-fenced startup candidate retention and coalesced retry ownership; account probe failures do not force new authentication. |
 | `shell/pro/credentials.rs` | Coalesced, generation-fenced credential-store writes with finite retries; persistence failures retain valid memory sessions, and only true revocation signs out. |
 | `shell/pro/auth.rs` | In-memory sign-in attempt lifecycle, cancellation/retry fences and bounded loopback callback parsing. |
 | `assets/sign-in.html` | Credential-free browser return page; success is sent only after native account activation. |
@@ -71,6 +72,14 @@ in-app SSH askpass, a signed auto-updater). Parent map: repo-root
   provisioning and removals missed during an events outage; sign-out cancels
   every account-owned task and listener. The generation fence prevents pending
   refresh writes and connect flights from restoring a signed-out account.
+  Startup retains the same unverified candidate Client across bounded account retries
+  (2, 5 and 15 seconds), including any token rotation before a failed account read.
+  Account probes run outside the operation lock; installation rechecks generation
+  under that lock. A denied or locked credential-store read requires explicit
+  **Check again** instead of repeatedly triggering OS prompts. Exhausted account
+  retries retain the candidate for an explicit retry. Neither case grants account
+  access before a fresh authenticated snapshot; replacement/sign-out fences late
+  results, and true revocation clears the saved session.
   Credential-store failures preserve verified in-memory sessions, including initial
   activation. A single writer retries after 2, 5, 15, 30 and 60 seconds; later token
   rotation or **Check again** starts a fresh attempt. Only exhausted retries show

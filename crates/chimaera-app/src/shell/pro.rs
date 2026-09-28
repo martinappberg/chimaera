@@ -21,6 +21,7 @@ mod auth;
 pub(super) mod billing;
 mod credentials;
 pub(super) mod projects;
+mod recovery;
 
 pub(super) struct Pro {
     endpoint: Option<String>,
@@ -42,6 +43,7 @@ pub(super) struct Pro {
     initialization_phase: Mutex<InitializationPhase>,
     credential_generation: Arc<AtomicU64>,
     credential_persistence: Arc<credentials::Persistence>,
+    recovery: recovery::Recovery<Client>,
 }
 
 struct Runtime {
@@ -110,6 +112,7 @@ impl Pro {
             initialization_phase: Mutex::new(InitializationPhase::Keychain),
             credential_generation: Arc::new(AtomicU64::new(0)),
             credential_persistence: Arc::new(credentials::Persistence::default()),
+            recovery: recovery::Recovery::default(),
         }
     }
 
@@ -261,27 +264,98 @@ fn save_tokens_locked(endpoint: &str, tokens: Option<&Tokens>) -> Result<()> {
 }
 
 pub(super) fn start(app: AppHandle) {
+    restore_account(app);
+}
+
+fn restore_account(app: AppHandle) {
+    let state = app.state::<Shell>();
+    let Some(endpoint) = state.pro.endpoint.clone() else {
+        return;
+    };
+    let expected = state.pro.generation();
+    let Some(attempt) = state.pro.recovery.begin(expected) else {
+        return;
+    };
     tauri::async_runtime::spawn(async move {
         let state = app.state::<Shell>();
-        let Some(endpoint) = state.pro.endpoint.clone() else {
-            return;
-        };
-        let _operation = state.pro.operation.lock().await;
-        let read_endpoint = endpoint.clone();
-        let loaded = tokio::task::spawn_blocking(move || load_tokens(&read_endpoint)).await;
-        let result = async {
-            let Some(tokens) = loaded?? else {
-                return Ok::<_, anyhow::Error>(());
+        for retry in 0..=recovery::RETRIES.len() {
+            if retry > 0 {
+                tokio::time::sleep(Duration::from_secs(recovery::RETRIES[retry - 1])).await;
+            }
+            if !attempt.current(state.pro.generation()) {
+                return;
+            }
+            let client = if let Some(client) = attempt.candidate() {
+                client
+            } else {
+                let read_endpoint = endpoint.clone();
+                let loaded = tokio::task::spawn_blocking(move || load_tokens(&read_endpoint)).await;
+                let _operation = state.pro.operation.lock().await;
+                if !attempt.current(state.pro.generation()) {
+                    return;
+                }
+                match loaded {
+                    Ok(Ok(Some(tokens))) => match Client::new(&endpoint, Some(tokens)) {
+                        Ok(client) => {
+                            attempt.remember(client.clone());
+                            client
+                        }
+                        Err(_) => {
+                            *lock(&state.pro.error) = Some(
+                                "Your saved sign-in could not be restored. Sign in again.".into(),
+                            );
+                            state.pro.ready.send_replace(true);
+                            let _ = app.emit("pro-changed", ());
+                            return;
+                        }
+                    },
+                    Ok(Ok(None)) => {
+                        *lock(&state.pro.error) = None;
+                        state.pro.ready.send_replace(true);
+                        let _ = app.emit("pro-changed", ());
+                        return;
+                    }
+                    _ => {
+                        // Retrying a denied/locked OS prompt automatically is disruptive.
+                        *lock(&state.pro.error) = Some(recovery::READ_WARNING.into());
+                        state.pro.ready.send_replace(true);
+                        let _ = app.emit("pro-changed", ());
+                        return;
+                    }
+                }
             };
-            let client = Client::new(&endpoint, Some(tokens))?;
-            activate(&app, client).await
+            let updates = client.token_updates();
+            if state.pro.initializing(InitializationPhase::Account) {
+                let _ = app.emit("pro-changed", ());
+            }
+            // Network probes do not hold the account operation lock. A newer
+            // sign-in/sign-out can supersede them before any state is installed.
+            let snapshot = account_snapshot(&client).await;
+            let operation = state.pro.operation.lock().await;
+            if !attempt.current(state.pro.generation()) {
+                return;
+            }
+            let restored = activate_snapshot(&app, client.clone(), updates, snapshot).await;
+            state.pro.ready.send_replace(true);
+            match restored {
+                Ok(()) => {
+                    let _ = app.emit("pro-changed", ());
+                    return;
+                }
+                Err(_) if client.tokens().await.is_none() => {
+                    drop(operation);
+                    let _ = sign_out(&app, false, Some(expected)).await;
+                    return;
+                }
+                Err(_) => {
+                    // The same Client retains any refresh rotation even when
+                    // the following account read or credential-store save fails.
+                    *lock(&state.pro.error) = Some(recovery::NETWORK_WARNING.into());
+                    let _ = app.emit("pro-changed", ());
+                }
+            }
+            drop(operation);
         }
-        .await;
-        if let Err(error) = result {
-            *lock(&state.pro.error) = Some(error.to_string());
-        }
-        state.pro.ready.send_replace(true);
-        let _ = app.emit("pro-changed", ());
     });
 }
 
@@ -308,11 +382,22 @@ async fn activate(app: &AppHandle, client: Client) -> Result<()> {
         let _ = app.emit("pro-changed", ());
     }
     let snapshot = account_snapshot(&client).await;
+    activate_snapshot(app, client, updates, snapshot).await
+}
+
+async fn activate_snapshot(
+    app: &AppHandle,
+    client: Client,
+    updates: tokio::sync::watch::Receiver<Option<Tokens>>,
+    snapshot: Result<(Account, Vec<Host>, Option<String>)>,
+) -> Result<()> {
+    let state = app.state::<Shell>();
     let endpoint = state.pro.endpoint.clone().context("endpoint unavailable")?;
     let tokens = client.tokens().await;
     let authenticated = tokens.is_some();
     let stored_endpoint = endpoint.clone();
     if snapshot.is_ok() {
+        state.pro.recovery.cancel();
         let previous = {
             let mut current = lock(&state.pro.client);
             state
@@ -710,11 +795,15 @@ pub async fn pro_status(state: tauri::State<'_, Shell>) -> Result<Status, String
 #[tauri::command]
 pub async fn pro_refresh_account(app: AppHandle) -> Result<(), String> {
     let state = app.state::<Shell>();
-    let (client, generation) = state
-        .pro
-        .client_snapshot()
-        .await
-        .ok_or("Sign in to refresh your account.")?;
+    let Some((client, generation)) = state.pro.client_snapshot().await else {
+        if lock(&state.pro.error).as_deref().is_some_and(|error| {
+            matches!(error, recovery::READ_WARNING | recovery::NETWORK_WARNING)
+        }) {
+            restore_account(app.clone());
+            return Ok(());
+        }
+        return Err("Sign in to refresh your account.".into());
+    };
     state.pro.credential_persistence.retry();
     reconcile_account(&app, &client, generation)
         .await
@@ -749,11 +838,18 @@ pub async fn pro_sign_in(
         .authorization_url(&endpoint, &redirect)
         .map_err(|error| error.to_string())?;
     screen_hint.unwrap_or_default().apply(&mut url);
-    let mut attempt = state
-        .pro
-        .sign_in
-        .begin()
-        .map_err(|error| error.to_string())?;
+    let mut attempt = {
+        let _operation = state.pro.operation.lock().await;
+        let attempt = state
+            .pro
+            .sign_in
+            .begin()
+            .map_err(|error| error.to_string())?;
+        // Keep a possibly rotated candidate for an explicit retry if this
+        // browser sign-in is canceled; its old in-flight probe cannot activate.
+        state.pro.recovery.supersede();
+        attempt
+    };
     *lock(&state.pro.error) = None;
     let _ = app.emit("pro-changed", ());
     let sign_in_app = app.clone();
@@ -867,7 +963,11 @@ pub async fn pro_cancel_sign_in(app: AppHandle) -> Result<(), String> {
         .sign_in
         .cancel_waiting()
         .map_err(|error| error.to_string())?;
-    *lock(&state.pro.error) = None;
+    *lock(&state.pro.error) = state
+        .pro
+        .recovery
+        .has_candidate(state.pro.generation())
+        .then(|| recovery::NETWORK_WARNING.into());
     let _ = app.emit("pro-changed", ());
     Ok(())
 }
@@ -1095,6 +1195,7 @@ async fn sign_out(app: &AppHandle, everywhere: bool, expected: Option<u64>) -> R
             return Ok(());
         }
         state.pro.sign_in.cancel();
+        state.pro.recovery.cancel();
         state.pro.billing.clear();
         *lock(&state.pro.return_target) = None;
         if everywhere {

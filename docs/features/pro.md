@@ -29,6 +29,10 @@ Cloud setup controls are implemented; automatic handoff and browser access are b
    On restart, saved account access shows its current phase immediately. If the
    system Keychain needs a response, the page says so while Home stays usable;
    billing and account changes wait until initialization completes.
+   A temporary account check failure retains the saved session, including refresh
+   token rotation, and retries after 2, 5 and 15 seconds. **Check again** retries
+   after those attempts or a failed credential-store read. A fresh authenticated
+   account check is still required; a revoked session requires a new sign-in.
 3. Signed-out and confirmed no-plan accounts see an illustrated introduction:
    start a session on your computer, continue a supported agent in the cloud,
    then access the same sessions, files and conversation on another device.

@@ -103,3 +103,12 @@ describe("cloud preparation progress", () => {
     expect(cloudPollDelay(false, 0)).toBe(30000);
   });
 });
+
+import { recoverableAccountRestore } from "./presentation";
+describe("saved account recovery", () => {
+  it("offers retry only for the two native restore outcomes", () => {
+    expect(recoverableAccountRestore("account_restore_locked")).toBe(true);
+    expect(recoverableAccountRestore("account_restore_unavailable")).toBe(true);
+    for (const value of [null, "sign in required", "authorization revoked", "some upstream error"]) expect(recoverableAccountRestore(value)).toBe(false);
+  });
+});
