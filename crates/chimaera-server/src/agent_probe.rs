@@ -13,6 +13,13 @@
 //! the TUI sees), time-boxed, output-capped, `kill_on_drop`; ONE probe runs
 //! daemon-wide at a time (a semaphore — three windows on the Plugins tab
 //! must not spawn three app-servers); answers are cached for a minute.
+//!
+//! Probes run under the user's Environment prelude, like sessions do — on
+//! HPC hosts `module load` is how claude and node reach PATH at all. The
+//! host-wide claude answer gets the host scope only; codex's per-directory
+//! answer (and its trust write) gets host ⊕ workspace. All `plugin details`
+//! calls share ONE login shell: the profile plus a prelude can take seconds
+//! per shell on a busy login node, and the gate is held throughout.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::Read as _;
@@ -36,6 +43,23 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(15);
 const RPC_LINE_CAP: usize = 8 * 1024 * 1024;
 /// Plugins whose `details` we ask claude for.
 const DETAILS_MAX: usize = 12;
+/// The whole `details` batch; sections finished by then still count.
+const DETAILS_TIMEOUT: Duration = Duration::from_secs(45);
+/// Every `claude plugin details` in one shell. Ids and the binary arrive
+/// as positional arguments, never as shell source. Each marker starts its
+/// own line (the leading newline) and carries the probe's random nonce, so
+/// no text a plugin ships can open, close or re-attribute a section.
+const DETAILS_SCRIPT: &str = r#"nonce=$1 bin=$2
+shift 2
+i=0
+for id in "$@"; do
+    printf '\n\036%s start %d\n' "$nonce" "$i"
+    "$bin" plugin details "$id"
+    status=$?
+    printf '\n\036%s end %d %d\n' "$nonce" "$i" "$status"
+    i=$((i + 1))
+done
+"#;
 /// SKILL.md frontmatter read budget.
 const SKILL_HEAD: u64 = 8 * 1024;
 /// Skills listed per scanned directory.
@@ -93,24 +117,74 @@ impl ProbeState {
     }
 }
 
+/// One probe's Environment prelude file. It lives exactly as long as the
+/// probe; removal is best effort and never on the reactor.
+struct ProbePrelude(Option<PathBuf>);
+
+impl ProbePrelude {
+    /// `workspace` None = the host scope alone. A failed write is "no
+    /// prelude", never a failed probe — the same degrade sessions get.
+    async fn write(state: &Arc<AppState>, workspace: Option<&str>) -> Self {
+        let state = Arc::clone(state);
+        let workspace = workspace.map(str::to_string);
+        let path = tokio::task::spawn_blocking(move || {
+            crate::environment::materialize_probe_prelude(&state, workspace.as_deref())
+        })
+        .await
+        .ok()
+        .flatten();
+        ProbePrelude(path)
+    }
+
+    fn path(&self) -> Option<&Path> {
+        self.0.as_deref()
+    }
+}
+
+impl Drop for ProbePrelude {
+    fn drop(&mut self) {
+        let Some(path) = self.0.take() else {
+            return;
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(rt) => {
+                rt.spawn_blocking(move || crate::environment::remove_prelude_path(&path));
+            }
+            Err(_) => crate::environment::remove_prelude_path(&path),
+        }
+    }
+}
+
 fn wrapped(bin: &Path, args: &[&str]) -> Vec<String> {
     let mut argv = vec![bin.to_string_lossy().into_owned()];
     argv.extend(args.iter().map(|a| a.to_string()));
     crate::launcher::wrap_login_shell(&crate::launcher::login_shell(), argv)
 }
 
-fn base_command(argv: &[String], cwd: Option<&Path>) -> tokio::process::Command {
+fn base_command(
+    argv: &[String],
+    cwd: Option<&Path>,
+    prelude: Option<&Path>,
+) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(&argv[0]);
     cmd.args(&argv[1..])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    // The daemon's own launcher markers (a daemon started inside Claude
-    // Code) must not make the probe think it is a nested child session.
-    for name in crate::api::launcher_context_env() {
+    // Every session spawn's env hygiene (`api::spawn_env_remove`): the
+    // daemon's own launcher markers (a daemon started inside Claude Code)
+    // must not make the probe a nested child session, and an inherited
+    // prelude pair (a daemon started in a chimaera terminal) must neither
+    // suppress this probe's prelude nor run another session's.
+    let env: Vec<(String, String)> = prelude
+        .map(|path| ("CHIMAERA_PRELUDE".to_string(), path.display().to_string()))
+        .into_iter()
+        .collect();
+    for name in crate::api::spawn_env_remove(&env) {
         cmd.env_remove(name);
     }
+    cmd.envs(env);
     if let Some(cwd) = cwd {
         cmd.current_dir(cwd);
     }
@@ -119,8 +193,12 @@ fn base_command(argv: &[String], cwd: Option<&Path>) -> tokio::process::Command 
 
 /// Run a CLI to completion: stdout capped (over the cap is an error, never a
 /// silently truncated JSON), stderr tail kept for the error message.
-async fn run_bounded(argv: &[String], cwd: Option<&Path>) -> Result<String, String> {
-    let mut child = base_command(argv, cwd)
+async fn run_bounded(
+    argv: &[String],
+    cwd: Option<&Path>,
+    prelude: Option<&Path>,
+) -> Result<String, String> {
+    let mut child = base_command(argv, cwd, prelude)
         .spawn()
         .map_err(|e| format!("could not start {}: {e}", argv[0]))?;
     let mut stdout = child.stdout.take().ok_or("no stdout")?;
@@ -160,6 +238,65 @@ async fn run_bounded(argv: &[String], cwd: Option<&Path>) -> Result<String, Stri
     Ok(String::from_utf8_lossy(&out).into_owned())
 }
 
+/// Kills a batch's whole process group when dropped: the shell AND the
+/// call it has in flight, which `kill_on_drop` (the shell alone) misses — a
+/// `claude` hung on a stalled NFS read would outlive the probe on a shared
+/// login node. Dropped before the shell is reaped, so the group id can't
+/// have been reused.
+struct GroupKill(Option<nix::unistd::Pid>);
+
+impl Drop for GroupKill {
+    fn drop(&mut self) {
+        if let Some(group) = self.0 {
+            let _ = nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL);
+        }
+    }
+}
+
+/// Run a batch under one overall deadline and return the stdout that
+/// arrived before it (or before the cap) — partial by design: the caller
+/// trusts only sections whose end marker made it in. Once reading stops
+/// (the shell would block on a full pipe past the cap), or if the probe is
+/// abandoned, the batch's process group is killed.
+async fn run_until(argv: &[String], prelude: Option<&Path>, limit: Duration) -> String {
+    let mut cmd = base_command(argv, None, prelude);
+    // Each call's failure is in its end marker's status; nothing reads stderr.
+    cmd.stderr(Stdio::null());
+    // Its own group: the login shell execs into the batch shell, whose
+    // children are the calls (see `GroupKill`).
+    cmd.process_group(0);
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(err) => {
+            tracing::debug!(%err, "agent probe batch did not start");
+            return String::new();
+        }
+    };
+    // Declared after `child`, so on an abandoned probe it drops first.
+    let group = GroupKill(child.id().map(|pid| nix::unistd::Pid::from_raw(pid as i32)));
+    let Some(mut stdout) = child.stdout.take() else {
+        return String::new();
+    };
+    let deadline = tokio::time::Instant::now() + limit;
+    let mut out = Vec::new();
+    let mut chunk = vec![0u8; 64 * 1024];
+    while out.len() < CLI_OUTPUT_CAP {
+        // `read` is cancel-safe: the deadline never loses bytes already read.
+        match tokio::time::timeout_at(deadline, stdout.read(&mut chunk)).await {
+            Ok(Ok(n)) if n > 0 => {
+                let keep = n.min(CLI_OUTPUT_CAP - out.len());
+                out.extend_from_slice(&chunk[..keep]);
+            }
+            // EOF, a read error, or the deadline.
+            _ => break,
+        }
+    }
+    drop(group);
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// A short-lived codex app-server: initialize once, then requests.
 struct CodexRpc {
     child: tokio::process::Child,
@@ -169,9 +306,9 @@ struct CodexRpc {
 }
 
 impl CodexRpc {
-    async fn open(bin: &Path, cwd: &Path) -> Result<Self, String> {
+    async fn open(bin: &Path, cwd: &Path, prelude: Option<&Path>) -> Result<Self, String> {
         let argv = wrapped(bin, &["app-server"]);
-        let mut cmd = base_command(&argv, Some(cwd));
+        let mut cmd = base_command(&argv, Some(cwd), prelude);
         cmd.stdin(Stdio::piped()).stderr(Stdio::null());
         let mut child = cmd
             .spawn()
@@ -287,7 +424,61 @@ fn parse_claude_details(text: &str) -> (Option<u64>, Option<u64>, Option<u64>) {
     (count_after("Skills"), count_after("Hooks"), tokens)
 }
 
-async fn claude_state(state: &AppState) -> Value {
+/// [`DETAILS_SCRIPT`]'s output → each asked id's text, in ask order. Only
+/// sections that carry this probe's nonce on both markers and ended with
+/// status 0 count; anything else (the login profile's chatter, a forged
+/// marker, a section cut off by the deadline) is None or plain text.
+fn split_details(out: &str, nonce: &str, count: usize) -> Vec<Option<String>> {
+    let start = format!("\u{1e}{nonce} start ");
+    let end = format!("\u{1e}{nonce} end ");
+    let mut sections = vec![None; count];
+    let mut open: Option<(usize, String)> = None;
+    for line in out.lines() {
+        if let Some(rest) = line.strip_prefix(&start) {
+            open = rest
+                .parse::<usize>()
+                .ok()
+                .filter(|&i| i < count)
+                .map(|i| (i, String::new()));
+        } else if let Some(rest) = line.strip_prefix(&end) {
+            let mut fields = rest.split(' ');
+            let index = fields.next().and_then(|f| f.parse::<usize>().ok());
+            let clean = fields.next() == Some("0") && fields.next().is_none();
+            if let Some((i, text)) = open.take() {
+                if index == Some(i) && clean {
+                    sections[i] = Some(text);
+                }
+            }
+        } else if let Some((_, text)) = open.as_mut() {
+            text.push_str(line);
+            text.push('\n');
+        }
+    }
+    sections
+}
+
+/// `claude plugin details` for every id (in order; None = no clean answer),
+/// in ONE login shell under one deadline.
+async fn claude_details(bin: &Path, ids: &[&str], prelude: Option<&Path>) -> Vec<Option<String>> {
+    if ids.is_empty() {
+        return Vec::new();
+    }
+    let nonce = chimaera_core::generate_token();
+    let mut argv = vec![
+        "/bin/bash".to_string(),
+        "-c".to_string(),
+        DETAILS_SCRIPT.to_string(),
+        "chimaera-probe".to_string(),
+        nonce.clone(),
+        bin.to_string_lossy().into_owned(),
+    ];
+    argv.extend(ids.iter().map(|id| id.to_string()));
+    let argv = crate::launcher::wrap_login_shell(&crate::launcher::login_shell(), argv);
+    let out = run_until(&argv, prelude, DETAILS_TIMEOUT).await;
+    split_details(&out, &nonce, ids.len())
+}
+
+async fn claude_state(state: &Arc<AppState>) -> Value {
     if let Some(hit) = state.probes.get("claude") {
         return hit;
     }
@@ -302,7 +493,14 @@ async fn claude_state(state: &AppState) -> Value {
         return hit;
     }
     let generation = state.probes.generation.load(Ordering::Relaxed);
-    let listed = run_bounded(&wrapped(&bin, &["plugin", "list", "--json"]), None).await;
+    // Host scope only: this one answer serves every workspace.
+    let prelude = ProbePrelude::write(state, None).await;
+    let listed = run_bounded(
+        &wrapped(&bin, &["plugin", "list", "--json"]),
+        None,
+        prelude.path(),
+    )
+    .await;
     let plugins: Vec<Value> = match listed.and_then(|out| {
         serde_json::from_str::<Vec<Value>>(out.trim())
             .map_err(|e| format!("unexpected output: {e}"))
@@ -315,6 +513,8 @@ async fn claude_state(state: &AppState) -> Value {
         }
     };
     let mut rows = Vec::new();
+    // (row index, id) of every plugin whose details are asked for.
+    let mut asked: Vec<(usize, String)> = Vec::new();
     for (i, p) in plugins.iter().enumerate() {
         let id = p
             .get("id")
@@ -324,22 +524,27 @@ async fn claude_state(state: &AppState) -> Value {
         if id.is_empty() {
             continue;
         }
-        let mut row = json!({
+        if i < DETAILS_MAX && crate::launcher::safe_arg(&id.replace(['@', '/'], "-")) {
+            asked.push((rows.len(), id.clone()));
+        }
+        rows.push(json!({
             "id": id,
             "version": p.get("version"),
             "scope": p.get("scope"),
             "enabled": p.get("enabled").and_then(Value::as_bool).unwrap_or(true),
             "install_path": p.get("installPath"),
-        });
-        if i < DETAILS_MAX && crate::launcher::safe_arg(&id.replace(['@', '/'], "-")) {
-            if let Ok(text) = run_bounded(&wrapped(&bin, &["plugin", "details", &id]), None).await {
-                let (skills, hooks, tokens) = parse_claude_details(&text);
-                row["skills_n"] = json!(skills);
-                row["hooks_n"] = json!(hooks);
-                row["always_on_tokens"] = json!(tokens);
-            }
-        }
-        rows.push(row);
+        }));
+    }
+    let ids: Vec<&str> = asked.iter().map(|(_, id)| id.as_str()).collect();
+    let details = claude_details(&bin, &ids, prelude.path()).await;
+    for ((row, _), text) in asked.iter().zip(details) {
+        let Some(text) = text else {
+            continue;
+        };
+        let (skills, hooks, tokens) = parse_claude_details(&text);
+        rows[*row]["skills_n"] = json!(skills);
+        rows[*row]["hooks_n"] = json!(hooks);
+        rows[*row]["always_on_tokens"] = json!(tokens);
     }
     let value = json!({"agent": "claude", "available": true, "version": version, "plugins": rows});
     state.probes.put("claude", value.clone(), generation);
@@ -348,8 +553,8 @@ async fn claude_state(state: &AppState) -> Value {
 
 // ---------------------------------------------------------------- codex
 
-/// The raw `skills/list` + `hooks/list` answers for one cwd.
-async fn codex_raw(state: &AppState, root: &Path) -> Value {
+/// The raw `skills/list` + `hooks/list` answers for one workspace's cwd.
+async fn codex_raw(state: &Arc<AppState>, workspace_id: &str, root: &Path) -> Value {
     let key = format!("codex:{}", root.display());
     if let Some(hit) = state.probes.get(&key) {
         return hit;
@@ -363,8 +568,10 @@ async fn codex_raw(state: &AppState, root: &Path) -> Value {
         return hit;
     }
     let generation = state.probes.generation.load(Ordering::Relaxed);
+    // Host ⊕ workspace, as a codex session in this workspace would see.
+    let prelude = ProbePrelude::write(state, Some(workspace_id)).await;
     let result = async {
-        let mut rpc = CodexRpc::open(&bin, root).await?;
+        let mut rpc = CodexRpc::open(&bin, root, prelude.path()).await?;
         let cwd = root.to_string_lossy().into_owned();
         let skills = rpc
             .request("skills/list", json!({"cwds": [cwd], "forceReload": false}))
@@ -500,8 +707,8 @@ fn codex_hooks(raw: &Value) -> Vec<Value> {
         .unwrap_or_default()
 }
 
-async fn codex_state(state: &AppState, root: &Path) -> Value {
-    let raw = codex_raw(state, root).await;
+async fn codex_state(state: &Arc<AppState>, workspace_id: &str, root: &Path) -> Value {
+    let raw = codex_raw(state, workspace_id, root).await;
     if raw.get("available") == Some(&json!(false)) {
         return json!({"agent": "codex", "available": false, "error": raw.get("error")});
     }
@@ -581,7 +788,7 @@ pub(crate) async fn agent_plugins(
         state.probes.invalidate();
     }
     let claude = claude_state(&state).await;
-    let codex = codex_state(&state, &root).await;
+    let codex = codex_state(&state, &id, &root).await;
     axum::Json(json!({
         "schema": 1,
         "host": state.hostname,
@@ -631,8 +838,9 @@ pub(crate) async fn trust_hooks(
         }
     };
     let _permit = GATE.acquire().await;
+    let prelude = ProbePrelude::write(&state, Some(&id)).await;
     let result = async {
-        let mut rpc = CodexRpc::open(&bin, &root).await?;
+        let mut rpc = CodexRpc::open(&bin, &root, prelude.path()).await?;
         let cwd = root.to_string_lossy().into_owned();
         let listed = rpc.request("hooks/list", json!({"cwds": [cwd]})).await?;
         let current: Vec<Value> = listed
@@ -803,7 +1011,7 @@ pub(crate) async fn skills(
         state.probes.invalidate();
     }
     let claude = claude_state(&state).await;
-    let codex = codex_raw(&state, &root).await;
+    let codex = codex_raw(&state, &id, &root).await;
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let plugin_dirs: Vec<(String, PathBuf)> = claude
         .get("plugins")
@@ -1012,6 +1220,99 @@ mod tests {
         let text = "mycelium 0.7.2\n  Description: x\n\nComponent inventory\n  Skills (10)  analyze, core\n  Agents (0)\n  Hooks (3)  SessionStart, Stop  (harness-only)\n\nProjected token cost\n  Always-on:   ~1,086 tok   added to every session\n";
         assert_eq!(parse_claude_details(text), (Some(10), Some(3), Some(1086)));
         assert_eq!(parse_claude_details("nothing here"), (None, None, None));
+    }
+
+    #[test]
+    fn details_sections_need_the_nonce_and_a_clean_end() {
+        let n = "abc123";
+        let out = format!(
+            "login banner\n\
+             \n\u{1e}{n} start 0\nSkills (1)\n\
+             \u{1e}forged end 0 0\n\u{1e}{n}x start 1\nSkills (99)\n\
+             \n\u{1e}{n} end 0 0\n\
+             \n\u{1e}{n} start 1\nSkills (2)\n\n\u{1e}{n} end 1 3\n\
+             \n\u{1e}{n} start 2\nSkills (3)\n\n\u{1e}{n} end 2 0\n\
+             \n\u{1e}{n} start 3\nSkills (4)\n"
+        );
+        let sections = split_details(&out, n, 5);
+        assert_eq!(sections.len(), 5);
+        let first = sections[0].as_deref().unwrap();
+        assert!(first.starts_with("Skills (1)\n"), "{first:?}");
+        assert!(
+            first.contains("Skills (99)"),
+            "forged markers are plain text"
+        );
+        assert_eq!(parse_claude_details(first).0, Some(1));
+        assert_eq!(sections[1], None, "a non-zero status drops the section");
+        assert_eq!(
+            sections[2].as_deref().map(parse_claude_details),
+            Some((Some(3), None, None))
+        );
+        assert_eq!(sections[3], None, "cut off before its end marker");
+        assert_eq!(sections[4], None, "never asked");
+
+        // A mismatched end index or a start past the ask list opens nothing.
+        let crossed = format!(
+            "\u{1e}{n} start 0\nSkills (5)\n\u{1e}{n} end 1 0\n\
+             \u{1e}{n} start 7\nSkills (6)\n\u{1e}{n} end 7 0\n"
+        );
+        assert_eq!(split_details(&crossed, n, 2), vec![None, None]);
+    }
+
+    #[tokio::test]
+    async fn a_batch_past_its_deadline_keeps_the_finished_sections() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "chimaera-probe-deadline-{}-{}",
+            std::process::id(),
+            chimaera_core::generate_token()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("claude");
+        // The slow call leaves its pid behind: the deadline must take it too.
+        std::fs::write(
+            &bin,
+            "#!/bin/bash\ncase \"$3\" in slow) echo $$ > \"${0%/*}/slow.pid\"; sleep 30;; esac\n\
+             echo \"Skills (7)\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let nonce = "n0nce";
+        let argv: Vec<String> = [
+            "/bin/bash",
+            "-c",
+            DETAILS_SCRIPT,
+            "chimaera-probe",
+            nonce,
+            bin.to_str().unwrap(),
+            "fast",
+            "slow",
+        ]
+        .map(str::to_string)
+        .to_vec();
+        let started = Instant::now();
+        let out = run_until(&argv, None, Duration::from_millis(1500)).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the deadline held"
+        );
+        let sections = split_details(&out, nonce, 2);
+        assert_eq!(
+            sections[0].as_deref().map(parse_claude_details),
+            Some((Some(7), None, None))
+        );
+        assert_eq!(sections[1], None);
+        let slow: i32 = std::fs::read_to_string(dir.join("slow.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let gone = (0..50).any(|_| {
+            std::thread::sleep(Duration::from_millis(20));
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(slow), None).is_err()
+        });
+        assert!(gone, "the call in flight at the deadline was killed too");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

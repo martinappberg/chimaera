@@ -215,6 +215,9 @@ pub(crate) struct AppState {
     /// Hook-driven turns of claude TUIs in flight (the Timeline's hooks
     /// tier; see `episodes`). Bounded by live sessions.
     pub(crate) tui_episodes: Mutex<episodes::TuiEpisodes>,
+    /// Turn starts and ends waiting on their workspace's Knowledge check,
+    /// one FIFO per workspace (see `episodes`).
+    pub(crate) episode_queue: episodes::EpisodeQueue,
     /// The Timeline's Slurm job task is running (idempotent start: tests
     /// build several routers over one state).
     pub(crate) timeline_jobs_started: std::sync::atomic::AtomicBool,
@@ -315,6 +318,7 @@ impl AppState {
             plugin_runtime: plugins::runtime::PluginRuntime::default(),
             plugin_state: Mutex::new(plugins::hostfns::PluginStates::default()),
             tui_episodes: Mutex::new(episodes::TuiEpisodes::default()),
+            episode_queue: episodes::EpisodeQueue::default(),
             timeline_jobs_started: std::sync::atomic::AtomicBool::new(false),
             probes: agent_probe::ProbeState::default(),
             chat_catalogs: Mutex::new(HashMap::new()),

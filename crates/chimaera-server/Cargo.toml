@@ -21,6 +21,7 @@ rust-embed.workspace = true
 mime_guess.workspace = true
 hostname.workspace = true
 rustix.workspace = true
+nix.workspace = true
 chimaera-agent.workspace = true
 chimaera-core.workspace = true
 chimaera-pty.workspace = true
