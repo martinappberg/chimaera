@@ -143,6 +143,9 @@
     const available = (agents?.agents ?? []).filter((a) => a.available).map((a) => a.agent);
     return agentsForSetup(model, available) as AgentId[];
   });
+  const needsSetup = $derived(!detected && canSetup);
+  // An empty eligible list still means setup is blocked, not optional.
+  const setupBlocked = $derived(needsSetup && !setupAgents.includes(setupAgent));
 
   /** Step numbers: the plugin's own install (when shown) comes first. */
   const nAgents = $derived(showInstallStep ? 2 : 1);
@@ -197,7 +200,7 @@
     if (notInstalled) return "Turn on";
     const parts: string[] = [];
     if (needsTrust && trust) parts.push("Trust hooks");
-    if (!detected && canSetup && setupAgents.length > 0) parts.push("set up");
+    if (needsSetup) parts.push("set up");
     else if (!plugin.on) parts.push("turn on");
     if (parts.length === 0) return "Done";
     const s = parts.join(" & ");
@@ -235,7 +238,7 @@
 
   async function complete(): Promise<void> {
     if (plugin === null || notInstalled || identityUncertain) return;
-    if (!detected && canSetup && setupAgents.length > 0 && !setupAgents.includes(setupAgent)) {
+    if (setupBlocked) {
       error = "Choose an agent with the required plugins enabled.";
       return;
     }
@@ -255,7 +258,7 @@
       }
       if (!plugin.on) await putWorkspacePlugin(wsId, pluginId, true);
       refreshWorkspacePlugins();
-      if (!detected && canSetup && setupAgents.length > 0) {
+      if (needsSetup) {
         const res = await setupPlugin(wsId, pluginId, setupAgent);
         refreshKnowledge();
         clearContinuation();
@@ -447,8 +450,8 @@
               </div>
               {#if identityUncertain}
                 <div class="smuted warn-text">Resolve the marketplace identity in the agent before continuing.</div>
-              {:else if setupAgents.length === 0 && rows.length > 0}
-                <div class="smuted">Install the plugin for an agent first (step {nAgents}).</div>
+              {:else if setupAgents.length === 0}
+                <div class="smuted">Setup needs an available agent with its required plugins installed and enabled (step {nAgents}).</div>
               {/if}
             {/if}
           </div>
@@ -462,7 +465,7 @@
       <button class="opt quiet" use:focusOnMount onclick={onClose}>Cancel</button>
       <button
         class="opt primary"
-        disabled={busy !== null || plugin === null || notInstalled || identityUncertain}
+        disabled={busy !== null || plugin === null || notInstalled || identityUncertain || setupBlocked}
         title={notInstalled && plugin !== null ? `install ${plugin.name} first` : undefined}
         onclick={() => void complete()}
       >

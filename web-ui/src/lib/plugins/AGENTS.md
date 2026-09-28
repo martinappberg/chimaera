@@ -66,6 +66,8 @@ QuickOpen — not in `shared/icons.ts`, which `prebuild` regenerates from Tabler
   The attach sheet repeats the ambiguity warning and refuses completion until
   resolved; setup choices require known enabled add-ons and all requirements
   for that agent. Use `agentsForSetup` for both the chooser and its default.
+  When setup is needed, an empty eligible list blocks the primary action and
+  completion before any trust/enable writes; it must never silently skip setup.
 - **Never list an agent that isn't installed on this host.** A
   recommendation for it says nothing; a requirement none of the listed
   agents here can meet says so once. `requirementsModel.ts` owns this rule —
