@@ -29,6 +29,7 @@ pub(super) fn export(sources: Sources, destination: &Path, budget: u64) -> Resul
     fs::create_dir_all(destination)?;
     let mut job = Export {
         destination,
+        workspace: &sources.workspace,
         remaining: budget.min(512 * 1024 * 1024),
         visited: 0,
         started: Instant::now(),
@@ -78,6 +79,7 @@ pub(super) fn export(sources: Sources, destination: &Path, budget: u64) -> Resul
 
 struct Export<'a> {
     destination: &'a Path,
+    workspace: &'a Path,
     remaining: u64,
     visited: usize,
     started: Instant,
@@ -146,7 +148,7 @@ impl Export<'_> {
                 self.report.excluded += 1;
                 return Ok(());
             };
-            policy::sanitize(&mut value, &mut self.report.missing_environment);
+            self.sanitize_config(&mut value, relative);
             bytes = serde_json::to_vec_pretty(&value)?;
         } else if extension == "toml" {
             let Ok(text) = std::str::from_utf8(&bytes) else {
@@ -158,7 +160,7 @@ impl Export<'_> {
                 return Ok(());
             };
             let mut json = serde_json::to_value(value)?;
-            policy::sanitize(&mut json, &mut self.report.missing_environment);
+            self.sanitize_config(&mut json, relative);
             bytes = write_toml(&json)?.into_bytes();
         }
         // This also guards hand-written instructions and plugin scripts whose
@@ -192,6 +194,41 @@ impl Export<'_> {
         self.report.files += 1;
         Ok(())
     }
+    fn sanitize_config(&mut self, value: &mut serde_json::Value, relative: &Path) {
+        // Redacted plugin metadata and examples are not active environment
+        // requirements. Even active files can contain other projects' settings.
+        let active = matches!(
+            relative.to_str(),
+            Some(".claude/settings.json" | ".claude.json" | ".codex/config.toml")
+        ) || relative.file_name().is_some_and(|name| name == ".mcp.json");
+        let mut declared = std::collections::HashSet::new();
+        if active {
+            let mut collect = |config: &serde_json::Value| {
+                if let Some(env) = config.get("env").and_then(serde_json::Value::as_object) {
+                    declared.extend(env.keys().filter(|name| name.len() <= 128).cloned());
+                }
+            };
+            collect(value);
+            for key in ["mcp_servers", "mcpServers"] {
+                if let Some(servers) = value.get(key).and_then(serde_json::Value::as_object) {
+                    for server in servers.values() {
+                        collect(server);
+                    }
+                }
+            }
+        }
+        let mut omitted = Vec::new();
+        policy::sanitize(value, &mut omitted, Some(self.workspace));
+        for name in omitted {
+            if declared.contains(&name)
+                && self.report.missing_environment.len() < 128
+                && !self.report.missing_environment.contains(&name)
+            {
+                self.report.missing_environment.push(name);
+            }
+        }
+    }
+
     fn rollouts(
         &mut self,
         directory: &Path,
@@ -290,7 +327,7 @@ fn write_toml(value: &serde_json::Value) -> Result<String> {
 
 /// Apply only the exported home-relative allowlist. Existing login material
 /// and symlinked directories are never replaced by a remote overlay.
-pub(super) fn import(source: &Path, home: &Path) -> Result<()> {
+pub(super) fn import(source: &Path, home: &Path, workspace: &Path) -> Result<()> {
     let mut pending = vec![(source.to_path_buf(), PathBuf::new())];
     let mut visited = 0;
     while let Some((directory, relative)) = pending.pop() {
@@ -340,7 +377,7 @@ pub(super) fn import(source: &Path, home: &Path) -> Result<()> {
                     .unwrap_or_default();
                 if extension == "json" || extension == "toml" {
                     let mut value = parse_config(&bytes, extension)?;
-                    policy::sanitize(&mut value, &mut Vec::new());
+                    policy::sanitize(&mut value, &mut Vec::new(), Some(workspace));
                     if cursor.exists() {
                         let mut existing = parse_config(&read_regular(&cursor)?, extension)?;
                         merge_config(&mut existing, value);
@@ -437,7 +474,11 @@ fn merge_config(existing: &mut serde_json::Value, incoming: serde_json::Value) {
         (serde_json::Value::Object(existing), serde_json::Value::Object(incoming)) => {
             for (key, value) in incoming {
                 if let Some(previous) = existing.get_mut(&key) {
-                    merge_config(previous, value);
+                    if matches!(key.as_str(), "mcp_servers" | "mcpServers") {
+                        merge_mcp_connections(previous, value);
+                    } else {
+                        merge_config(previous, value);
+                    }
                 } else {
                     existing.insert(key, value);
                 }
@@ -446,6 +487,49 @@ fn merge_config(existing: &mut serde_json::Value, incoming: serde_json::Value) {
         (existing, incoming) => *existing = incoming,
     }
 }
+fn merge_mcp_connections(existing: &mut serde_json::Value, incoming: serde_json::Value) {
+    let (Some(existing), serde_json::Value::Object(incoming)) =
+        (existing.as_object_mut(), incoming)
+    else {
+        return;
+    };
+    for (name, connection) in incoming {
+        if let Some(previous) = existing.get_mut(&name) {
+            // A destination's existing login belongs to its exact connection.
+            // Never retarget retained credentials to a new URL or process just
+            // because the source happens to use the same integration name.
+            let same_binding = [
+                "url",
+                "type",
+                "command",
+                "args",
+                "cwd",
+                "bearer_token_env_var",
+                "env_http_headers",
+            ]
+            .iter()
+            .all(|key| previous.get(key) == connection.get(key));
+            // Omitted credential values retain destination authority. Any
+            // supplied environment/header change may alter that authority's
+            // destination or executable lookup, so retain the whole connection.
+            let same_environment = ["env", "headers", "http_headers"].iter().all(|key| {
+                connection.get(key).is_none_or(|incoming| {
+                    incoming.as_object().is_some_and(|incoming| {
+                        incoming.iter().all(|(name, value)| {
+                            previous.get(key).and_then(|existing| existing.get(name)) == Some(value)
+                        })
+                    })
+                })
+            });
+            if same_binding && same_environment {
+                merge_config(previous, connection);
+            }
+        } else {
+            existing.insert(name, connection);
+        }
+    }
+}
+
 fn merge_git_preferences(existing: &[u8], incoming: &[u8]) -> Result<Vec<u8>> {
     const START: &str = "# chimaera portable Git preferences begin";
     const END: &str = "# chimaera portable Git preferences end";
@@ -599,7 +683,7 @@ mod tests {
     #[test]
     fn overlay_updates_preferences_without_replacing_local_credentials() {
         let mut incoming = serde_json::json!({"model":"new","env":{"PATH":"/new","SECRET_TOKEN":"foreign"},"password":"foreign"});
-        policy::sanitize(&mut incoming, &mut Vec::new());
+        policy::sanitize(&mut incoming, &mut Vec::new(), None);
         let mut existing = serde_json::json!({"model":"old","env":{"SECRET_TOKEN":"cloud-only"},"password":"local-only"});
         merge_config(&mut existing, incoming);
         assert_eq!(existing["model"], "new");
@@ -622,10 +706,94 @@ mod tests {
             .contains("helper = host-login-helper"));
     }
     #[test]
+    fn mcp_overlay_never_retargets_destination_credentials() {
+        for (key, original, replacement) in [
+            (
+                "url",
+                serde_json::json!("https://old.example/mcp"),
+                serde_json::json!("https://new.example/mcp"),
+            ),
+            (
+                "command",
+                serde_json::json!("npx"),
+                serde_json::json!("node"),
+            ),
+            (
+                "args",
+                serde_json::json!(["server-a"]),
+                serde_json::json!(["server-b"]),
+            ),
+            (
+                "bearer_token_env_var",
+                serde_json::json!("SERVICE_TOKEN"),
+                serde_json::json!("OTHER_TOKEN"),
+            ),
+        ] {
+            let mut existing = serde_json::json!({"mcp_servers":{"service":{"env":{"API_TOKEN":"cloud-only"},"timeout":10}}});
+            existing["mcp_servers"]["service"][key] = original;
+            let before = existing.clone();
+            let mut incoming = serde_json::json!({"mcp_servers":{"service":{"timeout":20}}});
+            incoming["mcp_servers"]["service"][key] = replacement;
+            merge_config(&mut existing, incoming);
+            assert_eq!(existing, before, "binding field {key}");
+        }
+        for (container, key) in [
+            ("env", "API_BASE_URL"),
+            ("env", "PATH"),
+            ("headers", "X-Service-Endpoint"),
+            ("http_headers", "X-Tenant"),
+        ] {
+            let mut existing = serde_json::json!({"mcp_servers":{"service":{"url":"https://same.example/mcp", "env":{"API_TOKEN":"cloud-only"},"timeout":10}}});
+            existing["mcp_servers"]["service"][container][key] = serde_json::json!("original");
+            let before = existing.clone();
+            let mut incoming = serde_json::json!({"mcp_servers":{"service":{"url":"https://same.example/mcp","timeout":20}}});
+            incoming["mcp_servers"]["service"][container] = serde_json::json!({key:"changed"});
+            merge_config(&mut existing, incoming);
+            assert_eq!(existing, before, "binding configuration {container}/{key}");
+        }
+        let mut existing = serde_json::json!({"mcpServers":{"service":{"url":"https://same.example/mcp","authorization":"cloud-only","timeout":10}}});
+        merge_config(
+            &mut existing,
+            serde_json::json!({"mcpServers":{"service":{"url":"https://same.example/mcp","timeout":20}}}),
+        );
+        assert_eq!(
+            existing["mcpServers"]["service"]["authorization"],
+            "cloud-only"
+        );
+        assert_eq!(existing["mcpServers"]["service"]["timeout"], 20);
+    }
+
+    #[test]
+    fn only_active_environment_omissions_are_reported() {
+        let root = std::env::temp_dir();
+        let mut export = Export {
+            destination: &root,
+            workspace: &root,
+            remaining: 1_000_000,
+            visited: 0,
+            started: Instant::now(),
+            report: Report::default(),
+        };
+        let mut metadata = serde_json::json!({"name":"token documentation", "env":{"EXAMPLE_TOKEN":"not-an-active-setting"}});
+        export.sanitize_config(&mut metadata, Path::new(".claude/plugins/demo/plugin.json"));
+        assert!(export.report.missing_environment.is_empty());
+        assert!(metadata.get("name").is_none());
+        let mut active = serde_json::json!({"env":{"API_TOKEN":"not-copied", "CODEX_HOME":"/Users/example/.codex"},"projects":{"other":{"env":{"UNRELATED_TOKEN":"not-copied"}}},"mcp_servers":{"service":{"url":"https://example.invalid/mcp", "env":{"SERVICE_TOKEN":"not-copied"}}}});
+        export.sanitize_config(&mut active, Path::new(".codex/config.toml"));
+        assert_eq!(
+            export.report.missing_environment,
+            ["API_TOKEN", "SERVICE_TOKEN"]
+        );
+        assert!(!serde_json::to_string(&active)
+            .unwrap()
+            .contains("not-copied"));
+    }
+
+    #[test]
     fn sanitized_toml_retains_nested_servers_and_types() {
         let mut value = serde_json::json!({"model":"codex", "mcp_servers":{"demo":{"command":"node", "args":["server.js"], "env":{"PATH":"/usr/bin", "SECRET_TOKEN":"bad"}}}, "flag":true});
         let mut missing = Vec::new();
-        policy::sanitize(&mut value, &mut missing);
+        policy::sanitize(&mut value, &mut missing, None);
         let text = write_toml(&value).unwrap();
         let parsed: toml::Value = toml::from_str(&text).unwrap();
         assert_eq!(

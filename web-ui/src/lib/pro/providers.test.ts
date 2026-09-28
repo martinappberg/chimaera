@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { providerLoginUrl, providersReady } from "./providers";
+import { handoffKey, nextReadyHandoff, providerLoginUrl, providersReady, type ProviderHandoff } from "./providers";
 import type { CloudProviderStatus } from "../net/native";
 const row = (id: string, state: CloudProviderStatus["state"], category: CloudProviderStatus["category"] = "agent"): CloudProviderStatus => ({ id, label: id, state, category, installed: true, reason: null, checked_at: 1, methods: ["device_code"] });
 describe("provider readiness", () => {
@@ -19,5 +19,25 @@ describe("provider readiness", () => {
     expect(providerLoginUrl("claude", "https://claude.com/cai/oauth/authorize?state=fixture")).toBe("https://claude.com/cai/oauth/authorize?state=fixture");
     expect(providerLoginUrl("claude", "https://claude.com.evil.test/cai/oauth/authorize")).toBeNull();
     expect(providerLoginUrl("future-provider", "https://auth.openai.com")).toBeNull();
+  });
+});
+
+describe("automatic provider-blocked continuation", () => {
+  const handoff: ProviderHandoff = { workspace_id: "project", name: "Project", expected_epoch: 7, blocked_providers: [{id: "claude", state: "needs_sign_in", reason: null}, {id: "codex", state: "needs_sign_in", reason: null}] };
+  const connected = [row("claude", "signed_in"), row("codex", "signed_in")];
+  it("requires a fresh complete provider confirmation for an existing scoped transfer", () => {
+    expect(nextReadyHandoff(connected, [handoff], [], true)).toBe(handoff);
+    expect(nextReadyHandoff(connected, [handoff], [], false)).toBeUndefined();
+    expect(nextReadyHandoff([row("claude", "signed_in"), row("codex", "unknown")], [handoff], [], true)).toBeUndefined();
+    for (const invalid of [{...handoff, blocked_providers: []}, {...handoff, workspace_id: ""}, {...handoff, expected_epoch: 0}, {...handoff, expected_epoch: 1.5}]) {
+      expect(nextReadyHandoff(connected, [invalid], [], true)).toBeUndefined();
+    }
+  });
+  it("attempts each epoch once and serially advances to other eligible projects", () => {
+    const second = {...handoff, workspace_id: "second"};
+    expect(nextReadyHandoff(connected, [handoff], [handoffKey(handoff)], true)).toBeUndefined();
+    expect(nextReadyHandoff(connected, [handoff, second], [handoffKey(handoff)], true)).toBe(second);
+    const later = {...handoff, expected_epoch: 8};
+    expect(nextReadyHandoff(connected, [later], [handoffKey(handoff)], true)).toBe(later);
   });
 });

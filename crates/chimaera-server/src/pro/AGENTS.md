@@ -11,19 +11,34 @@ revocable delegation over the authenticated local API.
 | `projects.rs` | Passive bounded cloud-project discovery and explicit per-device local adoption; native-picked folder validation, saved directory identity, retry and legacy-import fences. |
 | `projects/tests.rs` | Synthetic loopback HTTP plus real Git transfer, passive-read, conflict, retry, restart and two-device destination checks. |
 | `engine.rs` | Independent lease renewal, mirror coordinator, transactional hydration, profile execution and lazy return. |
+| `release.rs` | Bounded clean-release retry for the account publication fence; changed ownership, account or lease never retries. |
 | `provider_gate.rs` / `provider_tests.rs` | Per-agent cloud readiness, bounded blocked-provider status, and staged retry/cancellation tests with a synthetic CLI and real PTY. |
 | `protocol.rs` | Additive account contract subset; intentionally no link/TLS dependency in the daemon. |
 | `transport.rs` | Bounded external curl/git children; cached mirror-only Git compatibility selection; credentials only in memory, never argv or Git config. |
 | `policy.rs` | Mirrored-path policy, credential filtering, size budgets and cloud-profile classification. |
 | `mirror.rs` | Separate shadow and repository Git directories, incremental transfer and conservative hand-back. |
 | `repository.rs` | Portable remote/tracking allowlist; bounded ref import, compare-and-swap adoption and index/ref-lock cancellation cleanup. |
-| `config.rs` | Agent configuration export with credential fields removed and missing names recorded. |
+| `config.rs` | Portable agent configuration export/import, scoped environment-omission diagnostics and destination connection identity preservation. |
 
 One recorded holder and epoch controls shared writes. Failure to reach the service
 is not evidence that ownership moved; keep local work available until a newer
 owner is verified. Expired remote takeovers fork native conversations. Clean
 handoff stops agents before final export and releases only after the mirror and
-bundles are durable. An unstarted structured Claude chat with no native transcript is omitted only when a complete bounded startup-only journal, fresh-spawn recipe, and no submitted input or background work prove it empty; snapshots leave its source live, while clean handoff atomically fences input and durably suspends it for local return. Only exported agents enable automatic worker wake. Missing meaningful or ambiguous history still fails the flush and retains local ownership.
+bundles are durable. A fresh publication retains its account fence for ten seconds; release waits at most fifteen seconds and retries only `mirror_commit_in_progress` while the same server-confirmed holder, epoch and live lease remain valid. An unstarted structured Claude chat with no native transcript is omitted only when a complete bounded startup-only journal, fresh-spawn recipe, and no submitted input or background work prove it empty; snapshots leave its source live, while clean handoff atomically fences input and durably suspends it for local return. Only exported agents enable automatic worker wake. Missing meaningful or ambiguous history still fails the flush and retains local ownership.
+
+Configuration export keeps portable settings and MCP definitions, including
+validated `bearer_token_env_var` names, while excluding credential values and
+positively device-bound app helpers, outside-project home paths and loopback
+services. Paths inside the copied project remain portable. Environment omission
+diagnostics come only from declared environment maps in active config files;
+redacted plugin metadata and desktop runtime variables are not requirements.
+These diagnostics mean “not copied”, not “confirmed missing on the destination”.
+Import preserves cloud-local credentials. A same-name MCP with a different
+URL, process, arguments, credential reference or supplied environment/header
+configuration preserves the entire destination connection rather than retargeting
+its credentials. Other preferences merge for matching connections. Conflicts do
+not yet have a user-facing report; imported settings must not be described as
+having replaced every existing connection.
 
 No account refresh token or agent credential enters this module. Delegations and
 short-lived Git passwords are memory-only. Never log remote response bodies,

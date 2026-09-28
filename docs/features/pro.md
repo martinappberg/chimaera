@@ -98,9 +98,11 @@ The shared `web-ui/src/lib/net/plan.ts` store exposes confirmed free/paid, loadi
 ## Cloud readiness
 
 An eligible subscription prepares its first cloud machine automatically. The Pro
-page shows its current status, rather than a checklist to complete. Account-confirmed
-preparation distinguishes the private connection, machine startup, and its first
-acknowledgement. Preparation continues without a setup button; visible checks run
+page shows availability and the status of the user's work, rather than a checklist
+or machine lifecycle. Ready and idle compute have the same available state.
+Progress describes loading agent connections or preparing a named provider's
+sign-in; it does not narrate starting or stopping infrastructure. Initial
+preparation continues without a setup button; visible checks run
 sequentially every five seconds, slowing to thirty seconds after five minutes.
 Hidden views stop checking. Healthy phases do not ask the user to refresh.
 
@@ -136,14 +138,17 @@ Provider credentials remain on the cloud machine and are never copied from other
 
 A paused handoff names the specific providers its sessions need. **Connect agents
 to continue** opens the same flow with that project context. Every required agent
-must be connected before **Continue project** appears. Continuing asks the daemon
-to verify the current ownership epoch and provider state again; the UI cannot
-release the setup fence. A canceled connection leaves the project paused.
+must be confirmed by a fresh catalog before that existing staged transfer continues
+automatically. The UI tries each workspace/epoch once, sequentially, and offers
+**Try again** after a failure. The daemon verifies ownership and provider state
+again; the UI cannot release the setup fence or infer a new move. A canceled
+connection leaves the project paused. A successful continuation returns to the
+originating project only if that context is still current.
 
-Status reads never wake a sleeping worker. Its optional **Agent connections**
-disclosure offers **Open cloud connections** for deliberate management; opening
-that disclosure alone does not wake it. Opening the connection, connecting a
-provider, or opening a repository are explicit wake actions. Catalog checks are
+Status reads never wake a sleeping worker. Opening the optional **Agent connections**
+disclosure loads those connections and acquires access automatically. There is no
+separate cloud-start action. Connecting a provider or opening a repository also
+acquires access as part of that user request. Catalog checks are
 single-flight and visibility-gated. Active sign-in checks run sequentially every
 two seconds, stop while hidden, and end at the attempt's finite deadline. Pending
 connection operations keep the worker active only until they finish or expire.
@@ -188,9 +193,13 @@ The signed-in app gives its local daemon a separate, limited account credential.
 That credential stays in memory; the daemon can keep publishing mirrors after
 all app windows close. Signing out stops publishing on that daemon.
 
-Pro → **Project mirrors** shows the projects, file counts,
-storage budget, exclusions, missing cloud environment names and the last copy.
-**Never mirror this project** stops local publication and disables account-side
+Pro → **Projects and privacy** shows privacy, the last recorded copy, and actual
+problems such as an incomplete copy or a required provider connection. Healthy
+file counts, storage quotas, generic environment diagnostics, setup commands and
+idle-session pins are not account controls; Chimaera and its agents manage those
+details. Internal setup/profile and session-pin APIs remain available for their
+scoped workflows.
+**Keep this project on this device** stops local publication and disables account-side
 mirror access. Existing stored data is not silently deleted. Cloud setup commands
 and learned laptop-only commands appear in each project's details. A session's
 **Keep running when idle** pin persists across transfer and daemon restart.
@@ -226,7 +235,7 @@ foreground programs are not automatically relaunched.
 Hand-back restores new branches and fast-forwards unchanged local branches. The
 current checkout uses Git's index and ref locks; branches checked out in another
 worktree are preserved separately. Diverged branch tips remain as
-`<branch>@cloud-<commit>`, and Project mirrors lists them for merging. Existing
+`<branch>@cloud-<commit>`, and Projects and privacy lists them for merging. Existing
 remote configuration and `FETCH_HEAD` stay intact. If a file changed on both machines,
 the local file and a sibling cloud copy both remain. Saved setup commands run in
 a visible **Cloud setup** terminal. Deferred steps remain guidance for the returning agent, which assesses and runs them under its normal permissions; they are never automatically replayed by the daemon.

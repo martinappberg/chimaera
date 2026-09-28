@@ -3,7 +3,7 @@
   import { pageVisible } from "../shared/visibility";
   import { isNativeShell, writeClipboard, type CloudProviderConnection, type CloudProviderStatus, type CloudSetupInfo } from "../net/native";
   import { cloudRequest } from "./cloudTransport";
-  import { connectionError, pendingConnection, providerLoginUrl, providersReady, providerStateLabel } from "./providers";
+  import { connectionError, handoffKey, nextReadyHandoff, pendingConnection, providerLoginUrl, providersReady, providerStateLabel } from "./providers";
 
   let { visible = true, requiredProviders = [], contextLabel, workspaceId, onReady, onReadiness, compact = false }: {
     visible?: boolean; requiredProviders?: string[]; contextLabel?: string; workspaceId?: string; onReady?: () => void; onReadiness?: (ready: boolean | null) => void; compact?: boolean;
@@ -23,11 +23,16 @@
   let authorizationCode = $state("");
   let expanded = $state(false);
   let pollingPaused = $state(false);
+  let attemptedHandoffs = $state<string[]>([]);
+  let resumeFailures = $state<Record<string, string>>({});
   let alive = true;
   let catalogFlight = $state(false);
   let connectionFlight = $state(false);
   let catalogAgain = false;
   let mutation = 0;
+  let visibilityGeneration = 0;
+  let catalogMutation = $state(-1);
+  let catalogVisibility = $state(-1);
   const native = isNativeShell();
   const required = $derived(requiredProviders.length ? requiredProviders : focusedHandoff?.blocked_providers.map(p => p.id) ?? []);
   const projectName = $derived(contextLabel ?? focusedHandoff?.name);
@@ -38,7 +43,7 @@
   const ready = $derived(current && providersReady(providers, required));
   const uncertain = $derived(!loaded || !current || !ready && agents.some(p => p.state === "unknown"));
   const heading = $derived(uncertain ? !loaded ? "Checking your agent connections…" : error ? "Agent connections need attention" : "Agent connections aren’t confirmed yet" : ready ? required.length ? "The required agents are connected" : "Ready for cloud work" : required.length ? `Connect your agents${projectName ? ` for ${projectName}` : " to continue"}` : "Connect an agent to start cloud work");
-  const introduction = $derived(uncertain ? "Chimaera hasn't confirmed your cloud agent connections yet. Existing connections haven't been changed." : ready ? required.length ? "The connections this project needs are confirmed. You can continue its paused handoff below." : "Your connected agents are ready for cloud work. You can add another whenever you need it." : required.length ? "This project is paused until its agents are connected for cloud work." : "Choose the agent you want to use. Connect one to get started; you can add others later.");
+  const introduction = $derived(uncertain ? "Chimaera hasn't confirmed your cloud agent connections yet. Existing connections haven't been changed." : ready ? required.length ? selectedHandoff && !resumeFailures[handoffKey(selectedHandoff)] ? "The agents this project needs are connected. Chimaera will continue it automatically." : "The agents this project needs are connected." : "Your connected agents are ready for cloud work. You can add another whenever you need it." : required.length ? "Connect the agents this project uses so it can continue automatically." : "Choose the agent you want to use. Connect one to get started; you can add others later.");
   const waiting = $derived(pendingConnection(connection));
   const detailsNeeded = $derived(required.length > 0 || handoffs.length > 0 || connection !== null || loaded && (!ready || error !== null));
   const showDetails = $derived(!compact || expanded || detailsNeeded);
@@ -51,19 +56,34 @@
 
   $effect(() => { const value = current ? ready : null; untrack(() => onReadiness?.(value)); });
 
+  $effect(() => {
+    if (!visible || !$pageVisible || busy !== null || waiting) return;
+    if (catalogMutation !== mutation || catalogVisibility !== visibilityGeneration) return;
+    const handoff = nextReadyHandoff(providers, handoffs, attemptedHandoffs, current);
+    if (handoff) untrack(() => void resume(handoff, handoff.workspace_id === workspaceId));
+  });
+
   async function load(signal?: AbortSignal): Promise<void> {
     if (catalogFlight) { catalogAgain = true; return; }
     catalogFlight = true;
+    const operation = mutation;
+    const visibility = visibilityGeneration;
     try {
       const result = await cloudRequest({ operation: "providers" }, signal);
-      if (!alive || signal?.aborted) return;
+      if (!alive || signal?.aborted || visibility !== visibilityGeneration) return;
+      if (operation !== mutation) { catalogAgain = true; return; }
       providers = result.providers ?? [];
       handoffs = result.handoffs ?? [];
       current = result.available === true && result.providers !== undefined;
+      catalogMutation = operation;
+      catalogVisibility = visibility;
       loaded = true;
       error = current ? null : "Your cloud connections couldn't be checked yet. Check again shortly.";
     } catch {
-      if (alive && !signal?.aborted) { loaded = true; current = false; error = "Your provider connections couldn't refresh. Existing connections haven't been changed."; }
+      if (alive && !signal?.aborted && visibility === visibilityGeneration) {
+        if (operation !== mutation) catalogAgain = true;
+        else { loaded = true; current = false; error = "Your provider connections couldn't refresh. Existing connections haven't been changed."; }
+      }
     } finally {
       catalogFlight = false;
       if (catalogAgain && alive && visible && $pageVisible) { catalogAgain = false; void load(); }
@@ -90,7 +110,7 @@
     const controller = new AbortController();
     untrack(() => void load(controller.signal));
     const timer = setInterval(() => void load(controller.signal), 30_000);
-    return () => { controller.abort(); clearInterval(timer); };
+    return () => { visibilityGeneration += 1; controller.abort(); clearInterval(timer); };
   });
   $effect(() => {
     const id = connectionId;
@@ -178,13 +198,20 @@
     } catch { if (alive) connectionNotice = "The code couldn't be copied. You can select it below."; }
   }
   async function resume(handoff: Handoff, returnAfter = false): Promise<void> {
-    if (busy !== null || !current || !providersReady(providers, handoff.blocked_providers.map(p => p.id))) return;
+    if (busy !== null || !nextReadyHandoff(providers, [handoff], [], current)) return;
+    const key = handoffKey(handoff);
+    if (!attemptedHandoffs.includes(key)) attemptedHandoffs = [...attemptedHandoffs, key];
+    delete resumeFailures[key];
     const request = ++mutation;
     busy = `resume:${handoff.workspace_id}`; error = null;
     try {
       await cloudRequest({ operation: "resume_handoff", workspace_id: handoff.workspace_id, expected_epoch: handoff.expected_epoch });
-      if (alive && request === mutation) { focusedHandoff = null; await load(); if (returnAfter) onReady?.(); }
-    } catch { if (alive && request === mutation) error = "This project couldn't continue yet. Its cloud copy is still paused; check its setup and try again."; }
+      if (alive && request === mutation) {
+        focusedHandoff = null;
+        await load();
+        if (returnAfter && alive && request === mutation && visible && $pageVisible && workspaceId === handoff.workspace_id) onReady?.();
+      }
+    } catch { if (alive && request === mutation) resumeFailures[key] = "This project couldn’t continue yet. Your saved work is intact. Try again when you’re ready."; }
     finally { if (alive && request === mutation) busy = null; }
   }
 </script>
@@ -194,8 +221,8 @@
     <button class="management" aria-expanded={showDetails} onclick={() => (expanded = !expanded)}><span><strong>Agent connections</strong><span class="management-state">{!loaded ? "Checking connections…" : ready ? "Ready for cloud work" : "Checking connection status…"}</span></span><span class="chevron" class:expanded aria-hidden="true">›</span></button>
   {/if}
   {#if showDetails}
-  <div class="heading"><div><span class="eyebrow">Your cloud agents</span><h2>{waiting ? `Connect ${connectingLabel}` : heading}</h2></div>{#if error || !current && loaded}<button class="text-button" disabled={catalogFlight || busy !== null} onclick={() => void load()}>Check connections</button>{/if}</div>
-  <p class="intro">{waiting ? "Finish sign-in below. Chimaera will confirm the connection automatically." : introduction}</p>
+  <div class="heading"><div><span class="eyebrow">Your cloud agents</span><h2>{waiting ? connection?.phase === "preparing" ? `Preparing ${connectingLabel} sign-in…` : connection?.phase === "verifying" ? `Connecting ${connectingLabel}…` : `Connect ${connectingLabel}` : heading}</h2></div>{#if error || !current && loaded}<button class="text-button" disabled={catalogFlight || busy !== null} onclick={() => void load()}>Check connections</button>{/if}</div>
+  <p class="intro">{waiting ? connection?.phase === "preparing" ? "Sign-in will appear here when it’s ready." : connection?.phase === "verifying" ? "Chimaera is confirming your sign-in with the provider." : "Finish sign-in below. Chimaera will confirm the connection automatically." : introduction}</p>
   <p class="privacy">Use your own provider account and subscription. Sign-in connects this provider account to Chimaera cloud. Credentials from your other devices aren't copied.</p>
   {#if !loaded}<p class="muted" role="status">Checking your cloud connections…</p>{/if}
   {#if loaded && agents.length === 0}<p class="muted">No cloud agent connections are available yet.</p>{/if}
@@ -204,8 +231,8 @@
       <article class="provider-card" class:connected={current && provider.state === "signed_in"}>
         <div class="provider-title"><h3>{provider.label}</h3>{#if required.includes(provider.id)}<span class="required">Needed for this project</span>{/if}</div>
         <p class="state" class:positive={current && provider.state === "signed_in"}>{!current && provider.state === "signed_in" ? "Previously connected · checking status" : providerStateLabel(provider)}</p>
-        <p class="provider-note">{provider.state === "signed_in" ? "Signed in for cloud work." : provider.state === "missing" ? "We'll prepare the agent, then guide you through sign-in." : provider.state === "unknown" ? "Check the connection, or sign in again if needed." : provider.state === "unavailable" ? "This connection isn't available for cloud work yet." : "Connect the account you already use for this agent."}</p>
-        {#if provider.state !== "signed_in"}<button class="button" disabled={busy !== null || waiting && !pollingPaused || provider.methods.length === 0 || provider.state === "unavailable"} onclick={() => void connect(provider.id)}>{busy === provider.id ? "Starting…" : `Connect ${provider.label}`}</button>{:else}<span class="connected-label">{current ? "Connected" : "Check connection to confirm"}</span>{/if}
+        <p class="provider-note">{provider.state === "signed_in" ? "Signed in for cloud work." : provider.state === "unknown" ? "Check the connection, or sign in again if needed." : provider.state === "unavailable" ? "This connection isn't available for cloud work yet." : "Connect the account you already use for this agent."}</p>
+        {#if provider.state !== "signed_in"}<button class="button" disabled={busy !== null || waiting && !pollingPaused || provider.methods.length === 0 || provider.state === "unavailable"} onclick={() => void connect(provider.id)}>{busy === provider.id ? "Preparing sign-in…" : `Connect ${provider.label}`}</button>{:else}<span class="connected-label">{current ? "Connected" : "Check connection to confirm"}</span>{/if}
       </article>
     {/each}
   </div>
@@ -216,7 +243,7 @@
   {#if connection}
     {#if connection.phase === "connected"}<p class="connection-success" role="status">{connectingLabel} is connected for cloud work.</p>{:else}
     <section class="connection" aria-label={`Connect ${connectingLabel}`} tabindex="-1" bind:this={connectionElement}>
-      <div class="heading"><h3>{connection.phase === "failed" ? "Sign-in needs attention" : connection.phase === "expired" ? "Sign-in expired" : connection.phase === "canceled" ? "Sign-in canceled" : `Connect ${connectingLabel}`}</h3>{#if waiting}<span class="phase" role="status">{connection.phase === "preparing" ? "Preparing your agent…" : connection.phase === "verifying" ? "Confirming connection…" : "Waiting for sign-in"}</span>{/if}</div>
+      <div class="heading"><h3>{connection.phase === "failed" ? "Sign-in needs attention" : connection.phase === "expired" ? "Sign-in expired" : connection.phase === "canceled" ? "Sign-in canceled" : `Connect ${connectingLabel}`}</h3>{#if waiting}<span class="phase" role="status">{connection.phase === "preparing" ? "Preparing sign-in…" : connection.phase === "verifying" ? "Confirming connection…" : "Waiting for sign-in"}</span>{/if}</div>
       {#if ["failed", "expired", "canceled"].includes(connection.phase)}<p class="muted">{connectionError(connection.phase === "failed" ? connection.error_code : connection.phase)}</p><button class="button" disabled={busy !== null} onclick={() => void connect(connection!.provider_id)}>Try again</button>
       {:else if connection.phase === "preparing"}<p class="muted" role="status">Preparing {connectingLabel} for sign-in. This happens automatically and may take a moment.</p>
       {:else if connection.phase === "verifying"}<p class="muted" role="status">Confirming your connection with {connectingLabel}…</p>
@@ -245,9 +272,9 @@
     {/if}
   {/if}
 
-  {#if ready && onReady}<div class="ready"><p>{required.length ? "The required agents are connected. You're ready to continue." : "Your first agent is connected. You're ready to start cloud work."}</p><button class="button" disabled={busy !== null} onclick={() => selectedHandoff ? void resume(selectedHandoff, true) : onReady?.()}>{selectedHandoff ? "Continue project" : required.length ? "Back to project" : "Continue to projects"}</button></div>{/if}
-  {#each handoffs.filter(h => h.workspace_id !== selectedHandoff?.workspace_id) as handoff (handoff.workspace_id)}
-    <div class="handoff"><div><h3>{handoff.name}</h3><p class="muted small">{current && providersReady(providers, handoff.blocked_providers.map(p => p.id)) ? "The required agents are connected. Continue this paused project when you're ready." : "Waiting for an agent connection for cloud work."}</p></div>{#if current && providersReady(providers, handoff.blocked_providers.map(p => p.id))}<button class="button" disabled={busy !== null} onclick={() => void resume(handoff)}>{busy === `resume:${handoff.workspace_id}` ? "Continuing…" : "Continue project"}</button>{:else}<button class="button secondary" onclick={() => (focusedHandoff = handoff)}>Connect required agents</button>{/if}</div>
+  {#if ready && onReady && !selectedHandoff}<div class="ready"><p>{required.length ? "The required agents are connected." : "Your first agent is connected. You’re ready for cloud work."}</p><button class="button" disabled={busy !== null} onclick={() => onReady?.()}>{required.length ? "Back to project" : "Back to projects"}</button></div>{/if}
+  {#each handoffs as handoff (handoff.workspace_id)}
+    <div class="handoff"><div><h3>{handoff.name}</h3><p class="muted small" role="status">{resumeFailures[handoffKey(handoff)] ?? (current && providersReady(providers, handoff.blocked_providers.map(p => p.id)) ? "Continuing your project…" : "Waiting for an agent connection for cloud work.")}</p></div>{#if resumeFailures[handoffKey(handoff)]}<button class="button" disabled={busy !== null || !nextReadyHandoff(providers, [handoff], [], current)} onclick={() => void resume(handoff, handoff.workspace_id === workspaceId)}>Try again</button>{:else if !current || !providersReady(providers, handoff.blocked_providers.map(p => p.id))}<button class="button secondary" onclick={() => (focusedHandoff = handoff)}>Connect required agents</button>{/if}</div>
   {/each}
   {#if !waiting && repositories.length && required.length === 0}<details class="optional"><summary>Repository connections <span>Optional</span></summary><p class="muted small">Connect a repository provider when a project needs access to its private repositories.</p>{#each repositories as provider (provider.id)}<div class="repository"><div><h3>{provider.label}</h3><p class="muted small">{providerStateLabel(provider)}</p></div>{#if provider.state !== "signed_in"}<button class="button secondary" disabled={busy !== null || waiting || provider.methods.length === 0 || provider.state === "unavailable"} onclick={() => void connect(provider.id)}>Connect {provider.label}</button>{/if}</div>{/each}</details>{/if}
   {#if error}<p class="error" role="alert">{error}</p>{/if}

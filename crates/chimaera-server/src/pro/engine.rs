@@ -13,6 +13,9 @@ use std::{
     time::Duration,
 };
 
+#[path = "release.rs"]
+mod release;
+
 #[derive(Serialize, Deserialize)]
 pub(super) struct Manifest {
     version: u32,
@@ -190,6 +193,18 @@ pub(super) async fn reconcile(
     workspace: &str,
 ) -> Result<()> {
     let generation = state.pro.generation.load(Ordering::Acquire);
+    reconcile_generation(state, config, workspace, generation).await
+}
+async fn reconcile_generation(
+    state: &Arc<AppState>,
+    config: &Configure,
+    workspace: &str,
+    generation: u64,
+) -> Result<()> {
+    ensure!(
+        generation == state.pro.generation.load(Ordering::Acquire),
+        "Account changed during project transfer"
+    );
     ensure!(
         super::projects::account_matches(state, workspace),
         "This project belongs to another account"
@@ -198,6 +213,10 @@ pub(super) async fn reconcile(
         .await?
         .json()?;
     ensure!(baton.workspace_id == workspace, "baton workspace mismatch");
+    ensure!(
+        generation == state.pro.generation.load(Ordering::Acquire),
+        "Account changed during project transfer"
+    );
     super::projects::bind_workspace_account(state, config, workspace)?;
     let holder = &config.delegation.device_id;
     let previous = lock(&state.pro.ownership).get(workspace).cloned();
@@ -315,6 +334,10 @@ pub(super) async fn reconcile(
             .insert(workspace.into(), Ownership::Local { epoch: grant.epoch });
     }
     super::persist(state).await?;
+    ensure!(
+        generation == state.pro.generation.load(Ordering::Acquire),
+        "Account changed during project transfer"
+    );
     if !matches!(previous, Some(Ownership::Local { .. })) {
         crate::ledger::resume_deferred_workspace(state, workspace).await?;
     }
@@ -375,6 +398,7 @@ pub(super) async fn snapshot(
     workspace: &str,
     clean: bool,
 ) -> Result<()> {
+    let generation = state.pro.generation.load(Ordering::Acquire);
     let epoch = super::owned_epoch(state, workspace).context("workspace is not locally owned")?;
     let workspace = lock(&state.workspaces)
         .get(workspace)
@@ -438,20 +462,35 @@ pub(super) async fn snapshot(
         lock(&state.pro.status).insert(workspace.id.clone(), WorkspaceStatus {report,last_mirrored_at:Some(super::now()),storage_limit_bytes:budget,error:None,blocked_providers:Vec::new()});
         super::persist(state).await?;
         if clean {
-            let released = account(config, &format!("/v1/baton/{}/release",workspace.id), "POST", Some(&json!({"holder_id":config.delegation.device_id,"epoch":epoch}))).await?;
-            ensure!((200..300).contains(&released.status), "workspace release failed");
+            release::after_publication(config, &workspace.id, epoch, || {
+                generation == state.pro.generation.load(Ordering::Acquire)
+                    && matches!(lock(&state.pro.ownership).get(&workspace.id), Some(Ownership::Transferring { epoch: current }) if *current == epoch)
+            }).await?;
         }
         Ok::<_,anyhow::Error>(())
     }.await;
     let _ = tokio::fs::remove_dir_all(staging).await;
     if result.is_err() && clean {
-        // A failed flush must not strand a stopped laptop agent. Verify that
-        // the baton is still ours before resuming its durable suspended entry.
-        lock(&state.pro.ownership).insert(
-            workspace.id.clone(),
-            Ownership::AwaitingVerification { epoch },
-        );
-        let _ = reconcile(state, config, &workspace.id).await;
+        // A failed flush must not strand a stopped laptop agent, but a changed
+        // account must never recover using the previous account's credentials.
+        let recover = {
+            let _configuration = state.pro.configuration.lock().await;
+            let mut ownership = lock(&state.pro.ownership);
+            if generation == state.pro.generation.load(Ordering::Acquire)
+                && matches!(ownership.get(&workspace.id), Some(Ownership::Transferring { epoch: current }) if *current == epoch)
+            {
+                ownership.insert(
+                    workspace.id.clone(),
+                    Ownership::AwaitingVerification { epoch },
+                );
+                true
+            } else {
+                false
+            }
+        };
+        if recover {
+            let _ = reconcile_generation(state, config, &workspace.id, generation).await;
+        }
     }
     result
 }
@@ -701,12 +740,13 @@ pub(super) async fn hydrate(
             .to_path_buf();
         current()?;
         let account_state = state.clone();
+        let config_workspace = destination_root.clone();
         tokio::task::spawn_blocking(move || {
             ensure!(
                 generation == account_state.pro.generation.load(Ordering::Acquire),
                 "Account changed during project transfer"
             );
-            config::import(&overlay, &home)
+            config::import(&overlay, &home, &config_workspace)
         })
         .await??;
         current()?;

@@ -54,7 +54,7 @@
         {#if isBrowserGateway()}<a class="account-link" href="/account">Manage account and billing</a>{/if}
       {:else if worker === null}
         <h1>Connect your cloud agents</h1>
-        {#if error}<p role="status">We couldn't reach this machine to check its cloud connections. It may be resting.</p><div class="actions"><button disabled={checking} onclick={() => void check(true)}>Connect to cloud</button><button class="secondary" disabled={checking} onclick={() => void check()}>Check again</button></div>{:else}<p role="status">Checking this machine…</p>{/if}
+        {#if error}<p role="status">We couldn’t load your agent connections. Try again in a moment.</p><div class="actions"><button disabled={checking} onclick={() => void check(true)}>Try again</button></div>{:else}<p role="status">Loading your agent connections…</p>{/if}
       {:else}
         <h1>Your work, here and away.</h1>
         {#if isBrowserGateway()}<p>Your plan, billing and connected devices live in your account.</p><a class="button" href="/account">Open your account</a>{:else}<p>Open Chimaera Pro from the desktop app to manage your account.</p>{/if}
@@ -71,7 +71,6 @@
   h1 { font-size: clamp(27px, 3vw, 34px); font-weight: 560; letter-spacing: -.8px; line-height: 1.2; }
   p { color: var(--muted); font-size: var(--text-md); line-height: 1.7; }
   button, .button { display: inline-flex; margin-top: 16px; padding: 10px 15px; border: 1px solid transparent; border-radius: 7px; background: var(--fg); color: var(--bg); font: inherit; font-size: var(--text-sm); text-decoration: none; cursor: pointer; }
-  .secondary { background: transparent; border-color: var(--edge); color: var(--fg); }
   .account-link { color: var(--muted); font-size: var(--text-sm); text-underline-offset: 3px; }
   button:disabled { opacity: .5; cursor: default; }
   button:focus-visible, a:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 3px; }

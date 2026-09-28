@@ -1,4 +1,4 @@
-import type { CloudProviderConnection, CloudProviderStatus } from "../net/native";
+import type { CloudProviderConnection, CloudProviderStatus, CloudSetupInfo } from "../net/native";
 import catalog from "../../../../crates/chimaera-core/src/cloud-providers.json";
 
 export function pendingConnection(connection: CloudProviderConnection | null): boolean {
@@ -12,11 +12,27 @@ export function providersReady(providers: CloudProviderStatus[], required: strin
   return required.length > 0 ? required.every(id => connected.has(id)) : connected.size > 0;
 }
 
+export type ProviderHandoff = NonNullable<CloudSetupInfo["handoffs"]>[number];
+export function handoffKey(handoff: ProviderHandoff): string {
+  return JSON.stringify([handoff.workspace_id, handoff.expected_epoch]);
+}
+
+/** Only an existing provider-blocked transfer may continue automatically. A
+ * generic connected agent never authorizes a new move or an unscoped hydrate. */
+export function nextReadyHandoff(providers: CloudProviderStatus[], handoffs: ProviderHandoff[], attempted: string[], current: boolean): ProviderHandoff | undefined {
+  if (!current) return undefined;
+  return handoffs.find(handoff => handoff.workspace_id.length > 0
+    && Number.isSafeInteger(handoff.expected_epoch) && handoff.expected_epoch > 0
+    && handoff.blocked_providers.length > 0
+    && !attempted.includes(handoffKey(handoff))
+    && providersReady(providers, handoff.blocked_providers.map(provider => provider.id)));
+}
+
 export function providerStateLabel(provider: CloudProviderStatus): string {
   switch (provider.state) {
     case "signed_in": return "Connected";
     case "needs_sign_in": return "Not connected";
-    case "missing": return "Ready to set up";
+    case "missing": return "Not connected";
     case "unavailable": return "Unavailable";
     default: return "Couldn't confirm connection";
   }
@@ -39,12 +55,12 @@ export function connectionError(code: string | null): string {
     case "canceled": case "connection_canceled": return "Sign-in was canceled. Your existing provider connections haven't changed.";
     case "device_login_unavailable": return "Device sign-in couldn't start. Check your connection and that your provider account allows device sign-in, then try again.";
     case "device_auth_disabled": return "Device sign-in isn't enabled for this account. Enable it in your provider's security settings, then try again.";
-    case "installation_failed": case "install_failed": return "The agent couldn't be prepared on your cloud machine. Try again in a moment.";
-    case "installation_unavailable": return "The agent installer is unavailable on this cloud machine. Check again after its software is updated.";
+    case "installation_failed": case "install_failed": return "Sign-in couldn’t be prepared for this agent. Try again in a moment.";
+    case "installation_unavailable": return "Sign-in isn’t available for this agent right now. Try again later.";
     case "probe_timeout": return "The agent took too long to confirm sign-in. Check the connection again in a moment.";
     case "sign_in_not_confirmed": return "The provider hasn’t confirmed sign-in yet. Open its sign-in flow again to finish.";
-    case "browser_login_unavailable": return "This version of the agent couldn’t open guided sign-in. Update the agent, then try again.";
-    case "unsupported": case "unsupported_auth": return "This provider doesn't support guided sign-in on this cloud machine yet.";
+    case "browser_login_unavailable": return "Guided sign-in isn’t available for this agent right now. Try again later.";
+    case "unsupported": case "unsupported_auth": return "This provider doesn’t support guided sign-in for cloud work yet.";
     default: return "The provider couldn't complete sign-in. You can try again without changing your local account.";
   }
 }

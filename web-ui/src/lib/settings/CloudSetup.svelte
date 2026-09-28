@@ -22,16 +22,18 @@
   let actionGeneration = 0;
   let connectionChecked = $state(false);
   let providersMounted = $state(false);
+  let connectionsRequested = $state(false);
   let projects = $state<MirrorStatus | null>(null);
   let refreshFlight: Promise<void> | null = null;
   const browser = !isNativeShell();
   const copy = $derived(status?.state === "ready" && info?.available !== true
-    ? { title: connectionChecked ? "Cloud connection isn't ready" : "Checking your cloud connection…", detail: connectionChecked ? "Your cloud has started, but Chimaera couldn't reach it yet. Check again shortly. Your local work is available." : "Your cloud has started. We're checking that its workbench is reachable." }
-    : status?.state === "ready" && info?.available ? { title: "Your cloud is ready", detail: "Agents connected here can keep working while this computer sleeps." } : cloudCopy(status?.state ?? "error", status?.reason ?? null, status?.phase));
+    ? { title: connectionChecked ? "Cloud access is temporarily unavailable" : "Checking availability…", detail: connectionChecked ? "We couldn’t reach your projects and agent connections. We’ll keep checking. You can keep working here." : "Checking access to your projects and agent connections." }
+    : cloudCopy(status?.state ?? "error", status?.reason ?? null, status?.phase));
   const connected = $derived(info?.available === true && (browser || status?.state === "ready"));
-  $effect(() => { if (connected) providersMounted = true; });
-  const preparing = $derived(!browser && (status?.state === "preparing" || status?.state === "ready" && !connected));
-  const projectStatus = $derived(connected ? cloudProjectStatus(projects, workspaceId) : null);
+  $effect(() => { if (connected) { providersMounted = true; connectionsRequested = false; } });
+  const preparing = $derived(!browser && (status?.state === "preparing" || status?.state === "ready" && !connected && !connectionChecked));
+  const available = $derived(connected || status?.state === "sleeping");
+  const projectStatus = $derived(cloudProjectStatus(projects, workspaceId));
   const needsCheck = $derived(browser ? connectionChecked && !connected : status?.state === "error" || status?.state === "unavailable" || status?.state === "ready" && connectionChecked && !connected);
 
   async function readProjects(signal?: AbortSignal): Promise<MirrorStatus | null> {
@@ -72,12 +74,13 @@
             reachable = details?.available === true;
           } else { info = null; connectionChecked = false; }
         }
-        const nextProjects = reachable ? await readProjects(signal) : null;
+        // Native mirror metadata is local and stays useful while compute is idle.
+        const nextProjects = !browser || reachable ? await readProjects(signal) : null;
         if (alive && !signal?.aborted && current === generation) { projects = nextProjects; error = null; }
       } catch {
         if (alive && !signal?.aborted && current === generation) {
           status = { state: "error", reason: null }; info = null; projects = null; connectionChecked = true;
-          error = "Cloud readiness couldn't refresh. Your local work is still available.";
+          error = "Cloud availability couldn’t refresh. Your local work is still available.";
         }
       } finally { if (alive) refreshing = false; }
     })();
@@ -105,7 +108,7 @@
     if (busy !== null) return;
     const action = ++actionGeneration;
     busy = label; error = null;
-    if (request.operation === "start") generation += 1;
+    if (request.operation === "start") { connectionsRequested = true; generation += 1; }
     try {
       const result = await cloudRequest(request);
       if (!alive || action !== actionGeneration) return;
@@ -124,7 +127,7 @@
       if (!alive || action !== actionGeneration) return;
       if (request.operation === "project") repository = "";
       if (request.operation === "start") await refresh(undefined, true);
-    } catch (reason) { if (alive && action === actionGeneration) error = friendlyError(reason, request.operation === "project" ? "This repository couldn't open in the cloud. Check the URL and your Git access, then try again." : "Your cloud connection couldn't open yet. Check its progress and try again shortly."); }
+    } catch (reason) { if (alive && action === actionGeneration) error = friendlyError(reason, request.operation === "project" ? "This repository couldn't open in the cloud. Check the URL and your Git access, then try again." : "Your agent connections couldn’t load. Try again in a moment."); }
     finally { if (alive && action === actionGeneration) busy = null; }
   }
   async function copyKey(): Promise<void> {
@@ -135,15 +138,20 @@
 
 <section class="cloud" aria-label="Cloud status">
   <div class="machine" class:attention={needsCheck}>
-    <div class="heading"><div><span class="eyebrow">Your cloud</span><h2>{browser ? connected ? "Your cloud is ready" : connectionChecked ? "Cloud connection unavailable" : "Checking your cloud connection…" : status ? copy.title : "Checking cloud readiness…"}</h2></div><span class="status-mark" class:connected class:preparing aria-hidden="true">{#if connected}<svg viewBox="0 0 24 24"><path d="m6 12 4 4 8-8" /></svg>{:else}<svg viewBox="0 0 24 24"><path d="M7 17a4 4 0 0 1-1-7.9 6 6 0 0 1 11.4-1.5A4.7 4.7 0 0 1 18 17H7Z" /></svg>{/if}</span></div>
-    <p class="hint" role="status">{browser ? connected ? "Agents connected here can keep working while your computer sleeps." : connectionChecked ? "This workbench has not confirmed an available cloud connection. Your local work is still available." : "Checking that this workbench is reachable." : status ? copy.detail : "This check doesn't wake a sleeping machine."}</p>
-    {#if preparing}<p class="automatic">Preparation continues automatically. You can keep working here.</p>{/if}
+    <div class="heading"><div><span class="eyebrow">Your cloud</span><h2>{browser ? connected ? "Available when you need it" : connectionChecked ? "Cloud access is temporarily unavailable" : "Checking availability…" : status ? copy.title : "Checking availability…"}</h2></div><span class="status-mark" class:connected={available} class:preparing aria-hidden="true">{#if available}<svg viewBox="0 0 24 24"><path d="m6 12 4 4 8-8" /></svg>{:else}<svg viewBox="0 0 24 24"><path d="M7 17a4 4 0 0 1-1-7.9 6 6 0 0 1 11.4-1.5A4.7 4.7 0 0 1 18 17H7Z" /></svg>{/if}</span></div>
+    <p class="hint" role="status">{browser ? connected ? "Agents connected here can keep working while your computer sleeps." : connectionChecked ? "We couldn’t reach your projects and agent connections. Try again in a moment." : "Checking access to your projects and agent connections." : status ? copy.detail : "Your projects and conversations stay together across devices."}</p>
     {#if needsCheck}<div class="recovery"><button class="text-button" disabled={busy !== null || refreshing} onclick={() => void refresh()}>{refreshing ? "Checking…" : "Check again"}</button>{#if browser}<a class="account-link" href="/account">Open your account →</a>{/if}</div>{/if}
   </div>
   {#if projectStatus}
     <div class="project-status" class:attention={projectStatus.state === "attention"} role="status"><span class="project-dot" class:active={projectStatus.state === "active"} aria-hidden="true"></span><div><h3>{projectStatus.title}</h3><p class="hint">{projectStatus.detail}</p></div></div>
   {/if}
-  {#if !browser && status?.state === "sleeping"}<details class="sleeping-connections" ontoggle={(event) => { if (event.currentTarget.open) void act("connections", { operation: "start" }); }}><summary>Agent connections</summary><p class="hint">{busy === "connections" ? "Checking your agent connections… Your cloud is opening automatically for this request." : "Close and reopen this section to check your connections again."}</p></details>{/if}
+  {#if !browser && !connected && (status?.state === "sleeping" || connectionsRequested)}
+    <details class="sleeping-connections" ontoggle={(event) => { if (event.currentTarget.open && !connectionsRequested) void act("connections", { operation: "start" }); }}>
+      <summary>Agent connections</summary>
+      {#if busy === "connections" || preparing}<p class="hint" role="status">Loading your agent connections…</p>
+      {:else}<p class="hint">Your agent connections couldn’t load yet.</p><button class="text-button" disabled={busy !== null} onclick={() => void act("connections", { operation: "start" })}>Try again</button>{/if}
+    </details>
+  {/if}
   {#if providersMounted}
     <div class="provider-section" hidden={!connected}>
       <ProviderConnections visible={visible && connected} {requiredProviders} {contextLabel} {workspaceId} {onReady} compact />
@@ -163,7 +171,6 @@
   .status-mark svg { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-width: 1.4; stroke-linecap: round; stroke-linejoin: round; }
   .status-mark.connected { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 30%, var(--edge)); }
   .status-mark.preparing { color: var(--accent); }
-  .automatic { margin: 2px 0 0; color: var(--muted); font-size: var(--text-xs); line-height: 1.6; }
   .recovery { display: flex; align-items: center; flex-wrap: wrap; gap: 18px; margin-top: 5px; }
   .project-status { display: flex; gap: 11px; align-items: baseline; padding: 17px 0 0; border-top: 1px solid var(--edge); }
   .project-status h3 { margin: 0 0 4px; font-size: var(--text-sm); font-weight: 550; }

@@ -102,17 +102,31 @@ pub(super) fn contains_credential(bytes: &[u8]) -> bool {
     false
 }
 
-pub(super) fn sanitize(value: &mut Value, missing: &mut Vec<String>) {
+pub(super) fn sanitize(value: &mut Value, missing: &mut Vec<String>, workspace: Option<&Path>) {
     match value {
         Value::Object(map) => {
             map.retain(|key, value| {
+                if matches!(key.as_str(), "mcp_servers" | "mcpServers") {
+                    if let Value::Object(servers) = value {
+                        servers.retain(|_, server| !host_only_mcp(server, workspace));
+                        for server in servers.values_mut() {
+                            sanitize_mcp(server, missing, workspace);
+                        }
+                        return true;
+                    }
+                    return false;
+                }
                 if secret_name(key) {
-                    note_missing(missing, key);
                     return false;
                 }
                 if key.eq_ignore_ascii_case("env") {
                     if let Value::Object(env) = value {
                         env.retain(|name, value| {
+                            // Host runtime paths are recreated by the destination,
+                            // not missing service credentials the user must supply.
+                            if host_environment(name, value, workspace) {
+                                return false;
+                            }
                             let benign = matches!(
                                 name.as_str(),
                                 "PATH"
@@ -125,7 +139,7 @@ pub(super) fn sanitize(value: &mut Value, missing: &mut Vec<String>) {
                             ) && !value
                                 .as_str()
                                 .is_some_and(|s| contains_credential(s.as_bytes()));
-                            if !benign {
+                            if !benign && environment_name(name) {
                                 note_missing(missing, name);
                             }
                             benign
@@ -135,10 +149,9 @@ pub(super) fn sanitize(value: &mut Value, missing: &mut Vec<String>) {
                     }
                 }
                 if value.as_str().is_some_and(unsafe_string) {
-                    note_missing(missing, key);
                     return false;
                 }
-                sanitize(value, missing);
+                sanitize(value, missing, workspace);
                 true
             });
         }
@@ -155,7 +168,6 @@ pub(super) fn sanitize(value: &mut Value, missing: &mut Vec<String>) {
                         .map_or((flag, false), |(key, _)| (key, true));
                     if secret_name(key) {
                         skip_next = !inline;
-                        note_missing(missing, key);
                         return false;
                     }
                 }
@@ -163,11 +175,131 @@ pub(super) fn sanitize(value: &mut Value, missing: &mut Vec<String>) {
             });
             values.retain(|v| !v.as_str().is_some_and(unsafe_string));
             for value in values {
-                sanitize(value, missing);
+                sanitize(value, missing, workspace);
             }
         }
         _ => {}
     }
+}
+
+/// These are variable names, never values. Unknown secret-shaped fields still
+/// pass through the general redactor; only this documented MCP reference survives.
+fn sanitize_mcp(server: &mut Value, missing: &mut Vec<String>, workspace: Option<&Path>) {
+    let reference = server.as_object_mut().and_then(|map| {
+        map.remove("bearer_token_env_var")
+            .filter(|value| value.as_str().is_some_and(environment_name))
+    });
+    sanitize(server, missing, workspace);
+    if let (Some(map), Some(reference)) = (server.as_object_mut(), reference) {
+        map.insert("bearer_token_env_var".into(), reference);
+    }
+}
+
+fn environment_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name.bytes().enumerate().all(|(index, byte)| {
+            byte == b'_' || byte.is_ascii_alphabetic() || index > 0 && byte.is_ascii_digit()
+        })
+}
+
+fn host_environment(name: &str, value: &Value, workspace: Option<&Path>) -> bool {
+    matches!(
+        name,
+        "HOME"
+            | "USERPROFILE"
+            | "CODEX_HOME"
+            | "CLAUDE_CONFIG_DIR"
+            | "TMPDIR"
+            | "XDG_CONFIG_HOME"
+            | "XDG_DATA_HOME"
+            | "XDG_CACHE_HOME"
+            | "XDG_RUNTIME_DIR"
+    ) || matches!(name, "PATH" | "PYTHONPATH" | "VIRTUAL_ENV")
+        && value
+            .as_str()
+            .is_some_and(|value| host_path_list(value, workspace))
+}
+
+fn host_path(value: &str, workspace: Option<&Path>) -> bool {
+    let value = value.replace('\\', "/");
+    if let Some(root) = workspace.and_then(Path::to_str) {
+        let root = root.replace('\\', "/");
+        if Path::new(&value).starts_with(&root)
+            && !Path::new(&value)
+                .components()
+                .any(|part| matches!(part, Component::ParentDir))
+        {
+            return false;
+        }
+    }
+    let lower = value.to_ascii_lowercase();
+    [
+        "/Users/",
+        "/home/",
+        "/root/",
+        "/Applications/",
+        "/System/Applications/",
+        "/private/var/folders/",
+        "/var/folders/",
+    ]
+    .iter()
+    .any(|prefix| value.starts_with(prefix))
+        || lower.as_bytes().get(1) == Some(&b':')
+            && (lower[2..].starts_with("/users/") || lower[2..].starts_with("/program files/"))
+}
+
+fn host_path_list(value: &str, workspace: Option<&Path>) -> bool {
+    host_path(value, workspace)
+        || value
+            .split([':', ';'])
+            .any(|part| host_path(part, workspace))
+}
+
+/// Device-bound app helpers and loopback services cannot become cloud MCPs by
+/// copying their settings. Absolute paths within the copied project are valid.
+fn host_only_mcp(server: &Value, workspace: Option<&Path>) -> bool {
+    let command = server.get("command").and_then(Value::as_str);
+    if command
+        .is_some_and(|command| host_path(command, workspace) || command == "SkyComputerUseClient")
+    {
+        return true;
+    }
+    if server
+        .get("args")
+        .and_then(Value::as_array)
+        .is_some_and(|args| {
+            args.iter()
+                .filter_map(Value::as_str)
+                .any(|arg| host_path(arg, workspace))
+        })
+    {
+        return true;
+    }
+    if server
+        .get("env")
+        .and_then(Value::as_object)
+        .is_some_and(|env| {
+            env.iter().any(|(name, value)| {
+                (name.starts_with("NODE_REPL_")
+                    || matches!(name.as_str(), "SKY_CUA_SERVICE_PATH" | "CODEX_CLI_PATH"))
+                    && value
+                        .as_str()
+                        .is_some_and(|value| host_path_list(value, workspace))
+            })
+        })
+    {
+        return true;
+    }
+    server.get("url").and_then(Value::as_str)
+        .and_then(|url| url.parse::<axum::http::Uri>().ok())
+        .is_some_and(|uri| uri.host().is_some_and(|host| {
+            host.trim_end_matches('.').eq_ignore_ascii_case("localhost")
+                || host.trim_matches(['[', ']']).parse::<std::net::IpAddr>().is_ok_and(|address| {
+                    address.is_loopback() || address.is_unspecified()
+                        || matches!(address, std::net::IpAddr::V6(v6) if v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback() || v4.is_unspecified()))
+                })
+        }))
 }
 
 fn unsafe_string(value: &str) -> bool {
@@ -280,7 +412,7 @@ mod tests {
     fn config_filter_removes_nested_secrets_and_reports_environment_names() {
         let mut config = serde_json::json!({"model":"codex", "mcp_servers":{"example":{"url":"https://mcp.test/", "env":{"API_TOKEN":"credential", "PATH":"/usr/bin", "CUSTOM_AUTH":"secret"}, "authorization":"Bearer secret"}}, "api_key":"credential", "safe":"hello"});
         let mut missing = Vec::new();
-        sanitize(&mut config, &mut missing);
+        sanitize(&mut config, &mut missing, None);
         assert!(config.get("api_key").is_none());
         assert!(config["mcp_servers"]["example"]
             .get("authorization")
@@ -294,6 +426,72 @@ mod tests {
             .unwrap()
             .contains("credential"));
     }
+    #[test]
+    fn metadata_redaction_is_not_an_environment_requirement() {
+        let mut config = serde_json::json!({"name":"token help", "description":"use auth for this plugin", "api_key":"private", "args":["--token", "private"], "env":{"SERVICE_TOKEN":"private", "invalid-name":"private", "CODEX_HOME":"/Users/example/.codex", "PATH":"/Users/example/bin:/usr/bin"}});
+        let mut omitted = Vec::new();
+        sanitize(&mut config, &mut omitted, None);
+        assert_eq!(omitted, ["SERVICE_TOKEN"]);
+        assert!(config.get("name").is_none());
+        assert!(config.get("description").is_none());
+        assert!(!serde_json::to_string(&config).unwrap().contains("private"));
+    }
+
+    #[test]
+    fn portable_mcp_configs_keep_references_but_not_credentials_or_desktop_helpers() {
+        let mut config = serde_json::json!({"mcp_servers":{
+            "node_repl":{"command":"/Applications/Codex.app/Contents/node_repl", "env":{"BROWSER_USE_AVAILABLE_BACKENDS":"desktop", "CODEX_HOME":"/Users/example/.codex"}},
+            "goldfish":{"command":"/Users/example/.local/bin/goldfish-mcp"},
+            "computer-use":{"command":"SkyComputerUseClient"},
+            "loopback":{"url":"http://localhost:4000/mcp"},
+            "docs":{"url":"https://docs.example/mcp", "bearer_token_env_var":"DOCS_TOKEN", "authorization":"private", "enabled":true},
+            "portable":{"command":"npx", "args":["-y", "example-server"], "env":{"SERVICE_TOKEN":"private","NODE_ENV":"production"}},
+            "literal":{"url":"https://literal.example/mcp", "bearer_token_env_var":"sk-abcdefghijklmnopqrstuv"}
+        }});
+        let mut omitted = Vec::new();
+        sanitize(&mut config, &mut omitted, None);
+        let servers = config["mcp_servers"].as_object().unwrap();
+        assert_eq!(servers.len(), 3);
+        assert_eq!(servers["docs"]["bearer_token_env_var"], "DOCS_TOKEN");
+        assert_eq!(servers["docs"]["enabled"], true);
+        assert_eq!(servers["portable"]["command"], "npx");
+        assert_eq!(
+            servers["portable"]["args"],
+            serde_json::json!(["-y", "example-server"])
+        );
+        assert_eq!(servers["portable"]["env"]["NODE_ENV"], "production");
+        assert!(servers["literal"].get("bearer_token_env_var").is_none());
+        assert_eq!(omitted, ["SERVICE_TOKEN"]);
+        assert!(!serde_json::to_string(&config).unwrap().contains("private"));
+    }
+
+    #[test]
+    fn copied_project_paths_remain_portable_but_device_paths_and_loopbacks_do_not() {
+        for root in [
+            "/Users/example/project",
+            "/home/example/project",
+            "C:/Users/example/project",
+        ] {
+            let mut config = serde_json::json!({"mcp_servers":{
+                "project_script":{"command":"node", "args":[format!("{root}/tools/mcp.js")]},
+                "project_binary":{"command":format!("{root}/tools/mcp"), "args":[root]},
+                "escaped":{"command":format!("{root}/../.local/bin/helper")},
+                "mac_app":{"command":"/Applications/Codex.app/Contents/node_repl"},
+                "linux_local":{"command":"/home/example/.local/bin/goldfish-mcp"},
+                "windows_local":{"command":"C:\\Users\\example\\AppData\\Local\\helper.exe"},
+                "loopback4":{"url":"http://127.0.0.2:4000/mcp"},
+                "loopback6":{"url":"http://[::1]:4000/mcp"},
+                "unspecified4":{"url":"http://0.0.0.0:4000/mcp"},
+                "unspecified6":{"url":"http://[::]:4000/mcp"}
+            }});
+            sanitize(&mut config, &mut Vec::new(), Some(Path::new(root)));
+            let servers = config["mcp_servers"].as_object().unwrap();
+            assert_eq!(servers.len(), 2, "{root}: {servers:?}");
+            assert!(servers.contains_key("project_script"));
+            assert!(servers.contains_key("project_binary"));
+        }
+    }
+
     #[test]
     fn profile_learns_platform_steps_without_running_them() {
         let mut profile = CloudProfile::default();

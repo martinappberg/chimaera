@@ -79,7 +79,7 @@ return reopens Pro, including when a new window needed time to mount.
 | `EnvironmentSettings.svelte` | The Environment prelude panel (bespoke, `/api/v1/environment`-backed — see the exception above). |
 | `environment.ts` | Wire types + `getEnvironment`/`putEnvironment` for the prelude map. |
 | `CloudSetup.svelte` | Automatic cloud status, bounded visible polling, historical project-copy summaries and contextual provider connections; sleeping workers wake only for explicit connection management/use. Repository/key details stay secondary. See [provider map](../pro/AGENTS.md). |
-| `MirrorSettings.svelte` | Native laptop-daemon mirror status, privacy, setup profile and persistent session pins; visibility-gated 15-second status refresh; blocked-provider rows open the shared connection flow. |
+| `MirrorSettings.svelte` | Native project-copy status and privacy; visibility-gated 15-second status refresh; blocked-provider rows open the shared connection flow. Setup and idle-session policy stay agent/internal capabilities. |
 | `ProSettings.svelte` | Dedicated Pro overview content: account identity, plan choices, browser checkout/portal, usage, and progressive connection/privacy/security sections. |
 | `DocumentsSettings.svelte` | The Documents panel: the opt-in AGENTS.md / Claude skill installs (see the exception above). |
 | `agentDocs.ts` | Wire types + `getAgentDocs`/`installAgentDocs` for `/api/v1/agent-docs`. |
@@ -106,6 +106,12 @@ return reopens Pro, including when a new window needed time to mount.
 
 Idle cloud status means available on demand, not a manual Start task. Opening
 Agent connections explicitly requests access; passive polling never wakes compute.
+The page describes the requested work without narrating machine power state.
+Native project-copy status remains visible while compute is idle. Project privacy
+shows the last recorded copy and actual blockers; healthy file counts and storage
+quotas are not a task list. Setup commands and idle-session pins are not account
+controls. Generic missing-environment diagnostics are not shown
+as missing credentials or instructions without a verified integration requirement.
 After its first connection the provider component remains mounted while hidden
 across readiness changes, so unrelated status refreshes cannot reset sign-in.
 Ordinary connection rows exclude managed cloud workers; they remain available

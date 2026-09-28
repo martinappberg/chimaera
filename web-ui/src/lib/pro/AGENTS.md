@@ -20,8 +20,11 @@ enter UI settings or local storage.
 
 ## Boundaries
 
-- Cloud status distinguishes automatic preparation, verified agent connection and
-  recorded project copies without numbered tasks. Optional preparation `phase` is used only for `state:preparing`.
+- Cloud status distinguishes availability, verified agent connection and
+  recorded project copies without numbered tasks. Infrastructure `phase` stays off
+  the user surface; ready and idle compute share the same calm availability state.
+  Progress describes the requested task, such as loading agent connections or
+  preparing a named provider's sign-in, never machine startup or shutdown.
   A reachable daemon does not imply an agent is signed in or files are copied.
   Project transfer labels come only from recorded ownership; saved-copy counts
   require `last_mirrored_at`, and never-mirror projects are excluded. There is no
@@ -49,8 +52,12 @@ enter UI settings or local storage.
 - Mutations invalidate older connection responses. An old waiting response cannot
   overwrite a confirmed cancellation. Queued catalog refresh confirms completion
   even when an earlier passive read was in flight.
-- Continuing a handoff sends the current daemon-reported workspace and epoch.
-  The daemon retains authority to check ownership, authentication and setup.
+- An already staged provider-blocked handoff continues automatically once a fresh
+  catalog confirms every named provider. Attempts are sequential and once per
+  workspace/epoch; visibility or connection mutations invalidate that catalog.
+  A failed attempt offers explicit retry. Completion returns to the originating
+  project only if that context is still current. The daemon rechecks ownership,
+  authentication and setup; no connected agent authorizes a new move.
 - All external auth links require an exact HTTPS origin from
   `crates/chimaera-core/src/cloud-providers.json`, without credentials or a fragment.
   No status or discovery operation carries wake intent.
