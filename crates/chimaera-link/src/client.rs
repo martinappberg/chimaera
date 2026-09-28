@@ -271,6 +271,48 @@ impl Client {
         )
         .await
     }
+    pub async fn worker_status(&self) -> Result<WorkerStatus> {
+        json_response(
+            self.request(
+                Method::GET,
+                path(&self.inner.account, &["v1", "worker", "status"]),
+                None,
+            )
+            .await?,
+        )
+        .await
+    }
+    pub async fn billing_checkout(
+        &self,
+        plan: Plan,
+        interval: BillingInterval,
+    ) -> Result<BillingSession> {
+        if plan == Plan::None {
+            bail!("choose Pro or Max");
+        }
+        json_response(
+            self.request(
+                Method::POST,
+                path(&self.inner.account, &["v1", "billing", "checkout"]),
+                Some(
+                    serde_json::json!({"plan": plan, "interval": interval, "return_to": "desktop"}),
+                ),
+            )
+            .await?,
+        )
+        .await
+    }
+    pub async fn billing_portal(&self) -> Result<BillingSession> {
+        json_response(
+            self.request(
+                Method::POST,
+                path(&self.inner.account, &["v1", "billing", "portal"]),
+                Some(serde_json::json!({"return_to": "desktop"})),
+            )
+            .await?,
+        )
+        .await
+    }
     pub async fn set_handoff_policy(&self, workspace: &str, policy: &HandoffPolicy) -> Result<()> {
         self.request(
             Method::PUT,

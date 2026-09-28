@@ -542,3 +542,43 @@ async fn executable_handoff_conformance() {
         .unwrap();
     assert_eq!(checks.len(), 3);
 }
+
+#[tokio::test]
+async fn account_billing_and_cloud_status_use_device_authentication() {
+    let fixture = Fixture::start().await;
+    let client = fixture.client();
+    let status = client.worker_status().await.unwrap();
+    assert_eq!(status.state, WorkerState::Unavailable);
+    assert_eq!(status.reason, Some(WorkerReason::ProvisioningDisabled));
+    for plan in [Plan::Pro, Plan::Max] {
+        for interval in [BillingInterval::Month, BillingInterval::Year] {
+            assert!(client
+                .billing_checkout(plan.clone(), interval)
+                .await
+                .unwrap()
+                .url
+                .starts_with("https://checkout.stripe.com/"));
+        }
+    }
+    assert!(client
+        .billing_checkout(Plan::None, BillingInterval::Month)
+        .await
+        .is_err());
+    assert!(client
+        .billing_portal()
+        .await
+        .unwrap()
+        .url
+        .starts_with("https://billing.stripe.com/"));
+    let unsigned = Client::new(&fixture.keeper.endpoint, None).unwrap();
+    assert!(unsigned.worker_status().await.is_err());
+    assert!(unsigned.billing_portal().await.is_err());
+    let delegation = client.delegate_daemon().await.unwrap();
+    let response = reqwest::Client::new()
+        .get(format!("{}/v1/worker/status", fixture.keeper.endpoint))
+        .bearer_auth(&delegation.access_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 401);
+}

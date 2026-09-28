@@ -36,8 +36,33 @@ REST response bodies are limited to 1 MiB; control frames to 128 KiB.
 | `GET /v1/devices` | — | Device array below |
 | `DELETE /v1/devices/{id}` | — | `204`; revoke that device and its connections |
 | `POST /v1/sign-out-everywhere` | — | `204`; revoke all devices, close held SSH logins and all link sockets |
-| `POST /v1/billing/checkout` | `{plan:"pro"\|"max",interval:"month"\|"year"}` | `{url}` to hosted checkout |
-| `POST /v1/billing/portal` | `{}` | `{url}` to hosted billing portal |
+| `POST /v1/billing/checkout` | `{plan:"pro"\|"max",interval:"month"\|"year",return_to?:"desktop"}` | `{url}` to hosted checkout |
+| `POST /v1/billing/portal` | `{return_to?:"desktop"}` (or an empty body) | `{url}` to hosted billing portal |
+| `GET /v1/worker/status` | — | Passive `WorkerStatus` below; full device authentication, no provisioning or wake |
+
+`WorkerStatus` is `{state,reason}`. `state` is `no_plan`, `unavailable`,
+`preparing`, `ready`, `sleeping`, `limited` or `error`. `reason` is null or one
+of `provisioning_disabled`, `beta_invite_required`, `hours_exhausted`,
+`storage_exhausted`, `spend_limit_reached`, `provisioning_failed`. An inactive
+subscription is `no_plan`; disabled provisioning or an uninvited staging account
+is `unavailable`; an eligible initial allocation or start is `preparing`.
+`ready` requires a started worker with recent authenticated worker acknowledgement;
+it describes account-known compute availability, not daemon connection readiness.
+Clients still verify the live cloud information before opening provider terminals.
+`sleeping` describes an existing stopped/suspended worker without a pending start.
+Quota restrictions are `limited`; a failed preparation is `error`. Clients render
+their own fixed, actionable descriptions rather than vendor error bodies.
+
+This status read returns account-owned database state without calling Fly,
+creating resources, refreshing desired machine state or waking a worker. It
+contains no cell ids, service credentials or provider URLs. Automatic initial
+preparation is a bounded account-service responsibility for eligible active or
+trialing accounts; subsequent passive reads never wake a sleeping worker.
+
+The optional billing `return_to:"desktop"` selects a server-owned, credential-free
+browser return page that tells the user to return to the app. Omission preserves
+the browser account return. Arbitrary return URLs are never accepted. Returning
+from checkout does not grant a plan; the app refreshes authoritative account state.
 
 Account example (limits are supplied by the account, never hardcoded by clients):
 

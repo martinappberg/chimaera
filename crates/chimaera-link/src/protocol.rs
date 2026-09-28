@@ -16,6 +16,48 @@ pub enum Plan {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerState {
+    NoPlan,
+    Unavailable,
+    Preparing,
+    Ready,
+    Sleeping,
+    Limited,
+    Error,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerReason {
+    ProvisioningDisabled,
+    BetaInviteRequired,
+    HoursExhausted,
+    StorageExhausted,
+    SpendLimitReached,
+    ProvisioningFailed,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerStatus {
+    pub state: WorkerState,
+    pub reason: Option<WorkerReason>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BillingInterval {
+    Month,
+    Year,
+}
+
+// Hosted billing URLs are temporary capabilities; never include them in Debug.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct BillingSession {
+    pub url: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Limits {
     pub cloud_hours: u64,
     pub storage_bytes: u64,

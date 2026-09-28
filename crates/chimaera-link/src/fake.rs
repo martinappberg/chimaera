@@ -158,6 +158,24 @@ impl FakeKeeper {
         let private = Router::new()
             .merge(crate::fake_handoff::routes())
             .route("/v1/me", get(me))
+            .route(
+                "/v1/worker/status",
+                get(|| async {
+                    Json(WorkerStatus {
+                        state: WorkerState::Unavailable,
+                        reason: Some(WorkerReason::ProvisioningDisabled),
+                    })
+                }),
+            )
+            .route("/v1/billing/checkout", post(fixture_checkout))
+            .route(
+                "/v1/billing/portal",
+                post(|| async {
+                    Json(BillingSession {
+                        url: "https://billing.stripe.com/p/session/fixture".into(),
+                    })
+                }),
+            )
             .route("/v1/hosts", get(hosts).post(add_host))
             .route("/v1/hosts/{id}", axum::routing::delete(delete_host))
             .route("/v1/hosts/{id}/reconnect", post(reconnect))
@@ -183,6 +201,18 @@ impl FakeKeeper {
             .layer(DefaultBodyLimit::max(MAX_CONTROL_FRAME))
             .with_state(self.clone())
     }
+}
+async fn fixture_checkout(Json(body): Json<serde_json::Value>) -> Response {
+    if !matches!(body["plan"].as_str(), Some("pro" | "max"))
+        || !matches!(body["interval"].as_str(), Some("month" | "year"))
+        || body["return_to"].as_str() != Some("desktop")
+    {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    Json(BillingSession {
+        url: "https://checkout.stripe.com/c/pay/fixture".into(),
+    })
+    .into_response()
 }
 fn nonce() -> String {
     base64::Engine::encode(
