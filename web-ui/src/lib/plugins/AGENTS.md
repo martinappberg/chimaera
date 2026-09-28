@@ -59,6 +59,9 @@ QuickOpen — not in `shared/icons.ts`, which `prebuild` regenerates from Tabler
   hook trust and workspace setup still require the user's action.
   Both card and sheet send that row's `agent_plugin_id` to the install route and
   retain it in the continuation; another add-on for that agent cannot complete it.
+  Qualified reported ids take precedence over short names. A short name shared
+  by different marketplace ids for the same agent is ambiguous: neither installed
+  presence nor hook ownership can be inferred from it. Keep that row unknown.
 - **Never list an agent that isn't installed on this host.** A
   recommendation for it says nothing; a requirement none of the listed
   agents here can meet says so once. `requirementsModel.ts` owns this rule —

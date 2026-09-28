@@ -162,6 +162,9 @@ installation or hook trust and on reconnect; it carries no plugin payload.
     the specific requested add-on is detected (even disabled), the card says
     **Installed for <agent> — continue setup**. Card and sheet select that add-on by
     its manifest id, so a required and recommended plugin for one agent stay distinct.
+    Full marketplace ids take precedence over short names. If a short name could refer
+    to different marketplaces in the manifest or report, the row says the marketplace
+    is unclear and does not confirm installation or infer hook ownership.
     Omitting the optional id preserves required-first selection for older clients. The
     sheet resumes the existing install → hook review → workspace setup steps; installation
     alone does not trust hooks or initialize a repository. Newly started agent sessions load

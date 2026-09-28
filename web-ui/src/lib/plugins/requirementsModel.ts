@@ -152,9 +152,22 @@ export function requirementsModel(input: RequirementsInput): RequirementsModel {
     const entry = here(r.agent);
     if (entry === null) return null;
     const base = baseId(r.id);
-    const got = entry.plugins.find((p) => p.id === r.id || p.id === base) ?? null;
+    const candidateIds = new Set([
+      ...[...requires, ...recommends]
+        .filter((candidate) => candidate.agent === r.agent && baseId(candidate.id) === base)
+        .map((candidate) => candidate.id),
+      ...entry.plugins.filter((p) => p.id !== base && baseId(p.id) === base).map((p) => p.id),
+    ]);
+    const unambiguous = candidateIds.size === 1;
+    const baseReport = entry.plugins.find((p) => p.id === base);
+    const got = entry.plugins.find((p) => p.id === r.id) ?? (unambiguous ? baseReport : undefined);
     const out = blankRow(kind, r);
-    if (got === null) {
+    if (got === undefined && baseReport !== undefined) {
+      out.state = "marketplace unclear — check in the agent";
+      out.tone = "warn";
+      return out;
+    }
+    if (got === undefined) {
       out.status = "missing";
       out.offerInstall = true;
       out.state = "not installed";
@@ -166,7 +179,7 @@ export function requirementsModel(input: RequirementsInput): RequirementsModel {
     out.version = got.version ?? null;
     out.scope = got.scope ?? null;
     out.untrustedHooks = (entry.hooks ?? []).filter(
-      (h) => (h.plugin_id === r.id || h.plugin_id === base) && (h.trust === "untrusted" || h.trust === "modified"),
+      (h) => (h.plugin_id === r.id || (unambiguous && h.plugin_id === base)) && (h.trust === "untrusted" || h.trust === "modified"),
     );
     const n = out.untrustedHooks.length;
     if (!got.enabled) {

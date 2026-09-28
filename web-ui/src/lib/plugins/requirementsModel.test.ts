@@ -25,6 +25,29 @@ function report(agents: { agent: string; available?: boolean; plugins?: AgentPlu
 const mycelium = (enabled = true, id = "mycelium@mycelium"): AgentPlugin => ({ id, version: "0.7.2", scope: "user", enabled });
 
 describe("installation completion", () => {
+  it("does not attribute an ambiguous short name or hook to either marketplace", () => {
+    const required = { agent: "codex", id: "foo@market-a", marketplace: "owner/a" };
+    const recommended = { agent: "codex", id: "foo@market-b", marketplace: "owner/b" };
+    const short = mycelium(true, "foo");
+    const model = (plugins: AgentPlugin[]) => requirementsModel(input({
+      requires: [required], recommends: [recommended],
+      report: report([{ agent: "codex", plugins, hooks: [{key: "short", event: "Stop", plugin_id: "foo", trust: "untrusted", hash: "x"}] }]),
+    }));
+    const ambiguous = model([short]);
+    expect(ambiguous.rows.map((r) => r.status)).toEqual(["unknown", "unknown"]);
+    expect(installationDetected(ambiguous.rows, "codex", recommended.id)).toBe(false);
+    // Qualified evidence wins even if an unqualified report appears first.
+    const exact = model([short, mycelium(false, recommended.id)]);
+    expect(exact.rows.map((r) => r.status)).toEqual(["unknown", "disabled"]);
+    expect(installationDetected(exact.rows, "codex", recommended.id)).toBe(true);
+    expect(hooksAwaitingTrust(exact)).toEqual([]);
+    const otherReportedMarketplace = requirementsModel(input({
+      recommends: [recommended],
+      report: report([{agent: "codex", plugins: [short, mycelium(true, required.id)]}]),
+    }));
+    expect(installationDetected(otherReportedMarketplace.rows, "codex", recommended.id)).toBe(false);
+  });
+
   it.each([true, false])("matches the requested add-on independently of enablement (%s)", (enabled) => {
     const needed = { agent: "codex", id: "need@market", marketplace: "owner/needed" };
     const installed = mycelium(enabled, needed.id);
