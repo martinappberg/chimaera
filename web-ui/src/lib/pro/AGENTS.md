@@ -15,19 +15,20 @@ enter UI settings or local storage.
 | `providers.ts` | Readiness and safe provider-link presentation; imports the core provider catalog. |
 | `onboarding.svelte.ts` | Validated shared intent so a paused project opens the same onboarding flow. |
 | `billing.ts` | Native billing attempt copy; browser return never grants entitlement and raw errors never render. |
-| `presentation.ts` | Account, billing-intent and cloud-state copy; truthful setup stages and the finite preparation polling cadence. |
+| `presentation.ts` | Account, billing-intent and cloud-state copy; truthful project status and the finite preparation polling cadence. |
 
 ## Boundaries
 
-- Cloud setup distinguishes preparation, verified agent connection and project
-  copies. Optional preparation `phase` is used only for `state:preparing`.
+- Cloud status distinguishes automatic preparation, verified agent connection and
+  recorded project copies without numbered tasks. Optional preparation `phase` is used only for `state:preparing`.
   A reachable daemon does not imply an agent is signed in or files are copied.
   Project transfer labels come only from recorded ownership; saved-copy counts
   require `last_mirrored_at`, and never-mirror projects are excluded. There is no
   initial-sync or percentage estimate.
 - Preparation checks are sequential and visible-only: 5 seconds for the first
   five minutes, then 30 seconds. Other states use 30 seconds. A provider readiness
-  callback reuses the existing catalog poll; it never starts another probe loop.
+  component keeps its catalog poll and sign-in state when management is collapsed;
+  first/required connections and active sign-in remain inline.
 - Provider rows come from the daemon catalog. Adding a future provider requires
   its backend adapter and trusted auth origins, not another bespoke UI card.
 - `signed_in` is CLI-confirmed configured authentication. Installed, unknown and

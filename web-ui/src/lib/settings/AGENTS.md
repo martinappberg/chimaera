@@ -68,7 +68,7 @@ return reopens Pro, including when a new window needed time to mount.
 | `AgentsSettings.svelte` | Per-agent binary/model settings (paths, managed installs). |
 | `EnvironmentSettings.svelte` | The Environment prelude panel (bespoke, `/api/v1/environment`-backed — see the exception above). |
 | `environment.ts` | Wire types + `getEnvironment`/`putEnvironment` for the prelude map. |
-| `CloudSetup.svelte` | Truthful preparation stages, bounded visible status polling, reported project copies and first-class catalog-driven provider connections; an explicit Connect to cloud wakes an unavailable/sleeping worker. Repository/key details stay secondary. See [provider map](../pro/AGENTS.md). |
+| `CloudSetup.svelte` | Automatic cloud status, bounded visible polling, historical project-copy summaries and contextual provider connections; sleeping workers wake only for explicit connection management/use. Repository/key details stay secondary. See [provider map](../pro/AGENTS.md). |
 | `MirrorSettings.svelte` | Native laptop-daemon mirror status, privacy, setup profile and persistent session pins; visibility-gated 15-second status refresh; blocked-provider rows open the shared connection flow. |
 | `ProSettings.svelte` | Dedicated Pro overview content: account identity, plan choices, browser checkout/portal, usage, and progressive connection/privacy/security sections. |
 | `DocumentsSettings.svelte` | The Documents panel: the opt-in AGENTS.md / Claude skill installs (see the exception above). |

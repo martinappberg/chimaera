@@ -5,8 +5,8 @@
   import { cloudRequest } from "./cloudTransport";
   import { connectionError, pendingConnection, providerLoginUrl, providersReady, providerStateLabel } from "./providers";
 
-  let { visible = true, requiredProviders = [], contextLabel, workspaceId, onReady, onReadiness }: {
-    visible?: boolean; requiredProviders?: string[]; contextLabel?: string; workspaceId?: string; onReady?: () => void; onReadiness?: (ready: boolean | null) => void;
+  let { visible = true, requiredProviders = [], contextLabel, workspaceId, onReady, onReadiness, compact = false }: {
+    visible?: boolean; requiredProviders?: string[]; contextLabel?: string; workspaceId?: string; onReady?: () => void; onReadiness?: (ready: boolean | null) => void; compact?: boolean;
   } = $props();
   type Handoff = NonNullable<CloudSetupInfo["handoffs"]>[number];
   let providers = $state<CloudProviderStatus[]>([]);
@@ -20,6 +20,7 @@
   let error = $state<string | null>(null);
   let connectionNotice = $state<string | null>(null);
   let copied = $state(false);
+  let expanded = $state(false);
   let pollingPaused = $state(false);
   let alive = true;
   let catalogFlight = $state(false);
@@ -34,7 +35,12 @@
   const contextHandoff = $derived(handoffs.find(h => h.workspace_id === workspaceId));
   const selectedHandoff = $derived(contextHandoff ?? (focusedHandoff ? handoffs.find(h => h.workspace_id === focusedHandoff!.workspace_id) : undefined));
   const ready = $derived(current && providersReady(providers, required));
+  const uncertain = $derived(!loaded || !current || !ready && agents.some(p => p.state === "unknown"));
+  const heading = $derived(uncertain ? !loaded ? "Checking your agent connections…" : error ? "Agent connections need attention" : "Agent connections aren’t confirmed yet" : ready ? required.length ? "The required agents are connected" : "Your agents are connected" : required.length ? `Connect your agents${projectName ? ` for ${projectName}` : " to continue"}` : "Connect an agent to start cloud work");
+  const introduction = $derived(uncertain ? "Chimaera hasn't confirmed the agent connections on this cloud machine yet. Existing connections haven't been changed." : ready ? required.length ? "The connections this project needs are confirmed. You can continue its paused handoff below." : "Your connected agents can work on your cloud machine. You can add another whenever you need it." : required.length ? "This project is paused until the agents it uses are signed in on your cloud machine." : "Choose the agent you want to use. Connect one to get started; you can add others later.");
   const waiting = $derived(pendingConnection(connection));
+  const detailsNeeded = $derived(required.length > 0 || handoffs.length > 0 || connection !== null || loaded && (!ready || error !== null));
+  const showDetails = $derived(!compact || expanded || detailsNeeded);
   const connectionId = $derived(connection?.id ?? null);
   const connectionExpires = $derived(connection?.expires_at ?? null);
   const connectingLabel = $derived(providers.find(p => p.id === connection?.provider_id)?.label ?? "your agent");
@@ -162,9 +168,13 @@
   }
 </script>
 
-<section class="providers" aria-label="Cloud agent connections">
-  <div class="heading"><div><span class="eyebrow">Your cloud agents</span><h2>{required.length ? `Connect your agents${projectName ? ` for ${projectName}` : " to continue"}` : ready ? "Your agents are connected" : "Connect your first agent"}</h2></div><button class="text-button" disabled={catalogFlight || busy !== null} onclick={() => void load()}>Check connections</button></div>
-  <p class="intro">{required.length ? "This project is paused until the agents it uses are signed in on your cloud machine." : ready ? "Your connected agents can work on your cloud machine. You can add another whenever you need it." : "Choose the agent you want to use. Connect one to get started; you can add others later."}</p>
+<section class="providers" class:compact aria-label="Cloud agent connections">
+  {#if compact && !detailsNeeded}
+    <button class="management" aria-expanded={showDetails} onclick={() => (expanded = !expanded)}><span><strong>Agent connections</strong><span class="management-state">{!loaded ? "Checking connections…" : ready ? "Ready for cloud work" : "Checking connection status…"}</span></span><span class="chevron" class:expanded aria-hidden="true">›</span></button>
+  {/if}
+  {#if showDetails}
+  <div class="heading"><div><span class="eyebrow">Your cloud agents</span><h2>{heading}</h2></div>{#if error || !current && loaded}<button class="text-button" disabled={catalogFlight || busy !== null} onclick={() => void load()}>Check connections</button>{/if}</div>
+  <p class="intro">{introduction}</p>
   <p class="privacy">Use your own provider account and subscription. Sign-in authorizes this cloud machine; credentials from your other devices aren't copied.</p>
   {#if !loaded}<p class="muted" role="status">Checking your cloud connections…</p>{/if}
   {#if loaded && agents.length === 0}<p class="muted">No agent connections are available from this cloud machine yet.</p>{/if}
@@ -209,9 +219,19 @@
   {/each}
   {#if repositories.length && required.length === 0}<details class="optional"><summary>Repository connections <span>Optional</span></summary><p class="muted small">Connect a repository provider when a project needs access to its private repositories.</p>{#each repositories as provider (provider.id)}<div class="repository"><div><h3>{provider.label}</h3><p class="muted small">{providerStateLabel(provider)}</p></div>{#if provider.state !== "signed_in"}<button class="button secondary" disabled={busy !== null || waiting || provider.methods.length === 0 || provider.state === "unavailable"} onclick={() => void connect(provider.id)}>Connect {provider.label}</button>{/if}</div>{/each}</details>{/if}
   {#if error}<p class="error" role="alert">{error}</p>{/if}
+  {/if}
 </section>
 
 <style>
+  .management { display: flex; align-items: center; justify-content: space-between; gap: 16px; width: 100%; padding: 2px 0; background: transparent; border: 0; color: var(--fg); font: inherit; text-align: left; cursor: pointer; }
+  .management strong { display: block; font-size: var(--text-sm); font-weight: 550; }
+  .management-state { display: block; color: var(--muted); font-size: var(--text-xs); margin-top: 5px; }
+  .chevron { font-size: 24px; color: var(--muted); transform: rotate(0deg); }
+  .chevron.expanded { transform: rotate(90deg); }
+  .management + .heading { margin-top: 24px; }
+  .compact .eyebrow { display: none; }
+  .compact h2 { font-size: var(--text-lg); letter-spacing: -.2px; }
+  .compact .intro { font-size: var(--text-sm); margin-top: 10px; }
   .providers { color: var(--fg); }
   .heading { display: flex; align-items: center; justify-content: space-between; gap: 14px; flex-wrap: wrap; }
   .eyebrow { display: block; margin-bottom: 8px; color: var(--muted); font-size: var(--text-xs); letter-spacing: .06em; text-transform: uppercase; }

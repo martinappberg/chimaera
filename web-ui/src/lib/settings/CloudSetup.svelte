@@ -5,7 +5,7 @@
   import ProviderConnections from "../pro/ProviderConnections.svelte";
   import { cloudRequest } from "../pro/cloudTransport";
   import { pageVisible } from "../shared/visibility";
-  import { cloudCopy, cloudPollDelay, cloudStages, friendlyError } from "../pro/presentation";
+  import { cloudCopy, cloudPollDelay, cloudProjectStatus, friendlyError } from "../pro/presentation";
   import { connectHost, openWindow, isNativeShell, proCloudStatus, proMirrorStatus, writeClipboard, type MirrorStatus, type CloudSetupInfo, type CloudSetupRequest, type CloudProvisioningStatus } from "../net/native";
 
   let { visible = true, requiredProviders = [], contextLabel, workspaceId, onReady }: { visible?: boolean; requiredProviders?: string[]; contextLabel?: string; workspaceId?: string; onReady?: () => void } = $props();
@@ -22,18 +22,18 @@
   let actionGeneration = 0;
   let connectionChecked = $state(false);
   let providerRevision = $state(0);
-  let providerReady = $state<boolean | null>(null);
   let projects = $state<MirrorStatus | null>(null);
-  let providerElement = $state<HTMLDivElement>();
+  let manageSleeping = $state(false);
   let refreshFlight: Promise<void> | null = null;
   const browser = !isNativeShell();
   const copy = $derived(status?.state === "ready" && info?.available !== true
     ? { title: connectionChecked ? "Cloud connection isn't ready" : "Checking your cloud connection…", detail: connectionChecked ? "Your cloud has started, but Chimaera couldn't reach it yet. Check again shortly. Your local work is available." : "Your cloud has started. We're checking that its workbench is reachable." }
-    : status?.state === "ready" && info?.available ? { title: "Cloud machine connected", detail: "Agents connected here can keep working while this computer sleeps." } : cloudCopy(status?.state ?? "error", status?.reason ?? null, status?.phase));
+    : status?.state === "ready" && info?.available ? { title: "Your cloud is ready", detail: "Agents connected here can keep working while this computer sleeps." } : cloudCopy(status?.state ?? "error", status?.reason ?? null, status?.phase));
   const connected = $derived(info?.available === true && (browser || status?.state === "ready"));
-  const canSetUp = $derived(connected || !browser && status?.state === "sleeping");
+  const canSetUp = $derived(connected);
   const preparing = $derived(!browser && (status?.state === "preparing" || status?.state === "ready" && !connected));
-  const stages = $derived(cloudStages(connected, providerReady, projects, browser, workspaceId));
+  const projectStatus = $derived(connected ? cloudProjectStatus(projects, workspaceId) : null);
+  const needsCheck = $derived(browser ? connectionChecked && !connected : status?.state === "error" || status?.state === "unavailable" || status?.state === "ready" && connectionChecked && !connected);
 
   async function readProjects(signal?: AbortSignal): Promise<MirrorStatus | null> {
     try {
@@ -101,11 +101,6 @@
     untrack(() => void poll());
     return () => { generation += 1; controller.abort(); clearTimeout(timer); };
   });
-  function focusProviders(): void {
-    providerElement?.scrollIntoView({ block: "start", behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" });
-    providerElement?.focus({ preventScroll: true });
-  }
-  function providerStatus(ready: boolean | null): void { providerReady = ready; }
   onDestroy(() => { alive = false; generation += 1; actionGeneration += 1; });
   async function act(label: string, request: CloudSetupRequest): Promise<void> {
     if (busy !== null) return;
@@ -139,29 +134,20 @@
   }
 </script>
 
-<section class="cloud" aria-label="Cloud setup">
-  <div class="machine">
-    <div class="heading"><div><span class="eyebrow">Your cloud</span><h2>{browser ? connected ? "Cloud machine connected" : connectionChecked ? "Cloud connection unavailable" : "Checking your cloud connection…" : status ? copy.title : "Checking cloud readiness…"}</h2></div><button class="text-button" disabled={busy !== null || refreshing} onclick={() => void refresh()}>{refreshing ? "Checking…" : "Check again"}</button></div>
-    <p class="hint" role="status">{browser ? connected ? "Agents connected here can keep working while your computer sleeps." : connectionChecked ? "This workbench has not confirmed an available cloud connection. Check again or open your account." : "Checking that this workbench is reachable." : status ? copy.detail : "This check doesn't wake a sleeping machine."}</p>
+<section class="cloud" aria-label="Cloud status">
+  <div class="machine" class:attention={needsCheck}>
+    <div class="heading"><div><span class="eyebrow">Your cloud</span><h2>{browser ? connected ? "Your cloud is ready" : connectionChecked ? "Cloud connection unavailable" : "Checking your cloud connection…" : status ? copy.title : "Checking cloud readiness…"}</h2></div><span class="status-mark" class:connected class:preparing aria-hidden="true">{#if connected}<svg viewBox="0 0 24 24"><path d="m6 12 4 4 8-8" /></svg>{:else}<svg viewBox="0 0 24 24"><path d="M7 17a4 4 0 0 1-1-7.9 6 6 0 0 1 11.4-1.5A4.7 4.7 0 0 1 18 17H7Z" /></svg>{/if}</span></div>
+    <p class="hint" role="status">{browser ? connected ? "Agents connected here can keep working while your computer sleeps." : connectionChecked ? "This workbench has not confirmed an available cloud connection. Your local work is still available." : "Checking that this workbench is reachable." : status ? copy.detail : "This check doesn't wake a sleeping machine."}</p>
+    {#if preparing}<p class="automatic">Preparation continues automatically. You can keep working here.</p>{/if}
+    {#if needsCheck}<div class="recovery"><button class="text-button" disabled={busy !== null || refreshing} onclick={() => void refresh()}>{refreshing ? "Checking…" : "Check again"}</button>{#if browser}<a class="account-link" href="/account">Open your account →</a>{/if}</div>{/if}
   </div>
-  <ol class="stages" aria-label="Cloud setup progress">
-    {#each stages as stage, index}
-      <li class:complete={stage.state === "complete"} class:current={stage.state === "current"} aria-current={stage.state === "current" ? "step" : undefined}>
-        <span class="stage-number" aria-hidden="true">{stage.state === "complete" ? "✓" : `0${index + 1}`}</span>
-        <div><h3>{stage.title}</h3><p>{stage.detail}</p></div>
-      </li>
-    {/each}
-  </ol>
-  {#if preparing}
-    <div class="next-step"><div><h3>Next, connect your agent</h3><p class="hint">This step opens once your cloud workbench is reachable. You can keep using your local projects while preparation continues.</p></div><button class="btn" disabled>Waiting for your cloud</button></div>
-  {:else if connected && providerReady !== true}
-    <div class="next-step"><p class="hint">Choose an agent below to finish connecting your cloud.</p><button class="btn" onclick={focusProviders}>Connect an agent</button></div>
+  {#if projectStatus}
+    <div class="project-status" class:attention={projectStatus.state === "attention"} role="status"><span class="project-dot" class:active={projectStatus.state === "active"} aria-hidden="true"></span><div><h3>{projectStatus.title}</h3><p class="hint">{projectStatus.detail}</p></div></div>
   {/if}
-  {#if !browser && (status?.state === "sleeping" || status?.state === "ready" && !info?.available)}<button class="btn" disabled={busy !== null} onclick={() => void act("start", { operation: "start" })}>{busy === "start" ? "Connecting…" : "Connect to cloud"}</button>{/if}
-  {#if browser && !info?.available}<a class="account-link" href="/account">Open your account →</a>{/if}
+  {#if !browser && status?.state === "sleeping"}<details class="sleeping-connections" ontoggle={(event) => (manageSleeping = event.currentTarget.open)}><summary>Agent connections</summary>{#if manageSleeping}<p class="hint">Your cloud wakes automatically for work. Open its connections if you want to manage agent sign-ins now.</p><button class="btn" disabled={busy !== null} onclick={() => void act("start", { operation: "start" })}>{busy === "start" ? "Connecting…" : "Open cloud connections"}</button>{/if}</details>{/if}
   {#if canSetUp}
-    <div class="provider-section" bind:this={providerElement} tabindex="-1">
-      {#key providerRevision}<ProviderConnections {visible} {requiredProviders} {contextLabel} {workspaceId} {onReady} onReadiness={providerStatus} />{/key}
+    <div class="provider-section">
+      {#key providerRevision}<ProviderConnections {visible} {requiredProviders} {contextLabel} {workspaceId} {onReady} compact />{/key}
     </div>
     <details class="advanced" ontoggle={(event) => (advanced = event.currentTarget.open)}><summary>Repositories and advanced connections</summary>{#if advanced}<p class="hint">For a project that starts in the cloud, open a Git repository here. Private repositories may need the optional repository connection above.</p><form onsubmit={(event) => { event.preventDefault(); void act("project", { operation: "project", url: repository.trim() }); }}><label for="cloud-repository">Repository URL</label><div class="clone-row"><input id="cloud-repository" type="url" placeholder="https://github.com/you/project" bind:value={repository} required disabled={busy !== null} /><button class="btn" disabled={busy !== null || !repository.trim()}>{busy === "project" ? "Opening repository…" : "Open repository"}</button></div></form>{#if info?.ssh_public_key}<details><summary>SSH public key</summary><p class="hint">Use this public key only if your Git host or connection needs it.</p><textarea aria-label="Cloud SSH public key" readonly value={info.ssh_public_key} rows="3"></textarea><button class="btn" onclick={() => void copyKey()}>{copied ? "Copied" : "Copy public key"}</button></details>{/if}{/if}</details>
   {/if}
@@ -170,27 +156,26 @@
 </section>
 
 <style>
-  .cloud { container: cloud-setup / inline-size; min-width: 0; display: grid; gap: 25px; border: 1px solid var(--edge); border-radius: 10px; padding: 25px; margin: 22px 0; }
+  .cloud { container: cloud-setup / inline-size; min-width: 0; display: grid; gap: 25px; border: 1px solid var(--edge); border-radius: 10px; padding: clamp(18px, 4%, 25px); margin: 22px 0; }
   .machine { display: grid; gap: 9px; }
   .eyebrow { display: block; color: var(--muted); font-size: var(--text-xs); letter-spacing: .06em; text-transform: uppercase; margin-bottom: 7px; }
-  .stages { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); border: 1px solid var(--edge); border-radius: 8px; overflow: hidden; }
-  .stages li { min-width: 0; padding: 19px 16px; display: flex; align-items: flex-start; gap: 11px; color: var(--muted); }
-  .stages li + li { border-left: 1px solid var(--edge); }
-  .stages li.current { background: color-mix(in srgb, var(--accent) 5%, var(--bg)); color: var(--fg); }
-  .stage-number { font-size: var(--text-xs); font-variant-numeric: tabular-nums; border: 1px solid var(--edge); border-radius: 50%; width: 26px; height: 26px; flex: none; display: grid; place-items: center; }
-  .complete .stage-number { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, var(--edge)); }
-  .current .stage-number { color: var(--accent); }
-  h3 { margin: 2px 0 8px; font-size: var(--text-sm); font-weight: 600; color: inherit; }
-  .stages p { margin: 0; font-size: var(--text-sm); line-height: 1.6; color: var(--muted); overflow-wrap: anywhere; }
-  .next-step { display: flex; gap: 20px; justify-content: space-between; align-items: center; }
-  .next-step .btn { flex: none; align-self: center; }
-  .provider-section { border-top: 1px solid var(--edge); padding-top: 25px; scroll-margin-top: 20px; }
-  .provider-section:focus { outline: none; }
-  @container cloud-setup (max-width: 700px) { .stages { grid-template-columns: 1fr; } .stages li + li { border-left: 0; border-top: 1px solid var(--edge); } .stages li { padding: 15px; } .next-step { flex-direction: column; align-items: flex-start; gap: 12px; } .next-step .btn { align-self: flex-start; } }
+  .status-mark { flex: none; width: 36px; height: 36px; display: grid; place-items: center; color: var(--muted); border: 1px solid var(--edge); border-radius: 50%; }
+  .status-mark svg { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-width: 1.4; stroke-linecap: round; stroke-linejoin: round; }
+  .status-mark.connected { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 30%, var(--edge)); }
+  .status-mark.preparing { color: var(--accent); }
+  .automatic { margin: 2px 0 0; color: var(--muted); font-size: var(--text-xs); line-height: 1.6; }
+  .recovery { display: flex; align-items: center; flex-wrap: wrap; gap: 18px; margin-top: 5px; }
+  .project-status { display: flex; gap: 11px; align-items: baseline; padding: 17px 0 0; border-top: 1px solid var(--edge); }
+  .project-status h3 { margin: 0 0 4px; font-size: var(--text-sm); font-weight: 550; }
+  .project-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--muted); flex: none; }
+  .project-dot.active { background: var(--accent); }
+  .project-status.attention .project-dot { background: var(--warn); }
+  .provider-section { border-top: 1px solid var(--edge); padding-top: 22px; }
+  .sleeping-connections { border-top: 1px solid var(--edge); }
+  .sleeping-connections .btn { margin-top: 14px; }
+  @container cloud-setup (max-width: 420px) { .heading > div { flex-basis: 180px; } }
   .heading { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
   .heading > div { flex: 1 1 230px; min-width: 0; }
-  .heading .text-button { flex: none; white-space: nowrap; }
-  .stages li > div { min-width: 0; }
   h2 { margin: 0; font-size: var(--text-lg); font-weight: 600; }
   .hint { margin: 0; color: var(--muted); font-size: var(--text-sm); line-height: 1.6; }
   .clone-row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }

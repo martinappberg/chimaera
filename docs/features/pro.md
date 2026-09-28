@@ -83,26 +83,29 @@ The shared `web-ui/src/lib/net/plan.ts` store exposes confirmed free/paid, loadi
 ## Cloud readiness
 
 An eligible subscription prepares its first cloud machine automatically. The Pro
-page follows three separate steps: prepare the cloud, connect an agent, and make
-project copies available. Account-confirmed preparation stages distinguish the
-private connection, machine startup, and its first acknowledgement. Active setup
-checks run sequentially every five seconds while visible, slowing to thirty
-seconds after five minutes. Hidden views stop checking.
+page shows its current status, rather than a checklist to complete. Account-confirmed
+preparation distinguishes the private connection, machine startup, and its first
+acknowledgement. Preparation continues without a setup button; visible checks run
+sequentially every five seconds, slowing to thirty seconds after five minutes.
+Hidden views stop checking. Healthy phases do not ask the user to refresh.
 
-A disabled service or uninvited preview account shows that setup is waiting,
-without an activity animation or a claim that files are synchronizing. The page
-does not offer a manual machine-creation button. Provider readiness requires a
-current CLI authentication check. Project-copy summaries come from actual mirror
-metadata and ownership: completed copies, handoff in progress, restoration, or a
-setup that needs attention. No project or an unavailable check never becomes a
-completed step, and no transfer percentage is estimated.
+A disabled service or uninvited preview account shows that preparation is waiting,
+without an activity animation or a claim that files are synchronizing. A failed
+read or unavailable connection offers a secondary **Check again**. Project status
+appears only when mirror metadata exists: completed copies, handoff in progress,
+restoration, or setup that needs attention. Saved-copy counts describe completed
+copies, never active synchronization or a promise that every file is current.
+No project or an unavailable check invents a project task or completion state.
 
-Machine readiness and provider sign-in are separate. Once the cloud machine is
-available, **Connect your first agent** appears directly in the Pro overview.
-Choose one agent to get started; connecting the other agents is optional. The
-provider list comes from a shared catalog, initially Claude Code and Codex, rather
-than hard-coded buttons. Installation alone never shows a provider as connected.
-An unavailable or timed-out authentication check remains unknown.
+Machine readiness and provider sign-in are separate. Once the cloud is reachable
+and reports that an agent connection is needed, **Connect an agent to start cloud
+work** presents the provider choice inline. One agent is enough to start; others
+are optional. Connected users see a quiet **Agent connections** disclosure. A
+required project connection, active sign-in, or connection error stays visible.
+Collapsing management keeps the existing status poll and sign-in state intact.
+The provider list comes from a shared catalog, initially Claude Code and Codex.
+Installation alone never shows a provider as connected. An unavailable or timed-out
+authentication check remains unknown.
 
 **Connect** prepares a missing agent and then guides its supported sign-in flow.
 Codex uses a one-time device code and the provider's secure browser page. Claude
@@ -120,8 +123,10 @@ must be connected before **Continue project** appears. Continuing asks the daemo
 to verify the current ownership epoch and provider state again; the UI cannot
 release the setup fence. A canceled connection leaves the project paused.
 
-Status reads never wake a sleeping worker. **Connect to cloud**, connecting a
-provider or opening a repository are explicit wake actions. Catalog checks are
+Status reads never wake a sleeping worker. Its optional **Agent connections**
+disclosure offers **Open cloud connections** for deliberate management; opening
+that disclosure alone does not wake it. Opening the connection, connecting a
+provider, or opening a repository are explicit wake actions. Catalog checks are
 single-flight and visibility-gated. Active sign-in checks run sequentially every
 two seconds, stop while hidden, and end at the attempt's finite deadline. Pending
 connection operations keep the worker active only until they finish or expire.
