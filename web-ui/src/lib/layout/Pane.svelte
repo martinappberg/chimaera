@@ -488,6 +488,13 @@
     {:else}
       <Spinner />
     {/if}
+  {:else if tab.surface === "pro"}
+    {@const ProView = views.pro}
+    {#if ProView !== undefined}
+      <ProView visible={active} />
+    {:else if viewErrors.pro}
+      {@render loadFailure("pro", "Chimaera Pro")}
+    {/if}
   {:else if tab.surface === "settings"}
     {@const SettingsView = views.settings}
     {#if SettingsView !== undefined}

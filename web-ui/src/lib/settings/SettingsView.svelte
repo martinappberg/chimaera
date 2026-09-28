@@ -13,10 +13,8 @@
   import AgentsSettings from "./AgentsSettings.svelte";
   import EnvironmentSettings from "./EnvironmentSettings.svelte";
   import DocumentsSettings from "./DocumentsSettings.svelte";
-  import ProSettings from "./ProSettings.svelte";
   import CloudSetup from "./CloudSetup.svelte";
   import { isBrowserGateway } from "../net/base";
-  import { isNativeShell } from "../net/native";
   import NotificationStatus from "./NotificationStatus.svelte";
   import UpdatesStatus from "./UpdatesStatus.svelte";
   import { APP_MENU, PINNED } from "../shared/keys";
@@ -35,8 +33,7 @@
     const out = [...CATEGORIES];
     const at = out.indexOf("Agents");
     out.splice(at >= 0 ? at + 1 : out.length, 0, "Environment", "Documents");
-    if (isNativeShell()) out.splice(out.indexOf("Keyboard"), 0, "Chimaera Pro");
-    else if (isBrowserGateway()) out.splice(out.indexOf("Keyboard"), 0, "Cloud machine");
+    if (isBrowserGateway()) out.splice(out.indexOf("Keyboard"), 0, "Cloud machine");
     return out;
   })();
 
@@ -93,7 +90,7 @@
         if (docsVisible) out.push({ category: cat, defs: [] });
         continue;
       }
-      if (cat === "Chimaera Pro" || cat === "Cloud machine") {
+      if (cat === "Cloud machine") {
         if (proVisible) out.push({ category: cat, defs: [] });
         continue;
       }
@@ -242,10 +239,6 @@
                  /api/v1/agent-docs. It renders its own <h2>. -->
             <section data-section={group.category}>
               <DocumentsSettings />
-            </section>
-          {:else if group.category === "Chimaera Pro"}
-            <section data-section={group.category}>
-              <ProSettings visible={tabVisible} />
             </section>
           {:else if group.category === "Cloud machine"}
             <section data-section={group.category}>

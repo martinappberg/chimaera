@@ -41,6 +41,10 @@ export interface FileTab {
 export interface SettingsTab {
   surface: "settings";
 }
+/** Account view; distinct from daemon settings. */
+export interface ProTab {
+  surface: "pro";
+}
 /**
  * A Finder (Miller-columns file browser). Keyed by a stable `id` — NOT by
  * `path` — so several Finders can coexist and each navigates freely; `path` is
@@ -111,6 +115,7 @@ export type Tab =
   | TerminalTab
   | FileTab
   | SettingsTab
+  | ProTab
   | FinderTab
   | DiffTab
   | GitTab
@@ -136,6 +141,7 @@ export function tabKey(t: Tab): string {
   if (t.surface === "timeline") return "v:timeline";
   if (t.surface === "knowledge") return "v:knowledge";
   if (t.surface === "plugins") return "v:plugins";
+  if (t.surface === "pro") return "v:pro";
   if (t.surface === "changes") return `changes:${t.sessionId}`;
   // `w:` (web) — its own namespace beside the Finder's `d:` and diff's `g:`.
   if (t.surface === "browser") return `w:${t.id}`;
@@ -583,6 +589,10 @@ export function openPlugins(l: Layout): Layout {
 /** Open (or focus) the session-scoped changes review. */
 export function openChanges(l: Layout, sessionId: string): Layout {
   return openTab(l, { surface: "changes", sessionId });
+}
+
+export function openPro(l: Layout): Layout {
+  return openTab(l, { surface: "pro" });
 }
 
 export function openSettings(l: Layout): Layout {
@@ -1327,6 +1337,7 @@ function serNode(node: LayoutNode): SNode {
         if (t.surface === "timeline") return { v: "timeline" };
         if (t.surface === "knowledge") return { v: "knowledge" };
         if (t.surface === "plugins") return { v: "plugins" };
+        if (t.surface === "pro") return { v: "pro" };
         if (t.surface === "changes") return { cs: t.sessionId };
         if (t.surface === "browser") return { w: t.host, wo: t.port, wi: t.id, wp: t.path };
         return { v: "settings" };
@@ -1406,6 +1417,8 @@ function deserNode(
         const id = typeof t.wi === "string" && t.wi.length > 0 ? t.wi : uid();
         const path = typeof t.wp === "string" && t.wp.length <= 4096 ? t.wp : "/";
         tab = { surface: "browser", id, host: t.w, port: t.wo, path };
+      } else if (t.v === "pro") {
+        tab = { surface: "pro" };
       } else if (t.v === "settings") {
         tab = { surface: "settings" };
       } else {

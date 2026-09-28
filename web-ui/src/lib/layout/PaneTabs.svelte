@@ -369,6 +369,7 @@
   function label(tab: Tab): string {
     if (tab.surface === "terminal") return sessionLabel(tab.sessionId);
     if (tab.surface === "settings") return "Settings";
+    if (tab.surface === "pro") return "Chimaera Pro";
     if (tab.surface === "dashboard") return "Dashboard";
     if (tab.surface === "timeline") return "Timeline";
     if (tab.surface === "knowledge") return "Knowledge";
@@ -717,6 +718,8 @@
               size={10}
               title={s ? dotTitle(s) : "terminal"}
             />
+          {:else if tab.surface === "pro"}
+            <svg class="glyph" viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path d="M8 1.5 13.6 4.7v6.6L8 14.5l-5.6-3.2V4.7Z" fill="none" stroke="currentColor" stroke-width="1.2" /></svg>
           {:else if tab.surface === "settings"}
             <svg class="glyph" viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
               <title>settings</title>

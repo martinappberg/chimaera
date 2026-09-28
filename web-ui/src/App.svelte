@@ -1,7 +1,9 @@
 <script lang="ts">
   import { onMount, tick, untrack } from "svelte";
   import PlanBadge from "./lib/shared/PlanBadge.svelte";
+  import ProNavigation from "./lib/pro/ProNavigation.svelte";
   import { paidPlan } from "./lib/net/plan";
+  import { isBrowserGateway } from "./lib/net/base";
   import { runStallDrive, stallDriveSpec } from "./lib/perf/tabSwitchDrive";
   import {
     ApiError,
@@ -161,6 +163,7 @@
     openGit,
     openSession,
     openSettings,
+    openPro,
     paneForTab,
     panes as panesOf,
     pruneDeletedPath,
@@ -3197,17 +3200,33 @@
   }
 
   let homeSettingsOpen = $state(false);
+  let homeSurface = $state<"settings" | "pro">("settings");
   let homeSettingsLoad = $state<ReturnType<typeof loadPaneView> | null>(null);
 
   /** Account settings are useful before the first workspace exists. */
   function openSettingsSurface(): void {
     if (activeWsId === null) {
+      homeSurface = "settings";
       homeSettingsLoad = loadPaneView("settings");
       homeSettingsOpen = true;
       return;
     }
     if (!layoutReady) return;
     layout = openSettings(layout);
+    if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
+  }
+
+  function openProSurface(): void {
+    if (isBrowserGateway()) { location.assign("/account"); return; }
+    if (!isNativeShell()) return;
+    if (activeWsId === null) {
+      homeSurface = "pro";
+      homeSettingsLoad = loadPaneView("pro");
+      homeSettingsOpen = true;
+      return;
+    }
+    if (!layoutReady) return;
+    layout = openPro(layout);
     if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
   }
 
@@ -4676,12 +4695,12 @@
         <button class="home-settings-back" onclick={() => (homeSettingsOpen = false)}>← Home</button>
         <div class="home-settings-content">
           {#await homeSettingsLoad}
-            <p>Loading settings…</p>
+            <p>Loading {homeSurface === "pro" ? "Chimaera Pro" : "settings"}…</p>
           {:then SettingsView}
             {#if SettingsView}<SettingsView />{/if}
-          {:catch error}
-            <p role="alert">Couldn't load settings: {String(error)}</p>
-            <button onclick={openSettingsSurface}>Retry</button>
+          {:catch}
+            <p role="alert">Couldn't open {homeSurface === "pro" ? "Chimaera Pro" : "settings"}.</p>
+            <button onclick={homeSurface === "pro" ? openProSurface : openSettingsSurface}>Retry</button>
           {/await}
         </div>
       </div>
@@ -4697,6 +4716,7 @@
       onStop={stopWorkspace}
       onOpenFolder={openPicker}
       onSettings={openSettingsSurface}
+      onPro={openProSurface}
     />
     {/if}
   {:else}
@@ -5183,6 +5203,9 @@
              own truth, not the URL hash): countdown + resources, stacked
              ABOVE the daemon bar so neither crowds the other. -->
         <ComputeStrip self={$computeStatus.self} receivedAt={$computeStatus.received_at_ms} />
+      {/if}
+      {#if isNativeShell() || isBrowserGateway()}
+        <ProNavigation plan={$paidPlan} onOpen={openProSurface} />
       {/if}
       <div class="daemon" bind:this={daemonEl}>
         <!-- Two groups so the bar can WRAP: identity (dot, host, link RTT)

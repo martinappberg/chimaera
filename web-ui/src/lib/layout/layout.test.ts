@@ -21,6 +21,7 @@ import {
   openKnowledge,
   openPlugins,
   openSettings,
+  openPro,
   openChanges,
   openBrowser,
   freshBrowserTab,
@@ -158,6 +159,25 @@ describe("opening surfaces", () => {
       { surface: "plugins" },
       { surface: "settings" },
     ]);
+  });
+});
+
+describe("Pro navigation", () => {
+  it("preserves ordinary work and Settings while focusing one durable Pro tab", () => {
+    let layout = openSession(defaultLayout(), "working-agent");
+    layout = openSettings(layout);
+    layout = openPro(layout);
+    layout = openPro(layout);
+    const restored = deserializeLayout(serializeLayout(layout));
+    expect(restored).not.toBeNull();
+    expect(allTabs(restored!)).toEqual([
+      { surface: "terminal", sessionId: "working-agent" },
+      { surface: "settings" },
+      { surface: "pro" },
+    ]);
+    const pane = findPane(restored!.root, restored!.focusedPaneId)!;
+    expect(pane.tabs[pane.active]).toEqual({ surface: "pro" });
+    expect(allSessionIds(restored!)).toEqual(["working-agent"]);
   });
 });
 

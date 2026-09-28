@@ -877,6 +877,64 @@ export interface ProStatus {
   error: string | null;
   /** Optional when connected to an older native shell. */
   sign_in?: { phase: "waiting" | "finishing"; expires_at: number } | null;
+  limits?: { cloud_hours: number; storage_bytes: number } | null;
+  usage?: { cloud_hours: number; storage_bytes: number } | null;
+  hours_exhausted?: boolean;
+}
+
+export interface CloudProvisioningStatus {
+  state: "no_plan" | "unavailable" | "preparing" | "ready" | "sleeping" | "limited" | "error";
+  reason: "provisioning_disabled" | "beta_invite_required" | "hours_exhausted" | "storage_exhausted" | "spend_limit_reached" | "provisioning_failed" | null;
+}
+
+export async function proCloudStatus(): Promise<CloudProvisioningStatus> {
+  const t = tauri();
+  if (t === null) throw new Error("Open the desktop app to check your cloud status.");
+  return t.core.invoke<CloudProvisioningStatus>("pro_cloud_status");
+}
+
+export async function proRefreshAccount(): Promise<void> {
+  const t = tauri();
+  if (t === null) return;
+  await t.core.invoke<void>("pro_refresh_account");
+}
+
+export interface CloudProject {
+  workspace_id: string;
+  name: string;
+  host_id: string;
+  host_alias: string;
+  local_root: string | null;
+  available: boolean;
+  error: string | null;
+}
+
+export interface CloudProjectOpen {
+  workspace_id: string;
+  root: string;
+  name: string;
+}
+
+export async function proCloudProjects(): Promise<CloudProject[]> {
+  return (await tauri()?.core.invoke<CloudProject[]>("pro_cloud_projects")) ?? [];
+}
+
+export async function proOpenCloudProject(workspaceId: string): Promise<CloudProjectOpen | null> {
+  const t = tauri();
+  if (t === null) throw new Error("Open the desktop app to save a local project copy.");
+  return t.core.invoke<CloudProjectOpen | null>("pro_open_cloud_project", { workspaceId });
+}
+
+export async function proBillingCheckout(plan: "pro" | "max", interval: "month" | "year"): Promise<void> {
+  const t = tauri();
+  if (t === null) throw new Error("Open the desktop app to choose a plan.");
+  await t.core.invoke<void>("pro_billing_checkout", { plan, interval });
+}
+
+export async function proBillingPortal(): Promise<void> {
+  const t = tauri();
+  if (t === null) throw new Error("Open the desktop app to manage billing.");
+  await t.core.invoke<void>("pro_billing_portal");
 }
 
 export interface ProHost {

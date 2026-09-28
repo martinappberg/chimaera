@@ -14,7 +14,8 @@ export type PaneViewKind =
   | "knowledge"
   | "plugins"
   | "browser"
-  | "settings";
+  | "settings"
+  | "pro";
 
 type PaneViewModule = { default: Component<any> };
 
@@ -40,6 +41,7 @@ const loaders: Record<PaneViewKind, () => Promise<PaneViewModule>> = {
   knowledge: () => import("../knowledge/KnowledgeView.svelte"),
   plugins: () => import("../plugins/PluginsView.svelte"),
   browser: () => import("../browser/BrowserView.svelte"),
+  pro: () => import("../pro/ProView.svelte"),
   settings: () => import("../settings/SettingsView.svelte"),
 };
 
@@ -59,6 +61,7 @@ const viewChunkPrefixes: Record<PaneViewKind, string> = {
   plugins: "PluginsView-",
   browser: "BrowserView-",
   settings: "SettingsView-",
+  pro: "ProView-",
 };
 
 let retrySequence = 0;

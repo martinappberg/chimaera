@@ -3,7 +3,9 @@
   import BrandMark from "../shared/BrandMark.svelte";
   import PlanBadge from "../shared/PlanBadge.svelte";
   import { paidPlan } from "../net/plan";
+  import { isBrowserGateway } from "../net/base";
   import ComputeLaunchDialog from "./ComputeLaunchDialog.svelte";
+  import CloudProjects from "../pro/CloudProjects.svelte";
   import { keyHint } from "../shared/keybindings";
   import { isBusy, needsApproval, type Session, type Workspace } from "./sessions";
   import {
@@ -67,6 +69,7 @@
     /** Open the folder picker (browse/register a new folder). */
     onOpenFolder: () => void;
     onSettings: () => void;
+    onPro: () => void;
   }
 
   let {
@@ -80,6 +83,7 @@
     onStop,
     onOpenFolder,
     onSettings,
+    onPro,
   }: Props = $props();
 
   const native = isNativeShell();
@@ -846,7 +850,10 @@
         >{/if}
     </button>
   {/if}
-  <button class="home-settings" onclick={onSettings} title="Settings ({keyHint("settings")})">Settings</button>
+  <nav class="home-settings" aria-label="Account and settings">
+    {#if native || isBrowserGateway()}<button onclick={onPro}>Chimaera Pro</button>{/if}
+    <button onclick={onSettings} title="Settings ({keyHint("settings")})">Settings</button>
+  </nav>
   <div class="inner">
     <header class="masthead">
       <div class="masthead-leading">
@@ -1175,6 +1182,10 @@
       </section>
     {/if}
 
+    {#if native && ownAlias === null && $paidPlan !== null}
+      <CloudProjects onOpen={onOpen} knownIds={workspaces.map(workspace => workspace.id)} />
+    {/if}
+
     {#if ownAlias === null}
       <section>
         <div class="sec-head">
@@ -1465,7 +1476,10 @@
     font: inherit;
     cursor: pointer;
   }
-  .home-settings:hover { color: var(--fg); }
+  .home-settings { display: flex; flex-direction: column; gap: 8px; align-items: flex-end; }
+  .home-settings button { color: var(--muted); border: 0; background: var(--bg); border-radius: 5px; padding: 4px 8px; font: inherit; cursor: pointer; }
+  .home-settings button:hover { color: var(--fg); }
+  .home-settings button:focus-visible { outline: 2px solid var(--focus-ring); }
 
   .via-pro {
     flex: none;

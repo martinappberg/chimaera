@@ -2,12 +2,11 @@
   import { untrack } from "svelte";
   import { pageVisible } from "../shared/visibility";
   import { proMirrorStatus, proSetNeverMirror, proMirrorPreference, type MirrorStatus, type MirrorWorkspace, type MirrorProfile } from "../net/native";
-  let { visible = true }: { visible?: boolean } = $props();
+  let { visible = true, recoveryOnly = false }: { visible?: boolean; recoveryOnly?: boolean } = $props();
   let status = $state<MirrorStatus | null>(null);
   let error = $state<string | null>(null);
   let busy = $state<string | null>(null);
   let drafts = $state<Record<string,string>>({});
-  let projectsRoot = $state<string | null>(null);
   let revision = 0;
   async function load(): Promise<void> {
     const current = ++revision;
@@ -53,20 +52,16 @@
 </script>
 <div class="mirrors">
   <h3>Project mirrors</h3>
-  <p class="hint">Open projects are copied automatically. Git history, uncommitted files, agent conversations and selected agent settings travel together. Login files, private keys, environment secrets and ignored files stay here.</p>
+  {#if !recoveryOnly}<p class="hint">Open projects are copied automatically. Git history, uncommitted files, agent conversations and selected agent settings travel together. Login files, private keys, environment secrets and ignored files stay here.</p>{:else}<p class="hint">Existing project privacy stays available without an active plan. You can stop copying a project or retry a pending privacy change.</p>{/if}
   {#if error}<p class="error" role="alert">{error}</p>{/if}
-  {#if status && !status.configured}<p class="hint">Mirroring will start when your cloud machine is ready.</p>{/if}
-  {#if status}
-    <label class="field">Folder for projects started in the cloud<input value={projectsRoot ?? status.projects_root} oninput={(event) => { projectsRoot = event.currentTarget.value; }} /></label>
-    <button class="btn" disabled={busy !== null || (projectsRoot === null && status.projects_root_confirmed)} onclick={() => void act("projects", () => proMirrorPreference({ operation: "projects", root: projectsRoot ?? status!.projects_root }))}>{status.projects_root_confirmed ? "Save projects folder" : "Use this projects folder"}</button>
-  {/if}
-  {#if status?.workspaces.length === 0}<p class="hint">Open a project on this laptop to start its mirror.</p>{/if}
+  {#if !recoveryOnly && status && !status.configured}<p class="hint">Mirroring will start when your cloud machine is ready.</p>{/if}
+  {#if status?.workspaces.length === 0}<p class="hint">No project mirrors to show yet.</p>{/if}
   {#each status?.workspaces ?? [] as workspace (workspace.workspace_id)}
     <details>
       <summary><span class="title">{workspace.name}</span><span class="hint">{place(workspace)}</span></summary>
       <div class="project">
         <p class="path">{workspace.root}</p>
-        <label class="check"><input type="checkbox" checked={workspace.never_mirror} disabled={busy !== null} onchange={(event) => privacy(workspace,event.currentTarget)} />Never mirror this project</label>
+        <label class="check"><input type="checkbox" checked={workspace.never_mirror} disabled={busy !== null || (recoveryOnly && workspace.never_mirror)} onchange={(event) => privacy(workspace,event.currentTarget)} />Never mirror this project</label>
         {#if workspace.privacy_pending}<p class="error" role="status">Copying from this laptop has stopped. Cloud privacy is still pending; retry to disable it everywhere.</p><button class="btn" disabled={busy !== null} onclick={() => void act(workspace.workspace_id, () => proSetNeverMirror(workspace.workspace_id, true))}>Retry cloud privacy</button>{/if}
         {#if workspace.git_branches?.length}<p class="hint">Cloud changes are saved in {workspace.git_branches.join(", ")} for you to merge.</p>{/if}
         {#if workspace.mirror}
@@ -74,6 +69,7 @@
           {#if workspace.mirror.last_mirrored_at}<p class="hint">Last copied {new Date(workspace.mirror.last_mirrored_at * 1000).toLocaleString()}</p>{/if}
           {#if workspace.mirror.error}<p class="error" role="status">{workspace.mirror.error}</p>{/if}
         {/if}
+        {#if !recoveryOnly}
         <label class="field">Cloud setup command<input value={drafts[workspace.workspace_id] ?? workspace.profile?.setup_command ?? ""} oninput={(event) => { drafts[workspace.workspace_id] = event.currentTarget.value; }} placeholder="For example, npm ci" /></label>
         <button class="btn" disabled={busy !== null} onclick={() => void act(workspace.workspace_id,() => saveProfile(workspace))}>Save setup command</button>
         {#if workspace.profile?.missing_environment.length}<p class="hint">Missing on your cloud machine: {workspace.profile.missing_environment.join(", ")}. Configure these on the cloud machine; their values aren't copied.</p>{/if}
@@ -82,6 +78,7 @@
         {#each status?.sessions.filter((session) => session.workspace_id === workspace.workspace_id) ?? [] as session (session.id)}
           <label class="check"><input type="checkbox" checked={session.keep_running ?? false} disabled={busy !== null} onchange={(event) => { const value = event.currentTarget.checked; event.currentTarget.checked = session.keep_running ?? false; void act(session.id,() => proMirrorPreference({ operation: "pin",session_id:session.id,keep_running:value })); }} />Keep “{session.display_name ?? session.name}” running when idle</label>
         {/each}
+        {/if}
       </div>
     </details>
   {/each}

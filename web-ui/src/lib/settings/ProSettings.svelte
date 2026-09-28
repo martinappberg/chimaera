@@ -6,75 +6,123 @@
   import MirrorSettings from "./MirrorSettings.svelte";
   import { asyncDisposer } from "../shared/asyncDisposer";
   import { pageVisible } from "../shared/visibility";
+  import { paid, readIntent, friendlyError, type PaidPlan, type BillingInterval, type PurchaseIntent } from "../pro/presentation";
   import {
     onProChanged, proStatus, proSignIn, proCancelSignIn, proSignOut, proSignOutEverywhere,
-    proHosts, proSetHostKept, proDevices,
+    proHosts, proSetHostKept, proDevices, proBillingCheckout, proBillingPortal, proRefreshAccount,
     type ProStatus, type ProHost, type ProDevice,
   } from "../net/native";
 
   let { visible = true }: { visible?: boolean } = $props();
+  const intentKey = "chimaera.pro.purchase";
+  function savedIntent(): PurchaseIntent | null { try { return readIntent(sessionStorage.getItem(intentKey)); } catch { return null; } }
+  const initialIntent = savedIntent();
+  let intent = $state<PurchaseIntent | null>(initialIntent);
+  let selected = $state<PaidPlan>(initialIntent?.plan ?? "pro");
+  let interval = $state<BillingInterval>(initialIntent?.interval ?? "month");
   let status = $state<ProStatus | null>(null);
   let hosts = $state<ProHost[]>([]);
   let devices = $state<ProDevice[]>([]);
-  let loading = $state(true);
   let error = $state<string | null>(null);
+  let notice = $state<string | null>(null);
   let busy = $state<string | null>(null);
   let revision = $state(0);
+  let connectionsOpen = $state(false);
+  let securityOpen = $state(false);
+  let mirrorsOpen = $state(false);
+  let recoveryOpen = $state(false);
   let generation = 0;
   let alive = true;
+  const subscribed = $derived(status?.signed_in === true && paid(status.plan));
   const signInPhase = $derived(status?.sign_in?.phase ?? null);
+  const checkoutPending = $derived(intent?.stage === "checkout");
+  const cloudHours = $derived(status?.usage?.cloud_hours);
+  const cloudLimit = $derived(status?.limits?.cloud_hours);
 
-  async function load(): Promise<void> {
+  function remember(next: PurchaseIntent | null): void {
+    intent = next;
+    try { if (next) sessionStorage.setItem(intentKey, JSON.stringify(next)); else sessionStorage.removeItem(intentKey); } catch { /* Selection still survives while this view is open. */ }
+  }
+  async function load(refresh = false): Promise<void> {
     const request = ++generation;
     try {
-      const next = await proStatus();
+      let next = await proStatus();
+      if (refresh && next.signed_in) { await proRefreshAccount(); next = await proStatus(); }
       if (!alive || request !== generation) return;
       status = next;
-      if (next.signed_in) {
-        const [nextHosts, nextDevices] = await Promise.all([proHosts(), proDevices()]);
-        if (!alive || request !== generation) return;
-        hosts = nextHosts;
-        devices = nextDevices;
-      } else {
-        hosts = [];
-        devices = [];
+      if (next.signed_in && paid(next.plan) && intent !== null) {
+        remember(null);
+        notice = "Your plan is active. You're ready to continue.";
       }
       error = null;
     } catch (reason) {
-      if (alive && request === generation) error = reason instanceof Error ? reason.message : String(reason);
-    } finally {
-      if (alive && request === generation) loading = false;
+      if (alive && request === generation) error = friendlyError(reason, "Your account couldn't refresh. Please try again in a moment.");
     }
   }
-
-  // Events refresh visible settings only. Returning to the tab catches up;
-  // there is no account polling while a settings tab is parked.
   $effect(() => {
     revision;
     if (visible && $pageVisible) untrack(() => void load());
   });
+  // Only an explicitly opened checkout gets short-lived confirmation polling.
+  // Normal account changes arrive from the shell; hidden panes do no polling.
+  $effect(() => {
+    if (!visible || !$pageVisible || !checkoutPending) return;
+    const timer = setInterval(() => {
+      if (intent && Date.now() - intent.created < 5 * 60_000) void load(true);
+      else clearInterval(timer);
+    }, 5000);
+    return () => clearInterval(timer);
+  });
+  $effect(() => {
+    if (!visible || !$pageVisible || !status?.signed_in || !subscribed || !connectionsOpen) return;
+    let stopped = false;
+    void proHosts().then(value => { if (!stopped) hosts = value; }).catch(() => { if (!stopped) error = "Connected machines couldn't refresh. Please try again."; });
+    return () => { stopped = true; };
+  });
+  $effect(() => {
+    if (!visible || !$pageVisible || !status?.signed_in || !securityOpen) return;
+    let stopped = false;
+    void proDevices().then(value => { if (!stopped) devices = value; }).catch(() => { if (!stopped) error = "Your devices couldn't refresh. Please try again."; });
+    return () => { stopped = true; };
+  });
+  $effect(() => {
+    if (visible && status?.signed_in && !subscribed && intent?.stage === "sign_in" && busy === null) {
+      untrack(() => void checkout());
+    }
+  });
   onMount(() => {
     const dispose = asyncDisposer(onProChanged(() => { revision += 1; }));
-    return () => { alive = false; generation += 1; dispose(); };
+    const focus = () => { if (visible && document.visibilityState === "visible") void load(true); };
+    window.addEventListener("focus", focus);
+    return () => { alive = false; generation += 1; dispose(); window.removeEventListener("focus", focus); };
   });
-
-  async function act(name: string, operation: () => Promise<void>): Promise<void> {
+  async function act(name: string, operation: () => Promise<void>, failure: string): Promise<void> {
     if (busy !== null) return;
-    busy = name;
-    error = null;
+    busy = name; error = null;
     try { await operation(); await load(); }
-    catch (reason) { error = reason instanceof Error ? reason.message : String(reason); }
+    catch (reason) { error = friendlyError(reason, failure); }
     finally { busy = null; }
   }
-
-  function setKept(host: ProHost, checkbox: HTMLInputElement): void {
-    const kept = checkbox.checked;
-    // The keeper is authoritative. Preserve the confirmed check mark until
-    // the command succeeds, including when a fresh sign-in is required.
-    checkbox.checked = host.kept;
-    void act(`host:${host.alias}`, () => proSetHostKept(host.alias, kept));
+  async function checkout(): Promise<void> {
+    if (busy !== null) return;
+    if (!status?.signed_in) {
+      remember({ plan: selected, interval, stage: "sign_in", created: Date.now() });
+      await act("sign-in", proSignIn, "Sign-in couldn't start. Please try again.");
+      return;
+    }
+    // Mark before opening so an unrelated status event cannot launch it twice.
+    const choice = intent?.stage === "sign_in" ? intent : { plan: selected, interval };
+    remember({ ...choice, stage: "checkout", created: Date.now() });
+    await act("checkout", () => proBillingCheckout(choice.plan, choice.interval), "Checkout couldn't open. Your plan hasn't changed. Please try again.");
   }
-
+  async function cancelSignIn(): Promise<void> {
+    remember(null);
+    await act("cancel", proCancelSignIn, "Sign-in couldn't be cancelled. Please try again.");
+  }
+  function setKept(host: ProHost, checkbox: HTMLInputElement): void {
+    const kept = checkbox.checked; checkbox.checked = host.kept;
+    void act(`host:${host.alias}`, async () => { await proSetHostKept(host.alias, kept); hosts = await proHosts(); }, "This connection couldn't be updated. Please try again.");
+  }
   function lastSeen(value: string): string {
     const date = new Date(value);
     return Number.isNaN(date.valueOf()) ? "Last seen unavailable" : `Last seen ${date.toLocaleString()}`;
@@ -82,136 +130,124 @@
 </script>
 
 <section class="pro" aria-label="Chimaera Pro">
-  <h2 class="cat">Chimaera Pro</h2>
-  {#if loading && status === null}
-    <p class="state" role="status">Loading account…</p>
-  {:else if status !== null && !status.available}
-    <p class="state">Chimaera Pro isn't available in this build.</p>
-  {:else if status !== null && !status.signed_in}
-    {#if signInPhase === "waiting"}
-      <p class="intro" role="status">Continue in your browser</p>
-      <p class="state">Complete sign-in and verification there. Chimaera will open when you're ready. This request stays open for up to 15 minutes.</p>
-      <div class="actions">
-        <button class="btn primary" disabled={busy !== null} onclick={() => void act("sign-in", proSignIn)}>Start again</button>
-        <button class="btn" disabled={busy !== null} onclick={() => void act("cancel-sign-in", proCancelSignIn)}>Cancel sign-in</button>
-      </div>
-    {:else if signInPhase === "finishing"}
-      <p class="intro" role="status">Finishing sign-in…</p>
-      <p class="state">Saving your account securely on this computer.</p>
-    {:else}
-      <p class="intro">Sign in to keep your remote machines connected through Chimaera Pro.</p>
-      <div class="actions">
-        <button class="btn primary" disabled={busy !== null} onclick={() => void act("sign-in", proSignIn)}>
-          {busy === "sign-in" ? "Opening sign-in…" : "Sign in"}
-        </button>
+  <header class="heading">
+    <div class="brand"><BrandMark size={38} /><span>chimaera</span><span class="product">Pro</span></div>
+    <p class="eyebrow">Your work, within reach.</p>
+    <h1>{subscribed ? "A little more room for your work." : "Keep working beyond your laptop."}</h1>
+    <p class="lede">Stay connected to your machines. Let work continue while your computer is away. Your own agents, with the subscriptions you already use.</p>
+  </header>
+
+  {#if status === null}
+    <p class="muted" role="status">Loading your account…</p>
+  {:else if !status.available}
+    <div class="panel"><h2>Pro isn't available in this build</h2><p class="muted">Your local workbench and SSH connections are ready to use.</p></div>
+  {:else}
+    {#if status.signed_in}
+      <div class="identity">
+        <div><span class="email">{status.email}</span><span class="muted small">{subscribed ? "Your account" : "Signed in · No active plan"}</span></div>
+        <PlanBadge plan={paid(status.plan) ? status.plan : null} />
+        <button class="text-button" disabled={busy !== null} onclick={() => void load(true)}>Refresh</button>
       </div>
     {/if}
-  {:else if status?.signed_in}
-    <div class="account" class:subscribed={status.plan === "pro" || status.plan === "max"}>
-      <BrandMark size={32} />
-      <div class="account-identity">
-        <div class="account-brand">
-          <span class="wordmark">chimaera</span>
-          <PlanBadge plan={status.plan === "pro" || status.plan === "max" ? status.plan : null} />
-          {#if status.plan !== "pro" && status.plan !== "max"}<span class="plan">No active plan</span>{/if}
-        </div>
-        <span class="email">{status.email}</span>
-      </div>
-    </div>
 
-    <div class="group">
-      <h3>Hosts kept connected</h3>
-      {#if hosts.length === 0}
-        <p class="hint">Add a remote host on Home to keep it connected here.</p>
-      {:else}
-        <ul class="rows">
-          {#each hosts as host (host.alias)}
-            <li class="row">
-              <div class="detail">
-                <span class="name">{host.alias}</span>
-                <span class="hint" role="status">
-                  {host.status === "prompting" ? "Waiting for authentication" : host.status === "connecting" ? "Connecting…" : host.status === "connected" ? "Connected" : "Offline"}
-                  {#if host.kind === "device"} · Device{/if}
-                </span>
-              </div>
-              {#if host.kind === "ssh"}
-                <label class="keep">
-                  <input type="checkbox" checked={host.kept} disabled={busy !== null}
-                    onchange={(event) => setKept(host, event.currentTarget)} />
-                  <span>Keep connected</span>
-                </label>
-              {/if}
-            </li>
+    {#if signInPhase === "waiting"}
+      <div class="panel notice" role="status"><h2>Continue in your browser</h2><p>Complete sign-in and verification there. Your selection is saved here, and this request stays open for up to 15 minutes.</p><div class="actions"><button disabled={busy !== null} onclick={() => void act("sign-in", proSignIn, "Sign-in couldn't restart. Please try again.")}>Start again</button><button class="secondary" disabled={busy !== null} onclick={() => void cancelSignIn()}>Cancel sign-in</button></div></div>
+    {:else if signInPhase === "finishing"}
+      <div class="panel notice" role="status"><h2>Finishing sign-in…</h2><p>Saving your account securely on this computer.</p></div>
+    {/if}
+
+    {#if notice}<p class="notice message" role="status">{notice}</p>{/if}
+    {#if checkoutPending && !subscribed}
+      <div class="panel notice"><h2>Finish in your browser</h2><p>Review {intent?.plan === "max" ? "Max" : "Pro"} and complete checkout there. We'll show your plan here once payment is confirmed.</p><div class="actions"><button disabled={busy !== null} onclick={() => void load(true)}>Check plan status</button><button class="text-button" disabled={busy !== null} onclick={() => { remember(null); notice = null; }}>Back to plans</button></div><p class="small">Closed checkout? Choose a plan below to open it again. Closing this view won't affect your local work.</p></div>
+    {/if}
+
+    {#if !subscribed}
+      <section class="plans" aria-labelledby="plans-title">
+        <div class="section-heading"><h2 id="plans-title">Choose your room to work</h2><div class="interval" role="group" aria-label="Billing interval"><button class:chosen={interval === "month"} aria-pressed={interval === "month"} onclick={() => (interval = "month")}>Monthly</button><button class:chosen={interval === "year"} aria-pressed={interval === "year"} onclick={() => (interval = "year")}>Yearly <span>2 months free</span></button></div></div>
+        <div class="plan-options">
+          {#each ["pro", "max"] as plan}
+            <button class="plan-card" class:selected={selected === plan} aria-pressed={selected === plan} onclick={() => (selected = plan as PaidPlan)}>
+              <span class="plan-name">{plan === "pro" ? "Pro" : "Max"}</span><span class="price">${plan === "pro" ? (interval === "month" ? "8" : "80") : (interval === "month" ? "30" : "300")}<span> / {interval}</span></span>
+              <span class="plan-detail">{plan === "pro" ? "100" : "500"} cloud hours / month</span><span class="plan-detail">{plan === "pro" ? "20" : "100"} GB mirrored storage</span><span class="plan-note">{plan === "pro" ? "Everything in Pro." : "The same features, more capacity."}</span>
+            </button>
           {/each}
-        </ul>
-      {/if}
-    </div>
+        </div>
+        <ul class="benefits"><li>Keep remote machines connected</li><li>Automatic laptop and cloud handoff</li><li>Reach your work from another device</li></ul>
+        <div class="purchase"><button disabled={busy !== null || signInPhase !== null} onclick={() => void checkout()}>{busy === "checkout" ? "Opening checkout…" : status.signed_in ? `Continue with ${selected === "max" ? "Max" : "Pro"}` : "Sign in to continue"}</button><p class="small muted">{interval === "year" ? `Billed $${selected === "pro" ? "80" : "300"} yearly` : `Billed $${selected === "pro" ? "8" : "30"} monthly`}. Review the full details in secure browser checkout before subscribing.</p></div>
+        {#if !status.signed_in}<p class="small muted">Already subscribed? <button class="text-button" disabled={busy !== null || signInPhase !== null} onclick={() => { remember(null); void act("sign-in", proSignIn, "Sign-in couldn't start. Please try again."); }}>Sign in to your account</button></p>{/if}
+        <p class="free-note">Local work, agents and ordinary SSH remain free. You don't need an account to keep using them.</p>
+      </section>
+    {:else}
+      <section class="panel plan-current" aria-label="Current plan"><div class="section-heading"><h2>Chimaera {status.plan === "max" ? "Max" : "Pro"}</h2><button class="secondary" disabled={busy !== null} onclick={() => void act("billing", proBillingPortal, "Billing couldn't open. Please try again in a moment.")}>{busy === "billing" ? "Opening billing…" : "Manage billing"}</button></div>
+        {#if cloudHours !== undefined && cloudLimit !== undefined}<p><strong>{cloudHours.toFixed(1)}</strong> of {cloudLimit} cloud hours used this month</p><progress max={cloudLimit} value={Math.min(cloudHours, cloudLimit)} aria-label="Monthly cloud hours used"></progress>{/if}
+        {#if status.usage && status.limits}<p class="small muted">{(status.usage.storage_bytes / 1e9).toFixed(1)} of {Math.round(status.limits.storage_bytes / 1e9)} GB storage used</p>{/if}
+      </section>
+      <CloudSetup {visible} />
+      <details class="section" ontoggle={(event) => (connectionsOpen = event.currentTarget.open)}><summary>Connected machines</summary>{#if connectionsOpen}<div class="section-body"><p class="muted small">Add your remote hosts on Home. Keep a connection available through Pro here.</p>{#if hosts.length === 0}<p class="muted">No machines to show yet.</p>{/if}{#each hosts as host (host.alias)}<div class="row"><div><span>{host.alias}</span><span class="muted small">{host.status === "prompting" ? "Waiting for authentication" : host.status === "connecting" ? "Connecting…" : host.status === "connected" ? "Connected" : "Offline"}</span></div>{#if host.kind === "ssh"}<label class="keep"><input type="checkbox" checked={host.kept} disabled={busy !== null} onchange={(event) => setKept(host, event.currentTarget)} />Keep connected</label>{/if}</div>{/each}</div>{/if}</details>
+      <details class="section" ontoggle={(event) => (mirrorsOpen = event.currentTarget.open)}><summary>Project mirrors and privacy</summary>{#if mirrorsOpen}<MirrorSettings visible={visible && mirrorsOpen} />{/if}</details>
+    {/if}
 
-    <div class="group">
-      <h3>Devices</h3>
-      <ul class="rows">
-        {#each devices as device (device.id)}
-          <li class="row">
-            <div class="detail">
-              <span class="name">{device.name}</span>
-              <span class="hint">{lastSeen(device.last_seen)}</span>
-            </div>
-            {#if device.this}<span class="current">This device</span>{/if}
-          </li>
-        {/each}
-      </ul>
-    </div>
-
-    <CloudSetup {visible} />
-
-    <MirrorSettings {visible} />
-
-    <div class="actions">
-      <button class="btn" disabled={busy !== null} onclick={() => void act("sign-out", proSignOut)}>
-        {busy === "sign-out" ? "Signing out…" : "Sign out"}
-      </button>
-      <button class="btn" disabled={busy !== null} onclick={() => void act("sign-out-everywhere", proSignOutEverywhere)}>
-        {busy === "sign-out-everywhere" ? "Signing out everywhere…" : "Sign out everywhere"}
-      </button>
-    </div>
-    <p class="hint signout-hint">Signing out everywhere also closes the SSH logins kept by Pro.</p>
+    {#if status.signed_in}
+      {#if !subscribed}<details class="section" ontoggle={(event) => (recoveryOpen = event.currentTarget.open)}><summary>Existing project privacy</summary>{#if recoveryOpen}<MirrorSettings visible={visible && recoveryOpen} recoveryOnly />{/if}</details>{/if}
+      <details class="section" ontoggle={(event) => (securityOpen = event.currentTarget.open)}><summary>Account and devices</summary>{#if securityOpen}<div class="section-body">{#each devices as device (device.id)}<div class="row"><div><span>{device.name}</span><span class="muted small">{lastSeen(device.last_seen)}</span></div>{#if device.this}<span class="small muted">This device</span>{/if}</div>{/each}<div class="actions"><button class="secondary" disabled={busy !== null} onclick={() => { remember(null); void act("sign-out", proSignOut, "Sign-out couldn't finish. Please try again."); }}>Sign out</button><button class="text-button" disabled={busy !== null} onclick={() => { remember(null); void act("sign-out-all", proSignOutEverywhere, "Sign-out couldn't finish. Please try again."); }}>Sign out everywhere</button></div><p class="muted small">Signing out everywhere also closes the SSH logins held by Pro.</p></div>{/if}</details>
+    {/if}
   {/if}
-  {#if error !== null || status?.error}
-    <div class="error" role="alert">
-      <span>{error ?? status?.error}</span>
-      <button class="btn" disabled={busy !== null || signInPhase === "finishing"} onclick={() => status?.signed_in ? void load() : void act("sign-in", proSignIn)}>{status?.signed_in ? "Retry" : "Try again"}</button>
-    </div>
-  {/if}
+  {#if error || status?.error}<div class="error" role="alert"><span>{error ?? friendlyError(status?.error, "Part of your Pro connection couldn't refresh. Your local work remains available.")}</span><button class="secondary" disabled={busy !== null} onclick={() => void load(true)}>Try again</button></div>{/if}
 </section>
 
 <style>
-  .pro { display: flex; flex-direction: column; padding-bottom: 14px; }
-  .cat { margin: 18px 0 4px; padding: 0 14px; font-size: var(--text-xs); font-weight: 600; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); }
-  .intro, .state { margin: 0; padding: 8px 14px; font-size: var(--text-sm); line-height: 1.5; color: var(--muted); max-width: 64ch; }
-  .account { display: flex; gap: 12px; align-items: center; margin: 10px 14px; padding: 16px; border: 1px solid var(--edge); border-radius: 10px; }
-  .account.subscribed { border-color: color-mix(in srgb, var(--accent) 24%, var(--edge)); background: linear-gradient(115deg, color-mix(in srgb, var(--accent) 7%, transparent), transparent 80%); }
-  .account-identity { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
-  .account-brand { display: flex; flex-wrap: wrap; align-items: center; gap: 9px; }
-  .wordmark { font-size: var(--text-lg); font-weight: 600; letter-spacing: .01em; }
-  .email { font-size: var(--text-sm); color: var(--muted); overflow-wrap: anywhere; }
-  .plan, .current { font-size: var(--text-xs); color: var(--muted); flex: none; }
-  .group { padding: 10px 14px; }
-  h3 { margin: 0 0 8px; font-size: var(--text-sm); font-weight: 600; }
-  .rows { list-style: none; margin: 0; padding: 0; border: 1px solid var(--edge); border-radius: 8px; overflow: hidden; }
-  .row { display: flex; align-items: center; flex-wrap: wrap; gap: 10px 16px; padding: 12px; }
-  .row + .row { border-top: 1px solid var(--edge); }
-  .detail { flex: 1; display: flex; flex-direction: column; gap: 3px; min-width: 120px; overflow-wrap: anywhere; }
-  .name { font-size: var(--text-md); }
-  .hint { margin: 0; font-size: var(--text-sm); color: var(--muted); line-height: 1.4; }
-  .keep { display: flex; gap: 7px; align-items: center; font-size: var(--text-sm); cursor: pointer; }
-  .keep input { accent-color: var(--accent); width: 16px; height: 16px; margin: 0; }
-  .actions { display: flex; flex-wrap: wrap; gap: 8px; padding: 10px 14px; }
-  .btn { appearance: none; border: 1px solid var(--edge); border-radius: 6px; padding: 5px 10px; background: var(--term-bg); color: var(--fg); font: inherit; font-size: var(--text-sm); cursor: pointer; }
-  .btn:hover:not(:disabled) { background: var(--row-hover); }
-  .btn:focus-visible, .keep input:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
-  .btn:disabled { opacity: .5; cursor: default; }
-  .primary { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, var(--edge)); }
-  .signout-hint { padding: 0 14px; }
-  .error { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 8px 14px; padding: 8px 10px; border-radius: 6px; color: var(--warn); background: color-mix(in srgb, var(--warn) 10%, transparent); font-size: var(--text-sm); overflow-wrap: anywhere; }
-  .error span { flex: 1; min-width: 120px; }
+  .pro { box-sizing: border-box; max-width: 780px; margin: 0 auto; padding: 36px 32px 48px; color: var(--fg); font-size: var(--text-md); }
+  .heading { max-width: 620px; margin-bottom: 26px; }
+  .brand { display: flex; align-items: center; gap: 9px; font-size: 22px; font-weight: 600; letter-spacing: -.5px; }
+  .product { font-size: var(--text-sm); font-weight: 500; color: var(--muted); margin-left: 3px; padding-left: 12px; border-left: 1px solid var(--edge); letter-spacing: 0; }
+  .eyebrow { color: var(--muted); font-size: var(--text-xs); margin: 24px 0 9px; }
+  h1 { font-size: clamp(24px, 3vw, 31px); font-weight: 600; letter-spacing: -.7px; line-height: 1.2; margin: 0 0 12px; }
+  h2 { font-size: var(--text-lg); font-weight: 600; margin: 0; }
+  p { line-height: 1.6; margin: 10px 0; }
+  .lede, .muted { color: var(--muted); }
+  .small { font-size: var(--text-sm); }
+  button { display: inline-flex; justify-content: center; align-items: center; gap: 7px; padding: 9px 14px; border: 1px solid transparent; border-radius: 7px; font: inherit; cursor: pointer; background: var(--fg); color: var(--bg); }
+  button:hover:not(:disabled) { opacity: .85; }
+  button:disabled { opacity: .5; cursor: default; }
+  button:focus-visible, summary:focus-visible, input:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 3px; }
+  .secondary { background: transparent; border-color: var(--edge); color: var(--fg); }
+  .text-button { border: 0; padding: 3px 0; background: transparent; color: var(--accent); font-size: var(--text-sm); }
+  .identity { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-bottom: 22px; padding: 14px 0; border-bottom: 1px solid var(--edge); }
+  .identity > div { flex: 1 1 220px; min-width: 0; }
+  .email { overflow-wrap: anywhere; }
+  .identity .small, .row .small { display: block; margin-top: 4px; }
+  .panel { border: 1px solid var(--edge); border-radius: 12px; padding: 20px; margin: 18px 0; }
+  .section-heading { display: flex; align-items: center; justify-content: space-between; gap: 14px; flex-wrap: wrap; }
+  .interval { display: flex; gap: 3px; padding: 3px; background: var(--row-hover); border-radius: 7px; }
+  .interval button { background: transparent; color: var(--muted); padding: 6px 8px; font-size: var(--text-sm); }
+  .interval .chosen { background: var(--bg); color: var(--fg); border-color: var(--edge); }
+  .interval span { font-size: var(--text-xs); color: var(--accent); }
+  .plan-options { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr)); gap: 12px; margin-top: 18px; }
+  .plan-card { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; text-align: left; color: var(--fg); background: transparent; border-color: var(--edge); padding: 20px; }
+  .plan-card.selected { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 5%, var(--bg)); }
+  .plan-name { font-weight: 600; font-size: var(--text-lg); }
+  .price { font-size: 29px; font-weight: 600; letter-spacing: -.6px; margin: 7px 0; }
+  .price span { font-size: var(--text-sm); font-weight: 400; color: var(--muted); letter-spacing: 0; }
+  .plan-detail { font-size: var(--text-sm); }
+  .plan-note { font-size: var(--text-xs); color: var(--muted); margin-top: 7px; }
+  .benefits { display: flex; flex-wrap: wrap; gap: 8px 24px; padding: 0 0 0 17px; margin: 20px 0; color: var(--muted); font-size: var(--text-sm); line-height: 1.6; }
+  .purchase { margin-top: 20px; }
+  .purchase p { max-width: 55ch; }
+  .free-note { font-size: var(--text-sm); color: var(--muted); border-top: 1px solid var(--edge); padding-top: 16px; margin-top: 24px; }
+  .notice { background: color-mix(in srgb, var(--accent) 7%, transparent); }
+  .message { border-radius: 7px; padding: 12px; }
+  progress { width: 100%; height: 5px; accent-color: var(--accent); }
+  .section { border-top: 1px solid var(--edge); margin-top: 14px; }
+  summary { color: var(--muted); padding: 17px 0; cursor: pointer; font-size: var(--text-md); }
+  summary:hover { color: var(--fg); }
+  .section-body { padding-bottom: 14px; }
+  .row { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; padding: 10px 0; }
+  .row > div { min-width: 0; overflow-wrap: anywhere; }
+  .keep { display: flex; gap: 7px; align-items: center; font-size: var(--text-sm); }
+  input { accent-color: var(--accent); }
+  .actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px; margin: 14px 0; }
+  .error { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; padding: 14px; margin-top: 18px; background: color-mix(in srgb, var(--warn) 8%, transparent); color: var(--warn); border-radius: 8px; }
+  .error span { flex: 1; min-width: 160px; }
+  @media (max-width: 520px) { .pro { padding: 24px 18px 36px; } .plan-card { padding: 15px 12px; } .identity { flex-wrap: wrap; } .panel { padding: 16px; } .brand { font-size: 20px; } }
+  @media (max-width: 340px) { .plan-options { grid-template-columns: 1fr; } }
 </style>
