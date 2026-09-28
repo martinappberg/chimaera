@@ -172,19 +172,19 @@ fn base_command(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    // The daemon's own launcher markers (a daemon started inside Claude
-    // Code) must not make the probe think it is a nested child session.
-    for name in crate::api::launcher_context_env() {
+    // Every session spawn's env hygiene (`api::spawn_env_remove`): the
+    // daemon's own launcher markers (a daemon started inside Claude Code)
+    // must not make the probe a nested child session, and an inherited
+    // prelude pair (a daemon started in a chimaera terminal) must neither
+    // suppress this probe's prelude nor run another session's.
+    let env: Vec<(String, String)> = prelude
+        .map(|path| ("CHIMAERA_PRELUDE".to_string(), path.display().to_string()))
+        .into_iter()
+        .collect();
+    for name in crate::api::spawn_env_remove(&env) {
         cmd.env_remove(name);
     }
-    // Sessions' prelude pair (`api::spawn_env_remove`): an inherited one (a
-    // daemon started inside a chimaera terminal) must neither suppress this
-    // probe's prelude nor run another session's.
-    cmd.env_remove("CHIMAERA_PRELUDE_DONE");
-    match prelude {
-        Some(path) => cmd.env("CHIMAERA_PRELUDE", path),
-        None => cmd.env_remove("CHIMAERA_PRELUDE"),
-    };
+    cmd.envs(env);
     if let Some(cwd) = cwd {
         cmd.current_dir(cwd);
     }

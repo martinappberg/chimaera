@@ -99,6 +99,9 @@ const HOOK_LINE_MAX: usize = 1024;
 /// decisions and ~300 learnings is well under a MiB.
 pub(crate) const SNAPSHOT_MAX: usize = 4 << 20;
 const STAMP_MAX: usize = 1 << 20;
+/// Why a provider couldn't read, in its own words: shown on the Knowledge
+/// view and logged, so bounded like a hook line.
+const KNOWLEDGE_ERROR_MAX: usize = 1024;
 /// `emit` frames kept for the `/ws/events` clients, and one frame's size.
 const EVENTS_KEPT: usize = 64;
 pub(crate) const EVENT_MAX: usize = 16 * 1024;
@@ -928,35 +931,39 @@ impl PluginRuntime {
         }
     }
 
-    /// The Knowledge snapshot `(stamp, data)` from a provider plugin, or
-    /// None when `known` is still current.
+    /// The Knowledge snapshot from a provider plugin: None when `known` is
+    /// still current, else its stamp and its data — or why the data was
+    /// refused (over `SNAPSHOT_MAX`, not JSON). A refused snapshot keeps its
+    /// stamp, so the caller can hand it back and an unchanged tree is
+    /// refused again without being read again.
     pub(crate) async fn knowledge(
         &self,
         state: &Arc<AppState>,
         m: &Manifest,
         ws: &str,
         known: Option<&Value>,
-    ) -> Result<Option<(Value, Value)>, String> {
+    ) -> Result<Option<(Value, Result<Value, String>)>, String> {
         let call = Call::Knowledge(known.map(Value::to_string));
         let Reply::Knowledge(answer) = self.run(state, m, ws, None, call).await? else {
             unreachable!("knowledge answers Knowledge")
         };
-        let Some(snapshot) = answer? else {
+        let Some(snapshot) = answer.map_err(|e| clip(&e, KNOWLEDGE_ERROR_MAX))? else {
             return Ok(None);
         };
-        for (what, text, max) in [
-            ("snapshot", &snapshot.data, SNAPSHOT_MAX),
-            ("stamp", &snapshot.stamp, STAMP_MAX),
-        ] {
-            if text.len() > max {
-                return Err(format!(
+        let over = |what: &str, len: usize, max: usize| {
+            (len > max).then(|| {
+                format!(
                     "{}'s {what} is {:.1} MiB, over the {} MiB it may be",
                     m.name,
-                    text.len() as f64 / f64::from(1 << 20),
+                    len as f64 / f64::from(1 << 20),
                     max >> 20
-                ));
-            }
+                )
+            })
+        };
+        if let Some(why) = over("stamp", snapshot.stamp.len(), STAMP_MAX) {
+            return Err(why);
         }
+        let too_big = over("snapshot", snapshot.data.len(), SNAPSHOT_MAX);
         // Megabytes of JSON: parsed on the blocking pool.
         let name = m.name.clone();
         tokio::task::spawn_blocking(move || {
@@ -964,10 +971,12 @@ impl PluginRuntime {
                 serde_json::from_str::<Value>(text)
                     .map_err(|e| format!("{name}: the snapshot's {what} is not JSON ({e})"))
             };
-            Ok(Some((
-                parse("stamp", &snapshot.stamp)?,
-                parse("data", &snapshot.data)?,
-            )))
+            let stamp = parse("stamp", &snapshot.stamp)?;
+            let data = match too_big {
+                Some(why) => Err(why),
+                None => parse("data", &snapshot.data),
+            };
+            Ok(Some((stamp, data)))
         })
         .await
         .map_err(|e| format!("{}: reading its snapshot failed ({e})", m.name))?

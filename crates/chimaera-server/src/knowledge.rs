@@ -54,13 +54,24 @@ const MEMORY_NOTES_MAX: usize = 200;
 #[derive(Default)]
 pub(crate) struct KnowledgeState {
     cache: HashMap<String, Cached>,
+    /// A snapshot the provider gave but that was refused (too big, not a
+    /// JSON object), per workspace: its stamp is what the next ask hands
+    /// back, so an unchanged tree is refused again without a re-read.
+    refused: HashMap<String, Refused>,
     /// What the Timeline last saw, per workspace (the diff baseline).
     baseline: HashMap<String, Baseline>,
+}
+
+struct Refused {
+    build: (String, Arc<str>),
+    stamp: Value,
+    error: String,
 }
 
 impl KnowledgeState {
     pub(crate) fn forget_workspace(&mut self, ws: &str) {
         self.cache.remove(ws);
+        self.refused.remove(ws);
         self.baseline.remove(ws);
     }
 
@@ -77,6 +88,7 @@ impl KnowledgeState {
         let gone =
             |w: &String, build: &(String, Arc<str>)| build.0 == id && ws.is_none_or(|ws| ws == w);
         self.cache.retain(|w, c| !gone(w, &c.build));
+        self.refused.retain(|w, r| !gone(w, &r.build));
         self.baseline.retain(|w, b| !gone(w, &b.build));
     }
 }
@@ -177,6 +189,9 @@ async fn ask(state: &Arc<AppState>, ws: &str) -> Answer {
         if st.cache.get(ws).is_some_and(|c| c.build != build) {
             st.cache.remove(ws);
         }
+        if st.refused.get(ws).is_some_and(|r| r.build != build) {
+            st.refused.remove(ws);
+        }
         if st.baseline.get(ws).is_some_and(|b| b.build != build) {
             st.baseline.remove(ws);
         }
@@ -194,13 +209,36 @@ async fn ask(state: &Arc<AppState>, ws: &str) -> Answer {
             error,
         }
     };
-    // Twice at most: "unchanged" for a stamp whose cache entry was dropped
-    // meanwhile (the workspace forgotten) is asked again without one.
+    let refuse = |stamp: Value, error: String| {
+        let refused = Refused {
+            build: build.clone(),
+            stamp,
+            error: error.clone(),
+        };
+        crate::lock(&state.knowledge)
+            .refused
+            .insert(ws.to_string(), refused);
+        failed(error)
+    };
+    // Twice at most: "unchanged" for a stamp whose entry was replaced or
+    // dropped meanwhile (another ask, the workspace forgotten) is asked
+    // again with what is held now.
     for _ in 0..2 {
-        let held = crate::lock(&state.knowledge)
-            .cache
-            .get(ws)
-            .map(|c| c.stamp.clone());
+        // What to hand back: a refused snapshot's stamp (its tree unchanged,
+        // it's refused again unread), else the cached one's — this build's.
+        let (held, refused) = {
+            let st = crate::lock(&state.knowledge);
+            match st.refused.get(ws).filter(|r| r.build == build) {
+                Some(r) => (Some(r.stamp.clone()), Some(r.error.clone())),
+                None => (
+                    st.cache
+                        .get(ws)
+                        .filter(|c| c.build == build)
+                        .map(|c| c.stamp.clone()),
+                    None,
+                ),
+            }
+        };
         let answer = state
             .plugin_runtime
             .knowledge(state, &m, ws, held.as_ref())
@@ -208,7 +246,16 @@ async fn ask(state: &Arc<AppState>, ws: &str) -> Answer {
         match answer {
             Ok(None) => {
                 let st = crate::lock(&state.knowledge);
-                if let Some(c) = st
+                if let Some(error) = refused {
+                    let still = st
+                        .refused
+                        .get(ws)
+                        .is_some_and(|r| r.build == build && Some(&r.stamp) == held.as_ref());
+                    drop(st);
+                    if still {
+                        return failed(error);
+                    }
+                } else if let Some(c) = st
                     .cache
                     .get(ws)
                     .filter(|c| c.build == build && Some(&c.stamp) == held.as_ref())
@@ -216,9 +263,10 @@ async fn ask(state: &Arc<AppState>, ws: &str) -> Answer {
                     return Answer::Fresh(Current::of(c, &name));
                 }
             }
-            Ok(Some((stamp, data))) => {
+            Ok(Some((stamp, Err(error)))) => return refuse(stamp, error),
+            Ok(Some((stamp, Ok(data)))) => {
                 if !data.is_object() {
-                    return failed(format!("{}'s snapshot is not a JSON object", m.name));
+                    return refuse(stamp, format!("{}'s snapshot is not a JSON object", m.name));
                 }
                 let files = Arc::new(Stamp::deserialize(&stamp).unwrap_or_default());
                 let cached = Cached {
@@ -228,18 +276,35 @@ async fn ask(state: &Arc<AppState>, ws: &str) -> Answer {
                     knowledge: Arc::new(data),
                 };
                 let now = Current::of(&cached, &name);
-                crate::lock(&state.knowledge)
-                    .cache
-                    .insert(ws.to_string(), cached);
+                let mut st = crate::lock(&state.knowledge);
+                st.refused.remove(ws);
+                st.cache.insert(ws.to_string(), cached);
                 return Answer::Fresh(now);
             }
             Err(err) => return failed(err),
         }
     }
-    failed(format!(
-        "{} answered \"unchanged\" for a snapshot it never gave",
-        m.name
-    ))
+    // Asks racing this one kept replacing what it held: the snapshot they
+    // left is this build's current answer.
+    let settled = {
+        let st = crate::lock(&state.knowledge);
+        match st.refused.get(ws).filter(|r| r.build == build) {
+            Some(r) => Err(r.error.clone()),
+            None => Ok(st
+                .cache
+                .get(ws)
+                .filter(|c| c.build == build)
+                .map(|c| Current::of(c, &name))),
+        }
+    };
+    match settled {
+        Ok(Some(now)) => Answer::Fresh(now),
+        Err(error) => failed(error),
+        Ok(None) => failed(format!(
+            "{} answered \"unchanged\" for a snapshot it never gave",
+            m.name
+        )),
+    }
 }
 
 /// (entry id, kind, the workspace-relative file it lives in).
@@ -391,21 +456,21 @@ pub(crate) async fn prime_workspace(state: &Arc<AppState>, ws: &str) {
     }
 }
 
-/// `now` as the baseline, unless one was taken meanwhile.
+/// `now` as the baseline, unless one was taken meanwhile. The ids are
+/// collected outside the lock (hundreds of entries).
 fn take_baseline(state: &AppState, ws: &str, now: &Current) {
-    let mut st = crate::lock(&state.knowledge);
-    if st.baseline.contains_key(ws) {
+    if has_baseline(state, ws) {
         return;
     }
     let (ids, statuses) = ids_of(&now.knowledge);
-    st.baseline.insert(
-        ws.to_string(),
-        Baseline {
+    crate::lock(&state.knowledge)
+        .baseline
+        .entry(ws.to_string())
+        .or_insert(Baseline {
             build: now.build.clone(),
             ids: ids.into_iter().map(|(id, _, _)| id).collect(),
             statuses,
-        },
-    );
+        });
 }
 
 pub(crate) fn has_baseline(state: &AppState, ws: &str) -> bool {
@@ -632,13 +697,15 @@ pub(crate) async fn get_knowledge(
         )
             .into_response();
     };
-    let guidance = {
+    // A few stats on an NFS home, overlapping the provider's answer.
+    let guidance = async {
         let root = root.clone();
         tokio::task::spawn_blocking(move || guidance(&root))
             .await
             .unwrap_or_default()
     };
-    let (now, error) = match ask(&state, &id).await {
+    let (guidance, answer) = tokio::join!(guidance, ask(&state, &id));
+    let (now, error) = match answer {
         Answer::NoProvider => return Json(empty_body(Value::Null, guidance)).into_response(),
         // The one ask also primes the Timeline's baseline.
         Answer::Fresh(now) => {
@@ -689,6 +756,11 @@ pub(crate) async fn get_knowledge(
         body["schema"] = json!(1);
         body["provider"] = json!(now.provider);
         body["guidance"] = json!(guidance);
+        // `error` is the daemon's word that the provider couldn't answer,
+        // never a field of the provider's own.
+        if let Some(fields) = body.as_object_mut() {
+            fields.remove("error");
+        }
         if body.get("left_off").is_none() {
             body["left_off"] = Value::Null;
         }

@@ -157,6 +157,7 @@ async fn the_provider_answers_unchanged_for_its_own_stamp() {
         .await
         .unwrap()
         .expect("a first snapshot");
+    let data = data.expect("under the cap, and JSON");
     eprintln!(
         "knowledge, first ask (compile + instantiate + read): {:?}",
         started.elapsed()
@@ -181,7 +182,10 @@ async fn the_provider_answers_unchanged_for_its_own_stamp() {
         "knowledge, another workspace (instantiate + read): {:?}",
         started.elapsed()
     );
-    assert_eq!(first_there.map(|(_, data)| data), Some(data.clone()));
+    assert_eq!(
+        first_there.and_then(|(_, data)| data.ok()),
+        Some(data.clone())
+    );
 
     // The stamp names every file read, with its mtime and length.
     let files = stamp["files"].as_array().unwrap();
@@ -206,6 +210,7 @@ async fn the_provider_answers_unchanged_for_its_own_stamp() {
         .await
         .unwrap()
         .expect("a changed tree is re-read");
+    let data = data.unwrap();
     assert_ne!(moved, stamp);
     assert_eq!(data["counts"]["learnings"], 5);
 }
@@ -407,6 +412,7 @@ async fn a_symlinked_topic_is_refused_warned_about_and_stamped() {
         .await
         .unwrap()
         .expect("a snapshot");
+    let data = data.unwrap();
     assert_eq!(
         stamp["refused"],
         serde_json::json!([".living/findings/linked.md"])
@@ -728,5 +734,108 @@ async fn switching_the_provider_off_drops_its_snapshot() {
     let body = knowledge_of(&state, &ws).await;
     assert_eq!(body["provider"], serde_json::Value::Null);
     assert!(body.get("error").is_none(), "{body}");
+    state.sessions.kill(&sid).ok();
+}
+
+fn reads(state: &Arc<AppState>, ws: &str) -> u64 {
+    lock(&state.plugin_state)
+        .get("test-knowledge", ws, "reads")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
+/// A refused snapshot keeps its stamp: while the tree is unchanged the
+/// provider answers "unchanged" and it's refused again unread — an
+/// oversized `.living/` isn't re-parsed on every refetch and turn end.
+/// A readable snapshot again clears it.
+#[tokio::test]
+async fn a_refused_snapshot_is_not_read_again_while_its_tree_is_unchanged() {
+    let state = test_state();
+    let (ws, sid) = provider_workspace(&state, "knowledge-refused-stamp", "kr").await;
+    provider_mode(&state, &sid, "kr", serde_json::json!({"big": 5 << 20})).await;
+    for _ in 0..3 {
+        let body = knowledge_of(&state, &ws).await;
+        assert!(
+            body["error"].as_str().unwrap().contains("over the 4 MiB"),
+            "{body}"
+        );
+    }
+    assert_eq!(reads(&state, &ws), 1, "read once, refused three times");
+    provider_mode(&state, &sid, "kr", serde_json::Value::Null).await;
+    let body = knowledge_of(&state, &ws).await;
+    assert!(body.get("error").is_none(), "{body}");
+    assert_eq!(body["fixture_version"], "0.1.0");
+    state.sessions.kill(&sid).ok();
+}
+
+/// `error` on the wire is the daemon's word that the provider couldn't
+/// answer: a provider's own field of that name never reaches the view, and
+/// a provider's refusal is clipped before it does.
+#[tokio::test]
+async fn the_error_field_is_the_daemons_and_bounded() {
+    let state = test_state();
+    let (ws, sid) = provider_workspace(&state, "knowledge-error-field", "kx").await;
+    provider_mode(
+        &state,
+        &sid,
+        "kx",
+        serde_json::json!({"extra": {"error": "not the daemon's"}}),
+    )
+    .await;
+    let body = knowledge_of(&state, &ws).await;
+    assert!(body.get("error").is_none(), "{body}");
+    provider_mode(
+        &state,
+        &sid,
+        "kx",
+        serde_json::json!({"error_len": 100_000}),
+    )
+    .await;
+    let body = knowledge_of(&state, &ws).await;
+    let error = body["error"].as_str().unwrap();
+    assert!(
+        error.len() <= 1024 && error.ends_with('…'),
+        "{}",
+        error.len()
+    );
+    state.sessions.kill(&sid).ok();
+}
+
+/// A job that panics costs that job, not the workspace's queue: the jobs
+/// behind it get a new worker and land.
+#[tokio::test]
+async fn a_panicking_episode_job_does_not_wedge_the_queue() {
+    let state = test_state();
+    let ws = make_workspace(&state, "episodes-panic").await;
+    let sid = inject_silent_agent(&state, "kp");
+    lock(&state.session_workspaces).insert(sid.clone(), ws.clone());
+    let now = crate::timeline::now_ms();
+    state.episode_queue.push_panic(&state, &ws);
+    crate::episodes::record(&state, &sid, draft(now - 10, now), "protocol");
+    state.episode_queue.settled(&ws).await;
+    let entries = state.timeline.latest(&ws, 5).await;
+    assert_eq!(entries.len(), 1, "the turn behind the panic landed");
+    assert_eq!(entries[0].kind, crate::timeline::Kind::Episode);
+    state.sessions.kill(&sid).ok();
+}
+
+/// A turn start queues nothing where no plugin is switched on (no provider
+/// can answer there): the chat relay's hot path stays a lock check.
+#[tokio::test]
+async fn a_turn_start_queues_nothing_without_a_plugin_switched_on() {
+    let state = test_state();
+    let ws = make_workspace(&state, "episodes-no-plugin").await;
+    let sid = inject_silent_agent(&state, "kn");
+    lock(&state.session_workspaces).insert(sid.clone(), ws.clone());
+    crate::episodes::turn_started(&state, &sid);
+    assert!(!state.episode_queue.busy(&ws));
+    knowledge_fixture();
+    lock(&state.workspaces)
+        .set_plugin_on(&ws, "test-knowledge", true)
+        .unwrap();
+    crate::episodes::turn_started(&state, &sid);
+    assert!(state.episode_queue.busy(&ws), "no baseline yet: primed");
+    state.episode_queue.settled(&ws).await;
+    assert!(crate::knowledge::has_baseline(&state, &ws));
     state.sessions.kill(&sid).ok();
 }

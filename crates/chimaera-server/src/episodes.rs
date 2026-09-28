@@ -327,6 +327,9 @@ enum Job {
     /// An entry that only needs its place in line (a crash after the
     /// session's last turn).
     Append(Entry),
+    /// Tests: a job whose code panics.
+    #[cfg(test)]
+    Panic,
 }
 
 /// The per-workspace FIFOs; a workspace's worker task runs while its queue
@@ -357,17 +360,65 @@ impl EpisodeQueue {
         tokio::spawn(drain(state.clone(), ws.to_string()));
     }
 
-    /// Tests: until `ws`'s queue has run dry.
+    /// Tests: until `ws`'s queue has run dry (a wedged one fails the test).
     #[cfg(test)]
     pub(crate) async fn settled(&self, ws: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         while crate::lock(&self.queues).contains_key(ws) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the episode queue of {ws} never ran dry"
+            );
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
+    }
+
+    /// Tests: whether `ws` has jobs queued or running.
+    #[cfg(test)]
+    pub(crate) fn busy(&self, ws: &str) -> bool {
+        crate::lock(&self.queues).contains_key(ws)
+    }
+
+    /// Tests: queue a job that panics.
+    #[cfg(test)]
+    pub(crate) fn push_panic(&self, state: &Arc<AppState>, ws: &str) {
+        self.push(state, ws, Job::Panic);
+    }
+}
+
+/// A workspace's worker, while it runs. If a job panics, the jobs behind it
+/// get a new worker — otherwise the queue would stay in the map with nobody
+/// draining it, and every later turn end there would wait on it forever.
+struct Worker {
+    state: Arc<AppState>,
+    ws: String,
+}
+
+impl Drop for Worker {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            return;
+        }
+        tracing::error!(workspace = %self.ws, "an episode job panicked; the queue carries on");
+        let mut queues = crate::lock(&self.state.episode_queue.queues);
+        if queues.get(&self.ws).is_some_and(|q| !q.is_empty()) {
+            drop(queues);
+            if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                rt.spawn(drain(self.state.clone(), self.ws.clone()));
+                return;
+            }
+            queues = crate::lock(&self.state.episode_queue.queues);
+        }
+        queues.remove(&self.ws);
     }
 }
 
 /// One workspace's worker: its jobs in order, until none are left.
 async fn drain(state: Arc<AppState>, ws: String) {
+    let _worker = Worker {
+        state: state.clone(),
+        ws: ws.clone(),
+    };
     loop {
         // The job, how many wait behind it, and whether its session has
         // another turn end queued (then the files may hold that turn's too).
@@ -415,6 +466,8 @@ async fn drain(state: Arc<AppState>, ws: String) {
                 state.timeline.append(&ws, entry).await;
                 state.changes.notify_waiters();
             }
+            #[cfg(test)]
+            Job::Panic => panic!("an episode job panicked (test)"),
         }
     }
 }
@@ -436,8 +489,12 @@ pub(crate) fn turn_started(state: &Arc<AppState>, sid: &str) {
     let Some(ws) = crate::plugins::workspace_of_session(state, sid) else {
         return;
     };
-    // Most turns start with a baseline already taken: nothing to queue.
-    if !crate::knowledge::has_baseline(state, &ws) {
+    // Most turns start with a baseline already taken, and most workspaces
+    // have no plugin switched on to provide one: nothing to queue.
+    let any_on = crate::lock(&state.workspaces)
+        .get(&ws)
+        .is_some_and(|w| !w.plugins_on.is_empty());
+    if any_on && !crate::knowledge::has_baseline(state, &ws) {
         state.episode_queue.push(state, &ws, Job::Prime);
     }
 }

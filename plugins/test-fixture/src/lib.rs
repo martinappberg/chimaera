@@ -21,10 +21,12 @@ struct Fixture;
 impl Plugin for Fixture {
     /// A Knowledge provider for the daemon's tests, steered by the
     /// `knowledge` state key (the `state` tool sets it): "loop" never
-    /// answers, "error" refuses, "array" answers a snapshot that isn't a
-    /// JSON object, `{"big": n}` pads the snapshot with n bytes. Unset, an
-    /// empty snapshot. The stamp names the mode, so a new mode is re-read.
-    /// Each ask is counted under `asked`.
+    /// answers, "error" refuses, `{"error_len": n}` refuses in n bytes,
+    /// "array" answers a snapshot that isn't a JSON object, `{"big": n}`
+    /// pads the snapshot with n bytes, `{"extra": {..}}` adds those
+    /// top-level fields. Unset, an empty snapshot. The stamp names the mode,
+    /// so a new mode is re-read. Each ask is counted under `asked`, each
+    /// snapshot it reads and answers under `reads`.
     fn knowledge(cx: Context, known: Option<Value>) -> Result<Option<Snapshot>, String> {
         let asked = host::state_get(&cx, "asked")
             .ok()
@@ -46,16 +48,30 @@ impl Plugin for Fixture {
             Some("error") => return Err("the fixture refuses to read".into()),
             _ => {}
         }
+        if let Some(n) = mode.get("error_len").and_then(Value::as_u64) {
+            return Err("x".repeat(n as usize));
+        }
         let stamp = json!({"files": [], "mode": mode});
         if known.as_ref() == Some(&stamp) {
             return Ok(None);
         }
+        let reads = host::state_get(&cx, "reads")
+            .ok()
+            .flatten()
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let _ = host::state_put(&cx, "reads", &json!(reads + 1));
         let mut data = json!({"topics": [], "decisions": [], "learnings": [],
             "fixture_version": if cfg!(feature = "v2") { "0.2.0" } else { "0.1.0" }});
         if mode.as_str() == Some("array") {
             data = json!([]);
         } else if let Some(n) = mode.get("big").and_then(Value::as_u64) {
             data["padding"] = json!("x".repeat(n as usize));
+        }
+        if let Some(extra) = mode.get("extra").and_then(Value::as_object) {
+            for (key, value) in extra {
+                data[key] = value.clone();
+            }
         }
         Ok(Some(Snapshot::new(&stamp, &data)))
     }

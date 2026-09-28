@@ -213,12 +213,10 @@ impl WorkspaceStore {
             return Ok(None);
         };
         let was_on = entry.plugins_on.iter().any(|p| p == pid);
-        entry.plugins_on.retain(|p| p != pid);
-        if on {
-            entry.plugins_on.push(pid.to_string());
-            entry.plugins_on.sort();
-        }
-        let workspace = entry.clone();
+        self.put_switch(id, pid, on);
+        let Some(workspace) = self.get(id) else {
+            return Ok(None);
+        };
         let snapshot = match self.snapshot() {
             Ok(snapshot) => snapshot,
             Err(err) => {
