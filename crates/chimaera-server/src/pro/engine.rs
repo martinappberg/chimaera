@@ -13,6 +13,8 @@ use std::{
     time::Duration,
 };
 
+#[path = "handback.rs"]
+mod handback;
 #[path = "release.rs"]
 mod release;
 
@@ -148,7 +150,9 @@ pub(super) fn start(state: Arc<AppState>) {
                 let config = config.clone();
                 let task = tokio::spawn(async move {
                     let _guard = owner.pro.jobs.lock().await;
-                    let _ = lazy_handback(&owner, &config).await;
+                    if let Err(error) = lazy_handback(&owner, &config).await {
+                        tracing::warn!(phase="locate_return", error=%error, "Could not locate returning projects");
+                    }
                     let workspaces = lock(&owner.workspaces).list();
                     for workspace in workspaces
                         .into_iter()
@@ -255,6 +259,14 @@ async fn reconcile_generation(
         }
         return Ok(());
     }
+    // A remote release means its saved work must be hydrated first. The lease
+    // loop must not race hand-back and resume this machine's older journal.
+    if config.role == Role::Device
+        && baton.holder_id.is_none()
+        && matches!(previous, Some(Ownership::Remote { .. }))
+    {
+        return Ok(());
+    }
     let owned = baton.holder_id.as_deref() == Some(holder);
     let transferring = matches!(
         previous,
@@ -289,8 +301,10 @@ async fn reconcile_generation(
         "POST",
         Some(&body),
     )
-    .await?
-    .json()?;
+    .await
+    .context("Could not renew project ownership")?
+    .json()
+    .context("Could not confirm project ownership")?;
     ensure!(
         grant.workspace_id == workspace && grant.holder_id.as_deref() == Some(holder),
         "baton grant names another owner"
@@ -954,6 +968,9 @@ pub(super) async fn lazy_handback(state: &Arc<AppState>, config: &Configure) -> 
         })
         .take(128)
         .collect();
+    if remote.is_empty() {
+        return Ok(());
+    }
     let hosts: Vec<super::protocol::Host> = transport::request(
         &config.keeper_url,
         "/v1/hosts",
@@ -961,8 +978,10 @@ pub(super) async fn lazy_handback(state: &Arc<AppState>, config: &Configure) -> 
         &config.delegation.access_token,
         None,
     )
-    .await?
-    .json()?;
+    .await
+    .context("Could not reconnect to your saved work")?
+    .json()
+    .context("Could not read your connected workspaces")?;
     for (workspace, epoch, holder) in remote {
         // Only a project already registered on this device may return automatically.
         // Discovery and old global-folder preferences never authorize adoption.
@@ -983,22 +1002,25 @@ pub(super) async fn lazy_handback(state: &Arc<AppState>, config: &Configure) -> 
         }) else {
             continue;
         };
-        let response = transport::request(
-            &config.keeper_url,
-            &format!("/v1/hosts/{}/http/api/v1/pro/handoff", host.id),
-            "POST",
-            &config.delegation.access_token,
-            Some(&json!({"workspace_id":workspace,"expected_epoch":epoch})),
-        )
-        .await?;
-        if response.status == 409 {
-            continue;
+        let result = async {
+            let Some(epoch) =
+                handback::prepare(state, config, &workspace, host, &holder, epoch).await?
+            else {
+                return Ok::<_, anyhow::Error>(());
+            };
+            hydrate(state, config, &workspace, epoch, false, None)
+                .await
+                .context("Could not restore your saved work on this computer")?;
+            if let Some(status) = lock(&state.pro.status).get_mut(&workspace) {
+                status.error = None;
+            }
+            Ok(())
         }
-        ensure!(
-            (200..300).contains(&response.status),
-            "cloud hand-back is unavailable"
-        );
-        hydrate(state, config, &workspace, epoch, false, None).await?;
+        .await;
+        if let Err(error) = result {
+            record_error(state, &workspace, &error);
+            tracing::warn!(phase="automatic_return", error=%error, "Project return did not complete");
+        }
     }
     Ok(())
 }

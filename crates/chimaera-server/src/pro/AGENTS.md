@@ -11,6 +11,7 @@ revocable delegation over the authenticated local API.
 | `projects.rs` | Passive bounded cloud-project discovery and explicit per-device local adoption; native-picked folder validation, saved directory identity, retry and legacy-import fences. |
 | `projects/tests.rs` | Synthetic loopback HTTP plus real Git transfer, passive-read, conflict, retry, restart and two-device destination checks. |
 | `engine.rs` | Independent lease renewal, mirror coordinator, transactional hydration, profile execution and lazy return. |
+| `handback.rs` | Bounded automatic return coordination across worker wake and ownership changes; lost release replies are resolved by authority reads without repeating ambiguous requests. |
 | `release.rs` | Bounded clean-release retry for the account publication fence; changed ownership, account or lease never retries. |
 | `provider_gate.rs` / `provider_tests.rs` | Per-agent cloud readiness, bounded blocked-provider status, and staged retry/cancellation tests with a synthetic CLI and real PTY. |
 | `protocol.rs` | Additive account contract subset and strict worker host-to-holder identity translation; intentionally no link/TLS dependency in the daemon. |
@@ -91,6 +92,12 @@ pending-ID fences, never to permission to import. A partially registered legacy
 project needs explicit selection of its original folder before recovery.
 
 Normal lazy return only handles registered projects without a pending adoption.
+A return attempt rechecks ownership immediately after a worker wakes, rather than
+waiting for the next mirror pass. The verified source epoch is persisted before
+release; ambiguous responses are resolved by reading ownership, without repeating
+that epoch's request. Handoff responses have a 90-second transport budget within
+a 105-second preparation deadline. Generic ownership polling leaves a previously
+remote, now-unowned project fenced until hydration installs its current history.
 Existing laptop projects retain their original roots. Worker hand-back and explicit
 adoption compare the raw account holder against the typed keeper worker identity
 (`worker-{holder}`), while requests retain the complete route ID. A real-Git
