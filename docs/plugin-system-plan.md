@@ -390,7 +390,11 @@ What is deliberately not in 0.1: **`exec`** (a bounded child process on the
 host, the heart of the LaTeX plan's `build` point) and **`watch`** (ask the host
 to report file changes). Both are additive: a host may offer more imports than a
 component uses, so 0.2 adds them without breaking 0.1 plugins. They land with the
-first plugin that needs them. Removing or changing an export is the breaking
+first plugin that needs them. (2026-09-28: the LaTeX plan proposes a build world
+with `plan` and `digest` exports instead, the host running the process, because a
+build outlives a guest call's budget; see
+[latex-reports-plan.md](latex-reports-plan.md#why-a-build-plugin-cannot-simply-call-exec).
+Open until decided.) Removing or changing an export is the breaking
 direction; the exports above are the complete set a plugin must provide.
 
 ### The Rust side of it

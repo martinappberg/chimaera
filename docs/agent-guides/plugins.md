@@ -506,6 +506,12 @@ The LaTeX and Typst plugins are the first new plugins planned on this host.
 Their contribution point is `build` (files → a bounded, quiet child process
 on the host, diagnostics as editor marks, SyncTeX, a `compile_document` tool
 where on), designed in the
-[LaTeX and Typst plan](../latex-reports-plan.md#the-plugin-shape). It waits for
-WIT 0.2's `exec` import: running an engine is a host call, never something a
-plugin does itself.
+[LaTeX and Typst plan](../latex-reports-plan.md#the-plugin-shape). Running an
+engine is the host's job, never something a plugin does itself. The plan's
+2026-09-28 revision proposes a WIT 0.2 **build world** in place of the `exec` and
+`watch` imports sketched above: the host runs what the plugin's `plan` export asks
+for (programs declared in `[build]`, checked by the host) and hands the outputs to
+its `digest` export, because a guest call's 5 s budget and one-call-at-a-time
+instance cannot hold a three-minute build
+([why](../latex-reports-plan.md#why-a-build-plugin-cannot-simply-call-exec)).
+That is an open decision until the maintainer confirms it.
