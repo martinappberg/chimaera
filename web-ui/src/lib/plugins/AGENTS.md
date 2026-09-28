@@ -54,8 +54,11 @@ QuickOpen — not in `shared/icons.ts`, which `prebuild` regenerates from Tabler
   `agent_plugins` events (install completion, hook trust, reconnect) advance
   `store.ts`'s local revision. The visible Plugins/Skills segment refetches;
   hidden panes/documents catch up on return. Once the report confirms the
-  installed plugin (including an installed-but-disabled copy), the card's continuation reads "Installed for <agent>";
+  requested plugin by agent + plugin id (including an installed-but-disabled copy),
+  the card's continuation reads "Installed for <agent>";
   hook trust and workspace setup still require the user's action.
+  Both card and sheet send that row's `agent_plugin_id` to the install route and
+  retain it in the continuation; another add-on for that agent cannot complete it.
 - **Never list an agent that isn't installed on this host.** A
   recommendation for it says nothing; a requirement none of the listed
   agents here can meet says so once. `requirementsModel.ts` owns this rule —

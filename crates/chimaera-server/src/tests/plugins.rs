@@ -59,11 +59,25 @@ async fn agent_plugin_install_keeps_success_and_failure_until_acknowledged() {
         .unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
         preset_agent(&state, kind, Ok(bin), Some("test"));
+        let (status, _) = request(
+            &state,
+            Method::POST,
+            &format!("/api/v1/workspaces/{ws}/plugins/mycelium/install"),
+            Some(
+                serde_json::json!({"agent": kind.as_str(), "agent_plugin_id": "undeclared@market"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let mut body = serde_json::json!({"agent": kind.as_str()});
+        if kind == AgentKind::Codex {
+            body["agent_plugin_id"] = serde_json::json!("mycelium@mycelium");
+        }
         let (status, result) = request(
             &state,
             Method::POST,
             &format!("/api/v1/workspaces/{ws}/plugins/mycelium/install"),
-            Some(serde_json::json!({"agent": kind.as_str()})),
+            Some(body),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{result}");

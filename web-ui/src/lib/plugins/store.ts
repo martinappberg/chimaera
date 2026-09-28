@@ -343,21 +343,24 @@ export async function fetchSkills(workspaceId: string): Promise<SkillsReport> {
 
 /** Keep the handoff from the card or setup sheet after its terminal opens.
  *  One pending continuation, scoped to the workspace that requested it. */
-export const agentInstallContinuation = writable<{ workspaceId: string; pluginId: string; agent: AgentId } | null>(null);
+export const agentInstallContinuation = writable<{
+  workspaceId: string; pluginId: string; agent: AgentId; agentPluginId: string;
+} | null>(null);
 
 export async function installPlugin(
   workspaceId: string,
   pluginId: string,
   agent: AgentId,
+  agentPluginId: string,
 ): Promise<{ session_id: string }> {
   const result = await json<{ session_id: string }>(
     await api(`${ws(workspaceId)}/plugins/${encodeURIComponent(pluginId)}/install`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ agent }),
+      body: JSON.stringify({ agent, agent_plugin_id: agentPluginId }),
     }),
   );
-  agentInstallContinuation.set({ workspaceId, pluginId, agent });
+  agentInstallContinuation.set({ workspaceId, pluginId, agent, agentPluginId });
   return result;
 }
 

@@ -4,6 +4,7 @@ import {
   CHECKING,
   agentSideBlocks,
   hooksAwaitingTrust,
+  installationDetected,
   marketplaceUrl,
   requirementsModel,
   sheetText,
@@ -22,6 +23,26 @@ function report(agents: { agent: string; available?: boolean; plugins?: AgentPlu
 }
 
 const mycelium = (enabled = true, id = "mycelium@mycelium"): AgentPlugin => ({ id, version: "0.7.2", scope: "user", enabled });
+
+describe("installation completion", () => {
+  it.each([true, false])("matches the requested add-on independently of enablement (%s)", (enabled) => {
+    const needed = { agent: "codex", id: "need@market", marketplace: "owner/needed" };
+    const installed = mycelium(enabled, needed.id);
+    const before = requirementsModel(input({
+      requires: [needed], recommends: [myc("codex")],
+      report: report([{ agent: "codex", plugins: [installed] }]),
+    }));
+    expect(installationDetected(before.rows, "codex", needed.id)).toBe(true);
+    expect(installationDetected(before.rows, "codex", myc("codex").id)).toBe(false);
+    expect(installationDetected(before.rows, "claude", needed.id)).toBe(false);
+
+    const after = requirementsModel(input({
+      requires: [needed], recommends: [myc("codex")],
+      report: report([{ agent: "codex", plugins: [installed, mycelium(enabled)] }]),
+    }));
+    expect(installationDetected(after.rows, "codex", myc("codex").id)).toBe(true);
+  });
+});
 
 function input(over: Partial<RequirementsInput>): RequirementsInput {
   return { requires: [], recommends: [], knowledge: null, report: null, state: "ok", ...over };

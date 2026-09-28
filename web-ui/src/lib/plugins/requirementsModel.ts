@@ -64,6 +64,12 @@ export interface RequirementsModel {
   rows: RequirementRow[];
 }
 
+/** Installation presence is independent of enablement, and belongs to the
+ *  requested add-on: a different plugin for the same agent cannot complete it. */
+export function installationDetected(rows: RequirementRow[], agent: string, id: string): boolean {
+  return rows.some((r) => r.agent === agent && r.id === id && (r.status === "installed" || r.status === "disabled"));
+}
+
 export interface RequirementsInput {
   requires: PluginRequirement[];
   recommends: PluginRequirement[];

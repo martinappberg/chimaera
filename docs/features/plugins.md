@@ -31,7 +31,7 @@ sheet, hosted once in `web-ui/src/App.svelte`. Wire (all under `/api/v1`, bearer
 `POST /plugins/install {github, version?}` or `{path}` · `POST /plugins/{pid}/install` ·
 `POST /plugins/{pid}/update` · `POST /plugins/{pid}/rollback` · `POST /plugins/{pid}/check` ·
 `DELETE /plugins/{pid}` · `GET /plugins/{pid}/details` · `POST /plugins/preview {github}` ·
-`POST /workspaces/{id}/plugins/{pid}/install {agent}` ·
+`POST /workspaces/{id}/plugins/{pid}/install {agent, agent_plugin_id?}` ·
 `POST …/{pid}/setup {agent}` · `POST …/{pid}/trust-hooks {hooks:[{key,hash}]}` ·
 `GET /workspaces/{id}/agent-plugins?refresh=` · `GET /workspaces/{id}/skills?refresh=` ·
 `POST /workspaces/{id}/timeline/{seq}/deliver`; plugin tools ride the per-session MCP endpoint
@@ -159,7 +159,10 @@ installation or hook trust and on reconnect; it carries no plugin payload.
     automatically recheck via `/ws/events`. The card offers **continue setup**
     after an agent install is opened, including one launched from the attach sheet. Returning
     to Extensions during this flow and opening the sheet request a fresh agent report. Once
-    detected, the card says **Installed for <agent> — continue setup**. The
+    the specific requested add-on is detected (even disabled), the card says
+    **Installed for <agent> — continue setup**. Card and sheet select that add-on by
+    its manifest id, so a required and recommended plugin for one agent stay distinct.
+    Omitting the optional id preserves required-first selection for older clients. The
     sheet resumes the existing install → hook review → workspace setup steps; installation
     alone does not trust hooks or initialize a repository. Newly started agent sessions load
     the installed plugin. Setup is a fresh chat plus one Send (502 if the prompt didn't land —

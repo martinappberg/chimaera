@@ -222,11 +222,11 @@
     }
   }
 
-  async function install(agent: AgentId): Promise<void> {
+  async function install(agent: AgentId, agentPluginId: string): Promise<void> {
     busy = `install:${agent}`;
     error = null;
     try {
-      const res = await installPlugin(wsId, pluginId, agent);
+      const res = await installPlugin(wsId, pluginId, agent, agentPluginId);
       onOpenSession(res.session_id);
     } catch (e) {
       error = isMissingRoute(e) ? `this daemon can't run installs yet — run ${agent}'s own plugin manager instead` : message(e);
@@ -359,7 +359,7 @@
                         <button
                           class="opt"
                           disabled={busy !== null}
-                          onclick={() => void install(r.agent as AgentId)}
+                          onclick={() => void install(r.agent as AgentId, r.id)}
                           title="runs {r.agent}'s own plugin manager in a visible terminal"
                         >
                           {busy === `install:${r.agent}` ? "starting…" : `Install for ${r.agent}`}

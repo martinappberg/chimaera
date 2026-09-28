@@ -299,10 +299,16 @@ impl Manifest {
     /// first, else a recommendation (the install route and codex hook trust
     /// serve both).
     pub(crate) fn agent_plugin(&self, agent: &str) -> Option<&AgentPluginReq> {
+        self.agent_plugin_matching(agent, None)
+    }
+
+    fn agent_plugin_matching(&self, agent: &str, id: Option<&str>) -> Option<&AgentPluginReq> {
         self.requires
             .agent_plugins
             .get(agent)
-            .or_else(|| self.recommends.agent_plugins.get(agent))
+            .into_iter()
+            .chain(self.recommends.agent_plugins.get(agent))
+            .find(|req| id.is_none_or(|id| req.id == id))
     }
 }
 
@@ -1195,11 +1201,18 @@ pub(crate) struct AgentBody {
     agent: String,
 }
 
+#[derive(Deserialize)]
+pub(crate) struct InstallAgentBody {
+    agent: String,
+    /// Absent for older clients: preserve required-before-recommended selection.
+    agent_plugin_id: Option<String>,
+}
+
 pub(crate) fn bad_request(msg: impl Into<String>) -> Response {
     (StatusCode::BAD_REQUEST, Json(json!({"error": msg.into()}))).into_response()
 }
 
-/// POST /workspaces/{id}/plugins/{pid}/install {agent} — install the agent
+/// POST /workspaces/{id}/plugins/{pid}/install {agent, agent_plugin_id?} — install the agent
 /// plugin this workbench plugin requires or recommends, with the AGENT's own
 /// plugin manager, in a visible terminal the user watches (chimaera never
 /// reimplements `claude plugin` / `codex plugin`). The session is theirs to
@@ -1208,7 +1221,7 @@ pub(crate) fn bad_request(msg: impl Into<String>) -> Response {
 pub(crate) async fn install_requirement(
     State(state): State<Arc<AppState>>,
     AxPath((id, pid)): AxPath<(String, String)>,
-    Json(body): Json<AgentBody>,
+    Json(body): Json<InstallAgentBody>,
 ) -> Response {
     let Some(workspace) = crate::lock(&state.workspaces).get(&id) else {
         return not_found("unknown workspace");
@@ -1216,8 +1229,11 @@ pub(crate) async fn install_requirement(
     let Some(m) = manifest(&state, &pid) else {
         return not_found("unknown plugin");
     };
-    let Some(req) = m.agent_plugin(&body.agent) else {
-        return bad_request(format!("{} names no {} plugin", m.name, body.agent));
+    let Some(req) = m.agent_plugin_matching(&body.agent, body.agent_plugin_id.as_deref()) else {
+        return bad_request(format!(
+            "{} names no matching {} plugin",
+            m.name, body.agent
+        ));
     };
     let Some(kind) = crate::agents::AgentKind::parse(&body.agent) else {
         return bad_request("unknown agent");
@@ -1578,6 +1594,16 @@ mod tests {
         );
         assert_eq!(m.agent_plugin("claude").unwrap().id, "nice@x");
         assert!(m.agent_plugin("agy").is_none());
+        assert_eq!(
+            m.agent_plugin_matching("codex", Some("also@x"))
+                .unwrap()
+                .marketplace,
+            "x/also"
+        );
+        assert!(m.agent_plugin_matching("codex", Some("nice@x")).is_none());
+        assert!(m
+            .agent_plugin_matching("codex", Some("undeclared@x"))
+            .is_none());
         assert!(
             demo("version = \"0.1.0\"\napi = \"0.1\"\n[recommends]\nchimaera = \">=1\"\n").is_err()
         );
