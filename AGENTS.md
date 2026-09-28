@@ -72,6 +72,8 @@ bash scripts/build-plugins.sh      # tests only: the fixture + the locked releas
 node scripts/check-doc-links.mjs   # every relative markdown link + #anchor resolves
 node scripts/check-agent-assets.mjs # Claude/Codex skill + agent bridges stay in sync
 node scripts/check-workflow-security.mjs # immutable Actions pins + explicit permissions
+scripts/worktree-gc                # which worktrees are idle + what cleanup frees (dry run)
+bash scripts/worktree-gc.test.sh   # worktree-gc's deletion rules, on a throwaway repo
 ```
 
 **Isolated preview — use this in a worktree.** A debug daemon on its own state dir
@@ -97,6 +99,11 @@ pane and no HPC access; a SessionStart hook installs the web-UI deps and builds
   no busy loops, hard preview ceilings. **No SQLite near NFS/Lustre**; durable logs
   are append-only, size-capped JSONL under `~/.chimaera` (small whole-file state is
   capped JSON rewritten atomically); hot state is reconstructible.
+- **Worktrees fill the disk.** Each session builds in its own worktree, and one
+  worktree's cargo `target/` dirs have reached 35–60 GB. Follow the
+  **[worktree-lifecycle](.claude/skills/worktree-lifecycle/SKILL.md)** skill: remove
+  your worktree once its PR merges, run `scripts/worktree-gc` before a big build when
+  disk is low, and never touch a worktree it calls ACTIVE.
 - **The daemon↔UI wire is a stable public interface.** Core structs serialize
   straight to it — don't let its shape drift as a side effect of a refactor.
 - **Agent wire formats are pinned, not trusted** — a driver or agent-CLI change
@@ -136,12 +143,16 @@ mapping and the no-release path.
   live), **debug-live-app** (read daemon/UI logs, reproduce, common failure modes),
   **ship-pr** (open a PR + version bump), **chat-mode** (the structured chat stack),
   **document-feature** (add/update a docs/features page), **capture-feature-intent**
-  (the `feat:`-gated intent questionnaire).
+  (the `feat:`-gated intent questionnaire), **worktree-lifecycle** (worktree and
+  `target/` cleanup, low disk).
 - **Rules**: path-scoped constraints in `.claude/rules/`; see the explicit-read
   requirement above for agents that do not auto-load them.
 - **Subagents**: Claude definitions live in `.claude/agents/`; Codex definitions
   live in `.codex/agents/`. Both provide `area-implementer` (scoped edits + live
   verify) and `diff-reviewer` (read-only invariant check vs `origin/main`).
 - **Claude hooks**: `.claude/settings.json` — fmt-on-save, destructive-command + generated-
-  file guards, session orientation, the cloud-only bootstrap, and the doc-drift warn
+  file guards, session orientation, the cloud-only bootstrap, the doc-drift warn, and
+  worktree-gc (low-disk flag + idle-worktree cleanup at start, stale-object sweep at end)
   (personal hooks go in the gitignored `.claude/settings.local.json`).
+- **Codex hooks**: `.codex/hooks.json` — the same two worktree-gc hooks. Codex runs
+  project hooks only in a trusted project, after each is approved once in `/hooks`.
