@@ -66,8 +66,16 @@ impl EnvPreludes {
     /// which is the HPC mental model). Empty scopes are skipped; empty
     /// result means "set no CHIMAERA_PRELUDE at all".
     pub(crate) fn effective(&self, workspace_id: &str, launch: Option<&str>) -> String {
+        self.compose(Some(workspace_id), launch)
+    }
+
+    /// [`Self::effective`] with the workspace scope explicit: None is the
+    /// host scope alone, never "whatever an empty id happens to match".
+    fn compose(&self, workspace_id: Option<&str>, launch: Option<&str>) -> String {
         let host = self.host.as_ref().map(|e| e.text.as_str());
-        let workspace = self.workspaces.get(workspace_id).map(|e| e.text.as_str());
+        let workspace = workspace_id
+            .and_then(|id| self.workspaces.get(id))
+            .map(|e| e.text.as_str());
         let parts = [("host", host), ("workspace", workspace), ("launch", launch)];
         let mut out = String::new();
         for (scope, text) in parts {
@@ -198,19 +206,38 @@ pub(crate) fn materialize_prelude(
     let text = crate::lock(&state.env_preludes)
         .current()
         .effective(workspace_id, launch);
+    write_prelude(&format!("{session_id}.sh"), &text)
+}
+
+/// [`materialize_prelude`] for an agent probe (`agent_probe`): host scope,
+/// plus the workspace's when the answer is per-workspace. The name is
+/// unique per call — concurrent probes and sessions never share a file —
+/// and the caller removes it with [`remove_prelude_path`] when done.
+pub(crate) fn materialize_probe_prelude(
+    state: &AppState,
+    workspace_id: Option<&str>,
+) -> Option<PathBuf> {
+    let text = crate::lock(&state.env_preludes)
+        .current()
+        .compose(workspace_id, None);
+    let name = format!("probe-{}.sh", chimaera_core::generate_token());
+    write_prelude(&name, &text)
+}
+
+fn write_prelude(file_name: &str, text: &str) -> Option<PathBuf> {
     if text.is_empty() {
         return None;
     }
     let dir = chimaera_core::runtime_dir().join("preludes");
     if let Err(err) = std::fs::create_dir_all(&dir) {
-        tracing::warn!(%err, "cannot create prelude dir; session spawns without its prelude");
+        tracing::warn!(%err, "cannot create prelude dir; spawning without the prelude");
         return None;
     }
-    let path = dir.join(format!("{session_id}.sh"));
+    let path = dir.join(file_name);
     match std::fs::write(&path, text) {
         Ok(()) => Some(path),
         Err(err) => {
-            tracing::warn!(%err, path = %path.display(), "cannot write prelude; session spawns without it");
+            tracing::warn!(%err, path = %path.display(), "cannot write prelude; spawning without it");
             None
         }
     }
@@ -221,7 +248,12 @@ pub(crate) fn remove_prelude_file(session_id: &str) {
     let path = chimaera_core::runtime_dir()
         .join("preludes")
         .join(format!("{session_id}.sh"));
-    if let Err(err) = std::fs::remove_file(&path) {
+    remove_prelude_path(&path);
+}
+
+/// Best-effort removal of a materialized prelude file.
+pub(crate) fn remove_prelude_path(path: &std::path::Path) {
+    if let Err(err) = std::fs::remove_file(path) {
         if err.kind() != ErrorKind::NotFound {
             tracing::debug!(%err, path = %path.display(), "prelude file cleanup failed");
         }
@@ -330,6 +362,25 @@ mod tests {
         // Launch-only works with no stored preludes at all.
         let launch_only = EnvPreludes::default().effective("w-1", Some("echo hi"));
         assert!(launch_only.contains("echo hi"));
+    }
+
+    #[test]
+    fn compose_without_a_workspace_is_the_host_scope_alone() {
+        let data = EnvPreludes {
+            host: Some(PreludeEntry {
+                text: "ml nodejs".into(),
+            }),
+            workspaces: BTreeMap::from([(
+                String::new(),
+                PreludeEntry {
+                    text: "conda activate stray".into(),
+                },
+            )]),
+        };
+        let host_only = data.compose(None, None);
+        assert!(host_only.contains("ml nodejs"));
+        assert!(!host_only.contains("conda"), "{host_only}");
+        assert!(data.compose(Some(""), None).contains("conda"));
     }
 
     #[test]
