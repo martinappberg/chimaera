@@ -72,3 +72,106 @@ async fn cancelling_a_caller_keeps_its_blocking_commit_reserved_until_finished()
     install_fixture(&state, "w-a", 5).unwrap();
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[tokio::test]
+async fn reserved_launch_never_waits_on_configuration_that_is_draining_it() {
+    let (state, root) = fixture();
+    let guard = begin(&state, "w-a", 4, generation(&state)).unwrap();
+    let _configuration = state.pro.configuration.lock().await;
+    let result = tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        reserved_request(guard, super::super::prepare_launch(&state, "w-a")),
+    )
+    .await;
+    assert!(result.unwrap().is_err());
+    assert!(idle(&state, "w-a"));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn queued_real_shell_command_keeps_original_generation_and_epoch() {
+    use chimaera_pty::{ExecError, ExecStage, SpawnOpts};
+    use std::time::Duration;
+    for epoch in [4, 5] {
+        let (state, root) = fixture();
+        let workspace = lock(&state.workspaces).add(root.clone()).unwrap();
+        install_fixture(&state, &workspace.id, 4).unwrap();
+        let session = state
+            .sessions
+            .spawn(SpawnOpts {
+                cwd: root.clone(),
+                name: None,
+                cols: 80,
+                rows: 24,
+                command: Some(vec![
+                    "/bin/bash".into(),
+                    "--norc".into(),
+                    "--noprofile".into(),
+                ]),
+                id: None,
+                env: vec![],
+                env_remove: vec![],
+                scrollback: None,
+            })
+            .unwrap();
+        lock(&state.session_workspaces).insert(session.id.clone(), workspace.id.clone());
+        let mut attached = state.sessions.attach_quiet(&session.id).unwrap();
+        attached.input.send(bytes::Bytes::from_static(b"printf '\\033]133;C\\007'; printf 'QUEUE-%s\\n' ready; while [ ! -e allow-prompt ]; do sleep 0.01; done; printf '\\033]133;A\\007'\r")).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut output = String::new();
+            while !output.contains("QUEUE-ready") {
+                output.push_str(&String::from_utf8_lossy(
+                    &attached.output.recv().await.unwrap(),
+                ));
+            }
+        })
+        .await
+        .unwrap();
+        let owner = state.clone();
+        let id = session.id.clone();
+        let pending = tokio::spawn(async move {
+            crate::exec::run_exec(
+                &owner,
+                &id,
+                "printf stale > stale-command.txt".into(),
+                Some(2000),
+                Some(5000),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !matches!(
+                lock(&state.exec_status).get(&session.id),
+                Some(ExecStage::Queued)
+            ) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        // Deliberately leave the old shell alive: admission must work even
+        // before managed process shutdown gets a scheduling opportunity.
+        state.pro.generation.fetch_add(1, Ordering::AcqRel);
+        lock(&state.pro.execution.proofs).clear();
+        install_fixture(&state, &workspace.id, epoch).unwrap();
+        assert!(crate::pro::may_execute(&state, &workspace.id));
+        std::fs::write(root.join("allow-prompt"), b"").unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(6), pending)
+                .await
+                .unwrap()
+                .unwrap(),
+            Err(ExecError::Busy(_))
+        ));
+        assert!(!root.join("stale-command.txt").exists());
+        state.sessions.kill(&session.id).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while state.sessions.get(&session.id).is_some() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}

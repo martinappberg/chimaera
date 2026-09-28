@@ -36,6 +36,17 @@ pub(crate) async fn run_exec(
     timeout_ms: Option<u64>,
     queue_timeout_ms: Option<u64>,
 ) -> Result<chimaera_pty::ExecOutcome, chimaera_pty::ExecError> {
+    run_exec_scoped(state, id, command, timeout_ms, queue_timeout_ms, None).await
+}
+
+pub(crate) async fn run_exec_scoped(
+    state: &Arc<AppState>,
+    id: &str,
+    command: String,
+    timeout_ms: Option<u64>,
+    queue_timeout_ms: Option<u64>,
+    admission: Option<crate::workspace_scope::Mutation>,
+) -> Result<chimaera_pty::ExecOutcome, chimaera_pty::ExecError> {
     let workspace = crate::lock(&state.session_workspaces).get(id).cloned();
     if workspace
         .as_deref()
@@ -45,10 +56,38 @@ pub(crate) async fn run_exec(
             "Project execution is paused while ownership is verified".into(),
         ));
     }
-    if crate::pro::defer_command(state, id, &command)
+    let changed = |_| chimaera_pty::ExecError::Busy("workspace_scope_changed".into());
+    let admission = match admission {
+        Some(admission) => {
+            admission.session(state, id).map_err(changed)?;
+            Some(admission)
+        }
+        None => workspace
+            .as_deref()
+            .map(|workspace| crate::workspace_scope::Mutation::capture(state, workspace))
+            .transpose()
+            .map_err(changed)?
+            .flatten(),
+    };
+    // Profile learning/defer is itself a mutation. Its brief persistence work
+    // completes before the shell queue, where no reservation is retained.
+    let deferred = if let Some(admission) = admission.clone() {
+        let owner = state.clone();
+        let session = id.to_owned();
+        let command = command.clone();
+        // MCP callers can disappear too. The owner of a persisted profile
+        // update keeps its reservation until underlying blocking writes drain.
+        tokio::spawn(async move {
+            let _commit = admission.begin(&owner)?;
+            crate::pro::defer_command(&owner, &session, &command).await
+        })
         .await
-        .map_err(|error| chimaera_pty::ExecError::Busy(error.to_string()))?
-    {
+        .map_err(|_| chimaera_pty::ExecError::Busy("command preparation failed".into()))?
+    } else {
+        crate::pro::defer_command(state, id, &command).await
+    }
+    .map_err(|error| chimaera_pty::ExecError::Busy(error.to_string()))?;
+    if deferred {
         return Err(chimaera_pty::ExecError::Busy(
             "This step needs the laptop and is queued to run when the project returns home.".into(),
         ));
@@ -78,9 +117,11 @@ pub(crate) async fn run_exec(
         })
     };
 
+    let dispatch_state = state.clone();
+    let dispatch_id = id.to_owned();
     let outcome = state
         .sessions
-        .exec(
+        .exec_guarded(
             id,
             chimaera_pty::ExecOptions {
                 command,
@@ -92,6 +133,23 @@ pub(crate) async fn run_exec(
                 ),
                 allow_sentinel_over_running,
                 stage: Some(stage_tx),
+            },
+            move || {
+                if crate::lock(&dispatch_state.session_workspaces).get(&dispatch_id)
+                    != workspace.as_ref()
+                    || workspace.as_deref().is_some_and(|workspace| {
+                        !crate::pro::may_execute(&dispatch_state, workspace)
+                    })
+                {
+                    return Err(chimaera_pty::ExecError::Busy(
+                        "workspace_scope_changed".into(),
+                    ));
+                }
+                admission
+                    .as_ref()
+                    .map(|a| a.begin(&dispatch_state))
+                    .transpose()
+                    .map_err(changed)
             },
         )
         .await;

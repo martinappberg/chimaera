@@ -391,6 +391,7 @@ pub(crate) fn age(ms: u64) -> String {
 pub(crate) async fn deliver(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     axum::extract::Path((id, seq)): axum::extract::Path<(String, u64)>,
+    mutation: Option<axum::Extension<crate::workspace_scope::Mutation>>,
 ) -> Response {
     let fail = |code: StatusCode, msg: String| (code, Json(json!({"error": msg}))).into_response();
     let Some(workspace) = crate::lock(&state.workspaces).get(&id) else {
@@ -445,6 +446,10 @@ pub(crate) async fn deliver(
     }
     let command = chimaera_agent::model::AgentCommand::Send {
         blocks: vec![chimaera_agent::model::ContentBlock::Text { text: quoted }],
+    };
+    let _dispatch = match crate::workspace_scope::begin_mutation(&state, &mutation) {
+        Ok(guard) if crate::pro::may_execute(&state, &id) => guard,
+        _ => return fail(StatusCode::CONFLICT, "workspace_scope_changed".into()),
     };
     match state.chat.command(&target, command).await {
         Ok(()) => {

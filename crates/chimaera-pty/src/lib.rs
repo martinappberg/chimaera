@@ -9,12 +9,14 @@
 //! xterm.js instance, plus live output/event receivers and an input sender.
 
 pub mod exec;
+mod input;
 mod managed;
 pub mod marks;
 mod session;
 mod snapshot;
 
 pub use exec::{ExecError, ExecMode, ExecOptions, ExecOutcome, ExecStage};
+pub use input::InputSender;
 pub use marks::{CommandMeta, CommandSource, CommandView, Marks, ShellPhase};
 pub use session::KILL_ESCALATION_GRACE;
 
@@ -134,7 +136,7 @@ pub struct Attachment {
     pub snapshot: Vec<u8>,
     pub output: tokio::sync::broadcast::Receiver<bytes::Bytes>,
     pub events: tokio::sync::broadcast::Receiver<SessionEvent>,
-    pub input: tokio::sync::mpsc::Sender<bytes::Bytes>,
+    pub input: InputSender,
 }
 
 /// The final screen of an exited session, kept briefly so late attachers (a
@@ -304,6 +306,25 @@ impl SessionManager {
     pub async fn exec(&self, id: &str, opts: ExecOptions) -> Result<ExecOutcome, ExecError> {
         let session = self.session(id).ok_or(ExecError::SessionGone)?;
         exec::exec(session.marks(), session.input(), session.exec_lock(), opts).await
+    }
+
+    /// Revalidate the caller's authority in the writer after all queue waits.
+    /// The returned guard is owned through the blocking PTY write and flush.
+    pub async fn exec_guarded<G: Send + 'static>(
+        &self,
+        id: &str,
+        opts: ExecOptions,
+        admission: impl FnOnce() -> Result<G, ExecError> + Send + 'static,
+    ) -> Result<ExecOutcome, ExecError> {
+        let session = self.session(id).ok_or(ExecError::SessionGone)?;
+        exec::exec_guarded(
+            session.marks(),
+            session.input(),
+            session.exec_lock(),
+            opts,
+            Box::new(move || admission().map(|guard| Box::new(guard) as Box<dyn Send>)),
+        )
+        .await
     }
 
     /// Signal the session's child to terminate (SIGHUP); the wait thread

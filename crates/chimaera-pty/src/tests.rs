@@ -53,6 +53,87 @@ fn bash() -> Option<Vec<String>> {
     ])
 }
 
+#[tokio::test]
+async fn managed_exec_revalidates_after_shell_queue_before_real_pty_write() {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    let manager = SessionManager::new();
+    let session = manager.spawn_managed(opts(bash())).unwrap();
+    let mut attachment = manager.attach_quiet(&session.id).unwrap();
+    attachment
+        .input
+        .send(Bytes::from_static(
+            b"printf '\\033]133;C\\007'; printf 'QUEUE-%s\\n' ready\r",
+        ))
+        .await
+        .unwrap();
+    read_until(&mut attachment.output, "QUEUE-ready").await;
+    let marks = manager.marks(&session.id).unwrap();
+    marks.feed(b"\x1b]133;C\x07");
+    let valid = Arc::new(AtomicBool::new(true));
+    let authority = valid.clone();
+    let (stage, mut stages) = tokio::sync::watch::channel(crate::ExecStage::Executing);
+    let task_manager = manager.clone();
+    let id = session.id.clone();
+    let marker = std::env::temp_dir().join(format!("chimaera-stale-exec-{}", session.id));
+    let command = format!("printf bad > '{}'", marker.display());
+    let task = tokio::spawn(async move {
+        task_manager
+            .exec_guarded(
+                &id,
+                crate::ExecOptions {
+                    command,
+                    queue_timeout: Duration::from_secs(5),
+                    timeout: Duration::from_secs(2),
+                    allow_sentinel_over_running: false,
+                    stage: Some(stage),
+                },
+                move || {
+                    if authority.load(Ordering::Acquire) {
+                        Ok(())
+                    } else {
+                        Err(crate::ExecError::Busy("authority changed".into()))
+                    }
+                },
+            )
+            .await
+    });
+    tokio::time::timeout(TIMEOUT, stages.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(*stages.borrow(), crate::ExecStage::Queued);
+    valid.store(false, Ordering::Release);
+    marks.feed(b"\x1b]133;A\x07");
+    let result = tokio::time::timeout(TIMEOUT, task).await.unwrap().unwrap();
+    assert!(matches!(result, Err(crate::ExecError::Busy(_))));
+    assert!(
+        !marker.exists(),
+        "stale command wrote to the real filesystem"
+    );
+    // The same live shell still accepts a newly authorized operation.
+    marks.feed(b"\x1b]133;C\x07");
+    let outcome = manager
+        .exec_guarded(
+            &session.id,
+            crate::ExecOptions {
+                command: "printf fresh-authority".into(),
+                queue_timeout: Duration::ZERO,
+                timeout: Duration::from_secs(5),
+                allow_sentinel_over_running: true,
+                stage: None,
+            },
+            || Ok(()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome.record.exit_code, Some(0));
+    manager.fence(&session.id).unwrap();
+    wait_gone(&manager, &session.id).await;
+}
+
 /// Accumulate broadcast output (lossy UTF-8) until it contains `needle`.
 async fn read_until(rx: &mut broadcast::Receiver<Bytes>, needle: &str) -> String {
     let deadline = tokio::time::Instant::now() + TIMEOUT;

@@ -14,6 +14,23 @@ pub(crate) struct Guard {
     commits: Arc<Mutex<HashMap<String, usize>>>,
     workspace: String,
 }
+tokio::task_local! {
+    static REQUEST_RESERVED: ();
+}
+pub(crate) fn request_reserved() -> bool {
+    REQUEST_RESERVED.try_with(|_| ()).is_ok()
+}
+pub(crate) async fn reserved_request<F: std::future::Future>(
+    guard: Guard,
+    operation: F,
+) -> F::Output {
+    REQUEST_RESERVED
+        .scope((), async move {
+            let _guard = guard;
+            operation.await
+        })
+        .await
+}
 impl Drop for Guard {
     fn drop(&mut self) {
         let mut commits = lock(&self.commits);
@@ -36,6 +53,16 @@ impl std::error::Error for Changed {}
 
 pub(crate) fn generation(state: &AppState) -> u64 {
     state.pro.generation.load(Ordering::Acquire)
+}
+pub(crate) fn capture(state: &AppState, workspace: &str) -> anyhow::Result<Option<(u64, u64)>> {
+    if !super::managed(state, workspace) {
+        return Ok(None);
+    }
+    let generation = generation(state);
+    match lock(&state.pro.ownership).get(workspace) {
+        Some(Ownership::Local { epoch }) => Ok(Some((*epoch, generation))),
+        _ => Err(Changed.into()),
+    }
 }
 pub(super) fn idle(state: &AppState, workspace: &str) -> bool {
     lock(&state.pro.execution.commits.0)

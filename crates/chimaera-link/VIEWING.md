@@ -103,6 +103,14 @@ admitted commits, including filesystem work whose caller disconnected. No shared
 state mutex is held during filesystem I/O. Reservation capacity is bounded to 64;
 a stop/drain timeout fails closed rather than permitting a new owner early.
 
+Forwarded terminal, chat and event sockets retain the account generation from
+first-frame authentication. An equal workspace and epoch under a replacement
+configuration does not revive an old connection. Terminal input rechecks that
+admission in the actual PTY writer and holds it through write/flush; resizes hold
+it inside the blocking operation. Structured commands retain it through a bounded,
+owned enqueue, and clean transitions fence the old driver before activating a
+replacement. Unscoped local and SSH sockets preserve their existing behavior.
+
 The initial forwarded surface is an explicit allowlist: scoped workspace/session
 rosters; current project timeline, plugin, skill and knowledge reads; session
 creation and normal session actions; links between sessions in this project;

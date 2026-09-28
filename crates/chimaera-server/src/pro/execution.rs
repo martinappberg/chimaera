@@ -461,7 +461,17 @@ pub(crate) async fn prepare_launch(
     if !managed(state, workspace) {
         return Ok(());
     }
-    let _configuration = state.pro.configuration.lock().await;
+    let _configuration = if mutation::request_reserved() {
+        // Configure/stop may already hold this lock while draining our
+        // reservation. Do not wait on the operation that is waiting for us.
+        state
+            .pro
+            .configuration
+            .try_lock()
+            .map_err(|_| mutation::Changed)?
+    } else {
+        state.pro.configuration.lock().await
+    };
     ensure!(
         crate::pro::may_execute(state, workspace),
         "project execution authority unavailable"

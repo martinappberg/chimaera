@@ -20,6 +20,7 @@ use std::{
 
 pub(crate) const WORKSPACE_HEADER: &str = "x-chimaera-workspace";
 pub(crate) const EPOCH_HEADER: &str = "x-chimaera-epoch";
+mod commands;
 pub(crate) mod paths;
 const MAX_JSON: usize = 1024 * 1024;
 
@@ -29,6 +30,61 @@ const MAX_JSON: usize = 1024 * 1024;
 pub(crate) struct Mutation {
     scope: Scope,
     generation: u64,
+}
+impl Mutation {
+    pub(crate) fn for_scope(state: &AppState, scope: Scope) -> Result<Self> {
+        let admission = Self {
+            scope,
+            generation: crate::pro::mutation::generation(state),
+        };
+        // Prove the captured generation as well as the supplied epoch before
+        // exposing it to a long-lived socket; neither may refresh implicitly.
+        admission.validate(state)?;
+        Ok(admission)
+    }
+    /// Reads prove the captured identity without consuming mutation capacity.
+    /// Writes still call begin() at commit/dispatch for atomic reservation.
+    pub(crate) fn validate(&self, state: &AppState) -> Result<()> {
+        if self.generation != crate::pro::mutation::generation(state) {
+            return Err(crate::pro::mutation::Changed.into());
+        }
+        self.scope
+            .validate(state)
+            .map_err(|_| crate::pro::mutation::Changed)?;
+        if self.generation != crate::pro::mutation::generation(state) {
+            return Err(crate::pro::mutation::Changed.into());
+        }
+        Ok(())
+    }
+    pub(crate) fn session(&self, state: &AppState, session: &str) -> Result<()> {
+        self.scope
+            .session(state, session)
+            .map_err(|_| crate::pro::mutation::Changed.into())
+    }
+    pub(crate) fn capture(state: &AppState, workspace: &str) -> Result<Option<Self>> {
+        let Some((epoch, generation)) = crate::pro::mutation::capture(state, workspace)? else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            scope: Scope {
+                workspace_id: workspace.into(),
+                epoch,
+                viewer_root: None,
+            },
+            generation,
+        }))
+    }
+    pub(crate) fn begin(&self, state: &AppState) -> Result<crate::pro::mutation::Guard> {
+        self.scope
+            .validate(state)
+            .map_err(|_| crate::pro::mutation::Changed)?;
+        crate::pro::mutation::begin(
+            state,
+            &self.scope.workspace_id,
+            self.scope.epoch,
+            self.generation,
+        )
+    }
 }
 pub(crate) fn begin_mutation(
     state: &AppState,
@@ -377,9 +433,15 @@ async fn scoped_request(
     let mut target_keys = HashMap::new();
     let body = if needs_body {
         let (parts, stream) = request.into_parts();
-        let bytes = match axum::body::to_bytes(stream, MAX_JSON).await {
-            Ok(bytes) => bytes,
-            Err(_) => return denied(StatusCode::PAYLOAD_TOO_LARGE),
+        let bytes = match tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            axum::body::to_bytes(stream, MAX_JSON),
+        )
+        .await
+        {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(_)) => return denied(StatusCode::PAYLOAD_TOO_LARGE),
+            Err(_) => return denied(StatusCode::REQUEST_TIMEOUT),
         };
         let mut body = match serde_json::from_slice::<Value>(&bytes) {
             Ok(Value::Object(body)) => Value::Object(body),
@@ -415,7 +477,11 @@ async fn scoped_request(
         generation,
     });
     request.extensions_mut().insert(scope);
-    let response = next.run(request).await;
+    let response = if commands::reserved(&method, &path) {
+        commands::run(state, request, next).await
+    } else {
+        next.run(request).await
+    };
     let rewrite = matches!(
         path.as_str(),
         "/fs/list"

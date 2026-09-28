@@ -136,9 +136,29 @@ fn sentinel_line(command: &str) -> String {
 
 pub(crate) async fn exec(
     marks: Arc<Marks>,
-    input: tokio::sync::mpsc::Sender<Bytes>,
+    input: crate::InputSender,
     exec_lock: Arc<tokio::sync::Mutex<()>>,
     opts: ExecOptions,
+) -> Result<ExecOutcome, ExecError> {
+    exec_inner(marks, input, exec_lock, opts, None).await
+}
+
+pub(crate) async fn exec_guarded(
+    marks: Arc<Marks>,
+    input: crate::InputSender,
+    exec_lock: Arc<tokio::sync::Mutex<()>>,
+    opts: ExecOptions,
+    admission: crate::input::Admission,
+) -> Result<ExecOutcome, ExecError> {
+    exec_inner(marks, input, exec_lock, opts, Some(admission)).await
+}
+
+async fn exec_inner(
+    marks: Arc<Marks>,
+    input: crate::InputSender,
+    exec_lock: Arc<tokio::sync::Mutex<()>>,
+    opts: ExecOptions,
+    admission: Option<crate::input::Admission>,
 ) -> Result<ExecOutcome, ExecError> {
     validate(&opts.command)?;
     let set_stage = |stage: ExecStage| {
@@ -149,10 +169,20 @@ pub(crate) async fn exec(
     set_stage(ExecStage::Queued);
     let start = Instant::now();
 
-    // One exec at a time per session; queued execs wait here first.
-    let _guard = exec_lock.lock().await;
-
     let queue_deadline = start + opts.queue_timeout;
+    // The existing queue budget covers a previous exec too, not just the
+    // shell's prompt. A zero budget remains an immediate try.
+    let _guard = if opts.queue_timeout.is_zero() {
+        exec_lock
+            .try_lock()
+            .map_err(|_| ExecError::Busy("another exec is queued".into()))?
+    } else {
+        tokio::time::timeout_at(queue_deadline, exec_lock.lock())
+            .await
+            .map_err(|_| {
+                ExecError::Busy("another exec did not finish before the queue timeout".into())
+            })?
+    };
     let mode = wait_ready(&marks, &opts, start, queue_deadline).await?;
     if mode == ExecMode::Sentinel {
         wait_quiet(&marks, queue_deadline).await?;
@@ -164,9 +194,16 @@ pub(crate) async fn exec(
         ExecMode::Integrated => format!("{}\r", opts.command),
         ExecMode::Sentinel => sentinel_line(&opts.command),
     };
-    if input.send(Bytes::from(line)).await.is_err() {
+    let dispatched = match admission {
+        Some(admission) => input.send_guarded(Bytes::from(line), admission).await,
+        None => input
+            .send(Bytes::from(line))
+            .await
+            .map_err(|_| ExecError::SessionGone),
+    };
+    if let Err(error) = dispatched {
         marks.clear_agent_expect(token);
-        return Err(ExecError::SessionGone);
+        return Err(error);
     }
     set_stage(ExecStage::Executing);
 
@@ -325,7 +362,7 @@ mod tests {
     #[tokio::test]
     async fn integrated_without_c_marks_degrades_to_sentinel() {
         let marks = Arc::new(Marks::new());
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Bytes>(8);
+        let (tx, mut rx) = crate::input::channel(8);
         let lock = Arc::new(tokio::sync::Mutex::new(()));
         marks.feed(b"\x1b]133;A\x07$ ");
 
@@ -343,15 +380,28 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ExecError::NeverStarted(_)));
-        assert_eq!(rx.recv().await.unwrap(), Bytes::from("echo hi\r"));
+        rx.recv()
+            .await
+            .unwrap()
+            .write(|bytes| {
+                assert_eq!(bytes, b"echo hi\r");
+                Ok(())
+            })
+            .unwrap();
         assert!(marks.integration_start_broken());
 
         // Second exec on the same session: still phase ready, but typed
         // sentinel-wrapped; completes off its own printf'd marks.
         let task = tokio::spawn(exec(marks.clone(), tx.clone(), lock.clone(), opts));
-        let typed = rx.recv().await.unwrap();
-        let line = String::from_utf8(typed.to_vec()).unwrap();
-        assert!(line.starts_with("printf"), "expected sentinel line: {line}");
+        rx.recv()
+            .await
+            .unwrap()
+            .write(|bytes| {
+                let line = std::str::from_utf8(bytes).unwrap();
+                assert!(line.starts_with("printf"), "expected sentinel line: {line}");
+                Ok(())
+            })
+            .unwrap();
         marks.feed(b"\x1b]133;C\x07hi\r\n\x1b]133;D;0\x07");
         let outcome = task.await.unwrap().expect("sentinel exec completes");
         assert_eq!(outcome.mode, ExecMode::Sentinel);

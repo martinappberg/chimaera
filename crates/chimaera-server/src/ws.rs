@@ -162,6 +162,97 @@ enum ClientMessage {
     },
 }
 
+/// The first authenticated frame fixes both project scope and account generation.
+/// A later account with an equal workspace/epoch cannot revive this connection.
+#[derive(Clone)]
+struct SocketScope {
+    scope: crate::workspace_scope::Scope,
+    admission: crate::workspace_scope::Mutation,
+}
+impl std::ops::Deref for SocketScope {
+    type Target = crate::workspace_scope::Scope;
+    fn deref(&self) -> &Self::Target {
+        &self.scope
+    }
+}
+impl SocketScope {
+    fn from_fields(
+        state: &AppState,
+        fields: crate::workspace_scope::Fields,
+    ) -> anyhow::Result<Option<Self>> {
+        fields
+            .scope()?
+            .map(|scope| {
+                let admission = crate::workspace_scope::Mutation::for_scope(state, scope.clone())?;
+                Ok(Self { scope, admission })
+            })
+            .transpose()
+    }
+    fn validate(&self, state: &AppState) -> anyhow::Result<()> {
+        self.admission.validate(state)
+    }
+    fn session(&self, state: &AppState, id: &str) -> anyhow::Result<()> {
+        self.admission.session(state, id)?;
+        self.validate(state)
+    }
+    fn begin_session(
+        &self,
+        state: &AppState,
+        id: &str,
+    ) -> anyhow::Result<crate::pro::mutation::Guard> {
+        self.admission.session(state, id)?;
+        self.admission.begin(state)
+    }
+}
+
+async fn terminal_input(
+    state: &Arc<AppState>,
+    id: &str,
+    input: &chimaera_pty::InputSender,
+    bytes: Bytes,
+    scope: Option<&SocketScope>,
+) -> Result<(), chimaera_pty::ExecError> {
+    if let Some(scope) = scope {
+        let scope = scope.clone();
+        let state = Arc::clone(state);
+        let id = id.to_owned();
+        input
+            .send_authorized(bytes, move || {
+                scope
+                    .begin_session(&state, &id)
+                    .map_err(|_| chimaera_pty::ExecError::Busy("project connection changed".into()))
+            })
+            .await
+    } else {
+        input
+            .send(bytes)
+            .await
+            .map_err(|_| chimaera_pty::ExecError::SessionGone)
+    }
+}
+
+async fn chat_command(
+    state: &Arc<AppState>,
+    id: &str,
+    command: chimaera_agent::model::AgentCommand,
+    scope: Option<&SocketScope>,
+) -> anyhow::Result<()> {
+    let Some(scope) = scope else {
+        return state.chat.command(id, command).await;
+    };
+    let guard = scope.begin_session(state, id)?;
+    let state = Arc::clone(state);
+    let id = id.to_owned();
+    // Keep admitted enqueue work owned if its viewer disconnects. The bounded
+    // wait is cancellable before enqueue; an accepted item belongs to the old
+    // driver, which must be fenced before replacement authority can activate.
+    tokio::spawn(async move {
+        let _guard = guard;
+        tokio::time::timeout(Duration::from_secs(5), state.chat.command(&id, command)).await?
+    })
+    .await?
+}
+
 pub(crate) fn session_writable(state: &AppState, id: &str) -> bool {
     let workspace = crate::lock(&state.session_workspaces).get(id).cloned();
     workspace.is_none_or(|workspace| crate::pro::may_execute(state, &workspace))
@@ -222,7 +313,10 @@ async fn handle(
     // attach adopts nothing: a hidden window's stale dims must never reflow
     // the grid out from under a visible one.
     if let Some((cols, rows)) = auth_dims {
-        resize_off_reactor(&state, &id, cols, rows, "pre-attach resize").await;
+        if !resize_off_reactor(&state, &id, cols, rows, "pre-attach resize", scope.as_ref()).await {
+            scope_changed(&mut socket).await;
+            return;
+        }
     }
 
     let attach_res = match attach_off_reactor(&state, &id, auth.parked).await {
@@ -507,15 +601,18 @@ async fn handle(
                         let _ = send_ordered_json(&mut socket, &mut batch, &json!({"type":"error","code":"read_only","message":"This session is read only on this host"})).await;
                         continue;
                     }
-                    if !bytes.is_empty() { crate::activity::record(&state, &id); }
+                    let mut interacted = false;
                     for chunk in bytes.chunks(TERMINAL_INPUT_CHUNK) {
                         if !session_writable(&state, &id) || scope.as_ref().is_some_and(|s| s.session(&state, &id).is_err()) { scope_changed(&mut socket).await; return; }
-                        if attachment
-                            .input
-                            .send(Bytes::copy_from_slice(chunk))
-                            .await
-                            .is_err()
-                        {
+                        if let Err(error) = terminal_input(&state, &id, &attachment.input, Bytes::copy_from_slice(chunk), scope.as_ref()).await {
+                            if scope.as_ref().is_some_and(|s| s.session(&state, &id).is_err()) {
+                                scope_changed(&mut socket).await;
+                                return;
+                            }
+                            if matches!(error, chimaera_pty::ExecError::Busy(_)) {
+                                let _ = send_ordered_json(&mut socket, &mut batch, &json!({"type":"error","code":"read_only","message":"Your project is busy. Wait a moment before typing again."})).await;
+                                break;
+                            }
                             // Session is gone; flush the batched tail (its
                             // last words), tell the client, and hang up.
                             let _ = send_ordered_json(
@@ -526,6 +623,7 @@ async fn handle(
                             .await;
                             return;
                         }
+                        if !interacted { crate::activity::record(&state, &id); interacted = true; }
                     }
                 }
                 Some(Ok(Message::Text(text))) => {
@@ -541,7 +639,10 @@ async fn handle(
                             if !send_batch(&mut socket, &mut batch).await {
                                 return;
                             }
-                            resize_off_reactor(&state, &id, cols, rows, "ws resize").await;
+                            if !resize_off_reactor(&state, &id, cols, rows, "ws resize", scope.as_ref()).await {
+                                scope_changed(&mut socket).await;
+                                return;
+                            }
                         }
                         Ok(ClientMessage::Park) => {
                             if !parked {
@@ -625,14 +726,32 @@ async fn attach_off_reactor(
 /// term lock the snapshot render holds — off the reactor for the same
 /// reason. Failures are logged, not fatal (resizes are advisory; a dead or
 /// unknown session simply ignores them).
-async fn resize_off_reactor(state: &Arc<AppState>, id: &str, cols: u16, rows: u16, what: &str) {
+async fn resize_off_reactor(
+    state: &Arc<AppState>,
+    id: &str,
+    cols: u16,
+    rows: u16,
+    what: &str,
+    scope: Option<&SocketScope>,
+) -> bool {
     let state = Arc::clone(state);
     let task_id = id.to_string();
-    match tokio::task::spawn_blocking(move || state.sessions.resize(&task_id, cols, rows)).await {
+    let scope = scope.cloned();
+    match tokio::task::spawn_blocking(move || {
+        let _guard = scope
+            .as_ref()
+            .map(|scope| scope.begin_session(&state, &task_id))
+            .transpose()?;
+        state.sessions.resize(&task_id, cols, rows)
+    })
+    .await
+    {
         Ok(Ok(())) => {}
+        Ok(Err(err)) if err.is::<crate::pro::mutation::Changed>() => return false,
         Ok(Err(err)) => tracing::debug!(%id, %err, "{what} failed"),
         Err(err) => tracing::warn!(%id, %err, "{what} task failed"),
     }
+    true
 }
 
 /// Send the batched output as one frame, if any; false = socket gone.
@@ -909,9 +1028,13 @@ async fn handle_chat(
                                 return;
                             }
                             let interaction = crate::activity::is_interaction(&cmd);
-                            if let Err(err) = state.chat.command(&id, cmd).await {
+                            if let Err(err) = chat_command(&state, &id, cmd, scope.as_ref()).await {
                                 // The send never happened: neither do its copies.
                                 crate::upload::discard_saved_images(saved);
+                                if err.is::<crate::pro::mutation::Changed>() {
+                                    scope_changed(&mut socket).await;
+                                    return;
+                                }
                                 tracing::debug!(%id, %err, "chat command failed");
                                 // code=command_failed: one refused command is
                                 // NOT a dead socket — without the code the
@@ -1005,7 +1128,7 @@ fn chat_batch_end(replay: &[Arc<chimaera_agent::journal::SeqEvent>], start: usiz
 async fn chat_authenticate(
     socket: &mut WebSocket,
     state: &AppState,
-) -> Option<(u64, Option<crate::workspace_scope::Scope>)> {
+) -> Option<(u64, Option<SocketScope>)> {
     #[derive(Deserialize)]
     struct ChatAuth {
         #[serde(rename = "type")]
@@ -1018,9 +1141,10 @@ async fn chat_authenticate(
     }
     match tokio::time::timeout(AUTH_TIMEOUT, socket.recv()).await {
         Ok(Some(Ok(Message::Text(text)))) => match serde_json::from_str::<ChatAuth>(&text) {
-            Ok(auth) if auth.kind == "auth" && auth.token == state.token => {
-                Some((auth.last_seq, auth.scope.scope().ok()?))
-            }
+            Ok(auth) if auth.kind == "auth" && auth.token == state.token => Some((
+                auth.last_seq,
+                SocketScope::from_fields(state, auth.scope).ok()?,
+            )),
             _ => None,
         },
         _ => None,
@@ -1044,11 +1168,7 @@ async fn scope_changed(socket: &mut WebSocket) {
     let _ = send_json(socket, &json!({"type":"error","code":"workspace_scope_changed","message":"Your project connection changed. Reconnecting…"})).await;
 }
 
-async fn scoped_events(
-    mut socket: WebSocket,
-    state: Arc<AppState>,
-    scope: crate::workspace_scope::Scope,
-) {
+async fn scoped_events(mut socket: WebSocket, state: Arc<AppState>, scope: SocketScope) {
     if scope.validate(&state).is_err() {
         scope_changed(&mut socket).await;
         return;
@@ -1146,7 +1266,7 @@ async fn scoped_events(
                         if workspace_id.as_deref().is_some_and(|id| id != scope.workspace_id) { return; }
                         if let Some(alias)=&alias { for path in wanted_files.iter_mut().chain(dirs.iter_mut()) { *path=alias.input(path); } }
                         let paths = wanted_files.iter().chain(dirs.iter()).cloned().collect();
-                        if scope.paths(&state,paths).await.is_err() { return; }
+                        if scope.paths(&state,paths).await.is_err() || scope.validate(&state).is_err() { return; }
                         files.set(wanted_files,dirs);
                         tokio::time::sleep(EVENTS_THROTTLE).await;
                     }
@@ -1520,7 +1640,7 @@ async fn send_sessions_snapshot(
 struct AuthParams {
     dims: Option<(u16, u16)>,
     parked: bool,
-    scope: Option<crate::workspace_scope::Scope>,
+    scope: Option<SocketScope>,
 }
 
 async fn authenticate(socket: &mut WebSocket, state: &AppState) -> Option<AuthParams> {
@@ -1535,7 +1655,7 @@ async fn authenticate(socket: &mut WebSocket, state: &AppState) -> Option<AuthPa
             }) if token == state.token => Some(AuthParams {
                 dims: cols.zip(rows),
                 parked,
-                scope: scope.scope().ok()?,
+                scope: SocketScope::from_fields(state, scope).ok()?,
             }),
             _ => None,
         },

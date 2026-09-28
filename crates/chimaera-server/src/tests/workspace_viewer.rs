@@ -24,6 +24,102 @@ fn fixture() -> (
 }
 
 #[tokio::test]
+async fn delayed_lifecycle_bodies_cannot_mutate_a_replacement_epoch_or_account_generation() {
+    for next_epoch in [4, 5] {
+        for (method, path, json_body) in [
+            (
+                Method::POST,
+                "/sessions",
+                json!({"workspace_id":"WORKSPACE"}),
+            ),
+            (
+                Method::POST,
+                "/sessions/s-fixture/exec",
+                json!({"command":"printf stale"}),
+            ),
+            (
+                Method::POST,
+                "/sessions/s-fixture/view",
+                json!({"ui":"chat"}),
+            ),
+            (
+                Method::POST,
+                "/sessions/s-fixture/rewind",
+                json!({"resume_at":"anchor"}),
+            ),
+            (
+                Method::POST,
+                "/sessions/s-fixture/fork",
+                json!({"resume_at":"anchor"}),
+            ),
+            (
+                Method::PATCH,
+                "/sessions/s-fixture",
+                json!({"name":"stale"}),
+            ),
+            (Method::DELETE, "/sessions/s-fixture", json!({})),
+            (
+                Method::PUT,
+                "/workspaces/WORKSPACE/mastermind",
+                json!({"agent":"claude","mode":"ask"}),
+            ),
+            (
+                Method::PUT,
+                "/view-state/tabs_WORKSPACE",
+                json!({"stale":true}),
+            ),
+        ] {
+            let (state, one, _) = fixture();
+            lock(&state.session_workspaces).insert("s-fixture".into(), one.id.clone());
+            let bytes = json_body.to_string().replace("WORKSPACE", &one.id);
+            let uri = format!("/api/v1{}", path.replace("WORKSPACE", &one.id));
+            let (entered, ready) = tokio::sync::oneshot::channel();
+            let (finish, wait) = tokio::sync::oneshot::channel();
+            let body = Body::from_stream(futures::stream::once(async move {
+                entered.send(()).unwrap();
+                wait.await.unwrap();
+                Ok::<_, std::io::Error>(bytes::Bytes::from(bytes))
+            }));
+            let request = Request::builder()
+                .method(method)
+                .uri(&uri)
+                .header(header::AUTHORIZATION, "Bearer test-token")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-chimaera-workspace", &one.id)
+                .header("x-chimaera-epoch", "4")
+                .body(body)
+                .unwrap();
+            let pending = tokio::spawn(app(state.clone()).oneshot(request));
+            ready.await.unwrap();
+            assert_eq!(
+                super::support::request(&state, Method::DELETE, "/api/v1/pro/configure", None)
+                    .await
+                    .0,
+                StatusCode::NO_CONTENT
+            );
+            pro::install_execution_fixture(&state, &one.id, next_epoch).unwrap();
+            finish.send(()).unwrap();
+            let response = pending.await.unwrap().unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::CONFLICT,
+                "{uri}, epoch {next_epoch}"
+            );
+            assert!(state.sessions.list().is_empty());
+            assert!(state.chat.list().is_empty());
+            assert!(lock(&state.workspaces)
+                .get(&one.id)
+                .unwrap()
+                .mastermind
+                .is_none());
+            state
+                .stopping
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
+#[tokio::test]
 async fn scoped_delayed_save_and_upload_cannot_commit_into_a_replacement_epoch() {
     for (upload, next_epoch) in [(false, 4), (false, 5), (true, 4), (true, 5)] {
         let (state, one, _) = fixture();
@@ -395,6 +491,242 @@ async fn established_scoped_terminal_refuses_input_after_authority_is_invalidate
     );
     state.sessions.kill(&info.id).unwrap();
     task.abort();
+    state
+        .stopping
+        .store(true, std::sync::atomic::Ordering::Release);
+}
+
+#[tokio::test]
+async fn established_scoped_sockets_cannot_rejoin_a_replacement_account_at_the_same_epoch() {
+    for surface in ["sessions", "resize", "chat", "events"] {
+        let (state, project, _) = fixture();
+        let captured = project.root.join("synthetic-input.txt");
+        let id = if surface == "chat" {
+            let fake = write_fake_claude("viewer-generation-agent");
+            let script = std::fs::read_to_string(&fake).unwrap();
+            std::fs::write(
+                &fake,
+                script.replace("cat >/dev/null", "cat > \"$CHIMAERA_TEST_CAPTURE\""),
+            )
+            .unwrap();
+            let mut spec = chimaera_agent::driver::SpawnSpec::new(
+                "s-viewer-chat",
+                vec![fake.to_string_lossy().into_owned()],
+                project.root.clone(),
+            );
+            spec.env.push((
+                "CHIMAERA_TEST_CAPTURE".into(),
+                captured.to_string_lossy().into_owned(),
+            ));
+            state
+                .chat
+                .spawn(&chimaera_agent::claude::ClaudeAdapter, spec)
+                .unwrap();
+            "s-viewer-chat".to_owned()
+        } else {
+            state
+                .sessions
+                .spawn(chimaera_pty::SpawnOpts {
+                    cwd: project.root.clone(),
+                    name: None,
+                    cols: 80,
+                    rows: 24,
+                    command: Some(vec!["/bin/sh".into()]),
+                    id: None,
+                    env: Vec::new(),
+                    env_remove: Vec::new(),
+                    scrollback: None,
+                })
+                .unwrap()
+                .id
+        };
+        lock(&state.session_workspaces).insert(id.clone(), project.id.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = app(state.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let suffix = if surface == "events" {
+            String::new()
+        } else {
+            format!("/{id}")
+        };
+        let endpoint = if surface == "resize" {
+            "sessions"
+        } else {
+            surface
+        };
+        let (mut socket, _) =
+            tokio_tungstenite::connect_async(format!("ws://{address}/ws/{endpoint}{suffix}"))
+                .await
+                .unwrap();
+        socket.send(Message::Text(json!({"type":"auth","token":"test-token","workspace_id":project.id,"epoch":4,"viewer_root":"L3Byb2plY3Q"}).to_string().into())).await.unwrap();
+        let first = next_ws_frame(&mut socket).await;
+        let first: Value = serde_json::from_str(first.to_text().unwrap()).unwrap();
+        assert_eq!(
+            first["type"],
+            if surface == "events" {
+                "sessions"
+            } else {
+                "ready"
+            }
+        );
+
+        assert_eq!(
+            request(&state, Method::DELETE, "/api/v1/pro/configure", None)
+                .await
+                .0,
+            StatusCode::NO_CONTENT
+        );
+        // This is deliberately the same workspace and epoch. Fresh authority is
+        // valid, but the previous authenticated connection must remain retired.
+        pro::install_execution_fixture(&state, &project.id, 4).unwrap();
+        pro::validate_execution_scope(&state, &project.id, 4).unwrap();
+        let stale = match surface {
+            "resize" => Message::Text(
+                json!({"type":"resize","cols":177,"rows":63})
+                    .to_string()
+                    .into(),
+            ),
+            "sessions" => Message::Binary(bytes::Bytes::from_static(b"touch STALE_WS_INPUT\n")),
+            "chat" => Message::Text(
+                json!({"type":"send","blocks":[{"type":"text","text":"STALE_WS_MESSAGE"}]})
+                    .to_string()
+                    .into(),
+            ),
+            _ => Message::Text(
+                json!({"type":"watch","workspace_id":project.id,"files":["/project/note.txt"]})
+                    .to_string()
+                    .into(),
+            ),
+        };
+        socket.send(stale).await.unwrap();
+        loop {
+            let frame = next_ws_frame(&mut socket).await;
+            if let Message::Text(text) = frame {
+                if text.contains("workspace_scope_changed") {
+                    break;
+                }
+            }
+        }
+        assert!(!project.root.join("STALE_WS_INPUT").exists());
+        if surface == "resize" {
+            assert_eq!(state.sessions.get(&id).unwrap().cols, 80);
+            assert_eq!(state.sessions.get(&id).unwrap().rows, 24);
+        }
+        assert!(!std::fs::read_to_string(&captured)
+            .unwrap_or_default()
+            .contains("STALE_WS_MESSAGE"));
+        state
+            .stopping
+            .store(true, std::sync::atomic::Ordering::Release);
+        if surface == "chat" {
+            state.chat.kill(&id);
+        } else {
+            state.sessions.kill(&id).unwrap();
+        }
+        server.abort();
+        let _ = server.await;
+    }
+}
+
+#[tokio::test]
+async fn scoped_connection_reads_remain_valid_while_mutation_capacity_is_full() {
+    let (state, project, _) = fixture();
+    let scope = crate::workspace_scope::Scope {
+        workspace_id: project.id.clone(),
+        epoch: 4,
+        viewer_root: None,
+    };
+    let admission = crate::workspace_scope::Mutation::for_scope(&state, scope.clone()).unwrap();
+    let guards: Vec<_> = (0..64).map(|_| admission.begin(&state).unwrap()).collect();
+    assert!(
+        admission.begin(&state).is_err(),
+        "mutation ceiling remains enforced"
+    );
+    assert!(
+        admission.validate(&state).is_ok(),
+        "existing viewers are still authorized"
+    );
+    assert!(
+        crate::workspace_scope::Mutation::for_scope(&state, scope).is_ok(),
+        "read-only authentication needs no mutation slot"
+    );
+    let terminal = state
+        .sessions
+        .spawn(chimaera_pty::SpawnOpts {
+            cwd: project.root.clone(),
+            name: None,
+            cols: 80,
+            rows: 24,
+            command: Some(vec!["/bin/sh".into()]),
+            id: None,
+            env: Vec::new(),
+            env_remove: Vec::new(),
+            scrollback: None,
+        })
+        .unwrap();
+    lock(&state.session_workspaces).insert(terminal.id.clone(), project.id.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let router = app(state.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let (mut socket, _) =
+        tokio_tungstenite::connect_async(format!("ws://{address}/ws/sessions/{}", terminal.id))
+            .await
+            .unwrap();
+    socket
+        .send(Message::Text(
+            json!({"type":"auth","token":"test-token","workspace_id":project.id,"epoch":4})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let ready = next_ws_frame(&mut socket).await;
+    assert_eq!(
+        serde_json::from_str::<Value>(ready.to_text().unwrap()).unwrap()["type"],
+        "ready"
+    );
+    socket
+        .send(Message::Binary(bytes::Bytes::from_static(
+            b"touch BUSY_MUST_NOT_RUN\n",
+        )))
+        .await
+        .unwrap();
+    loop {
+        let frame = next_ws_frame(&mut socket).await;
+        if let Message::Text(text) = frame {
+            let frame: Value = serde_json::from_str(&text).unwrap();
+            if frame["type"] == "error" {
+                assert_eq!(
+                    frame["code"], "read_only",
+                    "busy input must not report session exit"
+                );
+                break;
+            }
+            assert_ne!(frame["type"], "exited");
+        }
+    }
+    assert!(!project.root.join("BUSY_MUST_NOT_RUN").exists());
+    assert!(state.sessions.get(&terminal.id).is_some());
+    drop(guards);
+    assert!(admission.begin(&state).is_ok());
+    socket
+        .send(Message::Binary(bytes::Bytes::from_static(
+            b"touch ACCEPTED_AFTER_BUSY\n",
+        )))
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !project.root.join("ACCEPTED_AFTER_BUSY").exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    state.sessions.kill(&terminal.id).unwrap();
+    server.abort();
+    let _ = server.await;
     state
         .stopping
         .store(true, std::sync::atomic::Ordering::Release);

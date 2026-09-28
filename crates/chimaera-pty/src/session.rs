@@ -17,7 +17,7 @@ use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
 use anyhow::Context;
 use bytes::Bytes;
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::broadcast;
 
 use crate::{
     lock_unpoisoned, marks::now_ms, marks::Marks, marks::ShellPhase, snapshot, validate_dimensions,
@@ -121,7 +121,7 @@ pub(crate) struct Session {
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     state: Arc<Mutex<SessionState>>,
     title: Arc<Mutex<Option<String>>>,
-    input_tx: mpsc::Sender<Bytes>,
+    input_tx: crate::InputSender,
     output_tx: broadcast::Sender<Bytes>,
     events_tx: broadcast::Sender<SessionEvent>,
     /// Shell-integration marks: OSC 133 phase + command journal.
@@ -206,7 +206,7 @@ impl Session {
 
         let (output_tx, _) = broadcast::channel::<Bytes>(OUTPUT_CHANNEL_CAPACITY);
         let (events_tx, _) = broadcast::channel::<SessionEvent>(EVENT_CHANNEL_CAPACITY);
-        let (input_tx, mut input_rx) = mpsc::channel::<Bytes>(INPUT_CHANNEL_CAPACITY);
+        let (input_tx, mut input_rx) = crate::input::channel(INPUT_CHANNEL_CAPACITY);
 
         let title = Arc::new(Mutex::new(None));
         let proxy = EventProxy {
@@ -303,7 +303,9 @@ impl Session {
                         {
                             break;
                         }
-                        if let Err(e) = writer.write_all(&data).and_then(|()| writer.flush()) {
+                        if let Err(e) = data
+                            .write(|bytes| writer.write_all(bytes).and_then(|()| writer.flush()))
+                        {
                             tracing::debug!(session = %id, error = %e, "pty writer stopped");
                             break;
                         }
@@ -421,7 +423,7 @@ impl Session {
     }
 
     /// Queue bytes to the PTY without an attachment (exec engine path).
-    pub(crate) fn input(&self) -> mpsc::Sender<Bytes> {
+    pub(crate) fn input(&self) -> crate::InputSender {
         self.input_tx.clone()
     }
 

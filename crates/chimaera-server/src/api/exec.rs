@@ -3,7 +3,7 @@ use std::sync::Arc;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
+use axum::{Extension, Json};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -26,8 +26,18 @@ pub(crate) struct ExecBody {
 pub(crate) async fn exec_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    mutation: Option<Extension<crate::workspace_scope::Mutation>>,
     Json(body): Json<ExecBody>,
 ) -> Response {
+    if let Err(error) = crate::workspace_scope::begin_mutation(&state, &mutation) {
+        return crate::workspace_scope::mutation_failure(&error).unwrap_or_else(|| {
+            (
+                StatusCode::CONFLICT,
+                Json(json!({"error":"workspace_scope_changed"})),
+            )
+                .into_response()
+        });
+    }
     // Agent sessions host a TUI, not a shell; typing commands into claude
     // would be chaos. Links (and this endpoint) are for terminals only.
     if crate::lock(&state.agents).contains_key(&id) {
@@ -45,12 +55,13 @@ pub(crate) async fn exec_session(
             .into_response();
     }
 
-    let outcome = crate::exec::run_exec(
+    let outcome = crate::exec::run_exec_scoped(
         &state,
         &id,
         body.command,
         body.timeout_ms,
         body.queue_timeout_ms,
+        mutation.map(|Extension(mutation)| mutation),
     )
     .await;
 
