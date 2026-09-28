@@ -169,14 +169,7 @@ impl FakeKeeper {
                 }),
             )
             .route("/v1/billing/checkout", post(fixture_checkout))
-            .route(
-                "/v1/billing/portal",
-                post(|| async {
-                    Json(BillingSession {
-                        url: "https://billing.stripe.com/p/session/fixture".into(),
-                    })
-                }),
-            )
+            .route("/v1/billing/portal", post(fixture_portal))
             .route("/v1/hosts", get(hosts).post(add_host))
             .route("/v1/hosts/{id}", axum::routing::delete(delete_host))
             .route("/v1/hosts/{id}/reconnect", post(reconnect))
@@ -207,6 +200,7 @@ async fn fixture_checkout(Json(body): Json<serde_json::Value>) -> Response {
     if !matches!(body["plan"].as_str(), Some("pro" | "max"))
         || !matches!(body["interval"].as_str(), Some("month" | "year"))
         || body["return_to"].as_str() != Some("desktop")
+        || !fixture_billing_callback_valid(&body)
     {
         return StatusCode::BAD_REQUEST.into_response();
     }
@@ -215,6 +209,29 @@ async fn fixture_checkout(Json(body): Json<serde_json::Value>) -> Response {
     })
     .into_response()
 }
+fn fixture_billing_callback_valid(body: &serde_json::Value) -> bool {
+    match body
+        .get("desktop_callback")
+        .filter(|value| !value.is_null())
+    {
+        None => true,
+        Some(value) => {
+            body["return_to"].as_str() == Some("desktop")
+                && serde_json::from_value::<DesktopBillingCallback>(value.clone())
+                    .is_ok_and(|callback| callback.validate().is_ok())
+        }
+    }
+}
+async fn fixture_portal(body: Option<Json<serde_json::Value>>) -> Response {
+    if body.is_some_and(|Json(body)| !fixture_billing_callback_valid(&body)) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    Json(BillingSession {
+        url: "https://billing.stripe.com/p/session/fixture".into(),
+    })
+    .into_response()
+}
+
 fn nonce() -> String {
     base64::Engine::encode(
         &base64::engine::general_purpose::URL_SAFE_NO_PAD,

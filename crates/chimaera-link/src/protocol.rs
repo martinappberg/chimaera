@@ -63,6 +63,33 @@ pub enum BillingInterval {
     Year,
 }
 
+/// A single native billing attempt. The nonce is not an account credential, but
+/// must not be logged or exposed to another window/attempt.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DesktopBillingCallback {
+    pub redirect_uri: String,
+    pub state: String,
+}
+impl DesktopBillingCallback {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        use base64::Engine;
+        let url = url::Url::parse(&self.redirect_uri)?;
+        let port = url.port().filter(|port| *port >= 1024);
+        if port.is_none()
+            || self.redirect_uri
+                != format!("http://127.0.0.1:{}/billing/callback", port.unwrap_or(0))
+            || self.state.len() != 43
+            || base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(&self.state)
+                .map_or(true, |bytes| bytes.len() != 32)
+        {
+            anyhow::bail!("invalid desktop billing callback");
+        }
+        Ok(())
+    }
+}
+
 // Hosted billing URLs are temporary capabilities; never include them in Debug.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct BillingSession {

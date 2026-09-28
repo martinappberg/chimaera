@@ -287,27 +287,65 @@ impl Client {
         plan: Plan,
         interval: BillingInterval,
     ) -> Result<BillingSession> {
+        self.billing_checkout_request(plan, interval, None).await
+    }
+    pub async fn billing_checkout_with_callback(
+        &self,
+        plan: Plan,
+        interval: BillingInterval,
+        callback: &DesktopBillingCallback,
+    ) -> Result<BillingSession> {
+        callback.validate()?;
+        self.billing_checkout_request(plan, interval, Some(callback))
+            .await
+    }
+    async fn billing_checkout_request(
+        &self,
+        plan: Plan,
+        interval: BillingInterval,
+        callback: Option<&DesktopBillingCallback>,
+    ) -> Result<BillingSession> {
         if plan == Plan::None {
             bail!("choose Pro or Max");
+        }
+        let mut body =
+            serde_json::json!({"plan": plan, "interval": interval, "return_to": "desktop"});
+        if let Some(callback) = callback {
+            body["desktop_callback"] = serde_json::to_value(callback)?;
         }
         json_response(
             self.request(
                 Method::POST,
                 path(&self.inner.account, &["v1", "billing", "checkout"]),
-                Some(
-                    serde_json::json!({"plan": plan, "interval": interval, "return_to": "desktop"}),
-                ),
+                Some(body),
             )
             .await?,
         )
         .await
     }
     pub async fn billing_portal(&self) -> Result<BillingSession> {
+        self.billing_portal_request(None).await
+    }
+    pub async fn billing_portal_with_callback(
+        &self,
+        callback: &DesktopBillingCallback,
+    ) -> Result<BillingSession> {
+        callback.validate()?;
+        self.billing_portal_request(Some(callback)).await
+    }
+    async fn billing_portal_request(
+        &self,
+        callback: Option<&DesktopBillingCallback>,
+    ) -> Result<BillingSession> {
+        let mut body = serde_json::json!({"return_to": "desktop"});
+        if let Some(callback) = callback {
+            body["desktop_callback"] = serde_json::to_value(callback)?;
+        }
         json_response(
             self.request(
                 Method::POST,
                 path(&self.inner.account, &["v1", "billing", "portal"]),
-                Some(serde_json::json!({"return_to": "desktop"})),
+                Some(body),
             )
             .await?,
         )

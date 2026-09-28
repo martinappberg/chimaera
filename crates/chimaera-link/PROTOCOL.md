@@ -36,8 +36,8 @@ REST response bodies are limited to 1 MiB; control frames to 128 KiB.
 | `GET /v1/devices` | — | Device array below |
 | `DELETE /v1/devices/{id}` | — | `204`; revoke that device and its connections |
 | `POST /v1/sign-out-everywhere` | — | `204`; revoke all devices, close held SSH logins and all link sockets |
-| `POST /v1/billing/checkout` | `{plan:"pro"\|"max",interval:"month"\|"year",return_to?:"desktop"}` | `{url}` to hosted checkout |
-| `POST /v1/billing/portal` | `{return_to?:"desktop"}` (or an empty body) | `{url}` to hosted billing portal |
+| `POST /v1/billing/checkout` | `{plan:"pro"\|"max",interval:"month"\|"year",return_to?:"desktop",desktop_callback?:DesktopBillingCallback}` | `{url}` to hosted checkout |
+| `POST /v1/billing/portal` | `{return_to?:"desktop",desktop_callback?:DesktopBillingCallback}` (or an empty body) | `{url}` to hosted billing portal |
 | `GET /v1/worker/status` | — | Passive `WorkerStatus` below; full device authentication, no provisioning or wake |
 
 `WorkerStatus` is `{state,reason,phase?}`. `state` is `no_plan`, `unavailable`,
@@ -76,9 +76,37 @@ preparation is a bounded account-service responsibility for eligible active or
 trialing accounts; subsequent passive reads never wake a sleeping worker.
 
 The optional billing `return_to:"desktop"` selects a server-owned, credential-free
-browser return page that tells the user to return to the app. Omission preserves
-the browser account return. Arbitrary return URLs are never accepted. Returning
-from checkout does not grant a plan; the app refreshes authoritative account state.
+browser return page. Omission preserves the browser account return. An optional
+`desktop_callback` is valid only with `return_to:"desktop"` and contains:
+
+```json
+{"redirect_uri":"http://127.0.0.1:49152/billing/callback","state":"<32 random bytes, unpadded base64url (43 characters)>"}
+```
+
+The URI must match that literal form exactly: decimal port 1024–65535, no
+userinfo, query, fragment, other hostname/address, encoded path or extra path.
+The app binds `127.0.0.1:0` before requesting billing and generates a fresh
+cryptographic nonce for each attempt. Callback values are never logged. A service
+validates both fields before any billing side effect and binds the attempt into
+checkout idempotency, so retrying with a new listener cannot reuse an old return
+URL. Missing callbacks remain compatible with older clients and services.
+
+The account's HTTPS return page automatically navigates to the validated native
+callback, with an explicit return button as a fallback. Its short-lived, tamper-
+evident return ticket carries no account/device credential and cannot select any
+other redirect target. Callback navigation is a GET with exactly one `state` and
+one `outcome` (`success`, `canceled` or `portal`). The app checks the exact Host,
+path and state, rejects duplicate/unknown parameters, bounds request size and
+read time, and consumes each callback once. Listeners and tasks are bound to the
+signed-in account generation and canceled on sign-out/replacement. Waiting is
+bounded to 15 minutes, followed by at most two minutes of payment confirmation.
+
+**The return is only a hint, never proof of payment.** A native-owned, bounded
+confirmation task refreshes authenticated account state even if the Pro pane is
+hidden or closed. Checkout succeeds only when a fresh response confirms the
+requested plan; portal return refreshes account state. A callback alone never
+grants access. Cancel/expiry/error remain recoverable and do not silently reopen
+checkout. No account token, Stripe session URL, or callback nonce enters UI state.
 
 Account example (limits are supplied by the account, never hardcoded by clients):
 
