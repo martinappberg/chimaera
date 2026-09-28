@@ -32,6 +32,18 @@ export interface LedgerRow {
   direction: LedgerDirection;
 }
 
+/** A follow-up the project wrote under its own `F-NNN addendum…` heading. */
+export interface FindingAddendum {
+  /** The heading's word and qualifier as written: "Addendum (2)". */
+  label: string;
+  /** The heading after its separator; may be empty. */
+  title: string;
+  /** Markdown. */
+  text: string;
+  /** 1-based line of its heading; 0 when unknown. */
+  line: number;
+}
+
 export interface Finding {
   id: string;
   /** Client-only, unique across the snapshot (`normalizeKnowledge`): the
@@ -43,6 +55,8 @@ export interface Finding {
   tags: string[];
   ledger: LedgerRow[];
   questions: string[];
+  /** In file order; empty when the provider sends none. */
+  addenda: FindingAddendum[];
   line: number;
   updated: string;
   recorded_by?: RecordedBy;
@@ -223,6 +237,12 @@ export function normalizeKnowledge(raw: unknown): Knowledge {
         direction: (str(row.direction) || "unknown") as LedgerDirection,
       })),
       questions: strs(f.questions),
+      addenda: objs<FindingAddendum>(f.addenda).map((a) => ({
+        label: str(a.label),
+        title: str(a.title),
+        text: str(a.text),
+        line: typeof a.line === "number" ? a.line : 0,
+      })),
     })),
   }));
   const num = (v: unknown, fallback: number): number => (typeof v === "number" ? v : fallback);

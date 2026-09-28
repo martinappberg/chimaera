@@ -524,21 +524,6 @@
   .grid.solo {
     grid-template-columns: minmax(0, 1fr);
   }
-  @container (max-width: 820px) {
-    .grid {
-      grid-template-columns: minmax(0, 1fr);
-      gap: 22px;
-    }
-    .nav {
-      position: static;
-      flex-direction: row;
-      flex-wrap: wrap;
-    }
-    .legend {
-      display: none;
-    }
-  }
-
   .nav {
     display: flex;
     flex-direction: column;
@@ -594,6 +579,23 @@
     line-height: 1.45;
     padding-top: 4px;
     opacity: 0.85;
+  }
+  /* After the base .grid/.nav/.legend rules: same specificity, so an earlier
+     block lost to them and the narrow view kept a sticky, see-through nav
+     over the findings. */
+  @container (max-width: 820px) {
+    .grid {
+      grid-template-columns: minmax(0, 1fr);
+      gap: 22px;
+    }
+    .nav {
+      position: static;
+      flex-direction: row;
+      flex-wrap: wrap;
+    }
+    .legend {
+      display: none;
+    }
   }
 
   .lbl {

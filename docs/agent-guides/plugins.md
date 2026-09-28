@@ -326,11 +326,13 @@ Knowledge stamps and Timeline baselines are scoped to the provider id and
 component digest: an update, rollback or provider change gets a fresh snapshot
 even when its input files are unchanged.
 
-A snapshot's ids may repeat — real `.living/` repositories file
-`### F-027 addendum:` headings under their finding's id and reuse numbers.
+A snapshot's ids may repeat — real `.living/` repositories reuse numbers.
 The UI keys its lists by a client-side `key` (never the id), and Timeline
 attribution takes the first entry with an id as the one meant, so a provider
-need not dedupe; it should still read an addendum as part of its finding.
+need not dedupe. An addendum (`### F-027 addendum:` under F-027) is part of
+its finding, not another one: Mycelium (≥ 0.1.3) lists it in the finding's
+optional `addenda: [{label, title, text, line}]`, which the Knowledge view
+renders under the finding.
 
 ## Build and test
 
