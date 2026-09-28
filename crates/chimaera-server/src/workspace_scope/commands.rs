@@ -6,9 +6,9 @@ use std::time::Duration;
 static REQUESTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(64);
 
 pub(super) fn reserved(method: &Method, path: &str) -> bool {
-    !matches!(*method, Method::GET | Method::HEAD)
-        && !path.starts_with("/fs/")
-        && !(path.starts_with("/sessions/") && path.ends_with("/upload"))
+    !(matches!(*method, Method::GET | Method::HEAD)
+        || path.starts_with("/fs/")
+        || path.starts_with("/sessions/") && path.ends_with("/upload"))
 }
 
 pub(super) async fn run(state: Arc<AppState>, request: Request<Body>, next: Next) -> Response {
