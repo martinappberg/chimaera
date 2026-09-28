@@ -47,7 +47,8 @@ jobs:
 
   # Fast repo-hygiene checks, no build needed: the release semver decision
   # (the most behavior-critical release piece), the destructive-command guard,
-  # docs, and agent-asset parity. jq is preinstalled on ubuntu-latest.
+  # worktree-gc's deletion rules, docs, and agent-asset parity. jq is
+  # preinstalled on ubuntu-latest.
   scripts:
     runs-on: ubuntu-latest
     steps:
@@ -57,6 +58,7 @@ jobs:
           node-version-file: .nvmrc
       - run: bash scripts/version-bump.test.sh
       - run: bash .claude/hooks/guard-bash.test.sh
+      - run: bash scripts/worktree-gc.test.sh
       - run: node scripts/check-doc-links.mjs
       - run: node scripts/check-agent-assets.mjs
       - run: node scripts/check-workflow-security.mjs
@@ -89,10 +91,18 @@ jobs:
         # unchecked it evicts the very main entries this job exists to prime.
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      # What chimaera-server's TEST build embeds and installs: plugins/dist-test
+      # (the fixture, built from the plugins/ cargo workspace, and the releases
+      # plugins/plugins.lock pins, downloaded and checksum-verified). The
+      # daemon itself carries no plugins, so the musl job doesn't need it.
+      - run: bash scripts/build-plugins.sh
       - run: cargo fmt --all --check
+      - run: cargo fmt --all --manifest-path plugins/Cargo.toml --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy --manifest-path plugins/Cargo.toml --all-targets -- -D warnings
       - run: cargo test --workspace
       - run: cargo test -p chimaera-link --all-features
+      - run: cargo test --manifest-path plugins/Cargo.toml
 
   musl:
     needs: ui

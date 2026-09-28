@@ -23,5 +23,8 @@ Depth: [chimaera-app/AGENTS.md](../../crates/chimaera-app/AGENTS.md).
 - **`--askpass` must stay lightweight** — it's the `SSH_ASKPASS` relay and must never
   spawn a daemon or window. The three-role argv dispatch order in `main.rs` is
   load-bearing.
-- Signing is release-only (`TAURI_SIGNING_PRIVATE_KEY*`); the `app.yml` PR build needs
-  no key.
+- Updater signing is release-only (`TAURI_SIGNING_PRIVATE_KEY*`); the `app.yml`
+  PR build needs no key. macOS code signing still applies the hardened runtime
+  and `Entitlements.plist` on PRs. Keep its Wasmtime executable-memory grant:
+  the signed app's `--daemon` role executes WASM plugins too. The signed-bundle
+  smoke in app/release CI catches failures that ordinary test binaries cannot.

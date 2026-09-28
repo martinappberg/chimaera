@@ -136,6 +136,9 @@ pub struct Shell {
     /// through): window teardown during quit must NOT remove records from the
     /// registry, or quitting would forget every window.
     quitting: AtomicBool,
+    /// The last destroyed workbench needs a local Home before automatic exit.
+    /// Consumed only by the runtime's last-window exit, never explicit Quit.
+    last_close_needs_home: AtomicBool,
     /// Each window's unsaved-file count and the close/quit prompts it is
     /// answering (see `unsaved`).
     unsaved: Mutex<unsaved::Guard>,
@@ -545,7 +548,7 @@ pub(crate) fn finish_quit(app: &AppHandle) {
 /// - every window is minimized or hidden → restore ONLY the most recently
 ///   used one; the rest stay in the Dock where the user put them.
 /// - no window at all (a repeated launch racing startup; closing the last
-///   window quits the app) → open Home.
+///   Home window quits the app) → open Home.
 pub(crate) fn activate_app(app: &AppHandle, dock_click: bool) {
     let windows: Vec<_> = app
         .webview_windows()
@@ -959,6 +962,7 @@ pub(crate) fn finish_startup(handle: &tauri::AppHandle, local: LocalDaemon) -> t
             registry: Mutex::new(WindowRegistry::load_default()),
             appearance: Mutex::new(crate::appearance::AppearanceCache::load_default()),
             quitting: AtomicBool::new(false),
+            last_close_needs_home: AtomicBool::new(false),
             unsaved: Mutex::new(unsaved::Guard::default()),
             caffeinate: Mutex::new(None),
             drags: Mutex::new(HashMap::new()),
@@ -1150,9 +1154,18 @@ pub fn run() {
                     // window was holding moves on to the next one.
                     unsaved::window_destroyed(window.app_handle(), window.label());
                     if !shell.quitting.load(Ordering::Relaxed) {
-                        if let Some(scope) = scope {
+                        if let Some(scope) = &scope {
                             lock(&shell.registry).remove(&scope.stable_id);
                         }
+                        // Only local Home ends the close-to-Home flow. Record
+                        // the actual destroyed scope, after any unsaved prompt,
+                        // and let ExitRequested decide whether it was the last.
+                        shell.last_close_needs_home.store(
+                            scope.as_ref().is_some_and(|scope| {
+                                scope.alias.is_some() || scope.ws.is_some() || scope.detached
+                            }),
+                            Ordering::Relaxed,
+                        );
                         // The tray lists open windows; drop the closed one, and
                         // resync Settings for whatever window is focused now
                         // (or none). Skipped during quit (all windows tear down).
@@ -1291,6 +1304,32 @@ pub fn run() {
             // asks windows with unsaved edits first, like any quit.
             tauri::RunEvent::ExitRequested { code, api, .. } => {
                 if let Some(state) = app.try_state::<Shell>() {
+                    if code.is_none()
+                        && !state.quitting.load(Ordering::Relaxed)
+                        && state.last_close_needs_home.swap(false, Ordering::Relaxed)
+                    {
+                        api.prevent_exit();
+                        let app = app.clone();
+                        // WebView2 cannot create a window inside a synchronous
+                        // event handler. Hold automatic exit while a worker
+                        // opens Home; explicit Quit still takes precedence.
+                        tauri::async_runtime::spawn_blocking(move || {
+                            if app.state::<Shell>().quitting.load(Ordering::Relaxed) {
+                                return;
+                            }
+                            if let Err(error) = show_local_home(&app, None) {
+                                tracing::error!(
+                                    "could not open Home after last window closed: {error}"
+                                );
+                                // A failed replacement must not leave an
+                                // invisible app running with no way to close it.
+                                if app.webview_windows().is_empty() {
+                                    request_quit(&app);
+                                }
+                            }
+                        });
+                        return;
+                    }
                     if unsaved::exit_may_hold(code, state.quitting.load(Ordering::Relaxed))
                         && !unsaved::quit_may_proceed(app)
                     {

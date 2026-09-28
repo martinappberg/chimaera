@@ -276,11 +276,15 @@ pub(crate) fn spawn_signal_task(state: Arc<AppState>) {
                             crate::lock(&state.chat_catalogs).insert(id.clone(), catalog);
                         }
                     }
-                    if matches!(entry.ev, AgentEvent::TurnStarted { .. }) {
-                        crate::knowledge::prime(&state, &id).await;
-                    }
+                    // Queued, never awaited here: the Knowledge check asks a
+                    // plugin, and this task relays every chat's events. A
+                    // turn a TurnStarted closes ends before the new one's
+                    // baseline is taken.
                     if let Some(draft) = episodes.observe(&id, entry.ts, &entry.ev) {
-                        crate::episodes::record(&state, &id, draft, "protocol").await;
+                        crate::episodes::record(&state, &id, draft, "protocol");
+                    }
+                    if matches!(entry.ev, AgentEvent::TurnStarted { .. }) {
+                        crate::episodes::turn_started(&state, &id);
                     }
                     state.changes.notify_waiters();
                 }
@@ -307,11 +311,12 @@ pub(crate) fn spawn_signal_task(state: Arc<AppState>) {
                     // the workspace mapping the Timeline entry needs.
                     if !deliberate {
                         crate::lock(&state.notes).forget_session(&id);
+                        crate::plugins::runtime::session_ended(&state, &id);
                         let now = crate::timeline::now_ms();
                         if let Some(draft) = episodes.flush(&id, now) {
-                            crate::episodes::record(&state, &id, draft, "protocol").await;
+                            crate::episodes::record(&state, &id, draft, "protocol");
                         }
-                        crate::episodes::record_exit(&state, &id, &exit).await;
+                        crate::episodes::record_exit(&state, &id, &exit);
                     }
                     handle_chat_exit(&state, &id, exit).await;
                     state.changes.notify_waiters();

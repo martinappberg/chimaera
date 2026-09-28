@@ -1317,10 +1317,13 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
     let mut last_git: Option<String> = None;
     let mut last_update_epoch: Option<u64> = None;
     let mut last_recents_epoch: Option<u64> = None;
+    let mut last_agent_plugins_epoch: Option<u64> = None;
     let mut last_timeline: Option<String> = None;
     // Notices start at the head: a (re)connecting window is told about what
     // happens from now on, never handed old alerts as new.
     let mut last_notice = state.notices.head();
+    // Plugin `emit` frames, same rule: from now on, never a replay.
+    let mut last_plugin_event = state.plugin_runtime.events_head();
     // A new window's FIRST settings frame gets one fresh disk read (off the
     // reactor): a hand-edit inside the watcher's poll window must not greet
     // a fresh window with stale settings. Steady-state sends stay cached.
@@ -1366,6 +1369,13 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
         return;
     }
     if send_timeline_snapshot(&mut socket, &state, &mut last_timeline)
+        .await
+        .is_err()
+    {
+        return;
+    }
+
+    if send_agent_plugins_snapshot(&mut socket, &state, &mut last_agent_plugins_epoch)
         .await
         .is_err()
     {
@@ -1468,8 +1478,25 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
         {
             return;
         }
+        if send_agent_plugins_snapshot(&mut socket, &state, &mut last_agent_plugins_epoch)
+            .await
+            .is_err()
+        {
+            return;
+        }
         if let Some(frame) = crate::notices::frame_since(&state, &mut last_notice) {
             if socket.send(Message::Text(frame.into())).await.is_err() {
+                return;
+            }
+        }
+        // `{"type":"plugin", ...}` — additive; a client ignores types it
+        // doesn't know.
+        for frame in state.plugin_runtime.events_since(&mut last_plugin_event) {
+            if socket
+                .send(Message::Text(frame.as_ref().into()))
+                .await
+                .is_err()
+            {
                 return;
             }
         }
@@ -1479,6 +1506,22 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
         }
         tokio::time::sleep(EVENTS_THROTTLE).await;
     }
+}
+
+/// Installs and hook trust affect every workspace on this host. Push only
+/// an invalidation; visible Extensions views pull the agents' own reports.
+async fn send_agent_plugins_snapshot(
+    socket: &mut WebSocket,
+    state: &AppState,
+    last_epoch: &mut Option<u64>,
+) -> Result<(), axum::Error> {
+    let epoch = state.probes.changed_epoch();
+    if *last_epoch == Some(epoch) {
+        return Ok(());
+    }
+    send_json(socket, &json!({"type": "agent_plugins", "epoch": epoch})).await?;
+    *last_epoch = Some(epoch);
+    Ok(())
 }
 
 /// Send a path-only filesystem invalidation. File contents/listings remain

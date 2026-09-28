@@ -53,19 +53,32 @@ gitignored) and takes an **auto-assigned free port** (`autoPort`, via `$PORT`).
 the real `$HOME`, so `~/.claude` auth still works. No Vite, so no 5173 clash and
 no Node needed at run time.
 
-**One-time build first** (the script fails fast if either is missing):
+**One-time build first** (the script fails fast if any is missing):
 
 ```sh
 nvm use 22 && npm --prefix web-ui ci \
   && npm --prefix web-ui run build            # Node 22 — the nvm default (16) errors
-cargo build -p chimaera                       # rust-embed requires dist to exist first
+cargo build -p chimaera                       # rust-embed requires web-ui/dist to exist first
 ```
+
+No plugin build: the daemon embeds only `plugins/plugins.lock`, never a
+plugin's bytes, so a fresh debug daemon has **no plugins** until you install
+one — from the Extensions tab, with `chimaera plugin add <id>` (a first-party
+plugin at the lock's version), or with `chimaera plugin add --path <dir>` for a
+local build (a directory holding `plugin.wasm` and `plugin.toml`; the same
+version again replaces it, and a running session's next `tools/list` is the new
+build). From a shell, point the CLI at this worktree's isolated daemon with
+`CHIMAERA_HOME="$PWD/.chimaera-dev" target/debug/chimaera plugin …`.
+`bash scripts/build-plugins.sh` is for the tests only (`just check` runs it):
+it builds the fixture and downloads the locked releases into
+`plugins/dist-test` (see [plugins/AGENTS.md](../../../plugins/AGENTS.md)).
 
 Then `preview_start chimaerad-isolated`, read the printed
 `http://127.0.0.1:<port>/#token=…` from `preview_logs`, and navigate the preview
 there (serve mode has no `/dev/manifest` auto-auth — the token rides the URL
 fragment). A **debug** daemon reads `web-ui/dist` from disk per request, so after
 a UI change just rebuild the UI and reload the page — no daemon restart.
+Plugin installs take effect at once, with no restart either.
 
 To reset this worktree's isolated daemon state, delete `.chimaera-dev/`.
 

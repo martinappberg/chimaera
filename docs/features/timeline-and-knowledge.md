@@ -88,8 +88,8 @@ and the Mastermind-tier MCP tool `read_timeline`.
 - **What & when.** "What do we know — and how sure?" A read-only view with a fixed,
   plain-words shape over what agents recorded as they worked. The user's correction path is the
   file itself ("open file" opens it in the editor — there is no jump to the entry's line).
-- **Sources.** The structured provider — **mycelium**, only while its workbench plugin is
-  *active* here ([plugins.md](plugins.md#workbench-plugins)): `.living/findings/<topic>.md`,
+- **Sources.** The structured provider — **mycelium**, a WASM workbench plugin, only while it
+  is *active* here ([plugins.md](plugins.md#workbench-plugins)): `.living/findings/<topic>.md`,
   `.living/decisions.md`, `.living/learnings.md`, `todo/TODO_REGISTRY.md`, and the
   `.mycelium/last-session.md` handoff (falling back to an in-flight
   `.mycelium/run/<host>/<session-id>/` one). Always: the guidance files at the root
@@ -105,12 +105,20 @@ and the Mastermind-tier MCP tool `read_timeline`.
   Guidance & memory. A sticky section nav with counts, a "How sure" legend, one client-side
   search box (it covers the handoff too). Without a provider: Guidance & memory plus one card,
   "Use mycelium for Knowledge →", opening the attach sheet.
-- **Where it lives.** `knowledge.rs` (`get_knowledge`, `prime`, `recorded_since_last_check`,
-  the `knowledge_search` / `knowledge_get` plugin tools), `mycelium.rs` (`read`, `stamp`,
-  `fingerprint`, the `Knowledge` wire shape). Route: `GET /workspaces/{id}/knowledge` →
-  `{schema:1, provider: "mycelium" | null, left_off, topics, decisions, learnings, todos,
-  questions, counts, guidance, warnings}`; paths workspace-relative (claude memory absolute).
-  UI: `KnowledgeView.svelte`, `FindingRow.svelte`, `Ladder.svelte`, `model.ts`.
+- **Where it lives.** Core `knowledge.rs` keeps guidance, attribution and the route
+  (`get_knowledge`, `prime_workspace`, `recorded_since_last_check`); it never parses the provider's
+  files. The provider is the WASM plugin Mycelium, its own repository
+  ([martinappberg/chimaera-plugin-mycelium](https://github.com/martinappberg/chimaera-plugin-mycelium),
+  pinned by `plugins/plugins.lock`) — `src/reader.rs` (plan, parse,
+  stamp, fingerprint, the `Knowledge` wire shape), `src/tools.rs` (`knowledge_search` /
+  `knowledge_get`), `src/lib.rs` (the `knowledge` export) — asked through
+  `plugins::runtime::knowledge` with the stamp the daemon holds. Route:
+  `GET /workspaces/{id}/knowledge` → `{schema:1, provider: "mycelium" | null, left_off, topics,
+  decisions, learnings, todos, questions, counts, guidance, warnings}` plus `error` only when the
+  provider couldn't answer; paths workspace-relative
+  (claude memory absolute). The route JSON and the tool texts are pinned by
+  `crates/chimaera-server/src/tests/knowledge.rs`. UI: `KnowledgeView.svelte`,
+  `FindingRow.svelte`, `Ladder.svelte`, `model.ts`.
 - **Key behaviors.**
   - **Agents write, Chimaera reads.** The ladder is mycelium's (derived from its evidence
     ledger), read, never computed. Nothing writes a knowledge file or touches
@@ -119,19 +127,42 @@ and the Mastermind-tier MCP tool `read_timeline`.
     to fewer items plus a `warnings` line (never an error); fence- and HTML-comment-aware (an
     example entry in a code block is not knowledge); never follows symlinks. Caps: a file over
     2 MiB is skipped, 16 MiB per read, 200 topic files, 400 items per kind, 50 ledger rows,
-    2 KiB per text field. Blocking fs runs under `spawn_blocking`; every request re-stats
-    (metadata only) and re-parses only when the stamp moved.
+    2 KiB per text field. It reads through the plugin host's bounded filesystem functions
+    (workspace-relative, symlinks refused, off the reactor). Every request re-stats (metadata
+    only): when the stamp — `(path, mtime, len)` triples — still matches the one the daemon
+    holds, the plugin answers "unchanged" and the cached snapshot is served; otherwise it
+    re-parses. The first ask in a daemon's life compiles the plugin (about 200 ms in a release
+    build); later asks take milliseconds.
   - **Ids:** findings by their `F-NNN`; decisions and learnings by a fingerprint (kind + date +
     title hash), never mycelium's positional `L-N` / `D-N`.
+  - **Addenda are part of their finding.** A follow-up written as an `F-NNN addendum…` heading
+    (`##`–`####`, "(2)" and the like allowed) is listed under the finding it extends, in file
+    order — an "Addenda" block in the expanded row and "· N addenda" in its meta — and its
+    evidence rows, open questions and tags are the finding's (Mycelium plugin ≥ 0.1.3; the
+    route's optional `addenda: [{label, title, text, line}]`). A file that writes one id on two
+    different findings still shows both, with a warning.
   - **Attribution (`recorded_by`) is never guessed.** At each episode end the provider is
-    diffed against the last check; a new entry is credited to that turn only when its file
-    changed after the turn started (2 s slack) AND no other agent in the workspace was running.
-    Otherwise it stays unattributed — a new finding becomes its own `knowledge` Timeline entry
-    (≤5 per check). The baseline is primed at turn start (and when the view loads) so the first
-    turn after a restart can be credited; a workspace's first check only sets the baseline.
-    Confidence moves are their own entries; moves to or from `unknown` (a torn read) never are.
-    `recorded_by` lives in daemon memory (gone after a restart); the episode's
-    `evidence.recorded` persists on the Timeline.
+    diffed against the last check (the file mtimes come from the stamp); a new entry is
+    credited to that turn only when its file changed after the turn started (2 s slack) AND no
+    other agent in the workspace was running AND the turn's own session hadn't moved on to
+    another turn by the check. Otherwise it stays unattributed — a new finding
+    becomes its own `knowledge` Timeline entry (≤5 per check). The baseline is primed at turn
+    start (and when the view loads) so the first turn after a restart can be credited; a
+    workspace's first check only sets the baseline. Confidence moves are their own entries;
+    moves to or from `unknown` (a torn read) never are. `recorded_by` lives in daemon memory
+    (gone after a restart); the episode's `evidence.recorded` persists on the Timeline.
+  - **The check never holds anything up.** Turn starts and ends queue their Knowledge work on a
+    per-workspace FIFO (`episodes::EpisodeQueue`) instead of waiting on the provider where they
+    are seen — the chat relay carries every chat's events, and claude waits on a hook's answer
+    (10 s). Entries still land in the order their turns ended. A queue 16 or more jobs behind
+    catches up without asking the provider and drops the baseline, so nothing is credited
+    across the gap.
+  - **A provider that can't answer** (faulted, too slow, a snapshot that isn't a JSON object or
+    is over 4 MiB) is still the provider: the route serves the last snapshot it gave here with
+    an `error` (or empty lists, still naming it), and the view says so in one quiet line —
+    "Showing what mycelium read last — it couldn't refresh just now." — instead of offering to
+    switch it on. The snapshot is held per workspace and dropped when the provider is switched
+    off, updated, rolled back or removed.
   - **Refresh:** the client refetches on the Timeline epoch nudge and on visibility return —
     never polled. A hand edit between turns shows on the next fetch but writes no Timeline
     entry until an episode ends.

@@ -225,7 +225,9 @@
     attachRequest,
     closeAttachSheet,
     knowledgeProviderActive,
+    onAgentPluginsChanged,
   } from "./lib/plugins/store";
+  import ExtensionsGlyph from "./lib/plugins/ExtensionsGlyph.svelte";
   import ComputeStrip from "./lib/workspace/ComputeStrip.svelte";
   import {
     dropSpotAt,
@@ -1240,6 +1242,7 @@
     onOpenSession: openSess,
     onOpenTimeline: openTimelineSurface,
     onOpenKnowledge: openKnowledgeSurface,
+    onOpenExtensions: openPluginsSurface,
   });
 
   /**
@@ -1588,6 +1591,7 @@
       onSettings: applyRemoteSettings,
       onGit: onGitNudge,
       onTimeline: onTimelineNudge,
+      onAgentPlugins: onAgentPluginsChanged,
       onUpdate: (status) => (updateState.daemon = status),
       onRecents: (epoch) => {
         // Invalidate-and-pull, like git: a conversation retired somewhere;
@@ -3293,7 +3297,8 @@
     if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
   }
 
-  /** Open/focus the Plugins tab (quick-open, the attach affordances). */
+  /** Open/focus the Extensions tab (the `plugins` surface: quick-open, the
+   *  dock row, the attach affordances). */
   function openPluginsSurface(): void {
     if (activeWsId === null || !layoutReady) return;
     layout = openPlugins(layout);
@@ -3301,11 +3306,19 @@
   }
 
   /** Quick-open commands: the workspace surfaces that have no file or session
-   *  to match on ("Timeline", "Knowledge", "Plugins"). */
+   *  to match on ("Timeline", "Knowledge", "Extensions" — which "plugins" and
+   *  "skills" still find). */
   const quickOpenCommands = [
     { id: "timeline", label: "Timeline", hint: "what happened", run: openTimelineSurface },
     { id: "knowledge", label: "Knowledge", hint: "what we know", run: openKnowledgeSurface },
-    { id: "plugins", label: "Plugins", hint: "add-ons for this workspace", run: openPluginsSurface },
+    {
+      id: "plugins",
+      label: "Extensions",
+      aliases: ["plugins", "skills"],
+      hint: "plugins and skills",
+      glyph: "extensions" as const,
+      run: openPluginsSurface,
+    },
     {
       id: "mastermind",
       label: "Mastermind",
@@ -4441,7 +4454,7 @@
                     : tab.surface === "knowledge"
                       ? "Knowledge"
                       : tab.surface === "plugins"
-                        ? "Plugins"
+                        ? "Extensions"
                         : tab.surface === "browser"
                           ? (tab.host || "Browser")
                           : "Settings";
@@ -5035,26 +5048,17 @@
           </button>
         {/if}
 
-        <!-- Plugins (Installed · Skills): always a row — it is where a
-             plugin gets added in the first place. -->
+        <!-- Extensions (Plugins · Skills): always a row — it is where a
+             plugin gets installed in the first place. -->
         <button
           class="row dash-row"
           class:dash-active={pluginsOpen}
-          title="plugins & skills — add-ons for this workspace, and every skill your agents can use"
+          title="extensions — install plugins, and see every skill your agents can use"
           onclick={openPluginsSurface}
         >
-          <svg class="dash-glyph" viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
-            <!-- The plugins tab's own plug (PaneTabs): one glyph per surface. -->
-            <path
-              d="M5.5 2v3M10.5 2v3M4 5h8v2.5a4 4 0 0 1-8 0zM8 11.5V14"
-              fill="none"
-              stroke="currentColor"
-              stroke-width="1.4"
-              stroke-linecap="round"
-              stroke-linejoin="round"
-            />
-          </svg>
-          <span class="dash-label">plugins</span>
+          <!-- The Extensions tab's own glyph (plugins/glyph.ts): one glyph per surface. -->
+          <ExtensionsGlyph class="dash-glyph" />
+          <span class="dash-label">extensions</span>
         </button>
 
         <!-- Terminals first (there are few), agents below (there are many);
@@ -5731,15 +5735,29 @@
        the plugin card, the Mastermind dock). Lazy — it rides the plugins
        chunk, not the always-loaded shell. -->
   {#await import("./lib/plugins/AttachSheet.svelte") then { default: AttachSheet }}
-    <AttachSheet
-      wsId={activeWsId}
-      pluginId={$attachRequest.pluginId}
-      onOpenSession={(id) => {
-        closeAttachSheet();
-        openSess(id);
-      }}
-      onClose={closeAttachSheet}
-    />
+    <!-- Keyed: the sheet checks its workspace once when it opens, so a
+         workspace switch underneath must start it over, never post one
+         workspace's hook hashes to another. Bounded like the pane views: a
+         throw here closes into a line, not a frozen window. -->
+    {#key `${activeWsId}:${$attachRequest.pluginId}`}
+      <svelte:boundary onerror={(e) => console.error("attach sheet failed", e)}>
+        <AttachSheet
+          wsId={activeWsId}
+          pluginId={$attachRequest.pluginId}
+          onOpenSession={(id) => {
+            closeAttachSheet();
+            openSess(id);
+          }}
+          onClose={closeAttachSheet}
+        />
+        {#snippet failed()}
+          <div class="sheet-crash" role="alert">
+            <span>The setup sheet hit an error.</span>
+            <button type="button" onclick={closeAttachSheet}>Close</button>
+          </div>
+        {/snippet}
+      </svelte:boundary>
+    {/key}
   {/await}
 {/if}
 
@@ -7646,5 +7664,33 @@
     .upload-spinner {
       animation: none;
     }
+  }
+
+  .sheet-crash {
+    position: fixed;
+    left: 50%;
+    top: 30%;
+    transform: translateX(-50%);
+    z-index: 110;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 14px 18px;
+    background: var(--bg);
+    border: 1px solid var(--edge);
+    border-radius: 10px;
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.22);
+    font-size: var(--text-sm);
+    color: var(--muted);
+  }
+
+  .sheet-crash button {
+    border: 1px solid var(--edge);
+    border-radius: 6px;
+    padding: 4px 12px;
+    background: var(--bg);
+    color: var(--fg);
+    font: inherit;
+    cursor: pointer;
   }
 </style>

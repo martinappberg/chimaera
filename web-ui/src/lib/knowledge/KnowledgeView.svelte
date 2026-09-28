@@ -26,7 +26,7 @@
     LADDER_LEGEND,
     byDateDesc,
     categoryTone,
-    recentStatusMove,
+    statusMoves,
     searchKnowledge,
     sectionNav,
     todoTone,
@@ -47,8 +47,10 @@
   let { wsRoot, paneId, ctrl, visible = true }: Props = $props();
 
   let query = $state("");
+  let root = $state<HTMLDivElement | null>(null);
   let section = $state<"all" | SectionKey>("all");
-  /** The one expanded finding (id), decision (fp) and learning (fp). */
+  /** The one expanded finding, decision and learning (each by its `key`:
+   *  ids and fingerprints may repeat in a real repository). */
   let openFinding = $state<string | null>(null);
   let openDecision = $state<string | null>(null);
   let openLearning = $state<string | null>(null);
@@ -90,22 +92,36 @@
     ctrl.openFileFrom(paneId, abs(p), false);
   }
 
-  /** An open question links to its finding: expand it and scroll there. */
+  /** An open question links to its finding (the first with that id):
+   *  expand it and scroll there. */
   async function revealFinding(id: string): Promise<void> {
+    const key = raw?.topics.flatMap((t) => t.findings).find((f) => f.id === id)?.key;
+    if (key === undefined) return;
     if (section !== "all" && section !== "found") section = "all";
-    openFinding = id;
+    // A search that hides it would make the click do nothing visible.
+    if (!shown?.topics.some((t) => t.findings.some((f) => f.key === key))) query = "";
+    openFinding = key;
     await tick();
-    document.getElementById(`finding-${id}`)?.scrollIntoView({ block: "center", behavior: "smooth" });
+    // This view's copy: another pane (or a parked workspace) may hold one too.
+    root?.querySelector(`[id="finding-${CSS.escape(key)}"]`)?.scrollIntoView({ block: "center", behavior: "smooth" });
   }
+
+  const moves = $derived(statusMoves(timelineStore.entries, now));
 
   const handoffAge = $derived(
     raw?.left_off?.written_ms ? formatMessageTimestamp(raw.left_off.written_ms, now) : null,
   );
 
   const counts = $derived(shown?.counts ?? null);
+  /** A failed refresh over a snapshot it gave before, or over nothing. */
+  const hasSnapshot = $derived(
+    raw !== null &&
+      (raw.left_off !== null ||
+        raw.topics.length + raw.decisions.length + raw.learnings.length + raw.todos.length + raw.questions.length > 0),
+  );
 </script>
 
-<div class="knowledge">
+<div class="knowledge" bind:this={root}>
   <div class="inner">
     <header class="head">
       <div class="titles">
@@ -148,6 +164,18 @@
     {:else if raw === null || shown === null}
       <p class="empty">loading…</p>
     {:else}
+      {#if providerActive && raw.error !== null}
+        <!-- Quiet: the provider is still the provider, it just couldn't
+             read this time. What it said is the plugin's own words. -->
+        <p class="stale">
+          {#if hasSnapshot}
+            Showing what {raw.provider} read last — it couldn't refresh just now.
+          {:else}
+            {raw.provider} couldn't read this project just now.
+          {/if}
+          <span class="why">{raw.error}</span>
+        </p>
+      {/if}
       {#if raw.warnings.length > 0}
         <div class="warnings">
           {#each raw.warnings as w, i (i)}<div>{w}</div>{/each}
@@ -226,20 +254,20 @@
           {#if providerActive && shown.topics.length > 0 && show("found")}
             <section aria-labelledby="k-found" class="found">
               <h2 id="k-found" class="lbl">What we found</h2>
-              {#each shown.topics as t (t.slug)}
+              {#each shown.topics as t (t.key)}
                 <div class="topic">
                   <div class="thead">
                     <span class="mono tslug">{t.slug}</span>
                     <span class="tdesc">{t.description}</span>
                   </div>
                   <div class="card list">
-                    {#each t.findings as f (f.id)}
+                    {#each t.findings as f (f.key)}
                       <FindingRow
                         finding={f}
                         topic={t.slug}
-                        open={openFinding === f.id}
-                        badge={recentStatusMove(f.id, timelineStore.entries, now)}
-                        onToggle={() => (openFinding = openFinding === f.id ? null : f.id)}
+                        open={openFinding === f.key}
+                        badge={moves.get(f.id) ?? null}
+                        onToggle={() => (openFinding = openFinding === f.key ? null : f.key)}
                         onOpenFile={() => openFile(t.path)}
                         filePath={t.path}
                         {visible}
@@ -255,9 +283,9 @@
             <section aria-labelledby="k-decided">
               <h2 id="k-decided" class="lbl">What we decided</h2>
               <div class="rows">
-                {#each byDateDesc(shown.decisions) as d (d.fp)}
+                {#each byDateDesc(shown.decisions) as d (d.key)}
                   <div class="drow-wrap">
-                    <button class="drow" aria-expanded={openDecision === d.fp} onclick={() => (openDecision = openDecision === d.fp ? null : d.fp)}>
+                    <button class="drow" aria-expanded={openDecision === d.key} onclick={() => (openDecision = openDecision === d.key ? null : d.key)}>
                       <span class="mono muted date">{d.date}</span>
                       <span class="dbody">
                         <!-- eslint-disable-next-line svelte/no-at-html-tags -- sanitized in inlineMarkdown -->
@@ -272,7 +300,7 @@
                       </span>
                       <span class="mono muted by">{d.recorded_by?.name ?? ""}</span>
                     </button>
-                    {#if openDecision === d.fp}
+                    {#if openDecision === d.key}
                       <div class="detail">
                         {#if d.context}<div class="block"><div class="lbl small">Context</div><div class="md"><Markdown text={d.context} {visible} /></div></div>{/if}
                         {#if d.rationale}<div class="block"><div class="lbl small">Why</div><div class="md"><Markdown text={d.rationale} {visible} /></div></div>{/if}
@@ -293,8 +321,8 @@
             <section aria-labelledby="k-watch">
               <h2 id="k-watch" class="lbl">Watch out for</h2>
               <div class="watch">
-                {#each byDateDesc(shown.learnings) as l (l.fp)}
-                  <button class="lcard" class:open={openLearning === l.fp} aria-expanded={openLearning === l.fp} onclick={() => (openLearning = openLearning === l.fp ? null : l.fp)}>
+                {#each byDateDesc(shown.learnings) as l (l.key)}
+                  <button class="lcard" class:open={openLearning === l.key} aria-expanded={openLearning === l.key} onclick={() => (openLearning = openLearning === l.key ? null : l.key)}>
                     <span class="lhead">
                       <span class="cat mono {categoryTone(l.category)}">{l.category}</span>
                       {#if l.tags.length > 0}<span class="ltags mono">{l.tags.join(" · ")}</span>{/if}
@@ -305,7 +333,7 @@
                       <!-- eslint-disable-next-line svelte/no-at-html-tags -- sanitized in inlineMarkdown -->
                       <span class="lwhy">{@html inlineMarkdown(l.why)}</span>
                     {/if}
-                    {#if openLearning === l.fp}
+                    {#if openLearning === l.key}
                       <span class="lmore">
                         {#if l.what}<span class="block"><span class="lbl small">What happened</span><span class="md"><Markdown text={l.what} {visible} /></span></span>{/if}
                         {#if l.resolution}<span class="block"><span class="lbl small">Resolution</span><span class="md"><Markdown text={l.resolution} {visible} /></span></span>{/if}
@@ -496,6 +524,17 @@
   .err {
     color: var(--err);
   }
+  .stale {
+    margin: 0;
+    font-size: var(--text-xs);
+    color: var(--muted);
+    line-height: 1.5;
+  }
+  .stale .why {
+    display: block;
+    font-family: var(--mono);
+    overflow-wrap: anywhere;
+  }
   .warnings {
     font-size: var(--text-xs);
     color: var(--warn);
@@ -514,21 +553,6 @@
   .grid.solo {
     grid-template-columns: minmax(0, 1fr);
   }
-  @container (max-width: 820px) {
-    .grid {
-      grid-template-columns: minmax(0, 1fr);
-      gap: 22px;
-    }
-    .nav {
-      position: static;
-      flex-direction: row;
-      flex-wrap: wrap;
-    }
-    .legend {
-      display: none;
-    }
-  }
-
   .nav {
     display: flex;
     flex-direction: column;
@@ -584,6 +608,23 @@
     line-height: 1.45;
     padding-top: 4px;
     opacity: 0.85;
+  }
+  /* After the base .grid/.nav/.legend rules: same specificity, so an earlier
+     block lost to them and the narrow view kept a sticky, see-through nav
+     over the findings. */
+  @container (max-width: 820px) {
+    .grid {
+      grid-template-columns: minmax(0, 1fr);
+      gap: 22px;
+    }
+    .nav {
+      position: static;
+      flex-direction: row;
+      flex-wrap: wrap;
+    }
+    .legend {
+      display: none;
+    }
   }
 
   .lbl {

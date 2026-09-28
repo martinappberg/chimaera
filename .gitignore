@@ -1,6 +1,12 @@
 /target
 node_modules/
 web-ui/dist/
+# The daemon tests' plugin layout (scripts/build-plugins.sh: the fixture and
+# the locked releases, and its staging dir); the plugins workspace has its
+# own target dir.
+plugins/dist-test/
+plugins/.dist-test.stage/
+plugins/target/
 # The native shell is a standalone cargo workspace (Tauri stays out of the
 # daemon workspace), so it has its own target dir.
 crates/chimaera-app/target/

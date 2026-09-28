@@ -44,7 +44,7 @@
   import { getSetting, setSetting } from "../settings/store.svelte";
   import { lastSeen, markSeen, timelineStore, type SeenMark } from "../workspace/timeline.svelte";
   import { knowledge, knowledgeAvailable } from "../workspace/knowledge";
-  import { knowledgeProviderActive, openAttachSheet } from "../plugins/store";
+  import { knowledgeProviderActive, workspacePlugins } from "../plugins/store";
 
   interface Props {
     dash: DashCtx;
@@ -456,13 +456,15 @@
         {/if}
 
         {#if $knowledgeAvailable !== false}
-          <!-- Where things stand: the top of Knowledge, or the one-line
-               attach offer. Hidden on a daemon without a knowledge route. -->
+          <!-- Where things stand: the top of Knowledge, or the calm note on
+               what Agent notes and Mycelium would add. Hidden on a daemon
+               without a knowledge route. -->
           <WhereThingsStand
             knowledge={$knowledge}
             providerActive={$knowledgeProviderActive}
+            notesActive={$workspacePlugins?.plugins.some((p) => p.id === "agent-notes" && p.active) === true}
             onOpenKnowledge={dash.onOpenKnowledge}
-            onAttach={() => openAttachSheet("mycelium")}
+            onOpenExtensions={dash.onOpenExtensions}
           />
         {/if}
 

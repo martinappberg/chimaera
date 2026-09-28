@@ -59,9 +59,15 @@
   import { activateUrl, isWebUrl, urlMenuEntries } from "../shared/urlOpen";
   import { contextMenu } from "../shared/contextMenu.svelte";
   import { safeDecodeUri } from "../previews/files";
+  import { mount, unmount } from "svelte";
   import { parseSizeHint, splitTarget } from "../shared/embed/embed";
-  import { mountEmbed, type EmbedHandle } from "../shared/embed/mount.svelte";
+  import { mountEmbed } from "../shared/embed/mount.svelte";
   import type { EmbedResolver } from "./embeds";
+  import { chipLabels, embedsAsChip } from "./artifacts";
+  import { refFragment, type HoverTargets } from "./hoverTargets";
+  import ProseChip from "./ProseChip.svelte";
+  import type { Reveal } from "../shared/reveal";
+  import { openPath } from "../shared/openPath";
 
   interface Props {
     text: string;
@@ -86,6 +92,9 @@
     /** Resolves local images in the prose (`![](figs/plot.png)`) against
      *  the session's directories, so they render as embed cards. */
     embeds?: EmbedResolver;
+    /** The chat's hover registry: resolved path links and document chips
+     *  register the file they preview. */
+    hoverTargets?: HoverTargets;
   }
 
   let {
@@ -96,6 +105,7 @@
     resolvePaths,
     onReveal,
     embeds,
+    hoverTargets,
   }: Props = $props();
 
   /** Embed slots this component built, each with the (hidden) placeholder
@@ -103,7 +113,7 @@
    *  HTML, so its leaving the DOM (a re-render, a rewritten stream, the
    *  settle swap) is what retires the slot: the card is destroyed and the
    *  slot removed — even when it sat outside the nodes `{@html}` tracks. */
-  const mountedEmbeds = new Map<HTMLElement, { img: HTMLElement; card: EmbedHandle | null }>();
+  const mountedEmbeds = new Map<HTMLElement, { img: HTMLElement; card: { destroy(): void } | null }>();
 
   function sweepEmbeds(all = false): void {
     for (const [slot, { img, card }] of mountedEmbeds) {
@@ -116,18 +126,28 @@
   }
 
   /** Swap every inert local-image placeholder in `root` (the sanitizer's
-   *  `data-md-embed` <img>) for an embed card in a slot this component
-   *  builds. Runs on settled/closed content only — the per-chunk open tail
-   *  keeps its placeholders, so a card never churns with the stream. */
+   *  `data-md-embed` <img>) for an embed card — or, for a document, a chip
+   *  (`embedsAsChip`) — in a slot this component builds. Runs on
+   *  settled/closed content only — the per-chunk open tail keeps its
+   *  placeholders, so a card never churns with the stream. */
   function upgradeEmbeds(root: HTMLElement): void {
     sweepEmbeds();
-    for (const img of root.querySelectorAll<HTMLImageElement>("img[data-md-embed]:not(.md-embed-src)")) {
+    const imgs = Array.from(root.querySelectorAll<HTMLImageElement>("img[data-md-embed]:not(.md-embed-src)"));
+    if (imgs.length === 0) return;
+    // Chips sharing a name show their folders (`a/README.md`, `b/README.md`).
+    const chipPaths = imgs
+      .map((img) => img.getAttribute("data-md-embed") ?? "")
+      .filter(embedsAsChip)
+      .map((t) => safeDecodeUri(splitTarget(t).path));
+    const labels = chipLabels([...new Set(chipPaths)]);
+    for (const img of imgs) {
       const target = img.getAttribute("data-md-embed") ?? "";
       const { alt, width } = parseSizeHint(img.getAttribute("alt") ?? "");
       const { path, fragment } = splitTarget(target);
       const shown = safeDecodeUri(path);
-      const slot = document.createElement("div");
-      slot.className = "md-embed";
+      const chip = embedsAsChip(target);
+      const slot = document.createElement(chip ? "span" : "div");
+      slot.className = chip ? "md-embed md-embed-chip" : "md-embed";
       // The placeholder stays (hidden) rather than being replaced: it may be
       // a top-level node of the settled `{@html}`, whose teardown walks the
       // nodes it inserted.
@@ -139,6 +159,25 @@
         slot.classList.add("md-embed-text");
         slot.textContent = alt !== "" ? `${alt} (${shown})` : shown;
         mountedEmbeds.set(slot, { img, card: null });
+        continue;
+      }
+      if (chip) {
+        // Without the chat's opener, the workbench's (an embed card's default).
+        const open: OpenPathFn = onOpenPath ?? openPath;
+        const mounted = mount(ProseChip, {
+          target: slot,
+          props: {
+            shown,
+            label: labels.get(shown) ?? shown,
+            fragment,
+            alt,
+            ...(resolver !== undefined ? { resolve: () => resolver.resolve(target) } : {}),
+            onOpen: (p: string, reveal: Reveal | undefined, e: MouseEvent) =>
+              open(p, "file", { split: e.metaKey || e.ctrlKey, ...(reveal !== undefined ? { reveal } : {}) }),
+            ...(hoverTargets !== undefined ? { hoverTargets } : {}),
+          },
+        });
+        mountedEmbeds.set(slot, { img, card: { destroy: () => void unmount(mounted) } });
         continue;
       }
       const card = mountEmbed(slot, {
@@ -206,6 +245,13 @@
 
   function markPath(node: Element, label: string, ref: FileRef, res: Resolution) {
     if (res.state === "miss") return;
+    // A file previews on a rest (a directory, or a name with several
+    // matches, has no one thing to show).
+    if (res.state === "hit" && res.hit.kind === "file") {
+      hoverTargets?.set(node, { path: res.hit.path, fragment: refFragment(ref, node.getAttribute("href")) });
+    } else {
+      hoverTargets?.delete(node);
+    }
     node.classList.add("md-path");
     node.classList.toggle("md-ambiguous", res.state === "ambiguous");
     node.setAttribute("role", "button");
@@ -227,6 +273,7 @@
   /** Undo `markPath`: the reference no longer resolves. */
   function unmarkPath(node: Element) {
     stamps.delete(node);
+    hoverTargets?.delete(node);
     node.classList.remove("md-path", "md-ambiguous");
     node.removeAttribute("role");
     node.removeAttribute("title");
@@ -1211,12 +1258,38 @@
     color: var(--muted);
     font-size: var(--text-xs);
   }
+  /* A document's placeholder is chip-sized: it becomes one (embedsAsChip),
+     and the line should not jump when its segment closes. */
+  .md
+    :global(
+      img[data-md-embed]:not(.md-embed-src):is(
+          [data-md-embed$=".md" i],
+          [data-md-embed*=".md#" i],
+          [data-md-embed$=".markdown" i],
+          [data-md-embed$=".docx" i],
+          [data-md-embed$=".pptx" i]
+        )
+    ) {
+    display: inline-block;
+    width: 9em;
+    height: 1.5em;
+    margin: 0.15em 0.25em 0.15em 0;
+    border-radius: 999px;
+    vertical-align: middle;
+  }
   .md :global(img.md-embed-src) {
     display: none;
   }
   .md :global(.md-embed) {
     display: block;
     max-width: 100%;
+  }
+  /* A document the prose embeds is named inline on a chip; several in a
+     row share the line. */
+  .md :global(.md-embed.md-embed-chip) {
+    display: inline-flex;
+    vertical-align: baseline;
+    margin: 0.15em 0.25em 0.15em 0;
   }
   .md :global(.md-embed-text) {
     color: var(--muted);

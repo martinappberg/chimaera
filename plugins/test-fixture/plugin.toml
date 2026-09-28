@@ -1,0 +1,23 @@
+# Test-only: built into plugins/dist-test, embedded only by the daemon's
+# test builds. Each tool pokes one host limit.
+id = "test-fixture"
+name = "Test fixture"
+version = "0.1.0"
+summary = "Pokes the plugin host's limits in the daemon's tests."
+description = "A plugin that exists only for chimaera's own tests. Each of its tools pushes one limit of the plugin host, so the tests can check that a plugin stays inside them."
+api = "0.1"
+
+[provides]
+mcp_tools = ["echo", "loop", "allocate", "panic", "read", "state", "append", "recent"]
+
+[adds]
+agents = ["8 test tools: echo · loop · allocate · panic · read · state · append · recent"]
+
+# An agent-side plugin it recommends (never needs), and the sentence the
+# card says about it: the tests read both back on the card's wire.
+[recommends]
+summary = "The fixture's agent-side helper gives claude a tool to call the fixture's tools. Install it only to test the Extensions tab."
+
+[recommends.agent_plugins.claude]
+id = "fixture-helper@fixture"
+marketplace = "acme/fixture-helper"

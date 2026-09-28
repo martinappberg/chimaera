@@ -3,13 +3,15 @@
    * Skills — "what can my agents do here?" (design §6.4): every skill any
    * agent can use in this workspace on this host, in the order you'd look
    * for it — this project's own, then each plugin's (a plugin is what you
-   * install, so it is what the list is read by), then yours, then the
-   * commands built into the agents as one quiet line. Each row names the
-   * skill, says what it does, and carries a badge only for the agents that
-   * can use it; a click opens the row in place: how each agent calls it
-   * (copyable, in the agent's own syntax), its SKILL.md, and any load error.
-   * Truth comes from the agents; codex's load errors are shown, not hidden.
+   * install, so it is what the list is read by), then yours, then what is
+   * built into claude and into codex, each as one quiet flow of chips in
+   * that agent's own syntax (`/name`, `$name`). Each row names the skill,
+   * says what it does, and carries a badge only for the agents that can use
+   * it; a click opens the row in place: how each agent calls it (copyable),
+   * its SKILL.md, and any load error. Truth comes from the agents; codex's
+   * load errors are shown, not hidden.
    */
+  import Segmented from "../shared/Segmented.svelte";
   import { inlineMarkdown } from "../shared/inlineMarkdown";
   import { copyText } from "../shared/clipboard";
   import {
@@ -19,8 +21,8 @@
     pluginSections,
     shortName,
     skillCounts,
-    usable,
     type SkillFilter,
+    type SkillGroup,
   } from "./skillsModel";
   import type { AgentId, Skill, SkillsReport } from "./store";
 
@@ -46,7 +48,8 @@
   $effect(() => () => {
     if (copiedTimer !== null) clearTimeout(copiedTimer);
   });
-  let builtinsAll = $state(false);
+  /** The built-in groups showing all their chips ("+ 12 more" opened). */
+  let builtinsAll = $state(new Set<string>());
   const BUILTIN_SHOWN = 18;
 
   const AGENTS: AgentId[] = ["claude", "codex"];
@@ -55,6 +58,16 @@
   const counts = $derived(skillCounts(all));
   const shown = $derived(filterSkills(all, filter, query));
   const groups = $derived(groupSkills(shown, host));
+  /** claude reports its built-ins only while one of its chats runs: say so
+   *  where they would be, and only then. */
+  const claudeQuiet = $derived(
+    report !== null && report.agents.claude.available && !report.agents.claude.live && filter !== "codex" && query.trim() === "",
+  );
+  const hasClaudeBuiltins = $derived(groups.some((g) => g.key === "builtin-claude"));
+
+  function builtinAgent(g: SkillGroup): AgentId {
+    return g.key === "builtin-codex" ? "codex" : "claude";
+  }
 
   function abs(p: string): string {
     return p.startsWith("/") || p.startsWith("~") || wsRoot === null ? p : `${wsRoot}/${p}`;
@@ -119,12 +132,13 @@
     </button>
     {#if expanded}
       {@const file = skillFile(s)}
-      <div class="sbody">
-        <div class="uses">
+      <dl class="sbody">
+        <dt>Use it</dt>
+        <dd class="uses">
           {#each AGENTS as a (a)}
             {@const st = s.agents[a]}
             {#if st.state === "available"}
-              <button class="use" title="copy — then type it in {a}" onclick={() => copy(s, a)}>
+              <button class="use" title="Copy, then type it in {a}" onclick={() => copy(s, a)}>
                 <span class="uagent">{a}</span>
                 <span class="uinv">{invokeSyntax(s, a)}</span>
                 <span class="ucopy">{copied === `${s.name}:${a}` ? "copied" : "copy"}</span>
@@ -133,72 +147,101 @@
               <span class="useoff"><span class="uagent">{a}</span>{st.reason ?? "present but not usable"}</span>
             {/if}
           {/each}
-        </div>
+        </dd>
         {#if file !== null}
-          <div class="fileline">
-            <button class="link" onclick={() => onOpenFile(abs(file))}>open SKILL.md</button>
+          <dt>File</dt>
+          <dd class="fileline">
+            <button class="link" title={abs(file)} onclick={() => onOpenFile(abs(file))}>open SKILL.md</button>
             <span class="fpath" title={abs(file)}>{file}</span>
-          </div>
+          </dd>
         {/if}
-        {#each errs as e, i (i)}
-          <div class="errline">{e}</div>
-        {/each}
-      </div>
+        {#if errs.length > 0}
+          <dt>Problems</dt>
+          <dd>
+            {#each errs as e, i (i)}
+              <div class="errline">{e}</div>
+            {/each}
+          </dd>
+        {/if}
+      </dl>
     {/if}
   </div>
+{/snippet}
+
+{#snippet builtins(g: SkillGroup)}
+  {@const agent = builtinAgent(g)}
+  {@const all = builtinsAll.has(g.key)}
+  <div class="flow">
+    {#each all ? g.skills : g.skills.slice(0, BUILTIN_SHOWN) as s (s.name)}
+      <button class="bchip" title="{s.description || s.name} — click to copy" onclick={() => copy(s, agent)}>
+        {copied === `${s.name}:${agent}` ? "copied" : invokeSyntax(s, agent)}
+      </button>
+    {/each}
+    {#if g.skills.length > BUILTIN_SHOWN}
+      <button
+        class="link small"
+        onclick={() => {
+          const next = new Set(builtinsAll);
+          if (all) next.delete(g.key);
+          else next.add(g.key);
+          builtinsAll = next;
+        }}
+      >
+        {all ? "fewer" : `${g.skills.length - BUILTIN_SHOWN} more`}
+      </button>
+    {/if}
+  </div>
+{/snippet}
+
+{#snippet claudeNote()}
+  <section class="group">
+    <h3 class="ghead"><span class="lbl">Built into claude</span></h3>
+    <p class="note">claude lists its built-in skills only while a claude chat runs.</p>
+  </section>
 {/snippet}
 
 {#if status === "unavailable"}
   <p class="empty">This daemon can't list skills yet — update chimaera.</p>
 {:else if status === "error" && report === null}
-  <p class="empty err">{error} <button class="link" onclick={onRefresh}>retry</button></p>
+  <p class="empty"><span class="err">Couldn't ask the agents: {error}</span> <button class="link" onclick={onRefresh}>Try again</button></p>
 {:else if report === null}
   <p class="empty">asking claude and codex…</p>
 {:else}
   <div class="bar">
-    <span class="count">
-      <b>{counts.total}</b> skill{counts.total === 1 ? "" : "s"}
-      <span class="muted">· claude {counts.claude} · codex {counts.codex}</span>
-    </span>
-    <div class="filters" role="group" aria-label="Show skills for">
-      {#each [
-        { v: "all", l: "All" },
-        { v: "claude", l: "claude" },
-        { v: "codex", l: "codex" },
-      ] as f (f.v)}
-        <button
-          class="fchip"
-          class:on={filter === f.v}
-          aria-pressed={filter === f.v}
-          onclick={() => (filter = f.v as SkillFilter)}>{f.l}</button
-        >
-      {/each}
-    </div>
+    <Segmented
+      label="Show skills for"
+      value={filter}
+      options={[
+        { value: "all", label: "All" },
+        { value: "claude", label: "claude" },
+        { value: "codex", label: "codex" },
+      ]}
+      onChange={(v) => (filter = v as SkillFilter)}
+    />
     <label class="search">
       <span class="sr">Search skills</span>
-      <input type="search" placeholder="Search skills…" bind:value={query} spellcheck="false" />
+      <input type="search" placeholder="Search skills" bind:value={query} spellcheck="false" autocomplete="off" />
     </label>
+    <span class="count">
+      {counts.total} skill{counts.total === 1 ? "" : "s"}
+      <span class="muted">· claude {counts.claude} · codex {counts.codex}</span>
+    </span>
   </div>
 
   {#if !report.agents.claude.available && !report.agents.codex.available}
     <p class="empty">Neither claude nor codex is installed on {host}, so there are no skills to list.</p>
   {:else if shown.length === 0}
-    <p class="empty">Nothing matches.</p>
+    <p class="empty">{query.trim() !== "" ? `No skill matches “${query.trim()}”.` : "No skills here yet."}</p>
   {/if}
 
   {#each groups as g (g.key)}
+    {#if g.key === "builtin-codex" && claudeQuiet && !hasClaudeBuiltins}
+      {@render claudeNote()}
+    {/if}
     <section class="group">
       <h3 class="ghead">
-        <span class="lbl">{g.key === "builtin" ? "Built into the agents" : g.label}</span>
-        {#if g.key === "builtin"}
-          <span class="hint"
-            >the commands they ship with{!report.agents.claude.live
-              ? " · start a claude chat session to see claude's"
-              : ""}</span
-          >
-        {:else if g.key !== "plugin" && g.hint}
-          <span class="hint">{g.hint}</span>
-        {/if}
+        <span class="lbl">{g.label}</span>
+        {#if g.key !== "plugin" && g.hint}<span class="hint">{g.hint}</span>{/if}
       </h3>
 
       {#if g.key === "plugin"}
@@ -208,7 +251,7 @@
               <span class="pname">{p.plugin}</span>
               <span class="hint"
                 >{p.skills.length} skill{p.skills.length === 1 ? "" : "s"}{p.agents.length > 0
-                  ? ` · ${p.agents.join(" + ")}`
+                  ? ` · ${p.agents.join(" and ")}`
                   : ""}</span
               >
             </div>
@@ -219,19 +262,8 @@
             </div>
           </div>
         {/each}
-      {:else if g.key === "builtin"}
-        <!-- One quiet line: the agents' own commands, in their own syntax. -->
-        <div class="flow">
-          {#each builtinsAll ? g.skills : g.skills.slice(0, BUILTIN_SHOWN) as s (s.name)}
-            {@const agent = usable(s, "claude") ? "claude" : "codex"}
-            <span class="bchip" title="{agent}: {s.description}">{invokeSyntax(s, agent)}</span>
-          {/each}
-          {#if g.skills.length > BUILTIN_SHOWN}
-            <button class="link" onclick={() => (builtinsAll = !builtinsAll)}>
-              {builtinsAll ? "fewer" : `+ ${g.skills.length - BUILTIN_SHOWN} more`}
-            </button>
-          {/if}
-        </div>
+      {:else if g.key === "builtin-claude" || g.key === "builtin-codex"}
+        {@render builtins(g)}
       {:else}
         <div class="list">
           {#each g.skills as s (s.name)}
@@ -241,6 +273,9 @@
       {/if}
     </section>
   {/each}
+  {#if claudeQuiet && !hasClaudeBuiltins && !groups.some((g) => g.key === "builtin-codex")}
+    {@render claudeNote()}
+  {/if}
 
   {#if strayErrors.length > 0}
     <section class="group">
@@ -284,6 +319,12 @@
     font-size: var(--text-xs);
     color: var(--muted);
   }
+  .note {
+    margin: 0;
+    font-size: var(--text-sm);
+    line-height: 1.5;
+    color: var(--muted);
+  }
   .link {
     appearance: none;
     border: none;
@@ -293,82 +334,66 @@
     font-size: var(--text-sm);
     color: var(--accent);
     cursor: pointer;
+    border-radius: 3px;
   }
   .link:hover {
     text-decoration: underline;
   }
+  .link.small {
+    font-size: var(--text-xs);
+  }
 
-  /* --- the bar: count · who · search ---------------------------------------- */
+  /* --- the controls: who · search · count (Settings' control recipes) ------- */
+  /* These blocks sit straight in PluginsView's column, whose gap spaces
+     them: no margins of their own. */
   .bar {
     display: flex;
     align-items: center;
-    gap: 14px;
+    gap: 10px 14px;
     flex-wrap: wrap;
-    margin-bottom: 22px;
-  }
-  .count {
-    font-size: var(--text-sm);
-    white-space: nowrap;
-  }
-  .filters {
-    display: flex;
-    gap: 4px;
-  }
-  .fchip {
-    appearance: none;
-    border: 1px solid var(--edge);
-    background: none;
-    color: var(--muted);
-    font: inherit;
-    font-size: var(--text-xs);
-    padding: 2px 10px;
-    border-radius: 999px;
-    cursor: pointer;
-    transition:
-      color 0.12s ease,
-      border-color 0.12s ease,
-      background-color 0.12s ease;
-  }
-  .fchip:hover {
-    color: var(--fg);
-  }
-  .fchip.on {
-    color: var(--fg);
-    border-color: color-mix(in srgb, var(--accent) 55%, var(--edge));
-    background: color-mix(in srgb, var(--accent) 10%, transparent);
   }
   .search {
-    margin-left: auto;
+    flex: 1 1 220px;
+    max-width: 340px;
+    display: flex;
   }
   .search input {
-    width: 220px;
-    max-width: 40vw;
+    width: 100%;
     font: inherit;
     font-size: var(--text-sm);
     color: var(--fg);
     background: var(--bg);
     border: 1px solid var(--edge);
-    border-radius: 8px;
-    padding: 5px 10px;
-    outline: none;
+    border-radius: 7px;
+    padding: 4px 10px;
   }
   .search input:focus {
-    border-color: color-mix(in srgb, var(--accent) 55%, var(--edge));
+    outline: 2px solid var(--focus-ring);
+    outline-offset: 1px;
+  }
+  .search input::placeholder {
+    color: var(--muted);
+  }
+  .count {
+    margin-left: auto;
+    font-size: var(--text-sm);
+    white-space: nowrap;
   }
 
   /* --- groups ---------------------------------------------------------------- */
   .group {
-    margin-bottom: 26px;
+    margin: 0;
   }
   .ghead {
     display: flex;
     align-items: baseline;
-    gap: 10px;
+    flex-wrap: wrap;
+    gap: 4px 10px;
     margin: 0 0 10px;
     font: inherit;
   }
-  .plugin {
-    margin-bottom: 14px;
+  .plugin + .plugin {
+    margin-top: 16px;
   }
   .phead {
     display: flex;
@@ -388,7 +413,7 @@
     border: 1px solid var(--edge);
     border-radius: 10px;
     overflow: hidden;
-    background: var(--bg);
+    background: var(--overlay-bg);
   }
   .skill + .skill {
     border-top: 1px solid var(--edge);
@@ -411,6 +436,9 @@
   }
   .shead:hover {
     background: var(--row-hover);
+  }
+  .shead:focus-visible {
+    outline-offset: -2px;
   }
   .expanded .shead {
     background: color-mix(in srgb, var(--accent) 5%, transparent);
@@ -440,6 +468,7 @@
   .expanded .sdesc {
     display: block;
     color: var(--fg);
+    line-height: 1.55;
   }
   .agents {
     display: flex;
@@ -486,18 +515,30 @@
   }
 
   /* --- the opened row: how to call it, where it lives ------------------------ */
-  /* Same columns as the row head, so everything lines up under the
-     description. */
+  /* A small definition list under the description: labels in the muted
+     label style, aligned in one column. */
   .sbody {
     display: grid;
-    grid-template-columns: minmax(120px, 210px) minmax(0, 1fr) auto 12px;
-    column-gap: 16px;
-    row-gap: 8px;
-    padding: 2px 14px 12px;
+    grid-template-columns: max-content minmax(0, 1fr);
+    align-items: baseline;
+    gap: 10px 18px;
+    margin: 0;
+    /* Past the name column (14px padding + its 210px + the 16px gap), so
+       it lines up under the description. */
+    padding: 4px 14px 14px 240px;
     background: color-mix(in srgb, var(--accent) 5%, transparent);
   }
-  .sbody > :global(*) {
-    grid-column: 2 / 4;
+  .sbody dt {
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--muted);
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  .sbody dd {
+    margin: 0;
+    min-width: 0;
   }
   .uses {
     display: flex;
@@ -514,8 +555,8 @@
     color: var(--fg);
     background: var(--bg);
     border: 1px solid var(--edge);
-    border-radius: 8px;
-    padding: 4px 6px 4px 10px;
+    border-radius: 7px;
+    padding: 3px 6px 3px 10px;
     cursor: pointer;
     transition: border-color 0.12s ease;
   }
@@ -547,13 +588,17 @@
     align-items: center;
     font-size: var(--text-sm);
     color: var(--muted);
-    padding: 4px 0;
+    padding: 3px 0;
   }
   .fileline {
     display: flex;
     align-items: baseline;
     gap: 10px;
     min-width: 0;
+  }
+  .fileline .link {
+    flex: none;
+    white-space: nowrap;
   }
   .fpath {
     font-family: var(--mono);
@@ -568,38 +613,54 @@
     font-size: var(--text-sm);
     color: var(--warn);
     line-height: 1.45;
+    overflow-wrap: anywhere;
   }
 
-  /* --- built-ins: one quiet flow -------------------------------------------- */
+  /* --- built-ins: one quiet flow per agent, each in its own syntax ---------- */
   .flow {
     display: flex;
     flex-wrap: wrap;
-    align-items: baseline;
-    gap: 6px 8px;
+    align-items: center;
+    gap: 6px;
   }
   .bchip {
+    appearance: none;
     font-family: var(--mono);
     font-size: var(--text-xs);
     color: var(--muted);
+    background: none;
     padding: 1px 8px;
     border: 1px solid var(--edge);
     border-radius: 999px;
-    cursor: default;
+    cursor: pointer;
+    transition:
+      color 0.12s ease,
+      border-color 0.12s ease;
+  }
+  .bchip:hover {
+    color: var(--fg);
+    border-color: color-mix(in srgb, var(--accent) 45%, var(--edge));
   }
 
-  @media (max-width: 720px) {
+  @container (max-width: 720px) {
     .shead {
       grid-template-columns: minmax(0, 1fr) auto 12px;
+      gap: 6px 12px;
     }
     .sdesc {
       grid-column: 1 / -1;
       grid-row: 2;
     }
     .sbody {
-      grid-template-columns: minmax(0, 1fr);
+      padding-left: 14px;
     }
-    .sbody > :global(*) {
-      grid-column: 1;
+    .count {
+      margin-left: 0;
+    }
+    .search {
+      max-width: none;
+      flex-basis: 100%;
+      order: 3;
     }
   }
 </style>

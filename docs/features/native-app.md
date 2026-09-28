@@ -55,9 +55,13 @@ app-build` (never the root `cargo`).
   coordinate math in `shell/drag.rs` — logical space on macOS, physical elsewhere).
   Closing a window removes its record (macOS convention) **except during quit** (guarded by an
   `AtomicBool quitting` so teardown doesn't forget every window). Geometry is stored in logical pixels
-  (correct across scale factors) on a slow 2s tick. Closing the final window exits the app directly
-  (on every platform — the maintainer's call, 2026-09-25, over the Mac convention of staying alive in
-  the Dock); the shell never inserts an extra Home that needs a second close. **Home is the New Window launcher**: File/tray
+  (correct across scale factors) on a slow 2s tick. Closing the final workspace, detached pane,
+  or remote-host detail window opens local Home. Closing local Home as the final window exits the
+  app on every platform. This fallback runs only after the unsaved-edits guard permits the close;
+  explicit Quit still exits directly and preserves the open window set for restore. The transition
+  lives in `shell.rs`'s `Destroyed` and `ExitRequested` handlers; automatic exit waits while
+  a worker opens Home (WebView2 cannot create it inside a synchronous window event).
+  **Home is the New Window launcher**: File/tray
   New Window creates a Home window when no unused launcher exists, otherwise it raises that singleton
   launcher. Browsing a connected host navigates the launcher to its detail page and Back re-homes it
   onto the local daemon. Selecting a local or remote workspace consumes the launcher and promotes that

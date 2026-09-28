@@ -40,7 +40,9 @@ Each area carries its own `AGENTS.md` map (file table + the invariants that bite
 | `crates/chimaera-pty` | the persistent PTY / terminal engine | [map](crates/chimaera-pty/AGENTS.md) |
 | `crates/chimaera-agent` | the structured-agent engine (drivers, journal) | [map](crates/chimaera-agent/AGENTS.md) · [PROTOCOL](crates/chimaera-agent/PROTOCOL.md) |
 | `crates/chimaera-remote` | SSH orchestration for `connect` (thorough in-code docs) | — |
-| `crates/chimaera-server` | the daemon: every route + WS + business logic; embeds `web-ui/dist` | [map](crates/chimaera-server/AGENTS.md) |
+| `crates/chimaera-server` | the daemon: every route + WS + business logic; embeds `web-ui/dist` and the plugins lock (no plugin bytes) | [map](crates/chimaera-server/AGENTS.md) |
+| `crates/chimaera-plugin-api` | the plugin interface: the `chimaera:plugin` WIT world + the Rust side plugins implement | [map](crates/chimaera-plugin-api/AGENTS.md) |
+| `plugins/` | `plugins.lock` (the curated first-party plugins: the release of each that installs, and its sha256s; each plugin lives in its own repository) + the host's test fixture | [map](plugins/AGENTS.md) |
 | `crates/chimaera-app` | the Tauri 2 native shell (its own standalone workspace) | [map](crates/chimaera-app/AGENTS.md) |
 | `web-ui/` | the Svelte 5 client the daemon serves | [chat](web-ui/src/lib/chat/AGENTS.md) · [dashboard](web-ui/src/lib/dashboard/AGENTS.md) · [settings](web-ui/src/lib/settings/AGENTS.md) · [knowledge](web-ui/src/lib/knowledge/AGENTS.md) · [plugins](web-ui/src/lib/plugins/AGENTS.md) |
 
@@ -66,9 +68,12 @@ just check                         # fmt --check + clippy -D warnings + test (pi
 npm --prefix web-ui run check      # svelte-check
 npm --prefix web-ui run test       # targeted Vitest suites (not browser/component tests)
 npm --prefix web-ui run build      # emits web-ui/dist, which the daemon embeds (rust-embed)
+bash scripts/build-plugins.sh      # tests only: the fixture + the locked releases → plugins/dist-test; not needed to build or run the daemon; `just plugins`
 node scripts/check-doc-links.mjs   # every relative markdown link + #anchor resolves
 node scripts/check-agent-assets.mjs # Claude/Codex skill + agent bridges stay in sync
 node scripts/check-workflow-security.mjs # immutable Actions pins + explicit permissions
+scripts/worktree-gc                # which worktrees are idle + what cleanup frees (dry run)
+bash scripts/worktree-gc.test.sh   # worktree-gc's deletion rules, on a throwaway repo
 ```
 
 **Isolated preview — use this in a worktree.** A debug daemon on its own state dir
@@ -94,6 +99,11 @@ pane and no HPC access; a SessionStart hook installs the web-UI deps and builds
   no busy loops, hard preview ceilings. **No SQLite near NFS/Lustre**; durable logs
   are append-only, size-capped JSONL under `~/.chimaera` (small whole-file state is
   capped JSON rewritten atomically); hot state is reconstructible.
+- **Worktrees fill the disk.** Each session builds in its own worktree, and one
+  worktree's cargo `target/` dirs have reached 35–60 GB. Follow the
+  **[worktree-lifecycle](.claude/skills/worktree-lifecycle/SKILL.md)** skill: remove
+  your worktree once its PR merges, run `scripts/worktree-gc` before a big build when
+  disk is low, and never touch a worktree it calls ACTIVE.
 - **The daemon↔UI wire is a stable public interface.** Core structs serialize
   straight to it — don't let its shape drift as a side effect of a refactor.
 - **Agent wire formats are pinned, not trusted** — a driver or agent-CLI change
@@ -133,12 +143,16 @@ mapping and the no-release path.
   live), **debug-live-app** (read daemon/UI logs, reproduce, common failure modes),
   **ship-pr** (open a PR + version bump), **chat-mode** (the structured chat stack),
   **document-feature** (add/update a docs/features page), **capture-feature-intent**
-  (the `feat:`-gated intent questionnaire).
+  (the `feat:`-gated intent questionnaire), **worktree-lifecycle** (worktree and
+  `target/` cleanup, low disk).
 - **Rules**: path-scoped constraints in `.claude/rules/`; see the explicit-read
   requirement above for agents that do not auto-load them.
 - **Subagents**: Claude definitions live in `.claude/agents/`; Codex definitions
   live in `.codex/agents/`. Both provide `area-implementer` (scoped edits + live
   verify) and `diff-reviewer` (read-only invariant check vs `origin/main`).
 - **Claude hooks**: `.claude/settings.json` — fmt-on-save, destructive-command + generated-
-  file guards, session orientation, the cloud-only bootstrap, and the doc-drift warn
+  file guards, session orientation, the cloud-only bootstrap, the doc-drift warn, and
+  worktree-gc (low-disk flag + idle-worktree cleanup at start, stale-object sweep at end)
   (personal hooks go in the gitignored `.claude/settings.local.json`).
+- **Codex hooks**: `.codex/hooks.json` — the same two worktree-gc hooks. Codex runs
+  project hooks only in a trusted project, after each is approved once in `/hooks`.

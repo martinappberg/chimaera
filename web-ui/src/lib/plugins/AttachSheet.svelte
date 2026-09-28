@@ -1,9 +1,12 @@
 <script lang="ts">
   /**
-   * "Use mycelium for Knowledge" — the one sheet, three live-checked steps
-   * (design §6.2): 1 installed for your agents (the CLIs' own installs, in a
-   * visible terminal), 2 trust codex's hooks right here (§6.6 — each hook in
-   * plain words, hash-pinned, never automated), 3 set up this workspace (the
+   * "Use mycelium for Knowledge" — the one sheet, live-checked steps
+   * (design §6.2): 0 install the plugin itself when it isn't on this host
+   * yet (the card's Install x.y.z flow), 1 the agent plugins it requires or
+   * recommends, for the agents installed here (requirementsModel.ts — the
+   * CLIs' own installs, in a visible terminal; a recommendation reads as
+   * optional), 2 trust codex's hooks right here (§6.6 — each hook in plain
+   * words, hash-pinned, never automated), 3 set up this workspace (the
    * plugin's own setup prompt sent to a new agent session of the user's
    * choosing — their click, their billing). Completing also switches the
    * plugin ON for the workspace. Re-checks every time it opens.
@@ -13,10 +16,15 @@
   import { focusOnMount } from "../shared/focusOnMount";
   import { modalFocus } from "../shared/modalFocus";
   import { refreshKnowledge } from "../workspace/knowledge";
+  import { installedOutcome, installTitle, pinnedVersion, type Outcome } from "./installCopy";
+  import { agentsForSetup, hooksAwaitingTrust, requirementsModel, sheetText, type AgentsState, type RequirementRow } from "./requirementsModel";
   import {
+    agentInstallContinuation,
     fetchAgentPlugins,
     fetchWorkspacePlugins,
+    installFirstPartyPlugin,
     installPlugin,
+    isMissingRoute,
     putWorkspacePlugin,
     refreshWorkspacePlugins,
     setupPlugin,
@@ -43,24 +51,33 @@
   let agentsAvailable = $state<boolean | null>(null);
   let loadError = $state<string | null>(null);
   let setupAgent = $state<AgentId>("claude");
+  /** A check has answered once: later ones keep the chosen agent. */
+  let rechecked = false;
   let trust = $state(true);
   let busy = $state<string | null>(null);
   let error = $state<string | null>(null);
   let skipped = $state<{ key: string; reason: string }[]>([]);
+  /** The plugin's own install from this sheet: its outcome, or its refusal. */
+  let installNote = $state<Outcome | null>(null);
+  let installError = $state<string | null>(null);
+
+  function message(e: unknown): string {
+    return e instanceof Error ? e.message : String(e);
+  }
 
   async function check(): Promise<void> {
     loadError = null;
     try {
       const [wp, ap] = await Promise.all([
         fetchWorkspacePlugins(wsId),
-        fetchAgentPlugins(wsId).then(
+        fetchAgentPlugins(wsId, true).then(
           (a) => {
             agentsAvailable = true;
             return a;
           },
           (e: unknown) => {
             agentsAvailable = !(e instanceof ApiError && e.status === 404);
-            if (agentsAvailable) loadError = e instanceof Error ? e.message : String(e);
+            if (agentsAvailable) loadError = message(e);
             return null;
           },
         ),
@@ -68,72 +85,92 @@
       plugin = wp.plugins.find((p) => p.id === pluginId) ?? null;
       agents = ap;
       if (plugin === null) loadError = `no plugin “${pluginId}” on this daemon`;
-      // Default the setup agent to one that is installed and has the plugin.
-      const preferred = requirements().find((r) => r.status === "ok")?.agent;
-      if (preferred !== undefined) setupAgent = preferred;
+      // Use the same readiness decision as the chooser, including every
+      // required add-on and any ambiguous marketplace report. A re-check
+      // keeps the user's pick while it is still eligible — it decides whose
+      // account the setup bills.
+      const preferred = setupAgents[0];
+      if (preferred !== undefined && (!rechecked || !setupAgents.includes(setupAgent))) {
+        setupAgent = preferred as AgentId;
+      }
+      rechecked = true;
     } catch (e) {
-      loadError = e instanceof Error ? e.message : String(e);
+      loadError = message(e);
     }
   }
   onMount(() => void check());
 
-  type ReqStatus = "checking" | "unknown" | "no-agent" | "missing" | "ok" | "disabled";
-  interface Req {
-    agent: AgentId;
-    id: string;
-    status: ReqStatus;
-    version: string | null;
-    scope: string | null;
-  }
-
-  function requirements(): Req[] {
-    if (plugin === null) return [];
-    return plugin.requires.map((r) => {
-      const agent = r.agent as AgentId;
-      if (agentsAvailable === false) return { agent, id: r.id, status: "unknown", version: null, scope: null };
-      if (agents === null) return { agent, id: r.id, status: "checking", version: null, scope: null };
-      const entry = agents.agents.find((a) => a.agent === agent);
-      if (entry === undefined || !entry.available) return { agent, id: r.id, status: "no-agent", version: null, scope: null };
-      const got = entry.plugins.find((p) => p.id === r.id || p.id === r.id.split("@")[0]);
-      if (got === undefined) return { agent, id: r.id, status: "missing", version: null, scope: null };
-      return {
-        agent,
-        id: r.id,
-        status: got.enabled ? "ok" : "disabled",
-        version: got.version ?? null,
-        scope: got.scope ?? null,
-      };
-    });
-  }
-  const reqs = $derived.by(() => {
-    // Re-derive on every input the checks read.
-    void plugin;
-    void agents;
-    void agentsAvailable;
-    return requirements();
+  /** The agents report's state, in the card's terms. */
+  const agentsState = $derived.by((): AgentsState => {
+    if (agentsAvailable === null) return "loading";
+    if (agentsAvailable === false) return "unavailable";
+    return agents !== null ? "ok" : "error";
   });
-  const step1Done = $derived(reqs.length > 0 && reqs.every((r) => r.status === "ok"));
 
-  /** Codex hooks of this plugin still waiting for trust (untrusted or
-   *  changed since they were trusted). */
-  const hooks = $derived.by((): AgentHook[] => {
-    if (plugin === null || agents === null) return [];
-    const req = plugin.requires.find((r) => r.agent === "codex");
-    if (req === undefined) return [];
-    const codex = agents.agents.find((a) => a.agent === "codex");
-    if (codex === undefined || !codex.available) return [];
-    const base = req.id.split("@")[0];
-    return (codex.hooks ?? []).filter(
-      (h) => (h.plugin_id === req.id || h.plugin_id === base) && (h.trust === "untrusted" || h.trust === "modified"),
-    );
-  });
+  const model = $derived(
+    plugin === null
+      ? null
+      : requirementsModel({
+          requires: plugin.requires,
+          recommends: plugin.recommends,
+          knowledge: plugin.provides.knowledge,
+          report: agents,
+          state: agentsState,
+        }),
+  );
+  const rows = $derived(model?.rows ?? []);
+  const identityUncertain = $derived(rows.some((r) => r.identityAmbiguous));
+
+  /** The plugin itself isn't on this host yet: installing it comes first. */
+  const notInstalled = $derived(plugin !== null && plugin.source === "available");
+  const showInstallStep = $derived(notInstalled || installNote !== null);
+
+  const agentsDone = $derived(
+    model !== null &&
+      (model.phase === "ready" || model.phase === "none") &&
+      model.notice === null &&
+      rows.every((r) => r.status === "installed"),
+  );
+  const agentsWarn = $derived(
+    identityUncertain || (model?.phase === "ready" && model.notice !== null) ||
+      rows.some((r) => r.kind === "requires" && (r.status === "missing" || r.status === "disabled")),
+  );
+
+  /** Codex hooks of its agent plugins (required or recommended) still
+   *  waiting for trust (untrusted or changed since they were trusted). */
+  const hooks = $derived.by((): AgentHook[] => (model === null ? [] : hooksAwaitingTrust(model)));
   const needsTrust = $derived(hooks.length > 0);
 
   const detected = $derived(plugin?.detected === true);
   const canSetup = $derived(plugin?.setup !== null && plugin?.setup !== undefined);
-  const setupAgents = $derived(
-    reqs.filter((r) => r.status === "ok" || r.status === "disabled" || r.status === "unknown").map((r) => r.agent),
-  );
+  /** Agents that can run the setup: those with its agent plugin, or — for
+   *  a plugin that asks nothing of the agents — any agent on this host. */
+  const setupAgents = $derived.by((): AgentId[] => {
+    if (model === null) return [];
+    const available = (agents?.agents ?? []).filter((a) => a.available).map((a) => a.agent);
+    return agentsForSetup(model, available) as AgentId[];
+  });
+  const needsSetup = $derived(!detected && canSetup);
+  // An empty eligible list still means setup is blocked, not optional.
+  const setupBlocked = $derived(needsSetup && !setupAgents.includes(setupAgent));
+
+  /** Step numbers: the plugin's own install (when shown) comes first. */
+  const nAgents = $derived(showInstallStep ? 2 : 1);
+  const nSetup = $derived(nAgents + (needsTrust ? 2 : 1));
+
+  /** Nothing listed and nothing to say: the agents it could use aren't here. */
+  function noAgentsLine(p: WorkspacePlugin): string {
+    const names = [...new Set(p.recommends.map((r) => r.agent))];
+    if (names.length === 1) return `${names[0]} isn't installed on this host; ${p.name} works without it.`;
+    if (names.length === 2) return `Neither ${names[0]} nor ${names[1]} is installed on this host; ${p.name} works without them.`;
+    return `None of the agents it works with is installed on this host; ${p.name} works without them.`;
+  }
+
+  function rowClass(r: RequirementRow): string {
+    if (r.status === "installed") return "good-text";
+    if (r.tone === "warn") return "warn-text";
+    return "muted-text";
+  }
 
   /** Plain words for a hook event + matcher (the codex vocabulary stays
    *  visible in mono beside them). */
@@ -167,34 +204,51 @@
 
   const primaryLabel = $derived.by(() => {
     if (plugin === null) return "…";
+    if (notInstalled) return "Turn on";
     const parts: string[] = [];
     if (needsTrust && trust) parts.push("Trust hooks");
-    if (!detected && canSetup && setupAgents.length > 0) parts.push("set up");
+    if (needsSetup) parts.push("set up");
     else if (!plugin.on) parts.push("turn on");
     if (parts.length === 0) return "Done";
     const s = parts.join(" & ");
     return s.charAt(0).toUpperCase() + s.slice(1);
   });
 
-  async function install(agent: AgentId): Promise<void> {
+  /** Install the plugin itself (the version chimaera pins), then re-check:
+   *  the installed manifest brings its agent plugins and setup with it. */
+  async function installThis(): Promise<void> {
+    if (plugin === null) return;
+    busy = "install-plugin";
+    installError = null;
+    try {
+      const res = await installFirstPartyPlugin(plugin.id);
+      installNote = installedOutcome(res, plugin.name);
+      await check();
+    } catch (e) {
+      installError = isMissingRoute(e) ? "this daemon can't install plugins yet — update chimaera" : message(e);
+    } finally {
+      busy = null;
+    }
+  }
+
+  async function install(agent: AgentId, agentPluginId: string): Promise<void> {
     busy = `install:${agent}`;
     error = null;
     try {
-      const res = await installPlugin(wsId, pluginId, agent);
+      const res = await installPlugin(wsId, pluginId, agent, agentPluginId);
       onOpenSession(res.session_id);
     } catch (e) {
-      error =
-        e instanceof ApiError && e.status === 404
-          ? `this daemon can't run installs yet — run ${agent}'s own plugin manager instead`
-          : e instanceof Error
-            ? e.message
-            : String(e);
+      error = isMissingRoute(e) ? `this daemon can't run installs yet — run ${agent}'s own plugin manager instead` : message(e);
       busy = null;
     }
   }
 
   async function complete(): Promise<void> {
-    if (plugin === null) return;
+    if (plugin === null || notInstalled || identityUncertain) return;
+    if (setupBlocked) {
+      error = "Choose an agent with the required plugins enabled.";
+      return;
+    }
     busy = "complete";
     error = null;
     skipped = [];
@@ -208,27 +262,40 @@
           hooks.map((h) => ({ key: h.key, hash: h.hash })),
         );
         skipped = res.skipped;
+        if (skipped.length > 0) {
+          // A hook changed after it was shown: nothing past this step
+          // runs on a trust the user didn't give. Re-read the hooks so
+          // the list (and the next click) carries their current hashes.
+          await check();
+          busy = null;
+          return;
+        }
       }
       if (!plugin.on) await putWorkspacePlugin(wsId, pluginId, true);
       refreshWorkspacePlugins();
-      if (!detected && canSetup && setupAgents.length > 0) {
+      if (needsSetup) {
         const res = await setupPlugin(wsId, pluginId, setupAgent);
         refreshKnowledge();
+        clearContinuation();
         onOpenSession(res.session_id);
         return;
       }
       refreshKnowledge();
-      if (skipped.length === 0) onClose();
-      else busy = null;
+      clearContinuation();
+      onClose();
     } catch (e) {
-      error =
-        e instanceof ApiError && e.status === 404
-          ? "this daemon can't finish that step yet — update chimaera"
-          : e instanceof Error
-            ? e.message
-            : String(e);
-      busy = null;
+      error = isMissingRoute(e) ? "this daemon can't finish that step yet — update chimaera" : message(e);
       refreshWorkspacePlugins();
+      // Steps before the failure may have landed (hooks trusted, switched
+      // on): show where things are now, so a retry doesn't redo them.
+      await check();
+      busy = null;
+    }
+  }
+
+  function clearContinuation(): void {
+    if ($agentInstallContinuation?.workspaceId === wsId && $agentInstallContinuation.pluginId === pluginId) {
+      agentInstallContinuation.set(null);
     }
   }
 
@@ -253,44 +320,78 @@
   >
     <header class="head">
       <h1 id="attach-title">Use {plugin?.name ?? pluginId} for Knowledge</h1>
-      <p>Your agents record findings, decisions and learnings as they work; chimaera shows them. Three steps, each checked live.</p>
+      <p>Your agents record findings, decisions and learnings as they work; chimaera shows them. Each step is checked live.</p>
     </header>
 
     {#if loadError !== null && plugin === null}
       <p class="err pad">{loadError}</p>
     {:else}
       <ol class="steps">
-        <!-- 1 · installed for your agents -->
+        <!-- 0 · the plugin itself, when it isn't on this host yet -->
+        {#if showInstallStep && plugin !== null}
+          <li class="step">
+            <span class="num" class:done={!notInstalled}>{notInstalled ? "1" : "✓"}</span>
+            <div class="sbody">
+              <div class="stitle">Install {plugin.name}</div>
+              {#if notInstalled}
+                <div class="smuted">
+                  Downloads {plugin.name} {pinnedVersion(plugin)} from its release into this host's
+                  <span class="mono">~/.chimaera/plugins</span>.
+                </div>
+                <div class="pills">
+                  <button class="opt" disabled={busy !== null} title={installTitle(plugin)} onclick={() => void installThis()}>
+                    {busy === "install-plugin" ? "installing…" : `Install ${pinnedVersion(plugin)}`}
+                  </button>
+                </div>
+              {/if}
+              {#if installNote !== null}<div class="smuted">{installNote.text}</div>{/if}
+              {#if installError !== null}<div class="err">{installError}</div>{/if}
+            </div>
+          </li>
+        {/if}
+
+        <!-- 1 · the agent plugins it requires or recommends -->
         <li class="step">
-          <span class="num" class:done={step1Done} class:warn={!step1Done && reqs.some((r) => r.status === "missing" || r.status === "no-agent")}>
-            {step1Done ? "✓" : "1"}
+          <span class="num" class:done={!notInstalled && agentsDone} class:warn={!notInstalled && !agentsDone && agentsWarn}>
+            {!notInstalled && agentsDone ? "✓" : nAgents}
           </span>
           <div class="sbody">
-            <div class="stitle">Installed for your agents</div>
-            {#if reqs.length === 0}
-              <div class="smuted">{plugin === null ? "checking…" : "nothing to install — this plugin needs no agent plugin"}</div>
+            <div class="stitle">For your agents</div>
+            {#if plugin === null || model === null || model.phase === "checking"}
+              <div class="smuted">checking the agents…</div>
+            {:else if notInstalled}
+              <div class="smuted">After the install, this shows what {plugin.name} can use from your agents.</div>
+            {:else if model.phase === "none"}
+              <div class="smuted">nothing to install — this plugin needs no agent plugin</div>
             {:else}
-              <div class="pills">
-                {#each reqs as r (r.agent)}
-                  {#if r.status === "ok"}
-                    <span class="pill good">{r.agent}{#if r.version} · {r.version}{/if}{#if r.scope} · {r.scope}{/if}</span>
-                  {:else if r.status === "disabled"}
-                    <span class="pill warn">{r.agent} · installed but disabled</span>
-                  {:else if r.status === "missing"}
-                    <span class="pill warn">{r.agent} · not installed</span>
-                    <button class="opt" disabled={busy !== null} onclick={() => void install(r.agent)} title="runs {r.agent}'s own plugin manager in a visible terminal">
-                      {busy === `install:${r.agent}` ? "starting…" : `Install for ${r.agent}`}
-                    </button>
-                  {:else if r.status === "no-agent"}
-                    <span class="pill neutral">{r.agent} · not installed on this host</span>
-                  {:else if r.status === "unknown"}
-                    <span class="pill neutral">{r.agent} · can't check on this daemon</span>
-                  {:else}
-                    <span class="pill neutral">{r.agent} · checking…</span>
-                  {/if}
-                {/each}
-              </div>
-              {#if reqs.some((r) => r.status === "missing")}
+              {@const said = plugin.requires_summary ?? plugin.recommends_summary}
+              {#if said !== null}<div class="smuted">{said}</div>{/if}
+              {#if model.notice !== null}<div class="smuted warn-text">{model.notice}</div>{/if}
+              {#if rows.length === 0 && model.notice === null}
+                <div class="smuted">
+                  {model.phase === "ready" ? noAgentsLine(plugin) : "can't check the agents' plugins on this daemon"}
+                </div>
+              {/if}
+              {#if rows.length > 0}
+                <div class="arows">
+                  {#each rows as r (`${r.kind}:${r.agent}:${r.id}`)}
+                    <div class="arow">
+                      <span class={rowClass(r)} title={r.scope ?? undefined}>{sheetText(r, plugin.provides.knowledge)}</span>
+                      {#if r.offerInstall}
+                        <button
+                          class="opt"
+                          disabled={busy !== null}
+                          onclick={() => void install(r.agent as AgentId, r.id)}
+                          title="runs {r.agent}'s own plugin manager in a visible terminal"
+                        >
+                          {busy === `install:${r.agent}` ? "starting…" : `Install for ${r.agent}`}
+                        </button>
+                      {/if}
+                    </div>
+                  {/each}
+                </div>
+              {/if}
+              {#if rows.some((r) => r.offerInstall)}
                 <div class="smuted">An install opens a terminal running the agent's own commands; come back here when it finishes.</div>
               {/if}
             {/if}
@@ -301,7 +402,7 @@
         <!-- 2 · trust codex hooks -->
         {#if needsTrust}
           <li class="step">
-            <span class="num warn">2</span>
+            <span class="num warn">{nAgents + 1}</span>
             <div class="sbody">
               <div class="stitle">Trust {plugin?.name ?? "the plugin"}'s hooks in codex</div>
               <div class="smuted">Codex won't run a plugin's hooks until you trust them. These are exactly what it will run:</div>
@@ -339,10 +440,12 @@
 
         <!-- 3 · set up this workspace -->
         <li class="step last">
-          <span class="num" class:done={detected}>{detected ? "✓" : needsTrust ? "3" : "2"}</span>
+          <span class="num" class:done={detected}>{detected ? "✓" : nSetup}</span>
           <div class="sbody">
             <div class="stitle">Set up this workspace</div>
-            {#if detected}
+            {#if notInstalled}
+              <div class="smuted">After the install.</div>
+            {:else if detected}
               <div class="smuted">Already set up here — {plugin?.detect[0] ?? "its files"} found. {plugin?.on ? "" : "Turning it on reads them."}</div>
             {:else if !canSetup}
               <div class="smuted">This plugin has no setup step.</div>
@@ -361,8 +464,10 @@
                 </select>
                 <span class="smuted">billed to your {setupAgent} account</span>
               </div>
-              {#if setupAgents.length === 0 && reqs.length > 0}
-                <div class="smuted">Install the plugin for an agent first (step 1).</div>
+              {#if identityUncertain}
+                <div class="smuted warn-text">Resolve the marketplace identity in the agent before continuing.</div>
+              {:else if setupAgents.length === 0}
+                <div class="smuted">Setup needs an available agent with its required plugins installed and enabled (step {nAgents}).</div>
               {/if}
             {/if}
           </div>
@@ -374,7 +479,12 @@
       <span class="fnote">Knowledge fills as soon as <span class="mono">.living/</span> appears.</span>
       {#if error !== null}<span class="err">{error}</span>{/if}
       <button class="opt quiet" use:focusOnMount onclick={onClose}>Cancel</button>
-      <button class="opt primary" disabled={busy !== null || plugin === null} onclick={() => void complete()}>
+      <button
+        class="opt primary"
+        disabled={busy !== null || plugin === null || notInstalled || identityUncertain || setupBlocked}
+        title={notInstalled && plugin !== null ? `install ${plugin.name} first` : undefined}
+        onclick={() => void complete()}
+      >
         {busy === "complete" ? "working…" : primaryLabel}
       </button>
     </footer>
@@ -500,23 +610,6 @@
     align-items: center;
     font-size: 12.5px;
   }
-  .pill {
-    padding: 2px 10px;
-    border-radius: 999px;
-    white-space: nowrap;
-  }
-  .pill.good {
-    background: color-mix(in srgb, var(--accent) 12%, transparent);
-    color: var(--accent);
-  }
-  .pill.warn {
-    background: color-mix(in srgb, var(--warn) 11%, transparent);
-    color: var(--warn);
-  }
-  .pill.neutral {
-    border: 1px solid var(--edge);
-    color: var(--muted);
-  }
 
   .hooks {
     background: color-mix(in srgb, var(--fg) 3%, transparent);
@@ -562,6 +655,26 @@
   }
   .warn-text {
     color: var(--warn);
+  }
+  .good-text {
+    color: var(--accent);
+  }
+  .muted-text {
+    color: var(--muted);
+  }
+  /* One agent plugin per line: its sentence, then the agent's own install. */
+  .arows {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    font-size: var(--text-sm);
+    line-height: 1.45;
+  }
+  .arow {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px 12px;
   }
   .check {
     display: flex;

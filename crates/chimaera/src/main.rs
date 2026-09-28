@@ -3,6 +3,7 @@ mod connect;
 mod daemonize;
 mod doctor;
 mod kill;
+mod plugin;
 mod status;
 
 use std::path::PathBuf;
@@ -84,6 +85,40 @@ enum Command {
         #[command(subcommand)]
         cmd: ComputeCmd,
     },
+    /// Workbench plugins on the daemon running here: list them (the
+    /// installed ones and the first-party ones you can install), install
+    /// one, update or remove an installed one.
+    Plugin {
+        #[command(subcommand)]
+        cmd: PluginCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum PluginCmd {
+    /// Every plugin with its version, whether it is a Chimaera plugin and
+    /// verified, where it came from, and any update.
+    List,
+    /// Install a plugin: a Chimaera plugin by its id (the release chimaera
+    /// pins), any plugin from its GitHub release, or a local build with
+    /// --path (checksum-verified whenever there is a SHA256SUMS).
+    Add {
+        /// A Chimaera plugin's id (`agent-notes`), or a repository:
+        /// owner/repo or its https://github.com/owner/repo URL.
+        #[arg(required_unless_present = "path", conflicts_with = "path")]
+        plugin: Option<String>,
+        /// A release version of a repository (default: its latest).
+        #[arg(long, conflicts_with = "path")]
+        version: Option<String>,
+        /// A local build instead: a directory holding plugin.wasm and
+        /// plugin.toml (and SHA256SUMS, if it should be verified).
+        #[arg(long)]
+        path: Option<std::path::PathBuf>,
+    },
+    /// Update an installed plugin to its latest release.
+    Update { id: String },
+    /// Remove an installed plugin (every version of it).
+    Remove { id: String },
 }
 
 #[derive(Subcommand)]
@@ -246,6 +281,16 @@ async fn dispatch(command: Command) -> anyhow::Result<()> {
             } => compute::connect(&host, &job_id, no_open).await,
             ComputeCmd::Cancel { host, job_id } => compute::cancel(&host, &job_id).await,
         },
+        Command::Plugin { cmd } => match cmd {
+            PluginCmd::List => plugin::list().await,
+            PluginCmd::Add {
+                plugin,
+                version,
+                path,
+            } => plugin::add(plugin.as_deref(), version.as_deref(), path.as_deref()).await,
+            PluginCmd::Update { id } => plugin::update(&id).await,
+            PluginCmd::Remove { id } => plugin::remove(&id).await,
+        },
     }
 }
 
@@ -310,6 +355,67 @@ mod tests {
         match fg.command {
             Command::Serve { daemonize, .. } => assert!(!daemonize),
             _ => panic!("expected serve"),
+        }
+    }
+
+    #[test]
+    fn plugin_subcommands_parse() {
+        let cli = Cli::try_parse_from([
+            "chimaera",
+            "plugin",
+            "add",
+            "acme/latex",
+            "--version",
+            "0.2.0",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Plugin {
+                cmd:
+                    PluginCmd::Add {
+                        plugin,
+                        version,
+                        path,
+                    },
+            } => {
+                assert_eq!(plugin.as_deref(), Some("acme/latex"));
+                assert_eq!(version.as_deref(), Some("0.2.0"));
+                assert_eq!(path, None);
+            }
+            _ => panic!("expected plugin add"),
+        }
+        let cli = Cli::try_parse_from(["chimaera", "plugin", "add", "--path", "target/x"]).unwrap();
+        match cli.command {
+            Command::Plugin {
+                cmd: PluginCmd::Add { plugin, path, .. },
+            } => {
+                assert_eq!(plugin, None);
+                assert_eq!(path, Some(std::path::PathBuf::from("target/x")));
+            }
+            _ => panic!("expected plugin add --path"),
+        }
+        for args in [
+            &["chimaera", "plugin", "list"][..],
+            &["chimaera", "plugin", "add", "agent-notes"],
+            &["chimaera", "plugin", "update", "latex"],
+            &["chimaera", "plugin", "remove", "latex"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_ok(), "{args:?}");
+        }
+        for args in [
+            &["chimaera", "plugin", "add"][..],
+            &["chimaera", "plugin", "add", "acme/x", "--path", "d"],
+            &[
+                "chimaera",
+                "plugin",
+                "add",
+                "--path",
+                "d",
+                "--version",
+                "1.0.0",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err(), "{args:?}");
         }
     }
 

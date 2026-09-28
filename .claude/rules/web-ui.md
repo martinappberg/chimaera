@@ -55,6 +55,12 @@ KaTeX math policy). The
   `net/reconnect.ts`; and infinite animations pause under the `html.app-hidden`
   root class, enumerated per component (see app.css). A deliberate exemption
   (e.g. a keep-alive that must outlive hiding) says so in a comment.
+- **A view that throws fails alone.** Every pane surface renders inside a
+  `<svelte:boundary>` (`layout/Pane.svelte`; the App-level attach sheet has
+  its own): an uncaught render error — a duplicate `{#each}` key from data,
+  say — otherwise escapes Svelte's update and freezes the whole window. Key
+  lists by something unique you control; ids from a daemon, plugin or agent
+  can repeat (`knowledge/AGENTS.md`).
 - **Hide with opacity + inert, and never churn siblings on a hot path.** A
   keep-alive surface (pane layers, the rail splitter) hides with `opacity:0` +
   `inert` and keeps one element per item mounted. `visibility`,

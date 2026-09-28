@@ -36,6 +36,7 @@ export interface DashCtx {
   /** Open/focus the workspace singletons the dashboard links into. */
   onOpenTimeline: () => void;
   onOpenKnowledge: () => void;
+  onOpenExtensions: () => void;
 }
 
 /**

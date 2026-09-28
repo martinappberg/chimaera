@@ -82,9 +82,12 @@ workspace/session wire, helpers in `web-ui/src/lib/workspace/sessions.ts`).
   [Knowledge](timeline-and-knowledge.md#knowledge): contradicted findings first, then the
   strongest with mycelium's confidence ladder, the next steps and a warn-toned blocker from
   the handoff; "open knowledge →".
-- **Key behaviors.** Without a structured provider it is one quiet line offering "Use mycelium
-  →" (the attach sheet — [plugins.md](plugins.md#workbench-plugins)). Hidden on a daemon
-  without a knowledge route.
+- **Key behaviors.** Without a structured provider it is one calm block of plain sentences,
+  never in the way: "Agent notes lets your agents leave each other findings and blockers on the
+  Timeline. Mycelium lets this project remember what was learned and why. Both are optional, in
+  Extensions." — the Agent notes sentence left out where Agent notes is already active — with
+  one link, **Extensions**, which opens that tab ([plugins.md](plugins.md#workbench-plugins)).
+  Hidden on a daemon without a knowledge route.
 
 ## Now (the roster line)
 

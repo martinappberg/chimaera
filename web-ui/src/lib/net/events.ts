@@ -46,6 +46,8 @@ export interface EventsSocketHandlers {
    * its own workspace iff the epoch moved.
    */
   onRecents?(epoch: number): void;
+  /** An agent-plugin install or hook-trust write invalidated the reports. */
+  onAgentPlugins?(epoch: number): void;
   /** Exact mounted paths whose disk metadata/listing changed. */
   onFs?(change: {
     files: string[];
@@ -244,6 +246,9 @@ export class EventsSocket {
       } else if (msg.type === "recents" && typeof msg.epoch === "number") {
         this.backoffMs = INITIAL_BACKOFF_MS;
         this.handlers.onRecents?.(msg.epoch);
+      } else if (msg.type === "agent_plugins" && typeof msg.epoch === "number") {
+        this.backoffMs = INITIAL_BACKOFF_MS;
+        this.handlers.onAgentPlugins?.(msg.epoch);
       } else if (msg.type === "fs") {
         this.backoffMs = INITIAL_BACKOFF_MS;
         this.handlers.onFs?.({
