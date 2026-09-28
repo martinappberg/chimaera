@@ -33,6 +33,7 @@ in-app SSH askpass, a signed auto-updater). Parent map: repo-root
 | File | What it owns |
 |---|---|
 | `main.rs` | The 3-role argv dispatch (order is load-bearing). |
+| `Entitlements.plist` | macOS hardened-runtime exception for Wasmtime's executable plugin memory, applied by `tauri.conf.json` to the binary that also runs `--daemon`. |
 | `command_manifest.rs` | Shared daemon/wizard command vocabulary for build-time permission generation and exact runtime daemon grants. |
 | `shell.rs` | Module root: app-global `Shell` state, `WindowScope`, `lock`, and the Tauri `Builder` assembly (`run`). Closing the last non-Home window opens local Home; closing the last local Home exits, while explicit Quit preserves restore state. Re-exports `open_ui_window`. |
 | `shell/commands.rs` | The IPC command surface (`#[tauri::command]` fns wired into `generate_handler!`) — thin delegators. |
@@ -76,5 +77,14 @@ in-app SSH askpass, a signed auto-updater). Parent map: repo-root
   `tauri.conf.json` + `crates/chimaera-app/Cargo.toml` + root `Cargo.toml` (release
   reads `chimaera-core::VERSION` to fetch the matching remote daemon). If any of
   those holds a non-`0.0.1` value, the sed silently no-ops → ships the wrong version.
-- Signing is a release-only concern (`TAURI_SIGNING_PRIVATE_KEY*`); the PR build
-  (`app.yml`) needs no key.
+- Updater signing is release-only (`TAURI_SIGNING_PRIVATE_KEY*`); the PR build
+  (`app.yml`) needs no key. macOS code signing still runs on PRs (ad hoc today)
+  with the hardened runtime. Keep `Entitlements.plist` wired into the bundle:
+  Wasmtime 49 uses mmap/mprotect, so `allow-jit` alone cannot authorize its code
+  pages. Missing `allow-unsigned-executable-memory` kills the daemon with
+  `CODESIGNING / Invalid Page` on the first plugin call, even when compilation
+  succeeds. Verify plugin execution in the signed bundle with
+  `node scripts/smoke-macos-plugins.mjs` after `bash scripts/build-plugins.sh`.
+  Both app PR CI and the macOS release job run it before publishing artifacts.
+  Ordinary `cargo test` binaries cannot catch hardened-runtime kills of the
+  app's `--daemon` process.
