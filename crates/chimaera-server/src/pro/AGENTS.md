@@ -11,6 +11,7 @@ revocable delegation over the authenticated local API.
 | `projects.rs` | Passive bounded cloud-project discovery and explicit per-device local adoption; native-picked folder validation, saved directory identity, retry and legacy-import fences. |
 | `projects/tests.rs` | Synthetic loopback HTTP plus real Git transfer, passive-read, conflict, retry, restart and two-device destination checks. |
 | `engine.rs` | Independent lease renewal, mirror coordinator, transactional hydration, profile execution and lazy return. |
+| `snapshot_diagnostics.rs` | Fixed snapshot failure categories; no response bodies, paths, identifiers or error text enter diagnostic logs. |
 | `handback.rs` | Bounded automatic return coordination across worker wake and ownership changes; lost release replies are resolved by authority reads without repeating ambiguous requests. |
 | `release.rs` | Bounded clean-release retry for the account publication fence; changed ownership, account or lease never retries. |
 | `provider_gate.rs` / `provider_tests.rs` | Per-agent cloud readiness, bounded blocked-provider status, and staged retry/cancellation tests with a synthetic CLI and real PTY. |
@@ -133,3 +134,5 @@ ownership changes and cancellation retain the fence. Personal-device and
 ordinary SSH/free workspace behavior is unchanged.
 
 Structured pause checks accept authoritative completed-turn/idle agent state even when a provider emits no textual idle status, but reject queued input, active turns, and background work (explicit permission/action waits remain safe pause points).
+
+Snapshot failures emit only a fixed operation phase, fixed error category and clean/snapshot boolean, including failures recovered by resuming an idle session. Recovery does not turn that failure into a successful handoff; response and retry behavior are unchanged.
