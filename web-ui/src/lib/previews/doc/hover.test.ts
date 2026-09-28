@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { hoverTarget, isLineFragment, placePopover, sectionBounds } from "./hover";
+import { hoverTarget, isLineFragment, placeIn, placePopover, sectionBounds } from "./hover";
 import { bodyText, documentContext } from "./model";
 
 describe("what a link previews", () => {
@@ -74,5 +74,23 @@ describe("where the popover sits", () => {
     expect(p.width).toBe(284);
     expect(p.top).toBe(64);
     expect(p.maxHeight).toBe(200 - 58 - 6 - 8);
+  });
+
+  it("keeps inside an area while mounted in a larger layer", () => {
+    // The chat: the layer is the whole view, the area its transcript below
+    // a 40px header and above a 120px composer.
+    const layer = { left: 0, top: 0, right: 800, bottom: 760 };
+    const area = { left: 0, top: 40, right: 800, bottom: 640 };
+    const below = placeIn({ left: 100, top: 140, right: 160, bottom: 158 }, area, layer, want);
+    expect(below).toEqual({ left: 100, width: 440, top: 164, bottom: null, maxHeight: 340 });
+    const above = placeIn({ left: 100, top: 540, right: 160, bottom: 558 }, area, layer, want);
+    expect(above.top).toBeNull();
+    // Measured from the layer's bottom, it clears the composer too.
+    expect(above.bottom).toBe(760 - 540 + 6);
+    expect(above.maxHeight).toBe(340);
+    // One box: the plain placement.
+    expect(placeIn({ left: 100, top: 100, right: 160, bottom: 118 }, { left: 0, top: 0, right: 800, bottom: 600 }, { left: 0, top: 0, right: 800, bottom: 600 }, want)).toEqual(
+      placePopover({ left: 100, top: 100, right: 160, bottom: 118 }, box, want),
+    );
   });
 });

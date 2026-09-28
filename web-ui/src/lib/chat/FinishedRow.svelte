@@ -3,6 +3,7 @@
   import Markdown from "./Markdown.svelte";
   import type { OpenPathFn, PathResolver } from "./paths";
   import type { EmbedResolver } from "./embeds";
+  import type { HoverTargets } from "./hoverTargets";
   import type { ChatBlock } from "./store.svelte";
 
   /**
@@ -20,6 +21,7 @@
     resolvePaths?: PathResolver;
     /** Local images in the report render as embed cards. */
     embeds?: EmbedResolver;
+    hoverTargets?: HoverTargets;
     visible?: boolean;
     sourceIndex?: number;
     sourceUid?: number;
@@ -30,6 +32,7 @@
     onOpenPath,
     resolvePaths,
     embeds,
+    hoverTargets,
     visible = true,
     sourceIndex,
     sourceUid,
@@ -115,7 +118,7 @@
   </div>
   {#if open && block.result !== null}
     <div class="report">
-      <Markdown text={block.result} streaming={false} {visible} {onOpenPath} {resolvePaths} {embeds} />
+      <Markdown text={block.result} streaming={false} {visible} {onOpenPath} {resolvePaths} {embeds} {hoverTargets} />
     </div>
   {/if}
 </div>
