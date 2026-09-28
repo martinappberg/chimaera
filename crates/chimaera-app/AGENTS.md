@@ -69,6 +69,12 @@ in-app SSH askpass, a signed auto-updater). Parent map: repo-root
   provisioning and removals missed during an events outage; sign-out cancels
   every account-owned task and listener. The generation fence prevents pending
   refresh writes and connect flights from restoring a signed-out account.
+  `pro_status` is a synchronous cached snapshot behind async IPC: it never waits
+  for the readiness watch, OS keychain or token-refresh mutex. Additive
+  `initializing` and `initialization_phase` (`keychain`, `account`, `connection`)
+  let the UI describe startup and withhold account mutations. Dependent commands
+  still wait for readiness; keychain writes are not detached or timed out to
+  manufacture UI responsiveness.
   Device-only aliases never fall back to SSH: open windows retain that source in
   windows.json, including across sign-out/restart; only SSH hosts have that fallback.
 - System-browser sign-in binds an ephemeral IPv4-loopback callback, verifies

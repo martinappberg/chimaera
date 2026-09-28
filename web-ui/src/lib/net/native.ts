@@ -870,6 +870,8 @@ export function openDetachedPopup(
 
 /** Account controls are native-shell state, separate from daemon settings. */
 export interface ProStatus {
+  initializing?: boolean;
+  initialization_phase?: "keychain" | "account" | "connection" | null;
   available: boolean;
   signed_in: boolean;
   email: string | null;

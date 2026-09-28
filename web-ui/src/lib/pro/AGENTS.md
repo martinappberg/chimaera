@@ -40,3 +40,8 @@ enter UI settings or local storage.
 
 Pure readiness/transport tests cover these boundaries; real rendered components
 still need light/dark, narrow, keyboard and lifecycle verification per verify-app.
+
+Native account status includes optional `initializing` / `initialization_phase`.
+Show the keychain/account recovery explanation immediately while startup waits;
+keep sign-in, billing and sign-out mutations behind that startup fence. Older
+native builds omit these fields and retain their existing account behavior.

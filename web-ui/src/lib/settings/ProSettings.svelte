@@ -59,10 +59,10 @@
     const request = ++generation;
     try {
       let next = await proStatus();
-      if (refresh && next.signed_in) { await proRefreshAccount(); next = await proStatus(); }
+      if (refresh && next.signed_in && !next.initializing) { await proRefreshAccount(); next = await proStatus(); }
       if (!alive || request !== generation) return;
       status = next;
-      if (next.signed_in && paid(next.plan) && intent !== null) {
+      if (!next.initializing && next.signed_in && paid(next.plan) && intent !== null) {
         remember(null);
         notice = "Your plan is active. You're ready to continue.";
       }
@@ -86,19 +86,19 @@
     return () => clearInterval(timer);
   });
   $effect(() => {
-    if (!visible || !$pageVisible || !status?.signed_in || !subscribed || !connectionsOpen) return;
+    if (!visible || !$pageVisible || !status?.signed_in || status.initializing || !subscribed || !connectionsOpen) return;
     let stopped = false;
     void proHosts().then(value => { if (!stopped) hosts = value; }).catch(() => { if (!stopped) error = "Connected machines couldn't refresh. Please try again."; });
     return () => { stopped = true; };
   });
   $effect(() => {
-    if (!visible || !$pageVisible || !status?.signed_in || !securityOpen) return;
+    if (!visible || !$pageVisible || !status?.signed_in || status.initializing || !securityOpen) return;
     let stopped = false;
     void proDevices().then(value => { if (!stopped) devices = value; }).catch(() => { if (!stopped) error = "Your devices couldn't refresh. Please try again."; });
     return () => { stopped = true; };
   });
   $effect(() => {
-    if (visible && status?.signed_in && !subscribed && intent?.stage === "sign_in" && busy === null) {
+    if (visible && status?.signed_in && !status.initializing && !subscribed && intent?.stage === "sign_in" && busy === null) {
       untrack(() => void checkout());
     }
   });
@@ -109,14 +109,14 @@
     return () => { alive = false; generation += 1; dispose(); window.removeEventListener("focus", focus); };
   });
   async function act(name: string, operation: () => Promise<void>, failure: string): Promise<void> {
-    if (busy !== null) return;
+    if (busy !== null || status?.initializing) return;
     busy = name; error = null;
     try { await operation(); await load(); }
     catch (reason) { error = friendlyError(reason, failure); }
     finally { busy = null; }
   }
   async function checkout(): Promise<void> {
-    if (busy !== null) return;
+    if (busy !== null || status?.initializing) return;
     if (!status?.signed_in) {
       remember({ plan: selected, interval, stage: "sign_in", created: Date.now() });
       await act("sign-in", proSignIn, "Sign-in couldn't start. Please try again.");
@@ -156,15 +156,25 @@
 <section class="pro" class:subscriber={subscribed} aria-label="Chimaera Pro">
   <header class="heading">
     <div class="brand"><BrandMark size={44} /><span>chimaera</span><span class="product">Pro</span></div>
-    {#if status && !subscribed}<h1>Your work, here and away.</h1>
+    {#if status && !status.initializing && !subscribed}<h1>Your work, here and away.</h1>
     <p class="lede">Start on your Mac. Let your agents continue in the cloud. Pick up your project when you return.</p>
     {#if status.available}<button class="secondary intro-plans" onclick={showPlans}>See plans</button>{/if}{/if}
   </header>
 
-  {#if status?.available && !subscribed}{@render howItWorks()}{/if}
+  {#if status?.initializing}
+    <div class="panel notice" role="status">
+      <h2>{status.initialization_phase === "keychain" ? "Opening your saved sign-in" : "Connecting your account"}</h2>
+      <p>{status.initialization_phase === "keychain"
+        ? "Your system keychain is checking access to your saved account. Respond to any keychain prompt for chimaera to continue. Your workspaces remain available while you do."
+        : "We're checking your saved account and restoring its connections. Your workspaces remain available."}</p>
+      <button class="secondary" onclick={() => void load()}>Check again</button>
+    </div>
+  {:else if status?.available && !subscribed}{@render howItWorks()}{/if}
 
   {#if status === null}
     <p class="muted" role="status">Loading your account…</p>
+  {:else if status.initializing}
+    <!-- Account mutations wait for the single startup operation and its keychain fence. -->
   {:else if !status.available}
     <div class="panel"><h2>Pro isn't available in this build</h2><p class="muted">Your local workbench and SSH connections are ready to use.</p></div>
   {:else}

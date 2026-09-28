@@ -36,6 +36,7 @@ pub(super) struct Pro {
     pub(super) operation: tokio::sync::Mutex<()>,
     refresh: tokio::sync::Mutex<()>,
     ready: tokio::sync::watch::Sender<bool>,
+    initialization_phase: Mutex<InitializationPhase>,
     credential_generation: Arc<AtomicU64>,
 }
 
@@ -46,8 +47,18 @@ struct Runtime {
     serve: Option<chimaera_link::Serve>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InitializationPhase {
+    Keychain,
+    Account,
+    Connection,
+}
+
 #[derive(Serialize)]
 pub struct Status {
+    initializing: bool,
+    initialization_phase: Option<InitializationPhase>,
     available: bool,
     signed_in: bool,
     email: Option<String>,
@@ -69,7 +80,10 @@ pub struct KeptHost {
 
 impl Pro {
     pub fn load() -> Self {
-        let endpoint = read_endpoint();
+        Self::new(read_endpoint())
+    }
+
+    fn new(endpoint: Option<String>) -> Self {
         let ready = endpoint.is_none();
         Self {
             endpoint,
@@ -86,7 +100,44 @@ impl Pro {
             operation: tokio::sync::Mutex::new(()),
             refresh: tokio::sync::Mutex::new(()),
             ready: tokio::sync::watch::channel(ready).0,
+            initialization_phase: Mutex::new(InitializationPhase::Keychain),
             credential_generation: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn initializing(&self, phase: InitializationPhase) -> bool {
+        if *self.ready.borrow() {
+            return false;
+        }
+        let mut current = lock(&self.initialization_phase);
+        let changed = *current != phase;
+        *current = phase;
+        changed
+    }
+
+    /// Presentation must not wait for the OS Keychain or a token refresh.
+    /// Mutations still use client_snapshot's readiness and generation fences.
+    fn status_snapshot(&self) -> Status {
+        let client = lock(&self.client).clone();
+        let signed_in = client
+            .as_ref()
+            .is_some_and(|client| client.token_updates().borrow().is_some());
+        let account = lock(&self.account).clone();
+        let initializing = !*self.ready.borrow();
+        Status {
+            initializing,
+            initialization_phase: initializing.then(|| *lock(&self.initialization_phase)),
+            available: self.endpoint.is_some(),
+            signed_in,
+            email: account.as_ref().map(|account| account.email.clone()),
+            plan: account.as_ref().map(|account| account.plan.clone()),
+            error: lock(&self.error).clone(),
+            sign_in: self.sign_in.status(),
+            limits: account.as_ref().map(|account| account.limits.clone()),
+            usage: account.as_ref().map(|account| account.usage.clone()),
+            hours_exhausted: account
+                .as_ref()
+                .is_some_and(|account| account.hours_exhausted),
         }
     }
 
@@ -227,6 +278,9 @@ async fn activate(app: &AppHandle, client: Client) -> Result<()> {
     let state = app.state::<Shell>();
     // Subscribe before any request can rotate the refresh token.
     let mut updates = client.token_updates();
+    if state.pro.initializing(InitializationPhase::Account) {
+        let _ = app.emit("pro-changed", ());
+    }
     let snapshot = account_snapshot(&client).await;
     let endpoint = state.pro.endpoint.clone().context("endpoint unavailable")?;
     let tokens = client.tokens().await;
@@ -250,6 +304,9 @@ async fn activate(app: &AppHandle, client: Client) -> Result<()> {
     }
     // A request can rotate credentials and then fail on its next hop. Preserve
     // that rotation even when the keeper is unavailable during activation.
+    if state.pro.initializing(InitializationPhase::Keychain) {
+        let _ = app.emit("pro-changed", ());
+    }
     tokio::task::spawn_blocking(move || save_tokens(&stored_endpoint, tokens.as_ref())).await??;
     let (account, hosts, connection_error) = snapshot?;
     anyhow::ensure!(authenticated, "sign in required");
@@ -302,6 +359,9 @@ async fn activate(app: &AppHandle, client: Client) -> Result<()> {
         }
     });
 
+    if state.pro.initializing(InitializationPhase::Connection) {
+        let _ = app.emit("pro-changed", ());
+    }
     super::power::install(app);
     if let Err(error) = configure_daemon(&state, &client).await {
         *lock(&state.pro.error) = Some(error.to_string());
@@ -611,26 +671,7 @@ pub(super) async fn refresh_serve(state: &Shell) {
 
 #[tauri::command]
 pub async fn pro_status(state: tauri::State<'_, Shell>) -> Result<Status, String> {
-    let client = state.pro.client().await;
-    let signed_in = if let Some(client) = client {
-        client.tokens().await.is_some()
-    } else {
-        false
-    };
-    let account = lock(&state.pro.account).clone();
-    Ok(Status {
-        available: state.pro.endpoint.is_some(),
-        signed_in,
-        email: account.as_ref().map(|account| account.email.clone()),
-        plan: account.as_ref().map(|account| account.plan.clone()),
-        error: lock(&state.pro.error).clone(),
-        sign_in: state.pro.sign_in.status(),
-        limits: account.as_ref().map(|account| account.limits.clone()),
-        usage: account.as_ref().map(|account| account.usage.clone()),
-        hours_exhausted: account
-            .as_ref()
-            .is_some_and(|account| account.hours_exhausted),
-    })
+    Ok(state.pro.status_snapshot())
 }
 
 #[tauri::command]
@@ -750,6 +791,101 @@ pub async fn pro_cancel_sign_in(app: AppHandle) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn account_snapshot_reports_pending_initialization_without_waiting() {
+        let pro = Pro::new(Some("http://127.0.0.1:1".into()));
+        let pending = pro.status_snapshot();
+        assert!(pending.available && pending.initializing);
+        assert!(!pending.signed_in);
+        assert_eq!(
+            pending.initialization_phase,
+            Some(InitializationPhase::Keychain)
+        );
+        assert!(pro.initializing(InitializationPhase::Account));
+        assert!(!pro.initializing(InitializationPhase::Account));
+        assert_eq!(
+            pro.status_snapshot().initialization_phase,
+            Some(InitializationPhase::Account)
+        );
+        pro.ready.send_replace(true);
+        let ready = pro.status_snapshot();
+        assert!(!ready.initializing);
+        assert!(ready.initialization_phase.is_none());
+        assert!(!pro.initializing(InitializationPhase::Keychain));
+        let absent = Pro::new(None).status_snapshot();
+        assert!(!absent.available && !absent.initializing);
+        assert!(absent.initialization_phase.is_none());
+    }
+
+    #[tokio::test]
+    async fn account_snapshot_does_not_wait_for_refresh_and_observes_revocation() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let (entered, entered_rx) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 8192];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            stream
+                .write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            stream.shutdown().await.unwrap();
+            let (mut stream, _) = listener.accept().await.unwrap();
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            entered.send(()).unwrap();
+            let _ = release_rx.await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            stream.shutdown().await.unwrap();
+        });
+        let client = Client::new(
+            &endpoint,
+            Some(Tokens {
+                access_token: "fixture-access".into(),
+                refresh_token: "fixture-refresh".into(),
+                token_type: "Bearer".into(),
+                expires_in: 3600,
+            }),
+        )
+        .unwrap();
+        let refreshing = client.clone();
+        let request = tokio::spawn(async move { refreshing.me().await });
+        tokio::time::timeout(Duration::from_secs(2), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        // The refresh path deliberately owns the token mutex while on the wire.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), client.tokens())
+                .await
+                .is_err()
+        );
+        let pro = Arc::new(Pro::new(Some(endpoint)));
+        *lock(&pro.client) = Some(client);
+        let pending = pro.clone();
+        let snapshot = tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::task::spawn_blocking(move || pending.status_snapshot()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(snapshot.initializing && snapshot.signed_in);
+        release.send(()).unwrap();
+        assert!(request.await.unwrap().is_err());
+        assert!(!pro.status_snapshot().signed_in);
+        server.await.unwrap();
+    }
+
     #[test]
     fn device_hosts_never_fall_back_to_ssh_without_an_account_route() {
         assert!(device_fallback::<()>(true).is_err());
