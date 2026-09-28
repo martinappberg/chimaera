@@ -2631,3 +2631,62 @@ async fn managed_fence_stops_a_synthetic_process_during_stalled_handshake() {
     .await
     .unwrap();
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn managed_fence_does_not_claim_containment_of_setsid_descendants() {
+    let f = fixture();
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::write(self.0.join("escape-stop"), b"stop");
+        }
+    }
+    let _cleanup = Cleanup(f.cwd.clone());
+    let mut launch = spec("managed-escape", &f.cwd, "detached-process-fixture");
+    launch.managed_execution = true;
+    launch.handshake_timeout = Duration::from_secs(60);
+    f.manager.spawn(&ClaudeAdapter, launch).unwrap();
+    let pulse = || {
+        std::fs::read_to_string(f.cwd.join("escape-heartbeat"))
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    tokio::time::timeout(Duration::from_secs(4), async {
+        while pulse() == 0 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(f.manager.fence("managed-escape"));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while f
+            .manager
+            .get("managed-escape")
+            .is_some_and(|info| info.alive)
+        {
+            f.manager.fence("managed-escape");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let stopped_parent_pulse = pulse();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while pulse() <= stopped_parent_pulse {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("setsid child demonstrates why expired takeover is not advertised");
+    std::fs::write(f.cwd.join("escape-stop"), b"stop").unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !f.cwd.join("escape-done").exists() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+}

@@ -143,3 +143,6 @@ async fn same_boot_crash_never_turns_empty_registry_into_stopped_evidence() {
     assert!(damaged.execution.proofs.lock().unwrap().is_empty());
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[path = "runtime_tests.rs"]
+mod runtime;

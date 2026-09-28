@@ -46,6 +46,11 @@ fn emit(value: Value) {
 
 fn main() {
     let mode = std::env::args().nth(1).unwrap_or_else(|| "normal".into());
+    #[cfg(unix)]
+    if mode == "detached-process-fixture" || mode == "detached-child-fixture" {
+        detached_process_fixture(mode == "detached-child-fixture");
+        return;
+    }
     match mode.as_str() {
         "die" => std::process::exit(3),
         "silent" => {
@@ -1021,4 +1026,47 @@ fn finish_turn(allowed: bool) {
             "usage": { "input_tokens": 10, "output_tokens": 5 },
         }));
     }
+}
+
+/// A bounded adversarial lifecycle fixture: a child deliberately leaves its
+/// parent's process group. No real provider, credentials or network are used.
+#[cfg(unix)]
+fn detached_process_fixture(child: bool) {
+    use std::{
+        os::unix::process::CommandExt,
+        process::{Command, Stdio},
+        time::{Duration, Instant},
+    };
+    if child {
+        let until = Instant::now() + Duration::from_secs(10);
+        let mut pulse = 0u64;
+        while Instant::now() < until && !std::path::Path::new("escape-stop").exists() {
+            pulse += 1;
+            if std::fs::write("escape-heartbeat", pulse.to_string()).is_err() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let _ = std::fs::write("escape-done", b"stopped");
+        return;
+    }
+    let mut command = Command::new(std::env::current_exe().expect("fixture binary"));
+    command
+        .arg("detached-child-fixture")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // setsid is async-signal-safe; this deliberately demonstrates the limit of
+    // managed process groups rather than claiming containment we do not have.
+    unsafe {
+        command.pre_exec(|| {
+            if nix::libc::setsid() < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    let mut detached = command.spawn().expect("detached fixture");
+    let _ = detached.wait();
 }

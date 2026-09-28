@@ -410,7 +410,10 @@ pub async fn run_driver<D: Driver>(driver: D, spec: SpawnSpec, mut io: DriverIo)
     let handshake = tokio::select! {
         biased;
         _=io.kill.changed()=>{
-            guard.terminate();drop(sink);guard.shutdown(KILL_GRACE).await;
+            guard.terminate();
+            drop(sink);
+            let status = guard.shutdown(KILL_GRACE).await;
+            let _ = io.events.send(AgentEvent::Exited { status }).await;
             return DriverExit::Killed;
         },
         result=tokio::time::timeout(spec.handshake_timeout,driver.handshake(&mut sink,&mut stream,&spec))=>result,
