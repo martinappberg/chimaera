@@ -85,6 +85,10 @@ const STDERR_CAP: usize = 4 * 1024;
 /// the instruction paragraph, a hook line.
 const RESULT_MAX: usize = 256 * 1024;
 const INSTRUCTIONS_MAX: usize = 8 * 1024;
+/// A tool's description and input schema, as offered to agents: they ride
+/// every session's `tools/list`, beside the core tools.
+const TOOL_DESCRIPTION_MAX: usize = 2 * 1024;
+const TOOL_SCHEMA_MAX: usize = 16 * 1024;
 const HOOK_LINE_MAX: usize = 1024;
 /// `emit` frames kept for the `/ws/events` clients, and one frame's size.
 const EVENTS_KEPT: usize = 64;
@@ -789,14 +793,21 @@ impl PluginRuntime {
                 }
             }
         }
-        let live = guard.as_mut().expect("instantiated above");
+        // Out of the slot for the call, back only when it finished: a
+        // caller dropped mid-call (a hook claude stopped waiting for, a
+        // closed window's request) drops the instance with it, instead of
+        // leaving one wasmtime can't enter again to trap the next call.
+        let mut live = guard.take().expect("instantiated above");
         live.store.data_mut().begin(state, &cx, budget);
         live.store.set_epoch_deadline(1);
-        let outcome = tokio::time::timeout(budget + HOST_GRACE, invoke(live, &cx, call)).await;
+        let outcome = tokio::time::timeout(budget + HOST_GRACE, invoke(&mut live, &cx, call)).await;
         live.store.data_mut().end();
         slot.touch();
         let why = match outcome {
-            Ok(Ok(reply)) => return Ok(reply),
+            Ok(Ok(reply)) => {
+                *guard = Some(live);
+                return Ok(reply);
+            }
             Ok(Err(err)) => {
                 let stderr = live.store.data().stderr.clone();
                 let why = describe(m, &err, budget, stderr.last_line());
@@ -819,9 +830,9 @@ impl PluginRuntime {
                 why
             }
         };
-        // A trapped (or abandoned) instance is dead: the next call makes a
-        // fresh one.
-        *guard = None;
+        // A trapped (or abandoned) instance is dead (`live` drops here): the
+        // next call makes a fresh one.
+        drop(live);
         self.record_fault(m, &key, &why);
         Err(why)
     }
@@ -990,15 +1001,33 @@ fn check_offer(
     }
     let mut tools = Vec::with_capacity(defs.len());
     for def in defs {
+        if def.input_schema.len() > TOOL_SCHEMA_MAX {
+            return Err(format!(
+                "{} is refused: the input schema of {} is over {} KiB",
+                m.name,
+                def.name,
+                TOOL_SCHEMA_MAX / 1024
+            ));
+        }
         let schema: Value = serde_json::from_str(&def.input_schema).map_err(|e| {
             format!(
                 "{} is refused: the input schema of {} is not JSON ({e})",
                 m.name, def.name
             )
         })?;
+        // MCP clients validate the whole `tools/list`: one schema that isn't
+        // an object schema loses the agent every chimaera tool, not just
+        // this plugin's.
+        if schema.get("type").and_then(Value::as_str) != Some("object") {
+            return Err(format!(
+                "{} is refused: the input schema of {} is not a JSON object schema \
+                 (`\"type\": \"object\"`)",
+                m.name, def.name
+            ));
+        }
         tools.push(json!({
             "name": def.name,
-            "description": def.description,
+            "description": clip(&def.description, TOOL_DESCRIPTION_MAX),
             "inputSchema": schema,
         }));
     }
@@ -1104,6 +1133,42 @@ mod tests {
         let table = wasmtime::TableType::new(wasmtime::RefType::FUNCREF, 40_000, None);
         assert!(wasmtime::Table::new(&mut store, table.clone(), wasmtime::Ref::Func(None)).is_ok());
         assert!(wasmtime::Table::new(&mut store, table, wasmtime::Ref::Func(None)).is_err());
+    }
+
+    /// MCP clients validate the whole `tools/list`: a plugin whose schema
+    /// isn't an object schema is refused, so it can't cost agents every
+    /// chimaera tool; long descriptions are clipped.
+    #[test]
+    fn a_tool_offer_needs_object_schemas() {
+        let m = crate::plugins::test_catalog::fixture();
+        let defs = |schema: &str, description: &str| -> Vec<wit::ToolDef> {
+            m.provides
+                .mcp_tools
+                .iter()
+                .map(|name| wit::ToolDef {
+                    name: name.clone(),
+                    description: description.to_string(),
+                    input_schema: schema.to_string(),
+                })
+                .collect()
+        };
+        let offer = check_offer(&m, defs(r#"{"type":"object"}"#, &"d".repeat(5000)), None).unwrap();
+        assert_eq!(offer.tools.len(), m.provides.mcp_tools.len());
+        assert!(offer.tools[0]["description"].as_str().unwrap().len() <= TOOL_DESCRIPTION_MAX);
+        for bad in [
+            r#""string""#,
+            r#"[]"#,
+            r#"{"properties":{}}"#,
+            r#"{"type":"array"}"#,
+        ] {
+            let err = check_offer(&m, defs(bad, "x"), None).err().unwrap();
+            assert!(err.contains("object schema"), "{bad}: {err}");
+        }
+        let huge = format!(
+            r#"{{"type":"object","description":"{}"}}"#,
+            "x".repeat(TOOL_SCHEMA_MAX)
+        );
+        assert!(check_offer(&m, defs(&huge, "x"), None).is_err());
     }
 
     #[test]

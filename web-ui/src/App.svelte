@@ -5618,15 +5618,29 @@
        the plugin card, the Mastermind dock). Lazy — it rides the plugins
        chunk, not the always-loaded shell. -->
   {#await import("./lib/plugins/AttachSheet.svelte") then { default: AttachSheet }}
-    <AttachSheet
-      wsId={activeWsId}
-      pluginId={$attachRequest.pluginId}
-      onOpenSession={(id) => {
-        closeAttachSheet();
-        openSess(id);
-      }}
-      onClose={closeAttachSheet}
-    />
+    <!-- Keyed: the sheet checks its workspace once when it opens, so a
+         workspace switch underneath must start it over, never post one
+         workspace's hook hashes to another. Bounded like the pane views: a
+         throw here closes into a line, not a frozen window. -->
+    {#key `${activeWsId}:${$attachRequest.pluginId}`}
+      <svelte:boundary onerror={(e) => console.error("attach sheet failed", e)}>
+        <AttachSheet
+          wsId={activeWsId}
+          pluginId={$attachRequest.pluginId}
+          onOpenSession={(id) => {
+            closeAttachSheet();
+            openSess(id);
+          }}
+          onClose={closeAttachSheet}
+        />
+        {#snippet failed()}
+          <div class="sheet-crash" role="alert">
+            <span>The setup sheet hit an error.</span>
+            <button type="button" onclick={closeAttachSheet}>Close</button>
+          </div>
+        {/snippet}
+      </svelte:boundary>
+    {/key}
   {/await}
 {/if}
 
@@ -7479,5 +7493,33 @@
     .upload-spinner {
       animation: none;
     }
+  }
+
+  .sheet-crash {
+    position: fixed;
+    left: 50%;
+    top: 30%;
+    transform: translateX(-50%);
+    z-index: 110;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 14px 18px;
+    background: var(--bg);
+    border: 1px solid var(--edge);
+    border-radius: 10px;
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.22);
+    font-size: var(--text-sm);
+    color: var(--muted);
+  }
+
+  .sheet-crash button {
+    border: 1px solid var(--edge);
+    border-radius: 6px;
+    padding: 4px 12px;
+    background: var(--bg);
+    color: var(--fg);
+    font: inherit;
+    cursor: pointer;
   }
 </style>

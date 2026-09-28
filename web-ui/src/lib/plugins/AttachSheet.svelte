@@ -51,6 +51,8 @@
   let agentsAvailable = $state<boolean | null>(null);
   let loadError = $state<string | null>(null);
   let setupAgent = $state<AgentId>("claude");
+  /** A check has answered once: later ones keep the chosen agent. */
+  let rechecked = false;
   let trust = $state(true);
   let busy = $state<string | null>(null);
   let error = $state<string | null>(null);
@@ -84,9 +86,14 @@
       agents = ap;
       if (plugin === null) loadError = `no plugin “${pluginId}” on this daemon`;
       // Use the same readiness decision as the chooser, including every
-      // required add-on and any ambiguous marketplace report.
+      // required add-on and any ambiguous marketplace report. A re-check
+      // keeps the user's pick while it is still eligible — it decides whose
+      // account the setup bills.
       const preferred = setupAgents[0];
-      if (preferred !== undefined) setupAgent = preferred as AgentId;
+      if (preferred !== undefined && (!rechecked || !setupAgents.includes(setupAgent))) {
+        setupAgent = preferred as AgentId;
+      }
+      rechecked = true;
     } catch (e) {
       loadError = message(e);
     }
@@ -255,6 +262,14 @@
           hooks.map((h) => ({ key: h.key, hash: h.hash })),
         );
         skipped = res.skipped;
+        if (skipped.length > 0) {
+          // A hook changed after it was shown: nothing past this step
+          // runs on a trust the user didn't give. Re-read the hooks so
+          // the list (and the next click) carries their current hashes.
+          await check();
+          busy = null;
+          return;
+        }
       }
       if (!plugin.on) await putWorkspacePlugin(wsId, pluginId, true);
       refreshWorkspacePlugins();
@@ -266,14 +281,15 @@
         return;
       }
       refreshKnowledge();
-      if (skipped.length === 0) {
-        clearContinuation();
-        onClose();
-      } else busy = null;
+      clearContinuation();
+      onClose();
     } catch (e) {
       error = isMissingRoute(e) ? "this daemon can't finish that step yet — update chimaera" : message(e);
-      busy = null;
       refreshWorkspacePlugins();
+      // Steps before the failure may have landed (hooks trusted, switched
+      // on): show where things are now, so a retry doesn't redo them.
+      await check();
+      busy = null;
     }
   }
 
