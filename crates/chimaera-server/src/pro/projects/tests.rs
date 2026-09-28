@@ -652,12 +652,21 @@ fn lazy_return_preserves_finished_conversation_through_real_worker_route() {
 
 #[test]
 fn worker_poll_cannot_skip_roundtrip_hydration_or_diverge_snapshot_ancestry() {
+    worker_roundtrip(false);
+}
+
+#[test]
+fn worker_roundtrip_recovers_damaged_shadow_without_losing_unpublished_cache_history() {
+    worker_roundtrip(true);
+}
+
+fn worker_roundtrip(corrupt_shadow: bool) {
     const CHILD: &str = "CHIMAERA_WORKER_ANCESTRY_TEST_CHILD";
     if std::env::var_os(CHILD).is_none() {
         let root = temp();
         std::fs::create_dir(root.join("home")).unwrap();
         let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "pro::projects::tests::worker_poll_cannot_skip_roundtrip_hydration_or_diverge_snapshot_ancestry", "--nocapture"])
+            .args(["--exact", if corrupt_shadow { "pro::projects::tests::worker_roundtrip_recovers_damaged_shadow_without_losing_unpublished_cache_history" } else { "pro::projects::tests::worker_poll_cannot_skip_roundtrip_hydration_or_diverge_snapshot_ancestry" }, "--nocapture"])
             .env(CHILD, "1").env("CHIMAERA_HOME", root.join("app"))
             .env("HOME", root.join("home")).env("SHELL", "/bin/sh")
             .output().unwrap();
@@ -800,6 +809,18 @@ fn worker_poll_cannot_skip_roundtrip_hydration_or_diverge_snapshot_ancestry() {
                 )
             })
             .collect();
+        let preserved = if corrupt_shadow {
+            let cache = shadow(&worker);
+            let damaged = git(&cache, &["rev-parse", "refs/heads/handoff"]);
+            let object = cache.join("objects").join(&damaged[..2]).join(&damaged[2..]);
+            std::fs::remove_file(&object).unwrap();
+            std::fs::write(&object, []).unwrap();
+            let unique_file = root.join("unpublished-cache.txt");
+            std::fs::write(&unique_file, "unique unpublished cache object").unwrap();
+            let unique = git(&cache, &["hash-object", "-w", unique_file.to_str().unwrap()]);
+            git(&cache, &["update-ref", "refs/preserved/unpublished", &unique]);
+            Some((damaged, unique))
+        } else { None };
         *lock(&fixture.holder) = None;
         fixture.epoch.store(3, Ordering::SeqCst);
         // The sleeping worker missed the intermediate device ownership entirely.
@@ -832,6 +853,12 @@ fn worker_poll_cannot_skip_roundtrip_hydration_or_diverge_snapshot_ancestry() {
             .await
             .unwrap();
         assert_eq!(fixture.acquires.load(Ordering::SeqCst), 3);
+        if let Some((damaged, unique)) = preserved {
+            let previous = worker.pro.root.join("w-cloud/working-tree.quarantine/previous.git");
+            assert_eq!(git(&previous, &["rev-parse", "refs/heads/handoff"]), damaged);
+            assert_eq!(git(&previous, &["rev-parse", "refs/preserved/unpublished"]), unique);
+            assert_eq!(git(&previous, &["cat-file", "blob", &unique]), "unique unpublished cache object");
+        }
         for (branch, oid) in &expected {
             assert_eq!(
                 git(
@@ -872,13 +899,17 @@ fn worker_poll_cannot_skip_roundtrip_hydration_or_diverge_snapshot_ancestry() {
             .all(|path| path == "GET /v1/baton/w-cloud" || path == "POST /v1/baton/w-cloud/renew"));
         // Equal cached epochs are not proof of ownership after a clean release.
         // Exercise the normal route's job reservation around that retry.
-        *lock(&fixture.holder) = None;
-        {
-            let _job = worker.pro.jobs.lock().await;
-            engine::hydrate(&worker, &worker_config, "w-cloud", 3, false, None)
-                .await
-                .unwrap();
+        async fn http_hydrate(worker: Arc<AppState>) -> StatusCode {
+            use tower::ServiceExt;
+            crate::router::app(worker).oneshot(
+                Request::builder().method("POST").uri("/api/v1/pro/hydrate")
+                    .header("Authorization", "Bearer local-test")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(r#"{"workspace_id":"w-cloud","expected_epoch":3,"requires_fork":false}"#)).unwrap()
+            ).await.unwrap().status()
         }
+        *lock(&fixture.holder) = None;
+        assert_eq!(http_hydrate(worker.clone()).await, StatusCode::NO_CONTENT);
         assert_eq!(fixture.acquires.load(Ordering::SeqCst), 4);
         assert_eq!(
             git(
@@ -891,24 +922,45 @@ fn worker_poll_cannot_skip_roundtrip_hydration_or_diverge_snapshot_ancestry() {
         // Neither an unowned busy-job no-op nor observing another holder is a
         // successful retained grant, even if cached Local was unchanged.
         *lock(&fixture.holder_after_next_read) = Some(None);
-        {
-            let _job = worker.pro.jobs.lock().await;
-            engine::hydrate(&worker, &worker_config, "w-cloud", 3, false, None)
-                .await
-                .unwrap();
-        }
+        assert_eq!(http_hydrate(worker.clone()).await, StatusCode::NO_CONTENT);
         assert_eq!(fixture.acquires.load(Ordering::SeqCst), 5);
         *lock(&fixture.holder_after_next_read) = Some(Some("device-2".into()));
-        {
-            let _job = worker.pro.jobs.lock().await;
-            assert!(engine::hydrate(&worker, &worker_config, "w-cloud", 3, false, None)
-                .await
-                .is_err());
-        }
+        assert_eq!(http_hydrate(worker.clone()).await, StatusCode::BAD_REQUEST);
         assert_eq!(fixture.acquires.load(Ordering::SeqCst), 5);
         assert!(matches!(lock(&worker.pro.ownership).get("w-cloud"), Some(Ownership::Remote { holder, epoch:3 }) if holder == "device-2"));
         assert!(worker.chat.list().is_empty());
         server.abort();
         let _ = server.await;
     });
+}
+
+#[tokio::test]
+async fn cache_wait_cannot_admit_an_old_account_configuration() {
+    let root = temp();
+    let owner = state(&root);
+    configure(&owner, "http://127.0.0.1:1");
+    let config = lock(&owner.pro.runtime).clone().unwrap();
+    for snapshot in [false, true] {
+        let cache = owner.pro.cache("w-generation").unwrap();
+        let guard = cache.lock_owned().await;
+        let future = async {
+            if snapshot {
+                engine::snapshot(&owner, &config, "w-generation", false).await
+            } else {
+                engine::hydrate(&owner, &config, "w-generation", 1, false, None).await
+            }
+        };
+        tokio::pin!(future);
+        assert!(tokio::time::timeout(Duration::from_millis(20), &mut future)
+            .await
+            .is_err());
+        owner.pro.generation.fetch_add(1, Ordering::AcqRel);
+        drop(guard);
+        assert_eq!(
+            future.await.unwrap_err().to_string(),
+            "Account changed while waiting for project cache"
+        );
+        assert!(!owner.pro.root.join("w-generation").exists());
+    }
+    std::fs::remove_dir_all(root).unwrap();
 }

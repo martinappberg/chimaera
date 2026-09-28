@@ -441,7 +441,19 @@ pub(crate) async fn hydrate(
         && lock(&state.workspaces).get(&request.workspace_id).is_some()
         && matches!(lock(&state.pro.ownership).get(&request.workspace_id),Some(Ownership::Local{epoch}|Ownership::AwaitingVerification{epoch}) if *epoch==request.expected_epoch)
     {
-        return match engine::reconcile(&state, &config, &request.workspace_id).await {
+        // Only the verified hydration path can prove a same-owner restart.
+        // Reconciliation may legitimately do nothing while this route holds
+        // the job reservation, so its success alone is not a completed import.
+        return match engine::hydrate(
+            &state,
+            &config,
+            &request.workspace_id,
+            request.expected_epoch,
+            request.requires_fork,
+            request.destination_root.as_deref(),
+        )
+        .await
+        {
             Ok(()) => StatusCode::NO_CONTENT.into_response(),
             Err(error) => failure(error),
         };
@@ -451,10 +463,30 @@ pub(crate) async fn hydrate(
         .root
         .join(&request.workspace_id)
         .join("incoming.git");
-    let manifest = match engine::fetch_snapshot(&config, &request.workspace_id, &cache).await {
+    let cache_mutex = match state.pro.cache(&request.workspace_id) {
+        Ok(cache) => cache,
+        Err(error) => return failure(error),
+    };
+    let cache_guard = Arc::new(cache_mutex.lock_owned().await);
+    if generation != state.pro.generation.load(Ordering::Acquire) {
+        return failure(anyhow::anyhow!(
+            "Account changed while waiting for project cache"
+        ));
+    }
+    if let Err(error) = super::transport::cache_quiescent(&request.workspace_id) {
+        return failure(error);
+    }
+    let manifest = match super::transport::cache_scope(
+        &request.workspace_id,
+        cache_guard.clone(),
+        engine::fetch_snapshot(&config, &request.workspace_id, &cache),
+    )
+    .await
+    {
         Ok(value) => value,
         Err(error) => return failure(error),
     };
+    drop(cache_guard);
     let root = request
         .destination_root
         .clone()

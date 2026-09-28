@@ -561,6 +561,28 @@ async fn snapshot_inner(
     clean: bool,
     phase: &mut &'static str,
 ) -> Result<()> {
+    let generation = state.pro.generation.load(Ordering::Acquire);
+    let cache = Arc::new(state.pro.cache(workspace)?.lock_owned().await);
+    ensure!(
+        generation == state.pro.generation.load(Ordering::Acquire),
+        "Account changed while waiting for project cache"
+    );
+    transport::cache_quiescent(workspace)?;
+    transport::cache_scope(
+        workspace,
+        cache,
+        snapshot_inner_scoped(state, config, workspace, clean, phase),
+    )
+    .await
+}
+
+async fn snapshot_inner_scoped(
+    state: &Arc<AppState>,
+    config: &Configure,
+    workspace: &str,
+    clean: bool,
+    phase: &mut &'static str,
+) -> Result<()> {
     authority::config_matches(state, config, workspace)?;
     let effective = execution::effective(state, config, workspace)?;
     let config = &effective;
@@ -804,9 +826,41 @@ pub(super) async fn hydrate(
     fork: bool,
     destination_root: Option<&Path>,
 ) -> Result<()> {
+    let generation = state.pro.generation.load(Ordering::Acquire);
     let bound_destination =
         authority::destination(state, config, workspace, destination_root).await?;
     let destination_root = bound_destination.as_deref();
+    let cache = Arc::new(state.pro.cache(workspace)?.lock_owned().await);
+    ensure!(
+        generation == state.pro.generation.load(Ordering::Acquire),
+        "Account changed while waiting for project cache"
+    );
+    transport::cache_quiescent(workspace)?;
+    transport::cache_scope(
+        workspace,
+        cache.clone(),
+        hydrate_scoped(
+            state,
+            config,
+            workspace,
+            expected_epoch,
+            fork,
+            destination_root,
+            cache,
+        ),
+    )
+    .await
+}
+
+async fn hydrate_scoped(
+    state: &Arc<AppState>,
+    config: &Configure,
+    workspace: &str,
+    expected_epoch: u64,
+    fork: bool,
+    destination_root: Option<&Path>,
+    mut cache_guard: Arc<tokio::sync::OwnedMutexGuard<()>>,
+) -> Result<()> {
     let generation = state.pro.generation.load(Ordering::Acquire);
     let install_epoch = std::sync::atomic::AtomicU64::new(0);
     let current = || -> Result<()> {
@@ -1008,10 +1062,11 @@ pub(super) async fn hydrate(
         .await?;
         let baseline = stage.join("baseline");
         let local_shadow = state.pro.root.join(workspace).join("working-tree.git");
-        let has_baseline = tokio::fs::try_exists(local_shadow.join("HEAD")).await?;
-        if has_baseline {
+        let old_shadow = super::shadow_cache::baseline(&local_shadow).await?;
+        let has_baseline = old_shadow.is_some();
+        if let Some(old_shadow) = &old_shadow {
             tokio::fs::create_dir_all(&baseline).await?;
-            let mut command = transport::git(&local_shadow, None).await?;
+            let mut command = transport::git(old_shadow, None).await?;
             command.env("GIT_WORK_TREE", &baseline);
             transport::git_output(
                 command,
@@ -1043,18 +1098,21 @@ pub(super) async fn hydrate(
             )
         })
         .await??;
-        mirror::initialize(&local_shadow).await?;
-        transport::git_output(
-            transport::git(&local_shadow, None).await?,
-            &[
-                "fetch",
-                "--no-tags",
-                cache.to_str().context("invalid cache path")?,
-                "+refs/heads/*:refs/heads/*",
-            ],
-            vec![],
-        )
-        .await?;
+        if let Some(repair) = super::shadow_cache::prepare(&local_shadow, &cache, cache_guard.clone()).await? {
+            let configuration = state.pro.configuration.clone().lock_owned().await;
+            let owner = state.clone();
+            let workspace = workspace.to_owned();
+            let epoch = grant.epoch;
+            cache_guard = super::shadow_cache::install(repair, cache_guard, configuration, move || {
+                transport::cache_quiescent(&workspace)?;
+                ensure!(generation == owner.pro.generation.load(Ordering::Acquire), "Account changed during shadow recovery");
+                ensure!(execution::valid_grant(&owner, &workspace, epoch), "Execution authority expired during shadow recovery");
+                ensure!(matches!(lock(&owner.pro.ownership).get(&workspace), Some(Ownership::Hydrating { epoch: current }) if *current == epoch), "Workspace ownership changed during shadow recovery");
+                Ok(())
+            }).await?;
+        }
+        current()?;
+        ensure!(matches!(lock(&state.pro.ownership).get(workspace), Some(Ownership::Hydrating { epoch }) if *epoch == grant.epoch), "Workspace ownership changed during hydration");
         let overlay = stage.join("config");
         let home = state
             .claude_settings_path
@@ -1127,6 +1185,7 @@ pub(super) async fn hydrate(
             run_profile_steps(state, config, workspace),
         )
         .await?;
+        drop(cache_guard);
         Ok::<_, anyhow::Error>(())
     }
     .await;

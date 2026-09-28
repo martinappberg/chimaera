@@ -1,16 +1,78 @@
 //! Bounded subprocess transports keep optional TLS and Git out of the daemon.
-use std::{path::Path, process::Stdio, time::Duration};
+use std::{
+    collections::HashSet,
+    future::Future,
+    path::Path,
+    process::Stdio,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, LazyLock, Mutex,
+    },
+    time::Duration,
+};
 
 use anyhow::{bail, ensure, Context, Result};
 use serde::de::DeserializeOwned;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     process::Command,
-    sync::{OnceCell, Semaphore},
+    sync::{OnceCell, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore},
 };
 
-static CHILDREN: Semaphore = Semaphore::const_new(2);
+static CHILDREN: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(2)));
 static MIRROR_GIT: OnceCell<MirrorGit> = OnceCell::const_new();
+static UNCERTAIN_CACHES: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+static UNCERTAIN_OVERFLOW: AtomicBool = AtomicBool::new(false);
+const CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+tokio::task_local! {
+    static CACHE_GUARD: CacheContext;
+}
+
+#[derive(Clone)]
+struct CacheContext {
+    workspace: String,
+    _guard: Arc<OwnedMutexGuard<()>>,
+}
+
+fn uncertain(workspace: Option<&str>) {
+    let Some(workspace) = workspace else {
+        return;
+    };
+    let mut caches = crate::lock(&UNCERTAIN_CACHES);
+    if caches.len() >= 128 && !caches.contains(workspace) {
+        UNCERTAIN_OVERFLOW.store(true, Ordering::Release);
+    } else {
+        caches.insert(workspace.to_owned());
+    }
+}
+
+/// Cache users retain the same exclusion inside an owned subprocess task.
+/// Cancellation of the request must not authorize the next cache writer.
+pub(super) async fn cache_scope<T>(
+    workspace: &str,
+    guard: Arc<OwnedMutexGuard<()>>,
+    future: impl Future<Output = T>,
+) -> T {
+    CACHE_GUARD
+        .scope(
+            CacheContext {
+                workspace: workspace.to_owned(),
+                _guard: guard,
+            },
+            future,
+        )
+        .await
+}
+
+pub(super) fn cache_quiescent(workspace: &str) -> Result<()> {
+    ensure!(
+        !UNCERTAIN_OVERFLOW.load(Ordering::Acquire)
+            && !crate::lock(&UNCERTAIN_CACHES).contains(workspace),
+        "Mirror helper cleanup could not be verified; cache recovery is unavailable"
+    );
+    Ok(())
+}
 type GitVersion = (u32, u32, u32);
 const FIXED_HTTP_GIT: GitVersion = (2, 45, 0);
 const HTTP_GIT_HINT: &str = "mirror Git HTTP transfer failed; an older Git/curl combination may truncate large uploads. Update Git to 2.45 or newer and restart Chimaera";
@@ -57,12 +119,12 @@ fn git_version(bytes: &[u8]) -> Option<GitVersion> {
     Some((major, minor, patch.parse().ok()?))
 }
 
-async fn probe_git(binary: &str) -> Option<GitVersion> {
+async fn probe_git(binary: &str, permit: Arc<OwnedSemaphorePermit>) -> Option<GitVersion> {
     let mut command = clean_command(binary);
     command.arg("--version");
     // Discovery already reserved a child slot. Each credential-free probe
     // has its own short deadline and never starts a login shell.
-    let output = run_reserved(command, vec![], Duration::from_secs(2), 256)
+    let output = run_reserved(command, vec![], Duration::from_secs(2), 256, permit)
         .await
         .ok()?;
     output
@@ -73,18 +135,20 @@ async fn probe_git(binary: &str) -> Option<GitVersion> {
 
 async fn discover_git<'a>(
     cell: &'a OnceCell<MirrorGit>,
-    children: &Semaphore,
+    children: &Arc<Semaphore>,
     queue_timeout: Duration,
 ) -> Result<&'a MirrorGit> {
     cell.get_or_try_init(|| async {
         // Capacity pressure is transient: leave the cell empty so a later
         // mirror attempt retries instead of permanently selecting unknown Git.
-        let _permit = tokio::time::timeout(queue_timeout, children.acquire())
-            .await
-            .context("mirror Git discovery is waiting for another helper; retry shortly")??;
-        let path = probe_git("git").await;
+        let permit = Arc::new(
+            tokio::time::timeout(queue_timeout, children.clone().acquire_owned())
+                .await
+                .context("mirror Git discovery is waiting for another helper; retry shortly")??,
+        );
+        let path = probe_git("git", permit.clone()).await;
         let system = if cfg!(target_os = "macos") && !known_fixed(path) {
-            probe_git("/usr/bin/git").await
+            probe_git("/usr/bin/git", permit.clone()).await
         } else {
             None
         };
@@ -111,6 +175,25 @@ pub(super) struct Output {
     pub success: bool,
     pub stdout: Vec<u8>,
     diagnostic: &'static str,
+    damaged_object: bool,
+}
+
+impl Output {
+    pub(super) fn object_damage(&self) -> bool {
+        self.damaged_object
+            || self.stdout.split(|b| *b == b'\n').any(|line| {
+                let Ok(line) = std::str::from_utf8(line) else {
+                    return false;
+                };
+                let mut words = line.split_whitespace();
+                matches!(words.next(), Some("missing"))
+                    && matches!(words.next(), Some("blob" | "tree" | "commit" | "tag"))
+                    && words.next().is_some_and(|oid| {
+                        matches!(oid.len(), 40 | 64) && oid.bytes().all(|b| b.is_ascii_hexdigit())
+                    })
+                    && words.next().is_none()
+            })
+    }
 }
 
 fn clean_command(binary: &str) -> Command {
@@ -155,31 +238,201 @@ pub(super) async fn run(
     timeout: Duration,
     cap: usize,
 ) -> Result<Output> {
-    let _permit = CHILDREN.acquire().await?;
-    run_reserved(command, input, timeout, cap).await
+    let permit = Arc::new(CHILDREN.clone().acquire_owned().await?);
+    run_reserved(command, input, timeout, cap, permit).await
 }
 
-/// The caller must hold one CHILDREN permit for this entire future.
 async fn run_reserved(
+    command: Command,
+    input: Vec<u8>,
+    timeout: Duration,
+    cap: usize,
+    permit: Arc<OwnedSemaphorePermit>,
+) -> Result<Output> {
+    let cache = CACHE_GUARD.try_with(Clone::clone).ok();
+    if let Some(cache) = &cache {
+        cache_quiescent(&cache.workspace)?;
+    }
+    let (cancel, canceled) = tokio::sync::oneshot::channel::<()>();
+    let task = tokio::spawn(async move {
+        let workspace = cache.as_ref().map(|cache| cache.workspace.as_str());
+        let _permit = permit;
+        let mut completion = HelperCompletion {
+            verified: false,
+            workspace,
+        };
+        let result = run_owned(command, input, timeout, cap, canceled, workspace).await;
+        completion.verified = true;
+        result
+    });
+    let result = task.await.context("mirror helper task failed")?;
+    drop(cancel);
+    result
+}
+
+struct HelperCompletion<'a> {
+    verified: bool,
+    workspace: Option<&'a str>,
+}
+impl Drop for HelperCompletion<'_> {
+    fn drop(&mut self) {
+        if !self.verified {
+            uncertain(self.workspace);
+        }
+    }
+}
+
+struct Helper<'a> {
+    child: tokio::process::Child,
+    cleaned: bool,
+    signaled: bool,
+    workspace: Option<&'a str>,
+    #[cfg(unix)]
+    group: Option<rustix::process::Pid>,
+}
+impl Helper<'_> {
+    fn stop(&mut self) {
+        if self.signaled {
+            return;
+        }
+        self.signaled = true;
+        #[cfg(unix)]
+        if let Some(group) = self.group {
+            let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+        }
+        let _ = self.child.start_kill();
+    }
+
+    async fn exited(&mut self) -> std::io::Result<bool> {
+        #[cfg(unix)]
+        {
+            use rustix::process::{waitid, WaitId, WaitIdOptions};
+            let group = self
+                .group
+                .ok_or_else(|| std::io::Error::other("helper identity unavailable"))?;
+            let mut changed =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child())?;
+            loop {
+                match waitid(
+                    WaitId::Pid(group),
+                    WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+                ) {
+                    Ok(Some(status)) => return Ok(status.exit_status() == Some(0)),
+                    Ok(None) => {}
+                    Err(rustix::io::Errno::INTR) => continue,
+                    Err(error) => return Err(error.into()),
+                }
+                // Keep the exited leader unreaped until the group signal. Its
+                // reserved PID cannot become an unrelated process group.
+                tokio::select! {
+                    _ = changed.recv() => {},
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => {},
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        Ok(self.child.wait().await?.success())
+    }
+    async fn finish(&mut self, _completed: bool) -> Result<()> {
+        self.stop();
+        let cleanup = async {
+            self.child.wait().await?;
+            #[cfg(not(unix))]
+            ensure!(
+                _completed,
+                "mirror helper descendant cleanup is unsupported"
+            );
+            #[cfg(unix)]
+            if let Some(group) = self.group {
+                loop {
+                    match rustix::process::test_kill_process_group(group) {
+                        Err(rustix::io::Errno::SRCH) => break,
+                        // macOS can transiently return EPERM while a killed
+                        // orphan group is being reaped. It still counts as
+                        // present: retain exclusion until ESRCH or timeout.
+                        Ok(()) | Err(rustix::io::Errno::PERM) => {
+                            tokio::time::sleep(Duration::from_millis(10)).await
+                        }
+                        Err(rustix::io::Errno::INTR) => continue,
+                        Err(_) => bail!("mirror helper group cleanup failed"),
+                    }
+                }
+            }
+            Ok::<_, anyhow::Error>(())
+        };
+        let result = tokio::time::timeout(CLEANUP_TIMEOUT, cleanup).await;
+        if !matches!(result, Ok(Ok(()))) {
+            uncertain(self.workspace);
+            bail!("mirror helper cleanup could not be verified");
+        }
+        #[cfg(unix)]
+        {
+            self.group = None;
+        }
+        self.cleaned = true;
+        Ok(())
+    }
+}
+impl Drop for Helper<'_> {
+    fn drop(&mut self) {
+        if !self.cleaned {
+            uncertain(self.workspace);
+        }
+        self.stop();
+    }
+}
+
+async fn run_owned(
     mut command: Command,
     input: Vec<u8>,
     timeout: Duration,
     cap: usize,
+    mut canceled: tokio::sync::oneshot::Receiver<()>,
+    workspace: Option<&str>,
 ) -> Result<Output> {
-    let mut child = command
+    if matches!(
+        canceled.try_recv(),
+        Ok(()) | Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+    ) {
+        bail!("mirror helper request canceled");
+    }
+    #[cfg(unix)]
+    command.process_group(0);
+    let child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
         .context("could not start mirror helper")?;
-    let mut stdin = child.stdin.take().context("helper input unavailable")?;
-    let stdout = child.stdout.take().context("helper output unavailable")?;
-    let stderr = child
-        .stderr
-        .take()
-        .context("helper diagnostics unavailable")?;
-    tokio::time::timeout(timeout, async move {
+    #[cfg(unix)]
+    let group = child
+        .id()
+        .and_then(|id| rustix::process::Pid::from_raw(id as i32));
+    let mut helper = Helper {
+        child,
+        cleaned: false,
+        signaled: false,
+        workspace,
+        #[cfg(unix)]
+        group,
+    };
+    let work = async {
+        let mut stdin = helper
+            .child
+            .stdin
+            .take()
+            .context("helper input unavailable")?;
+        let stdout = helper
+            .child
+            .stdout
+            .take()
+            .context("helper output unavailable")?;
+        let stderr = helper
+            .child
+            .stderr
+            .take()
+            .context("helper diagnostics unavailable")?;
         let send = async move {
             if !input.is_empty() {
                 stdin.write_all(&input).await?;
@@ -190,16 +443,34 @@ async fn run_reserved(
             send,
             read_bounded(stdout, cap),
             read_bounded(stderr, 16 * 1024),
-            child.wait()
+            helper.exited()
         )?;
+        let diagnostic = helper_diagnostic(&stderr);
+        let text = String::from_utf8_lossy(&stderr).to_ascii_lowercase();
+        let damaged_object = diagnostic == "repository"
+            && [
+                "bad object",
+                "invalid object",
+                "bad tree",
+                "not a valid object name",
+                "unable to read tree",
+                "corrupt",
+            ]
+            .iter()
+            .any(|pattern| text.contains(pattern));
         Ok::<_, anyhow::Error>(Output {
-            success: status.success(),
+            success: status,
             stdout,
-            diagnostic: helper_diagnostic(&stderr),
+            diagnostic,
+            damaged_object,
         })
-    })
-    .await
-    .context("mirror helper timed out")?
+    };
+    let result = tokio::select! {
+        result = tokio::time::timeout(timeout, work) => result.context("mirror helper timed out").and_then(|v| v),
+        _ = &mut canceled => Err(anyhow::anyhow!("mirror helper request canceled")),
+    };
+    helper.finish(result.is_ok()).await?;
+    result
 }
 
 // Never retain helper stderr: Git can include credentials, remote URLs or
@@ -273,6 +544,7 @@ fn helper_diagnostic(stderr: &[u8]) -> &'static str {
                 "bad object",
                 "invalid object",
                 "bad tree",
+                "not a valid object name",
                 "unable to read tree",
                 "corrupt",
             ][..],
@@ -460,7 +732,14 @@ pub(super) async fn request(
 /// password from the child environment only; neither argv nor .git/config
 /// contains the credential, and redirects are forbidden.
 pub(super) async fn git(dir: &Path, credentials: Option<(&str, &str)>) -> Result<Command> {
-    let mut command = clean_command(mirror_git().await?.binary);
+    let selected = mirror_git().await?;
+    ensure!(
+        selected
+            .version
+            .is_some_and(|version| version >= (2, 36, 0)),
+        "Cloud mirroring needs Git 2.36 or newer to save snapshots safely; update Git and retry"
+    );
+    let mut command = clean_command(selected.binary);
     command
         .current_dir(dir)
         .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -473,6 +752,14 @@ pub(super) async fn git(dir: &Path, credentials: Option<(&str, &str)>) -> Result
         .args([
             "-c",
             "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsync=committed,reference,pack-metadata",
+            "-c",
+            "core.fsyncMethod=fsync",
+            "-c",
+            "gc.auto=0",
+            "-c",
+            "maintenance.auto=false",
             "-c",
             "http.followRedirects=false",
             "-c",
@@ -541,6 +828,119 @@ pub(super) async fn git_output(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    async fn delayed_writer(cancel: bool, close_pipes: bool) {
+        let root = std::env::temp_dir().join(format!(
+            "chimaera-helper-lifetime-{}",
+            chimaera_core::generate_token()
+        ));
+        tokio::fs::create_dir(&root).await.unwrap();
+        let ready = root.join("ready");
+        let written = root.join("late-write");
+        let cache = Arc::new(tokio::sync::Mutex::new(()));
+        let guard = Arc::new(cache.clone().lock_owned().await);
+        let permits = Arc::new(Semaphore::new(1));
+        let permit = Arc::new(permits.clone().acquire_owned().await.unwrap());
+        let mut command = clean_command("/bin/sh");
+        command
+            .env("HELPER_READY", &ready)
+            .env("HELPER_WRITE", &written);
+        command.args(["-c", if close_pipes {
+            "(exec >/dev/null 2>&1; printf ready > \"$HELPER_READY\"; sleep 0.4; printf escaped > \"$HELPER_WRITE\") & exit 0"
+        } else {
+            "(printf ready > \"$HELPER_READY\"; sleep 0.4; printf escaped > \"$HELPER_WRITE\") & wait"
+        }]);
+        let workspace = format!("w-{}", chimaera_core::generate_token());
+        let owned_workspace = workspace.clone();
+        let task = tokio::spawn(async move {
+            cache_scope(&owned_workspace, guard, async move {
+                run_reserved(
+                    command,
+                    vec![],
+                    if cancel {
+                        Duration::from_secs(10)
+                    } else {
+                        Duration::from_millis(100)
+                    },
+                    1024,
+                    permit,
+                )
+                .await
+            })
+            .await
+        });
+        if cancel {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while !tokio::fs::try_exists(&ready).await.unwrap() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+            task.abort();
+            assert!(matches!(task.await, Err(error) if error.is_cancelled()));
+        } else if close_pipes {
+            assert!(task.await.unwrap().unwrap().success);
+        } else {
+            assert!(task.await.unwrap().is_err());
+        }
+        // The next cache operation is permitted only after the entire original
+        // process group is gone, including a child that closed its stdio.
+        let _next = tokio::time::timeout(Duration::from_secs(6), cache.lock())
+            .await
+            .unwrap();
+        assert_eq!(permits.available_permits(), 1);
+        cache_quiescent(&workspace).unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(!tokio::fs::try_exists(written).await.unwrap());
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn canceled_helper_retains_cache_until_delayed_descendant_is_stopped() {
+        delayed_writer(true, false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_out_helper_and_closed_pipe_descendant_cannot_outlive_cache_exclusion() {
+        delayed_writer(false, false).await;
+        delayed_writer(false, true).await;
+    }
+
+    #[test]
+    fn missing_object_diagnostics_require_exact_bounded_identity() {
+        let output = |text: &str| Output {
+            success: false,
+            stdout: text.as_bytes().to_vec(),
+            diagnostic: "unknown",
+            damaged_object: false,
+        };
+        assert!(output("missing blob 0123456789012345678901234567890123456789\n").object_damage());
+        for text in [
+            "missing blob ../private",
+            "missing resource 0123456789012345678901234567890123456789",
+            "missing blob 0123456789012345678901234567890123456789 extra",
+        ] {
+            assert!(!output(text).object_damage());
+        }
+    }
+
+    #[test]
+    fn uncertain_cleanup_stays_bound_to_its_workspace() {
+        let failed = format!("w-{}", chimaera_core::generate_token());
+        let sibling = format!("w-{}", chimaera_core::generate_token());
+        uncertain(Some(&failed));
+        assert!(cache_quiescent(&failed).is_err());
+        assert!(cache_quiescent(&sibling).is_ok());
+        // The record is independent of the weak cache-mutex entry and account
+        // Configure lifetime; a later lock allocation cannot erase it.
+        uncertain(None);
+        assert!(cache_quiescent(&failed).is_err());
+    }
+
     #[test]
     fn diagnostics_are_fixed_categories_without_remote_or_credential_text() {
         assert_eq!(helper_diagnostic(b"fatal: Authentication failed for 'https://fixture-user:fixture-secret@mirror.test/repository.git'"), "authentication");
@@ -648,7 +1048,7 @@ mod tests {
     #[tokio::test]
     async fn capacity_timeout_does_not_cache_unknown_git() {
         let cell = OnceCell::new();
-        let children = Semaphore::new(0);
+        let children = Arc::new(Semaphore::new(0));
         assert!(discover_git(&cell, &children, Duration::from_millis(1))
             .await
             .is_err());

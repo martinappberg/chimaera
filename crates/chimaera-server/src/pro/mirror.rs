@@ -19,6 +19,14 @@ pub(super) struct Report {
 }
 
 pub(super) async fn initialize(path: &Path) -> Result<()> {
+    if path
+        .file_name()
+        .is_some_and(|name| name == "working-tree.git")
+        && !tokio::fs::try_exists(path).await?
+        && tokio::fs::try_exists(path.with_file_name("working-tree.quarantine")).await?
+    {
+        anyhow::bail!("An interrupted shadow recovery must finish through hydration");
+    }
     tokio::fs::create_dir_all(path).await?;
     if !tokio::fs::try_exists(path.join("HEAD")).await? {
         transport::git_output(

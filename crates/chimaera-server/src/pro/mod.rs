@@ -11,6 +11,7 @@ mod protocol;
 mod provider_gate;
 mod repository;
 mod routes;
+mod shadow_cache;
 mod transport;
 pub(crate) use policy::CloudProfile;
 pub(crate) use provider_gate::{cloud_provider_blocks, workspace_provider_blocks};
@@ -23,7 +24,7 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicU64},
-        Mutex,
+        Arc, Mutex, Weak,
     },
 };
 use tokio::sync::Mutex as AsyncMutex;
@@ -48,7 +49,8 @@ pub(crate) struct ProState {
     mirror_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     jobs: AsyncMutex<()>,
     persistence: AsyncMutex<()>,
-    configuration: AsyncMutex<()>,
+    configuration: Arc<AsyncMutex<()>>,
+    caches: Mutex<HashMap<String, Weak<AsyncMutex<()>>>>,
     awake_since: AtomicU64,
     power_suitable: AtomicBool,
 }
@@ -116,6 +118,21 @@ struct DiskState {
     preferences: HashMap<String, Preference>,
 }
 impl ProState {
+    fn cache(&self, workspace: &str) -> anyhow::Result<Arc<AsyncMutex<()>>> {
+        anyhow::ensure!(valid_id(workspace), "invalid workspace cache identity");
+        let mut caches = crate::lock(&self.caches);
+        caches.retain(|_, cache| cache.strong_count() > 0);
+        if let Some(cache) = caches.get(workspace).and_then(Weak::upgrade) {
+            return Ok(cache);
+        }
+        anyhow::ensure!(
+            caches.len() < 128,
+            "workspace cache capacity is busy; retry shortly"
+        );
+        let cache = Arc::new(AsyncMutex::new(()));
+        caches.insert(workspace.into(), Arc::downgrade(&cache));
+        Ok(cache)
+    }
     pub(crate) fn new(root: PathBuf) -> Self {
         // Construction already happens on the daemon's startup blocking path.
         // A capped record can gate restore without needing an account token.
@@ -191,7 +208,8 @@ impl ProState {
             mirror_task: Mutex::new(None),
             jobs: AsyncMutex::new(()),
             persistence: AsyncMutex::new(()),
-            configuration: AsyncMutex::new(()),
+            configuration: Arc::new(AsyncMutex::new(())),
+            caches: Mutex::new(HashMap::new()),
             awake_since: AtomicU64::new(now()),
             power_suitable: AtomicBool::new(false),
         }

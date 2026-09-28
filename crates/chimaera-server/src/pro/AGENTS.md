@@ -22,6 +22,7 @@ revocable delegation over the authenticated local API.
 | `transport.rs` | Bounded external curl/git children; cached mirror-only Git compatibility selection; credentials only in memory, never argv or Git config. |
 | `policy.rs` | Mirrored-path policy, credential filtering, size budgets and cloud-profile classification. |
 | `mirror.rs` | Separate shadow and repository Git directories, incremental transfer and conservative hand-back. |
+| `shadow_cache.rs` | Validated reconstruction of an objectively damaged outgoing shadow, retaining its complete prior store in a bounded no-overwrite quarantine. |
 | `repository.rs` | Portable remote/tracking allowlist; bounded ref import, compare-and-swap adoption and index/ref-lock cancellation cleanup. |
 | `canonical.rs` | Bounded private preservation of unpublished local file conflicts before canonical checkpoint adoption; never overwrites previous conflict copies. |
 | `config.rs` | Portable agent configuration export/import, scoped environment-omission diagnostics and destination connection identity preservation. |
@@ -128,7 +129,7 @@ a 105-second preparation deadline. Generic ownership polling leaves a previously
 remote, now-unowned project fenced until hydration installs its current history.
 Worker polling also fences unowned projects whose intervening device tenure was
 missed during sleep. A durable worker restart shortcut requires a freshly renewed
-matching owner and epoch; a busy-job no-op or changed owner cannot skip import.
+matching owner and epoch, including the HTTP entry point; a busy-job no-op or changed owner cannot skip import.
 Negotiated checkpoint execution retains its separate canonical hydration path.
 Existing laptop projects retain their original roots. Worker hand-back and explicit
 adoption compare the raw account holder against the typed keeper worker identity
@@ -179,3 +180,5 @@ project namespaces, or project-bound routing of generic daemon/MCP APIs. Those
 remain prerequisites to enabling selected-project secrets.
 
 Snapshot failures emit only a fixed operation phase, fixed error category and clean/snapshot boolean, including failures recovered by resuming an idle session. Recovery does not turn that failure into a successful handoff; response and retry behavior are unchanged.
+
+Mirror helpers require known Git 2.36 or newer and explicitly harden committed objects, refs and pack metadata with full fsync. A failed local shadow fetch only becomes eligible for repair when strict object validation confirms a missing or damaged object in the existing shadow; healthy divergence and ordinary transport failures retain their failure. Incoming and replacement object graphs must pass complete strict Git validation. The previous working-tree baseline is extracted before replacement. Both replacement and preserved evidence files are boundedly fsynced before the final authority check and swap. The entire damaged repository, including unpublished refs, reflogs and objects, is retained in one fixed same-volume quarantine; a second replacement cannot overwrite it. An interrupted swap with a missing current shadow uses only the preserved previous repository as its local baseline and rebuilds from the newly authenticated incoming snapshot. Per-workspace owned cache guards serialize snapshot, preflight fetch and hydration without blocking other projects; weak registry entries retain the same mutex while detached cleanup holds it. Managed Git process-group cleanup retains the guard and child capacity until observed quiescence; unknown cleanup keeps only that workspace unavailable for the daemon lifetime. The blocking rebuild cleanup and finalizer retain the guard across caller cancellation, and final replacement also holds configuration exclusion while checking exact ownership and synchronizing directories. No user repository ref or forced publication is involved.
