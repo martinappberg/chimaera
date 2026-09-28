@@ -13,7 +13,7 @@ revocable delegation over the authenticated local API.
 | `engine.rs` | Independent lease renewal, mirror coordinator, transactional hydration, profile execution and lazy return. |
 | `provider_gate.rs` / `provider_tests.rs` | Per-agent cloud readiness, bounded blocked-provider status, and staged retry/cancellation tests with a synthetic CLI and real PTY. |
 | `protocol.rs` | Additive account contract subset; intentionally no link/TLS dependency in the daemon. |
-| `transport.rs` | Bounded external curl/git children; credentials only in memory, never argv or Git config. |
+| `transport.rs` | Bounded external curl/git children; cached mirror-only Git compatibility selection; credentials only in memory, never argv or Git config. |
 | `policy.rs` | Mirrored-path policy, credential filtering, size budgets and cloud-profile classification. |
 | `mirror.rs` | Separate shadow and repository Git directories, incremental transfer and conservative hand-back. |
 | `repository.rs` | Portable remote/tracking allowlist; bounded ref import, compare-and-swap adoption and index/ref-lock cancellation cleanup. |
@@ -37,7 +37,16 @@ the real index reservation and a prepared Git ref transaction before touching
 the working tree. Its bounded finalizer survives caller cancellation and installs
 the matching index after a committed ref; ambiguous failures retain the prepared
 index. Prepared transactions serialize so their helper cannot deadlock on the
-two-child transport budget. Another worktree's branch is retained separately. Unsupported
+two-child transport budget. Git selection is probed once asynchronously with
+credential-free, output-capped two-second helpers. The bounded 30-second wait for
+a helper slot is retryable and never caches a transient capacity failure. On macOS only, an older or
+unknown PATH Git falls back to `/usr/bin/git` if that binary reports at least
+2.45 (the upstream curl POST-size reuse fix); modern PATH Git and other platforms
+keep their existing selection. This affects only mirror helpers, not ordinary
+workspace Git settings. Failed HTTP transfers with an older/unknown selected
+Git give static upgrade guidance without exposing stderr. There is no enlarged
+POST buffer, automatic failed-push replay, or weakened publication check.
+Another worktree's branch is retained separately. Unsupported
 transaction support preserves a cloud ref instead. Network Git has a finite
 16-minute deadline; ordinary helpers retain short deadlines. Repository and
 shadow histories are quota-bound and retained, never silently rewritten/pruned.

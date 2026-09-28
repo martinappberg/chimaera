@@ -135,7 +135,7 @@ fn allowed(entry: &Entry) -> bool {
     }
 }
 async fn optional(root: &Path, args: &[&str]) -> Result<Option<String>> {
-    let mut command = transport::git(root, None);
+    let mut command = transport::git(root, None).await?;
     command.args(args);
     let output = transport::run(
         command,
@@ -154,7 +154,7 @@ pub(super) async fn capture(root: &Path) -> Result<Option<Snapshot>> {
     }
     let head = optional(root, &["rev-parse", "--verify", "HEAD"]).await?;
     let bytes = transport::git_output(
-        transport::git(root, None),
+        transport::git(root, None).await?,
         &["config", "--local", "--no-includes", "--null", "--list"],
         vec![],
     )
@@ -188,7 +188,7 @@ pub(super) async fn keep_source_head(root: &Path, cache: &Path) -> Result<()> {
         .is_some()
     {
         transport::git_output(
-            transport::git(cache, None),
+            transport::git(cache, None).await?,
             &[
                 "fetch",
                 "--no-tags",
@@ -224,7 +224,7 @@ async fn install_config(
         for value in config.iter().filter(|value| value.key == entry.key) {
             check()?;
             transport::git_output(
-                transport::git(root, None),
+                transport::git(root, None).await?,
                 &["config", "--local", "--add", &entry.key, &value.value],
                 vec![],
             )
@@ -270,7 +270,7 @@ pub(super) async fn receive(
     mirror::initialize(cache).await?;
     let url = transport::endpoint(&credentials.repository_url)?;
     transport::git_output(
-        transport::git(cache, Some((&credentials.username, &credentials.password))),
+        transport::git(cache, Some((&credentials.username, &credentials.password))).await?,
         &["fetch", "--prune", "--no-tags", &url, "+refs/*:refs/*"],
         vec![],
     )
@@ -282,7 +282,7 @@ pub(super) async fn receive(
     if !existing {
         check()?;
         transport::git_output(
-            transport::git(root, None),
+            transport::git(root, None).await?,
             &["init", "--quiet", "."],
             vec![],
         )
@@ -294,7 +294,7 @@ pub(super) async fn receive(
         chimaera_core::generate_token()
     );
     transport::git_output(
-        transport::git(root, None),
+        transport::git(root, None).await?,
         &[
             "fetch",
             "--no-write-fetch-head",
@@ -308,7 +308,7 @@ pub(super) async fn receive(
     let result = publish_refs(root, &namespace, existing, check).await;
     // Remove only this operation's private namespace, even if publishing failed.
     let refs = transport::git_output(
-        transport::git(root, None),
+        transport::git(root, None).await?,
         &["for-each-ref", "--format=%(refname)", &namespace],
         vec![],
     )
@@ -324,7 +324,7 @@ pub(super) async fn receive(
     }
     if !cleanup.is_empty() {
         transport::git_output(
-            transport::git(root, None),
+            transport::git(root, None).await?,
             &["update-ref", "--stdin"],
             cleanup,
         )
@@ -335,14 +335,14 @@ pub(super) async fn receive(
     if !existing {
         if let Some(branch) = branch {
             transport::git_output(
-                transport::git(root, None),
+                transport::git(root, None).await?,
                 &["symbolic-ref", "HEAD", branch],
                 vec![],
             )
             .await?;
         } else if let Some(head) = snapshot.and_then(|snapshot| snapshot.head.as_deref()) {
             transport::git_output(
-                transport::git(root, None),
+                transport::git(root, None).await?,
                 &["update-ref", "--no-deref", "HEAD", head],
                 vec![],
             )
@@ -353,8 +353,12 @@ pub(super) async fn receive(
             .is_some()
         {
             check()?;
-            transport::git_output(transport::git(root, None), &["read-tree", "HEAD"], vec![])
-                .await?;
+            transport::git_output(
+                transport::git(root, None).await?,
+                &["read-tree", "HEAD"],
+                vec![],
+            )
+            .await?;
         }
     }
     if let Some(snapshot) = snapshot {
@@ -367,7 +371,7 @@ pub(super) async fn receive(
         {
             check()?;
             transport::git_output(
-                transport::git(root, None),
+                transport::git(root, None).await?,
                 &["remote", "add", "origin", origin],
                 vec![],
             )
@@ -383,7 +387,7 @@ async fn publish_refs(
     check: &(dyn Fn() -> Result<()> + Sync),
 ) -> Result<Vec<String>> {
     let refs = transport::git_output(
-        transport::git(root, None),
+        transport::git(root, None).await?,
         &[
             "for-each-ref",
             "--format=%(refname) %(objectname)",
@@ -399,7 +403,7 @@ async fn publish_refs(
     );
     let current = optional(root, &["symbolic-ref", "-q", "HEAD"]).await?;
     let worktrees = transport::git_output(
-        transport::git(root, None),
+        transport::git(root, None).await?,
         &["worktree", "list", "--porcelain"],
         vec![],
     )
@@ -409,7 +413,7 @@ async fn publish_refs(
         .filter_map(|line| line.strip_prefix("branch "))
         .collect();
     let clean = transport::git_output(
-        transport::git(root, None),
+        transport::git(root, None).await?,
         &["status", "--porcelain", "--untracked-files=no"],
         vec![],
     )
@@ -435,7 +439,7 @@ async fn publish_refs(
         if previous.is_none() || !existing {
             check()?;
             transport::git_output(
-                transport::git(root, None),
+                transport::git(root, None).await?,
                 &[
                     "update-ref",
                     &reference,
@@ -448,7 +452,7 @@ async fn publish_refs(
             continue;
         }
         let previous = previous.unwrap();
-        let mut ancestor = transport::git(root, None);
+        let mut ancestor = transport::git(root, None).await?;
         ancestor.args(["merge-base", "--is-ancestor", &previous, incoming]);
         let advance = reference.starts_with("refs/heads/")
             && transport::run(ancestor, vec![], Duration::from_secs(15), 1024)
@@ -474,7 +478,7 @@ async fn publish_refs(
                 ensure!(existing.is_none(), "cloud preservation ref already differs");
                 check()?;
                 transport::git_output(
-                    transport::git(root, None),
+                    transport::git(root, None).await?,
                     &["update-ref", &kept, incoming, &"0".repeat(incoming.len())],
                     vec![],
                 )
@@ -489,7 +493,7 @@ async fn publish_refs(
 }
 
 async fn advance_unchecked_branch(root: &Path, reference: &str, incoming: &str) -> Result<bool> {
-    let mut command = transport::git(root, None);
+    let mut command = transport::git(root, None).await?;
     command.args([
         "fetch",
         "--no-write-fetch-head",
@@ -595,7 +599,7 @@ async fn fast_forward_current(
         return Ok(false);
     }
     let clean = transport::git_output(
-        transport::git(root, None),
+        transport::git(root, None).await?,
         &["status", "--porcelain", "--untracked-files=no"],
         vec![],
     )
@@ -643,7 +647,7 @@ async fn finalize_current(
             .and_then(|reservation| reservation.path.as_ref())
             .context("Git index reservation unavailable")?
             .clone();
-        let mut command = transport::git(&root, None);
+        let mut command = transport::git(&root, None).await?;
         command.env("GIT_INDEX_FILE", &index_lock);
         transport::git_output(
             command,
@@ -742,8 +746,8 @@ impl RefTransaction {
     async fn begin(root: &Path, index_lock: IndexReservation) -> Result<Self> {
         async {
             let transaction_permit = REF_TRANSACTIONS.acquire().await?;
+            let mut command = transport::git(root, None).await?;
             let permit = transport::child_permit().await?;
-            let mut command = transport::git(root, None);
             let mut child = command
                 .args(["update-ref", "--stdin"])
                 .stdin(std::process::Stdio::piped())
@@ -827,7 +831,7 @@ impl Drop for RefTransaction {
 mod tests {
     use super::*;
     async fn git(root: &Path, args: &[&str]) -> String {
-        let mut command = transport::git(root, None);
+        let mut command = transport::git(root, None).await.unwrap();
         command
             .env("GIT_AUTHOR_NAME", "Mirror fixture")
             .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
@@ -902,7 +906,7 @@ mod tests {
             .unwrap();
         transaction.confirm("start: ok").await.unwrap();
         transaction.confirm("prepare: ok").await.unwrap();
-        let mut checkout = transport::git(&root, None);
+        let mut checkout = transport::git(&root, None).await.unwrap();
         checkout.args(["switch", "cloud"]);
         assert!(
             !transport::run(checkout, vec![], Duration::from_secs(5), 4096)

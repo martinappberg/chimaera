@@ -6,10 +6,104 @@ use serde::de::DeserializeOwned;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     process::Command,
-    sync::Semaphore,
+    sync::{OnceCell, Semaphore},
 };
 
 static CHILDREN: Semaphore = Semaphore::const_new(2);
+static MIRROR_GIT: OnceCell<MirrorGit> = OnceCell::const_new();
+type GitVersion = (u32, u32, u32);
+const FIXED_HTTP_GIT: GitVersion = (2, 45, 0);
+const HTTP_GIT_HINT: &str = "mirror Git HTTP transfer failed; an older Git/curl combination may truncate large uploads. Update Git to 2.45 or newer and restart Chimaera";
+
+struct MirrorGit {
+    binary: &'static str,
+    version: Option<GitVersion>,
+}
+
+fn known_fixed(version: Option<GitVersion>) -> bool {
+    version.is_some_and(|version| version >= FIXED_HTTP_GIT)
+}
+
+fn choose_git(path: Option<GitVersion>, system: Option<GitVersion>, macos: bool) -> MirrorGit {
+    // An old Apple Git must not replace a newer package-manager Git. Older
+    // Linux builds may carry the fix or use an unaffected curl, so keep PATH.
+    if macos && !known_fixed(path) && known_fixed(system) {
+        MirrorGit {
+            binary: "/usr/bin/git",
+            version: system,
+        }
+    } else {
+        MirrorGit {
+            binary: "git",
+            version: path,
+        }
+    }
+}
+
+fn git_version(bytes: &[u8]) -> Option<GitVersion> {
+    let line = std::str::from_utf8(bytes).ok()?.lines().next()?;
+    let version = line
+        .strip_prefix("git version ")?
+        .split_whitespace()
+        .next()?;
+    let mut parts = version.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch: String = parts
+        .next()?
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    Some((major, minor, patch.parse().ok()?))
+}
+
+async fn probe_git(binary: &str) -> Option<GitVersion> {
+    let mut command = clean_command(binary);
+    command.arg("--version");
+    // Discovery already reserved a child slot. Each credential-free probe
+    // has its own short deadline and never starts a login shell.
+    let output = run_reserved(command, vec![], Duration::from_secs(2), 256)
+        .await
+        .ok()?;
+    output
+        .success
+        .then(|| git_version(&output.stdout))
+        .flatten()
+}
+
+async fn discover_git<'a>(
+    cell: &'a OnceCell<MirrorGit>,
+    children: &Semaphore,
+    queue_timeout: Duration,
+) -> Result<&'a MirrorGit> {
+    cell.get_or_try_init(|| async {
+        // Capacity pressure is transient: leave the cell empty so a later
+        // mirror attempt retries instead of permanently selecting unknown Git.
+        let _permit = tokio::time::timeout(queue_timeout, children.acquire())
+            .await
+            .context("mirror Git discovery is waiting for another helper; retry shortly")??;
+        let path = probe_git("git").await;
+        let system = if cfg!(target_os = "macos") && !known_fixed(path) {
+            probe_git("/usr/bin/git").await
+        } else {
+            None
+        };
+        Ok(choose_git(path, system, cfg!(target_os = "macos")))
+    })
+    .await
+}
+
+async fn mirror_git() -> Result<&'static MirrorGit> {
+    discover_git(&MIRROR_GIT, &CHILDREN, Duration::from_secs(30)).await
+}
+
+fn http_transfer(args: &[&str]) -> bool {
+    args.first()
+        .is_some_and(|arg| matches!(*arg, "fetch" | "push" | "clone"))
+        && args
+            .iter()
+            .any(|arg| arg.starts_with("https://") || arg.starts_with("http://"))
+}
 pub(super) const JSON_CAP: usize = 2 * 1024 * 1024;
 pub(super) const PATH_CAP: usize = 8 * 1024 * 1024;
 
@@ -55,12 +149,22 @@ pub(super) async fn child_permit() -> Result<tokio::sync::SemaphorePermit<'stati
 }
 
 pub(super) async fn run(
-    mut command: Command,
+    command: Command,
     input: Vec<u8>,
     timeout: Duration,
     cap: usize,
 ) -> Result<Output> {
     let _permit = CHILDREN.acquire().await?;
+    run_reserved(command, input, timeout, cap).await
+}
+
+/// The caller must hold one CHILDREN permit for this entire future.
+async fn run_reserved(
+    mut command: Command,
+    input: Vec<u8>,
+    timeout: Duration,
+    cap: usize,
+) -> Result<Output> {
     let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -250,8 +354,8 @@ pub(super) async fn request(
 /// The clean mirror repository owns its Git configuration. A helper reads its
 /// password from the child environment only; neither argv nor .git/config
 /// contains the credential, and redirects are forbidden.
-pub(super) fn git(dir: &Path, credentials: Option<(&str, &str)>) -> Command {
-    let mut command = clean_command("git");
+pub(super) async fn git(dir: &Path, credentials: Option<(&str, &str)>) -> Result<Command> {
+    let mut command = clean_command(mirror_git().await?.binary);
     command
         .current_dir(dir)
         .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -279,7 +383,7 @@ pub(super) fn git(dir: &Path, credentials: Option<(&str, &str)>) -> Command {
         command.env("CHIMAERA_MIRROR_USERNAME", username).env("CHIMAERA_MIRROR_PASSWORD", password)
             .args(["-c", "credential.helper=!f() { test \"$1\" = get || exit 0; printf 'username=%s\\npassword=%s\\n' \"$CHIMAERA_MIRROR_USERNAME\" \"$CHIMAERA_MIRROR_PASSWORD\"; }; f"]);
     }
-    command
+    Ok(command)
 }
 
 pub(super) async fn git_output(
@@ -299,8 +403,17 @@ pub(super) async fn git_output(
     } else {
         Duration::from_secs(45)
     };
-    let output = run(command, input, timeout, PATH_CAP).await?;
+    let compatibility_hint = http_transfer(args) && !known_fixed(mirror_git().await?.version);
+    let result = run(command, input, timeout, PATH_CAP).await;
+    let output = if compatibility_hint {
+        result.context(HTTP_GIT_HINT)?
+    } else {
+        result?
+    };
     if !output.success {
+        if compatibility_hint {
+            bail!(HTTP_GIT_HINT);
+        }
         bail!("mirror Git operation failed");
     }
     Ok(output.stdout)
@@ -309,6 +422,112 @@ pub(super) async fn git_output(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn mirror_git_selection_preserves_modern_path_and_only_uses_fixed_macos_fallback() {
+        let old = Some((2, 43, 0));
+        let fixed = Some((2, 45, 0));
+        let newer = Some((2, 54, 0));
+        for path in [fixed, newer, Some((3, 0, 0))] {
+            for system in [None, old, fixed, newer] {
+                assert_eq!(choose_git(path, system, true).binary, "git");
+            }
+        }
+        for path in [None, old, Some((2, 44, 9))] {
+            for system in [fixed, newer] {
+                let selected = choose_git(path, system, true);
+                assert_eq!(selected.binary, "/usr/bin/git");
+                assert_eq!(selected.version, system);
+            }
+            for system in [None, old] {
+                let selected = choose_git(path, system, true);
+                assert_eq!(selected.binary, "git");
+                assert_eq!(selected.version, path);
+            }
+        }
+        for path in [None, old, fixed, newer] {
+            let selected = choose_git(path, newer, false);
+            assert_eq!(selected.binary, "git");
+            assert_eq!(selected.version, path);
+        }
+    }
+
+    #[test]
+    fn version_parser_and_diagnostic_scope_are_conservative() {
+        assert_eq!(
+            git_version(b"git version 2.54.0 (Apple Git-157)\n"),
+            Some((2, 54, 0))
+        );
+        assert_eq!(
+            git_version(b"git version 2.45.1.windows.1\n"),
+            Some((2, 45, 1))
+        );
+        for invalid in [
+            b"git version 2.45".as_slice(),
+            b"banner\ngit version 2.54.0",
+            b"git version unknown",
+            b"git version 2.x.0",
+            b"\xff",
+        ] {
+            assert_eq!(git_version(invalid), None);
+        }
+        assert!(http_transfer(&[
+            "push",
+            "--atomic",
+            "https://mirror.test/repository.git",
+            "refs/heads/main"
+        ]));
+        assert!(http_transfer(&[
+            "fetch",
+            "http://127.0.0.1:1234/repository.git"
+        ]));
+        for args in [
+            vec!["fetch", "/local/repository.git"],
+            vec!["push", "git@example.test:repo"],
+            vec!["config", "remote.origin.url", "https://example.test/repo"],
+            vec!["status"],
+        ] {
+            assert!(!http_transfer(&args));
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_selection_is_cached_and_commands_keep_credentials_out_of_arguments() {
+        let (first, second) = tokio::join!(mirror_git(), mirror_git());
+        let (first, second) = (first.unwrap(), second.unwrap());
+        assert!(std::ptr::eq(first, second));
+        let command = git(Path::new("."), Some(("fixture-user", "fixture-password")))
+            .await
+            .unwrap();
+        let command = command.as_std();
+        assert_eq!(command.get_program(), first.binary);
+        assert!(!command
+            .get_args()
+            .any(|arg| arg.to_string_lossy().contains("fixture-password")));
+        assert!(command
+            .get_envs()
+            .any(|(key, value)| key == "CHIMAERA_MIRROR_PASSWORD"
+                && value.is_some_and(|value| value == "fixture-password")));
+        assert!(!command.get_envs().any(|(key, _)| key == "GIT_TRACE"
+            || key == "GIT_TRACE_CURL"
+            || key == "GIT_EXEC_PATH"));
+    }
+
+    #[tokio::test]
+    async fn capacity_timeout_does_not_cache_unknown_git() {
+        let cell = OnceCell::new();
+        let children = Semaphore::new(0);
+        assert!(discover_git(&cell, &children, Duration::from_millis(1))
+            .await
+            .is_err());
+        assert!(cell.get().is_none());
+        children.add_permits(1);
+        let selected = discover_git(&cell, &children, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(std::ptr::eq(selected, cell.get().unwrap()));
+        assert_eq!(children.available_permits(), 1);
+    }
+
     #[test]
     fn transport_refuses_credentials_cleartext_and_config_injection() {
         for value in [

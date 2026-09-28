@@ -420,7 +420,7 @@ pub(super) async fn snapshot(
             tokio::fs::rename(path, handoff.join(&archive)).await?;
             archives.push(SessionArchive {id,archive});
         }
-        let branch=transport::git_output(transport::git(&workspace.root,None),&["symbolic-ref","-q","HEAD"],vec![]).await.ok().and_then(|bytes|String::from_utf8(bytes).ok()).map(|text|text.trim().to_string());
+        let branch=transport::git_output(transport::git(&workspace.root,None).await?,&["symbolic-ref","-q","HEAD"],vec![]).await.ok().and_then(|bytes|String::from_utf8(bytes).ok()).map(|text|text.trim().to_string());
         let repository_origin=mirror::repository_origin(&workspace.root).await;
         let repository=super::repository::capture(&workspace.root).await?;
         let manifest = Manifest {version:1,branch,repository_origin,repository,workspace_id:workspace.id.clone(),root:workspace.root.clone(),name:workspace.name.clone(),epoch,clean,profile:profile.clone(),sessions:archives};
@@ -463,13 +463,13 @@ pub(super) async fn fetch_snapshot(
     mirror::initialize(cache).await?;
     let url = transport::endpoint(&grant.working_tree_url)?;
     transport::git_output(
-        transport::git(cache, Some((&grant.username, &grant.password))),
+        transport::git(cache, Some((&grant.username, &grant.password))).await?,
         &["fetch", "--no-tags", &url, "+refs/heads/*:refs/heads/*"],
         vec![],
     )
     .await?;
     let bytes = transport::git_output(
-        transport::git(cache, None),
+        transport::git(cache, None).await?,
         &["show", "refs/heads/handoff:manifest.json"],
         vec![],
     )
@@ -613,7 +613,7 @@ pub(super) async fn hydrate(
             .await?;
             let destination = stage.join(folder);
             tokio::fs::create_dir_all(&destination).await?;
-            let mut command = transport::git(&cache, None);
+            let mut command = transport::git(&cache, None).await?;
             command.env("GIT_WORK_TREE", &destination);
             transport::git_output(
                 command,
@@ -651,7 +651,7 @@ pub(super) async fn hydrate(
         let has_baseline = tokio::fs::try_exists(local_shadow.join("HEAD")).await?;
         if has_baseline {
             tokio::fs::create_dir_all(&baseline).await?;
-            let mut command = transport::git(&local_shadow, None);
+            let mut command = transport::git(&local_shadow, None).await?;
             command.env("GIT_WORK_TREE", &baseline);
             transport::git_output(
                 command,
@@ -680,7 +680,7 @@ pub(super) async fn hydrate(
         .await??;
         mirror::initialize(&local_shadow).await?;
         transport::git_output(
-            transport::git(&local_shadow, None),
+            transport::git(&local_shadow, None).await?,
             &[
                 "fetch",
                 "--no-tags",

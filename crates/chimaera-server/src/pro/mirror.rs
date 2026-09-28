@@ -22,7 +22,7 @@ pub(super) async fn initialize(path: &Path) -> Result<()> {
     tokio::fs::create_dir_all(path).await?;
     if !tokio::fs::try_exists(path.join("HEAD")).await? {
         transport::git_output(
-            transport::git(path, None),
+            transport::git(path, None).await?,
             &["init", "--bare", "--quiet", "."],
             vec![],
         )
@@ -32,12 +32,12 @@ pub(super) async fn initialize(path: &Path) -> Result<()> {
 }
 
 pub(super) async fn inventory(root: &Path, shadow: &Path) -> Result<Vec<PathBuf>> {
-    let mut command = transport::git(root, None);
+    let mut command = transport::git(root, None).await?;
     command.args(["rev-parse", "--is-inside-work-tree"]);
     let repo = transport::run(command, vec![], std::time::Duration::from_secs(5), 256)
         .await?
         .success;
-    let mut command = transport::git(root, None);
+    let mut command = transport::git(root, None).await?;
     if !repo {
         command.env("GIT_DIR", shadow).env("GIT_WORK_TREE", root);
     }
@@ -58,7 +58,7 @@ pub(super) async fn inventory(root: &Path, shadow: &Path) -> Result<Vec<PathBuf>
     let bytes = match bytes {
         Ok(bytes) => bytes,
         Err(error) if !tokio::fs::try_exists(root.join(".chimaeraignore")).await? => {
-            let mut command = transport::git(root, None);
+            let mut command = transport::git(root, None).await?;
             if !repo {
                 command.env("GIT_DIR", shadow).env("GIT_WORK_TREE", root);
             }
@@ -95,7 +95,7 @@ pub(super) async fn inventory(root: &Path, shadow: &Path) -> Result<Vec<PathBuf>
             input.extend_from_slice(path.to_str().context("invalid project path")?.as_bytes());
             input.push(0);
         }
-        let mut command = transport::git(root, None);
+        let mut command = transport::git(root, None).await?;
         if !repo {
             command.env("GIT_DIR", shadow).env("GIT_WORK_TREE", root);
         }
@@ -233,8 +233,8 @@ pub(super) async fn commit_tree(repository: &Path, tree: &Path, branch: &str) ->
     );
     let index = repository.join(format!("index-{}", chimaera_core::generate_token()));
     let result = async {
-        let command = || {
-            let mut command = transport::git(repository, None);
+        let command = async || {
+            let mut command = transport::git(repository, None).await?;
             command
                 .env("GIT_DIR", repository)
                 .env("GIT_WORK_TREE", tree)
@@ -243,16 +243,22 @@ pub(super) async fn commit_tree(repository: &Path, tree: &Path, branch: &str) ->
                 .env("GIT_AUTHOR_EMAIL", "mirror@localhost")
                 .env("GIT_COMMITTER_NAME", "chimaera")
                 .env("GIT_COMMITTER_EMAIL", "mirror@localhost");
-            command
+            Ok::<_, anyhow::Error>(command)
         };
-        transport::git_output(command(), &["read-tree", "--empty"], vec![]).await?;
-        transport::git_output(command(), &["add", "--all", "--force", "--", "."], vec![]).await?;
-        let tree =
-            String::from_utf8(transport::git_output(command(), &["write-tree"], vec![]).await?)?
-                .trim()
-                .to_string();
+        transport::git_output(command().await?, &["read-tree", "--empty"], vec![]).await?;
+        transport::git_output(
+            command().await?,
+            &["add", "--all", "--force", "--", "."],
+            vec![],
+        )
+        .await?;
+        let tree = String::from_utf8(
+            transport::git_output(command().await?, &["write-tree"], vec![]).await?,
+        )?
+        .trim()
+        .to_string();
         let reference = format!("refs/heads/{branch}");
-        let mut lookup = command();
+        let mut lookup = command().await?;
         lookup.args(["rev-parse", "--verify", &reference]);
         let old = transport::run(lookup, vec![], std::time::Duration::from_secs(5), 128).await?;
         let parent = if old.success {
@@ -262,7 +268,7 @@ pub(super) async fn commit_tree(repository: &Path, tree: &Path, branch: &str) ->
         };
         if let Some(parent) = &parent {
             let old_tree = transport::git_output(
-                command(),
+                command().await?,
                 &["rev-parse", &format!("{parent}^{{tree}}")],
                 vec![],
             )
@@ -276,11 +282,16 @@ pub(super) async fn commit_tree(repository: &Path, tree: &Path, branch: &str) ->
             args.extend(["-p", parent]);
         }
         let commit = String::from_utf8(
-            transport::git_output(command(), &args, b"Workspace mirror\n".to_vec()).await?,
+            transport::git_output(command().await?, &args, b"Workspace mirror\n".to_vec()).await?,
         )?
         .trim()
         .to_string();
-        transport::git_output(command(), &["update-ref", &reference, &commit], vec![]).await?;
+        transport::git_output(
+            command().await?,
+            &["update-ref", &reference, &commit],
+            vec![],
+        )
+        .await?;
         Ok::<_, anyhow::Error>(commit)
     }
     .await;
@@ -306,7 +317,8 @@ pub(super) async fn push(
         transport::git(
             repository,
             Some((&credentials.username, &credentials.password)),
-        ),
+        )
+        .await?,
         &args,
         vec![],
     )
@@ -319,7 +331,7 @@ pub(super) async fn mirror_repository(
     cache: &Path,
     credentials: &MirrorCredentials,
 ) -> Result<()> {
-    let mut check = transport::git(root, None);
+    let mut check = transport::git(root, None).await?;
     check.args(["rev-parse", "--git-dir"]);
     if !transport::run(check, vec![], std::time::Duration::from_secs(5), 4096)
         .await?
@@ -329,7 +341,7 @@ pub(super) async fn mirror_repository(
     }
     initialize(cache).await?;
     transport::git_output(
-        transport::git(cache, None),
+        transport::git(cache, None).await?,
         &[
             "fetch",
             "--prune",
@@ -342,7 +354,7 @@ pub(super) async fn mirror_repository(
     .await?;
     super::repository::keep_source_head(root, cache).await?;
     let objects = transport::git_output(
-        transport::git(cache, None),
+        transport::git(cache, None).await?,
         &["rev-list", "--objects", "--all"],
         vec![],
     )
@@ -358,7 +370,7 @@ pub(super) async fn mirror_repository(
     }
     let url = transport::endpoint(&credentials.repository_url)?;
     transport::git_output(
-        transport::git(cache, Some((&credentials.username, &credentials.password))),
+        transport::git(cache, Some((&credentials.username, &credentials.password))).await?,
         &["push", "--mirror", &url],
         vec![],
     )
@@ -375,7 +387,7 @@ pub(super) async fn validate_tree(
     max_file: u64,
 ) -> Result<()> {
     let bytes = transport::git_output(
-        transport::git(repository, None),
+        transport::git(repository, None).await?,
         &["ls-tree", "-r", "-z", "-l", branch],
         vec![],
     )
@@ -428,7 +440,7 @@ pub(super) async fn validate_tree(
 
 pub(super) async fn repository_origin(root: &Path) -> Option<String> {
     let bytes = transport::git_output(
-        transport::git(root, None),
+        transport::git(root, None).await.ok()?,
         &["config", "--get", "remote.origin.url"],
         vec![],
     )
