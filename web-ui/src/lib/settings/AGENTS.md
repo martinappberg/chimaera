@@ -25,7 +25,9 @@ the opt-in "teach agents the document dialect" installs over
 owns the text; the confirm dialog shows it verbatim before anything is written.
 
 **Pro is a separate account surface.** `../pro/ProView.svelte` is a singleton
-workbench tab and Home view, reached through the quiet Pro entry above Settings.
+workbench tab and Home view. Settings starts with a small Chimaera Pro group
+that opens it; Home retains its Pro navigation. A paid workspace plan badge also
+opens it, without adding a full-width sidebar row for any plan.
 It renders `ProSettings.svelte`, which invokes the native `pro_*` commands.
 The generic Settings form no longer embeds account/billing/onboarding controls.
 An account browser on a cloud worker opens the same provider flow; other hosts

@@ -10,7 +10,8 @@ Cloud setup controls are implemented; automatic handoff and browser access are b
 
 ## How it is used
 
-1. Open **Pro** from Home or the entry above Settings in the workspace sidebar.
+1. Open **Pro** from Home or the first **Chimaera Pro** group in Settings.
+   Paid accounts can also click the compact plan badge beside the workspace name.
    It opens a dedicated account page; ordinary app settings stay separate.
    In an account browser, the cloud machine opens the same agent-connection
    flow; other machines link to the account surface. Ordinary daemon browser
@@ -59,7 +60,7 @@ for a local integration run.
 
 ## Subscriber branding
 
-An active Pro or Max account wears a small plan badge beside the Home wordmark and in the workspace header. The dedicated Pro page uses the same badge. The quiet navigation entry uses the Chimaera mark, an Active label for Pro, or the Max badge. The styling follows the current theme, and an unknown, signed-out or inactive plan shows no paid badge.
+An active Pro or Max account wears a small plan badge beside the Home wordmark and in the workspace header. The dedicated Pro page uses the same badge. The workspace badge opens the dedicated Pro page. There is no full-width Pro row in the workspace sidebar; free and signed-out users can still find Pro at the top of Settings and from Home. The styling follows the current theme, and an unknown, signed-out or inactive plan shows no paid badge.
 
 The shared `web-ui/src/lib/net/plan.ts` store reads native `pro_status` and refreshes on `pro-changed` and visibility return. Account-browser windows instead make a bounded, same-origin `HEAD` request to their existing `/app/{host}/` index. Its optional `X-Chimaera-Plan` response header is `none`, `pro` or `max`, derived from the authenticated account's active or trialing subscription; an absent header or failed request leaves branding neutral. Index responses remain `Cache-Control: no-store`. The browser refreshes once per minute while visible and when returning to the page, without requesting or waking a keeper or worker. Ordinary daemon browser windows make no account request. The badge is presentation only and grants no capabilities.
 
