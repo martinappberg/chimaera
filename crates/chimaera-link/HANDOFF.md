@@ -295,3 +295,56 @@ Publishing another policy does not clear this privacy choice. Only an explicit
 full-device POST `/v1/baton/{workspace}/enable-mirror` with `{}` may re-enable
 credential issuance (204); daemon delegations and worker credentials cannot call
 it. Re-enabling does not restore the automatic handoff flags.
+
+
+## Managed execution v2 (negotiated implementation)
+
+The additive public types are in `continuity.rs`. This protocol is enabled only
+through exact capability negotiation; a legacy configure success never proves
+execution fencing. The current capability is
+`{version:1,boundary:"managed_processes",expired_takeover:false}`. It deliberately
+rejects expired takeover: an ordinary userspace process group cannot guarantee
+ordering after an unannounced OS resume or contain arbitrary detached children.
+The required home-first behavior above remains the acceptance target.
+
+`GET /v2/capabilities` returns execution_authority 2, that exact capability,
+installation_binding 1, workspace_placement 2 and checkpoint_receipts 1. Native
+clients keep the stable installation proof in the account/origin-specific
+keychain; the daemon receives only its opaque installation ID.
+`POST /api/v1/pro/configure/execution` takes ordinary Configure plus
+`execution:{version:1,installation_id,capability}` and optional workspace_root
+for a workspace-bound worker. Its 200 response must exactly match
+`ExecutionConfigureAck`; 204, HTML, 404, missing/changed fields fail closed.
+
+`GET /v2/baton/{workspace}` may observe legacy work with null continuity; it
+never grants execution. Existing live legacy grants remain legacy until a clean
+release. Acquire/renew/release add execution_capability and return continuity
+(version 2, mode managed_v1, policy_revision, preferred_installation_id), an
+execution_lease (opaque id and increasing sequence), and a checkpoint. Acquiring
+and renewing pin the selected checkpoint; GET reports the latest acknowledged
+publication. Once enrolled, legacy acquisition/renewal/write credentials and
+publication cannot downgrade the workspace.
+
+A client deadline starts before the mutating request and uses server-relative
+lease duration (at most 90 seconds), minus a 15-second stop margin. Passive GET,
+replayed lease sequences, stale generations, clock discontinuity and restart
+cannot extend that deadline. Viewer location never selects the preferred home.
+Clean transfer selects exactly the receipt's working-tree/config/handoff Git
+object IDs. Unknown continuation evidence is uncertain, never a blind replay of
+external actions.
+
+A normal installation rebind first stops/publishes/releases with its old valid
+credentials. If those credentials expired, full new-device authentication plus
+the existing installation proof can request
+`POST /v2/installations/{installation}/recovery` with workspace_id and
+expected_epoch. The response is `ExecutionRecoveryGrant`: five-minute, one-use
+mirror/release authority for exactly the old device, workspace and epoch. It
+does not renew execution and is never accepted by ordinary acquire, renew,
+proxy, or daemon Configure. The dedicated local
+`POST /api/v1/pro/execution/recover` accepts `ExecutionRecoveryRequest`, verifies
+the old binding, stops managed execution, publishes its final snapshot using
+`/v2/recovery/mirror/credentials`, and calls `/v2/recovery/release`. Only the exact
+200 `ExecutionRecoveryAck` permits the native rebind. This uses the same trusted
+owner clean-release boundary as normal handoff, not an OS attestation assembled
+from client JSON. Account issuance reserves the old epoch; a timeout cannot
+renew the recovery deadline or grant another execution owner.

@@ -1,7 +1,9 @@
 //! Optional device transport. Constructing a client never opens a connection.
 mod bridge;
 mod client;
+mod continuity;
 mod handoff;
+pub use continuity::*;
 mod oauth;
 pub use handoff::*;
 pub mod protocol;
