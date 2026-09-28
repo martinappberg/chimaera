@@ -8,6 +8,13 @@ describe("purchase intent", () => {
     for (const invalid of [null, "broken", JSON.stringify({ ...intent, plan: "free" }), JSON.stringify({ ...intent, stage: "complete" }), JSON.stringify({ ...intent, stage: "checkout" }), JSON.stringify({ ...intent, created: 3000 })]) expect(readIntent(invalid, 2000)).toBeNull();
     expect(readIntent(JSON.stringify(intent), 1000 + 86400001)).toBeNull();
   });
+  it("retains signup versus signin for retry without turning either draft into a checkout request", () => {
+    for (const screenHint of ["sign-up", "sign-in"] as const) {
+      expect(readIntent(JSON.stringify({ ...intent, screenHint }), 2000)).toEqual({ ...intent, screenHint });
+    }
+    expect(readIntent(JSON.stringify({ ...intent, screenHint: "admin" }), 2000)).toBeNull();
+    expect(readIntent(JSON.stringify({ ...intent, stage: "checkout", screenHint: "sign-up" }), 2000)).toBeNull();
+  });
   it("never treats no plan, absent status or an unknown future plan as entitlement", () => {
     expect(paid("pro")).toBe(true); expect(paid("max")).toBe(true);
     for (const value of [null, undefined, "none", "trial", "preparing"]) expect(paid(value)).toBe(false);

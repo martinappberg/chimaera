@@ -92,6 +92,11 @@ in-app SSH askpass, a signed auto-updater). Parent map: repo-root
   is independent of successful account authentication. Remote prompt, daemon
   bearer and account-token data must never appear in Settings host rows or logs.
 
+- `pro_sign_in` accepts an optional closed `screenHint` (`sign-up` or `sign-in`,
+  default `sign-in`) that changes only the hosted account entry screen. PKCE,
+  callback validation, invitation checks and MFA remain the same. Signing in
+  returns to plan review; checkout requires another explicit user action.
+
 - Billing waits at most 15 minutes for the browser, then at most two minutes
   for account confirmation. Checkout only confirms the exact requested plan
   from a fresh authenticated account response; callback outcome is a hint.

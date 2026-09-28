@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import type { ProBillingAttempt } from "../net/native";
-import { billingCopy, billingPending, billingNeedsReview } from "./billing";
+import type { ProBillingAttempt, ProStatus } from "../net/native";
+import { billingCopy, billingPending, billingNeedsReview, explicitCheckoutChoice } from "./billing";
 const attempt = (phase: ProBillingAttempt["phase"], kind: ProBillingAttempt["kind"] = "checkout"): ProBillingAttempt => ({ id: 7, kind, phase, expires_at: 123, error: "private failure token=never-render-this" });
 
 describe("native billing presentation", () => {
@@ -34,5 +34,28 @@ describe("native billing presentation", () => {
   it("describes a completed portal return without claiming new entitlement", () => {
     expect(billingCopy(attempt("confirmed", "portal"), false).title).toBe("Account updated");
     expect(billingCopy(attempt("waiting", "portal"), true).title).toContain("Billing");
+  });
+});
+
+
+describe("explicit checkout choice", () => {
+  const free: ProStatus = { available: true, signed_in: true, email: "fixture@example.invalid", plan: "none", error: null };
+  const choice = { plan: "max", interval: "year" } as const;
+  it("uses the current review choice, independently of the earlier sign-in selection", () => {
+    expect(explicitCheckoutChoice(free, true, choice)).toEqual(choice);
+    expect(explicitCheckoutChoice(free, true, { plan: "pro", interval: "month" })).toEqual({ plan: "pro", interval: "month" });
+  });
+  it("never accepts a signed-out, stale, initializing, failed or unknown account for purchase", () => {
+    expect(explicitCheckoutChoice(null, true, choice)).toBeNull();
+    expect(explicitCheckoutChoice(free, false, choice)).toBeNull();
+    for (const delta of [{ available: false }, { signed_in: false }, { initializing: true }, { error: "refresh failed" }, { plan: null }, { plan: "pro" as const }, { plan: "max" as const }, { sign_in: { phase: "finishing" as const, expires_at: 123 } }]) {
+      expect(explicitCheckoutChoice({ ...free, ...delta }, true, choice)).toBeNull();
+    }
+  });
+  it("does not start a second checkout while a browser attempt or uncertain result needs attention", () => {
+    for (const phase of ["waiting", "confirming", "expired", "failed", "confirmed"] as const) {
+      expect(explicitCheckoutChoice({ ...free, billing: attempt(phase) }, true, choice)).toBeNull();
+    }
+    expect(explicitCheckoutChoice({ ...free, billing: attempt("canceled") }, true, choice)).toEqual(choice);
   });
 });

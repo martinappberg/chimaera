@@ -17,8 +17,9 @@ Cloud setup controls are implemented; automatic handoff and browser access are b
    flow; other machines link to the account surface. Ordinary daemon browser
    windows have no Pro entry. A build with no configured endpoint shows only
    “Chimaera Pro isn't available in this build.”
-2. With an endpoint configured, choose **Sign in**. Complete the system-browser
-   sign-in; the app receives an authorization code through its loopback callback.
+2. With an endpoint configured, choose **Sign up**, or the smaller
+   **Already have an account? Sign in** link. Each opens its corresponding
+   identity-provider screen. Complete the system-browser authentication; the app receives an authorization code through its loopback callback.
    The app waits up to 15 minutes for sign-in and verification. While waiting,
    **Start again** opens a fresh sign-in and **Cancel sign-in** closes the request.
    An expired or failed request offers **Try again**. The browser confirms success
@@ -38,13 +39,16 @@ Cloud setup controls are implemented; automatic handoff and browser access are b
    before checkout; **See plans** jumps directly to the comparison.
    Active subscribers see **Your Chimaera Pro** or **Your Chimaera Max** with
    account, cloud and project controls. They see no sales introduction or plan
-   comparison. Numeric usage and limits remain under **Usage and plan details**,
-   using the service's current values. Loading, unavailable and unknown account
-   states stay neutral; a saved purchase intent waits for a confirmed free plan.
+   comparison. **Usage and plan details** shows the percentage of cloud work and
+   mirrored-project capacity used, calculated from the service's current limits.
+   Loading, unavailable and unknown account states stay neutral; a remembered
+   plan selection never starts a purchase.
    The page shows the signed-in email and current plan. Without a plan, choose
    Pro or Max and monthly or yearly billing, then continue to checkout in the
-   system browser. The single signed-out **Sign in** action remembers that
-   selection; an existing active plan is restored without opening checkout.
+   system browser. Both **Sign up** and **Sign in** remember that
+   selection and returns to the plan page after account creation or sign-in.
+   Checkout opens only after a separate, explicit purchase action from the
+   signed-in account. An existing active plan restores the subscriber view.
    Existing subscribers can open **Manage billing**. Checkout and billing return
    to Pro automatically. The native shell waits up to 15 minutes for the browser,
    then checks account confirmation for up to two minutes, even if Pro is hidden

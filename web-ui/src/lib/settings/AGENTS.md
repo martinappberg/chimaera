@@ -42,12 +42,15 @@ Account sign-in, entitlement, and cloud readiness are separate. No-plan accounts
 see plan selection, not paid operation controls. Existing privacy controls remain
 available in a recovery disclosure. Checkout runs in the browser through the
 native authenticated bridge; confirmed account state alone activates the plan.
-The signed-out page has one Sign in action: it retains a chosen plan, but an
-already active account restores its existing plan without opening checkout.
+The signed-out page leads with Sign up and a smaller existing-account Sign in
+link. Each opens the matching authentication screen, retains the chosen plan,
+and returns to plan selection after authentication. Checkout requires a separate explicit action
+from a confirmed free account. An active account restores its subscriber view.
 Only confirmed free accounts see the illustrated introduction and plan selection.
 Paid accounts see an operational overview without a sales pitch or walkthrough.
-Unknown/startup/error account states stay neutral, and never trigger a remembered
-purchase until a confirmed no-plan status arrives. The static introduction shows
+Unknown/startup/error account states stay neutral. Neither a remembered selection
+nor a successful account refresh can trigger checkout. Usage shows percentages
+computed from the account's current allowances, not fixed hour or storage totals. The static introduction shows
 project/conversation continuity; it is not live setup progress or arbitrary
 process migration.
 Native billing attempts own their finite confirmation lifetime even if this view

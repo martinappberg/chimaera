@@ -1,7 +1,7 @@
 //! One in-memory browser sign-in per shell. The PKCE secret and callback
 //! listener belong to the attempt; cancellation never persists either.
 use anyhow::{bail, Context, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     sync::Mutex,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -11,6 +11,26 @@ use tokio::{
     net::{TcpListener, TcpStream},
     sync::watch,
 };
+
+/// A presentation hint only: both screens keep the same PKCE and MFA gates.
+#[derive(Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ScreenHint {
+    SignUp,
+    #[default]
+    SignIn,
+}
+impl ScreenHint {
+    pub fn apply(self, url: &mut url::Url) {
+        url.query_pairs_mut().append_pair(
+            "screen_hint",
+            match self {
+                Self::SignUp => "sign-up",
+                Self::SignIn => "sign-in",
+            },
+        );
+    }
+}
 
 pub(super) const WINDOW: Duration = Duration::from_secs(15 * 60);
 
@@ -232,7 +252,7 @@ async fn reply(mut socket: TcpStream, success: bool) {
     };
     let body = include_str!("../../../assets/sign-in.html")
         .replace("{{title}}", title)
-        .replace("{message}", message)
+        .replace("{{message}}", message)
         .replace("{{footer}}", "Secure desktop sign-in");
     let response = format!("HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nReferrer-Policy: no-referrer\r\nContent-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n{body}", body.len());
     let _ = tokio::time::timeout(Duration::from_secs(5), async {
@@ -245,6 +265,44 @@ async fn reply(mut socket: TcpStream, success: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn screen_hint_is_closed_and_preserves_pkce_and_callback() {
+        let pkce = chimaera_link::Pkce::new();
+        let original = pkce
+            .authorization_url(
+                "https://account.example.invalid",
+                "http://127.0.0.1:45678/callback",
+            )
+            .unwrap();
+        for (value, expected) in [
+            (None, "sign-in"),
+            (Some("sign-in"), "sign-in"),
+            (Some("sign-up"), "sign-up"),
+        ] {
+            let hint = value
+                .map(|v| serde_json::from_value::<ScreenHint>(serde_json::json!(v)).unwrap())
+                .unwrap_or_default();
+            let mut url = original.clone();
+            hint.apply(&mut url);
+            let before: Vec<_> = original.query_pairs().collect();
+            let after: Vec<_> = url
+                .query_pairs()
+                .filter(|(key, _)| key != "screen_hint")
+                .collect();
+            assert_eq!(before, after);
+            assert_eq!(
+                url.query_pairs()
+                    .find(|(key, _)| key == "screen_hint")
+                    .unwrap()
+                    .1,
+                expected
+            );
+        }
+        for invalid in ["signup", "admin", "", "sign-up&prompt=none"] {
+            assert!(serde_json::from_value::<ScreenHint>(serde_json::json!(invalid)).is_err());
+        }
+    }
+
     #[tokio::test]
     async fn retry_and_cancel_fence_old_attempts_but_do_not_interrupt_activation() {
         let state = SignIn::default();
@@ -294,6 +352,15 @@ mod tests {
             let mut response = String::new();
             socket.read_to_string(&mut response).await.unwrap();
             assert!(response.starts_with("HTTP/1.1 400"));
+            let main = response
+                .split_once("<main>")
+                .unwrap()
+                .1
+                .split_once("</main>")
+                .unwrap()
+                .0;
+            assert!(!main.contains(['{', '}']));
+            assert!(main.contains("<p>Return to Chimaera and choose Try again to start a fresh sign-in. You can close this tab.</p>"));
             assert!(!response.contains(&state));
         }
         let mut socket = TcpStream::connect(address).await.unwrap();
@@ -316,7 +383,16 @@ mod tests {
         assert!(headers.contains("Cache-Control: no-store"));
         assert!(body.contains("You're signed in"));
         assert!(body.contains("Secure desktop sign-in"));
-        assert!(!body.contains("{{footer}}"));
+        let main = body
+            .split_once("<main>")
+            .unwrap()
+            .1
+            .split_once("</main>")
+            .unwrap()
+            .0;
+        assert!(!main.contains(['{', '}']));
+        assert!(main.contains("<p>Your account is connected. Chimaera is bringing you back to the app. You can close this tab.</p>"));
+        assert!(!body.contains("{{"));
         assert!(!body.contains("bound-code"));
         assert!(!body.contains(&state));
     }

@@ -984,10 +984,12 @@ export async function proStatus(): Promise<ProStatus> {
   return t.core.invoke<ProStatus>("pro_status");
 }
 
-export async function proSignIn(): Promise<void> {
+export type ProAuthScreenHint = "sign-up" | "sign-in";
+
+export async function proSignIn(screenHint: ProAuthScreenHint = "sign-in"): Promise<void> {
   const t = tauri();
   if (t === null) throw new Error("not running in the native shell");
-  await t.core.invoke<void>("pro_sign_in");
+  await t.core.invoke<void>("pro_sign_in", { screenHint });
 }
 
 export async function proCancelSignIn(): Promise<void> {

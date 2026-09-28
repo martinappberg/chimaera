@@ -140,6 +140,11 @@ Generate independent cryptographically random state and PKCE verifier values
 
 `GET /v1/oauth/authorize` takes `response_type=code`, `client_id=chimaera`,
 `redirect_uri`, `state`, `code_challenge`, `code_challenge_method=S256`.
+An optional `screen_hint` is exactly `sign-up` or `sign-in`; omission retains
+the sign-in entry. It selects the identity provider's initial screen only and
+never changes account authorization, MFA, PKCE, or billing. Unknown values are
+rejected. Account creation/sign-in returns to the app; starting checkout always
+requires a separate explicit action.
 The browser signs in and completes mandatory multifactor authentication. It
 returns `code` and the exact `state` to the callback. The client rejects absent,
 duplicate or mismatched state/code and imposes a short callback deadline.

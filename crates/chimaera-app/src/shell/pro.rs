@@ -714,7 +714,11 @@ pub async fn pro_refresh_account(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub async fn pro_sign_in(app: AppHandle, window: tauri::WebviewWindow) -> Result<(), String> {
+pub async fn pro_sign_in(
+    app: AppHandle,
+    window: tauri::WebviewWindow,
+    screen_hint: Option<auth::ScreenHint>,
+) -> Result<(), String> {
     let state = app.state::<Shell>();
     let endpoint = state
         .pro
@@ -733,9 +737,10 @@ pub async fn pro_sign_in(app: AppHandle, window: tauri::WebviewWindow) -> Result
             .port()
     );
     let pkce = chimaera_link::Pkce::new();
-    let url = pkce
+    let mut url = pkce
         .authorization_url(&endpoint, &redirect)
         .map_err(|error| error.to_string())?;
+    screen_hint.unwrap_or_default().apply(&mut url);
     let mut attempt = state
         .pro
         .sign_in

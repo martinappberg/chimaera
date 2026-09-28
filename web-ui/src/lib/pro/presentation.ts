@@ -1,17 +1,18 @@
-import type { CloudProvisioningStatus, MirrorStatus } from "../net/native";
+import type { CloudProvisioningStatus, MirrorStatus, ProAuthScreenHint } from "../net/native";
 
 export type PaidPlan = "pro" | "max";
 export type BillingInterval = "month" | "year";
 export interface PlanChoice { plan: PaidPlan; interval: BillingInterval }
-export interface PurchaseIntent extends PlanChoice { stage: "sign_in"; created: number }
+export interface PurchaseIntent extends PlanChoice { stage: "sign_in"; created: number; screenHint?: ProAuthScreenHint }
 
 export function paid(plan: unknown): plan is PaidPlan { return plan === "pro" || plan === "max"; }
 export function readIntent(value: string | null, now = Date.now()): PurchaseIntent | null {
   try {
     const v = JSON.parse(value ?? "null");
     if (!v || !paid(v.plan) || !["month", "year"].includes(v.interval) || v.stage !== "sign_in"
+      || (v.screenHint !== undefined && v.screenHint !== "sign-in" && v.screenHint !== "sign-up")
       || !Number.isFinite(v.created) || v.created > now || now - v.created > 24 * 60 * 60 * 1000) return null;
-    return { plan: v.plan, interval: v.interval, stage: v.stage, created: v.created };
+    return { plan: v.plan, interval: v.interval, stage: v.stage, created: v.created, ...(v.screenHint ? { screenHint: v.screenHint } : {}) };
   } catch { return null; }
 }
 export function cloudCopy(state: string, reason: string | null, phase?: CloudProvisioningStatus["phase"]): { title: string; detail: string } {

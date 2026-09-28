@@ -3,8 +3,9 @@
   import BrandMark from "../shared/BrandMark.svelte";
   import PlanBadge from "../shared/PlanBadge.svelte";
   import ProWalkthrough from "../pro/ProWalkthrough.svelte";
-  import { billingCopy, billingPending, billingNeedsReview } from "../pro/billing";
-  import { onMount, untrack } from "svelte";
+  import AccountUsage from "../pro/AccountUsage.svelte";
+  import { billingCopy, billingPending, billingNeedsReview, explicitCheckoutChoice } from "../pro/billing";
+  import { onMount, tick, untrack } from "svelte";
   import MirrorSettings from "./MirrorSettings.svelte";
   import { asyncDisposer } from "../shared/asyncDisposer";
   import { pageVisible } from "../shared/visibility";
@@ -12,7 +13,7 @@
   import {
     onProChanged, proStatus, proSignIn, proCancelSignIn, proSignOut, proSignOutEverywhere,
     proHosts, proSetHostKept, proDevices, proBillingCheckout, proBillingPortal, proCancelBilling, proRefreshAccount,
-    type ProStatus, type ProHost, type ProDevice,
+    type ProStatus, type ProHost, type ProDevice, type ProAuthScreenHint,
   } from "../net/native";
 
   let { visible = true, requiredProviders = [], contextLabel, workspaceId, onReady }: { visible?: boolean; requiredProviders?: string[]; contextLabel?: string; workspaceId?: string; onReady?: () => void } = $props();
@@ -29,6 +30,8 @@
   let intent = $state<PurchaseIntent | null>(initialIntent);
   let selected = $state<PaidPlan>(initialIntent?.plan ?? "pro");
   let interval = $state<BillingInterval>(initialIntent?.interval ?? "month");
+  let authScreen = $state<ProAuthScreenHint>(initialIntent?.screenHint ?? "sign-in");
+  let shownSelection: number | null = null;
   let status = $state<ProStatus | null>(null);
   let accountFresh = $state(false);
   let accountLoading = $state(false);
@@ -56,8 +59,6 @@
   const billingRecovery = $derived(billingNeedsReview(billing, subscribed));
   const offerPlans = $derived(confirmedFree && !billingActive && !billingRecovery);
   const canReturnToPlans = $derived(billingRecovery && confirmedFree && reviewedBilling === billing?.id);
-  const cloudHours = $derived(status?.usage?.cloud_hours);
-  const cloudLimit = $derived(status?.limits?.cloud_hours);
 
   function showPlans(): void {
     plansElement?.scrollIntoView({ block: "start", behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" });
@@ -77,11 +78,22 @@
       if (!alive || request !== generation) return;
       status = next;
       accountFresh = true;
+      if (!next.signed_in) notice = null;
       if (!next.initializing && next.signed_in && paid(next.plan) && intent !== null) {
         remember(null);
-        notice = "Your plan is active. Follow your cloud setup below.";
+        notice = "Your plan is active.";
       }
       error = null;
+      // Account updates restore the draft only. Purchasing always needs a new click.
+      const selection = intent;
+      if (selection && next.signed_in && offerPlans && shownSelection !== selection.created) {
+        notice = "You're signed in. Review your plan, then continue to checkout.";
+        await tick();
+        if (alive && request === generation && visible && document.visibilityState === "visible" && plansElement) {
+          shownSelection = selection.created;
+          showPlans();
+        }
+      }
     } catch (reason) {
       if (alive && request === generation) error = friendlyError(reason, "Your account couldn't refresh. Please try again in a moment.");
     } finally {
@@ -105,11 +117,6 @@
     void proDevices().then(value => { if (!stopped) devices = value; }).catch(() => { if (!stopped) error = "Your devices couldn't refresh. Please try again."; });
     return () => { stopped = true; };
   });
-  $effect(() => {
-    if (visible && $pageVisible && status?.signed_in && confirmedFree && !billingActive && !billingRecovery && intent?.stage === "sign_in" && busy === null) {
-      untrack(() => void checkout());
-    }
-  });
   onMount(() => {
     const changed = () => { if (alive) { reviewedBilling = null; accountFresh = false; revision += 1; } };
     const dispose = asyncDisposer(onProChanged(changed).then((unlisten) => { changed(); return unlisten; }));
@@ -129,12 +136,8 @@
     // A returning subscriber uses the same sign-in action, never a new checkout.
     if (subscribed) { remember(null); return; }
     if (!confirmedFree || billingActive || billingRecovery) return;
-    if (!status?.signed_in) {
-      remember({ plan: selected, interval, stage: "sign_in", created: Date.now() });
-      await act("sign-in", proSignIn, "Sign-in couldn't start. Please try again.");
-      return;
-    }
-    const choice = intent ?? { plan: selected, interval };
+    const choice = explicitCheckoutChoice(status, accountFresh, { plan: selected, interval });
+    if (!choice) return;
     // The shell owns the attempt from here. A view remount must not reopen it.
     remember(null);
     notice = null;
@@ -142,6 +145,17 @@
       await proBillingCheckout(choice.plan, choice.interval);
       if (status?.billing === undefined) notice = "Checkout opened in your browser. Return here to check your account when you're done.";
     }, "Checkout couldn't open. Please try again.");
+  }
+  function selectPlan(plan: PaidPlan, nextInterval = interval): void {
+    selected = plan;
+    interval = nextInterval;
+    if (intent) remember({ ...intent, plan, interval: nextInterval });
+  }
+  async function authenticate(screenHint: ProAuthScreenHint): Promise<void> {
+    if (busy !== null || !status?.available || status.initializing || status.signed_in || billingActive || billingRecovery) return;
+    authScreen = screenHint;
+    remember({ plan: selected, interval, stage: "sign_in", screenHint, created: Date.now() });
+    await act("sign-in", () => proSignIn(screenHint), "Your browser couldn't open. Please try again.");
   }
   async function openBilling(): Promise<void> {
     if (billingActive) return;
@@ -228,7 +242,7 @@
     {/if}
 
     {#if signInPhase === "waiting"}
-      <div class="panel notice" role="status"><h2>Continue in your browser</h2><p>Complete sign-in and verification there. Your selection is saved here, and this request stays open for up to 15 minutes.</p><div class="actions"><button disabled={busy !== null} onclick={() => void act("sign-in", proSignIn, "Sign-in couldn't restart. Please try again.")}>Start again</button><button class="secondary" disabled={busy !== null} onclick={() => void cancelSignIn()}>Cancel sign-in</button></div></div>
+      <div class="panel notice" role="status"><h2>Continue in your browser</h2><p>Complete sign-in and verification there. Your selection is saved here, and this request stays open for up to 15 minutes.</p><div class="actions"><button disabled={busy !== null} onclick={() => void authenticate(authScreen)}>Start again</button><button class="secondary" disabled={busy !== null} onclick={() => void cancelSignIn()}>Cancel sign-in</button></div></div>
     {:else if signInPhase === "finishing"}
       <div class="panel notice" role="status"><h2>Finishing sign-in…</h2><p>Saving your account securely on this computer.</p></div>
     {/if}
@@ -248,11 +262,11 @@
       <section class="plans" aria-labelledby="plans-title" tabindex="-1" bind:this={plansElement}>
         <div class="section-heading plan-heading">
           <div><h2 id="plans-title">Choose your plan</h2><p class="muted small">The same features in both. More cloud capacity with Max.</p></div>
-          <div class="interval" role="group" aria-label="Billing interval"><button class:chosen={interval === "month"} aria-pressed={interval === "month"} onclick={() => (interval = "month")}>Monthly</button><button class:chosen={interval === "year"} aria-pressed={interval === "year"} onclick={() => (interval = "year")}>Yearly <span>2 months free</span></button></div>
+          <div class="interval" role="group" aria-label="Billing interval"><button class:chosen={interval === "month"} aria-pressed={interval === "month"} onclick={() => selectPlan(selected, "month")}>Monthly</button><button class:chosen={interval === "year"} aria-pressed={interval === "year"} onclick={() => selectPlan(selected, "year")}>Yearly <span>2 months free</span></button></div>
         </div>
         <div class="plan-options" role="group" aria-label="Choose Pro or Max">
           {#each planChoices as choice (choice.plan)}
-            <button class="plan-card" class:selected={selected === choice.plan} aria-pressed={selected === choice.plan} onclick={() => (selected = choice.plan)}>
+            <button class="plan-card" class:selected={selected === choice.plan} aria-pressed={selected === choice.plan} onclick={() => selectPlan(choice.plan)}>
               <span class="plan-top"><span class="plan-name">{choice.name}</span><span class="selection-mark" aria-hidden="true"></span></span>
               <span class="plan-purpose">{choice.purpose}</span>
               <span class="plan-detail">{choice.detail}</span>
@@ -262,17 +276,15 @@
           {/each}
         </div>
         <div class="included"><span class="section-label">Included with both</span><ul><li>Project mirrors and agent handoff</li><li>Persistent remote connections</li><li>Browser access to your work</li><li>Project-by-project privacy controls</li></ul></div>
-        <div class="purchase"><button disabled={busy !== null || signInPhase !== null || billingActive} onclick={() => void checkout()}>{busy === "checkout" ? "Opening checkout…" : status.signed_in ? `Continue with ${selected === "max" ? "Max" : "Pro"}` : "Sign in"}</button><p class="small muted">Billed ${prices[selected][interval]} {interval === "year" ? "yearly" : "monthly"}. Cloud work and mirrored storage have plan limits. Review billing details in secure checkout before subscribing.</p></div>
+        <div class="purchase"><button disabled={busy !== null || signInPhase !== null || billingActive} onclick={() => status?.signed_in ? void checkout() : void authenticate("sign-up")}>{busy === "checkout" ? "Opening checkout…" : status.signed_in ? "Continue to checkout" : "Sign up"}</button><p class="small muted">{#if status.signed_in}Billed ${prices[selected][interval]} {interval === "year" ? "yearly" : "monthly"}. Cloud work and mirrored storage have plan limits. Review billing details in secure checkout before subscribing.{:else}Create your account first. You can review your plan before checkout.{/if}</p></div>
+        {#if !status.signed_in}<p class="signin-alternative small muted">Already have an account? <button class="text-button" disabled={busy !== null || signInPhase !== null || billingActive} onclick={() => void authenticate("sign-in")}>Sign in</button></p>{/if}
         <p class="free-note"><strong>Your local workbench stays free.</strong> Local projects, agents and ordinary SSH work without a Pro account.</p>
       </section>
     {:else if subscribed}
       {#key status.email}<CloudSetup {visible} {requiredProviders} {contextLabel} {workspaceId} {onReady} />{/key}
       <section class="panel plan-current" aria-label="Current plan">
         <div class="section-heading"><div><span class="section-label">Your plan</span><h2>Chimaera {status.plan === "max" ? "Max" : "Pro"}</h2></div><button class="secondary" disabled={busy !== null || billingActive} onclick={() => void openBilling()}>{busy === "billing" ? "Opening billing…" : "Manage billing"}</button></div>
-        <details class="usage-details"><summary>Usage and plan details</summary><div class="usage-grid">
-          {#if cloudHours !== undefined && cloudLimit !== undefined}<div><span class="usage-label">Cloud work this month</span><p class="usage-value"><strong>{cloudHours.toFixed(1)}</strong><span> / {cloudLimit} hours</span></p>{#if cloudLimit > 0}<progress max={cloudLimit} value={Math.max(0, Math.min(cloudHours, cloudLimit))} aria-label="Monthly cloud hours used"></progress>{/if}</div>{/if}
-          {#if status.usage && status.limits}<div><span class="usage-label">Mirrored projects</span><p class="usage-value"><strong>{(status.usage.storage_bytes / 1e9).toFixed(1)}</strong><span> / {(status.limits.storage_bytes / 1e9).toLocaleString(undefined, { maximumFractionDigits: 1 })} GB</span></p>{#if status.limits.storage_bytes > 0}<progress max={status.limits.storage_bytes} value={Math.max(0, Math.min(status.usage.storage_bytes, status.limits.storage_bytes))} aria-label="Mirrored storage used"></progress>{/if}</div>{/if}
-        </div>{#if !status.usage || !status.limits}<p class="muted small">Usage isn't available yet. Refresh your account to check again.</p>{:else}<p class="muted small usage-note">These are your account's current allowances. Local work remains available when a cloud limit is reached.</p>{/if}</details>
+        <AccountUsage usage={status.usage} limits={status.limits} />
       </section>
       <details class="section" ontoggle={(event) => (connectionsOpen = event.currentTarget.open)}><summary>Connected machines</summary>{#if connectionsOpen}<div class="section-body"><p class="muted small">Add your remote hosts on Home. Keep a connection available through Pro here.</p>{#if hosts.length === 0}<p class="muted">No machines to show yet.</p>{/if}{#each hosts as host (host.alias)}<div class="row"><div><span>{host.alias}</span><span class="muted small">{host.status === "prompting" ? "Waiting for authentication" : host.status === "connecting" ? "Connecting…" : host.status === "connected" ? "Connected" : "Offline"}</span></div>{#if host.kind === "ssh"}<label class="keep"><input type="checkbox" checked={host.kept} disabled={busy !== null} onchange={(event) => setKept(host, event.currentTarget)} />Keep connected</label>{/if}</div>{/each}</div>{/if}</details>
       <details class="section" ontoggle={(event) => (mirrorsOpen = event.currentTarget.open)}><summary>Project mirrors and privacy</summary>{#if mirrorsOpen}<MirrorSettings visible={visible && mirrorsOpen} />{/if}</details>
@@ -281,7 +293,7 @@
     {:else if accountLoading}
       <p class="muted" role="status">Refreshing your account…</p>
     {:else}
-      <div class="panel" role="status"><h2>Your account needs attention</h2><p class="muted">{friendlyError(error ?? status.error, "We couldn't confirm your account details. Your local work remains available.")}</p>{#if !status.signed_in && signInPhase === null}<button disabled={busy !== null} onclick={() => void act("sign-in", proSignIn, "Sign-in couldn't restart. Please try again.")}>Sign in</button>{:else if signInPhase === null}<button class="secondary" disabled={busy !== null} onclick={() => void load(true)}>Check again</button>{/if}</div>
+      <div class="panel" role="status"><h2>Your account needs attention</h2><p class="muted">{friendlyError(error ?? status.error, "We couldn't confirm your account details. Your local work remains available.")}</p>{#if !status.signed_in && signInPhase === null}<button disabled={busy !== null} onclick={() => void authenticate(authScreen)}>{authScreen === "sign-up" ? "Try signing up again" : "Sign in again"}</button>{:else if signInPhase === null}<button class="secondary" disabled={busy !== null} onclick={() => void load(true)}>Check again</button>{/if}</div>
     {/if}
 
     {#if status.signed_in}
@@ -346,21 +358,13 @@
   .included li::marker { color: var(--muted); font-size: .7em; }
   .purchase { display: flex; align-items: center; gap: 22px; margin-top: 23px; }
   .purchase > button { flex: none; }
+  .signin-alternative { margin: 14px 0 0; }
   .purchase p { max-width: 44ch; margin: 0; font-size: var(--text-xs); }
   .free-note { margin-top: 30px; padding-top: 22px; border-top: 1px solid var(--edge); color: var(--muted); font-size: var(--text-sm); }
   .free-note strong { display: block; color: var(--fg); font-weight: 500; margin-bottom: 3px; }
   .notice { background: color-mix(in srgb, var(--accent) 5%, transparent); }
   .message { border-radius: 7px; padding: 12px 15px; }
   .plan-current .section-label { margin-bottom: 8px; }
-  .usage-details { margin-top: 20px; border-top: 1px solid var(--edge); }
-  .usage-details summary { padding: 15px 0 0; font-size: var(--text-sm); }
-  .usage-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 28px; margin-top: 24px; }
-  .usage-label { color: var(--muted); font-size: var(--text-sm); }
-  .usage-value { margin: 8px 0; font-size: var(--text-sm); }
-  .usage-value strong { font-size: 23px; font-weight: 500; }
-  .usage-value span { color: var(--muted); }
-  .usage-note { margin: 16px 0 0; font-size: var(--text-xs); }
-  progress { width: 100%; height: 4px; accent-color: var(--fg); }
   .section { margin-top: 14px; border-top: 1px solid var(--edge); }
   summary { padding: 18px 0; color: var(--muted); font-size: var(--text-md); cursor: pointer; }
   summary:hover { color: var(--fg); }
@@ -373,7 +377,7 @@
   .error { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-top: 18px; padding: 15px; border-radius: 8px; background: color-mix(in srgb, var(--warn) 8%, transparent); color: var(--warn); }
   .error span { flex: 1; min-width: 160px; }
   @container (max-width: 660px) { .purchase { align-items: flex-start; flex-direction: column; gap: 12px; } }
-  @container (max-width: 460px) { .plan-options, .included ul, .usage-grid { grid-template-columns: 1fr; } .plan-card, .panel { padding: 21px; } .interval { width: 100%; } .interval button { flex: 1; } }
+  @container (max-width: 460px) { .plan-options, .included ul { grid-template-columns: 1fr; } .plan-card, .panel { padding: 21px; } .interval { width: 100%; } .interval button { flex: 1; } }
   @media (max-width: 760px) { .pro { padding: 30px 25px 44px; } .purchase { align-items: flex-start; flex-direction: column; gap: 12px; } }
-  @media (max-width: 520px) { .pro { padding: 26px 20px 36px; } .heading { margin-bottom: 27px; } .brand { margin-bottom: 24px; font-size: 21px; } .plan-options, .included ul, .usage-grid { grid-template-columns: 1fr; } .plan-card, .panel { padding: 21px; } .interval { width: 100%; } .interval button { flex: 1; } .plan-price { margin-top: 20px; } }
+  @media (max-width: 520px) { .pro { padding: 26px 20px 36px; } .heading { margin-bottom: 27px; } .brand { margin-bottom: 24px; font-size: 21px; } .plan-options, .included ul { grid-template-columns: 1fr; } .plan-card, .panel { padding: 21px; } .interval { width: 100%; } .interval button { flex: 1; } .plan-price { margin-top: 20px; } }
 </style>

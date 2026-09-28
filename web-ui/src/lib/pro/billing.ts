@@ -1,4 +1,14 @@
-import type { ProBillingAttempt } from "../net/native";
+import type { ProBillingAttempt, ProStatus } from "../net/native";
+
+import type { PlanChoice } from "./presentation";
+
+/** Called only by an explicit purchase action; remembered drafts are never authority. */
+export function explicitCheckoutChoice(status: ProStatus | null, fresh: boolean, selected: PlanChoice): PlanChoice | null {
+  if (!fresh || !status?.available || !status.signed_in || status.initializing || status.error
+    || status.sign_in != null || status.plan !== "none" || billingPending(status.billing)
+    || billingNeedsReview(status.billing, false)) return null;
+  return { ...selected };
+}
 
 export function billingPending(attempt: ProBillingAttempt | null | undefined): boolean {
   return attempt?.phase === "waiting" || attempt?.phase === "confirming";

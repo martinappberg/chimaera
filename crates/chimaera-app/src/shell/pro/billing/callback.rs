@@ -30,7 +30,7 @@ impl Callback {
         };
         let body = include_str!("../../../../assets/sign-in.html")
             .replace("{{title}}", title)
-            .replace("{message}", message)
+            .replace("{{message}}", message)
             .replace("{{footer}}", "Secure account return");
         reply(self.socket, "200 OK", &body).await;
     }
@@ -227,6 +227,11 @@ mod tests {
 
     #[tokio::test]
     async fn accepted_return_is_one_use_and_response_contains_no_nonce_or_entitlement() {
+        for (outcome, checkout, message) in [
+            ("success", true, "Chimaera is checking your account and will update automatically. You can close this tab."),
+            ("portal", false, "Chimaera is checking your account and will update automatically. You can close this tab."),
+            ("canceled", true, "Checkout was canceled. You can close this tab and continue in the app."),
+        ] {
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap();
@@ -237,23 +242,26 @@ mod tests {
             state: nonce.clone(),
         };
         let server = tokio::spawn(async move {
-            receive(listener, &callback, true)
+            receive(listener, &callback, checkout)
                 .await
                 .unwrap()
                 .finish()
                 .await;
         });
         let mut socket = TcpStream::connect(address).await.unwrap();
-        socket.write_all(format!("GET /billing/callback?state={nonce}&outcome=success HTTP/1.1\r\nHost: {address}\r\n\r\n").as_bytes()).await.unwrap();
+        socket.write_all(format!("GET /billing/callback?state={nonce}&outcome={outcome} HTTP/1.1\r\nHost: {address}\r\n\r\n").as_bytes()).await.unwrap();
         let mut response = String::new();
         socket.read_to_string(&mut response).await.unwrap();
         server.await.unwrap();
-        assert!(response.contains("checking your account"));
+        let main = response.split_once("<main>").unwrap().1.split_once("</main>").unwrap().0;
+        assert!(!main.contains(['{', '}']));
+        assert!(main.contains(&format!("<p>{message}</p>")));
         assert!(response.contains("Secure account return"));
         assert!(!response.contains("Secure desktop sign-in"));
-        assert!(!response.contains("{{footer}}"));
+        assert!(!response.contains("{{"));
         assert!(!response.contains(&nonce));
         assert!(!response.contains("plan is active"));
         assert!(TcpStream::connect(address).await.is_err());
+        }
     }
 }

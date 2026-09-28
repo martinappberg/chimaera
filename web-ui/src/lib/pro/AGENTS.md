@@ -14,6 +14,7 @@ enter UI settings or local storage.
 | `cloudTransport.ts` | Native/browser request parity; passive GETs, explicit wake intent and focused terminal routing. |
 | `providers.ts` | Readiness and safe provider-link presentation; imports the core provider catalog. |
 | `onboarding.svelte.ts` | Validated shared intent so a paused project opens the same onboarding flow. |
+| `AccountUsage.svelte` / `usage.ts` | Percentage-first account usage; real limits, bounded accessible bars, neutral unknown/zero allowance. |
 | `billing.ts` | Native billing attempt copy; browser return never grants entitlement and raw errors never render. |
 | `presentation.ts` | Account, billing-intent and cloud-state copy; truthful project status and the finite preparation polling cadence. |
 
@@ -61,6 +62,7 @@ native builds omit these fields and retain their existing account behavior.
 Billing verification belongs to the native shell, including while Pro is hidden or
 closed. The page reads optional `ProStatus.billing` and listens for `pro-changed`;
 it never polls checkout or trusts a browser query. Storage retains only a selected
-plan awaiting sign-in; old checkout markers are ignored. `pro-return` is targeted
+plan selection across sign-in; it never authorizes automatic checkout. Old
+checkout markers are ignored. `pro-return` is targeted
 to one native window and `pro_take_return` consumes that window's pending marker
 after listener registration. App defers opening Pro until its layout is ready.
