@@ -11,6 +11,7 @@ revocable delegation over the authenticated local API.
 | `routes.rs` | Authenticated configure/status/privacy/profile/power/hydration HTTP handlers. |
 | `projects.rs` | Passive bounded cloud-project discovery and explicit per-device local adoption; native-picked folder validation, saved directory identity, retry and legacy-import fences. |
 | `projects/tests.rs` | Synthetic loopback HTTP plus real Git transfer, passive-read, conflict, retry, restart and two-device destination checks. |
+| `execution.rs` / `execution/` | Negotiated execution leases, independent stop watchdog, durable launch/crash evidence, immutable receipts and stopped same-installation recovery. |
 | `engine.rs` | Independent lease renewal, mirror coordinator, transactional hydration, profile execution and lazy return. |
 | `release.rs` | Bounded clean-release retry for the account publication fence; changed ownership, account or lease never retries. |
 | `provider_gate.rs` / `provider_tests.rs` | Per-agent cloud readiness, bounded blocked-provider status, and staged retry/cancellation tests with a synthetic CLI and real PTY. |
@@ -21,9 +22,25 @@ revocable delegation over the authenticated local API.
 | `repository.rs` | Portable remote/tracking allowlist; bounded ref import, compare-and-swap adoption and index/ref-lock cancellation cleanup. |
 | `config.rs` | Portable agent configuration export/import, scoped environment-omission diagnostics and destination connection identity preservation. |
 
-One recorded holder and epoch controls shared writes. Failure to reach the service
-is not evidence that ownership moved; keep local work available until a newer
-owner is verified. Expired remote takeovers fork native conversations. Clean
+One recorded holder and epoch controls shared writes. Legacy v1 retains its
+existing offline-local behavior and expired remote conversation forks. Negotiated
+v2 execution requires an unexpired acquire/renew proof, never a passive GET.
+A request-start deadline reserves stop time; clock divergence closes admission.
+The independent watchdog fences chat/PTY input and owned process groups, including
+stalled startup. Clean release waits for observed termination, durable publication
+and an exact immutable keeper receipt. Each managed launch first persists active
+execution evidence; same-boot restart cannot treat an empty registry as proof that
+old children stopped. A separate enrollment latch rejects lost ordinary state or
+protocol downgrade. macOS boot-session UUID and Linux boot ID can distinguish a
+cold reboot; neither authorizes takeover by another device.
+
+The capability remains `managed_processes` with `expired_takeover:false`.
+Detached descendants and unannounced OS-resume scheduling require a stronger
+supervisor boundary before abrupt cloud takeover is allowed. Native installation
+proofs never enter the daemon. Recovery accepts only a bounded same-installation
+mirror/release grant after execution stops, keeps it in memory, publishes the
+stopped source and consumes release; it cannot acquire/renew or resume execution.
+Failed or ambiguous recovery retains the local files and execution fence. Clean
 handoff stops agents before final export and releases only after the mirror and
 bundles are durable. A fresh publication retains its account fence for ten seconds; release waits at most fifteen seconds and retries only `mirror_commit_in_progress` while the same server-confirmed holder, epoch and live lease remain valid. An unstarted structured Claude chat with no native transcript is omitted only when a complete bounded startup-only journal, fresh-spawn recipe, and no submitted input or background work prove it empty; snapshots leave its source live, while clean handoff atomically fences input and durably suspends it for local return. Only exported agents enable automatic worker wake. Missing meaningful or ambiguous history still fails the flush and retains local ownership.
 

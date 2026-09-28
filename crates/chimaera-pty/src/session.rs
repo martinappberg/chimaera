@@ -116,7 +116,8 @@ pub(crate) struct Session {
     /// OS pid of the direct child, captured at spawn.
     child_pid: Option<u32>,
     term: Arc<Mutex<Term<EventProxy>>>,
-    master: Mutex<Box<dyn MasterPty + Send>>,
+    master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
+    managed: Option<Arc<crate::managed::Managed>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     state: Arc<Mutex<SessionState>>,
     title: Arc<Mutex<Option<String>>>,
@@ -138,6 +139,7 @@ impl Session {
         id: SessionId,
         opts: &SpawnOpts,
         on_exit: Box<dyn FnOnce() + Send + 'static>,
+        managed: bool,
     ) -> anyhow::Result<Arc<Session>> {
         // openpty and the headless Term must never see an invalid or
         // allocation-hostile grid. `resize` shares this exact boundary.
@@ -199,6 +201,8 @@ impl Session {
         let mut writer = master.take_writer().context("failed to take pty writer")?;
         let killer = child.clone_killer();
         let child_pid = child.process_id();
+        let managed = managed.then(|| Arc::new(crate::managed::Managed::new(child_pid)));
+        let master = Arc::new(Mutex::new(master));
 
         let (output_tx, _) = broadcast::channel::<Bytes>(OUTPUT_CHANNEL_CAPACITY);
         let (events_tx, _) = broadcast::channel::<SessionEvent>(EVENT_CHANNEL_CAPACITY);
@@ -288,10 +292,17 @@ impl Session {
         // portable-pty writer is blocking, so this lives on its own thread.
         {
             let id = id.clone();
+            let managed = managed.clone();
             std::thread::Builder::new()
                 .name(format!("pty-write-{id}"))
                 .spawn(move || {
                     while let Some(data) = input_rx.blocking_recv() {
+                        if managed
+                            .as_ref()
+                            .is_some_and(|managed| managed.closed.load(Ordering::Acquire))
+                        {
+                            break;
+                        }
                         if let Err(e) = writer.write_all(&data).and_then(|()| writer.flush()) {
                             tracing::debug!(session = %id, error = %e, "pty writer stopped");
                             break;
@@ -310,8 +321,9 @@ impl Session {
             let id = id.clone();
             std::thread::Builder::new()
                 .name(format!("pty-wait-{id}"))
-                .spawn(move || {
-                    let status = match child.wait() {
+                .spawn({let managed=managed.clone();let master=master.clone();move || {
+                    let result=match managed {Some(managed)=>managed.wait(&mut *child,&master),None=>child.wait()};
+                    let status = match result {
                         Ok(status) => {
                             if status.signal().is_some() {
                                 None
@@ -336,7 +348,7 @@ impl Session {
                     // the session's last words before unregistering it.
                     std::thread::sleep(std::time::Duration::from_millis(60));
                     on_exit();
-                })
+                }})
                 .context("failed to spawn child wait thread")?;
         }
 
@@ -351,7 +363,8 @@ impl Session {
                 .unwrap_or(0),
             child_pid,
             term,
-            master: Mutex::new(master),
+            master,
+            managed,
             killer: Mutex::new(killer),
             state,
             title,
@@ -522,7 +535,18 @@ impl Session {
     /// in the registry forever. Non-blocking: the escalation runs on a detached
     /// thread. Killing a session whose child already exited is a no-op. Reaping
     /// and state bookkeeping still happen on the wait thread.
+    pub(crate) fn fence(&self) {
+        if let Some(managed) = &self.managed {
+            managed.fence(&self.master);
+        } else {
+            self.kill();
+        }
+    }
     pub(crate) fn kill(&self) {
+        if let Some(managed) = &self.managed {
+            managed.fence(&self.master);
+            return;
+        }
         if !lock_unpoisoned(&self.state).alive {
             return;
         }

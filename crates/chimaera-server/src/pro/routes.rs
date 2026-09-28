@@ -1,5 +1,5 @@
 use super::{
-    authority, engine,
+    authority, engine, execution,
     protocol::{Configure, WorkspaceConfigure},
     transport, Ownership,
 };
@@ -49,17 +49,56 @@ pub(crate) struct Privacy {
     confirmed: bool,
 }
 
+pub(crate) use execution::recovery::recover as recover_execution;
 pub(crate) async fn configure(
     State(state): State<Arc<AppState>>,
     Json(config): Json<Configure>,
 ) -> Response {
+    if config.execution.is_some() {
+        return failure(anyhow::anyhow!(
+            "execution authority requires negotiated configuration"
+        ));
+    }
     configure_inner(state, config, None).await
 }
 pub(crate) async fn configure_workspace(
     State(state): State<Arc<AppState>>,
     Json(request): Json<WorkspaceConfigure>,
 ) -> Response {
+    if request.config.execution.is_some() {
+        return failure(anyhow::anyhow!(
+            "execution authority requires negotiated configuration"
+        ));
+    }
     configure_inner(state, request.config, Some(request.workspace_root)).await
+}
+#[derive(Deserialize)]
+pub(crate) struct ExecutionConfigure {
+    #[serde(flatten)]
+    config: Configure,
+    #[serde(default)]
+    workspace_root: Option<std::path::PathBuf>,
+}
+pub(crate) async fn configure_execution(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<ExecutionConfigure>,
+) -> Response {
+    if request.config.execution.is_none() {
+        return failure(anyhow::anyhow!("execution configuration required"));
+    }
+    configure_inner(state, request.config, request.workspace_root).await
+}
+fn configure_ack(
+    config: &Configure,
+    workspace: Option<super::protocol::WorkspaceConfigureAck>,
+) -> Response {
+    if let Some(execution) = &config.execution {
+        return Json(json!({"execution_authority":1,"execution":execution,"workspace_configuration":workspace})).into_response();
+    }
+    match workspace {
+        Some(value) => Json(value).into_response(),
+        None => StatusCode::NO_CONTENT.into_response(),
+    }
 }
 async fn configure_inner(
     state: Arc<AppState>,
@@ -75,6 +114,17 @@ async fn configure_inner(
         ));
     }
     let validation = (|| -> anyhow::Result<()> {
+        execution::validate_configuration(&config)?;
+        let enrolled = !lock(&state.pro.execution.latched).is_empty();
+        anyhow::ensure!(
+            config.execution.is_some()
+                || (!state.pro.execution.invalid
+                    && !enrolled
+                    && !lock(&state.pro.preferences)
+                        .values()
+                        .any(|p| p.continuity.is_some())),
+            "continuity upgrade required"
+        );
         anyhow::ensure!(
             config.account_id.as_deref().is_none_or(super::valid_id),
             "invalid account identity"
@@ -115,7 +165,27 @@ async fn configure_inner(
     if let Err(error) = super::ensure_root(&state.pro.root).await {
         return failure(error);
     }
-    stop_tasks(&state).await;
+    // Refreshing the same negotiated identity only replaces the credential;
+    // it must not interrupt running work or reset the local lease deadline.
+    let same = lock(&state.pro.runtime).as_ref().is_some_and(|old| {
+        old.endpoint == config.endpoint
+            && old.account_id == config.account_id
+            && old.role == config.role
+            && old.keeper_url == config.keeper_url
+            && old.execution == config.execution
+            && old.delegation.device_id == config.delegation.device_id
+            && old.delegation.workspace == config.delegation.workspace
+            && old.delegation.scope == config.delegation.scope
+            && config.execution.is_some()
+    });
+    if same && state.pro.configured.load(Ordering::Acquire) {
+        let response = configure_ack(&config, accepted.as_ref().map(|v| v.ack()));
+        *lock(&state.pro.runtime) = Some(config);
+        return response;
+    }
+    if let Err(error) = stop_tasks(&state).await {
+        return failure(error);
+    }
     *lock(&state.pro.runtime) = None;
     state.pro.configured.store(false, Ordering::Release);
     if let Some(value) = &accepted {
@@ -126,15 +196,19 @@ async fn configure_inner(
         *lock(&state.pro.authority) = authority::Authority::Bound(value.clone());
     }
     *lock(&state.pro.project_cache) = Default::default();
+    let response = configure_ack(&config, accepted.as_ref().map(|v| v.ack()));
+    let managed = config.execution.is_some();
     *lock(&state.pro.runtime) = Some(config);
     state.pro.configured.store(true, Ordering::Release);
     engine::start(state.clone());
-    match accepted {
-        Some(value) => Json(value.ack()).into_response(),
-        None => StatusCode::NO_CONTENT.into_response(),
+    if managed {
+        execution::start(&state);
     }
+    response
 }
-async fn stop_tasks(state: &AppState) {
+async fn stop_tasks(state: &Arc<AppState>) -> anyhow::Result<()> {
+    let stopping = execution::invalidate(state);
+    state.pro.configured.store(false, Ordering::Release);
     state.pro.generation.fetch_add(1, Ordering::AcqRel);
     let lease_task = lock(&state.pro.task).take();
     let mirror_task = lock(&state.pro.mirror_task).take();
@@ -144,10 +218,15 @@ async fn stop_tasks(state: &AppState) {
     for task in [lease_task, mirror_task].into_iter().flatten() {
         let _ = task.await;
     }
+    execution::stop(state, &stopping).await?;
+    execution::clear_stopped(state);
+    Ok(())
 }
 pub(crate) async fn disconnect(State(state): State<Arc<AppState>>) -> Response {
     let _configuration = state.pro.configuration.lock().await;
-    stop_tasks(&state).await;
+    if let Err(error) = stop_tasks(&state).await {
+        return failure(error);
+    }
     *lock(&state.pro.project_cache) = Default::default();
     *lock(&state.pro.runtime) = None;
     state.pro.configured.store(false, Ordering::Release);
@@ -174,7 +253,7 @@ pub(crate) async fn status(State(state): State<Arc<AppState>>) -> Json<serde_jso
     let ownership = lock(&state.pro.ownership).clone();
     let statuses = lock(&state.pro.status).clone();
     Json(
-        json!({"configured":state.pro.configured.load(Ordering::Acquire),"workspace_configuration":authority.acknowledgment(),"projects_root":super::projects_root(&state),"projects_root_confirmed":lock(&state.pro.projects_root).is_some(),"sessions":sessions,"workspaces":workspaces.into_iter().filter(|workspace| authority.allows(&workspace.id)).take(128).map(|workspace|json!({"workspace_id":workspace.id,"name":workspace.name,"root":workspace.root,"never_mirror":preferences.get(&workspace.id).is_some_and(|p|p.never_mirror),"privacy_pending":preferences.get(&workspace.id).is_some_and(|p|p.privacy_pending),"ownership":ownership.get(&workspace.id),"mirror":statuses.get(&workspace.id),"blocked_providers":statuses.get(&workspace.id).map(|status|status.blocked_providers.clone()).unwrap_or_default(),"git_branches":preferences.get(&workspace.id).map(|p|&p.git_branches),"profile":preferences.get(&workspace.id).map(|p|&p.profile)})).collect::<Vec<_>>()}),
+        json!({"configured":state.pro.configured.load(Ordering::Acquire),"workspace_configuration":authority.acknowledgment(),"projects_root":super::projects_root(&state),"projects_root_confirmed":lock(&state.pro.projects_root).is_some(),"sessions":sessions,"workspaces":workspaces.into_iter().filter(|workspace| authority.allows(&workspace.id)).take(128).map(|workspace|json!({"workspace_id":workspace.id,"name":workspace.name,"root":workspace.root,"never_mirror":preferences.get(&workspace.id).is_some_and(|p|p.never_mirror),"privacy_pending":preferences.get(&workspace.id).is_some_and(|p|p.privacy_pending),"ownership":ownership.get(&workspace.id),"continuity":preferences.get(&workspace.id).and_then(|p|p.continuity.as_ref()),"execution_allowed":super::may_execute(&state,&workspace.id),"execution_uncertain":preferences.get(&workspace.id).is_some_and(|p|p.execution_uncertain),"mirror":statuses.get(&workspace.id),"blocked_providers":statuses.get(&workspace.id).map(|status|status.blocked_providers.clone()).unwrap_or_default(),"git_branches":preferences.get(&workspace.id).map(|p|&p.git_branches),"profile":preferences.get(&workspace.id).map(|p|&p.profile)})).collect::<Vec<_>>()}),
     )
 }
 pub(crate) async fn privacy(
@@ -500,6 +579,13 @@ pub(crate) async fn handoff(
             Json(json!({"error":"workspace_busy"})),
         )
             .into_response();
+    }
+    if execution::managed(&state, &request.workspace_id) {
+        if let Err(error) =
+            super::validate_execution_scope(&state, &request.workspace_id, request.expected_epoch)
+        {
+            return failure(error);
+        }
     }
     let _guard = state.pro.jobs.lock().await;
     if super::owned_epoch(&state, &request.workspace_id) != Some(request.expected_epoch)

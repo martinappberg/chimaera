@@ -2,6 +2,7 @@
 mod authority;
 mod config;
 mod engine;
+mod execution;
 mod mirror;
 mod policy;
 mod projects;
@@ -32,6 +33,7 @@ pub(crate) struct ProState {
     generation: AtomicU64,
     runtime: Mutex<Option<protocol::Configure>>,
     authority: Mutex<authority::Authority>,
+    execution: execution::State,
     ownership: Mutex<HashMap<String, Ownership>>,
     preferences: Mutex<HashMap<String, Preference>>,
     projects_root: Mutex<Option<PathBuf>>,
@@ -64,6 +66,18 @@ enum Ownership {
 struct Preference {
     #[serde(default)]
     account: Option<String>,
+    #[serde(default)]
+    continuity: Option<execution::wire::Continuity>,
+    #[serde(default)]
+    execution_uncertain: bool,
+    #[serde(default)]
+    execution_active: bool,
+    #[serde(default)]
+    execution_boot: Option<String>,
+    #[serde(default)]
+    execution_identity: Option<execution::wire::Identity>,
+    #[serde(default)]
+    recovery_pending: bool,
     #[serde(default)]
     never_mirror: bool,
     #[serde(default)]
@@ -155,12 +169,14 @@ impl ProState {
             })
             .collect();
         let authority = authority::Authority::load(&root);
+        let execution = execution::State::restore(&root, &disk.preferences);
         Self {
             root,
             configured: AtomicBool::new(false),
             generation: AtomicU64::new(0),
             runtime: Mutex::new(None),
             authority: Mutex::new(authority),
+            execution,
             ownership: Mutex::new(ownership),
             preferences: Mutex::new(disk.preferences.into_iter().take(128).collect()),
             projects_root: Mutex::new(disk.projects_root),
@@ -221,6 +237,28 @@ pub(crate) fn may_write(state: &crate::AppState, workspace: &str) -> bool {
             )
         )
 }
+/// Execution has a stricter lease boundary than local file editing.
+pub(crate) use execution::prepare_launch as prepare_managed_launch;
+pub(crate) fn managed_execution(state: &crate::AppState, workspace: &str) -> bool {
+    execution::managed(state, workspace)
+}
+pub(crate) fn may_execute(state: &crate::AppState, workspace: &str) -> bool {
+    may_write(state, workspace) && execution::allows(state, workspace)
+}
+pub(crate) fn validate_execution_scope(
+    state: &crate::AppState,
+    workspace: &str,
+    epoch: u64,
+) -> anyhow::Result<()> {
+    authority::workspace(state, workspace)?;
+    anyhow::ensure!(
+        execution::managed(state, workspace)
+            && may_execute(state, workspace)
+            && execution::epoch(state, workspace) == Some(epoch),
+        "workspace execution authority changed"
+    );
+    Ok(())
+}
 pub(crate) fn owned_epoch(state: &crate::AppState, workspace: &str) -> Option<u64> {
     match crate::lock(&state.pro.ownership).get(workspace) {
         Some(Ownership::Local { epoch }) => Some(*epoch),
@@ -266,6 +304,7 @@ async fn persist(state: &crate::AppState) -> anyhow::Result<()> {
         preferences,
     })?;
     anyhow::ensure!(bytes.len() <= 1024 * 1024, "mirror settings exceed limit");
+    execution::persist_latch(state).await?;
     let path = state.pro.root.join("state.json");
     tokio::task::spawn_blocking(move || crate::persist::atomic_write_json(&path, bytes)).await??;
     Ok(())
@@ -501,6 +540,8 @@ mod tests {
         crate::lock(&old.pro.ownership)
             .insert("w-loading".into(), Ownership::Hydrating { epoch: 8 });
         crate::lock(&old.pro.runtime).replace(protocol::Configure {
+            recovery: false,
+            execution: None,
             account_id: None,
             endpoint: "http://127.0.0.1:1".into(),
             keeper_url: String::new(),

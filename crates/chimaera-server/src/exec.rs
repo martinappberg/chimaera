@@ -36,6 +36,15 @@ pub(crate) async fn run_exec(
     timeout_ms: Option<u64>,
     queue_timeout_ms: Option<u64>,
 ) -> Result<chimaera_pty::ExecOutcome, chimaera_pty::ExecError> {
+    let workspace = crate::lock(&state.session_workspaces).get(id).cloned();
+    if workspace
+        .as_deref()
+        .is_some_and(|workspace| !crate::pro::may_execute(state, workspace))
+    {
+        return Err(chimaera_pty::ExecError::Busy(
+            "Project execution is paused while ownership is verified".into(),
+        ));
+    }
     if crate::pro::defer_command(state, id, &command)
         .await
         .map_err(|error| chimaera_pty::ExecError::Busy(error.to_string()))?

@@ -8,8 +8,9 @@
 use std::collections::VecDeque;
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -105,7 +106,26 @@ impl JsonlChild {
         env: &[(String, String)],
         env_remove: &[String],
     ) -> Result<Self> {
+        Self::spawn_controlled(bin, args, cwd, env, env_remove, None)
+    }
+    pub(crate) fn spawn_controlled(
+        bin: &str,
+        args: &[String],
+        cwd: &Path,
+        env: &[(String, String)],
+        env_remove: &[String],
+        control: Option<&Arc<ProcessControl>>,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            control.is_none_or(|c| !c.fenced()),
+            "managed process was fenced before spawn"
+        );
         let mut cmd = Command::new(bin);
+        #[cfg(unix)]
+        if control.is_some() {
+            cmd.process_group(0);
+        }
+
         cmd.args(args)
             .current_dir(cwd)
             .stdin(Stdio::piped())
@@ -147,12 +167,17 @@ impl JsonlChild {
             }
         });
 
+        let child = Arc::new(Mutex::new(child));
+        if let Some(control) = control {
+            control.attach(&child);
+        }
         Ok(Self {
             sink: JsonlSink { stdin },
             stream: JsonlStream {
                 lines: CappedLines::new(stdout, MAX_STDOUT_LINE_BYTES),
             },
             guard: ChildGuard {
+                managed_group: control.is_some(),
                 child,
                 stderr_tail,
                 stderr_task,
@@ -248,7 +273,8 @@ const STDERR_SETTLE: Duration = Duration::from_secs(1);
 
 /// Owns the child for lifecycle: bounded shutdown, kill, stderr diagnostics.
 pub struct ChildGuard {
-    child: Child,
+    managed_group: bool,
+    child: Arc<Mutex<Child>>,
     stderr_tail: Arc<Mutex<VecDeque<String>>>,
     stderr_task: tokio::task::JoinHandle<()>,
 }
@@ -264,7 +290,7 @@ impl ChildGuard {
     /// (PROTOCOL.md Pass 32). A no-op once the child has been reaped (tokio
     /// clears the pid then, so a recycled pid is never signalled).
     pub fn terminate(&self) {
-        if let Some(pid) = self.child.id() {
+        if let Some(pid) = self.child.lock().expect("child lifecycle lock").id() {
             let _ = nix::sys::signal::kill(
                 nix::unistd::Pid::from_raw(pid as i32),
                 nix::sys::signal::Signal::SIGTERM,
@@ -284,12 +310,38 @@ impl ChildGuard {
     /// after the child died. A fast-crashing child otherwise loses the race
     /// and its failure diagnostics read as an empty tail.
     pub async fn shutdown_with_stderr(mut self, grace: Duration) -> (Option<i32>, String) {
-        let status = match tokio::time::timeout(grace, self.child.wait()).await {
-            Ok(Ok(status)) => status.code(),
-            _ => {
-                self.child.start_kill().ok();
-                self.child.wait().await.ok().and_then(|s| s.code())
+        if self.managed_group {
+            tokio::time::sleep(grace.min(Duration::from_secs(2))).await;
+            let child = self.child.lock().expect("child lifecycle lock");
+            #[cfg(unix)]
+            if let Some(pid) = child.id() {
+                let _ = nix::sys::signal::killpg(
+                    nix::unistd::Pid::from_raw(pid as i32),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
             }
+        }
+        let deadline = Instant::now() + grace;
+        let status = loop {
+            let observed = self.child.lock().expect("child lifecycle lock").try_wait();
+            match observed {
+                Ok(Some(status)) => break status.code(),
+                Err(_) => break None,
+                Ok(None) => {}
+            }
+            if Instant::now() >= deadline {
+                let _ = self
+                    .child
+                    .lock()
+                    .expect("child lifecycle lock")
+                    .start_kill();
+            }
+            // Keep the synchronous control lock free while waiting. A lease
+            // watchdog can stop the owned handle during handshake or IO stalls.
+            if Instant::now() >= deadline + Duration::from_secs(5) {
+                break None;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
         };
         let _ = tokio::time::timeout(STDERR_SETTLE, &mut self.stderr_task).await;
         let tail = self.stderr_tail();
@@ -306,5 +358,80 @@ fn truncate(s: &str, max: usize) -> &str {
     match s.char_indices().nth(max) {
         Some((idx, _)) => &s[..idx],
         None => s,
+    }
+}
+
+/// Opt-in managed-process fence; ordinary CLI/probe shutdown retains its normal
+/// SIGTERM behavior. No cached PID is signalled after the Child was reaped.
+#[derive(Default)]
+pub struct ProcessControl {
+    state: Mutex<ControlState>,
+}
+#[derive(Default)]
+struct ControlState {
+    child: Weak<Mutex<Child>>,
+    fenced_at: Option<Instant>,
+}
+impl ProcessControl {
+    fn fenced(&self) -> bool {
+        self.state
+            .lock()
+            .expect("process control lock")
+            .fenced_at
+            .is_some()
+    }
+    fn attach(&self, child: &Arc<Mutex<Child>>) {
+        let mut state = self.state.lock().expect("process control lock");
+        state.child = Arc::downgrade(child);
+        if state.fenced_at.is_some() {
+            Self::signal(&state);
+        }
+    }
+    /// Called repeatedly during the bounded stop window. First SIGTERM lets
+    /// the official CLI stop detached helpers; the owned group gets SIGKILL
+    /// after two seconds. This is not containment of arbitrary setsid children.
+    pub fn fence(&self) {
+        let mut state = self.state.lock().expect("process control lock");
+        state.fenced_at.get_or_insert_with(Instant::now);
+        Self::signal(&state);
+    }
+    fn signal(state: &ControlState) {
+        let Some(child) = state.child.upgrade() else {
+            return;
+        };
+        let mut child = child.lock().expect("child lifecycle lock");
+        let Some(pid) = child.id() else {
+            return;
+        };
+        let force = state
+            .fenced_at
+            .is_some_and(|at| at.elapsed() >= Duration::from_secs(2));
+        #[cfg(unix)]
+        {
+            let signal = if force {
+                nix::sys::signal::Signal::SIGKILL
+            } else {
+                nix::sys::signal::Signal::SIGTERM
+            };
+            let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pid as i32), signal);
+        }
+        if force {
+            let _ = child.start_kill();
+        }
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if !self.managed_group {
+            return;
+        }
+        #[cfg(unix)]
+        if let Some(pid) = self.child.lock().expect("child lifecycle lock").id() {
+            let _ = nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(pid as i32),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
     }
 }

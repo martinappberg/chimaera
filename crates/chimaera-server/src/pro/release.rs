@@ -24,17 +24,29 @@ pub(super) async fn after_publication(
                 current(),
                 "Account or project ownership changed before release"
             );
-            let response = account(
-                config,
-                &format!("/v1/baton/{workspace}/release"),
-                "POST",
-                Some(&json!({"holder_id":config.delegation.device_id,"epoch":epoch})),
-            )
-            .await?;
+            let mut body = super::super::execution::body(config, epoch, false);
+            let path = if config.recovery {
+                body["workspace_id"] = workspace.into();
+                body.as_object_mut().unwrap().remove("execution_capability");
+                "/v2/recovery/release".into()
+            } else {
+                super::super::execution::path(config, workspace, "release")
+            };
+            let response = account(config, &path, "POST", Some(&body)).await?;
             if (200..300).contains(&response.status) {
                 return Ok(());
             }
             ensure!(response.status == 409, "workspace release failed");
+            if config.recovery {
+                let value: serde_json::Value = serde_json::from_slice(&response.body)
+                    .context("invalid recovery release response")?;
+                ensure!(
+                    value["error"] == "mirror_commit_in_progress",
+                    "recovery release failed"
+                );
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
             let conflict: Conflict = serde_json::from_slice(&response.body)
                 .context("invalid workspace release response")?;
             let baton = conflict.baton;
@@ -158,6 +170,8 @@ mod tests {
             .with_state(fixture.clone());
         let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let config = Configure {
+            recovery: false,
+            execution: None,
             account_id: None,
             role: Role::Device,
             endpoint,
@@ -244,6 +258,8 @@ mod tests {
         }));
         let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let config = Configure {
+            recovery: false,
+            execution: None,
             account_id: None,
             role: Role::Device,
             endpoint,

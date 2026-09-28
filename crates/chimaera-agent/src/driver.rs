@@ -51,6 +51,8 @@ pub const IDLE_FLUSH_GRACE_TICKS: u32 = (1500 / COALESCE_INTERVAL_MS) as u32;
 /// protocol.
 #[derive(Clone, Debug)]
 pub struct SpawnSpec {
+    /// Opt-in owner-controlled process group, independent of protocol progress.
+    pub managed_execution: bool,
     pub session_id: String,
     pub argv: Vec<String>,
     pub cwd: PathBuf,
@@ -147,6 +149,7 @@ pub struct McpAutoApprove {
 impl SpawnSpec {
     pub fn new(session_id: impl Into<String>, argv: Vec<String>, cwd: PathBuf) -> Self {
         Self {
+            managed_execution: false,
             session_id: session_id.into(),
             argv,
             cwd,
@@ -174,6 +177,7 @@ impl SpawnSpec {
 /// Channels a driver runs on. Command-channel closure or a `kill` signal
 /// both mean "shut the child down politely, then hard".
 pub struct DriverIo {
+    pub process_control: std::sync::Arc<crate::ndjson::ProcessControl>,
     pub commands: mpsc::Receiver<AgentCommand>,
     pub events: mpsc::Sender<AgentEvent>,
     pub kill: watch::Receiver<bool>,
@@ -381,12 +385,13 @@ pub const FAILURE_AT_BIRTH_WINDOW: Duration = Duration::from_secs(10);
 pub async fn run_driver<D: Driver>(driver: D, spec: SpawnSpec, mut io: DriverIo) -> DriverExit {
     let mut env = spec.env.clone();
     env.extend(driver.env_extra());
-    let child = match JsonlChild::spawn(
+    let child = match JsonlChild::spawn_controlled(
         &spec.argv[0],
         &spec.argv[1..],
         &spec.cwd,
         &env,
         &spec.env_remove,
+        spec.managed_execution.then_some(&io.process_control),
     ) {
         Ok(child) => child,
         Err(err) => {
@@ -402,11 +407,14 @@ pub async fn run_driver<D: Driver>(driver: D, spec: SpawnSpec, mut io: DriverIo)
 
     // Handshake watchdog: a session that cannot prove the protocol works must
     // fail fast so the server can respawn it as a PTY instead of hanging a pane.
-    let handshake = tokio::time::timeout(
-        spec.handshake_timeout,
-        driver.handshake(&mut sink, &mut stream, &spec),
-    )
-    .await;
+    let handshake = tokio::select! {
+        biased;
+        _=io.kill.changed()=>{
+            guard.terminate();drop(sink);guard.shutdown(KILL_GRACE).await;
+            return DriverExit::Killed;
+        },
+        result=tokio::time::timeout(spec.handshake_timeout,driver.handshake(&mut sink,&mut stream,&spec))=>result,
+    };
     let Handshake {
         mut mapper,
         initial,

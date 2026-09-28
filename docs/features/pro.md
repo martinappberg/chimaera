@@ -314,6 +314,23 @@ gates; Linux and Windows physical sleep still need their own hosts.
 
 ---
 
+## Negotiated execution authority
+
+The opt-in v2 contract separates the preferred home installation from the viewing
+device and current execution holder. Passive viewing never grants execution.
+Managed processes need a fresh bounded execution lease; expiration fences input
+and stops registered chat/terminal process groups. A clean handoff publishes an
+immutable, acknowledged checkpoint before releasing ownership, and hydration
+selects that receipt rather than a moving mirror head. Same-installation sign-in
+recovery publishes stopped local work before replacing its old device binding.
+
+This implementation still advertises that expired takeover is unsupported:
+process groups do not contain deliberately detached children or guarantee ordering
+on unannounced OS resume. Persisted unclean-launch evidence blocks unsafe
+same-boot restart. A stronger supervised execution boundary must be verified
+before abrupt battery-loss takeover can be enabled. Local non-Pro execution is
+unchanged; no machine chooser or new secret-sharing capability is introduced.
+
 ## Intent — human-authored ground truth
 
 ### Viewing anywhere, execution at home while available

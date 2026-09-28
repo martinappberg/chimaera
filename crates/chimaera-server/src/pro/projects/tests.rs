@@ -145,6 +145,8 @@ async fn respond(State(f): State<Arc<Fixture>>, request: Request<Body>) -> Respo
 }
 fn configure(state: &AppState, origin: &str) {
     *lock(&state.pro.runtime) = Some(Configure {
+        recovery: false,
+        execution: None,
         account_id: Some("account-fixture".into()),
         role: Role::Device,
         endpoint: origin.into(),

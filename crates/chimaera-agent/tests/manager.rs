@@ -2588,3 +2588,46 @@ async fn conversation_settings_are_indexed_per_native_id() {
     assert_eq!(fx.manager.index().settings(&native).model, *model);
     assert!(fx.manager.kill("s-own"));
 }
+
+#[tokio::test]
+async fn managed_fence_stops_a_synthetic_process_during_stalled_handshake() {
+    let f = fixture();
+    let mut launch = SpawnSpec::new(
+        "managed-stalled",
+        vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "trap '' TERM; sleep 60".into(),
+        ],
+        f.cwd.clone(),
+    );
+    launch.managed_execution = true;
+    launch.handshake_timeout = Duration::from_secs(60);
+    f.manager.spawn(&ClaudeAdapter, launch).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(f.manager.fence("managed-stalled"));
+    assert!(f
+        .manager
+        .command(
+            "managed-stalled",
+            AgentCommand::Send {
+                blocks: vec![ContentBlock::Text {
+                    text: "must not reach process".into()
+                }]
+            }
+        )
+        .await
+        .is_err());
+    tokio::time::timeout(Duration::from_secs(6), async {
+        while f
+            .manager
+            .get("managed-stalled")
+            .is_some_and(|info| info.alive)
+        {
+            f.manager.fence("managed-stalled");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+}

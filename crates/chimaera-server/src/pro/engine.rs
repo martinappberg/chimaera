@@ -1,5 +1,5 @@
 use super::{
-    authority, config, mirror,
+    authority, config, execution, mirror,
     protocol::{Baton, Configure, MirrorCredentials, Role},
     transport, Ownership, WorkspaceStatus,
 };
@@ -30,6 +30,8 @@ pub(super) struct Manifest {
     name: String,
     epoch: u64,
     clean: bool,
+    #[serde(default)]
+    continuation: execution::wire::Continuation,
     profile: super::policy::CloudProfile,
     sessions: Vec<SessionArchive>,
 }
@@ -45,6 +47,18 @@ pub(super) async fn account(
     method: &str,
     body: Option<&serde_json::Value>,
 ) -> Result<transport::Response> {
+    if config.recovery {
+        ensure!(
+            method == "POST"
+                && matches!(
+                    path,
+                    "/v2/recovery/mirror/credentials"
+                        | "/v2/recovery/checkpoint"
+                        | "/v2/recovery/release"
+                ),
+            "recovery authority cannot execute ordinary account requests"
+        );
+    }
     authority::account_request(config, path, method, body)?;
     transport::request(
         &config.endpoint,
@@ -65,10 +79,20 @@ async fn credentials(
     if let Some(epoch) = epoch {
         body["epoch"] = epoch.into();
     }
-    let credentials: MirrorCredentials =
-        account(config, "/v1/mirror/credentials", "POST", Some(&body))
-            .await?
-            .json()?;
+    let credentials: MirrorCredentials = account(
+        config,
+        if config.recovery {
+            "/v2/recovery/mirror/credentials"
+        } else if config.execution.is_some() {
+            "/v2/mirror/credentials"
+        } else {
+            "/v1/mirror/credentials"
+        },
+        "POST",
+        Some(&body),
+    )
+    .await?
+    .json()?;
     ensure!(
         credentials.workspace_id == workspace
             && credentials.storage_limit_bytes > 0
@@ -216,7 +240,7 @@ async fn reconcile_generation(
         super::projects::account_matches(state, workspace),
         "This project belongs to another account"
     );
-    let baton: Baton = account(config, &format!("/v1/baton/{workspace}"), "GET", None)
+    let baton: Baton = account(config, &execution::path(config, workspace, ""), "GET", None)
         .await?
         .json()?;
     ensure!(baton.workspace_id == workspace, "baton workspace mismatch");
@@ -224,7 +248,15 @@ async fn reconcile_generation(
         generation == state.pro.generation.load(Ordering::Acquire),
         "Account changed during project transfer"
     );
-    super::projects::bind_workspace_account(state, config, workspace)?;
+    execution::observe(state, config, &baton)?;
+    if baton.continuity.is_some() {
+        super::persist(state).await?;
+    }
+    let operation_config = if baton.holder_id.is_none() && config.role == Role::Device {
+        config.clone()
+    } else {
+        execution::effective(state, config, workspace)?
+    };
     let holder = &config.delegation.device_id;
     let previous = lock(&state.pro.ownership).get(workspace).cloned();
     if baton.mirror_disabled {
@@ -262,6 +294,9 @@ async fn reconcile_generation(
         }
         return Ok(());
     }
+    if baton.holder_id.is_none() && matches!(previous, Some(Ownership::Remote { .. })) {
+        return Ok(());
+    }
     let owned = baton.holder_id.as_deref() == Some(holder);
     let transferring = matches!(
         previous,
@@ -285,14 +320,20 @@ async fn reconcile_generation(
     } else {
         "acquire"
     };
-    let body = if operation == "renew" {
-        json!({"holder_id":holder,"epoch":baton.epoch})
-    } else {
-        json!({"holder_id":holder,"expected_epoch":baton.epoch})
-    };
+    let body = execution::body(&operation_config, baton.epoch, operation == "acquire");
+    if operation_config.execution.is_some() && baton.continuity.is_none() {
+        lock(&state.pro.ownership).insert(
+            workspace.into(),
+            Ownership::AwaitingVerification { epoch: baton.epoch },
+        );
+        super::persist(state).await?;
+        suspend_workspace(state, workspace).await?;
+        execution::stop(state, &[workspace.to_owned()]).await?;
+    }
+    let request_start = execution::RequestStart::now();
     let grant: Baton = account(
-        config,
-        &format!("/v1/baton/{workspace}/{operation}"),
+        &operation_config,
+        &execution::path(&operation_config, workspace, operation),
         "POST",
         Some(&body),
     )
@@ -306,6 +347,11 @@ async fn reconcile_generation(
         generation == state.pro.generation.load(Ordering::Acquire),
         "Account changed while verifying project ownership"
     );
+    execution::accept(state, &operation_config, &grant, generation, request_start)?;
+    super::projects::bind_workspace_account(state, config, workspace)?;
+    if operation_config.execution.is_some() {
+        super::persist(state).await?;
+    }
     if transferring {
         if let Some(Ownership::SettingUp { epoch }) = previous {
             ensure!(
@@ -345,7 +391,9 @@ async fn reconcile_generation(
         generation == state.pro.generation.load(Ordering::Acquire),
         "Account changed during project transfer"
     );
-    if !matches!(previous, Some(Ownership::Local { .. })) {
+    if !matches!(previous, Some(Ownership::Local { .. }))
+        && execution::resume_allowed(state, workspace)
+    {
         crate::ledger::resume_deferred_workspace(state, workspace).await?;
     }
     Ok(())
@@ -406,6 +454,21 @@ pub(super) async fn snapshot(
     clean: bool,
 ) -> Result<()> {
     authority::config_matches(state, config, workspace)?;
+    let effective = execution::effective(state, config, workspace)?;
+    let config = &effective;
+    ensure!(
+        config.recovery || execution::allows(state, workspace),
+        "execution authority expired before publication"
+    );
+    if config.recovery {
+        ensure!(
+            execution::quiescent(state, workspace)
+                && lock(&state.pro.preferences)
+                    .get(workspace)
+                    .is_some_and(|p| p.recovery_pending),
+            "recovery execution has not stopped"
+        );
+    }
     let generation = state.pro.generation.load(Ordering::Acquire);
     let epoch = super::owned_epoch(state, workspace).context("workspace is not locally owned")?;
     let workspace = lock(&state.workspaces)
@@ -420,6 +483,7 @@ pub(super) async fn snapshot(
     tokio::fs::create_dir_all(&staging).await?;
     let result = async {
         let agent_ids=sessions(state,&workspace.id);
+        let continuation=continuation(state,&workspace.id);
         let mut has_agents=false;
         let session_ids:Vec<_>=lock(&state.session_workspaces).iter().filter(|(_,workspace_id)|*workspace_id==&workspace.id).map(|(id,_)|id.clone()).take(64).collect();
         let mut stopped=std::collections::HashMap::new();
@@ -430,6 +494,7 @@ pub(super) async fn snapshot(
                 let target=staging.join(format!("stopped-{id}.zip"));tokio::fs::rename(path,&target).await?;stopped.insert(id.clone(),target);
             }
         }
+        if clean && config.execution.is_some(){execution::stop(state,std::slice::from_ref(&workspace.id)).await?;}
         let paths = mirror::inventory(&workspace.root, &shadow).await?;
         let project = workspace.root.clone(); let destination = staging.join("tree");
         let budget = grant.storage_limit_bytes; let max_file = grant.max_file_bytes;
@@ -458,15 +523,18 @@ pub(super) async fn snapshot(
         let branch=transport::git_output(transport::git(&workspace.root,None).await?,&["symbolic-ref","-q","HEAD"],vec![]).await.ok().and_then(|bytes|String::from_utf8(bytes).ok()).map(|text|text.trim().to_string());
         let repository_origin=mirror::repository_origin(&workspace.root).await;
         let repository=super::repository::capture(&workspace.root).await?;
-        let manifest = Manifest {version:1,branch,repository_origin,repository,workspace_id:workspace.id.clone(),root:workspace.root.clone(),name:workspace.name.clone(),epoch,clean,profile:profile.clone(),sessions:archives};
+        let manifest = Manifest {version:1,branch,repository_origin,repository,workspace_id:workspace.id.clone(),root:workspace.root.clone(),name:workspace.name.clone(),epoch,clean,continuation,profile:profile.clone(),sessions:archives};
         tokio::fs::write(handoff.join("manifest.json"), serde_json::to_vec(&manifest)?).await?;
         mirror::mirror_repository(&workspace.root, &root.join("repository.git"), &grant).await?;
-        mirror::commit_tree(&shadow, &staging.join("tree"), "main").await?;
-        mirror::commit_tree(&shadow, &staging.join("config"), "config").await?;
-        mirror::commit_tree(&shadow, &handoff, "handoff").await?;
+        let tree_oid=mirror::commit_tree(&shadow, &staging.join("tree"), "main").await?;
+        let config_oid=mirror::commit_tree(&shadow, &staging.join("config"), "config").await?;
+        let handoff_oid=mirror::commit_tree(&shadow, &handoff, "handoff").await?;
         mirror::push(&shadow, &grant, &["refs/heads/main", "refs/heads/config", "refs/heads/handoff"]).await?;
-        let policy = account(config, &format!("/v1/baton/{}/policy", workspace.id), "PUT", Some(&json!({"holder_id":config.delegation.device_id,"epoch":epoch,"handoff_enabled":!config.hours_exhausted,"offline_takeover":!config.hours_exhausted,"has_agents":has_agents}))).await?;
-        ensure!((200..300).contains(&policy.status), "mirror policy update failed");
+        if config.execution.is_some(){execution::receipt::published(config,&workspace.id,epoch,[&tree_oid,&config_oid,&handoff_oid],continuation).await?;}
+        if config.execution.is_none() {
+            let policy = account(config, &format!("/v1/baton/{}/policy", workspace.id), "PUT", Some(&json!({"holder_id":config.delegation.device_id,"epoch":epoch,"handoff_enabled":!config.hours_exhausted,"offline_takeover":!config.hours_exhausted,"has_agents":has_agents}))).await?;
+            ensure!((200..300).contains(&policy.status), "mirror policy update failed");
+        }
         lock(&state.pro.preferences).entry(workspace.id.clone()).or_default().profile = profile;
         lock(&state.pro.status).insert(workspace.id.clone(), WorkspaceStatus {report,last_mirrored_at:Some(super::now()),storage_limit_bytes:budget,error:None,blocked_providers:Vec::new()});
         super::persist(state).await?;
@@ -479,7 +547,7 @@ pub(super) async fn snapshot(
         Ok::<_,anyhow::Error>(())
     }.await;
     let _ = tokio::fs::remove_dir_all(staging).await;
-    if result.is_err() && clean {
+    if result.is_err() && clean && !config.recovery {
         // A failed flush must not strand a stopped laptop agent, but a changed
         // account must never recover using the previous account's credentials.
         let recover = {
@@ -510,6 +578,35 @@ pub(super) async fn fetch_snapshot(
     cache: &Path,
 ) -> Result<Manifest> {
     authority::config_workspace(config, workspace)?;
+    let mut effective = config.clone();
+    let receipt = if config.execution.is_some() {
+        let baton: Baton = account(config, &execution::path(config, workspace, ""), "GET", None)
+            .await?
+            .json()?;
+        ensure!(
+            baton.workspace_id == workspace,
+            "checkpoint workspace mismatch"
+        );
+        if baton.continuity.is_some() {
+            Some(baton.checkpoint.context("durable checkpoint required")?)
+        } else {
+            effective.execution = None;
+            None
+        }
+    } else {
+        None
+    };
+    fetch_snapshot_at(&effective, workspace, cache, receipt.as_ref()).await
+}
+async fn fetch_snapshot_at(
+    config: &Configure,
+    workspace: &str,
+    cache: &Path,
+    receipt: Option<&execution::wire::Checkpoint>,
+) -> Result<Manifest> {
+    if let Some(receipt) = receipt {
+        execution::receipt::validate(receipt)?;
+    }
     let grant = credentials(config, workspace, None).await?;
     mirror::initialize(cache).await?;
     let url = transport::endpoint(&grant.working_tree_url)?;
@@ -519,9 +616,32 @@ pub(super) async fn fetch_snapshot(
         vec![],
     )
     .await?;
+    if let Some(receipt) = receipt {
+        transport::git_output(
+            transport::git(cache, Some((&grant.username, &grant.password))).await?,
+            &[
+                "fetch",
+                "--no-tags",
+                &url,
+                &format!(
+                    "+refs/chimaera/checkpoints/{}/*:refs/chimaera/checkpoints/{}/*",
+                    receipt.id, receipt.id
+                ),
+            ],
+            vec![],
+        )
+        .await?;
+        execution::receipt::pin(cache, receipt).await?;
+    }
     let bytes = transport::git_output(
         transport::git(cache, None).await?,
-        &["show", "refs/heads/handoff:manifest.json"],
+        &[
+            "show",
+            &format!(
+                "{}:manifest.json",
+                execution::receipt::revision(receipt, "handoff")?
+            ),
+        ],
         vec![],
     )
     .await?;
@@ -534,6 +654,12 @@ pub(super) async fn fetch_snapshot(
             && manifest.root.is_absolute(),
         "invalid handoff manifest"
     );
+    if let Some(receipt) = receipt {
+        ensure!(
+            manifest.epoch == receipt.source_epoch && manifest.continuation == receipt.continuation,
+            "handoff receipt does not match manifest"
+        );
+    }
     for entry in &manifest.sessions {
         ensure!(
             super::valid_id(&entry.id) && entry.archive == format!("bundles/{}.zip", entry.id),
@@ -555,7 +681,13 @@ pub(super) async fn hydrate(
         authority::destination(state, config, workspace, destination_root).await?;
     let destination_root = bound_destination.as_deref();
     let generation = state.pro.generation.load(Ordering::Acquire);
+    let install_epoch = std::sync::atomic::AtomicU64::new(0);
     let current = || -> Result<()> {
+        let epoch = install_epoch.load(Ordering::Acquire);
+        ensure!(
+            epoch == 0 || execution::valid_grant(state, workspace, epoch),
+            "execution authority expired during project transfer"
+        );
         ensure!(
             generation == state.pro.generation.load(Ordering::Acquire),
             "Account changed during project transfer; open the project again"
@@ -612,26 +744,30 @@ pub(super) async fn hydrate(
         .context("root_setup_required")?;
     tokio::fs::remove_file(&probe).await?;
     current()?;
-    let existing: Baton = account(config, &format!("/v1/baton/{workspace}"), "GET", None)
+    let existing: Baton = account(config, &execution::path(config, workspace, ""), "GET", None)
         .await?
         .json()?;
+    execution::observe(state, config, &existing)?;
+    let effective = execution::effective(state, config, workspace)?;
+    let config = &effective;
+    let request_start = execution::RequestStart::now();
     let grant: Baton = if existing.holder_id.as_deref() == Some(&config.delegation.device_id)
         && matches!(lock(&state.pro.ownership).get(workspace),Some(Ownership::Hydrating{epoch}) if *epoch==existing.epoch)
     {
         account(
             config,
-            &format!("/v1/baton/{workspace}/renew"),
+            &execution::path(config, workspace, "renew"),
             "POST",
-            Some(&json!({"holder_id":config.delegation.device_id,"epoch":existing.epoch})),
+            Some(&execution::body(config, existing.epoch, false)),
         )
         .await?
         .json()?
     } else {
         account(
             config,
-            &format!("/v1/baton/{workspace}/acquire"),
+            &execution::path(config, workspace, "acquire"),
             "POST",
-            Some(&json!({"holder_id":config.delegation.device_id,"expected_epoch":expected_epoch})),
+            Some(&execution::body(config, expected_epoch, true)),
         )
         .await?
         .json()?
@@ -641,11 +777,28 @@ pub(super) async fn hydrate(
         "invalid handoff ownership grant"
     );
     current()?;
+    execution::accept(state, config, &grant, generation, request_start)?;
+    install_epoch.store(grant.epoch, Ordering::Release);
+    let receipt = if config.execution.is_some() {
+        Some(
+            grant
+                .checkpoint
+                .as_ref()
+                .context("acquired grant has no durable checkpoint")?,
+        )
+    } else {
+        None
+    };
     lock(&state.pro.ownership).insert(
         workspace.into(),
         Ownership::Hydrating { epoch: grant.epoch },
     );
     super::persist(state).await?;
+    let manifest = if let Some(receipt) = receipt {
+        fetch_snapshot_at(config, workspace, &cache, Some(receipt)).await?
+    } else {
+        manifest
+    };
     let stage = state
         .pro
         .root
@@ -660,7 +813,7 @@ pub(super) async fn hydrate(
         ] {
             mirror::validate_tree(
                 &cache,
-                &format!("refs/heads/{branch}"),
+                execution::receipt::revision(receipt, branch)?,
                 read_grant.storage_limit_bytes,
                 read_grant.max_file_bytes,
             )
@@ -675,7 +828,7 @@ pub(super) async fn hydrate(
                     "--work-tree",
                     destination.to_str().context("invalid stage path")?,
                     "checkout",
-                    &format!("refs/heads/{branch}"),
+                    execution::receipt::revision(receipt, branch)?,
                     "--",
                     ".",
                 ],
@@ -777,6 +930,14 @@ pub(super) async fn hydrate(
         let owner = state.clone();
         tokio::task::spawn_blocking(move || lock(&owner.workspaces).import_exact(new_workspace))
             .await??;
+        if receipt
+            .is_some_and(|receipt| receipt.continuation == execution::wire::Continuation::Uncertain)
+        {
+            lock(&state.pro.preferences)
+                .entry(workspace.into())
+                .or_default()
+                .execution_uncertain = true;
+        }
         for archive in manifest.sessions {
             current()?;
             crate::bundle::import(
@@ -959,8 +1120,10 @@ pub(super) async fn lazy_handback(state: &Arc<AppState>, config: &Configure) -> 
         return Ok(());
     }
     if config.role != Role::Device
-        || !state.pro.power_suitable.load(Ordering::Acquire)
-        || super::now().saturating_sub(state.pro.awake_since.load(Ordering::Acquire)) < 300
+        || (config.execution.is_none()
+            && (!state.pro.power_suitable.load(Ordering::Acquire)
+                || super::now().saturating_sub(state.pro.awake_since.load(Ordering::Acquire))
+                    < 300))
     {
         return Ok(());
     }
@@ -990,9 +1153,10 @@ pub(super) async fn lazy_handback(state: &Arc<AppState>, config: &Configure) -> 
         {
             continue;
         }
-        if lock(&state.pro.preferences)
-            .get(&workspace)
-            .is_some_and(|p| p.never_mirror)
+        if !execution::preferred_here(state, config, &workspace)
+            || lock(&state.pro.preferences)
+                .get(&workspace)
+                .is_some_and(|p| p.never_mirror)
         {
             continue;
         }
@@ -1129,7 +1293,16 @@ async fn finish_hydration_checked(
     if let Some(status) = lock(&state.pro.status).get_mut(workspace) {
         status.error = None;
     }
-    crate::ledger::resume_deferred_workspace(state, workspace).await?;
+    // Each managed child takes this lock for durable launch admission. Release
+    // it before restoring sessions; their admission rechecks the current grant.
+    drop(_configuration);
+    ensure!(
+        generation == state.pro.generation.load(Ordering::Acquire),
+        "Account changed before project resume"
+    );
+    if execution::resume_allowed(state, workspace) {
+        crate::ledger::resume_deferred_workspace(state, workspace).await?;
+    }
     Ok(())
 }
 
@@ -1304,6 +1477,8 @@ mod tests {
             .unwrap();
         assert_eq!(super::super::owned_epoch(&state, "w-project"), Some(3));
         let config = Configure {
+            recovery: false,
+            execution: None,
             account_id: None,
             role: Role::Device,
             endpoint: String::new(),
@@ -1439,4 +1614,22 @@ mod pause_tests {
         ));
         assert!(!chat_at_pause(&chat, Some(&carry), true, finished));
     }
+}
+
+fn continuation(state: &AppState, workspace: &str) -> execution::wire::Continuation {
+    use execution::wire::Continuation;
+    let mut result = Continuation::Idle;
+    for agent in crate::ledger::snapshot(state)
+        .0
+        .into_iter()
+        .filter(|entry| entry.workspace_id == workspace)
+        .filter_map(|entry| entry.agent)
+    {
+        match agent.carryover {
+            None => return Continuation::Uncertain,
+            Some(carry) if carry.interrupted_work() => result = Continuation::Interrupted,
+            _ => {}
+        }
+    }
+    result
 }

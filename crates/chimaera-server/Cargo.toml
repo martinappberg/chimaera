@@ -20,6 +20,7 @@ tracing.workspace = true
 rust-embed.workspace = true
 mime_guess.workspace = true
 hostname.workspace = true
+nix.workspace = true
 rustix = { workspace = true, features = ["process"] }
 chimaera-agent.workspace = true
 chimaera-core.workspace = true
@@ -57,6 +58,8 @@ async_zip = { version = "0.0.18", default-features = false, features = ["tokio",
 tokio-util = { version = "0.7", features = ["io", "compat"] }
 # `Last-Modified` on `/raw` (already in the tree through hyper).
 httpdate = "1.0"
+# UTC lease parsing is independent of the local wall-clock offset.
+time = { version = "0.3", features = ["parsing"] }
 # Decoding a sent chat image into its saved copy (already in the tree
 # through axum).
 base64 = "0.22"

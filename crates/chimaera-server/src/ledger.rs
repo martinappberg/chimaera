@@ -492,7 +492,7 @@ pub(crate) async fn restore(state: &Arc<AppState>, boot: BootLedger) {
     let mut respawned = 0usize;
     let mut retired = 0usize;
     for entry in &boot.sessions {
-        if entry.suspended || !crate::pro::may_write(state, &entry.workspace_id) {
+        if entry.suspended || !crate::pro::may_execute(state, &entry.workspace_id) {
             let mut deferred = entry.clone();
             deferred.suspended = true;
             if let Err(error) = defer(state, deferred) {
@@ -784,7 +784,7 @@ pub(crate) async fn resume_deferred_workspace(
     state: &Arc<AppState>,
     workspace_id: &str,
 ) -> anyhow::Result<()> {
-    if !crate::pro::may_write(state, workspace_id) {
+    if !crate::pro::may_execute(state, workspace_id) {
         anyhow::bail!("workspace ownership has not been verified");
     }
     let workspace = crate::lock(&state.workspaces)

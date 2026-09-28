@@ -9,6 +9,7 @@
 //! xterm.js instance, plus live output/event receivers and an input sender.
 
 pub mod exec;
+mod managed;
 pub mod marks;
 mod session;
 mod snapshot;
@@ -176,6 +177,21 @@ impl SessionManager {
     /// Spawn a new session and register it. Returns its initial info. The
     /// session unregisters itself when its child exits.
     pub fn spawn(self: &Arc<Self>, opts: SpawnOpts) -> anyhow::Result<SessionInfo> {
+        self.spawn_inner(opts, false)
+    }
+    /// Opt-in owned process-group shutdown for lease-managed work.
+    pub fn spawn_managed(self: &Arc<Self>, opts: SpawnOpts) -> anyhow::Result<SessionInfo> {
+        anyhow::ensure!(
+            cfg!(any(target_os = "linux", target_os = "macos")),
+            "managed execution unsupported on this platform"
+        );
+        self.spawn_inner(opts, true)
+    }
+    fn spawn_inner(
+        self: &Arc<Self>,
+        opts: SpawnOpts,
+        managed: bool,
+    ) -> anyhow::Result<SessionInfo> {
         let id = match &opts.id {
             Some(id) => {
                 if lock_unpoisoned(&self.sessions).contains_key(id) {
@@ -201,7 +217,7 @@ impl SessionManager {
                 lock_unpoisoned(&m.sessions).remove(&exit_id);
             }
         });
-        let session = session::Session::spawn(id.clone(), &opts, on_exit)
+        let session = session::Session::spawn(id.clone(), &opts, on_exit, managed)
             .with_context(|| format!("failed to spawn session in {}", opts.cwd.display()))?;
         let info = session.info();
         lock_unpoisoned(&self.sessions).insert(id, session);
@@ -293,6 +309,13 @@ impl SessionManager {
     /// Signal the session's child to terminate (SIGHUP); the wait thread
     /// reaps it and the session unregisters itself. Killing an unknown or
     /// already-exited session is a no-op, so deletes are idempotent.
+    pub fn fence(&self, id: &str) -> anyhow::Result<()> {
+        let session = self
+            .session(id)
+            .ok_or_else(|| anyhow!("session not found"))?;
+        session.fence();
+        Ok(())
+    }
     pub fn kill(&self, id: &str) -> anyhow::Result<()> {
         if let Some(session) = self.session(id) {
             session.kill();

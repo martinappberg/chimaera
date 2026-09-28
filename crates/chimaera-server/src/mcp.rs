@@ -1575,6 +1575,9 @@ async fn message_agent(
             "that session is you — the Mastermind cannot message itself".to_string(),
         );
     }
+    if !crate::pro::may_execute(state, &workspace.id) {
+        return tool_error("Project execution is paused while ownership is verified".into());
+    }
     if let Some(info) = state.chat.get(&sid) {
         if !info.alive {
             return tool_error(format!("chat session {sid} has exited"));

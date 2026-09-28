@@ -21,6 +21,7 @@ has subtle repaint invariants — read the architecture guide before touching th
 |---|---|
 | `lib.rs` | `SessionManager`: the session registry + `attach` (snapshot stream + live receivers) / `attach_quiet` (subscribe only, no snapshot — the parked attach), `resize`, `kill_all`. The crate's public surface for `chimaera-server`. |
 | `session.rs` | `Session`: PTY spawn, the output→`Term` mirror, `resize`, the wait/last-words reaper, the bounded output broadcast (`OUTPUT_CHANNEL_CAPACITY`). |
+| `managed.rs` | Opt-in owned-process fencing, closed input, bounded signal escalation and non-reaping exit observation; ordinary terminal lifecycle remains unchanged. |
 | `snapshot.rs` | `render_snapshot` — rebuilds the terminal as an escape stream (SGR minimization + private-mode/cursor/title restoration). `screen_text` for text scrapes. |
 | `marks.rs` | The OSC 133/633/7 marks scanner → shell phase + a bounded command journal. Most methods are exec-internal correlation; the server uses `phase()`/`journal()`. |
 | `exec.rs` | The exec engine that types agent commands into a live shell (integrated or sentinel mode) and correlates completion via marks. |
@@ -45,3 +46,8 @@ has subtle repaint invariants — read the architecture guide before touching th
 - Leaf crate: depends on nothing else in the workspace. `serde::Serialize` on the
   metadata types (`SessionInfo`, `SessionEvent`, `ExecOutcome`, …) is a benign wire
   convenience — but note those types ARE the daemon↔UI contract (see the server map).
+
+Managed execution owns its direct child until process-group signaling finishes;
+PID reuse must never target an unrelated process. This is a bounded managed
+process boundary, not containment of deliberately detached descendants. It does
+not authorize cloud takeover after unannounced host suspension.

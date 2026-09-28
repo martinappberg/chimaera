@@ -472,6 +472,7 @@ struct ChatSession {
     cmd_tx: mpsc::Sender<AgentCommand>,
     events_tx: broadcast::Sender<Arc<SeqEvent>>,
     kill_tx: watch::Sender<bool>,
+    process_control: Arc<ndjson::ProcessControl>,
     /// Serializes reservations with channel enqueue so driver echoes consume
     /// the manager's FIFO in exactly the command order.
     command_order: tokio::sync::Mutex<()>,
@@ -643,6 +644,7 @@ impl ChatManager {
             remote_control_url: None,
             background_running: 0,
         };
+        let process_control = Arc::new(ndjson::ProcessControl::default());
         let session = Arc::new(ChatSession {
             info: Mutex::new(info.clone()),
             background_work: Mutex::new(BackgroundWork::default()),
@@ -651,6 +653,7 @@ impl ChatManager {
             cmd_tx,
             events_tx: events_tx.clone(),
             kill_tx,
+            process_control: process_control.clone(),
             command_order: tokio::sync::Mutex::new(()),
             command_budget: Mutex::new(CommandBudget::default()),
         });
@@ -659,6 +662,7 @@ impl ChatManager {
             .spawn(
                 spec,
                 DriverIo {
+                    process_control,
                     commands: cmd_rx,
                     events: ev_tx,
                     kill: kill_rx,
@@ -1018,6 +1022,21 @@ impl ChatManager {
 
     /// Ask the driver to shut the child down (polite, then SIGKILL after the
     /// grace period). The pump reports the exit through the usual hooks.
+    /// Close ingress and signal the owned managed child even if its driver is
+    /// blocked in handshake or provider IO. Repeated calls escalate safely.
+    pub fn fence(&self, id: &str) -> bool {
+        let Ok(session) = self.get_session(id) else {
+            return false;
+        };
+        session
+            .command_budget
+            .lock()
+            .expect("command budget lock")
+            .commands_paused = true;
+        session.process_control.fence();
+        let _ = session.kill_tx.send(true);
+        true
+    }
     pub fn kill(&self, id: &str) -> bool {
         match self.get_session(id) {
             Ok(session) => session.kill_tx.send(true).is_ok(),

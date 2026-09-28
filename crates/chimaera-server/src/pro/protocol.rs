@@ -29,6 +29,11 @@ pub(crate) struct Delegation {
 
 #[derive(Clone, Deserialize)]
 pub(crate) struct Configure {
+    /// Internal-only recovery transport; HTTP Configure cannot enable it.
+    #[serde(skip)]
+    pub recovery: bool,
+    #[serde(default)]
+    pub execution: Option<super::execution::wire::ExecutionConfiguration>,
     #[serde(default)]
     pub account_id: Option<String>,
     #[serde(default)]
@@ -42,6 +47,14 @@ pub(crate) struct Configure {
 
 #[derive(Clone, Deserialize)]
 pub(super) struct Baton {
+    #[serde(default)]
+    pub continuity: Option<super::execution::wire::Continuity>,
+    #[serde(default)]
+    pub execution_capability: Option<super::execution::wire::ExecutionCapability>,
+    #[serde(default)]
+    pub execution_lease: Option<super::execution::wire::ExecutionLease>,
+    #[serde(default)]
+    pub checkpoint: Option<super::execution::wire::Checkpoint>,
     #[serde(default)]
     pub mirror_disabled: bool,
     pub workspace_id: String,

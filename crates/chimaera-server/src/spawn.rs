@@ -73,7 +73,7 @@ pub(crate) async fn spawn_session(
     spec: SpawnSpec,
 ) -> Result<serde_json::Value, SpawnFailure> {
     let workspace = spec.workspace;
-    if !crate::pro::may_write(state, &workspace.id) {
+    if !crate::pro::may_execute(state, &workspace.id) {
         return Err(SpawnFailure::Internal(anyhow::anyhow!(
             "workspace owned elsewhere"
         )));
@@ -316,9 +316,28 @@ pub(crate) async fn spawn_session(
         }
     }
 
-    match state.sessions.spawn(opts) {
+    if !crate::pro::may_execute(state, &workspace.id) {
+        return Err(SpawnFailure::Internal(anyhow::anyhow!(
+            "project execution authority changed during launch"
+        )));
+    }
+    crate::pro::prepare_managed_launch(state, &workspace.id)
+        .await
+        .map_err(SpawnFailure::Internal)?;
+    let spawned = if crate::pro::managed_execution(state, &workspace.id) {
+        state.sessions.spawn_managed(opts)
+    } else {
+        state.sessions.spawn(opts)
+    };
+    match spawned {
         Ok(info) => {
             crate::lock(&state.session_workspaces).insert(info.id.clone(), workspace.id.clone());
+            if !crate::pro::may_execute(state, &workspace.id) {
+                let _ = state.sessions.kill(&info.id);
+                return Err(SpawnFailure::Internal(anyhow::anyhow!(
+                    "project execution authority changed during launch"
+                )));
+            }
             // Remember the spawn theme: resurrection re-themes the session's
             // successor with it (there is no other durable record of it).
             crate::lock(&state.session_themes).insert(info.id.clone(), spec.theme.clone());

@@ -870,7 +870,21 @@ async fn degrade_to_pty(
         env_remove,
         scrollback: crate::lock(&state.settings).scrollback_lines(),
     };
-    match state.sessions.spawn(opts) {
+    if !crate::pro::may_execute(state, &successor_recipe.workspace_id) {
+        return false;
+    }
+    if crate::pro::prepare_managed_launch(state, &successor_recipe.workspace_id)
+        .await
+        .is_err()
+    {
+        return false;
+    }
+    let spawned = if crate::pro::managed_execution(state, &successor_recipe.workspace_id) {
+        state.sessions.spawn_managed(opts)
+    } else {
+        state.sessions.spawn(opts)
+    };
+    match spawned {
         Ok(_) => {
             crate::lock(&state.chat_recipes).insert(id.to_string(), successor_recipe);
             tracing::info!(%id, "chat session degraded to PTY TUI");
@@ -3111,6 +3125,10 @@ pub(crate) async fn spawn_chat_session(
     recipe: ChatRecipe,
     pinned_override: Option<String>,
 ) -> anyhow::Result<ChatInfo> {
+    anyhow::ensure!(
+        crate::pro::may_execute(state, &recipe.workspace_id),
+        "project execution authority unavailable"
+    );
     let recovered_effort = codex_initial_effort(state, &recipe).await;
     // Re-enforce the journal-dir budget as sessions are created: pruning only
     // at boot lets a weeks-long daemon accumulate one capped journal per
@@ -3364,6 +3382,12 @@ pub(crate) async fn spawn_chat_session(
         let _ = tokio::task::block_in_place(|| seed_resumed_journal(state, &id, &recipe));
     }
 
+    anyhow::ensure!(
+        crate::pro::may_execute(state, &recipe.workspace_id),
+        "project execution authority changed during launch"
+    );
+    crate::pro::prepare_managed_launch(state, &recipe.workspace_id).await?;
+    spec.managed_execution = crate::pro::managed_execution(state, &recipe.workspace_id);
     crate::lock(&state.chat_recipes).insert(id.clone(), recipe.clone());
     let info = match recipe.kind {
         AgentKind::Claude => state
@@ -3373,6 +3397,9 @@ pub(crate) async fn spawn_chat_session(
     };
     if info.is_err() {
         crate::lock(&state.chat_recipes).remove(&id);
+    } else if !crate::pro::may_execute(state, &recipe.workspace_id) {
+        state.chat.fence(&id);
+        anyhow::bail!("project execution authority changed during launch");
     }
     info
 }
@@ -3402,7 +3429,7 @@ pub(crate) async fn resurrect_chat_transfer(
     fork_head: bool,
     origin: Option<&'static str>,
 ) -> anyhow::Result<()> {
-    if !crate::pro::may_write(state, &workspace.id) {
+    if !crate::pro::may_execute(state, &workspace.id) {
         anyhow::bail!("workspace owned elsewhere");
     }
     let agent = entry

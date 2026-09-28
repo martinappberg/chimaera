@@ -86,7 +86,7 @@ pub(crate) async fn create_session(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CreateSession>,
 ) -> Response {
-    if !crate::pro::may_write(&state, &body.workspace_id) {
+    if !crate::pro::may_execute(&state, &body.workspace_id) {
         return (
             StatusCode::CONFLICT,
             Json(json!({"error":"workspace_owned_elsewhere"})),

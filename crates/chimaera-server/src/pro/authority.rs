@@ -225,7 +225,7 @@ pub(super) fn account_request(
         return Ok(());
     };
     validate_scoped(config)?;
-    let baton = format!("/v1/baton/{}", binding.workspace_id);
+    let baton = super::execution::path(config, &binding.workspace_id, "");
     let allowed = (path == "/v1/delegations/renew" && method == "POST")
         || (path == baton && method == "GET")
         || (["acquire", "renew", "release"]
@@ -233,7 +233,12 @@ pub(super) fn account_request(
             .any(|action| path == format!("{baton}/{action}"))
             && method == "POST")
         || (path == format!("{baton}/policy") && method == "PUT")
-        || (path == "/v1/mirror/credentials"
+        || (path
+            == if config.execution.is_some() {
+                "/v2/mirror/credentials"
+            } else {
+                "/v1/mirror/credentials"
+            }
             && method == "POST"
             && body.and_then(|body| body["workspace_id"].as_str()) == Some(&binding.workspace_id));
     ensure!(allowed, "workspace authority denied");

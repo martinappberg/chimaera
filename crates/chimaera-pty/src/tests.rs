@@ -661,3 +661,28 @@ async fn fast_death_leaves_readable_last_words() {
 
     assert!(mgr.last_words("s-never-existed").is_none());
 }
+
+#[tokio::test]
+async fn managed_fence_closes_queued_input_and_stops_the_owned_process_group() {
+    let manager = SessionManager::new();
+    let command = vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        "trap '' HUP TERM; sleep 60 & echo managed-ready; wait".into(),
+    ];
+    let info = manager.spawn_managed(opts(Some(command))).unwrap();
+    let attached = attach_when_snapshot_contains(&manager, &info.id, "managed-ready").await;
+    manager.fence(&info.id).unwrap();
+    let _ = attached
+        .input
+        .send(Bytes::from_static(b"echo should-not-run\n"))
+        .await;
+    tokio::time::timeout(Duration::from_secs(6), async {
+        while manager.get(&info.id).is_some_and(|info| info.alive) {
+            let _ = manager.fence(&info.id);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
