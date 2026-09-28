@@ -28,8 +28,10 @@ Cloud setup controls are implemented; automatic handoff and browser access are b
    billing and account changes wait until initialization completes.
 3. Signed-out and confirmed no-plan accounts see an illustrated introduction:
    start a session on your computer, continue a supported agent in the cloud,
-   then return to the same project, files and conversation in another device's
-   browser. The three static sketches are explanatory, not setup indicators.
+   then access the same sessions, files and conversation on another device.
+   Work continues locally when you’re back. The three distinct static scenes
+   show an open laptop, an agent working above a closed laptop, and a shared
+   project across devices; they are explanatory, not setup indicators.
    Local projects, agents and ordinary SSH remain free. Plan cards show pricing
    before checkout; **See plans** jumps directly to the comparison.
    Active subscribers see **Your Chimaera Pro** or **Your Chimaera Max** with

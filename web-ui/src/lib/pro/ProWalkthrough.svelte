@@ -1,8 +1,8 @@
 <script lang="ts">
   const steps = [
-    { id: "computer", place: "On your computer", title: "Start a session", description: "Work on your project with Claude or Codex. Your files and conversation stay together." },
-    { id: "cloud", place: "In the cloud", title: "Keep it moving", description: "Continue a supported agent session in the cloud, so it can work while your computer is offline." },
-    { id: "device", place: "On another device", title: "Pick up where you left off", description: "Open your cloud workspace in a browser. Return to the same project, files, and conversation." },
+    { id: "computer", place: "Start here", title: "Start on your computer", description: "Work on your project with Claude or Codex. Your files and conversation stay together." },
+    { id: "cloud", place: "Step away", title: "Keep agents working", description: "Let your agents continue in the cloud while your computer is offline." },
+    { id: "device", place: "Pick it up", title: "Access anywhere", description: "Pick up your sessions, files, and conversation on another device. Work continues locally when you’re back." },
   ] as const;
 </script>
 
@@ -12,42 +12,66 @@
       <li>
         <div class="place"><span class="number" aria-hidden="true">0{index + 1}</span>{step.place}</div>
         <div class="illustration" aria-hidden="true">
-          <svg viewBox="0 0 260 176" fill="none" focusable="false">
-            {#if step.id === "cloud"}
-              <path class="connection" d="M130 31v-8" />
-              <path class="cloud" d="M116 23h28a7 7 0 0 0 0-14h-1a13 13 0 0 0-24-1 8 8 0 0 0-3 15Z" />
-            {/if}
-            <rect class="frame" x="20" y="31" width="220" height="124" rx={step.id === "device" ? 12 : 7} />
-            <path class="divider" d="M20 56h220" />
-            <rect class="project-mark" x="32" y="39" width="10" height="10" rx="3" />
-            <path class="project-glyph" d="m35 44 2 2 3-4" />
-            <text class="project-name" x="49" y="47">My project</text>
-            {#if step.id === "device"}
-              <path class="chrome" d="m213 41-3 3 3 3m10-6 3 3-3 3" />
-            {:else}
-              <circle class="chrome-dot" cx="215" cy="44" r="1.5" />
-              <circle class="chrome-dot" cx="222" cy="44" r="1.5" />
-              <circle class="chrome-dot" cx="229" cy="44" r="1.5" />
-            {/if}
-            <rect class="rail" x="21" y="57" width="32" height="97" rx="1" />
-            <path class="file" d="M31 69h8m-8 7h12m-12 7h10m-10 19h8m-8 7h12m-12 7h10" />
-            <rect class="message" x="67" y="67" width="155" height="24" rx="5" />
-            <text class="prompt" x="77" y="82">Let's build on this idea.</text>
-            <circle class="agent-dot" cx="73" cy="107" r="3" />
-            <text class="reply" x="83" y="110">{step.id === "computer" ? "A good place to start…" : step.id === "cloud" ? "Working on your next step…" : "Here's where we left off."}</text>
-            <path class="thread" d="M83 120h120m-120 6h95" />
+          <svg viewBox="0 0 280 184" fill="none" focusable="false">
             {#if step.id === "computer"}
-              <path class="laptop" d="M8 155h244l-8 8H16Z" />
-              <path class="divider" d="M111 156h38" />
+              <rect class="frame" x="20" y="22" width="240" height="137" rx="7" />
+              <rect class="screen" x="27" y="29" width="226" height="122" rx="3" />
+              <path class="divider" d="M27 54h226" />
+              <rect class="project-mark" x="37" y="36" width="12" height="12" rx="3" />
+              <path class="project-glyph" d="m40 42 2 2 4-5" />
+              <text class="project-name" x="56" y="45">My project</text>
+              <path class="file" d="M39 69h18m-18 8h25m-25 8h22m-22 18h17m-17 8h25m-25 8h20" />
+              <path class="divider" d="M76 55v96" />
+              <rect class="message" x="89" y="66" width="150" height="25" rx="5" />
+              <text class="prompt" x="99" y="82">Let's build on this idea.</text>
+              <circle class="agent-dot" cx="95" cy="108" r="3" />
+              <text class="reply" x="105" y="111">A good place to start…</text>
+              <path class="thread" d="M105 123h119m-119 7h96" />
+              <path class="hardware" d="M7 159h266l-10 9H17Z" />
+              <path class="divider" d="M119 160h42" />
             {:else if step.id === "cloud"}
-              <path class="thread" d="M83 132h109" />
+              <path class="connection dashed" d="M63 148v-22q0-16 16-16h15" />
+              <path class="cloud" d="M105 134h124a29 29 0 0 0 7-57 42 42 0 0 0-79-27 29 29 0 0 0-47 21 32 32 0 0 0-5 63Z" />
+              <circle class="agent-dot" cx="126" cy="65" r="3" />
+              <text class="project-name" x="136" y="68">Agent at work</text>
+              <rect class="task" x="110" y="79" width="126" height="22" rx="5" />
+              <path class="project-glyph" d="m118 90 3 3 5-6" />
+              <text class="task-name" x="134" y="93">Review changes</text>
+              <rect class="task" x="110" y="106" width="126" height="22" rx="5" />
+              <circle class="task-ring" cx="122" cy="117" r="4" />
+              <text class="task-name" x="134" y="120">Build the next step</text>
+              <path class="hardware closed-lid" d="m15 153 82-6 19 9-83 6Z" />
+              <path class="hardware" d="m15 153 18 9 83-6v5l-83 7-18-9Z" />
+              <path class="sleep" d="M36 126a9 9 0 1 1-9-13 8 8 0 0 0 9 13Z" />
             {:else}
-              <rect class="phone" x="208" y="82" width="40" height="82" rx="7" />
-              <path class="divider" d="M219 88h18" />
-              <rect class="project-mark" x="215" y="97" width="9" height="9" rx="2" />
-              <path class="project-glyph" d="m217 102 2 2 3-4" />
-              <path class="phone-thread" d="M215 114h24m-24 5h19m-19 12h24m-24 5h20" />
-              <path class="divider" d="M221 157h14" />
+              <path class="connection" d="M155 113V97m-5 5 5-5 5 5M107 137H86m111 0h27" />
+              <rect class="frame" x="120" y="14" width="146" height="78" rx="5" />
+              <rect class="screen" x="126" y="20" width="134" height="60" rx="2" />
+              <rect class="project-mark" x="135" y="28" width="10" height="10" rx="2.5" />
+              <path class="project-glyph" d="m137 33 2 2 4-5" />
+              <text class="project-name" x="151" y="36">My project</text>
+              <rect class="message" x="135" y="45" width="115" height="12" rx="3" />
+              <path class="thread" d="M141 51h66m-6 16h47m-107 0h11" />
+              <path class="hardware" d="M185 92h15l2 11h-19Z" />
+              <path class="hardware-line" d="M175 105h35" />
+              <rect class="frame" x="13" y="88" width="83" height="81" rx="8" />
+              <rect class="screen" x="19" y="96" width="71" height="64" rx="3" />
+              <rect class="project-mark" x="27" y="104" width="10" height="10" rx="2.5" />
+              <path class="project-glyph" d="m29 109 2 2 4-5" />
+              <path class="thread" d="M43 108h37m-53 16h53m-53 6h41m-41 12h53m-53 6h36" />
+              <path class="divider" d="M48 165h14" />
+              <rect class="frame" x="222" y="111" width="39" height="66" rx="7" />
+              <path class="divider" d="M235 116h13" />
+              <rect class="project-mark" x="230" y="125" width="9" height="9" rx="2" />
+              <path class="project-glyph" d="m232 129 2 2 3-4" />
+              <path class="thread" d="M230 142h22m-22 6h17m-17 8h22" />
+              <path class="divider" d="M236 172h11" />
+              <rect class="shared-project" x="106" y="116" width="98" height="45" rx="7" />
+              <rect class="project-mark" x="115" y="125" width="12" height="12" rx="3" />
+              <path class="project-glyph" d="m118 131 2 2 4-5" />
+              <text class="project-name" x="132" y="133">My project</text>
+              <path class="conversation" d="M116 144h9v6h-5l-3 2v-2h-1Z" />
+              <path class="thread" d="M132 145h59m-59 6h43" />
             {/if}
           </svg>
         </div>
@@ -67,23 +91,27 @@
   .illustration { margin: 12px 8px 0; }
   svg { display: block; width: 100%; height: auto; }
   svg text { font-family: inherit; font-size: 8.5px; }
-  .frame, .phone { fill: var(--bg); stroke: color-mix(in srgb, var(--fg) 24%, var(--edge)); stroke-width: 1.2; }
-  .divider, .file, .thread, .phone-thread { stroke: var(--edge); stroke-linecap: round; }
-  .thread, .phone-thread { stroke: color-mix(in srgb, var(--muted) 32%, var(--bg)); stroke-width: 2; }
-  .file { stroke: color-mix(in srgb, var(--muted) 35%, var(--bg)); stroke-width: 2; }
-  .rail, .laptop { fill: color-mix(in srgb, var(--fg) 3%, var(--bg)); }
-  .laptop { stroke: color-mix(in srgb, var(--fg) 24%, var(--edge)); stroke-width: 1.2; stroke-linejoin: round; }
+  .frame { fill: color-mix(in srgb, var(--fg) 2%, var(--bg)); stroke: color-mix(in srgb, var(--fg) 28%, var(--edge)); stroke-width: 1.2; }
+  .screen { fill: var(--bg); stroke: var(--edge); stroke-width: .7; }
+  .divider, .file, .thread { stroke: var(--edge); stroke-linecap: round; }
+  .thread { stroke: color-mix(in srgb, var(--muted) 37%, var(--bg)); stroke-width: 1.6; }
+  .file { stroke: color-mix(in srgb, var(--muted) 40%, var(--bg)); stroke-width: 2; }
+  .hardware { fill: color-mix(in srgb, var(--fg) 5%, var(--bg)); stroke: color-mix(in srgb, var(--fg) 28%, var(--edge)); stroke-width: 1.2; stroke-linejoin: round; }
+  .closed-lid { fill: color-mix(in srgb, var(--fg) 2%, var(--bg)); }
+  .hardware-line { stroke: color-mix(in srgb, var(--fg) 35%, var(--edge)); stroke-width: 1.5; stroke-linecap: round; }
   .project-mark { fill: color-mix(in srgb, var(--accent) 13%, var(--bg)); }
-  .project-glyph { stroke: var(--accent); stroke-width: 1.2; stroke-linecap: round; stroke-linejoin: round; }
+  .project-glyph, .task-ring, .conversation { stroke: var(--accent); stroke-width: 1.2; stroke-linecap: round; stroke-linejoin: round; }
   .project-name { fill: var(--fg); font-weight: 550; }
-  .chrome { stroke: var(--muted); stroke-linecap: round; stroke-linejoin: round; }
-  .chrome-dot { fill: var(--edge); }
   .message { fill: color-mix(in srgb, var(--fg) 4%, var(--bg)); }
-  .prompt { fill: var(--fg); }
+  .prompt, .task-name { fill: var(--fg); }
   .agent-dot { fill: var(--accent); }
   .reply { fill: var(--muted); }
-  .cloud { fill: color-mix(in srgb, var(--accent) 6%, var(--bg)); stroke: color-mix(in srgb, var(--accent) 65%, var(--edge)); stroke-width: 1.2; stroke-linejoin: round; }
-  .connection { stroke: color-mix(in srgb, var(--accent) 55%, var(--edge)); stroke-width: 1.2; }
+  .cloud { fill: color-mix(in srgb, var(--accent) 5%, var(--bg)); stroke: color-mix(in srgb, var(--accent) 62%, var(--edge)); stroke-width: 1.3; stroke-linejoin: round; }
+  .task { fill: var(--bg); stroke: color-mix(in srgb, var(--accent) 16%, var(--edge)); stroke-width: .8; }
+  .shared-project { fill: var(--bg); stroke: color-mix(in srgb, var(--accent) 60%, var(--edge)); stroke-width: 1.2; }
+  .connection { stroke: color-mix(in srgb, var(--accent) 62%, var(--edge)); stroke-width: 1.3; stroke-linecap: round; stroke-linejoin: round; }
+  .dashed { stroke-dasharray: 3 4; }
+  .sleep { fill: color-mix(in srgb, var(--fg) 5%, var(--bg)); stroke: var(--muted); stroke-width: 1; }
   .caption { padding: 16px 18px 22px; }
   h2 { margin: 0 0 10px; font-size: var(--text-md); font-weight: 560; letter-spacing: -.2px; line-height: 1.4; }
   .caption p { margin: 0; color: var(--muted); font-size: var(--text-sm); line-height: 1.75; }
