@@ -79,9 +79,7 @@ Daemon side: `crates/chimaera-server/src/{workspaces.rs,view_state.rs,quickopen.
   a tab to a pane edge. Drag the divider to reratio (double-click snaps 50/50; Escape restores).
   Open a surface → it appends a tab to the focused pane (VS Code "no duplicates": if already
   open anywhere, that tab is focused). Middle-click or `×` closes a tab (**detaches the view —
-  never kills the session**). The `×` stays visible on the right of active and inactive
-  tabs; unread output has a separate dot beside the icon, so it never replaces the close
-  control or changes the tab's width. `Mod+Alt+[`/`]` cycle tabs. Drag a tab to reorder within a bar,
+  never kills the session**). `Mod+Alt+[`/`]` cycle tabs. Drag a tab to reorder within a bar,
   move to another pane, tear off into a split, or slam a **window edge** to split the whole window.
   A **pane grip** (a small window icon) fades in at the top-left of the tab strip on hover; drag
   it to move the **whole pane** (all its tabs) to another split — center merges, edges tear a
@@ -98,7 +96,10 @@ Daemon side: `crates/chimaera-server/src/{workspaces.rs,view_state.rs,quickopen.
   the strip's end opens a menu of **every** tab in order, the active one marked — pick one to
   activate it. The active tab is scrolled into view whenever it changes (click, `Mod+Alt+[`/`]`,
   an open, a layout restore) and stays in view across a resize when it was in view before it — a
-  strip the user scrolled away from is not snapped back by an unrelated layout change. Adjacent
+  strip the user scrolled away from is not snapped back by an unrelated layout change.
+  The reveal accounts for the dropdown taking space; in narrow panes the edge fades yield
+  to the selected tab so its right-hand close button stays reachable. Close buttons keep
+  their hover/active visibility, with an unread dot in the same slot on inactive agent tabs. Adjacent
   tabs are separated by a hairline and the
   active tab carries a thin accent underline; a tab drag hovering near either edge of an
   overflowed strip auto-scrolls it.
@@ -112,7 +113,7 @@ Daemon side: `crates/chimaera-server/src/{workspaces.rs,view_state.rs,quickopen.
 - **Where it lives.** `web-ui/src/lib/layout/layout.ts` (`splitPane`, `openFile`/`pinTab`/
   `pinPaths`, `detachTab`, `tabKey`, `moveTabToIndex`/`dropTab`/`dropTabAtRootEdge`,
   `movePane`/`movePaneToRootEdge`/`movePaneToIndex`), `dnd.ts` (custom pointer DnD),
-  `SplitNode.svelte`/`Pane.svelte`/`PaneTabs.svelte`.
+  `SplitNode.svelte`/`Pane.svelte`/`PaneTabs.svelte`, `tabScroll.ts` (reveal and fade geometry).
 - **Key behaviors.** Ratio clamps to `[0.05, 0.95]` and a 120px minimum during drag; divider
   drags are rAF-throttled and **gate terminal refits** (`pool.setDragging`) to avoid reflow
   jank. The layout tree is pure/immutable with structural sharing. DnD is custom pointer-based
