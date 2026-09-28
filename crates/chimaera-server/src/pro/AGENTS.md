@@ -84,7 +84,7 @@ unknown PATH Git falls back to `/usr/bin/git` if that binary reports at least
 2.45 (the upstream curl POST-size reuse fix); modern PATH Git and other platforms
 keep their existing selection. This affects only mirror helpers, not ordinary
 workspace Git settings. Failed HTTP transfers with an older/unknown selected
-Git give static upgrade guidance without exposing stderr. There is no enlarged
+Git give static upgrade guidance without exposing stderr. Failed helpers emit only fixed diagnostic categories and a fixed operation name; stderr, URLs, paths and credentials never enter logs. There is no enlarged
 POST buffer, automatic failed-push replay, or weakened publication check.
 Another worktree's branch is retained separately. Unsupported
 transaction support preserves a cloud ref instead. Network Git has a finite

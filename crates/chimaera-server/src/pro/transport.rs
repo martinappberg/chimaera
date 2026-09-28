@@ -110,6 +110,7 @@ pub(super) const PATH_CAP: usize = 8 * 1024 * 1024;
 pub(super) struct Output {
     pub success: bool,
     pub stdout: Vec<u8>,
+    diagnostic: &'static str,
 }
 
 fn clean_command(binary: &str) -> Command {
@@ -185,7 +186,7 @@ async fn run_reserved(
             }
             stdin.shutdown().await
         };
-        let (_, stdout, _, status) = tokio::try_join!(
+        let (_, stdout, stderr, status) = tokio::try_join!(
             send,
             read_bounded(stdout, cap),
             read_bounded(stderr, 16 * 1024),
@@ -194,10 +195,97 @@ async fn run_reserved(
         Ok::<_, anyhow::Error>(Output {
             success: status.success(),
             stdout,
+            diagnostic: helper_diagnostic(&stderr),
         })
     })
     .await
     .context("mirror helper timed out")?
+}
+
+// Never retain helper stderr: Git can include credentials, remote URLs or
+// private paths. Only fixed categories may reach diagnostic logs.
+fn helper_diagnostic(stderr: &[u8]) -> &'static str {
+    let text = String::from_utf8_lossy(stderr).to_ascii_lowercase();
+    for (category, patterns) in [
+        (
+            "authentication",
+            &[
+                "authentication failed",
+                "could not read username",
+                "could not read password",
+                "error: 401",
+                "error: 403",
+            ][..],
+        ),
+        ("http_missing", &["error: 404", "repository not found"][..]),
+        (
+            "http_unavailable",
+            &["error: 500", "error: 502", "error: 503", "error: 504"][..],
+        ),
+        (
+            "tls",
+            &["ssl certificate", "certificate verify", "tls connection"][..],
+        ),
+        (
+            "network",
+            &[
+                "could not resolve",
+                "failed to connect",
+                "connection refused",
+                "connection reset",
+                "empty reply from server",
+            ][..],
+        ),
+        (
+            "helper_missing",
+            &[
+                "is not a git command",
+                "cannot run",
+                "unable to find remote helper",
+            ][..],
+        ),
+        ("disk_full", &["no space left on device"][..]),
+        (
+            "permission",
+            &["permission denied", "dubious ownership"][..],
+        ),
+        (
+            "repository",
+            &[
+                "not a git repository",
+                "bad object",
+                "invalid object",
+                "bad tree",
+                "unable to read tree",
+                "corrupt",
+            ][..],
+        ),
+        (
+            "reference",
+            &[
+                "couldn't find remote ref",
+                "could not find remote ref",
+                "invalid refspec",
+                "cannot lock ref",
+                "ambiguous argument",
+            ][..],
+        ),
+        ("lock", &["index.lock", "another git process"][..]),
+        (
+            "transfer",
+            &[
+                "rpc failed",
+                "early eof",
+                "unexpected disconnect",
+                "index-pack failed",
+            ][..],
+        ),
+    ] {
+        if patterns.iter().any(|pattern| text.contains(pattern)) {
+            return category;
+        }
+    }
+    "unknown"
 }
 
 async fn read_bounded(mut input: impl AsyncRead + Unpin, cap: usize) -> std::io::Result<Vec<u8>> {
@@ -411,6 +499,20 @@ pub(super) async fn git_output(
         result?
     };
     if !output.success {
+        let operation = match args.first().copied() {
+            Some("fetch") => "fetch",
+            Some("push") => "push",
+            Some("clone") => "clone",
+            Some("show") => "show",
+            Some("rev-parse") => "rev_parse",
+            Some("cat-file") => "cat_file",
+            _ => "local_git",
+        };
+        tracing::warn!(
+            operation,
+            category = output.diagnostic,
+            "mirror Git helper failed"
+        );
         if compatibility_hint {
             bail!(HTTP_GIT_HINT);
         }
@@ -422,6 +524,20 @@ pub(super) async fn git_output(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn diagnostics_are_fixed_categories_without_remote_or_credential_text() {
+        assert_eq!(helper_diagnostic(b"fatal: Authentication failed for 'https://fixture-user:fixture-secret@mirror.test/repository.git'"), "authentication");
+        assert_eq!(
+            helper_diagnostic(b"fatal: cannot run git-remote-https: No such file or directory"),
+            "helper_missing"
+        );
+        assert_eq!(
+            helper_diagnostic(b"remote: private response fixture-secret"),
+            "unknown"
+        );
+        assert_eq!(helper_diagnostic(b"fatal: unable to access 'https://mirror.test': The requested URL returned error: 503"), "http_unavailable");
+    }
+
     #[test]
     fn mirror_git_selection_preserves_modern_path_and_only_uses_fixed_macos_fallback() {
         let old = Some((2, 43, 0));
