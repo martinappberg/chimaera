@@ -435,7 +435,7 @@ mod platform {
 
     /// The launcher badge (Unity launcher API on Linux, the taskbar overlay
     /// on Windows) hangs off a window; with none open there is nothing to
-    /// badge — and closing the last window exits the app here anyway.
+    /// badge — and closing the last Home window exits the app here anyway.
     pub(crate) fn set_badge(app: &AppHandle, count: usize) {
         let count = (count > 0).then_some(count as i64);
         for window in app.webview_windows().values() {
