@@ -51,6 +51,8 @@
   let agentsAvailable = $state<boolean | null>(null);
   let loadError = $state<string | null>(null);
   let setupAgent = $state<AgentId>("claude");
+  /** A check has answered once: later ones keep the chosen agent. */
+  let rechecked = false;
   let trust = $state(true);
   let busy = $state<string | null>(null);
   let error = $state<string | null>(null);
@@ -84,9 +86,14 @@
       agents = ap;
       if (plugin === null) loadError = `no plugin “${pluginId}” on this daemon`;
       // Use the same readiness decision as the chooser, including every
-      // required add-on and any ambiguous marketplace report.
+      // required add-on and any ambiguous marketplace report. A re-check
+      // keeps the user's pick while it is still eligible — it decides whose
+      // account the setup bills.
       const preferred = setupAgents[0];
-      if (preferred !== undefined) setupAgent = preferred as AgentId;
+      if (preferred !== undefined && (!rechecked || !setupAgents.includes(setupAgent))) {
+        setupAgent = preferred as AgentId;
+      }
+      rechecked = true;
     } catch (e) {
       loadError = message(e);
     }

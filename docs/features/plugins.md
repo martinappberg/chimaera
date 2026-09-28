@@ -150,9 +150,9 @@ installation or hook trust and on reconnect; it carries no plugin payload.
     <agent>` terminal (ids and marketplace sources charset-gated, never flag-shaped); 409 when
     the agent binary is missing. `plugins/install-agent.sh` receives metadata as arguments,
     never shell source. It inherits the host + workspace **Settings → Environment** commands
-    so module loads and PATH setup apply, and the git chimaera resolved (**Settings → Git
-    binary path**, else the login shell's) goes first on its PATH when it is new enough — a
-    login node's stock `/usr/bin/git` 1.8.3 can't do Claude's marketplace clone. A failed
+    so module loads and PATH setup apply, and the git **Settings → Git binary path** names
+    goes first on its PATH when it is new enough (≥ 2.15) — a login node's stock
+    `/usr/bin/git` 1.8.3 can't do Claude's marketplace clone. A failed
     Claude marketplace fetch explains missing Git or lack of `--shallow-submodules` support;
     an existing cached marketplace can still install. Codex's fetcher is independent of this
     Git requirement.

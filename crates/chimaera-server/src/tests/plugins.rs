@@ -226,8 +226,8 @@ fn agent_plugin_install_explains_claude_git_without_blocking_cached_installs() {
     }
 }
 
-/// The git chimaera resolved (the Git binary path setting) reaches the
-/// agent's plugin manager ahead of an old system git — seen on a login node
+/// The Git binary path setting's git reaches the agent's plugin manager
+/// ahead of an old system git — seen on a login node
 /// whose /usr/bin/git is 1.8.3 while the setting pointed at a module's 2.45.
 #[test]
 fn agent_plugin_install_puts_the_resolved_git_first_on_path() {

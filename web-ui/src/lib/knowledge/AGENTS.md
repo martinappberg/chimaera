@@ -14,7 +14,7 @@ and on visibility return — never polled).
 | `KnowledgeView.svelte` | The tab: header (counts, the source chip, the one client-side search box), the sticky section nav with counts + the "How sure" legend, and the sections in their fixed order — Where we left off · What we found (topics → `FindingRow`) · What we decided · Watch out for · Open · Guidance & memory. An empty section doesn't render; with no structured provider it is Guidance & memory plus the one attach card. |
 | `FindingRow.svelte` | One finding: id · claim · meta + a Timeline-derived badge · the ladder + status word · the evidence strip (one mark per ledger row: filled supports, half refines, ring contradicts), expanding to So what / Evidence table / Open questions / open file. |
 | `Ladder.svelte` | mycelium's confidence ladder as one glyph (●○○ · ●●○ · ●●● · ✕). |
-| `model.ts` | Pure derivations: `searchKnowledge`, `whereThingsStand` (contradicted first, then strongest, then newest), `sectionNav`, the ledger summary/caption, the tone tables (colour is never alone), `recentStatusMove` (the Timeline cross-link). Vitest: `model.test.ts`. |
+| `model.ts` | Pure derivations: `searchKnowledge`, `whereThingsStand` (contradicted first, then strongest, then newest), `sectionNav`, the ledger summary/caption, the tone tables (colour is never alone), `statusMoves` (the Timeline cross-link, one pass for every finding). Vitest: `model.test.ts`. |
 
 ## Invariants / gotchas
 

@@ -8,10 +8,11 @@ marketplace=$4
 plugin_id=$5
 install_verb=$6
 completion_file=$7
-# The directory of the git chimaera resolved (the Git binary path setting, or
-# the login shell's), empty when it found none new enough. First on PATH so
-# the agent's marketplace clone uses it, not an old system git.
+# The directory of the git the Git binary path setting names, empty when it
+# is unset or too old. First on PATH so the agent's marketplace clone uses
+# it, not an old system git. A ':' would split it into two PATH entries.
 git_dir=${8:-}
+case $git_dir in *:*) git_dir= ;; esac
 if [ -n "$git_dir" ]; then
     PATH="$git_dir:$PATH"
     export PATH

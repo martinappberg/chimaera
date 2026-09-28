@@ -461,3 +461,40 @@ async fn mark_path_dirty_canonicalizes_symlinked_paths() {
         "a symlinked in-workspace path must bump the epoch after canonicalize (before={before}, after={after})"
     );
 }
+
+/// What an agent-plugin install puts first on PATH: the Git binary path
+/// setting's directory — only when set, absolute and new enough — and never
+/// a login-shell git (already on that shell's PATH).
+#[tokio::test]
+async fn usable_git_dir_is_the_settings_git_when_new_enough() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = test_dir("usable-git-dir");
+    let fake = |name: &str, version: &str| {
+        let bin = dir.join(name).join("git");
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::write(&bin, format!("#!/bin/sh\necho 'git version {version}'\n")).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+        bin
+    };
+    let modern = fake("modern", "2.45.1");
+    let ancient = fake("ancient", "1.8.3.1");
+    let state = test_state();
+    let set = |path: Option<&std::path::Path>| {
+        let mut map = serde_json::Map::new();
+        if let Some(path) = path {
+            map.insert("git.path".into(), path.to_string_lossy().into());
+        }
+        crate::lock(&state.settings).put(map).unwrap();
+    };
+    assert_eq!(crate::git::usable_git_dir(&state).await, None, "unset");
+    set(Some(&modern));
+    assert_eq!(
+        crate::git::usable_git_dir(&state).await.as_deref(),
+        Some(dir.join("modern").as_path())
+    );
+    set(Some(&ancient));
+    assert_eq!(crate::git::usable_git_dir(&state).await, None, "too old");
+    set(Some(std::path::Path::new("git")));
+    assert_eq!(crate::git::usable_git_dir(&state).await, None, "relative");
+}

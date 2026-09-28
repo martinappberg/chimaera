@@ -218,9 +218,10 @@ the lifecycle, keep them consistent:
 - **Agent-plugin installs keep their result visible.** `plugins/install-agent.sh`
   receives metadata and the executable path as positional arguments; never
   splice them into shell source. The 8th argument is the directory of the git
-  the daemon resolved (`git::usable_git_dir`: the `git.path` setting, else the
-  login shell's, only when ≥ 2.15), put first on the install's PATH after the
-  login shell and prelude ran — claude's marketplace clone needs
+  the `git.path` setting names (`git::usable_git_dir`, only when ≥ 2.15 — a
+  login-shell git is already on the login shell's PATH, and forcing its dir,
+  often `/usr/bin`, first would shadow the user's tools), put first on the
+  install's PATH after the login shell and prelude ran — claude's marketplace clone needs
   `--shallow-submodules`, which a login node's stock git 1.8.3 lacks. Its exit trap reports the outcome, writes
   a private runtime completion marker to invalidate agent probes, and waits
   for Enter before exiting with the install's status. Terminal titles are

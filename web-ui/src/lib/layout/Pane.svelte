@@ -287,8 +287,18 @@
     requestAssetReload();
   }
 
+  /** Never throws: it renders inside the error card itself. */
   function errorText(error: unknown): string {
-    const text = error instanceof Error ? error.message : String(error);
+    let text: string;
+    try {
+      const message =
+        typeof error === "object" && error !== null && "message" in error
+          ? (error as { message: unknown }).message
+          : error;
+      text = typeof message === "string" ? message : (JSON.stringify(message) ?? String(message));
+    } catch {
+      text = "unknown error";
+    }
     return text.length > 300 ? `${text.slice(0, 300)}…` : text;
   }
 

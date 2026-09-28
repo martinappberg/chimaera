@@ -5,7 +5,7 @@ import {
   ledgerCaption,
   ladderFill,
   ledgerSummary,
-  recentStatusMove,
+  statusMoves,
   searchKnowledge,
   sectionNav,
   statusRank,
@@ -172,7 +172,7 @@ describe("tones pair colour with a word", () => {
   });
 });
 
-describe("recentStatusMove", () => {
+describe("statusMoves", () => {
   it("reads a finding's status move off the timeline within a day", () => {
     const now = 1_000_000_000;
     const entries = [
@@ -180,10 +180,10 @@ describe("recentStatusMove", () => {
       { seq: 2, ts: now - 2000, kind: "knowledge", knowledge: { change: "status", id: "F-003", from: "preliminary", to: "supported", claim: "" } },
       { seq: 1, ts: now - 2 * 86_400_000, kind: "knowledge", knowledge: { change: "new", id: "F-001", to: "preliminary", claim: "" } },
     ] as const;
-    expect(recentStatusMove("F-002", entries as never, now)).toEqual({ text: "contradicted today", tone: "err" });
-    expect(recentStatusMove("F-003", entries as never, now)).toEqual({ text: "now supported", tone: "accent" });
-    expect(recentStatusMove("F-001", entries as never, now)).toBeNull();
-    expect(recentStatusMove("F-009", entries as never, now)).toBeNull();
+    expect(statusMoves(entries as never, now).get("F-002")).toEqual({ text: "contradicted today", tone: "err" });
+    expect(statusMoves(entries as never, now).get("F-003")).toEqual({ text: "now supported", tone: "accent" });
+    expect(statusMoves(entries as never, now).get("F-001")).toBeNull();
+    expect(statusMoves(entries as never, now).get("F-009")).toBeUndefined();
   });
 });
 

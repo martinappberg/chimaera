@@ -229,22 +229,11 @@ export function sectionNav(k: Knowledge): SectionNav[] {
 }
 
 /**
- * A finding's recent status move from the Timeline (the cross-link the
- * design asks for): "now supported" / "contradicted today" within 24 h.
- */
-export function recentStatusMove(
-  findingId: string,
-  entries: readonly TimelineEntry[],
-  nowMs: number,
-): { text: string; tone: Tone } | null {
-  return statusMoves(entries, nowMs).get(findingId) ?? null;
-}
-
-/**
- * Every finding's recent status move in ONE pass over the Timeline (newest
- * first): its newest knowledge entry decides — a badge when within 24 h,
- * nothing when older. The view asks per row; a scan per row was findings ×
- * entries on every snapshot, Timeline page and minute tick.
+ * Every finding's recent status move from the Timeline (the cross-link the
+ * design asks for): "now supported" / "contradicted today" within 24 h. One
+ * pass, newest first: a finding's newest knowledge entry decides — a badge
+ * when within 24 h, nothing when older. The view looks each row up; a scan
+ * per row was findings × entries on every snapshot, page and minute tick.
  */
 export function statusMoves(
   entries: readonly TimelineEntry[],

@@ -1290,9 +1290,9 @@ pub(crate) async fn install_requirement(
     };
     let env = crate::api::session_env(&state, &session_id, "dark", prelude.as_deref());
     let env_remove = crate::api::spawn_env_remove(&env);
-    // The agent's plugin manager runs a bare `git`; the one chimaera resolved
-    // (the Git binary path setting, else the login shell's) goes first on its
-    // PATH, after the login shell and the Environment prelude have run.
+    // The agent's plugin manager runs a bare `git`; the Git binary path
+    // setting's goes first on its PATH, after the login shell and the
+    // Environment prelude have run.
     let git_dir = crate::git::usable_git_dir(&state)
         .await
         .map(|dir| dir.to_string_lossy().into_owned())
