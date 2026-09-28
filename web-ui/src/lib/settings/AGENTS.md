@@ -60,7 +60,9 @@ Subscriber billing feedback stays inside the account card, preserving cloud and
 provider panels. Account events immediately invalidate older reads; billing
 snapshots cannot roll back to an older attempt or phase. Pro subscribers can
 choose Upgrade to Max, review the interval locally, then explicitly open the
-hosted price/proration confirmation. Only server-confirmed Max changes the plan.
+hosted price/proration confirmation. Only server-confirmed Max changes the plan. An unconfirmed review return settles
+after a bounded native check with the actual current plan; it never implies that
+the user canceled or that a delayed billing update cannot arrive.
 Only an authoritative active account plan unlocks paid content. Expired/failed
 checkout stays neutral until an explicit Check account succeeds with no plan for
 the same attempt; Return to plans then acknowledges and clears that attempt. A targeted native

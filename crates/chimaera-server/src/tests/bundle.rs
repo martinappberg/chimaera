@@ -4,6 +4,7 @@ use bundle::{ExportMode, ImportOptions, Origin};
 
 #[tokio::test]
 async fn bundle_preserves_shell_identity_and_defers_moved_terminal() {
+    let _serial = crate::bundle::TEST_SERIAL.lock().await;
     let source = test_state();
     let target = test_state();
     let root = std::fs::canonicalize(test_dir("bundle-project")).unwrap();
@@ -149,6 +150,7 @@ async fn suspended_ledger_never_respawns_until_verified_resume() {
 
 #[tokio::test]
 async fn destination_remap_preserves_relative_cwd_and_stages_before_resume() {
+    let _serial = crate::bundle::TEST_SERIAL.lock().await;
     let source = test_state();
     let target = test_state();
     let root = std::fs::canonicalize(test_dir("remap-source")).unwrap();

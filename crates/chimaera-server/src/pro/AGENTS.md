@@ -23,7 +23,7 @@ One recorded holder and epoch controls shared writes. Failure to reach the servi
 is not evidence that ownership moved; keep local work available until a newer
 owner is verified. Expired remote takeovers fork native conversations. Clean
 handoff stops agents before final export and releases only after the mirror and
-bundles are durable. A failed flush retains local ownership.
+bundles are durable. An unstarted structured Claude chat with no native transcript is omitted only when a complete bounded startup-only journal, fresh-spawn recipe, and no submitted input or background work prove it empty; snapshots leave its source live, while clean handoff atomically fences input and durably suspends it for local return. Only exported agents enable automatic worker wake. Missing meaningful or ambiguous history still fails the flush and retains local ownership.
 
 No account refresh token or agent credential enters this module. Delegations and
 short-lived Git passwords are memory-only. Never log remote response bodies,
@@ -105,3 +105,5 @@ files and repeats setup/readiness without fetching another snapshot. It never
 starts authentication or transfers provider credentials. Account replacement,
 ownership changes and cancellation retain the fence. Personal-device and
 ordinary SSH/free workspace behavior is unchanged.
+
+Structured pause checks accept authoritative completed-turn/idle agent state even when a provider emits no textual idle status, but reject queued input, active turns, and background work (explicit permission/action waits remain safe pause points).

@@ -13,6 +13,7 @@ use tokio::{net::TcpListener, sync::watch, time::Instant};
 mod callback;
 const WAIT: Duration = Duration::from_secs(15 * 60);
 const CONFIRM: Duration = Duration::from_secs(2 * 60);
+const REVIEW_CONFIRM: Duration = Duration::from_secs(20);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -21,6 +22,15 @@ pub(super) enum Kind {
     Portal,
     PlanChange,
 }
+impl Kind {
+    fn confirmation_window(self) -> Duration {
+        if self == Self::PlanChange {
+            REVIEW_CONFIRM
+        } else {
+            CONFIRM
+        }
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum Phase {
@@ -28,6 +38,7 @@ pub(super) enum Phase {
     Waiting,
     Confirming,
     Confirmed,
+    Unconfirmed,
     Canceled,
     Expired,
     Failed,
@@ -129,7 +140,7 @@ impl Billing {
         pending.status.phase = phase;
         pending.status.error = error.map(str::to_owned);
         if phase == Phase::Confirming {
-            pending.status.expires_at = now() + CONFIRM.as_secs();
+            pending.status.expires_at = now() + pending.status.kind.confirmation_window().as_secs();
         }
         true
     }
@@ -230,10 +241,19 @@ async fn open_billing(
         if state.pro.generation() != generation {
             return Err("Your account changed. Open billing again.".into());
         }
-        let account_id = super::lock(&state.pro.account)
-            .as_ref()
-            .map(|account| account.account_id.clone())
-            .ok_or("Your account is still loading. Try again shortly.")?;
+        let account_id = {
+            let saved = super::lock(&state.pro.account);
+            let account = saved
+                .as_ref()
+                .ok_or("Your account is still loading. Try again shortly.")?;
+            if target
+                .as_ref()
+                .is_some_and(|target| target.plan == account.plan)
+            {
+                return Err("Use Manage billing to change your billing interval.".into());
+            }
+            account.account_id.clone()
+        };
         state.pro.billing.begin(
             generation,
             account_id,
@@ -377,7 +397,7 @@ async fn run(
             accepted.finish().await;
             return;
         }
-        attempt.deadline = Instant::now() + CONFIRM;
+        attempt.deadline = Instant::now() + attempt.kind.confirmation_window();
         if !verified {
             update(&app, attempt.id, Phase::Confirming, None);
         }
@@ -389,25 +409,47 @@ async fn run(
         if verified {
             return;
         }
-        let mut count = 0;
-        loop {
-            if matches!(
-                tokio::time::timeout_at(attempt.deadline, refresh(&app, &client, &attempt)).await,
-                Ok(Ok(true))
-            ) {
-                update(&app, attempt.id, Phase::Confirmed, None);
-                return;
-            }
-            if Instant::now() >= attempt.deadline {
-                break;
-            }
-            count += 1;
-            let delay = Duration::from_secs(if count < 5 { 2 } else { 5 });
-            tokio::time::sleep_until((Instant::now() + delay).min(attempt.deadline)).await;
-        }
-        update(&app, attempt.id, Phase::Expired, Some("Confirmation is taking longer than expected. Your account will keep checking in the background; you do not need to pay again."));
+        let phase = confirm_until(attempt.kind, attempt.deadline, || {
+            refresh(&app, &client, &attempt)
+        })
+        .await;
+        let message = match phase {
+            Phase::Expired => Some("Confirmation is taking longer than expected. Your account will keep checking in the background; you do not need to pay again."),
+            Phase::Failed => Some("Your account couldn't be checked. Check it again before reviewing another change."),
+            _ => None,
+        };
+        update(&app, attempt.id, phase, message);
     };
     tokio::select! { _ = canceled.wait_for(|cancel| *cancel) => {}, _ = task => {} }
+}
+
+/// A review can return without a purchase. Wait briefly for asynchronous billing
+/// updates, then report the observed account without inferring cancellation.
+async fn confirm_until<F, Fut>(kind: Kind, deadline: Instant, mut check: F) -> Phase
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<bool>>,
+{
+    let mut observed_other_plan = false;
+    let mut count = 0;
+    loop {
+        match tokio::time::timeout_at(deadline, check()).await {
+            Ok(Ok(true)) => return Phase::Confirmed,
+            Ok(Ok(false)) => observed_other_plan = true,
+            _ => {}
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        count += 1;
+        let delay = Duration::from_secs(if count < 5 { 2 } else { 5 });
+        tokio::time::sleep_until((Instant::now() + delay).min(deadline)).await;
+    }
+    match (kind, observed_other_plan) {
+        (Kind::PlanChange, true) => Phase::Unconfirmed,
+        (Kind::PlanChange, false) => Phase::Failed,
+        _ => Phase::Expired,
+    }
 }
 
 #[tauri::command]
@@ -439,6 +481,44 @@ pub async fn pro_cancel_billing(app: AppHandle, attempt_id: Option<u64>) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn unconfirmed_plan_review_settles_but_failures_never_claim_an_unchanged_plan() {
+        assert_eq!(
+            Kind::PlanChange.confirmation_window(),
+            Duration::from_secs(20)
+        );
+        assert_eq!(Kind::Checkout.confirmation_window(), CONFIRM);
+        assert_eq!(Kind::Portal.confirmation_window(), CONFIRM);
+        let deadline = || Instant::now() + Duration::from_millis(15);
+        assert_eq!(
+            confirm_until(Kind::PlanChange, deadline(), || async { Ok(false) }).await,
+            Phase::Unconfirmed
+        );
+        assert_eq!(
+            confirm_until(Kind::PlanChange, deadline(), || async { Ok(true) }).await,
+            Phase::Confirmed
+        );
+        assert_eq!(
+            confirm_until(Kind::PlanChange, deadline(), || async {
+                anyhow::bail!("unavailable")
+            })
+            .await,
+            Phase::Failed
+        );
+        assert_eq!(
+            confirm_until(Kind::PlanChange, deadline(), || async {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                Ok(false)
+            })
+            .await,
+            Phase::Failed
+        );
+        assert_eq!(
+            confirm_until(Kind::Checkout, deadline(), || async { Ok(false) }).await,
+            Phase::Expired
+        );
+    }
+
     #[test]
     fn billing_links_accept_only_exact_secure_provider_origins() {
         for host in [

@@ -47,6 +47,11 @@ export function billingCopy(attempt: ProBillingAttempt, plan: ProStatus["plan"])
     case "confirmed": return checkout || change
       ? { title: "Check your account", detail: "The browser returned, but the requested plan hasn't been confirmed. Check your account before starting again.", pending: false, check: true, success: false }
       : { title: "You're back from billing", detail: "Your current plan and usage have been refreshed.", pending: false, check: false, success: true };
+    case "unconfirmed": return {
+      title: plan === "pro" ? "Your plan is still Pro" : plan === "max" ? "Your plan is still Max" : "No plan change confirmed",
+      detail: "No plan change has been confirmed. If you confirmed a change in billing, check your account again shortly.",
+      pending: false, check: true, success: false,
+    };
     case "canceled": return { title: "Stopped waiting for billing", detail: "Chimaera is no longer watching this browser session. This doesn't close the billing page or cancel a payment or subscription. You can reopen billing or check your account.", pending: false, check: true, success: false };
     case "expired": return { title: "Confirmation timed out", detail: checkout || change ? "We stopped waiting for this browser request. If you completed payment, check your account before opening checkout again." : "We stopped waiting for the billing page. Check your account to see any changes you made.", pending: false, check: true, success: false };
     case "failed": return { title: "We couldn't confirm this request", detail: checkout || change ? "Check your account to see its latest status. If you completed payment, do that before trying checkout again." : "We couldn't refresh your billing changes. Check your account to see its latest status.", pending: false, check: true, success: false };

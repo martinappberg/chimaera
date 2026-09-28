@@ -872,7 +872,7 @@ export interface ProBillingAttempt {
   id: number;
   kind: "checkout" | "portal" | "plan_change";
   requested_plan?: "pro" | "max" | null;
-  phase: "opening" | "waiting" | "confirming" | "confirmed" | "canceled" | "expired" | "failed";
+  phase: "opening" | "waiting" | "confirming" | "confirmed" | "unconfirmed" | "canceled" | "expired" | "failed";
   expires_at: number;
   error: string | null;
 }

@@ -306,7 +306,7 @@
         {#if status.plan === "pro"}
           <div class="upgrade-entry">
             <div><h3>More room for your work</h3><p class="small muted">Max includes more cloud time and mirrored storage, with the same workflow.</p></div>
-            <button class="secondary" aria-expanded={upgradeOpen} disabled={busy !== null || billingActive || !canReviewUpgrade(status, accountFresh)} onclick={() => (upgradeOpen = !upgradeOpen)}>Upgrade to Max</button>
+            <button class="secondary" aria-expanded={upgradeOpen} disabled={busy !== null || billingActive || !canReviewUpgrade(status, accountFresh)} onclick={() => (upgradeOpen = !upgradeOpen)}>{billing?.kind === "plan_change" && billing.phase === "unconfirmed" ? "Review upgrade again" : "Upgrade to Max"}</button>
           </div>
           {#if upgradeOpen}
             <div class="upgrade-review" aria-label="Review Max upgrade">

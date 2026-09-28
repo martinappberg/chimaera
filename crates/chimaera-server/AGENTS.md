@@ -22,6 +22,7 @@ the module you need and read its header doc.
 | `persist.rs` | `atomic_write_json` — the shared temp-write + rename dance for the small JSON state stores (view-state/ledger/workspaces/recents/settings). |
 | `pro/` | Optional credential-free persisted ownership fences, daemon-owned Git/config mirrors, profile and pin policy, staged hydration, clean sleep release, lazy hand-back for known local projects, and passive discovery with explicit per-project native adoption. See its [map](src/pro/AGENTS.md). |
 | `activity.rs` | Bounded last-input timestamps from authenticated terminal input and accepted interactive chat commands; passive readers and output never count. `session_view` exposes nullable `last_input_ms` on session list rows. |
+| `bundle_empty.rs` | Conservative startup-only chat proof for automatic mirrors; explicit export and any meaningful/missing history stay strict. |
 | `bundle.rs` | Bounded session ZIP snapshots/stop/export/import, native transcript identity, checked hashes, staged hydration and moved/home context; public format in [BUNDLE.md](BUNDLE.md). No credentials or process snapshots. |
 | `session_proxy.rs` | Epoch-fenced loopback placements, bounded remote roster cache and authenticated HTTP/WS proxy. An unavailable remote session never falls back to a local spawn. |
 | `session_view.rs` | The session-row JSON builders (`session_json`/`sessions_json`), shared by `api/` and `ws.rs` (so `ws` doesn't depend on `api`). |

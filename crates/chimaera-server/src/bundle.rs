@@ -23,10 +23,15 @@ use std::{
 };
 use tokio::io::AsyncWriteExt;
 
+#[path = "bundle_empty.rs"]
+mod empty;
+
 pub(crate) const MAX_ARCHIVE: u64 = 100_000_000;
 const MAX_NATIVE: u64 = 90_000_000;
 const MAX_JOURNAL: u64 = 4 * 1024 * 1024;
 const MAX_METADATA: u64 = 256 * 1024;
+#[cfg(test)]
+pub(crate) static TEST_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 static OPERATIONS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ExportMode {
@@ -204,6 +209,28 @@ async fn flush_ledger(state: &Arc<AppState>) -> Result<()> {
 
 /// The caller owns and must unlink the returned temporary archive.
 pub(crate) async fn export(state: Arc<AppState>, id: &str, mode: ExportMode) -> Result<PathBuf> {
+    export_inner(state, id, mode, false)
+        .await?
+        .context("conversation is empty")
+}
+
+/// A proven unstarted chat has no portable conversation yet. Automatic mirrors
+/// preserve it on the source (durably suspended for clean handoff); explicit
+/// single-session export remains strict.
+pub(crate) async fn export_for_mirror(
+    state: Arc<AppState>,
+    id: &str,
+    mode: ExportMode,
+) -> Result<Option<PathBuf>> {
+    export_inner(state, id, mode, true).await
+}
+
+async fn export_inner(
+    state: Arc<AppState>,
+    id: &str,
+    mode: ExportMode,
+    skip_unstarted: bool,
+) -> Result<Option<PathBuf>> {
     let _permit = OPERATIONS.try_acquire().context("bundle operation limit")?;
     if !valid_id(id) {
         bail!("invalid session ID");
@@ -222,15 +249,31 @@ pub(crate) async fn export(state: Arc<AppState>, id: &str, mode: ExportMode) -> 
         .context("unknown workspace")?;
     // Reject a missing native handle before stopping anything. A snapshot may
     // race an append; the checked copy below then asks the caller to retry.
+    let mut paused = if skip_unstarted && mode == ExportMode::Stop && state.chat.get(id).is_some() {
+        Some(
+            tokio::time::timeout(Duration::from_secs(3), state.chat.pause_commands(id))
+                .await
+                .context("session input did not pause before transfer deadline")??,
+        )
+    } else {
+        None
+    };
     let checked = state.clone();
     let probe = entry.clone();
-    tokio::task::spawn_blocking(move || native_path(&checked, &probe)).await??;
+    let native = tokio::task::spawn_blocking(move || match native_path(&checked, &probe) {
+        Ok(_) => Ok(true),
+        Err(_) if skip_unstarted && empty::unstarted(&checked, &probe) => Ok(false),
+        Err(error) => Err(error),
+    })
+    .await??;
     if mode == ExportMode::Stop && entry.agent.is_some() {
         let mut suspended = entry.clone();
         suspended.suspended = true;
         crate::ledger::defer(&state, suspended)?;
         flush_ledger(&state).await?;
-        if state.chat.get(id).is_some() {
+        if let Some(pause) = paused.take() {
+            pause.commit_kill();
+        } else if state.chat.get(id).is_some() {
             state.chat.kill(id);
         } else {
             // Agent CLIs use TERM to flush native state and clean detached work.
@@ -266,6 +309,9 @@ pub(crate) async fn export(state: Arc<AppState>, id: &str, mode: ExportMode) -> 
         state.chat.remove(id);
         flush_ledger(&state).await?;
     }
+    if !native {
+        return Ok(None);
+    }
     let path = temp_path(&state);
     let destination = path.clone();
     let result = tokio::task::spawn_blocking(move || {
@@ -276,7 +322,7 @@ pub(crate) async fn export(state: Arc<AppState>, id: &str, mode: ExportMode) -> 
         let _ = tokio::fs::remove_file(&path).await;
         return Err(error);
     }
-    Ok(path)
+    Ok(Some(path))
 }
 fn write_archive(
     state: &AppState,

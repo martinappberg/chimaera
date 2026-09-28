@@ -386,13 +386,14 @@ pub(super) async fn snapshot(
     let staging = root.join(format!("stage-{}", chimaera_core::generate_token()));
     tokio::fs::create_dir_all(&staging).await?;
     let result = async {
-        let has_agents=!sessions(state,&workspace.id).is_empty();
+        let agent_ids=sessions(state,&workspace.id);
+        let mut has_agents=false;
         let session_ids:Vec<_>=lock(&state.session_workspaces).iter().filter(|(_,workspace_id)|*workspace_id==&workspace.id).map(|(id,_)|id.clone()).take(64).collect();
         let mut stopped=std::collections::HashMap::new();
         if clean {
             lock(&state.pro.ownership).insert(workspace.id.clone(),Ownership::Transferring{epoch});super::persist(state).await?;
             for id in &session_ids {
-                let path=crate::bundle::export(state.clone(),id,crate::bundle::ExportMode::Stop).await?;
+                let Some(path)=crate::bundle::export_for_mirror(state.clone(),id,crate::bundle::ExportMode::Stop).await? else {continue;};
                 let target=staging.join(format!("stopped-{id}.zip"));tokio::fs::rename(path,&target).await?;stopped.insert(id.clone(),target);
             }
         }
@@ -411,7 +412,8 @@ pub(super) async fn snapshot(
         let handoff = staging.join("handoff"); tokio::fs::create_dir_all(handoff.join("bundles")).await?;
         let mut archives = Vec::new(); let mut archive_bytes = 0u64;
         for id in session_ids {
-            let path = if clean {stopped.remove(&id).context("stopped archive missing")?} else {crate::bundle::export(state.clone(), &id, crate::bundle::ExportMode::Snapshot).await?};
+            let Some(path) = (if clean {stopped.remove(&id)} else {crate::bundle::export_for_mirror(state.clone(), &id, crate::bundle::ExportMode::Snapshot).await?}) else {continue;};
+            has_agents |= agent_ids.contains(&id);
             let length = tokio::fs::metadata(&path).await?.len();
             if length > max_file { let _ = tokio::fs::remove_file(path).await; anyhow::bail!("session archive exceeds mirror file limit"); }
             archive_bytes = archive_bytes.saturating_add(length);
@@ -848,13 +850,42 @@ fn install_tree(source: &Path, destination: &Path, baseline: Option<&Path>) -> R
     Ok(())
 }
 
+fn chat_at_pause(
+    chat: &chimaera_agent::ChatInfo,
+    carry: Option<&chimaera_agent::Carryover>,
+    queued_input: bool,
+    agent_state: Option<crate::agent_state::AgentState>,
+) -> bool {
+    let Some(carry) = carry else {
+        return false;
+    };
+    chat.background_running == 0
+        && carry.background.is_empty()
+        && !queued_input
+        && (chat.pending_permission
+            || chat.status_needs_action
+            || (!carry.turn_in_flight
+                && (chat.status_category.as_deref() == Some("idle")
+                    || matches!(
+                        agent_state,
+                        Some(
+                            crate::agent_state::AgentState::Finished
+                                | crate::agent_state::AgentState::IdlePrompt
+                        )
+                    ))))
+}
+
 pub(super) fn at_pause(state: &AppState, workspace: &str) -> bool {
     sessions(state, workspace).into_iter().all(|id| {
         if let Some(chat) = state.chat.get(&id) {
-            chat.background_running == 0
-                && (chat.pending_permission
-                    || chat.status_needs_action
-                    || chat.status_category.as_deref() == Some("idle"))
+            let activity = state.chat.input_activity(&id);
+            let agent_state = lock(&state.agents).get(&id).map(|agent| agent.state);
+            chat_at_pause(
+                &chat,
+                activity.as_ref().map(|(carry, _)| carry),
+                activity.as_ref().is_none_or(|(_, pending)| *pending),
+                agent_state,
+            )
         } else {
             lock(&state.agents).get(&id).is_none_or(|agent| {
                 matches!(
@@ -1297,5 +1328,56 @@ mod tests {
             .to_string_lossy()
             .starts_with("conflict.txt.cloud-")));
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod pause_tests {
+    use super::*;
+    #[test]
+    fn completed_chat_needs_no_vendor_status_but_active_work_stays_blocked() {
+        let mut chat = chimaera_agent::ChatInfo {
+            id: "s-codex".into(),
+            agent: "codex".into(),
+            cwd: "/tmp".into(),
+            created_at_ms: 0,
+            alive: true,
+            exit_status: None,
+            native_session_id: None,
+            model: None,
+            current_mode: None,
+            pending_permission: false,
+            status_detail: None,
+            status_category: None,
+            status_needs_action: false,
+            remote_control_url: None,
+            background_running: 0,
+        };
+        let mut carry = chimaera_agent::Carryover::default();
+        let finished = Some(crate::agent_state::AgentState::Finished);
+        assert!(chat_at_pause(&chat, Some(&carry), false, finished));
+        assert!(!chat_at_pause(&chat, Some(&carry), true, finished));
+        carry.turn_in_flight = true;
+        assert!(!chat_at_pause(&chat, Some(&carry), false, finished));
+        carry.turn_in_flight = false;
+        chat.background_running = 1;
+        assert!(!chat_at_pause(&chat, Some(&carry), false, finished));
+        chat.background_running = 0;
+        assert!(!chat_at_pause(
+            &chat,
+            Some(&carry),
+            false,
+            Some(crate::agent_state::AgentState::Running)
+        ));
+        assert!(!chat_at_pause(&chat, None, false, finished));
+        chat.pending_permission = true;
+        carry.turn_in_flight = true;
+        assert!(chat_at_pause(
+            &chat,
+            Some(&carry),
+            false,
+            Some(crate::agent_state::AgentState::NeedsPermission)
+        ));
+        assert!(!chat_at_pause(&chat, Some(&carry), true, finished));
     }
 }

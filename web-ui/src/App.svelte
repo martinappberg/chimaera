@@ -6082,6 +6082,7 @@
     align-items: center;
     gap: 8px;
     padding: 0 16px 12px;
+    min-height: 40px;
   }
 
   .needs {

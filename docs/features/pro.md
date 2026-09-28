@@ -55,8 +55,12 @@ Cloud setup controls are implemented; automatic handoff and browser access are b
    review leaves the current plan unchanged and preserves any existing trial.
    Checkout and billing return
    to Pro automatically. The native shell waits up to 15 minutes for the browser,
-   then checks account confirmation for up to two minutes, even if Pro is hidden
-   or closed. Subscriber billing feedback stays in the current-plan card while
+   then checks checkout/account confirmation for up to two minutes, even if Pro
+   is hidden or closed. A plan-review return instead checks for 20 seconds, then
+   shows the current plan if fresh account reads have not confirmed the change.
+   Failed reads remain unknown; a later confirmed update can still change the
+   displayed plan. Billing-interval-only changes use **Manage billing**.
+   Subscriber billing feedback stays in the current-plan card while
    cloud and provider panels remain in place. The page distinguishes opening,
    waiting, confirming and confirmed account states;
    a browser return alone never activates a plan. **Stop waiting** ends the local

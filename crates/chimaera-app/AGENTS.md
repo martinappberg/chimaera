@@ -77,8 +77,10 @@ in-app SSH askpass, a signed auto-updater). Parent map: repo-root
   still wait for readiness; keychain writes are not detached or timed out to
   manufacture UI responsiveness.
   Managed workers remain in the routing map but are excluded from `list_hosts`
-  and ordinary Settings machine rows; project placement and provider connections
-  reach them automatically. Background account reads retain confirmed cosmetic
+  and ordinary Settings machine rows; the current physical device is also omitted
+  by matching its authenticated daemon token, so it cannot duplicate local work.
+  Project placement and provider connections reach managed workers automatically.
+  Background account reads retain confirmed cosmetic
   plan branding while pending, so reconciliation cannot move the workspace rail.
   Device-only aliases never fall back to SSH: open windows retain that source in
   windows.json, including across sign-out/restart; only SSH hosts have that fallback.
@@ -102,7 +104,10 @@ in-app SSH askpass, a signed auto-updater). Parent map: repo-root
   returns to plan review; checkout requires another explicit user action.
 
 - Billing waits at most 15 minutes for the browser, then at most two minutes
-  for account confirmation. Opening, waiting and confirming are distinct states.
+  for checkout/account confirmation. A targeted plan review instead reconciles
+  for 20 seconds after return: a fresh read without the target ends unconfirmed,
+  while failed reads never claim an unchanged plan. Later account updates can
+  still confirm the exact target. Opening, waiting and confirming are distinct states.
   A targeted portal request opens a hosted plan-change review; it never directly
   changes a subscription. Checkout and plan changes confirm the exact requested plan
   from a fresh authenticated account response; callback outcome is a hint.

@@ -12,7 +12,7 @@ describe("native billing presentation", () => {
   it("only keeps the native waiting and confirming phases active", () => {
     expect(billingPending(undefined)).toBe(false); expect(billingPending(null)).toBe(false);
     for (const phase of ["opening", "waiting", "confirming"] as const) expect(billingPending(attempt(phase))).toBe(true);
-    for (const phase of ["confirmed", "canceled", "expired", "failed"] as const) expect(billingPending(attempt(phase))).toBe(false);
+    for (const phase of ["confirmed", "unconfirmed", "canceled", "expired", "failed"] as const) expect(billingPending(attempt(phase))).toBe(false);
   });
   it("explains timeout and cancellation without claiming payment was canceled or exposing errors", () => {
     for (const phase of ["canceled", "expired", "failed"] as const) {
@@ -76,6 +76,13 @@ describe("subscriber upgrade review", () => {
       expect(billingCopy(upgrade, null).success).toBe(false);
       expect(billingCopy(upgrade, "max").success).toBe(true);
     }
+  });
+  it("settles an unconfirmed review honestly and still recognizes a later exact-plan update", () => {
+    const review = { ...attempt("unconfirmed", "plan_change"), requested_plan: "max" as const };
+    expect(billingCopy(review, "pro")).toMatchObject({ title: "Your plan is still Pro", pending: false, success: false, check: true });
+    expect(billingCopy(review, null)).toMatchObject({ title: "No plan change confirmed", success: false });
+    expect(billingCopy(review, "max")).toMatchObject({ title: "You're on Chimaera Max", success: true });
+    expect(billingCopy(review, "pro").detail).not.toContain("canceled");
   });
   it("does not pretend stopping a local wait closed the browser", () => {
     const copy = billingCopy(attempt("canceled", "portal"), "pro");

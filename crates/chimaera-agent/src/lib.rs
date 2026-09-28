@@ -88,6 +88,9 @@ struct SendReservation {
 
 #[derive(Default)]
 struct CommandBudget {
+    submitted_input: bool,
+    commands_paused: bool,
+    awaiting_turn: bool,
     bytes: usize,
     sends: usize,
     next_token: u64,
@@ -108,6 +111,7 @@ impl CommandBudget {
         {
             return Err(CommandQueueFull);
         }
+        self.submitted_input = true;
         let token = self.next_token;
         self.next_token = self.next_token.wrapping_add(1);
         self.bytes = self.bytes.saturating_add(bytes);
@@ -162,19 +166,27 @@ impl CommandBudget {
                 }
                 // An immediately delivered send cannot leave bulk input in a
                 // driver FIFO.
+                self.awaiting_turn = true;
                 self.release(reservation);
             }
-            AgentEvent::UserMessageUpdate { id, .. } => {
+            AgentEvent::UserMessageUpdate { id, state } => {
                 if let Some(reservation) = self.queued.remove(id) {
+                    if *state == model::UserMessageState::Sent {
+                        self.awaiting_turn = true;
+                    }
                     self.release(reservation);
                 }
             }
+            AgentEvent::TurnStarted { .. }
+            | AgentEvent::TurnCompleted { .. }
+            | AgentEvent::TurnAborted { .. } => self.awaiting_turn = false,
             AgentEvent::Exited { .. } => self.clear(),
             _ => {}
         }
     }
 
     fn clear(&mut self) {
+        self.awaiting_turn = false;
         self.bytes = 0;
         self.sends = 0;
         self.unassigned.clear();
@@ -466,6 +478,30 @@ struct ChatSession {
     command_budget: Mutex<CommandBudget>,
 }
 
+/// A temporary command-ingress fence for a lifecycle proof. Dropping it restores
+/// ingress; committing a kill keeps it closed until this process is replaced.
+pub struct PausedCommands {
+    session: Arc<ChatSession>,
+    restore: bool,
+}
+impl PausedCommands {
+    pub fn commit_kill(mut self) {
+        self.restore = false;
+        let _ = self.session.kill_tx.send(true);
+    }
+}
+impl Drop for PausedCommands {
+    fn drop(&mut self) {
+        if self.restore {
+            self.session
+                .command_budget
+                .lock()
+                .expect("command budget lock")
+                .commands_paused = false;
+        }
+    }
+}
+
 /// What a WS bridge gets on attach. `replay` covers everything after the
 /// client's `last_seq`; `live` may overlap its tail — consumers drop live
 /// events whose seq is ≤ the last replayed one. `head_seq` is the journal's
@@ -685,16 +721,17 @@ impl ChatManager {
 
     /// Journal + broadcast one event and fold it into the session info.
     async fn absorb(&self, id: &str, session: &ChatSession, mut ev: AgentEvent) {
-        session
-            .command_budget
-            .lock()
-            .expect("command budget lock")
-            .observe(&mut ev);
-        session
-            .carryover
-            .lock()
-            .expect("carryover lock")
-            .observe(&ev);
+        {
+            // A delivered input may precede TurnStarted. Fold both sides of
+            // that boundary under the same locks used by input_activity.
+            let mut budget = session.command_budget.lock().expect("command budget lock");
+            budget.observe(&mut ev);
+            session
+                .carryover
+                .lock()
+                .expect("carryover lock")
+                .observe(&ev);
+        }
         let background_running = session
             .background_work
             .lock()
@@ -929,6 +966,14 @@ impl ChatManager {
         cmd.validate_ingress().context("invalid agent command")?;
         let session = self.get_session(id)?;
         let _order = session.command_order.lock().await;
+        anyhow::ensure!(
+            !session
+                .command_budget
+                .lock()
+                .expect("command budget lock")
+                .commands_paused,
+            "session is paused for transfer; retry after the project returns"
+        );
         let mut reservation = if let Some(bytes) = cmd.retained_send_bytes() {
             let token = session
                 .command_budget
@@ -949,6 +994,26 @@ impl ChatManager {
             reservation.disarm();
         }
         Ok(())
+    }
+
+    /// Serialize a lifecycle proof with all accepted commands. A caller must
+    /// bound waiting for a stalled enqueue; cancellation before acquisition has
+    /// no effect, and dropping the returned guard always reopens ingress.
+    pub async fn pause_commands(&self, id: &str) -> Result<PausedCommands> {
+        let session = self.get_session(id)?;
+        {
+            let _order = session.command_order.lock().await;
+            let mut budget = session.command_budget.lock().expect("command budget lock");
+            anyhow::ensure!(
+                !budget.commands_paused,
+                "session lifecycle operation already in progress"
+            );
+            budget.commands_paused = true;
+        }
+        Ok(PausedCommands {
+            session,
+            restore: true,
+        })
     }
 
     /// Ask the driver to shut the child down (polite, then SIGKILL after the
@@ -976,6 +1041,28 @@ impl ChatManager {
             .expect("sessions lock")
             .get(id)
             .map(|s| s.info.lock().expect("info lock").clone())
+    }
+
+    /// Conservative lifetime evidence, including an accepted Send not yet
+    /// echoed into the journal. Never cleared when delivery releases its quota.
+    pub fn has_submitted_input(&self, id: &str) -> bool {
+        self.get_session(id).map_or(true, |session| {
+            session
+                .command_budget
+                .lock()
+                .expect("command budget lock")
+                .submitted_input
+        })
+    }
+
+    /// Coherent lifecycle evidence: carryover and any input still queued or
+    /// delivered before TurnStarted. Never interprets released memory quota as
+    /// proof that the corresponding turn has finished.
+    pub fn input_activity(&self, id: &str) -> Option<(Carryover, bool)> {
+        let session = self.get_session(id).ok()?;
+        let budget = session.command_budget.lock().expect("command budget lock");
+        let carry = session.carryover.lock().expect("carryover lock").clone();
+        Some((carry, budget.sends != 0 || budget.awaiting_turn))
     }
 
     /// The live process's [`Carryover`] — what a restart would cut off.
@@ -1084,6 +1171,63 @@ mod tests {
             remote_control_url: None,
             background_running: 0,
         }
+    }
+
+    #[test]
+    fn submitted_input_evidence_survives_queue_release_and_exit() {
+        let mut budget = CommandBudget::default();
+        assert!(!budget.submitted_input);
+        let token = budget.reserve(1, None).unwrap();
+        budget.release_unassigned(token);
+        assert_eq!(budget.sends, 0);
+        assert!(budget.submitted_input);
+        budget.clear();
+        assert!(budget.submitted_input);
+    }
+
+    #[test]
+    fn delivered_input_stays_busy_before_turn_started_without_holding_quota() {
+        let mut budget = CommandBudget::default();
+        budget.reserve(1, None).unwrap();
+        budget.observe(&mut AgentEvent::UserMessage {
+            text: "work".into(),
+            attachments: 0,
+            attachment_paths: vec![],
+            id: Some("u".into()),
+            queued: false,
+            origin: None,
+        });
+        assert_eq!(budget.sends, 0);
+        assert!(budget.awaiting_turn);
+        budget.observe(&mut AgentEvent::TurnStarted {
+            turn_id: "t".into(),
+        });
+        assert!(!budget.awaiting_turn); // carryover is now active under the same lock.
+        budget.reserve(1, None).unwrap();
+        budget.observe(&mut AgentEvent::UserMessage {
+            text: "queued".into(),
+            attachments: 0,
+            attachment_paths: vec![],
+            id: Some("q".into()),
+            queued: true,
+            origin: None,
+        });
+        budget.observe(&mut AgentEvent::TurnCompleted {
+            turn_id: "t".into(),
+            usage: model::Usage::default(),
+        });
+        assert_eq!(budget.sends, 1);
+        budget.observe(&mut AgentEvent::UserMessageUpdate {
+            id: "q".into(),
+            state: model::UserMessageState::Sent,
+        });
+        assert!(budget.awaiting_turn);
+        budget.observe(&mut AgentEvent::TurnAborted {
+            turn_id: "t2".into(),
+            reason: "interrupted".into(),
+            interrupted: true,
+        });
+        assert!(!budget.awaiting_turn);
     }
 
     #[test]

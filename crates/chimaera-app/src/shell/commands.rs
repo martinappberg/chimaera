@@ -1,5 +1,5 @@
 //! The IPC command surface the daemon-served UI calls
-//! (`web-ui/src/lib/native.ts` is the other half of this contract — change
+//! (`web-ui/src/lib/net/native.ts` is the other half of this contract — change
 //! command and event names in lockstep). Thin delegators over the connect
 //! flight state machine and the window/tunnel state.
 
@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::Duration;
 
-use chimaera_link::protocol::HostKind;
+use chimaera_link::{Host, HostKind};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -77,6 +77,17 @@ fn report_can_reclaim_local_home(alias: &Option<String>, ws: &Option<String>) ->
     alias.is_none() && ws.is_none()
 }
 
+// The physical device already has the local-workspaces section. Compare its
+// authenticated daemon identity, never a user-editable alias or an opaque id.
+fn visible_machine(host: &Host, local_token: &str) -> bool {
+    host.kind != HostKind::Worker
+        && !(host.kind == HostKind::Device
+            && host
+                .daemon
+                .as_ref()
+                .is_some_and(|daemon| daemon.token == local_token))
+}
+
 #[tauri::command]
 pub(super) async fn list_hosts(state: State<'_, Shell>) -> Result<Vec<HostState>, String> {
     tracing::debug!("ipc: list_hosts");
@@ -85,6 +96,7 @@ pub(super) async fn list_hosts(state: State<'_, Shell>) -> Result<Vec<HostState>
     let connecting: HashSet<String> = lock(&state.connecting).keys().cloned().collect();
     let unhealthy = lock(&state.unhealthy_tunnels).clone();
     let keeper = lock(&state.pro.hosts).clone();
+    let local_token = lock(&state.local).token.clone();
     let mut out: Vec<_> = hosts
         .iter()
         // Managed workers are placement infrastructure, never remote-machine
@@ -92,7 +104,7 @@ pub(super) async fn list_hosts(state: State<'_, Shell>) -> Result<Vec<HostState>
         .filter(|h| {
             !keeper
                 .values()
-                .any(|host| host.alias == h.alias && host.kind == HostKind::Worker)
+                .any(|host| host.alias == h.alias && !visible_machine(host, &local_token))
         })
         .map(|h| {
             if let Some(host) = keeper.values().find(|host| host.alias == h.alias) {
@@ -115,7 +127,10 @@ pub(super) async fn list_hosts(state: State<'_, Shell>) -> Result<Vec<HostState>
             }
         })
         .collect();
-    for host in keeper.values().filter(|host| host.kind != HostKind::Worker) {
+    for host in keeper
+        .values()
+        .filter(|host| visible_machine(host, &local_token))
+    {
         if !hosts.iter().any(|entry| entry.alias == host.alias) {
             out.push(super::connect::keeper_state(
                 host,

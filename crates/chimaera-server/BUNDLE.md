@@ -33,6 +33,19 @@ The internal export API returns a temporary file owned by its caller, which
 must unlink it after consumption. HTTP responses unlink the backing file as soon
 as the streaming reader owns it. Neither route buffers the whole ZIP in RAM.
 
+Automatic workspace mirrors have a narrower empty-chat exception than these
+explicit export routes. If native history is missing, the mirror can omit a live
+unstarted structured Claude chat only with a complete startup-only journal (from seq 1,
+at most 256 events / 256 KiB), no resumed/forked context, no submitted input, and
+no active or background work. Accepted input is remembered before its journal
+echo, so a just-submitted turn cannot qualify. Snapshots leave the source live.
+Clean handoff atomically pauses command ingress before proving emptiness, then
+durably suspends its ledger entry and stops its process; local ownership return
+restores the same session with a fresh empty CLI. Failed or canceled proofs
+restore ingress, and late sends receive an explicit paused error. Codex native
+history remains strict because its restore path requires an existing thread.
+Missing, truncated, corrupt or meaningful history is still a transfer error.
+
 ## Archive format
 
 ZIP members use stored compression, regular-file permissions 0600, and exact
