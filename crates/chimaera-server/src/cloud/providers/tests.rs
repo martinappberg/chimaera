@@ -183,3 +183,48 @@ fn every_auth_adapter_uses_the_shared_provider_catalog() {
         assert!(!status.methods.is_empty());
     }
 }
+
+#[tokio::test]
+async fn prompt_observations_are_passive_catalog_scoped_and_expire() {
+    let (root, state) = fixture("prompt-observations");
+    let absent = cached_observations(&state);
+    assert_eq!(absent.len(), PROVIDERS.len());
+    assert!(absent
+        .iter()
+        .all(|p| p.state == ProviderState::Unknown && p.installed.is_none()));
+    let mut connected = ProviderStatus::new("claude");
+    connected.installed = Some(true);
+    connected.state = ProviderState::SignedIn;
+    connected.label = "private-host".into();
+    connected.reason = Some("private diagnostic".into());
+    {
+        let mut cache = crate::lock(&state.cloud_providers.cache);
+        cache.insert("claude".into(), (Instant::now(), connected.clone()));
+        cache.insert(
+            "codex".into(),
+            (Instant::now() - Duration::from_secs(31), connected.clone()),
+        );
+        cache.insert("unsupported".into(), (Instant::now(), connected));
+    }
+    let observed = cached_observations(&state);
+    assert_eq!(
+        observed.iter().find(|p| p.id == "claude").unwrap().state,
+        ProviderState::SignedIn
+    );
+    assert_eq!(
+        observed.iter().find(|p| p.id == "codex").unwrap().state,
+        ProviderState::Unknown
+    );
+    assert!(observed
+        .iter()
+        .all(|p| p.id != "unsupported" && p.label != "private-host" && p.reason.is_none()));
+    assert!(state.sessions.list().is_empty() && state.chat.list().is_empty());
+    assert!(crate::lock(&state.cloud_providers.connections).is_empty());
+    assert_eq!(
+        crate::lock(&state.cloud_providers.cache).len(),
+        3,
+        "reads do not mutate or probe"
+    );
+    drop(state);
+    std::fs::remove_dir_all(root).unwrap();
+}

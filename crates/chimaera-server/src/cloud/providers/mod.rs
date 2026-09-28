@@ -233,6 +233,43 @@ async fn probe(state: &Arc<AppState>, id: &str) -> ProviderStatus {
     }
     status
 }
+/// Prompt context must never turn a read into authentication or a CLI probe.
+/// Expired, absent, concurrently changed and disconnecting states are unknown.
+pub(crate) fn cached_observations(state: &AppState) -> Vec<ProviderStatus> {
+    let epoch = state.cloud_providers.auth_epoch.load(Ordering::Acquire);
+    let now = Instant::now();
+    let cache = crate::lock(&state.cloud_providers.cache);
+    let mut result: Vec<_> = PROVIDERS
+        .iter()
+        .map(|definition| {
+            let mut observation = ProviderStatus::new(definition.id);
+            if let Some((_, status)) = cache
+                .get(definition.id)
+                .filter(|(at, _)| *at <= now && now.duration_since(*at) < Duration::from_secs(30))
+            {
+                observation.installed = status.installed;
+                observation.state =
+                    if status.state == ProviderState::SignedIn && status.installed != Some(true) {
+                        ProviderState::Unknown
+                    } else {
+                        status.state
+                    };
+                observation.checked_at = status.checked_at;
+            }
+            observation
+        })
+        .collect();
+    drop(cache);
+    for observation in &mut result {
+        if state.cloud_providers.auth_epoch.load(Ordering::Acquire) != epoch
+            || connect::disconnecting(state, &observation.id)
+        {
+            *observation = ProviderStatus::new(&observation.id);
+        }
+    }
+    result
+}
+
 /// Shared by onboarding and staged handoff. This NEVER installs or signs in.
 /// Unknown future IDs fail closed; they are not treated as shell sessions.
 pub(crate) async fn readiness(
