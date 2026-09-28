@@ -173,7 +173,7 @@ async fn passive_discovery_then_explicit_real_git_adoption_preserves_roots_and_r
         requests: Mutex::new(Vec::new()),
         handoffs: AtomicUsize::new(0),
         acquires: AtomicUsize::new(0),
-        holder: Mutex::new(Some("worker-1".into())),
+        holder: Mutex::new(Some("1".into())),
         invalidate_on_repository_fetch: Mutex::new(None),
     });
     let router = Router::new()
@@ -306,7 +306,7 @@ async fn passive_discovery_then_explicit_real_git_adoption_preserves_roots_and_r
     assert_eq!(fixture.handoffs.load(Ordering::Relaxed), 1);
     // A second device's explicit choice records a different local root for the
     // same stable workspace identity, without moving the first device's files.
-    *lock(&fixture.holder) = Some("worker-1".into());
+    *lock(&fixture.holder) = Some("1".into());
     let second = state(&root.join("second-laptop"));
     configure(&second, &origin);
     let second_root = root.join("second-choice");
@@ -332,7 +332,7 @@ async fn passive_discovery_then_explicit_real_git_adoption_preserves_roots_and_r
     drop(second);
     // Signing out during the repository network transfer must be observed
     // before git init/ref adoption or any working file installation starts.
-    *lock(&fixture.holder) = Some("worker-1".into());
+    *lock(&fixture.holder) = Some("1".into());
     let canceled = state(&root.join("canceled-device"));
     configure(&canceled, &origin);
     let cancel_root = root.join("cancel-target");
@@ -380,7 +380,7 @@ async fn legacy_pending_registration_is_fenced_until_explicit_folder_choice() {
     lock(&old.workspaces)
         .import_exact(workspace.clone())
         .unwrap();
-    std::fs::write(root.join("daemon/pro/state.json"),serde_json::to_vec(&json!({"ownership":{"w-cloud":{"state":"remote","holder":"worker-1","epoch":3}},"preferences":{},"import_roots":{"w-cloud":target},"projects_root":root.join("legacy-global")})).unwrap()).unwrap();
+    std::fs::write(root.join("daemon/pro/state.json"),serde_json::to_vec(&json!({"ownership":{"w-cloud":{"state":"remote","holder":"1","epoch":3}},"preferences":{},"import_roots":{"w-cloud":target},"projects_root":root.join("legacy-global")})).unwrap()).unwrap();
     drop(old);
     let restored = state(&root.join("daemon"));
     assert!(adoption_pending(&restored, "w-cloud"));
@@ -468,4 +468,109 @@ async fn original_laptop_root_is_bound_to_its_account_before_automatic_return() 
     );
     drop(state);
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn lazy_return_preserves_finished_conversation_through_real_worker_route() {
+    // Agent launch helpers read process-global home paths. Keep this synthetic
+    // CLI and its imported conversation isolated from real provider settings.
+    const CHILD: &str = "CHIMAERA_HANDBACK_IDENTITY_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let root = temp();
+        std::fs::create_dir(root.join("home")).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "pro::projects::tests::lazy_return_preserves_finished_conversation_through_real_worker_route", "--nocapture"])
+            .env(CHILD, "1")
+            .env("CHIMAERA_HOME", root.join("app"))
+            .env("HOME", root.join("home"))
+            .env("SHELL", "/bin/sh")
+            .output().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        use std::os::unix::fs::PermissionsExt;
+        const SESSION: &str = "s-finished";
+        const NATIVE: &str = "11111111-1111-4111-8111-111111111111";
+        let root = PathBuf::from(std::env::var_os("CHIMAERA_HOME").unwrap()).parent().unwrap().to_path_buf();
+        let fixture_root = root.clone();
+        tokio::task::spawn_blocking(move || repositories(&fixture_root)).await.unwrap();
+        let source = root.join("cloud-project");
+        std::fs::create_dir(&source).unwrap();
+        let cloud = state(&root.join("cloud-daemon"));
+        let workspace = crate::workspaces::Workspace { id: "w-cloud".into(), root: source.clone(), name: "Cloud project".into(), last_opened_at: super::super::now(), mastermind: None, plugins_on: Vec::new(), cloud_internal: false };
+        lock(&cloud.workspaces).import_exact(workspace.clone()).unwrap();
+        let native = cloud.claude_projects_dir.join(crate::launcher::encode_cwd(&source)).join(format!("{NATIVE}.jsonl"));
+        std::fs::create_dir_all(native.parent().unwrap()).unwrap();
+        let native_bytes = format!("{{\"sessionId\":\"{NATIVE}\",\"type\":\"assistant\",\"message\":{{\"content\":\"Finished the requested work.\"}}}}\n");
+        std::fs::write(&native, &native_bytes).unwrap();
+        let journal = format!("{}\n", serde_json::to_string(&chimaera_agent::journal::SeqEvent { seq: 17, ts: 123, ev: chimaera_agent::model::AgentEvent::Notice { text: "Completed conversation remains here".into() } }).unwrap());
+        std::fs::create_dir_all(cloud.chat.journal_dir()).unwrap();
+        std::fs::write(cloud.chat.journal_dir().join(format!("{SESSION}.jsonl")), &journal).unwrap();
+        crate::ledger::defer(&cloud, crate::ledger::LedgerEntry {
+            id: SESSION.into(), workspace_id: "w-cloud".into(), cwd: source, suspended: true, handoff: None, pinned_name: Some("Finished task".into()), cols: 80, rows: 24, theme: "dark".into(), created_at: 123,
+            agent: Some(crate::ledger::LedgerAgent { kind: crate::agents::AgentKind::Claude, resume: Some(NATIVE.into()), transcript: None, native_cwd: None, title: "Finished task".into(), ui: chimaera_agent::model::SessionUi::Chat, model: None, carryover: Some(chimaera_agent::Carryover::default()) }),
+        }).unwrap();
+        let archive = crate::bundle::export(cloud.clone(), SESSION, crate::bundle::ExportMode::Snapshot).await.unwrap();
+        let repository = root.join("source");
+        std::fs::create_dir(repository.join("bundles")).unwrap();
+        std::fs::rename(archive, repository.join(format!("bundles/{SESSION}.zip"))).unwrap();
+        let manifest_path = repository.join("manifest.json");
+        let mut manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["sessions"] = json!([{"id": SESSION, "archive": format!("bundles/{SESSION}.zip")}]);
+        std::fs::write(manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let update = root.clone();
+        tokio::task::spawn_blocking(move || {
+            git(&update.join("source"), &["add", "."]);
+            git(&update.join("source"), &["commit", "-qm", "finished conversation"]);
+            git(&update.join("working-tree.git"), &["fetch", "--quiet", update.join("source").to_str().unwrap(), "+refs/heads/handoff:refs/heads/handoff"]);
+            git(&update.join("working-tree.git"), &["update-server-info"]);
+        }).await.unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let fixture = Arc::new(Fixture { root: root.clone(), origin: origin.clone(), requests: Mutex::new(Vec::new()), handoffs: AtomicUsize::new(0), acquires: AtomicUsize::new(0), holder: Mutex::new(Some("1".into())), invalidate_on_repository_fetch: Mutex::new(None) });
+        let router = Router::new().fallback(any(respond)).with_state(fixture.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let laptop = state(&root.join("laptop"));
+        configure(&laptop, &origin);
+        let destination = root.join("original-project");
+        std::fs::create_dir(&destination).unwrap();
+        lock(&laptop.workspaces).import_exact(crate::workspaces::Workspace { root: destination.clone(), ..workspace }).unwrap();
+        lock(&laptop.pro.ownership).insert("w-cloud".into(), super::super::Ownership::Remote { epoch: 3, holder: "1".into() });
+        laptop.pro.power_suitable.store(true, Ordering::Release);
+        laptop.pro.awake_since.store(super::super::now().saturating_sub(301), Ordering::Release);
+        let script = root.join("claude-fixture");
+        let inputs = root.join("received.jsonl");
+        std::fs::write(&script, format!("#!/bin/sh\nprintf '%s\\n' '{{\"type\":\"control_response\",\"response\":{{\"subtype\":\"success\",\"request_id\":\"init\",\"response\":{{\"commands\":[]}}}}}}'\nprintf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"{NATIVE}\",\"model\":\"fixture-model\",\"permissionMode\":\"default\"}}'\ncat > '{}'\n", inputs.display())).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        lock(&laptop.agent_bins).insert(crate::agents::AgentKind::Claude, crate::launcher::AgentDetection { path: Ok(script), version: Some("2.1.283".into()), managed: false, explicit: true, mtime: None });
+        let config = lock(&laptop.pro.runtime).clone().unwrap();
+        engine::lazy_handback(&laptop, &config).await.unwrap();
+        assert_eq!(fixture.handoffs.load(Ordering::Relaxed), 1, "raw baton holder must resolve to the full keeper route ID");
+        assert_eq!(fixture.acquires.load(Ordering::Relaxed), 1);
+        assert_eq!(super::super::owned_epoch(&laptop, "w-cloud"), Some(3));
+        assert!(lock(&fixture.requests).iter().any(|path| path == "POST /v1/hosts/worker-1/http/api/v1/pro/handoff"));
+        assert_eq!(std::fs::read_to_string(destination.join("project.txt")).unwrap(), "cloud source\n");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !laptop.chat.get(SESSION).is_some_and(|chat| chat.alive && chat.native_session_id.as_deref() == Some(NATIVE)) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.unwrap();
+        assert_eq!(lock(&laptop.session_workspaces).get(SESSION).map(String::as_str), Some("w-cloud"));
+        assert_eq!(lock(&laptop.agents).get(SESSION).unwrap().state, crate::agent_state::AgentState::Finished);
+        assert!(std::fs::read_to_string(laptop.chat.journal_dir().join(format!("{SESSION}.jsonl"))).unwrap().contains("Completed conversation remains here"));
+        assert_eq!(std::fs::read_to_string(laptop.claude_projects_dir.join(crate::launcher::encode_cwd(&destination)).join(format!("{NATIVE}.jsonl"))).unwrap(), native_bytes);
+        let recorded = std::fs::read_to_string(&inputs).unwrap_or_default();
+        assert!(!recorded.lines().filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok()).any(|frame| frame["type"] == "user"), "finished conversation must not receive a new model turn");
+        laptop.stopping.store(true, Ordering::Relaxed);
+        laptop.chat.kill(SESSION);
+        server.abort();
+        let _ = server.await;
+    });
 }

@@ -979,10 +979,7 @@ pub(super) async fn lazy_handback(state: &Arc<AppState>, config: &Configure) -> 
             continue;
         }
         let Some(host) = hosts.iter().find(|host| {
-            host.id == holder
-                && super::valid_id(&host.id)
-                && host.kind == "worker"
-                && host.status == "connected"
+            host.worker_holder() == Some(holder.as_str()) && host.status == "connected"
         }) else {
             continue;
         };

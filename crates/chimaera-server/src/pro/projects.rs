@@ -574,7 +574,7 @@ async fn open(state: &Arc<AppState>, request: Open) -> Result<serde_json::Value>
             .as_ref()
             .context("The cloud project is unavailable; try again when it reconnects")?;
         ensure!(
-            holder == project.host_id,
+            super::protocol::worker_holder_id(&project.host_id) == Some(holder),
             "This project is currently open on another device"
         );
         let response = transport::request(

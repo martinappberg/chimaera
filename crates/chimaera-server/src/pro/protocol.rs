@@ -62,3 +62,52 @@ pub(crate) enum Role {
     Device,
     Worker,
 }
+
+/// Keeper transport addresses workers by a prefixed host ID; account ownership
+/// uses the raw registered worker ID. Never apply this to device/SSH rows.
+pub(super) fn worker_holder_id(host_id: &str) -> Option<&str> {
+    if !super::valid_id(host_id) {
+        return None;
+    }
+    host_id
+        .strip_prefix("worker-")
+        .filter(|holder| super::valid_id(holder))
+}
+impl Host {
+    pub(super) fn worker_holder(&self) -> Option<&str> {
+        (self.kind == "worker")
+            .then(|| worker_holder_id(&self.id))
+            .flatten()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn worker_identity_translation_is_typed_exact_and_bounded() {
+        let mut host: Host = serde_json::from_value(
+            serde_json::json!({"id":"worker-873107b04056d8","kind":"worker","status":"connected"}),
+        )
+        .unwrap();
+        assert_eq!(host.worker_holder(), Some("873107b04056d8"));
+        for kind in ["device", "ssh", "future"] {
+            host.kind = kind.into();
+            assert!(host.worker_holder().is_none());
+        }
+        for id in [
+            "",
+            "worker-",
+            "873107b04056d8",
+            "prefix-worker-873107b04056d8",
+            "worker-873107b04056d8/other",
+        ] {
+            assert!(worker_holder_id(id).is_none());
+        }
+        assert!(worker_holder_id(&format!("worker-{}", "x".repeat(128))).is_none());
+        assert_ne!(
+            worker_holder_id("worker-worker-873107b04056d8"),
+            Some("873107b04056d8")
+        );
+    }
+}

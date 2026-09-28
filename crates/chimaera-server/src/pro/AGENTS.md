@@ -13,7 +13,7 @@ revocable delegation over the authenticated local API.
 | `engine.rs` | Independent lease renewal, mirror coordinator, transactional hydration, profile execution and lazy return. |
 | `release.rs` | Bounded clean-release retry for the account publication fence; changed ownership, account or lease never retries. |
 | `provider_gate.rs` / `provider_tests.rs` | Per-agent cloud readiness, bounded blocked-provider status, and staged retry/cancellation tests with a synthetic CLI and real PTY. |
-| `protocol.rs` | Additive account contract subset; intentionally no link/TLS dependency in the daemon. |
+| `protocol.rs` | Additive account contract subset and strict worker host-to-holder identity translation; intentionally no link/TLS dependency in the daemon. |
 | `transport.rs` | Bounded external curl/git children; cached mirror-only Git compatibility selection; credentials only in memory, never argv or Git config. |
 | `policy.rs` | Mirrored-path policy, credential filtering, size budgets and cloud-profile classification. |
 | `mirror.rs` | Separate shadow and repository Git directories, incremental transfer and conservative hand-back. |
@@ -91,7 +91,11 @@ pending-ID fences, never to permission to import. A partially registered legacy
 project needs explicit selection of its original folder before recovery.
 
 Normal lazy return only handles registered projects without a pending adoption.
-Existing laptop projects retain their original roots. Hydration checks account
+Existing laptop projects retain their original roots. Worker hand-back and explicit
+adoption compare the raw account holder against the typed keeper worker identity
+(`worker-{holder}`), while requests retain the complete route ID. A real-Git
+regression returns a completed synthetic conversation through that route, retaining
+its session/native identity and history without starting a new model turn. Hydration checks account
 generation at ownership, filesystem and session-install boundaries; signing out
 cannot finish an old transfer as a fresh local ownership grant. HTTP transfer is
 bounded to nineteen minutes. Cancellation can leave a persisted Hydrating fence
