@@ -173,20 +173,28 @@ pub(crate) fn load_version(dir: &Path, id: &str, version: &str) -> Result<Manife
     Ok(m)
 }
 
-/// Decide `first_party`, `verified` and the checksum fault for a copy whose
-/// component `m.wasm` holds and whose `plugin.toml` hashes to `toml_sha256`,
-/// against the `SHA256SUMS` kept beside them (`None`: there is none).
-fn check_files(m: &mut Manifest, toml_sha256: &str, sums: Option<&[u8]>, source: Option<&str>) {
-    let lock = super::lock_entry(&m.id);
-    let first_party = lock.is_some_and(|l| {
+/// Whether a copy of `m` (its files hashing to these) is the first-party
+/// plugin the lock names: its id, released from the lock's repository, and
+/// either installed from there (`source`, the release marker) or byte for
+/// byte the pinned release.
+fn first_party(m: &Manifest, wasm_sha256: &str, toml_sha256: &str, source: Option<&str>) -> bool {
+    super::lock_entry(&m.id).is_some_and(|l| {
         m.release
             .as_ref()
             .is_some_and(|r| r.github.eq_ignore_ascii_case(&l.repo))
             && (source.is_some_and(|s| s.eq_ignore_ascii_case(&l.repo))
                 || (m.version == l.version
-                    && *m.wasm.sha256 == l.sha256_wasm
+                    && wasm_sha256 == l.sha256_wasm
                     && toml_sha256 == l.sha256_toml))
-    });
+    })
+}
+
+/// Decide `first_party`, `verified` and the checksum fault for a copy whose
+/// component `m.wasm` holds and whose `plugin.toml` hashes to `toml_sha256`,
+/// against the `SHA256SUMS` kept beside them (`None`: there is none).
+fn check_files(m: &mut Manifest, toml_sha256: &str, sums: Option<&[u8]>, source: Option<&str>) {
+    let lock = super::lock_entry(&m.id);
+    let first_party = first_party(m, &m.wasm.sha256, toml_sha256, source);
     let mut verified = false;
     if let Some(sums) = sums {
         let sums = releases::parse_sums(&String::from_utf8_lossy(sums));
@@ -736,9 +744,10 @@ async fn install_path(state: &Arc<AppState>, src: PathBuf) -> Result<Installed, 
         Ok((m, files, src))
     })
     .await?;
-    // A local build is never first-party (`first_party` needs the release
-    // marker only a release install writes).
-    fresh_switches(state, &m.id, false).await?;
+    // A local build is first-party only as the pinned release's exact bytes
+    // (no release marker is written for it).
+    let pinned = first_party(&m, &files.wasm_sha256, &files.toml_sha256, None);
+    fresh_switches(state, &m.id, pinned).await?;
     let from = src.clone();
     let done = blocking(move || {
         let dir = root.join(&m.id);
