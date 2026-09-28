@@ -100,6 +100,7 @@ async fn agent_plugin_install_keeps_success_and_failure_until_acknowledged() {
 #[test]
 fn agent_plugin_install_treats_names_as_data() {
     let root = test_dir("plugin-install-quoting");
+    let completion = root.join("completion");
     let name = "Mycelium's $(touch injected) `touch injected-too`";
     let output = std::process::Command::new("/bin/bash")
         .args([
@@ -112,7 +113,7 @@ fn agent_plugin_install_treats_names_as_data() {
             "arjunrajlaboratory/mycelium",
             "mycelium@mycelium",
             "install",
-            "Plugin installation finished",
+            completion.to_str().unwrap(),
         ])
         .current_dir(&root)
         .stdin(std::process::Stdio::null())
@@ -124,8 +125,89 @@ fn agent_plugin_install_treats_names_as_data() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains(name));
+    assert_eq!(std::fs::read(&completion).unwrap(), b"1");
     assert!(!root.join("injected").exists());
     assert!(!root.join("injected-too").exists());
+}
+
+/// A CLI (or a manifest name echoed by the installer) can set any terminal
+/// title. It must not retire the completion watcher before the install ends.
+#[tokio::test]
+async fn agent_plugin_install_ignores_forged_completion_title() {
+    use crate::agents::AgentKind;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::Duration;
+
+    let state = test_state();
+    install_first_party(&state, "mycelium").await;
+    let ws = make_workspace(&state, "plugin-install-forged-title").await;
+    let root = root_of(&state, &ws);
+    let bin = root.join("claude");
+    std::fs::write(
+        &bin,
+        r#"#!/bin/bash
+cd -- "${0%/*}" || exit 1
+case "$2" in
+    list) printf 'probe\n' >> probes; printf '[]\n';;
+    install)
+        printf '\033]2;Plugin installation finished\007'
+        while [ ! -f release-install ]; do sleep 0.05; done
+        ;;
+esac
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+    preset_agent(&state, AgentKind::Claude, Ok(bin), Some("test"));
+    preset_agent(
+        &state,
+        AgentKind::Codex,
+        Err("test: unavailable".into()),
+        None,
+    );
+    let report_url = format!("/api/v1/workspaces/{ws}/agent-plugins");
+    let (status, _) = request(&state, Method::GET, &report_url, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let probe_calls = || std::fs::read_to_string(root.join("probes")).unwrap();
+    assert_eq!(probe_calls(), "probe\n");
+
+    let (status, result) = request(
+        &state,
+        Method::POST,
+        &format!("/api/v1/workspaces/{ws}/plugins/mycelium/install"),
+        Some(serde_json::json!({"agent": "claude"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    let sid = result["session_id"].as_str().unwrap();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while state.sessions.get(sid).unwrap().title.as_deref()
+            != Some("Plugin installation finished")
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    // Cross the watcher's two-second poll while the real install is blocked.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    request(&state, Method::GET, &report_url, None).await;
+    assert_eq!(probe_calls(), "probe\n", "title must not invalidate probes");
+
+    std::fs::write(root.join("release-install"), "").unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            request(&state, Method::GET, &report_url, None).await;
+            if probe_calls() == "probe\nprobe\n" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("completion did not invalidate probes before terminal dismissal");
+    assert!(state.sessions.get(sid).is_some());
+    state.sessions.kill(sid).unwrap();
 }
 
 async fn tools(state: &Arc<AppState>, sid: &str, key: &str) -> Vec<String> {

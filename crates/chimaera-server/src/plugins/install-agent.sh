@@ -7,7 +7,7 @@ agent_bin=$3
 marketplace=$4
 plugin_id=$5
 install_verb=$6
-finished_title=$7
+completion_file=$7
 
 finish() {
     install_status=$?
@@ -19,12 +19,16 @@ finish() {
     else
         printf 'Install failed (exit %s). Review the output above, then retry from Extensions.\n' "$install_status"
     fi
-    # The daemon can refresh plugin probes before this terminal is closed.
-    printf '\033]2;%s\007' "$finished_title"
     # Ordinary PTYs disappear on exit. Keep this operation's result visible
     # until acknowledged, including failures that finish before UI attachment.
     if [ -t 0 ]; then
         printf '\nPress Enter to close this terminal.'
+    fi
+    # The title is presentation only. Probe invalidation uses a private file,
+    # because plugin names and CLI output can contain arbitrary OSC sequences.
+    printf '\033]2;Plugin installation finished\007'
+    printf '1' > "$completion_file"
+    if [ -t 0 ]; then
         IFS= read -r acknowledgement
     fi
     exit "$install_status"

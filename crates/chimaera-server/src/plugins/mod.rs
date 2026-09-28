@@ -58,8 +58,6 @@ pub(crate) mod releases;
 pub(crate) mod runtime;
 pub(crate) mod tools;
 
-const INSTALL_FINISHED_TITLE: &str = "Plugin installation finished";
-
 /// How long a workspace's detect result is trusted before a re-stat.
 const DETECT_TTL: Duration = Duration::from_secs(30);
 
@@ -1240,6 +1238,27 @@ pub(crate) async fn install_requirement(
         "install"
     };
     let agent = kind.as_str();
+    // Keep completion out of the untrusted PTY stream. The runtime directory
+    // is private and the random, exclusively created marker is one byte at most.
+    let completion = match tokio::task::spawn_blocking(|| {
+        let path = chimaera_core::runtime_dir().join(format!(
+            "plugin-install-{}",
+            chimaera_core::generate_token()
+        ));
+        std::fs::File::create_new(&path).map(|_| path)
+    })
+    .await
+    {
+        Ok(Ok(path)) => path,
+        err => {
+            tracing::warn!(?err, "could not prepare plugin install completion marker");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "could not prepare plugin installation"})),
+            )
+                .into_response();
+        }
+    };
     let session_id = crate::agents::fresh_session_id();
     let env = crate::api::session_env(&state, &session_id, "dark", None);
     let env_remove = crate::api::spawn_env_remove(&env);
@@ -1266,7 +1285,7 @@ pub(crate) async fn install_requirement(
                 req.marketplace.clone(),
                 req.id.clone(),
                 install_verb.to_string(),
-                INSTALL_FINISHED_TITLE.to_string(),
+                completion.to_string_lossy().into_owned(),
             ],
         )),
         id: Some(session_id.clone()),
@@ -1281,13 +1300,16 @@ pub(crate) async fn install_requirement(
             let watch_state = state.clone();
             let sid = info.id.clone();
             tokio::spawn(async move {
-                while watch_state
-                    .sessions
-                    .get(&sid)
-                    .is_some_and(|s| s.title.as_deref() != Some(INSTALL_FINISHED_TITLE))
-                {
+                while watch_state.sessions.get(&sid).is_some() {
+                    if tokio::fs::metadata(&completion)
+                        .await
+                        .is_ok_and(|metadata| metadata.len() > 0)
+                    {
+                        break;
+                    }
                     tokio::time::sleep(Duration::from_secs(2)).await;
                 }
+                let _ = tokio::fs::remove_file(&completion).await;
                 watch_state.probes.invalidate();
                 watch_state.changes.notify_waiters();
             });
@@ -1295,11 +1317,14 @@ pub(crate) async fn install_requirement(
             state.changes.notify_waiters();
             Json(json!({"session_id": info.id})).into_response()
         }
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": err.to_string()})),
-        )
-            .into_response(),
+        Err(err) => {
+            let _ = tokio::fs::remove_file(&completion).await;
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": err.to_string()})),
+            )
+                .into_response()
+        }
     }
 }
 
