@@ -43,6 +43,7 @@
   import ArtifactGallery from "./ArtifactGallery.svelte";
   import { EmbedResolver } from "./embeds";
   import { HoverTargets } from "./hoverTargets";
+  import { resolveTargets } from "../shared/embed/embed";
   import { HoverPreviews } from "../previews/doc/hoverController.svelte";
   import PermissionCard from "./PermissionCard.svelte";
   import PlanApprovalCard from "./PlanApprovalCard.svelte";
@@ -1447,7 +1448,14 @@
         const ctx = untrack(() => linkContext());
         return { wsRoot: ctx.root, workspaceId: ctx.workspaceId };
       },
-      ask: (ref) => proseEmbeds.resolve(ref.target),
+      // Asked fresh, not through proseEmbeds (whose hits stand 30 s): a
+      // preview shows the file as it is now, and the agent may just have
+      // rewritten it. The chat's targets are absolute paths.
+      ask: (ref) =>
+        resolveTargets([ref.target], "/").then(
+          (r) => r[ref.target] ?? null,
+          () => null,
+        ),
       theme: () => untrack(() => activeTheme().kind),
       fontSize: () => untrack(() => chatFontSize),
       targetOf: (el) => hoverTargets.targetOf(el),

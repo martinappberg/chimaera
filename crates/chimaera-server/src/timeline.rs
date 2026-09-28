@@ -615,13 +615,13 @@ pub(crate) fn headline(text: &str) -> Option<String> {
             in_fence = !in_fence;
             continue;
         }
-        // An embed on a line of its own (`![umap](figs/umap.png)`) is a
-        // picture or a document chip in the chat, not a sentence.
+        // Embeds on a line of their own (`![umap](figs/umap.png)`) are
+        // pictures or document chips in the chat, not a sentence.
         if in_fence
             || line.is_empty()
             || line.starts_with('#')
             || line.starts_with('|')
-            || line.starts_with("![")
+            || embeds_only(line)
         {
             continue;
         }
@@ -633,6 +633,25 @@ pub(crate) fn headline(text: &str) -> Option<String> {
         return Some(cap(&first_sentence(plain), RESULT_MAX));
     }
     None
+}
+
+/// Whether `line` is nothing but markdown embeds (`![a](x.png) ![b](y.md)`).
+fn embeds_only(line: &str) -> bool {
+    let mut rest = line.trim();
+    if !rest.starts_with("![") {
+        return false;
+    }
+    while let Some(after) = rest.strip_prefix("![") {
+        let Some(close) = after.find("](") else {
+            return false;
+        };
+        let target = &after[close + 2..];
+        let Some(end) = target.find(')') else {
+            return false;
+        };
+        rest = target[end + 1..].trim_start();
+    }
+    rest.is_empty()
 }
 
 fn strip_block_marker(line: &str) -> &str {
@@ -656,14 +675,17 @@ fn strip_block_marker(line: &str) -> &str {
 fn strip_inline_markdown(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
     let mut chars = line.chars().peekable();
+    // A `!` right before `[`: an embed's, unless the brackets turn out not
+    // to be a link (then it was the sentence's own and is put back).
+    let mut bang = false;
     while let Some(c) = chars.next() {
+        let after_bang = std::mem::take(&mut bang);
         match c {
             '*' | '_' if chars.peek() == Some(&c) => {
                 chars.next();
             }
             '`' => {}
-            // `![alt](url)` reads as its alt text, like a link.
-            '!' if chars.peek() == Some(&'[') => {}
+            '!' if chars.peek() == Some(&'[') => bang = true,
             '[' => {
                 // [text](url) → text
                 let mut label = String::new();
@@ -675,8 +697,13 @@ fn strip_inline_markdown(line: &str) -> String {
                     }
                     label.push(n);
                 }
+                let link = closed && chars.peek() == Some(&'(');
+                // `![alt](url)` reads as its alt text, like a link.
+                if after_bang && !link {
+                    out.push('!');
+                }
                 out.push_str(&label);
-                if closed && chars.peek() == Some(&'(') {
+                if link {
                     for n in chars.by_ref() {
                         if n == ')' {
                             break;
@@ -949,6 +976,17 @@ mod tests {
             Some("The UMAP shows two clusters.")
         );
         assert_eq!(headline("Updated the plan:\n\n![the plan](plan.md)"), None);
+        assert_eq!(headline("![a](a.png) ![b](b.md)"), None);
+        // An embed that opens a sentence keeps the sentence.
+        assert_eq!(
+            headline("![umap](u.png) The clusters separate on PC1.").as_deref(),
+            Some("umap The clusters separate on PC1.")
+        );
+        // A `!` that is the sentence's own stays.
+        assert_eq!(
+            headline("It works![sic] Really.").as_deref(),
+            Some("It works!sic Really.")
+        );
         assert_eq!(headline(""), None);
     }
 

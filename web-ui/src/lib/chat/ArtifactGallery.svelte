@@ -224,25 +224,21 @@
   }
 </script>
 
-{#snippet tiles(items: Tile[], label: string)}
-  <div class="gallery" role="group" aria-label={label}>
-    {#each items as tile (tile.path)}
-      <div class="tile">
-        <EmbedCard
-          path={tile.path}
-          info={tile.info}
-          compact
-          onOpen={onOpenPath !== undefined ? open : undefined}
-        />
-      </div>
-    {/each}
-  </div>
-{/snippet}
-
 <div class="gallery-host" bind:this={host}>
   {#if visuals.length > 0}
     <div class="label">{heading}</div>
-    {@render tiles(visuals, heading.toLowerCase())}
+    <div class="gallery" role="group" aria-label={heading.toLowerCase()}>
+      {#each visuals as tile (tile.path)}
+        <div class="tile">
+          <EmbedCard
+            path={tile.path}
+            info={tile.info}
+            compact
+            onOpen={onOpenPath !== undefined ? open : undefined}
+          />
+        </div>
+      {/each}
+    </div>
   {/if}
   {#if documents.length > 0}
     <!-- Documents are opened, not stared at: one chip each, the same quiet

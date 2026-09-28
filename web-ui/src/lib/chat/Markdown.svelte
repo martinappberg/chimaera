@@ -67,6 +67,7 @@
   import { refFragment, type HoverTargets } from "./hoverTargets";
   import ProseChip from "./ProseChip.svelte";
   import type { Reveal } from "../shared/reveal";
+  import { openPath } from "../shared/openPath";
 
   interface Props {
     text: string;
@@ -138,7 +139,7 @@
       .map((img) => img.getAttribute("data-md-embed") ?? "")
       .filter(embedsAsChip)
       .map((t) => safeDecodeUri(splitTarget(t).path));
-    const labels = chipLabels(chipPaths);
+    const labels = chipLabels([...new Set(chipPaths)]);
     for (const img of imgs) {
       const target = img.getAttribute("data-md-embed") ?? "";
       const { alt, width } = parseSizeHint(img.getAttribute("alt") ?? "");
@@ -161,7 +162,8 @@
         continue;
       }
       if (chip) {
-        const open = onOpenPath;
+        // Without the chat's opener, the workbench's (an embed card's default).
+        const open: OpenPathFn = onOpenPath ?? openPath;
         const mounted = mount(ProseChip, {
           target: slot,
           props: {
@@ -170,12 +172,8 @@
             fragment,
             alt,
             ...(resolver !== undefined ? { resolve: () => resolver.resolve(target) } : {}),
-            ...(open !== undefined
-              ? {
-                  onOpen: (p: string, reveal: Reveal | undefined, e: MouseEvent) =>
-                    open(p, "file", { split: e.metaKey || e.ctrlKey, ...(reveal !== undefined ? { reveal } : {}) }),
-                }
-              : {}),
+            onOpen: (p: string, reveal: Reveal | undefined, e: MouseEvent) =>
+              open(p, "file", { split: e.metaKey || e.ctrlKey, ...(reveal !== undefined ? { reveal } : {}) }),
             ...(hoverTargets !== undefined ? { hoverTargets } : {}),
           },
         });

@@ -106,7 +106,9 @@ interface Candidate {
   key: unknown;
   target: HoverTarget;
   note?: string;
-  rect: DOMRect;
+  /** Where it is, measured when the preview opens (not per pointermove:
+   *  that would force a layout on every move over a streaming reply). */
+  rect: () => DOMRect;
   via: "pointer" | "key";
 }
 
@@ -149,6 +151,15 @@ function sourceLinkAt(view: EditorView, pos: number): { href: string; byName: bo
   return null;
 }
 
+/** An element's padding box, in viewport coordinates: what an absolutely
+ *  positioned child is placed against (its border box is `getBoundingClientRect`). */
+function paddingBox(el: HTMLElement): { left: number; top: number; right: number; bottom: number } {
+  const b = el.getBoundingClientRect();
+  const left = b.left + el.clientLeft;
+  const top = b.top + el.clientTop;
+  return { left, top, right: left + el.clientWidth, bottom: top + el.clientHeight };
+}
+
 /** The rect of `el` the point sits in (a wrapped link has several). */
 function rectNear(el: Element, x: number | null, y: number | null): DOMRect {
   const rects = Array.from(el.getClientRects());
@@ -183,9 +194,10 @@ export class HoverPreviews {
       if (this.shown?.c.via === "pointer") this.scheduleHide();
     });
     on(root, "keydown", (e) => this.key(e));
-    // Anything scrolling moves the link out from under the popover.
+    // Anything scrolling moves the link out from under the popover — and
+    // from under a preview still due (it would open where the link was).
     on(root, "scroll", (e) => {
-      if (this.shown !== null && !this.inPopover(e.target)) this.hide();
+      if (!this.inPopover(e.target)) this.hide();
     }, { capture: true, passive: true });
     on(root, "focusout", (e) => {
       if (this.shown?.c.via === "key" && e.target === this.shown.c.key) this.hide();
@@ -209,8 +221,15 @@ export class HoverPreviews {
     this.sources.clear();
   }
 
-  /** Close the popover (a mode switch, a new document). */
+  /** Close the popover and drop a preview still due (a mode switch, a new
+   *  document, a hidden view). */
   hide(): void {
+    this.cancelPending();
+    this.close();
+  }
+
+  /** Close the popover only: a pending preview for another link stays due. */
+  private close(): void {
     if (this.hideTimer !== null) clearTimeout(this.hideTimer);
     this.hideTimer = null;
     const s = this.shown;
@@ -271,7 +290,8 @@ export class HoverPreviews {
     const t = hoverTarget(link.href, link.byName);
     if (t === null) return null;
     const lineHeight = view.defaultLineHeight;
-    return { key, target: t, rect: new DOMRect(x - 4, y - lineHeight / 2, 8, lineHeight), via: "pointer" };
+    const rect = new DOMRect(x - 4, y - lineHeight / 2, 8, lineHeight);
+    return { key, target: t, rect: () => rect, via: "pointer" };
   }
 
   /** An element the host named (or one inside it), as a candidate. */
@@ -283,12 +303,12 @@ export class HoverPreviews {
     for (let n: Element | null = from; n !== null && n !== root; n = n.parentElement) {
       const t = of(n);
       if (t === null) continue;
-      const { x, y } = this.pointer;
+      const el = n;
       return {
-        key: n,
+        key: el,
         target: t.target,
         ...(t.note !== undefined ? { note: t.note } : {}),
-        rect: via === "pointer" ? rectNear(n, x, y) : rectNear(n, null, null),
+        rect: () => this.rectOf(el, via),
         via,
       };
     }
@@ -299,8 +319,12 @@ export class HoverPreviews {
   private linkCandidate(a: HTMLAnchorElement, via: Candidate["via"]): Candidate | null {
     const t = hoverTarget(a.getAttribute("href") ?? "", a.hasAttribute("data-wikilink"));
     if (t === null) return null;
-    const { x, y } = this.pointer;
-    return { key: a, target: t, rect: via === "pointer" ? rectNear(a, x, y) : rectNear(a, null, null), via };
+    return { key: a, target: t, rect: () => this.rectOf(a, via), via };
+  }
+
+  /** The rect of `el` to place against: the one under the pointer. */
+  private rectOf(el: Element, via: Candidate["via"]): DOMRect {
+    return via === "pointer" ? rectNear(el, this.pointer.x, this.pointer.y) : rectNear(el, null, null);
   }
 
   private consider(target: EventTarget | null, mod: boolean): void {
@@ -339,7 +363,7 @@ export class HoverPreviews {
     if (this.hideTimer !== null) return;
     this.hideTimer = setTimeout(() => {
       this.hideTimer = null;
-      this.hide();
+      this.close();
     }, LEAVE_GRACE);
   }
 
@@ -382,7 +406,8 @@ export class HoverPreviews {
     const at = view.coordsAtPos(head);
     const t = link === null ? null : hoverTarget(link.href, link.byName);
     if (link === null || t === null || at === null) return null;
-    return { key: `src:${link.from}:${link.href}`, target: t, rect: new DOMRect(at.left, at.top, 1, at.bottom - at.top), via: "key" };
+    const rect = new DOMRect(at.left, at.top, 1, at.bottom - at.top);
+    return { key: `src:${link.from}:${link.href}`, target: t, rect: () => rect, via: "key" };
   }
 
   private windowKey(e: KeyboardEvent): void {
@@ -413,7 +438,9 @@ export class HoverPreviews {
     // A place in a document drawn by the daemon (too large for the browser)
     // has no text here to draw from.
     if (target.kind === "self" && this.host.text() === null) return;
-    this.hide();
+    // A re-render replaced the link while the preview was due.
+    if (c.key instanceof Element && !c.key.isConnected) return;
+    this.close();
     const layer = this.host.layer?.() ?? this.host.root;
     const content = document.createElement("div");
     const state: PreviewState = $state({
@@ -422,7 +449,7 @@ export class HoverPreviews {
       visible: false,
       standalone: this.host.standalone === true,
       note: c.note ?? "",
-      place: placeIn(c.rect, this.host.root.getBoundingClientRect(), layer.getBoundingClientRect(), WANT),
+      place: placeIn(c.rect(), this.host.root.getBoundingClientRect(), paddingBox(layer), WANT),
       fontSize: this.host.fontSize(),
       path: this.host.docPath(),
       name: "",
