@@ -36,6 +36,12 @@ and on visibility return — never polled).
   assigns — never `id`/`fp`/`slug`. The same normalization turns non-string
   fields into strings, so a provider's odd JSON renders instead of throwing.
   An unchanged body keeps the held snapshot (no re-render per turn end).
+- **A failed refresh is quiet, not "no provider".** When the provider plugin
+  couldn't answer, the daemon keeps `provider` set and adds `error` (only
+  then) to the last snapshot it gave (or to empty lists); `normalizeKnowledge`
+  keeps it as `error: string | null` and the view shows one muted line
+  ("Showing what mycelium read last — it couldn't refresh just now." + the
+  plugin's words) — never the attach card, never a red banner.
 - **Paths on the wire are workspace-relative** (`.living/…`, `todo/…`) or
   absolute (claude's memory dir); join with `wsRoot` before opening. There is
   no open-at-line — the file just opens.

@@ -97,8 +97,12 @@ installation or hook trust and on reconnect; it carries no plugin payload.
     empty = always present, as for Agent notes). An available plugin is never active: switching
     it on answers 409 "<name> isn't installed — install it first". The switch persists in
     `workspaces.json` by plugin id — durable or refused, since a forgotten toggle would silently
-    change what agents see — so reinstalling a plugin that was on here makes it active again;
-    flipping it drops the plugin's instance there and clears a fault. Detection is a few
+    change what agents see (written off the workspaces lock, taken back if the write fails) —
+    so reinstalling a first-party plugin that was on here makes it active again. A third-party
+    plugin's switches go when it is removed, and a plugin new to this daemon that isn't
+    first-party starts off everywhere: a switch kept under its id never binds another
+    publisher's plugin. Switching off is accepted for any id, installed or not. Flipping the
+    switch drops the plugin's instance there and clears a fault. Detection is a few
     `stat`s off the reactor, cached 30 s per workspace, re-run on every switch and before any
     answer that decides what an agent sees.
   - **Core never changes what agents see; a plugin changes it only where active.** With none
@@ -218,7 +222,10 @@ installation or hook trust and on reconnect; it carries no plugin payload.
     of virtual address space instead of wasmtime's 4 GiB (login nodes run under `ulimit -v`). **WASI grants nothing:** no files, env, args or network; the guest's
     stderr is kept (4 KiB) only to explain a trap.
   - **A trap costs the instance, never the daemon**; five in a minute mark the plugin *faulted*
-    in that workspace (the card says why) until the user switches it off and on. Traps ride Unix
+    in that workspace (the card says why) until the user switches it off and on. A build the
+    host can't run at all (it doesn't compile, or its imports don't link) is its fault on the
+    card too — never recompiled per call, tried again when the switch flips or the plugin's
+    version changes. Traps ride Unix
     signal handlers on macOS too (`macos_use_mach_ports(false)`): wasmtime's Mach-port thread
     aborted the whole process when a caught SIGCHLD from an ending PTY shell interrupted it.
   - **Host functions, each bounded** (`hostfns.rs`): workspace-relative `read` / `stat` /
@@ -383,7 +390,10 @@ installation or hook trust and on reconnect; it carries no plugin payload.
     "the downloaded files don't match what the release published — reinstall it" (the log line
     names the file): it never loads, its switch refuses on, and Use previous to that version is
     refused. **Reinstall** — installing that same version again from its repository — replaces
-    such a copy in place (an intact copy at that version still answers 409). A first-party copy at the lock's pinned version
+    such a copy in place (an intact copy at that version still answers 409) — the old copy is
+    set aside until the new one is in place, and put back if the move fails. Every change runs
+    to its end even when the window that asked for it closes, so the catalog always follows
+    the files. A first-party copy at the lock's pinned version
     is `verified` only when its bytes also equal the lock's two sha256s, so a local build at the
     pinned version is unverified, without a fault.
   - **Three install kinds:**
@@ -446,7 +456,8 @@ installation or hook trust and on reconnect; it carries no plugin payload.
     `https://github.com` in the first-party download URLs.
   - A release is a tag `v<version>` with three assets: `plugin.wasm`, `plugin.toml` (that
     version's manifest) and `SHA256SUMS`. A plugin's state and its per-workspace switch follow
-    its id across versions, and the switch survives a remove and a reinstall.
+    its id across versions; a first-party plugin's switch survives a remove and a reinstall
+    (a third-party plugin's goes with it — see above).
 
 ## Agent plugins & the Skills view
 
