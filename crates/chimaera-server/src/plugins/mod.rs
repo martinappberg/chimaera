@@ -58,6 +58,8 @@ pub(crate) mod releases;
 pub(crate) mod runtime;
 pub(crate) mod tools;
 
+const INSTALL_FINISHED_TITLE: &str = "Plugin installation finished";
+
 /// How long a workspace's detect result is trusted before a re-stat.
 const DETECT_TTL: Duration = Duration::from_secs(30);
 
@@ -1203,7 +1205,8 @@ pub(crate) fn bad_request(msg: impl Into<String>) -> Response {
 /// plugin this workbench plugin requires or recommends, with the AGENT's own
 /// plugin manager, in a visible terminal the user watches (chimaera never
 /// reimplements `claude plugin` / `codex plugin`). The session is theirs to
-/// read and close; the probe cache is invalidated when it ends.
+/// read and close; the probe cache is invalidated when the command finishes,
+/// even while its terminal waits for the user to dismiss the result.
 pub(crate) async fn install_requirement(
     State(state): State<Arc<AppState>>,
     AxPath((id, pid)): AxPath<(String, String)>,
@@ -1231,22 +1234,12 @@ pub(crate) async fn install_requirement(
             return (StatusCode::CONFLICT, Json(json!({"error": err}))).into_response();
         }
     };
-    let bin = crate::runtimes::sq(&bin.to_string_lossy());
     let install_verb = if kind == crate::agents::AgentKind::Codex {
         "add"
     } else {
         "install"
     };
     let agent = kind.as_str();
-    let script = format!(
-        "echo 'Installing {name} for {agent} with {agent}'\''s own plugin manager.'\n         echo\n         echo '$ {agent} plugin marketplace add {mkt}'\n         {bin} plugin marketplace add {mkt_q} || echo '(already added or unavailable — continuing)'\n         echo\n         echo '$ {agent} plugin {install_verb} {pid_s}'\n         {bin} plugin {install_verb} {pid_q}\n         status=$?\n         echo\n         if [ $status -eq 0 ]; then echo 'Done — you can close this terminal.'; \
-         else echo \"Install failed (exit $status).\"; fi\n         exit $status\n",
-        name = m.name.replace('\'', ""),
-        mkt = req.marketplace,
-        mkt_q = crate::runtimes::sq(&req.marketplace),
-        pid_s = req.id,
-        pid_q = crate::runtimes::sq(&req.id),
-    );
     let session_id = crate::agents::fresh_session_id();
     let env = crate::api::session_env(&state, &session_id, "dark", None);
     let env_remove = crate::api::spawn_env_remove(&env);
@@ -1260,7 +1253,21 @@ pub(crate) async fn install_requirement(
         // user's PATH, which an app-launched daemon's own env lacks.
         command: Some(crate::launcher::wrap_login_shell(
             &crate::launcher::login_shell(),
-            vec!["/bin/bash".to_string(), "-c".to_string(), script],
+            // Values are arguments, never interpolated shell source. Plugin
+            // names and executable paths can contain quotes or shell syntax.
+            vec![
+                "/bin/bash".to_string(),
+                "-c".to_string(),
+                include_str!("install-agent.sh").to_string(),
+                "chimaera-plugin-install".to_string(),
+                m.name.clone(),
+                agent.to_string(),
+                bin.to_string_lossy().into_owned(),
+                req.marketplace.clone(),
+                req.id.clone(),
+                install_verb.to_string(),
+                INSTALL_FINISHED_TITLE.to_string(),
+            ],
         )),
         id: Some(session_id.clone()),
         env,
@@ -1274,7 +1281,11 @@ pub(crate) async fn install_requirement(
             let watch_state = state.clone();
             let sid = info.id.clone();
             tokio::spawn(async move {
-                while watch_state.sessions.get(&sid).is_some() {
+                while watch_state
+                    .sessions
+                    .get(&sid)
+                    .is_some_and(|s| s.title.as_deref() != Some(INSTALL_FINISHED_TITLE))
+                {
                     tokio::time::sleep(Duration::from_secs(2)).await;
                 }
                 watch_state.probes.invalidate();

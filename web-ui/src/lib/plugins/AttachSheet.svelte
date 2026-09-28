@@ -19,6 +19,7 @@
   import { installedOutcome, installTitle, pinnedVersion, type Outcome } from "./installCopy";
   import { hooksAwaitingTrust, requirementsModel, sheetText, type AgentsState, type RequirementRow } from "./requirementsModel";
   import {
+    agentInstallContinuation,
     fetchAgentPlugins,
     fetchWorkspacePlugins,
     installFirstPartyPlugin,
@@ -67,7 +68,7 @@
     try {
       const [wp, ap] = await Promise.all([
         fetchWorkspacePlugins(wsId),
-        fetchAgentPlugins(wsId).then(
+        fetchAgentPlugins(wsId, true).then(
           (a) => {
             agentsAvailable = true;
             return a;
@@ -254,16 +255,25 @@
       if (!detected && canSetup && setupAgents.length > 0) {
         const res = await setupPlugin(wsId, pluginId, setupAgent);
         refreshKnowledge();
+        clearContinuation();
         onOpenSession(res.session_id);
         return;
       }
       refreshKnowledge();
-      if (skipped.length === 0) onClose();
-      else busy = null;
+      if (skipped.length === 0) {
+        clearContinuation();
+        onClose();
+      } else busy = null;
     } catch (e) {
       error = isMissingRoute(e) ? "this daemon can't finish that step yet — update chimaera" : message(e);
       busy = null;
       refreshWorkspacePlugins();
+    }
+  }
+
+  function clearContinuation(): void {
+    if ($agentInstallContinuation?.workspaceId === wsId && $agentInstallContinuation.pluginId === pluginId) {
+      agentInstallContinuation.set(null);
     }
   }
 

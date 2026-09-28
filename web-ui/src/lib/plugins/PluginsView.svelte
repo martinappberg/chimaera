@@ -21,6 +21,7 @@
   import InstalledView from "./InstalledView.svelte";
   import SkillsView from "./SkillsView.svelte";
   import {
+    agentInstallContinuation,
     fetchAgentPlugins,
     fetchSkills,
     openAttachSheet,
@@ -52,12 +53,12 @@
   let skills = $state<Fetch<SkillsReport>>({ state: "idle", data: null, error: null });
 
   let apSeq = 0;
-  async function loadAgentPlugins(): Promise<void> {
+  async function loadAgentPlugins(refresh = false): Promise<void> {
     if (wsId === null) return;
     const mine = ++apSeq;
     agentPlugins = { ...agentPlugins, state: "loading" };
     try {
-      const data = await fetchAgentPlugins(wsId);
+      const data = await fetchAgentPlugins(wsId, refresh || $agentInstallContinuation?.workspaceId === wsId);
       if (mine !== apSeq) return;
       agentPlugins = { state: "ok", data, error: null };
     } catch (e) {
@@ -167,7 +168,7 @@
             onOpenSession={dash.onOpenSession}
             onRefresh={() => {
               refreshWorkspacePlugins();
-              void loadAgentPlugins();
+              void loadAgentPlugins(true);
             }}
             {wsId}
           />

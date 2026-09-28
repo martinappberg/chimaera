@@ -8,6 +8,126 @@
 use super::support::*;
 use crate::{lock, AppState};
 
+/// Exercise the route's exact shell program in a real PTY. A fast success
+/// or failure must still be readable by a client attaching after completion.
+#[tokio::test]
+async fn agent_plugin_install_keeps_success_and_failure_until_acknowledged() {
+    use crate::agents::AgentKind;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::Duration;
+
+    for (kind, verb, code) in [
+        (AgentKind::Claude, "install", 0),
+        (AgentKind::Codex, "add", 7),
+    ] {
+        let state = test_state();
+        install_first_party(&state, "mycelium").await;
+        let ws = make_workspace(&state, "plugin-install-result").await;
+        let root = root_of(&state, &ws);
+        let bin = root.join("agent's cli");
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/bash\nprintf '%s\\n' \"$*\" >> calls\n\
+                 if [ \"$2\" = marketplace ]; then exit 1; fi\n\
+                 printf 'agent install output\\n'\nexit {code}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+        preset_agent(&state, kind, Ok(bin), Some("test"));
+        let (status, result) = request(
+            &state,
+            Method::POST,
+            &format!("/api/v1/workspaces/{ws}/plugins/mycelium/install"),
+            Some(serde_json::json!({"agent": kind.as_str()})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{result}");
+        let sid = result["session_id"].as_str().unwrap();
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let info = state
+                    .sessions
+                    .get(sid)
+                    .expect("install vanished before acknowledgement");
+                if info.title.as_deref() == Some("Plugin installation finished") {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("install never finished");
+        assert_eq!(
+            std::fs::read_to_string(root.join("calls")).unwrap(),
+            format!("plugin marketplace add arjunrajlaboratory/mycelium\nplugin {verb} mycelium@mycelium\n")
+        );
+        let sessions = state.sessions.clone();
+        let attach_id = sid.to_string();
+        let attachment = tokio::task::spawn_blocking(move || sessions.attach(&attach_id))
+            .await
+            .unwrap()
+            .unwrap();
+        let screen = String::from_utf8_lossy(&attachment.snapshot);
+        assert!(screen.contains("agent install output"), "{screen}");
+        assert!(screen.contains("Press Enter to close"), "{screen}");
+        let outcome = if code == 0 {
+            "Installed."
+        } else {
+            "Install failed (exit 7)"
+        };
+        assert!(screen.contains(outcome), "{screen}");
+        attachment
+            .input
+            .send(bytes::Bytes::from_static(b"\r"))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while state.sessions.get(sid).is_some() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            state.sessions.last_words(sid).unwrap().info.exit_status,
+            Some(code)
+        );
+    }
+}
+
+#[test]
+fn agent_plugin_install_treats_names_as_data() {
+    let root = test_dir("plugin-install-quoting");
+    let name = "Mycelium's $(touch injected) `touch injected-too`";
+    let output = std::process::Command::new("/bin/bash")
+        .args([
+            "-c",
+            include_str!("../plugins/install-agent.sh"),
+            "chimaera-plugin-install",
+            name,
+            "claude",
+            "/usr/bin/true",
+            "arjunrajlaboratory/mycelium",
+            "mycelium@mycelium",
+            "install",
+            "Plugin installation finished",
+        ])
+        .current_dir(&root)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains(name));
+    assert!(!root.join("injected").exists());
+    assert!(!root.join("injected-too").exists());
+}
+
 async fn tools(state: &Arc<AppState>, sid: &str, key: &str) -> Vec<String> {
     let (status, out) = mcp_post(
         state,

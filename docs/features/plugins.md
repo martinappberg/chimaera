@@ -146,8 +146,16 @@ sheet, hosted once in `web-ui/src/App.svelte`. Wire (all under `/api/v1`, bearer
     `requires_summary` / `recommends_summary`.
   - **Agent-plugin installs are the agent's own CLI** in a visible `install <plugin> for
     <agent>` terminal (ids and marketplace sources charset-gated, never flag-shaped); 409 when
-    the agent binary is missing; the probe cache is invalidated when that terminal ends. Setup
-    is a fresh chat plus one Send (502 if the prompt didn't land — the session still exists).
+    the agent binary is missing. `plugins/install-agent.sh` receives metadata as arguments,
+    never shell source. Success and failure output stay visible until **Enter** closes the
+    terminal; the original exit status is preserved. The probe cache is invalidated when the
+    command finishes, even while its result remains open. The card offers **continue setup**
+    after an agent install is opened, including one launched from the attach sheet. Returning
+    to Extensions during this flow and opening the sheet request a fresh agent report. The
+    sheet resumes the existing install → hook review → workspace setup steps; installation
+    alone does not trust hooks or initialize a repository. Newly started agent sessions load
+    the installed plugin. Setup is a fresh chat plus one Send (502 if the prompt didn't land —
+    the session still exists).
     Chimaera never installs or updates anything on its own.
   - **Status: partial.** Built and proven live on an isolated daemon (2026-09-26, a stand-in
     agent, nothing billed): the WASM host, both plugins as components, versions, installs,
