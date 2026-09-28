@@ -2,10 +2,12 @@
  * The context bridge's reference composer: selection knows its source.
  *
  * Pure functions build the exact text typed into an agent or shell input
- * (path relativization, shell escaping, selection truncation) — nothing here
- * ever appends a newline/carriage return, so a composed reference can NEVER
- * auto-submit. The two small stores coordinate the UI halves: views publish
- * the current selection (file views and terminals), the app publishes the
+ * (path relativization, shell escaping, selection truncation) — nothing
+ * typed into a PTY ever carries a newline/carriage return, so a composed
+ * reference can NEVER auto-submit (the chat quote keeps its lines: it only
+ * ever lands in a chat composer's textarea). The two small stores coordinate
+ * the UI halves: views publish the current selection (file views, terminals
+ * and chat transcripts), the app publishes the
  * resolved target agent, and the floating affordances + the chord both funnel
  * through one registered handler (parity principle).
  *
@@ -49,7 +51,15 @@ export interface TerminalSelection {
   text: string;
 }
 
-export type SelectionSource = FileSelection | TerminalSelection;
+/** Text selected in a chat transcript. It is referenced in the same chat
+ *  (quoted into its own reply), never in another agent. */
+export interface ChatSelection {
+  kind: "chat";
+  sessionId: string;
+  text: string;
+}
+
+export type SelectionSource = FileSelection | TerminalSelection | ChatSelection;
 
 /**
  * The one live selection eligible for referencing (last writer wins across
@@ -246,6 +256,64 @@ export function composeSelectionReference(
   return `${out} `;
 }
 
+/**
+ * A chat-transcript selection quoted into the same chat's reply: a Markdown
+ * blockquote of the selected text, then a blank line to write the reply
+ * under. Unlike the one-line references, line structure is kept (a table's
+ * rows, a list), because a chat composer is a textarea that never submits on
+ * an inserted newline; it is never typed into a PTY. Control characters
+ * other than tab and newline become spaces, blank-line runs fold to one, and
+ * the body is capped at `max` chars. "" when nothing but whitespace was
+ * selected.
+ */
+export function composeChatQuote(text: string, max = QUOTE_MAX): string {
+  const lines = text
+    .replace(/\r\n?/g, "\n")
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, " ")
+    .split("\n")
+    .map((line) => line.trimEnd());
+  const kept: string[] = [];
+  for (const line of lines) {
+    if (line === "" && (kept.length === 0 || kept[kept.length - 1] === "")) continue;
+    kept.push(line);
+  }
+  while (kept.length > 0 && kept[kept.length - 1] === "") kept.pop();
+  let body = kept.join("\n");
+  if (body.trim() === "") return "";
+  if (body.length > max) body = `${body.slice(0, max).trimEnd()}…`;
+  return `${body
+    .split("\n")
+    .map((line) => (line === "" ? ">" : `> ${line}`))
+    .join("\n")}\n\n`;
+}
+
+/** A run of `text`'s lines: quoted (each led by a Markdown `>`, as
+ *  `composeChatQuote` writes them) or not. */
+export interface QuoteRun {
+  quote: boolean;
+  text: string;
+}
+
+/**
+ * `text` cut into runs of whole lines, quoted or not, losslessly (the runs
+ * concatenate back to `text`; a line's newline stays with it). A sent
+ * message shows its quoted passage apart from the words around it.
+ */
+export function quoteRuns(text: string): QuoteRun[] {
+  const runs: QuoteRun[] = [];
+  const lines = text.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    const line = i < lines.length - 1 ? `${lines[i]}\n` : lines[i];
+    if (line === "" && runs.length > 0) break;
+    const quote = /^ {0,3}>/.test(line);
+    const last = runs[runs.length - 1];
+    if (last !== undefined && last.quote === quote) last.text += line;
+    else runs.push({ quote, text: line });
+  }
+  return runs;
+}
+
 /** Whether delivering `sel` to `target` first uploads its crop (a terminal
  *  agent reads pixels from a file; chat attaches them). */
 export function needsCropUpload(sel: SelectionSource, target: ReferenceTargetKind): boolean {
@@ -266,20 +334,22 @@ export function composeAgentPathReference(relPath: string): string {
 /**
  * The provenance suffix typed after a matching paste into an agent composer:
  * ` [from @<rel-path>#L3-L9] ` for file snippets, ` [from <name> output] `
- * for terminal snippets. Additive and visible — the pasted text itself is
- * never touched (plain paste stays plain), and there is never a newline.
+ * for terminal snippets, ` [from <name> reply] ` for a chat's. Additive and
+ * visible — the pasted text itself is never touched (plain paste stays
+ * plain), and there is never a newline.
  */
 export function composeProvenanceSuffix(
   source: SelectionSource,
   relPath: string | null,
-  terminalName: string | null,
+  sessionName: string | null,
 ): string {
   if (source.kind === "file") {
     const path = relPath ?? source.path;
     const loc = selectionLocator(source);
     return ` [from ${agentMention(path, loc)}] `;
   }
-  return ` [from ${terminalName ?? "terminal"} output] `;
+  if (source.kind === "chat") return ` [from ${sessionName ?? "agent"} reply] `;
+  return ` [from ${sessionName ?? "terminal"} output] `;
 }
 
 /**

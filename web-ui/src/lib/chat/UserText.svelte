@@ -1,5 +1,6 @@
 <script lang="ts">
   import { extractFileRefs, revealOf, type FileRef } from "../shared/fileRef";
+  import { quoteRuns } from "../shared/reference";
   import MathText from "./MathText.svelte";
   import { splitUserMath } from "./math";
   import {
@@ -16,7 +17,9 @@
    * documents), whitespace preserved, with recognized LaTeX spans rendered
    * as math and @-mentions / real paths made clickable through the same
    * resolver as agent prose. Mentions render as quiet pills — the visual
-   * receipt that the tag landed.
+   * receipt that the tag landed. A quoted passage (`>`-led lines, as the
+   * transcript's quote chip writes them) reads muted, markers kept, so the
+   * words about it stand apart.
    */
   interface Props {
     text: string;
@@ -32,18 +35,17 @@
     ref: FileRef | null;
     mention: boolean;
     math: { source: string; display: boolean } | null;
+    /** Inside a quoted passage. */
+    quote: boolean;
   }
 
-  function plain(t: string): Token {
-    return { text: t, ref: null, mention: false, math: null };
-  }
-
-  function appendPlain(out: Token[], run: string) {
+  function appendPlain(out: Token[], run: string, quote: boolean) {
+    const plain = (t: string): Token => ({ text: t, ref: null, mention: false, math: null, quote });
     let last = 0;
     for (const f of extractFileRefs(run)) {
       if (f.start > last) out.push(plain(run.slice(last, f.start)));
       const t = run.slice(f.start, f.end);
-      out.push({ text: t, ref: f.ref, mention: t.startsWith("@"), math: null });
+      out.push({ text: t, ref: f.ref, mention: t.startsWith("@"), math: null, quote });
       last = f.end;
     }
     if (last < run.length) out.push(plain(run.slice(last)));
@@ -51,11 +53,14 @@
 
   const tokens = $derived.by(() => {
     const out: Token[] = [];
-    for (const run of splitUserMath(text)) {
-      if (run.kind === "text") {
-        appendPlain(out, run.text);
-      } else {
-        out.push({ text: "", ref: null, mention: false, math: { source: run.source, display: run.display } });
+    for (const passage of quoteRuns(text)) {
+      for (const run of splitUserMath(passage.text)) {
+        if (run.kind === "text") {
+          appendPlain(out, run.text, passage.quote);
+        } else {
+          const math = { source: run.source, display: run.display };
+          out.push({ text: "", ref: null, mention: false, math, quote: passage.quote });
+        }
       }
     }
     return out;
@@ -150,16 +155,20 @@
   >{#each tokens as t, i (i)}{@const res = resFor(t)}{#if t.math !== null}<MathText source={t.math.source} display={t.math.display} />{:else if res !== undefined}<button
         class="path"
         class:mention={t.mention}
+        class:quote={t.quote}
         class:ambiguous={res.state === "ambiguous"}
         title={titleFor(t, res)}
         data-full={shortLabel(t) !== null ? t.text : undefined}
-        onclick={(e) => activate(e, t, res)}>{shortLabel(t) ?? t.text}</button>{:else}{t.text}{/if}{/each}</span
+        onclick={(e) => activate(e, t, res)}>{shortLabel(t) ?? t.text}</button>{:else if t.quote}<span class="quote">{t.text}</span>{:else}{t.text}{/if}{/each}</span
 >
 
 <style>
   .usertext {
     white-space: pre-wrap;
     word-break: break-word;
+  }
+  .quote {
+    color: var(--muted);
   }
   .path {
     display: inline;
@@ -177,6 +186,9 @@
     text-decoration-color: color-mix(in srgb, var(--fg) 40%, transparent);
     transition: color 0.12s ease;
     word-break: break-all;
+  }
+  .path.quote {
+    color: var(--muted);
   }
   .path.mention {
     background: color-mix(in srgb, var(--accent) 12%, transparent);

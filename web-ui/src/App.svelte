@@ -104,6 +104,7 @@
     activeSelection,
     clearSelection,
     composeAgentPathReference,
+    composeChatQuote,
     composeSelectionReference,
     composeShellPathReference,
     needsCropUpload,
@@ -1238,14 +1239,20 @@
   });
 
   /**
-   * Where a reference lands, most-explicit first: the agent LINKED to the
-   * selection's source terminal (the leash is the bridge the user built),
-   * else the focused agent session, else the workspace's most recently
-   * active agent, else its newest live agent. Null (no agent session at
-   * all) renders every reference affordance disabled.
+   * Where a reference lands, most-explicit first: a chat transcript's
+   * selection goes to that same chat (quoted into its reply — never to
+   * another agent; null while it cannot take a message), the agent LINKED
+   * to the selection's source terminal (the leash is the bridge the user
+   * built), else the focused agent session, else the workspace's most
+   * recently active agent, else its newest live agent. Null (no agent
+   * session at all) renders every reference affordance disabled.
    */
   const refTargetSession = $derived.by(() => {
     const sel = $activeSelection;
+    if (sel !== null && sel.kind === "chat") {
+      const own = sessionsById.get(sel.sessionId);
+      return own !== undefined && own.kind === "agent" && own.ui === "chat" && own.alive ? own : null;
+    }
     if (sel !== null && sel.kind === "terminal") {
       const leash = linksByTerminal.get(sel.sessionId);
       const linked = leash !== undefined ? sessionsById.get(leash) : undefined;
@@ -1799,16 +1806,14 @@
     const source = provenanceFor(text);
     if (source === null) return;
     // Pasting a snippet back into where it came from needs no tag.
-    if (source.kind === "terminal" && source.sessionId === id) return;
+    if (source.kind !== "file" && source.sessionId === id) return;
     const root = workspace?.root;
     const suffix = composeProvenanceSuffix(
       source,
       source.kind === "file" && root !== undefined
         ? workspaceRelative(source.path, root)
         : null,
-      source.kind === "terminal"
-        ? (displayNames.get(source.sessionId) ?? "terminal")
-        : null,
+      source.kind !== "file" ? (displayNames.get(source.sessionId) ?? null) : null,
     );
     queueMicrotask(() => pool.sendText(id, suffix));
   }
@@ -1848,6 +1853,14 @@
     const target = refTargetSession;
     if (sel === null || target === null) return;
     const targetId = target.id;
+    if (sel.kind === "chat") {
+      // Quoted into the reply of the chat it was selected in: that chat is
+      // on screen (the selection is in it, maybe in the Mastermind panel
+      // rather than a pane), so nothing is split open or activated.
+      const quote = composeChatQuote(sel.text);
+      if (targetId === sel.sessionId && quote !== "") insertIntoComposer(targetId, quote, "block");
+      return;
+    }
     const kind = target.ui === "chat" ? "chat" : "terminal";
     // A reference never lands out of sight: surface the target agent first,
     // splitting beside the selection's own pane when it is not open anywhere.

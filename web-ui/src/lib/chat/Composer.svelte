@@ -19,6 +19,7 @@
   } from "./images";
   import { loadDraft, saveDraft } from "./drafts";
   import {
+    draftWithInsert,
     slashChoices as choicesForSlash,
     slashContextAt,
     type ComposerCommand,
@@ -283,13 +284,13 @@
     }
   }
 
-  // Workbench insert flows (selection references, provenance tags) land in
-  // the draft exactly like they would type into a PTY's input — appended,
-  // never submitted.
+  // Workbench insert flows (selection references, provenance tags, quoted
+  // passages) land in the draft exactly like they would type into a PTY's
+  // input — appended, never submitted.
   $effect(() => {
     if (sessionId === null) return;
-    return registerComposer(sessionId, (text) => {
-      draft = draft.length > 0 && !draft.endsWith(" ") ? `${draft} ${text}` : draft + text;
+    return registerComposer(sessionId, (text, placement) => {
+      draft = draftWithInsert(draft, text, placement);
       focusAt(draft.length);
     });
   });

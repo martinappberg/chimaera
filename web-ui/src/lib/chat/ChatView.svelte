@@ -55,6 +55,8 @@
   import ForkDialog from "./ForkDialog.svelte";
   import AgentMessageMeta from "./AgentMessageMeta.svelte";
   import Composer from "./Composer.svelte";
+  import ReferenceChip from "../shared/ReferenceChip.svelte";
+  import { clearSelection, setSelection } from "../shared/reference";
   import { skillBlocksForText, type ComposerCommand } from "./composer";
   import type { ImageAttachment } from "./images";
   import type {
@@ -2073,6 +2075,95 @@
     }, refreshIn);
     return () => clearTimeout(timer);
   });
+
+  // --- context bridge: quoting a passage of this transcript -----------------
+  // A selection here is published like a file view's, and the chip (or the
+  // reference chord) quotes it into THIS chat's reply. The chip floats on the
+  // chat root, not in the column: the reading anchor binary-searches the
+  // column's children as a vertical stack, which a floating child would
+  // break.
+  const quoteOwner = {};
+  let quoteChip = $state<{ x: number; y: number } | null>(null);
+  /** The chip's footprint, for keeping it inside the transcript's view. */
+  const QUOTE_CHIP_W = 136;
+  const QUOTE_CHIP_H = 26;
+
+  function dropQuote(): void {
+    quoteChip = null;
+    clearSelection(quoteOwner);
+  }
+
+  /** The live selection's range when it lies in this transcript's column
+   *  (and not in a card's text field), else null. */
+  function quotableRange(): Range | null {
+    const column = columnEl;
+    const sel = document.getSelection();
+    if (column === null || sel === null || sel.rangeCount === 0 || sel.isCollapsed) return null;
+    const range = sel.getRangeAt(0);
+    const common = range.commonAncestorContainer;
+    if (!column.contains(common)) return null;
+    const el = common instanceof Element ? common : common.parentElement;
+    return el?.closest("input, textarea, [contenteditable]") == null ? range : null;
+  }
+
+  function syncQuoteSelection(): void {
+    const range = quotableRange();
+    const text = range !== null ? (document.getSelection()?.toString() ?? "") : "";
+    if (range === null || text.trim() === "") {
+      dropQuote();
+      return;
+    }
+    setSelection(quoteOwner, { kind: "chat", sessionId: session.id, text });
+    quoteChip = quoteChipAt(range);
+  }
+
+  /** Just past the selection's last line of text, kept inside the
+   *  transcript's visible box (a selection running off screen still offers
+   *  its chip at the edge). Relative to the chat root. */
+  function quoteChipAt(range: Range): { x: number; y: number } | null {
+    const host = chatEl;
+    const scroller = transcriptEl;
+    if (host === null || scroller === null) return null;
+    const rects = range.getClientRects();
+    // A selection ending at the start of the next block ends in an empty rect.
+    let last: DOMRect | null = null;
+    for (let i = rects.length - 1; i >= 0 && last === null; i--) {
+      if (rects[i].width > 0) last = rects[i];
+    }
+    const end = last ?? range.getBoundingClientRect();
+    const box = host.getBoundingClientRect();
+    const view = scroller.getBoundingClientRect();
+    const clamp = (n: number, lo: number, hi: number) => Math.min(Math.max(n, lo), Math.max(lo, hi));
+    return {
+      x: clamp(end.right - box.left + 4, view.left - box.left + 4, view.right - box.left - QUOTE_CHIP_W - 4),
+      y: clamp(end.bottom - box.top + 6, view.top - box.top + 4, view.bottom - box.top - QUOTE_CHIP_H - 4),
+    };
+  }
+
+  $effect(() => {
+    const scroller = transcriptEl;
+    if (scroller === null || !visible) return;
+    // Scrolling moves the selection, not what is selected: re-anchor the chip
+    // once per frame. Capturing, so a wide table's own scroll counts too.
+    let frame = 0;
+    const onScroll = () => {
+      if (frame !== 0 || quoteChip === null) return;
+      frame = requestAnimationFrame(() => {
+        frame = 0;
+        const range = quotableRange();
+        if (range !== null && quoteChip !== null) quoteChip = quoteChipAt(range);
+      });
+    };
+    const opts = { capture: true, passive: true } as const;
+    document.addEventListener("selectionchange", syncQuoteSelection);
+    scroller.addEventListener("scroll", onScroll, opts);
+    return () => {
+      document.removeEventListener("selectionchange", syncQuoteSelection);
+      scroller.removeEventListener("scroll", onScroll, opts);
+      if (frame !== 0) cancelAnimationFrame(frame);
+      dropQuote();
+    };
+  });
 </script>
 
 <!-- The outside-dismiss action closes any open header menu / the /mcp panel on
@@ -2530,6 +2621,10 @@
     {/if}
     </div>
   </div>
+
+  {#if quoteChip !== null}
+    <ReferenceChip x={quoteChip.x} y={quoteChip.y} quote />
+  {/if}
 
   {#if pinnedAgents.length > 0}
     <AgentsTray

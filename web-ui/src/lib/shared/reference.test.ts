@@ -4,9 +4,11 @@ import {
   activeSelection,
   agentMention,
   composeAgentPathReference,
+  composeChatQuote,
   composeProvenanceSuffix,
   composeSelectionReference,
   needsCropUpload,
+  quoteRuns,
   referenceNow,
   setReferenceHandler,
   type FileSelection,
@@ -101,6 +103,11 @@ describe("provenance and one-click references", () => {
   it("the provenance suffix carries a locator", () => {
     expect(composeProvenanceSuffix(file({ fragment: "page=2" }), "paper.pdf", null)).toBe(" [from @paper.pdf#page=2] ");
   });
+  it("a chat snippet names the chat it came from", () => {
+    const chat = { kind: "chat", sessionId: "c-1", text: "" } as const;
+    expect(composeProvenanceSuffix(chat, null, "claude")).toBe(" [from claude reply] ");
+    expect(composeProvenanceSuffix(chat, null, null)).toBe(" [from agent reply] ");
+  });
   it("referenceNow publishes, references through the handler, then clears", () => {
     const seen: unknown[] = [];
     setReferenceHandler(() => seen.push(get(activeSelection)));
@@ -139,5 +146,57 @@ describe("agentMention: a mention claude reads whole", () => {
     expect(composeProvenanceSuffix(file({ startLine: 3, endLine: 9 }), "raw data/qc.tsv", null)).toBe(
       ' [from @"raw data/qc.tsv#L3-L9"] ',
     );
+  });
+});
+
+describe("composeChatQuote: a transcript passage quoted into the reply", () => {
+  it("quotes every line and leaves a blank line to write under", () => {
+    expect(composeChatQuote("the median is noisier")).toBe("> the median is noisier\n\n");
+  });
+  it("keeps a table's rows and cells as selected", () => {
+    const table = "\tN = 5\tN = 101\nMean\t0.13\t0.03\nMedian\t0.19\t0.05\n";
+    expect(composeChatQuote(table)).toBe("> \tN = 5\tN = 101\n> Mean\t0.13\t0.03\n> Median\t0.19\t0.05\n\n");
+  });
+  it("folds blank-line runs, trims the ends, and marks a kept blank line", () => {
+    expect(composeChatQuote("\n\none  \n\n\n\ntwo\r\n\n")).toBe("> one\n>\n> two\n\n");
+  });
+  it("sends nothing for a whitespace-only selection", () => {
+    expect(composeChatQuote(" \n\t\n ")).toBe("");
+  });
+  it("turns control characters into spaces", () => {
+    expect(composeChatQuote("a\u0007b\u001bc")).toBe("> a b c\n\n");
+  });
+  it("caps a long passage with an ellipsis", () => {
+    const quoted = composeChatQuote(`${"x".repeat(50)}\n${"y".repeat(50)}`, 60);
+    expect(quoted).toBe(`> ${"x".repeat(50)}\n> ${"y".repeat(9)}…\n\n`);
+  });
+});
+
+describe("quoteRuns: a sent message's quoted passages", () => {
+  it("splits whole lines losslessly", () => {
+    const text = "> a\n> b\n\nwhy?\n>c";
+    const runs = quoteRuns(text);
+    expect(runs).toEqual([
+      { quote: true, text: "> a\n> b\n" },
+      { quote: false, text: "\nwhy?\n" },
+      { quote: true, text: ">c" },
+    ]);
+    expect(runs.map((r) => r.text).join("")).toBe(text);
+  });
+  it("reads a marker behind up to three spaces, not four or mid-line", () => {
+    expect(quoteRuns("   > q").map((r) => r.quote)).toEqual([true]);
+    expect(quoteRuns("    > code").map((r) => r.quote)).toEqual([false]);
+    expect(quoteRuns("a > b").map((r) => r.quote)).toEqual([false]);
+  });
+  it("round-trips what composeChatQuote writes", () => {
+    const runs = quoteRuns(`${composeChatQuote("one\n\ntwo")}the question`);
+    expect(runs).toEqual([
+      { quote: true, text: "> one\n>\n> two\n" },
+      { quote: false, text: "\nthe question" },
+    ]);
+  });
+  it("a message without quotes is one plain run", () => {
+    expect(quoteRuns("plain\ntext")).toEqual([{ quote: false, text: "plain\ntext" }]);
+    expect(quoteRuns("")).toEqual([{ quote: false, text: "" }]);
   });
 });

@@ -266,6 +266,20 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   reveal spans shortly after its fade), because span-fragmented text copies with a hard newline
   at every visual wrap point. Blockquotes render as a quiet accent-washed quote card, distinct
   from code chrome.
+- **Quote part of a reply back to the agent.** Select any text in the transcript — a sentence of a
+  reply, a few table rows, a line of tool output — and a quiet **`>` quote in reply** chip appears at
+  the selection's end (the context bridge's chip; the chord `⇧⌘R` / `Ctrl+Shift+R` does the same).
+  It quotes the selection into **this chat's own** composer as a Markdown blockquote — lines kept,
+  so a table stays rows of cells; control characters dropped, blank-line runs folded, capped at
+  8 KB — on its own paragraph after anything already drafted, with the caret below it for the
+  question. Never sent by itself, and never to another agent: while the chat's agent isn't running
+  the chip is disabled. A sent message shows its quoted lines (`>`-led) muted, markers kept, so the
+  question stands apart. Copying a passage and pasting it into a *terminal* agent tags it
+  ` [from <chat> reply] ` (copy provenance). Where: `ChatView.svelte` (publishes the selection,
+  floats `shared/ReferenceChip.svelte` on the chat root — not in the column, whose children the
+  reading anchor walks as a stack), `shared/reference.ts` (`ChatSelection`, `composeChatQuote`,
+  `quoteRuns`), `App.svelte` (`refTargetSession`, `referenceSelection`), `composerBus.ts` (the
+  `block` placement) + `composer.ts` (`draftWithInsert`), `UserText.svelte`.
 - **Hydration + history window.** A fresh attach folds replay into the reducer behind one quiet
   "loading recent conversation" state until the advertised journal `head` arrives; it then mounts
   the newest 64 blocks bottom-anchored in one paint, rather than visibly growing from the oldest
