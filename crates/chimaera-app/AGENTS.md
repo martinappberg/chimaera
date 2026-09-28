@@ -40,6 +40,8 @@ in-app SSH askpass, a signed auto-updater). Parent map: repo-root
 | `shell/cloud.rs` | Explicit cloud provisioning and bounded worker setup calls; credentials remain in Rust. |
 | `shell/power.rs` | System sleep/wake notifications (macOS IOKit, Linux logind delay inhibitor, Windows power callbacks), bounded daemon flush, and AC-power gating for delayed hand-back. |
 | `shell/pro.rs` | Optional account runtime: endpoint in app.json, OS-keychain tokens, PKCE loopback sign-in, bounded keeper cache/events, reverse local-daemon sharing, and account IPC. No endpoint means no keychain access or network work. |
+| `shell/pro/auth.rs` | In-memory sign-in attempt lifecycle, cancellation/retry fences and bounded loopback callback parsing. |
+| `assets/sign-in.html` | Credential-free browser return page; success is sent only after native account activation. |
 | `shell/tunnel.rs` | App-only SSH / keeper transport wrapper. Both expose one loopback daemon endpoint; keep chimaera-link out of the daemon dependency graph. |
 | `shell/restore.rs` | `open_ui_window`, the tunnel health monitor (a 3 s `interval` tick — a down host's probe burns its 2 s timeout inside it; 3-miss hysteresis; confirmed-down keys back off per miss up to 10 ticks, compute keys 2; a `down` edge files a wedge suspect), and launch-time window restore. |
 | `daemon.rs` | Launch/adopt the local daemon; version/parity policy (unix: spawn-self; windows: delegates to `wsl.rs`). |
@@ -68,7 +70,11 @@ in-app SSH askpass, a signed auto-updater). Parent map: repo-root
   Device-only aliases never fall back to SSH: open windows retain that source in
   windows.json, including across sign-out/restart; only SSH hosts have that fallback.
 - System-browser sign-in binds an ephemeral IPv4-loopback callback, verifies
-  PKCE state, bounds requests and expires after 180 s. Remote prompt, daemon
+  PKCE state and Host, bounds requests and allows 15 minutes for sign-in plus
+  MFA. Waiting does not hold the account operation lock. Restart/cancel closes
+  the old listener and fences its result; finishing credential activation is
+  serialized and cannot be interrupted by UI cancellation. Keeper availability
+  is independent of successful account authentication. Remote prompt, daemon
   bearer and account-token data must never appear in Settings host rows or logs.
 
 - **The command list is a lockstep** the type system does NOT fully enforce, so a

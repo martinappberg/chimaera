@@ -875,6 +875,8 @@ export interface ProStatus {
   email: string | null;
   plan: "pro" | "max" | "none" | null;
   error: string | null;
+  /** Optional when connected to an older native shell. */
+  sign_in?: { phase: "waiting" | "finishing"; expires_at: number } | null;
 }
 
 export interface ProHost {
@@ -901,6 +903,12 @@ export async function proSignIn(): Promise<void> {
   const t = tauri();
   if (t === null) throw new Error("not running in the native shell");
   await t.core.invoke<void>("pro_sign_in");
+}
+
+export async function proCancelSignIn(): Promise<void> {
+  const t = tauri();
+  if (t === null) return;
+  await t.core.invoke<void>("pro_cancel_sign_in");
 }
 
 export async function proSignOut(): Promise<void> {

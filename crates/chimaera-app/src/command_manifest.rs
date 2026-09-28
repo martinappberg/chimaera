@@ -52,6 +52,7 @@ pub const DAEMON_UI_COMMANDS: &[&str] = &[
     "pro_mirror_preference",
     "pro_set_never_mirror",
     "pro_sign_in",
+    "pro_cancel_sign_in",
     "pro_sign_out",
     "pro_sign_out_everywhere",
     "pro_hosts",

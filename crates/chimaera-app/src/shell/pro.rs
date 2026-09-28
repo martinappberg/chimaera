@@ -14,9 +14,10 @@ use anyhow::{Context, Result};
 use chimaera_link::{Account, Client, Device, Event, Host, HostKind, HostStatus, Tokens};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::{lock, Shell};
+
+mod auth;
 
 pub(super) struct Pro {
     endpoint: Option<String>,
@@ -25,6 +26,7 @@ pub(super) struct Pro {
     pub hosts: Mutex<HashMap<String, Host>>,
     device_aliases: Mutex<HashSet<String>>,
     error: Mutex<Option<String>>,
+    sign_in: auth::SignIn,
     delegation: Mutex<Option<chimaera_link::Delegation>>,
     daemon_stamp: Mutex<Option<(u16, String, bool)>>,
     worker_links: tokio::sync::Mutex<HashMap<String, chimaera_link::LinkTunnel>>,
@@ -48,6 +50,7 @@ pub struct Status {
     email: Option<String>,
     plan: Option<chimaera_link::Plan>,
     error: Option<String>,
+    sign_in: Option<auth::Status>,
 }
 
 #[derive(Serialize)]
@@ -69,6 +72,7 @@ impl Pro {
             hosts: Mutex::new(HashMap::new()),
             device_aliases: Mutex::new(HashSet::new()),
             error: Mutex::new(None),
+            sign_in: auth::SignIn::default(),
             delegation: Mutex::new(None),
             daemon_stamp: Mutex::new(None),
             worker_links: tokio::sync::Mutex::new(HashMap::new()),
@@ -197,20 +201,26 @@ pub(super) fn start(app: AppHandle) {
     });
 }
 
+async fn account_snapshot(client: &Client) -> Result<(Account, Vec<Host>, Option<String>)> {
+    let account = client.me().await?;
+    // Account authentication is independent of keeper provisioning. A valid
+    // login must remain signed in while that optional connection comes online.
+    let (hosts, connection_error) = if !keeper_available(&account) {
+        (Vec::new(), None)
+    } else {
+        match client.hosts().await {
+            Ok(hosts) => (hosts, None),
+            Err(_) => (Vec::new(), Some("You're signed in. Your Pro connection is preparing; Chimaera will reconnect automatically.".into())),
+        }
+    };
+    Ok((account, hosts, connection_error))
+}
+
 async fn activate(app: &AppHandle, client: Client) -> Result<()> {
     let state = app.state::<Shell>();
     // Subscribe before any request can rotate the refresh token.
     let mut updates = client.token_updates();
-    let snapshot = async {
-        let account = client.me().await?;
-        let hosts = if !keeper_available(&account) {
-            Vec::new()
-        } else {
-            client.hosts().await?
-        };
-        Ok::<_, anyhow::Error>((account, hosts))
-    }
-    .await;
+    let snapshot = account_snapshot(&client).await;
     let endpoint = state.pro.endpoint.clone().context("endpoint unavailable")?;
     let tokens = client.tokens().await;
     let authenticated = tokens.is_some();
@@ -234,7 +244,7 @@ async fn activate(app: &AppHandle, client: Client) -> Result<()> {
     // A request can rotate credentials and then fail on its next hop. Preserve
     // that rotation even when the keeper is unavailable during activation.
     tokio::task::spawn_blocking(move || save_tokens(&stored_endpoint, tokens.as_ref())).await??;
-    let (account, hosts) = snapshot?;
+    let (account, hosts, connection_error) = snapshot?;
     anyhow::ensure!(authenticated, "sign in required");
     let has_keeper = keeper_available(&account);
     *lock(&state.pro.account) = Some(account);
@@ -247,7 +257,7 @@ async fn activate(app: &AppHandle, client: Client) -> Result<()> {
         .map(|host| (host.id.clone(), host))
         .collect();
     *lock(&state.pro.client) = Some(client.clone());
-    *lock(&state.pro.error) = None;
+    *lock(&state.pro.error) = connection_error;
 
     let token_app = app.clone();
     let generation = state.pro.credential_generation.clone();
@@ -586,123 +596,114 @@ pub async fn pro_status(state: tauri::State<'_, Shell>) -> Result<Status, String
         email: account.as_ref().map(|account| account.email.clone()),
         plan: account.map(|account| account.plan),
         error: lock(&state.pro.error).clone(),
+        sign_in: state.pro.sign_in.status(),
     })
 }
 
 #[tauri::command]
-pub async fn pro_sign_in(app: AppHandle) -> Result<(), String> {
-    async {
-        let state = app.state::<Shell>();
-        let _operation = state
-            .pro
-            .operation
-            .try_lock()
-            .map_err(|_| anyhow::anyhow!("Account operation already in progress"))?;
-        let endpoint = state
-            .pro
-            .endpoint
-            .clone()
-            .context("Chimaera Pro isn't available in this build")?;
-        let client = Client::new(&endpoint, None)?;
-        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
-        let redirect = format!(
-            "http://127.0.0.1:{}/callback",
-            listener.local_addr()?.port()
-        );
-        let pkce = chimaera_link::Pkce::new();
-        let url = pkce.authorization_url(&endpoint, &redirect)?;
-        open::that(url.as_str()).context("could not open the sign-in browser")?;
-        let code = tokio::time::timeout(
-            Duration::from_secs(180),
-            oauth_callback(listener, &redirect, &pkce),
-        )
+pub async fn pro_sign_in(app: AppHandle, window: tauri::WebviewWindow) -> Result<(), String> {
+    let state = app.state::<Shell>();
+    let endpoint = state
+        .pro
+        .endpoint
+        .clone()
+        .ok_or("Chimaera Pro isn't available in this build")?;
+    let client = Client::new(&endpoint, None).map_err(|error| error.to_string())?;
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .await
-        .context("Sign-in timed out")??;
-        client
-            .exchange_code(chimaera_link::TokenRequest {
-                grant_type: "authorization_code".into(),
-                code,
-                redirect_uri: redirect,
-                code_verifier: pkce.verifier,
-                device_name: machine_name(),
-            })
-            .await?;
-        activate(&app, client).await?;
-        let _ = app.emit("pro-changed", ());
-        Ok::<_, anyhow::Error>(())
-    }
-    .await
-    .map_err(|error| error.to_string())
-}
-
-async fn oauth_callback(
-    listener: tokio::net::TcpListener,
-    redirect: &str,
-    pkce: &chimaera_link::Pkce,
-) -> Result<String> {
-    loop {
-        let (mut socket, _) = listener.accept().await?;
-        let mut request = Vec::new();
-        let received = tokio::time::timeout(Duration::from_secs(5), async {
-            let mut bytes = [0_u8; 1024];
-            while request.len() < 8192 {
-                let n = socket.read(&mut bytes).await?;
-                if n == 0 {
-                    break;
-                }
-                request.extend_from_slice(&bytes[..n]);
-                if request.windows(4).any(|w| w == b"\r\n\r\n") {
-                    break;
+        .map_err(|_| "Could not open the local sign-in listener. Try again.".to_string())?;
+    let redirect = format!(
+        "http://127.0.0.1:{}/callback",
+        listener
+            .local_addr()
+            .map_err(|error| error.to_string())?
+            .port()
+    );
+    let pkce = chimaera_link::Pkce::new();
+    let url = pkce
+        .authorization_url(&endpoint, &redirect)
+        .map_err(|error| error.to_string())?;
+    let mut attempt = state
+        .pro
+        .sign_in
+        .begin()
+        .map_err(|error| error.to_string())?;
+    *lock(&state.pro.error) = None;
+    let _ = app.emit("pro-changed", ());
+    let sign_in_app = app.clone();
+    tokio::spawn(async move {
+        let app = sign_in_app;
+        let state = app.state::<Shell>();
+        let deadline = tokio::time::Instant::now() + auth::WINDOW;
+        let mut accepted = None;
+        let outcome = async {
+            tokio::select! {
+                _ = attempt.cancelled() => anyhow::bail!("Sign-in cancelled"),
+                result = tokio::task::spawn_blocking(move || open::that(url.as_str())) => {
+                    result?.context("Could not open your browser. Try again from Chimaera.")?;
                 }
             }
-            Ok::<_, std::io::Error>(())
-        })
-        .await;
-        let target = received
-            .ok()
-            .and_then(Result::ok)
-            .and_then(|_| std::str::from_utf8(&request).ok())
-            .and_then(|request| request.lines().next())
-            .and_then(|line| line.strip_prefix("GET "))
-            .and_then(|line| line.split_once(" HTTP/1.").map(|(target, _)| target))
-            .filter(|target| target.starts_with("/callback?"))
-            .and_then(|target| {
-                url::Url::parse(&format!(
-                    "{}{}",
-                    redirect.trim_end_matches("/callback"),
-                    target
-                ))
-                .ok()
-            });
-        let outcome = target
-            .as_ref()
-            .filter(|url| {
-                let states: Vec<_> = url
-                    .query_pairs()
-                    .filter(|(key, _)| key == "state")
-                    .collect();
-                states.len() == 1 && states[0].1 == pkce.state
-            })
-            .map(|url| pkce.callback_code(url));
-        let code = outcome.as_ref().and_then(|result| result.as_ref().ok());
-        let (status, body) = if code.is_some() {
-            ("200 OK", "You can return to chimaera.")
-        } else {
-            ("400 Bad Request", "Invalid sign-in callback.")
-        };
-        let response = format!("HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n{body}", body.len());
-        let _ = socket.write_all(response.as_bytes()).await;
-        let _ = socket.shutdown().await;
-        if let Some(outcome) = outcome {
-            return outcome;
+            let callback =
+                auth::wait_callback(listener, &redirect, &pkce, &mut attempt, deadline).await?;
+            accepted = Some(callback);
+            // Waiting for the browser never locks sign-out, sleep handling or
+            // account reconciliation. Only the bounded credential commit does.
+            let _operation = tokio::select! {
+                _ = attempt.cancelled() => anyhow::bail!("Sign-in cancelled"),
+                result = tokio::time::timeout_at(deadline, state.pro.operation.lock()) => {
+                    result.context("Sign-in expired. Choose Try again.")?
+                }
+            };
+            anyhow::ensure!(state.pro.sign_in.finishing(attempt.id), "Sign-in cancelled");
+            let _ = app.emit("pro-changed", ());
+            client
+                .exchange_code(chimaera_link::TokenRequest {
+                    grant_type: "authorization_code".into(),
+                    code: accepted.as_ref().unwrap().code.clone(),
+                    redirect_uri: redirect,
+                    code_verifier: pkce.verifier,
+                    device_name: machine_name(),
+                })
+                .await
+                .context("Sign-in could not be completed. Choose Try again.")?;
+            activate(&app, client).await?;
+            Ok::<_, anyhow::Error>(())
         }
-    }
+        .await;
+        let current = state.pro.sign_in.complete(attempt.id);
+        let success = current && outcome.is_ok();
+        if current {
+            if let Err(error) = outcome {
+                *lock(&state.pro.error) = Some(error.to_string());
+            }
+            let _ = app.emit("pro-changed", ());
+        }
+        if let Some(callback) = accepted {
+            callback.finish(success).await;
+        }
+        if success {
+            let _ = window.set_focus();
+        }
+    });
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn pro_cancel_sign_in(app: AppHandle) -> Result<(), String> {
+    let state = app.state::<Shell>();
+    state
+        .pro
+        .sign_in
+        .cancel_waiting()
+        .map_err(|error| error.to_string())?;
+    *lock(&state.pro.error) = None;
+    let _ = app.emit("pro-changed", ());
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
     fn device_hosts_never_fall_back_to_ssh_without_an_account_route() {
         assert!(device_fallback::<()>(true).is_err());
@@ -710,22 +711,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oauth_callback_rejects_wrong_state_before_accepting_the_bound_code() {
+    async fn keeper_unavailability_does_not_reject_a_valid_account_login() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let redirect = format!("http://{address}/callback");
-        let pkce = chimaera_link::Pkce::new();
-        let state = pkce.state.clone();
-        let callback =
-            tokio::spawn(async move { oauth_callback(listener, &redirect, &pkce).await });
-        for (state, expected) in [("wrong".to_string(), "400"), (state, "200")] {
-            let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
-            socket.write_all(format!("GET /callback?code=bound-code&state={state} HTTP/1.1\r\nHost: {address}\r\n\r\n").as_bytes()).await.unwrap();
-            let mut reply = String::new();
-            socket.read_to_string(&mut reply).await.unwrap();
-            assert!(reply.starts_with(&format!("HTTP/1.1 {expected}")));
-        }
-        assert_eq!(callback.await.unwrap().unwrap(), "bound-code");
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let keeper = endpoint.clone();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut bytes = [0; 8192];
+                let n = stream.read(&mut bytes).await.unwrap();
+                let me = std::str::from_utf8(&bytes[..n])
+                    .unwrap()
+                    .starts_with("GET /v1/me ");
+                let (status, body) = if me {
+                    ("200 OK", serde_json::json!({"account_id":"fixture","email":"fixture@example.invalid","plan":"pro","device_id":"fixture-device","protocol":0,"keeper_url":keeper,"limits":{"cloud_hours":100,"storage_bytes":20000000000u64},"usage":{"cloud_hours":0,"storage_bytes":0},"hours_exhausted":false}).to_string())
+                } else {
+                    ("503 Service Unavailable", "{}".into())
+                };
+                stream.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                stream.shutdown().await.unwrap();
+            }
+        });
+        let client = Client::new(
+            &endpoint,
+            Some(Tokens {
+                access_token: "fixture-access".into(),
+                refresh_token: "fixture-refresh".into(),
+                token_type: "Bearer".into(),
+                expires_in: 3600,
+            }),
+        )
+        .unwrap();
+        let (account, hosts, warning) = account_snapshot(&client).await.unwrap();
+        assert_eq!(account.plan, chimaera_link::Plan::Pro);
+        assert!(hosts.is_empty());
+        assert!(warning.unwrap().starts_with("You're signed in."));
+        assert!(client.tokens().await.is_some());
+        server.await.unwrap();
     }
 }
 
@@ -746,6 +769,7 @@ async fn sign_out(app: &AppHandle, everywhere: bool, expected: Option<u64>) -> R
         if expected.is_some_and(|expected| expected != state.pro.generation()) {
             return Ok(());
         }
+        state.pro.sign_in.cancel();
         if everywhere {
             state
                 .pro

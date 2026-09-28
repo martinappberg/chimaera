@@ -1040,6 +1040,7 @@ pub fn run() {
             pro::pro_mirror_preference,
             pro::pro_set_never_mirror,
             pro::pro_sign_in,
+            pro::pro_cancel_sign_in,
             pro::pro_sign_out,
             pro::pro_sign_out_everywhere,
             pro::pro_hosts,

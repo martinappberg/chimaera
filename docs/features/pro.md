@@ -16,6 +16,10 @@ Cloud setup controls are implemented; automatic handoff and browser access are b
    “Chimaera Pro isn't available in this build.”
 2. With an endpoint configured, choose **Sign in**. Complete the system-browser
    sign-in; the app receives an authorization code through its loopback callback.
+   The app waits up to 15 minutes for sign-in and verification. While waiting,
+   **Start again** opens a fresh sign-in and **Cancel sign-in** closes the request.
+   An expired or failed request offers **Try again**. The browser confirms success
+   only after the account is active in the app; keeper provisioning can finish later.
 3. The panel shows the signed-in email, plan, hosts and devices. Toggle **Keep
    connected** for a saved SSH host. A password or Duo challenge uses the usual
    host-scoped prompt, with “Asked by your Pro connection” underneath its title.

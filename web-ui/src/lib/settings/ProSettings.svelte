@@ -7,7 +7,7 @@
   import { asyncDisposer } from "../shared/asyncDisposer";
   import { pageVisible } from "../shared/visibility";
   import {
-    onProChanged, proStatus, proSignIn, proSignOut, proSignOutEverywhere,
+    onProChanged, proStatus, proSignIn, proCancelSignIn, proSignOut, proSignOutEverywhere,
     proHosts, proSetHostKept, proDevices,
     type ProStatus, type ProHost, type ProDevice,
   } from "../net/native";
@@ -22,6 +22,7 @@
   let revision = $state(0);
   let generation = 0;
   let alive = true;
+  const signInPhase = $derived(status?.sign_in?.phase ?? null);
 
   async function load(): Promise<void> {
     const request = ++generation;
@@ -87,12 +88,24 @@
   {:else if status !== null && !status.available}
     <p class="state">Chimaera Pro isn't available in this build.</p>
   {:else if status !== null && !status.signed_in}
-    <p class="intro">Sign in to keep your remote machines connected through Chimaera Pro.</p>
-    <div class="actions">
-      <button class="btn primary" disabled={busy !== null} onclick={() => void act("sign-in", proSignIn)}>
-        {busy === "sign-in" ? "Finish signing in in your browser…" : "Sign in"}
-      </button>
-    </div>
+    {#if signInPhase === "waiting"}
+      <p class="intro" role="status">Continue in your browser</p>
+      <p class="state">Complete sign-in and verification there. Chimaera will open when you're ready. This request stays open for up to 15 minutes.</p>
+      <div class="actions">
+        <button class="btn primary" disabled={busy !== null} onclick={() => void act("sign-in", proSignIn)}>Start again</button>
+        <button class="btn" disabled={busy !== null} onclick={() => void act("cancel-sign-in", proCancelSignIn)}>Cancel sign-in</button>
+      </div>
+    {:else if signInPhase === "finishing"}
+      <p class="intro" role="status">Finishing sign-in…</p>
+      <p class="state">Saving your account securely on this computer.</p>
+    {:else}
+      <p class="intro">Sign in to keep your remote machines connected through Chimaera Pro.</p>
+      <div class="actions">
+        <button class="btn primary" disabled={busy !== null} onclick={() => void act("sign-in", proSignIn)}>
+          {busy === "sign-in" ? "Opening sign-in…" : "Sign in"}
+        </button>
+      </div>
+    {/if}
   {:else if status?.signed_in}
     <div class="account" class:subscribed={status.plan === "pro" || status.plan === "max"}>
       <BrandMark size={32} />
@@ -166,7 +179,7 @@
   {#if error !== null || status?.error}
     <div class="error" role="alert">
       <span>{error ?? status?.error}</span>
-      <button class="btn" disabled={busy !== null} onclick={() => void load()}>Retry</button>
+      <button class="btn" disabled={busy !== null || signInPhase === "finishing"} onclick={() => status?.signed_in ? void load() : void act("sign-in", proSignIn)}>{status?.signed_in ? "Retry" : "Try again"}</button>
     </div>
   {/if}
 </section>
