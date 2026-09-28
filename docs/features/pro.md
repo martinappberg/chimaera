@@ -8,6 +8,9 @@ continue to work without an account.
 **Status: partial.** This page covers the native account and connection surface.
 Cloud setup controls are implemented; automatic handoff and browser access are being verified before acceptance. Native phone apps remain separate.
 
+For the combined public implementation, review entrypoints, reproducible checks,
+and remaining acceptance gates, see the [integration review guide](../agent-guides/pro-integration.md).
+
 ## How it is used
 
 1. Open **Pro** from Home or the first **Chimaera Pro** group in Settings.
