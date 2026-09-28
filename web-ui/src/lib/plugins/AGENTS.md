@@ -62,6 +62,10 @@ QuickOpen — not in `shared/icons.ts`, which `prebuild` regenerates from Tabler
   Qualified reported ids take precedence over short names. A short name shared
   by different marketplace ids for the same agent is ambiguous: neither installed
   presence nor hook ownership can be inferred from it. Keep that row unknown.
+  An unqualified manifest id does not turn a short report into exact evidence.
+  The attach sheet repeats the ambiguity warning and refuses completion until
+  resolved; setup choices require known enabled add-ons and all requirements
+  for that agent. Use `agentsForSetup` for both the chooser and its default.
 - **Never list an agent that isn't installed on this host.** A
   recommendation for it says nothing; a requirement none of the listed
   agents here can meet says so once. `requirementsModel.ts` owns this rule —

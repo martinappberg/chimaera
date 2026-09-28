@@ -17,7 +17,7 @@
   import { modalFocus } from "../shared/modalFocus";
   import { refreshKnowledge } from "../workspace/knowledge";
   import { installedOutcome, installTitle, pinnedVersion, type Outcome } from "./installCopy";
-  import { hooksAwaitingTrust, requirementsModel, sheetText, type AgentsState, type RequirementRow } from "./requirementsModel";
+  import { agentsForSetup, hooksAwaitingTrust, requirementsModel, sheetText, type AgentsState, type RequirementRow } from "./requirementsModel";
   import {
     agentInstallContinuation,
     fetchAgentPlugins,
@@ -83,8 +83,9 @@
       plugin = wp.plugins.find((p) => p.id === pluginId) ?? null;
       agents = ap;
       if (plugin === null) loadError = `no plugin “${pluginId}” on this daemon`;
-      // Default the setup agent to one that is installed and has the plugin.
-      const preferred = model?.rows.find((r) => r.status === "installed")?.agent;
+      // Use the same readiness decision as the chooser, including every
+      // required add-on and any ambiguous marketplace report.
+      const preferred = setupAgents[0];
       if (preferred !== undefined) setupAgent = preferred as AgentId;
     } catch (e) {
       loadError = message(e);
@@ -111,6 +112,7 @@
         }),
   );
   const rows = $derived(model?.rows ?? []);
+  const identityUncertain = $derived(rows.some((r) => r.identityAmbiguous));
 
   /** The plugin itself isn't on this host yet: installing it comes first. */
   const notInstalled = $derived(plugin !== null && plugin.source === "available");
@@ -123,7 +125,7 @@
       rows.every((r) => r.status === "installed"),
   );
   const agentsWarn = $derived(
-    (model?.phase === "ready" && model.notice !== null) ||
+    identityUncertain || (model?.phase === "ready" && model.notice !== null) ||
       rows.some((r) => r.kind === "requires" && (r.status === "missing" || r.status === "disabled")),
   );
 
@@ -138,11 +140,8 @@
    *  a plugin that asks nothing of the agents — any agent on this host. */
   const setupAgents = $derived.by((): AgentId[] => {
     if (model === null) return [];
-    const ids =
-      model.phase === "none"
-        ? (agents?.agents ?? []).filter((a) => a.available).map((a) => a.agent)
-        : rows.filter((r) => r.status !== "missing").map((r) => r.agent);
-    return [...new Set(ids)] as AgentId[];
+    const available = (agents?.agents ?? []).filter((a) => a.available).map((a) => a.agent);
+    return agentsForSetup(model, available) as AgentId[];
   });
 
   /** Step numbers: the plugin's own install (when shown) comes first. */
@@ -159,7 +158,7 @@
 
   function rowClass(r: RequirementRow): string {
     if (r.status === "installed") return "good-text";
-    if (r.status === "disabled" || (r.kind === "requires" && r.status === "missing")) return "warn-text";
+    if (r.tone === "warn") return "warn-text";
     return "muted-text";
   }
 
@@ -235,7 +234,11 @@
   }
 
   async function complete(): Promise<void> {
-    if (plugin === null || notInstalled) return;
+    if (plugin === null || notInstalled || identityUncertain) return;
+    if (!detected && canSetup && setupAgents.length > 0 && !setupAgents.includes(setupAgent)) {
+      error = "Choose an agent with the required plugins enabled.";
+      return;
+    }
     busy = "complete";
     error = null;
     skipped = [];
@@ -442,7 +445,9 @@
                 </select>
                 <span class="smuted">billed to your {setupAgent} account</span>
               </div>
-              {#if setupAgents.length === 0 && rows.length > 0}
+              {#if identityUncertain}
+                <div class="smuted warn-text">Resolve the marketplace identity in the agent before continuing.</div>
+              {:else if setupAgents.length === 0 && rows.length > 0}
                 <div class="smuted">Install the plugin for an agent first (step {nAgents}).</div>
               {/if}
             {/if}
@@ -457,7 +462,7 @@
       <button class="opt quiet" use:focusOnMount onclick={onClose}>Cancel</button>
       <button
         class="opt primary"
-        disabled={busy !== null || plugin === null || notInstalled}
+        disabled={busy !== null || plugin === null || notInstalled || identityUncertain}
         title={notInstalled && plugin !== null ? `install ${plugin.name} first` : undefined}
         onclick={() => void complete()}
       >

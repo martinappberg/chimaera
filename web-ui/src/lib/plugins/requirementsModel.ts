@@ -40,6 +40,8 @@ export interface RequirementRow {
   /** The id's part before `@`. */
   name: string;
   status: RowStatus;
+  /** A short report cannot identify this marketplace; setup must not guess. */
+  identityAmbiguous?: boolean;
   /** What the agent reports for its installed copy. */
   version: string | null;
   scope: string | null;
@@ -68,6 +70,19 @@ export interface RequirementsModel {
  *  requested add-on: a different plugin for the same agent cannot complete it. */
 export function installationDetected(rows: RequirementRow[], agent: string, id: string): boolean {
   return rows.some((r) => r.agent === agent && r.id === id && (r.status === "installed" || r.status === "disabled"));
+}
+
+/** Setup needs an enabled add-on and all mandatory add-ons for that agent.
+ *  Missing optional add-ons are fine; an unknown identity is never readiness. */
+export function agentsForSetup(model: RequirementsModel, available: string[]): string[] {
+  if (model.phase === "none") return available;
+  if (model.phase !== "ready") return [];
+  return available.filter((agent) => {
+    const rows = model.rows.filter((r) => r.agent === agent);
+    return rows.some((r) => r.status === "installed") && rows.every(
+      (r) => r.status !== "unknown" && (r.kind !== "requires" || r.status === "installed"),
+    );
+  });
 }
 
 export interface RequirementsInput {
@@ -160,9 +175,11 @@ export function requirementsModel(input: RequirementsInput): RequirementsModel {
     ]);
     const unambiguous = candidateIds.size === 1;
     const baseReport = entry.plugins.find((p) => p.id === base);
-    const got = entry.plugins.find((p) => p.id === r.id) ?? (unambiguous ? baseReport : undefined);
+    const exact = r.id !== base ? entry.plugins.find((p) => p.id === r.id) : undefined;
+    const got = exact ?? (unambiguous ? baseReport : undefined);
     const out = blankRow(kind, r);
     if (got === undefined && baseReport !== undefined) {
+      out.identityAmbiguous = true;
       out.state = "marketplace unclear — check in the agent";
       out.tone = "warn";
       return out;
@@ -290,6 +307,7 @@ function fallbackSummary(kind: RowKind, p: BlockInput): string {
  *  recommendation as optional. */
 export function sheetText(row: RequirementRow, knowledge: string | null | undefined): string {
   const v = row.version !== null ? ` ${row.version}` : "";
+  if (row.identityAmbiguous) return `${row.agent}'s ${row.id}: ${row.state}`;
   if (row.status === "installed") return `${row.agent} has ${row.name}${v} ✓`;
   if (row.status === "disabled") return `${row.agent} has ${row.name}${v}, but it is disabled`;
   if (row.kind === "requires") {

@@ -165,6 +165,8 @@ installation or hook trust and on reconnect; it carries no plugin payload.
     Full marketplace ids take precedence over short names. If a short name could refer
     to different marketplaces in the manifest or report, the row says the marketplace
     is unclear and does not confirm installation or infer hook ownership.
+    The setup sheet repeats this warning and blocks completion until resolved;
+    setup runs only through an agent with known enabled add-ons and all its requirements.
     Omitting the optional id preserves required-first selection for older clients. The
     sheet resumes the existing install → hook review → workspace setup steps; installation
     alone does not trust hooks or initialize a repository. Newly started agent sessions load
