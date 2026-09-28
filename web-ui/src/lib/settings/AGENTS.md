@@ -40,8 +40,12 @@ available in a recovery disclosure. Checkout runs in the browser through the
 native authenticated bridge; confirmed account state alone activates the plan.
 The signed-out page has one Sign in action: it retains a chosen plan, but an
 already active account restores its existing plan without opening checkout.
-The introduction describes device-neutral file/conversation continuity; browser
-access on another device does not imply arbitrary process migration.
+Only confirmed free accounts see the illustrated introduction and plan selection.
+Paid accounts see an operational overview without a sales pitch or walkthrough.
+Unknown/startup/error account states stay neutral, and never trigger a remembered
+purchase until a confirmed no-plan status arrives. The static introduction shows
+project/conversation continuity; it is not live setup progress or arbitrary
+process migration.
 Refresh and short-lived checkout polling stop while the view is hidden.
 
 ## File map

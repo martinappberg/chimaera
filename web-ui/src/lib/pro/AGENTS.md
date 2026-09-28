@@ -8,6 +8,7 @@ enter UI settings or local storage.
 | --- | --- |
 | `ProView.svelte` | Desktop account surface and browser worker detection; shared project/provider context. |
 | `ProNavigation.svelte` | Quiet workbench Pro entry. |
+| `ProWalkthrough.svelte` | Static, decorative continuity sketches for confirmed free accounts only; repeated project/thread motif, theme tokens, responsive captions. |
 | `CloudProjects.svelte` | Passive cloud-project discovery and explicit per-project local opening. |
 | `ProviderConnections.svelte` | First-agent onboarding, guided connection lifecycle, optional repository providers and exact pending-handoff continuation. |
 | `cloudTransport.ts` | Native/browser request parity; passive GETs, explicit wake intent and focused terminal routing. |

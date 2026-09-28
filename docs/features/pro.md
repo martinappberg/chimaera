@@ -26,16 +26,17 @@ Cloud setup controls are implemented; automatic handoff and browser access are b
    On restart, saved account access shows its current phase immediately. If the
    system Keychain needs a response, the page says so while Home stays usable;
    billing and account changes wait until initialization completes.
-3. The page explains the workflow in three steps: work where you are, keep
-   supported agents running in the cloud, and continue on another device through
-   the browser. Files and conversation history stay connected; when first bringing
-   a cloud-created project onto a computer, choose its local folder.
-   Provider sign-in and the limits of process handoff are stated alongside that
-   explanation. Local projects, agents and ordinary SSH remain free.
-   Plan cards lead with what Pro includes and how Max adds capacity; pricing is
-   visible before checkout; **See plans** jumps directly to the comparison. Active subscribers see account controls and cloud
-   readiness first, with the introduction under **How Pro works**. Numeric usage
-   and limits appear only in the active account's **Usage and plan details**, using the service's current values.
+3. Signed-out and confirmed no-plan accounts see an illustrated introduction:
+   start a session on your computer, continue a supported agent in the cloud,
+   then return to the same project, files and conversation in another device's
+   browser. The three static sketches are explanatory, not setup indicators.
+   Local projects, agents and ordinary SSH remain free. Plan cards show pricing
+   before checkout; **See plans** jumps directly to the comparison.
+   Active subscribers see **Your Chimaera Pro** or **Your Chimaera Max** with
+   account, cloud and project controls. They see no sales introduction or plan
+   comparison. Numeric usage and limits remain under **Usage and plan details**,
+   using the service's current values. Loading, unavailable and unknown account
+   states stay neutral; a saved purchase intent waits for a confirmed free plan.
    The page shows the signed-in email and current plan. Without a plan, choose
    Pro or Max and monthly or yearly billing, then continue to checkout in the
    system browser. The single signed-out **Sign in** action remembers that
