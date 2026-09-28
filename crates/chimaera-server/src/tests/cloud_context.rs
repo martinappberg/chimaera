@@ -142,8 +142,10 @@ async fn cloud_context_real_http_is_scoped_revisioned_and_never_executes_on_save
     assert_eq!(status, StatusCode::FORBIDDEN);
     let (_, init) = rpc(port, "s-cloud", "cloud-fixture", "initialize", json!({})).await;
     let text = init["result"]["instructions"].as_str().unwrap();
-    assert!(text.contains("Chimaera cloud worker") && text.contains(std::env::consts::ARCH));
-    assert!(text.contains("Runtime observations") && text.contains("normal permissions"));
+    assert!(
+        text.contains("\"execution_location\":\"cloud\"") && text.contains(std::env::consts::ARCH)
+    );
+    assert!(text.contains("work-capabilities") && text.contains("normal permissions"));
     assert!(!text.contains("synthetic-fixture"));
     let (_, tools) = rpc(port, "s-cloud", "cloud-fixture", "tools/list", json!({})).await;
     assert!(tools["result"]["tools"]
@@ -221,6 +223,36 @@ async fn cloud_context_real_http_is_scoped_revisioned_and_never_executes_on_save
     );
     #[cfg(unix)]
     tui_mcp(&state, &workspace, true).await;
+    let (status,_) = request(&state,Method::POST,"/api/v1/pro/configure",Some(json!({"endpoint":format!("http://127.0.0.1:{port}"),"keeper_url":"","account_id":"fixture-account","role":"device","delegation":{"access_token":"synthetic-return","expires_at":"2099-01-01T00:00:00Z","scope":["baton","mirror"],"device_id":"device-fixture"},"hours_exhausted":false}))).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, returned) = rpc(port, "s-cloud", "cloud-fixture", "initialize", json!({})).await;
+    let text = returned["result"]["instructions"].as_str().unwrap();
+    assert!(
+        text.contains("\"execution_location\":\"device\"")
+            && text.contains("replaces earlier cloud-only assumptions")
+    );
+    assert!(!text.contains("This is a headless environment") && !text.contains("synthetic-return"));
+    let (_, read) = rpc(
+        port,
+        "s-cloud",
+        "cloud-fixture",
+        "tools/call",
+        json!({"name":"read_cloud_profile","arguments":{}}),
+    )
+    .await;
+    let read = content(&read);
+    assert!(read["context"]
+        .as_str()
+        .unwrap()
+        .contains("\"execution_location\":\"device\""));
+    assert!(
+        !read.to_string().contains("worker-fixture")
+            && !read.to_string().contains("device-fixture")
+    );
+    assert!(
+        state.chat.list().is_empty(),
+        "context refresh must not start a model turn"
+    );
     request(&state, Method::DELETE, "/api/v1/pro/configure", None).await;
     let (_, disconnected) = rpc(
         port,

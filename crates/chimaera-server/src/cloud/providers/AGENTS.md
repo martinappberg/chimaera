@@ -6,7 +6,7 @@ Worker-only readiness and explicitly requested provider authentication. Parent:
 
 | File | Responsibility |
 |---|---|
-| `mod.rs` | Catalog adapters, allowlisted status parsing, bounded single-flight cache, authenticated HTTP handlers and the handoff `readiness` helper. |
+| `mod.rs` | Catalog adapters, allowlisted status parsing, bounded single-flight cache, authenticated HTTP handlers the handoff `readiness` helper, and catalog-only passive prompt observations (expired/absent status is unknown). |
 | `process.rs` | Capped CLI output and Codex auth-only JSON-RPC; owned process-group cleanup. No raw output enters HTTP errors or logs. |
 | `claude.rs` | Official Claude CLI headless browser/code adapter; bounded URL extraction and one-time stdin reply, without a workspace or PTY. |
 | `connect.rs` | Short-lived connection/disconnection jobs, one writer per provider, curated runtime installation, exact login terminals, Codex device codes, cancellation and cleanup acknowledgement. |
