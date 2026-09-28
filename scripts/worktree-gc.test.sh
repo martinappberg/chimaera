@@ -260,8 +260,14 @@ out=$(cd "$M" && bash "$GC" --hook session-start </dev/null)
 i=0
 while [ $i -lt 60 ] && ! grep -q "nothing to do\|df free: " "$LOG" 2>/dev/null; do sleep 1; i=$((i + 1)); done
 grep -q -- "--- auto run" "$LOG" && ok || no "no background run logged: $(ls -la "$M/.git/worktree-gc" 2>&1; cat "$LOG" 2>&1)"
-out=$(cd "$M" && bash "$GC" --hook session-start </dev/null; ls "$M/.git/worktree-gc")
-case "$out" in *lock*) no "second run inside the interval started: $out" ;; *) ok ;; esac
+# The run's last log line comes before its exit trap drops the lock: wait for
+# the lock, then count runs. A leftover lock proves nothing either way.
+i=0
+while [ $i -lt 30 ] && [ -d "$M/.git/worktree-gc/lock" ]; do sleep 1; i=$((i + 1)); done
+(cd "$M" && bash "$GC" --hook session-start </dev/null)
+sleep 3
+runs=$(grep -c -- "--- auto run" "$LOG")
+[ "$runs" = 1 ] && ok || no "a second run started inside the interval ($runs runs): $(cat "$LOG")"
 # session-end: /clear does nothing; a real end sweeps the session's worktree
 # (named by the hook payload's cwd) in the background.
 fake_target "$S"
