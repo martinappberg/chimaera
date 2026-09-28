@@ -305,8 +305,8 @@ export async function putWorkspacePlugin(
   );
 }
 
-export async function fetchAgentPlugins(workspaceId: string): Promise<AgentPlugins> {
-  const body = await json<AgentPlugins>(await api(`${ws(workspaceId)}/agent-plugins`));
+export async function fetchAgentPlugins(workspaceId: string, refresh = false): Promise<AgentPlugins> {
+  const body = await json<AgentPlugins>(await api(`${ws(workspaceId)}/agent-plugins${refresh ? "?refresh=true" : ""}`));
   return {
     schema: body.schema ?? 1,
     host: typeof body.host === "string" ? body.host : "",
@@ -341,18 +341,24 @@ export async function fetchSkills(workspaceId: string): Promise<SkillsReport> {
   };
 }
 
+/** Keep the handoff from the card or setup sheet after its terminal opens.
+ *  One pending continuation, scoped to the workspace that requested it. */
+export const agentInstallContinuation = writable<{ workspaceId: string; pluginId: string; agent: AgentId } | null>(null);
+
 export async function installPlugin(
   workspaceId: string,
   pluginId: string,
   agent: AgentId,
 ): Promise<{ session_id: string }> {
-  return json(
+  const result = await json<{ session_id: string }>(
     await api(`${ws(workspaceId)}/plugins/${encodeURIComponent(pluginId)}/install`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ agent }),
     }),
   );
+  agentInstallContinuation.set({ workspaceId, pluginId, agent });
+  return result;
 }
 
 export async function setupPlugin(

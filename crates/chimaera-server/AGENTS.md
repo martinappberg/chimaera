@@ -215,6 +215,16 @@ the lifecycle, keep them consistent:
 
 ## Invariants / gotchas
 
+- **Agent-plugin installs keep their result visible.** `plugins/install-agent.sh`
+  receives metadata and the executable path as positional arguments; never
+  splice them into shell source. Its exit trap reports the outcome, writes
+  a private runtime completion marker to invalidate agent probes, and waits
+  for Enter before exiting with the install's status. Terminal titles are
+  presentation only, never a trusted completion signal. The watcher removes
+  the marker on completion or session exit. This retention belongs to the
+  installer, not ordinary terminal sessions. `tests/plugins.rs` drives the
+  install route with fast success/failure commands and late PTY attachment.
+
 - **Auth every new route.** Chat WS uses first-frame token auth
   (`chat_authenticate`), same token as the rest. Don't add an unauthenticated
   endpoint.

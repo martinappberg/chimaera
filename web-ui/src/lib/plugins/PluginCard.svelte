@@ -45,6 +45,7 @@
   } from "./installCopy";
   import { agentSideBlocks, requirementsModel, type AgentsState, type RequirementRow } from "./requirementsModel";
   import {
+    agentInstallContinuation,
     changeWorkbenchPlugin,
     checkedAt,
     detailsKey,
@@ -153,6 +154,11 @@
     });
   });
   const checked = $derived($checkedAt.get(p.id));
+  const continuation = $derived(
+    $agentInstallContinuation?.workspaceId === wsId && $agentInstallContinuation.pluginId === p.id
+      ? $agentInstallContinuation
+      : null,
+  );
   /** A plugin that can't run here: the switch can't turn it on (the daemon
    *  refuses) until the fault is gone. A fault while on is the plugin
    *  failing in this workspace, which switching off and on clears. */
@@ -485,6 +491,11 @@
     <p class="status" role="status">{WORKING[working]}</p>
   {:else if error !== null}
     <p class="status err" role="alert">{error}</p>
+  {:else if continuation !== null}
+    <p class="status" role="status">
+      Installation opened for {continuation.agent}. When it finishes,
+      <button class="link" onclick={() => onAttach(p.id)}>continue setup</button>.
+    </p>
   {:else if note !== null}
     <p class="status" role="status">{note.text}</p>
   {/if}

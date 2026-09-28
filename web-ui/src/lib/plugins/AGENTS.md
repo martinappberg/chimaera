@@ -74,7 +74,13 @@ QuickOpen — not in `shared/icons.ts`, which `prebuild` regenerates from Tabler
   posts only the hashes the user saw; the daemon writes only those whose
   current hash still matches.
 - **Installs and setups of agent plugins are the CLIs' own commands** in a
-  visible session; the sheet closes and opens that session.
+  visible session; the sheet closes and opens that session. The install
+  terminal keeps its result until Enter. `store.ts::agentInstallContinuation`
+  remembers the latest install's workspace/plugin/agent so its card offers
+  **continue setup** even when the install began in the sheet. Returns to
+  Extensions with this continuation, explicit refreshes, and sheet opens
+  bypass the agent-probe cache. A completed sheet or launched setup clears
+  its matching continuation; an install response alone never means success.
 - **Canonical vocabulary**: `/name` for claude, `$name` for codex; plugin ids
   as the agents report them.
 - **Versions, sources and verification come from the daemon** (the lock, the
