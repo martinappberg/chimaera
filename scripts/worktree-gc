@@ -4,8 +4,9 @@
 # and reclaim the disk the idle ones hold. The lifecycle it enforces is in the
 # worktree-lifecycle skill (.claude/skills/worktree-lifecycle/SKILL.md).
 #
-# Dry run by default: it prints what it would do and changes nothing. It acts
-# only with --apply.
+# Dry run by default: it prints what it would do and changes nothing (beyond a
+# `git fetch origin`, so origin/main and the remote branches are current). It
+# acts only with --apply.
 #
 #   scripts/worktree-gc                  table of every worktree + what --apply does
 #   scripts/worktree-gc --apply          remove the REMOVE group, trim the TRIM group
@@ -107,8 +108,17 @@ esac
 NOW=$(date +%s)
 
 SELF_PATH=$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")
-HERE=$(git rev-parse --show-toplevel 2>/dev/null) || die "not inside a git worktree"
-COMMON=$(cd "$HERE" && cd "$(git rev-parse --git-common-dir)" && pwd -P) || die "no git common dir"
+# The repo to act on is the one this script belongs to — never merely the
+# caller's cwd: a hook fired while a session's cwd sits in some other repo must
+# not collect that repo's worktrees. The cwd only picks which worktree of THIS
+# repo is "the current one" (--self, and the one never to touch).
+common_of() { (cd "$1" 2>/dev/null && cd "$(git rev-parse --git-common-dir 2>/dev/null)" 2>/dev/null && pwd -P); }
+HERE=$(cd "$(dirname "$SELF_PATH")" && git rev-parse --show-toplevel 2>/dev/null) ||
+  HERE=$(git rev-parse --show-toplevel 2>/dev/null) || die "not inside a git worktree"
+COMMON=$(common_of "$HERE") || die "no git common dir"
+CUR=$HERE
+cwd_top=$(git rev-parse --show-toplevel 2>/dev/null) &&
+  [ "$(common_of "$cwd_top")" = "$COMMON" ] && CUR=$cwd_top
 STATE="$COMMON/$PROG"
 TMPD=$(mktemp -d "${TMPDIR:-/tmp}/$PROG.XXXXXX") || die "mktemp failed"
 trap 'rm -rf "$TMPD"' EXIT
@@ -266,7 +276,7 @@ du_kb() { # files-with-paths → total KiB
 fetch_and_prs() {
   BASE=$(git -C "$HERE" symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null || echo origin/main)
   if [ "$FETCH" = 1 ]; then
-    with_timeout 60 git -C "$HERE" fetch --quiet --prune origin >/dev/null 2>&1 ||
+    with_timeout 60 git -C "$HERE" fetch --quiet origin >/dev/null 2>&1 ||
       say "warning: git fetch failed; judging against the last-fetched $BASE"
   fi
   : >"$TMPD/prs"
@@ -299,8 +309,9 @@ pr_for() { # branch head
 classify() {
   local n=0 path rpath head branch locked prunable gd sizekb idle_s mt reason group
   local pr prs prn proid dirty unpushed in_base removable why extra lockpid self_rp
-  self_rp=$(realdir "$HERE")
-  local claude_rp=""
+  self_rp=$(realdir "$CUR")
+  local claude_rp="" script_rp
+  script_rp=$(realdir "$HERE")
   [ -n "${CLAUDE_PROJECT_DIR:-}" ] && claude_rp=$(realdir "$CLAUDE_PROJECT_DIR")
   : >"$TMPD/rows"
   while IFS="$(printf '\t')" read -r path rpath head branch locked prunable; do
@@ -308,17 +319,23 @@ classify() {
     [ "$branch" = "-" ] && branch=""
     : >"$TMPD/b.$n"
     reason="" group="" sizekb=0 pr="-" dirty="-" unpushed="-" idle="-"
-    if [ "$prunable" != "-" ] || [ ! -d "$path" ]; then
+    if [ ! -d "$path" ]; then
       printf 'REMOVE\t0\t%s\t-\t-\t-\t-\t%s\t%s\t%s\n' "${branch:-(detached)}" "$path" "directory is gone; git worktree prune clears the entry" "$n" >>"$TMPD/rows"
+      continue
+    fi
+    if [ "$prunable" != "-" ]; then
+      printf 'KEEP\t0\t%s\t-\t-\t-\t-\t%s\t%s\t%s\n' "${branch:-(detached)}" "$path" "git calls it prunable ($prunable) but the folder is still there: left for a human" "$n" >>"$TMPD/rows"
       continue
     fi
     gd=$(cd "$path" && git rev-parse --absolute-git-dir 2>/dev/null)
     build_dirs "$path" >"$TMPD/b.$n"
-    [ "$SIZES" = 1 ] && sizekb=$(du_kb "$TMPD/b.$n")
     mt=$(newest_mtime "$path" "$gd" "$TMPD/b.$n")
-    idle_s=$((NOW - ${mt:-0}))
-    [ "$idle_s" -lt 0 ] && idle_s=0
-    idle=$(age_h "$idle_s")
+    idle_s=0 idle="?"
+    if [ -n "$mt" ]; then
+      idle_s=$((NOW - mt))
+      [ "$idle_s" -lt 0 ] && idle_s=0
+      idle=$(age_h "$idle_s")
+    fi
 
     # ACTIVE — first matching reason wins.
     if [ "$locked" != "-" ]; then
@@ -327,10 +344,12 @@ classify() {
       if [ -n "$lockpid" ] && ! kill -0 "$lockpid" 2>/dev/null && ! ps -p "$lockpid" >/dev/null 2>&1; then
         reason="$reason (stale? pid $lockpid is gone; git worktree unlock to release)"
       fi
-    elif [ "$rpath" = "$self_rp" ] || { [ -n "$claude_rp" ] && [ "$rpath" = "$claude_rp" ]; }; then
+    elif [ "$rpath" = "$self_rp" ] || [ "$rpath" = "$script_rp" ] || { [ -n "$claude_rp" ] && [ "$rpath" = "$claude_rp" ]; }; then
       reason="this session runs here"
     elif [ "$PROC_SRC" = none ]; then
       reason="cannot inspect processes (no lsof or /proc): assumed in use"
+    elif [ -z "$mt" ]; then
+      reason="cannot read its files' times: assumed in use"
     else
       reason=$(proc_reason "$rpath")
       if [ -z "$reason" ] && [ "$idle_s" -lt $((ACTIVE_HOURS * 3600)) ]; then
@@ -401,6 +420,11 @@ classify() {
         group=KEEP reason="$why; idle only $idle (< ${IDLE_HOURS}h)"
       fi
     fi
+    # du walks every file of a target/ (tens of thousands): the hooks' hourly
+    # background run only sizes what it is about to delete.
+    if [ "$SIZES" = 1 ] && { [ "$AUTO" = 0 ] || [ "$group" = REMOVE ] || [ "$group" = TRIM ]; }; then
+      sizekb=$(du_kb "$TMPD/b.$n")
+    fi
     [ -n "$branch" ] || branch="(detached)"
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$group" "$sizekb" "$branch" "$pr" "$dirty" "$unpushed" "$idle" "$path" "$reason" "$n" >>"$TMPD/rows"
   done <"$TMPD/wts"
@@ -463,7 +487,7 @@ still_idle() { # n path rpath
   [ -z "$(proc_reason "$3")" ] || return 1
   git -C "$HERE" worktree list --porcelain | awk -v p="$2" '$0 == "worktree " p { f = 1; next } /^worktree / { f = 0 } f && /^locked/ { exit 1 }' || return 1
   mt=$(newest_mtime "$2" "$(cd "$2" && git rev-parse --absolute-git-dir 2>/dev/null)" "$TMPD/b.$1")
-  [ $(($(date +%s) - ${mt:-0})) -ge $((ACTIVE_HOURS * 3600)) ]
+  [ -n "$mt" ] && [ $(($(date +%s) - mt)) -ge $((ACTIVE_HOURS * 3600)) ]
 }
 
 safe_rm_build_dir() { # worktree dir
@@ -520,23 +544,29 @@ apply_rows() {
 # Stale debug objects: on macOS a dev build keeps each executable's object
 # files in deps/ for the debugger (split-debuginfo=unpacked), and every
 # incremental rebuild writes new ones without deleting the old — tens of GB
-# over a long-lived worktree. An object no executable or dylib in the same
-# deps/ references (by name) is garbage; young ones may belong to a link in
-# progress and are kept.
+# over a long-lived worktree. An object no binary of that profile references
+# (by name) is garbage: the executables and dylibs in deps/, plus executables
+# elsewhere in the profile dir — uplifted bins, examples, and hard links that
+# still hold an older build (run-app-isolated.sh's chimaera-dev.app). Young
+# objects may belong to a link in progress and are kept.
 stale_objects() { # deps-dir → paths
   local deps=$1 f b
-  for f in "$deps"/*; do
-    b=${f##*/}
-    case "$b" in *.dylib | *.so) ;; *.*) continue ;; esac
-    [ -f "$f" ] && LC_ALL=C grep -aoE '[^/[:cntrl:]]+\.rcgu\.o' "$f"
-  done | sort -u >"$TMPD/refs"
+  {
+    for f in "$deps"/*; do
+      b=${f##*/}
+      case "$b" in *.dylib | *.so) ;; *.*) continue ;; esac
+      [ -f "$f" ] && printf '%s\0' "$f"
+    done
+    find "${deps%/*}" "(" -path "$deps" -o -name incremental -o -name build -o -name .fingerprint ")" -prune \
+      -o -type f -perm -u+x -print0 2>/dev/null
+  } | xargs -0 env LC_ALL=C grep -aohE '[^/[:cntrl:]]+\.rcgu\.o' 2>/dev/null | sort -u >"$TMPD/refs"
   find "$deps" -maxdepth 1 -type f -name '*.rcgu.o' -mmin +"$SWEEP_MIN_AGE_MIN" 2>/dev/null |
     awk -v refs="$TMPD/refs" 'BEGIN { while ((getline r < refs) > 0) R[r] = 1 } { b = $0; sub(/.*\//, "", b); if (!(b in R)) print }'
 }
 
 self_mode() {
-  local wt rwt d deps before after busy stale_kb=0 stale_n=0 total=0 f sz
-  wt=$HERE
+  local wt rwt d i before after busy stale_kb=0 stale_n=0 total=0
+  wt=$CUR
   rwt=$(realdir "$wt")
   printf '%s\n' "$rwt" >"$TMPD/roots"
   git -C "$HERE" worktree list --porcelain | awk '/^worktree /{ print substr($0, 10) "\t" }' >"$TMPD/wts"
@@ -566,9 +596,20 @@ self_mode() {
       stale_objects "$deps"
     done >"$TMPD/stale"
     stale_n=$(wc -l <"$TMPD/stale" | tr -d ' ')
-    stale_kb=$(tr '\n' '\0' <"$TMPD/stale" | xargs -0 du -ck 2>/dev/null | awk '$2 == "total" { s += $1 } END { print s + 0 }')
-    if [ "$APPLY" = 1 ]; then
+    # (GNU xargs runs its command once even on empty input: du would size the cwd.)
+    [ -s "$TMPD/stale" ] &&
+      stale_kb=$(tr '\n' '\0' <"$TMPD/stale" | xargs -0 du -ck 2>/dev/null | awk '$2 == "total" { s += $1 } END { print s + 0 }')
+    if [ ! -s "$TMPD/stale" ]; then
+      say "$(short_path "$wt"): no stale debug objects."
+    elif [ "$APPLY" = 1 ]; then
+      # Deleting files bumps deps/'s mtime, which newest_mtime reads as build
+      # activity: put it back so a sweep never restarts the idle clock.
+      sed 's|/[^/]*$||' "$TMPD/stale" | sort -u >"$TMPD/stale-dirs"
+      i=0
+      while IFS= read -r d; do i=$((i + 1)); touch -r "$d" "$TMPD/stamp.$i"; done <"$TMPD/stale-dirs"
       tr '\n' '\0' <"$TMPD/stale" | xargs -0 rm -f
+      i=0
+      while IFS= read -r d; do i=$((i + 1)); touch -r "$TMPD/stamp.$i" "$d"; done <"$TMPD/stale-dirs"
       after=$(free_kb "$wt")
       say "$(short_path "$wt"): swept $stale_n stale debug object(s); $(df_delta "$before" "$after")."
     else
@@ -591,7 +632,10 @@ self_mode() {
 # Start a fully detached copy of this script (its own process group, stdio
 # off the hook's pipes) so the hook returns at once and the work survives the
 # session's teardown.
-spawn_detached() {
+spawn_detached() { spawn_detached_in "$HERE" "$@"; }
+spawn_detached_in() { # dir args...
+  local dir=$1
+  shift
   mkdir -p "$STATE" 2>/dev/null || return 0
   local log="$STATE/log"
   # Keep the log bounded: the last 2000 lines.
@@ -600,7 +644,7 @@ spawn_detached() {
   fi
   (
     set -m
-    cd "$HERE" && nohup bash "$SELF_PATH" "$@" </dev/null >>"$log" 2>&1 &
+    cd "$dir" && nohup bash "$SELF_PATH" "$@" </dev/null >>"$log" 2>&1 &
   ) >/dev/null 2>&1
 }
 
@@ -632,14 +676,14 @@ hook_mode() {
       reason=$(printf '%s' "$input" | sed -n 's/.*"reason"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
       [ "$reason" = clear ] && exit 0
       # The session's own worktree is its last cwd (Claude and Codex both send
-      # it) — but only when that is still a checkout of this repo.
+      # it) when that is a checkout of this repo; otherwise the one this script
+      # was run from (Claude runs it from $CLAUDE_PROJECT_DIR).
       cwd=$(printf '%s' "$input" | sed -n 's/.*"cwd"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
-      if [ -n "$cwd" ] && [ -d "$cwd" ] &&
-        [ "$(cd "$cwd" && cd "$(git rev-parse --git-common-dir 2>/dev/null)" 2>/dev/null && pwd -P)" = "$COMMON" ]; then
-        HERE=$(cd "$cwd" && git rev-parse --show-toplevel)
+      if [ -n "$cwd" ] && [ -d "$cwd" ] && [ "$(common_of "$cwd")" = "$COMMON" ]; then
+        CUR=$(cd "$cwd" && git rev-parse --show-toplevel)
       fi
       auto_enabled || exit 0
-      spawn_detached --self --sweep --apply --auto
+      spawn_detached_in "$CUR" --self --sweep --apply --auto
       ;;
     *) die "unknown hook: $HOOK (session-start | session-end)" ;;
   esac

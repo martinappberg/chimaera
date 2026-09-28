@@ -39,7 +39,9 @@ branch about something else entirely.
    worktree it runs in (it is ACTIVE: "this session runs here"), so:
    - drop its build output now with `scripts/worktree-gc --self --apply`;
    - end the session. The next gc run (any session's start, at most hourly) removes
-     the worktree once nothing uses it — merged, clean and pushed is REMOVE.
+     the worktree once nothing uses it — merged, clean and pushed is REMOVE — unless
+     automatic cleanup is off on that machine (`worktree-gc.auto`, below); then say
+     so and leave the removal to the human.
    - Working from another checkout? `git worktree remove <path>` — never `--force`,
      and never on a worktree the table calls ACTIVE.
 3. **At session end** the SessionEnd hook runs `--self --sweep`: it deletes only the
@@ -71,10 +73,14 @@ scripts/worktree-gc --self [--sweep] [--apply]   # this worktree's own target/
 bash scripts/worktree-gc.test.sh       # the safety rules, against a throwaway repo
 ```
 
-Knobs (environment): `WORKTREE_GC_ACTIVE_HOURS` (6), `WORKTREE_GC_IDLE_HOURS` (24),
-`WORKTREE_GC_LOW_GB` (50), `WORKTREE_GC_INTERVAL_MIN` (60), and `WORKTREE_GC=off`
-to silence the hooks. It fails safe: without `lsof`/`/proc` every worktree is ACTIVE,
-and without `gh` nothing is removable by PR state.
+Knobs: `git config worktree-gc.auto false` stops the hooks from deleting anything
+(they still flag low disk; `git config --get worktree-gc.auto` shows whether a
+machine opted out), `WORKTREE_GC=off` silences them entirely, and
+`WORKTREE_GC_ACTIVE_HOURS` (6), `WORKTREE_GC_IDLE_HOURS` (24), `WORKTREE_GC_LOW_GB`
+(50), `WORKTREE_GC_INTERVAL_MIN` (60) tune them. It acts only on the repo it lives
+in, whatever the cwd. It fails safe: without `lsof`/`/proc`, or when it can't read a
+worktree's files, that worktree is ACTIVE; without `gh` nothing is removable by PR
+state.
 
 ## Hooks
 

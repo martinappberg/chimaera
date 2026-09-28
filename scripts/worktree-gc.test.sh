@@ -5,7 +5,6 @@
 # Run: bash scripts/worktree-gc.test.sh
 set -u
 here=$(cd "$(dirname "$0")" && pwd)
-GC="$here/worktree-gc"
 T=$(mktemp -d "${TMPDIR:-/tmp}/worktree-gc-test.XXXXXX")
 T=$(cd "$T" && pwd -P)
 pids=""
@@ -27,6 +26,7 @@ export WORKTREE_GC_LOW_GB=0
 mkdir -p "$T/bin"
 cat >"$T/bin/gh" <<'EOF'
 #!/bin/sh
+[ -z "${GH_FAKE_FAIL:-}" ] || exit 1
 cat "$GH_FAKE_PRS"
 EOF
 chmod +x "$T/bin/gh"
@@ -40,6 +40,9 @@ printf 'target/\nnode_modules/\n' >.gitignore
 echo base >file.txt
 git add -A && git commit -qm base && git push -q origin main
 git remote set-head origin main
+# The script acts on the repo it lives in, so the copy under test lives here.
+mkdir -p "$M/tools" && cp "$here/worktree-gc" "$M/tools/worktree-gc"
+GC="$M/tools/worktree-gc"
 
 W="$T/wt"
 mkdir -p "$W"
@@ -116,6 +119,10 @@ git -C "$M" worktree lock --reason "agent pid 999999" "$W/locked"
 new_wt inuse
 new_wt recent
 
+# A worktree whose folder was deleted by hand: only git's entry is left.
+new_wt gone
+rm -rf "$W/gone"
+
 printf '%s\t%s\t%s\t%s\n' \
   b/merged MERGED 11 "$merged_oid" \
   b/closed CLOSED 12 "$closed_oid" \
@@ -163,9 +170,24 @@ expect b/locked ACTIVE "locked: agent pid 999999 (stale?"
 expect b/inuse ACTIVE "in use by sleep"
 expect b/recent ACTIVE "changed"
 expect main ACTIVE "this session runs here"
+expect b/gone REMOVE "directory is gone"
 grep -q "Dry run: nothing changed" "$T/out" && ok || no "dry run footer missing"
 for n in merged closed contained open localonly; do [ -d "$W/$n" ] && ok || no "dry run touched $n"; done
 [ -d "$W/open/target" ] && ok || no "dry run trimmed open/target"
+
+# Without gh, nothing is removable by PR state (HEAD-in-main still is).
+GH_FAKE_FAIL=1 bash "$GC" --no-fetch >"$T/out" 2>&1
+expect b/merged TRIM "PR state unknown"
+expect b/contained REMOVE "HEAD is in origin/main"
+
+# Run from inside another repo, it still judges its own repo's worktrees.
+git init -q -b main "$T/other" && git -C "$T/other" commit -q --allow-empty -m x
+git -C "$T/other" worktree add -q -b o/foreign "$T/other-wt"
+(cd "$T/other" && bash "$GC" --no-fetch) >"$T/out" 2>&1
+expect b/merged REMOVE "PR #11 merged"
+grep -q "o/foreign" "$T/out" && no "judged another repo's worktree: $(grep o/foreign "$T/out")" || ok
+
+bash "$GC" --no-fetch >"$T/out" 2>&1
 
 # --markdown renders the same rows.
 bash "$GC" --markdown --no-fetch >"$T/md" 2>&1
@@ -173,6 +195,8 @@ grep -q '^| REMOVE | .* | `b/merged` | MERGED #11 |' "$T/md" && ok || no "markdo
 
 bash "$GC" --apply >"$T/apply" 2>&1
 for n in merged closed contained detached; do [ ! -e "$W/$n" ] && ok || no "$n not removed: $(cat "$T/apply")"; done
+[ -z "$(git -C "$M" worktree list --porcelain | grep -F "$W/gone")" ] && ok || no "gone's entry not pruned"
+[ -d "$T/other-wt" ] && ok || no "another repo's worktree was touched"
 for b in b/merged b/closed b/contained; do git -C "$M" rev-parse -q --verify "refs/heads/$b" >/dev/null && ok || no "branch $b deleted"; done
 [ ! -e "$W/open/target" ] && [ ! -e "$W/open/crates/app/target" ] && ok || no "open's build output not trimmed"
 [ -f "$W/open/file.txt" ] && ok || no "trim deleted open's source"
@@ -188,13 +212,23 @@ fake_target "$S"
 D="$S/target/debug/deps"
 printf 'junk\0%s/app-1.a.cgu.00.rcgu.o\0junk' "$D" >"$D/app-1"
 chmod +x "$D/app-1"
-for o in app-1.a.cgu.00.rcgu.o app-1.old.cgu.07.rcgu.o app-1.young.cgu.03.rcgu.o; do echo o >"$D/$o"; done
-touch -t 202601010000 "$D/app-1.a.cgu.00.rcgu.o" "$D/app-1.old.cgu.07.rcgu.o"
+for o in app-1.a.cgu.00.rcgu.o app-1.old.cgu.07.rcgu.o app-1.young.cgu.03.rcgu.o app-1.dev.cgu.05.rcgu.o; do echo o >"$D/$o"; done
+# An older build still hard-linked outside deps/ (run-app-isolated.sh's .app).
+mkdir -p "$S/target/debug/dev.app/Contents/MacOS"
+printf 'x\0%s/app-1.dev.cgu.05.rcgu.o\0' "$D" >"$S/target/debug/dev.app/Contents/MacOS/dev"
+chmod +x "$S/target/debug/dev.app/Contents/MacOS/dev"
+touch -t 202601010000 "$D/app-1.a.cgu.00.rcgu.o" "$D/app-1.old.cgu.07.rcgu.o" "$D/app-1.dev.cgu.05.rcgu.o" "$D"
+deps_mtime() { if stat -f %m "$D" >/dev/null 2>&1; then stat -f %m "$D"; else stat -c %Y "$D"; fi; }
+before_mtime=$(deps_mtime)
 (cd "$S" && bash "$GC" --self --sweep) >"$T/self" 2>&1
 grep -q "1 stale debug object" "$T/self" && [ -f "$D/app-1.old.cgu.07.rcgu.o" ] && ok || no "self sweep dry run: $(cat "$T/self")"
 (cd "$S" && bash "$GC" --self --sweep --apply) >"$T/self" 2>&1
 [ ! -e "$D/app-1.old.cgu.07.rcgu.o" ] && ok || no "stale object not swept: $(cat "$T/self")"
 [ -f "$D/app-1.a.cgu.00.rcgu.o" ] && [ -f "$D/app-1.young.cgu.03.rcgu.o" ] && [ -f "$D/libx.rlib" ] && ok || no "sweep deleted a live object"
+[ -f "$D/app-1.dev.cgu.05.rcgu.o" ] && ok || no "sweep deleted an object a binary outside deps/ references"
+[ "$(deps_mtime)" = "$before_mtime" ] && ok || no "sweep moved deps/ mtime (the idle clock)"
+(cd "$S" && bash "$GC" --self --sweep --apply) >"$T/self" 2>&1
+grep -q "no stale debug objects" "$T/self" && ok || no "empty sweep: $(cat "$T/self")"
 
 # --self: the whole target dir, but not while something runs from it.
 (cd "$S" && bash "$GC" --self) >"$T/self" 2>&1
