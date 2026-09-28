@@ -313,12 +313,26 @@ explain a trap), one call at a time per (plugin, workspace) instance. A trap
 costs the instance, not the daemon; five traps in a minute mark the plugin
 faulted in that workspace until the user switches it off and on. What a
 plugin returns is capped too: a tool result at 256 KiB, the instruction
-paragraph at 8 KiB, a hook line at 1 KiB. A component whose `tools()` names
-differ from its manifest's `provides.mcp_tools` is refused.
+paragraph at 8 KiB, a hook line at 1 KiB, a tool description at 2 KiB. A
+component whose `tools()` names differ from its manifest's
+`provides.mcp_tools` is refused, and so is one whose tool input schema isn't a
+JSON object schema (`"type": "object"`, ≤ 16 KiB): agents' MCP clients
+validate the whole tool list, so one bad schema would cost them every
+chimaera tool. A call whose caller stops waiting (a hook the agent gave up on,
+a closed window) drops its instance; the next call starts a fresh one and
+nothing counts as a failure.
 
 Knowledge stamps and Timeline baselines are scoped to the provider id and
 component digest: an update, rollback or provider change gets a fresh snapshot
 even when its input files are unchanged.
+
+A snapshot's ids may repeat — real `.living/` repositories reuse numbers.
+The UI keys its lists by a client-side `key` (never the id), and Timeline
+attribution takes the first entry with an id as the one meant, so a provider
+need not dedupe. An addendum (`### F-027 addendum:` under F-027) is part of
+its finding, not another one: Mycelium (≥ 0.1.3) lists it in the finding's
+optional `addenda: [{label, title, text, line}]`, which the Knowledge view
+renders under the finding.
 
 ## Build and test
 
@@ -388,7 +402,8 @@ What the card shows is the daemon's, never the plugin's own claim:
 
 - **The check badge** ("Verified by the Chimaera maintainers"; `first_party`
   on the wire): the plugin's id is in `plugins/plugins.lock` — the curated
-  list the maintainers review — and the installed copy's `[release] github`
+  list the maintainers keep, whose versions follow each repository's releases
+  automatically (CI-gated) — and the installed copy's `[release] github`
   matches the lock's `repo` (case-insensitive). The bytes must also match the
   lock or come from a release install whose source the host recorded in
   `source-github`. An update from that repository keeps the badge. Local
@@ -428,12 +443,14 @@ A first-party bump:
    installed plugin whose manifest names `[release]`, and **Update** (or
    `chimaera plugin update <id>`) installs it. A first-party copy updated past
    the pin keeps its check badge.
-3. In the chimaera repository, set the entry's `version`, `sha256_wasm` and
-   `sha256_toml` in `plugins/plugins.lock` from that release's `SHA256SUMS`
-   (and `name` / `summary` if they changed), run
-   `bash scripts/build-plugins.sh` (it downloads the new release into
-   `plugins/dist-test/`) and `just check`, and review the change like code:
-   from the next chimaera release, **Install** fetches that version.
+3. The chimaera repository follows on its own: within the hour, the
+   `plugin-lock` workflow checks the new release (`SHA256SUMS` against the
+   downloaded bytes; the manifest's id, version and `[release] github`
+   against the lock), rewrites the entry in `plugins/plugins.lock` and opens
+   `fix: update <Name> to <version>` with squash auto-merge. CI installs the
+   release against the new lock, and the merge cuts a patch release: from it,
+   **Install** fetches that version. Details, the one-time token and how to
+   turn a version down: [plugins/AGENTS.md](../../plugins/AGENTS.md).
 
 To add one: a repository shaped like those two, its first release, a
 `[[plugin]]` in the lock, the daemon-side tests (above), a feature page and

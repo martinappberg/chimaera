@@ -677,20 +677,27 @@ pub(crate) fn build_agent_resume_command(
 /// What every CHAT spawn is told about its host — and only chat spawns: a
 /// TUI session is the agent's own screen, but a chat reply is rendered by
 /// chimaera, and the agent cannot know that a markdown image link to a local
-/// file becomes an inline card unless told. Claude takes it through
+/// file becomes an inline card unless told. Results get cards; documents
+/// get plain links (the UI draws an embedded document as a chip anyway, but
+/// the sentence around a link reads right). Claude takes it through
 /// `--append-system-prompt`, codex through `developer_instructions`; a
 /// forked branch carries it at the head of its portable context instead
 /// (`chat::portable_context_prompt`), since that context rides the same
-/// channel. Short and cached with the system prompt: a few dozen tokens.
+/// channel. Short and cached with the system prompt: under 200 tokens.
 pub(crate) const CHAT_HOST_PROMPT: &str = "\
 You are running in chimaera's chat, which renders your replies as markdown in a \
 workbench beside the user's files. A markdown image link to a local file renders \
-inline as a card the user can open — ![UMAP](figs/umap.png), \
-![page 3](paper.pdf#page=3), ![first rows](out/summary.csv). Whenever you \
-produce or change a figure, a rendered report, a table or a document the user \
-should see, include such a link in your reply, with a path relative to the \
-working directory, rather than only naming the path. Files you write during a \
-turn are listed under your reply automatically.";
+inline as a card the user can open. Use one for a result the user should see: a \
+figure, a rendered HTML report, a PDF page, a table slice, as in \
+![UMAP](figs/umap.png), ![page 3](paper.pdf#page=3) or \
+![first rows](out/summary.csv#row=1-10). Whenever you produce or change such a \
+result, include that link in your reply, with a path relative to the working \
+directory, rather than only naming the path. Link a document the user may want \
+to read, such as a markdown note, plan or report, with an ordinary link like \
+[the plan](analysis/PLAN.md), not an image link: the user can preview it on \
+hover or open it. When a few numbers carry the point, put a small markdown table \
+in the reply itself. Files you write during a turn are listed under your reply \
+automatically.";
 
 /// The workspace Mastermind's role frame, appended to its claude chat spawn
 /// via `--append-system-prompt`. Short by design: the MCP server's own

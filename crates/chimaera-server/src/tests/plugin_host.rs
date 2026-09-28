@@ -99,6 +99,26 @@ async fn a_runaway_loop_is_stopped_at_its_deadline_and_the_plugin_recovers() {
     state.sessions.kill(&sid).ok();
 }
 
+/// A caller that stops waiting mid-call (claude giving up on a hook, a
+/// window closed on a request) takes the instance with it: the next call
+/// gets a fresh one and nothing counts as the plugin's failure.
+#[tokio::test]
+async fn a_call_dropped_midway_leaves_a_working_plugin_and_no_failure() {
+    let (state, ws, sid) = fixture_workspace("host-dropped", "k9").await;
+    mcp_tool_call(&state, &sid, "k9", "echo", serde_json::json!({})).await;
+    let cut = tokio::time::timeout(
+        Duration::from_millis(200),
+        mcp_tool_call(&state, &sid, "k9", "loop", serde_json::json!({})),
+    )
+    .await;
+    assert!(cut.is_err(), "the loop must still be running when dropped");
+    let (is_err, text) = mcp_tool_call(&state, &sid, "k9", "echo", serde_json::json!({})).await;
+    assert!(!is_err, "{text}");
+    let m = crate::plugins::manifest(&state, "test-fixture").unwrap();
+    assert_eq!(state.plugin_runtime.fault(&m, &ws), None);
+    state.sessions.kill(&sid).ok();
+}
+
 #[tokio::test]
 async fn linear_memory_is_capped_per_instance() {
     let (state, _ws, sid) = fixture_workspace("host-memory", "k3").await;

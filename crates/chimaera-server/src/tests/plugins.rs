@@ -226,6 +226,64 @@ fn agent_plugin_install_explains_claude_git_without_blocking_cached_installs() {
     }
 }
 
+/// The Git binary path setting's git reaches the agent's plugin manager
+/// ahead of an old system git — seen on a login node
+/// whose /usr/bin/git is 1.8.3 while the setting pointed at a module's 2.45.
+#[test]
+fn agent_plugin_install_puts_the_resolved_git_first_on_path() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = test_dir("plugin-install-git-dir");
+    let exe = |path: &std::path::Path, body: &str| {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    };
+    exe(
+        &root.join("old/git"),
+        "#!/bin/bash\nprintf 'usage: git clone [--recursive]\\n'; exit 129\n",
+    );
+    exe(
+        &root.join("new/git"),
+        "#!/bin/bash\nprintf '%s\\n' '--[no-]shallow-submodules'; exit 129\n",
+    );
+    let bin = root.join("agent");
+    exe(
+        &bin,
+        "#!/bin/bash\ncommand -v git >> seen\nif [ \"$2\" = marketplace ]; then exit 1; fi\nexit 0\n",
+    );
+    let completion = root.join("completion");
+    let output = std::process::Command::new("/bin/bash")
+        .args([
+            "-c",
+            include_str!("../plugins/install-agent.sh"),
+            "chimaera-plugin-install",
+            "Mycelium",
+            "claude",
+            bin.to_str().unwrap(),
+            "arjunrajlaboratory/mycelium",
+            "mycelium@mycelium",
+            "install",
+            completion.to_str().unwrap(),
+            root.join("new").to_str().unwrap(),
+        ])
+        .env("PATH", root.join("old"))
+        .current_dir(&root)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let screen = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{screen}");
+    let seen = std::fs::read_to_string(root.join("seen")).unwrap();
+    let new_git = root.join("new/git");
+    assert!(
+        seen.lines().all(|l| l == new_git.to_str().unwrap()),
+        "{seen}"
+    );
+    // The failed marketplace fetch is explained against the git it used.
+    assert!(!screen.contains("--shallow-submodules."), "{screen}");
+}
+
 /// A CLI (or a manifest name echoed by the installer) can set any terminal
 /// title. It must not retire the completion watcher before the install ends.
 #[tokio::test]

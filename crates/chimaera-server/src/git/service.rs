@@ -787,6 +787,24 @@ pub(super) fn configured_git(state: &AppState) -> Option<String> {
     crate::lock(&state.settings).git_path()
 }
 
+/// The directory of the git the `git.path` setting names, when it is
+/// absolute and clears the version gate — for commands chimaera runs on the
+/// user's behalf that call a bare `git` themselves (`claude plugin
+/// marketplace add` clones with `--shallow-submodules`). Putting it first on
+/// their PATH makes the setting reach them too; on a host whose stock git is
+/// RHEL 7's 1.8.3 that is the difference between working and not. Only the
+/// setting: a login-shell git is already on those commands' (login-shell)
+/// PATH, and forcing its directory — often `/usr/bin` — first would shadow
+/// the user's own python, node and the rest.
+pub(crate) async fn usable_git_dir(state: &AppState) -> Option<PathBuf> {
+    let configured = configured_git(state)?;
+    let git = state.git.resolve_git(Some(configured)).await;
+    if !git.adequate || !git.path.is_absolute() {
+        return None;
+    }
+    git.path.parent().map(Path::to_path_buf)
+}
+
 /// Dirty-path cap on [`git_facts`]: the MCP answer is a digest, not the
 /// status panel.
 pub(crate) const GIT_FACTS_DIRTY_CAP: usize = 100;

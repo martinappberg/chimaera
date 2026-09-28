@@ -194,14 +194,18 @@ fn text<'a>(v: &'a Value, key: &str) -> &'a str {
 /// Every entry id in a knowledge snapshot, with the file it lives in, and
 /// the findings' statuses. The snapshot is the Knowledge view's shape:
 /// `topics[].{path, findings[].{id, status}}`, `decisions[].fp`,
-/// `learnings[].fp`.
+/// `learnings[].fp`. Ids repeat in real repositories (`### F-027 addendum:`
+/// under F-027, a number reused): the FIRST entry with an id is the one
+/// meant — its status is the finding's (an addendum's "unrated" must not
+/// read as a move), and a repeat is neither news nor a second credit.
 fn ids_of(k: &Value) -> (EntryIds, HashMap<String, String>) {
     let mut ids = Vec::new();
+    let mut seen = HashSet::new();
     let mut statuses = HashMap::new();
     for topic in items(k, "topics") {
         for f in items(topic, "findings") {
             let id = text(f, "id");
-            if id.is_empty() {
+            if id.is_empty() || !seen.insert(id.to_string()) {
                 continue;
             }
             ids.push((id.to_string(), "finding", text(topic, "path").to_string()));
@@ -214,7 +218,7 @@ fn ids_of(k: &Value) -> (EntryIds, HashMap<String, String>) {
     ] {
         for e in items(k, list) {
             let fp = text(e, "fp");
-            if !fp.is_empty() {
+            if !fp.is_empty() && seen.insert(fp.to_string()) {
                 ids.push((fp.to_string(), kind, file.to_string()));
             }
         }
@@ -579,4 +583,35 @@ pub(crate) async fn get_knowledge(
         body["left_off"] = Value::Null;
     }
     Json(body).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A real `.living/` files addenda under their finding's id: the first
+    /// entry is the finding (its status counts), repeats are counted once.
+    #[test]
+    fn a_repeated_id_is_its_first_entry() {
+        let k = json!({
+            "topics": [
+                {"path": ".living/findings/a.md", "findings": [
+                    {"id": "F-027", "status": "supported", "claim": "the finding"},
+                    {"id": "F-027", "status": "unknown", "claim": "addendum: more"},
+                ]},
+                {"path": ".living/findings/b.md", "findings": [
+                    {"id": "F-027", "status": "contradicted"},
+                    {"id": "F-028", "status": "robust"},
+                ]},
+            ],
+            "decisions": [{"fp": "d1"}, {"fp": "d1"}],
+            "learnings": [{"fp": "l1"}],
+        });
+        let (ids, statuses) = ids_of(&k);
+        let names: Vec<&str> = ids.iter().map(|(id, _, _)| id.as_str()).collect();
+        assert_eq!(names, ["F-027", "F-028", "d1", "l1"]);
+        assert_eq!(ids[0].2, ".living/findings/a.md");
+        assert_eq!(statuses["F-027"], "supported");
+        assert_eq!(claim_of(&k, "F-027"), "the finding");
+    }
 }

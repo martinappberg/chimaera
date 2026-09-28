@@ -3,6 +3,7 @@ import {
   artifactMentions,
   artifactShape,
   chipLabels,
+  embedsAsChip,
   fileStateAfter,
   isArtifactPath,
   namesFile,
@@ -33,6 +34,27 @@ describe("artifactShape", () => {
     }
     for (const p of ["main.rs", "run.log", "flow.mmd", "config.json"]) {
       expect(artifactShape(p), p).toBeNull();
+    }
+  });
+});
+
+describe("embedsAsChip", () => {
+  it("names documents on a chip and keeps results as cards", () => {
+    for (const t of ["analysis/PLAN.md", "notes.md#Results", "my%20plan.markdown", "memo.docx", "deck.pptx"]) {
+      expect(embedsAsChip(t), t).toBe(true);
+    }
+    for (const t of [
+      "figs/umap.png",
+      "report.html",
+      "paper.pdf#page=3",
+      "out/summary.csv#row=1-10",
+      "run.ipynb#cell=4",
+      "book.xlsx",
+      "run.py#L10-L30",
+      // A deck's slide is a picture of the deck.
+      "talk.md#slide=3",
+    ]) {
+      expect(embedsAsChip(t), t).toBe(false);
     }
   });
 });

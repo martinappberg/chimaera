@@ -32,14 +32,31 @@ export interface LedgerRow {
   direction: LedgerDirection;
 }
 
+/** A follow-up the project wrote under its own `F-NNN addendum…` heading. */
+export interface FindingAddendum {
+  /** The heading's word and qualifier as written: "Addendum (2)". */
+  label: string;
+  /** The heading after its separator; may be empty. */
+  title: string;
+  /** Markdown. */
+  text: string;
+  /** 1-based line of its heading; 0 when unknown. */
+  line: number;
+}
+
 export interface Finding {
   id: string;
+  /** Client-only, unique across the snapshot (`normalizeKnowledge`): the
+   *  list key, the expand state and the element id. `id` may repeat. */
+  key: string;
   claim: string;
   status: FindingStatus;
   implications: string;
   tags: string[];
   ledger: LedgerRow[];
   questions: string[];
+  /** In file order; empty when the provider sends none. */
+  addenda: FindingAddendum[];
   line: number;
   updated: string;
   recorded_by?: RecordedBy;
@@ -47,6 +64,8 @@ export interface Finding {
 
 export interface Topic {
   slug: string;
+  /** Client-only, unique among the topics; `slug` may repeat. */
+  key: string;
   description: string;
   path: string;
   findings: Finding[];
@@ -54,6 +73,8 @@ export interface Topic {
 
 export interface Decision {
   fp: string;
+  /** Client-only, unique among the decisions; `fp` may repeat. */
+  key: string;
   date: string;
   title: string;
   context: string;
@@ -68,6 +89,8 @@ export interface Decision {
 
 export interface Learning {
   fp: string;
+  /** Client-only, unique among the learnings; `fp` may repeat. */
+  key: string;
   date: string;
   title: string;
   category: LearningCategory | string;
@@ -147,40 +170,133 @@ function arr<T>(v: unknown): T[] {
   return Array.isArray(v) ? (v as T[]) : [];
 }
 
-/** Defensive normalization: every list defaults to empty so a partial or
- *  older payload renders its present sections instead of throwing. */
+/** Objects only: a provider's list may hold anything. */
+function objs<T>(v: unknown): T[] {
+  return arr<unknown>(v).filter((x): x is T => typeof x === "object" && x !== null);
+}
+
+function str(v: unknown): string {
+  return typeof v === "string" ? v : "";
+}
+
+function strs(v: unknown): string[] {
+  return arr<unknown>(v).filter((x): x is string => typeof x === "string");
+}
+
+/**
+ * Keys for keyed lists, unique within one snapshot. The provider is a
+ * plugin reading hand-kept files, and real ones repeat ids (a `.living/`
+ * that files `### F-027 addendum:` under F-027, decisions numbered twice):
+ * a repeated key throws inside Svelte's list reconciler and takes the whole
+ * window's UI down with it. The first holder keeps the id; later ones get
+ * `~2`, `~3`, … (never a key already taken).
+ */
+function keyer(): (base: string) => string {
+  const used = new Set<string>();
+  return (base) => {
+    const b = base === "" ? "entry" : base;
+    let key = b;
+    for (let n = 2; used.has(key); n++) key = `${b}~${n}`;
+    used.add(key);
+    return key;
+  };
+}
+
+/** Defensive normalization: every list defaults to empty, every text field
+ *  to a string, and every row gets a unique `key`, so a partial, older or
+ *  odd provider payload renders its present sections instead of throwing. */
 export function normalizeKnowledge(raw: unknown): Knowledge {
   const r = (typeof raw === "object" && raw !== null ? raw : {}) as Record<string, unknown>;
   const counts = (typeof r.counts === "object" && r.counts !== null ? r.counts : {}) as Record<
     string,
     unknown
   >;
-  const topics = arr<Topic>(r.topics).map((t) => ({
+  const num = (v: unknown, fallback: number): number => (typeof v === "number" ? v : fallback);
+  const topicKey = keyer();
+  const findingKey = keyer();
+  const topics = objs<Topic>(r.topics).map((t) => ({
     ...t,
-    findings: arr<Finding>(t.findings).map((f) => ({
+    slug: str(t.slug),
+    key: topicKey(str(t.slug)),
+    description: str(t.description),
+    path: str(t.path),
+    findings: objs<Finding>(t.findings).map((f) => ({
       ...f,
-      tags: arr<string>(f.tags),
-      ledger: arr<LedgerRow>(f.ledger),
-      questions: arr<string>(f.questions),
+      id: str(f.id),
+      key: findingKey(str(f.id)),
+      claim: str(f.claim),
+      status: (str(f.status) || "unknown") as FindingStatus,
+      implications: str(f.implications),
+      updated: str(f.updated),
+      tags: strs(f.tags),
+      ledger: objs<LedgerRow>(f.ledger).map((row) => ({
+        date: str(row.date),
+        run: str(row.run),
+        dataset: str(row.dataset),
+        project: str(row.project),
+        result: str(row.result),
+        direction: (str(row.direction) || "unknown") as LedgerDirection,
+      })),
+      questions: strs(f.questions),
+      addenda: objs<FindingAddendum>(f.addenda).map((a) => ({
+        label: str(a.label),
+        title: str(a.title),
+        text: str(a.text),
+        line: num(a.line, 0),
+      })),
     })),
   }));
-  const num = (v: unknown, fallback: number): number => (typeof v === "number" ? v : fallback);
   const findingsN = topics.reduce((n, t) => n + t.findings.length, 0);
-  const decisions = arr<Decision>(r.decisions).map((d) => ({
+  const decisionKey = keyer();
+  const decisions = objs<Decision>(r.decisions).map((d) => ({
     ...d,
-    alternatives: arr<string>(d.alternatives),
-    tags: arr<string>(d.tags),
+    fp: str(d.fp),
+    key: decisionKey(str(d.fp)),
+    date: str(d.date),
+    title: str(d.title),
+    context: str(d.context),
+    decision: str(d.decision),
+    rationale: str(d.rationale),
+    consequences: str(d.consequences),
+    alternatives: strs(d.alternatives),
+    tags: strs(d.tags),
   }));
-  const learnings = arr<Learning>(r.learnings).map((l) => ({ ...l, tags: arr<string>(l.tags) }));
-  const todos = arr<Todo>(r.todos);
-  const questions = arr<OpenQuestion>(r.questions);
+  const learningKey = keyer();
+  const learnings = objs<Learning>(r.learnings).map((l) => ({
+    ...l,
+    fp: str(l.fp),
+    key: learningKey(str(l.fp)),
+    date: str(l.date),
+    title: str(l.title),
+    category: str(l.category),
+    what: str(l.what),
+    why: str(l.why),
+    resolution: str(l.resolution),
+    tags: strs(l.tags),
+  }));
+  const todos = objs<Todo>(r.todos).map((t) => ({
+    ...t,
+    item: str(t.item),
+    priority: str(t.priority),
+    status: str(t.status),
+    category: str(t.category),
+    author: str(t.author),
+  }));
+  const questions = objs<OpenQuestion>(r.questions).map((q) => ({
+    text: str(q.text),
+    finding: str(q.finding),
+  }));
   const leftRaw = r.left_off;
   const left_off =
     typeof leftRaw === "object" && leftRaw !== null
       ? {
           ...(leftRaw as LeftOff),
-          blockers: arr<string>((leftRaw as LeftOff).blockers),
-          next: arr<string>((leftRaw as LeftOff).next),
+          current: str((leftRaw as LeftOff).current),
+          worked_on: str((leftRaw as LeftOff).worked_on),
+          decisions: str((leftRaw as LeftOff).decisions),
+          path: str((leftRaw as LeftOff).path),
+          blockers: strs((leftRaw as LeftOff).blockers),
+          next: strs((leftRaw as LeftOff).next),
         }
       : null;
   return {
@@ -199,15 +315,9 @@ export function normalizeKnowledge(raw: unknown): Knowledge {
       learnings: num(counts.learnings, learnings.length),
       open: num(counts.open, todos.length + questions.length),
     },
-    guidance: arr<GuidanceFile>(r.guidance),
-    warnings: arr<string>(r.warnings),
+    guidance: objs<GuidanceFile>(r.guidance),
+    warnings: strs(r.warnings),
   };
-}
-
-export async function fetchKnowledge(workspaceId: string): Promise<Knowledge> {
-  return normalizeKnowledge(
-    await json<unknown>(await api(`/workspaces/${encodeURIComponent(workspaceId)}/knowledge`)),
-  );
 }
 
 // ---- reactive store (active workspace only) ---------------------------------
@@ -226,6 +336,10 @@ export const knowledgeError: Readable<string | null> = errorStore;
 
 let currentWs: string | null = null;
 let refreshSeq = 0;
+/** The body behind the snapshot held: most refetches (every turn end
+ *  nudges one) answer the same bytes, and a new object would re-render
+ *  every row of a large repository for nothing. */
+let heldText: string | null = null;
 let staleWhileHidden = false;
 
 function hidden(): boolean {
@@ -256,6 +370,7 @@ export async function activateKnowledgeWorkspace(wsId: string | null): Promise<v
   if (wsId === currentWs) return;
   currentWs = wsId;
   knowledgeStore.set(null);
+  heldText = null;
   availableStore.set(null);
   errorStore.set(null);
   staleWhileHidden = false;
@@ -265,9 +380,14 @@ export async function activateKnowledgeWorkspace(wsId: string | null): Promise<v
 async function refresh(wsId: string): Promise<void> {
   const seq = ++refreshSeq;
   try {
-    const k = await fetchKnowledge(wsId);
+    const res = await api(`/workspaces/${encodeURIComponent(wsId)}/knowledge`);
+    if (!res.ok) await json<unknown>(res);
+    const text = await res.text();
     if (currentWs !== wsId || seq !== refreshSeq) return;
-    knowledgeStore.set(k);
+    if (text !== heldText) {
+      knowledgeStore.set(normalizeKnowledge(JSON.parse(text)));
+      heldText = text;
+    }
     availableStore.set(true);
     errorStore.set(null);
   } catch (e) {

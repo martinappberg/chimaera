@@ -1290,6 +1290,13 @@ pub(crate) async fn install_requirement(
     };
     let env = crate::api::session_env(&state, &session_id, "dark", prelude.as_deref());
     let env_remove = crate::api::spawn_env_remove(&env);
+    // The agent's plugin manager runs a bare `git`; the Git binary path
+    // setting's goes first on its PATH, after the login shell and the
+    // Environment prelude have run.
+    let git_dir = crate::git::usable_git_dir(&state)
+        .await
+        .map(|dir| dir.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let opts = chimaera_pty::SpawnOpts {
         cwd: workspace.root.clone(),
         name: Some(format!("install {} for {agent}", m.id)),
@@ -1314,6 +1321,7 @@ pub(crate) async fn install_requirement(
                 req.id.clone(),
                 install_verb.to_string(),
                 completion.to_string_lossy().into_owned(),
+                git_dir,
             ],
         )),
         id: Some(session_id.clone()),

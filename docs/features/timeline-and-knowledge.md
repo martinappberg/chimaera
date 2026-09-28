@@ -134,6 +134,12 @@ and the Mastermind-tier MCP tool `read_timeline`.
     build); later asks take milliseconds.
   - **Ids:** findings by their `F-NNN`; decisions and learnings by a fingerprint (kind + date +
     title hash), never mycelium's positional `L-N` / `D-N`.
+  - **Addenda are part of their finding.** A follow-up written as an `F-NNN addendum…` heading
+    (`##`–`####`, "(2)" and the like allowed) is listed under the finding it extends, in file
+    order — an "Addenda" block in the expanded row and "· N addenda" in its meta — and its
+    evidence rows, open questions and tags are the finding's (Mycelium plugin ≥ 0.1.3; the
+    route's optional `addenda: [{label, title, text, line}]`). A file that writes one id on two
+    different findings still shows both, with a warning.
   - **Attribution (`recorded_by`) is never guessed.** At each episode end the provider is
     diffed against the last check (the file mtimes come from the stamp); a new entry is
     credited to that turn only when its file changed after the turn started (2 s slack) AND no

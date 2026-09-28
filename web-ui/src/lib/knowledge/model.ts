@@ -127,8 +127,8 @@ export function whereThingsStand(k: Knowledge, limit = 3): { finding: Finding; t
     .slice(0, limit);
 }
 
-function has(hay: string | undefined, q: string): boolean {
-  return hay !== undefined && hay.toLowerCase().includes(q);
+function has(hay: unknown, q: string): boolean {
+  return typeof hay === "string" && hay.toLowerCase().includes(q);
 }
 
 function hasAny(list: readonly string[] | undefined, q: string): boolean {
@@ -154,6 +154,7 @@ export function searchKnowledge(k: Knowledge, query: string): Knowledge {
           has(f.implications, q) ||
           hasAny(f.tags, q) ||
           hasAny(f.questions, q) ||
+          f.addenda.some((a) => has(a.title, q) || has(a.text, q)) ||
           f.ledger.some((r) => has(r.result, q) || has(r.dataset, q) || has(r.run, q)) ||
           has(t.slug, q),
       ),
@@ -229,26 +230,33 @@ export function sectionNav(k: Knowledge): SectionNav[] {
 }
 
 /**
- * A finding's recent status move from the Timeline (the cross-link the
- * design asks for): "now supported" / "contradicted today" within 24 h.
+ * Every finding's recent status move from the Timeline (the cross-link the
+ * design asks for): "now supported" / "contradicted today" within 24 h. One
+ * pass, newest first: a finding's newest knowledge entry decides — a badge
+ * when within 24 h, nothing when older. The view looks each row up; a scan
+ * per row was findings × entries on every snapshot, page and minute tick.
  */
-export function recentStatusMove(
-  findingId: string,
+export function statusMoves(
   entries: readonly TimelineEntry[],
   nowMs: number,
-): { text: string; tone: Tone } | null {
+): Map<string, { text: string; tone: Tone } | null> {
   const dayAgo = nowMs - 86_400_000;
+  const out = new Map<string, { text: string; tone: Tone } | null>();
   for (const e of entries) {
-    if (e.kind !== "knowledge" || e.knowledge === undefined || e.knowledge.id !== findingId) continue;
-    if (e.ts < dayAgo) break;
+    if (e.kind !== "knowledge" || e.knowledge === undefined || out.has(e.knowledge.id)) continue;
+    if (e.ts < dayAgo) {
+      out.set(e.knowledge.id, null);
+      continue;
+    }
     const to = e.knowledge.to;
-    if (e.knowledge.change === "new") return { text: "new today", tone: "accent" };
-    return {
-      text: to === "contradicted" ? "contradicted today" : `now ${to}`,
-      tone: to === "contradicted" ? "err" : "accent",
-    };
+    out.set(
+      e.knowledge.id,
+      e.knowledge.change === "new"
+        ? { text: "new today", tone: "accent" }
+        : { text: to === "contradicted" ? "contradicted today" : `now ${to}`, tone: to === "contradicted" ? "err" : "accent" },
+    );
   }
-  return null;
+  return out;
 }
 
 /** Newest first: ISO dates sort lexically. */

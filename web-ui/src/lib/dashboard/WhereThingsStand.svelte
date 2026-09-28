@@ -55,7 +55,7 @@
     <div class="card" class:two={next.length > 0 || blocker !== null}>
       {#if picks.length > 0}
         <div class="findings">
-          {#each picks as p (p.finding.id)}
+          {#each picks as p (p.finding.key)}
             <button class="frow" onclick={onOpenKnowledge} title="{p.finding.id} · {p.topic} — open in Knowledge">
               <Ladder status={p.finding.status} />
               <!-- eslint-disable-next-line svelte/no-at-html-tags -- sanitized in inlineMarkdown -->

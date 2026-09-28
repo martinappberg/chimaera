@@ -325,7 +325,9 @@
             <p class="gline">{a.agent} has no plugins</p>
           {:else}
             <ul class="plist">
-              {#each a.plugins as pl (pl.id)}
+              <!-- The agent lists one row per installation: the same id can come
+                   back at user and project scope, so the id alone isn't a key. -->
+              {#each a.plugins as pl, i (`${i}:${pl.id}`)}
                 {@const waiting = waitingHooks(a.hooks, pl)}
                 {@const meta = metaLine(pl)}
                 {@const wb = waiting > 0 ? wantedBy(a.agent, pl.id) : undefined}
