@@ -30,8 +30,8 @@ and on visibility return — never polled).
 - **Ids repeat; keys don't.** The snapshot is a plugin's reading of
   hand-kept files, and real ones reuse ids (two different `## F-038`; the
   Mycelium plugin before 0.1.3 also read `### F-027 addendum:` as another
-  F-027 — it now lists it in F-027's `addenda`). A repeated `{#each}` key throws inside Svelte and used to freeze
-  the whole window, so every list, expand state and element id uses the
+  F-027 — it now lists it in F-027's `addenda`). A repeated `{#each}` key
+  throws inside Svelte and used to freeze the whole window, so every list, expand state and element id uses the
   client-only `key` that `normalizeKnowledge` (`../workspace/knowledge.ts`)
   assigns — never `id`/`fp`/`slug`. The same normalization turns non-string
   fields into strings, so a provider's odd JSON renders instead of throwing.

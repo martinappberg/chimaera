@@ -84,13 +84,16 @@
           <div class="lbl">Addenda</div>
           <ol class="addenda">
             {#each finding.addenda as a, i (i)}
+              {@const q = qualifier(a.label)}
               <li class="addendum">
-                <div class="ahead">
-                  {#if qualifier(a.label)}<span class="aq mono">{qualifier(a.label)}</span>{/if}
-                  <!-- eslint-disable-next-line svelte/no-at-html-tags -- sanitized in inlineMarkdown -->
-                  {#if a.title}<span class="atitle">{@html inlineMarkdown(a.title)}</span>{/if}
-                  {#if a.line > 0}<span class="aline muted">line {a.line}</span>{/if}
-                </div>
+                {#if q || a.title || a.line > 0}
+                  <div class="ahead">
+                    {#if q}<span class="aq mono">{q}</span>{/if}
+                    <!-- eslint-disable-next-line svelte/no-at-html-tags -- sanitized in inlineMarkdown -->
+                    {#if a.title}<span class="atitle">{@html inlineMarkdown(a.title)}</span>{/if}
+                    {#if a.line > 0}<span class="aline muted">line {a.line}</span>{/if}
+                  </div>
+                {/if}
                 {#if a.text}
                   <div class="md">
                     <Markdown text={a.text} {visible} />

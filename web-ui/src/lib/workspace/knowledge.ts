@@ -211,6 +211,7 @@ export function normalizeKnowledge(raw: unknown): Knowledge {
     string,
     unknown
   >;
+  const num = (v: unknown, fallback: number): number => (typeof v === "number" ? v : fallback);
   const topicKey = keyer();
   const findingKey = keyer();
   const topics = objs<Topic>(r.topics).map((t) => ({
@@ -241,11 +242,10 @@ export function normalizeKnowledge(raw: unknown): Knowledge {
         label: str(a.label),
         title: str(a.title),
         text: str(a.text),
-        line: typeof a.line === "number" ? a.line : 0,
+        line: num(a.line, 0),
       })),
     })),
   }));
-  const num = (v: unknown, fallback: number): number => (typeof v === "number" ? v : fallback);
   const findingsN = topics.reduce((n, t) => n + t.findings.length, 0);
   const decisionKey = keyer();
   const decisions = objs<Decision>(r.decisions).map((d) => ({
