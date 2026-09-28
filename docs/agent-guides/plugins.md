@@ -400,7 +400,8 @@ What the card shows is the daemon's, never the plugin's own claim:
 
 - **The check badge** ("Verified by the Chimaera maintainers"; `first_party`
   on the wire): the plugin's id is in `plugins/plugins.lock` — the curated
-  list the maintainers review — and the installed copy's `[release] github`
+  list the maintainers keep, whose versions follow each repository's releases
+  automatically (CI-gated) — and the installed copy's `[release] github`
   matches the lock's `repo` (case-insensitive). The bytes must also match the
   lock or come from a release install whose source the host recorded in
   `source-github`. An update from that repository keeps the badge. Local
@@ -440,12 +441,14 @@ A first-party bump:
    installed plugin whose manifest names `[release]`, and **Update** (or
    `chimaera plugin update <id>`) installs it. A first-party copy updated past
    the pin keeps its check badge.
-3. In the chimaera repository, set the entry's `version`, `sha256_wasm` and
-   `sha256_toml` in `plugins/plugins.lock` from that release's `SHA256SUMS`
-   (and `name` / `summary` if they changed), run
-   `bash scripts/build-plugins.sh` (it downloads the new release into
-   `plugins/dist-test/`) and `just check`, and review the change like code:
-   from the next chimaera release, **Install** fetches that version.
+3. The chimaera repository follows on its own: within the hour, the
+   `plugin-lock` workflow checks the new release (`SHA256SUMS` against the
+   downloaded bytes; the manifest's id, version and `[release] github`
+   against the lock), rewrites the entry in `plugins/plugins.lock` and opens
+   `fix: update <Name> to <version>` with squash auto-merge. CI installs the
+   release against the new lock, and the merge cuts a patch release: from it,
+   **Install** fetches that version. Details, the one-time token and how to
+   turn a version down: [plugins/AGENTS.md](../../plugins/AGENTS.md).
 
 To add one: a repository shaped like those two, its first release, a
 `[[plugin]]` in the lock, the daemon-side tests (above), a feature page and

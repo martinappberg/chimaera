@@ -1,0 +1,129 @@
+name: plugin-lock
+
+# Keeps plugins/plugins.lock on each first-party plugin's latest release, so
+# a plugin release reaches the app with no hand-made pull request: a newer,
+# checked release (.github/scripts/plugin-lock.mjs) becomes a `fix:` PR with
+# squash auto-merge, CI installs it against the new lock, and the merge cuts
+# a patch release. Hourly, on demand, and on a `plugin-released` dispatch
+# (a plugin repository may send one after publishing; the schedule covers
+# it otherwise).
+#
+# Writes use the PLUGIN_LOCK_TOKEN secret, not GITHUB_TOKEN: a branch pushed
+# and a PR opened with GITHUB_TOKEN trigger no workflows, so ci.yml and the
+# cla status would never report and auto-merge would never fire, and a merge
+# it made would not start release.yml. Without the secret a bump is only
+# reported (a warning), never opened. Setup: plugins/AGENTS.md.
+on:
+  schedule:
+    - cron: "23 * * * *"
+  workflow_dispatch:
+  repository_dispatch:
+    types: [plugin-released]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+# One bump at a time; a queued run sees the PR the running one opened.
+concurrency:
+  group: plugin-lock
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    env:
+      LOCK_TOKEN: ${{ secrets.PLUGIN_LOCK_TOKEN }}
+      REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+
+      # An open bump lands first; newer releases wait for the next run. With
+      # `main` requiring up-to-date branches, a bump that fell behind would
+      # never auto-merge, so bring it up to date (its checks rerun). One that
+      # can't land any more — it conflicts with a lock edited on main, or main
+      # already carries its change (an empty squash would cut an empty
+      # release) — is closed and its branch deleted, and this run bumps
+      # afresh from main's lock.
+      - name: an open bump comes first
+        id: open
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          pr="$(gh pr list --repo "$REPO" --state open --limit 100 --json number,headRefName \
+            --jq '[.[] | select(.headRefName | startswith("plugin-lock/"))][0].number // empty')"
+          if [ -n "$pr" ]; then
+            state="$(gh pr view "$pr" --repo "$REPO" --json mergeStateStatus --jq .mergeStateStatus)"
+            changed="$(gh api "repos/$REPO/pulls/$pr" --jq .changed_files)"
+            echo "plugin-lock PR #$pr is open ($state, $changed file(s) changed)"
+            if [ -n "$LOCK_TOKEN" ] && { [ "$state" = DIRTY ] || [ "$changed" = 0 ]; }; then
+              GH_TOKEN="$LOCK_TOKEN" gh pr close "$pr" --repo "$REPO" --delete-branch \
+                --comment "Superseded: this bump no longer applies to main (it conflicts, or main already has it). The plugin-lock workflow bumps afresh from main's lock."
+              echo "closed #$pr; bumping from main"
+              pr=""
+            elif [ "$state" = BEHIND ] && [ -n "$LOCK_TOKEN" ]; then
+              GH_TOKEN="$LOCK_TOKEN" gh api -X PUT "repos/$REPO/pulls/$pr/update-branch" --silent
+              echo "brought #$pr up to date with main; newer releases wait until it lands"
+            else
+              echo "newer releases wait until it lands"
+            fi
+          fi
+          echo "open=$pr" >> "$GITHUB_OUTPUT"
+
+      - name: check the latest releases
+        id: bump
+        if: steps.open.outputs.open == ''
+        # A release that fails a check must not hold back the others: the
+        # PR still opens for those, and the last step fails the run.
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node .github/scripts/plugin-lock.mjs --write --out "$RUNNER_TEMP/plugin-lock"
+
+      - name: open the pull request
+        if: steps.bump.outputs.bumped == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/plugin-lock"
+          title="$(cat "$dir/title")"
+          branch="$(cat "$dir/branch")"
+          # A bump PR someone closed unmerged turned that version down: never
+          # reopen it. (The workflow's own closes above delete the branch and
+          # say so; a branch left by a run that failed before its PR is
+          # simply overwritten below.)
+          declined="$(gh pr list --repo "$REPO" --state closed --head "$branch" --limit 20 \
+            --json number,mergedAt,comments \
+            --jq '[.[] | select(.mergedAt == null) | select(all(.comments[]; (.body | startswith("Superseded:")) | not))] | length')"
+          if [ "$declined" != 0 ]; then
+            echo "::notice title=plugin-lock::a PR for $branch was closed unmerged; that version was turned down, not reopening it"
+            exit 0
+          fi
+          git diff -- plugins/plugins.lock
+          if [ -z "$LOCK_TOKEN" ]; then
+            echo "::warning title=plugin-lock::'$title' is ready, but the PLUGIN_LOCK_TOKEN secret isn't set, so no pull request was opened (setup: plugins/AGENTS.md)"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          git commit -q -m "$title" -- plugins/plugins.lock
+          # --force: the branch is the workflow's own, left (if at all) by a
+          # run that failed before its PR opened.
+          git push -q --force "https://x-access-token:${LOCK_TOKEN}@github.com/${REPO}.git" "HEAD:refs/heads/${branch}"
+          export GH_TOKEN="$LOCK_TOKEN"
+          gh pr create --repo "$REPO" --base main --head "$branch" --title "$title" --body-file "$dir/body.md"
+          gh pr merge "$branch" --repo "$REPO" --auto --squash
+
+      - name: a release failed its checks
+        if: steps.bump.outcome == 'failure'
+        run: |
+          echo "::error title=plugin-lock::a plugin release failed its checks (see 'check the latest releases'); the lock keeps the version it had"
+          exit 1
