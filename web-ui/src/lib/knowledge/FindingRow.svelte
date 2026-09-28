@@ -2,9 +2,10 @@
   /**
    * One finding: id · claim · meta + badges · the confidence ladder · the
    * evidence strip (one mark per ledger row: filled supports, half refines,
-   * ring contradicts), expanding to So what / Evidence / Open questions /
-   * open in file. Everything shown is what the agent wrote; one-liners go
-   * through inlineMarkdown, the body through the sanitized Markdown.
+   * ring contradicts), expanding to So what / Addenda / Evidence / Open
+   * questions / open in file. Everything shown is what the agent wrote;
+   * one-liners go through inlineMarkdown, bodies through the sanitized
+   * Markdown.
    */
   import Markdown from "../chat/Markdown.svelte";
   import { inlineMarkdown } from "../shared/inlineMarkdown";
@@ -30,6 +31,14 @@
 
   const caption = $derived(ledgerCaption(finding.ledger));
   const statusWord = $derived(finding.status === "unknown" ? "unrated" : finding.status);
+  const addendaCount = $derived(
+    finding.addenda.length === 1 ? "1 addendum" : `${finding.addenda.length} addenda`,
+  );
+
+  /** "(2)" of "Addendum (2)": the block is already headed Addenda. */
+  function qualifier(label: string): string {
+    return label.replace(/^addend(?:um|a)\b\s*/i, "");
+  }
 </script>
 
 <div class="finding" id="finding-{finding.key}">
@@ -41,6 +50,7 @@
       <span class="meta">
         <span class="topic">{topic}</span>
         {#if finding.updated}<span>· {finding.updated}</span>{/if}
+        {#if finding.addenda.length > 0}<span>· {addendaCount}</span>{/if}
         {#if finding.recorded_by}<span>· recorded by <span class="mono">{finding.recorded_by.name}</span></span>{/if}
         {#if badge !== null}<span class="badge {badge.tone}">{badge.text}</span>{/if}
       </span>
@@ -67,6 +77,31 @@
           <div class="md">
             <Markdown text={finding.implications} {visible} />
           </div>
+        </div>
+      {/if}
+      {#if finding.addenda.length > 0}
+        <div class="block">
+          <div class="lbl">Addenda</div>
+          <ol class="addenda">
+            {#each finding.addenda as a, i (i)}
+              {@const q = qualifier(a.label)}
+              <li class="addendum">
+                {#if q || a.title || a.line > 0}
+                  <div class="ahead">
+                    {#if q}<span class="aq mono">{q}</span>{/if}
+                    <!-- eslint-disable-next-line svelte/no-at-html-tags -- sanitized in inlineMarkdown -->
+                    {#if a.title}<span class="atitle">{@html inlineMarkdown(a.title)}</span>{/if}
+                    {#if a.line > 0}<span class="aline muted">line {a.line}</span>{/if}
+                  </div>
+                {/if}
+                {#if a.text}
+                  <div class="md">
+                    <Markdown text={a.text} {visible} />
+                  </div>
+                {/if}
+              </li>
+            {/each}
+          </ol>
         </div>
       {/if}
       {#if finding.ledger.length > 0}
@@ -160,7 +195,8 @@
   }
   .claim :global(code),
   .result :global(code),
-  .q :global(code) {
+  .q :global(code),
+  .atitle :global(code) {
     font-family: var(--mono);
     font-size: 0.92em;
   }
@@ -295,6 +331,43 @@
   }
   .md :global(p:last-child) {
     margin-bottom: 0;
+  }
+  .addenda {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+  .addendum {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding-left: 12px;
+    border-left: 2px solid var(--edge);
+  }
+  .ahead {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+  }
+  .aq {
+    flex: none;
+    font-size: 11.5px;
+    color: var(--muted);
+  }
+  .atitle {
+    min-width: 0;
+    font-size: var(--text-sm);
+    font-weight: 600;
+    line-height: 1.4;
+    overflow-wrap: anywhere;
+  }
+  .aline {
+    flex: none;
+    margin-left: auto;
+    font-size: var(--text-xs);
   }
   .ledger {
     display: flex;

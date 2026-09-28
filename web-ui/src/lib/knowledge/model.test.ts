@@ -209,6 +209,36 @@ describe("normalizeKnowledge", () => {
     expect(k.learnings.map((l) => l.key)).toEqual(["l1", "l1~2", "l1~3"]);
   });
 
+  it("lists a finding's addenda, typed, and searches their text", () => {
+    const k = normalizeKnowledge({
+      provider: "mycelium",
+      topics: [
+        {
+          slug: "cohort",
+          findings: [
+            { id: "F-027", claim: "CUIMC2 is complete" },
+            {
+              id: "F-028",
+              claim: "Swaps are rare",
+              addenda: [
+                { label: "Addendum (2)", title: "pileup", text: "Tracks **BAM** reads.", line: 27 },
+                { label: 3, title: null, line: "9" },
+                "junk",
+              ],
+            },
+          ],
+        },
+      ],
+    });
+    const [f27, f28] = k.topics[0].findings;
+    expect(f27.addenda).toEqual([]);
+    expect(f28.addenda).toEqual([
+      { label: "Addendum (2)", title: "pileup", text: "Tracks **BAM** reads.", line: 27 },
+      { label: "", title: "", text: "", line: 0 },
+    ]);
+    expect(searchKnowledge(k, "tracks").topics[0].findings.map((f) => f.id)).toEqual(["F-028"]);
+  });
+
   it("turns non-string fields and non-object rows into something renderable", () => {
     const k = normalizeKnowledge({
       provider: "mycelium",

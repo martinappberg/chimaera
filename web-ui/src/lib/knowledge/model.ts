@@ -154,6 +154,7 @@ export function searchKnowledge(k: Knowledge, query: string): Knowledge {
           has(f.implications, q) ||
           hasAny(f.tags, q) ||
           hasAny(f.questions, q) ||
+          f.addenda.some((a) => has(a.title, q) || has(a.text, q)) ||
           f.ledger.some((r) => has(r.result, q) || has(r.dataset, q) || has(r.run, q)) ||
           has(t.slug, q),
       ),
