@@ -241,7 +241,10 @@ On macOS, the app's system sleep hook gives publication up to 25 seconds before
 acknowledging sleep. A failed flush leaves the lease takeover path available.
 After the laptop has been awake on AC power for five minutes, connected cloud
 projects can return at an agent pause. Busy or unobservable agent states stay on
-the cloud. Plain shells become paused placeholders in the cloud; arbitrary
+the cloud. A return attempt follows ownership changes caused by waking an idle
+worker immediately, and imports its saved conversation before local work can
+resume. A lost response is checked against current ownership without repeating
+the same release request. Plain shells become paused placeholders in the cloud; arbitrary
 foreground programs are not automatically relaunched.
 
 Hand-back restores new branches and fast-forwards unchanged local branches. The

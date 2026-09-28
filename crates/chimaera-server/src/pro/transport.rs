@@ -331,8 +331,8 @@ pub(super) async fn request(
     let (mut command, input) = curl(&url, method, token, body)?;
     command.args(["--write-out", "\n%{http_code}"]);
     let timeout = if path.ends_with("/pro/handoff") {
-        command.args(["--max-time", "25"]);
-        Duration::from_secs(28)
+        command.args(["--max-time", "90"]);
+        Duration::from_secs(93)
     } else {
         Duration::from_secs(15)
     };
