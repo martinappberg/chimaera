@@ -42,6 +42,8 @@
   import Chevron from "../shared/Chevron.svelte";
   import ArtifactGallery from "./ArtifactGallery.svelte";
   import { EmbedResolver } from "./embeds";
+  import { HoverTargets } from "./hoverTargets";
+  import { HoverPreviews } from "../previews/doc/hoverController.svelte";
   import PermissionCard from "./PermissionCard.svelte";
   import PlanApprovalCard from "./PlanApprovalCard.svelte";
   import QuestionCard from "./QuestionCard.svelte";
@@ -80,7 +82,7 @@
   } from "./transcriptWindow";
   import { measureShift, selectAnchor, type ReadingAnchor } from "./readingAnchor";
   import { blockWeight, HistoryWeights } from "./heightModel";
-  import { getSetting } from "../settings/store.svelte";
+  import { activeTheme, getSetting } from "../settings/store.svelte";
 
   interface Props {
     session: Session;
@@ -1426,6 +1428,42 @@
    *  gallery's shell-written files) resolve against the same directories,
    *  strictly: an embed names one file. */
   const proseEmbeds = new EmbedResolver(() => untrack(() => linkContext()));
+  /** What the transcript's path links and document chips preview on a
+   *  rest (the document view's hover preview, over the transcript). */
+  const hoverTargets = new HoverTargets();
+  let chatEl = $state<HTMLElement | null>(null);
+  let hoverPreviews: HoverPreviews | null = null;
+  $effect(() => {
+    const root = transcriptEl;
+    const layer = chatEl;
+    if (root === null || layer === null) return;
+    const h = new HoverPreviews({
+      root,
+      layer: () => layer,
+      docPath: () => "",
+      mode: () => "reading",
+      text: () => null,
+      links: () => {
+        const ctx = untrack(() => linkContext());
+        return { wsRoot: ctx.root, workspaceId: ctx.workspaceId };
+      },
+      ask: (ref) => proseEmbeds.resolve(ref.target),
+      theme: () => untrack(() => activeTheme().kind),
+      fontSize: () => untrack(() => chatFontSize),
+      targetOf: (el) => hoverTargets.targetOf(el),
+      anchors: false,
+      standalone: true,
+    });
+    hoverPreviews = h;
+    return () => {
+      h.destroy();
+      if (hoverPreviews === h) hoverPreviews = null;
+    };
+  });
+  // A hidden tab keeps its DOM: a preview must not outlive the view.
+  $effect(() => {
+    if (!visible) hoverPreviews?.hide();
+  });
 
   // A turn end is when files the agent mentioned have come to exist: drop
   // the misses so the renderers holding them ask again.
@@ -2034,6 +2072,7 @@
      stay open (the chips live in ChatHeader, the panel is a sibling overlay). -->
 <div
   class="chat"
+  bind:this={chatEl}
   class:focused
   class:visible
   style:--chat-font-size={`${chatFontSize}px`}
@@ -2245,6 +2284,7 @@
             onOpenPath={openProsePath}
             resolvePaths={prosePaths}
             embeds={proseEmbeds}
+            {hoverTargets}
             onReveal={() => {
               if (visible && atBottom && !composerEngaged) queueBottomScroll();
             }}
@@ -2278,6 +2318,7 @@
           onOpenPath={openProsePath}
           resolvePaths={prosePaths}
           embeds={proseEmbeds}
+          {hoverTargets}
           sourceIndex={item.index}
           sourceUid={item.block.uid}
         />
@@ -2321,6 +2362,7 @@
               endedAtMs={block.endedAtMs}
               resolver={proseEmbeds}
               onOpenPath={openProsePath}
+              {hoverTargets}
             />
           {/if}
 

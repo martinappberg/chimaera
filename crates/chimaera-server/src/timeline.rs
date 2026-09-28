@@ -615,7 +615,14 @@ pub(crate) fn headline(text: &str) -> Option<String> {
             in_fence = !in_fence;
             continue;
         }
-        if in_fence || line.is_empty() || line.starts_with('#') || line.starts_with('|') {
+        // An embed on a line of its own (`![umap](figs/umap.png)`) is a
+        // picture or a document chip in the chat, not a sentence.
+        if in_fence
+            || line.is_empty()
+            || line.starts_with('#')
+            || line.starts_with('|')
+            || line.starts_with("![")
+        {
             continue;
         }
         let plain = strip_inline_markdown(strip_block_marker(line));
@@ -655,6 +662,8 @@ fn strip_inline_markdown(line: &str) -> String {
                 chars.next();
             }
             '`' => {}
+            // `![alt](url)` reads as its alt text, like a link.
+            '!' if chars.peek() == Some(&'[') => {}
             '[' => {
                 // [text](url) → text
                 let mut label = String::new();
@@ -934,6 +943,12 @@ mod tests {
             Some("The config was wrong.")
         );
         assert_eq!(headline("Done.\n\nAll set!"), None);
+        assert_eq!(
+            headline("Updated the plan:\n\n![the plan](plan.md)\n\nThe ![UMAP](u.png) shows two clusters.")
+                .as_deref(),
+            Some("The UMAP shows two clusters.")
+        );
+        assert_eq!(headline("Updated the plan:\n\n![the plan](plan.md)"), None);
         assert_eq!(headline(""), None);
     }
 
