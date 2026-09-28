@@ -226,13 +226,14 @@ pub(super) async fn wait_callback(
 
 async fn reply(mut socket: TcpStream, success: bool) {
     let (status, title, message) = if success {
-        ("200 OK", "You're signed in", "Chimaera is ready. Return to the app to continue with your work. You can close this tab.")
+        ("200 OK", "You're signed in", "Your account is connected. Chimaera is bringing you back to the app. You can close this tab.")
     } else {
         ("400 Bad Request", "Sign-in wasn't completed", "Return to Chimaera and choose Try again to start a fresh sign-in. You can close this tab.")
     };
     let body = include_str!("../../../assets/sign-in.html")
         .replace("{{title}}", title)
-        .replace("{{message}}", message);
+        .replace("{message}", message)
+        .replace("{{footer}}", "Secure desktop sign-in");
     let response = format!("HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nReferrer-Policy: no-referrer\r\nContent-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n{body}", body.len());
     let _ = tokio::time::timeout(Duration::from_secs(5), async {
         socket.write_all(response.as_bytes()).await?;
@@ -314,6 +315,8 @@ mod tests {
         assert!(headers.contains(&format!("Content-Length: {}", body.len())));
         assert!(headers.contains("Cache-Control: no-store"));
         assert!(body.contains("You're signed in"));
+        assert!(body.contains("Secure desktop sign-in"));
+        assert!(!body.contains("{{footer}}"));
         assert!(!body.contains("bound-code"));
         assert!(!body.contains(&state));
     }

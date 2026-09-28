@@ -3,6 +3,7 @@
   import { onMount, tick, untrack } from "svelte";
   import ProNavigation from "./lib/pro/ProNavigation.svelte";
   import { paidPlan } from "./lib/net/plan";
+  import { listenForProReturn } from "./lib/net/proReturn";
   import { isBrowserGateway } from "./lib/net/base";
   import { runStallDrive, stallDriveSpec } from "./lib/perf/tabSwitchDrive";
   import {
@@ -1636,6 +1637,7 @@
     // Native menu items the shell forwards to the focused window. Cmd+W
     // closes the focused VIEW (a home window just closes), reclaiming the
     // chords a browser reserves for tabs.
+    const stopProReturn = isNativeShell() ? listenForProReturn(() => { pendingProReturn = true; }) : () => {};
     let unlistenMenu: (() => void) | null = null;
     let unlistenDaemonMoved: (() => void) | null = null;
     let unlistenHostStatus: (() => void) | null = null;
@@ -1783,6 +1785,7 @@
       window.removeEventListener("keydown", onKeydown, true);
       window.removeEventListener("pagehide", onPagehide);
       window.removeEventListener("chimaera:open-pro", openProSurface);
+      stopProReturn();
       unlistenMenu?.();
       unlistenDaemonMoved?.();
       unlistenHostStatus?.();
@@ -3225,6 +3228,13 @@
     if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
   }
 
+  let pendingProReturn = $state(false);
+  $effect(() => {
+    if (pendingProReturn && (activeWsId === null || layoutReady)) {
+      pendingProReturn = false;
+      untrack(openProSurface);
+    }
+  });
   let homeSettingsOpen = $state(false);
   let homeSurface = $state<"settings" | "pro">("settings");
   let homeSettingsLoad = $state<ReturnType<typeof loadPaneView> | null>(null);

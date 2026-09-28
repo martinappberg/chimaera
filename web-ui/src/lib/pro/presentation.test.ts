@@ -5,7 +5,7 @@ describe("purchase intent", () => {
   const intent = { plan: "max", interval: "year", stage: "sign_in", created: 1000 };
   it("preserves the explicitly selected plan across sign-in without trusting malformed or stale storage", () => {
     expect(readIntent(JSON.stringify(intent), 2000)).toEqual(intent);
-    for (const invalid of [null, "broken", JSON.stringify({ ...intent, plan: "free" }), JSON.stringify({ ...intent, stage: "complete" }), JSON.stringify({ ...intent, created: 3000 })]) expect(readIntent(invalid, 2000)).toBeNull();
+    for (const invalid of [null, "broken", JSON.stringify({ ...intent, plan: "free" }), JSON.stringify({ ...intent, stage: "complete" }), JSON.stringify({ ...intent, stage: "checkout" }), JSON.stringify({ ...intent, created: 3000 })]) expect(readIntent(invalid, 2000)).toBeNull();
     expect(readIntent(JSON.stringify(intent), 1000 + 86400001)).toBeNull();
   });
   it("never treats no plan, absent status or an unknown future plan as entitlement", () => {

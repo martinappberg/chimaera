@@ -40,7 +40,8 @@ in-app SSH askpass, a signed auto-updater). Parent map: repo-root
 | `shell/cloud.rs` | Passive cloud/provider readiness, explicit bounded connection/retry actions, shared-catalog authentication URL validation and exact login-terminal focus. Account credentials remain in Rust. Polls never wake a worker. `pro_cloud_status` passes through optional account-confirmed preparing phases (`keeper`, `worker`, `connecting`); these are not daemon/provider readiness. |
 | `shell/power.rs` | System sleep/wake notifications (macOS IOKit, Linux logind delay inhibitor, Windows power callbacks), bounded daemon flush, and AC-power gating for delayed hand-back. |
 | `shell/pro.rs` | Optional account runtime: endpoint in app.json, OS-keychain tokens, PKCE loopback sign-in, bounded keeper cache/events, reverse local-daemon sharing, and account IPC. No endpoint means no keychain access or network work. |
-| `shell/pro/billing.rs` | Device-authenticated checkout/portal creation and exact provider-origin validation before system-browser open. |
+| `shell/pro/billing.rs` | Native-owned checkout/portal attempts, exact provider-origin validation, cancellation, and authenticated plan confirmation independent of page visibility. |
+| `shell/pro/billing/callback.rs` | One-use billing return: literal loopback Host, exact nonce/outcome query, bounded request/response and credential-free browser page. |
 | `shell/pro/projects.rs` | Passive cloud project listing and per-project native destination selection; cancellation creates no import request. |
 | `shell/pro/auth.rs` | In-memory sign-in attempt lifecycle, cancellation/retry fences and bounded loopback callback parsing. |
 | `assets/sign-in.html` | Credential-free browser return page; success is sent only after native account activation. |
@@ -81,9 +82,27 @@ in-app SSH askpass, a signed auto-updater). Parent map: repo-root
   PKCE state and Host, bounds requests and allows 15 minutes for sign-in plus
   MFA. Waiting does not hold the account operation lock. Restart/cancel closes
   the old listener and fences its result; finishing credential activation is
-  serialized and cannot be interrupted by UI cancellation. Keeper availability
+  serialized and cannot be interrupted by UI cancellation. Successful browser
+  returns unhide/show/unminimize the originating managed window; if it closed,
+  an existing Home (or a new Home while the shell is still alive) receives the
+  return. `pro-return` is targeted; `pro_take_return` consumes one generation-
+  fenced pending route after the page registers its listener, covering startup.
+  No custom URL scheme is registered: a fully exited app must be reopened.
+  Keeper availability
   is independent of successful account authentication. Remote prompt, daemon
   bearer and account-token data must never appear in Settings host rows or logs.
+
+- Billing waits at most 15 minutes for the browser, then at most two minutes
+  for account confirmation. Checkout only confirms the exact requested plan
+  from a fresh authenticated account response; callback outcome is a hint.
+  A 15 s account check while waiting also handles a lost browser redirect;
+  return accelerates it to bounded 2–5 s checks. These share the account refresh
+  mutex but never hold the operation lock during network requests or waiting.
+  Replacing an attempt, canceling, sign-out and shell exit close its listener;
+  terminal status remains available until explicitly acknowledged, replaced or
+  signed out. The ordinary
+  30 s reconciliation still discovers late webhook confirmation. No payment,
+  return nonce or provider URL is stored in webview localStorage or app.json.
 
 - **The command list is a lockstep** the type system does NOT fully enforce, so a
   drift only surfaces at runtime: `shell.rs` `generate_handler!` ↔

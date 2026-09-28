@@ -29,6 +29,8 @@ pub(super) struct Pro {
     device_aliases: Mutex<HashSet<String>>,
     error: Mutex<Option<String>>,
     sign_in: auth::SignIn,
+    billing: billing::Billing,
+    return_target: Mutex<Option<(String, u64)>>,
     delegation: Mutex<Option<chimaera_link::Delegation>>,
     daemon_stamp: Mutex<Option<(u16, String, bool)>>,
     worker_links: tokio::sync::Mutex<HashMap<String, chimaera_link::LinkTunnel>>,
@@ -65,6 +67,7 @@ pub struct Status {
     plan: Option<chimaera_link::Plan>,
     error: Option<String>,
     sign_in: Option<auth::Status>,
+    billing: Option<billing::Status>,
     limits: Option<chimaera_link::Limits>,
     usage: Option<chimaera_link::Usage>,
     hours_exhausted: bool,
@@ -93,6 +96,8 @@ impl Pro {
             device_aliases: Mutex::new(HashSet::new()),
             error: Mutex::new(None),
             sign_in: auth::SignIn::default(),
+            billing: billing::Billing::default(),
+            return_target: Mutex::new(None),
             delegation: Mutex::new(None),
             daemon_stamp: Mutex::new(None),
             worker_links: tokio::sync::Mutex::new(HashMap::new()),
@@ -133,12 +138,25 @@ impl Pro {
             plan: account.as_ref().map(|account| account.plan.clone()),
             error: lock(&self.error).clone(),
             sign_in: self.sign_in.status(),
+            billing: self.billing.status(),
             limits: account.as_ref().map(|account| account.limits.clone()),
             usage: account.as_ref().map(|account| account.usage.clone()),
             hours_exhausted: account
                 .as_ref()
                 .is_some_and(|account| account.hours_exhausted),
         }
+    }
+
+    fn take_return(&self, window: &str) -> bool {
+        let mut target = lock(&self.return_target);
+        if target
+            .as_ref()
+            .is_some_and(|(label, generation)| label == window && *generation == self.generation())
+        {
+            target.take();
+            return true;
+        }
+        false
     }
 
     pub fn is_device(&self, alias: &str) -> bool {
@@ -483,10 +501,33 @@ pub(super) async fn reconcile_account(
     // Blocking HTTP requests cannot be cancelled by aborting the reconcile task.
     // Serialize mutations through completion so sign-out's final DELETE wins.
     let _operation = state.pro.operation.lock().await;
-    let mut runtime = state.pro.runtime.lock().await;
     if state.pro.generation() != generation {
         return Ok(());
     }
+    publish_account(app, client, account).await;
+    if connection_error.is_none() {
+        replace_hosts(app, hosts).await;
+    }
+    // Account confirmation must survive a keeper that is still starting. The
+    // runtime keeps retrying transport setup independently of billing identity.
+    let setup = configure_daemon(&state, client).await;
+    let placement = if setup.is_ok() && connection_error.is_none() {
+        reconcile_placements(&state, client).await
+    } else {
+        Ok(())
+    };
+    *lock(&state.pro.error) = connection_error.or_else(|| {
+        (setup.is_err() || placement.is_err()).then(|| "Your account is up to date. The Pro connection is not ready yet; Chimaera will retry automatically.".into())
+    });
+    let _ = app.emit("pro-changed", ());
+    Ok(())
+}
+
+/// Publish fresh account identity without waiting for optional daemon setup.
+/// Callers serialize generation checks and this mutation with `operation`.
+async fn publish_account(app: &AppHandle, client: &Client, account: Account) {
+    let state = app.state::<Shell>();
+    let mut runtime = state.pro.runtime.lock().await;
     let changed = lock(&state.pro.account).as_ref().is_none_or(|old| {
         old.keeper_url != account.keeper_url || keeper_available(old) != keeper_available(&account)
     });
@@ -507,23 +548,6 @@ pub(super) async fn reconcile_account(
         }
     }
     *lock(&state.pro.account) = Some(account);
-    if connection_error.is_none() {
-        replace_hosts(app, hosts).await;
-    }
-    drop(runtime);
-    // Account confirmation must survive a keeper that is still starting. The
-    // runtime keeps retrying transport setup independently of billing identity.
-    let setup = configure_daemon(&state, client).await;
-    let placement = if setup.is_ok() && connection_error.is_none() {
-        reconcile_placements(&state, client).await
-    } else {
-        Ok(())
-    };
-    *lock(&state.pro.error) = connection_error.or_else(|| {
-        (setup.is_err() || placement.is_err()).then(|| "Your account is up to date. The Pro connection is not ready yet; Chimaera will retry automatically.".into())
-    });
-    let _ = app.emit("pro-changed", ());
-    Ok(())
 }
 
 async fn replace_hosts(app: &AppHandle, hosts: Vec<Host>) {
@@ -616,6 +640,8 @@ async fn host_signal(app: &AppHandle, host: &Host) {
 }
 
 pub(super) async fn stop(state: &Shell) {
+    state.pro.billing.clear();
+    *lock(&state.pro.return_target) = None;
     let links = std::mem::take(&mut *state.pro.worker_links.lock().await);
     for (host, link) in links {
         let _ = daemon_request(
@@ -754,9 +780,10 @@ pub async fn pro_sign_in(app: AppHandle, window: tauri::WebviewWindow) -> Result
                 .await
                 .context("Sign-in could not be completed. Choose Try again.")?;
             activate(&app, client).await?;
-            Ok::<_, anyhow::Error>(())
+            Ok::<_, anyhow::Error>(state.pro.generation())
         }
         .await;
+        let generation = outcome.as_ref().ok().copied();
         let current = state.pro.sign_in.complete(attempt.id);
         let success = current && outcome.is_ok();
         if current {
@@ -769,10 +796,54 @@ pub async fn pro_sign_in(app: AppHandle, window: tauri::WebviewWindow) -> Result
             callback.finish(success).await;
         }
         if success {
-            let _ = window.set_focus();
+            let _operation = state.pro.operation.lock().await;
+            return_to_app(&app, window.label(), generation.unwrap());
         }
     });
     Ok(())
+}
+
+/// Only an authenticated, current flow may focus a managed daemon window.
+/// A newly opened Home consumes the pending route after its listener mounts.
+fn return_to_app(app: &AppHandle, origin: &str, generation: u64) {
+    let state = app.state::<Shell>();
+    if state.pro.generation() != generation || lock(&state.pro.client).is_none() {
+        return;
+    }
+    #[cfg(target_os = "macos")]
+    let _ = app.show();
+    let original = lock(&state.windows)
+        .contains_key(origin)
+        .then(|| app.get_webview_window(origin))
+        .flatten();
+    let home = || {
+        let label = lock(&state.windows)
+            .iter()
+            .find(|(_, scope)| scope.home_hub)
+            .map(|(label, _)| label.clone())?;
+        app.get_webview_window(&label)
+    };
+    let target = original.or_else(home).or_else(|| {
+        if super::show_local_home(app, None).is_err() {
+            return None;
+        }
+        home()
+    });
+    if let Some(window) = target {
+        *lock(&state.pro.return_target) = Some((window.label().into(), generation));
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+        let _ = window.emit("pro-return", ());
+    }
+}
+
+#[tauri::command]
+pub async fn pro_take_return(
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, Shell>,
+) -> Result<bool, String> {
+    Ok(state.pro.take_return(window.label()))
 }
 
 #[tauri::command]
@@ -791,6 +862,18 @@ pub async fn pro_cancel_sign_in(app: AppHandle) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_return_is_targeted_one_use_and_account_generation_bound() {
+        let pro = Pro::new(None);
+        *lock(&pro.return_target) = Some(("home".into(), 0));
+        assert!(!pro.take_return("other"));
+        assert!(pro.take_return("home"));
+        assert!(!pro.take_return("home"));
+        *lock(&pro.return_target) = Some(("home".into(), 0));
+        pro.credential_generation.store(1, Ordering::SeqCst);
+        assert!(!pro.take_return("home"));
+    }
+
     #[test]
     fn account_snapshot_reports_pending_initialization_without_waiting() {
         let pro = Pro::new(Some("http://127.0.0.1:1".into()));
@@ -952,6 +1035,8 @@ async fn sign_out(app: &AppHandle, everywhere: bool, expected: Option<u64>) -> R
             return Ok(());
         }
         state.pro.sign_in.cancel();
+        state.pro.billing.clear();
+        *lock(&state.pro.return_target) = None;
         if everywhere {
             state
                 .pro

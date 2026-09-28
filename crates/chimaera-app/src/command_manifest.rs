@@ -54,6 +54,8 @@ pub const DAEMON_UI_COMMANDS: &[&str] = &[
     "pro_open_cloud_project",
     "pro_billing_checkout",
     "pro_billing_portal",
+    "pro_cancel_billing",
+    "pro_take_return",
     "pro_mirror_status",
     "pro_mirror_preference",
     "pro_set_never_mirror",

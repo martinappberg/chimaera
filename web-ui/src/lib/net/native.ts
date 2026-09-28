@@ -868,6 +868,14 @@ export function openDetachedPopup(
   return true;
 }
 
+export interface ProBillingAttempt {
+  id: number;
+  kind: "checkout" | "portal";
+  phase: "waiting" | "confirming" | "confirmed" | "canceled" | "expired" | "failed";
+  expires_at: number;
+  error: string | null;
+}
+
 /** Account controls are native-shell state, separate from daemon settings. */
 export interface ProStatus {
   initializing?: boolean;
@@ -879,6 +887,8 @@ export interface ProStatus {
   error: string | null;
   /** Optional when connected to an older native shell. */
   sign_in?: { phase: "waiting" | "finishing"; expires_at: number } | null;
+  /** Native owns verification even when this page is closed. Older shells omit it. */
+  billing?: ProBillingAttempt | null;
   limits?: { cloud_hours: number; storage_bytes: number } | null;
   usage?: { cloud_hours: number; storage_bytes: number } | null;
   hours_exhausted?: boolean;
@@ -932,6 +942,20 @@ export async function proBillingCheckout(plan: "pro" | "max", interval: "month" 
   const t = tauri();
   if (t === null) throw new Error("Open the desktop app to choose a plan.");
   await t.core.invoke<void>("pro_billing_checkout", { plan, interval });
+}
+
+export async function proCancelBilling(attemptId?: number): Promise<void> {
+  await tauri()?.core.invoke<void>("pro_cancel_billing", { attemptId });
+}
+
+export async function proTakeReturn(): Promise<boolean> {
+  return (await tauri()?.core.invoke<boolean>("pro_take_return")) ?? false;
+}
+
+export function onProReturn(handler: () => void): Promise<() => void> {
+  const t = tauri();
+  if (t === null) return Promise.resolve(() => {});
+  return t.webviewWindow.getCurrentWebviewWindow().listen<null>("pro-return", () => handler());
 }
 
 export async function proBillingPortal(): Promise<void> {

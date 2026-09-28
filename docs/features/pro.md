@@ -23,6 +23,8 @@ Cloud setup controls are implemented; automatic handoff and browser access are b
    **Start again** opens a fresh sign-in and **Cancel sign-in** closes the request.
    An expired or failed request offers **Try again**. The browser confirms success
    only after the account is active in the app; keeper provisioning can finish later.
+   Successful sign-in returns to Pro in the initiating app window, restoring it
+   if minimized. A newly opened window consumes its pending return after loading.
    On restart, saved account access shows its current phase immediately. If the
    system Keychain needs a response, the page says so while Home stays usable;
    billing and account changes wait until initialization completes.
@@ -43,9 +45,18 @@ Cloud setup controls are implemented; automatic handoff and browser access are b
    Pro or Max and monthly or yearly billing, then continue to checkout in the
    system browser. The single signed-out **Sign in** action remembers that
    selection; an existing active plan is restored without opening checkout.
-   Existing subscribers can open **Manage billing**. The app
-   refreshes account state on return; a browser return alone never activates a
-   plan. With an active plan, toggle **Keep connected** for a saved SSH host. A password or Duo challenge uses the usual
+   Existing subscribers can open **Manage billing**. Checkout and billing return
+   to Pro automatically. The native shell waits up to 15 minutes for the browser,
+   then checks account confirmation for up to two minutes, even if Pro is hidden
+   or closed. The page shows waiting, confirming and confirmed account states;
+   a browser return alone never activates a plan. **Stop waiting** ends the local
+   request without canceling a payment or subscription. A timeout or failed
+   check offers **Check account** and keeps plan selection hidden. If that fresh
+   check confirms no active plan, **Return to plans** explicitly closes the old
+   request before another checkout can start. Older shells
+   without native attempt status retain an explicit account-refresh fallback.
+   With an active plan, toggle **Keep connected** for a saved SSH host. A password
+   or Duo challenge uses the usual
    host-scoped prompt, with “Asked by your Pro connection” underneath its title.
 4. Open that host from Home. Its **via Pro** label identifies the connection;
    workspaces still open through a local loopback port with the existing daemon UI.

@@ -36,7 +36,7 @@ struct Inner {
     keeper: RwLock<Option<Url>>,
     http: reqwest::Client,
     tls: Arc<rustls::ClientConfig>,
-    tokens: Mutex<Option<Tokens>>,
+    tokens: Arc<Mutex<Option<Tokens>>>,
     token_updates: watch::Sender<Option<Tokens>>,
 }
 impl Client {
@@ -64,7 +64,7 @@ impl Client {
                     .timeout(Duration::from_secs(30))
                     .build()?,
                 tls: Arc::new(tls),
-                tokens: Mutex::new(tokens),
+                tokens: Arc::new(Mutex::new(tokens)),
                 token_updates,
             }),
         })
@@ -114,38 +114,45 @@ impl Client {
             .context("sign in required")
     }
     async fn refresh_if_current(&self, rejected: &str) -> Result<()> {
-        // One refresh can rotate the token for all sockets: concurrent 401s must
-        // never reuse an already-consumed refresh token.
-        let mut guard = self.inner.tokens.lock().await;
+        // Take ownership before spawning: concurrent 401s wait here rather than
+        // launching duplicate rotations. A canceled account read must not lose
+        // a one-use refresh token already consumed by the server. Only this
+        // HTTP-timeout-bounded rotation survives its caller; clear_tokens waits
+        // for it and then clears the result, so sign-out cannot be resurrected.
+        let mut guard = self.inner.tokens.clone().lock_owned().await;
         let old = guard.as_ref().context("sign in required")?;
         if old.access_token != rejected {
             return Ok(());
         }
-        let response = self
-            .inner
-            .http
-            .post(path(&self.inner.account, &["v1", "oauth", "refresh"]))
-            .json(&RefreshRequest {
-                refresh_token: old.refresh_token.clone(),
-            })
-            .send()
-            .await?;
-        if matches!(response.status().as_u16(), 401 | 403) {
-            *guard = None;
-            self.inner.token_updates.send_replace(None);
-            *self.inner.keeper.write().await = None;
-            bail!("device authorization revoked");
-        }
-        let tokens: Tokens = json_response(response).await?;
-        if tokens.token_type != "Bearer"
-            || tokens.access_token.is_empty()
-            || tokens.refresh_token.is_empty()
-        {
-            bail!("invalid refresh response");
-        }
-        *guard = Some(tokens.clone());
-        self.inner.token_updates.send_replace(Some(tokens));
-        Ok(())
+        let refresh_token = old.refresh_token.clone();
+        let client = self.clone();
+        tokio::spawn(async move {
+            let response = client
+                .inner
+                .http
+                .post(path(&client.inner.account, &["v1", "oauth", "refresh"]))
+                .json(&RefreshRequest { refresh_token })
+                .send()
+                .await?;
+            if matches!(response.status().as_u16(), 401 | 403) {
+                *guard = None;
+                client.inner.token_updates.send_replace(None);
+                *client.inner.keeper.write().await = None;
+                bail!("device authorization revoked");
+            }
+            let tokens: Tokens = json_response(response).await?;
+            if tokens.token_type != "Bearer"
+                || tokens.access_token.is_empty()
+                || tokens.refresh_token.is_empty()
+            {
+                bail!("invalid refresh response");
+            }
+            *guard = Some(tokens.clone());
+            client.inner.token_updates.send_replace(Some(tokens));
+            Ok(())
+        })
+        .await
+        .context("credential refresh task stopped")?
     }
     async fn request_raw(
         &self,

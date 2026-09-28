@@ -29,6 +29,8 @@ Invariants:
   follow authenticated redirects or downgrade a discovered keeper from HTTPS.
 - Device tokens belong in the caller's OS keychain; refresh rotations must be
   persisted through `Client::token_updates`. Daemon tokens stay in memory.
+  A started refresh rotation finishes under the token lock (bounded by the HTTP
+  timeout) even if its caller is canceled; clearing credentials waits behind it.
   Debug output and errors must not print any token or SSH password.
 - Every data message is ≤64 KiB, queues ≤16 frames, concurrent streams ≤128.
   Control frames are ≤128 KiB, REST bodies ≤1 MiB. Backpressure is mandatory.

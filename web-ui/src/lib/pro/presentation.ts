@@ -3,13 +3,13 @@ import type { CloudProvisioningStatus, MirrorStatus } from "../net/native";
 export type PaidPlan = "pro" | "max";
 export type BillingInterval = "month" | "year";
 export interface PlanChoice { plan: PaidPlan; interval: BillingInterval }
-export interface PurchaseIntent extends PlanChoice { stage: "sign_in" | "checkout"; created: number }
+export interface PurchaseIntent extends PlanChoice { stage: "sign_in"; created: number }
 
 export function paid(plan: unknown): plan is PaidPlan { return plan === "pro" || plan === "max"; }
 export function readIntent(value: string | null, now = Date.now()): PurchaseIntent | null {
   try {
     const v = JSON.parse(value ?? "null");
-    if (!v || !paid(v.plan) || !["month", "year"].includes(v.interval) || !["sign_in", "checkout"].includes(v.stage)
+    if (!v || !paid(v.plan) || !["month", "year"].includes(v.interval) || v.stage !== "sign_in"
       || !Number.isFinite(v.created) || v.created > now || now - v.created > 24 * 60 * 60 * 1000) return null;
     return { plan: v.plan, interval: v.interval, stage: v.stage, created: v.created };
   } catch { return null; }

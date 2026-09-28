@@ -50,7 +50,13 @@ Unknown/startup/error account states stay neutral, and never trigger a remembere
 purchase until a confirmed no-plan status arrives. The static introduction shows
 project/conversation continuity; it is not live setup progress or arbitrary
 process migration.
-Refresh and short-lived checkout polling stop while the view is hidden.
+Native billing attempts own their finite confirmation lifetime even if this view
+is hidden or closed. The UI has no checkout polling loop; it displays native
+waiting/confirming/result states and refreshes cached status on events or return.
+Only an authoritative active account plan unlocks paid content. Expired/failed
+checkout stays neutral until an explicit Check account succeeds with no plan for
+the same attempt; Return to plans then acknowledges and clears that attempt. A targeted native
+return reopens Pro, including when a new window needed time to mount.
 
 ## File map
 

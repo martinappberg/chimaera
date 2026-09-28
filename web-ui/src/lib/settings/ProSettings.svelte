@@ -3,6 +3,7 @@
   import BrandMark from "../shared/BrandMark.svelte";
   import PlanBadge from "../shared/PlanBadge.svelte";
   import ProWalkthrough from "../pro/ProWalkthrough.svelte";
+  import { billingCopy, billingPending, billingNeedsReview } from "../pro/billing";
   import { onMount, untrack } from "svelte";
   import MirrorSettings from "./MirrorSettings.svelte";
   import { asyncDisposer } from "../shared/asyncDisposer";
@@ -10,7 +11,7 @@
   import { paid, readIntent, friendlyError, type PaidPlan, type BillingInterval, type PurchaseIntent } from "../pro/presentation";
   import {
     onProChanged, proStatus, proSignIn, proCancelSignIn, proSignOut, proSignOutEverywhere,
-    proHosts, proSetHostKept, proDevices, proBillingCheckout, proBillingPortal, proRefreshAccount,
+    proHosts, proSetHostKept, proDevices, proBillingCheckout, proBillingPortal, proCancelBilling, proRefreshAccount,
     type ProStatus, type ProHost, type ProDevice,
   } from "../net/native";
 
@@ -35,6 +36,7 @@
   let devices = $state<ProDevice[]>([]);
   let error = $state<string | null>(null);
   let notice = $state<string | null>(null);
+  let reviewedBilling = $state<number | null>(null);
   let busy = $state<string | null>(null);
   let revision = $state(0);
   let connectionsOpen = $state(false);
@@ -48,7 +50,12 @@
   const confirmedFree = $derived(accountFresh && status?.available === true && !status.initializing && !status.error && (status.signed_in ? status.plan === "none" : true));
   const accountNeedsAttention = $derived(status?.available === true && !status.initializing && !subscribed && !confirmedFree && !accountLoading);
   const signInPhase = $derived(status?.sign_in?.phase ?? null);
-  const checkoutPending = $derived(intent?.stage === "checkout");
+  const billing = $derived(status?.billing ?? null);
+  const billingActive = $derived(billingPending(billing));
+  const billingMessage = $derived(billing ? billingCopy(billing, subscribed) : null);
+  const billingRecovery = $derived(billingNeedsReview(billing, subscribed));
+  const offerPlans = $derived(confirmedFree && !billingActive && !billingRecovery);
+  const canReturnToPlans = $derived(billingRecovery && confirmedFree && reviewedBilling === billing?.id);
   const cloudHours = $derived(status?.usage?.cloud_hours);
   const cloudLimit = $derived(status?.limits?.cloud_hours);
 
@@ -86,16 +93,6 @@
     if (visible && $pageVisible) untrack(() => void load());
     else untrack(() => { accountFresh = false; accountLoading = false; generation += 1; });
   });
-  // Only an explicitly opened checkout gets short-lived confirmation polling.
-  // Normal account changes arrive from the shell; hidden panes do no polling.
-  $effect(() => {
-    if (!visible || !$pageVisible || !checkoutPending) return;
-    const timer = setInterval(() => {
-      if (intent && Date.now() - intent.created < 5 * 60_000) void load(true);
-      else clearInterval(timer);
-    }, 5000);
-    return () => clearInterval(timer);
-  });
   $effect(() => {
     if (!visible || !$pageVisible || !status?.signed_in || status.initializing || !subscribed || !connectionsOpen) return;
     let stopped = false;
@@ -109,12 +106,13 @@
     return () => { stopped = true; };
   });
   $effect(() => {
-    if (visible && $pageVisible && status?.signed_in && confirmedFree && intent?.stage === "sign_in" && busy === null) {
+    if (visible && $pageVisible && status?.signed_in && confirmedFree && !billingActive && !billingRecovery && intent?.stage === "sign_in" && busy === null) {
       untrack(() => void checkout());
     }
   });
   onMount(() => {
-    const dispose = asyncDisposer(onProChanged(() => { accountFresh = false; revision += 1; }));
+    const changed = () => { if (alive) { reviewedBilling = null; accountFresh = false; revision += 1; } };
+    const dispose = asyncDisposer(onProChanged(changed).then((unlisten) => { changed(); return unlisten; }));
     const focus = () => { if (visible && document.visibilityState === "visible") void load(true); };
     window.addEventListener("focus", focus);
     return () => { alive = false; generation += 1; dispose(); window.removeEventListener("focus", focus); };
@@ -130,16 +128,51 @@
     if (busy !== null || status?.initializing) return;
     // A returning subscriber uses the same sign-in action, never a new checkout.
     if (subscribed) { remember(null); return; }
-    if (!confirmedFree) return;
+    if (!confirmedFree || billingActive || billingRecovery) return;
     if (!status?.signed_in) {
       remember({ plan: selected, interval, stage: "sign_in", created: Date.now() });
       await act("sign-in", proSignIn, "Sign-in couldn't start. Please try again.");
       return;
     }
-    // Mark before opening so an unrelated status event cannot launch it twice.
-    const choice = intent?.stage === "sign_in" ? intent : { plan: selected, interval };
-    remember({ ...choice, stage: "checkout", created: Date.now() });
-    await act("checkout", () => proBillingCheckout(choice.plan, choice.interval), "Checkout couldn't open. Your plan hasn't changed. Please try again.");
+    const choice = intent ?? { plan: selected, interval };
+    // The shell owns the attempt from here. A view remount must not reopen it.
+    remember(null);
+    notice = null;
+    await act("checkout", async () => {
+      await proBillingCheckout(choice.plan, choice.interval);
+      if (status?.billing === undefined) notice = "Checkout opened in your browser. Return here to check your account when you're done.";
+    }, "Checkout couldn't open. Please try again.");
+  }
+  async function openBilling(): Promise<void> {
+    if (billingActive) return;
+    notice = null;
+    await act("billing", async () => {
+      await proBillingPortal();
+      if (status?.billing === undefined) notice = "Billing opened in your browser. Return here to check your account when you're done.";
+    }, "Billing couldn't open. Please try again in a moment.");
+  }
+  async function checkBillingAccount(): Promise<void> {
+    const id = billing?.id;
+    if (id === undefined || busy !== null) return;
+    reviewedBilling = null;
+    let refreshed = false;
+    await act("billing-check", async () => {
+      await proRefreshAccount();
+      refreshed = true;
+    }, "Your account couldn't be checked. Please try again before starting another checkout.");
+    if (alive && refreshed && confirmedFree && billing?.id === id) reviewedBilling = id;
+  }
+  async function stopBilling(): Promise<void> {
+    const id = billing?.id;
+    if (id === undefined) return;
+    await act("cancel-billing", () => proCancelBilling(id), "This request couldn't be stopped. Please check its latest status.");
+  }
+  async function returnToPlans(): Promise<void> {
+    const id = billing?.id;
+    if (!canReturnToPlans || id === undefined) return;
+    remember(null);
+    await act("dismiss-billing", () => proCancelBilling(id), "This request couldn't be closed. Please check your account again.");
+    reviewedBilling = null;
   }
   async function cancelSignIn(): Promise<void> {
     remember(null);
@@ -160,7 +193,9 @@
     <div class="brand"><BrandMark size={44} /><span>chimaera</span><span class="product">{subscribed && status?.plan === "max" ? "Max" : "Pro"}</span></div>
     {#if subscribed}
       <h1>Your Chimaera {status?.plan === "max" ? "Max" : "Pro"}</h1>
-    {:else if confirmedFree}
+    {:else if billingActive || billingRecovery}
+      <h1>Your Chimaera account</h1>
+    {:else if offerPlans}
       <h1>Your work, wherever you are.</h1>
       <p class="lede">Let your agents keep working while you’re away. Return to the same project, conversation, and files on another device.</p>
       <button class="secondary intro-plans" onclick={showPlans}>See plans</button>
@@ -175,7 +210,7 @@
         : "We're checking your saved account and restoring its connections. Your workspaces remain available."}</p>
       <button class="secondary" onclick={() => void load()}>Check again</button>
     </div>
-  {:else if confirmedFree}<ProWalkthrough />{/if}
+  {:else if offerPlans}<ProWalkthrough />{/if}
 
   {#if status === null}
     <p class="muted" role="status">Loading your account…</p>
@@ -199,11 +234,17 @@
     {/if}
 
     {#if notice}<p class="notice message" role="status">{notice}</p>{/if}
-    {#if checkoutPending && confirmedFree}
-      <div class="panel notice"><h2>Finish in your browser</h2><p>Review {intent?.plan === "max" ? "Max" : "Pro"} and complete checkout there. We'll show your plan here once payment is confirmed.</p><div class="actions"><button disabled={busy !== null} onclick={() => void load(true)}>Check plan status</button><button class="text-button" disabled={busy !== null} onclick={() => { remember(null); notice = null; }}>Back to plans</button></div><p class="small">Closed checkout? Choose a plan below to open it again. Closing this view won't affect your local work.</p></div>
+    {#if billingMessage}
+      <div class="panel notice" role="status">
+        <h2>{billingMessage.title}</h2><p>{billingMessage.detail}</p>
+        {#if billingMessage.pending}<button class="secondary" disabled={busy !== null} onclick={() => void stopBilling()}>Stop waiting</button>
+        {:else if billingMessage.check}<div class="actions"><button class="secondary" disabled={busy !== null || accountLoading} onclick={() => void checkBillingAccount()}>{busy === "billing-check" || accountLoading ? "Checking…" : "Check account"}</button>{#if canReturnToPlans}<button onclick={() => void returnToPlans()} disabled={busy !== null}>Return to plans</button>{/if}</div>{/if}
+        {#if canReturnToPlans}<p class="small muted">Your account currently has no active plan. You can return to plans when you're ready.</p>{/if}
+        {#if billingRecovery && error}<p class="small" role="alert">{error}</p>{/if}
+      </div>
     {/if}
 
-    {#if confirmedFree}
+    {#if offerPlans}
       <section class="plans" aria-labelledby="plans-title" tabindex="-1" bind:this={plansElement}>
         <div class="section-heading plan-heading">
           <div><h2 id="plans-title">Choose your plan</h2><p class="muted small">The same features in both. More cloud capacity with Max.</p></div>
@@ -221,13 +262,13 @@
           {/each}
         </div>
         <div class="included"><span class="section-label">Included with both</span><ul><li>Project mirrors and agent handoff</li><li>Persistent remote connections</li><li>Browser access to your work</li><li>Project-by-project privacy controls</li></ul></div>
-        <div class="purchase"><button disabled={busy !== null || signInPhase !== null} onclick={() => void checkout()}>{busy === "checkout" ? "Opening checkout…" : status.signed_in ? `Continue with ${selected === "max" ? "Max" : "Pro"}` : "Sign in"}</button><p class="small muted">Billed ${prices[selected][interval]} {interval === "year" ? "yearly" : "monthly"}. Cloud work and mirrored storage have plan limits. Review billing details in secure checkout before subscribing.</p></div>
+        <div class="purchase"><button disabled={busy !== null || signInPhase !== null || billingActive} onclick={() => void checkout()}>{busy === "checkout" ? "Opening checkout…" : status.signed_in ? `Continue with ${selected === "max" ? "Max" : "Pro"}` : "Sign in"}</button><p class="small muted">Billed ${prices[selected][interval]} {interval === "year" ? "yearly" : "monthly"}. Cloud work and mirrored storage have plan limits. Review billing details in secure checkout before subscribing.</p></div>
         <p class="free-note"><strong>Your local workbench stays free.</strong> Local projects, agents and ordinary SSH work without a Pro account.</p>
       </section>
     {:else if subscribed}
       {#key status.email}<CloudSetup {visible} {requiredProviders} {contextLabel} {workspaceId} {onReady} />{/key}
       <section class="panel plan-current" aria-label="Current plan">
-        <div class="section-heading"><div><span class="section-label">Your plan</span><h2>Chimaera {status.plan === "max" ? "Max" : "Pro"}</h2></div><button class="secondary" disabled={busy !== null} onclick={() => void act("billing", proBillingPortal, "Billing couldn't open. Please try again in a moment.")}>{busy === "billing" ? "Opening billing…" : "Manage billing"}</button></div>
+        <div class="section-heading"><div><span class="section-label">Your plan</span><h2>Chimaera {status.plan === "max" ? "Max" : "Pro"}</h2></div><button class="secondary" disabled={busy !== null || billingActive} onclick={() => void openBilling()}>{busy === "billing" ? "Opening billing…" : "Manage billing"}</button></div>
         <details class="usage-details"><summary>Usage and plan details</summary><div class="usage-grid">
           {#if cloudHours !== undefined && cloudLimit !== undefined}<div><span class="usage-label">Cloud work this month</span><p class="usage-value"><strong>{cloudHours.toFixed(1)}</strong><span> / {cloudLimit} hours</span></p>{#if cloudLimit > 0}<progress max={cloudLimit} value={Math.max(0, Math.min(cloudHours, cloudLimit))} aria-label="Monthly cloud hours used"></progress>{/if}</div>{/if}
           {#if status.usage && status.limits}<div><span class="usage-label">Mirrored projects</span><p class="usage-value"><strong>{(status.usage.storage_bytes / 1e9).toFixed(1)}</strong><span> / {(status.limits.storage_bytes / 1e9).toLocaleString(undefined, { maximumFractionDigits: 1 })} GB</span></p>{#if status.limits.storage_bytes > 0}<progress max={status.limits.storage_bytes} value={Math.max(0, Math.min(status.usage.storage_bytes, status.limits.storage_bytes))} aria-label="Mirrored storage used"></progress>{/if}</div>{/if}
@@ -235,6 +276,8 @@
       </section>
       <details class="section" ontoggle={(event) => (connectionsOpen = event.currentTarget.open)}><summary>Connected machines</summary>{#if connectionsOpen}<div class="section-body"><p class="muted small">Add your remote hosts on Home. Keep a connection available through Pro here.</p>{#if hosts.length === 0}<p class="muted">No machines to show yet.</p>{/if}{#each hosts as host (host.alias)}<div class="row"><div><span>{host.alias}</span><span class="muted small">{host.status === "prompting" ? "Waiting for authentication" : host.status === "connecting" ? "Connecting…" : host.status === "connected" ? "Connected" : "Offline"}</span></div>{#if host.kind === "ssh"}<label class="keep"><input type="checkbox" checked={host.kept} disabled={busy !== null} onchange={(event) => setKept(host, event.currentTarget)} />Keep connected</label>{/if}</div>{/each}</div>{/if}</details>
       <details class="section" ontoggle={(event) => (mirrorsOpen = event.currentTarget.open)}><summary>Project mirrors and privacy</summary>{#if mirrorsOpen}<MirrorSettings visible={visible && mirrorsOpen} />{/if}</details>
+    {:else if billingActive || billingRecovery}
+      <!-- The native attempt continues while this surface is hidden or closed. -->
     {:else if accountLoading}
       <p class="muted" role="status">Refreshing your account…</p>
     {:else}
@@ -246,7 +289,7 @@
       <details class="section" ontoggle={(event) => (securityOpen = event.currentTarget.open)}><summary>Account and devices</summary>{#if securityOpen}<div class="section-body">{#each devices as device (device.id)}<div class="row"><div><span>{device.name}</span><span class="muted small">{lastSeen(device.last_seen)}</span></div>{#if device.this}<span class="small muted">This device</span>{/if}</div>{/each}<div class="actions"><button class="secondary" disabled={busy !== null} onclick={() => { remember(null); void act("sign-out", proSignOut, "Sign-out couldn't finish. Please try again."); }}>Sign out</button><button class="text-button" disabled={busy !== null} onclick={() => { remember(null); void act("sign-out-all", proSignOutEverywhere, "Sign-out couldn't finish. Please try again."); }}>Sign out everywhere</button></div><p class="muted small">Signing out everywhere also closes the SSH logins held by Pro.</p></div>{/if}</details>
     {/if}
   {/if}
-  {#if (error || status?.error) && !accountNeedsAttention}<div class="error" role="alert"><span>{error ?? friendlyError(status?.error, "Part of your Pro connection couldn't refresh. Your local work remains available.")}</span><button class="secondary" disabled={busy !== null} onclick={() => void load(true)}>Try again</button></div>{/if}
+  {#if (error || status?.error) && !accountNeedsAttention && !billingRecovery}<div class="error" role="alert"><span>{error ?? friendlyError(status?.error, "Part of your Pro connection couldn't refresh. Your local work remains available.")}</span><button class="secondary" disabled={busy !== null} onclick={() => void load(true)}>Try again</button></div>{/if}
 </section>
 
 <style>

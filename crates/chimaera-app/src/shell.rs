@@ -1043,6 +1043,8 @@ pub fn run() {
             pro::projects::pro_open_cloud_project,
             pro::billing::pro_billing_checkout,
             pro::billing::pro_billing_portal,
+            pro::billing::pro_cancel_billing,
+            pro::pro_take_return,
             pro::pro_mirror_status,
             pro::pro_mirror_preference,
             pro::pro_set_never_mirror,

@@ -8,6 +8,7 @@ The public UI runs directly on a daemon, inside the native shell, or beneath a b
 | `api.ts` | authentication bootstrap, typed HTTP wrapper, browser CSRF marker, reauthentication signal |
 | `events.ts` | daemon event stream and reconnect lifecycle |
 | `native.ts` | native IPC with browser fallbacks and prefixed window URLs |
+| `proReturn.ts` | targeted account-return listener: register before consuming the native pending-window marker, coalesce events, and ignore late results after teardown |
 
 Never put browser credentials in JavaScript, storage, URLs or proxy pages. Gateway requests use an HttpOnly cookie and same-origin proof; account browser sessions are distinct from daemon bearer tokens. Host choice belongs to the URL, never a shared cookie. Keep direct/native URLs unchanged, and preserve nonsecret workspace/window bootstrap metadata when switching hosts. Arbitrary preview apps must run on their isolated preview origin; their opaque proxy ids are capabilities, never raw daemon tokens. No user-selected upstream origin is accepted by the gateway helper.
 
