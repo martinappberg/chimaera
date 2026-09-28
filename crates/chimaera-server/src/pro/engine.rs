@@ -17,6 +17,8 @@ use std::{
 mod handback;
 #[path = "release.rs"]
 mod release;
+#[path = "snapshot_diagnostics.rs"]
+mod snapshot_diagnostics;
 
 #[derive(Serialize, Deserialize)]
 pub(super) struct Manifest {
@@ -485,6 +487,28 @@ pub(super) async fn snapshot(
     workspace: &str,
     clean: bool,
 ) -> Result<()> {
+    let mut phase = "ownership";
+    let result = snapshot_inner(state, config, workspace, clean, &mut phase).await;
+    if let Err(error) = &result {
+        // Recovery may clear the transient status while resuming an idle session.
+        // The fixed phase/category survives that recovery without recording data.
+        tracing::warn!(
+            phase,
+            category = snapshot_diagnostics::category(error),
+            clean,
+            "Project snapshot failed"
+        );
+    }
+    result
+}
+
+async fn snapshot_inner(
+    state: &Arc<AppState>,
+    config: &Configure,
+    workspace: &str,
+    clean: bool,
+    phase: &mut &'static str,
+) -> Result<()> {
     authority::config_matches(state, config, workspace)?;
     let effective = execution::effective(state, config, workspace)?;
     let config = &effective;
@@ -506,10 +530,13 @@ pub(super) async fn snapshot(
     let workspace = lock(&state.workspaces)
         .get(workspace)
         .context("unknown workspace")?;
+    *phase = "destination";
     authority::destination(state, config, &workspace.id, Some(&workspace.root)).await?;
+    *phase = "credentials";
     let grant = credentials(config, &workspace.id, Some(epoch)).await?;
     let root = state.pro.root.join(&workspace.id);
     let shadow = root.join("working-tree.git");
+    *phase = "initialize";
     mirror::initialize(&shadow).await?;
     let staging = root.join(format!("stage-{}", chimaera_core::generate_token()));
     tokio::fs::create_dir_all(&staging).await?;
@@ -520,17 +547,22 @@ pub(super) async fn snapshot(
         let session_ids:Vec<_>=lock(&state.session_workspaces).iter().filter(|(_,workspace_id)|*workspace_id==&workspace.id).map(|(id,_)|id.clone()).take(64).collect();
         let mut stopped=std::collections::HashMap::new();
         if clean {
+            *phase = "stop_sessions";
             lock(&state.pro.ownership).insert(workspace.id.clone(),Ownership::Transferring{epoch});super::persist(state).await?;
             for id in &session_ids {
                 let Some(path)=crate::bundle::export_for_mirror(state.clone(),id,crate::bundle::ExportMode::Stop).await? else {continue;};
                 let target=staging.join(format!("stopped-{id}.zip"));tokio::fs::rename(path,&target).await?;stopped.insert(id.clone(),target);
             }
         }
+        *phase = "stop_execution";
         if clean && config.execution.is_some(){execution::stop(state,std::slice::from_ref(&workspace.id)).await?;}
+        *phase = "inventory";
         let paths = mirror::inventory(&workspace.root, &shadow).await?;
         let project = workspace.root.clone(); let destination = staging.join("tree");
         let budget = grant.storage_limit_bytes; let max_file = grant.max_file_bytes;
+        *phase = "copy_files";
         let report = tokio::task::spawn_blocking(move || mirror::copy_tree(&project, &destination, paths, budget, max_file)).await??;
+        *phase = "export_config";
         let home = state.claude_settings_path.parent().and_then(Path::parent).context("agent home unavailable")?.to_path_buf();
         let sources = config::Sources { home, claude:state.claude_settings_path.parent().unwrap().to_path_buf(), codex:state.codex_config_path.parent().context("codex home unavailable")?.to_path_buf(), workspace:workspace.root.clone() };
         let destination = staging.join("config");
@@ -539,6 +571,7 @@ pub(super) async fn snapshot(
         profile.missing_environment = config_report.missing_environment;
         let command_sessions:Vec<_>=lock(&state.session_workspaces).iter().filter(|(_,id)|*id==&workspace.id).map(|(id,_)|id.clone()).take(64).collect();
         for id in command_sessions {if let Some(marks)=state.sessions.marks(&id) {for command in marks.journal(32) {if let Some(command)=command.command.as_deref(){profile.observe_command(command);}}}}
+        *phase = "archive_sessions";
         let handoff = staging.join("handoff"); tokio::fs::create_dir_all(handoff.join("bundles")).await?;
         let mut archives = Vec::new(); let mut archive_bytes = 0u64;
         for id in session_ids {
@@ -552,25 +585,35 @@ pub(super) async fn snapshot(
             tokio::fs::rename(path, handoff.join(&archive)).await?;
             archives.push(SessionArchive {id,archive});
         }
+        *phase = "capture_repository";
         let branch=transport::git_output(transport::git(&workspace.root,None).await?,&["symbolic-ref","-q","HEAD"],vec![]).await.ok().and_then(|bytes|String::from_utf8(bytes).ok()).map(|text|text.trim().to_string());
         let repository_origin=mirror::repository_origin(&workspace.root).await;
         let repository=super::repository::capture(&workspace.root).await?;
         let manifest = Manifest {version:1,branch,repository_origin,repository,workspace_id:workspace.id.clone(),root:workspace.root.clone(),name:workspace.name.clone(),epoch,clean,continuation,profile:profile.clone(),sessions:archives};
         tokio::fs::write(handoff.join("manifest.json"), serde_json::to_vec(&manifest)?).await?;
+        *phase = "mirror_repository";
         mirror::mirror_repository(&workspace.root, &root.join("repository.git"), &grant).await?;
+        *phase = "commit_files";
         let tree_oid=mirror::commit_tree(&shadow, &staging.join("tree"), "main").await?;
+        *phase = "commit_config";
         let config_oid=mirror::commit_tree(&shadow, &staging.join("config"), "config").await?;
+        *phase = "commit_sessions";
         let handoff_oid=mirror::commit_tree(&shadow, &handoff, "handoff").await?;
+        *phase = "publish_snapshot";
         mirror::push(&shadow, &grant, &["refs/heads/main", "refs/heads/config", "refs/heads/handoff"]).await?;
+        *phase = "confirm_checkpoint";
         if config.execution.is_some(){execution::receipt::published(config,&workspace.id,epoch,[&tree_oid,&config_oid,&handoff_oid],continuation).await?;}
         if config.execution.is_none() {
+            *phase = "update_policy";
             let policy = account(config, &format!("/v1/baton/{}/policy", workspace.id), "PUT", Some(&json!({"holder_id":config.delegation.device_id,"epoch":epoch,"handoff_enabled":!config.hours_exhausted,"offline_takeover":!config.hours_exhausted,"has_agents":has_agents}))).await?;
             ensure!((200..300).contains(&policy.status), "mirror policy update failed");
         }
         lock(&state.pro.preferences).entry(workspace.id.clone()).or_default().profile = profile;
         lock(&state.pro.status).insert(workspace.id.clone(), WorkspaceStatus {report,last_mirrored_at:Some(super::now()),storage_limit_bytes:budget,error:None,blocked_providers:Vec::new()});
+        *phase = "persist_snapshot";
         super::persist(state).await?;
         if clean {
+            *phase = "release";
             release::after_publication(config, &workspace.id, epoch, || {
                 generation == state.pro.generation.load(Ordering::Acquire)
                     && matches!(lock(&state.pro.ownership).get(&workspace.id), Some(Ownership::Transferring { epoch: current }) if *current == epoch)
