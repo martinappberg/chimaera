@@ -37,6 +37,7 @@ pub(crate) struct Store {
 }
 #[derive(Default)]
 struct Data {
+    generation: u64,
     routes: HashMap<String, Route>,
     rows: HashMap<String, Value>,
     tickets: HashMap<String, Ticket>,
@@ -62,6 +63,12 @@ pub(crate) struct Registration {
     host_id: String,
     endpoint: String,
     token: String,
+    workspace_id: String,
+    epoch: u64,
+}
+#[derive(Serialize)]
+struct RegisteredPlacement {
+    host_id: String,
     workspace_id: String,
     epoch: u64,
 }
@@ -134,14 +141,17 @@ impl Store {
                 bail!("placement workspace limit");
             }
         }
+        data.generation = data.generation.wrapping_add(1);
+        let generation = data.generation;
         for existing in data.routes.values_mut() {
             if existing.host_id != request.host_id
                 && existing.workspaces.remove(&request.workspace_id).is_some()
             {
                 existing.roots.remove(&request.workspace_id);
-                existing.generation = existing.generation.wrapping_add(1);
+                existing.generation = generation;
             }
         }
+        data.routes.retain(|_, route| !route.workspaces.is_empty());
         let route = data
             .routes
             .entry(request.host_id.clone())
@@ -164,7 +174,7 @@ impl Store {
         route.token = request.token;
         route.roots.insert(request.workspace_id.clone(), local_root);
         route.workspaces.insert(request.workspace_id, request.epoch);
-        route.generation = route.generation.wrapping_add(1);
+        route.generation = generation;
         Ok(())
     }
     fn for_session(&self, id: &str) -> Option<Route> {
@@ -190,19 +200,43 @@ impl Store {
             .find(|r| r.workspaces.contains_key(workspace))
             .cloned()
     }
+    fn inventory(&self) -> Vec<RegisteredPlacement> {
+        let data = crate::lock(&self.inner);
+        let mut rows: Vec<_> = data
+            .routes
+            .values()
+            .flat_map(|route| {
+                route
+                    .workspaces
+                    .iter()
+                    .map(|(workspace, epoch)| RegisteredPlacement {
+                        host_id: route.host_id.clone(),
+                        workspace_id: workspace.clone(),
+                        epoch: *epoch,
+                    })
+            })
+            .collect();
+        rows.sort_by(|a, b| (&a.workspace_id, &a.host_id).cmp(&(&b.workspace_id, &b.host_id)));
+        rows
+    }
     pub(crate) fn rows(&self) -> Vec<Value> {
         crate::lock(&self.inner).rows.values().cloned().collect()
     }
     pub(crate) fn clear_workspace(&self, workspace: &str) {
         let mut data = crate::lock(&self.inner);
+        data.generation = data.generation.wrapping_add(1);
+        let generation = data.generation;
         data.rows
             .retain(|_, row| row["workspace_id"].as_str() != Some(workspace));
         for route in data.routes.values_mut() {
             if route.workspaces.remove(workspace).is_some() {
                 route.roots.remove(workspace);
-                route.generation = route.generation.wrapping_add(1);
+                route.generation = generation;
             }
         }
+        // A retired last project must not permanently occupy a bounded host
+        // slot. Captured requests/tickets fail current() once the route is gone.
+        data.routes.retain(|_, route| !route.workspaces.is_empty());
     }
     fn install(&self, route: &Route, rows: Vec<Value>) {
         let mut data = crate::lock(&self.inner);
@@ -238,6 +272,11 @@ impl Store {
             data.rows.insert(id, row);
         }
     }
+}
+/// Authenticated local inventory lets a restarted native shell retire stale
+/// project routes without exposing the transport credentials or real roots.
+pub(crate) async fn inventory(State(state): State<Arc<AppState>>) -> Response {
+    Json(state.session_proxy.inventory()).into_response()
 }
 pub(crate) async fn register(
     State(state): State<Arc<AppState>>,
@@ -278,10 +317,12 @@ pub(crate) async fn remove(
         return StatusCode::BAD_REQUEST;
     };
     let mut data = crate::lock(&state.session_proxy.inner);
+    data.generation = data.generation.wrapping_add(1);
+    let generation = data.generation;
     if let Some(route) = data.routes.get_mut(&host_id) {
         route.address = None;
         route.token.clear();
-        route.generation = route.generation.wrapping_add(1);
+        route.generation = generation;
     }
     for row in data.rows.values_mut() {
         if row["placement"]["remote"].as_str() == Some(&host_id) {
@@ -504,7 +545,7 @@ pub(crate) async fn api_proxy(
         .and_then(|v| v.to_str().ok())
         .filter(|id| valid_id(id))
         .map(str::to_owned);
-    let hinted = hint.and_then(|workspace| {
+    let hinted = hint.clone().and_then(|workspace| {
         state
             .session_proxy
             .for_workspace(&workspace)
@@ -532,6 +573,20 @@ pub(crate) async fn api_proxy(
         incoming = Request::from_parts(parts, Body::from(bytes));
     }
     let Some((route, workspace)) = target else {
+        // A logical project with no reachable owner must not silently become a
+        // view or edit of an old local copy. Ordinary local/SSH scopes keep their
+        // existing behavior because unmanaged projects may execute locally.
+        if project_resource
+            && hint
+                .as_deref()
+                .is_some_and(|workspace| !crate::pro::may_execute(&state, workspace))
+        {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error":"project_unavailable"})),
+            )
+                .into_response();
+        }
         if incoming.method() != axum::http::Method::GET
             && id.is_some_and(|id| !crate::ws::session_writable(&state, id))
         {
@@ -927,6 +982,88 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn retiring_last_project_releases_the_bounded_host_slot() {
+        let store = Store::default();
+        for index in 0..=MAX_HOSTS {
+            store
+                .register(
+                    Registration {
+                        host_id: format!("worker-{index}"),
+                        endpoint: "http://127.0.0.1:1234".into(),
+                        token: "fixture".into(),
+                        workspace_id: "w-retired".into(),
+                        epoch: 1,
+                    },
+                    "/project".into(),
+                )
+                .unwrap();
+            let captured = store.for_workspace("w-retired").unwrap();
+            store.clear_workspace("w-retired");
+            assert!(store.inventory().is_empty());
+            assert!(!store.current(&captured));
+        }
+        let mut previous = None;
+        for _ in 0..3 {
+            store
+                .register(
+                    Registration {
+                        host_id: "worker-reused".into(),
+                        endpoint: "http://127.0.0.1:1234".into(),
+                        token: "fixture".into(),
+                        workspace_id: "w-reused".into(),
+                        epoch: 1,
+                    },
+                    "/project".into(),
+                )
+                .unwrap();
+            if let Some(old) = &previous {
+                assert!(!store.current(old), "retired generation must not revive");
+            }
+            previous = store.for_workspace("w-reused");
+            store.clear_workspace("w-reused");
+        }
+        for index in 0..=MAX_HOSTS {
+            store
+                .register(
+                    Registration {
+                        host_id: format!("device-{index}"),
+                        endpoint: "http://127.0.0.1:1234".into(),
+                        token: "fixture".into(),
+                        workspace_id: "w-moving".into(),
+                        epoch: index as u64 + 1,
+                    },
+                    "/project".into(),
+                )
+                .unwrap();
+            assert_eq!(store.inventory().len(), 1);
+        }
+    }
+    #[test]
+    fn shared_route_retirement_changes_generation_once_and_steady_polls_do_not() {
+        let store = Store::default();
+        let registration = |workspace: &str| Registration {
+            host_id: "worker-shared".into(),
+            endpoint: "http://127.0.0.1:1234".into(),
+            token: "fixture".into(),
+            workspace_id: workspace.into(),
+            epoch: 9,
+        };
+        store.register(registration("w-a"), "/a".into()).unwrap();
+        store.register(registration("w-b"), "/b".into()).unwrap();
+        let old = store.for_workspace("w-b").unwrap();
+        store.clear_workspace("w-a");
+        assert!(!store.current(&old));
+        let current = store.for_workspace("w-b").unwrap();
+        for _ in 0..3 {
+            store.register(registration("w-b"), "/b".into()).unwrap();
+            store.clear_workspace("w-a");
+            assert!(
+                store.current(&current),
+                "unchanged polling must not reconnect healthy viewers"
+            );
+        }
+    }
     #[test]
     fn destination_and_epoch_checks_prevent_route_confusion() {
         assert!(endpoint("http://127.0.0.1:1234").is_ok());

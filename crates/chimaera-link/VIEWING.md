@@ -28,6 +28,18 @@ nor preferred-home metadata overrides the current owner. The account proves
 ownership, not network reachability. A checkpoint ID proves a reported saved
 copy, not that a fresh sync completed on this viewing device.
 
+The local authenticated `GET /api/v1/pro/placements` returns registered
+`{host_id,workspace_id,epoch}` rows only. It never exposes transport URLs, tokens
+or filesystem roots and is not available through a forwarded project scope.
+Native reconciliation uses this daemon inventory even after its own restart:
+missing, private, unowned, local-owned, disconnected or unsuccessfully verified
+projects are retired with `DELETE ...?workspace_id=…`. A shared transport stays
+open while any healthy project still needs it. Failed probes do not skip healthy
+siblings; failed retirements remain reported and retry on the next bounded refresh.
+A hinted project without a route must have live local execution authority before
+its local files or Git state can be substituted. Unavailable ownership returns an
+error instead of silently viewing or saving a stale local copy.
+
 ## Forwarded requests
 
 The account browser gateway serves `/workspace/{workspace}/`; its cookie-authenticated
@@ -78,6 +90,14 @@ and raw/download tickets use their registered filesystem resource. A ticket for
 another project remains forbidden even with valid scope headers. Native forwarding
 uses a bounded expiring ticket map; stable upstream tickets preserve the same
 local preview URL, and changed route generations invalidate old tickets.
+
+Forwarded filesystem and draft mutations retain the admitted account generation
+and workspace epoch. Receiving or staging an upload body grants no execution
+authority. Final commits recheck the exact live scope and hold a bounded commit
+reservation; clean handoff and account/configuration replacement drain already
+admitted commits, including filesystem work whose caller disconnected. No shared
+state mutex is held during filesystem I/O. Reservation capacity is bounded to 64;
+a stop/drain timeout fails closed rather than permitting a new owner early.
 
 The initial forwarded surface is an explicit allowlist: scoped workspace/session
 rosters; current project timeline, plugin, skill and knowledge reads; session

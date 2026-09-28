@@ -22,6 +22,7 @@ pub(super) mod billing;
 mod credentials;
 mod installation;
 mod machine;
+mod placements;
 pub(super) mod projects;
 mod recovery;
 mod store;
@@ -1701,72 +1702,105 @@ async fn reconcile_placements(state: &Shell, client: &Client) -> Result<()> {
             row["workspace_id"].as_str() == Some(id.as_str()) && row["never_mirror"] != true
         })
     });
-    let mut desired = std::collections::HashSet::new();
+    let inventory = daemon_request(state, "GET", "/pro/placements", None).await?;
+    let mut reconciliation = placements::Reconciliation::new(inventory)?;
     let mut links = state.pro.worker_links.lock().await;
     for workspace in workspaces {
         let Some(id) = workspace["workspace_id"].as_str() else {
             continue;
         };
-        if workspace["never_mirror"] == true {
-            continue;
+        let result = async {
+            if workspace["never_mirror"] == true {
+                return Ok(None);
+            }
+            let placement = client.workspace_placement(id).await?;
+            lock(&state.pro.placements).insert(id.to_owned(), placement.clone());
+            if placement.availability != chimaera_link::PlacementAvailability::Owned
+                || placement.holder_id.as_deref() == Some(&account.device_id)
+            {
+                return Ok(None);
+            }
+            let route = placement
+                .route_host_id
+                .as_ref()
+                .context("workspace route unavailable")?;
+            let Some(host) = hosts.get(route).filter(|host| {
+                placement
+                    .holder_id
+                    .as_deref()
+                    .is_some_and(|holder| host_holds(host, holder))
+                    && host.status == HostStatus::Connected
+            }) else {
+                return Ok(None);
+            };
+            let Some(daemon) = host.daemon.as_ref() else {
+                return Ok(None);
+            };
+            if !links.contains_key(&host.id) {
+                links.insert(
+                    host.id.clone(),
+                    chimaera_link::LinkTunnel::bind(client.clone(), host.id.clone()).await?,
+                );
+            }
+            let port = links
+                .get(&host.id)
+                .context("project connection unavailable")?
+                .local_port;
+            verify_project_target(port, &daemon.token, id, placement.epoch).await?;
+            daemon_request(
+                state,
+                "POST",
+                "/pro/placements",
+                Some(serde_json::json!({
+                    "host_id":host.id,"endpoint":format!("http://127.0.0.1:{port}"),
+                    "token":daemon.token,"workspace_id":id,"epoch":placement.epoch
+                })),
+            )
+            .await?;
+            Ok(Some(host.id.clone()))
         }
-        let placement = client.workspace_placement(id).await?;
-        lock(&state.pro.placements).insert(id.to_owned(), placement.clone());
-        if placement.availability != chimaera_link::PlacementAvailability::Owned
-            || placement.holder_id.as_deref() == Some(&account.device_id)
-        {
-            continue;
-        }
-        let route = placement
-            .route_host_id
-            .as_ref()
-            .context("workspace route unavailable")?;
-        let Some(host) = hosts.get(route).filter(|host| {
-            placement
-                .holder_id
-                .as_deref()
-                .is_some_and(|holder| host_holds(host, holder))
-                && host.status == HostStatus::Connected
-        }) else {
-            continue;
-        };
-        let Some(daemon) = host.daemon.as_ref() else {
-            continue;
-        };
-        desired.insert(host.id.clone());
-        if !links.contains_key(&host.id) {
-            links.insert(
-                host.id.clone(),
-                chimaera_link::LinkTunnel::bind(client.clone(), host.id.clone()).await?,
-            );
-        }
-        let port = links
-            .get(&host.id)
-            .context("project connection unavailable")?
-            .local_port;
-        verify_project_target(port, &daemon.token, id, placement.epoch).await?;
-        daemon_request(state,"POST","/pro/placements",Some(serde_json::json!({"host_id":host.id,"endpoint":format!("http://127.0.0.1:{port}"),"token":daemon.token,"workspace_id":id,"epoch":placement.epoch}))).await?;
+        .await;
+        // One unavailable project must not skip reconciliation of its siblings.
+        reconciliation.observe(id, result);
     }
-    let retired: Vec<_> = links
-        .keys()
-        .filter(|id| !desired.contains(*id))
-        .cloned()
-        .collect();
-    for id in retired {
-        // A failed removal preserves the old transport for explicit invalidation
-        // on the next reconcile; target epoch checks still refuse stale writes.
-        daemon_request(
+    let mut retained_hosts = reconciliation.desired_hosts();
+    for (workspace, host) in reconciliation.retired_workspaces() {
+        if let Err(error) = daemon_request(
+            state,
+            "DELETE",
+            &format!("/pro/placements?workspace_id={workspace}"),
+            None,
+        )
+        .await
+        {
+            // Preserve transport until explicit retirement succeeds on retry.
+            retained_hosts.insert(host);
+            reconciliation.failed(error);
+        }
+    }
+    let mut known_hosts = reconciliation.known_hosts();
+    known_hosts.extend(links.keys().cloned());
+    for id in known_hosts
+        .into_iter()
+        .filter(|id| !retained_hosts.contains(id))
+    {
+        match daemon_request(
             state,
             "DELETE",
             &format!("/pro/placements?host_id={id}"),
             None,
         )
-        .await?;
-        if let Some(link) = links.remove(&id) {
-            link.close();
+        .await
+        {
+            Ok(_) => {
+                if let Some(link) = links.remove(&id) {
+                    link.close();
+                }
+            }
+            Err(error) => reconciliation.failed(error),
         }
     }
-    Ok(())
+    reconciliation.finish()
 }
 async fn verify_project_target(port: u16, token: &str, workspace: &str, epoch: u64) -> Result<()> {
     let token = token.to_owned();

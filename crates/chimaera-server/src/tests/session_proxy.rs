@@ -259,3 +259,214 @@ async fn old_target_that_ignores_scope_never_receives_a_mutating_request() {
     local.stopping.store(true, Ordering::Release);
     task.abort();
 }
+
+#[tokio::test]
+async fn retiring_stale_project_preserves_live_sibling_on_shared_host() {
+    let remote = test_state();
+    let local = test_state();
+    let mut projects = Vec::new();
+    for name in ["retired", "healthy"] {
+        let workspace = lock(&remote.workspaces)
+            .add(
+                test_dir(&format!("shared-{name}-remote"))
+                    .canonicalize()
+                    .unwrap(),
+            )
+            .unwrap();
+        let mut viewing = workspace.clone();
+        viewing.root = test_dir(&format!("shared-{name}-local"))
+            .canonicalize()
+            .unwrap();
+        lock(&local.workspaces)
+            .import_exact(viewing.clone())
+            .unwrap();
+        projects.push((workspace, viewing));
+    }
+    let (healthy, viewing) = &projects[1];
+    std::fs::write(
+        healthy.root.join("proof.txt"),
+        b"still on the current owner",
+    )
+    .unwrap();
+    pro::install_execution_fixture(&remote, &healthy.id, 9).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let target = app(remote.clone());
+    let task = tokio::spawn(async move {
+        axum::serve(listener, target).await.unwrap();
+    });
+    for (workspace, _) in &projects {
+        assert_eq!(
+            request(
+                &local,
+                Method::POST,
+                "/api/v1/pro/placements",
+                Some(serde_json::json!({
+                    "host_id":"worker-shared","endpoint":format!("http://{addr}"),
+                    "token":"test-token","workspace_id":workspace.id,"epoch":9
+                }))
+            )
+            .await
+            .0,
+            StatusCode::NO_CONTENT
+        );
+    }
+    let stale_query = crate::workspace_scope::paths::encode_query(&[(
+        "path".into(),
+        projects[0]
+            .1
+            .root
+            .join("unavailable.txt")
+            .to_string_lossy()
+            .into_owned(),
+    )]);
+    let stale = app(local.clone())
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/fs/file?{stale_query}"))
+                .header(header::AUTHORIZATION, "Bearer test-token")
+                .header("x-chimaera-viewer-workspace", &projects[0].0.id)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stale.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let unauthenticated = app(local.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/pro/placements")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+    let scoped = app(remote.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/pro/placements")
+                .header(header::AUTHORIZATION, "Bearer test-token")
+                .header("x-chimaera-workspace", &healthy.id)
+                .header("x-chimaera-epoch", "9")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(scoped.status(), StatusCode::FORBIDDEN);
+    // This read is also what a newly started native shell sees: no remembered
+    // tunnel state is needed, and no token, URL or filesystem root is disclosed.
+    let (status, inventory) = request(&local, Method::GET, "/api/v1/pro/placements", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(inventory.as_array().unwrap().len(), 2);
+    for row in inventory.as_array().unwrap() {
+        assert_eq!(row.as_object().unwrap().len(), 3);
+        assert_eq!(row["host_id"], "worker-shared");
+        assert_eq!(row["epoch"], 9);
+        assert!(row["workspace_id"].is_string());
+    }
+    assert_eq!(
+        request(
+            &local,
+            Method::DELETE,
+            &format!("/api/v1/pro/placements?workspace_id={}", projects[0].0.id),
+            None
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT
+    );
+    let (_, inventory) = request(&local, Method::GET, "/api/v1/pro/placements", None).await;
+    assert_eq!(
+        inventory,
+        serde_json::json!([{
+            "host_id":"worker-shared","workspace_id":healthy.id,"epoch":9
+        }])
+    );
+    let query = crate::workspace_scope::paths::encode_query(&[(
+        "path".into(),
+        viewing
+            .root
+            .join("proof.txt")
+            .to_string_lossy()
+            .into_owned(),
+    )]);
+    let response = app(local.clone())
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/fs/file?{query}"))
+                .header(header::AUTHORIZATION, "Bearer test-token")
+                .header("x-chimaera-viewer-workspace", &healthy.id)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.into_body().collect().await.unwrap().to_bytes(),
+        b"still on the current owner"[..]
+    );
+    local
+        .stopping
+        .store(true, std::sync::atomic::Ordering::Release);
+    remote
+        .stopping
+        .store(true, std::sync::atomic::Ordering::Release);
+    task.abort();
+}
+
+#[tokio::test]
+async fn unavailable_logical_project_never_falls_back_to_stale_local_files() {
+    let local = test_state();
+    let workspace = lock(&local.workspaces)
+        .add(test_dir("unavailable-local-copy").canonicalize().unwrap())
+        .unwrap();
+    let path = workspace.root.join("copy.txt");
+    std::fs::write(&path, b"preserved local copy").unwrap();
+    let query = crate::workspace_scope::paths::encode_query(&[(
+        "path".into(),
+        path.to_string_lossy().into_owned(),
+    )]);
+    let read = || {
+        Request::builder()
+            .uri(format!("/api/v1/fs/file?{query}"))
+            .header(header::AUTHORIZATION, "Bearer test-token")
+            .header("x-chimaera-viewer-workspace", &workspace.id)
+            .body(Body::empty())
+            .unwrap()
+    };
+    assert_eq!(
+        app(local.clone()).oneshot(read()).await.unwrap().status(),
+        StatusCode::OK,
+        "ordinary non-Pro local file access stays unchanged"
+    );
+    pro::install_execution_fixture(&local, &workspace.id, 9).unwrap();
+    assert_eq!(
+        request(&local, Method::DELETE, "/api/v1/pro/configure", None)
+            .await
+            .0,
+        StatusCode::NO_CONTENT
+    );
+    assert!(!pro::may_execute(&local, &workspace.id));
+    assert_eq!(
+        app(local.clone()).oneshot(read()).await.unwrap().status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    let save = Request::builder()
+        .method(Method::PUT)
+        .uri(format!("/api/v1/fs/file?{query}"))
+        .header(header::AUTHORIZATION, "Bearer test-token")
+        .header("x-chimaera-viewer-workspace", &workspace.id)
+        .body(Body::from("must not silently save here"))
+        .unwrap();
+    assert_eq!(
+        app(local.clone()).oneshot(save).await.unwrap().status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(std::fs::read(path).unwrap(), b"preserved local copy");
+    local
+        .stopping
+        .store(true, std::sync::atomic::Ordering::Release);
+}

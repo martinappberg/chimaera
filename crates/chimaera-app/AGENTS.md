@@ -43,6 +43,7 @@ in-app SSH askpass, a signed auto-updater). Parent map: repo-root
 | `shell/pro/billing.rs` | Native-owned checkout/portal attempts, exact provider-origin validation, cancellation, and authenticated plan confirmation independent of page visibility. |
 | `shell/pro/billing/callback.rs` | One-use billing return: literal loopback Host, exact nonce/outcome query, bounded request/response and credential-free browser page. |
 | `shell/pro/projects.rs` | Passive cloud project listing and per-project native destination selection; cancellation creates no import request. |
+| `shell/pro/placements.rs` | Workspace-specific reconciliation from the daemon inventory; failed or retired projects do not discard a healthy shared transport. |
 | `shell/pro/machine.rs` | Friendly device label from macOS ComputerName; never an identity or network-hostname grouping key. |
 | `shell/pro/store.rs` | Credential namespace keys: isolated previews bind session entries to their canonical config directory; legacy unbound entries are never imported or deleted. |
 | `shell/pro/recovery.rs` | Generation-fenced startup candidate retention and coalesced retry ownership; account probe failures do not force new authentication. |
@@ -69,7 +70,9 @@ in-app SSH askpass, a signed auto-updater). Parent map: repo-root
 
 - Logical project viewing uses passive placement and exact target scope acknowledgment.
   It follows the current owner (home device or worker), including files and watches,
-  without acquiring or moving execution. Native window layouts remain local and
+  without acquiring or moving execution. Reconciliation reads the daemon’s redacted
+  placement inventory, retires each no-longer-current workspace (including after
+  native restart), and keeps healthy siblings on shared transports. Native window layouts remain local and
   only the fixed `/project` alias crosses hosts. See the
   [viewer contract](../chimaera-link/VIEWING.md).
   `shell/pro/installation.rs` keeps the stable installation proof in an

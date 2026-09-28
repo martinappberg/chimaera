@@ -91,7 +91,9 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         )
         .route(
             "/pro/placements",
-            post(crate::session_proxy::register).delete(crate::session_proxy::remove),
+            get(crate::session_proxy::inventory)
+                .post(crate::session_proxy::register)
+                .delete(crate::session_proxy::remove),
         )
         .route(
             "/workspaces",
