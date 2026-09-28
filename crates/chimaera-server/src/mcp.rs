@@ -522,6 +522,7 @@ pub(crate) fn is_core_tool(name: &str) -> bool {
                 .as_array()
                 .expect("tool definitions are an array")
                 .iter()
+                .chain(cloud_context::definitions().iter())
                 .filter_map(|t| t["name"].as_str().map(str::to_owned))
                 .collect()
         });

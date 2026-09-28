@@ -10,6 +10,21 @@ use std::time::{Duration, Instant};
 use super::support::*;
 use crate::{lock, AppState};
 
+#[test]
+fn plugins_cannot_claim_project_cloud_tools_even_without_an_active_account() {
+    let manifest = |tool: &str| {
+        format!(
+            "id = \"profile-plugin\"\nname = \"Profile plugin\"\nversion = \"1.0.0\"\n\
+             summary = \"Fixture\"\napi = \"0.1\"\n[provides]\nmcp_tools = [\"{tool}\"]\n"
+        )
+    };
+    assert!(crate::plugins::parse_manifest(&manifest("plugin_profile")).is_ok());
+    for tool in ["read_cloud_profile", "update_cloud_profile"] {
+        let error = crate::plugins::parse_manifest(&manifest(tool)).unwrap_err();
+        assert!(error.contains("reserved by chimaera"), "{error}");
+    }
+}
+
 /// A workspace with the fixture switched on and one agent session in it.
 async fn fixture_workspace(label: &str, key: &str) -> (Arc<AppState>, String, String) {
     crate::plugins::test_catalog::fixture();
