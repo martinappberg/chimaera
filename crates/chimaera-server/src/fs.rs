@@ -18,7 +18,7 @@ use axum::body::{Body, Bytes};
 use axum::extract::{Query, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
+use axum::{Extension, Json};
 use flate2::read::{GzDecoder, MultiGzDecoder};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -270,6 +270,9 @@ fn ascii_header(value: &str) -> HeaderValue {
 
 /// 400 with a JSON error body.
 pub(crate) fn bad_request(err: &anyhow::Error) -> Response {
+    if let Some(response) = crate::workspace_scope::mutation_failure(err) {
+        return response;
+    }
     (
         StatusCode::BAD_REQUEST,
         Json(json!({"error": format!("{err:#}")})),
@@ -853,6 +856,7 @@ enum WriteOutcome {
 /// - `expect_mtime` (a previous `X-Mtime`): the metadata token must match.
 pub(crate) async fn put_file(
     State(state): State<Arc<AppState>>,
+    mutation: Option<Extension<crate::workspace_scope::Mutation>>,
     Query(query): Query<PutFileQuery>,
     body: Bytes,
 ) -> Response {
@@ -869,6 +873,7 @@ pub(crate) async fn put_file(
             .into_response();
     }
     let dirty_path = query.path.clone();
+    let owner = state.clone();
     let result = tokio::task::spawn_blocking(move || {
         let expect_hash = query.expect_hash.map(|h| h.to_ascii_lowercase());
         let pre = match (expect_hash.as_deref(), query.expect_mtime.as_deref()) {
@@ -876,7 +881,9 @@ pub(crate) async fn put_file(
             (None, Some(mtime)) => Precondition::Mtime(mtime),
             (None, None) => Precondition::None,
         };
-        write_file(&query.path, &body, pre)
+        write_file(&query.path, &body, pre, || {
+            crate::workspace_scope::begin_mutation(&owner, &mutation)
+        })
     })
     .await;
     match result {
@@ -1109,7 +1116,12 @@ fn sync_dir(dir: &Path) {
 ///
 /// A target with other hard links is rewritten in place instead (see
 /// [`write_in_place`]).
-fn write_file(raw: &str, bytes: &[u8], pre: Precondition<'_>) -> anyhow::Result<WriteOutcome> {
+fn write_file(
+    raw: &str,
+    bytes: &[u8],
+    pre: Precondition<'_>,
+    commit: impl FnOnce() -> anyhow::Result<Option<crate::pro::mutation::Guard>>,
+) -> anyhow::Result<WriteOutcome> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
     let expanded = expand_tilde(raw)?;
@@ -1162,6 +1174,7 @@ fn write_file(raw: &str, bytes: &[u8], pre: Precondition<'_>) -> anyhow::Result<
     }
 
     if existing.as_ref().is_some_and(|meta| meta.nlink() > 1) {
+        let _commit = commit()?;
         return write_in_place(&target, bytes, pre, body_hash);
     }
 
@@ -1205,6 +1218,7 @@ fn write_file(raw: &str, bytes: &[u8], pre: Precondition<'_>) -> anyhow::Result<
     if let Err(outcome) = judge(pre, version_for(pre, &target)?, &body_hash) {
         return Ok(outcome);
     }
+    let _commit = commit()?;
     std::fs::rename(&tmp, &target)
         .with_context(|| format!("failed to rename into {}", target.display()))?;
     guard.disarm();
@@ -3831,8 +3845,13 @@ pub(crate) struct MkdirRequest {
 /// as writing a file via PUT /fs/file. Idempotent: an already-existing
 /// directory is a success. Backs the folder picker's "create folder" action,
 /// so a workspace can be opened on a path that does not exist yet.
-pub(crate) async fn mkdir(Json(body): Json<MkdirRequest>) -> Response {
+pub(crate) async fn mkdir(
+    State(state): State<Arc<AppState>>,
+    mutation: Option<Extension<crate::workspace_scope::Mutation>>,
+    Json(body): Json<MkdirRequest>,
+) -> Response {
     let work = move || -> anyhow::Result<serde_json::Value> {
+        let _commit = crate::workspace_scope::begin_mutation(&state, &mutation)?;
         let expanded = expand_tilde(&body.path)?;
         if expanded.as_os_str().is_empty() {
             anyhow::bail!("empty path");
@@ -3870,11 +3889,22 @@ enum MutateOutcome {
 /// response shape (200 Json / 409 conflict / 400 error). On success the
 /// touched paths nudge the git watcher (same reason as `put_file`: the
 /// tree/panel refetch without polling).
-async fn run_mutation<F>(state: &AppState, work: F, dirty: &[&str]) -> Response
+async fn run_mutation<F>(
+    state: &Arc<AppState>,
+    mutation: Option<Extension<crate::workspace_scope::Mutation>>,
+    work: F,
+    dirty: &[&str],
+) -> Response
 where
     F: FnOnce() -> anyhow::Result<MutateOutcome> + Send + 'static,
 {
-    match tokio::task::spawn_blocking(work).await {
+    let owner = state.clone();
+    match tokio::task::spawn_blocking(move || {
+        let _commit = crate::workspace_scope::begin_mutation(&owner, &mutation)?;
+        work()
+    })
+    .await
+    {
         Ok(Ok(MutateOutcome::Done(body))) => {
             for path in dirty {
                 crate::git::mark_path_dirty(state, path).await;
@@ -3918,6 +3948,7 @@ pub(crate) struct CreateRequest {
 /// model as PUT /fs/file: the daemon runs as the user.
 pub(crate) async fn create(
     State(state): State<Arc<AppState>>,
+    mutation: Option<Extension<crate::workspace_scope::Mutation>>,
     Json(body): Json<CreateRequest>,
 ) -> Response {
     let raw = body.path.clone();
@@ -3967,7 +3998,7 @@ pub(crate) async fn create(
             json!({ "path": path.to_string_lossy() }),
         ))
     };
-    run_mutation(&state, work, &[&raw]).await
+    run_mutation(&state, mutation, work, &[&raw]).await
 }
 
 #[derive(Deserialize)]
@@ -3985,6 +4016,7 @@ pub(crate) struct RenameRequest {
 /// new path.
 pub(crate) async fn rename(
     State(state): State<Arc<AppState>>,
+    mutation: Option<Extension<crate::workspace_scope::Mutation>>,
     Json(body): Json<RenameRequest>,
 ) -> Response {
     let (raw_from, raw_to) = (body.from.clone(), body.to.clone());
@@ -4028,7 +4060,7 @@ pub(crate) async fn rename(
         // resolve a renamed symlink to its target.
         Ok(MutateOutcome::Done(json!({ "path": to.to_string_lossy() })))
     };
-    run_mutation(&state, work, &[&raw_from, &raw_to]).await
+    run_mutation(&state, mutation, work, &[&raw_from, &raw_to]).await
 }
 
 #[derive(Deserialize)]
@@ -4043,6 +4075,7 @@ pub(crate) struct DeleteRequest {
 /// directory. 204 on success.
 pub(crate) async fn delete(
     State(state): State<Arc<AppState>>,
+    mutation: Option<Extension<crate::workspace_scope::Mutation>>,
     Json(body): Json<DeleteRequest>,
 ) -> Response {
     let raw = body.path.clone();
@@ -4065,7 +4098,7 @@ pub(crate) async fn delete(
         }
         Ok(MutateOutcome::Done(serde_json::Value::Null))
     };
-    run_mutation(&state, work, &[&raw]).await
+    run_mutation(&state, mutation, work, &[&raw]).await
 }
 
 /// Hard ceiling on entries a single copy/move walk may touch — the same
@@ -4176,6 +4209,7 @@ pub(crate) struct CopyRequest {
 /// into itself or a descendant. Returns the canonical new path.
 pub(crate) async fn copy(
     State(state): State<Arc<AppState>>,
+    mutation: Option<Extension<crate::workspace_scope::Mutation>>,
     Json(body): Json<CopyRequest>,
 ) -> Response {
     let (raw_from, raw_to) = (body.from.clone(), body.to.clone());
@@ -4214,7 +4248,7 @@ pub(crate) async fn copy(
         }
         Ok(MutateOutcome::Done(json!({ "path": to.to_string_lossy() })))
     };
-    run_mutation(&state, work, &[&raw_from, &raw_to]).await
+    run_mutation(&state, mutation, work, &[&raw_from, &raw_to]).await
 }
 
 #[derive(Deserialize)]
@@ -4230,6 +4264,7 @@ pub(crate) struct MoveRequest {
 /// 409 if `to` already exists. Returns the canonical new path.
 pub(crate) async fn move_(
     State(state): State<Arc<AppState>>,
+    mutation: Option<Extension<crate::workspace_scope::Mutation>>,
     Json(body): Json<MoveRequest>,
 ) -> Response {
     let (raw_from, raw_to) = (body.from.clone(), body.to.clone());
@@ -4293,7 +4328,7 @@ pub(crate) async fn move_(
         }
         Ok(MutateOutcome::Done(json!({ "path": to.to_string_lossy() })))
     };
-    run_mutation(&state, work, &[&raw_from, &raw_to]).await
+    run_mutation(&state, mutation, work, &[&raw_from, &raw_to]).await
 }
 
 /// In-memory store of short-lived raw-access tickets. A ticket is bound to

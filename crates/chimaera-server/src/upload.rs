@@ -13,7 +13,7 @@ use axum::body::Body;
 use axum::extract::{Path as UrlPath, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
+use axum::{Extension, Json};
 use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::json;
@@ -131,6 +131,7 @@ async fn dir_usage(dir: &Path) -> (u64, usize) {
 /// Bearer-authed like every REST route.
 pub(crate) async fn upload(
     State(state): State<Arc<AppState>>,
+    mutation: Option<Extension<crate::workspace_scope::Mutation>>,
     UrlPath(id): UrlPath<String>,
     Query(query): Query<UploadQuery>,
     body: Body,
@@ -274,9 +275,12 @@ pub(crate) async fn upload(
         final_name = candidate;
         target = dir.join(&final_name);
     }
-    if let Err(err) = tokio::fs::rename(&tmp, &target).await {
+    if let Err(err) = finalize_upload(&state, mutation, &tmp, &target).await {
         let _ = tokio::fs::remove_file(&tmp).await;
-        return internal(&target, "failed to finalize upload", &err.into());
+        if let Some(response) = crate::workspace_scope::mutation_failure(&err) {
+            return response;
+        }
+        return internal(&target, "failed to finalize upload", &err);
     }
 
     Json(json!({
@@ -306,6 +310,7 @@ pub(crate) struct DirUploadQuery {
 /// non-directory `dir`, 413 past the per-file cap.
 pub(crate) async fn upload_to_dir(
     State(state): State<Arc<AppState>>,
+    mutation: Option<Extension<crate::workspace_scope::Mutation>>,
     Query(query): Query<DirUploadQuery>,
     body: Body,
 ) -> Response {
@@ -421,9 +426,12 @@ pub(crate) async fn upload_to_dir(
         final_name = candidate;
         target = dir.join(&final_name);
     }
-    if let Err(err) = tokio::fs::rename(&tmp, &target).await {
+    if let Err(err) = finalize_upload(&state, mutation, &tmp, &target).await {
         let _ = tokio::fs::remove_file(&tmp).await;
-        return internal(&target, "failed to finalize upload", &err.into());
+        if let Some(response) = crate::workspace_scope::mutation_failure(&err) {
+            return response;
+        }
+        return internal(&target, "failed to finalize upload", &err);
     }
     // Nudge the git watcher so the tree/panel refetch without polling (same
     // reason the fs mutations do).
@@ -435,6 +443,25 @@ pub(crate) async fn upload_to_dir(
         "size": written,
     }))
     .into_response()
+}
+
+async fn finalize_upload(
+    state: &Arc<AppState>,
+    mutation: Option<Extension<crate::workspace_scope::Mutation>>,
+    temporary: &Path,
+    target: &Path,
+) -> anyhow::Result<()> {
+    let state = state.clone();
+    let temporary = temporary.to_owned();
+    let target = target.to_owned();
+    // The blocking task owns its reservation even if the HTTP client goes away.
+    // Body streaming never holds authority or prevents a clean handoff.
+    tokio::task::spawn_blocking(move || {
+        let _commit = crate::workspace_scope::begin_mutation(&state, &mutation)?;
+        std::fs::rename(temporary, target)?;
+        Ok(())
+    })
+    .await?
 }
 
 fn internal(path: &Path, what: &str, err: &anyhow::Error) -> Response {

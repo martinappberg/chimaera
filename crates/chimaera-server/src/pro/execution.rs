@@ -1,6 +1,7 @@
 //! Managed execution authority. A passive observation can fence execution, but
 //! only an authenticated acquire/renew response can create a fresh local lease.
 mod lease;
+pub(crate) mod mutation;
 mod restart;
 pub(super) use restart::persist_latch;
 pub(super) mod receipt;
@@ -28,6 +29,7 @@ pub(super) use watchdog::{start, stop};
 #[derive(Default)]
 pub(super) struct State {
     proofs: Mutex<HashMap<String, Proof>>,
+    commits: mutation::Commits,
     pub(super) latched: Mutex<std::collections::HashSet<String>>,
     unclean: std::collections::HashSet<String>,
     pub(super) invalid: bool,
@@ -264,6 +266,17 @@ pub(super) fn accept(
     let deadline = lease::Deadline::from_response(start, remaining)
         .context("execution lease arrived too late")?;
     let mut proofs = lock(&state.pro.execution.proofs);
+    // A canceled HTTP future does not cancel a blocking filesystem commit.
+    // Replacing its epoch must wait for that owned reservation to be dropped.
+    ensure!(
+        proofs.get(&baton.workspace_id).is_some_and(|previous| {
+            !previous.stopped
+                && previous.epoch == baton.epoch
+                && previous.generation == generation
+                && previous.lease.id == lease.id
+        }) || mutation::idle(state, &baton.workspace_id),
+        "previous project mutation is still committing"
+    );
     ensure!(
         proofs.len() < 128 || proofs.contains_key(&baton.workspace_id),
         "execution workspace limit"
@@ -379,7 +392,10 @@ pub(super) fn fence_workspace(state: &AppState, workspace: &str) {
 }
 
 pub(super) fn quiescent(state: &AppState, workspace: &str) -> bool {
-    if state.pro.execution.invalid || state.pro.execution.unclean.contains(workspace) {
+    if state.pro.execution.invalid
+        || state.pro.execution.unclean.contains(workspace)
+        || !mutation::idle(state, workspace)
+    {
         return false;
     }
     let ids: Vec<_> = lock(&state.session_workspaces)

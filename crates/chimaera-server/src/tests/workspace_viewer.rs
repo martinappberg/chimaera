@@ -22,6 +22,125 @@ fn fixture() -> (
     pro::install_execution_fixture(&state, &one.id, 4).unwrap();
     (state, one, other)
 }
+
+#[tokio::test]
+async fn scoped_delayed_save_and_upload_cannot_commit_into_a_replacement_epoch() {
+    for (upload, next_epoch) in [(false, 4), (false, 5), (true, 4), (true, 5)] {
+        let (state, one, _) = fixture();
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let (finish, wait) = tokio::sync::oneshot::channel();
+        let body = Body::from_stream(futures::stream::once(async move {
+            entered.send(()).unwrap();
+            wait.await.unwrap();
+            Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"stale bytes"))
+        }));
+        let (method, uri) = if upload {
+            (
+                Method::POST,
+                "/api/v1/fs/upload?dir=%2Fproject&name=late.txt",
+            )
+        } else {
+            (Method::PUT, "/api/v1/fs/file?path=%2Fproject%2Fnote.txt")
+        };
+        let request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::AUTHORIZATION, "Bearer test-token")
+            .header("x-chimaera-workspace", &one.id)
+            .header("x-chimaera-epoch", "4")
+            .header("x-chimaera-viewer-root", "L3Byb2plY3Q")
+            .body(body)
+            .unwrap();
+        let pending = tokio::spawn(app(state.clone()).oneshot(request));
+        ready.await.unwrap();
+        assert_eq!(
+            super::support::request(&state, Method::DELETE, "/api/v1/pro/configure", None)
+                .await
+                .0,
+            StatusCode::NO_CONTENT
+        );
+        pro::install_execution_fixture(&state, &one.id, next_epoch).unwrap();
+        std::fs::write(one.root.join("note.txt"), "new canonical bytes").unwrap();
+        finish.send(()).unwrap();
+        let response = pending.await.unwrap().unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT, "upload={upload}");
+        assert_eq!(
+            std::fs::read(one.root.join("note.txt")).unwrap(),
+            b"new canonical bytes"
+        );
+        assert!(!one.root.join("late.txt").exists());
+        assert!(std::fs::read_dir(&one.root).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".tmp")));
+        state
+            .stopping
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+#[tokio::test]
+async fn live_tcp_save_started_before_handoff_cannot_overwrite_new_owner() {
+    use futures::StreamExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (state, one, _) = fixture();
+    let (entered, mut ready) = tokio::sync::mpsc::channel(1);
+    let router = app(state.clone()).layer(axum::middleware::from_fn(
+        move |request: Request<Body>, next: axum::middleware::Next| {
+            let entered = entered.clone();
+            async move {
+                let (parts, body) = request.into_parts();
+                let body = Body::from_stream(body.into_data_stream().inspect(move |_| {
+                    let _ = entered.try_send(());
+                }));
+                next.run(Request::from_parts(parts, body)).await
+            }
+        },
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+    let headers = format!("PUT /api/v1/fs/file?path=%2Fproject%2Fnote.txt HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer test-token\r\nX-Chimaera-Workspace: {}\r\nX-Chimaera-Epoch: 4\r\nX-Chimaera-Viewer-Root: L3Byb2plY3Q\r\nContent-Length: 11\r\nConnection: close\r\n\r\nstale", one.id);
+    client.write_all(headers.as_bytes()).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), ready.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        request(&state, Method::DELETE, "/api/v1/pro/configure", None)
+            .await
+            .0,
+        StatusCode::NO_CONTENT
+    );
+    pro::install_execution_fixture(&state, &one.id, 5).unwrap();
+    std::fs::write(one.root.join("note.txt"), "new canonical bytes").unwrap();
+    client.write_all(b" bytes").await.unwrap();
+    let mut response = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        (&mut client).take(16384).read_to_end(&mut response),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        response.starts_with(b"HTTP/1.1 409"),
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
+    assert_eq!(
+        std::fs::read(one.root.join("note.txt")).unwrap(),
+        b"new canonical bytes"
+    );
+    server.abort();
+    state
+        .stopping
+        .store(true, std::sync::atomic::Ordering::Release);
+}
 async fn scoped(
     state: &Arc<AppState>,
     workspace: &str,

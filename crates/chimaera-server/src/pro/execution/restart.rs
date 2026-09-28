@@ -55,6 +55,7 @@ impl State {
             .collect();
         Self {
             proofs: Mutex::default(),
+            commits: mutation::Commits::default(),
             latched: Mutex::new(latched),
             unclean,
             invalid,

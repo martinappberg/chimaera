@@ -31,7 +31,7 @@ use anyhow::Context;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
+use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -353,6 +353,7 @@ fn client_ms(value: Option<&serde_json::Value>) -> Option<u64> {
 /// counted) the least recently updated drafts are evicted.
 pub(crate) async fn put_draft(
     State(state): State<Arc<AppState>>,
+    mutation: Option<Extension<crate::workspace_scope::Mutation>>,
     Json(body): Json<PutDraftRequest>,
 ) -> Response {
     if body.text.len() > MAX_DRAFT_TEXT_BYTES {
@@ -384,6 +385,7 @@ pub(crate) async fn put_draft(
     let root = state.drafts_root.clone();
     let mut usage = DRAFTS_WRITE.lock().await;
     blocking(move || {
+        let _commit = crate::workspace_scope::begin_mutation(&state, &mutation)?;
         let stored = StoredDraft {
             bytes: body.text.len() as u64,
             path: body.path,
@@ -539,11 +541,13 @@ fn stored_writer(root: &Path, id: &str, path: &str) -> Option<Option<String>> {
 /// 204 whether or not one existed or went.
 pub(crate) async fn delete_draft(
     State(state): State<Arc<AppState>>,
+    mutation: Option<Extension<crate::workspace_scope::Mutation>>,
     Query(query): Query<DraftQuery>,
 ) -> Response {
     let root = state.drafts_root.clone();
     let mut usage = DRAFTS_WRITE.lock().await;
     blocking(move || {
+        let _commit = crate::workspace_scope::begin_mutation(&state, &mutation)?;
         let id = draft_id(&query.path);
         if let Some(writer) = &query.writer {
             let owned = stored_writer(&root, &id, &query.path)

@@ -8,7 +8,7 @@ use axum::{
     http::{HeaderMap, Method, Request, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
-    Json,
+    Extension, Json,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -22,6 +22,39 @@ pub(crate) const WORKSPACE_HEADER: &str = "x-chimaera-workspace";
 pub(crate) const EPOCH_HEADER: &str = "x-chimaera-epoch";
 pub(crate) mod paths;
 const MAX_JSON: usize = 1024 * 1024;
+
+/// Captured at request admission, consumed only at the actual mutation commit.
+/// A body/queue wait cannot silently adopt a replacement account generation.
+#[derive(Clone)]
+pub(crate) struct Mutation {
+    scope: Scope,
+    generation: u64,
+}
+pub(crate) fn begin_mutation(
+    state: &AppState,
+    mutation: &Option<Extension<Mutation>>,
+) -> Result<Option<crate::pro::mutation::Guard>> {
+    mutation
+        .as_ref()
+        .map(|Extension(mutation)| {
+            mutation
+                .scope
+                .validate(state)
+                .map_err(|_| crate::pro::mutation::Changed)?;
+            crate::pro::mutation::begin(
+                state,
+                &mutation.scope.workspace_id,
+                mutation.scope.epoch,
+                mutation.generation,
+            )
+        })
+        .transpose()
+}
+pub(crate) fn mutation_failure(error: &anyhow::Error) -> Option<Response> {
+    error
+        .is::<crate::pro::mutation::Changed>()
+        .then(|| denied(StatusCode::CONFLICT))
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Scope {
@@ -212,6 +245,7 @@ async fn scoped_request(
     mut request: Request<Body>,
     next: Next,
 ) -> Response {
+    let generation = crate::pro::mutation::generation(&state);
     if scope.validate(&state).is_err() {
         return denied(StatusCode::CONFLICT);
     }
@@ -376,6 +410,10 @@ async fn scoped_request(
     if scope.validate(&state).is_err() {
         return denied(StatusCode::CONFLICT);
     }
+    request.extensions_mut().insert(Mutation {
+        scope: scope.clone(),
+        generation,
+    });
     request.extensions_mut().insert(scope);
     let response = next.run(request).await;
     let rewrite = matches!(
