@@ -45,6 +45,10 @@ Also decided the same day, on the plan's open questions:
    template or an existing project ([the guide](#document_guide-and-the-instructions)).
 9. **Markdown to PDF starts with the small Typst template**; a converter in core only
    if its gaps matter ([markdown to PDF](#6-markdown-to-pdf-and-word-later)).
+10. **No Tectonic.** LaTeX builds with the host's TeX Live only; a host without it
+    gets clear directions instead of a second, older LaTeX
+    ([why](#latex-the-hosts-tex-live)). Typst is the one engine Chimaera installs,
+    with one click, like an agent CLI; the user's own Typst wins.
 
 **Why not a plugin** (the reasoning the decision rests on). The workbench plugin model
 ([plugin system plan](plugin-system-plan.md)) exists for add-ons that are someone
@@ -61,16 +65,16 @@ repositories and an install step for every user. Plugins stay what they are for.
 ## The short version
 
 - **Open a `.tex` or `.typ` file and it works.** Source and PDF side by side, with no
-  plugin and no switch. A host with no engine is one click from one.
+  plugin and no switch. A host without Typst is one click from it.
 - **Compile on the host, never in the browser.** The daemon runs the host's own
   engine as a small, limited child process, only when a document is open or an agent
   asks. Only the PDF crosses the tunnel, and only the pages you look at.
-- **Your engines first, then one click.** LaTeX: latexmk from the host's TeX Live if
-  present (whatever `module load texlive` puts on PATH in a terminal), else your own
-  Tectonic ([why that order](#the-latex-ladder)). Typst (a newer, much faster
-  typesetting language with simpler syntax): your `typst`. Where there is none,
-  Chimaera installs Typst or Tectonic with one click, the way it installs agent CLIs
-  ([installs](#installing-an-engine-like-an-agent)). No engine ships in the binary.
+- **The host's LaTeX, and Typst on one click.** LaTeX builds with the host's TeX Live
+  through latexmk: whatever `module load texlive` puts on PATH in a terminal. No
+  TeX Live, no LaTeX build, and the view says how to get it. Typst (a newer, much
+  faster typesetting language with simpler syntax): your own `typst`, else one click
+  installs it the way agent CLIs are installed
+  ([installs](#installing-typst-like-an-agent)). No engine ships in the binary.
 - **Compile on save.** Debounced, one job at a time, niced, time-limited, output
   capped. An agent's write to any file of the document recompiles it too while it is
   open. Build files go to a cache folder, never into the repository.
@@ -144,8 +148,8 @@ Cmd-click, change marks), a SyncTeX parser in a Web Worker, diagnostics through
 `@codemirror/lint`, the change bars, and a lazily loaded Typst grammar. Every chunk
 loads only when a document opens.
 
-**Installs:** a curated Typst recipe and a Tectonic recipe beside the agents' in
-`runtimes.rs`, reusing its layout, checksums, visible terminal and update check.
+**Installs:** a curated Typst recipe beside the agents' in `runtimes.rs`, reusing its
+layout, checksums, visible terminal and update check.
 
 **Agents:** no new tool. `check_document` builds `.tex` and `.typ`; `document_guide`
 gains a section; the documents paragraph gains one sentence.
@@ -153,7 +157,7 @@ gains a section; the documents paragraph gains one sentence.
 **Deliberately not built** (each is either out of scope or a later, separate step):
 
 - no plugin, no manifest point, no WIT change;
-- no engine in the binary and no WASM engine (engines install on a click instead);
+- no engine in the binary, no WASM engine, and no Tectonic (Typst installs on a click);
 - no language server, completion or refactoring;
 - no copy of SyncTeX in the daemon: the browser parses it;
 - no second build of an old revision in the first version (before-and-after and the
@@ -182,7 +186,7 @@ document tool. Never at boot, so users who never write a report pay nothing.
   it once per prelude change, instead of on every save, keeps compile-on-save fast.
 - **Walking PATH, not `command -v`.** Same reason as Slurm detection in `compute.rs`:
   clusters wrap tools in shell functions, and a PATH walk works the same under bash,
-  zsh and fish. Look for `tectonic`, `latexmk`, `pdflatex`, `xelatex`, `lualatex`,
+  zsh and fish. Look for `latexmk`, `pdflatex`, `xelatex`, `lualatex`,
   `biber`, `bibtex`, `synctex`, `typst`, `pandoc`, and later `pdftoppm`. Each found
   tool reports its version (`--version`, 5 s timeout, capped output).
 - **Cached** in memory per prelude text hash. A `PUT /api/v1/environment` or a
@@ -190,41 +194,45 @@ document tool. Never at boot, so users who never write a report pay nothing.
 - **Test knob.** `CHIMAERA_DOC_BINDIR` points at stand-in engines, like
   `CHIMAERA_SLURM_BINDIR`, so the whole flow runs in CI without TeX.
 
-### The LaTeX ladder
+### LaTeX: the host's TeX Live
 
-For a given main file, first match wins:
+LaTeX builds only with **latexmk and the TeX Live the host already has**. For a
+given main file:
 
-1. **Workspace override** (`auto | latexmk | tectonic | off`), set from the document's
-   toolbar and remembered per workspace.
-2. **Project signals.** A `Tectonic.toml` at or above the main file means Tectonic's
-   project mode. A project `latexmkrc` means latexmk (its Perl runs only behind the
-   [trust gate](#security)).
-3. **Engine hints.** A `% !TEX program = xelatex | lualatex | pdflatex` magic comment
-   picks latexmk's engine flag.
-4. **latexmk** if on PATH together with the needed engine: the host's TeX Live.
-5. **Tectonic** if on PATH: the user's own.
-6. **Chimaera's Tectonic**, installed with one click like an agent CLI
-   ([installs](#installing-an-engine-like-an-agent)).
-7. **None**: the empty state offers that install (below).
+1. **A project `latexmkrc`** is honored, its Perl running only behind the
+   [trust gate](#security).
+2. **The engine** comes from a `% !TEX program = xelatex | lualatex | pdflatex` magic
+   comment, else a per-workspace choice in the toolbar, else pdfLaTeX.
+3. **latexmk and that engine on PATH** build it.
+4. **Otherwise nothing builds**, and the empty state says exactly what is missing
+   ([below](#when-there-is-no-engine)).
 
-**Why latexmk first, although the request proposed Tectonic first.** Tectonic is
-maintained (0.17.0 shipped 2026-07-27) but slowly, and its facts decide it:
+**Why not Tectonic** (decided 2026-09-28). Tectonic is the one LaTeX small enough to
+install like an agent (a 10 MB binary that downloads packages on demand), but it is
+the wrong second LaTeX:
 
-- Its package bundle was last updated to **TeX Live 2022**. The host's TeX Live is
-  what the user's co-authors, journal templates and cluster jobs use.
+- Its package bundle was last updated to **TeX Live 2022**, so a document can build
+  differently than for co-authors, journals and cluster jobs.
 - It is **XeTeX only**: no pdfTeX, no LuaTeX.
 - Its bundle ships **biblatex 3.17**, which needs exactly **biber 2.17**; any newer
-  biber on PATH fails (Tectonic issue 1267, open).
-- It defaults to **US letter** paper.
+  biber fails (Tectonic issue 1267, open).
+- It defaults to **US letter** paper, and its first build of a document needs the
+  network.
 
-Its advantages mostly vanish here: Chimaera puts every build in a cache folder anyway,
-so "no aux files" no longer matters, and shell escape can be turned off for latexmk
-too. What remains is decisive only where there is **no TeX Live at all**: most
-laptops and fresh cloud machines. There, a 10 MB static Tectonic binary is the best
-LaTeX available, so it is the fallback, not the default. The status chip names the
-engine, explains a failure that the other engine would avoid (a biber mismatch, a
-LuaTeX-only package), and switches in one click. Whether to confirm this order is
-[the one open decision](#open-decisions).
+A document that builds here should build the same way everywhere else. Where TeX Live
+is missing, Typst covers new reports, and an existing LaTeX project's authors usually
+have TeX Live already.
+
+**Is TeX Live common?** Mostly where LaTeX gets written, and rarely by default:
+
+- **HPC and university clusters:** usually available, as a module or a system
+  package; Settings → Environment is where `module load texlive` goes.
+- **Linux workstations and servers:** only if someone installed it. It is one
+  package-manager command with admin rights (on Debian and Ubuntu `latexmk` is its
+  own package), or TeX Live's own installer into the home folder without them.
+- **Macs:** not by default. People who write LaTeX usually have MacTeX (about 5 GB) or
+  the smaller BasicTeX.
+- **Fresh cloud machines and containers:** usually not.
 
 The latexmk command, run with the main file's folder as the working directory:
 
@@ -253,12 +261,6 @@ build folder.
   knows when to run biber (a `.bcf` exists) or bibtex (`\bibdata` in the `.aux`), and
   handles the output-folder quirks.
 
-Tectonic: `tectonic -X compile main.tex --outdir <build dir> --synctex --keep-logs`
-with `TECTONIC_UNTRUSTED_MODE=1` in the environment, which disables shell escape
-whatever else asks for it. Never `-Z deterministic-mode`, which breaks SyncTeX. A
-`Tectonic.toml` project uses `tectonic -X build`, which writes to the project's own
-`build/` folder (the project chose that) and has no SyncTeX flag, so those projects
-get no sync until that is checked.
 
 ### The Typst ladder
 
@@ -288,11 +290,14 @@ second. If font discovery on a network filesystem turns out slow,
 The document still opens and edits exactly like any text file today. The PDF side
 shows a calm empty state instead of an error:
 
-- **No LaTeX engine on this host.** "Chimaera compiles with the tools on
-  *sherlock*. It looked for latexmk and Tectonic on the PATH your terminals get,
-  including your environment prelude." Actions: **Open Environment settings** (with a
-  hint such as `module load texlive`, shown, never written for them), **Check again**,
-  and **Install Tectonic** (or **Install Typst** for a `.typ`), which says what it
+- **No TeX Live on this host.** "Chimaera builds LaTeX with the TeX Live your
+  terminals get on *sherlock*, including your environment prelude, and didn't find
+  latexmk." Then the one step that fits the host: on a cluster, **Open Environment
+  settings** with a hint such as `module load texlive` (shown, never written for
+  them); elsewhere, how to install TeX Live on this system, with a link. When TeX
+  Live is there but latexmk is not, it names the missing package. **Check again**
+  re-detects.
+- **No Typst on this host.** **Install Typst** (one click, below), which says what it
   installs and where before it runs.
 - **A PDF already sits beside the source** (`report.pdf` next to `report.tex`): show
   it, with a banner "built elsewhere; may be older than the source" when its mtime is
@@ -301,7 +306,7 @@ shows a calm empty state instead of an error:
   (`status: no_engine`, what was searched, and how the user can fix it), never a
   failure without words.
 
-### Installing an engine like an agent
+### Installing Typst like an agent
 
 **Not bundled in the binary; installed with one click, the way agent CLIs are.**
 Chimaera already installs claude and codex for users who do not have them: a click
@@ -309,25 +314,19 @@ on an install chip runs a curated script in a visible terminal (official release
 files, checksums checked, never sudo), puts the program under `~/.chimaera`, and
 labels it **chimaera** beside the user's own copies, labelled **yours**
 ([agents](features/agents.md#managed-runtimes--install--update--theming-shims)).
-Engines get the same treatment, with the same rule: **yours always wins**.
+Typst gets the same treatment, with the same rule: **yours always wins**.
 
 - **Typst** installs as one static binary (16.7 MB download for 0.15.1). That is the
   whole engine: a Chimaera-installed Typst builds any Typst document.
-- **Tectonic** is the LaTeX that can be installed this way (a 9.7 MB static binary for
-  0.17.0). It fetches the TeX packages a document needs on its first build (tens of MB,
-  cached in `~/.cache/Tectonic`, so that first build needs the network) and then works
-  offline. It carries the limits above: 2022 packages, XeLaTeX only, letter paper by
-  default, and biblatex documents need exactly biber 2.17. For a new report that is
-  fine, and Typst avoids all of it.
-- **TeX Live itself cannot be installed this way.** It is several GB and belongs to the
-  host's admins or the user's own setup (`module load texlive`). When it is there, it
-  wins, because it is what co-authors and journals use.
-- **The layout is the agents' layout:** `~/.chimaera/tools/<tool>/<version>/` behind an
+- **TeX Live cannot be installed this way.** It is several GB and belongs to the host's
+  admins or the user's own setup, and Tectonic, the small alternative, is
+  [not supported](#latex-the-hosts-tex-live).
+- **The layout is the agents' layout:** `~/.chimaera/tools/typst/<version>/` behind an
   atomic symlink swap, `~/.chimaera/tools/bin` placed *after* the user's own PATH so
-  their engines win, an **update →** chip when a newer release exists, and uninstall
+  their Typst wins, an **update →** chip when a newer release exists, and uninstall
   from Settings. Nothing installs without a click.
-- **In the binary instead?** No: every host would carry about 26 MB it may never use,
-  and every deploy and update over ssh would move it. Installing on first use gives the
+- **In the binary instead?** No: every host would carry 17 MB it may never use, and
+  every deploy and update over ssh would move it. Installing on first use gives the
   same one-click result without the weight.
 
 **A WASM engine in the browser** is rejected as the main path:
@@ -444,10 +443,10 @@ Engines get the same treatment, with the same rule: **yours always wins**.
 - **Heuristics are ported, not invented.** LaTeX Workshop's log parser (MIT) has
   years of edge cases: one pattern covers both the `file:line:` and the `!` error
   forms, and it tracks the file stack by counting parentheses. texlab's parser
-  re-joins lines of exactly 79 characters, which is still needed for Tectonic: it does
-  not use kpathsea, so `max_print_line` may not reach it. A shared fixture corpus of
-  real logs (pdflatex, xelatex, lualatex, Tectonic, biber, bibtex, Typst) runs in the
-  Rust suite, like `mathBlocks.fixture.json` does for math.
+  re-joins lines of exactly 79 characters, kept as a fallback for a site whose
+  configuration ignores `max_print_line`. A shared fixture corpus of real logs
+  (pdflatex, xelatex, lualatex, biber, bibtex, Typst) runs in the Rust suite, like
+  `mathBlocks.fixture.json` does for math.
 - **In the editor**: `@codemirror/lint` (already a dependency, used by the settings
   JSON editor) shows gutter marks and underlines through `CodeView`'s `extra`
   compartment. Marks map through later edits automatically and clear on the next
@@ -482,7 +481,7 @@ Engines get the same treatment, with the same rule: **yours always wins**.
 
 ### Where the data comes from
 
-latexmk (`-synctex=1`) and Tectonic (`--synctex`) write `main.synctex.gz` into the
+latexmk (`-synctex=1`) writes `main.synctex.gz` into the
 build folder. It maps typeset boxes to source file and line.
 
 ### Parse it in the browser
@@ -495,15 +494,16 @@ build folder. It maps typeset boxes to source file and line.
   search, because the `synctex` binary mishandles some non-ASCII paths.
 - **Why the browser.** Sync must feel instant, and every daemon round trip costs about
   two tunnel round trips ([remote perf plan](perf-remote-plan.md), F2). Parsing a
-  thesis-sized SyncTeX file would also take tens of MB of daemon memory. The `synctex`
-  command-line tool is not an option either, since Tectonic-only hosts do not have it.
+  thesis-sized SyncTeX file would also take tens of MB of daemon memory, and running
+  the `synctex` command-line tool per click would cost a process and a round trip
+  each time.
   The same parsed data feeds the change marks of
   [section 8](#8-changes-git-differences-in-the-source-and-the-pdf).
 - **Cap.** Over 16 MB compressed, sync turns off with a note.
 - **Units and paths.** The file stores scaled points plus a unit and offsets from its
   preamble; there are 65,781.76 scaled points to a PDF point, and SyncTeX measures
   from the page's top left while PDF measures from the bottom left. Input paths are as
-  the engine saw them (Tectonic writes absolute paths since 0.8.1); they are
+  the engine saw them, absolute or relative; they are
   normalized against the main file's folder and mapped to workspace paths.
 
 ### Forward: source to PDF
@@ -592,8 +592,8 @@ For a `.tex` file, first match wins:
 5. **Ask once.** Several candidates, or none: a small picker in the toolbar. The
    answer is remembered per workspace in a small capped JSON file under
    `~/.chimaera`.
-6. **Project files.** A trusted `latexmkrc`'s `@default_files`, and `Tectonic.toml`
-   projects, name their own main files.
+6. **Project files.** A trusted `latexmkrc`'s `@default_files` names its own main
+   files.
 
 For a `.typ` file: it is its own main unless a recent build's dependency list
 (`--deps`) or a static scan of `#include`/`#import` in its folder shows another file
@@ -622,9 +622,6 @@ A member file shows its main document's PDF, labelled "part of main.tex".
   `.bcf`) and reruns as needed. Chimaera adds only diagnostics from the `.blg`, and the
   plain-words message for the most common HPC failure: a biber (often from conda)
   that does not match the TeX Live's biblatex.
-- **Tectonic** runs bibtex itself (ported to Rust in 0.15). biblatex documents need an
-  external biber, and its bundled biblatex 3.17 accepts only biber 2.17; with any
-  other biber the chip offers latexmk.
 - **Typst** reads `.bib` (BibLaTeX) or Hayagriva `.yml` natively with
   `#bibliography("refs.bib")`. No extra tool, no extra pass. One more reason to
   recommend Typst for new reports.
@@ -672,8 +669,9 @@ behind the reading view's issues chip). This plan adds no tool. It widens those 
   (new reports) or LaTeX (a journal template, an existing project); one main file per
   report, included LaTeX files starting with `% !TEX root = main.tex`, Typst's one
   `main.typ` that `#include`s the rest; figures as PDF for vector plots and PNG at
-  300 dpi or more, relative paths, no EPS; the paper size set explicitly (Tectonic
-  defaults to US letter, TeX Live to its site setting); one bibliography tool per
+  300 dpi or more, relative paths, no EPS; the paper size set explicitly (TeX Live
+  follows its site setting, so leaving it out gives different PDFs on different
+  hosts); one bibliography tool per
   project (Typst's `#bibliography("refs.bib")`, or biblatex with biber, or natbib
   with bibtex); no packages that need unrestricted shell escape (`svg`, TikZ
   externalization, minted before version 3), no `\write18`, no absolute paths, no
@@ -758,16 +756,14 @@ plain wall-clock limit where it does not.
 
 - **Treat a compile as running code.** Everything below narrows what a document can
   do; none of it makes compiling an untrusted document fully safe.
-- **Shell escape.** Unrestricted shell escape (`-shell-escape`, Tectonic's
-  `-Z shell-escape`) is off and can only be turned on by the user, per project, in the
+- **Shell escape.** Unrestricted shell escape (`-shell-escape`) is off and can only be turned on by the user, per project, in the
   UI; never by an agent and never by a file in the repo. TeX Live's own default,
   **restricted** shell escape, stays as the site configured it: a short list of helpers
   (`bibtex`, `kpsewhich`, `makeindex`, `repstopdf`, `latexminted` and a few more).
   Documents rely on it for EPS figures and minted code listings. That list has had
   holes (`mpost` allowed arbitrary commands until it was replaced by `r-mpost`,
   CVE-2016-10243); the maintainer kept the restricted default on 2026-09-28 because
-  documents rely on it. Tectonic always runs with
-  `TECTONIC_UNTRUSTED_MODE=1`. Typst has no shell escape at all.
+  documents rely on it. Typst has no shell escape at all.
 - **Old LuaTeX can run commands anyway.** LuaTeX 1.04 to 1.16 (TeX Live 2017 to 2022
   and the first TeX Live 2023) could run shell commands even with shell escape off
   (CVE-2023-32700) and open network sockets (CVE-2023-32668). HPC modules are often
@@ -792,11 +788,10 @@ plain wall-clock limit where it does not.
   kernels) or bubblewrap where user namespaces work. That is a later, opt-in hardening
   step, not a default, because many HPC kernels have neither.
 - **Network.** TeX Live's pdfTeX and XeTeX never touch the network (old LuaTeX: see
-  above). Tectonic downloads bundle files on a cache miss and Typst downloads `@preview`
-  packages on first import; both are the engine fetching its own packages, allowed. An
-  **offline** setting (for compute nodes) passes Tectonic's `--only-cached`. Typst has
-  no offline switch, but a cached package never touches the network, and a missing one
-  on an offline host becomes a plain-words diagnostic. Chimaera does not sandbox the
+  above). Typst downloads `@preview` packages on first import; that is the engine
+  fetching its own packages, allowed. Typst has no offline switch, but a cached package
+  never touches the network, and a missing one on an offline host becomes a
+  plain-words diagnostic. Chimaera does not sandbox the
   network itself, for the same reason as reads.
 - **Environment hygiene.** Compiles get the captured prelude environment, minus the
   daemon's own variables and anything on `api::spawn_env_remove`. No token ever reaches
@@ -942,15 +937,15 @@ login node with `module load texlive` and a real `typst`: an article, a thesis-s
 `\include` project with biber, an infinite-loop document, a Typst document that
 allocates without bound, and a claude and a codex session each running the
 check-and-fix loop. Record what the research could not find: prelude capture time,
-Typst time and memory for a 20-page report, Tectonic's memory and cache growth, and
+Typst time and memory for a 20-page report, and
 both agents' MCP tool-call timeouts.
 
 ### Phase B: the document view
 
 `DocumentView`, compile on open, on save and on agent writes to the open file or its
 main file, the in-place PDF swap, error marks, the problems list, **Ask agent**, the
-status chip, the empty states with **Install Typst** and **Install Tectonic** (the
-curated recipes in `runtimes.rs`), **Save PDF beside source**, the setting.
+status chip, the empty states with the TeX Live directions and **Install Typst** (the
+curated recipe in `runtimes.rs`), **Save PDF beside source**, the setting.
 
 **Verification.** Driven live in the isolated preview on Chromium and WebKit, against a
 remote daemon over a real tunnel: type, save, watch the PDF swap without a flash; let
@@ -1013,16 +1008,10 @@ is there:
 
 ## Open decisions
 
-1. **Which engine wins when several are present.** Recommended order, first found
-   wins: the host's TeX Live (latexmk), then the user's own Tectonic, then Chimaera's
-   one-click Tectonic; for Typst, the user's own, then Chimaera's one-click Typst
-   ([the evidence](#the-latex-ladder), [installs](#installing-an-engine-like-an-agent)).
-   The request first proposed Tectonic ahead of TeX Live. Consequence of the
-   recommendation: documents build with what co-authors and journals use whenever the
-   host has TeX Live, and every other host is one click from a working engine.
-
-Decided on 2026-09-28: core, not a plugin; kept lean; and the eight questions listed
-under [decisions](#decisions-maintainer-2026-09-28).
+None. Everything the plan asked was decided on 2026-09-28: core, not a plugin; kept
+lean; and the questions listed under [decisions](#decisions-maintainer-2026-09-28),
+including LaTeX through the host's TeX Live only and Typst installed with one click.
+New questions will surface in Phase A's measurements; they go here.
 
 ## Out of scope
 
@@ -1030,8 +1019,9 @@ under [decisions](#decisions-maintainer-2026-09-28).
   ([decisions](#decisions-maintainer-2026-09-28)).
 - **A language server, completion or refactoring** (texlab, tinymist): the DESIGN.md
   non-goal.
-- **A WASM engine in the browser**, and **bundling** Typst, Tectonic or TeX Live in the
-  binary ([why](#installing-an-engine-like-an-agent)).
+- **A WASM engine in the browser**, **bundling** Typst or TeX Live in the binary
+  ([why](#installing-typst-like-an-agent)), and **Tectonic**
+  ([why](#latex-the-hosts-tex-live)).
 - **Managing TeX packages** (`tlmgr`). The host's admins and the user's prelude own the
   TeX installation.
 - **Committing, staging or reverting from the changes views.** Git stays read-only
@@ -1121,7 +1111,7 @@ Checked 2026-09-25. Several official doc sites were unreachable from the researc
 environment, so some facts come from the projects' source files and release pages
 instead; those links are what is cited.
 
-- **Tectonic**: [changelog](https://github.com/tectonic-typesetting/tectonic/blob/release/CHANGELOG.md)
+- **Tectonic** (why it is not supported): [changelog](https://github.com/tectonic-typesetting/tectonic/blob/release/CHANGELOG.md)
   (0.17.0, bundle history, SyncTeX paths),
   [README](https://github.com/tectonic-typesetting/tectonic/blob/master/README.md) (XeTeX
   only), [`-X compile`](https://github.com/tectonic-typesetting/tectonic/blob/master/docs/src/v2cli/compile.md)
@@ -1185,7 +1175,5 @@ instead; those links are what is cited.
   Rust converter behind the Typst package; crate and licence to confirm).
 
 **Not verified, measured in Phase A instead**: Typst's time and memory for a
-20-page report; Tectonic's memory per compile and its official cache size; whether
-Tectonic honors `max_print_line`; whether Tectonic confines absolute-path reads; how
-long a login shell with `module load texlive` takes on a busy login node; whether
+20-page report; how long a login shell with `module load texlive` takes on a busy login node; whether
 `typst eval` can report heading positions.
