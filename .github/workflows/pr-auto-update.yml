@@ -16,9 +16,10 @@ name: pr-auto-update
 # workflow's own token. Without the secret the pick is only reported (a
 # warning). Setup: plugins/AGENTS.md.
 #
-# pull_request_target runs main's copy of this workflow and script (the
-# checkout below is the base branch, never the pull request's code) — it is
-# here only so switching auto-merge on is answered at once.
+# pull_request_target runs main's copy of this workflow and script (checkout's
+# default for it is the base branch, never the pull request's code) — it is
+# here only so switching auto-merge on is answered at once. A manual run is a
+# dry run unless `dry_run` is unticked: it reports the pick, updates nothing.
 on:
   push:
     branches: [main]
@@ -27,6 +28,11 @@ on:
   schedule:
     - cron: "*/20 * * * *"
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Report what would be updated, update nothing
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -46,7 +52,6 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -56,4 +61,5 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           UPDATE_TOKEN: ${{ secrets.PLUGIN_LOCK_TOKEN }}
           REPO: ${{ github.repository }}
-        run: node .github/scripts/pr-auto-update.mjs
+          EVENT: ${{ github.event_name }}
+        run: node .github/scripts/pr-auto-update.mjs ${{ inputs.dry_run && '--dry-run' || '' }}

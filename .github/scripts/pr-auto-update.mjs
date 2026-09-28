@@ -10,7 +10,9 @@
 // GitHub's update-branch (a merge of main into it, never a rebase), its
 // checks rerun, and auto-merge lands it. One at a time: while a pull request
 // in line is up to date and its required checks are still running, the rest
-// wait — one merge must not set off a CI run for every waiting branch. A
+// wait — one merge must not set off a CI run for every waiting branch — but
+// only for `HOLD_MS` after it last moved: a check waiting on a person (a
+// first-time contributor's CLA) or a runner must not stall the line. A
 // pull request whose required checks failed is skipped until it is fixed:
 // its session (or author) owns that, and the line moves on without it.
 //
@@ -19,7 +21,9 @@
 // Reads use GH_TOKEN (the workflow's own token). The update uses
 // UPDATE_TOKEN (the PLUGIN_LOCK_TOKEN secret): a commit GITHUB_TOKEN makes
 // starts no workflow, so the required checks would never report on it.
-// Without UPDATE_TOKEN, or with --dry-run, the pick is only reported.
+// Without UPDATE_TOKEN, or with --dry-run, the pick is only reported. EVENT
+// is the triggering event: a scheduled run only warns on an error (it is
+// the backstop, every 20 minutes; the run after each merge still fails).
 
 import { pathToFileURL } from "node:url";
 
@@ -28,9 +32,29 @@ const BASE = "main";
 /** Merge state is computed lazily after main moves: ask again, this often. */
 const UNKNOWN_RETRIES = 6;
 const UNKNOWN_WAIT_MS = 10_000;
+/** How long an up-to-date pull request still checking holds the line after
+ *  it last moved (CI takes 10–15 minutes). */
+const HOLD_MS = 45 * 60_000;
 
 /** A required check's conclusions that need a fix, not a wait. */
 const RUN_FAILED = new Set(["FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE", "STALE"]);
+
+/**
+ * The latest run of each required check: a re-run (or the cla workflow's
+ * comment-triggered run beside its pull-request one) replaces the run before
+ * it, as it does for GitHub's merge. A run not started yet is the newest.
+ */
+function latestRequired(contexts) {
+  const latest = new Map();
+  for (const c of contexts) {
+    if (!c.isRequired) continue;
+    const key = c.__typename === "CheckRun" ? `run:${c.name}` : `status:${c.context}`;
+    const at = c.__typename === "CheckRun" ? (c.startedAt ?? "\uffff") : "";
+    const seen = latest.get(key);
+    if (!seen || at >= seen.at) latest.set(key, { c, at });
+  }
+  return [...latest.values()].map((v) => v.c);
+}
 
 /**
  * A commit's required checks in one word: "failing" (one needs a fix),
@@ -39,7 +63,7 @@ const RUN_FAILED = new Set(["FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTIO
  * CheckRun / StatusContext nodes with `isRequired`.
  */
 export function requiredState(contexts) {
-  const required = contexts.filter((c) => c.isRequired);
+  const required = latestRequired(contexts);
   const failed = (c) =>
     c.__typename === "CheckRun" ? RUN_FAILED.has(c.conclusion) : c.state === "FAILURE" || c.state === "ERROR";
   const running = (c) =>
@@ -49,26 +73,54 @@ export function requiredState(contexts) {
   return required.length > 0 ? "passing" : "none";
 }
 
+/** When a pull request last moved: its head commit, or its newest required
+ *  run starting (ISO time), whichever is later. */
+export function lastMoved(committedDate, contexts) {
+  let at = committedDate ?? "";
+  for (const c of contexts) {
+    if (c.isRequired && c.__typename === "CheckRun" && c.startedAt && c.startedAt > at) at = c.startedAt;
+  }
+  return at || null;
+}
+
+/** The pull requests in line: open against main (the query's filter), auto-merge
+ *  on, not a draft, from this repository. */
+export function inLine(prs) {
+  return prs.filter((p) => p.autoMergeEnabledAt && !p.draft && !p.crossRepository);
+}
+
 /**
- * What to update, from the open pull requests: `{number, headSha, reason}`,
- * `number` null when nothing should be. Each pull request carries `number`,
- * `draft`, `crossRepository`, `autoMergeEnabledAt` (null without auto-merge),
- * `mergeState` (GitHub's mergeStateStatus), `headSha` and `required`
- * (`requiredState`, or null when not asked).
+ * What to update, from the open pull requests: `{number, headSha, holding,
+ * reason}`, `number` null when nothing should be (`holding` names the pull
+ * request that holds the line, if one does). Each pull request carries
+ * `number`, `draft`, `crossRepository`, `autoMergeEnabledAt` (null without
+ * auto-merge), `mergeState` (GitHub's mergeStateStatus), `headSha`,
+ * `required` (`requiredState`, or null when not asked) and `movedAt`
+ * (`lastMoved`, or null).
  */
-export function pick(prs) {
-  const line = prs.filter((p) => p.autoMergeEnabledAt && !p.draft && !p.crossRepository);
+export function pick(prs, now = Date.now()) {
+  const line = inLine(prs);
   if (line.length === 0) return { number: null, reason: "no pull request has auto-merge on" };
   // BLOCKED with nothing failed: its required checks haven't finished (main
-  // requires no reviews). CLEAN / UNSTABLE ones are merging now and don't
-  // hold the line: their merge starts the next run.
-  const running = line.find((p) => p.mergeState === "BLOCKED" && (p.required === "pending" || p.required === "none"));
+  // requires no reviews). It holds the line while it moved recently; CLEAN /
+  // UNSTABLE ones are merging now and don't: their merge starts the next run.
+  const running = line.find(
+    (p) =>
+      p.mergeState === "BLOCKED" &&
+      (p.required === "pending" || p.required === "none") &&
+      p.movedAt !== null &&
+      now - Date.parse(p.movedAt) < HOLD_MS,
+  );
   if (running) {
-    return { number: null, reason: `#${running.number} is up to date and its checks are running; the rest wait for it` };
+    return {
+      number: null,
+      holding: running.number,
+      reason: `#${running.number} is up to date and its checks are running; the rest wait for it`,
+    };
   }
   const behind = line
     .filter((p) => p.mergeState === "BEHIND" && p.required !== "failing")
-    .sort((a, b) => a.autoMergeEnabledAt.localeCompare(b.autoMergeEnabledAt) || a.number - b.number);
+    .sort((a, b) => (a.autoMergeEnabledAt < b.autoMergeEnabledAt ? -1 : a.autoMergeEnabledAt > b.autoMergeEnabledAt ? 1 : a.number - b.number));
   if (behind.length === 0) return { number: null, reason: "no pull request in line is behind main" };
   const next = behind[0];
   return { number: next.number, headSha: next.headSha, reason: `#${next.number} is the oldest in line behind main` };
@@ -96,9 +148,9 @@ const LIST = `query($owner: String!, $name: String!, $base: String!) {
 const CHECKS = `query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
-      commits(last: 1) { nodes { commit { statusCheckRollup { contexts(first: 100) { nodes {
+      commits(last: 1) { nodes { commit { committedDate statusCheckRollup { contexts(first: 100) { nodes {
         __typename
-        ... on CheckRun { name status conclusion isRequired(pullRequestNumber: $number) }
+        ... on CheckRun { name status conclusion startedAt isRequired(pullRequestNumber: $number) }
         ... on StatusContext { context state isRequired(pullRequestNumber: $number) }
       } } } } } }
     }
@@ -116,6 +168,7 @@ async function openPullRequests(token, owner, name) {
       headSha: p.headRefOid,
       autoMergeEnabledAt: p.autoMergeRequest?.enabledAt ?? null,
       required: null,
+      movedAt: null,
     }));
     const unknown = prs.some((p) => p.autoMergeEnabledAt && p.mergeState === "UNKNOWN");
     if (!unknown || attempt >= UNKNOWN_RETRIES) return prs;
@@ -131,16 +184,22 @@ async function main() {
   if (!owner || !name || !readToken) throw new Error("REPO (owner/name) and GH_TOKEN are required");
 
   const prs = await openPullRequests(readToken, owner, name);
-  // Only the pull requests the pick weighs need their checks asked.
-  for (const p of prs) {
-    if (p.autoMergeEnabledAt && (p.mergeState === "BEHIND" || p.mergeState === "BLOCKED")) {
-      const data = await graphql(readToken, CHECKS, { owner, name, number: p.number });
-      const contexts = data.repository.pullRequest.commits.nodes[0]?.commit.statusCheckRollup?.contexts.nodes ?? [];
-      p.required = requiredState(contexts);
-    }
+  const ask = async (p) => {
+    const data = await graphql(readToken, CHECKS, { owner, name, number: p.number });
+    const commit = data.repository.pullRequest.commits.nodes[0]?.commit;
+    const contexts = commit?.statusCheckRollup?.contexts.nodes ?? [];
+    p.required = requiredState(contexts);
+    p.movedAt = lastMoved(commit?.committedDate, contexts);
+  };
+  // The blocked ones first: one still checking holds the line, and then the
+  // behind ones needn't be asked at all.
+  await Promise.all(inLine(prs).filter((p) => p.mergeState === "BLOCKED").map(ask));
+  if (!pick(prs).holding) {
+    await Promise.all(inLine(prs).filter((p) => p.mergeState === "BEHIND").map(ask));
   }
   for (const p of prs.filter((p) => p.autoMergeEnabledAt)) {
-    console.log(`#${p.number}: ${p.mergeState}, required checks ${p.required ?? "not asked"}${p.draft ? ", draft" : ""}`);
+    const moved = p.movedAt ? `, moved ${p.movedAt}` : "";
+    console.log(`#${p.number}: ${p.mergeState}, required checks ${p.required ?? "not asked"}${moved}${p.draft ? ", draft" : ""}`);
   }
 
   const next = pick(prs);
@@ -176,6 +235,10 @@ async function main() {
 
 if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
   main().catch((err) => {
+    if (process.env.EVENT === "schedule") {
+      console.log(`::warning title=pr-auto-update::${err.message}`);
+      return;
+    }
     console.error(err.message);
     process.exit(1);
   });
