@@ -101,9 +101,15 @@ suspended after daemon restart until its ownership has been verified.
 Clean transfer resumes the same native conversation. Offline takeover requests
 the CLI's native head fork: Claude `--fork-session`, Codex `thread/fork` without
 `lastTurnId`, or Codex TUI `fork <id>`. Native transcript IDs are never rewritten.
-Structured chats receive one attributed `moved`/`home` context message. Native
-TUIs receive the same bounded context as one positional prompt on resume/fork. The
-Mastermind remains reactive and receives no automatic turn.
+Structured chats receive one attributed `moved`/`home` context message only when
+the captured carryover records an interrupted turn or background work. Finished
+conversations resume idle, preserving history without starting a model turn.
+Fresh MCP initialization supplies current-host context for configured cloud
+projects, including idle chats and native TUIs. Native TUIs receive the same
+bounded context as one positional prompt on resume/fork. Their ledger does not yet
+capture reliable active-versus-idle turn state across providers, so the idle-turn
+suppression currently applies only to structured chats. The Mastermind remains
+reactive and receives no automatic turn.
 
 Plain terminals remain on the source laptop. Their moved bundle imports as a
 paused row, preserving tabs without restarting arbitrary foreground programs.

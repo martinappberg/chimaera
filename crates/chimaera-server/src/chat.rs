@@ -3550,11 +3550,14 @@ pub(crate) async fn resurrect_chat_transfer(
             let pick_up = if mastermind_mode.is_some() {
                 None
             } else if let Some(origin) = origin {
-                let mut text = handoff_message(origin, carry.as_ref());
-                text.push_str(
-                    &crate::mcp::cloud_context::arrival(state, &entry.workspace_id).await,
-                );
-                Some(text)
+                if let Some(mut text) = handoff_message(origin, carry.as_ref()) {
+                    text.push_str(
+                        &crate::mcp::cloud_context::arrival(state, &entry.workspace_id).await,
+                    );
+                    Some(text)
+                } else {
+                    None
+                }
             } else {
                 pickup_message(
                     &entry.id,
@@ -3752,9 +3755,18 @@ fn restart_message(carry: &chimaera_agent::Carryover) -> Option<String> {
     Some(text)
 }
 
-/// A transfer always states the new host context; the native conversation and
-/// historical journal remain intact, and this is the one visible new turn.
-pub(crate) fn handoff_message(origin: &str, carry: Option<&chimaera_agent::Carryover>) -> String {
+/// Only interrupted work needs a transfer pick-up turn. Idle conversations keep
+/// their history without asking the model to do more work; fresh MCP initialization
+/// supplies the current host context before a later user-requested turn.
+fn handoff_message(origin: &str, carry: Option<&chimaera_agent::Carryover>) -> Option<String> {
+    let carry = carry.filter(|c| c.interrupted_work())?;
+    Some(transfer_context(origin, Some(carry)))
+}
+
+/// TUIs do not yet record reliable turn state for every provider. Keep their
+/// existing transfer prompt until that state can distinguish idle from interrupted
+/// work; a missing carryover must not silently suppress an active TUI's pickup.
+pub(crate) fn transfer_context(origin: &str, carry: Option<&chimaera_agent::Carryover>) -> String {
     let place = if origin == "home" {
         "back on the laptop"
     } else {
@@ -4834,6 +4846,64 @@ mod tests {
         let text = restart_message(&both).expect("both");
         assert!(text.contains("Your last turn was also cut off"), "{text}");
         assert!(text.contains("then continue where you left off"), "{text}");
+    }
+
+    #[test]
+    fn handoff_message_keeps_finished_conversations_idle_in_both_directions() {
+        use chimaera_agent::Carryover;
+
+        for origin in ["moved", "home"] {
+            assert_eq!(handoff_message(origin, None), None, "older ledger");
+            assert_eq!(handoff_message(origin, Some(&Carryover::default())), None);
+            let idle = Carryover {
+                remote_control: true,
+                ultracode: true,
+                pickup_at_ms: 1,
+                ..Carryover::default()
+            };
+            assert_eq!(
+                handoff_message(origin, Some(&idle)),
+                None,
+                "settings and an earlier pickup are not unfinished work"
+            );
+        }
+    }
+
+    #[test]
+    fn handoff_message_continues_interrupted_turns_and_background_work() {
+        use chimaera_agent::{CarriedTask, Carryover};
+
+        let turn = Carryover {
+            turn_in_flight: true,
+            ..Carryover::default()
+        };
+        let background = Carryover {
+            background: vec![CarriedTask {
+                id: "b-1".into(),
+                task_type: "local_bash".into(),
+                description: "Watch CI for PR 158".into(),
+                workflow_name: None,
+                monitor: true,
+            }],
+            ..Carryover::default()
+        };
+        let both = Carryover {
+            turn_in_flight: true,
+            ..background.clone()
+        };
+        for (origin, place) in [("moved", "on another host"), ("home", "back on the laptop")] {
+            for carry in [&turn, &background, &both] {
+                let text = handoff_message(origin, Some(carry)).expect("interrupted work");
+                assert!(text.contains(place), "{text}");
+                assert!(text.contains("Re-check tools and paths"), "{text}");
+                assert!(text.contains("Continue the interrupted task"), "{text}");
+                assert_eq!(
+                    text.contains("Background task: Watch CI for PR 158"),
+                    !carry.background.is_empty(),
+                    "{text}"
+                );
+            }
+        }
     }
 
     /// Who gets a pick-up message: only a chat whose work was cut off, whose

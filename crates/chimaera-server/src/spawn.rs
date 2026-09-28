@@ -262,7 +262,7 @@ pub(crate) async fn spawn_session(
             let transferred = crate::lock(&state.deferred_sessions).get(&id).cloned();
             if let Some(entry) = transferred.filter(|entry| entry.workspace_id == workspace.id) {
                 if let Some(handoff) = entry.handoff {
-                    let context = crate::chat::handoff_message(
+                    let context = crate::chat::transfer_context(
                         handoff.origin.as_str(),
                         entry.agent.as_ref().and_then(|a| a.carryover.as_ref()),
                     );

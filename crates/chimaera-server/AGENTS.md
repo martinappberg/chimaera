@@ -247,6 +247,9 @@ the lifecycle, keep them consistent:
   agent (`pickup_message`: gated by `chat.resumeAfterRestart`, never to a
   Mastermind, and withheld within 10 min of the chat's last pick-up so a
   crash loop can't bill a turn per crash).
+  Transfer restore similarly sends a `moved`/`home` pickup only for captured
+  interrupted work. Finished conversations remain idle; regenerated MCP
+  initialization provides current-host context without starting a model turn.
 - **`close-all` / `shutdown` must stop chat drivers too** (`kill_all` only
   covers PTYs).
 - **Resource discipline is a review criterion.** ~150 MB RSS, no unbounded

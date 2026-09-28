@@ -47,7 +47,7 @@
 </script>
 <div class="mirrors">
   <h3>Project copies</h3>
-  {#if !recoveryOnly}<p class="hint">Your files, conversations and supported agent settings stay together across devices. Passwords, private keys and ignored files stay on this device.</p>{:else}<p class="hint">You can still manage project privacy without an active plan.</p>{/if}
+  {#if !recoveryOnly}<p class="hint">Your files, conversations and supported agent settings stay together across devices. Connected services are authorized separately.</p>{:else}<p class="hint">You can still manage project privacy without an active plan.</p>{/if}
   {#if error}<p class="error" role="alert">{error}</p>{/if}
   {#if !recoveryOnly && status && !status.configured}<p class="hint">Automatic project copying is getting ready. You can keep working here.</p>{/if}
   {#if status?.workspaces.length === 0}<p class="hint">No project copies to show yet.</p>{/if}
