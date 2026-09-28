@@ -425,3 +425,14 @@ The preview cookie authorizes only its exact host and proxy ID. An absolute app
 resource may use a same-origin Referer that names that ID; ambiguous cookie-only
 routing is forbidden. Upstream cookies never become account/keeper credentials.
 Browsers that block third-party cookies can open the preview in a separate tab.
+
+### Device display and installation binding
+
+`GET /v1/devices` may include `installation_id` for an account-verified native
+installation. Its absence denotes an unbound sign-in, not proof of another
+physical computer. Names are display-only and must never be used for grouping or
+authorization. `POST /v2/installations/bind` accepts optional `display_name`
+(nonempty, at most 120 UTF-8 bytes, no control characters); only a successful
+authenticated binding may update that device's label. The native app reads macOS
+ComputerName instead of a network-assigned hostname. Older sign-ins remain
+individually revocable; displaying them never revokes or merges credentials.

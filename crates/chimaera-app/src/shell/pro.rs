@@ -21,6 +21,7 @@ mod auth;
 pub(super) mod billing;
 mod credentials;
 mod installation;
+mod machine;
 pub(super) mod projects;
 mod recovery;
 mod store;
@@ -672,7 +673,7 @@ async fn replace_hosts(app: &AppHandle, hosts: Vec<Host>) {
 }
 
 fn machine_name() -> String {
-    chimaera_core::this_node().unwrap_or_else(|| "My computer".into())
+    machine::display_name()
 }
 
 pub(super) async fn apply_current_host(app: &AppHandle, host: Host, generation: u64) -> bool {
@@ -1435,6 +1436,34 @@ pub async fn pro_devices(state: tauri::State<'_, Shell>) -> Result<Vec<Device>, 
         .devices()
         .await
         .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn pro_revoke_device(app: AppHandle, device_id: String) -> Result<(), String> {
+    let state = app.state::<Shell>();
+    let generation = state.pro.generation();
+    let client = state.pro.client().await.ok_or("Sign in first")?;
+    let _operation = state.pro.operation.lock().await;
+    if generation != state.pro.generation() {
+        return Err("Your account changed. Refresh your sign-ins first.".into());
+    }
+    let devices = client
+        .devices()
+        .await
+        .map_err(|_| "Your sign-ins couldn't be checked.")?;
+    if devices.len() > 256
+        || !devices
+            .iter()
+            .any(|device| device.id == device_id && !device.current)
+    {
+        return Err("This sign-in is no longer available to remove.".into());
+    }
+    client
+        .revoke_device(&device_id)
+        .await
+        .map_err(|_| "This sign-in couldn't be removed.")?;
+    let _ = app.emit("pro-changed", ());
+    Ok(())
 }
 
 /// The native account panel always targets the laptop daemon, including when

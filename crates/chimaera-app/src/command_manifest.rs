@@ -66,6 +66,7 @@ pub const DAEMON_UI_COMMANDS: &[&str] = &[
     "pro_hosts",
     "pro_set_host_kept",
     "pro_devices",
+    "pro_revoke_device",
 ];
 
 // The application crate consumes only the daemon list at runtime; this list is

@@ -974,6 +974,7 @@ export interface ProHost {
 
 export interface ProDevice {
   id: string;
+  installation_id?: string | null;
   name: string;
   last_seen: string;
   this: boolean;
@@ -1019,6 +1020,12 @@ export async function proSetHostKept(alias: string, kept: boolean): Promise<void
 
 export async function proDevices(): Promise<ProDevice[]> {
   return (await tauri()?.core.invoke<ProDevice[]>("pro_devices")) ?? [];
+}
+
+export async function proRevokeDevice(deviceId: string): Promise<void> {
+  const t = tauri();
+  if (t === null) throw new Error("not running in the native shell");
+  await t.core.invoke<void>("pro_revoke_device", { deviceId });
 }
 
 export function onProChanged(handler: () => void): Promise<() => void> {

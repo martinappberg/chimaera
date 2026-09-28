@@ -1,4 +1,5 @@
 <script lang="ts">
+  import AccountDevices from "../pro/AccountDevices.svelte";
   import CloudSetup from "./CloudSetup.svelte";
   import BrandMark from "../shared/BrandMark.svelte";
   import PlanBadge from "../shared/PlanBadge.svelte";
@@ -12,7 +13,7 @@
   import { paid, readIntent, friendlyError, recoverableAccountRestore, type PaidPlan, type BillingInterval, type PurchaseIntent } from "../pro/presentation";
   import {
     onProChanged, proStatus, proSignIn, proCancelSignIn, proSignOut, proSignOutEverywhere,
-    proHosts, proSetHostKept, proDevices, proBillingCheckout, proBillingPortal, proCancelBilling, proRefreshAccount,
+    proHosts, proSetHostKept, proDevices, proRevokeDevice, proBillingCheckout, proBillingPortal, proCancelBilling, proRefreshAccount,
     type ProStatus, type ProHost, type ProDevice, type ProAuthScreenHint,
   } from "../net/native";
 
@@ -37,6 +38,7 @@
   let accountLoading = $state(false);
   let hosts = $state<ProHost[]>([]);
   let devices = $state<ProDevice[]>([]);
+  let deviceAccount: string | null = null;
   let error = $state<string | null>(null);
   let notice = $state<string | null>(null);
   let reviewedBilling = $state<number | null>(null);
@@ -116,7 +118,10 @@
     return () => { stopped = true; };
   });
   $effect(() => {
-    if (!visible || !$pageVisible || !status?.signed_in || status.initializing || !securityOpen) return;
+    revision;
+    const account = status?.email;
+    if (deviceAccount !== (account ?? null)) { deviceAccount = account ?? null; devices = []; }
+    if (!visible || !$pageVisible || !status?.signed_in || status.initializing || !securityOpen || !account) return;
     let stopped = false;
     void proDevices().then(value => { if (!stopped) devices = value; }).catch(() => { if (!stopped) error = "Your devices couldn't refresh. Please try again."; });
     return () => { stopped = true; };
@@ -209,9 +214,8 @@
     const kept = checkbox.checked; checkbox.checked = host.kept;
     void act(`host:${host.alias}`, async () => { await proSetHostKept(host.alias, kept); hosts = (await proHosts()).filter(host => host.kind !== "worker"); }, "This connection couldn't be updated. Please try again.");
   }
-  function lastSeen(value: string): string {
-    const date = new Date(value);
-    return Number.isNaN(date.valueOf()) ? "Last seen unavailable" : `Last seen ${date.toLocaleString()}`;
+  async function removeSignIn(device: ProDevice): Promise<void> {
+    await act(`device:${device.id}`, async () => { await proRevokeDevice(device.id); devices = await proDevices(); }, "This sign-in couldn't be removed. Please try again.");
   }
 </script>
 
@@ -332,7 +336,7 @@
 
     {#if status.signed_in}
       {#if !subscribed}<details class="section" ontoggle={(event) => (recoveryOpen = event.currentTarget.open)}><summary>Existing project privacy</summary>{#if recoveryOpen}<MirrorSettings visible={visible && recoveryOpen} recoveryOnly />{/if}</details>{/if}
-      <details class="section" ontoggle={(event) => (securityOpen = event.currentTarget.open)}><summary>Account and devices</summary>{#if securityOpen}<div class="section-body">{#each devices as device (device.id)}<div class="row"><div><span>{device.name}</span><span class="muted small">{lastSeen(device.last_seen)}</span></div>{#if device.this}<span class="small muted">This device</span>{/if}</div>{/each}<div class="actions"><button class="secondary" disabled={busy !== null} onclick={() => { remember(null); void act("sign-out", proSignOut, "Sign-out couldn't finish. Please try again."); }}>Sign out</button><button class="text-button" disabled={busy !== null} onclick={() => { remember(null); void act("sign-out-all", proSignOutEverywhere, "Sign-out couldn't finish. Please try again."); }}>Sign out everywhere</button></div><p class="muted small">Signing out everywhere also closes the SSH logins held by Pro.</p></div>{/if}</details>
+      <details class="section" ontoggle={(event) => (securityOpen = event.currentTarget.open)}><summary>Account and devices</summary>{#if securityOpen}<div class="section-body"><AccountDevices {devices} busy={busy !== null} onrevoke={removeSignIn} /><div class="actions"><button class="secondary" disabled={busy !== null} onclick={() => { remember(null); void act("sign-out", proSignOut, "Sign-out couldn't finish. Please try again."); }}>Sign out</button><button class="text-button" disabled={busy !== null} onclick={() => { remember(null); void act("sign-out-all", proSignOutEverywhere, "Sign-out couldn't finish. Please try again."); }}>Sign out everywhere</button></div><p class="muted small">Signing out everywhere also closes the SSH logins held by Pro.</p></div>{/if}</details>
     {/if}
   {/if}
   {#if (error || status?.error) && !accountNeedsAttention && !billingRecovery}<div class="error" role="alert"><span>{error ?? friendlyError(status?.error, "Part of your Pro connection couldn't refresh. Your local work remains available.")}</span><button class="secondary" disabled={busy !== null} onclick={() => void load(true)}>Try again</button></div>{/if}

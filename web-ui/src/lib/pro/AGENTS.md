@@ -14,6 +14,7 @@ enter UI settings or local storage.
 | `cloudTransport.ts` | Native/browser request parity; passive GETs, explicit wake intent and focused terminal routing. |
 | `providers.ts` | Readiness and safe provider-link presentation; imports the core provider catalog. |
 | `onboarding.svelte.ts` | Validated shared intent so a paused project opens the same onboarding flow. |
+| `AccountDevices.svelte` / `devices.ts` | Verified installation grouping, separate older sign-ins and named per-sign-in removal confirmation. Names never identify a computer. |
 | `AccountUsage.svelte` / `usage.ts` | Percentage-first account usage; real limits, bounded accessible bars, neutral unknown/zero allowance. |
 | `billing.ts` | Native billing copy, stale-attempt fencing and explicit upgrade-review eligibility; browser return never grants entitlement and raw errors never render. |
 | `presentation.ts` | Account, billing-intent and cloud-state copy; truthful project status and the finite preparation polling cadence. |

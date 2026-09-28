@@ -411,3 +411,10 @@ preview environment before signing and pass deep/strict signature verification.
 Replacing that executable with a script can make Keychain reject valid saved
 credentials without a useful prompt; the [development recipe](../../.claude/skills/develop/SKILL.md)
 now fails before launch on invalid signatures.
+
+Device names use the computer's friendly system name. Account and devices shows
+one row per verified native installation, with earlier unbound sessions under
+**Other sign-ins**. These older rows may belong to the same computer; their
+hostnames are not evidence of separate devices. Each other sign-in can be
+removed explicitly without signing out the current one. Grouping never merges
+or revokes credentials automatically.

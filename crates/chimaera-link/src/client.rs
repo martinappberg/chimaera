@@ -308,12 +308,27 @@ impl Client {
         &self,
         identity: &crate::InstallationIdentity,
     ) -> Result<crate::InstallationBinding> {
+        self.bind_installation_named(identity, None).await
+    }
+    pub async fn bind_installation_named(
+        &self,
+        identity: &crate::InstallationIdentity,
+        display_name: Option<&str>,
+    ) -> Result<crate::InstallationBinding> {
         identity.validate()?;
+        let mut body = serde_json::to_value(identity)?;
+        if let Some(name) = display_name {
+            anyhow::ensure!(
+                !name.trim().is_empty() && name.len() <= 120 && !name.chars().any(char::is_control),
+                "invalid installation display name"
+            );
+            body["display_name"] = name.into();
+        }
         let response = self
             .request_raw(
                 Method::POST,
                 path(&self.inner.account, &["v2", "installations", "bind"]),
-                Some(serde_json::to_value(identity)?),
+                Some(body),
             )
             .await?;
         if response.status() == reqwest::StatusCode::CONFLICT {

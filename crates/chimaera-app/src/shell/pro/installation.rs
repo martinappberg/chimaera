@@ -54,7 +54,11 @@ pub(super) async fn bind(
     let account_id = account.account_id.clone();
     let identity =
         tokio::task::spawn_blocking(move || load_or_create(&owned_endpoint, &account_id)).await??;
-    match client.bind_installation(&identity).await {
+    let display_name = super::machine_name();
+    match client
+        .bind_installation_named(&identity, Some(&display_name))
+        .await
+    {
         Ok(binding) => {
             ensure!(
                 binding.device_id == account.device_id,
@@ -68,7 +72,10 @@ pub(super) async fn bind(
     // Re-signing in must not revoke the old holder before its processes stop
     // and its latest snapshot is durable. Try its existing authority first.
     let _ = daemon_request(state, "POST", "/pro/sleep", None).await;
-    match client.bind_installation(&identity).await {
+    match client
+        .bind_installation_named(&identity, Some(&display_name))
+        .await
+    {
         Ok(binding) => {
             ensure!(
                 binding.device_id == account.device_id,
@@ -117,7 +124,9 @@ pub(super) async fn bind(
         .await?;
         ExecutionRecoveryAck::decode(200, &serde_json::to_vec(&ack)?, &request.recovery)?;
     }
-    let binding = client.bind_installation(&identity).await?;
+    let binding = client
+        .bind_installation_named(&identity, Some(&display_name))
+        .await?;
     ensure!(
         binding.device_id == account.device_id,
         "installation device mismatch"

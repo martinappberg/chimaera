@@ -50,6 +50,9 @@ async fn handle(
     .unwrap();
     if path == "/v2/installations/bind" {
         assert_eq!(method, Method::POST);
+        if phase == 0 {
+            assert_eq!(body["display_name"], "My Mac");
+        }
         if phase == 1 {
             return (
                 StatusCode::CONFLICT,
@@ -103,6 +106,12 @@ async fn passive_placement_and_exact_installation_acknowledgments_never_infer_au
         .iter()
         .all(|(method, _)| *method == Method::GET));
     let identity = InstallationIdentity::generate();
+    for invalid in ["", " ", "Mac\nname", &"é".repeat(61)] {
+        assert!(client
+            .bind_installation_named(&identity, Some(invalid))
+            .await
+            .is_err());
+    }
     state.phase.store(1, Ordering::SeqCst);
     assert!(client
         .bind_installation(&identity)
@@ -113,7 +122,11 @@ async fn passive_placement_and_exact_installation_acknowledgments_never_infer_au
     assert!(client.bind_installation(&identity).await.is_err());
     state.phase.store(0, Ordering::SeqCst);
     assert_eq!(
-        client.bind_installation(&identity).await.unwrap().device_id,
+        client
+            .bind_installation_named(&identity, Some("My Mac"))
+            .await
+            .unwrap()
+            .device_id,
         "d-new"
     );
     let grant = client

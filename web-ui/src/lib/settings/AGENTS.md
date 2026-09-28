@@ -37,6 +37,8 @@ The generic Settings form no longer embeds account/billing/onboarding controls.
 An account browser on a cloud worker opens the same provider flow; other hosts
 link to `/account`. Ordinary browser daemons have no Pro entry. Their Cloud machine category remains host-pinned and cookie-authenticated.
 Credentials stay in the app's keychain, never in the schema or this UI.
+Account devices group only verified installation bindings; unbound older sessions
+are collapsed under Other sign-ins, retaining individual removal controls.
 
 Account sign-in, entitlement, and cloud readiness are separate. No-plan accounts
 see plan selection, not paid operation controls. Existing privacy controls remain

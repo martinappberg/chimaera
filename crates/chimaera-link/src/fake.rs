@@ -356,6 +356,7 @@ async fn reconnect(State(keeper): State<FakeKeeper>, Path(id): Path<String>) -> 
 async fn devices() -> Json<Vec<Device>> {
     Json(vec![Device {
         id: "fake-device".into(),
+        installation_id: None,
         name: "Development device".into(),
         last_seen: "2026-09-27T00:00:00Z".into(),
         current: true,

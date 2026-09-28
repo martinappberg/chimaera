@@ -135,6 +135,8 @@ pub struct Account {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Device {
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installation_id: Option<String>,
     pub name: String,
     pub last_seen: String,
     #[serde(rename = "this")]

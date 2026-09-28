@@ -1055,6 +1055,7 @@ pub fn run() {
             pro::pro_hosts,
             pro::pro_set_host_kept,
             pro::pro_devices,
+            pro::pro_revoke_device,
             commands::list_hosts,
             commands::add_host,
             commands::remove_host,

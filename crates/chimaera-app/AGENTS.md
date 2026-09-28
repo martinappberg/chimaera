@@ -43,6 +43,7 @@ in-app SSH askpass, a signed auto-updater). Parent map: repo-root
 | `shell/pro/billing.rs` | Native-owned checkout/portal attempts, exact provider-origin validation, cancellation, and authenticated plan confirmation independent of page visibility. |
 | `shell/pro/billing/callback.rs` | One-use billing return: literal loopback Host, exact nonce/outcome query, bounded request/response and credential-free browser page. |
 | `shell/pro/projects.rs` | Passive cloud project listing and per-project native destination selection; cancellation creates no import request. |
+| `shell/pro/machine.rs` | Friendly device label from macOS ComputerName; never an identity or network-hostname grouping key. |
 | `shell/pro/store.rs` | Credential namespace keys: isolated previews bind session entries to their canonical config directory; legacy unbound entries are never imported or deleted. |
 | `shell/pro/recovery.rs` | Generation-fenced startup candidate retention and coalesced retry ownership; account probe failures do not force new authentication. |
 | `shell/pro/credentials.rs` | Coalesced, generation-fenced credential-store writes with finite retries; persistence failures retain valid memory sessions, and only true revocation signs out. |
@@ -75,6 +76,9 @@ in-app SSH askpass, a signed auto-updater). Parent map: repo-root
   endpoint/account/configuration-scoped Keychain entry. It must save before bind;
   clean release/recovery acknowledgment precedes a rebind that revokes the old
   device. Neither daemon nor webview receives the proof.
+- Device rows group only account-verified installation IDs. Legacy sign-ins remain
+  individually removable; the native revoke command refreshes the roster under
+  the account-operation fence and rejects removal of the current sign-in.
 - Account credentials belong only in the OS keychain (macOS Keychain, Windows
   Credential Manager, Linux Secret Service). app.json stores only the endpoint;
   hosts.json stores only the additive `kept` preference. Keeper host rows are
