@@ -312,6 +312,23 @@ gates; Linux and Windows physical sleep still need their own hosts.
 
 ## Intent — human-authored ground truth
 
+### Viewing anywhere, execution at home while available
+_Captured 2026-09-28 from the maintainer's instructions in this conversation._
+
+- **Placement:** The maintainer clarified that cloud is the sync and handoff
+  fallback. Viewing from a phone or browser should still execute on the home
+  computer while it is available; the viewing device must not choose the host.
+- **Continuity:** If the home computer becomes unavailable, including sudden
+  battery loss, work should continue from the same project, session history and
+  files in the cloud, then return locally when the computer is available again.
+- **Experience:** The user should not need cloud-machine chooser controls or
+  backend startup decisions. The system should handle placement automatically.
+
+This records the intended experience. Recovery depends on durable checkpoints;
+it cannot promise recovery of unsaved state or exact replay of external actions.
+Existing ownership and publication fences must remain intact. Routing/failover
+coverage and selected-project secret isolation are separate implementation gates.
+
 ### Cloud connections — scope and experience
 _Captured 2026-09-28 from the maintainer's instructions in this conversation._
 

@@ -1,5 +1,5 @@
 use super::{
-    config, mirror,
+    authority, config, mirror,
     protocol::{Baton, Configure, MirrorCredentials, Role},
     transport, Ownership, WorkspaceStatus,
 };
@@ -45,6 +45,7 @@ pub(super) async fn account(
     method: &str,
     body: Option<&serde_json::Value>,
 ) -> Result<transport::Response> {
+    authority::account_request(config, path, method, body)?;
     transport::request(
         &config.endpoint,
         path,
@@ -59,6 +60,7 @@ async fn credentials(
     workspace: &str,
     epoch: Option<u64>,
 ) -> Result<MirrorCredentials> {
+    authority::config_workspace(config, workspace)?;
     let mut body = json!({"workspace_id":workspace});
     if let Some(epoch) = epoch {
         body["epoch"] = epoch.into();
@@ -111,11 +113,15 @@ pub(super) fn start(state: Arc<AppState>) {
                 if let Ok(response) =
                     account(&config, "/v1/delegations/renew", "POST", Some(&json!({}))).await
                 {
-                    if let Ok(delegation) = response.json() {
-                        if let Some(runtime) = lock(&state.pro.runtime).as_mut() {
-                            runtime.delegation = delegation;
+                    if let Ok(delegation) = response.json::<super::protocol::Delegation>() {
+                        if authority::install_renewal(
+                            &state,
+                            generation,
+                            &config.delegation,
+                            delegation,
+                        ) {
+                            renewed = super::now();
                         }
-                        renewed = super::now();
                     }
                 }
             }
@@ -201,6 +207,7 @@ async fn reconcile_generation(
     workspace: &str,
     generation: u64,
 ) -> Result<()> {
+    authority::config_matches(state, config, workspace)?;
     ensure!(
         generation == state.pro.generation.load(Ordering::Acquire),
         "Account changed during project transfer"
@@ -398,11 +405,13 @@ pub(super) async fn snapshot(
     workspace: &str,
     clean: bool,
 ) -> Result<()> {
+    authority::config_matches(state, config, workspace)?;
     let generation = state.pro.generation.load(Ordering::Acquire);
     let epoch = super::owned_epoch(state, workspace).context("workspace is not locally owned")?;
     let workspace = lock(&state.workspaces)
         .get(workspace)
         .context("unknown workspace")?;
+    authority::destination(state, config, &workspace.id, Some(&workspace.root)).await?;
     let grant = credentials(config, &workspace.id, Some(epoch)).await?;
     let root = state.pro.root.join(&workspace.id);
     let shadow = root.join("working-tree.git");
@@ -500,6 +509,7 @@ pub(super) async fn fetch_snapshot(
     workspace: &str,
     cache: &Path,
 ) -> Result<Manifest> {
+    authority::config_workspace(config, workspace)?;
     let grant = credentials(config, workspace, None).await?;
     mirror::initialize(cache).await?;
     let url = transport::endpoint(&grant.working_tree_url)?;
@@ -541,6 +551,9 @@ pub(super) async fn hydrate(
     fork: bool,
     destination_root: Option<&Path>,
 ) -> Result<()> {
+    let bound_destination =
+        authority::destination(state, config, workspace, destination_root).await?;
+    let destination_root = bound_destination.as_deref();
     let generation = state.pro.generation.load(Ordering::Acquire);
     let current = || -> Result<()> {
         ensure!(
@@ -671,6 +684,7 @@ pub(super) async fn hydrate(
             .await?;
         }
         current()?;
+        authority::destination(state, config, workspace, Some(&destination_root)).await?;
         super::projects::begin_install(state, workspace, &destination_root).await?;
         current()?;
         let git_branches = super::repository::receive(
@@ -709,6 +723,7 @@ pub(super) async fn hydrate(
             .await?;
         }
         current()?;
+        authority::destination(state, config, workspace, Some(&destination_root)).await?;
         let tree = stage.join("tree");
         let destination = destination_root.clone();
         tokio::task::spawn_blocking(move || {
@@ -940,6 +955,9 @@ pub(super) fn at_pause(state: &AppState, workspace: &str) -> bool {
     })
 }
 pub(super) async fn lazy_handback(state: &Arc<AppState>, config: &Configure) -> Result<()> {
+    if config.delegation.workspace.is_some() {
+        return Ok(());
+    }
     if config.role != Role::Device
         || !state.pro.power_suitable.load(Ordering::Acquire)
         || super::now().saturating_sub(state.pro.awake_since.load(Ordering::Acquire)) < 300
@@ -1188,6 +1206,9 @@ async fn run_profile_steps(
 mod provider_tests;
 
 pub(super) fn eligible(state: &AppState, workspace: &crate::workspaces::Workspace) -> bool {
+    if authority::registered_root(state, &workspace.id, &workspace.root).is_err() {
+        return false;
+    }
     if crate::cloud::is_onboarding_workspace(workspace)
         || lock(&state.pro.legacy_pending).contains(&workspace.id)
         || !super::projects::account_matches(state, &workspace.id)
@@ -1292,6 +1313,7 @@ mod tests {
             keeper_url: String::new(),
             hours_exhausted: false,
             delegation: super::super::protocol::Delegation {
+                workspace: None,
                 access_token: String::new(),
                 expires_at: String::new(),
                 scope: vec![],

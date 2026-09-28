@@ -138,6 +138,10 @@ pub(super) fn bind_workspace_account(
     Ok(())
 }
 async fn discover(state: &Arc<AppState>, config: &Configure) -> Result<Vec<Project>> {
+    anyhow::ensure!(
+        config.delegation.workspace.is_none(),
+        "workspace authority does not permit discovery"
+    );
     let hosts: Vec<Host> = transport::request(
         &config.keeper_url,
         "/v1/hosts",
@@ -403,6 +407,10 @@ pub(super) async fn begin_install(state: &AppState, workspace: &str, root: &Path
 }
 
 async fn open(state: &Arc<AppState>, request: Open) -> Result<serde_json::Value> {
+    anyhow::ensure!(
+        !crate::lock(&state.pro.authority).restricted(),
+        "workspace destination is fixed"
+    );
     ensure!(
         super::valid_id(&request.workspace_id),
         "Invalid project identity"

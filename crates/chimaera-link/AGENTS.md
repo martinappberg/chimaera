@@ -4,7 +4,7 @@
 | --- | --- |
 | [PROTOCOL.md](PROTOCOL.md) | Versioned account/keeper contract; change it with code |
 | [HANDOFF.md](HANDOFF.md) | Additive baton, mirror credential and scoped daemon delegation contracts |
-| `src/handoff.rs` | Typed ownership and credential bodies; secrets redact Debug |
+| `src/handoff.rs` | Typed ownership and credential bodies, immutable workspace binding and bounded exact daemon acknowledgment; secrets redact Debug |
 | `src/fake_handoff.rs` | Bounded baton and credential-fencing fixture |
 | `src/protocol.rs` | Serializable wire types and resource ceilings |
 | `src/client.rs` | Account REST, refresh serialization, events reconnect, loopback tunnels, reverse serve |
@@ -16,6 +16,12 @@
 | `tests/` | Security, lifecycle and real-socket regression coverage |
 
 Invariants:
+
+- Workspace-bound daemon configuration uses a distinct endpoint and exact
+  version/binding/root acknowledgment. Never fall back to legacy configure on
+  failure; an old daemon can silently ignore an additive delegation field.
+  Omitted workspace binding retains legacy account-wide semantics. Consumer
+  acceptance alone does not prove remote authorization or project isolation.
 
 - App-only dependency: the daemon must not depend on this crate. Fixture server
   dependencies are optional and never ship in a release bundle.

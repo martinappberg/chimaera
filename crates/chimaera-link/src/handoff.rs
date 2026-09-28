@@ -65,18 +65,37 @@ impl std::fmt::Debug for MirrorCredentials {
     }
 }
 
+/// An immutable project restriction, not a requested expansion of authority.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceBinding {
+    pub workspace_id: String,
+    pub revision: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceConfigureAck {
+    pub workspace_authority: u16,
+    pub workspace: WorkspaceBinding,
+    pub workspace_root: std::path::PathBuf,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Delegation {
     pub access_token: String,
     pub expires_at: String,
     pub scope: Vec<String>,
     pub device_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<WorkspaceBinding>,
 }
 impl std::fmt::Debug for Delegation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Delegation")
             .field("device_id", &self.device_id)
             .field("scope", &self.scope)
+            .field("workspace", &self.workspace)
             .field("expires_at", &self.expires_at)
             .finish_non_exhaustive()
     }
@@ -97,4 +116,32 @@ pub struct WorkerWake {
     pub worker_id: Option<String>,
     pub state: String,
     pub keeper_url: String,
+}
+
+impl WorkspaceConfigureAck {
+    /// Verify the distinct scoped endpoint's bounded response before allowing
+    /// project work. Callers must not fall back to legacy configure on failure.
+    pub fn decode(
+        status: u16,
+        body: &[u8],
+        expected: &WorkspaceBinding,
+        root: &std::path::Path,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            status == 200 && body.len() <= 16 * 1024,
+            "workspace configuration not acknowledged"
+        );
+        let value: Self = serde_json::from_slice(body)
+            .map_err(|_| anyhow::anyhow!("invalid workspace configuration acknowledgment"))?;
+        anyhow::ensure!(
+            value.confirms(expected, root),
+            "workspace configuration acknowledgment mismatch"
+        );
+        Ok(value)
+    }
+
+    /// An old daemon's 204/missing field never confirms scoped acceptance.
+    pub fn confirms(&self, expected: &WorkspaceBinding, root: &std::path::Path) -> bool {
+        self.workspace_authority == 1 && &self.workspace == expected && self.workspace_root == root
+    }
 }

@@ -7,6 +7,7 @@ revocable delegation over the authenticated local API.
 | File | Responsibility |
 | --- | --- |
 | `mod.rs` | Bounded, credential-free persistent state, ownership/import fences, session pins and deferred-command policy. |
+| `authority.rs` / `authority_tests.rs` | Immutable workspace-bound worker acceptance, credential-free persisted latch, renewal/route/root guards and synthetic side-effect regressions. |
 | `routes.rs` | Authenticated configure/status/privacy/profile/power/hydration HTTP handlers. |
 | `projects.rs` | Passive bounded cloud-project discovery and explicit per-device local adoption; native-picked folder validation, saved directory identity, retry and legacy-import fences. |
 | `projects/tests.rs` | Synthetic loopback HTTP plus real Git transfer, passive-read, conflict, retry, restart and two-device destination checks. |
@@ -122,3 +123,15 @@ ownership changes and cancellation retain the fence. Personal-device and
 ordinary SSH/free workspace behavior is unchanged.
 
 Structured pause checks accept authoritative completed-turn/idle agent state even when a provider emits no textual idle status, but reject queued input, active turns, and background work (explicit permission/action waits remain safe pause points).
+
+The distinct authenticated `POST /api/v1/pro/configure/workspace` accepts only a
+worker delegation bound to one workspace/revision, explicit account identity,
+no keeper URL and exactly baton/mirror scopes. Its versioned nonsecret ack and
+status field must match the supervisor's registered root before enabling work.
+Legacy configure never accepts such a binding. The accepted origin/account/root
+and directory identity survive disconnect/restart; invalid records fail closed.
+Pro operations reject foreign workspace IDs before filesystem/network work and
+hydrate only into the accepted root. Renew cannot drop/change the binding or
+holder or add keeper scope. This does not replace service-side authorization,
+project namespaces, or project-bound routing of generic daemon/MCP APIs. Those
+remain prerequisites to enabling selected-project secrets.

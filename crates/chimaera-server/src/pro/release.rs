@@ -164,6 +164,7 @@ mod tests {
             keeper_url: String::new(),
             hours_exhausted: false,
             delegation: Delegation {
+                workspace: None,
                 access_token: "fixture".into(),
                 expires_at: String::new(),
                 scope: vec![],
@@ -249,6 +250,7 @@ mod tests {
             keeper_url: String::new(),
             hours_exhausted: false,
             delegation: Delegation {
+                workspace: None,
                 access_token: "fixture".into(),
                 expires_at: String::new(),
                 scope: vec![],

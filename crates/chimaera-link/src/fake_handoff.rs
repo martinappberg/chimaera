@@ -338,6 +338,7 @@ async fn mirror_write(State(keeper): State<FakeKeeper>, Json(request): Json<Writ
 
 fn delegated_response(token: String, device: String, seconds: i64) -> Json<Delegation> {
     Json(Delegation {
+        workspace: None,
         access_token: token,
         device_id: device,
         expires_at: timestamp(seconds),

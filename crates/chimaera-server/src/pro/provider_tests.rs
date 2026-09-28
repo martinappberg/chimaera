@@ -208,7 +208,7 @@ fn missing_provider_keeps_staged_files_and_explicit_retry_resumes_real_pty() {
         let origin=format!("http://{}",listener.local_addr().unwrap());
         let app=axum::Router::new().fallback(axum::routing::any(move |uri:axum::http::Uri| {let observed=observed.clone();async move {lock(&observed).push(uri.path().to_owned());axum::Json(json!({"workspace_id":"w-project","holder_id":"worker-fixture","epoch":3,"expires_at":"2099-01-01T00:00:00Z","server_now":"2026-01-01T00:00:00Z","requires_fork":false}))}}));
         let server=tokio::spawn(async move{axum::serve(listener,app).await.unwrap()});
-        *lock(&state.pro.runtime)=Some(Configure{account_id:None,role:Role::Worker,endpoint:origin,keeper_url:String::new(),hours_exhausted:false,delegation:super::super::protocol::Delegation{access_token:"fixture".into(),expires_at:String::new(),scope:vec!["baton".into(),"mirror".into()],device_id:"worker-fixture".into()}});
+        *lock(&state.pro.runtime)=Some(Configure{account_id:None,role:Role::Worker,endpoint:origin,keeper_url:String::new(),hours_exhausted:false,delegation:super::super::protocol::Delegation{workspace:None,access_token:"fixture".into(),expires_at:String::new(),scope:vec!["baton".into(),"mirror".into()],device_id:"worker-fixture".into()}});
         crate::ledger::defer(&state,entry(AgentKind::Claude)).unwrap();
         let source=root.join("project/preserved.txt");std::fs::write(&source,"installed source").unwrap();
         let error=finish_hydration(&state,"w-project",3,0,async{Ok(())}).await.unwrap_err();

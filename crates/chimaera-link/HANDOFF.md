@@ -132,7 +132,7 @@ Renewal never extends the parent device's authorization lifetime. Daemons renew
 hourly with jitter, keep credentials only in memory, and stop authenticated
 background work on definitive 401/403. Network failure preserves local work.
 
-The scoped token can access only baton, mirror and keeper transport operations,
+The operation-scoped, account-wide token can access only baton, mirror and keeper transport operations,
 plus its own renewal. It cannot read `/v1/me`, enumerate or revoke devices, access
 billing, start OAuth or mint another delegation. The keeper introspector accepts
 it as the same account and original device holder, restricted to the keeper
@@ -140,6 +140,98 @@ scope. Parent device revocation and sign-out-everywhere invalidate it and close
 its keeper transport. Servers store only a token hash. The app passes this
 credential only to its authenticated local daemon; it never persists the value
 in configuration, logs, bundles or mirrors.
+
+## Workspace-bound worker delegation
+
+`Delegation` additionally accepts `workspace: {workspace_id, revision}`. Absence
+or `null` retains the existing account-wide semantics. Presence is an immutable
+restriction to one registered workspace and positive registration revision; it
+is never a request to expand authority. This revision identifies supervisor
+registration, independently of the baton epoch. The initial bound contract is
+worker-only with exactly `baton` and `mirror` scopes and no keeper scope.
+
+A service implementing bound grants must authorize the workspace and live
+registration revision before reading or creating a baton, changing policy, or
+issuing mirror credentials. Derived Git grants retain that restriction and lose
+access on project revocation/rebinding, parent revocation or account epoch
+change. Renewal must preserve the exact workspace, revision, holder and scope;
+a missing or different binding is not an acceptable replacement. Bound grants
+cannot enter keeper discovery, inventory, raw TCP, reverse streams, provider
+controls, account/device/billing management, or service-level worker operations.
+The existing account-wide routes and grants retain their current behavior.
+
+### Daemon acceptance
+
+The trusted supervisor uses the authenticated **distinct** local route
+`POST /api/v1/pro/configure/workspace`. Its body is the existing configure body
+(`account_id`, `role`, `endpoint`, `keeper_url`, `delegation`, optional
+`hours_exhausted`) plus `workspace_root`. It requires an explicit account ID,
+`role: "worker"`, an empty keeper URL, a bound delegation with exactly the two
+scopes above, and an existing absolute registered project directory. Initial daemon acceptance
+requires Unix directory identity; unsupported platforms reject this route while
+keeping the legacy device flow unchanged. The daemon
+must be dedicated to that project: no unrelated registered workspace is accepted.
+An unbound daemon already configured for an account must first be replaced with
+a fresh dedicated daemon; reconfiguration cannot downgrade its authority.
+
+A success is HTTP 200 with only:
+
+```json
+{
+  "workspace_authority": 1,
+  "workspace": { "workspace_id": "w-12345678", "revision": 7 },
+  "workspace_root": "/projects/registered-project"
+}
+```
+
+The supervisor must verify the version, exact binding and canonical registered
+root before enabling work. `WorkspaceConfigureAck::decode` verifies a bounded
+response without including its contents in errors. An old daemon's 404, 204,
+SPA HTML fallback, missing acknowledgment, or mismatched acknowledgment fails
+closed. **Never retry through legacy `/api/v1/pro/configure`.** That legacy route
+rejects a bound payload in a supporting daemon; older serde consumers may ignore
+the additive field, which is why a separate endpoint is mandatory. A service's
+scoped mint likewise requires a distinct endpoint and explicit binding response,
+never a body added to a legacy endpoint that may ignore unknown fields.
+
+Acceptance latches account origin, account identity, workspace, revision and root
+directory identity in a small credential-free record. Disconnect and restart
+retain this restriction; malformed records disable scoped work. A different
+binding requires a new trusted daemon registration/state, never deletion of a
+live daemon's record. Delegation credentials remain memory-only. The additive
+`workspace_configuration` field in `GET /api/v1/pro/status` reports the accepted
+acknowledgment, including while disconnected; `configured` separately reports
+whether credentials are currently installed.
+
+Pro operations reject another workspace before filesystem or account access.
+Hydration uses only the accepted directory, never an imported manifest's root or
+an arbitrary caller destination; directory identity is rechecked before install.
+A changed account origin or binding is rejected. Renewal also preserves the
+holder and cannot widen scopes. Explicit trusted reconfiguration may change the
+worker holder for the same registration; the remote service must separately
+validate any such worker migration. Bound workers do not run account-wide
+project discovery or lazy hand-back.
+
+This daemon-owned marker prevents accidental reconfiguration; it is not a trusted
+supervisor registry. A missing marker loads as legacy/unbound. A compromised
+daemon could remove its own state, so the supervisor must independently retain
+its registration and verify the exact scoped acknowledgment at every startup.
+The remote credential restriction remains mandatory even if this marker is lost.
+No missing marker or refused configuration permits a broad credential fallback.
+
+This is a **consumer contract**, not complete project isolation. It does not
+scope every generic session/file/MCP endpoint or protect against a compromised
+daemon with an account-wide network credential. Project namespaces, trusted
+project routing, provider delivery and cryptographically enforced service-side
+workspace authority must all be integrated and verified before selected-project
+secret sharing is enabled. The public fake account still implements legacy
+account-wide delegation only; service-side scoped conformance remains a separate
+implementation gate.
+
+Conformance includes legacy optional-field decoding, exact acknowledgment
+validation, a real loopback old-daemon rejection without fallback, retained
+restrictions after disconnect/restart, renewal downgrade rejection, changed-root
+rejection, and foreign-workspace requests with no file or network side effects.
 
 ## Automatic takeover policy
 
@@ -155,6 +247,36 @@ Policy survives ownership changes. Automatic worker wake considers an expired
 current entitlement and budget. An expired worker lease alone never wakes a
 worker. These flags do not change the lease compare-and-swap rules or permit
 active-owner takeover.
+
+## Required placement and execution-fencing follow-up
+
+The maintainer's requested next placement contract is distinct from the current
+v1 behavior above. V1 deliberately lets a laptop keep running during account
+unreachability until it verifies a newer epoch; its remote write fences do not
+prove that an offline old process has stopped. The workspace credential consumer
+contract does not resolve that execution-partition gap.
+
+Acceptance for the placement follow-up requires:
+
+- A preferred home host, current execution holder and viewer device are separate
+  identities. A phone/browser follows the logical workspace and current session;
+  opening that view cannot choose or wake a different execution host.
+- Available home execution stays at home. Cloud is the synchronized handoff and
+  recovery fallback when home is unavailable; safe return prefers home again.
+- Abrupt loss recovers only the latest durably published project/conversation
+  checkpoint. It cannot recover uncheckpointed bytes or blindly replay external
+  actions that may already have happened.
+- Before cloud takeover, an execution lease or equally strong end-to-end fence
+  must prevent old-home execution from continuing concurrently during a network
+  partition. Account write fencing alone is insufficient for arbitrary external
+  tool side effects. Expiry, resume from sleep and return must preserve the same
+  single-runner guarantee, with deliberate safe handling of uncertain effects.
+- Browser/native routing, current-host changes and recovery are verified together;
+  no cloud-machine chooser is part of the normal continuity flow.
+
+These are required follow-up gates, not claims that v1 or the workspace-bound
+credential addition already implements automatic home-first routing or complete
+execution fencing.
 
 ## Explicit worker wake
 

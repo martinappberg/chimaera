@@ -1,4 +1,5 @@
 //! Optional daemon-owned mirrors and workspace handoff. No credential is durable.
+mod authority;
 mod config;
 mod engine;
 mod mirror;
@@ -30,6 +31,7 @@ pub(crate) struct ProState {
     configured: AtomicBool,
     generation: AtomicU64,
     runtime: Mutex<Option<protocol::Configure>>,
+    authority: Mutex<authority::Authority>,
     ownership: Mutex<HashMap<String, Ownership>>,
     preferences: Mutex<HashMap<String, Preference>>,
     projects_root: Mutex<Option<PathBuf>>,
@@ -152,11 +154,13 @@ impl ProState {
                 ))
             })
             .collect();
+        let authority = authority::Authority::load(&root);
         Self {
             root,
             configured: AtomicBool::new(false),
             generation: AtomicU64::new(0),
             runtime: Mutex::new(None),
+            authority: Mutex::new(authority),
             ownership: Mutex::new(ownership),
             preferences: Mutex::new(disk.preferences.into_iter().take(128).collect()),
             projects_root: Mutex::new(disk.projects_root),
@@ -180,6 +184,15 @@ impl ProState {
 /// Only a verified ownership transition, restart verification, or explicit
 /// clean handoff fences a writer. Connectivity loss never pauses local work.
 pub(crate) fn may_write(state: &crate::AppState, workspace: &str) -> bool {
+    if authority::workspace(state, workspace).is_err()
+        || (crate::lock(&state.pro.authority).restricted()
+            && !state
+                .pro
+                .configured
+                .load(std::sync::atomic::Ordering::Acquire))
+    {
+        return false;
+    }
     if matches!(
         crate::lock(&state.pro.ownership).get(workspace),
         Some(Ownership::SettingUp { .. })
@@ -266,6 +279,7 @@ pub(crate) async fn set_keep_running(
     session_id: &str,
     value: bool,
 ) -> anyhow::Result<()> {
+    authority::session(state, session_id)?;
     anyhow::ensure!(valid_id(session_id), "invalid session identity");
     {
         let mut pins = crate::lock(&state.pro.keep_running);
@@ -285,6 +299,15 @@ pub(crate) async fn set_keep_running(
 }
 
 pub(crate) fn may_import(state: &crate::AppState, workspace: &str, epoch: u64) -> bool {
+    if authority::workspace(state, workspace).is_err()
+        || (crate::lock(&state.pro.authority).restricted()
+            && !state
+                .pro
+                .configured
+                .load(std::sync::atomic::Ordering::Acquire))
+    {
+        return false;
+    }
     match crate::lock(&state.pro.ownership).get(workspace) {
         Some(Ownership::Local { epoch: current } | Ownership::Hydrating { epoch: current }) => {
             *current == epoch
@@ -313,6 +336,7 @@ pub(crate) async fn defer_command(
     let Some(workspace) = crate::lock(&state.session_workspaces).get(session).cloned() else {
         return Ok(false);
     };
+    authority::workspace(state, &workspace)?;
     let should_defer = {
         let mut preferences = crate::lock(&state.pro.preferences);
         let profile = &mut preferences.entry(workspace).or_default().profile;
@@ -382,6 +406,7 @@ pub(crate) fn is_worker(state: &crate::AppState) -> bool {
         .is_some_and(|config| config.role == protocol::Role::Worker)
 }
 pub(crate) fn workspace_profile(state: &crate::AppState, workspace: &str) -> Option<CloudProfile> {
+    authority::workspace(state, workspace).ok()?;
     if !state
         .pro
         .configured
@@ -405,6 +430,7 @@ pub(crate) async fn save_workspace_profile(
     expected: &CloudProfile,
     updated: CloudProfile,
 ) -> anyhow::Result<()> {
+    authority::workspace(state, workspace)?;
     updated.validate()?;
     let _configuration = state.pro.configuration.lock().await;
     anyhow::ensure!(
@@ -481,6 +507,7 @@ mod tests {
             role: protocol::Role::Worker,
             hours_exhausted: false,
             delegation: protocol::Delegation {
+                workspace: None,
                 access_token: "MUST_NEVER_PERSIST".into(),
                 device_id: "worker-test".into(),
                 expires_at: String::new(),

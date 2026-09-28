@@ -1,4 +1,8 @@
-use super::{engine, protocol::Configure, transport, Ownership};
+use super::{
+    authority, engine,
+    protocol::{Configure, WorkspaceConfigure},
+    transport, Ownership,
+};
 use crate::{lock, AppState};
 use axum::{
     extract::{Query, State},
@@ -47,8 +51,29 @@ pub(crate) struct Privacy {
 
 pub(crate) async fn configure(
     State(state): State<Arc<AppState>>,
-    Json(mut config): Json<Configure>,
+    Json(config): Json<Configure>,
 ) -> Response {
+    configure_inner(state, config, None).await
+}
+pub(crate) async fn configure_workspace(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<WorkspaceConfigure>,
+) -> Response {
+    configure_inner(state, request.config, Some(request.workspace_root)).await
+}
+async fn configure_inner(
+    state: Arc<AppState>,
+    mut config: Configure,
+    root: Option<std::path::PathBuf>,
+) -> Response {
+    let _configuration = state.pro.configuration.lock().await;
+    if root.is_none()
+        && (config.delegation.workspace.is_some() || lock(&state.pro.authority).restricted())
+    {
+        return failure(anyhow::anyhow!(
+            "workspace authority requires scoped configuration"
+        ));
+    }
     let validation = (|| -> anyhow::Result<()> {
         anyhow::ensure!(
             config.account_id.as_deref().is_none_or(super::valid_id),
@@ -79,16 +104,35 @@ pub(crate) async fn configure(
     if let Err(error) = validation {
         return failure(error);
     }
+    let accepted = if let Some(root) = root {
+        match authority::prepare(&state, &config, root).await {
+            Ok(value) => Some(value),
+            Err(error) => return failure(error),
+        }
+    } else {
+        None
+    };
     if let Err(error) = super::ensure_root(&state.pro.root).await {
         return failure(error);
     }
-    let _configuration = state.pro.configuration.lock().await;
     stop_tasks(&state).await;
+    *lock(&state.pro.runtime) = None;
+    state.pro.configured.store(false, Ordering::Release);
+    if let Some(value) = &accepted {
+        *lock(&state.pro.authority) = authority::Authority::Invalid;
+        if let Err(error) = authority::save(&state, value).await {
+            return failure(error);
+        }
+        *lock(&state.pro.authority) = authority::Authority::Bound(value.clone());
+    }
     *lock(&state.pro.project_cache) = Default::default();
     *lock(&state.pro.runtime) = Some(config);
     state.pro.configured.store(true, Ordering::Release);
     engine::start(state.clone());
-    StatusCode::NO_CONTENT.into_response()
+    match accepted {
+        Some(value) => Json(value.ack()).into_response(),
+        None => StatusCode::NO_CONTENT.into_response(),
+    }
 }
 async fn stop_tasks(state: &AppState) {
     state.pro.generation.fetch_add(1, Ordering::AcqRel);
@@ -115,19 +159,31 @@ pub(crate) async fn disconnect(State(state): State<Arc<AppState>>) -> Response {
     }
 }
 pub(crate) async fn status(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    let sessions = crate::session_view::sessions_json(&state);
+    let authority = lock(&state.pro.authority).clone();
+    let sessions: Vec<_> = crate::session_view::sessions_json(&state)
+        .into_iter()
+        .filter(|row| {
+            !authority.restricted()
+                || row["workspace_id"]
+                    .as_str()
+                    .is_some_and(|id| authority.allows(id))
+        })
+        .collect();
     let workspaces = lock(&state.workspaces).list();
     let preferences = lock(&state.pro.preferences).clone();
     let ownership = lock(&state.pro.ownership).clone();
     let statuses = lock(&state.pro.status).clone();
     Json(
-        json!({"configured":state.pro.configured.load(Ordering::Acquire),"projects_root":super::projects_root(&state),"projects_root_confirmed":lock(&state.pro.projects_root).is_some(),"sessions":sessions,"workspaces":workspaces.into_iter().take(128).map(|workspace|json!({"workspace_id":workspace.id,"name":workspace.name,"root":workspace.root,"never_mirror":preferences.get(&workspace.id).is_some_and(|p|p.never_mirror),"privacy_pending":preferences.get(&workspace.id).is_some_and(|p|p.privacy_pending),"ownership":ownership.get(&workspace.id),"mirror":statuses.get(&workspace.id),"blocked_providers":statuses.get(&workspace.id).map(|status|status.blocked_providers.clone()).unwrap_or_default(),"git_branches":preferences.get(&workspace.id).map(|p|&p.git_branches),"profile":preferences.get(&workspace.id).map(|p|&p.profile)})).collect::<Vec<_>>()}),
+        json!({"configured":state.pro.configured.load(Ordering::Acquire),"workspace_configuration":authority.acknowledgment(),"projects_root":super::projects_root(&state),"projects_root_confirmed":lock(&state.pro.projects_root).is_some(),"sessions":sessions,"workspaces":workspaces.into_iter().filter(|workspace| authority.allows(&workspace.id)).take(128).map(|workspace|json!({"workspace_id":workspace.id,"name":workspace.name,"root":workspace.root,"never_mirror":preferences.get(&workspace.id).is_some_and(|p|p.never_mirror),"privacy_pending":preferences.get(&workspace.id).is_some_and(|p|p.privacy_pending),"ownership":ownership.get(&workspace.id),"mirror":statuses.get(&workspace.id),"blocked_providers":statuses.get(&workspace.id).map(|status|status.blocked_providers.clone()).unwrap_or_default(),"git_branches":preferences.get(&workspace.id).map(|p|&p.git_branches),"profile":preferences.get(&workspace.id).map(|p|&p.profile)})).collect::<Vec<_>>()}),
     )
 }
 pub(crate) async fn privacy(
     State(state): State<Arc<AppState>>,
     Json(request): Json<Privacy>,
 ) -> Response {
+    if let Err(error) = authority::workspace(&state, &request.workspace_id) {
+        return failure(error);
+    }
     if !super::valid_id(&request.workspace_id)
         || lock(&state.workspaces).get(&request.workspace_id).is_none()
     {
@@ -164,6 +220,9 @@ pub(crate) async fn profile(
     State(state): State<Arc<AppState>>,
     Query(query): Query<WorkspaceQuery>,
 ) -> Response {
+    if let Err(error) = authority::workspace(&state, &query.workspace_id) {
+        return failure(error);
+    }
     if lock(&state.workspaces).get(&query.workspace_id).is_none() {
         return StatusCode::NOT_FOUND.into_response();
     }
@@ -180,6 +239,9 @@ pub(crate) async fn put_profile(
     Query(query): Query<WorkspaceQuery>,
     Json(profile): Json<super::policy::CloudProfile>,
 ) -> Response {
+    if let Err(error) = authority::workspace(&state, &query.workspace_id) {
+        return failure(error);
+    }
     let _configuration = state.pro.configuration.lock().await;
     let Ok(_job) = state.pro.jobs.try_lock() else {
         return (
@@ -188,6 +250,9 @@ pub(crate) async fn put_profile(
         )
             .into_response();
     };
+    if let Err(error) = authority::workspace(&state, &query.workspace_id) {
+        return failure(error);
+    }
     if lock(&state.workspaces).get(&query.workspace_id).is_none() {
         return StatusCode::NOT_FOUND.into_response();
     }
@@ -213,7 +278,11 @@ pub(crate) async fn sleep(State(state): State<Arc<AppState>>) -> Response {
     let _guard = state.pro.jobs.lock().await;
     let workspaces = lock(&state.workspaces).list();
     let mut failed = Vec::new();
-    for workspace in workspaces.into_iter().take(128) {
+    for workspace in workspaces
+        .into_iter()
+        .filter(|workspace| lock(&state.pro.authority).allows(&workspace.id))
+        .take(128)
+    {
         if lock(&state.pro.preferences)
             .get(&workspace.id)
             .is_some_and(|p| p.never_mirror)
@@ -231,7 +300,8 @@ pub(crate) async fn wake(State(state): State<Arc<AppState>>) -> Response {
     state.pro.awake_since.store(super::now(), Ordering::Release);
     {
         let mut ownership = lock(&state.pro.ownership);
-        for owner in ownership.values_mut() {
+        let authority = lock(&state.pro.authority).clone();
+        for (_, owner) in ownership.iter_mut().filter(|(id, _)| authority.allows(id)) {
             if let Ownership::Transferring { epoch } = owner {
                 *owner = Ownership::AwaitingVerification { epoch: *epoch };
             }
@@ -244,8 +314,11 @@ pub(crate) async fn wake(State(state): State<Arc<AppState>>) -> Response {
 }
 pub(crate) async fn hydrate(
     State(state): State<Arc<AppState>>,
-    Json(request): Json<Hydrate>,
+    Json(mut request): Json<Hydrate>,
 ) -> Response {
+    if let Err(error) = authority::workspace(&state, &request.workspace_id) {
+        return failure(error);
+    }
     if !super::valid_id(&request.workspace_id) {
         return StatusCode::BAD_REQUEST.into_response();
     }
@@ -256,6 +329,17 @@ pub(crate) async fn hydrate(
             return StatusCode::PRECONDITION_FAILED.into_response();
         };
         (config, state.pro.generation.load(Ordering::Acquire))
+    };
+    request.destination_root = match authority::destination(
+        &state,
+        &config,
+        &request.workspace_id,
+        request.destination_root.as_deref(),
+    )
+    .await
+    {
+        Ok(root) => root,
+        Err(error) => return failure(error),
     };
     if lock(&state.workspaces).get(&request.workspace_id).is_some()
         && matches!(lock(&state.pro.ownership).get(&request.workspace_id),Some(Ownership::SettingUp{epoch}) if *epoch==request.expected_epoch)
@@ -351,6 +435,17 @@ pub(crate) struct Pin {
     keep_running: bool,
 }
 pub(crate) async fn pin(State(state): State<Arc<AppState>>, Json(request): Json<Pin>) -> Response {
+    if lock(&state.pro.authority).restricted() {
+        let workspace = lock(&state.session_workspaces)
+            .get(&request.session_id)
+            .cloned();
+        if workspace
+            .as_ref()
+            .is_none_or(|workspace| authority::workspace(&state, workspace).is_err())
+        {
+            return failure(anyhow::anyhow!("workspace authority denied"));
+        }
+    }
     if state.sessions.get(&request.session_id).is_none()
         && state.chat.get(&request.session_id).is_none()
         && !lock(&state.deferred_sessions).contains_key(&request.session_id)
@@ -390,6 +485,9 @@ pub(crate) async fn handoff(
     State(state): State<Arc<AppState>>,
     Json(request): Json<Handoff>,
 ) -> Response {
+    if let Err(error) = authority::workspace(&state, &request.workspace_id) {
+        return failure(error);
+    }
     let Some(config) = lock(&state.pro.runtime).clone() else {
         return StatusCode::PRECONDITION_FAILED.into_response();
     };
@@ -423,6 +521,9 @@ pub(crate) async fn projects(
     State(state): State<Arc<AppState>>,
     Json(request): Json<Projects>,
 ) -> Response {
+    if lock(&state.pro.authority).restricted() {
+        return failure(anyhow::anyhow!("workspace destination is fixed"));
+    }
     if !request.root.is_absolute()
         || request
             .root

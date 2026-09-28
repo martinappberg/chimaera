@@ -25,6 +25,10 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
             "/pro/configure",
             post(crate::pro::configure).delete(crate::pro::disconnect),
         )
+        .route(
+            "/pro/configure/workspace",
+            post(crate::pro::configure_workspace),
+        )
         .route("/pro/status", get(crate::pro::status))
         .route("/pro/keep-running", put(crate::pro::pin))
         .route("/pro/privacy", put(crate::pro::privacy))

@@ -151,6 +151,7 @@ fn configure(state: &AppState, origin: &str) {
         keeper_url: origin.into(),
         hours_exhausted: false,
         delegation: super::super::protocol::Delegation {
+            workspace: None,
             access_token: "synthetic".into(),
             expires_at: "2099-01-01T00:00:00Z".into(),
             scope: vec!["baton".into(), "mirror".into()],
@@ -467,5 +468,67 @@ async fn original_laptop_root_is_bound_to_its_account_before_automatic_return() 
         "local work"
     );
     drop(state);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn scoped_worker_hydrates_real_git_only_into_registered_root() {
+    let root = temp();
+    let fixture_root = root.clone();
+    let head = tokio::task::spawn_blocking(move || repositories(&fixture_root))
+        .await
+        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let fixture = Arc::new(Fixture {
+        root: root.clone(),
+        origin: origin.clone(),
+        requests: Mutex::new(Vec::new()),
+        handoffs: AtomicUsize::new(0),
+        acquires: AtomicUsize::new(0),
+        holder: Mutex::new(None),
+        invalidate_on_repository_fetch: Mutex::new(None),
+    });
+    let router = Router::new()
+        .fallback(any(respond))
+        .with_state(fixture.clone());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    let worker = state(&root.join("scoped-daemon"));
+    worker.stopping.store(true, Ordering::Release);
+    let registered = root.join("registered-project");
+    std::fs::create_dir(&registered).unwrap();
+    let body = json!({"account_id":"account-fixture","role":"worker","endpoint":origin,"keeper_url":"","workspace_root":registered,
+        "delegation":{"access_token":"synthetic","expires_at":"2099-01-01T00:00:00Z","scope":["baton","mirror"],"device_id":"device-1","workspace":{"workspace_id":"w-cloud","revision":2}}});
+    let configured = super::super::routes::configure_workspace(
+        State(worker.clone()),
+        Json(serde_json::from_value(body).unwrap()),
+    )
+    .await;
+    assert_eq!(configured.status(), StatusCode::OK);
+    let config = lock(&worker.pro.runtime).clone().unwrap();
+    engine::hydrate(&worker, &config, "w-cloud", 3, false, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        lock(&worker.workspaces).get("w-cloud").unwrap().root,
+        registered
+    );
+    assert_eq!(
+        std::fs::read_to_string(registered.join("project.txt")).unwrap(),
+        "cloud source\n"
+    );
+    assert_eq!(git(&registered, &["rev-parse", "HEAD"]), head);
+    assert_eq!(fixture.handoffs.load(Ordering::Relaxed), 0);
+    assert!(lock(&fixture.requests)
+        .iter()
+        .all(|path| !path.contains("/v1/hosts")));
+    assert!(super::super::may_write(&worker, "w-cloud"));
+    assert!(!super::super::may_write(&worker, "w-other"));
+    server.abort();
+    let _ = server.await;
+    drop(worker);
     std::fs::remove_dir_all(root).unwrap();
 }
