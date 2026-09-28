@@ -150,9 +150,12 @@ installation or hook trust and on reconnect; it carries no plugin payload.
     <agent>` terminal (ids and marketplace sources charset-gated, never flag-shaped); 409 when
     the agent binary is missing. `plugins/install-agent.sh` receives metadata as arguments,
     never shell source. It inherits the host + workspace **Settings → Environment** commands
-    so module loads and PATH setup apply. A failed Claude marketplace fetch explains missing
-    Git or lack of `--shallow-submodules` support; an existing cached marketplace can still
-    install. Codex's fetcher is independent of this Git requirement.
+    so module loads and PATH setup apply, and the git **Settings → Git binary path** names
+    goes first on its PATH when it is new enough (≥ 2.15) — a login node's stock
+    `/usr/bin/git` 1.8.3 can't do Claude's marketplace clone. A failed
+    Claude marketplace fetch explains missing Git or lack of `--shallow-submodules` support;
+    an existing cached marketplace can still install. Codex's fetcher is independent of this
+    Git requirement.
     Success and failure output stay visible until **Enter** closes the
     terminal; the original exit status is preserved. The probe cache is invalidated when the
     command finishes, even while its result remains open, and visible Extensions tabs
@@ -227,7 +230,8 @@ installation or hook trust and on reconnect; it carries no plugin payload.
     `emit` (one JSON object ≤ 16 KiB); `now-ms`; `log` (≤ 64 lines a call). The host serves the
     workspace and session of the call in flight, never the context a guest passes back.
   - **What a plugin hands back is capped too** — a tool result at 256 KiB, the instruction
-    paragraph at 8 KiB, a hook line at 1 KiB — and a component whose `tools()` names differ
+    paragraph at 8 KiB, a hook line at 1 KiB, a tool description at 2 KiB; a tool input
+    schema must be a JSON object schema (≤ 16 KiB) — and a component whose `tools()` names differ
     from its manifest's `provides.mcp_tools` is refused everywhere (the card's Adds line and the
     call gate come from the manifest). Tool names are unique within a manifest, 1–64 ASCII
     letters, digits, underscores, dots or dashes; built-in tool names are reserved. If active

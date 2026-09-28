@@ -32,7 +32,7 @@
   const statusWord = $derived(finding.status === "unknown" ? "unrated" : finding.status);
 </script>
 
-<div class="finding" id="finding-{finding.id}">
+<div class="finding" id="finding-{finding.key}">
   <button class="row" aria-expanded={open} onclick={onToggle}>
     <span class="id">{finding.id}</span>
     <span class="body">

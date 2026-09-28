@@ -174,8 +174,12 @@ export function requirementsModel(input: RequirementsInput): RequirementsModel {
       ...entry.plugins.filter((p) => p.id !== base && baseId(p.id) === base).map((p) => p.id),
     ]);
     const unambiguous = candidateIds.size === 1;
-    const baseReport = entry.plugins.find((p) => p.id === base);
-    const exact = r.id !== base ? entry.plugins.find((p) => p.id === r.id) : undefined;
+    // One row per installation (user and project scope can both hold it):
+    // an enabled copy answers for the plugin.
+    const report = (id: string) =>
+      entry.plugins.find((p) => p.id === id && p.enabled) ?? entry.plugins.find((p) => p.id === id);
+    const baseReport = report(base);
+    const exact = r.id !== base ? report(r.id) : undefined;
     const got = exact ?? (unambiguous ? baseReport : undefined);
     const out = blankRow(kind, r);
     if (got === undefined && baseReport !== undefined) {
