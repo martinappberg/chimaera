@@ -52,7 +52,7 @@ pub(crate) struct ProState {
     awake_since: AtomicU64,
     power_suitable: AtomicBool,
 }
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 enum Ownership {
     PrivacyDisabled { epoch: u64 },

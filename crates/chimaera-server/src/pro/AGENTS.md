@@ -126,6 +126,10 @@ release; ambiguous responses are resolved by reading ownership, without repeatin
 that epoch's request. Handoff responses have a 90-second transport budget within
 a 105-second preparation deadline. Generic ownership polling leaves a previously
 remote, now-unowned project fenced until hydration installs its current history.
+Worker polling also fences unowned projects whose intervening device tenure was
+missed during sleep. A durable worker restart shortcut requires a freshly renewed
+matching owner and epoch; a busy-job no-op or changed owner cannot skip import.
+Negotiated checkpoint execution retains its separate canonical hydration path.
 Existing laptop projects retain their original roots. Worker hand-back and explicit
 adoption compare the raw account holder against the typed keeper worker identity
 (`worker-{holder}`), while requests retain the complete route ID. A real-Git
