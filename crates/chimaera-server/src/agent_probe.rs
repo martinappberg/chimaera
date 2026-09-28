@@ -238,15 +238,33 @@ async fn run_bounded(
     Ok(String::from_utf8_lossy(&out).into_owned())
 }
 
+/// Kills a batch's whole process group when dropped: the shell AND the
+/// call it has in flight, which `kill_on_drop` (the shell alone) misses — a
+/// `claude` hung on a stalled NFS read would outlive the probe on a shared
+/// login node. Dropped before the shell is reaped, so the group id can't
+/// have been reused.
+struct GroupKill(Option<nix::unistd::Pid>);
+
+impl Drop for GroupKill {
+    fn drop(&mut self) {
+        if let Some(group) = self.0 {
+            let _ = nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL);
+        }
+    }
+}
+
 /// Run a batch under one overall deadline and return the stdout that
 /// arrived before it (or before the cap) — partial by design: the caller
-/// trusts only sections whose end marker made it in. The shell is killed
-/// once reading stops (it would block on a full pipe past the cap); a call
-/// it had in flight loses its stdout and dies on its next write.
+/// trusts only sections whose end marker made it in. Once reading stops
+/// (the shell would block on a full pipe past the cap), or if the probe is
+/// abandoned, the batch's process group is killed.
 async fn run_until(argv: &[String], prelude: Option<&Path>, limit: Duration) -> String {
     let mut cmd = base_command(argv, None, prelude);
     // Each call's failure is in its end marker's status; nothing reads stderr.
     cmd.stderr(Stdio::null());
+    // Its own group: the login shell execs into the batch shell, whose
+    // children are the calls (see `GroupKill`).
+    cmd.process_group(0);
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(err) => {
@@ -254,6 +272,8 @@ async fn run_until(argv: &[String], prelude: Option<&Path>, limit: Duration) -> 
             return String::new();
         }
     };
+    // Declared after `child`, so on an abandoned probe it drops first.
+    let group = GroupKill(child.id().map(|pid| nix::unistd::Pid::from_raw(pid as i32)));
     let Some(mut stdout) = child.stdout.take() else {
         return String::new();
     };
@@ -271,6 +291,7 @@ async fn run_until(argv: &[String], prelude: Option<&Path>, limit: Duration) -> 
             _ => break,
         }
     }
+    drop(group);
     let _ = child.start_kill();
     let _ = child.wait().await;
     String::from_utf8_lossy(&out).into_owned()
@@ -1248,9 +1269,11 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let bin = dir.join("claude");
+        // The slow call leaves its pid behind: the deadline must take it too.
         std::fs::write(
             &bin,
-            "#!/bin/bash\ncase \"$3\" in slow) sleep 3;; esac\necho \"Skills (7)\"\n",
+            "#!/bin/bash\ncase \"$3\" in slow) echo $$ > \"${0%/*}/slow.pid\"; sleep 30;; esac\n\
+             echo \"Skills (7)\"\n",
         )
         .unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -1279,6 +1302,16 @@ mod tests {
             Some((Some(7), None, None))
         );
         assert_eq!(sections[1], None);
+        let slow: i32 = std::fs::read_to_string(dir.join("slow.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let gone = (0..50).any(|_| {
+            std::thread::sleep(Duration::from_millis(20));
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(slow), None).is_err()
+        });
+        assert!(gone, "the call in flight at the deadline was killed too");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
