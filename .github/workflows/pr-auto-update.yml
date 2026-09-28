@@ -1,0 +1,59 @@
+name: pr-auto-update
+
+# Keeps pull requests with auto-merge moving: `main` requires branches to be
+# up to date before merging, and GitHub's auto-merge never updates a branch,
+# so each merge used to leave the others waiting for someone to merge main
+# into them. After every push to main, when auto-merge is switched on, and
+# every 20 minutes as a backstop, the oldest pull request in line that fell
+# behind main is brought up to date (GitHub's update-branch — a merge, never
+# a rebase); its checks rerun and auto-merge lands it. One at a time, so a
+# merge doesn't set off a CI run per waiting branch. The rules and their
+# tests: .github/scripts/pr-auto-update.mjs.
+#
+# The update uses the PLUGIN_LOCK_TOKEN secret, not GITHUB_TOKEN: a commit
+# GITHUB_TOKEN pushes starts no workflow, so ci.yml and the cla status would
+# never report on it and auto-merge would never fire. Reads use the
+# workflow's own token. Without the secret the pick is only reported (a
+# warning). Setup: plugins/AGENTS.md.
+#
+# pull_request_target runs main's copy of this workflow and script (the
+# checkout below is the base branch, never the pull request's code) — it is
+# here only so switching auto-merge on is answered at once.
+on:
+  push:
+    branches: [main]
+  pull_request_target:
+    types: [auto_merge_enabled]
+  schedule:
+    - cron: "*/20 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+  checks: read
+  statuses: read
+
+# One pick at a time: a queued run sees the update the running one made.
+concurrency:
+  group: pr-auto-update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+      - name: bring the next pull request in line up to date
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPDATE_TOKEN: ${{ secrets.PLUGIN_LOCK_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: node .github/scripts/pr-auto-update.mjs

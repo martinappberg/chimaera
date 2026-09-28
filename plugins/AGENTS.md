@@ -92,7 +92,10 @@ version again replaces it in place).
    `martinappberg/chimaera`, permissions **Contents: Read and write** and
    **Pull requests: Read and write**, saved as the repository secret
    `PLUGIN_LOCK_TOKEN`. Without it a run only reports the bump it would make
-   (a warning). Replace it before it expires.
+   (a warning). Replace it before it expires. The same secret lets
+   `.github/workflows/pr-auto-update.yml` bring pull requests with
+   auto-merge up to date with `main` (update-branch needs the same two
+   permissions).
 
 ## Rules
 
