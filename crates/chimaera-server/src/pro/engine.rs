@@ -199,14 +199,16 @@ pub(super) async fn reconcile(
     workspace: &str,
 ) -> Result<()> {
     let generation = state.pro.generation.load(Ordering::Acquire);
-    reconcile_generation(state, config, workspace, generation).await
+    reconcile_generation(state, config, workspace, generation)
+        .await
+        .map(|_| ())
 }
 async fn reconcile_generation(
     state: &Arc<AppState>,
     config: &Configure,
     workspace: &str,
     generation: u64,
-) -> Result<()> {
+) -> Result<Option<u64>> {
     ensure!(
         generation == state.pro.generation.load(Ordering::Acquire),
         "Account changed during project transfer"
@@ -259,7 +261,52 @@ async fn reconcile_generation(
         if matches!(previous, Some(Ownership::Local { .. })) {
             suspend_workspace(state, workspace).await?;
         }
-        return Ok(());
+        return Ok(None);
+    }
+    // A worker may sleep through an entire device tenure. Its cached local
+    // state is then stale even if it never observed a remote owner. Only the
+    // serialized hydration path may acquire an unowned project and resume it.
+    if config.role == Role::Worker && baton.holder_id.is_none() {
+        // Snapshot recovery can call reconciliation while already holding jobs.
+        // Leave that operation alone; the next poll or hydrate owns the retry.
+        let Ok(_job) = state.pro.jobs.try_lock() else {
+            return Ok(None);
+        };
+        let fenced = {
+            let _configuration = state.pro.configuration.lock().await;
+            ensure!(
+                generation == state.pro.generation.load(Ordering::Acquire),
+                "Account changed during project transfer"
+            );
+            let mut ownership = lock(&state.pro.ownership);
+            if ownership.get(workspace) == previous.as_ref()
+                && !matches!(
+                    previous,
+                    Some(
+                        Ownership::Transferring { .. }
+                            | Ownership::Hydrating { .. }
+                            | Ownership::SettingUp { .. }
+                    )
+                )
+            {
+                ownership.insert(
+                    workspace.into(),
+                    Ownership::Hydrating { epoch: baton.epoch },
+                );
+                true
+            } else {
+                false
+            }
+        };
+        if fenced {
+            super::persist(state).await?;
+            ensure!(
+                generation == state.pro.generation.load(Ordering::Acquire),
+                "Account changed during project transfer"
+            );
+            suspend_workspace(state, workspace).await?;
+        }
+        return Ok(None);
     }
     // A remote release means its saved work must be hydrated first. The lease
     // loop must not race hand-back and resume this machine's older journal.
@@ -267,7 +314,7 @@ async fn reconcile_generation(
         && baton.holder_id.is_none()
         && matches!(previous, Some(Ownership::Remote { .. }))
     {
-        return Ok(());
+        return Ok(None);
     }
     let owned = baton.holder_id.as_deref() == Some(holder);
     let transferring = matches!(
@@ -279,7 +326,7 @@ async fn reconcile_generation(
         )
     );
     if transferring && !owned {
-        return Ok(());
+        return Ok(None);
     }
 
     let operation = if owned
@@ -322,7 +369,7 @@ async fn reconcile_generation(
                 "Project ownership changed; retry the handoff"
             );
         }
-        return Ok(());
+        return Ok(Some(grant.epoch));
     }
     if config.role == Role::Worker
         && (!matches!(previous, Some(Ownership::Local { .. }))
@@ -336,7 +383,8 @@ async fn reconcile_generation(
             workspace.into(),
             Ownership::SettingUp { epoch: grant.epoch },
         );
-        return finish_hydration(state, workspace, grant.epoch, generation, async { Ok(()) }).await;
+        finish_hydration(state, workspace, grant.epoch, generation, async { Ok(()) }).await?;
+        return Ok(Some(grant.epoch));
     }
     if baton.mirror_disabled
         && !matches!(
@@ -357,7 +405,7 @@ async fn reconcile_generation(
     if !matches!(previous, Some(Ownership::Local { .. })) {
         crate::ledger::resume_deferred_workspace(state, workspace).await?;
     }
-    Ok(())
+    Ok(Some(grant.epoch))
 }
 async fn suspend_workspace(state: &Arc<AppState>, workspace: &str) -> Result<()> {
     for id in sessions(state, workspace) {
@@ -622,7 +670,21 @@ pub(super) async fn hydrate(
         && config.role == Role::Worker
         && matches!(lock(&state.pro.ownership).get(workspace),Some(Ownership::Local{epoch}|Ownership::AwaitingVerification{epoch}) if *epoch==expected_epoch)
     {
-        return reconcile(state, config, workspace).await;
+        let baton: Baton = account(config, &format!("/v1/baton/{workspace}"), "GET", None)
+            .await?
+            .json()?;
+        ensure!(baton.workspace_id == workspace, "baton workspace mismatch");
+        current()?;
+        if baton.holder_id.as_deref() == Some(&config.delegation.device_id)
+            && baton.epoch == expected_epoch
+        {
+            let verified = reconcile_generation(state, config, workspace, generation).await?;
+            if verified == Some(expected_epoch)
+                && super::owned_epoch(state, workspace) == Some(expected_epoch)
+            {
+                return Ok(());
+            }
+        }
     }
     let cache = state.pro.root.join(workspace).join("incoming.git");
     let manifest = fetch_snapshot(config, workspace, &cache).await?;

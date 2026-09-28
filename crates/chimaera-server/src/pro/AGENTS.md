@@ -99,7 +99,7 @@ release; ambiguous responses are resolved by reading ownership, without repeatin
 that epoch's request. Handoff responses have a 90-second transport budget within
 a 105-second preparation deadline. Generic ownership polling leaves a previously
 remote, now-unowned project fenced until hydration installs its current history.
-Existing laptop projects retain their original roots. Worker hand-back and explicit
+Worker polling also leaves every unowned project fenced for serialized hydration, even when its cached local state missed an intervening device tenure. Hydration refreshes all outgoing shadow branches from the accepted incoming snapshot before resuming; an ordinary atomic push must extend the newly imported configuration and conversation history. The durable worker restart shortcut requires the service still name that worker at the same epoch. Existing laptop projects retain their original roots. Worker hand-back and explicit
 adoption compare the raw account holder against the typed keeper worker identity
 (`worker-{holder}`), while requests retain the complete route ID. A real-Git
 regression returns a completed synthetic conversation through that route, retaining
