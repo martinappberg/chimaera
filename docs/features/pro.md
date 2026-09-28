@@ -87,7 +87,10 @@ A developer can configure `pro.endpoint` in the native app's `app.json` as
 `{"pro":{"endpoint":"http://127.0.0.1:PORT"}}`. The file is under
 `chimaera_core::config_dir()` (`$CHIMAERA_HOME/config` in an isolated development
 run). It is separate from the daemon's settings JSON and takes effect when the app
-starts. Tokens never belong in this file. Use the
+starts. Isolated previews keep separate credentials per configuration directory.
+Upgrading an older preview requires one fresh sign-in; its old shared credential
+entry is left untouched. The regular app keeps its existing account session.
+Tokens never belong in this file. Use the
 [loopback fixture](../../crates/chimaera-link/PROTOCOL.md#fixture-and-conformance)
 for a local integration run.
 

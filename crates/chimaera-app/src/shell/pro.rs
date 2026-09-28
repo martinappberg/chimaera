@@ -22,6 +22,7 @@ pub(super) mod billing;
 mod credentials;
 pub(super) mod projects;
 mod recovery;
+mod store;
 
 pub(super) struct Pro {
     endpoint: Option<String>,
@@ -225,12 +226,15 @@ fn read_endpoint() -> Option<String> {
 }
 
 fn credential(endpoint: &str) -> Result<keyring::Entry> {
-    let service = if chimaera_core::is_dev_build() {
-        "chimaera.dev.pro"
-    } else {
-        "chimaera.pro"
-    };
-    Ok(keyring::Entry::new(service, endpoint)?)
+    let development = chimaera_core::is_dev_build();
+    let isolated =
+        development || std::env::var_os("CHIMAERA_HOME").is_some_and(|value| !value.is_empty());
+    let config = isolated
+        .then(|| chimaera_core::config_dir().canonicalize())
+        .transpose()
+        .context("could not resolve account credential scope")?;
+    let (service, account) = store::session_key(endpoint, development, config.as_deref())?;
+    Ok(keyring::Entry::new(service, &account)?)
 }
 
 fn load_tokens(endpoint: &str) -> Result<Option<Tokens>> {
