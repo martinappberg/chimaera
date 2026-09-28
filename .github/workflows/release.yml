@@ -147,6 +147,16 @@ jobs:
           sed -i "" "s/\"version\": \"0.0.1\"/\"version\": \"${{ needs.version.outputs.version }}\"/" crates/chimaera-app/tauri.conf.json
           sed -i "" "s/^version = \"0.0.1\"/version = \"${{ needs.version.outputs.version }}\"/" crates/chimaera-app/Cargo.toml
           sed -i "" "s/^version = \"0.0.1\"/version = \"${{ needs.version.outputs.version }}\"/" Cargo.toml
+      # Test plugin execution under the actual macOS signing policy BEFORE
+      # tauri-action publishes anything. Its build reuses this compiled binary
+      # and adds the DMG/updater artifacts with the same entitlement config.
+      - name: Build signed macOS app for plugin smoke
+        run: npx tauri build --bundles app --config '{"bundle":{"createUpdaterArtifacts":false}}'
+        working-directory: crates/chimaera-app
+      - name: Exercise plugins before publishing
+        run: |
+          bash scripts/build-plugins.sh
+          node scripts/smoke-macos-plugins.mjs
       - uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
