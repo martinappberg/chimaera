@@ -17,8 +17,26 @@ impl ExecutionCapability {
             expired_takeover: false,
         }
     }
+    /// Automatic recovery owns canonical checkpoints, not arbitrary physical
+    /// process side effects on a disconnected host.
+    pub fn checkpoint_fork() -> Self {
+        Self {
+            version: 2,
+            boundary: "canonical_checkpoint".into(),
+            expired_takeover: true,
+        }
+    }
     pub fn supported(&self) -> bool {
-        self == &Self::managed()
+        self == &Self::managed() || self == &Self::checkpoint_fork()
+    }
+    pub fn policy_mode(&self) -> Option<&'static str> {
+        if self == &Self::managed() {
+            Some("managed_v1")
+        } else if self == &Self::checkpoint_fork() {
+            Some("checkpoint_fork_v1")
+        } else {
+            None
+        }
     }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
