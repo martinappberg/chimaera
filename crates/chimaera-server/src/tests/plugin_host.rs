@@ -425,6 +425,83 @@ async fn a_component_whose_tools_differ_from_its_manifest_is_refused() {
     state.sessions.kill(&sid).ok();
 }
 
+/// A component the host can't run (it doesn't compile, or its imports
+/// don't link) is the plugin's fault on the card — not "active" with its
+/// tools silently gone — and switching it off and on (the user's retry)
+/// has it compiled again.
+#[tokio::test]
+async fn a_build_the_host_cannot_run_is_its_fault_until_the_user_retries() {
+    let manifest = "id = \"test-broken\"\nname = \"Broken\"\nversion = \"0.1.0\"\nsummary = \"x\"\napi = \"0.1\"\n\
+                    [provides]\nmcp_tools = [\"broken_tool\"]\n[adds]\nagents = [\"x\"]\n";
+    // The magic and a component version, then nothing a decoder accepts.
+    let mut wasm = b"\0asm\x0d\0\x01\0".to_vec();
+    wasm.extend_from_slice(&[0xff; 64]);
+    crate::plugins::test_catalog::add(manifest, wasm);
+    let state = test_state();
+    let ws = make_workspace(&state, "host-broken").await;
+    let sid = inject_agent(&state, "k11");
+    lock(&state.session_workspaces).insert(sid.clone(), ws.clone());
+    let switch = |on: bool| {
+        let state = state.clone();
+        let ws = ws.clone();
+        async move {
+            let (status, out) = request(
+                &state,
+                Method::PUT,
+                &format!("/api/v1/workspaces/{ws}/plugins/test-broken"),
+                Some(serde_json::json!({"on": on})),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{out}");
+        }
+    };
+    let card = || {
+        let state = state.clone();
+        let ws = ws.clone();
+        async move {
+            let (_, out) = request(
+                &state,
+                Method::GET,
+                &format!("/api/v1/workspaces/{ws}/plugins"),
+                None,
+            )
+            .await;
+            out["plugins"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| p["id"] == "test-broken")
+                .unwrap()
+                .clone()
+        }
+    };
+    switch(true).await;
+    let (is_err, text) =
+        mcp_tool_call(&state, &sid, "k11", "broken_tool", serde_json::json!({})).await;
+    assert!(
+        is_err && text.contains("not a component this host can run"),
+        "{text}"
+    );
+    let faulted = card().await;
+    assert!(
+        faulted["fault"]
+            .as_str()
+            .is_some_and(|f| f.contains("not a component this host can run")),
+        "{faulted}"
+    );
+
+    // The retry forgets it: no fault until the build is tried again.
+    switch(false).await;
+    switch(true).await;
+    assert!(card().await.get("fault").is_none());
+    mcp_tool_call(&state, &sid, "k11", "broken_tool", serde_json::json!({})).await;
+    assert!(
+        card().await["fault"].is_string(),
+        "compiled again, refused again"
+    );
+    state.sessions.kill(&sid).ok();
+}
+
 #[tokio::test]
 async fn an_emitted_event_is_a_plugin_frame_for_the_ui() {
     let (state, ws, sid) = fixture_workspace("host-emit", "k10").await;

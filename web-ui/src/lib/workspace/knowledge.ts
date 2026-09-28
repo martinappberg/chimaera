@@ -150,6 +150,10 @@ export interface Knowledge {
   counts: { findings: number; decisions: number; learnings: number; open: number };
   guidance: GuidanceFile[];
   warnings: string[];
+  /** The provider couldn't answer just now (faulted, too slow, a bad
+   *  snapshot): the lists are the last snapshot it gave, or empty. Null
+   *  when it answered. */
+  error: string | null;
 }
 
 async function json<T>(res: Response): Promise<T> {
@@ -317,6 +321,7 @@ export function normalizeKnowledge(raw: unknown): Knowledge {
     },
     guidance: objs<GuidanceFile>(r.guidance),
     warnings: strs(r.warnings),
+    error: typeof r.error === "string" && r.error !== "" ? r.error : null,
   };
 }
 

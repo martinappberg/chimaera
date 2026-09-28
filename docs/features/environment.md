@@ -35,7 +35,10 @@ route + per-session materialization) and `crates/chimaera-core/src/shellint.rs`
   (`launcher::wrap_login_shell`) sources it before `exec`ing the agent. All spawn surfaces
   funnel through it: PTY shells and agent TUIs (`spawn.rs`), chat drivers + the
   degrade-to-PTY respawn (`chat.rs`), and agent-plugin installs (`plugins/mod.rs`),
-  each via `api::session_env`. Runtime bootstrap installers deliberately skip the
+  each via `api::session_env`. The agent probes behind the Extensions and Skills views
+  (`agent_probe.rs`) run under it too, through `materialize_probe_prelude`: the host scope
+  for claude's host-wide `plugin list`/`details`, host ⊕ workspace for codex's
+  per-directory app-server and hook trust. Runtime bootstrap installers deliberately skip the
   prelude so a broken environment cannot prevent installing the agent itself.
 - **Key behaviors / constraints.**
   - **Once per real spawn, never on reconnect** — reattach reuses the live PTY; the

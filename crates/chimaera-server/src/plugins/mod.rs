@@ -1157,35 +1157,65 @@ pub(crate) async fn put_workspace_plugin(
             }
         }
         Some(_) => {}
-        // A first-party plugin with no installed copy has nothing to run;
-        // switching it off is still fine (it clears a switch kept from
-        // before a Remove).
-        None if body.on || lock_entry(&pid).is_none() => {
-            return not_installed(&pid).into_response();
-        }
+        // Nothing installed has nothing to run; switching it off is still
+        // fine — it clears a switch kept from before a Remove, first-party
+        // or not (a third-party one has no card left to do it from).
+        None if body.on => return not_installed(&pid).into_response(),
+        None if !valid_id(&pid) => return not_found("unknown plugin"),
         None => {}
     }
-    let result = crate::lock(&state.workspaces).set_plugin_on(&id, &pid, body.on);
-    match result {
-        Ok(Some(workspace)) => {
-            // Either way the plugin starts over here: a fresh instance on
-            // next use, and a fault cleared (switching off and on is how
-            // the user retries a faulted plugin).
-            state.plugin_runtime.reset(&pid, &id);
-            // The switch is the moment agents' view changes: re-detect now
-            // so the next connect answers from a fresh footprint.
-            refresh_detect(&state, &id).await;
-            state.changes.notify_waiters();
-            Json(json!({"workspace_id": id, "plugins_on": workspace.plugins_on})).into_response()
-        }
-        Ok(None) => not_found("unknown workspace"),
-        Err(err) => (
+    let save_failed = |err: anyhow::Error| {
+        (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": format!("could not save the workspace: {err}")})),
         )
-            .into_response(),
+            .into_response()
+    };
+    let staged = crate::lock(&state.workspaces).stage_plugin_on(&id, &pid, body.on);
+    let crate::workspaces::PluginSwitch {
+        workspace,
+        snapshot,
+        undo,
+    } = match staged {
+        Ok(Some(switch)) => switch,
+        Ok(None) => return not_found("unknown workspace"),
+        Err(err) => return save_failed(err),
+    };
+    // Written off the workspaces lock (every route takes it; the file may
+    // be on NFS), and taken back if it can't be.
+    let written = tokio::task::spawn_blocking(move || snapshot.write())
+        .await
+        .unwrap_or_else(|err| Err(anyhow::anyhow!("the write task failed: {err}")));
+    if let Err(err) = written {
+        crate::lock(&state.workspaces).undo_plugin_on(&id, &pid, undo);
+        return save_failed(err);
     }
+    // Either way the plugin starts over here: a fresh instance on next use,
+    // and a fault cleared (switching off and on is how the user retries a
+    // faulted plugin).
+    state.plugin_runtime.reset(&pid, &id);
+    crate::lock(&state.knowledge).forget_provider(&pid, Some(&id));
+    // The switch is the moment agents' view changes: re-detect now so the
+    // next connect answers from a fresh footprint.
+    refresh_detect(&state, &id).await;
+    state.changes.notify_waiters();
+    Json(json!({"workspace_id": id, "plugins_on": workspace.plugins_on})).into_response()
 }
+
+/// Switch `pid` off in every workspace, durably — see
+/// `WorkspaceStore::clear_plugin`. The write runs off the workspaces lock.
+pub(crate) async fn clear_switches(state: &AppState, pid: &str) -> anyhow::Result<()> {
+    let snapshot = crate::lock(&state.workspaces).clear_plugin(pid)?;
+    let Some(snapshot) = snapshot else {
+        return Ok(());
+    };
+    tokio::task::spawn_blocking(move || snapshot.write())
+        .await
+        .unwrap_or_else(|err| Err(anyhow::anyhow!("the write task failed: {err}")))?;
+    tracing::info!(plugin = pid, "plugin switched off in every workspace");
+    Ok(())
+}
+
 /// Plugin ids / marketplace sources we hand to an agent CLI: first-party
 /// manifest strings, still charset-gated (and never flag-shaped) because they
 /// land in a generated script.

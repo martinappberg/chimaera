@@ -2,6 +2,7 @@
 
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -58,6 +59,51 @@ pub(crate) struct Workspace {
 pub(crate) struct WorkspaceStore {
     path: PathBuf,
     items: Vec<Workspace>,
+    /// Bumped per snapshot: what `written` compares.
+    generation: u64,
+    /// The generation last on disk, behind the one lock every write takes.
+    written: Arc<Mutex<u64>>,
+}
+
+/// The list as of one change, to write off the store's lock (a plugin
+/// switch: `workspaces.json` can live on NFS, and every route reads this
+/// store).
+pub(crate) struct Snapshot {
+    path: PathBuf,
+    bytes: Vec<u8>,
+    generation: u64,
+    written: Arc<Mutex<u64>>,
+}
+
+impl Snapshot {
+    /// Write it — unless a later snapshot already reached the disk (it holds
+    /// this change too): a slow write must never put an older list back.
+    /// One write at a time; they share the temp file.
+    pub(crate) fn write(self) -> anyhow::Result<()> {
+        let mut written = crate::lock(&self.written);
+        if *written >= self.generation {
+            return Ok(());
+        }
+        crate::persist::atomic_write_json(&self.path, &self.bytes)?;
+        *written = self.generation;
+        Ok(())
+    }
+}
+
+/// A plugin switch applied in memory, with the snapshot that makes it
+/// durable; `undo_plugin_on(.., undo)` takes it back if that write fails.
+pub(crate) struct PluginSwitch {
+    pub(crate) workspace: Workspace,
+    pub(crate) snapshot: Snapshot,
+    pub(crate) undo: SwitchUndo,
+}
+
+/// What taking a staged switch back needs.
+#[derive(Clone, Copy)]
+pub(crate) struct SwitchUndo {
+    on: bool,
+    was_on: bool,
+    generation: u64,
 }
 
 impl WorkspaceStore {
@@ -78,7 +124,12 @@ impl WorkspaceStore {
                 Vec::new()
             }
         };
-        WorkspaceStore { path, items }
+        WorkspaceStore {
+            path,
+            items,
+            generation: 0,
+            written: Arc::new(Mutex::new(0)),
+        }
     }
 
     pub(crate) fn list(&self) -> Vec<Workspace> {
@@ -147,33 +198,98 @@ impl WorkspaceStore {
         Ok(Some(workspace))
     }
 
-    /// Switch plugin `pid` on or off for workspace `id`. Same durability
-    /// contract as [`Self::set_mastermind`], with the rollback done here: an
-    /// agent-visible toggle the next restart forgets is worse than a refused
-    /// one.
+    /// Switch plugin `pid` on or off for workspace `id`, in memory; the
+    /// caller writes the snapshot off this lock and, if that fails, calls
+    /// [`Self::undo_plugin_on`] — same durability contract as
+    /// [`Self::set_mastermind`]: an agent-visible toggle the next restart
+    /// forgets is worse than a refused one. `Ok(None)` = unknown workspace.
+    pub(crate) fn stage_plugin_on(
+        &mut self,
+        id: &str,
+        pid: &str,
+        on: bool,
+    ) -> anyhow::Result<Option<PluginSwitch>> {
+        let Some(entry) = self.items.iter_mut().find(|w| w.id == id) else {
+            return Ok(None);
+        };
+        let was_on = entry.plugins_on.iter().any(|p| p == pid);
+        self.put_switch(id, pid, on);
+        let Some(workspace) = self.get(id) else {
+            return Ok(None);
+        };
+        let snapshot = match self.snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                self.put_switch(id, pid, was_on);
+                return Err(err);
+            }
+        };
+        let undo = SwitchUndo {
+            on,
+            was_on,
+            generation: snapshot.generation,
+        };
+        Ok(Some(PluginSwitch {
+            workspace,
+            snapshot,
+            undo,
+        }))
+    }
+
+    /// Take back a staged switch whose write failed — unless the list
+    /// changed since: a later snapshot carries this switch as it is now,
+    /// and whether that one lands is its writer's to say.
+    pub(crate) fn undo_plugin_on(&mut self, id: &str, pid: &str, undo: SwitchUndo) {
+        if self.generation == undo.generation && undo.on != undo.was_on {
+            self.put_switch(id, pid, undo.was_on);
+        }
+    }
+
+    fn put_switch(&mut self, id: &str, pid: &str, on: bool) {
+        let Some(entry) = self.items.iter_mut().find(|w| w.id == id) else {
+            return;
+        };
+        entry.plugins_on.retain(|p| p != pid);
+        if on {
+            entry.plugins_on.push(pid.to_string());
+            entry.plugins_on.sort();
+        }
+    }
+
+    /// Switch `pid` on or off and write it, under this lock. Tests only:
+    /// the route writes off the lock.
+    #[cfg(test)]
     pub(crate) fn set_plugin_on(
         &mut self,
         id: &str,
         pid: &str,
         on: bool,
     ) -> anyhow::Result<Option<Workspace>> {
-        let Some(entry) = self.items.iter_mut().find(|w| w.id == id) else {
+        let Some(switch) = self.stage_plugin_on(id, pid, on)? else {
             return Ok(None);
         };
-        let before = entry.plugins_on.clone();
-        entry.plugins_on.retain(|p| p != pid);
-        if on {
-            entry.plugins_on.push(pid.to_string());
-            entry.plugins_on.sort();
-        }
-        let workspace = entry.clone();
-        if let Err(err) = self.save() {
-            if let Some(entry) = self.items.iter_mut().find(|w| w.id == id) {
-                entry.plugins_on = before;
-            }
+        if let Err(err) = switch.snapshot.write() {
+            self.undo_plugin_on(id, pid, switch.undo);
             return Err(err);
         }
-        Ok(Some(workspace))
+        Ok(Some(switch.workspace))
+    }
+
+    /// Switch `pid` off in every workspace — a plugin that is gone, or new
+    /// under an id another publisher's plugin had: its switch must not bind
+    /// whatever is installed under that id next. The snapshot to write, or
+    /// None when no workspace had it on.
+    pub(crate) fn clear_plugin(&mut self, pid: &str) -> anyhow::Result<Option<Snapshot>> {
+        let mut changed = false;
+        for w in &mut self.items {
+            let before = w.plugins_on.len();
+            w.plugins_on.retain(|p| p != pid);
+            changed |= w.plugins_on.len() != before;
+        }
+        if !changed {
+            return Ok(None);
+        }
+        self.snapshot().map(Some)
     }
 
     /// Clear `workspace_id`'s Mastermind binding IF it names `session_id`
@@ -222,9 +338,21 @@ impl WorkspaceStore {
         Ok(removed)
     }
 
-    /// Atomically persist the list (tmp file + rename).
-    fn save(&self) -> anyhow::Result<()> {
-        crate::persist::atomic_write_json(&self.path, serde_json::to_vec_pretty(&self.items)?)
+    /// The list as it is now, stamped with the next generation.
+    fn snapshot(&mut self) -> anyhow::Result<Snapshot> {
+        let bytes = serde_json::to_vec_pretty(&self.items)?;
+        self.generation += 1;
+        Ok(Snapshot {
+            path: self.path.clone(),
+            bytes,
+            generation: self.generation,
+            written: self.written.clone(),
+        })
+    }
+
+    /// Atomically persist the list (tmp file + rename), under this lock.
+    fn save(&mut self) -> anyhow::Result<()> {
+        self.snapshot()?.write()
     }
 }
 
@@ -313,6 +441,43 @@ mod tests {
         assert!(reloaded.get(&ws.id).unwrap().mastermind.is_none());
 
         std::fs::remove_file(reloaded.path.clone()).ok();
+    }
+
+    /// A plugin switch is written off the store's lock, so two writes can
+    /// land in either order: an older snapshot reaching the disk after a
+    /// newer one is dropped (the newer one holds its change too).
+    #[test]
+    fn an_older_snapshot_never_overwrites_a_newer_one() {
+        let path = test_dir("snap-order").join("workspaces.json");
+        let mut store = WorkspaceStore::load(path.clone());
+        let ws = store.add(test_dir("snap-order-root")).unwrap();
+        let first = store.stage_plugin_on(&ws.id, "a", true).unwrap().unwrap();
+        let second = store.stage_plugin_on(&ws.id, "b", true).unwrap().unwrap();
+        second.snapshot.write().unwrap();
+        first.snapshot.write().unwrap();
+        let reloaded = WorkspaceStore::load(path.clone());
+        assert_eq!(reloaded.get(&ws.id).unwrap().plugins_on, ["a", "b"]);
+        std::fs::remove_file(path).ok();
+    }
+
+    /// A switch whose write failed is taken back — unless the list changed
+    /// since (that later snapshot carries it; its writer decides).
+    #[test]
+    fn undo_takes_back_a_switch_only_when_nothing_changed_since() {
+        let mut store = WorkspaceStore::load(test_dir("snap-undo").join("workspaces.json"));
+        let ws = store.add(test_dir("snap-undo-root")).unwrap();
+        let on = store.stage_plugin_on(&ws.id, "p", true).unwrap().unwrap();
+        store.undo_plugin_on(&ws.id, "p", on.undo);
+        assert!(store.get(&ws.id).unwrap().plugins_on.is_empty());
+
+        let on = store.stage_plugin_on(&ws.id, "p", true).unwrap().unwrap();
+        store.touch(&ws.id);
+        store.undo_plugin_on(&ws.id, "p", on.undo);
+        assert_eq!(
+            store.get(&ws.id).unwrap().plugins_on,
+            ["p"],
+            "changed since: kept"
+        );
     }
 
     /// A binding change whose persistence FAILS surfaces as `Err`, never a

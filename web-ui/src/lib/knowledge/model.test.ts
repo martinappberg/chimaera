@@ -256,4 +256,15 @@ describe("normalizeKnowledge", () => {
     expect(k.decisions[0].alternatives).toEqual(["b"]);
     expect(searchKnowledge(k, "x").todos).toHaveLength(1);
   });
+
+  // A provider that couldn't refresh still names itself; the daemon adds
+  // `error` (only then) to the snapshot it gave last.
+  it("keeps the provider's error, and only a non-empty string", () => {
+    const failed = normalizeKnowledge({ provider: "mycelium", topics: [], error: "mycelium did not answer within 32 s" });
+    expect(failed.provider).toBe("mycelium");
+    expect(failed.error).toBe("mycelium did not answer within 32 s");
+    expect(normalizeKnowledge({ provider: "mycelium" }).error).toBeNull();
+    expect(normalizeKnowledge({ provider: "mycelium", error: "" }).error).toBeNull();
+    expect(normalizeKnowledge({ provider: "mycelium", error: { why: 1 } }).error).toBeNull();
+  });
 });
