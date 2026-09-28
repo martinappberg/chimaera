@@ -72,13 +72,15 @@ describe("cloud preparation progress", () => {
     expect(cloudProjectStatus(mirror([row("saved", 123)]), "other")).toBeNull();
   });
   it("reports completed copies as history, excludes private projects and scopes handoffs", () => {
-    expect(cloudProjectStatus(mirror([row("new", null)]))).toMatchObject({title: "Waiting for a project copy", state: "quiet"});
+    expect(cloudProjectStatus(mirror([row("new", null)]))).toMatchObject({title: "Project copy status", state: "quiet"});
     expect(cloudProjectStatus(mirror([row("saved", 123)]))).toMatchObject({ title: "Cloud copies saved", state: "quiet" });
+    expect(cloudProjectStatus(mirror([{...row("remote", null), checkpoint_id:"c-confirmed"}]))).toMatchObject({title:"Cloud copies saved",state:"quiet"});
+    expect(cloudProjectStatus(mirror([row("unknown", null)]))?.detail).not.toContain("No completed");
     const privateProject = {...row("private", null), never_mirror: true};
     expect(cloudProjectStatus(mirror([row("saved", 123), privateProject]))?.detail).toContain("1 project has");
     const both = mirror([row("saved", 123), row("new", null)]);
-    expect(cloudProjectStatus(both)?.detail).toContain("Other projects have not reported");
-    expect(cloudProjectStatus(both, "new")?.title).toBe("Waiting for a project copy");
+    expect(cloudProjectStatus(both)?.detail).toContain("Copy status for other projects");
+    expect(cloudProjectStatus(both, "new")?.title).toBe("Project copy status");
   });
   it("uses actual ownership for active progress and keeps privacy/configuration failures ahead of saved counts", () => {
     const paused = {...mirror([row("saved", 123)]), configured: false};

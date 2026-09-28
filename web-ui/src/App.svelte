@@ -4,7 +4,7 @@
   import ProNavigation from "./lib/pro/ProNavigation.svelte";
   import { paidPlan } from "./lib/net/plan";
   import { listenForProReturn } from "./lib/net/proReturn";
-  import { isBrowserGateway } from "./lib/net/base";
+  import { isBrowserGateway, gatewayWorkspace } from "./lib/net/base";
   import { runStallDrive, stallDriveSpec } from "./lib/perf/tabSwitchDrive";
   import {
     ApiError,
@@ -2858,6 +2858,12 @@
    *  "New window" and Cmd/Ctrl-click stay the explicit "another window"
    *  gestures. */
   async function activateWorkspace(w: Workspace): Promise<void> {
+    const logicalWorkspace = gatewayWorkspace();
+    if (logicalWorkspace !== null && logicalWorkspace !== w.id) {
+      // A gateway tab is bound to its logical project, even when its owner moves.
+      location.assign(`/workspace/${encodeURIComponent(w.id)}/`);
+      return;
+    }
     workspaces = workspaces.some((x) => x.id === w.id)
       ? workspaces.map((x) => (x.id === w.id ? w : x))
       : [w, ...workspaces];

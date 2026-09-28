@@ -1,3 +1,4 @@
+import { sendSocketAuth } from "./placement";
 import { daemonSocketUrl } from "./base";
 import { getToken } from "./api";
 import { nudgeReconnectors, retryDelayMs } from "./reconnect";
@@ -97,6 +98,7 @@ interface ServerEventFrame {
  */
 export class EventsSocket {
   private ws: WebSocket | null = null;
+  private authenticatedSocket: WebSocket | null = null;
   private closed = false;
   private fatal = false;
   /** A fatal socket has been revived by the health cross-nudge (once ever —
@@ -174,7 +176,7 @@ export class EventsSocket {
   }
 
   private sendWatch(): void {
-    if (this.ws?.readyState !== WebSocket.OPEN) return;
+    if (this.ws?.readyState !== WebSocket.OPEN || this.authenticatedSocket !== this.ws) return;
     this.ws.send(
       JSON.stringify({
         type: "watch",
@@ -191,9 +193,12 @@ export class EventsSocket {
     this.ws = ws;
 
     ws.onopen = () => {
-      ws.send(JSON.stringify({ type: "auth", token: getToken() ?? "" }));
-      // Re-assert interest: a reconnect starts a fresh watcher registration.
-      this.sendWatch();
+      sendSocketAuth(ws, { type: "auth", token: getToken() ?? "" },
+        () => this.ws === ws && !this.closed, () => {
+          this.authenticatedSocket = ws;
+          // Re-assert interest only after the scoped authentication frame.
+          this.sendWatch();
+        });
     };
 
     ws.onmessage = (ev: MessageEvent) => {

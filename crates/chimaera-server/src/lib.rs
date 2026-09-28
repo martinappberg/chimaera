@@ -50,6 +50,7 @@ mod timeline;
 mod update;
 mod upload;
 mod view_state;
+mod workspace_scope;
 mod workspaces;
 mod ws;
 

@@ -84,9 +84,9 @@ export function cloudProjectStatus(projects: MirrorStatus | null, workspaceId?: 
   if (rows.some(p => p.ownership?.state === "awaiting_verification")) return { title: "Checking your project", detail: "Chimaera is checking where you left off before continuing.", state: "active" };
   if (rows.some(p => p.ownership?.state === "privacy_disabled")) return { title: "Project copying is disabled", detail: "Review this project's setting in Projects and privacy.", state: "attention" };
   if (rows.some(p => p.mirror?.error || p.privacy_pending)) return { title: "A project needs attention", detail: "Open Projects and privacy below for details. Existing copies are retained.", state: "attention" };
-  const copied = rows.filter(p => p.mirror?.last_mirrored_at != null).length;
-  if (copied) return { title: "Cloud copies saved", detail: `${copied} ${copied === 1 ? "project has" : "projects have"} a completed cloud copy.${copied < rows.length ? " Other projects have not reported a completed copy yet." : ""}`, state: "quiet" };
-  return { title: "Waiting for a project copy", detail: "Chimaera is watching your registered projects. No completed cloud copy has been reported yet.", state: "quiet" };
+  const copied = rows.filter(p => p.mirror?.last_mirrored_at != null || (typeof p.checkpoint_id === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(p.checkpoint_id))).length;
+  if (copied) return { title: "Cloud copies saved", detail: `${copied} ${copied === 1 ? "project has" : "projects have"} a completed cloud copy.${copied < rows.length ? " Copy status for other projects isn’t available on this device yet." : ""}`, state: "quiet" };
+  return { title: "Project copy status", detail: "Your latest copy status isn’t available on this device yet. Existing copies are retained.", state: "quiet" };
 }
 
 export function recoverableAccountRestore(error: unknown): boolean {

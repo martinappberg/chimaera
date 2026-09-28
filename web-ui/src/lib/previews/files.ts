@@ -801,7 +801,7 @@ export async function fsDownload(path: string): Promise<void> {
     }),
   );
   const a = document.createElement("a");
-  a.href = `/download/${body.ticket}`;
+  a.href = daemonPath(`/download/${body.ticket}`);
   a.rel = "noopener";
   // The `download` attribute forces a download even for a showable MIME (a
   // .md is text/*): without it the Tauri WKWebView navigates the main webview

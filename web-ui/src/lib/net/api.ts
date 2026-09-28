@@ -1,4 +1,6 @@
-import { daemonPath, gatewayPrefix, isBrowserGateway } from "./base";
+import { daemonPath, gatewayPrefix, gatewayWorkspace, isBrowserGateway } from "./base";
+
+import { PlacementError, workspaceHeaders } from "./placement";
 
 import { writable } from "svelte/store";
 
@@ -40,7 +42,7 @@ function initFromHash(): string | null {
   }
   const params = new URLSearchParams(location.hash.slice(1));
   const tokenFromHash = isBrowserGateway() ? null : params.get("token");
-  const wsFromHash = params.get("ws");
+  const wsFromHash = gatewayWorkspace() ?? params.get("ws");
   const hostFromHash = params.get("host");
   const winFromHash = params.get("win");
   const homeHubFromHash = params.get("hub") === "1";
@@ -258,6 +260,12 @@ export async function api(path: string, init: RequestInit = {}): Promise<Respons
     headers.set("Authorization", `Bearer ${token}`);
   }
   if (isBrowserGateway()) headers.set("X-Chimaera-Browser", "1");
+  if (!isBrowserGateway()) {
+    const workspace=getActiveWorkspaceId();
+    if (workspace !== null && /^[A-Za-z0-9_-]{1,128}$/.test(workspace)) headers.set("X-Chimaera-Viewer-Workspace",workspace);
+  }
+  try { await workspaceHeaders(headers); }
+  catch (error) { if (error instanceof PlacementError && error.status === 401) notifyUnauthorized(); throw error; }
   const res = await fetch(daemonPath(`/api/v1${path}`), { ...init, headers });
   if (res.status === 401) notifyUnauthorized();
   return res;

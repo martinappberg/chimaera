@@ -66,6 +66,15 @@ in-app SSH askpass, a signed auto-updater). Parent map: repo-root
 
 ## Invariants / gotchas
 
+- Logical project viewing uses passive placement and exact target scope acknowledgment.
+  It follows the current owner (home device or worker), including files and watches,
+  without acquiring or moving execution. Native window layouts remain local and
+  only the fixed `/project` alias crosses hosts. See the
+  [viewer contract](../chimaera-link/VIEWING.md).
+  `shell/pro/installation.rs` keeps the stable installation proof in an
+  endpoint/account/configuration-scoped Keychain entry. It must save before bind;
+  clean release/recovery acknowledgment precedes a rebind that revokes the old
+  device. Neither daemon nor webview receives the proof.
 - Account credentials belong only in the OS keychain (macOS Keychain, Windows
   Credential Manager, Linux Secret Service). app.json stores only the endpoint;
   hosts.json stores only the additive `kept` preference. Keeper host rows are

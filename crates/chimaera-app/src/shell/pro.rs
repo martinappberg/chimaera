@@ -20,6 +20,7 @@ use super::{lock, Shell};
 mod auth;
 pub(super) mod billing;
 mod credentials;
+mod installation;
 pub(super) mod projects;
 mod recovery;
 mod store;
@@ -45,6 +46,7 @@ pub(super) struct Pro {
     credential_generation: Arc<AtomicU64>,
     credential_persistence: Arc<credentials::Persistence>,
     recovery: recovery::Recovery<Client>,
+    placements: Mutex<HashMap<String, chimaera_link::WorkspacePlacement>>,
 }
 
 struct Runtime {
@@ -114,6 +116,7 @@ impl Pro {
             credential_generation: Arc::new(AtomicU64::new(0)),
             credential_persistence: Arc::new(credentials::Persistence::default()),
             recovery: recovery::Recovery::default(),
+            placements: Mutex::new(HashMap::new()),
         }
     }
 
@@ -737,6 +740,7 @@ async fn host_signal(app: &AppHandle, host: &Host) {
 
 pub(super) async fn stop(state: &Shell) {
     state.pro.billing.clear();
+    lock(&state.pro.placements).clear();
     *lock(&state.pro.return_target) = None;
     let links = std::mem::take(&mut *state.pro.worker_links.lock().await);
     for (host, link) in links {
@@ -991,7 +995,7 @@ mod tests {
             "scope": ["baton", "mirror"], "device_id": "873107b04056d8",
         }))
         .unwrap();
-        assert!(worker_holds(&host, &delegation.device_id));
+        assert!(host_holds(&host, &delegation.device_id));
         assert_eq!(host.id, "worker-873107b04056d8");
         for holder in [
             "",
@@ -1000,10 +1004,10 @@ mod tests {
             "x873107b04056d8",
             "873107b04056d8/other",
         ] {
-            assert!(!worker_holds(&host, holder));
+            assert!(!host_holds(&host, holder));
         }
         for kind in [HostKind::Device, HostKind::Ssh] {
-            assert!(!worker_holds(
+            assert!(!host_holds(
                 &Host {
                     kind,
                     ..host.clone()
@@ -1016,7 +1020,7 @@ mod tests {
             "prefix-worker-873107b04056d8",
             "worker-worker-873107b04056d8",
         ] {
-            assert!(!worker_holds(
+            assert!(!host_holds(
                 &Host {
                     id: id.into(),
                     ..host.clone()
@@ -1481,8 +1485,11 @@ pub(super) async fn daemon_request(
                 .header("Authorization", &authorization)
                 .config()
                 .timeout_global(Some(Duration::from_secs(
-                    if suffix == "/pro/projects/open" {
-                        1200
+                    if matches!(
+                        suffix.as_str(),
+                        "/pro/projects/open" | "/pro/sleep" | "/pro/execution/recover"
+                    ) {
+                        1140
                     } else {
                         30
                     },
@@ -1593,6 +1600,20 @@ async fn configure_daemon(state: &Shell, client: &Client) -> Result<()> {
     if lock(&state.pro.daemon_stamp).as_ref() == Some(&stamp) {
         return Ok(());
     }
+    // Both service and daemon must acknowledge the exact new protocol. A legacy
+    // fallback would silently remove fencing while still showing a paid account.
+    let capabilities = client.execution_capabilities().await?;
+    let endpoint = state
+        .pro
+        .endpoint
+        .clone()
+        .context("Pro endpoint unavailable")?;
+    let identity = installation::bind(state, client, &endpoint, &account).await?;
+    let execution = chimaera_link::ExecutionConfiguration {
+        version: 1,
+        installation_id: Some(identity.installation_id),
+        capability: capabilities.execution_capability,
+    };
     let cached = lock(&state.pro.delegation).clone();
     let delegation = if let Some(delegation) = cached {
         delegation
@@ -1604,21 +1625,31 @@ async fn configure_daemon(state: &Shell, client: &Client) -> Result<()> {
         .endpoint
         .clone()
         .context("Pro endpoint unavailable")?;
-    daemon_request(state,"POST","/pro/configure",Some(serde_json::json!({"endpoint":endpoint,"keeper_url":account.keeper_url,"account_id":account.account_id,"delegation":delegation,"role":"device","hours_exhausted":account.hours_exhausted}))).await?;
+    let ack = daemon_request(state,"POST","/pro/configure/execution",Some(serde_json::json!({"endpoint":endpoint,"keeper_url":account.keeper_url,"account_id":account.account_id,"delegation":delegation,"role":"device","hours_exhausted":account.hours_exhausted,"execution":execution}))).await?;
+    chimaera_link::ExecutionConfigureAck::decode(
+        200,
+        &serde_json::to_vec(&ack)?,
+        &execution,
+        None,
+    )?;
     *lock(&state.pro.delegation) = Some(delegation);
     *lock(&state.pro.daemon_stamp) = Some(stamp);
     Ok(())
 }
 // Keeper route IDs are distinct from the account's worker baton holder ID.
 // This translation applies only to the typed worker registration contract.
-fn worker_holds(host: &Host, holder: &str) -> bool {
-    host.kind == HostKind::Worker
+fn host_holds(host: &Host, holder: &str) -> bool {
+    matches!(host.kind, HostKind::Worker | HostKind::Device)
         && !holder.is_empty()
         && holder.len() <= 128
         && holder
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || b"-_".contains(&byte))
-        && host.id.strip_prefix("worker-") == Some(holder)
+        && host.id.strip_prefix(match host.kind {
+            HostKind::Worker => "worker-",
+            HostKind::Device => "device-",
+            _ => return false,
+        }) == Some(holder)
 }
 
 async fn reconcile_placements(state: &Shell, client: &Client) -> Result<()> {
@@ -1628,33 +1659,52 @@ async fn reconcile_placements(state: &Shell, client: &Client) -> Result<()> {
         return Ok(());
     }
     let status = daemon_request(state, "GET", "/pro/status", None).await?;
-    let hosts: Vec<_> = lock(&state.pro.hosts)
-        .values()
-        .filter(|host| host.kind == HostKind::Worker)
-        .cloned()
-        .collect();
+    let hosts = lock(&state.pro.hosts).clone();
+    let account = lock(&state.pro.account)
+        .clone()
+        .context("account unavailable")?;
+    let workspaces = status["workspaces"]
+        .as_array()
+        .context("workspace status unavailable")?;
+    anyhow::ensure!(workspaces.len() <= 128, "workspace placement limit");
+    lock(&state.pro.placements).retain(|id, _| {
+        workspaces.iter().any(|row| {
+            row["workspace_id"].as_str() == Some(id.as_str()) && row["never_mirror"] != true
+        })
+    });
+    let mut desired = std::collections::HashSet::new();
     let mut links = state.pro.worker_links.lock().await;
-    let retired: Vec<_> = links
-        .keys()
-        .filter(|id| !hosts.iter().any(|host| &host.id == *id))
-        .cloned()
-        .collect();
-    for id in retired {
-        if let Some(link) = links.remove(&id) {
-            daemon_request(
-                state,
-                "DELETE",
-                &format!("/pro/placements?host_id={id}"),
-                None,
-            )
-            .await?;
-            link.close();
+    for workspace in workspaces {
+        let Some(id) = workspace["workspace_id"].as_str() else {
+            continue;
+        };
+        if workspace["never_mirror"] == true {
+            continue;
         }
-    }
-    for host in hosts {
+        let placement = client.workspace_placement(id).await?;
+        lock(&state.pro.placements).insert(id.to_owned(), placement.clone());
+        if placement.availability != chimaera_link::PlacementAvailability::Owned
+            || placement.holder_id.as_deref() == Some(&account.device_id)
+        {
+            continue;
+        }
+        let route = placement
+            .route_host_id
+            .as_ref()
+            .context("workspace route unavailable")?;
+        let Some(host) = hosts.get(route).filter(|host| {
+            placement
+                .holder_id
+                .as_deref()
+                .is_some_and(|holder| host_holds(host, holder))
+                && host.status == HostStatus::Connected
+        }) else {
+            continue;
+        };
         let Some(daemon) = host.daemon.as_ref() else {
             continue;
         };
+        desired.insert(host.id.clone());
         if !links.contains_key(&host.id) {
             links.insert(
                 host.id.clone(),
@@ -1663,28 +1713,107 @@ async fn reconcile_placements(state: &Shell, client: &Client) -> Result<()> {
         }
         let port = links
             .get(&host.id)
-            .expect("inserted worker link")
+            .context("project connection unavailable")?
             .local_port;
-        for workspace in status["workspaces"].as_array().into_iter().flatten() {
-            if workspace["ownership"]["state"] != "remote"
-                || !workspace["ownership"]["holder"]
-                    .as_str()
-                    .is_some_and(|holder| worker_holds(&host, holder))
-            {
-                continue;
-            }
-            daemon_request(state,"POST","/pro/placements",Some(serde_json::json!({"host_id":host.id,"endpoint":format!("http://127.0.0.1:{port}"),"token":daemon.token,"workspace_id":workspace["workspace_id"],"epoch":workspace["ownership"]["epoch"]}))).await?;
+        verify_project_target(port, &daemon.token, id, placement.epoch).await?;
+        daemon_request(state,"POST","/pro/placements",Some(serde_json::json!({"host_id":host.id,"endpoint":format!("http://127.0.0.1:{port}"),"token":daemon.token,"workspace_id":id,"epoch":placement.epoch}))).await?;
+    }
+    let retired: Vec<_> = links
+        .keys()
+        .filter(|id| !desired.contains(*id))
+        .cloned()
+        .collect();
+    for id in retired {
+        // A failed removal preserves the old transport for explicit invalidation
+        // on the next reconcile; target epoch checks still refuse stale writes.
+        daemon_request(
+            state,
+            "DELETE",
+            &format!("/pro/placements?host_id={id}"),
+            None,
+        )
+        .await?;
+        if let Some(link) = links.remove(&id) {
+            link.close();
         }
     }
     Ok(())
 }
+async fn verify_project_target(port: u16, token: &str, workspace: &str, epoch: u64) -> Result<()> {
+    let token = token.to_owned();
+    let workspace = workspace.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let mut response = crate::http::agent()
+            .get(&format!("http://127.0.0.1:{port}/api/v1/workspaces"))
+            .header("Authorization", &format!("Bearer {token}"))
+            .header("X-Chimaera-Workspace", &workspace)
+            .header("X-Chimaera-Epoch", &epoch.to_string())
+            .header("X-Chimaera-Viewer-Root", "L3Byb2plY3Q")
+            .config()
+            .timeout_global(Some(Duration::from_secs(10)))
+            .max_redirects(0)
+            .build()
+            .call()?;
+        anyhow::ensure!(
+            response
+                .headers()
+                .get("x-chimaera-scope-version")
+                .and_then(|v| v.to_str().ok())
+                == Some("1")
+                && response
+                    .headers()
+                    .get("x-chimaera-workspace")
+                    .and_then(|v| v.to_str().ok())
+                    == Some(workspace.as_str())
+                && response
+                    .headers()
+                    .get("x-chimaera-epoch")
+                    .and_then(|v| v.to_str().ok())
+                    == Some(epoch.to_string().as_str()),
+            "project scope acknowledgment missing"
+        );
+        let mut bytes = Vec::new();
+        response
+            .body_mut()
+            .as_reader()
+            .take(16385)
+            .read_to_end(&mut bytes)?;
+        anyhow::ensure!(bytes.len() <= 16384, "project metadata exceeds limit");
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&bytes)?;
+        anyhow::ensure!(
+            rows.len() == 1 && rows[0]["id"] == workspace,
+            "project metadata scope mismatch"
+        );
+        let root = rows[0]["root"].as_str().context("project root missing")?;
+        anyhow::ensure!(
+            root.len() <= 4096 && std::path::Path::new(root).is_absolute() && !root.contains('\0'),
+            "invalid project root"
+        );
+        anyhow::ensure!(root == "/project", "project presentation mismatch");
+        Ok(())
+    })
+    .await?
+}
+
 #[tauri::command]
 pub async fn pro_mirror_status(
     state: tauri::State<'_, Shell>,
 ) -> Result<serde_json::Value, String> {
-    daemon_request(&state, "GET", "/pro/status", None)
+    let mut status = daemon_request(&state, "GET", "/pro/status", None)
         .await
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    let placements = lock(&state.pro.placements);
+    for row in status["workspaces"].as_array_mut().into_iter().flatten() {
+        if let Some(placement) = row["workspace_id"]
+            .as_str()
+            .and_then(|id| placements.get(id))
+        {
+            // Account-acknowledged checkpoint is historical copy evidence. It
+            // does not imply the owner is reachable or a new sync completed.
+            row["checkpoint_id"] = serde_json::json!(placement.checkpoint_id);
+        }
+    }
+    Ok(status)
 }
 #[tauri::command]
 pub async fn pro_set_never_mirror(

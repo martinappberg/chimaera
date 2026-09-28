@@ -1,3 +1,4 @@
+import { sendSocketAuth } from "../net/placement";
 import { daemonSocketUrl } from "../net/base";
 import { getToken } from "../net/api";
 import { Reconnector, UNKNOWN_SESSION_RETRIES } from "../net/reconnect";
@@ -68,6 +69,7 @@ interface ServerTextFrame {
  */
 export class SessionSocket {
   private ws: WebSocket | null = null;
+  private authenticatedSocket: WebSocket | null = null;
   private closed = false;
   private fatal = false;
   private exited = false;
@@ -109,9 +111,8 @@ export class SessionSocket {
       // Carry the client grid so the server resizes BEFORE rendering the
       // snapshot; the frame then always matches what the terminal displays.
       const dims = parked || readOnly ? null : (this.handlers.dims?.() ?? null);
-      ws.send(
-        JSON.stringify({ type: "auth", token: getToken() ?? "", parked, ...(dims ?? {}) }),
-      );
+      sendSocketAuth(ws, { type: "auth", token: getToken() ?? "", parked, ...(dims ?? {}) },
+        () => this.ws === ws && !this.closed, () => { this.authenticatedSocket = ws; });
     };
 
     ws.onmessage = (ev: MessageEvent) => {
@@ -195,7 +196,7 @@ export class SessionSocket {
         break;
       case "error":
         if (msg.code === "read_only") { this.handlers.onError(msg.message ?? "Just watching"); break; }
-        if (msg.code === "remote_unavailable" || msg.code === "worker_asleep") { break; }
+        if (msg.code === "remote_unavailable" || msg.code === "worker_asleep" || msg.code === "workspace_scope_changed") { break; }
         if (msg.code === "unknown_session") {
           // After a witnessed exit, "unknown" means even the session's
           // last words are gone (bounded server-side memory) — terminal-
@@ -222,12 +223,12 @@ export class SessionSocket {
 
   /** True while the socket is connected and can accept input frames. */
   get isOpen(): boolean {
-    return this.ws?.readyState === WebSocket.OPEN;
+    return this.ws?.readyState === WebSocket.OPEN && this.authenticatedSocket === this.ws;
   }
 
   /** Send raw keyboard input (from term.onData) as a binary frame. */
   sendInput(data: string): void {
-    if (!this.handlers.readOnly?.() && this.ws?.readyState === WebSocket.OPEN) {
+    if (!this.handlers.readOnly?.() && this.ws?.readyState === WebSocket.OPEN && this.authenticatedSocket === this.ws) {
       this.ws.send(this.encoder.encode(data));
     }
   }
@@ -236,7 +237,7 @@ export class SessionSocket {
    *  down — reconnect re-establishes the state these frames carry (dims via
    *  the ready reconcile, parked via the auth flag). */
   private sendJson(msg: unknown): void {
-    if (this.ws?.readyState === WebSocket.OPEN) {
+    if (this.ws?.readyState === WebSocket.OPEN && this.authenticatedSocket === this.ws) {
       this.ws.send(JSON.stringify(msg));
     }
   }

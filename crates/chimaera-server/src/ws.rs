@@ -132,6 +132,8 @@ enum ClientMessage {
         /// out from under a visible one).
         #[serde(default)]
         parked: bool,
+        #[serde(flatten)]
+        scope: crate::workspace_scope::Fields,
     },
     Resize {
         cols: u16,
@@ -162,7 +164,7 @@ enum ClientMessage {
 
 pub(crate) fn session_writable(state: &AppState, id: &str) -> bool {
     let workspace = crate::lock(&state.session_workspaces).get(id).cloned();
-    workspace.is_none_or(|workspace| crate::pro::may_write(state, &workspace))
+    workspace.is_none_or(|workspace| crate::pro::may_execute(state, &workspace))
 }
 
 /// GET /ws/sessions/{id}
@@ -194,9 +196,18 @@ async fn handle(
             return;
         }
     };
+    let scope = auth.scope.clone();
+    if scope
+        .as_ref()
+        .is_some_and(|scope| scope.session(&state, &id).is_err())
+    {
+        scope_changed(&mut socket).await;
+        return;
+    }
     let remote_auth = json!({"type":"auth", "token":"", "cols":auth.dims.map(|d| d.0), "rows":auth.dims.map(|d| d.1), "parked":auth.parked});
-    if crate::session_proxy::socket(&state, &id, "sessions", &options, remote_auth, &mut socket)
-        .await
+    if scope.is_none()
+        && crate::session_proxy::socket(&state, &id, "sessions", &options, remote_auth, &mut socket)
+            .await
     {
         return;
     }
@@ -238,10 +249,14 @@ async fn handle(
                 };
                 ready.insert("type".to_string(), json!("ready"));
                 ready.insert("cwd_current".to_string(), json!(words.info.cwd.clone()));
-                if send_json(&mut socket, &serde_json::Value::Object(ready))
-                    .await
-                    .is_err()
+                let mut ready = serde_json::Value::Object(ready);
+                if let Some(alias) = scope
+                    .as_ref()
+                    .and_then(|scope| scope.alias(&state).ok().flatten())
                 {
+                    alias.session(&mut ready);
+                }
+                if send_json(&mut socket, &ready).await.is_err() {
                     return;
                 }
                 // A parked client discards any snapshot on this connection
@@ -289,10 +304,14 @@ async fn handle(
         .cloned()
         .unwrap_or_else(|| attachment.info.cwd.clone());
     ready.insert("cwd_current".to_string(), json!(cwd_current));
-    if send_json(&mut socket, &serde_json::Value::Object(ready))
-        .await
-        .is_err()
+    let mut ready = serde_json::Value::Object(ready);
+    if let Some(alias) = scope
+        .as_ref()
+        .and_then(|scope| scope.alias(&state).ok().flatten())
     {
+        alias.session(&mut ready);
+    }
+    if send_json(&mut socket, &ready).await.is_err() {
         return;
     }
 
@@ -347,8 +366,13 @@ async fn handle(
     tokio::pin!(resync_sleep);
     let flush_sleep = tokio::time::sleep(Duration::ZERO);
     tokio::pin!(flush_sleep);
+    let mut scope_tick = tokio::time::interval(Duration::from_secs(1));
+    scope_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
+            _ = scope_tick.tick(), if scope.is_some() => {
+                if scope.as_ref().is_some_and(|s| s.session(&state, &id).is_err()) { scope_changed(&mut socket).await; return; }
+            },
             _ = &mut resync_sleep, if resync_at.is_some() => {
                 resync_at = None;
                 if !repaint(&mut socket, &id, &state, &mut attachment,
@@ -478,12 +502,14 @@ async fn handle(
             },
             msg = socket.recv() => match msg {
                 Some(Ok(Message::Binary(bytes))) => {
+                    if scope.as_ref().is_some_and(|s| s.session(&state, &id).is_err()) { scope_changed(&mut socket).await; return; }
                     if options.read_only || !session_writable(&state, &id) {
                         let _ = send_ordered_json(&mut socket, &mut batch, &json!({"type":"error","code":"read_only","message":"This session is read only on this host"})).await;
                         continue;
                     }
                     if !bytes.is_empty() { crate::activity::record(&state, &id); }
                     for chunk in bytes.chunks(TERMINAL_INPUT_CHUNK) {
+                        if !session_writable(&state, &id) || scope.as_ref().is_some_and(|s| s.session(&state, &id).is_err()) { scope_changed(&mut socket).await; return; }
                         if attachment
                             .input
                             .send(Bytes::copy_from_slice(chunk))
@@ -503,6 +529,7 @@ async fn handle(
                     }
                 }
                 Some(Ok(Message::Text(text))) => {
+                    if scope.as_ref().is_some_and(|s| s.session(&state, &id).is_err()) { scope_changed(&mut socket).await; return; }
                     match serde_json::from_str::<ClientMessage>(&text) {
                         Ok(ClientMessage::Resize { cols, rows }) => {
                             if options.read_only || !session_writable(&state, &id) { continue; }
@@ -714,7 +741,7 @@ async fn handle_chat(
     state: Arc<AppState>,
     options: crate::session_proxy::SocketOptions,
 ) {
-    let Some(last_seq) = chat_authenticate(&mut socket, &state).await else {
+    let Some((last_seq, scope)) = chat_authenticate(&mut socket, &state).await else {
         let _ = send_json(
             &mut socket,
             &json!({"type": "error", "message": "unauthorized"}),
@@ -723,15 +750,23 @@ async fn handle_chat(
         return;
     };
 
-    if crate::session_proxy::socket(
-        &state,
-        &id,
-        "chat",
-        &options,
-        json!({"type":"auth","token":"","last_seq":last_seq}),
-        &mut socket,
-    )
-    .await
+    if scope
+        .as_ref()
+        .is_some_and(|s| s.session(&state, &id).is_err())
+    {
+        scope_changed(&mut socket).await;
+        return;
+    }
+    if scope.is_none()
+        && crate::session_proxy::socket(
+            &state,
+            &id,
+            "chat",
+            &options,
+            json!({"type":"auth","token":"","last_seq":last_seq}),
+            &mut socket,
+        )
+        .await
     {
         return;
     }
@@ -781,8 +816,13 @@ async fn handle_chat(
     }
 
     let mut live = attachment.live;
+    let mut scope_tick = tokio::time::interval(Duration::from_secs(1));
+    scope_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
+            _ = scope_tick.tick(), if scope.is_some() => {
+                if scope.as_ref().is_some_and(|s| s.session(&state, &id).is_err()) { scope_changed(&mut socket).await; return; }
+            },
             event = live.recv() => match event {
                 Ok(entry) => {
                     // The replay tail can overlap the subscription start.
@@ -840,6 +880,7 @@ async fn handle_chat(
             },
             msg = socket.recv() => match msg {
                 Some(Ok(Message::Text(text))) => {
+                    if scope.as_ref().is_some_and(|s| s.session(&state, &id).is_err()) { scope_changed(&mut socket).await; return; }
                     match serde_json::from_str::<chimaera_agent::model::AgentCommand>(&text) {
                         Ok(mut cmd) => {
                             if options.read_only || !session_writable(&state, &id) {
@@ -862,6 +903,11 @@ async fn handle_chat(
                             // A send's images get a saved copy the echoed
                             // message can show after replay.
                             let saved = crate::upload::save_send_images(&state, &id, &mut cmd).await;
+                            if !session_writable(&state, &id) || scope.as_ref().is_some_and(|s| s.session(&state, &id).is_err()) {
+                                crate::upload::discard_saved_images(saved);
+                                scope_changed(&mut socket).await;
+                                return;
+                            }
                             let interaction = crate::activity::is_interaction(&cmd);
                             if let Err(err) = state.chat.command(&id, cmd).await {
                                 // The send never happened: neither do its copies.
@@ -956,7 +1002,10 @@ fn chat_batch_end(replay: &[Arc<chimaera_agent::journal::SeqEvent>], start: usiz
 
 /// First-frame auth for the chat channel: carries `last_seq` instead of grid
 /// dims. `None` = rejected.
-async fn chat_authenticate(socket: &mut WebSocket, state: &AppState) -> Option<u64> {
+async fn chat_authenticate(
+    socket: &mut WebSocket,
+    state: &AppState,
+) -> Option<(u64, Option<crate::workspace_scope::Scope>)> {
     #[derive(Deserialize)]
     struct ChatAuth {
         #[serde(rename = "type")]
@@ -964,10 +1013,14 @@ async fn chat_authenticate(socket: &mut WebSocket, state: &AppState) -> Option<u
         token: String,
         #[serde(default)]
         last_seq: u64,
+        #[serde(flatten)]
+        scope: crate::workspace_scope::Fields,
     }
     match tokio::time::timeout(AUTH_TIMEOUT, socket.recv()).await {
         Ok(Some(Ok(Message::Text(text)))) => match serde_json::from_str::<ChatAuth>(&text) {
-            Ok(auth) if auth.kind == "auth" && auth.token == state.token => Some(auth.last_seq),
+            Ok(auth) if auth.kind == "auth" && auth.token == state.token => {
+                Some((auth.last_seq, auth.scope.scope().ok()?))
+            }
             _ => None,
         },
         _ => None,
@@ -987,6 +1040,125 @@ pub(crate) async fn events_ws(
         .on_upgrade(move |socket| handle_events(socket, state))
 }
 
+async fn scope_changed(socket: &mut WebSocket) {
+    let _ = send_json(socket, &json!({"type":"error","code":"workspace_scope_changed","message":"Your project connection changed. Reconnecting…"})).await;
+}
+
+async fn scoped_events(
+    mut socket: WebSocket,
+    state: Arc<AppState>,
+    scope: crate::workspace_scope::Scope,
+) {
+    if scope.validate(&state).is_err() {
+        scope_changed(&mut socket).await;
+        return;
+    }
+    state.wait_restored().await;
+    let alias = match scope.alias(&state) {
+        Ok(alias) => alias,
+        Err(_) => return,
+    };
+    let mut watch = crate::git::WatchGuard::new(state.clone());
+    watch.set(Some(scope.workspace_id.clone()));
+    let mut files = crate::fs_watch::FsWatch::new();
+    let mut last = String::new();
+    let mut settings = None;
+    let mut epochs_sent = std::collections::HashMap::new();
+    let mut recents = None;
+    let mut last_notice = state.notices.head();
+    let mut tick = tokio::time::interval(EVENTS_TICK);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        if scope.validate(&state).is_err() {
+            scope_changed(&mut socket).await;
+            return;
+        }
+        let frame = json!({"type":"sessions","sessions":crate::workspace_scope::sessions(&state,&scope),"links":crate::workspace_scope::links(&state,&scope)}).to_string();
+        if frame != last {
+            if socket
+                .send(Message::Text(frame.clone().into()))
+                .await
+                .is_err()
+            {
+                return;
+            }
+            last = frame;
+        }
+        if send_settings_snapshot(&mut socket, &state, &mut settings)
+            .await
+            .is_err()
+        {
+            return;
+        }
+        for (kind, epochs) in [
+            ("git", state.git.epochs_snapshot()),
+            ("timeline", state.timeline.epochs_snapshot()),
+        ] {
+            let own: std::collections::BTreeMap<_, _> = epochs
+                .into_iter()
+                .filter(|(id, _)| id == &scope.workspace_id)
+                .collect();
+            let value = json!({"type":kind,"epochs":own});
+            if epochs_sent.get(kind) != Some(&value) {
+                if send_json(&mut socket, &value).await.is_err() {
+                    return;
+                }
+                epochs_sent.insert(kind, value);
+            }
+        }
+        if send_recents_snapshot(&mut socket, &state, &mut recents)
+            .await
+            .is_err()
+        {
+            return;
+        }
+        if let Some(frame) = crate::notices::frame_since(&state, &mut last_notice) {
+            if let Ok(mut frame) = serde_json::from_str::<serde_json::Value>(&frame) {
+                if let Some(rows) = frame["notices"].as_array_mut() {
+                    rows.retain(|row| row["workspace_id"].as_str() == Some(&scope.workspace_id));
+                    if !rows.is_empty() && send_json(&mut socket, &frame).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+        let mut changes = files.poll(false).await;
+        if let Some(alias) = &alias {
+            for paths in [
+                &mut changes.files,
+                &mut changes.removed,
+                &mut changes.dirs,
+                &mut changes.removed_dirs,
+            ] {
+                for path in paths {
+                    *path = alias.output(path);
+                }
+            }
+        }
+        if send_fs_changes(&mut socket, changes).await.is_err() {
+            return;
+        }
+        tokio::select! {
+            _ = tick.tick() => {},
+            message = socket.recv() => match message {
+                Some(Ok(Message::Text(text))) => {
+                    if let Ok(ClientMessage::Watch {workspace_id, files: mut wanted_files, mut dirs}) = serde_json::from_str(&text) {
+                        if workspace_id.as_deref().is_some_and(|id| id != scope.workspace_id) { return; }
+                        if let Some(alias)=&alias { for path in wanted_files.iter_mut().chain(dirs.iter_mut()) { *path=alias.input(path); } }
+                        let paths = wanted_files.iter().chain(dirs.iter()).cloned().collect();
+                        if scope.paths(&state,paths).await.is_err() { return; }
+                        files.set(wanted_files,dirs);
+                        tokio::time::sleep(EVENTS_THROTTLE).await;
+                    }
+                },
+                Some(Ok(Message::Ping(payload))) => { if socket.send(Message::Pong(payload)).await.is_err() { return; } },
+                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return,
+                _ => {},
+            },
+        }
+    }
+}
+
 /// Minimum gap between snapshot frames (<= 4/s). Also the reuse window of
 /// the shared sessions-snapshot cache (`session_view::EVENTS_SNAPSHOT_REUSE`
 /// is defined AS this constant so the two can't drift apart).
@@ -996,12 +1168,16 @@ pub(crate) const EVENTS_THROTTLE: Duration = Duration::from_millis(250);
 const EVENTS_TICK: Duration = Duration::from_secs(1);
 
 async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
-    if authenticate(&mut socket, &state).await.is_none() {
+    let Some(auth) = authenticate(&mut socket, &state).await else {
         let _ = send_json(
             &mut socket,
             &json!({"type": "error", "message": "unauthorized"}),
         )
         .await;
+        return;
+    };
+    if let Some(scope) = auth.scope {
+        scoped_events(socket, state, scope).await;
         return;
     }
 
@@ -1115,6 +1291,10 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
                     if let Ok(ClientMessage::Watch { workspace_id, files, dirs }) =
                         serde_json::from_str::<ClientMessage>(&text)
                     {
+                        if let Some(workspace)=workspace_id.as_deref() {
+                            let registration=json!({"type":"watch","workspace_id":workspace,"files":files,"dirs":dirs});
+                            if crate::session_proxy::events(&state,workspace,registration,&mut socket).await {return;}
+                        }
                         watch.set(workspace_id);
                         if fs_watch.set(files, dirs) {
                             // Establish new metadata baselines immediately when
@@ -1340,6 +1520,7 @@ async fn send_sessions_snapshot(
 struct AuthParams {
     dims: Option<(u16, u16)>,
     parked: bool,
+    scope: Option<crate::workspace_scope::Scope>,
 }
 
 async fn authenticate(socket: &mut WebSocket, state: &AppState) -> Option<AuthParams> {
@@ -1350,9 +1531,11 @@ async fn authenticate(socket: &mut WebSocket, state: &AppState) -> Option<AuthPa
                 cols,
                 rows,
                 parked,
+                scope,
             }) if token == state.token => Some(AuthParams {
                 dims: cols.zip(rows),
                 parked,
+                scope: scope.scope().ok()?,
             }),
             _ => None,
         },

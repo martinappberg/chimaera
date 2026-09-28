@@ -32,6 +32,14 @@ pub(super) fn session_key(
     }
 }
 
+pub(super) fn installation_key(endpoint: &str, account: &str, config: &Path) -> Result<String> {
+    Ok(serde_json::to_string(&(
+        endpoint,
+        account,
+        config.to_str().context("invalid installation scope")?,
+    ))?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

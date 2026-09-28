@@ -1095,6 +1095,7 @@ export interface MirrorProfile {
 }
 export interface MirrorWorkspace {
   workspace_id: string; name: string; root: string; never_mirror: boolean; privacy_pending?: boolean;
+  checkpoint_id?: string | null;
   ownership: { state: "awaiting_verification" | "local" | "remote" | "transferring" | "hydrating" | "setting_up" | "privacy_disabled"; epoch: number; holder?: string } | null;
   mirror: { files: number; bytes: number; excluded: number; too_large: number; last_mirrored_at: number | null; storage_limit_bytes: number; error: string | null } | null;
   profile: MirrorProfile | null;

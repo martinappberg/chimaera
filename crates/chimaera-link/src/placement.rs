@@ -1,0 +1,218 @@
+//! Passive logical-workspace placement. Viewing never requests execution.
+use anyhow::{ensure, Context, Result};
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlacementAvailability {
+    Owned,
+    Unowned,
+    Expired,
+    PrivacyDisabled,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct WorkspacePlacement {
+    pub workspace_id: String,
+    pub holder_id: Option<String>,
+    pub route_host_id: Option<String>,
+    pub epoch: u64,
+    pub policy_revision: u64,
+    pub availability: PlacementAvailability,
+    pub preferred_installation_id: Option<String>,
+    pub checkpoint_id: Option<String>,
+    pub server_now: String,
+    pub expires_at: Option<String>,
+}
+
+pub(crate) fn valid_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_".contains(&byte))
+}
+impl WorkspacePlacement {
+    pub fn validate(&self, workspace: &str) -> Result<()> {
+        ensure!(
+            valid_id(workspace) && self.workspace_id == workspace,
+            "workspace placement identity mismatch"
+        );
+        for id in [
+            self.holder_id.as_deref(),
+            self.route_host_id.as_deref(),
+            self.preferred_installation_id.as_deref(),
+            self.checkpoint_id.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            ensure!(valid_id(id), "invalid workspace placement identity");
+        }
+        ensure!(
+            !self.server_now.is_empty() && self.server_now.len() <= 64,
+            "invalid workspace placement clock"
+        );
+        let now = time::OffsetDateTime::parse(
+            &self.server_now,
+            &time::format_description::well_known::Rfc3339,
+        )
+        .map_err(|_| anyhow::anyhow!("invalid workspace placement clock"))?;
+        if self.availability == PlacementAvailability::Owned {
+            let holder = self
+                .holder_id
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("workspace owner missing"))?;
+            let route = self
+                .route_host_id
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("workspace route missing"))?;
+            ensure!(
+                route.strip_prefix("worker-") == Some(holder)
+                    || route.strip_prefix("device-") == Some(holder),
+                "workspace route does not match owner"
+            );
+            let expiry = self
+                .expires_at
+                .as_deref()
+                .filter(|value| value.len() <= 64)
+                .context("workspace lease missing")?;
+            let expiry =
+                time::OffsetDateTime::parse(expiry, &time::format_description::well_known::Rfc3339)
+                    .map_err(|_| anyhow::anyhow!("invalid workspace lease clock"))?;
+            ensure!(expiry > now, "workspace lease expired");
+            ensure!(
+                self.epoch > 0
+                    && self
+                        .expires_at
+                        .as_ref()
+                        .is_some_and(|value| !value.is_empty() && value.len() <= 64),
+                "workspace lease missing"
+            );
+        } else {
+            ensure!(
+                self.route_host_id.is_none(),
+                "inactive workspace must not have an execution route"
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct InstallationIdentity {
+    pub installation_id: String,
+    pub installation_proof: String,
+}
+impl std::fmt::Debug for InstallationIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InstallationIdentity")
+            .field("installation_id", &self.installation_id)
+            .finish_non_exhaustive()
+    }
+}
+impl InstallationIdentity {
+    pub fn generate() -> Self {
+        use base64::Engine;
+        let proof = rand::random::<[u8; 32]>();
+        let id = rand::random::<[u8; 16]>();
+        Self {
+            installation_id: format!(
+                "i-{}",
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(id)
+            ),
+            installation_proof: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(proof),
+        }
+    }
+    pub fn validate(&self) -> Result<()> {
+        use base64::Engine;
+        ensure!(
+            valid_id(&self.installation_id) && self.installation_id.starts_with("i-"),
+            "invalid installation identity"
+        );
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(&self.installation_proof)
+            .map_err(|_| anyhow::anyhow!("invalid installation proof"))?;
+        ensure!(
+            bytes.len() == 32
+                && base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&bytes)
+                    == self.installation_proof,
+            "invalid installation proof"
+        );
+        Ok(())
+    }
+}
+#[derive(Clone, Debug, Deserialize)]
+pub struct InstallationBinding {
+    pub installation_id: String,
+    pub device_id: String,
+}
+#[derive(Clone, Debug, Deserialize)]
+pub struct WorkspaceHome {
+    pub workspace_id: String,
+    pub preferred_installation_id: String,
+    pub policy_revision: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn owned() -> WorkspacePlacement {
+        serde_json::from_value(serde_json::json!({"workspace_id":"w-project","holder_id":"d-home","route_host_id":"device-d-home","epoch":4,"policy_revision":2,"availability":"owned","preferred_installation_id":"i-home","checkpoint_id":"c-one","server_now":"2026-09-28T19:00:00Z","expires_at":"2026-09-28T19:01:30Z"})).unwrap()
+    }
+    #[test]
+    fn placement_binds_exact_workspace_and_typed_owner() {
+        let mut value = owned();
+        value.validate("w-project").unwrap();
+        assert!(value.validate("w-other").is_err());
+        value.route_host_id = Some("worker-wrong".into());
+        assert!(value.validate("w-project").is_err());
+        value.route_host_id = Some("prefix-device-d-home".into());
+        assert!(value.validate("w-project").is_err());
+        value.route_host_id = Some("worker-d-home".into());
+        value.validate("w-project").unwrap();
+        value.availability = PlacementAvailability::Expired;
+        assert!(value.validate("w-project").is_err());
+        value.route_host_id = None;
+        value.validate("w-project").unwrap();
+    }
+    #[test]
+    fn installation_proof_is_canonical_bounded_and_not_debuggable() {
+        let value = InstallationIdentity::generate();
+        value.validate().unwrap();
+        assert!(!format!("{value:?}").contains(&value.installation_proof));
+        let mut invalid = value.clone();
+        invalid.installation_proof.push('=');
+        assert!(invalid.validate().is_err());
+        invalid.installation_proof = "AA".into();
+        assert!(invalid.validate().is_err());
+        invalid.installation_id = "i-../other".into();
+        assert!(invalid.validate().is_err());
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ExecutionCapabilities {
+    pub execution_authority: u16,
+    pub execution_capability: crate::ExecutionCapability,
+    pub installation_binding: u16,
+    pub workspace_placement: u16,
+    pub checkpoint_receipts: u16,
+}
+impl ExecutionCapabilities {
+    pub fn supported(&self) -> bool {
+        self.execution_authority == 2
+            && self.execution_capability.supported()
+            && self.installation_binding == 1
+            && self.workspace_placement == 2
+            && self.checkpoint_receipts == 1
+    }
+}
+#[derive(Debug)]
+pub struct CleanReleaseRequired;
+impl std::fmt::Display for CleanReleaseRequired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("clean_release_required")
+    }
+}
+impl std::error::Error for CleanReleaseRequired {}

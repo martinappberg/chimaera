@@ -390,3 +390,24 @@ _Captured 2026-09-28 from the maintainer's instructions in this conversation._
 
 _Broader Pro intent capture remains pending. The behavior above the divider is
 derived from code; the statements here record the maintainer's instructions._
+
+
+### Project views follow the current owner
+
+The maintainer's requirement is home-first work: opening the same project on a
+phone, browser or another computer must not move execution away from an online
+home computer. Logical browser routes and native project views now resolve the
+current owner passively, carry its exact workspace/epoch and preserve the same
+session identity. Files, previews and watches follow that owner while native file
+tabs retain their local presentation paths. A stale connection stops input and
+reconnects; it never automatically sends the same action twice. The initial
+project route admits registered project resources; host-wide configuration and
+unbound browser proxy/worktree operations retain their ordinary local/SSH paths.
+See the [wire and resource contract](../../crates/chimaera-link/VIEWING.md).
+
+Account startup and preview packaging are independent of this routing. A macOS
+preview must retain the built Mach-O as its actual bundle executable, bind its
+preview environment before signing and pass deep/strict signature verification.
+Replacing that executable with a script can make Keychain reject valid saved
+credentials without a useful prompt; the [development recipe](../../.claude/skills/develop/SKILL.md)
+now fails before launch on invalid signatures.

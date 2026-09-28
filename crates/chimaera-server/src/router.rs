@@ -265,6 +265,10 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
             state.clone(),
             crate::session_proxy::api_proxy,
         ))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::workspace_scope::middleware,
+        ))
         .route_layer(middleware::from_fn_with_state(state.clone(), api::auth))
         // Registered after route_layer, so hook ingestion is NOT behind bearer
         // auth: claude's hooks cannot know the daemon token, so the random
@@ -293,6 +297,14 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         // An HTML report's relative assets, confined to its folder.
         .route("/raw/{ticket}/{*rest}", get(fs::raw_asset))
         .route("/download/{ticket}", get(download::download))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::workspace_scope::ticket_middleware,
+        ))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::session_proxy::ticket_proxy,
+        ))
         // Three spellings because `{*path}` refuses an EMPTY tail: the bare
         // form redirects to the slashed form, the slashed form IS the app's
         // root document, and the wildcard carries everything deeper.
@@ -308,5 +320,6 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         // requests from proxied apps (cookie/Referer), and applies the SPA
         // index.html rules — see proxy::fallback.
         .fallback_service(axum::routing::any(proxy::fallback).with_state(state))
+        .layer(middleware::from_fn(crate::workspace_scope::reject_unbound))
         .layer(TraceLayer::new_for_http())
 }

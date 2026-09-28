@@ -1,4 +1,5 @@
 import { daemonSocketUrl } from "../net/base";
+import { sendSocketAuth } from "../net/placement";
 import { getToken } from "../net/api";
 import { Reconnector, UNKNOWN_SESSION_RETRIES } from "../net/reconnect";
 import { CooperativeQueue } from "./cooperativeQueue";
@@ -73,6 +74,7 @@ type ChatDelivery =
  */
 export class ChatSocket {
   private ws: WebSocket | null = null;
+  private authenticatedSocket: WebSocket | null = null;
   private closed = false;
   private fatal = false;
   private ended = false;
@@ -128,13 +130,9 @@ export class ChatSocket {
     this.ws = ws;
 
     ws.onopen = () => {
-      ws.send(
-        JSON.stringify({
-          type: "auth",
-          token: getToken() ?? "",
-          last_seq: this.handlers.lastSeq(),
-        }),
-      );
+      sendSocketAuth(ws, {
+        type: "auth", token: getToken() ?? "", last_seq: this.handlers.lastSeq(),
+      }, () => this.ws === ws && !this.closed, () => { this.authenticatedSocket = ws; });
     };
 
     ws.onmessage = (ev: MessageEvent) => {
@@ -186,7 +184,7 @@ export class ChatSocket {
           });
           break;
         case "error":
-          if (msg.code === "remote_unavailable" || msg.code === "worker_asleep") break;
+          if (msg.code === "remote_unavailable" || msg.code === "worker_asleep" || msg.code === "workspace_scope_changed") break;
           // Mid view-switch the driver may not be registered yet — the
           // normal onclose reconnect path retries before this goes fatal.
           if (
@@ -243,7 +241,7 @@ export class ChatSocket {
 
   /** Send an AgentCommand frame; false when the socket is not open. */
   send(command: Record<string, unknown>): boolean {
-    if (this.ws?.readyState !== WebSocket.OPEN) return false;
+    if (this.ws?.readyState !== WebSocket.OPEN || this.authenticatedSocket !== this.ws) return false;
     this.ws.send(JSON.stringify(command));
     return true;
   }

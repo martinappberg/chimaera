@@ -237,6 +237,119 @@ impl Client {
         )
         .await
     }
+    pub async fn execution_capabilities(&self) -> Result<crate::ExecutionCapabilities> {
+        let value: crate::ExecutionCapabilities = json_response(
+            self.request(
+                Method::GET,
+                path(&self.inner.account, &["v2", "capabilities"]),
+                None,
+            )
+            .await?,
+        )
+        .await?;
+        anyhow::ensure!(value.supported(), "managed execution is unavailable");
+        Ok(value)
+    }
+    pub async fn installation_recovery(
+        &self,
+        identity: &crate::InstallationIdentity,
+        workspace: &str,
+        holder: &str,
+        expected_epoch: u64,
+    ) -> Result<crate::ExecutionRecoveryGrant> {
+        identity.validate()?;
+        anyhow::ensure!(
+            crate::placement::valid_id(workspace)
+                && crate::placement::valid_id(holder)
+                && expected_epoch > 0,
+            "invalid recovery identity"
+        );
+        let value: crate::ExecutionRecoveryGrant = json_response(self.request(Method::POST,
+            path(&self.inner.account, &["v2", "installations", &identity.installation_id, "recovery"]),
+            Some(serde_json::json!({"installation_proof":identity.installation_proof,"workspace_id":workspace,"expected_epoch":expected_epoch}))).await?).await?;
+        anyhow::ensure!(
+            value.workspace_id == workspace
+                && value.holder_id == holder
+                && value.epoch == expected_epoch
+                && value.scope.len() == 2
+                && value.scope.iter().any(|s| s == "mirror")
+                && value.scope.iter().any(|s| s == "release")
+                && !value.access_token.is_empty()
+                && value.access_token.len() <= 8192
+                && !value.access_token.chars().any(char::is_control)
+                && !value.expires_at.is_empty()
+                && value.expires_at.len() <= 64,
+            "recovery grant mismatch"
+        );
+        Ok(value)
+    }
+    /// Read the current owner without acquiring, waking or transferring work.
+    pub async fn workspace_placement(&self, workspace: &str) -> Result<crate::WorkspacePlacement> {
+        anyhow::ensure!(
+            crate::placement::valid_id(workspace),
+            "invalid workspace identity"
+        );
+        let value: crate::WorkspacePlacement = json_response(
+            self.request(
+                Method::GET,
+                path(
+                    &self.inner.account,
+                    &["v2", "workspaces", workspace, "placement"],
+                ),
+                None,
+            )
+            .await?,
+        )
+        .await?;
+        value.validate(workspace)?;
+        Ok(value)
+    }
+    pub async fn bind_installation(
+        &self,
+        identity: &crate::InstallationIdentity,
+    ) -> Result<crate::InstallationBinding> {
+        identity.validate()?;
+        let response = self
+            .request_raw(
+                Method::POST,
+                path(&self.inner.account, &["v2", "installations", "bind"]),
+                Some(serde_json::to_value(identity)?),
+            )
+            .await?;
+        if response.status() == reqwest::StatusCode::CONFLICT {
+            let error: serde_json::Value = json_response_body(response).await?;
+            if error["error"] == "clean_release_required" {
+                return Err(crate::CleanReleaseRequired.into());
+            }
+            bail!("installation binding rejected");
+        }
+        let value: crate::InstallationBinding = json_response(response).await?;
+        anyhow::ensure!(
+            value.installation_id == identity.installation_id
+                && crate::placement::valid_id(&value.device_id),
+            "installation binding identity mismatch"
+        );
+        Ok(value)
+    }
+    pub async fn set_workspace_home(
+        &self,
+        workspace: &str,
+        installation: &str,
+        expected_policy_revision: u64,
+    ) -> Result<crate::WorkspaceHome> {
+        anyhow::ensure!(
+            crate::placement::valid_id(workspace) && crate::placement::valid_id(installation),
+            "invalid workspace home identity"
+        );
+        let value: crate::WorkspaceHome = json_response(self.request(Method::PUT, path(&self.inner.account, &["v2", "workspaces", workspace, "home"]), Some(serde_json::json!({"installation_id":installation,"expected_policy_revision":expected_policy_revision}))).await?).await?;
+        anyhow::ensure!(
+            value.workspace_id == workspace
+                && value.preferred_installation_id == installation
+                && value.policy_revision >= expected_policy_revision,
+            "workspace home identity mismatch"
+        );
+        Ok(value)
+    }
     pub async fn baton(&self, workspace: &str) -> Result<Baton> {
         self.baton_request(Method::GET, workspace, None, None).await
     }

@@ -8,7 +8,7 @@ repository.workspace = true
 [features]
 default = []
 # Test fixture and executable conformance tooling never enter the app binary.
-fixtures = ["dep:axum", "dep:clap", "dep:time"]
+fixtures = ["dep:axum", "dep:clap", "time/formatting"]
 
 [dependencies]
 anyhow.workspace = true
@@ -27,7 +27,7 @@ clap = { workspace = true, optional = true, features = ["env"] }
 
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 webpki-roots = "1"
-time = { version = "0.3", features = ["formatting"], optional = true }
+time = { version = "0.3", features = ["parsing"] }
 
 [[bin]]
 name = "fake-keeper"
