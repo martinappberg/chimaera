@@ -91,4 +91,23 @@ describe("toolRunHealth", () => {
   it("never recovers a denial", () => {
     expect(toolRunHealth([call({ denied: true, status: "failed" }), call()])).toBe("failed");
   });
+
+  it("recovers a failed command with any later completed command", () => {
+    const cmd = (over: Partial<HealthTool> = {}) => call({ tool: "execute", title: "cargo build", ...over });
+    expect(toolRunHealth([cmd({ status: "failed" }), cmd({ title: "cargo build 2>&1 | tail" })])).toBe(
+      "recovered",
+    );
+    expect(toolRunHealth([cmd({ status: "failed" }), cmd({ status: "in_progress" })])).toBe("failed");
+    expect(toolRunHealth([cmd({ status: "failed" }), call({ title: "cargo build" })])).toBe("failed");
+  });
+
+  it("looks past the run into the rest of its turn", () => {
+    const failedEdit = call({ status: "failed", locations: ["/a.rs"] });
+    const retry = call({ locations: ["/a.rs"] });
+    const other = call({ locations: ["/b.rs"] });
+    expect(toolRunHealth([failedEdit], { tools: [failedEdit, other, retry], from: 1 })).toBe("recovered");
+    expect(toolRunHealth([failedEdit], { tools: [failedEdit, other], from: 1 })).toBe("failed");
+    // Calls before `from` belong to the run (or precede it) and don't count.
+    expect(toolRunHealth([failedEdit], { tools: [retry, failedEdit], from: 2 })).toBe("failed");
+  });
 });
