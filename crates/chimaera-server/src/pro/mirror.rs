@@ -478,4 +478,69 @@ mod tests {
         assert!(!project.join(".git").exists());
         fs::remove_dir_all(root).unwrap();
     }
+
+    #[tokio::test]
+    async fn snapshots_exclude_in_progress_writes_and_include_completed_rename() {
+        for repository in [false, true] {
+            let root = std::env::temp_dir().join(format!(
+                "chimaera-mirror-staging-{}",
+                chimaera_core::generate_token()
+            ));
+            let project = root.join("project");
+            let shadow = root.join("shadow");
+            fs::create_dir_all(&project).unwrap();
+            initialize(&shadow).await.unwrap();
+            if repository {
+                transport::git_output(
+                    transport::git(&project, None).await.unwrap(),
+                    &["init", "--quiet", "."],
+                    vec![],
+                )
+                .await
+                .unwrap();
+            }
+            let target = project.join("notes.md");
+            fs::write(&target, "previous complete version").unwrap();
+            fs::write(project.join(".notes.backup.tmp"), "user backup").unwrap();
+            fs::write(project.join(".chimaeraignore"), "!.chimaera-staging-*\n").unwrap();
+            let staged_name = crate::persist::project_temp_name(target.file_name().unwrap());
+            let staged = project.join(&staged_name);
+            let mut upload = fs::File::create(&staged).unwrap();
+            upload.write_all(b"unfinished").unwrap();
+            upload.flush().unwrap();
+            if repository {
+                // A mistakenly tracked temporary file is still never transferable.
+                transport::git_output(
+                    transport::git(&project, None).await.unwrap(),
+                    &["add", "--force", staged_name.to_str().unwrap()],
+                    vec![],
+                )
+                .await
+                .unwrap();
+            }
+            let paths = inventory(&project, &shadow).await.unwrap();
+            assert!(paths.iter().any(|path| path == Path::new(&staged_name)));
+            let first = root.join("first");
+            copy_tree(&project, &first, paths, 10000, 1000).unwrap();
+            assert!(!first.join(&staged_name).exists());
+            assert_eq!(
+                fs::read(first.join("notes.md")).unwrap(),
+                b"previous complete version"
+            );
+            assert!(first.join(".notes.backup.tmp").exists());
+            upload.write_all(b" now complete").unwrap();
+            upload.sync_all().unwrap();
+            drop(upload);
+            fs::rename(&staged, &target).unwrap();
+            let paths = inventory(&project, &shadow).await.unwrap();
+            let second = root.join("second");
+            copy_tree(&project, &second, paths, 10000, 1000).unwrap();
+            assert_eq!(
+                fs::read(second.join("notes.md")).unwrap(),
+                b"unfinished now complete"
+            );
+            assert!(!second.join(&staged_name).exists());
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
 }

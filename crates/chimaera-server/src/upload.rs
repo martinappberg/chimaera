@@ -177,8 +177,9 @@ pub(crate) async fn upload(
 
     // Stream to a hidden tmp sibling, then rename — a partial upload is never
     // visible under its final name (an agent could read it mid-write).
-    let token = &chimaera_core::generate_token()[..8];
-    let tmp = dir.join(format!(".{name}.{token}.tmp"));
+    let tmp = dir.join(crate::persist::project_temp_name(std::ffi::OsStr::new(
+        &name,
+    )));
     let mut file = match tokio::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -341,8 +342,9 @@ pub(crate) async fn upload_to_dir(
 
     // Hidden tmp sibling then rename — a partial upload never appears under its
     // final name.
-    let token = &chimaera_core::generate_token()[..8];
-    let tmp = dir.join(format!(".{name}.{token}.tmp"));
+    let tmp = dir.join(crate::persist::project_temp_name(std::ffi::OsStr::new(
+        &name,
+    )));
     let mut file = match tokio::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -611,7 +613,9 @@ pub(crate) fn save_images_blocking(
         }
         let token = &chimaera_core::generate_token()[..8];
         let target = dir.join(format!("image-{token}.{ext}"));
-        let tmp = dir.join(format!(".image-{token}.{ext}.tmp"));
+        let tmp = dir.join(crate::persist::project_temp_name(
+            target.file_name().unwrap(),
+        ));
         let written = std::fs::write(&tmp, &bytes).and_then(|()| std::fs::rename(&tmp, &target));
         if let Err(err) = written {
             let _ = std::fs::remove_file(&tmp);

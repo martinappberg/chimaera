@@ -67,6 +67,8 @@ its credentials. Other preferences merge for matching connections. Conflicts do
 not yet have a user-facing report; imported settings must not be described as
 having replaced every existing connection.
 
+Project save/upload siblings use the reserved `.chimaera-staging-` prefix. Snapshot policy excludes that namespace even when tracked or explicitly included by an ignore file, so an unfinished body cannot enter a canonical snapshot before its final guarded rename. Ordinary user temporary files keep their existing policy.
+
 No account refresh token or agent credential enters this module. Delegations and
 short-lived Git passwords are memory-only. Never log remote response bodies,
 credential helpers, or secret-bearing structs. Filesystem work runs off the

@@ -34,7 +34,8 @@ pub(super) fn allowed_path(path: &Path) -> bool {
                 | "keychain"
                 | "keychains"
                 | "application_default_credentials.json"
-        ) || name == ".env"
+        ) || name.starts_with(crate::persist::PROJECT_STAGING_PREFIX)
+            || name == ".env"
             || name.starts_with(".env.")
             || name.starts_with(".env-")
             || name.starts_with("id_rsa")

@@ -407,7 +407,9 @@ fn list_dirs(raw: &str, hidden: bool) -> anyhow::Result<serde_json::Value> {
         // Unreadable entries are skipped silently.
         let Ok(entry) = entry else { continue };
         let name = entry.file_name().to_string_lossy().into_owned();
-        if !hidden && name.starts_with('.') {
+        if name.starts_with(crate::persist::PROJECT_STAGING_PREFIX)
+            || !hidden && name.starts_with('.')
+        {
             continue;
         }
         if !entry_is_dir(&entry) {
@@ -488,7 +490,9 @@ fn list_entries(raw: &str, hidden: bool) -> anyhow::Result<serde_json::Value> {
     for entry in read {
         let Ok(entry) = entry else { continue };
         let name = entry.file_name().to_string_lossy().into_owned();
-        if !hidden && name.starts_with('.') {
+        if name.starts_with(crate::persist::PROJECT_STAGING_PREFIX)
+            || !hidden && name.starts_with('.')
+        {
             continue;
         }
         let entry_path = entry.path();
@@ -1053,31 +1057,6 @@ impl Drop for TempFile {
     }
 }
 
-/// Longest file name most filesystems accept (NAME_MAX).
-const MAX_NAME_BYTES: usize = 255;
-
-/// The hidden temp sibling's name: `.{name}.{8 random}.tmp`, with `name`
-/// shortened (at a UTF-8 boundary when it is UTF-8) so the whole stays within
-/// [`MAX_NAME_BYTES`] — a 250-byte file name must still be saveable.
-fn temp_name(name: &std::ffi::OsStr) -> std::ffi::OsString {
-    use std::os::unix::ffi::{OsStrExt, OsStringExt};
-    let nonce = &chimaera_core::generate_token()[..8];
-    let budget = MAX_NAME_BYTES - (".".len() + ".".len() + nonce.len() + ".tmp".len());
-    let bytes = name.as_bytes();
-    let mut cut = bytes.len().min(budget);
-    // Never split a multi-byte character: back off past continuation bytes.
-    while cut > 0 && cut < bytes.len() && (bytes[cut] & 0b1100_0000) == 0b1000_0000 {
-        cut -= 1;
-    }
-    let mut out = Vec::with_capacity(cut + 14);
-    out.push(b'.');
-    out.extend_from_slice(&bytes[..cut]);
-    out.push(b'.');
-    out.extend_from_slice(nonce.as_bytes());
-    out.extend_from_slice(b".tmp");
-    std::ffi::OsString::from_vec(out)
-}
-
 /// Give the temp file the target's owner and group where the kernel allows.
 /// A non-root daemon can never give a file away, but may move it to any group
 /// it belongs to — the shared project directory case — so a refused full
@@ -1184,7 +1163,7 @@ fn write_file(
     let name = target
         .file_name()
         .with_context(|| format!("{} has no file name", target.display()))?;
-    let tmp = parent.join(temp_name(name));
+    let tmp = parent.join(crate::persist::project_temp_name(name));
     let mode = existing
         .as_ref()
         .map_or(0o666, |meta| meta.permissions().mode() & 0o7777);
@@ -1379,24 +1358,42 @@ mod write_tests {
         guard.disarm();
         drop(guard);
         assert!(kept.exists());
+        let staged = dir.join(crate::persist::project_temp_name(std::ffi::OsStr::new(
+            "report.md",
+        )));
+        std::fs::write(&staged, b"incomplete").unwrap();
+        let listing = list_entries(dir.to_str().unwrap(), true).unwrap();
+        let entries = listing["entries"].as_array().unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "internal staging must remain hidden even with dotfiles enabled"
+        );
+        assert_eq!(
+            entries[0]["name"], ".b.tmp",
+            "ordinary user temporary files remain visible"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn temp_names_fit_name_max_without_splitting_characters() {
         use std::os::unix::ffi::OsStrExt;
-        let short = temp_name(std::ffi::OsStr::new("notes.md"));
+        let short = crate::persist::project_temp_name(std::ffi::OsStr::new("notes.md"));
         let short = short.to_str().unwrap();
         assert!(
-            short.starts_with(".notes.md.") && short.ends_with(".tmp"),
+            short.starts_with(".chimaera-staging-notes.md.") && short.ends_with(".tmp"),
             "{short}"
         );
-        assert_eq!(short.len(), ".notes.md.".len() + 8 + ".tmp".len());
+        assert_eq!(
+            short.len(),
+            ".chimaera-staging-notes.md.".len() + 32 + ".tmp".len()
+        );
 
         // 254 bytes of two-byte characters: cut to fit, on a boundary.
         let long = "é".repeat(127);
-        let name = temp_name(std::ffi::OsStr::new(&long));
-        assert!(name.as_bytes().len() <= MAX_NAME_BYTES);
+        let name = crate::persist::project_temp_name(std::ffi::OsStr::new(&long));
+        assert!(name.as_bytes().len() <= 255);
         assert!(name.to_str().is_some(), "split a character: {name:?}");
     }
 }
