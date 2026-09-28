@@ -160,7 +160,9 @@
       : null,
   );
   const installationDetected = $derived(
-    continuation !== null && model.rows.some((r) => r.agent === continuation.agent && r.status === "installed"),
+    continuation !== null && model.rows.some(
+      (r) => r.agent === continuation.agent && (r.status === "installed" || r.status === "disabled"),
+    ),
   );
   /** A plugin that can't run here: the switch can't turn it on (the daemon
    *  refuses) until the fault is gone. A fault while on is the plugin
