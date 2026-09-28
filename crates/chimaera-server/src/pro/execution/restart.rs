@@ -90,8 +90,8 @@ fn boot_id() -> Option<String> {
             .read_to_string(&mut value)
             .ok()?;
         let value = value.trim();
-        return (value.len() == 36 && value.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-'))
-            .then(|| value.into());
+        (value.len() == 36 && value.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-'))
+            .then(|| value.into())
     }
     #[cfg(target_os = "macos")]
     {
