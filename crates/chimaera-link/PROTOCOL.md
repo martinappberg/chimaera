@@ -228,7 +228,13 @@ available. `build` is the daemon build-id string, `sessions` a count. The daemon
 token is delivered only to authorized devices over the protected link and retained
 in memory only. `error` is null or a short user-safe explanation, never SSH output
 containing passwords or key material. Host ids are opaque path segments; clients
-must URL-encode them. Aliases have a maximum of 255 bytes.
+must URL-encode them. Aliases have a maximum of 255 bytes. For `kind: "worker"`,
+the registered route ID is exactly `worker-` followed by the account's worker ID.
+That account worker ID is also the worker delegation's `device_id` and baton
+`holder_id`; the prefix is not part of baton ownership. Clients may compare these
+identities only for typed worker rows and must retain the complete host ID for
+keeper requests, tunnels and placement routing. Device and SSH IDs have no such
+translation.
 
 ## Events
 

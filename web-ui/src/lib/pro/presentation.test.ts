@@ -32,6 +32,14 @@ describe("honest cloud state", () => {
     expect(cloudCopy("limited", "hours_exhausted").detail).toContain("resets next month");
     expect(cloudCopy("limited", "storage_exhausted").detail).toContain("local projects remain available");
   });
+  it("explains a credential save failure without claiming authentication expired", () => {
+    const copy = friendlyError("account_credentials_unsaved", "fallback");
+    expect(copy).toContain("You’re signed in");
+    expect(copy).toContain("Check again");
+    expect(copy).toContain("after restarting");
+    expect(copy).not.toContain("expired");
+    expect(friendlyError("account_credentials_unsaved private-details", "fallback")).toBe("fallback");
+  });
   it("never renders arbitrary service errors", () => {
     expect(friendlyError("account request rejected (503) secret=example", "Please retry.")).toBe("Please retry.");
     expect(friendlyError("account request rejected (409)", "Please retry.")).toContain("Manage billing");

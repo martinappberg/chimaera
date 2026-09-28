@@ -3,11 +3,11 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
-use std::sync::Mutex;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
 };
+use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -19,6 +19,7 @@ use super::{lock, Shell};
 
 mod auth;
 pub(super) mod billing;
+mod credentials;
 pub(super) mod projects;
 
 pub(super) struct Pro {
@@ -40,6 +41,7 @@ pub(super) struct Pro {
     ready: tokio::sync::watch::Sender<bool>,
     initialization_phase: Mutex<InitializationPhase>,
     credential_generation: Arc<AtomicU64>,
+    credential_persistence: Arc<credentials::Persistence>,
 }
 
 struct Runtime {
@@ -107,6 +109,7 @@ impl Pro {
             ready: tokio::sync::watch::channel(ready).0,
             initialization_phase: Mutex::new(InitializationPhase::Keychain),
             credential_generation: Arc::new(AtomicU64::new(0)),
+            credential_persistence: Arc::new(credentials::Persistence::default()),
         }
     }
 
@@ -136,7 +139,12 @@ impl Pro {
             signed_in,
             email: account.as_ref().map(|account| account.email.clone()),
             plan: account.as_ref().map(|account| account.plan.clone()),
-            error: lock(&self.error).clone(),
+            error: self
+                .credential_persistence
+                .warning(self.generation())
+                .filter(|_| signed_in)
+                .map(str::to_owned)
+                .or_else(|| lock(&self.error).clone()),
             sign_in: self.sign_in.status(),
             billing: self.billing.status(),
             limits: account.as_ref().map(|account| account.limits.clone()),
@@ -237,7 +245,7 @@ fn save_tokens(endpoint: &str, tokens: Option<&Tokens>) -> Result<()> {
     save_tokens_locked(endpoint, tokens)
 }
 
-static KEYCHAIN_IO: Mutex<()> = Mutex::new(());
+static KEYCHAIN_IO: LazyLock<Arc<Mutex<()>>> = LazyLock::new(|| Arc::new(Mutex::new(())));
 
 fn save_tokens_locked(endpoint: &str, tokens: Option<&Tokens>) -> Result<()> {
     let entry = credential(endpoint)?;
@@ -295,7 +303,7 @@ async fn account_snapshot(client: &Client) -> Result<(Account, Vec<Host>, Option
 async fn activate(app: &AppHandle, client: Client) -> Result<()> {
     let state = app.state::<Shell>();
     // Subscribe before any request can rotate the refresh token.
-    let mut updates = client.token_updates();
+    let updates = client.token_updates();
     if state.pro.initializing(InitializationPhase::Account) {
         let _ = app.emit("pro-changed", ());
     }
@@ -325,7 +333,11 @@ async fn activate(app: &AppHandle, client: Client) -> Result<()> {
     if state.pro.initializing(InitializationPhase::Keychain) {
         let _ = app.emit("pro-changed", ());
     }
-    tokio::task::spawn_blocking(move || save_tokens(&stored_endpoint, tokens.as_ref())).await??;
+    let persisted =
+        tokio::task::spawn_blocking(move || save_tokens(&stored_endpoint, tokens.as_ref())).await;
+    // Successful authentication remains usable even when the OS cannot save it.
+    // The writer retries the current pair without inventing an auth failure.
+    let credentials_dirty = !matches!(persisted, Ok(Ok(())));
     let (account, hosts, connection_error) = snapshot?;
     anyhow::ensure!(authenticated, "sign in required");
     let has_keeper = keeper_available(&account);
@@ -342,38 +354,33 @@ async fn activate(app: &AppHandle, client: Client) -> Result<()> {
     *lock(&state.pro.error) = connection_error;
 
     let token_app = app.clone();
-    let generation = state.pro.credential_generation.clone();
-    let expected = generation.load(Ordering::SeqCst);
+    let expected = state.pro.generation();
+    let writer = credentials::Writer {
+        updates,
+        generation: state.pro.credential_generation.clone(),
+        expected,
+        serialization: KEYCHAIN_IO.clone(),
+        persistence: state.pro.credential_persistence.clone(),
+    };
     let tokens = tokio::spawn(async move {
-        while updates.changed().await.is_ok() {
-            let tokens = updates.borrow_and_update().clone();
-            let revoked = tokens.is_none();
-            let endpoint = endpoint.clone();
-            let generation = generation.clone();
-            let result = tokio::task::spawn_blocking(move || {
-                let _serialized = lock(&KEYCHAIN_IO);
-                if generation.load(Ordering::SeqCst) != expected {
-                    return Ok(());
-                }
-                save_tokens_locked(&endpoint, tokens.as_ref())
-            })
-            .await;
-            if revoked || !matches!(result, Ok(Ok(()))) {
-                let app = token_app.clone();
-                tokio::spawn(async move {
-                    let _ = sign_out(&app, false, Some(expected)).await;
-                    let state = app.state::<Shell>();
-                    if state.pro.generation() == expected + 1 {
-                        *lock(&state.pro.error) = Some(if revoked {
-                            "Your account session expired. Sign in again."
-                        } else {
-                            "Account credentials could not be saved in the system keychain. Sign in again."
-                        }.into());
-                        let _ = app.emit("pro-changed", ());
+        let changed_app = token_app.clone();
+        let end = writer
+            .run(
+                credentials_dirty,
+                move |tokens| save_tokens_locked(&endpoint, Some(tokens)),
+                move || {
+                    if changed_app.state::<Shell>().pro.generation() == expected {
+                        let _ = changed_app.emit("pro-changed", ());
                     }
-                });
-                break;
-            }
+                },
+            )
+            .await;
+        if end == credentials::End::Revoked {
+            // Sign-out aborts the runtime's token watcher; its cleanup must live
+            // outside that watcher so the serialized credential deletion finishes.
+            tokio::spawn(async move {
+                let _ = sign_out(&token_app, false, Some(expected)).await;
+            });
         }
     });
 
@@ -708,6 +715,7 @@ pub async fn pro_refresh_account(app: AppHandle) -> Result<(), String> {
         .client_snapshot()
         .await
         .ok_or("Sign in to refresh your account.")?;
+    state.pro.credential_persistence.retry();
     reconcile_account(&app, &client, generation)
         .await
         .map_err(|_| "Couldn't refresh your account. Check your connection and try again.".into())
@@ -867,6 +875,53 @@ pub async fn pro_cancel_sign_in(app: AppHandle) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn worker_placement_matches_account_holder_but_keeps_keeper_route_identity() {
+        let host: Host = serde_json::from_value(serde_json::json!({
+            "id": "worker-873107b04056d8", "alias": "Cloud machine", "kind": "worker",
+            "status": "connected", "daemon": null, "error": null,
+        }))
+        .unwrap();
+        let delegation: chimaera_link::Delegation = serde_json::from_value(serde_json::json!({
+            "access_token": "fixture", "expires_at": "2026-09-29T00:00:00Z",
+            "scope": ["baton", "mirror"], "device_id": "873107b04056d8",
+        }))
+        .unwrap();
+        assert!(worker_holds(&host, &delegation.device_id));
+        assert_eq!(host.id, "worker-873107b04056d8");
+        for holder in [
+            "",
+            "worker-873107b04056d8",
+            "873107b04056d9",
+            "x873107b04056d8",
+            "873107b04056d8/other",
+        ] {
+            assert!(!worker_holds(&host, holder));
+        }
+        for kind in [HostKind::Device, HostKind::Ssh] {
+            assert!(!worker_holds(
+                &Host {
+                    kind,
+                    ..host.clone()
+                },
+                &delegation.device_id
+            ));
+        }
+        for id in [
+            "873107b04056d8",
+            "prefix-worker-873107b04056d8",
+            "worker-worker-873107b04056d8",
+        ] {
+            assert!(!worker_holds(
+                &Host {
+                    id: id.into(),
+                    ..host.clone()
+                },
+                &delegation.device_id
+            ));
+        }
+    }
+
     #[test]
     fn native_return_is_targeted_one_use_and_account_generation_bound() {
         let pro = Pro::new(None);
@@ -1102,7 +1157,8 @@ async fn sign_out(app: &AppHandle, everywhere: bool, expected: Option<u64>) -> R
         if let Some(endpoint) = state.pro.endpoint.clone() {
             tokio::task::spawn_blocking(move || save_tokens(&endpoint, None)).await??;
         }
-        *lock(&state.pro.error) = None;
+        *lock(&state.pro.error) =
+            expected.map(|_| "Your account session expired. Sign in again.".into());
         let _ = app.emit("pro-changed", ());
         Ok::<_, anyhow::Error>(())
     }
@@ -1448,6 +1504,18 @@ async fn configure_daemon(state: &Shell, client: &Client) -> Result<()> {
     *lock(&state.pro.daemon_stamp) = Some(stamp);
     Ok(())
 }
+// Keeper route IDs are distinct from the account's worker baton holder ID.
+// This translation applies only to the typed worker registration contract.
+fn worker_holds(host: &Host, holder: &str) -> bool {
+    host.kind == HostKind::Worker
+        && !holder.is_empty()
+        && holder.len() <= 128
+        && holder
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_".contains(&byte))
+        && host.id.strip_prefix("worker-") == Some(holder)
+}
+
 async fn reconcile_placements(state: &Shell, client: &Client) -> Result<()> {
     if lock(&state.pro.account).as_ref().is_none_or(|account| {
         account.plan == chimaera_link::Plan::None || account.keeper_url.is_empty()
@@ -1494,7 +1562,9 @@ async fn reconcile_placements(state: &Shell, client: &Client) -> Result<()> {
             .local_port;
         for workspace in status["workspaces"].as_array().into_iter().flatten() {
             if workspace["ownership"]["state"] != "remote"
-                || workspace["ownership"]["holder"] != host.id
+                || !workspace["ownership"]["holder"]
+                    .as_str()
+                    .is_some_and(|holder| worker_holds(&host, holder))
             {
                 continue;
             }

@@ -276,7 +276,11 @@ Passive roster polls, reconnects and watchers carry no cloud wake intent.
 - Default endpoint is unset. The Pro transport starts no sockets until explicitly
   configured and signed in; the existing SSH route remains the signed-out fallback.
 - Account credentials live in the OS keychain. Refresh-token rotations replace the
-  stored pair. Daemon bearer tokens remain in memory and do not enter `hosts.json`.
+  stored pair. A temporary credential-store failure keeps a verified session
+  signed in while the app retries saving. After bounded retries, an account notice
+  explains how to check the credential store and retry; an unsaved session may
+  require sign-in again after restarting. Actual authentication revocation still
+  signs out. Daemon bearer tokens remain in memory and do not enter `hosts.json`.
 - SSH aliases resolve on the device. Only hostname, username and port are passed
   to the keeper; local private keys and arbitrary SSH configuration are not copied.
 - HTTPS/WSS is required except for literal `127.0.0.1` fixtures. `/v1/me` negotiates

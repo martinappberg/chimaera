@@ -43,6 +43,7 @@ in-app SSH askpass, a signed auto-updater). Parent map: repo-root
 | `shell/pro/billing.rs` | Native-owned checkout/portal attempts, exact provider-origin validation, cancellation, and authenticated plan confirmation independent of page visibility. |
 | `shell/pro/billing/callback.rs` | One-use billing return: literal loopback Host, exact nonce/outcome query, bounded request/response and credential-free browser page. |
 | `shell/pro/projects.rs` | Passive cloud project listing and per-project native destination selection; cancellation creates no import request. |
+| `shell/pro/credentials.rs` | Coalesced, generation-fenced credential-store writes with finite retries; persistence failures retain valid memory sessions, and only true revocation signs out. |
 | `shell/pro/auth.rs` | In-memory sign-in attempt lifecycle, cancellation/retry fences and bounded loopback callback parsing. |
 | `assets/sign-in.html` | Credential-free browser return page; success is sent only after native account activation. |
 | `shell/tunnel.rs` | App-only SSH / keeper transport wrapper. Both expose one loopback daemon endpoint; keep chimaera-link out of the daemon dependency graph. |
@@ -70,6 +71,14 @@ in-app SSH askpass, a signed auto-updater). Parent map: repo-root
   provisioning and removals missed during an events outage; sign-out cancels
   every account-owned task and listener. The generation fence prevents pending
   refresh writes and connect flights from restoring a signed-out account.
+  Credential-store failures preserve verified in-memory sessions, including initial
+  activation. A single writer retries after 2, 5, 15, 30 and 60 seconds; later token
+  rotation or **Check again** starts a fresh attempt. Only exhausted retries show
+  a save warning, independent of account/keeper reconciliation. Writes snapshot the
+  latest token pair under the shared I/O lock without holding the token watch
+  across OS calls. Revocation interrupts waiting immediately; serialized deletion
+  follows any already-running OS write. Queued writes and results are generation-
+  fenced, so an old account cannot overwrite a replacement or resurrect sign-out.
   `pro_status` is a synchronous cached snapshot behind async IPC: it never waits
   for the readiness watch, OS keychain or token-refresh mutex. Additive
   `initializing` and `initialization_phase` (`keychain`, `account`, `connection`)
@@ -80,6 +89,8 @@ in-app SSH askpass, a signed auto-updater). Parent map: repo-root
   and ordinary Settings machine rows; the current physical device is also omitted
   by matching its authenticated daemon token, so it cannot duplicate local work.
   Project placement and provider connections reach managed workers automatically.
+  Worker placement matches the raw account baton holder to the typed keeper
+  `worker-{worker_id}` host, retaining the full host ID for routing.
   Background account reads retain confirmed cosmetic
   plan branding while pending, so reconciliation cannot move the workspace rail.
   Device-only aliases never fall back to SSH: open windows retain that source in
