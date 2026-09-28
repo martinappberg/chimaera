@@ -121,7 +121,9 @@ pane and no HPC access; a SessionStart hook installs the web-UI deps and builds
 CI + releases are automatic. `ci.yml` (fmt/clippy/test + UI + musl cross-builds)
 gates every PR; `app.yml` build-checks the Tauri bundle when the app or UI change;
 `release.yml` evaluates every merge to `main`, but publishes only for a releasing
-squash-commit prefix. Get the prefix right — or add `[skip release]` — via the
+squash-commit prefix. `pr-auto-update.yml` keeps pull requests with auto-merge up
+to date with `main` (which requires it), the oldest behind first, one at a time.
+Get the prefix right — or add `[skip release]` — via the
 **[ship-pr](.claude/skills/ship-pr/SKILL.md)** skill, which owns the exact version
 mapping and the no-release path.
 

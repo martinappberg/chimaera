@@ -75,6 +75,14 @@ End the PR body with an accurate agent trailer. For Codex:
 
 Claude Code uses its corresponding Claude Code trailer instead.
 
+**Landing it.** With squash auto-merge on, you don't merge `origin/main` in by
+hand just to catch up: `main` requires branches to be up to date, and
+`.github/workflows/pr-auto-update.yml` brings the oldest pull request with
+auto-merge that fell behind up to date after each merge, one at a time, so it
+lands on its own. Merge `origin/main` in yourself only to resolve a conflict (the
+PR says it has conflicts), which the workflow can't. A PR whose required checks
+fail is skipped until it's fixed.
+
 ## After merge
 
 Watch that the intended workflow ran: for a normal PR, `release.yml` should
