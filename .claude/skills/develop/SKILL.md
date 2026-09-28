@@ -219,6 +219,16 @@ is not a repair for that packaging defect. Ad-hoc builds have a changing code
 identity, so any legitimate macOS access prompt still belongs to the user.
 Never change Keychain ACLs or copy credentials to avoid that prompt.
 
+Prefer each checkout's own native target directory. If a custom preview reuses
+another checkout's Cargo target cache, clean the local workspace packages before
+switching source revisions and verify the generated command permissions against
+that checkout's command manifest. A relative build-script dependency can reuse a
+stale command generator even when the embedded daemon build stamp is current.
+Capture the final signed executable and bundle in an immutable artifact directory;
+never install later from a shared `target/debug/chimaera` path that another build
+may have replaced. Signing changes executable bytes, so compare signed artifacts
+with their own recorded hashes rather than with the unsigned linker output.
+
 **2. To test against a REMOTE host from that isolated app** (e.g. Sherlock): a
 dev connect deploys **your** build, never a release, so a musl daemon of this
 branch must exist where THIS app looks. The trap: the in-app hint says
