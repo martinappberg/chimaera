@@ -64,9 +64,19 @@ The shared `web-ui/src/lib/net/plan.ts` store reads native `pro_status` and refr
 ## Cloud readiness
 
 An eligible subscription prepares its first cloud machine automatically. The Pro
-page shows passive account-owned readiness: preparing, ready, sleeping, unavailable
-or a plan limit. A disabled service or uninvited preview account shows its actual
-availability. The page does not offer a manual machine-creation button.
+page follows three separate steps: prepare the cloud, connect an agent, and make
+project copies available. Account-confirmed preparation stages distinguish the
+private connection, machine startup, and its first acknowledgement. Active setup
+checks run sequentially every five seconds while visible, slowing to thirty
+seconds after five minutes. Hidden views stop checking.
+
+A disabled service or uninvited preview account shows that setup is waiting,
+without an activity animation or a claim that files are synchronizing. The page
+does not offer a manual machine-creation button. Provider readiness requires a
+current CLI authentication check. Project-copy summaries come from actual mirror
+metadata and ownership: completed copies, handoff in progress, restoration, or a
+setup that needs attention. No project or an unavailable check never becomes a
+completed step, and no transfer percentage is estimated.
 
 Machine readiness and provider sign-in are separate. Once the cloud machine is
 available, **Connect your first agent** appears directly in the Pro overview.

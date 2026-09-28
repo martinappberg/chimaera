@@ -164,6 +164,7 @@ impl FakeKeeper {
                     Json(WorkerStatus {
                         state: WorkerState::Unavailable,
                         reason: Some(WorkerReason::ProvisioningDisabled),
+                        phase: None,
                     })
                 }),
             )

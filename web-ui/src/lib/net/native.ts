@@ -885,6 +885,7 @@ export interface ProStatus {
 }
 
 export interface CloudProvisioningStatus {
+  phase?: "keeper" | "worker" | "connecting" | null;
   state: "no_plan" | "unavailable" | "preparing" | "ready" | "sleeping" | "limited" | "error";
   reason: "provisioning_disabled" | "beta_invite_required" | "hours_exhausted" | "storage_exhausted" | "spend_limit_reached" | "provisioning_failed" | null;
 }

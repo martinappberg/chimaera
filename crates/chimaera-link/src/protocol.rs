@@ -38,10 +38,22 @@ pub enum WorkerReason {
     ProvisioningFailed,
 }
 
+/// Account-confirmed preparation stage, not an estimate or daemon readiness.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerPhase {
+    Keeper,
+    Worker,
+    Connecting,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkerStatus {
     pub state: WorkerState,
     pub reason: Option<WorkerReason>,
+    /// Present only while preparing; older services omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<WorkerPhase>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

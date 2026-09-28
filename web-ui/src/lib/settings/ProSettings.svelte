@@ -64,7 +64,7 @@
       status = next;
       if (!next.initializing && next.signed_in && paid(next.plan) && intent !== null) {
         remember(null);
-        notice = "Your plan is active. You're ready to continue.";
+        notice = "Your plan is active. Follow your cloud setup below.";
       }
       error = null;
     } catch (reason) {

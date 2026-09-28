@@ -19,6 +19,8 @@ Invariants:
 
 - App-only dependency: the daemon must not depend on this crate. Fixture server
   dependencies are optional and never ship in a release bundle.
+- Worker status is passive. Its optional preparing phase describes confirmed
+  account state, never a percentage, a wake request or provider readiness.
 - Constructing a client is inert. Closing/dropping an owning handle cancels its
   tasks and child streams. Never detach a tunnel/reverse task without an owner.
 - Non-loopback requires TLS. Only literal `127.0.0.1` permits cleartext. Never

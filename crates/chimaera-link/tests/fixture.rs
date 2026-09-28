@@ -550,6 +550,7 @@ async fn account_billing_and_cloud_status_use_device_authentication() {
     let status = client.worker_status().await.unwrap();
     assert_eq!(status.state, WorkerState::Unavailable);
     assert_eq!(status.reason, Some(WorkerReason::ProvisioningDisabled));
+    assert_eq!(status.phase, None);
     for plan in [Plan::Pro, Plan::Max] {
         for interval in [BillingInterval::Month, BillingInterval::Year] {
             assert!(client

@@ -5,8 +5,8 @@
   import { cloudRequest } from "./cloudTransport";
   import { connectionError, pendingConnection, providerLoginUrl, providersReady, providerStateLabel } from "./providers";
 
-  let { visible = true, requiredProviders = [], contextLabel, workspaceId, onReady }: {
-    visible?: boolean; requiredProviders?: string[]; contextLabel?: string; workspaceId?: string; onReady?: () => void;
+  let { visible = true, requiredProviders = [], contextLabel, workspaceId, onReady, onReadiness }: {
+    visible?: boolean; requiredProviders?: string[]; contextLabel?: string; workspaceId?: string; onReady?: () => void; onReadiness?: (ready: boolean | null) => void;
   } = $props();
   type Handoff = NonNullable<CloudSetupInfo["handoffs"]>[number];
   let providers = $state<CloudProviderStatus[]>([]);
@@ -41,6 +41,8 @@
   const action = $derived(connection?.action ?? null);
   const loginUrl = $derived(connection && action && (action.type === "device_code" || action.type === "browser")
     ? providerLoginUrl(connection.provider_id, action.type === "device_code" ? action.verification_url : action.url) : null);
+
+  $effect(() => { const value = current ? ready : null; untrack(() => onReadiness?.(value)); });
 
   async function load(signal?: AbortSignal): Promise<void> {
     if (catalogFlight) { catalogAgain = true; return; }

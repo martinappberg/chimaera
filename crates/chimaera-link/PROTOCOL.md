@@ -40,7 +40,7 @@ REST response bodies are limited to 1 MiB; control frames to 128 KiB.
 | `POST /v1/billing/portal` | `{return_to?:"desktop"}` (or an empty body) | `{url}` to hosted billing portal |
 | `GET /v1/worker/status` | — | Passive `WorkerStatus` below; full device authentication, no provisioning or wake |
 
-`WorkerStatus` is `{state,reason}`. `state` is `no_plan`, `unavailable`,
+`WorkerStatus` is `{state,reason,phase?}`. `state` is `no_plan`, `unavailable`,
 `preparing`, `ready`, `sleeping`, `limited` or `error`. `reason` is null or one
 of `provisioning_disabled`, `beta_invite_required`, `hours_exhausted`,
 `storage_exhausted`, `spend_limit_reached`, `provisioning_failed`. An inactive
@@ -52,6 +52,22 @@ Clients still verify the live cloud information before opening provider terminal
 `sleeping` describes an existing stopped/suspended worker without a pending start.
 Quota restrictions are `limited`; a failed preparation is `error`. Clients render
 their own fixed, actionable descriptions rather than vendor error bodies.
+
+`phase` is optional and emitted only with `state:"preparing"`. It identifies an
+account-confirmed stage, with no percentage or timing estimate:
+
+- `keeper`: a matching started keeper cell and its registration are not yet ready.
+- `worker`: the keeper is ready, but the worker is absent or not yet started.
+- `connecting`: the keeper is ready and the worker is started, but a fresh
+  authenticated worker acknowledgement is still pending within the startup grace.
+
+Missing/null phase means preparation detail is unavailable; render the generic
+preparing state. Ignore phase outside preparing. Existing state/reason precedence
+is unchanged, and every other state omits phase. A phase is derived from the same
+account database snapshot, without vendor calls or a wake. `connecting` does not
+assert a live daemon connection or provider authentication. Older clients ignore
+this additive field; older services remain valid without it. The native
+`pro_cloud_status` command passes the typed status through unchanged.
 
 This status read returns account-owned database state without calling Fly,
 creating resources, refreshing desired machine state or waking a worker. It
