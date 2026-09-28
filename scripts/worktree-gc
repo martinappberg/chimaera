@@ -1,0 +1,683 @@
+#!/usr/bin/env bash
+#
+# worktree-gc — sort this repo's git worktrees by whether they are still in use,
+# and reclaim the disk the idle ones hold. The lifecycle it enforces is in the
+# worktree-lifecycle skill (.claude/skills/worktree-lifecycle/SKILL.md).
+#
+# Dry run by default: it prints what it would do and changes nothing. It acts
+# only with --apply.
+#
+#   scripts/worktree-gc                  table of every worktree + what --apply does
+#   scripts/worktree-gc --apply          remove the REMOVE group, trim the TRIM group
+#   scripts/worktree-gc --markdown       the same table as markdown (for a PR/notes)
+#   scripts/worktree-gc --self [--sweep] [--apply]
+#                                        this worktree's own Rust build output:
+#                                        delete its target/ dirs, or with --sweep
+#                                        only the stale debug objects nothing uses
+#   scripts/worktree-gc --hook session-start|session-end
+#                                        the agent-hook entry points (fast; the
+#                                        work runs detached in the background)
+#
+# A worktree is judged ONLY by its branch, that branch's PR, its git state and
+# the live processes using it — never by its folder name: both agent apps
+# reuse folders (.claude/worktrees/<name>, ~/.codex/worktrees/<id>/<repo>)
+# for unrelated sessions. Every `git worktree list` entry lands in one group:
+#
+#   ACTIVE  a process has its cwd or an open file inside it; something in it
+#           changed in the last --active-hours; it is `git worktree lock`ed;
+#           or this script runs from it. Never touched.
+#   REMOVE  its PR is merged or closed, or its HEAD is already in origin/main;
+#           AND no uncommitted changes AND no unpushed commits AND not ACTIVE.
+#           `git worktree remove` (never --force), then `git worktree prune`.
+#           The branch is kept.
+#   TRIM    not removable, and idle for more than --idle-hours: its build
+#           output (git-ignored target/ and node_modules/ dirs) is deleted.
+#           Source is never touched.
+#   KEEP    everything else — e.g. unpushed commits with no PR.
+#
+# What it reads: `git worktree list`, `gh pr list` (one call; squash merges
+# make `git merge-base --is-ancestor` useless for merge status), lsof (or
+# /proc on Linux) for every process's cwd and open files, file mtimes. It
+# fails safe: when it cannot see processes, every worktree counts as ACTIVE;
+# when it cannot reach GitHub, no worktree is removable by PR state.
+#
+# Sizes are `du` of the build output. du can overstate what a delete frees
+# (cargo hardlinks objects between deps/ and incremental/, and APFS clones
+# share blocks), so --apply reports the real change in free space from df.
+#
+# `git config worktree-gc.auto false` keeps the hooks from deleting anything
+# (they still flag low disk); WORKTREE_GC=off silences them entirely.
+# Environment:
+# WORKTREE_GC_ACTIVE_HOURS (6), WORKTREE_GC_IDLE_HOURS (24), WORKTREE_GC_LOW_GB
+# (50: below this much free space the session-start hook flags low disk),
+# WORKTREE_GC_INTERVAL_MIN (60: the hook's background run happens at most
+# this often). The hooks log to <git-common-dir>/worktree-gc/log.
+#
+# Portable to bash 3.2 (macOS) and GNU/Linux; needs git, and gh for PR state.
+set -uo pipefail
+
+PROG=worktree-gc
+ACTIVE_HOURS=${WORKTREE_GC_ACTIVE_HOURS:-6}
+IDLE_HOURS=${WORKTREE_GC_IDLE_HOURS:-24}
+LOW_GB=${WORKTREE_GC_LOW_GB:-50}
+INTERVAL_MIN=${WORKTREE_GC_INTERVAL_MIN:-60}
+# A deps/ object younger than this may belong to a build still linking.
+SWEEP_MIN_AGE_MIN=15
+
+APPLY=0 FETCH=1 SIZES=1 MARKDOWN=0 AUTO=0 MODE=all SWEEP=0 HOOK=""
+
+usage() { sed -n '3,/^set -uo/p' "$0" | sed '$d; s/^# \{0,1\}//'; }
+die() {
+  echo "$PROG: $*" >&2
+  # A hook must never fail the agent's session start/end over this.
+  [ -n "$HOOK" ] && exit 0
+  exit 2
+}
+say() { [ "$AUTO" = 1 ] && printf '%s %s\n' "$(date '+%F %T')" "$*" || printf '%s\n' "$*"; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --apply) APPLY=1 ;;
+    --self) MODE=self ;;
+    --sweep) SWEEP=1 ;;
+    --markdown) MARKDOWN=1 ;;
+    --no-fetch) FETCH=0 ;;
+    --no-sizes) SIZES=0 ;;
+    --auto) AUTO=1 ;; # the hooks' background run: --apply, logged
+    --active-hours) ACTIVE_HOURS=${2:?}; shift ;;
+    --idle-hours) IDLE_HOURS=${2:?}; shift ;;
+    --hook) HOOK=${2:?}; shift ;;
+    -h | --help) usage; exit 0 ;;
+    *) die "unknown argument: $1 (see --help)" ;;
+  esac
+  shift
+done
+case "$ACTIVE_HOURS$IDLE_HOURS$LOW_GB$INTERVAL_MIN" in *[!0-9]*) die "hours/GB/minutes must be whole numbers" ;; esac
+[ "$IDLE_HOURS" -ge "$ACTIVE_HOURS" ] || IDLE_HOURS=$ACTIVE_HOURS
+[ "$SWEEP" = 0 ] || [ "$MODE" = self ] || die "--sweep only goes with --self"
+
+# Never let a hook's git call take a lock or refresh an index: `git status`
+# rewrites the index opportunistically, which would stamp every worktree
+# "recently changed" and keep it ACTIVE forever.
+export GIT_OPTIONAL_LOCKS=0
+case "$(uname -s)" in
+  Darwin | *BSD) STAT_M="-f %m" ;;
+  *) STAT_M="-c %Y" ;;
+esac
+NOW=$(date +%s)
+
+SELF_PATH=$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")
+HERE=$(git rev-parse --show-toplevel 2>/dev/null) || die "not inside a git worktree"
+COMMON=$(cd "$HERE" && cd "$(git rev-parse --git-common-dir)" && pwd -P) || die "no git common dir"
+STATE="$COMMON/$PROG"
+TMPD=$(mktemp -d "${TMPDIR:-/tmp}/$PROG.XXXXXX") || die "mktemp failed"
+trap 'rm -rf "$TMPD"' EXIT
+
+realdir() { (cd "$1" 2>/dev/null && pwd -P); }
+kb_h() { # KiB → human
+  awk -v k="${1:-0}" 'BEGIN { if (k >= 1048576) printf "%.1fG", k/1048576; else if (k >= 1024) printf "%.0fM", k/1024; else printf "%dK", k }'
+}
+age_h() { # seconds → 3d / 5h / 12m
+  local s=$1
+  if [ "$s" -ge 172800 ]; then echo "$((s / 86400))d"; elif [ "$s" -ge 7200 ]; then echo "$((s / 3600))h"; else echo "$((s / 60))m"; fi
+}
+free_kb() { df -Pk "$1" 2>/dev/null | awk 'NR == 2 { print $4 }'; }
+# "df free: 89.1G → 91.3G (+2.2G)" — the real effect, net of other writers.
+df_delta() { # before-kb after-kb
+  local d=$(($2 - $1)) sign=+
+  [ "$d" -lt 0 ] && sign=- d=$((-d))
+  printf 'df free: %s → %s (%s%s)' "$(kb_h "$1")" "$(kb_h "$2")" "$sign" "$(kb_h "$d")"
+}
+disk_line() { df -Pk "$1" 2>/dev/null | awk 'NR == 2 { printf "%.0f GiB free of %.0f GiB (%s used) on %s", $4/1048576, $2/1048576, $5, $6 }'; }
+# Run a command, killed by SIGALRM after $1 seconds (macOS has no timeout(1);
+# perl is on every macOS and practically every Linux). Without perl: no limit.
+with_timeout() {
+  local secs=$1
+  shift
+  if command -v perl >/dev/null 2>&1; then
+    perl -e 'alarm shift; exec @ARGV or exit 127' "$secs" "$@"
+  else
+    "$@"
+  fi
+}
+
+# ---------------------------------------------------------------- inventory ---
+
+# One line per worktree: path \t realpath \t head \t branch \t locked \t prunable
+# (branch "-" when detached; locked/prunable hold git's reason text, "yes" when
+# it gave none, "-" when unset — never an empty field, which a tab IFS collapses).
+list_worktrees() {
+  git -C "$HERE" worktree list --porcelain | awk '
+    function flush() {
+      if (path != "" && !bare) print path "\t" head "\t" branch "\t" locked "\t" prunable
+      path = ""; head = ""; branch = "-"; locked = "-"; prunable = "-"; bare = 0
+    }
+    BEGIN { branch = "-"; locked = "-"; prunable = "-" }
+    /^worktree / { flush(); path = substr($0, 10); next }
+    /^HEAD / { head = substr($0, 6); next }
+    /^branch / { branch = substr($0, 8); sub(/^refs\/heads\//, "", branch); next }
+    /^detached$/ { branch = "-"; next }
+    /^bare$/ { bare = 1; next }
+    /^locked/ { locked = substr($0, 8); if (locked == "") locked = "yes"; next }
+    /^prunable/ { prunable = substr($0, 10); if (prunable == "") prunable = "yes"; next }
+    END { flush() }' | while IFS="$(printf '\t')" read -r path head branch locked prunable; do
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$path" "$(realdir "$path" || echo "$path")" "$head" "$branch" "$locked" "$prunable"
+  done
+}
+
+# Every process's cwd, executable and open files, one per line:
+# pid \t command \t fd \t path. Sets PROC_SRC (lsof | proc | none).
+scan_processes() {
+  : >"$TMPD/procs"
+  PROC_SRC=none
+  # lsof can hang on a stale NFS mount (HPC login nodes). A run it didn't
+  # finish is a partial process list, and partial must mean "can't see", never
+  # "idle": a signal exit (>= 128, e.g. the alarm) leaves PROC_SRC=none.
+  if command -v lsof >/dev/null 2>&1; then
+    with_timeout 60 lsof -nP -w -Fpcfn 2>/dev/null >"$TMPD/lsof"
+    if [ $? -lt 128 ]; then
+      awk '
+        /^p/ { pid = substr($0, 2); next }
+        /^c/ { cmd = substr($0, 2); next }
+        /^f/ { fd = substr($0, 2); next }
+        /^n/ { print pid "\t" cmd "\t" fd "\t" substr($0, 2) }' "$TMPD/lsof" >"$TMPD/procs"
+      [ -s "$TMPD/procs" ] && PROC_SRC=lsof
+    fi
+  fi
+  if [ "$PROC_SRC" = none ] && [ -r /proc/self/cwd ]; then
+    find /proc/[0-9]*/cwd /proc/[0-9]*/exe /proc/[0-9]*/fd -maxdepth 1 -type l -printf '%p\t%l\n' 2>/dev/null | awk -F'\t' '
+      { n = split($1, a, "/"); fd = a[n]; if (fd == "exe") fd = "txt"
+        c = "?"; f = "/proc/" a[3] "/comm"; if ((getline c < f) <= 0) c = "?"; close(f)
+        print a[3] "\t" c "\t" fd "\t" $2 }' >"$TMPD/procs"
+    [ -s "$TMPD/procs" ] && PROC_SRC=proc
+  fi
+  # Attribute each path to the innermost worktree containing it (the main
+  # checkout contains .claude/worktrees/*): root \t pid \t cmd \t fd \t path.
+  awk -F'\t' -v roots="$TMPD/roots" -v self="$$" '
+    BEGIN { while ((getline r < roots) > 0) if (r != "") R[++n] = r }
+    $1 == self { next }
+    { best = ""
+      for (i = 1; i <= n; i++) if (($4 == R[i] || index($4, R[i] "/") == 1) && length(R[i]) > length(best)) best = R[i]
+      if (best != "") print best "\t" $0 }' "$TMPD/procs" >"$TMPD/hits"
+}
+
+# ACTIVE reason from processes, or nothing: "in use by codex, node (+9 procs)".
+proc_reason() { # realpath
+  awk -F'\t' -v r="$1" '$1 == r { if (!($2 in P)) { P[$2] = 1; n++ } if (!($3 in C)) { C[$3] = 1; c[++k] = $3 } }
+    END { if (n == 0) exit
+      s = c[1]; for (i = 2; i <= k && i <= 3; i++) s = s ", " c[i]
+      printf "in use by %s (%d process%s)", s, n, (n == 1 ? "" : "es") }' "$TMPD/hits"
+}
+
+# The worktrees nested inside $1 (by registered path), one per line.
+nested_in() {
+  awk -F'\t' -v w="$1" 'index($1, w "/") == 1 { print $1 }' "$TMPD/wts"
+}
+
+# Git-ignored build output inside a worktree: cargo target dirs (they carry
+# CACHEDIR.TAG) and node_modules. Never descends into a nested worktree.
+build_dirs() { # path
+  local wt=$1 d rel args
+  args=("$wt" -maxdepth 4 "(" -path "$wt/.git")
+  while IFS= read -r d; do [ -n "$d" ] && args+=(-o -path "$d"); done <<EOF
+$(nested_in "$wt")
+EOF
+  args+=(")" -prune -o -type d "(" -name target -o -name node_modules ")" -print -prune)
+  find "${args[@]}" 2>/dev/null | while IFS= read -r d; do
+    [ -L "$d" ] && continue
+    case "${d##*/}" in target) [ -f "$d/CACHEDIR.TAG" ] || [ -f "$d/.rustc_info.json" ] || continue ;; esac
+    rel=${d#"$wt"/}
+    git -C "$wt" check-ignore -q "$rel" 2>/dev/null || continue
+    [ -z "$(git -C "$wt" ls-files -- "$rel" 2>/dev/null | head -1)" ] || continue
+    printf '%s\n' "$d"
+  done
+}
+
+# Newest mtime (epoch) of what a person or agent touches: the worktree's files
+# (not target/ or node_modules/ contents, not nested worktrees), its git
+# HEAD/index/reflog, and its build dirs' deps/ and .fingerprint/ stamps — any
+# build that compiles something updates those directories.
+newest_mtime() { # path gitdir builddirs-file
+  local wt=$1 gd=$2 bd=$3 d args
+  args=("$wt" "(" -path "$wt/.git" -o -name target -o -name node_modules)
+  while IFS= read -r d; do [ -n "$d" ] && args+=(-o -path "$d"); done <<EOF
+$(nested_in "$wt")
+EOF
+  args+=(")" -prune -o -type f -print0)
+  {
+    find "${args[@]}" 2>/dev/null | xargs -0 stat $STAT_M 2>/dev/null
+    stat $STAT_M "$gd/HEAD" "$gd/index" "$gd/logs/HEAD" 2>/dev/null
+    while IFS= read -r d; do
+      [ -n "$d" ] && stat $STAT_M "$d" "$d"/*/deps "$d"/*/.fingerprint "$d"/*/*/deps "$d"/*/*/.fingerprint 2>/dev/null
+    done <"$bd"
+  } | sort -n | tail -1
+}
+
+du_kb() { # files-with-paths → total KiB
+  local total=0 k d
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    k=$(du -sk "$d" 2>/dev/null | cut -f1)
+    total=$((total + ${k:-0}))
+  done <"$1"
+  echo "$total"
+}
+
+fetch_and_prs() {
+  BASE=$(git -C "$HERE" symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null || echo origin/main)
+  if [ "$FETCH" = 1 ]; then
+    with_timeout 60 git -C "$HERE" fetch --quiet --prune origin >/dev/null 2>&1 ||
+      say "warning: git fetch failed; judging against the last-fetched $BASE"
+  fi
+  : >"$TMPD/prs"
+  PR_OK=0
+  if command -v gh >/dev/null 2>&1 &&
+    (cd "$HERE" && with_timeout 60 gh pr list --state all --limit 1000 \
+      --json number,state,headRefName,headRefOid,isCrossRepository \
+      --jq '.[] | select(.isCrossRepository | not) | [.headRefName, .state, (.number | tostring), .headRefOid] | @tsv') \
+      >"$TMPD/prs" 2>/dev/null; then
+    PR_OK=1
+  else
+    say "warning: could not list PRs with gh; no worktree is removable by PR state"
+  fi
+}
+
+# The PR for a branch (or, for a detached HEAD, the PR whose head is that
+# commit): "STATE NUMBER OID". Open beats merged beats closed; newest first.
+pr_for() { # branch head
+  awk -F'\t' -v b="$1" -v h="$2" '
+    (b != "" && $1 == b) || (b == "" && $4 == h) {
+      rank = ($2 == "OPEN") ? 0 : ($2 == "MERGED") ? 1 : 2
+      print rank "\t" $3 "\t" $2 "\t" $4 }' "$TMPD/prs" | sort -t "$(printf '\t')" -k1,1n -k2,2nr | head -1 |
+    awk -F'\t' '{ print $3 " " $2 " " $4 }'
+}
+
+# --------------------------------------------------------------- classify ---
+
+# Writes $TMPD/rows: group \t kb \t branch \t pr \t dirty \t unpushed \t idle \t path \t reason
+# and $TMPD/b.<n> (the build dirs of worktree n) for --apply.
+classify() {
+  local n=0 path rpath head branch locked prunable gd sizekb idle_s mt reason group
+  local pr prs prn proid dirty unpushed in_base removable why extra lockpid self_rp
+  self_rp=$(realdir "$HERE")
+  local claude_rp=""
+  [ -n "${CLAUDE_PROJECT_DIR:-}" ] && claude_rp=$(realdir "$CLAUDE_PROJECT_DIR")
+  : >"$TMPD/rows"
+  while IFS="$(printf '\t')" read -r path rpath head branch locked prunable; do
+    n=$((n + 1))
+    [ "$branch" = "-" ] && branch=""
+    : >"$TMPD/b.$n"
+    reason="" group="" sizekb=0 pr="-" dirty="-" unpushed="-" idle="-"
+    if [ "$prunable" != "-" ] || [ ! -d "$path" ]; then
+      printf 'REMOVE\t0\t%s\t-\t-\t-\t-\t%s\t%s\t%s\n' "${branch:-(detached)}" "$path" "directory is gone; git worktree prune clears the entry" "$n" >>"$TMPD/rows"
+      continue
+    fi
+    gd=$(cd "$path" && git rev-parse --absolute-git-dir 2>/dev/null)
+    build_dirs "$path" >"$TMPD/b.$n"
+    [ "$SIZES" = 1 ] && sizekb=$(du_kb "$TMPD/b.$n")
+    mt=$(newest_mtime "$path" "$gd" "$TMPD/b.$n")
+    idle_s=$((NOW - ${mt:-0}))
+    [ "$idle_s" -lt 0 ] && idle_s=0
+    idle=$(age_h "$idle_s")
+
+    # ACTIVE — first matching reason wins.
+    if [ "$locked" != "-" ]; then
+      reason="locked: $locked"
+      lockpid=$(printf '%s' "$locked" | sed -n 's/.*pid \([0-9][0-9]*\).*/\1/p')
+      if [ -n "$lockpid" ] && ! kill -0 "$lockpid" 2>/dev/null && ! ps -p "$lockpid" >/dev/null 2>&1; then
+        reason="$reason (stale? pid $lockpid is gone; git worktree unlock to release)"
+      fi
+    elif [ "$rpath" = "$self_rp" ] || { [ -n "$claude_rp" ] && [ "$rpath" = "$claude_rp" ]; }; then
+      reason="this session runs here"
+    elif [ "$PROC_SRC" = none ]; then
+      reason="cannot inspect processes (no lsof or /proc): assumed in use"
+    else
+      reason=$(proc_reason "$rpath")
+      if [ -z "$reason" ] && [ "$idle_s" -lt $((ACTIVE_HOURS * 3600)) ]; then
+        reason="changed $idle ago (< ${ACTIVE_HOURS}h)"
+      fi
+    fi
+    [ -n "$reason" ] && group=ACTIVE
+
+    # Git state (read-only; GIT_OPTIONAL_LOCKS=0).
+    dirty=$(git -C "$path" status --porcelain --untracked-files=normal 2>/dev/null | wc -l | tr -d ' ') || dirty="?"
+    prs=$(pr_for "$branch" "$head")
+    prn="" proid=""
+    if [ -n "$prs" ]; then
+      set -- $prs
+      pr="$1 #$2" prn=$2 proid=$3
+    elif [ "$PR_OK" = 1 ]; then
+      pr="none"
+    else
+      pr="?"
+    fi
+    extra=""
+    if [ -n "$proid" ] && git -C "$path" cat-file -e "$proid^{commit}" 2>/dev/null; then
+      unpushed=$(git -C "$path" rev-list --count HEAD --not --remotes "$proid" 2>/dev/null || echo "?")
+      extra=$(git -C "$path" rev-list --count HEAD --not "$BASE" "$proid" 2>/dev/null || echo "?")
+    else
+      unpushed=$(git -C "$path" rev-list --count HEAD --not --remotes 2>/dev/null || echo "?")
+      [ -n "$proid" ] && [ "$proid" != "$head" ] && extra="?"
+    fi
+    in_base=0
+    git -C "$path" merge-base --is-ancestor HEAD "$BASE" 2>/dev/null && in_base=1
+
+    if [ -z "$group" ]; then
+      removable="" why=""
+      if [ "$path" = "$(head -1 "$TMPD/wts" | cut -f1)" ]; then
+        why="main checkout"
+      elif [ "$in_base" = 1 ]; then
+        removable="HEAD is in $BASE"
+      else
+        case "$pr" in
+          MERGED* | CLOSED*)
+            if [ -n "$extra" ] && [ "$extra" != 0 ]; then
+              why="${extra} commit(s) since ${pr} that are not in $BASE"
+            else
+              removable="PR #$prn $(printf '%s' "${pr%% *}" | tr 'A-Z' 'a-z')"
+            fi
+            ;;
+          OPEN*) why="PR #$prn open" ;;
+          none) why="no PR, HEAD not in $BASE" ;;
+          *) why="PR state unknown" ;;
+        esac
+      fi
+      if [ -n "$removable" ]; then
+        if [ "$dirty" != 0 ]; then
+          why="$dirty uncommitted change(s) ($removable)"
+          removable=""
+        elif [ "$unpushed" != 0 ]; then
+          why="$unpushed unpushed commit(s) ($removable)"
+          removable=""
+        fi
+      fi
+      if [ -n "$removable" ]; then
+        group=REMOVE reason="$removable; clean; nothing unpushed"
+      elif [ "$idle_s" -ge $((IDLE_HOURS * 3600)) ] && [ -s "$TMPD/b.$n" ]; then
+        group=TRIM reason="idle $idle; $why"
+      elif [ "$idle_s" -ge $((IDLE_HOURS * 3600)) ]; then
+        group=KEEP reason="$why; idle, no build output to trim"
+      else
+        group=KEEP reason="$why; idle only $idle (< ${IDLE_HOURS}h)"
+      fi
+    fi
+    [ -n "$branch" ] || branch="(detached)"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$group" "$sizekb" "$branch" "$pr" "$dirty" "$unpushed" "$idle" "$path" "$reason" "$n" >>"$TMPD/rows"
+  done <"$TMPD/wts"
+}
+
+short_path() {
+  local p=$1 main
+  main=$(head -1 "$TMPD/wts" | cut -f1)
+  case "$p" in "$main"/*) p=${p#"$main"/} ;; "$HOME"/*) p="~/${p#"$HOME"/}" ;; esac
+  printf '%s' "$p"
+}
+
+print_table() {
+  local g kb raw br pr dirty up idle path reason n order=0 total_r=0 total_t=0 c_a=0 c_r=0 c_t=0 c_k=0
+  : >"$TMPD/table"
+  while IFS="$(printf '\t')" read -r g kb br pr dirty up idle path reason n; do
+    case "$g" in REMOVE) order=1 c_r=$((c_r + 1)) total_r=$((total_r + kb)) ;; TRIM) order=2 c_t=$((c_t + 1)) total_t=$((total_t + kb)) ;; KEEP) order=3 c_k=$((c_k + 1)) ;; ACTIVE) order=4 c_a=$((c_a + 1)) ;; esac
+    raw=$kb
+    if [ "$SIZES" = 1 ]; then kb=$(kb_h "$kb"); else kb="-"; fi
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$order" "$raw" "$g" "$kb" "$br" "$pr" "$dirty" "$up" "$idle" "$(short_path "$path")" "$reason" >>"$TMPD/table"
+  done <"$TMPD/rows"
+  sort -t "$(printf '\t')" -k1,1n -k2,2nr "$TMPD/table" | cut -f3- >"$TMPD/table.sorted"
+  if [ "$MARKDOWN" = 1 ]; then
+    echo "| Group | Build output | Branch | PR | Uncommitted | Unpushed | Idle | Worktree | Reason |"
+    echo "|---|--:|---|---|--:|--:|--:|---|---|"
+    awk -F'\t' '{ printf "| %s | %s | `%s` | %s | %s | %s | %s | `%s` | %s |\n", $1, $2, $3, $4, $5, $6, $7, $8, $9 }' "$TMPD/table.sorted"
+  else
+    { printf 'GROUP\tBUILD\tBRANCH\tPR\tDIRTY\tUNPUSHED\tIDLE\tWORKTREE\tREASON\n'; cat "$TMPD/table.sorted"; } | awk -F'\t' '
+      { for (i = 1; i <= NF; i++) { cell[NR, i] = $i; if (i < NF && length($i) > w[i]) w[i] = length($i) } nf[NR] = NF }
+      END { for (r = 1; r <= NR; r++) { line = ""; for (i = 1; i <= nf[r]; i++) line = line (i < nf[r] ? sprintf("%-" w[i] "s  ", cell[r, i]) : cell[r, i]); print line } }'
+  fi
+  echo
+  say "ACTIVE $c_a · REMOVE $c_r ($(kb_h "$total_r") build output) · TRIM $c_t ($(kb_h "$total_t")) · KEEP $c_k — $(disk_line "$HERE")"
+  local stubs
+  stubs=$(codex_stubs)
+  [ -n "$stubs" ] && say "Codex stub folders (only .codex-worktree-name left; the Codex app's, left alone): $stubs"
+}
+
+# ~/.codex/worktrees/<id>/ folders that hold nothing but the Codex app's name
+# marker — what the app leaves after it (or we) remove the checkout inside.
+codex_stubs() {
+  local root="${CODEX_HOME:-$HOME/.codex}/worktrees" d out=""
+  [ -d "$root" ] || return 0
+  for d in "$root"/*/; do
+    d=${d%/}
+    [ -f "$d/.codex-worktree-name" ] || continue
+    [ -z "$(ls -A "$d" | grep -v -e '^\.codex-worktree-name$' -e '^\.DS_Store$')" ] || continue
+    out="$out ${d##*/}"
+  done
+  printf '%s' "${out# }"
+}
+
+# ------------------------------------------------------------------- apply ---
+
+# Re-check right before acting: processes and mtimes move while we work.
+still_idle() { # n path rpath
+  local mt
+  scan_processes
+  [ "$PROC_SRC" != none ] || return 1
+  [ -z "$(proc_reason "$3")" ] || return 1
+  git -C "$HERE" worktree list --porcelain | awk -v p="$2" '$0 == "worktree " p { f = 1; next } /^worktree / { f = 0 } f && /^locked/ { exit 1 }' || return 1
+  mt=$(newest_mtime "$2" "$(cd "$2" && git rev-parse --absolute-git-dir 2>/dev/null)" "$TMPD/b.$1")
+  [ $(($(date +%s) - ${mt:-0})) -ge $((ACTIVE_HOURS * 3600)) ]
+}
+
+safe_rm_build_dir() { # worktree dir
+  local wt=$1 d=$2
+  case "$d" in "$wt"/*) ;; *) return 1 ;; esac
+  case "${d##*/}" in target | node_modules) ;; *) return 1 ;; esac
+  [ -d "$d" ] && [ ! -L "$d" ] || return 1
+  rm -rf "$d"
+}
+
+apply_rows() {
+  local g kb br pr dirty up idle path reason n rpath before after acted=0 pruned=0 d
+  before=$(free_kb "$HERE")
+  while IFS="$(printf '\t')" read -r g kb br pr dirty up idle path reason n; do
+    case "$g" in REMOVE | TRIM) ;; *) continue ;; esac
+    if [ ! -d "$path" ]; then
+      pruned=1
+      continue
+    fi
+    rpath=$(realdir "$path")
+    if ! still_idle "$n" "$path" "$rpath"; then
+      say "skip $g $(short_path "$path"): became active"
+      continue
+    fi
+    if [ "$g" = REMOVE ]; then
+      if [ -n "$(git -C "$path" status --porcelain --untracked-files=normal 2>/dev/null)" ]; then
+        say "skip REMOVE $(short_path "$path"): no longer clean"
+        continue
+      fi
+      if git -C "$HERE" worktree remove "$path" 2>"$TMPD/err"; then
+        say "removed $(short_path "$path") ($br; $reason; branch kept)"
+        acted=1 pruned=1
+      else
+        say "git refused to remove $(short_path "$path"): $(tr '\n' ' ' <"$TMPD/err")"
+      fi
+    else
+      while IFS= read -r d; do
+        [ -n "$d" ] || continue
+        if safe_rm_build_dir "$path" "$d"; then say "trimmed $(short_path "$d")"; acted=1; fi
+      done <"$TMPD/b.$n"
+    fi
+  done <"$TMPD/rows"
+  [ "$pruned" = 1 ] && git -C "$HERE" worktree prune
+  after=$(free_kb "$HERE")
+  if [ "$acted" = 1 ]; then
+    say "$(df_delta "$before" "$after")"
+  else
+    say "nothing to do."
+  fi
+}
+
+# -------------------------------------------------------------------- self ---
+
+# Stale debug objects: on macOS a dev build keeps each executable's object
+# files in deps/ for the debugger (split-debuginfo=unpacked), and every
+# incremental rebuild writes new ones without deleting the old — tens of GB
+# over a long-lived worktree. An object no executable or dylib in the same
+# deps/ references (by name) is garbage; young ones may belong to a link in
+# progress and are kept.
+stale_objects() { # deps-dir → paths
+  local deps=$1 f b
+  for f in "$deps"/*; do
+    b=${f##*/}
+    case "$b" in *.dylib | *.so) ;; *.*) continue ;; esac
+    [ -f "$f" ] && LC_ALL=C grep -aoE '[^/[:cntrl:]]+\.rcgu\.o' "$f"
+  done | sort -u >"$TMPD/refs"
+  find "$deps" -maxdepth 1 -type f -name '*.rcgu.o' -mmin +"$SWEEP_MIN_AGE_MIN" 2>/dev/null |
+    awk -v refs="$TMPD/refs" 'BEGIN { while ((getline r < refs) > 0) R[r] = 1 } { b = $0; sub(/.*\//, "", b); if (!(b in R)) print }'
+}
+
+self_mode() {
+  local wt rwt d deps before after busy stale_kb=0 stale_n=0 total=0 f sz
+  wt=$HERE
+  rwt=$(realdir "$wt")
+  printf '%s\n' "$rwt" >"$TMPD/roots"
+  git -C "$HERE" worktree list --porcelain | awk '/^worktree /{ print substr($0, 10) "\t" }' >"$TMPD/wts"
+  build_dirs "$wt" | while IFS= read -r d; do [ "${d##*/}" = target ] && printf '%s\n' "$d"; done >"$TMPD/targets"
+  if [ ! -s "$TMPD/targets" ]; then
+    say "$(short_path "$wt"): no cargo target dir; nothing to trim."
+    return 0
+  fi
+  scan_processes
+  # A build in progress holds target/**/.cargo-lock; anything else open under
+  # a target dir (a daemon or app running from target/debug) blocks the full trim.
+  busy=""
+  while IFS= read -r d; do
+    d=$(realdir "$d")
+    busy="$busy$(awk -F'\t' -v t="$d" -v s="$SWEEP" 'index($5, t "/") == 1 && (s == 0 || $5 ~ /\.cargo-lock$/ || $3 == "cargo" || $3 == "rustc") { print $3 " (pid " $2 ")"; exit }' "$TMPD/hits")"
+  done <"$TMPD/targets"
+  [ "$PROC_SRC" = none ] && busy="(cannot inspect processes)"
+  if [ -n "$busy" ]; then
+    say "$(short_path "$wt"): skipped — $busy is using its build output."
+    return 0
+  fi
+  before=$(free_kb "$wt")
+  if [ "$SWEEP" = 1 ]; then
+    while IFS= read -r d; do
+      find "$d" -maxdepth 3 -type d -name deps 2>/dev/null
+    done <"$TMPD/targets" | while IFS= read -r deps; do
+      stale_objects "$deps"
+    done >"$TMPD/stale"
+    stale_n=$(wc -l <"$TMPD/stale" | tr -d ' ')
+    stale_kb=$(tr '\n' '\0' <"$TMPD/stale" | xargs -0 du -ck 2>/dev/null | awk '$2 == "total" { s += $1 } END { print s + 0 }')
+    if [ "$APPLY" = 1 ]; then
+      tr '\n' '\0' <"$TMPD/stale" | xargs -0 rm -f
+      after=$(free_kb "$wt")
+      say "$(short_path "$wt"): swept $stale_n stale debug object(s); $(df_delta "$before" "$after")."
+    else
+      say "$(short_path "$wt"): $stale_n stale debug object(s), ≈$(kb_h "$stale_kb") (du; hardlinked objects free less). Dry run — add --apply."
+    fi
+    return 0
+  fi
+  total=$(du_kb "$TMPD/targets")
+  if [ "$APPLY" = 1 ]; then
+    while IFS= read -r d; do safe_rm_build_dir "$wt" "$d" && say "trimmed $(short_path "$d")"; done <"$TMPD/targets"
+    after=$(free_kb "$wt")
+    say "$(short_path "$wt"): $(df_delta "$before" "$after"). The next cargo build starts cold."
+  else
+    say "$(short_path "$wt"): would delete $(tr '\n' ' ' <"$TMPD/targets")($(kb_h "$total")). Dry run — add --apply."
+  fi
+}
+
+# ------------------------------------------------------------------- hooks ---
+
+# Start a fully detached copy of this script (its own process group, stdio
+# off the hook's pipes) so the hook returns at once and the work survives the
+# session's teardown.
+spawn_detached() {
+  mkdir -p "$STATE" 2>/dev/null || return 0
+  local log="$STATE/log"
+  # Keep the log bounded: the last 2000 lines.
+  if [ -f "$log" ] && [ "$(wc -l <"$log")" -gt 4000 ]; then
+    tail -2000 "$log" >"$log.tmp" && mv "$log.tmp" "$log"
+  fi
+  (
+    set -m
+    cd "$HERE" && nohup bash "$SELF_PATH" "$@" </dev/null >>"$log" 2>&1 &
+  ) >/dev/null 2>&1
+}
+
+auto_enabled() { [ "$(git -C "$HERE" config --get worktree-gc.auto 2>/dev/null)" != false ]; }
+
+hook_mode() {
+  [ "${WORKTREE_GC:-on}" = off ] && exit 0
+  local input="" free reason cwd
+  [ -t 0 ] || input=$(cat 2>/dev/null)
+  case "$HOOK" in
+    session-start)
+      free=$(free_kb "$HERE")
+      if [ -n "$free" ] && [ "$free" -lt $((LOW_GB * 1048576)) ]; then
+        echo "Disk is low: $(disk_line "$HERE"). Before a big build, run \`scripts/worktree-gc\` (dry run; --apply acts) and follow the worktree-lifecycle skill. Never touch ACTIVE worktrees."
+      fi
+      # Cloud sessions are one throwaway checkout; nothing to collect.
+      [ "${CLAUDE_CODE_REMOTE:-}" = true ] && exit 0
+      auto_enabled || exit 0
+      mkdir -p "$STATE" 2>/dev/null || exit 0
+      # At most one background run per interval, and never two at once.
+      if [ -z "$(find "$STATE/last-run" -mmin -"$INTERVAL_MIN" 2>/dev/null)" ]; then
+        touch "$STATE/last-run"
+        spawn_detached --auto
+      fi
+      ;;
+    session-end)
+      # /clear keeps working in the same session; only a real end sweeps.
+      reason=$(printf '%s' "$input" | sed -n 's/.*"reason"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+      [ "$reason" = clear ] && exit 0
+      # The session's own worktree is its last cwd (Claude and Codex both send
+      # it) — but only when that is still a checkout of this repo.
+      cwd=$(printf '%s' "$input" | sed -n 's/.*"cwd"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+      if [ -n "$cwd" ] && [ -d "$cwd" ] &&
+        [ "$(cd "$cwd" && cd "$(git rev-parse --git-common-dir 2>/dev/null)" 2>/dev/null && pwd -P)" = "$COMMON" ]; then
+        HERE=$(cd "$cwd" && git rev-parse --show-toplevel)
+      fi
+      auto_enabled || exit 0
+      spawn_detached --self --sweep --apply --auto
+      ;;
+    *) die "unknown hook: $HOOK (session-start | session-end)" ;;
+  esac
+  exit 0
+}
+
+# -------------------------------------------------------------------- main ---
+
+[ -n "$HOOK" ] && hook_mode
+
+if [ "$MODE" = self ]; then
+  self_mode
+  exit 0
+fi
+
+if [ "$AUTO" = 1 ]; then
+  auto_enabled || exit 0
+  APPLY=1
+  mkdir -p "$STATE" && if ! mkdir "$STATE/lock" 2>/dev/null; then
+    # A lock older than two hours is a crashed run's.
+    if [ -n "$(find "$STATE/lock" -maxdepth 0 -mmin +120 2>/dev/null)" ]; then
+      rmdir "$STATE/lock" 2>/dev/null && mkdir "$STATE/lock" 2>/dev/null || exit 0
+    else
+      exit 0
+    fi
+  fi
+  trap 'rm -rf "$TMPD"; rmdir "$STATE/lock" 2>/dev/null' EXIT
+  say "--- auto run from $HERE"
+fi
+
+list_worktrees >"$TMPD/wts"
+cut -f2 "$TMPD/wts" >"$TMPD/roots"
+fetch_and_prs
+scan_processes
+[ "$PROC_SRC" = none ] && say "warning: neither lsof nor /proc is available; every worktree counts as ACTIVE"
+classify
+print_table
+if [ "$APPLY" = 1 ]; then
+  apply_rows
+else
+  echo "Dry run: nothing changed. --apply removes the REMOVE group and trims the TRIM group; ACTIVE and KEEP are never touched."
+fi
