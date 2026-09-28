@@ -43,6 +43,7 @@ export function connectionError(code: string | null): string {
     case "installation_unavailable": return "The agent installer is unavailable on this cloud machine. Check again after its software is updated.";
     case "probe_timeout": return "The agent took too long to confirm sign-in. Check the connection again in a moment.";
     case "sign_in_not_confirmed": return "The provider hasn’t confirmed sign-in yet. Open its sign-in flow again to finish.";
+    case "browser_login_unavailable": return "This version of the agent couldn’t open guided sign-in. Update the agent, then try again.";
     case "unsupported": case "unsupported_auth": return "This provider doesn't support guided sign-in on this cloud machine yet.";
     default: return "The provider couldn't complete sign-in. You can try again without changing your local account.";
   }

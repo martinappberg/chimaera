@@ -331,22 +331,36 @@ impl Client {
         .await
     }
     pub async fn billing_portal(&self) -> Result<BillingSession> {
-        self.billing_portal_request(None).await
+        self.billing_portal_request(None, None).await
     }
     pub async fn billing_portal_with_callback(
         &self,
         callback: &DesktopBillingCallback,
     ) -> Result<BillingSession> {
         callback.validate()?;
-        self.billing_portal_request(Some(callback)).await
+        self.billing_portal_request(Some(callback), None).await
+    }
+    pub async fn billing_portal_review_with_callback(
+        &self,
+        target: &BillingPortalTarget,
+        callback: &DesktopBillingCallback,
+    ) -> Result<BillingSession> {
+        target.validate()?;
+        callback.validate()?;
+        self.billing_portal_request(Some(callback), Some(target))
+            .await
     }
     async fn billing_portal_request(
         &self,
         callback: Option<&DesktopBillingCallback>,
+        target: Option<&BillingPortalTarget>,
     ) -> Result<BillingSession> {
         let mut body = serde_json::json!({"return_to": "desktop"});
         if let Some(callback) = callback {
             body["desktop_callback"] = serde_json::to_value(callback)?;
+        }
+        if let Some(target) = target {
+            body["target"] = serde_json::to_value(target)?;
         }
         json_response(
             self.request(

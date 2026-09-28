@@ -16,6 +16,8 @@ describe("provider readiness", () => {
   it("rejects credential-bearing and deceptive provider links", () => {
     expect(providerLoginUrl("codex", "https://auth.openai.com/codex/device")).toBe("https://auth.openai.com/codex/device");
     for (const url of ["http://auth.openai.com/codex/device", "https://auth.openai.com.evil.test", "https://x@auth.openai.com", "https://auth.openai.com:444/", "javascript:alert(1)", "https://auth.openai.com/#fragment", "https://auth.openai.com/" + "x".repeat(4096)]) expect(providerLoginUrl("codex", url)).toBeNull();
+    expect(providerLoginUrl("claude", "https://claude.com/cai/oauth/authorize?state=fixture")).toBe("https://claude.com/cai/oauth/authorize?state=fixture");
+    expect(providerLoginUrl("claude", "https://claude.com.evil.test/cai/oauth/authorize")).toBeNull();
     expect(providerLoginUrl("future-provider", "https://auth.openai.com")).toBeNull();
   });
 });

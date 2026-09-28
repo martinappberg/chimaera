@@ -18,14 +18,8 @@ pub(crate) async fn list_workspaces(
         crate::lock(&state.workspaces)
             .list()
             .into_iter()
-            .map(|workspace| {
-                let internal = crate::cloud::is_onboarding_workspace(&workspace);
-                let mut value = json!(workspace);
-                if internal {
-                    value["cloud_internal"] = json!(true);
-                }
-                value
-            })
+            .filter(|workspace| !crate::cloud::is_onboarding_workspace(workspace))
+            .map(|workspace| json!(workspace))
             .collect(),
     )
 }

@@ -162,3 +162,36 @@ async fn workspaces_open_and_delete() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(list.as_array().unwrap().len(), 0);
 }
+
+#[tokio::test]
+async fn internal_setup_is_persisted_and_hidden_without_hiding_similarly_named_user_projects() {
+    let data = test_dir("internal-workspaces-data");
+    let state = test_state_with_data_dir(0, data.clone());
+    let projects = test_dir("internal-workspaces-roots");
+    let internal = crate::lock(&state.workspaces)
+        .add_internal(projects.join("managed-login"))
+        .unwrap();
+    let normal = crate::lock(&state.workspaces)
+        .add(projects.join(".chimaera-setup"))
+        .unwrap();
+    let (status, rows) = request(&state, Method::GET, "/api/v1/workspaces", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(rows.as_array().unwrap().len(), 1);
+    assert_eq!(rows[0]["id"], normal.id);
+    let restarted = test_state_with_data_dir(0, data);
+    assert!(
+        crate::lock(&restarted.workspaces)
+            .get(&internal.id)
+            .unwrap()
+            .cloud_internal
+    );
+    assert!(
+        !crate::lock(&restarted.workspaces)
+            .get(&normal.id)
+            .unwrap()
+            .cloud_internal
+    );
+    let (_, rows) = request(&restarted, Method::GET, "/api/v1/workspaces", None).await;
+    assert_eq!(rows.as_array().unwrap().len(), 1);
+    assert_eq!(rows[0]["id"], normal.id);
+}

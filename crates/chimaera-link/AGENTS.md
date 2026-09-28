@@ -19,6 +19,8 @@ Invariants:
 
 - App-only dependency: the daemon must not depend on this crate. Fixture server
   dependencies are optional and never ship in a release bundle.
+- Optional portal targets are closed plan/interval pairs opening a hosted review,
+  never direct subscription mutations or client-supplied provider price IDs.
 - Native billing returns use an attempt-scoped loopback nonce; only authenticated
   account state confirms payment. Keep callback validation and PROTOCOL in sync.
 - Worker status is passive. Its optional preparing phase describes confirmed

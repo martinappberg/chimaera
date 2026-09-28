@@ -49,12 +49,19 @@ Cloud setup controls are implemented; automatic handoff and browser access are b
    selection and returns to the plan page after account creation or sign-in.
    Checkout opens only after a separate, explicit purchase action from the
    signed-in account. An existing active plan restores the subscriber view.
-   Existing subscribers can open **Manage billing**. Checkout and billing return
+   Existing subscribers can open **Manage billing**. Pro subscribers also see
+   **Upgrade to Max**: choose monthly or yearly, then **Review upgrade in browser**
+   to review the final price, proration and timing before confirming. Opening the
+   review leaves the current plan unchanged and preserves any existing trial.
+   Checkout and billing return
    to Pro automatically. The native shell waits up to 15 minutes for the browser,
    then checks account confirmation for up to two minutes, even if Pro is hidden
-   or closed. The page shows waiting, confirming and confirmed account states;
+   or closed. Subscriber billing feedback stays in the current-plan card while
+   cloud and provider panels remain in place. The page distinguishes opening,
+   waiting, confirming and confirmed account states;
    a browser return alone never activates a plan. **Stop waiting** ends the local
-   request without canceling a payment or subscription. A timeout or failed
+   request without closing the browser page or canceling a payment or subscription.
+   A stopped request can be dismissed or replaced by reopening billing. A timeout or failed
    check offers **Check account** and keeps plan selection hidden. If that fresh
    check confirms no active plan, **Return to plans** explicitly closes the old
    request before another checkout can start. Older shells
@@ -113,10 +120,12 @@ authentication check remains unknown.
 
 **Connect** prepares a missing agent and then guides its supported sign-in flow.
 Codex uses a one-time device code and the provider's secure browser page. Claude
-Code uses its dedicated sign-in terminal. A new attempt brings its guide into
-view; background status updates never scroll the page. Installation progress and
-sign-in are named separately. Users can cancel, retry an expired request or reopen
-the exact provider terminal. Sign-in is confirmed by the provider CLI on the cloud
+Code opens its own browser sign-in page and returns a one-time code to the same
+connection panel. Its official CLI completes authentication; no temporary project
+or terminal window opens. The code is used once and never saved by Chimaera.
+A new attempt brings its guide into view; background status updates never scroll
+or reload the page. Installation remains automatic and separate from sign-in.
+Users can cancel or retry an expired request in place. Sign-in is confirmed by the provider CLI on the cloud
 machine, not by a local checkbox or simply opening a browser. This confirms the
 configured account; it does not promise available provider quota or model access.
 Provider credentials remain on the cloud machine and are never copied from other devices.

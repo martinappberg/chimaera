@@ -1,7 +1,7 @@
 //! Browser returns are navigation hints. Only an authenticated account read can
 //! confirm a purchase; the bounded task belongs to the shell, not a webview.
 use super::super::Shell;
-use chimaera_link::{BillingInterval, Client, DesktopBillingCallback, Plan};
+use chimaera_link::{BillingInterval, BillingPortalTarget, Client, DesktopBillingCallback, Plan};
 use serde::Serialize;
 use std::{
     sync::Mutex,
@@ -19,10 +19,12 @@ const CONFIRM: Duration = Duration::from_secs(2 * 60);
 pub(super) enum Kind {
     Checkout,
     Portal,
+    PlanChange,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum Phase {
+    Opening,
     Waiting,
     Confirming,
     Confirmed,
@@ -32,13 +34,14 @@ pub(super) enum Phase {
 }
 impl Phase {
     fn pending(self) -> bool {
-        matches!(self, Self::Waiting | Self::Confirming)
+        matches!(self, Self::Opening | Self::Waiting | Self::Confirming)
     }
 }
 #[derive(Clone, Serialize)]
 pub(super) struct Status {
     id: u64,
     kind: Kind,
+    requested_plan: Option<Plan>,
     phase: Phase,
     expires_at: u64,
     error: Option<String>,
@@ -61,6 +64,7 @@ struct Attempt {
     generation: u64,
     account_id: String,
     plan: Option<Plan>,
+    kind: Kind,
     window: String,
     cancel: watch::Receiver<bool>,
     deadline: Instant,
@@ -77,6 +81,7 @@ impl Billing {
         generation: u64,
         account_id: String,
         plan: Option<Plan>,
+        kind: Kind,
         window: String,
     ) -> Attempt {
         let mut state = super::lock(&self.state);
@@ -90,12 +95,9 @@ impl Billing {
             cancel,
             status: Status {
                 id,
-                kind: if plan.is_some() {
-                    Kind::Checkout
-                } else {
-                    Kind::Portal
-                },
-                phase: Phase::Waiting,
+                kind,
+                requested_plan: plan.clone(),
+                phase: Phase::Opening,
                 expires_at: now() + WAIT.as_secs(),
                 error: None,
             },
@@ -105,6 +107,7 @@ impl Billing {
             generation,
             account_id,
             plan,
+            kind,
             window,
             cancel: receiver,
             deadline: Instant::now() + WAIT,
@@ -183,6 +186,7 @@ async fn open_billing(
     app: AppHandle,
     window: WebviewWindow,
     checkout: Option<(Plan, BillingInterval)>,
+    target: Option<BillingPortalTarget>,
 ) -> Result<(), String> {
     let state = app.state::<Shell>();
     let (client, generation) = state
@@ -196,6 +200,18 @@ async fn open_billing(
     {
         return Err("Choose Pro or Max.".into());
     }
+    if let Some(target) = &target {
+        target
+            .validate()
+            .map_err(|_| "Choose Pro or Max.".to_string())?;
+    }
+    let kind = if checkout.is_some() {
+        Kind::Checkout
+    } else if target.is_some() {
+        Kind::PlanChange
+    } else {
+        Kind::Portal
+    };
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .await
         .map_err(|_| "Could not prepare the return to chimaera. Try again.".to_string())?;
@@ -221,7 +237,11 @@ async fn open_billing(
         state.pro.billing.begin(
             generation,
             account_id,
-            checkout.as_ref().map(|(plan, _)| plan.clone()),
+            checkout
+                .as_ref()
+                .map(|(plan, _)| plan.clone())
+                .or_else(|| target.as_ref().map(|target| target.plan.clone())),
+            kind,
             window.label().into(),
         )
     };
@@ -230,6 +250,10 @@ async fn open_billing(
         let session = if let Some((plan, interval)) = checkout {
             client
                 .billing_checkout_with_callback(plan, interval, &callback)
+                .await
+        } else if let Some(target) = &target {
+            client
+                .billing_portal_review_with_callback(target, &callback)
                 .await
         } else {
             client.billing_portal_with_callback(&callback).await
@@ -257,6 +281,7 @@ async fn open_billing(
         let _ = app.emit("pro-changed", ());
         return Err(error);
     }
+    update(&app, attempt.id, Phase::Waiting, None);
     tokio::spawn(run(app, client, listener, callback, attempt));
     Ok(())
 }
@@ -315,7 +340,7 @@ async fn run(
 ) {
     let mut canceled = attempt.cancel.clone();
     let task = async {
-        let receive = callback::receive(listener, &callback, attempt.plan.is_some());
+        let receive = callback::receive(listener, &callback, attempt.kind == Kind::Checkout);
         tokio::pin!(receive);
         let mut verified = false;
         let mut poll = Instant::now() + Duration::from_secs(15);
@@ -392,11 +417,15 @@ pub async fn pro_billing_checkout(
     plan: Plan,
     interval: BillingInterval,
 ) -> Result<(), String> {
-    open_billing(app, window, Some((plan, interval))).await
+    open_billing(app, window, Some((plan, interval)), None).await
 }
 #[tauri::command]
-pub async fn pro_billing_portal(app: AppHandle, window: WebviewWindow) -> Result<(), String> {
-    open_billing(app, window, None).await
+pub async fn pro_billing_portal(
+    app: AppHandle,
+    window: WebviewWindow,
+    target: Option<BillingPortalTarget>,
+) -> Result<(), String> {
+    open_billing(app, window, None, target).await
 }
 #[tauri::command]
 pub async fn pro_cancel_billing(app: AppHandle, attempt_id: Option<u64>) -> Result<(), String> {
@@ -461,8 +490,20 @@ mod tests {
     #[tokio::test]
     async fn replacement_cancel_and_signout_fence_late_results() {
         let billing = Billing::default();
-        let old = billing.begin(1, "account".into(), Some(Plan::Pro), "home".into());
-        let current = billing.begin(1, "account".into(), Some(Plan::Max), "home".into());
+        let old = billing.begin(
+            1,
+            "account".into(),
+            Some(Plan::Pro),
+            Kind::Checkout,
+            "home".into(),
+        );
+        let current = billing.begin(
+            1,
+            "account".into(),
+            Some(Plan::Max),
+            Kind::Checkout,
+            "home".into(),
+        );
         assert!(*old.cancel.borrow());
         assert!(!billing.cancel(Some(old.id)));
         assert!(!*current.cancel.borrow());
@@ -487,7 +528,13 @@ mod tests {
             state: chimaera_link::Pkce::new().state,
         };
         let billing = Billing::default();
-        let mut attempt = billing.begin(1, "account".into(), Some(Plan::Pro), "home".into());
+        let mut attempt = billing.begin(
+            1,
+            "account".into(),
+            Some(Plan::Pro),
+            Kind::Checkout,
+            "home".into(),
+        );
         let id = attempt.id;
         let task = tokio::spawn(async move {
             tokio::select! {
@@ -506,9 +553,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_new_portal_replaces_stopped_status_and_closed_socket_cannot_cancel_it() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let billing = Billing::default();
+        let old = billing.begin(1, "account".into(), None, Kind::Portal, "home".into());
+        assert!(billing.cancel(Some(old.id)));
+        let attempt = billing.begin(1, "account".into(), None, Kind::Portal, "home".into());
+        assert_eq!(billing.status().unwrap().phase, Phase::Opening);
+        assert!(!billing.cancel(Some(old.id)));
+        assert!(billing.update(attempt.id, Phase::Waiting, None));
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let state = chimaera_link::Pkce::new().state;
+        let callback = DesktopBillingCallback {
+            redirect_uri: format!("http://{address}/billing/callback"),
+            state: state.clone(),
+        };
+        let receive =
+            tokio::spawn(
+                async move { callback::receive(listener, &callback, false).await.unwrap() },
+            );
+        // A browser may preconnect then close. It is neither a return nor cancellation.
+        drop(tokio::net::TcpStream::connect(address).await.unwrap());
+        let mut wrong = tokio::net::TcpStream::connect(address).await.unwrap();
+        wrong.write_all(format!("GET /billing/callback?state={state}&outcome=canceled HTTP/1.1\r\nHost: {address}\r\n\r\n").as_bytes()).await.unwrap();
+        let mut response = String::new();
+        wrong.read_to_string(&mut response).await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 400"));
+        assert_eq!(billing.status().unwrap().phase, Phase::Waiting);
+        assert!(!*attempt.cancel.borrow());
+        let mut browser = tokio::net::TcpStream::connect(address).await.unwrap();
+        browser.write_all(format!("GET /billing/callback?state={state}&outcome=portal HTTP/1.1\r\nHost: {address}\r\n\r\n").as_bytes()).await.unwrap();
+        let accepted = tokio::time::timeout(Duration::from_secs(1), receive)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(accepted.outcome, callback::Outcome::Portal);
+        assert!(billing.update(attempt.id, Phase::Confirming, None));
+        accepted.finish().await;
+        assert_eq!(billing.status().unwrap().phase, Phase::Confirming);
+        // The return alone does not confirm entitlement; the account read does.
+        assert!(billing.update(attempt.id, Phase::Confirmed, None));
+    }
+
+    #[tokio::test]
     async fn observed_purchase_cannot_be_downgraded_by_late_cancel_or_timeout() {
         let billing = Billing::default();
-        let attempt = billing.begin(1, "account".into(), Some(Plan::Pro), "home".into());
+        let attempt = billing.begin(
+            1,
+            "account".into(),
+            Some(Plan::Pro),
+            Kind::Checkout,
+            "home".into(),
+        );
         assert!(billing.update(attempt.id, Phase::Confirmed, None));
         assert!(!billing.update(attempt.id, Phase::Expired, None));
         // Explicitly acknowledging a terminal result clears presentation and

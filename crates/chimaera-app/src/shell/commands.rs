@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::Duration;
 
+use chimaera_link::protocol::HostKind;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -86,6 +87,13 @@ pub(super) async fn list_hosts(state: State<'_, Shell>) -> Result<Vec<HostState>
     let keeper = lock(&state.pro.hosts).clone();
     let mut out: Vec<_> = hosts
         .iter()
+        // Managed workers are placement infrastructure, never remote-machine
+        // choices. Keep the authoritative host map intact for automatic routing.
+        .filter(|h| {
+            !keeper
+                .values()
+                .any(|host| host.alias == h.alias && host.kind == HostKind::Worker)
+        })
         .map(|h| {
             if let Some(host) = keeper.values().find(|host| host.alias == h.alias) {
                 return super::connect::keeper_state(
@@ -107,7 +115,7 @@ pub(super) async fn list_hosts(state: State<'_, Shell>) -> Result<Vec<HostState>
             }
         })
         .collect();
-    for host in keeper.values() {
+    for host in keeper.values().filter(|host| host.kind != HostKind::Worker) {
         if !hosts.iter().any(|entry| entry.alias == host.alias) {
             out.push(super::connect::keeper_state(
                 host,

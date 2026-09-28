@@ -1,7 +1,10 @@
 #![cfg(feature = "fixtures")]
 
 use axum::{extract::State, http::HeaderMap, routing::post, Json, Router};
-use chimaera_link::{fake, BillingInterval, BillingSession, Client, DesktopBillingCallback, Plan};
+use chimaera_link::{
+    fake, BillingInterval, BillingPortalTarget, BillingSession, Client, DesktopBillingCallback,
+    Plan,
+};
 use serde_json::{json, Value};
 use tokio::{net::TcpListener, sync::mpsc};
 
@@ -110,6 +113,35 @@ async fn callback_requests_are_authenticated_additive_and_validate_before_sendin
         requests.recv().await.unwrap(),
         json!({"return_to":"desktop"})
     );
+    let target = BillingPortalTarget {
+        plan: Plan::Max,
+        interval: BillingInterval::Year,
+    };
+    client
+        .billing_portal_review_with_callback(&target, &callback)
+        .await
+        .unwrap();
+    assert_eq!(
+        requests.recv().await.unwrap(),
+        json!({
+            "return_to":"desktop", "desktop_callback":portal["desktop_callback"],
+            "target":{"plan":"max","interval":"year"}
+        })
+    );
+    assert!(client
+        .billing_portal_review_with_callback(
+            &BillingPortalTarget {
+                plan: Plan::None,
+                interval: BillingInterval::Month
+            },
+            &callback
+        )
+        .await
+        .is_err());
+    assert!(serde_json::from_value::<BillingPortalTarget>(
+        json!({"plan":"max","interval":"month","price_id":"arbitrary"})
+    )
+    .is_err());
     let invalid = DesktopBillingCallback {
         redirect_uri: "https://evil.test/callback".into(),
         ..callback

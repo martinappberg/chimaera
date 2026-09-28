@@ -33,6 +33,7 @@ fn actions_reject_untrusted_origins_and_cancellation_cannot_be_resurrected() {
         finished: AtomicBool::new(false),
         session: Mutex::new(None),
         process: Mutex::new(None),
+        input: Mutex::new(None),
     };
     attempt.cancel();
     attempt.update(Phase::Connected, None, None);
@@ -57,50 +58,90 @@ async fn waiting(state: &AppState, id: &str) -> Connection {
     .unwrap()
 }
 #[tokio::test]
-async fn explicit_terminal_connection_deduplicates_and_cancel_stops_owned_session() {
-    let (root, state) = fixture("terminal-connect");
+async fn browser_connection_deduplicates_and_cancel_stops_owned_process_without_workspace() {
+    let (root, state) = fixture("browser-connect");
     let cli = root.join("claude");
-    executable(&cli,"#!/bin/sh\nif [ \"$1 $2\" = 'auth status' ]; then printf '%s' '{\"loggedIn\":false}'; exit 1; fi\n[ \"$1 $2 $3\" = 'auth login --claudeai' ] || exit 99\nprintf 'Provider-owned sign-in prompt\\n'\nexec sleep 300\n");
+    executable(&cli, "#!/bin/sh\nif [ \"$1 $2\" = 'auth status' ]; then printf '%s' '{\"loggedIn\":false}'; exit 1; fi\n[ \"$1 $2 $3\" = 'auth login --claudeai' ] || exit 99\nprintf 'https://claude.com/cai/oauth/authorize?state=fixture\\nPaste code here if prompted > '\nexec sleep 300\n");
     preset(&state, AgentKind::Claude, cli);
     let def = super::super::definition("claude").unwrap();
     let first = start(state.clone(), def);
-    let duplicate = start(state.clone(), def);
-    assert_eq!(first.id, duplicate.id);
+    assert_eq!(first.id, start(state.clone(), def).id);
     let c = waiting(&state, &first.id).await;
-    let Some(Action::Terminal { session_id, .. }) = c.action else {
-        panic!("terminal action required")
-    };
-    assert!(state.sessions.get(&session_id).is_some());
-    crate::lock(&state.cloud_providers.connections)
-        .get(&first.id)
-        .unwrap()
-        .cancel();
-    let while_canceling = start(state.clone(), def);
-    assert_eq!(
-        while_canceling.id, first.id,
-        "cancellation must retain writer reservation"
-    );
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while state.sessions.get(&session_id).is_some() {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .unwrap();
-    assert_eq!(
-        crate::lock(&state.cloud_providers.connections)
-            .get(&first.id)
-            .unwrap()
-            .snapshot()
-            .phase,
-        Phase::Canceled
-    );
+    assert!(matches!(
+        c.action,
+        Some(Action::Browser {
+            input: "authorization_code",
+            ..
+        })
+    ));
+    assert!(state.sessions.list().is_empty());
+    assert!(crate::lock(&state.workspaces).list().is_empty());
     let attempt = crate::lock(&state.cloud_providers.connections)
         .get(&first.id)
         .unwrap()
         .clone();
+    let process = *crate::lock(&attempt.process);
+    assert!(process.is_some_and(process::group_alive));
+    attempt.cancel();
+    assert_eq!(
+        start(state.clone(), def).id,
+        first.id,
+        "cancel retains the writer until cleanup"
+    );
+    assert!(attempt.submit("fixture-code".into()).is_err());
     attempt.wait_finished().await;
     assert!(attempt.finished());
+    assert!(!process.is_some_and(process::group_alive));
+    assert_eq!(attempt.snapshot().phase, Phase::Canceled);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn browser_code_is_single_use_and_cli_confirmation_is_authoritative() {
+    let (root, state) = fixture("browser-code");
+    let cli = root.join("claude");
+    let ready = root.join("ready");
+    executable(
+        &cli,
+        &format!(
+            r##"#!/bin/sh
+if [ "$1 $2" = 'auth status' ]; then
+    if [ -f '{ready}' ]; then printf '%s' '{{"loggedIn":true}}'; exit 0; fi
+    printf '%s' '{{"loggedIn":false}}'; exit 1
+fi
+[ "$1 $2 $3" = 'auth login --claudeai' ] || exit 99
+printf '\033]8;;https://claude.com/cai/oauth/authorize?state=fixture\007Sign in\033]8;;\007\nPaste code here if prompted > '
+IFS= read -r code
+[ "$code" = 'one-time-fixture#state' ] || exit 1
+: > '{ready}'
+"##,
+            ready = ready.display()
+        ),
+    );
+    preset(&state, AgentKind::Claude, cli);
+    let c = start(state.clone(), super::super::definition("claude").unwrap());
+    waiting(&state, &c.id).await;
+    let attempt = crate::lock(&state.cloud_providers.connections)
+        .get(&c.id)
+        .unwrap()
+        .clone();
+    for invalid in ["", "line\nother", "space code", "zero\0", "carriage\r"] {
+        assert!(attempt.submit(invalid.into()).is_err());
+        assert_eq!(attempt.snapshot().phase, Phase::Waiting);
+    }
+    assert!(attempt.submit("a".repeat(4097)).is_err());
+    attempt.submit("one-time-fixture#state".into()).unwrap();
+    assert_eq!(attempt.snapshot().phase, Phase::Verifying);
+    assert!(attempt.submit("one-time-fixture#state".into()).is_err());
+    attempt.wait_finished().await;
+    assert!(attempt.finished());
+    assert_eq!(attempt.snapshot().phase, Phase::Connected);
+    assert!(!serde_json::to_string(&attempt.snapshot())
+        .unwrap()
+        .contains("one-time-fixture"));
+    assert!(state.sessions.list().is_empty());
+    assert!(crate::lock(&state.workspaces).list().is_empty());
+    assert!(crate::lock(&attempt.input).is_none());
     std::fs::remove_dir_all(root).unwrap();
 }
 

@@ -55,7 +55,12 @@ project/conversation continuity; it is not live setup progress or arbitrary
 process migration.
 Native billing attempts own their finite confirmation lifetime even if this view
 is hidden or closed. The UI has no checkout polling loop; it displays native
-waiting/confirming/result states and refreshes cached status on events or return.
+opening/waiting/confirming/result states and refreshes cached status on events or return.
+Subscriber billing feedback stays inside the account card, preserving cloud and
+provider panels. Account events immediately invalidate older reads; billing
+snapshots cannot roll back to an older attempt or phase. Pro subscribers can
+choose Upgrade to Max, review the interval locally, then explicitly open the
+hosted price/proration confirmation. Only server-confirmed Max changes the plan.
 Only an authoritative active account plan unlocks paid content. Expired/failed
 checkout stays neutral until an explicit Check account succeeds with no plan for
 the same attempt; Return to plans then acknowledges and clears that attempt. A targeted native
@@ -96,3 +101,11 @@ return reopens Pro, including when a new window needed time to mount.
   when you touch the persist path.
 - **UI quality is an acceptance criterion.** Use the theme tokens; light and dark
   both hold.
+
+Idle cloud status means available on demand, not a manual Start task. Opening
+Agent connections explicitly requests access; passive polling never wakes compute.
+After its first connection the provider component remains mounted while hidden
+across readiness changes, so unrelated status refreshes cannot reset sign-in.
+Ordinary connection rows exclude managed cloud workers; they remain available
+through automatic Pro routing. Background plan checks retain the last confirmed
+badge while pending; confirmed sign-out or failed account reads clear it.

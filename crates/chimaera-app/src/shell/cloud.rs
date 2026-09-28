@@ -39,6 +39,10 @@ pub enum Request {
     ProviderCancel {
         connection_id: String,
     },
+    ProviderSubmit {
+        connection_id: String,
+        code: String,
+    },
     OpenProviderBrowser {
         connection_id: String,
     },
@@ -156,6 +160,7 @@ pub async fn pro_cloud_request(app: AppHandle, request: Request) -> Result<Value
             | Request::OpenProviderTerminal { .. }
             | Request::ResumeHandoff { .. }
     );
+    let submit_code = matches!(request, Request::ProviderSubmit { .. });
     let open_browser = matches!(request, Request::OpenProviderBrowser { .. });
     let open_terminal = matches!(request, Request::OpenProviderTerminal { .. });
     let timeout = match &request {
@@ -166,6 +171,16 @@ pub async fn pro_cloud_request(app: AppHandle, request: Request) -> Result<Value
     let Some(host) = worker(&app, &client, generation, wake).await? else {
         return Ok(json!({"available":false}));
     };
+    // A one-time reply must not outlive account replacement while the blocking
+    // HTTP client is sending it to its original worker-owned login attempt.
+    let _submit_operation = if submit_code {
+        Some(state.pro.operation.lock().await)
+    } else {
+        None
+    };
+    if submit_code && state.pro.generation() != generation {
+        return Err("Your account changed. Start sign-in again.".into());
+    }
     let (route, body): (String, Option<Value>) = match request {
         Request::Info | Request::Start => ("cloud".into(), None),
         Request::Providers => ("cloud/providers".into(), None),
@@ -187,6 +202,19 @@ pub async fn pro_cloud_request(app: AppHandle, request: Request) -> Result<Value
             format!("cloud/connections/{connection_id}/cancel"),
             Some(json!({})),
         ),
+        Request::ProviderSubmit {
+            connection_id,
+            code,
+        } if valid_id(&connection_id)
+            && !code.is_empty()
+            && code.len() <= 4096
+            && !code.chars().any(|c| c.is_control() || c.is_whitespace()) =>
+        {
+            (
+                format!("cloud/connections/{connection_id}/input"),
+                Some(json!({"code":code})),
+            )
+        }
         Request::ResumeHandoff {
             workspace_id,
             expected_epoch,

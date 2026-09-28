@@ -15,7 +15,7 @@ enter UI settings or local storage.
 | `providers.ts` | Readiness and safe provider-link presentation; imports the core provider catalog. |
 | `onboarding.svelte.ts` | Validated shared intent so a paused project opens the same onboarding flow. |
 | `AccountUsage.svelte` / `usage.ts` | Percentage-first account usage; real limits, bounded accessible bars, neutral unknown/zero allowance. |
-| `billing.ts` | Native billing attempt copy; browser return never grants entitlement and raw errors never render. |
+| `billing.ts` | Native billing copy, stale-attempt fencing and explicit upgrade-review eligibility; browser return never grants entitlement and raw errors never render. |
 | `presentation.ts` | Account, billing-intent and cloud-state copy; truthful project status and the finite preparation polling cadence. |
 
 ## Boundaries
@@ -38,6 +38,10 @@ enter UI settings or local storage.
 - Connection completion comes from the daemon. A browser opening, terminal exit,
   copied code or local marker cannot confirm it. Codes are transient and never
   stored. Native browser/terminal actions send only a connection ID.
+- Claude browser authorization stays in the connection panel. The one-time reply
+  is cleared from the input on submit, cancellation, hide or teardown and sent
+  only to its current attempt; it is never saved in browser storage. Installation
+  remains automatic and does not navigate to its internal workspace.
 - Provider and connection polls are single-flight and visibility-gated. The
   connection effect depends on primitive ID/deadline/active-state values so
   replacing a response object cannot restart it into an immediate request loop.

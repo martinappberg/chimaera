@@ -344,6 +344,9 @@
     unlisteners.push(
       asyncDisposer(
         onHostStatus((e) => {
+          // Managed cloud connections use this event bus too. They are not
+          // machine choices and must not fetch/render internal workspaces here.
+          if (!hosts.some((host) => host.alias === e.alias)) return;
           hosts = hosts.map((h) =>
             h.alias === e.alias
               ? {
@@ -1142,6 +1145,10 @@
     {/if}
 
 
+    {#if native && ownAlias === null && $paidPlan !== null}
+      <CloudProjects onOpen={onOpen} knownIds={workspaces.map(workspace => workspace.id)} />
+    {/if}
+
     {#if ownAlias === null}
       <section class="remotes" aria-label="Remote machines">
         <div class="sec-head">
@@ -1385,9 +1392,6 @@
           {/if}
         {/if}
       </section>
-    {/if}
-    {#if native && ownAlias === null && $paidPlan !== null}
-      <CloudProjects onOpen={onOpen} knownIds={workspaces.map(workspace => workspace.id)} />
     {/if}
     <footer class="home-footer">
   {#if health !== null}

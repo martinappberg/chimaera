@@ -37,8 +37,17 @@ REST response bodies are limited to 1 MiB; control frames to 128 KiB.
 | `DELETE /v1/devices/{id}` | — | `204`; revoke that device and its connections |
 | `POST /v1/sign-out-everywhere` | — | `204`; revoke all devices, close held SSH logins and all link sockets |
 | `POST /v1/billing/checkout` | `{plan:"pro"\|"max",interval:"month"\|"year",return_to?:"desktop",desktop_callback?:DesktopBillingCallback}` | `{url}` to hosted checkout |
-| `POST /v1/billing/portal` | `{return_to?:"desktop",desktop_callback?:DesktopBillingCallback}` (or an empty body) | `{url}` to hosted billing portal |
+| `POST /v1/billing/portal` | `{return_to?:"desktop",desktop_callback?:DesktopBillingCallback,target?:{plan:"pro"\|"max",interval:"month"\|"year"}}` (or an empty body) | `{url}` to hosted billing portal |
 | `GET /v1/worker/status` | — | Passive `WorkerStatus` below; full device authentication, no provisioning or wake |
+
+A portal `target` opens a hosted subscription-change **review** for the account's
+existing subscription. The service chooses the owned subscription/item and its
+configured price; clients cannot supply customer, subscription, item, or price
+IDs. Creating the portal session never changes the subscription. The hosted page
+shows the final amount and timing and requires explicit confirmation. Existing
+trial time is preserved. The native return retains `outcome=portal`; clients
+confirm the requested plan using a fresh authenticated `/v1/me`, never from the
+return alone. A generic portal request remains unchanged.
 
 `WorkerStatus` is `{state,reason,phase?}`. `state` is `no_plan`, `unavailable`,
 `preparing`, `ready`, `sleeping`, `limited` or `error`. `reason` is null or one

@@ -37,7 +37,7 @@ in-app SSH askpass, a signed auto-updater). Parent map: repo-root
 | `shell.rs` | Module root: app-global `Shell` state, `WindowScope`, `lock`, and the Tauri `Builder` assembly (`run`). Re-exports `open_ui_window`. |
 | `shell/commands.rs` | The IPC command surface (`#[tauri::command]` fns wired into `generate_handler!`) — thin delegators. |
 | `shell/connect.rs` | The `connect` flight state machine (one coalesced ssh attempt per host; a flight for a wedge suspect — or with no live tunnel — first clears a wedged ControlMaster, before the old tunnel's teardown — both masters for an alias routed to its daemon's login node) + the host-row wire vocabulary (`HostState` — incl. `node`, the login node a pool alias is pinned to — /`HostStatus`, and the `routing` progress phase) + `with_hosts`, the app's single path to hosts.json (serialized, off the reactor via `spawn_blocking`; the CLI writes it directly in crates/chimaera/src/connect.rs). |
-| `shell/cloud.rs` | Passive cloud/provider readiness, explicit bounded connection/retry actions, shared-catalog authentication URL validation and exact login-terminal focus. Account credentials remain in Rust. Polls never wake a worker. `pro_cloud_status` passes through optional account-confirmed preparing phases (`keeper`, `worker`, `connecting`); these are not daemon/provider readiness. |
+| `shell/cloud.rs` | Passive cloud/provider readiness, explicit bounded connection/retry actions, shared-catalog authentication URL validation, memory-only Claude authorization-code submission under the account-operation fence, and exact terminal focus only for legacy provider adapters. Account credentials remain in Rust. Polls never wake a worker. `pro_cloud_status` passes through optional account-confirmed preparing phases (`keeper`, `worker`, `connecting`); these are not daemon/provider readiness. |
 | `shell/power.rs` | System sleep/wake notifications (macOS IOKit, Linux logind delay inhibitor, Windows power callbacks), bounded daemon flush, and AC-power gating for delayed hand-back. |
 | `shell/pro.rs` | Optional account runtime: endpoint in app.json, OS-keychain tokens, PKCE loopback sign-in, bounded keeper cache/events, reverse local-daemon sharing, and account IPC. No endpoint means no keychain access or network work. |
 | `shell/pro/billing.rs` | Native-owned checkout/portal attempts, exact provider-origin validation, cancellation, and authenticated plan confirmation independent of page visibility. |
@@ -76,6 +76,10 @@ in-app SSH askpass, a signed auto-updater). Parent map: repo-root
   let the UI describe startup and withhold account mutations. Dependent commands
   still wait for readiness; keychain writes are not detached or timed out to
   manufacture UI responsiveness.
+  Managed workers remain in the routing map but are excluded from `list_hosts`
+  and ordinary Settings machine rows; project placement and provider connections
+  reach them automatically. Background account reads retain confirmed cosmetic
+  plan branding while pending, so reconciliation cannot move the workspace rail.
   Device-only aliases never fall back to SSH: open windows retain that source in
   windows.json, including across sign-out/restart; only SSH hosts have that fallback.
 - System-browser sign-in binds an ephemeral IPv4-loopback callback, verifies
@@ -98,7 +102,9 @@ in-app SSH askpass, a signed auto-updater). Parent map: repo-root
   returns to plan review; checkout requires another explicit user action.
 
 - Billing waits at most 15 minutes for the browser, then at most two minutes
-  for account confirmation. Checkout only confirms the exact requested plan
+  for account confirmation. Opening, waiting and confirming are distinct states.
+  A targeted portal request opens a hosted plan-change review; it never directly
+  changes a subscription. Checkout and plan changes confirm the exact requested plan
   from a fresh authenticated account response; callback outcome is a hint.
   A 15 s account check while waiting also handles a lost browser redirect;
   return accelerates it to bounded 2–5 s checks. These share the account refresh

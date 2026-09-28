@@ -77,7 +77,7 @@ describe("shared paid plan", () => {
     vi.useRealTimers();
   });
 
-  it("shares native reads, invalidates immediately, and stops only after the last subscriber", async () => {
+  it("shares native reads, retains branding until the response, and stops only after the last subscriber", async () => {
     const first = subscribe();
     const second = subscribe();
     await flush();
@@ -91,7 +91,7 @@ describe("shared paid plan", () => {
 
     bridge.proStatus.mockResolvedValue(status("max"));
     changed();
-    expect(first.at(-1)).toBeNull();
+    expect(first.at(-1)).toBe("pro");
     await flush();
     expect(first.at(-1)).toBe("max");
     bridge.proStatus.mockResolvedValue(status("max", false));
@@ -104,6 +104,32 @@ describe("shared paid plan", () => {
     subscriptions.shift()!();
     expect(unlisten).toHaveBeenCalledTimes(1);
     expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("keeps the paid badge mounted through repeated background checks and visibility changes", async () => {
+    const account = subscribeAccount();
+    const badge = subscribe();
+    await flush();
+    for (let i = 0; i < 3; i += 1) {
+      const checking = deferred<ProStatus>();
+      bridge.proStatus.mockReturnValueOnce(checking.promise);
+      changed();
+      await vi.advanceTimersByTimeAsync(500);
+      expect(account).toEqual(["loading", "pro"]);
+      expect(badge).toEqual([null, "pro"]);
+      checking.resolve(status("pro"));
+      await flush();
+    }
+    visibility("hidden");
+    visibility("visible");
+    await flush();
+    expect(account).toEqual(["loading", "pro"]);
+    expect(badge).toEqual([null, "pro"]);
+    bridge.proStatus.mockResolvedValue(status("none", false));
+    changed();
+    await flush();
+    expect(account).toEqual(["loading", "pro", "free"]);
+    expect(badge).toEqual([null, "pro", null]);
   });
 
   it("rejects an older native response after sign-out and clears failures", async () => {
@@ -124,7 +150,7 @@ describe("shared paid plan", () => {
     expect(values.at(-1)).toBe("pro");
     bridge.proStatus.mockRejectedValue(new Error("native unavailable"));
     changed();
-    expect(values.at(-1)).toBeNull();
+    expect(values.at(-1)).toBe("pro");
     await flush();
     expect(values.at(-1)).toBeNull();
   });
@@ -212,7 +238,7 @@ describe("shared paid plan", () => {
     expect(values.at(-1)).toBe("pro");
     fetcher.mockRejectedValue(new Error("connection lost"));
     visibility("visible");
-    expect(values.at(-1)).toBeNull();
+    expect(values.at(-1)).toBe("pro");
     await flush();
     expect(values.at(-1)).toBeNull();
   });
@@ -233,8 +259,9 @@ describe("shared paid plan", () => {
 
     for (const plan of ["none", "pro", "max"] as const) {
       bridge.proStatus.mockResolvedValue(status(plan));
+      const confirmed = account.at(-1);
       changed();
-      expect(account.at(-1)).toBe("loading");
+      expect(account.at(-1)).toBe(confirmed);
       await flush();
       expect(account.at(-1)).toBe(plan === "none" ? "free" : plan);
       expect(badge.at(-1)).toBe(plan === "none" ? null : plan);

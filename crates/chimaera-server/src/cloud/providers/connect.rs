@@ -14,7 +14,10 @@ use std::{
     },
     time::Duration,
 };
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
+
+#[path = "claude.rs"]
+mod claude;
 
 static ACTIVE: AtomicUsize = AtomicUsize::new(0);
 pub(crate) fn active() -> usize {
@@ -45,6 +48,10 @@ impl Phase {
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(super) enum Action {
+    Browser {
+        url: String,
+        input: &'static str,
+    },
     DeviceCode {
         verification_url: String,
         user_code: String,
@@ -69,6 +76,7 @@ pub(super) struct Attempt {
     finished: AtomicBool,
     session: Mutex<Option<String>>,
     process: Mutex<Option<u32>>,
+    input: Mutex<Option<mpsc::Sender<String>>>,
 }
 impl Attempt {
     pub fn finished(&self) -> bool {
@@ -84,6 +92,37 @@ impl Attempt {
     }
     pub fn snapshot(&self) -> Connection {
         crate::lock(&self.value).clone()
+    }
+    pub fn submit(&self, code: String) -> Result<(), &'static str> {
+        if code.is_empty()
+            || code.len() > 4096
+            || code.chars().any(|c| c.is_control() || c.is_whitespace())
+        {
+            return Err("invalid_authorization_code");
+        }
+        let mut value = crate::lock(&self.value);
+        if value.phase != Phase::Waiting
+            || value.expires_at <= now()
+            || !matches!(
+                value.action,
+                Some(Action::Browser {
+                    input: "authorization_code",
+                    ..
+                })
+            )
+        {
+            return Err("connection_not_waiting");
+        }
+        let input = crate::lock(&self.input);
+        input
+            .as_ref()
+            .ok_or("connection_not_waiting")?
+            .try_send(code)
+            .map_err(|_| "connection_not_waiting")?;
+        // The submitted code is never part of connection state or diagnostics.
+        value.phase = Phase::Verifying;
+        value.action = None;
+        Ok(())
     }
     pub fn cancel(&self) {
         let mut value = crate::lock(&self.value);
@@ -139,6 +178,7 @@ pub(super) fn start(state: Arc<AppState>, def: &'static ProviderDefinition) -> C
         finished: AtomicBool::new(false),
         session: Mutex::new(None),
         process: Mutex::new(None),
+        input: Mutex::new(None),
     });
     connections.insert(value.id.clone(), attempt.clone());
     drop(connections);
@@ -179,6 +219,7 @@ pub(super) fn start(state: Arc<AppState>, def: &'static ProviderDefinition) -> C
         })
         .await
         .is_ok();
+        crate::lock(&attempt.input).take();
         crate::lock(&state.cloud_providers.cache).remove(def.id);
         match result {
             Ok(()) => attempt.update(Phase::Connected, None, None),
@@ -216,7 +257,7 @@ async fn workspace(state: &Arc<AppState>) -> Result<crate::workspaces::Workspace
     let owner = state.clone();
     tokio::task::spawn_blocking(move || {
         crate::lock(&owner.workspaces)
-            .add(root)
+            .add_internal(root)
             .map_err(|_| "setup_unavailable")
     })
     .await
@@ -428,7 +469,9 @@ async fn run(
         install(state, def, attempt).await?;
     }
     let bin = super::binary(state, def, false).await?;
-    if def.id == "codex" {
+    if def.id == "claude" {
+        claude::login(state, &bin, attempt).await?;
+    } else if def.id == "codex" {
         codex(state, &bin, attempt).await?;
     } else {
         terminal(state, def, &bin, attempt).await?;

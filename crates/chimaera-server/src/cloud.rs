@@ -22,10 +22,11 @@ pub(crate) fn enabled() -> bool {
 pub(crate) fn is_onboarding_workspace(workspace: &crate::workspaces::Workspace) -> bool {
     // Provider login terminals belong to worker setup, never to a project
     // that should be mirrored or offered for a local copy.
-    enabled()
-        && std::env::var_os("HOME").is_some_and(|home| {
-            workspace.root == PathBuf::from(home).join("projects/.chimaera-setup")
-        })
+    workspace.cloud_internal
+        || enabled()
+            && std::env::var_os("HOME").is_some_and(|home| {
+                workspace.root == PathBuf::from(home).join("projects/.chimaera-setup")
+            })
 }
 fn unavailable() -> Response {
     (
@@ -126,7 +127,7 @@ pub(crate) async fn onboard(
     if tokio::fs::create_dir_all(&setup).await.is_err() {
         return error("could not prepare cloud setup directory");
     }
-    let workspace = match crate::lock(&state.workspaces).add(setup) {
+    let workspace = match crate::lock(&state.workspaces).add_internal(setup) {
         Ok(w) => w,
         Err(_) => return error("could not register cloud setup workspace"),
     };

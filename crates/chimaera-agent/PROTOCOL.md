@@ -2622,3 +2622,22 @@ already completed login. Official references: [Codex authentication](https://dev
 [app-server account API](https://developers.openai.com/codex/app-server),
 [Claude CLI reference](https://code.claude.com/docs/en/cli-reference), and
 [GitHub auth status](https://cli.github.com/manual/gh_auth_status).
+
+
+## Pass 40 (2026-09-28 — Claude 2.1.283): headless browser/code sign-in. ADOPTED.
+
+In a fresh temporary HOME and CLAUDE_CONFIG_DIR, `claude auth login --claudeai`
+with piped stdin/stdout and browser launching suppressed emitted an OSC hyperlink
+on `https://claude.com/cai/oauth/authorize`, followed by `Paste code here if prompted >`.
+No PTY is required. The bounded probe observed the URL/prompt then killed only
+its owned process; no account credentials were submitted and no existing account
+was used. Only origin/path and query-key names were retained as evidence.
+
+The daemon's adapter extracts that complete allowlisted URL without exposing raw
+CLI output. A one-time code is forwarded as one stdin line to the same official
+CLI, which still owns OAuth/PKCE/token storage. Process success alone does not
+confirm connection: the shared readiness helper performs a fresh `auth status`
+check. Synthetic subprocess regressions verify code framing, replay rejection,
+completion, cancellation and no workspace/session registration. This replaces
+the terminal-based Claude onboarding in Pass39. Provider authentication is separate
+from model turns; this change does not alter the structured agent driver.

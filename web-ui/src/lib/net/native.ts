@@ -870,8 +870,9 @@ export function openDetachedPopup(
 
 export interface ProBillingAttempt {
   id: number;
-  kind: "checkout" | "portal";
-  phase: "waiting" | "confirming" | "confirmed" | "canceled" | "expired" | "failed";
+  kind: "checkout" | "portal" | "plan_change";
+  requested_plan?: "pro" | "max" | null;
+  phase: "opening" | "waiting" | "confirming" | "confirmed" | "canceled" | "expired" | "failed";
   expires_at: number;
   error: string | null;
 }
@@ -958,10 +959,10 @@ export function onProReturn(handler: () => void): Promise<() => void> {
   return t.webviewWindow.getCurrentWebviewWindow().listen<null>("pro-return", () => handler());
 }
 
-export async function proBillingPortal(): Promise<void> {
+export async function proBillingPortal(target?: { plan: "pro" | "max"; interval: "month" | "year" }): Promise<void> {
   const t = tauri();
   if (t === null) throw new Error("Open the desktop app to manage billing.");
-  await t.core.invoke<void>("pro_billing_portal");
+  await t.core.invoke<void>("pro_billing_portal", { target });
 }
 
 export interface ProHost {
@@ -1041,7 +1042,7 @@ export interface CloudProviderConnection {
   phase: "preparing" | "waiting" | "verifying" | "connected" | "failed" | "canceled" | "expired";
   expires_at: number;
   action: { type: "device_code"; verification_url: string; user_code: string }
-    | { type: "browser"; url: string }
+    | { type: "browser"; url: string; input?: "authorization_code" }
     | { type: "terminal"; workspace_id: string; session_id: string } | null;
   error_code: string | null;
 }
@@ -1072,6 +1073,7 @@ export interface CloudSetupInfo {
 export type CloudSetupRequest = { operation: "info" | "start" | "providers" }
   | { operation: "onboard"; agent: string }
   | { operation: "provider_connect"; provider_id: string }
+  | { operation: "provider_submit"; connection_id: string; code: string }
   | { operation: "provider_connection" | "provider_cancel" | "open_provider_browser" | "open_provider_terminal"; connection_id: string }
   | { operation: "resume_handoff"; workspace_id: string; expected_epoch: number }
   | { operation: "project"; url: string; name?: string };

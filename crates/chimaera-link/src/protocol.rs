@@ -63,6 +63,20 @@ pub enum BillingInterval {
     Year,
 }
 
+/// A hosted subscription-change review, never an instruction to mutate billing.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BillingPortalTarget {
+    pub plan: Plan,
+    pub interval: BillingInterval,
+}
+impl BillingPortalTarget {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(self.plan != Plan::None, "choose Pro or Max");
+        Ok(())
+    }
+}
+
 /// A single native billing attempt. The nonce is not an account credential, but
 /// must not be logged or exposed to another window/attempt.
 #[derive(Clone, Serialize, Deserialize)]

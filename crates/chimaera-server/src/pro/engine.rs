@@ -715,6 +715,7 @@ pub(super) async fn hydrate(
             last_opened_at: super::now(),
             mastermind: None,
             plugins_on: Vec::new(),
+            cloud_internal: false,
         };
         let owner = state.clone();
         tokio::task::spawn_blocking(move || lock(&owner.workspaces).import_exact(new_workspace))
@@ -1176,6 +1177,7 @@ mod tests {
                 last_opened_at: super::super::now(),
                 mastermind: None,
                 plugins_on: vec![],
+                cloud_internal: false,
             })
             .unwrap();
         lock(&state.pro.ownership).insert("w-project".into(), Ownership::Hydrating { epoch: 3 });

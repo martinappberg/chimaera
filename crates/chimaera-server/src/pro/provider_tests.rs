@@ -23,6 +23,7 @@ fn fixture(root: &Path) -> Arc<AppState> {
             last_opened_at: super::super::now(),
             mastermind: None,
             plugins_on: vec![],
+            cloud_internal: false,
         })
         .unwrap();
     lock(&state.pro.ownership).insert("w-project".into(), Ownership::Hydrating { epoch: 3 });

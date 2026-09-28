@@ -374,6 +374,7 @@ async fn legacy_pending_registration_is_fenced_until_explicit_folder_choice() {
         last_opened_at: super::super::now(),
         mastermind: None,
         plugins_on: vec![],
+        cloud_internal: false,
     };
     std::fs::create_dir_all(root.join("daemon/pro")).unwrap();
     lock(&old.workspaces)
@@ -435,6 +436,7 @@ async fn original_laptop_root_is_bound_to_its_account_before_automatic_return() 
         last_opened_at: super::super::now(),
         mastermind: None,
         plugins_on: vec![],
+        cloud_internal: false,
     };
     lock(&state.workspaces)
         .import_exact(workspace.clone())

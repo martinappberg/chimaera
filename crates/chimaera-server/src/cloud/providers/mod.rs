@@ -31,7 +31,7 @@ pub(crate) struct ProviderDefinition {
 pub(crate) const PROVIDERS: &[ProviderDefinition] = &[
     ProviderDefinition {
         id: "claude",
-        methods: &["terminal"],
+        methods: &["browser_code"],
         kind: Some(AgentKind::Claude),
     },
     ProviderDefinition {
@@ -311,6 +311,33 @@ pub(crate) async fn start(State(state): State<Arc<AppState>>, Path(id): Path<Str
 }
 pub(crate) async fn get(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
     connection_response(&state, &id, false).await
+}
+#[derive(serde::Deserialize)]
+pub(crate) struct Input {
+    code: String,
+}
+pub(crate) async fn submit(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(input): Json<Input>,
+) -> Response {
+    if !super::enabled() {
+        return unavailable();
+    }
+    let attempt = crate::lock(&state.cloud_providers.connections)
+        .get(&id)
+        .cloned();
+    let Some(attempt) = attempt else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error":"connection_expired"})),
+        )
+            .into_response();
+    };
+    if let Err(code) = attempt.submit(input.code) {
+        return (StatusCode::CONFLICT, Json(json!({"error":code}))).into_response();
+    }
+    Json(json!({"available":true,"connection":attempt.snapshot()})).into_response()
 }
 pub(crate) async fn cancel(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
     connection_response(&state, &id, true).await

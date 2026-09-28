@@ -4,7 +4,7 @@
   import PlanBadge from "../shared/PlanBadge.svelte";
   import ProWalkthrough from "../pro/ProWalkthrough.svelte";
   import AccountUsage from "../pro/AccountUsage.svelte";
-  import { billingCopy, billingPending, billingNeedsReview, explicitCheckoutChoice } from "../pro/billing";
+  import { billingCopy, billingPending, billingNeedsReview, explicitCheckoutChoice, canReviewUpgrade, latestBilling } from "../pro/billing";
   import { onMount, tick, untrack } from "svelte";
   import MirrorSettings from "./MirrorSettings.svelte";
   import { asyncDisposer } from "../shared/asyncDisposer";
@@ -40,7 +40,10 @@
   let error = $state<string | null>(null);
   let notice = $state<string | null>(null);
   let reviewedBilling = $state<number | null>(null);
+  let upgradeOpen = $state(false);
+  let upgradeInterval = $state<BillingInterval>("month");
   let busy = $state<string | null>(null);
+  let openingBillingAfter = $state<number | null>(null);
   let revision = $state(0);
   let connectionsOpen = $state(false);
   let securityOpen = $state(false);
@@ -55,7 +58,7 @@
   const signInPhase = $derived(status?.sign_in?.phase ?? null);
   const billing = $derived(status?.billing ?? null);
   const billingActive = $derived(billingPending(billing));
-  const billingMessage = $derived(billing ? billingCopy(billing, subscribed) : null);
+  const billingMessage = $derived(billing && !(openingBillingAfter !== null && billing.id <= openingBillingAfter) ? billingCopy(billing, status?.plan ?? null) : null);
   const billingRecovery = $derived(billingNeedsReview(billing, subscribed));
   const offerPlans = $derived(confirmedFree && !billingActive && !billingRecovery);
   const canReturnToPlans = $derived(billingRecovery && confirmedFree && reviewedBilling === billing?.id);
@@ -76,6 +79,7 @@
       let next = await proStatus();
       if (refresh && next.signed_in && !next.initializing) { await proRefreshAccount(); next = await proStatus(); }
       if (!alive || request !== generation) return;
+      if (next.signed_in && status?.signed_in && next.email === status.email) next.billing = latestBilling(status.billing, next.billing);
       status = next;
       accountFresh = true;
       if (!next.signed_in) notice = null;
@@ -108,7 +112,7 @@
   $effect(() => {
     if (!visible || !$pageVisible || !status?.signed_in || status.initializing || !subscribed || !connectionsOpen) return;
     let stopped = false;
-    void proHosts().then(value => { if (!stopped) hosts = value; }).catch(() => { if (!stopped) error = "Connected machines couldn't refresh. Please try again."; });
+    void proHosts().then(value => { if (!stopped) hosts = value.filter(host => host.kind !== "worker"); }).catch(() => { if (!stopped) error = "Connected machines couldn't refresh. Please try again."; });
     return () => { stopped = true; };
   });
   $effect(() => {
@@ -118,7 +122,7 @@
     return () => { stopped = true; };
   });
   onMount(() => {
-    const changed = () => { if (alive) { reviewedBilling = null; accountFresh = false; revision += 1; } };
+    const changed = () => { if (alive) { generation += 1; reviewedBilling = null; accountFresh = false; revision += 1; } };
     const dispose = asyncDisposer(onProChanged(changed).then((unlisten) => { changed(); return unlisten; }));
     const focus = () => { if (visible && document.visibilityState === "visible") void load(true); };
     window.addEventListener("focus", focus);
@@ -157,13 +161,17 @@
     remember({ plan: selected, interval, stage: "sign_in", screenHint, created: Date.now() });
     await act("sign-in", () => proSignIn(screenHint), "Your browser couldn't open. Please try again.");
   }
-  async function openBilling(): Promise<void> {
-    if (billingActive) return;
+  async function openBilling(target?: { plan: PaidPlan; interval: BillingInterval }): Promise<void> {
+    if (busy !== null || billingActive || !status?.signed_in || !subscribed || status.initializing) return;
+    if (target && !canReviewUpgrade(status, accountFresh)) return;
     notice = null;
-    await act("billing", async () => {
-      await proBillingPortal();
+    openingBillingAfter = billing?.id ?? 0;
+    await act(target ? "upgrade" : "billing", async () => {
+      await proBillingPortal(target);
+      upgradeOpen = false;
       if (status?.billing === undefined) notice = "Billing opened in your browser. Return here to check your account when you're done.";
     }, "Billing couldn't open. Please try again in a moment.");
+    openingBillingAfter = null;
   }
   async function checkBillingAccount(): Promise<void> {
     const id = billing?.id;
@@ -181,6 +189,11 @@
     if (id === undefined) return;
     await act("cancel-billing", () => proCancelBilling(id), "This request couldn't be stopped. Please check its latest status.");
   }
+  async function dismissBilling(): Promise<void> {
+    const id = billing?.id;
+    if (id === undefined || billingActive || billingRecovery) return;
+    await act("dismiss-billing", () => proCancelBilling(id), "This message couldn't be dismissed. Please try again.");
+  }
   async function returnToPlans(): Promise<void> {
     const id = billing?.id;
     if (!canReturnToPlans || id === undefined) return;
@@ -194,13 +207,26 @@
   }
   function setKept(host: ProHost, checkbox: HTMLInputElement): void {
     const kept = checkbox.checked; checkbox.checked = host.kept;
-    void act(`host:${host.alias}`, async () => { await proSetHostKept(host.alias, kept); hosts = await proHosts(); }, "This connection couldn't be updated. Please try again.");
+    void act(`host:${host.alias}`, async () => { await proSetHostKept(host.alias, kept); hosts = (await proHosts()).filter(host => host.kind !== "worker"); }, "This connection couldn't be updated. Please try again.");
   }
   function lastSeen(value: string): string {
     const date = new Date(value);
     return Number.isNaN(date.valueOf()) ? "Last seen unavailable" : `Last seen ${date.toLocaleString()}`;
   }
 </script>
+
+{#snippet billingNotice()}
+    {#if billingMessage}
+      <div class="panel notice" role="status">
+        <h2>{billingMessage.title}</h2><p>{billingMessage.detail}</p>
+        {#if billingMessage.pending}<button class="secondary" disabled={busy !== null} onclick={() => void stopBilling()}>Stop waiting</button>
+        {:else if billingMessage.check}<div class="actions"><button class="secondary" disabled={busy !== null || accountLoading} onclick={() => void checkBillingAccount()}>{busy === "billing-check" || accountLoading ? "Checking…" : "Check account"}</button>{#if canReturnToPlans}<button onclick={() => void returnToPlans()} disabled={busy !== null}>Return to plans</button>{/if}</div>{/if}
+        {#if !billingMessage.pending && !billingRecovery}<button class="text-button" disabled={busy !== null} onclick={() => void dismissBilling()}>Dismiss</button>{/if}
+        {#if canReturnToPlans}<p class="small muted">Your account currently has no active plan. You can return to plans when you're ready.</p>{/if}
+        {#if billingRecovery && error}<p class="small" role="alert">{error}</p>{/if}
+      </div>
+    {/if}
+{/snippet}
 
 <section class="pro" class:subscriber={subscribed} aria-label="Chimaera Pro">
   <header class="heading">
@@ -248,15 +274,7 @@
     {/if}
 
     {#if notice}<p class="notice message" role="status">{notice}</p>{/if}
-    {#if billingMessage}
-      <div class="panel notice" role="status">
-        <h2>{billingMessage.title}</h2><p>{billingMessage.detail}</p>
-        {#if billingMessage.pending}<button class="secondary" disabled={busy !== null} onclick={() => void stopBilling()}>Stop waiting</button>
-        {:else if billingMessage.check}<div class="actions"><button class="secondary" disabled={busy !== null || accountLoading} onclick={() => void checkBillingAccount()}>{busy === "billing-check" || accountLoading ? "Checking…" : "Check account"}</button>{#if canReturnToPlans}<button onclick={() => void returnToPlans()} disabled={busy !== null}>Return to plans</button>{/if}</div>{/if}
-        {#if canReturnToPlans}<p class="small muted">Your account currently has no active plan. You can return to plans when you're ready.</p>{/if}
-        {#if billingRecovery && error}<p class="small" role="alert">{error}</p>{/if}
-      </div>
-    {/if}
+    {#if !subscribed}{@render billingNotice()}{/if}
 
     {#if offerPlans}
       <section class="plans" aria-labelledby="plans-title" tabindex="-1" bind:this={plansElement}>
@@ -284,6 +302,22 @@
       {#key status.email}<CloudSetup {visible} {requiredProviders} {contextLabel} {workspaceId} {onReady} />{/key}
       <section class="panel plan-current" aria-label="Current plan">
         <div class="section-heading"><div><span class="section-label">Your plan</span><h2>Chimaera {status.plan === "max" ? "Max" : "Pro"}</h2></div><button class="secondary" disabled={busy !== null || billingActive} onclick={() => void openBilling()}>{busy === "billing" ? "Opening billing…" : "Manage billing"}</button></div>
+        {@render billingNotice()}
+        {#if status.plan === "pro"}
+          <div class="upgrade-entry">
+            <div><h3>More room for your work</h3><p class="small muted">Max includes more cloud time and mirrored storage, with the same workflow.</p></div>
+            <button class="secondary" aria-expanded={upgradeOpen} disabled={busy !== null || billingActive || !canReviewUpgrade(status, accountFresh)} onclick={() => (upgradeOpen = !upgradeOpen)}>Upgrade to Max</button>
+          </div>
+          {#if upgradeOpen}
+            <div class="upgrade-review" aria-label="Review Max upgrade">
+              <h3>Review Chimaera Max</h3>
+              <div class="interval" role="group" aria-label="Upgrade billing interval"><button class:chosen={upgradeInterval === "month"} aria-pressed={upgradeInterval === "month"} onclick={() => (upgradeInterval = "month")}>Monthly</button><button class:chosen={upgradeInterval === "year"} aria-pressed={upgradeInterval === "year"} onclick={() => (upgradeInterval = "year")}>Yearly</button></div>
+              <p class="upgrade-price">${prices.max[upgradeInterval]} <span class="small muted">/ {upgradeInterval === "year" ? "year" : "month"}</span></p>
+              <p class="small muted">Your current plan stays active. Review the final amount, any prorated charge, and when the change takes effect before confirming in secure billing. Any remaining trial time is kept.</p>
+              <div class="actions"><button disabled={busy !== null || !canReviewUpgrade(status, accountFresh)} onclick={() => void openBilling({ plan: "max", interval: upgradeInterval })}>{busy === "upgrade" ? "Opening review…" : "Review upgrade in browser"}</button><button class="text-button" disabled={busy !== null} onclick={() => (upgradeOpen = false)}>Keep current plan</button></div>
+            </div>
+          {/if}
+        {/if}
         <AccountUsage usage={status.usage} limits={status.limits} />
       </section>
       <details class="section" ontoggle={(event) => (connectionsOpen = event.currentTarget.open)}><summary>Connected machines</summary>{#if connectionsOpen}<div class="section-body"><p class="muted small">Add your remote hosts on Home. Keep a connection available through Pro here.</p>{#if hosts.length === 0}<p class="muted">No machines to show yet.</p>{/if}{#each hosts as host (host.alias)}<div class="row"><div><span>{host.alias}</span><span class="muted small">{host.status === "prompting" ? "Waiting for authentication" : host.status === "connecting" ? "Connecting…" : host.status === "connected" ? "Connected" : "Offline"}</span></div>{#if host.kind === "ssh"}<label class="keep"><input type="checkbox" checked={host.kept} disabled={busy !== null} onchange={(event) => setKept(host, event.currentTarget)} />Keep connected</label>{/if}</div>{/each}</div>{/if}</details>
@@ -365,6 +399,17 @@
   .notice { background: color-mix(in srgb, var(--accent) 5%, transparent); }
   .message { border-radius: 7px; padding: 12px 15px; }
   .plan-current .section-label { margin-bottom: 8px; }
+  .plan-current :global(.panel.notice) { padding: 16px 0; margin: 18px 0 0; border: 0; border-top: 1px solid var(--edge); border-radius: 0; background: transparent; }
+  .plan-current :global(.panel.notice h2) { font-size: var(--text-md); }
+  .upgrade-entry { display: flex; align-items: center; justify-content: space-between; gap: 20px; flex-wrap: wrap; margin-top: 24px; padding-top: 20px; border-top: 1px solid var(--edge); }
+  .upgrade-entry > div { flex: 1 1 220px; }
+  .upgrade-entry h3, .upgrade-review h3 { margin: 0; font-size: var(--text-md); font-weight: 550; }
+  .upgrade-entry p { margin-bottom: 0; }
+  .upgrade-entry > button { flex: none; }
+  .upgrade-review { margin-top: 20px; padding: 20px; border: 1px solid var(--edge); border-radius: 8px; }
+  .upgrade-review .interval { margin-top: 16px; width: fit-content; }
+  .upgrade-price { margin: 16px 0 0; font-size: 24px; font-weight: 550; }
+  .upgrade-review .actions { margin-bottom: 0; }
   .section { margin-top: 14px; border-top: 1px solid var(--edge); }
   summary { padding: 18px 0; color: var(--muted); font-size: var(--text-md); cursor: pointer; }
   summary:hover { color: var(--fg); }

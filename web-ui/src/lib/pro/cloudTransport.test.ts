@@ -48,3 +48,14 @@ describe("cloud provider request intent", () => {
     expect(mocks.api).not.toHaveBeenCalled();
   });
 });
+
+it("submits an authorization code only to its owned connection without navigation", async () => {
+  const dispatchEvent = vi.fn();
+  vi.stubGlobal("window", { dispatchEvent });
+  await cloudRequest({ operation: "provider_submit", connection_id: "attempt-1", code: "synthetic-code#state" });
+  const [path, options] = mocks.api.mock.calls[0];
+  expect(path).toBe("/pro/cloud/connections/attempt-1/input");
+  expect(options.method).toBe("POST");
+  expect(JSON.parse(options.body)).toEqual({ code: "synthetic-code#state" });
+  expect(dispatchEvent).not.toHaveBeenCalled();
+});

@@ -223,7 +223,13 @@ fn fixture_billing_callback_valid(body: &serde_json::Value) -> bool {
     }
 }
 async fn fixture_portal(body: Option<Json<serde_json::Value>>) -> Response {
-    if body.is_some_and(|Json(body)| !fixture_billing_callback_valid(&body)) {
+    if body.is_some_and(|Json(body)| {
+        !fixture_billing_callback_valid(&body)
+            || body.get("target").is_some_and(|target| {
+                !serde_json::from_value::<BillingPortalTarget>(target.clone())
+                    .is_ok_and(|target| target.validate().is_ok())
+            })
+    }) {
         return StatusCode::BAD_REQUEST.into_response();
     }
     Json(BillingSession {

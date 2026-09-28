@@ -24,7 +24,7 @@ describe("honest cloud state", () => {
   it("distinguishes disabled service from preparing and sleeping", () => {
     expect(cloudCopy("unavailable", "provisioning_disabled").title).toContain("paused");
     expect(cloudCopy("preparing", null).title).toContain("Preparing");
-    expect(cloudCopy("sleeping", null).title).toContain("resting");
+    expect(cloudCopy("sleeping", null).title).toBe("Available when you need it");
     expect(cloudCopy("unknown", null).title).toContain("unavailable");
   });
   it("explains quota recovery without converting it into an infrastructure setup task", () => {
@@ -44,7 +44,7 @@ describe("cloud preparation progress", () => {
     expect(cloudCopy("preparing", null, "worker").title).toBe("Starting your cloud machine");
     expect(cloudCopy("preparing", null, "connecting").title).toBe("Connecting your cloud workbench");
     expect(cloudCopy("preparing", null).title).toBe("Preparing your cloud");
-    expect(cloudCopy("sleeping", null, "worker").title).toContain("resting");
+    expect(cloudCopy("sleeping", null, "worker").title).toBe("Available when you need it");
     expect(cloudCopy("preparing", "hours_exhausted", "worker").title).toContain("hours used");
   });
   const mirror = (workspaces: import("../net/native").MirrorWorkspace[]): import("../net/native").MirrorStatus => ({ configured: true, projects_root: "", projects_root_confirmed: false, workspaces, sessions: [] });

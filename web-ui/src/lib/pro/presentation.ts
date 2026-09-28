@@ -23,7 +23,7 @@ export function cloudCopy(state: string, reason: string | null, phase?: CloudPro
   if (reason === "spend_limit_reached") return { title: "Cloud use is paused", detail: "Your account's cloud spending limit has been reached. Your local work is unaffected." };
   switch (state) {
     case "ready": return { title: "Your cloud is ready", detail: "Your computer stays the first place work runs. Cloud handoff happens automatically when it's needed." };
-    case "sleeping": return { title: "Your cloud is resting", detail: "It wakes automatically when work needs it." };
+    case "sleeping": return { title: "Available when you need it", detail: "Your cloud wakes automatically for work, then pauses when it’s idle. Keep working here as usual." };
     case "preparing":
       if (phase === "keeper") return { title: "Preparing your cloud connection", detail: "Chimaera is setting up the private connection between your account and your machines." };
       if (phase === "worker") return { title: "Starting your cloud machine", detail: "Your account connection is ready. Chimaera is preparing the machine where your agents will run." };

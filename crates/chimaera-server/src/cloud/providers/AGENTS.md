@@ -8,6 +8,7 @@ Worker-only readiness and explicitly requested provider authentication. Parent:
 |---|---|
 | `mod.rs` | Catalog adapters, allowlisted status parsing, bounded single-flight cache, authenticated HTTP handlers and the handoff `readiness` helper. |
 | `process.rs` | Capped CLI output and Codex auth-only JSON-RPC; owned process-group cleanup. No raw output enters HTTP errors or logs. |
+| `claude.rs` | Official Claude CLI headless browser/code adapter; bounded URL extraction and one-time stdin reply, without a workspace or PTY. |
 | `connect.rs` | Short-lived connection jobs, curated runtime installation, exact login terminals, Codex device codes, cancellation and cleanup acknowledgement. |
 | `tests.rs`, `connect_tests.rs` | Status isolation, cache/freshness, real child/PTY cleanup, cancellation/retry races and device completion verification. |
 
@@ -20,10 +21,16 @@ All routes are behind the daemon bearer middleware, under `/api/v1/pro/cloud`:
   `needs_sign_in`, `signed_in`, `unknown` or `unavailable`; `installed` is nullable.
   `handoffs` comes from `pro::cloud_provider_blocks`, never inferred from UI state.
 - `POST /providers/{id}/connect`, `GET /connections/{id}`, and
-  `POST /connections/{id}/cancel` return `{available,connection}`. An attempt has
+  `POST /connections/{id}/cancel`, and `POST /connections/{id}/input` return `{available,connection}`. An attempt has
   `id,provider_id,phase,expires_at,action,error_code`. Phase is `preparing`,
   `waiting`, `verifying`, `connected`, `failed`, `canceled` or `expired`.
-- An action is `{type:"device_code",verification_url,user_code}` or
+- `POST /connections/{id}/input {code}` accepts a single-use, nonempty authorization
+  code (maximum 4096 bytes, no whitespace/control characters) only while that
+  exact attempt is waiting for `authorization_code`. Code bodies are never logged,
+  persisted, returned, or added to a command line. Native submission remains bound
+  to its account generation through the request.
+- An action is `{type:"browser",url,input:"authorization_code"}`,
+  `{type:"device_code",verification_url,user_code}` or
   `{type:"terminal",workspace_id,session_id}`. Openers validate the shared
   provider origin policy and resolve the action afresh; client-supplied URLs or
   commands are never executed. Timestamps are Unix seconds.
@@ -38,7 +45,7 @@ All routes are behind the daemon bearer middleware, under `/api/v1/pro/cloud`:
 - Codex uses only auth app-server requests: initialize, account/read with
   `refreshToken:false`, and explicit account/login/start with
   `type:"chatgptDeviceCode"`. Claude uses `auth status --json` and explicit
-  `auth login --claudeai`; GitHub is optional and uses `gh auth status` JSON plus
+  `auth login --claudeai` with piped I/O, its own browser URL and code prompt; GitHub is optional and uses `gh auth status` JSON plus
   its official login/setup-git terminal. Unknown protocols fail closed.
 - `readiness` is shared by onboarding and handoff. Only `signed_in` with a
   confirmed installed runtime may satisfy a required session provider. An
@@ -60,8 +67,13 @@ All routes are behind the daemon bearer middleware, under `/api/v1/pro/cloud`:
   vendor code already issued (that code expires at the provider), or sign out an
   account whose login completed concurrently. No user credentials are copied from
   another host. Raw CLI errors, account email and token fields never leave a probe.
+- Claude sign-in creates no workspace or PTY. It validates the current official
+  `https://claude.com/cai/oauth/authorize` URL and prompt before exposing the
+  browser action. Unrecognized CLI output fails closed. A code is passed once
+  to the owned CLI; success still requires a fresh status probe.
 - Install/login terminals live only in `~/projects/.chimaera-setup`, the existing
-  excluded setup workspace. Cancel kills only the job's own session. Install uses
+  excluded setup workspace. Its purpose is recorded as `cloud_internal`, and normal
+  workspace lists omit it; old worker-reserved paths migrate to that marker. Cancel kills only the job's own session. Install uses
   the runtime subsystem's curated official downloads and existing reservation;
   it never attaches to or cancels someone else's install.
 

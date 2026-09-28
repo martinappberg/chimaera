@@ -82,12 +82,14 @@ export const accountPlan = readable<AccountPlan>("loading", (set) => {
     }
   }
 
-  const visibility = (): void => { void refresh(); };
+  // Keep confirmed branding mounted while a background read is pending.
+  // Fresh sign-out/error responses still clear it; this store grants no access.
+  const visibility = (): void => { void refresh(false); };
   document.addEventListener("visibilitychange", visibility);
   // Listen before the first read so a concurrent sign-out cannot be missed.
   // asyncDisposer also handles the last subscriber leaving during registration.
   const dispose = native
-    ? asyncDisposer(onProChanged(() => { void refresh(); }).then(
+    ? asyncDisposer(onProChanged(() => { void refresh(false); }).then(
       (unlisten) => { void refresh(); return unlisten; },
       () => { void refresh(); return () => {}; },
     ))

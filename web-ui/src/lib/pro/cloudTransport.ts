@@ -17,6 +17,7 @@ export async function cloudRequest(request: CloudSetupRequest, signal?: AbortSig
     case "providers": path = "/pro/cloud/providers"; break;
     case "provider_connect": path = `/pro/cloud/providers/${encodeURIComponent(request.provider_id)}/connect`; method = "POST"; body = {}; break;
     case "provider_connection": path = `/pro/cloud/connections/${encodeURIComponent(request.connection_id)}`; break;
+    case "provider_submit": path = `/pro/cloud/connections/${encodeURIComponent(request.connection_id)}/input`; method = "POST"; body = { code: request.code }; break;
     case "provider_cancel": path = `/pro/cloud/connections/${encodeURIComponent(request.connection_id)}/cancel`; method = "POST"; body = {}; break;
     case "resume_handoff": path = "/pro/hydrate"; method = "POST"; body = { workspace_id: request.workspace_id, expected_epoch: request.expected_epoch, requires_fork: false }; break;
     case "open_provider_terminal": {

@@ -52,6 +52,9 @@ pub(crate) struct Workspace {
     /// switch is per workspace. Additive wire field: absent when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) plugins_on: Vec<String>,
+    /// Daemon-owned setup, never a user project or a mirror/adoption candidate.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) cloud_internal: bool,
 }
 
 /// In-memory workspace list backed by a JSON file (save-on-change).
@@ -64,7 +67,7 @@ impl WorkspaceStore {
     /// Load the store from `path`. A missing or corrupt file yields an empty
     /// store (with a warning for the corrupt case).
     pub(crate) fn load(path: PathBuf) -> Self {
-        let items = match std::fs::read_to_string(&path) {
+        let mut items: Vec<Workspace> = match std::fs::read_to_string(&path) {
             Ok(contents) => match serde_json::from_str(&contents) {
                 Ok(items) => items,
                 Err(err) => {
@@ -78,7 +81,22 @@ impl WorkspaceStore {
                 Vec::new()
             }
         };
-        WorkspaceStore { path, items }
+        let mut migrated = false;
+        for workspace in &mut items {
+            // Older workers recorded only this daemon-reserved absolute path.
+            // Persist the purpose once so ordinary names never drive filtering.
+            if !workspace.cloud_internal && crate::cloud::is_onboarding_workspace(workspace) {
+                workspace.cloud_internal = true;
+                migrated = true;
+            }
+        }
+        let store = WorkspaceStore { path, items };
+        if migrated {
+            if let Err(error) = store.save() {
+                tracing::warn!(%error, "could not persist internal workspace purpose");
+            }
+        }
+        store
     }
 
     pub(crate) fn list(&self) -> Vec<Workspace> {
@@ -107,8 +125,18 @@ impl WorkspaceStore {
             last_opened_at: unix_now(),
             mastermind: None,
             plugins_on: Vec::new(),
+            cloud_internal: false,
         };
         self.items.push(workspace.clone());
+        self.save()?;
+        Ok(workspace)
+    }
+
+    pub(crate) fn add_internal(&mut self, root: PathBuf) -> anyhow::Result<Workspace> {
+        let added = self.add(root)?;
+        let entry = self.items.iter_mut().find(|w| w.id == added.id).unwrap();
+        entry.cloud_internal = true;
+        let workspace = entry.clone();
         self.save()?;
         Ok(workspace)
     }
