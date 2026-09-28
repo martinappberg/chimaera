@@ -10,7 +10,7 @@ use serde::Deserialize;
 use serde_json::json;
 use std::sync::{atomic::Ordering, Arc};
 
-fn failure(error: anyhow::Error) -> Response {
+pub(super) fn failure(error: anyhow::Error) -> Response {
     (
         StatusCode::BAD_REQUEST,
         Json(json!({"error":error.to_string().chars().take(256).collect::<String>()})),
@@ -43,6 +43,10 @@ pub(crate) async fn configure(
     Json(mut config): Json<Configure>,
 ) -> Response {
     let validation = (|| -> anyhow::Result<()> {
+        anyhow::ensure!(
+            config.account_id.as_deref().is_none_or(super::valid_id),
+            "invalid account identity"
+        );
         config.endpoint = transport::endpoint(&config.endpoint)?;
         if !config.keeper_url.is_empty() {
             config.keeper_url = transport::endpoint(&config.keeper_url)?;
@@ -73,6 +77,7 @@ pub(crate) async fn configure(
     }
     let _configuration = state.pro.configuration.lock().await;
     stop_tasks(&state).await;
+    *lock(&state.pro.project_cache) = Default::default();
     *lock(&state.pro.runtime) = Some(config);
     state.pro.configured.store(true, Ordering::Release);
     engine::start(state.clone());
@@ -92,6 +97,7 @@ async fn stop_tasks(state: &AppState) {
 pub(crate) async fn disconnect(State(state): State<Arc<AppState>>) -> Response {
     let _configuration = state.pro.configuration.lock().await;
     stop_tasks(&state).await;
+    *lock(&state.pro.project_cache) = Default::default();
     *lock(&state.pro.runtime) = None;
     state.pro.configured.store(false, Ordering::Release);
     // Known remote ownership remains fenced across sign-out and restart.
@@ -167,6 +173,14 @@ pub(crate) async fn put_profile(
     Query(query): Query<WorkspaceQuery>,
     Json(profile): Json<super::policy::CloudProfile>,
 ) -> Response {
+    let _configuration = state.pro.configuration.lock().await;
+    let Ok(_job) = state.pro.jobs.try_lock() else {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error":"Project transfer is active; retry after it finishes"})),
+        )
+            .into_response();
+    };
     if lock(&state.workspaces).get(&query.workspace_id).is_none() {
         return StatusCode::NOT_FOUND.into_response();
     }
@@ -388,7 +402,6 @@ pub(crate) async fn projects(
     }
     let root = request.root;
     let checked = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-        std::fs::create_dir_all(&root)?;
         let canonical = std::fs::canonicalize(root)?;
         anyhow::ensure!(canonical.is_dir(), "projects folder is not a directory");
         Ok(canonical)
@@ -404,3 +417,6 @@ pub(crate) async fn projects(
         Err(error) => failure(error),
     }
 }
+
+// Discovery is passive; adoption has a separate, explicit local action.
+pub(crate) use super::projects::{open_project, project_list};

@@ -38,6 +38,7 @@ use axum::Json;
 use serde_json::{json, Value};
 
 use crate::AppState;
+pub(crate) mod cloud_context;
 
 /// Protocol version offered when the client's is unknown to us.
 const PROTOCOL_FALLBACK: &str = "2025-06-18";
@@ -252,9 +253,27 @@ pub(crate) async fn mcp(
             .and_then(|w| w.mastermind)
             .is_some();
     let result = match method {
-        "initialize" => Ok(initialize_result(&params, mastermind, supervised, &plugins)),
+        "initialize" => {
+            let mut result = initialize_result(&params, mastermind, supervised, &plugins);
+            if let Some(workspace) = workspace_of(&state, &agent_id) {
+                let context = cloud_context::arrival(&state, &workspace.id).await;
+                if let Some(text) = result["instructions"].as_str() {
+                    result["instructions"] = Value::String(format!("{text}{context}"));
+                }
+            }
+            Ok(result)
+        }
         "ping" => Ok(json!({})),
-        "tools/list" => Ok(json!({ "tools": tool_defs(mastermind, supervised, &plugins) })),
+        "tools/list" => {
+            let mut tools = tool_defs(mastermind, supervised, &plugins);
+            if cloud_context::available(&state, &agent_id) {
+                tools
+                    .as_array_mut()
+                    .unwrap()
+                    .extend(cloud_context::definitions());
+            }
+            Ok(json!({"tools":tools}))
+        }
         "tools/call" => {
             tools_call(&state, &agent_id, mastermind, supervised, &plugins, &params).await
         }
@@ -728,6 +747,9 @@ async fn tools_call(
         return Ok(crate::plugins::tools::call(state, agent_id, name, &args).await);
     }
     match name {
+        "read_cloud_profile" | "update_cloud_profile" => {
+            Ok(cloud_context::call(state, agent_id, name, &args).await)
+        }
         "list_terminals" => Ok(list_terminals(state, agent_id).await),
         "run_in_terminal" => Ok(run_in_terminal(state, agent_id, &args).await),
         "read_terminal" => Ok(read_terminal(state, agent_id, &args).await),

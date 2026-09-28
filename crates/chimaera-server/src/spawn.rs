@@ -189,10 +189,8 @@ pub(crate) async fn spawn_session(
             } else {
                 None
             };
-            // Codex TUIs reach the chimaera endpoint only while a plugin with
-            // tools is active here or a Mastermind is appointed (opt-ins the
-            // user made — `spawn_allow`); with neither, the argv and env stay
-            // exactly what they were.
+            // Cloud projects also need host/profile context on the TUI surface.
+            // Otherwise preserve the existing plugin/Mastermind opt-in boundary.
             let codex_plugin_tools = if agent_kind == AgentKind::Codex {
                 crate::plugins::spawn_allow(state, &workspace.id).await
             } else {
@@ -240,7 +238,10 @@ pub(crate) async fn spawn_session(
             if agent_kind == AgentKind::Codex {
                 argv.extend(crate::codex_notify::args(state, &id, &key).await);
             }
-            if !codex_plugin_tools.is_empty() {
+            if !codex_plugin_tools.is_empty()
+                || (agent_kind == AgentKind::Codex
+                    && crate::pro::workspace_profile(state, &workspace.id).is_some())
+            {
                 // Pre-approved: the prompt-free tools every session gets
                 // (`notify`) plus the active plugins' own.
                 let approve: Vec<String> = crate::mcp::ALWAYS_ALLOWED_TOOLS

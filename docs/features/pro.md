@@ -5,14 +5,15 @@ through an authenticated keeper, relays SSH login prompts, and offers the local
 daemon to other signed-in devices. Ordinary SSH connections and the free daemon
 continue to work without an account.
 
-**Status: partial.** This page covers the native connection and settings surface.
+**Status: partial.** This page covers the native account and connection surface.
 Cloud setup controls are implemented; automatic handoff and browser access are being verified before acceptance. Native phone apps remain separate.
 
 ## How it is used
 
-1. Open Settings → Chimaera Pro in the native app. Settings is available from
-   Home before opening a workspace, and through the native Settings menu. An account browser workbench has a Cloud machine category; ordinary browser
-   windows have no account category. A build with no configured endpoint shows only
+1. Open **Pro** from Home or the entry above Settings in the workspace sidebar.
+   It opens a dedicated account page; ordinary app settings stay separate.
+   An account browser entry opens the account surface; ordinary daemon browser
+   windows have no Pro entry. A build with no configured endpoint shows only
    “Chimaera Pro isn't available in this build.”
 2. With an endpoint configured, choose **Sign in**. Complete the system-browser
    sign-in; the app receives an authorization code through its loopback callback.
@@ -20,8 +21,11 @@ Cloud setup controls are implemented; automatic handoff and browser access are b
    **Start again** opens a fresh sign-in and **Cancel sign-in** closes the request.
    An expired or failed request offers **Try again**. The browser confirms success
    only after the account is active in the app; keeper provisioning can finish later.
-3. The panel shows the signed-in email, plan, hosts and devices. Toggle **Keep
-   connected** for a saved SSH host. A password or Duo challenge uses the usual
+3. The page shows the signed-in email and current plan. Without a plan, choose
+   Pro or Max and monthly or yearly billing, then continue to checkout in the
+   system browser. Existing subscribers can open **Manage billing**. The app
+   refreshes account state on return; a browser return alone never activates a
+   plan. With an active plan, toggle **Keep connected** for a saved SSH host. A password or Duo challenge uses the usual
    host-scoped prompt, with “Asked by your Pro connection” underneath its title.
 4. Open that host from Home. Its **via Pro** label identifies the connection;
    workspaces still open through a local loopback port with the existing daemon UI.
@@ -39,42 +43,49 @@ for a local integration run.
 
 ## Subscriber branding
 
-An active Pro or Max account wears a small plan badge beside the Home wordmark and in the workspace header. The native account panel uses the same badge in its identity card. The styling follows the current theme, and an unknown, signed-out or inactive plan shows no paid badge.
+An active Pro or Max account wears a small plan badge beside the Home wordmark and in the workspace header. The dedicated Pro page and navigation entry use the same badge. The styling follows the current theme, and an unknown, signed-out or inactive plan shows no paid badge.
 
 The shared `web-ui/src/lib/net/plan.ts` store reads native `pro_status` and refreshes on `pro-changed` and visibility return. Account-browser windows instead make a bounded, same-origin `HEAD` request to their existing `/app/{host}/` index. Its optional `X-Chimaera-Plan` response header is `none`, `pro` or `max`, derived from the authenticated account's active or trialing subscription; an absent header or failed request leaves branding neutral. Index responses remain `Cache-Control: no-store`. The browser refreshes once per minute while visible and when returning to the page, without requesting or waking a keeper or worker. Ordinary daemon browser windows make no account request. The badge is presentation only and grants no capabilities.
 
 `web-ui/src/lib/shared/PlanBadge.svelte` supplies the common visual treatment used by Home, the workspace header and `ProSettings.svelte`.
 
-## Cloud setup
+## Cloud readiness
 
-In the signed-in panel, **Set up cloud machine** explicitly requests a worker.
-Once it is ready, the panel opens the unmodified Claude, Codex and GitHub login
-flows in ordinary terminals on that worker. Credentials remain on that machine.
+An eligible subscription prepares its first cloud machine automatically. The Pro
+page shows passive account-owned readiness: preparing, ready, sleeping, unavailable
+or a plan limit. A disabled service or uninvited preview account shows its actual
+availability. The page does not offer a manual machine-creation button.
+
+When the machine is ready, provider actions open the unmodified Claude, Codex and
+GitHub login flows in ordinary terminals on that worker. Credentials remain on that machine.
 The worker has its own SSH public key, which can be copied from the panel.
 An HTTPS Git URL clones into the worker's persistent projects folder and opens
 as a workspace. Duplicate names and embedded URL credentials are rejected.
 Only one clone runs at a time; incomplete clones are not registered.
 
-Passive cloud information reads do not wake a sleeping worker. An explicit setup
-or login action does. A running clone counts as active work until it finishes.
+Passive cloud information reads do not wake a sleeping worker. A provider login or repository-open
+action does. A running clone counts as active work until it finishes.
 The daemon exposes `/api/v1/pro/cloud`, `/api/v1/pro/cloud/onboard`, and
 `/api/v1/pro/cloud/project` only on a worker. The native `pro_cloud_request`
 command keeps both account and daemon credentials out of the UI. The account
 browser uses the same daemon routes through its host-pinned gateway; its account
-launcher provisions the first worker.
+launcher displays the same passive account readiness.
 
 ## Where it lives
 
 | Surface | Entry points |
 | --- | --- |
-| Settings and native bridge | `web-ui/src/lib/settings/ProSettings.svelte`, `SettingsView.svelte`, `web-ui/src/lib/net/native.ts` |
+| Pro account surface and native bridge | `web-ui/src/lib/pro/ProView.svelte`, `web-ui/src/lib/settings/ProSettings.svelte`, `web-ui/src/lib/net/native.ts` |
+| Billing and local project adoption | `crates/chimaera-app/src/shell/pro/billing.rs`, `projects.rs`, `web-ui/src/lib/pro/CloudProjects.svelte` |
 | Host and prompt labels | `web-ui/src/lib/workspace/HomeScreen.svelte`, `AskpassModal.svelte` |
 | Cloud setup | `web-ui/src/lib/settings/CloudSetup.svelte`, `crates/chimaera-app/src/shell/cloud.rs`, `crates/chimaera-server/src/cloud.rs` |
 | App account lifecycle | `crates/chimaera-app/src/shell/pro.rs` |
 | App connections and prompt routing | `crates/chimaera-app/src/shell/connect.rs`, `askpass.rs` |
 | Device transport and wire types | `crates/chimaera-link/src/`, [protocol](../../crates/chimaera-link/PROTOCOL.md) |
 
-Native IPC commands: `pro_status`, `pro_sign_in`, `pro_sign_out`,
+Native IPC commands: `pro_status`, `pro_refresh_account`, `pro_billing_checkout`,
+`pro_billing_portal`, `pro_cloud_status`, `pro_cloud_projects`,
+`pro_open_cloud_project`, `pro_sign_in`, `pro_sign_out`,
 `pro_sign_out_everywhere`, `pro_hosts`, `pro_set_host_kept`, `pro_devices`.
 The app broadcasts `pro-changed` when account/host state changes. The panel
 refreshes while visible and catches up when shown again; it does not poll while
@@ -87,7 +98,7 @@ The signed-in app gives its local daemon a separate, limited account credential.
 That credential stays in memory; the daemon can keep publishing mirrors after
 all app windows close. Signing out stops publishing on that daemon.
 
-Settings → Chimaera Pro → **Project mirrors** shows the projects, file counts,
+Pro → **Project mirrors** shows the projects, file counts,
 storage budget, exclusions, missing cloud environment names and the last copy.
 **Never mirror this project** stops local publication and disables account-side
 mirror access. Existing stored data is not silently deleted. Cloud setup commands
@@ -111,6 +122,10 @@ ownership verification before old conversations can resume. A cold cloud takeove
 forks native conversations; a clean handoff resumes their existing identities.
 Imported sessions remain suspended while the complete handoff is staged.
 
+Agents receive a current-host brief through MCP initialization; structured conversations also receive it in their transfer pickup message. It identifies the OS and architecture, reports bounded runtime CPU/memory observations without confusing them with subscription quotas, and lists missing variable names and saved setup/deferred guidance as untrusted project data. Agents must check local resources and tools, use their own CLI sign-in, and reassess background work before restarting it. Ordinary Claude and Codex terminal sessions receive the same MCP context for configured cloud projects.
+
+`read_cloud_profile` and `update_cloud_profile` operate only on the authenticated session's registered project. Updates require the current revision, reject unknown fields and credential-shaped content, and are capped at 32 KiB. They keep ordinary agent permissions: saving `setup_command` schedules future cloud setup, while deferred laptop steps remain guidance. Saving a profile never runs a command or wakes a machine. Implementation: [`mcp/cloud_context.rs`](../../crates/chimaera-server/src/mcp/cloud_context.rs).
+
 On macOS, the app's system sleep hook gives publication up to 25 seconds before
 acknowledging sleep. A failed flush leaves the lease takeover path available.
 After the laptop has been awake on AC power for five minutes, connected cloud
@@ -124,12 +139,16 @@ worktree are preserved separately. Diverged branch tips remain as
 `<branch>@cloud-<commit>`, and Project mirrors lists them for merging. Existing
 remote configuration and `FETCH_HEAD` stay intact. If a file changed on both machines,
 the local file and a sibling cloud copy both remain. Saved setup commands run in
-a visible **Cloud setup** terminal. Deferred steps run in a **Deferred laptop
-steps** terminal when the project returns; failed steps stay listed for attention.
+a visible **Cloud setup** terminal. Deferred steps remain guidance for the returning agent, which assesses and runs them under its normal permissions; they are never automatically replayed by the daemon.
 
-Projects first created in the cloud return to the folder confirmed once in
-Project mirrors (default `~/chimaera`). Native conversation identifiers survive
-when the local folder differs. Both repository and shadow histories are retained
+Projects first created in the cloud appear on Home without being downloaded.
+Opening one on a computer without a local copy asks for an empty destination
+folder through the native picker. Cancellation leaves the cloud copy untouched.
+The confirmed destination is remembered for that project on that computer;
+existing local projects retain their original folders. A missing destination or
+an unrelated nonempty folder fails safely instead of overwriting data. Native
+conversation identifiers survive when the local folder differs. The old global
+projects-root preference no longer authorizes automatic imports. Both repository and shadow histories are retained
 within the account quota; source history is never silently pruned. Initial Git
 transfers have a bounded 16-minute deadline and remain cancelable.
 

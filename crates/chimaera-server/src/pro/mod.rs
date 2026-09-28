@@ -3,11 +3,14 @@ mod config;
 mod engine;
 mod mirror;
 mod policy;
+mod projects;
 mod protocol;
 mod repository;
 mod routes;
 mod transport;
+pub(crate) use policy::CloudProfile;
 pub(crate) use routes::*;
+tokio::task_local! { static PROFILE_SETUP: (String, u64); }
 
 use serde::{Deserialize, Serialize};
 use std::{
@@ -28,7 +31,10 @@ pub(crate) struct ProState {
     ownership: Mutex<HashMap<String, Ownership>>,
     preferences: Mutex<HashMap<String, Preference>>,
     projects_root: Mutex<Option<PathBuf>>,
-    import_roots: Mutex<HashMap<String, PathBuf>>,
+    adoptions: Mutex<HashMap<String, projects::Destination>>,
+    legacy_pending: Mutex<std::collections::HashSet<String>>,
+    project_cache: Mutex<projects::Cache>,
+    discovery: AsyncMutex<()>,
     keep_running: Mutex<std::collections::HashSet<String>>,
     status: Mutex<HashMap<String, WorkspaceStatus>>,
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -44,6 +50,7 @@ pub(crate) struct ProState {
 enum Ownership {
     PrivacyDisabled { epoch: u64 },
     Hydrating { epoch: u64 },
+    SettingUp { epoch: u64 },
     AwaitingVerification { epoch: u64 },
     Local { epoch: u64 },
     Remote { epoch: u64, holder: String },
@@ -51,6 +58,8 @@ enum Ownership {
 }
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct Preference {
+    #[serde(default)]
+    account: Option<String>,
     #[serde(default)]
     never_mirror: bool,
     #[serde(default)]
@@ -73,6 +82,10 @@ struct DiskState {
     #[serde(default)]
     projects_root: Option<PathBuf>,
     #[serde(default)]
+    adoptions: HashMap<String, projects::Destination>,
+    #[serde(default)]
+    legacy_pending: std::collections::HashSet<String>,
+    #[serde(default, skip_serializing)]
     import_roots: HashMap<String, PathBuf>,
     #[serde(default)]
     keep_running: std::collections::HashSet<String>,
@@ -94,6 +107,13 @@ impl ProState {
                     .flatten()
             })
             .unwrap_or_default();
+        let legacy_pending = disk
+            .legacy_pending
+            .into_iter()
+            .chain(disk.import_roots.into_keys())
+            .filter(|id| valid_id(id))
+            .take(128)
+            .collect();
         let ownership = disk
             .ownership
             .into_iter()
@@ -116,7 +136,10 @@ impl ProState {
             ownership: Mutex::new(ownership),
             preferences: Mutex::new(disk.preferences.into_iter().take(128).collect()),
             projects_root: Mutex::new(disk.projects_root),
-            import_roots: Mutex::new(disk.import_roots.into_iter().take(128).collect()),
+            adoptions: Mutex::new(disk.adoptions.into_iter().take(128).collect()),
+            legacy_pending: Mutex::new(legacy_pending),
+            project_cache: Mutex::new(projects::Cache::default()),
+            discovery: AsyncMutex::new(()),
             keep_running: Mutex::new(disk.keep_running.into_iter().take(512).collect()),
             status: Mutex::new(HashMap::new()),
             task: Mutex::new(None),
@@ -133,16 +156,33 @@ impl ProState {
 /// Only a verified ownership transition, restart verification, or explicit
 /// clean handoff fences a writer. Connectivity loss never pauses local work.
 pub(crate) fn may_write(state: &crate::AppState, workspace: &str) -> bool {
-    !matches!(
+    if matches!(
         crate::lock(&state.pro.ownership).get(workspace),
-        Some(
-            Ownership::Remote { .. }
-                | Ownership::PrivacyDisabled { .. }
-                | Ownership::Hydrating { .. }
-                | Ownership::Transferring { .. }
-                | Ownership::AwaitingVerification { .. }
+        Some(Ownership::SettingUp { .. })
+    ) {
+        return PROFILE_SETUP
+            .try_with(|(id, generation)| {
+                id == workspace
+                    && *generation
+                        == state
+                            .pro
+                            .generation
+                            .load(std::sync::atomic::Ordering::Acquire)
+            })
+            .unwrap_or(false);
+    }
+    !crate::lock(&state.pro.legacy_pending).contains(workspace)
+        && !matches!(
+            crate::lock(&state.pro.ownership).get(workspace),
+            Some(
+                Ownership::Remote { .. }
+                    | Ownership::PrivacyDisabled { .. }
+                    | Ownership::Hydrating { .. }
+                    | Ownership::SettingUp { .. }
+                    | Ownership::Transferring { .. }
+                    | Ownership::AwaitingVerification { .. }
+            )
         )
-    )
 }
 pub(crate) fn owned_epoch(state: &crate::AppState, workspace: &str) -> Option<u64> {
     match crate::lock(&state.pro.ownership).get(workspace) {
@@ -170,9 +210,12 @@ async fn persist(state: &crate::AppState) -> anyhow::Result<()> {
     let ownership = crate::lock(&state.pro.ownership).clone();
     let preferences = crate::lock(&state.pro.preferences).clone();
     let projects_root = crate::lock(&state.pro.projects_root).clone();
-    let import_roots = crate::lock(&state.pro.import_roots).clone();
+    let adoptions = crate::lock(&state.pro.adoptions).clone();
+    let legacy_pending = crate::lock(&state.pro.legacy_pending).clone();
     let bytes = serde_json::to_vec(&DiskState {
-        import_roots,
+        legacy_pending,
+        import_roots: HashMap::new(),
+        adoptions,
         projects_root,
         keep_running,
         ownership,
@@ -291,6 +334,90 @@ fn projects_root(state: &crate::AppState) -> PathBuf {
         })
 }
 
+pub(crate) fn profile_generation(state: &crate::AppState) -> u64 {
+    state
+        .pro
+        .generation
+        .load(std::sync::atomic::Ordering::Acquire)
+}
+pub(crate) fn cloud_hours_exhausted(state: &crate::AppState) -> Option<bool> {
+    crate::lock(&state.pro.runtime)
+        .as_ref()
+        .map(|config| config.hours_exhausted)
+}
+pub(crate) fn is_worker(state: &crate::AppState) -> bool {
+    crate::lock(&state.pro.runtime)
+        .as_ref()
+        .is_some_and(|config| config.role == protocol::Role::Worker)
+}
+pub(crate) fn workspace_profile(state: &crate::AppState, workspace: &str) -> Option<CloudProfile> {
+    if !state
+        .pro
+        .configured
+        .load(std::sync::atomic::Ordering::Acquire)
+        || !projects::account_matches(state, workspace)
+        || crate::lock(&state.workspaces).get(workspace).is_none()
+    {
+        return None;
+    }
+    Some(
+        crate::lock(&state.pro.preferences)
+            .get(workspace)
+            .map(|entry| entry.profile.clone())
+            .unwrap_or_default(),
+    )
+}
+pub(crate) async fn save_workspace_profile(
+    state: &std::sync::Arc<crate::AppState>,
+    workspace: &str,
+    expected_generation: u64,
+    expected: &CloudProfile,
+    updated: CloudProfile,
+) -> anyhow::Result<()> {
+    updated.validate()?;
+    let _configuration = state.pro.configuration.lock().await;
+    anyhow::ensure!(
+        profile_generation(state) == expected_generation,
+        "Account changed; read the cloud profile again before updating"
+    );
+    let _job = state
+        .pro
+        .jobs
+        .try_lock()
+        .map_err(|_| anyhow::anyhow!("Project transfer is active; retry after it finishes"))?;
+    anyhow::ensure!(
+        may_write(state, workspace) && projects::account_matches(state, workspace),
+        "Project is currently read-only"
+    );
+    let current = workspace_profile(state, workspace)
+        .ok_or_else(|| anyhow::anyhow!("Cloud profile is unavailable"))?;
+    anyhow::ensure!(
+        &current == expected,
+        "Cloud profile changed; read it again before updating"
+    );
+    let previous = {
+        let mut preferences = crate::lock(&state.pro.preferences);
+        anyhow::ensure!(
+            preferences.len() < 128 || preferences.contains_key(workspace),
+            "Cloud profile limit reached"
+        );
+        let previous = preferences.get(workspace).cloned();
+        preferences.entry(workspace.into()).or_default().profile = updated;
+        previous
+    };
+    if let Err(error) = persist(state).await {
+        let mut preferences = crate::lock(&state.pro.preferences);
+        if let Some(previous) = previous {
+            preferences.insert(workspace.into(), previous);
+        } else {
+            preferences.remove(workspace);
+        }
+        return Err(error);
+    }
+    state.changes.notify_waiters();
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -317,6 +444,7 @@ mod tests {
         crate::lock(&old.pro.ownership)
             .insert("w-loading".into(), Ownership::Hydrating { epoch: 8 });
         crate::lock(&old.pro.runtime).replace(protocol::Configure {
+            account_id: None,
             endpoint: "http://127.0.0.1:1".into(),
             keeper_url: String::new(),
             role: protocol::Role::Worker,

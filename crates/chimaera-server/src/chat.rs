@@ -3550,7 +3550,11 @@ pub(crate) async fn resurrect_chat_transfer(
             let pick_up = if mastermind_mode.is_some() {
                 None
             } else if let Some(origin) = origin {
-                Some(handoff_message(origin, carry.as_ref()))
+                let mut text = handoff_message(origin, carry.as_ref());
+                text.push_str(
+                    &crate::mcp::cloud_context::arrival(state, &entry.workspace_id).await,
+                );
+                Some(text)
             } else {
                 pickup_message(
                     &entry.id,

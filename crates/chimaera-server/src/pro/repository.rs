@@ -201,7 +201,11 @@ pub(super) async fn keep_source_head(root: &Path, cache: &Path) -> Result<()> {
     }
     Ok(())
 }
-async fn install_config(root: &Path, config: &[Entry]) -> Result<()> {
+async fn install_config(
+    root: &Path,
+    config: &[Entry],
+    check: &(dyn Fn() -> Result<()> + Sync),
+) -> Result<()> {
     ensure!(
         config.len() <= MAX_CONFIG && config.iter().all(allowed),
         "unsafe portable Git configuration"
@@ -218,6 +222,7 @@ async fn install_config(root: &Path, config: &[Entry]) -> Result<()> {
             continue;
         }
         for value in config.iter().filter(|value| value.key == entry.key) {
+            check()?;
             transport::git_output(
                 transport::git(root, None),
                 &["config", "--local", "--add", &entry.key, &value.value],
@@ -237,6 +242,7 @@ pub(super) async fn receive(
     branch: Option<&str>,
     origin: Option<&str>,
     snapshot: Option<&Snapshot>,
+    check: &(dyn Fn() -> Result<()> + Sync),
 ) -> Result<Vec<String>> {
     if branch.is_none() && snapshot.is_none() {
         return Ok(Vec::new());
@@ -269,8 +275,12 @@ pub(super) async fn receive(
         vec![],
     )
     .await?;
+    // A network fetch can take minutes. Recheck the account before touching
+    // the selected repository, even when the caller was current at entry.
+    check()?;
     let existing = optional(root, &["rev-parse", "--git-dir"]).await?.is_some();
     if !existing {
+        check()?;
         transport::git_output(
             transport::git(root, None),
             &["init", "--quiet", "."],
@@ -278,6 +288,7 @@ pub(super) async fn receive(
         )
         .await?;
     }
+    check()?;
     let namespace = format!(
         "refs/chimaera-transfer/{}/",
         chimaera_core::generate_token()
@@ -294,7 +305,7 @@ pub(super) async fn receive(
         vec![],
     )
     .await?;
-    let result = publish_refs(root, &namespace, existing).await;
+    let result = publish_refs(root, &namespace, existing, check).await;
     // Remove only this operation's private namespace, even if publishing failed.
     let refs = transport::git_output(
         transport::git(root, None),
@@ -320,6 +331,7 @@ pub(super) async fn receive(
         .await?;
     }
     let preserved = result?;
+    check()?;
     if !existing {
         if let Some(branch) = branch {
             transport::git_output(
@@ -340,18 +352,20 @@ pub(super) async fn receive(
             .await?
             .is_some()
         {
+            check()?;
             transport::git_output(transport::git(root, None), &["read-tree", "HEAD"], vec![])
                 .await?;
         }
     }
     if let Some(snapshot) = snapshot {
-        install_config(root, &snapshot.config).await?;
+        install_config(root, &snapshot.config, check).await?;
     }
     if let Some(origin) = origin.filter(|url| safe_url(url)) {
         if optional(root, &["config", "--local", "--get", "remote.origin.url"])
             .await?
             .is_none()
         {
+            check()?;
             transport::git_output(
                 transport::git(root, None),
                 &["remote", "add", "origin", origin],
@@ -362,7 +376,12 @@ pub(super) async fn receive(
     }
     Ok(preserved)
 }
-async fn publish_refs(root: &Path, namespace: &str, existing: bool) -> Result<Vec<String>> {
+async fn publish_refs(
+    root: &Path,
+    namespace: &str,
+    existing: bool,
+    check: &(dyn Fn() -> Result<()> + Sync),
+) -> Result<Vec<String>> {
     let refs = transport::git_output(
         transport::git(root, None),
         &[
@@ -414,6 +433,7 @@ async fn publish_refs(root: &Path, namespace: &str, existing: bool) -> Result<Ve
             continue;
         }
         if previous.is_none() || !existing {
+            check()?;
             transport::git_output(
                 transport::git(root, None),
                 &[
@@ -434,6 +454,7 @@ async fn publish_refs(root: &Path, namespace: &str, existing: bool) -> Result<Ve
             && transport::run(ancestor, vec![], Duration::from_secs(15), 1024)
                 .await?
                 .success;
+        check()?;
         if advance
             && !checked.contains(reference.as_str())
             && advance_unchecked_branch(root, &reference, incoming).await?
@@ -443,7 +464,7 @@ async fn publish_refs(root: &Path, namespace: &str, existing: bool) -> Result<Ve
         } else if advance
             && current.as_deref() == Some(&reference)
             && clean
-            && fast_forward_current(root, &reference, &previous, incoming).await?
+            && fast_forward_current(root, &reference, &previous, incoming, check).await?
         {
             // The prepared ref transaction adopted this exact branch.
         } else {
@@ -451,6 +472,7 @@ async fn publish_refs(root: &Path, namespace: &str, existing: bool) -> Result<Ve
             let existing = optional(root, &["rev-parse", "--verify", &kept]).await?;
             if existing.as_deref() != Some(incoming) {
                 ensure!(existing.is_none(), "cloud preservation ref already differs");
+                check()?;
                 transport::git_output(
                     transport::git(root, None),
                     &["update-ref", &kept, incoming, &"0".repeat(incoming.len())],
@@ -493,10 +515,12 @@ async fn fast_forward_current(
     reference: &str,
     previous: &str,
     incoming: &str,
+    check: &(dyn Fn() -> Result<()> + Sync),
 ) -> Result<bool> {
     let index = optional(root, &["rev-parse", "--git-path", "index"])
         .await?
         .context("Git index unavailable")?;
+    check()?;
     let index = root.join(index);
     let index_lock = index.with_file_name(format!(
         "{}.lock",
@@ -544,6 +568,7 @@ async fn fast_forward_current(
     let Ok(reservation) = reservation else {
         return Ok(false);
     };
+    check()?;
     let mut transaction = RefTransaction::begin(root, reservation).await?;
     let current = optional(root, &["symbolic-ref", "-q", "HEAD"]).await?;
     if current.as_deref() != Some(reference) {
@@ -579,6 +604,7 @@ async fn fast_forward_current(
     if !clean {
         return Ok(false);
     }
+    check()?;
     finalize_current(
         root.to_owned(),
         index,
@@ -1102,7 +1128,9 @@ mod tests {
         )
         .await;
         std::fs::write(laptop.join(".git/FETCH_HEAD"), "user fetch marker\n").unwrap();
-        let preserved = publish_refs(&laptop, namespace, true).await.unwrap();
+        let preserved = publish_refs(&laptop, namespace, true, &|| Ok(()))
+            .await
+            .unwrap();
         assert_eq!(
             std::fs::read_to_string(laptop.join(".git/FETCH_HEAD")).unwrap(),
             "user fetch marker\n"
@@ -1138,7 +1166,9 @@ mod tests {
         let fresh = root.join("fresh");
         std::fs::create_dir(&fresh).unwrap();
         git(&fresh, &["init", "--quiet"]).await;
-        install_config(&fresh, &snapshot.config).await.unwrap();
+        install_config(&fresh, &snapshot.config, &|| Ok(()))
+            .await
+            .unwrap();
         assert_eq!(
             git(&fresh, &["config", "remote.upstream.url"]).await,
             "git@example.test:upstream/project.git"
@@ -1156,7 +1186,9 @@ mod tests {
             ],
         )
         .await;
-        install_config(&fresh, &snapshot.config).await.unwrap();
+        install_config(&fresh, &snapshot.config, &|| Ok(()))
+            .await
+            .unwrap();
         assert_eq!(
             git(&fresh, &["config", "remote.origin.url"]).await,
             "https://local.example/project"

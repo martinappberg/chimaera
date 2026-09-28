@@ -20,13 +20,14 @@ the module you need and read its header doc.
 | `api/` | REST, split by resource: `workspaces`/`sessions`/`exec`/`shutdown`/`env` + `mod.rs` (auth+health+re-exports). |
 | `exec.rs` | `run_exec` — the transport-neutral "type a command into a live shell, with sentinel policy" helper, shared by `api::exec_session` (REST) and `mcp::run_in_terminal` (so `mcp` doesn't depend on `api`). |
 | `persist.rs` | `atomic_write_json` — the shared temp-write + rename dance for the small JSON state stores (view-state/ledger/workspaces/recents/settings). |
-| `pro/` | Optional credential-free persisted ownership fences, daemon-owned Git/config mirrors, profile and pin policy, staged hydration, clean sleep release and lazy hand-back. See its [map](src/pro/AGENTS.md). |
+| `pro/` | Optional credential-free persisted ownership fences, daemon-owned Git/config mirrors, profile and pin policy, staged hydration, clean sleep release, lazy hand-back for known local projects, and passive discovery with explicit per-project native adoption. See its [map](src/pro/AGENTS.md). |
 | `activity.rs` | Bounded last-input timestamps from authenticated terminal input and accepted interactive chat commands; passive readers and output never count. `session_view` exposes nullable `last_input_ms` on session list rows. |
 | `bundle.rs` | Bounded session ZIP snapshots/stop/export/import, native transcript identity, checked hashes, staged hydration and moved/home context; public format in [BUNDLE.md](BUNDLE.md). No credentials or process snapshots. |
 | `session_proxy.rs` | Epoch-fenced loopback placements, bounded remote roster cache and authenticated HTTP/WS proxy. An unavailable remote session never falls back to a local spawn. |
 | `session_view.rs` | The session-row JSON builders (`session_json`/`sessions_json`), shared by `api/` and `ws.rs` (so `ws` doesn't depend on `api`). |
 | `ws.rs` | WebSockets: `/ws/sessions/{id}` (PTY byte pipe; 1 MiB frames chunked to the input queue; output coalesced — leading-edge first chunk, then one frame per ~8 ms tick or 32 KiB, and always flushed ahead of event frames and resizes so the byte stream is never overtaken; attach/resync snapshot renders AND resizes run under `spawn_blocking`, off the reactor; a reset-bearing frame and its snapshot are sent adjacently — a client contract; `park`/`unpark` client frames stop and resume output forwarding for hidden pooled terminals, with the session's broadcast ring as the catch-up buffer and a repaint when it can't cover the gap — `auth.parked` attaches without a snapshot at all), **`/ws/chat/{id}`** (structured events; 10 MiB command frames and ~512 KiB replay batches), `/ws/events` (the session-list bus; the sessions frame is built ONCE per change generation and shared across every connected window — per-client state like fs_watch, git epochs, and the last-sent compare stays per-client — and the settings frame reads only the cached generation, never a reactor stat: external edits arrive via `settings::watch_external_edits`). |
 | `chat.rs` | **The chat-mode glue** (see below). |
+| `mcp/cloud_context.rs` | Bounded current-host observations and untrusted profile summaries for MCP initialization and structured transfer pickup; session-bound profile read/update tools with revision checks and ordinary write approval. |
 | `launcher.rs` | argv assembly (`build_agent_command`, `build_chat_command`, `build_agent_resume_command` — the degrade/toggle-to-TUI argv), binary `detect`, login-shell wrapping, per-agent binary resolution. Unit-tested — argv logic lives HERE, not in drivers or `chat.rs`. |
 | `agent_state.rs` | The pure state core: `AgentKind`/`AgentState`/`AgentRecord` + the hook→state / title helpers. A leaf (no transport/fs/`AppState`) — this is what lets `chat.rs` depend on it without the old agents↔chat cycle. |
 | `agents.rs` | The agent glue over `agent_state`: hook ingest, settings/mcp writers, the transcript watcher. |
@@ -161,11 +162,7 @@ One privileged chat session per workspace (the dashboard plan §6/§7 —
 Codex chat sessions get the per-session chimaera MCP injected at spawn via
 `-c mcp_servers.chimaera.url=…` + `bearer_token_env_var` — the key rides the
 spawn env, never world-readable argv (`launcher::build_codex_chat_command`).
-Codex TUIs get the same injection only while a workbench plugin with tools
-is active in the workspace or a Mastermind is appointed (`plugins::spawn_allow`
-→ `launcher::codex_tui_mcp_args`, `spawn.rs`), with a per-tool
-`approval_mode="approve"` for exactly those tools (plus `tell_mastermind` and
-`notify`); with neither, a codex TUI's argv is unchanged. Workers message the
+Codex TUIs get the same injection while a workbench plugin with tools is active, a Mastermind is appointed, or the project has an enabled Pro cloud profile (`plugins::spawn_allow` / `pro::workspace_profile` → `launcher::codex_tui_mcp_args`, `spawn.rs`). Only the existing prompt-free/plugin tools receive `approval_mode="approve"`; cloud profile updates retain normal agent permissions. Without these opt-ins, a Codex TUI's argv is unchanged. Workers message the
 Mastermind with `tell_mastermind` (`notes.rs`: inbox in ask-first, a capped
 wake in auto).
 

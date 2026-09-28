@@ -8,6 +8,8 @@ revocable delegation over the authenticated local API.
 | --- | --- |
 | `mod.rs` | Bounded, credential-free persistent state, ownership/import fences, session pins and deferred-command policy. |
 | `routes.rs` | Authenticated configure/status/privacy/profile/power/hydration HTTP handlers. |
+| `projects.rs` | Passive bounded cloud-project discovery and explicit per-device local adoption; native-picked folder validation, saved directory identity, retry and legacy-import fences. |
+| `projects/tests.rs` | Synthetic loopback HTTP plus real Git transfer, passive-read, conflict, retry, restart and two-device destination checks. |
 | `engine.rs` | Independent lease renewal, mirror coordinator, transactional hydration, profile execution and lazy return. |
 | `protocol.rs` | Additive account contract subset; intentionally no link/TLS dependency in the daemon. |
 | `transport.rs` | Bounded external curl/git children; credentials only in memory, never argv or Git config. |
@@ -38,3 +40,43 @@ two-child transport budget. Another worktree's branch is retained separately. Un
 transaction support preserves a cloud ref instead. Network Git has a finite
 16-minute deadline; ordinary helpers retain short deadlines. Repository and
 shadow histories are quota-bound and retained, never silently rewritten/pruned.
+
+Cloud discovery is independent of power state and the obsolete global projects
+folder. `GET /api/v1/pro/projects` returns `{projects,error}`; each row has
+`workspace_id`, `name`, `host_id`, `host_alias`, `local_root`, `available`, and
+`error`. Refreshes are serialized, cached for 30 seconds, bounded to ten seconds,
+eight workers and 128 rows. They use ordinary cached worker GETs: no wake intent,
+mkdir, Git fetch, workspace registration or baton mutation. The worker's explicit
+`cloud_internal` setup-workspace marker excludes provider-login scratch projects
+from both discovery and automatic mirroring.
+
+`POST /api/v1/pro/projects/open` accepts `{workspace_id,destination_root?,expected_account_id,expected_endpoint}` and
+returns `{workspace_id,root,name}`. The native shell supplies the chosen final
+folder; webview arguments contain only a workspace ID. A fresh folder must
+already exist, be writable and empty, and lie outside another project/repository.
+The selection is checked before cloud hand-back and immediately before install.
+Recorded directory identity prevents missing/replaced folders from being silently
+recreated. The local configure request accepts additive `account_id`; personal
+devices supply it and worker callers may omit it. Each new adoption binds its
+folder to the account endpoint and account ID, so signing into another account
+cannot reuse a colliding project's local path. Discovery/configuration snapshots
+pair runtime and generation under the configuration lock. Unstarted failed choices can be replaced explicitly; started imports
+remain pinned to their saved folder. Old `import_roots` entries migrate only to
+pending-ID fences, never to permission to import. A partially registered legacy
+project needs explicit selection of its original folder before recovery.
+
+Normal lazy return only handles registered projects without a pending adoption.
+Existing laptop projects retain their original roots. Hydration checks account
+generation at ownership, filesystem and session-install boundaries; signing out
+cannot finish an old transfer as a fresh local ownership grant. HTTP transfer is
+bounded to nineteen minutes. Cancellation can leave a persisted Hydrating fence
+and partial files; an explicit retry resumes at the saved destination. No worker
+project is adopted merely because this daemon starts or becomes suitable for work.
+
+Required worker setup runs before any imported agent resumes. Persisted
+`SettingUp` ownership fences ordinary writers and ledger restore while its
+explicit daemon setup task alone can spawn/execute the setup terminal. Failure
+keeps that fence and exposes an attention error; a hydrate retry runs the updated
+setup against already installed files. Laptop-only deferred steps stay in the
+profile as instructions for the returning agent under its usual permissions;
+the daemon never replays those commands automatically.

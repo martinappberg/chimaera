@@ -37,9 +37,11 @@ in-app SSH askpass, a signed auto-updater). Parent map: repo-root
 | `shell.rs` | Module root: app-global `Shell` state, `WindowScope`, `lock`, and the Tauri `Builder` assembly (`run`). Re-exports `open_ui_window`. |
 | `shell/commands.rs` | The IPC command surface (`#[tauri::command]` fns wired into `generate_handler!`) — thin delegators. |
 | `shell/connect.rs` | The `connect` flight state machine (one coalesced ssh attempt per host; a flight for a wedge suspect — or with no live tunnel — first clears a wedged ControlMaster, before the old tunnel's teardown — both masters for an alias routed to its daemon's login node) + the host-row wire vocabulary (`HostState` — incl. `node`, the login node a pool alias is pinned to — /`HostStatus`, and the `routing` progress phase) + `with_hosts`, the app's single path to hosts.json (serialized, off the reactor via `spawn_blocking`; the CLI writes it directly in crates/chimaera/src/connect.rs). |
-| `shell/cloud.rs` | Explicit cloud provisioning and bounded worker setup calls; credentials remain in Rust. |
+| `shell/cloud.rs` | Passive cloud readiness and bounded provider/repository actions that wake only on interaction; credentials remain in Rust. |
 | `shell/power.rs` | System sleep/wake notifications (macOS IOKit, Linux logind delay inhibitor, Windows power callbacks), bounded daemon flush, and AC-power gating for delayed hand-back. |
 | `shell/pro.rs` | Optional account runtime: endpoint in app.json, OS-keychain tokens, PKCE loopback sign-in, bounded keeper cache/events, reverse local-daemon sharing, and account IPC. No endpoint means no keychain access or network work. |
+| `shell/pro/billing.rs` | Device-authenticated checkout/portal creation and exact provider-origin validation before system-browser open. |
+| `shell/pro/projects.rs` | Passive cloud project listing and per-project native destination selection; cancellation creates no import request. |
 | `shell/pro/auth.rs` | In-memory sign-in attempt lifecycle, cancellation/retry fences and bounded loopback callback parsing. |
 | `assets/sign-in.html` | Credential-free browser return page; success is sent only after native account activation. |
 | `shell/tunnel.rs` | App-only SSH / keeper transport wrapper. Both expose one loopback daemon endpoint; keep chimaera-link out of the daemon dependency graph. |

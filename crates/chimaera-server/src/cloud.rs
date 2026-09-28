@@ -18,6 +18,14 @@ pub(crate) fn active_operations() -> usize {
 pub(crate) fn enabled() -> bool {
     std::env::var("CHIMAERA_WORKER").as_deref() == Ok("1")
 }
+pub(crate) fn is_onboarding_workspace(workspace: &crate::workspaces::Workspace) -> bool {
+    // Provider login terminals belong to worker setup, never to a project
+    // that should be mirrored or offered for a local copy.
+    enabled()
+        && std::env::var_os("HOME").is_some_and(|home| {
+            workspace.root == PathBuf::from(home).join("projects/.chimaera-setup")
+        })
+}
 fn unavailable() -> Response {
     (
         StatusCode::NOT_FOUND,

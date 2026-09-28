@@ -6,6 +6,23 @@ use serde_json::{json, Value};
 use std::{io::Read, time::Duration};
 use tauri::{AppHandle, Manager};
 
+#[tauri::command]
+pub async fn pro_cloud_status(app: AppHandle) -> Result<chimaera_link::WorkerStatus, String> {
+    let state = app.state::<Shell>();
+    let (client, generation) = state
+        .pro
+        .client_snapshot()
+        .await
+        .ok_or("Sign in to see your cloud status.")?;
+    let status = client.worker_status().await.map_err(|_| {
+        "Couldn't check cloud availability. Check your connection and try again.".to_string()
+    })?;
+    if state.pro.generation() != generation {
+        return Err("Your account changed. Refresh your cloud status.".into());
+    }
+    Ok(status)
+}
+
 #[derive(Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub enum Request {
@@ -48,7 +65,9 @@ async fn worker(
                 return Err("Account changed during cloud setup".into());
             }
             if !wake || live_worker(client, &host).await {
-                pro::apply_host(app, host.clone()).await;
+                if !pro::apply_current_host(app, host.clone(), generation).await {
+                    return Err("Account changed during cloud setup".into());
+                }
                 return Ok(Some(host));
             }
         }
@@ -101,8 +120,7 @@ async fn live_worker(client: &Client, host: &Host) -> bool {
 #[tauri::command]
 pub async fn pro_cloud_request(app: AppHandle, request: Request) -> Result<Value, String> {
     let state = app.state::<Shell>();
-    let client = state.pro.client().await.ok_or("Sign in first")?;
-    let generation = state.pro.generation();
+    let (client, generation) = state.pro.client_snapshot().await.ok_or("Sign in first")?;
     let wake = !matches!(request, Request::Info);
     let Some(host) = worker(&app, &client, generation, wake).await? else {
         return Ok(json!({"available":false}));

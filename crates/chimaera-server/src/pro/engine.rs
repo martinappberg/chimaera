@@ -189,10 +189,15 @@ pub(super) async fn reconcile(
     config: &Configure,
     workspace: &str,
 ) -> Result<()> {
+    ensure!(
+        super::projects::account_matches(state, workspace),
+        "This project belongs to another account"
+    );
     let baton: Baton = account(config, &format!("/v1/baton/{workspace}"), "GET", None)
         .await?
         .json()?;
     ensure!(baton.workspace_id == workspace, "baton workspace mismatch");
+    super::projects::bind_workspace_account(state, config, workspace)?;
     let holder = &config.delegation.device_id;
     let previous = lock(&state.pro.ownership).get(workspace).cloned();
     if baton.mirror_disabled {
@@ -233,7 +238,11 @@ pub(super) async fn reconcile(
     let owned = baton.holder_id.as_deref() == Some(holder);
     let transferring = matches!(
         previous,
-        Some(Ownership::Transferring { .. } | Ownership::Hydrating { .. })
+        Some(
+            Ownership::Transferring { .. }
+                | Ownership::Hydrating { .. }
+                | Ownership::SettingUp { .. }
+        )
     );
     if transferring && !owned {
         return Ok(());
@@ -466,6 +475,27 @@ pub(super) async fn hydrate(
     fork: bool,
     destination_root: Option<&Path>,
 ) -> Result<()> {
+    let generation = state.pro.generation.load(Ordering::Acquire);
+    let current = || -> Result<()> {
+        ensure!(
+            generation == state.pro.generation.load(Ordering::Acquire),
+            "Account changed during project transfer; open the project again"
+        );
+        Ok(())
+    };
+    if lock(&state.workspaces).get(workspace).is_some()
+        && matches!(lock(&state.pro.ownership).get(workspace),Some(Ownership::SettingUp{epoch}) if *epoch==expected_epoch)
+    {
+        reconcile(state, config, workspace).await?;
+        return finish_hydration(
+            state,
+            workspace,
+            expected_epoch,
+            generation,
+            run_profile_steps(state, config, workspace),
+        )
+        .await;
+    }
     // Existing durable worker work must never be replaced with an older remote
     // snapshot after a restart. The normal grant path resumes its own ledger.
     if lock(&state.workspaces).get(workspace).is_some()
@@ -502,6 +532,7 @@ pub(super) async fn hydrate(
         .await
         .context("root_setup_required")?;
     tokio::fs::remove_file(&probe).await?;
+    current()?;
     let existing: Baton = account(config, &format!("/v1/baton/{workspace}"), "GET", None)
         .await?
         .json()?;
@@ -530,6 +561,7 @@ pub(super) async fn hydrate(
         grant.holder_id.as_deref() == Some(&config.delegation.device_id),
         "invalid handoff ownership grant"
     );
+    current()?;
     lock(&state.pro.ownership).insert(
         workspace.into(),
         Ownership::Hydrating { epoch: grant.epoch },
@@ -572,6 +604,9 @@ pub(super) async fn hydrate(
             )
             .await?;
         }
+        current()?;
+        super::projects::begin_install(state, workspace, &destination_root).await?;
+        current()?;
         let git_branches = super::repository::receive(
             &destination_root,
             &state
@@ -583,6 +618,7 @@ pub(super) async fn hydrate(
             manifest.branch.as_deref(),
             manifest.repository_origin.as_deref(),
             manifest.repository.as_ref(),
+            &current,
         )
         .await?;
         let baseline = stage.join("baseline");
@@ -606,6 +642,7 @@ pub(super) async fn hydrate(
             )
             .await?;
         }
+        current()?;
         let tree = stage.join("tree");
         let destination = destination_root.clone();
         tokio::task::spawn_blocking(move || {
@@ -635,7 +672,17 @@ pub(super) async fn hydrate(
             .and_then(Path::parent)
             .context("agent home unavailable")?
             .to_path_buf();
-        tokio::task::spawn_blocking(move || config::import(&overlay, &home)).await??;
+        current()?;
+        let account_state = state.clone();
+        tokio::task::spawn_blocking(move || {
+            ensure!(
+                generation == account_state.pro.generation.load(Ordering::Acquire),
+                "Account changed during project transfer"
+            );
+            config::import(&overlay, &home)
+        })
+        .await??;
+        current()?;
         let new_workspace = crate::workspaces::Workspace {
             id: workspace.into(),
             root: destination_root.clone(),
@@ -648,6 +695,7 @@ pub(super) async fn hydrate(
         tokio::task::spawn_blocking(move || lock(&owner.workspaces).import_exact(new_workspace))
             .await??;
         for archive in manifest.sessions {
+            current()?;
             crate::bundle::import(
                 state.clone(),
                 &stage.join("handoff").join(archive.archive),
@@ -671,11 +719,15 @@ pub(super) async fn hydrate(
             preference.profile = manifest.profile;
             preference.git_branches = git_branches;
         }
-        lock(&state.pro.ownership)
-            .insert(workspace.into(), Ownership::Local { epoch: grant.epoch });
-        super::persist(state).await?;
-        crate::ledger::resume_deferred_workspace(state, workspace).await?;
-        run_profile_steps(state, config, workspace).await?;
+        current()?;
+        finish_hydration(
+            state,
+            workspace,
+            grant.epoch,
+            generation,
+            run_profile_steps(state, config, workspace),
+        )
+        .await?;
         Ok::<_, anyhow::Error>(())
     }
     .await;
@@ -790,7 +842,7 @@ pub(super) fn at_pause(state: &AppState, workspace: &str) -> bool {
         }
     })
 }
-async fn lazy_handback(state: &Arc<AppState>, config: &Configure) -> Result<()> {
+pub(super) async fn lazy_handback(state: &Arc<AppState>, config: &Configure) -> Result<()> {
     if config.role != Role::Device
         || !state.pro.power_suitable.load(Ordering::Acquire)
         || super::now().saturating_sub(state.pro.awake_since.load(Ordering::Acquire)) < 300
@@ -814,8 +866,15 @@ async fn lazy_handback(state: &Arc<AppState>, config: &Configure) -> Result<()> 
     )
     .await?
     .json()?;
-    discover_cloud_projects(state, config, &hosts).await?;
     for (workspace, epoch, holder) in remote {
+        // Only a project already registered on this device may return automatically.
+        // Discovery and old global-folder preferences never authorize adoption.
+        if lock(&state.workspaces).get(&workspace).is_none()
+            || super::projects::adoption_pending(state, &workspace)
+            || !super::projects::account_matches(state, &workspace)
+        {
+            continue;
+        }
         if lock(&state.pro.preferences)
             .get(&workspace)
             .is_some_and(|p| p.never_mirror)
@@ -889,20 +948,59 @@ fn same_file(left: &Path, right: &Path) -> Result<bool> {
     }
 }
 
+async fn finish_hydration(
+    state: &Arc<AppState>,
+    workspace: &str,
+    epoch: u64,
+    generation: u64,
+    setup: impl std::future::Future<Output = Result<()>>,
+) -> Result<()> {
+    ensure!(
+        generation == state.pro.generation.load(Ordering::Acquire),
+        "Account changed during project setup"
+    );
+    ensure!(
+        matches!(lock(&state.pro.ownership).get(workspace),Some(Ownership::Hydrating{epoch:current} | Ownership::SettingUp{epoch:current}) if *current==epoch),
+        "Project ownership changed before setup"
+    );
+    lock(&state.pro.ownership).insert(workspace.into(), Ownership::SettingUp { epoch });
+    super::persist(state).await?;
+    if let Err(error) = super::PROFILE_SETUP
+        .scope((workspace.to_owned(), generation), setup)
+        .await
+    {
+        record_error(state, workspace, &error);
+        state.changes.notify_waiters();
+        return Err(error);
+    }
+    ensure!(
+        generation == state.pro.generation.load(Ordering::Acquire)
+            && matches!(lock(&state.pro.ownership).get(workspace),Some(Ownership::SettingUp {epoch:current}) if *current==epoch),
+        "Project ownership changed during setup"
+    );
+    lock(&state.pro.ownership).insert(workspace.into(), Ownership::Local { epoch });
+    super::persist(state).await?;
+    if let Some(status) = lock(&state.pro.status).get_mut(workspace) {
+        status.error = None;
+    }
+    crate::ledger::resume_deferred_workspace(state, workspace).await?;
+    Ok(())
+}
+
 async fn run_profile_steps(
     state: &Arc<AppState>,
     config: &Configure,
     workspace: &str,
 ) -> Result<()> {
+    // Deferred laptop steps are agent guidance, never daemon auto-exec.
+    if config.role != Role::Worker {
+        return Ok(());
+    }
     let profile = lock(&state.pro.preferences)
         .get(workspace)
         .map(|preference| preference.profile.clone())
         .unwrap_or_default();
-    let commands: Vec<String> = if config.role == Role::Worker {
-        profile.setup_command.into_iter().collect()
-    } else {
-        profile.deferred
-    };
+    let commands: Vec<String> = profile.setup_command.into_iter().collect();
     if commands.is_empty() {
         return Ok(());
     }
@@ -939,6 +1037,10 @@ async fn run_profile_steps(
         .as_str()
         .context("setup terminal has no identity")?;
     for command in commands {
+        ensure!(
+            super::may_write(state, workspace),
+            "Account changed before project setup execution"
+        );
         let outcome =
             crate::exec::run_exec(state, id, command.clone(), Some(600_000), Some(15_000))
                 .await
@@ -946,20 +1048,17 @@ async fn run_profile_steps(
         if outcome.record.exit_code != Some(0) || outcome.timed_out {
             anyhow::bail!("project setup needs attention in its terminal");
         }
-        if config.role == Role::Device {
-            lock(&state.pro.preferences)
-                .entry(workspace.into())
-                .or_default()
-                .profile
-                .deferred
-                .retain(|entry| entry != &command);
-            super::persist(state).await?;
-        }
     }
     Ok(())
 }
 
-fn eligible(state: &AppState, workspace: &crate::workspaces::Workspace) -> bool {
+pub(super) fn eligible(state: &AppState, workspace: &crate::workspaces::Workspace) -> bool {
+    if crate::cloud::is_onboarding_workspace(workspace)
+        || lock(&state.pro.legacy_pending).contains(&workspace.id)
+        || !super::projects::account_matches(state, &workspace.id)
+    {
+        return false;
+    }
     let home = state.claude_settings_path.parent().and_then(Path::parent);
     if home.is_some_and(|home| home.starts_with(&workspace.root)) {
         return false;
@@ -988,138 +1087,101 @@ fn eligible(state: &AppState, workspace: &crate::workspaces::Workspace) -> bool 
             .any(|id| id == &workspace.id)
 }
 
-async fn discover_cloud_projects(
-    state: &Arc<AppState>,
-    config: &Configure,
-    hosts: &[super::protocol::Host],
-) -> Result<()> {
-    if lock(&state.pro.projects_root).is_none() {
-        return Ok(());
-    }
-    #[derive(Deserialize)]
-    struct Project {
-        id: String,
-        name: String,
-    }
-    for host in hosts
-        .iter()
-        .filter(|host| {
-            super::valid_id(&host.id) && host.kind == "worker" && host.status == "connected"
-        })
-        .take(8)
-    {
-        let response = transport::request(
-            &config.keeper_url,
-            &format!("/v1/hosts/{}/http/api/v1/workspaces", host.id),
-            "GET",
-            &config.delegation.access_token,
-            None,
-        )
-        .await?;
-        let projects: Vec<Project> = response.json()?;
-        for project in projects.into_iter().take(128) {
-            if !super::valid_id(&project.id) {
-                continue;
-            }
-            let pending_root = lock(&state.pro.import_roots).get(&project.id).cloned();
-            if lock(&state.workspaces).get(&project.id).is_some() {
-                if pending_root.is_none() {
-                    continue;
-                }
-                if super::owned_epoch(state, &project.id).is_some() {
-                    lock(&state.pro.import_roots).remove(&project.id);
-                    super::persist(state).await?;
-                    continue;
-                }
-            }
-            let baton: Baton = account(config, &format!("/v1/baton/{}", project.id), "GET", None)
-                .await?
-                .json()?;
-            ensure!(baton.workspace_id == project.id, "baton workspace mismatch");
-            if baton.mirror_disabled {
-                continue;
-            }
-            let worker_owned = baton.holder_id.as_deref() == Some(&host.id);
-            let resuming = pending_root.is_some()
-                && (baton.holder_id.is_none()
-                    || baton.holder_id.as_deref() == Some(&config.delegation.device_id));
-            if !worker_owned && !resuming {
-                continue;
-            }
-            let destination = if let Some(root) = pending_root {
-                root
-            } else {
-                ensure!(
-                    lock(&state.pro.import_roots).len() < 128,
-                    "too many pending cloud projects"
-                );
-                let name: String = project
-                    .name
-                    .chars()
-                    .take(64)
-                    .map(|c| {
-                        if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                            c
-                        } else {
-                            '-'
-                        }
-                    })
-                    .collect();
-                let root = super::projects_root(state).join(format!(
-                    "{}-{}",
-                    if name.is_empty() { "project" } else { &name },
-                    project.id
-                ));
-                let create = root.clone();
-                tokio::task::spawn_blocking(move || -> Result<()> {
-                    let parent = create.parent().context("invalid projects folder")?;
-                    std::fs::create_dir_all(parent)?;
-                    // Exclusive creation prevents an unrelated existing folder
-                    // from becoming the target of a background cloud import.
-                    std::fs::create_dir(&create)?;
-                    Ok(())
-                })
-                .await??;
-                lock(&state.pro.import_roots).insert(project.id.clone(), root.clone());
-                super::persist(state).await?;
-                root
-            };
-            if worker_owned {
-                let response = transport::request(
-                    &config.keeper_url,
-                    &format!("/v1/hosts/{}/http/api/v1/pro/handoff", host.id),
-                    "POST",
-                    &config.delegation.access_token,
-                    Some(&json!({"workspace_id":project.id,"expected_epoch":baton.epoch})),
-                )
-                .await?;
-                if response.status == 409 {
-                    continue;
-                }
-                ensure!(
-                    (200..300).contains(&response.status),
-                    "cloud project is not ready to return"
-                );
-            }
-            hydrate(
-                state,
-                config,
-                &project.id,
-                baton.epoch,
-                false,
-                Some(&destination),
-            )
-            .await?;
-            lock(&state.pro.import_roots).remove(&project.id);
-            super::persist(state).await?;
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn setup_failure_fences_agents_until_success_and_laptop_steps_never_autoplay() {
+        let root = std::env::temp_dir().join(format!(
+            "chimaera-setup-fence-{}",
+            chimaera_core::generate_token()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let state = Arc::new(AppState::new(
+            "fixture".into(),
+            "fixture".into(),
+            4242,
+            0,
+            root.clone(),
+            root.join("config"),
+        ));
+        lock(&state.workspaces)
+            .import_exact(crate::workspaces::Workspace {
+                id: "w-project".into(),
+                root: root.clone(),
+                name: "Fixture".into(),
+                last_opened_at: super::super::now(),
+                mastermind: None,
+                plugins_on: vec![],
+            })
+            .unwrap();
+        lock(&state.pro.ownership).insert("w-project".into(), Ownership::Hydrating { epoch: 3 });
+        let owner = state.clone();
+        let result = finish_hydration(&state, "w-project", 3, 0, async move {
+            assert!(super::super::may_write(&owner, "w-project"));
+            let outside = owner.clone();
+            assert!(
+                !tokio::spawn(async move { super::super::may_write(&outside, "w-project") })
+                    .await
+                    .unwrap()
+            );
+            anyhow::bail!("fixture setup failed")
+        })
+        .await;
+        assert!(result.is_err());
+        assert!(!super::super::may_write(&state, "w-project"));
+        assert_eq!(super::super::owned_epoch(&state, "w-project"), None);
+        assert!(lock(&state.pro.status)
+            .get("w-project")
+            .unwrap()
+            .error
+            .is_some());
+        let restarted = Arc::new(AppState::new(
+            "fixture".into(),
+            "fixture".into(),
+            4242,
+            0,
+            root.clone(),
+            root.join("config"),
+        ));
+        assert!(!super::super::may_write(&restarted, "w-project"));
+        finish_hydration(&state, "w-project", 3, 0, async { Ok(()) })
+            .await
+            .unwrap();
+        assert_eq!(super::super::owned_epoch(&state, "w-project"), Some(3));
+        let config = Configure {
+            account_id: None,
+            role: Role::Device,
+            endpoint: String::new(),
+            keeper_url: String::new(),
+            hours_exhausted: false,
+            delegation: super::super::protocol::Delegation {
+                access_token: String::new(),
+                expires_at: String::new(),
+                scope: vec![],
+                device_id: String::new(),
+            },
+        };
+        lock(&state.pro.preferences)
+            .entry("w-project".into())
+            .or_default()
+            .profile
+            .deferred = vec!["must-not-be-executed".into()];
+        run_profile_steps(&state, &config, "w-project")
+            .await
+            .unwrap();
+        assert_eq!(
+            lock(&state.pro.preferences)
+                .get("w-project")
+                .unwrap()
+                .profile
+                .deferred,
+            ["must-not-be-executed"]
+        );
+        drop(restarted);
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn three_way_return_preserves_local_conflicts_and_applies_unmodified_files() {
         let root = std::env::temp_dir().join(format!(

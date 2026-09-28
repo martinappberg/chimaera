@@ -12,6 +12,8 @@ pub(crate) struct Delegation {
 #[derive(Clone, Deserialize)]
 pub(crate) struct Configure {
     #[serde(default)]
+    pub account_id: Option<String>,
+    #[serde(default)]
     pub role: Role,
     pub endpoint: String,
     pub keeper_url: String,
@@ -47,6 +49,8 @@ pub(super) struct MirrorCredentials {
 #[derive(Clone, Deserialize)]
 pub(super) struct Host {
     pub id: String,
+    #[serde(default)]
+    pub alias: String,
     pub kind: String,
     pub status: String,
 }

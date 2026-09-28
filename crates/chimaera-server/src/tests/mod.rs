@@ -2,6 +2,7 @@ mod agent_view;
 mod agents;
 mod bundle;
 mod chat;
+mod cloud_context;
 mod doc_check;
 mod download;
 mod drafts;

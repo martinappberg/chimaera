@@ -28,7 +28,11 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         .route("/pro/status", get(crate::pro::status))
         .route("/pro/keep-running", put(crate::pro::pin))
         .route("/pro/privacy", put(crate::pro::privacy))
-        .route("/pro/projects", put(crate::pro::projects))
+        .route(
+            "/pro/projects",
+            get(crate::pro::project_list).put(crate::pro::projects),
+        )
+        .route("/pro/projects/open", post(crate::pro::open_project))
         .route(
             "/pro/profile",
             get(crate::pro::profile).put(crate::pro::put_profile),

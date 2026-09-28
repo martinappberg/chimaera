@@ -202,7 +202,7 @@ fn note_missing(missing: &mut Vec<String>, name: &str) {
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CloudProfile {
     #[serde(default)]
     pub setup_command: Option<String>,

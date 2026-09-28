@@ -8,12 +8,26 @@ use axum::Json;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::workspaces::Workspace;
 use crate::AppState;
 
 /// GET /api/v1/workspaces
-pub(crate) async fn list_workspaces(State(state): State<Arc<AppState>>) -> Json<Vec<Workspace>> {
-    Json(crate::lock(&state.workspaces).list())
+pub(crate) async fn list_workspaces(
+    State(state): State<Arc<AppState>>,
+) -> Json<Vec<serde_json::Value>> {
+    Json(
+        crate::lock(&state.workspaces)
+            .list()
+            .into_iter()
+            .map(|workspace| {
+                let internal = crate::cloud::is_onboarding_workspace(&workspace);
+                let mut value = json!(workspace);
+                if internal {
+                    value["cloud_internal"] = json!(true);
+                }
+                value
+            })
+            .collect(),
+    )
 }
 
 #[derive(Deserialize)]

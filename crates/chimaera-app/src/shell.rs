@@ -1033,9 +1033,16 @@ pub fn run() {
         }))
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             cloud::pro_cloud_request,
+            cloud::pro_cloud_status,
             pro::pro_status,
+            pro::pro_refresh_account,
+            pro::projects::pro_cloud_projects,
+            pro::projects::pro_open_cloud_project,
+            pro::billing::pro_billing_checkout,
+            pro::billing::pro_billing_portal,
             pro::pro_mirror_status,
             pro::pro_mirror_preference,
             pro::pro_set_never_mirror,

@@ -18,6 +18,8 @@ use tauri::{AppHandle, Emitter, Manager};
 use super::{lock, Shell};
 
 mod auth;
+pub(super) mod billing;
+pub(super) mod projects;
 
 pub(super) struct Pro {
     endpoint: Option<String>,
@@ -32,6 +34,7 @@ pub(super) struct Pro {
     worker_links: tokio::sync::Mutex<HashMap<String, chimaera_link::LinkTunnel>>,
     runtime: tokio::sync::Mutex<Option<Runtime>>,
     operation: tokio::sync::Mutex<()>,
+    refresh: tokio::sync::Mutex<()>,
     ready: tokio::sync::watch::Sender<bool>,
     credential_generation: Arc<AtomicU64>,
 }
@@ -51,6 +54,9 @@ pub struct Status {
     plan: Option<chimaera_link::Plan>,
     error: Option<String>,
     sign_in: Option<auth::Status>,
+    limits: Option<chimaera_link::Limits>,
+    usage: Option<chimaera_link::Usage>,
+    hours_exhausted: bool,
 }
 
 #[derive(Serialize)]
@@ -78,6 +84,7 @@ impl Pro {
             worker_links: tokio::sync::Mutex::new(HashMap::new()),
             runtime: tokio::sync::Mutex::new(None),
             operation: tokio::sync::Mutex::new(()),
+            refresh: tokio::sync::Mutex::new(()),
             ready: tokio::sync::watch::channel(ready).0,
             credential_generation: Arc::new(AtomicU64::new(0)),
         }
@@ -111,7 +118,7 @@ impl Pro {
         self.client_snapshot().await.map(|(client, _)| client)
     }
 
-    async fn client_snapshot(&self) -> Option<(Client, u64)> {
+    pub(super) async fn client_snapshot(&self) -> Option<(Client, u64)> {
         let mut ready = self.ready.subscribe();
         let _ = ready.wait_for(|ready| *ready).await;
         let client = lock(&self.client);
@@ -405,13 +412,14 @@ pub(super) async fn reconcile_account(
     client: &Client,
     generation: u64,
 ) -> Result<()> {
-    let account = client.me().await?;
-    let hosts = if !keeper_available(&account) {
-        Vec::new()
-    } else {
-        client.hosts().await?
-    };
     let state = app.state::<Shell>();
+    // A manual billing refresh and the periodic refresh must observe and apply
+    // snapshots in order. Keep sign-out independent of a slow network request.
+    let _refresh = state.pro.refresh.lock().await;
+    if state.pro.generation() != generation {
+        return Ok(());
+    }
+    let (account, hosts, connection_error) = account_snapshot(client).await?;
     // Blocking HTTP requests cannot be cancelled by aborting the reconcile task.
     // Serialize mutations through completion so sign-out's final DELETE wins.
     let _operation = state.pro.operation.lock().await;
@@ -439,11 +447,21 @@ pub(super) async fn reconcile_account(
         }
     }
     *lock(&state.pro.account) = Some(account);
-    replace_hosts(app, hosts).await;
+    if connection_error.is_none() {
+        replace_hosts(app, hosts).await;
+    }
     drop(runtime);
-    configure_daemon(&state, client).await?;
-    reconcile_placements(&state, client).await?;
-    *lock(&state.pro.error) = None;
+    // Account confirmation must survive a keeper that is still starting. The
+    // runtime keeps retrying transport setup independently of billing identity.
+    let setup = configure_daemon(&state, client).await;
+    let placement = if setup.is_ok() && connection_error.is_none() {
+        reconcile_placements(&state, client).await
+    } else {
+        Ok(())
+    };
+    *lock(&state.pro.error) = connection_error.or_else(|| {
+        (setup.is_err() || placement.is_err()).then(|| "Your account is up to date. The Pro connection is not ready yet; Chimaera will retry automatically.".into())
+    });
     let _ = app.emit("pro-changed", ());
     Ok(())
 }
@@ -472,6 +490,16 @@ async fn replace_hosts(app: &AppHandle, hosts: Vec<Host>) {
 
 fn machine_name() -> String {
     chimaera_core::this_node().unwrap_or_else(|| "My computer".into())
+}
+
+pub(super) async fn apply_current_host(app: &AppHandle, host: Host, generation: u64) -> bool {
+    let state = app.state::<Shell>();
+    let _operation = state.pro.operation.lock().await;
+    if state.pro.generation() != generation {
+        return false;
+    }
+    apply_host(app, host).await;
+    true
 }
 
 pub(super) async fn apply_host(app: &AppHandle, host: Host) {
@@ -594,10 +622,28 @@ pub async fn pro_status(state: tauri::State<'_, Shell>) -> Result<Status, String
         available: state.pro.endpoint.is_some(),
         signed_in,
         email: account.as_ref().map(|account| account.email.clone()),
-        plan: account.map(|account| account.plan),
+        plan: account.as_ref().map(|account| account.plan.clone()),
         error: lock(&state.pro.error).clone(),
         sign_in: state.pro.sign_in.status(),
+        limits: account.as_ref().map(|account| account.limits.clone()),
+        usage: account.as_ref().map(|account| account.usage.clone()),
+        hours_exhausted: account
+            .as_ref()
+            .is_some_and(|account| account.hours_exhausted),
     })
+}
+
+#[tauri::command]
+pub async fn pro_refresh_account(app: AppHandle) -> Result<(), String> {
+    let state = app.state::<Shell>();
+    let (client, generation) = state
+        .pro
+        .client_snapshot()
+        .await
+        .ok_or("Sign in to refresh your account.")?;
+    reconcile_account(&app, &client, generation)
+        .await
+        .map_err(|_| "Couldn't refresh your account. Check your connection and try again.".into())
 }
 
 #[tauri::command]
@@ -1047,8 +1093,15 @@ pub(super) async fn daemon_request(
                 .post(&url)
                 .header("Authorization", &authorization)
                 .config()
-                .timeout_global(Some(Duration::from_secs(30)))
+                .timeout_global(Some(Duration::from_secs(
+                    if suffix == "/pro/projects/open" {
+                        1200
+                    } else {
+                        30
+                    },
+                )))
                 .max_redirects(0)
+                .http_status_as_error(false)
                 .build()
                 .send_json(body.unwrap_or(serde_json::Value::Null))?,
             _ => anyhow::bail!("invalid local Pro method"),
@@ -1063,6 +1116,16 @@ pub(super) async fn daemon_request(
             bytes.len() <= 2 * 1024 * 1024,
             "local Pro response exceeds limit"
         );
+        if !response.status().is_success() {
+            if suffix == "/pro/projects/open" {
+                let detail = serde_json::from_slice::<serde_json::Value>(&bytes)
+                    .ok()
+                    .and_then(|v| v["error"].as_str().map(str::to_owned))
+                    .unwrap_or_default();
+                anyhow::bail!(project_failure(&detail));
+            }
+            anyhow::bail!("The Pro operation couldn't finish. Try again shortly.");
+        }
         if bytes.is_empty() {
             Ok(serde_json::Value::Null)
         } else {
@@ -1070,6 +1133,30 @@ pub(super) async fn daemon_request(
         }
     })
     .await?
+}
+
+fn project_failure(detail: &str) -> &'static str {
+    let text = detail.to_ascii_lowercase();
+    if text.contains("not empty")
+        || text.contains("nonempty")
+        || text.contains("non-empty")
+        || text.contains("empty folder")
+        || text.contains("folder now contains files")
+    {
+        "Choose an empty folder for this project. Its cloud copy is unchanged."
+    } else if text.contains("missing")
+        || text.contains("no such file")
+        || text.contains("moved")
+        || text.contains("destination changed")
+    {
+        "The project's local folder is missing or moved. Restore that folder and try again."
+    } else if text.contains("pause") || text.contains("busy") || text.contains("still running") {
+        "The project is still running in the cloud. Try again when it reaches a pause."
+    } else if text.contains("account changed") || text.contains("configuration changed") {
+        "Your account changed. Open the project again."
+    } else {
+        "The project couldn't open here. Its cloud copy is intact. Try again shortly."
+    }
 }
 async fn configure_daemon(state: &Shell, client: &Client) -> Result<()> {
     let Some(account) = lock(&state.pro.account).clone() else {
@@ -1130,7 +1217,7 @@ async fn configure_daemon(state: &Shell, client: &Client) -> Result<()> {
         .endpoint
         .clone()
         .context("Pro endpoint unavailable")?;
-    daemon_request(state,"POST","/pro/configure",Some(serde_json::json!({"endpoint":endpoint,"keeper_url":account.keeper_url,"delegation":delegation,"role":"device","hours_exhausted":account.hours_exhausted}))).await?;
+    daemon_request(state,"POST","/pro/configure",Some(serde_json::json!({"endpoint":endpoint,"keeper_url":account.keeper_url,"account_id":account.account_id,"delegation":delegation,"role":"device","hours_exhausted":account.hours_exhausted}))).await?;
     *lock(&state.pro.delegation) = Some(delegation);
     *lock(&state.pro.daemon_stamp) = Some(stamp);
     Ok(())
