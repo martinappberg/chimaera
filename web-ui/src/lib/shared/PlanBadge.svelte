@@ -12,30 +12,6 @@
 {/if}
 
 <style>
-  .plan-badge {
-    display: inline-flex;
-    align-items: center;
-    flex: none;
-    padding: 3px 7px;
-    border: 1px solid color-mix(in srgb, var(--accent) 32%, var(--edge));
-    border-radius: 6px;
-    background: linear-gradient(135deg,
-      color-mix(in srgb, var(--accent) 12%, transparent),
-      color-mix(in srgb, var(--accent) 4%, transparent));
-    color: color-mix(in srgb, var(--accent) 65%, var(--fg));
-    font-family: var(--ui-font);
-    font-size: var(--text-xs);
-    font-weight: 650;
-    line-height: 1;
-    letter-spacing: .06em;
-    text-transform: uppercase;
-    white-space: nowrap;
-    user-select: none;
-  }
-  .compact {
-    padding: 3px 5px;
-    border-radius: 5px;
-    font-size: calc(var(--text-xs) - 1px);
-    letter-spacing: .04em;
-  }
+  .plan-badge { display: inline-flex; align-items: center; flex: none; padding: 3px 7px; border: 1px solid var(--edge); border-radius: 5px; background: color-mix(in srgb, var(--fg) 3%, transparent); color: var(--muted); font-family: var(--ui-font); font-size: var(--text-xs); font-weight: 550; line-height: 1.15; white-space: nowrap; user-select: none; }
+  .compact { padding: 2px 5px; border-radius: 4px; font-size: calc(var(--text-xs) - 1px); }
 </style>

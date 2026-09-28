@@ -326,6 +326,7 @@
   import { hintsActive, initChordHints } from "./lib/shared/chordHints.svelte";
   import FolderPicker from "./lib/workspace/FolderPicker.svelte";
   import HomeScreen from "./lib/workspace/HomeScreen.svelte";
+  import HomeNavigation from "./lib/workspace/HomeNavigation.svelte";
   import { loadPaneView } from "./lib/layout/lazyViews";
   import AskpassModal from "./lib/workspace/AskpassModal.svelte";
   import ContextMenuHost from "./lib/shared/ContextMenuHost.svelte";
@@ -4691,8 +4692,19 @@
          exist once a workspace scopes this window. A Mastermind is never a
          worker: keep it out of the per-workspace live/attention rollups. -->
     {#if homeSettingsOpen}
+      <div class="home-settings-shell">
+        <HomeNavigation active={homeSurface} plan={$paidPlan} showPro={isNativeShell() || isBrowserGateway()}
+          onHome={() => (homeSettingsOpen = false)} onPro={openProSurface} onSettings={openSettingsSurface} />
       <div class="home-settings-surface">
-        <button class="home-settings-back" onclick={() => (homeSettingsOpen = false)}>← Home</button>
+        <nav class="home-surface-nav" aria-label="Home navigation">
+          <button class="home-settings-back" onclick={() => (homeSettingsOpen = false)}>
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="m9.5 4-4 4 4 4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" /></svg>
+            Home
+          </button>
+          <span class="home-surface-divider" aria-hidden="true">/</span>
+          <span aria-current="page">{homeSurface === "pro" ? "Chimaera Pro" : "Settings"}</span>
+          <kbd class="home-back-hint">esc</kbd>
+        </nav>
         <div class="home-settings-content">
           {#await homeSettingsLoad}
             <p>Loading {homeSurface === "pro" ? "Chimaera Pro" : "settings"}…</p>
@@ -4703,6 +4715,7 @@
             <button onclick={homeSurface === "pro" ? openProSurface : openSettingsSurface}>Retry</button>
           {/await}
         </div>
+      </div>
       </div>
     {:else}
     <HomeScreen
@@ -5874,21 +5887,49 @@
 {/if}
 
 <style>
-  .home-settings-surface {
+  .home-settings-shell {
     position: absolute;
-    inset: 38px 16px 16px;
+    inset: 0;
+    display: flex;
+    background: var(--bg);
+  }
+  .home-settings-surface {
+    flex: 1;
+    min-width: 0;
+    min-height: 0;
+    padding: 44px 24px 24px;
     display: flex;
     flex-direction: column;
+    gap: 14px;
+  }
+  .home-surface-nav {
+    display: flex;
+    align-items: center;
     gap: 12px;
+    min-height: 34px;
+    font-size: var(--text-sm);
+    color: var(--fg);
   }
   .home-settings-back {
-    align-self: flex-start;
-    color: var(--fg);
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    color: var(--muted);
     background: transparent;
     border: 0;
-    padding: 4px 8px;
+    border-radius: 6px;
+    padding: 8px;
     font: inherit;
     cursor: pointer;
+  }
+  .home-settings-back:hover { color: var(--fg); background: var(--row-hover); }
+  .home-settings-back:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
+  .home-surface-divider, .home-back-hint { color: var(--muted); }
+  .home-back-hint { margin-left: auto; font-size: var(--text-xs); }
+  @media (max-width: 700px) {
+    .home-settings-shell { flex-direction: column; }
+    .home-settings-surface { padding: 16px 14px 14px; gap: 8px; }
+    .home-back-hint { display: none; }
   }
   .home-settings-content {
     position: relative;

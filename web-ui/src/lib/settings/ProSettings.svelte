@@ -15,6 +15,13 @@
 
   let { visible = true }: { visible?: boolean } = $props();
   const intentKey = "chimaera.pro.purchase";
+  const prices: Record<PaidPlan, Record<BillingInterval, number>> = {
+    pro: { month: 8, year: 80 }, max: { month: 30, year: 300 },
+  };
+  const planChoices = [
+    { plan: "pro" as PaidPlan, name: "Pro", purpose: "For your everyday projects", detail: "Keep your projects connected, and continue agent work while you're away from your Mac.", capacity: "The complete Pro workflow." },
+    { plan: "max" as PaidPlan, name: "Max", purpose: "For more cloud work", detail: "The same Pro workflow, with more capacity for longer cloud runs and more mirrored projects.", capacity: "More capacity. All the same features." },
+  ];
   function savedIntent(): PurchaseIntent | null { try { return readIntent(sessionStorage.getItem(intentKey)); } catch { return null; } }
   const initialIntent = savedIntent();
   let intent = $state<PurchaseIntent | null>(initialIntent);
@@ -31,6 +38,7 @@
   let securityOpen = $state(false);
   let mirrorsOpen = $state(false);
   let recoveryOpen = $state(false);
+  let plansElement: HTMLElement | undefined;
   let generation = 0;
   let alive = true;
   const subscribed = $derived(status?.signed_in === true && paid(status.plan));
@@ -39,6 +47,10 @@
   const cloudHours = $derived(status?.usage?.cloud_hours);
   const cloudLimit = $derived(status?.limits?.cloud_hours);
 
+  function showPlans(): void {
+    plansElement?.scrollIntoView({ block: "start", behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" });
+    plansElement?.focus({ preventScroll: true });
+  }
   function remember(next: PurchaseIntent | null): void {
     intent = next;
     try { if (next) sessionStorage.setItem(intentKey, JSON.stringify(next)); else sessionStorage.removeItem(intentKey); } catch { /* Selection still survives while this view is open. */ }
@@ -129,13 +141,27 @@
   }
 </script>
 
-<section class="pro" aria-label="Chimaera Pro">
+{#snippet howItWorks()}
+    <section class="workflow" aria-labelledby="workflow-title">
+      <h2 id="workflow-title" class="section-label">How it fits your day</h2>
+      <ol class="steps">
+        <li><span class="step-number" aria-hidden="true">01</span><h3>Work here</h3><p>Use your usual project folders and your own Claude or Codex subscription. Your Mac stays the first place you work.</p></li>
+        <li><span class="step-number" aria-hidden="true">02</span><h3>Continue in the cloud</h3><p>Pro mirrors your project and conversation history so your agent work can continue while your Mac is away.</p></li>
+        <li><span class="step-number" aria-hidden="true">03</span><h3>Pick up on your Mac</h3><p>Existing projects return to their original folders. For a project started in the cloud, choose where to save it the first time you open it here.</p></li>
+      </ol>
+      <p class="workflow-note">Sign in to Claude or Codex on the cloud machine before using it. Handoff resumes supported agent sessions; other running programs stay on their original machine.</p>
+    </section>
+{/snippet}
+
+<section class="pro" class:subscriber={subscribed} aria-label="Chimaera Pro">
   <header class="heading">
-    <div class="brand"><BrandMark size={38} /><span>chimaera</span><span class="product">Pro</span></div>
-    <p class="eyebrow">Your work, within reach.</p>
-    <h1>{subscribed ? "A little more room for your work." : "Keep working beyond your laptop."}</h1>
-    <p class="lede">Stay connected to your machines. Let work continue while your computer is away. Your own agents, with the subscriptions you already use.</p>
+    <div class="brand"><BrandMark size={44} /><span>chimaera</span><span class="product">Pro</span></div>
+    {#if status && !subscribed}<h1>Your work, here and away.</h1>
+    <p class="lede">Start on your Mac. Let your agents continue in the cloud. Pick up your project when you return.</p>
+    {#if status.available}<button class="secondary intro-plans" onclick={showPlans}>See plans</button>{/if}{/if}
   </header>
+
+  {#if status?.available && !subscribed}{@render howItWorks()}{/if}
 
   {#if status === null}
     <p class="muted" role="status">Loading your account…</p>
@@ -162,29 +188,39 @@
     {/if}
 
     {#if !subscribed}
-      <section class="plans" aria-labelledby="plans-title">
-        <div class="section-heading"><h2 id="plans-title">Choose your room to work</h2><div class="interval" role="group" aria-label="Billing interval"><button class:chosen={interval === "month"} aria-pressed={interval === "month"} onclick={() => (interval = "month")}>Monthly</button><button class:chosen={interval === "year"} aria-pressed={interval === "year"} onclick={() => (interval = "year")}>Yearly <span>2 months free</span></button></div></div>
-        <div class="plan-options">
-          {#each ["pro", "max"] as plan}
-            <button class="plan-card" class:selected={selected === plan} aria-pressed={selected === plan} onclick={() => (selected = plan as PaidPlan)}>
-              <span class="plan-name">{plan === "pro" ? "Pro" : "Max"}</span><span class="price">${plan === "pro" ? (interval === "month" ? "8" : "80") : (interval === "month" ? "30" : "300")}<span> / {interval}</span></span>
-              <span class="plan-detail">{plan === "pro" ? "100" : "500"} cloud hours / month</span><span class="plan-detail">{plan === "pro" ? "20" : "100"} GB mirrored storage</span><span class="plan-note">{plan === "pro" ? "Everything in Pro." : "The same features, more capacity."}</span>
+      <section class="plans" aria-labelledby="plans-title" tabindex="-1" bind:this={plansElement}>
+        <div class="section-heading plan-heading">
+          <div><h2 id="plans-title">Choose your plan</h2><p class="muted small">The same features in both. More cloud capacity with Max.</p></div>
+          <div class="interval" role="group" aria-label="Billing interval"><button class:chosen={interval === "month"} aria-pressed={interval === "month"} onclick={() => (interval = "month")}>Monthly</button><button class:chosen={interval === "year"} aria-pressed={interval === "year"} onclick={() => (interval = "year")}>Yearly <span>2 months free</span></button></div>
+        </div>
+        <div class="plan-options" role="group" aria-label="Choose Pro or Max">
+          {#each planChoices as choice (choice.plan)}
+            <button class="plan-card" class:selected={selected === choice.plan} aria-pressed={selected === choice.plan} onclick={() => (selected = choice.plan)}>
+              <span class="plan-top"><span class="plan-name">{choice.name}</span><span class="selection-mark" aria-hidden="true"></span></span>
+              <span class="plan-purpose">{choice.purpose}</span>
+              <span class="plan-detail">{choice.detail}</span>
+              <span class="plan-price"><span class="price">${prices[choice.plan][interval]}</span><span class="price-period">/ {interval === "year" ? "year" : "month"}</span></span>
+              <span class="plan-note">{choice.capacity}</span>
             </button>
           {/each}
         </div>
-        <ul class="benefits"><li>Keep remote machines connected</li><li>Automatic laptop and cloud handoff</li><li>Reach your work from another device</li></ul>
-        <div class="purchase"><button disabled={busy !== null || signInPhase !== null} onclick={() => void checkout()}>{busy === "checkout" ? "Opening checkout…" : status.signed_in ? `Continue with ${selected === "max" ? "Max" : "Pro"}` : "Sign in to continue"}</button><p class="small muted">{interval === "year" ? `Billed $${selected === "pro" ? "80" : "300"} yearly` : `Billed $${selected === "pro" ? "8" : "30"} monthly`}. Review the full details in secure browser checkout before subscribing.</p></div>
-        {#if !status.signed_in}<p class="small muted">Already subscribed? <button class="text-button" disabled={busy !== null || signInPhase !== null} onclick={() => { remember(null); void act("sign-in", proSignIn, "Sign-in couldn't start. Please try again."); }}>Sign in to your account</button></p>{/if}
-        <p class="free-note">Local work, agents and ordinary SSH remain free. You don't need an account to keep using them.</p>
+        <div class="included"><span class="section-label">Included with both</span><ul><li>Project mirrors and agent handoff</li><li>Persistent remote connections</li><li>Browser access to your work</li><li>Project-by-project privacy controls</li></ul></div>
+        <div class="purchase"><button disabled={busy !== null || signInPhase !== null} onclick={() => void checkout()}>{busy === "checkout" ? "Opening checkout…" : status.signed_in ? `Continue with ${selected === "max" ? "Max" : "Pro"}` : "Sign in to continue"}</button><p class="small muted">Billed ${prices[selected][interval]} {interval === "year" ? "yearly" : "monthly"}. Cloud work and mirrored storage have plan limits. Review billing details in secure checkout before subscribing.</p></div>
+        {#if !status.signed_in}<p class="small muted account-link">Already subscribed? <button class="text-button" disabled={busy !== null || signInPhase !== null} onclick={() => { remember(null); void act("sign-in", proSignIn, "Sign-in couldn't start. Please try again."); }}>Sign in to your account</button></p>{/if}
+        <p class="free-note"><strong>Your local workbench stays free.</strong> Local projects, agents and ordinary SSH work without a Pro account.</p>
       </section>
     {:else}
-      <section class="panel plan-current" aria-label="Current plan"><div class="section-heading"><h2>Chimaera {status.plan === "max" ? "Max" : "Pro"}</h2><button class="secondary" disabled={busy !== null} onclick={() => void act("billing", proBillingPortal, "Billing couldn't open. Please try again in a moment.")}>{busy === "billing" ? "Opening billing…" : "Manage billing"}</button></div>
-        {#if cloudHours !== undefined && cloudLimit !== undefined}<p><strong>{cloudHours.toFixed(1)}</strong> of {cloudLimit} cloud hours used this month</p><progress max={cloudLimit} value={Math.min(cloudHours, cloudLimit)} aria-label="Monthly cloud hours used"></progress>{/if}
-        {#if status.usage && status.limits}<p class="small muted">{(status.usage.storage_bytes / 1e9).toFixed(1)} of {Math.round(status.limits.storage_bytes / 1e9)} GB storage used</p>{/if}
+      <section class="panel plan-current" aria-label="Current plan">
+        <div class="section-heading"><div><span class="section-label">Your plan</span><h2>Chimaera {status.plan === "max" ? "Max" : "Pro"}</h2><p class="muted small">Project mirrors, cloud handoff and connected machines are included.</p></div><button class="secondary" disabled={busy !== null} onclick={() => void act("billing", proBillingPortal, "Billing couldn't open. Please try again in a moment.")}>{busy === "billing" ? "Opening billing…" : "Manage billing"}</button></div>
+        <details class="usage-details"><summary>Usage and plan details</summary><div class="usage-grid">
+          {#if cloudHours !== undefined && cloudLimit !== undefined}<div><span class="usage-label">Cloud work this month</span><p class="usage-value"><strong>{cloudHours.toFixed(1)}</strong><span> / {cloudLimit} hours</span></p>{#if cloudLimit > 0}<progress max={cloudLimit} value={Math.max(0, Math.min(cloudHours, cloudLimit))} aria-label="Monthly cloud hours used"></progress>{/if}</div>{/if}
+          {#if status.usage && status.limits}<div><span class="usage-label">Mirrored projects</span><p class="usage-value"><strong>{(status.usage.storage_bytes / 1e9).toFixed(1)}</strong><span> / {(status.limits.storage_bytes / 1e9).toLocaleString(undefined, { maximumFractionDigits: 1 })} GB</span></p>{#if status.limits.storage_bytes > 0}<progress max={status.limits.storage_bytes} value={Math.max(0, Math.min(status.usage.storage_bytes, status.limits.storage_bytes))} aria-label="Mirrored storage used"></progress>{/if}</div>{/if}
+        </div>{#if !status.usage || !status.limits}<p class="muted small">Usage isn't available yet. Refresh your account to check again.</p>{:else}<p class="muted small usage-note">These are your account's current allowances. Local work remains available when a cloud limit is reached.</p>{/if}</details>
       </section>
       <CloudSetup {visible} />
       <details class="section" ontoggle={(event) => (connectionsOpen = event.currentTarget.open)}><summary>Connected machines</summary>{#if connectionsOpen}<div class="section-body"><p class="muted small">Add your remote hosts on Home. Keep a connection available through Pro here.</p>{#if hosts.length === 0}<p class="muted">No machines to show yet.</p>{/if}{#each hosts as host (host.alias)}<div class="row"><div><span>{host.alias}</span><span class="muted small">{host.status === "prompting" ? "Waiting for authentication" : host.status === "connecting" ? "Connecting…" : host.status === "connected" ? "Connected" : "Offline"}</span></div>{#if host.kind === "ssh"}<label class="keep"><input type="checkbox" checked={host.kept} disabled={busy !== null} onchange={(event) => setKept(host, event.currentTarget)} />Keep connected</label>{/if}</div>{/each}</div>{/if}</details>
       <details class="section" ontoggle={(event) => (mirrorsOpen = event.currentTarget.open)}><summary>Project mirrors and privacy</summary>{#if mirrorsOpen}<MirrorSettings visible={visible && mirrorsOpen} />{/if}</details>
+      <details class="section how-it-works"><summary>How Pro works</summary><div class="section-body">{@render howItWorks()}</div></details>
     {/if}
 
     {#if status.signed_in}
@@ -196,58 +232,94 @@
 </section>
 
 <style>
-  .pro { box-sizing: border-box; max-width: 780px; margin: 0 auto; padding: 36px 32px 48px; color: var(--fg); font-size: var(--text-md); }
-  .heading { max-width: 620px; margin-bottom: 26px; }
-  .brand { display: flex; align-items: center; gap: 9px; font-size: 22px; font-weight: 600; letter-spacing: -.5px; }
-  .product { font-size: var(--text-sm); font-weight: 500; color: var(--muted); margin-left: 3px; padding-left: 12px; border-left: 1px solid var(--edge); letter-spacing: 0; }
-  .eyebrow { color: var(--muted); font-size: var(--text-xs); margin: 24px 0 9px; }
-  h1 { font-size: clamp(24px, 3vw, 31px); font-weight: 600; letter-spacing: -.7px; line-height: 1.2; margin: 0 0 12px; }
-  h2 { font-size: var(--text-lg); font-weight: 600; margin: 0; }
-  p { line-height: 1.6; margin: 10px 0; }
-  .lede, .muted { color: var(--muted); }
+  .pro { box-sizing: border-box; max-width: 940px; margin: 0 auto; padding: 44px 42px 64px; color: var(--fg); font-size: var(--text-md); }
+  .heading { max-width: 660px; margin-bottom: 36px; }
+  .subscriber .heading { margin-bottom: 20px; }
+  .subscriber .brand { margin-bottom: 0; }
+  .how-it-works .workflow { margin-bottom: 5px; }
+  .brand { display: flex; align-items: center; gap: 10px; margin-bottom: 30px; font-size: 23px; font-weight: 600; letter-spacing: -.65px; }
+  .product { margin-left: 4px; padding-left: 14px; border-left: 1px solid var(--edge); color: var(--muted); font-size: var(--text-md); font-weight: 450; letter-spacing: 0; }
+  h1 { margin: 0 0 15px; font-size: clamp(28px, 3.2vw, 36px); font-weight: 560; letter-spacing: -1px; line-height: 1.18; }
+  h2 { margin: 0; font-size: calc(var(--text-lg) + 2px); font-weight: 560; letter-spacing: -.3px; }
+  h3 { margin: 19px 0 11px; font-size: var(--text-lg); font-weight: 560; letter-spacing: -.2px; }
+  p { margin: 10px 0; line-height: 1.65; }
+  .lede { max-width: 56ch; margin: 0; font-size: var(--text-lg); color: var(--muted); line-height: 1.7; }
+  .intro-plans { margin-top: 20px; }
+  .plans { scroll-margin-top: 20px; }
+  .plans:focus { outline: none; }
+  .muted { color: var(--muted); }
   .small { font-size: var(--text-sm); }
-  button { display: inline-flex; justify-content: center; align-items: center; gap: 7px; padding: 9px 14px; border: 1px solid transparent; border-radius: 7px; font: inherit; cursor: pointer; background: var(--fg); color: var(--bg); }
+  .section-label { display: block; color: var(--muted); font-size: var(--text-xs); font-weight: 550; letter-spacing: .065em; text-transform: uppercase; }
+  .workflow { margin-bottom: 38px; }
+  .steps { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; list-style: none; margin: 15px 0 0; padding: 0; }
+  .steps li { padding: 23px 21px 21px; border: 1px solid var(--edge); border-radius: 10px; background: color-mix(in srgb, var(--fg) 1.5%, var(--bg)); }
+  .step-number { color: var(--muted); font-size: var(--text-xs); font-variant-numeric: tabular-nums; letter-spacing: .08em; }
+  .steps p { margin: 0; color: var(--muted); font-size: var(--text-sm); line-height: 1.75; }
+  .workflow-note { max-width: 84ch; margin: 16px 0 0; color: var(--muted); font-size: var(--text-xs); line-height: 1.7; }
+  button { display: inline-flex; justify-content: center; align-items: center; gap: 7px; padding: 10px 16px; border: 1px solid transparent; border-radius: 7px; background: var(--fg); color: var(--bg); font: inherit; font-size: var(--text-sm); font-weight: 500; cursor: pointer; }
   button:hover:not(:disabled) { opacity: .85; }
   button:disabled { opacity: .5; cursor: default; }
   button:focus-visible, summary:focus-visible, input:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 3px; }
   .secondary { background: transparent; border-color: var(--edge); color: var(--fg); }
-  .text-button { border: 0; padding: 3px 0; background: transparent; color: var(--accent); font-size: var(--text-sm); }
-  .identity { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-bottom: 22px; padding: 14px 0; border-bottom: 1px solid var(--edge); }
+  .text-button { padding: 3px 0; border: 0; background: transparent; color: var(--fg); font-size: var(--text-sm); font-weight: 450; text-decoration: underline; text-decoration-color: var(--edge); text-underline-offset: 4px; }
+  .identity { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-bottom: 25px; padding: 17px 0; border-top: 1px solid var(--edge); border-bottom: 1px solid var(--edge); }
   .identity > div { flex: 1 1 220px; min-width: 0; }
   .email { overflow-wrap: anywhere; }
   .identity .small, .row .small { display: block; margin-top: 4px; }
-  .panel { border: 1px solid var(--edge); border-radius: 12px; padding: 20px; margin: 18px 0; }
-  .section-heading { display: flex; align-items: center; justify-content: space-between; gap: 14px; flex-wrap: wrap; }
-  .interval { display: flex; gap: 3px; padding: 3px; background: var(--row-hover); border-radius: 7px; }
-  .interval button { background: transparent; color: var(--muted); padding: 6px 8px; font-size: var(--text-sm); }
-  .interval .chosen { background: var(--bg); color: var(--fg); border-color: var(--edge); }
-  .interval span { font-size: var(--text-xs); color: var(--accent); }
-  .plan-options { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr)); gap: 12px; margin-top: 18px; }
-  .plan-card { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; text-align: left; color: var(--fg); background: transparent; border-color: var(--edge); padding: 20px; }
-  .plan-card.selected { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 5%, var(--bg)); }
-  .plan-name { font-weight: 600; font-size: var(--text-lg); }
-  .price { font-size: 29px; font-weight: 600; letter-spacing: -.6px; margin: 7px 0; }
-  .price span { font-size: var(--text-sm); font-weight: 400; color: var(--muted); letter-spacing: 0; }
-  .plan-detail { font-size: var(--text-sm); }
-  .plan-note { font-size: var(--text-xs); color: var(--muted); margin-top: 7px; }
-  .benefits { display: flex; flex-wrap: wrap; gap: 8px 24px; padding: 0 0 0 17px; margin: 20px 0; color: var(--muted); font-size: var(--text-sm); line-height: 1.6; }
-  .purchase { margin-top: 20px; }
-  .purchase p { max-width: 55ch; }
-  .free-note { font-size: var(--text-sm); color: var(--muted); border-top: 1px solid var(--edge); padding-top: 16px; margin-top: 24px; }
-  .notice { background: color-mix(in srgb, var(--accent) 7%, transparent); }
-  .message { border-radius: 7px; padding: 12px; }
-  progress { width: 100%; height: 5px; accent-color: var(--accent); }
-  .section { border-top: 1px solid var(--edge); margin-top: 14px; }
-  summary { color: var(--muted); padding: 17px 0; cursor: pointer; font-size: var(--text-md); }
+  .panel { margin: 20px 0; padding: 24px; border: 1px solid var(--edge); border-radius: 10px; }
+  .section-heading { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 18px; }
+  .plan-heading p { margin-bottom: 0; }
+  .interval { display: flex; flex: none; gap: 3px; padding: 3px; border: 1px solid var(--edge); border-radius: 8px; }
+  .interval button { padding: 7px 10px; background: transparent; color: var(--muted); font-size: var(--text-sm); }
+  .interval .chosen { background: var(--row-hover); color: var(--fg); }
+  .interval span { margin-left: 2px; color: var(--muted); font-size: var(--text-xs); font-weight: 400; }
+  .plan-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin-top: 24px; }
+  .plan-card { display: flex; align-items: flex-start; flex-direction: column; gap: 0; padding: 24px; border-color: var(--edge); border-radius: 10px; background: transparent; color: var(--fg); text-align: left; }
+  .plan-card:hover:not(:disabled) { opacity: 1; background: var(--row-hover); }
+  .plan-card.selected { border-color: color-mix(in srgb, var(--fg) 48%, var(--edge)); background: color-mix(in srgb, var(--fg) 2.5%, var(--bg)); }
+  .plan-top { display: flex; align-items: center; justify-content: space-between; width: 100%; gap: 12px; }
+  .plan-name { font-size: calc(var(--text-lg) + 2px); font-weight: 600; }
+  .selection-mark { box-sizing: border-box; width: 15px; height: 15px; flex: none; border: 1px solid var(--edge); border-radius: 50%; }
+  .selected .selection-mark { border: 4px solid var(--fg); }
+  .plan-purpose { margin-top: 18px; font-size: var(--text-md); font-weight: 550; }
+  .plan-detail { flex: 1; margin-top: 8px; color: var(--muted); font-size: var(--text-sm); font-weight: 400; line-height: 1.7; }
+  .plan-price { display: flex; align-items: baseline; gap: 7px; margin-top: 24px; }
+  .price { font-size: 32px; font-weight: 550; letter-spacing: -.8px; }
+  .price-period { color: var(--muted); font-size: var(--text-sm); font-weight: 400; }
+  .plan-note { margin-top: 7px; color: var(--muted); font-size: var(--text-xs); font-weight: 400; }
+  .included { padding: 24px 0; border-bottom: 1px solid var(--edge); }
+  .included ul { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 30px; padding-left: 16px; margin: 14px 0 0; font-size: var(--text-sm); line-height: 1.6; }
+  .included li::marker { color: var(--muted); font-size: .7em; }
+  .purchase { display: flex; align-items: center; gap: 22px; margin-top: 23px; }
+  .purchase > button { flex: none; }
+  .purchase p { max-width: 44ch; margin: 0; font-size: var(--text-xs); }
+  .account-link { margin-top: 18px; }
+  .free-note { margin-top: 30px; padding-top: 22px; border-top: 1px solid var(--edge); color: var(--muted); font-size: var(--text-sm); }
+  .free-note strong { display: block; color: var(--fg); font-weight: 500; margin-bottom: 3px; }
+  .notice { background: color-mix(in srgb, var(--accent) 5%, transparent); }
+  .message { border-radius: 7px; padding: 12px 15px; }
+  .plan-current .section-label { margin-bottom: 8px; }
+  .plan-current .section-heading p { margin-bottom: 0; }
+  .usage-details { margin-top: 20px; border-top: 1px solid var(--edge); }
+  .usage-details summary { padding: 15px 0 0; font-size: var(--text-sm); }
+  .usage-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 28px; margin-top: 24px; }
+  .usage-label { color: var(--muted); font-size: var(--text-sm); }
+  .usage-value { margin: 8px 0; font-size: var(--text-sm); }
+  .usage-value strong { font-size: 23px; font-weight: 500; }
+  .usage-value span { color: var(--muted); }
+  .usage-note { margin: 16px 0 0; font-size: var(--text-xs); }
+  progress { width: 100%; height: 4px; accent-color: var(--fg); }
+  .section { margin-top: 14px; border-top: 1px solid var(--edge); }
+  summary { padding: 18px 0; color: var(--muted); font-size: var(--text-md); cursor: pointer; }
   summary:hover { color: var(--fg); }
   .section-body { padding-bottom: 14px; }
   .row { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; padding: 10px 0; }
   .row > div { min-width: 0; overflow-wrap: anywhere; }
-  .keep { display: flex; gap: 7px; align-items: center; font-size: var(--text-sm); }
+  .keep { display: flex; align-items: center; gap: 7px; font-size: var(--text-sm); }
   input { accent-color: var(--accent); }
-  .actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px; margin: 14px 0; }
-  .error { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; padding: 14px; margin-top: 18px; background: color-mix(in srgb, var(--warn) 8%, transparent); color: var(--warn); border-radius: 8px; }
+  .actions { display: flex; align-items: center; flex-wrap: wrap; gap: 10px 16px; margin: 14px 0; }
+  .error { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-top: 18px; padding: 15px; border-radius: 8px; background: color-mix(in srgb, var(--warn) 8%, transparent); color: var(--warn); }
   .error span { flex: 1; min-width: 160px; }
-  @media (max-width: 520px) { .pro { padding: 24px 18px 36px; } .plan-card { padding: 15px 12px; } .identity { flex-wrap: wrap; } .panel { padding: 16px; } .brand { font-size: 20px; } }
-  @media (max-width: 340px) { .plan-options { grid-template-columns: 1fr; } }
+  @media (max-width: 760px) { .pro { padding: 30px 25px 44px; } .steps { grid-template-columns: 1fr; gap: 10px; } .steps li { display: grid; grid-template-columns: 24px 1fr; column-gap: 14px; padding: 20px; } .step-number { padding-top: 3px; grid-row: 1 / 3; } .steps h3 { margin: 0 0 7px; } .steps p { grid-column: 2; } .purchase { align-items: flex-start; flex-direction: column; gap: 12px; } }
+  @media (max-width: 520px) { .pro { padding: 26px 20px 36px; } .heading { margin-bottom: 27px; } .brand { margin-bottom: 24px; font-size: 21px; } .plan-options, .included ul, .usage-grid { grid-template-columns: 1fr; } .plan-card, .panel { padding: 21px; } .interval { width: 100%; } .interval button { flex: 1; } .workflow { margin-bottom: 28px; } .plan-price { margin-top: 20px; } }
 </style>

@@ -1,7 +1,8 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import BrandMark from "../shared/BrandMark.svelte";
-  import PlanBadge from "../shared/PlanBadge.svelte";
+  import HomeNavigation from "./HomeNavigation.svelte";
+  import HomeActions from "./HomeActions.svelte";
+  import { isMac } from "../shared/keys";
   import { paidPlan } from "../net/plan";
   import { isBrowserGateway } from "../net/base";
   import ComputeLaunchDialog from "./ComputeLaunchDialog.svelte";
@@ -832,28 +833,8 @@
 </script>
 
 <div class="home">
-  {#if health !== null}
-    <!-- The mark identifies the DAEMON serving this window (the daemon
-         outlives app reinstalls by design, so this is the version that
-         actually matters — and a dev daemon must say so instead of posing
-         as an ordinary "v0.0.1"). A click is an explicit update check: the
-         toast answers it, "up to date" or "development build" included. -->
-    <button
-      class="version-mark"
-      class:newer={stampNewer !== null}
-      title={stampTitle}
-      onpointerenter={() => (stampNow = Date.now())}
-      onclick={() => void checkForUpdates(true)}
-    >
-      {#if health.version === "0.0.1"}daemon dev·{(health.build ?? "unknown").split(".")[0]}{:else}v{health.version}{/if}{#if stampNewer !== null}<span class="newer-tag"
-          >{` · ${stampNewer} available`}</span
-        >{/if}
-    </button>
-  {/if}
-  <nav class="home-settings" aria-label="Account and settings">
-    {#if native || isBrowserGateway()}<button onclick={onPro}>Chimaera Pro</button>{/if}
-    <button onclick={onSettings} title="Settings ({keyHint("settings")})">Settings</button>
-  </nav>
+  <HomeNavigation active="workspaces" plan={$paidPlan} showPro={native || isBrowserGateway()}
+    onHome={() => { if (showBackToHome) void backToHome(); }} {onPro} {onSettings} />
   <div class="inner">
     <header class="masthead">
       <div class="masthead-leading">
@@ -872,38 +853,15 @@
             <span>Home</span>
           </button>
         {/if}
-        <div class="brand">
-          <BrandMark size={24} draw title="chimaera" />
-          <h1>chimaera</h1>
-          <PlanBadge plan={$paidPlan} />
+        <div class="welcome">
+          <h1>{ownAlias === null ? "Workspaces" : hostLabel}</h1>
+          <p>{ownAlias === null ? "Pick up where you left off." : "Workspaces and sessions on this machine."}</p>
         </div>
       </div>
-      <div class="where" title={health?.hostname}>
-        <span class="host-label">{hostLabel}</span>
-        {#if health !== null && health.hostname !== hostLabel}
-          <span class="hostname">{health.hostname}</span>
-        {/if}
-        {#if ownAlias !== null}
-          <span
-            class="remote-status"
-            class:online={daemonReachable}
-            role="status"
-            title={daemonReachable
-              ? `${hostLabel} daemon is reachable`
-              : `${hostLabel} daemon is not currently reachable`}
-          >
-            <span class="daemon-dot" class:ok={daemonReachable} aria-hidden="true"></span>
-            {daemonReachable ? "online" : "offline"}
-          </span>
-        {:else}
-          <span
-            class="daemon-dot"
-            class:ok={daemonReachable}
-            title={daemonReachable ? "local daemon is online" : "local daemon is offline"}
-            aria-label={daemonReachable ? "local daemon online" : "local daemon offline"}
-          ></span>
-        {/if}
-      </div>
+      <button class="cta open-folder" onclick={onOpenFolder}>
+        <svg viewBox="0 0 20 20" width="17" height="17" aria-hidden="true"><path d="M2.5 5.5h5l2 2h8v9h-15zM2.5 5.5v-2h5l2 2h6v2" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" /></svg>
+        Open folder <kbd>{keyHint("picker")}</kbd>
+      </button>
       {#if native && hostLabel === "local" && localState?.outdated}
         <div class="update-line" title={buildNote(localState.build)}>
           <span>daemon is an older build —</span>
@@ -936,23 +894,29 @@
       <ComputeBanner self={$computeStatus.self} receivedAt={$computeStatus.received_at_ms} />
     {/if}
 
-    <section>
+    <section class="workspaces" aria-label="Workspaces on this machine">
       <div class="sec-head">
-        <span class="sec-title">workspaces</span>
-        <button class="ghost" onclick={onOpenFolder}
-          >open a folder… <kbd>{keyHint("picker")}</kbd></button
-        >
+        <h2 class="sec-title">{ownAlias === null ? (native && isMac ? "This Mac" : "This computer") : "On this machine"}</h2>
+        <div class="where" title={health?.hostname}>
+          {#if health !== null}<span class="hostname">{health.hostname}</span>{/if}
+          <span class="remote-status" class:online={daemonReachable} role="status">
+            <span class="daemon-dot" class:ok={daemonReachable} aria-hidden="true"></span>
+            {daemonReachable ? "Online" : "Offline"}
+          </span>
+        </div>
       </div>
+      {#if !daemonReachable}<p class="offline-note" role="status">Connection interrupted. Your workspaces will reconnect when this machine is available.</p>{/if}
       {#if sorted.length === 0}
         <div class="blank">
-          <p>Nothing here yet — open a folder to start terminals and agents in it.</p>
-          <button class="cta" onclick={onOpenFolder}>Open a folder</button>
+          <h3>A folder is your workspace.</h3>
+          <p>Open a project to start terminals and agents together. Your files stay where they are.</p>
+          <button class="cta" onclick={onOpenFolder}>Open folder</button>
         </div>
       {:else}
         <div class="rows">
           {#each sorted as w (w.id)}
             {@const live = liveByWs.get(w.id)}
-            {@const wsState = live && live.attn > 0 ? "attn" : live && live.live > 0 ? "alive" : ""}
+            {@const wsState = !daemonReachable ? "" : live && live.attn > 0 ? "attn" : live && live.live > 0 ? "alive" : ""}
             {#if confirmStopId === w.id}
               <div class="row confirm" role="alertdialog" aria-label="end sessions?">
                 <span class="name">{w.name}</span>
@@ -964,7 +928,7 @@
                   onclick={() => {
                     confirmStopId = null;
                     onStop(w);
-                  }}>end sessions</button
+                  }}>End sessions</button
                 >
                 <button class="confirm-no" onclick={() => (confirmStopId = null)}>cancel</button>
               </div>
@@ -982,54 +946,49 @@
                 <button class="confirm-no" onclick={() => (confirmRemoveId = null)}>cancel</button>
               </div>
             {:else}
-              <div class="rowwrap" role="presentation" class:live={wsState === "alive"} class:attn={wsState === "attn"}>
+              <div class="rowwrap workspace-row" role="presentation" class:live={wsState === "alive"} class:attn={wsState === "attn"}>
                 <button class="row" title={w.root} onclick={(e) => openRow(e, w)}>
                   <span
                     class="dot {wsState}"
-                    title={wsState === "attn"
+                    title={!daemonReachable ? "Last known session state — this machine is offline" : wsState === "attn"
                       ? `${live?.attn} awaiting approval`
                       : wsState === "alive"
                         ? `${live?.live} live session${live?.live === 1 ? "" : "s"}`
                         : "no live sessions"}
                   ></span>
-                  <span class="name">{w.name}</span>
-                  <span class="path">{tildify(w.root)}</span>
-                  {#if live !== undefined && live.attn > 0}
-                    <span class="badge attn" title="{live.attn} awaiting approval">
-                      <span class="dot attn"></span>{live.attn}
-                    </span>
-                  {/if}
-                  {#if live !== undefined && live.live > 0}
-                    <span
-                      class="badge"
-                      title="{live.live} live session{live.live === 1 ? '' : 's'}"
-                    >
-                      <span class="dot alive"></span>{live.live}
-                    </span>
-                  {/if}
-                  <span class="when">{ago(w.last_opened_at)}</span>
+                  <span class="workspace-label"><span class="name">{w.name}</span><span class="path">{tildify(w.root)}</span></span>
+                  <span class="workspace-meta">
+                    {#if live !== undefined && live.attn > 0}
+                      <span class="session-state" class:attention={daemonReachable} class:stale={!daemonReachable}>{live.attn} {daemonReachable ? "awaiting approval" : `approval${live.attn === 1 ? "" : "s"} last seen`}</span>
+                    {:else if live !== undefined && live.live > 0}
+                      <span class="session-state" class:stale={!daemonReachable}>{live.live} {daemonReachable ? "live " : ""}session{live.live === 1 ? "" : "s"}{daemonReachable ? "" : " last seen"}</span>
+                    {/if}
+                    <span class="when">{ago(w.last_opened_at)}</span>
+                  </span>
                 </button>
-                {#if live !== undefined && live.live > 0}
+                <HomeActions label={`Actions for ${w.name}`}>
+                  {#if live !== undefined && live.live > 0}
+                    <button
+                      class="side stop"
+                      title="end this workspace's {live.live} running session{live.live === 1
+                        ? ''
+                        : 's'}"
+                      onclick={() => (confirmStopId = w.id)}>End sessions</button
+                    >
+                  {/if}
+                  {#if !jobScoped}
+                    <button
+                      class="side"
+                      title="open in a new window"
+                      onclick={() => void openWindow(ownAlias, w.id, true)}>Open in new window</button
+                    >
+                  {/if}
                   <button
-                    class="side stop shown"
-                    title="end this workspace's {live.live} running session{live.live === 1
-                      ? ''
-                      : 's'}"
-                    onclick={() => (confirmStopId = w.id)}>stop</button
+                    class="side x"
+                    title="remove from this list (folder untouched)"
+                    onclick={() => (confirmRemoveId = w.id)}>Remove from list</button
                   >
-                {/if}
-                {#if !jobScoped}
-                  <button
-                    class="side"
-                    title="open in a new window"
-                    onclick={() => void openWindow(ownAlias, w.id, true)}>new window</button
-                  >
-                {/if}
-                <button
-                  class="side x"
-                  title="remove from this list (folder untouched)"
-                  onclick={() => (confirmRemoveId = w.id)}>&times;</button
-                >
+                </HomeActions>
               </div>
             {/if}
           {/each}
@@ -1064,7 +1023,7 @@
            launched and managed; the local home screen only counts them. -->
       <section>
         <div class="sec-head">
-          <span class="sec-title">compute sessions</span>
+          <h2 class="sec-title">Compute sessions</h2>
           <span class="sec-acts">
             <button class="ghost" onclick={() => (launchOpen = true)}
               >new compute session…</button
@@ -1182,21 +1141,18 @@
       </section>
     {/if}
 
-    {#if native && ownAlias === null && $paidPlan !== null}
-      <CloudProjects onOpen={onOpen} knownIds={workspaces.map(workspace => workspace.id)} />
-    {/if}
 
     {#if ownAlias === null}
-      <section>
+      <section class="remotes" aria-label="Remote machines">
         <div class="sec-head">
-          <span class="sec-title">remote hosts</span>
+          <h2 class="sec-title">Remote machines</h2>
           {#if native}
             <button
               class="ghost"
               onclick={() => {
                 addOpen = !addOpen;
                 addError = null;
-              }}>add a host…</button
+              }}>Add machine</button
             >
           {/if}
         </div>
@@ -1219,7 +1175,8 @@
               <input
                 class="add-input"
                 bind:value={addAlias}
-                placeholder="ssh alias or user@host (from your ~/.ssh/config)"
+                aria-label="SSH alias or user at host"
+                placeholder="SSH alias or user@host"
                 spellcheck="false"
                 autocomplete="off"
                 autofocus
@@ -1231,7 +1188,7 @@
                 }}
               />
               <button class="cta small" type="submit" disabled={addAlias.trim() === ""}
-                >connect</button
+                >Connect</button
               >
             </form>
             {#if addError !== null}
@@ -1241,8 +1198,7 @@
 
           {#if hosts.length === 0 && !addOpen}
             <p class="hint">
-              No remotes yet. Add your cluster's ssh alias — chimaera installs its own daemon in
-              <code>~/.chimaera{localState?.dev_build ? "-dev" : ""}</code> over ssh, no root needed.
+              Connect a server or cluster using its SSH alias. Sessions keep running there when you disconnect.
             </p>
           {:else}
             <div class="rows">
@@ -1252,6 +1208,7 @@
                 {@const ws = remoteWs.get(h.alias)}
                 {@const compCount = computeCount(h.alias)}
                 {@const comp = remoteCompute.get(h.alias)}
+                <div class="host-card">
                 {#if confirmShutdown === h.alias}
                   <div class="row confirm strong" role="alertdialog" aria-label="shut down host?">
                     <span class="name">{h.alias}</span>
@@ -1260,7 +1217,7 @@
                         ? ""
                         : "s"} and stop the daemon?</span
                     >
-                    <button class="confirm-yes" onclick={() => void shutdown(h.alias)}>shut down</button
+                    <button class="confirm-yes" onclick={() => void shutdown(h.alias)}>Shut down</button
                     >
                     <button class="confirm-no" onclick={() => (confirmShutdown = null)}>cancel</button>
                   </div>
@@ -1273,7 +1230,7 @@
                         : "s"}? (the daemon keeps running)</span
                     >
                     <button class="confirm-yes" onclick={() => void endSessions(h.alias)}
-                      >end sessions</button
+                      >End sessions</button
                     >
                     <button class="confirm-no" onclick={() => (confirmEnd = null)}>cancel</button>
                   </div>
@@ -1285,7 +1242,7 @@
                     <button class="confirm-no" onclick={() => (confirmForget = null)}>cancel</button>
                   </div>
                 {:else}
-                  <div class="rowwrap" role="presentation" class:connected={h.status === "connected"}>
+                  <div class="rowwrap host-row" role="presentation" class:connected={h.status === "connected"}>
                     <button
                       class="row"
                       title={h.status === "connected"
@@ -1309,63 +1266,41 @@
                             ? "connecting…"
                             : "not connected"}
                       ></span>
-                      <span class="name">{h.alias}</span>
-                      {#if h.via_pro}
-                        <span class="via-pro" title="Connected through Chimaera Pro">via Pro</span>
-                      {/if}
-                      {#if localState?.dev_build}
-                        <span
-                          class="pill-dev"
-                          title="dev build — every connection targets this machine's own build in ~/.chimaera-dev on {h.alias}; the real daemon there is untouched"
-                          >dev</span
-                        >
-                      {/if}
-                      {#if phase !== undefined}
-                        <span class="phase">{phase}</span>
-                      {:else if h.status === "connected" && h.node}
-                        <span
-                          class="phase quiet"
-                          title="{h.alias} spans several login nodes; its daemon runs on {h.node}, so this connection is pinned there"
-                          >online · {shortNode(h.node)} · 127.0.0.1:{h.local_port}</span
-                        >
-                      {:else if h.status === "connected"}
-                        <span class="phase quiet">online · 127.0.0.1:{h.local_port}</span>
-                      {:else}
-                        <span class="when">{ago(h.last_connected_at)}</span>
-                      {/if}
-                      {#if h.status === "connected" && (h.live_sessions ?? 0) > 0}
-                        <span
-                          class="badge"
-                          title="{h.live_sessions} live session{h.live_sessions === 1
-                            ? ''
-                            : 's'} on {h.alias}"
-                        >
-                          <span class="dot alive"></span>{h.live_sessions}
+                      <span class="workspace-label">
+                        <span class="host-name"><span class="name">{h.alias}</span>{#if h.via_pro}<span class="via-pro" title="Connected through Chimaera Pro">via Pro</span>{/if}{#if localState?.dev_build}<span class="pill-dev" title="Isolated development daemon">dev</span>{/if}</span>
+                        <span class="phase quiet">
+                          {#if phase !== undefined}{phase}
+                          {:else if h.status === "connected"}Connected{#if h.node} · {shortNode(h.node)}{/if}{#if (h.live_sessions ?? 0) > 0} · {h.live_sessions} live session{h.live_sessions === 1 ? "" : "s"}{/if}
+                          {:else if h.status === "connecting"}Connecting…
+                          {:else}Not connected{#if h.last_connected_at} · Last connected {ago(h.last_connected_at)}{/if}{/if}
                         </span>
-                      {/if}
+                      </span>
+                      <span class="host-open">{h.status === "connected" ? "Open" : h.status === "connecting" ? "" : "Connect"}<span aria-hidden="true"> →</span></span>
                     </button>
-                    {#if h.status === "connected"}
-                      {#if (h.live_sessions ?? 0) > 0}
+                    <HomeActions label={`Actions for ${h.alias}`}>
+                      {#if h.status === "connected"}
+                        {#if (h.live_sessions ?? 0) > 0}
+                          <button
+                            class="side"
+                            title="end all sessions on {h.alias} — the daemon keeps running"
+                            onclick={() => (confirmEnd = h.alias)}>End sessions</button
+                          >
+                        {/if}
                         <button
                           class="side"
-                          title="end all sessions on {h.alias} — the daemon keeps running"
-                          onclick={() => (confirmEnd = h.alias)}>end sessions</button
+                          title="close the tunnel — sessions keep running on {h.alias}"
+                          onclick={() => void disconnect(h.alias)}>Disconnect</button
+                        >
+                        <button
+                          class="side stop"
+                          title="shut down {h.alias} — end all sessions and stop the daemon"
+                          onclick={() => (confirmShutdown = h.alias)}>Shut down</button
                         >
                       {/if}
-                      <button
-                        class="side"
-                        title="close the tunnel — sessions keep running on {h.alias}"
-                        onclick={() => void disconnect(h.alias)}>disconnect</button
+                      <button class="side x" title="forget host" onclick={() => (confirmForget = h.alias)}
+                        >Forget machine</button
                       >
-                      <button
-                        class="side stop"
-                        title="shut down {h.alias} — end all sessions and stop the daemon"
-                        onclick={() => (confirmShutdown = h.alias)}>shut down</button
-                      >
-                    {/if}
-                    <button class="side x" title="forget host" onclick={() => (confirmForget = h.alias)}
-                      >&times;</button
-                    >
+                    </HomeActions>
                   </div>
                   {#if err !== undefined}
                     <div class="err-line">{err}</div>
@@ -1438,18 +1373,42 @@
                       {/if}
                       <div class="rowwrap" role="presentation">
                         <button class="row sub browse" onclick={() => void navigateHost(h.alias)}>
-                          <span class="name">browse {h.alias}…</span>
+                          <span class="name">Open {h.alias}</span><span aria-hidden="true">→</span>
                         </button>
                       </div>
                     </div>
                   {/if}
                 {/if}
+                </div>
               {/each}
             </div>
           {/if}
         {/if}
       </section>
     {/if}
+    {#if native && ownAlias === null && $paidPlan !== null}
+      <CloudProjects onOpen={onOpen} knownIds={workspaces.map(workspace => workspace.id)} />
+    {/if}
+    <footer class="home-footer">
+  {#if health !== null}
+    <!-- The mark identifies the DAEMON serving this window (the daemon
+         outlives app reinstalls by design, so this is the version that
+         actually matters — and a dev daemon must say so instead of posing
+         as an ordinary "v0.0.1"). A click is an explicit update check: the
+         toast answers it, "up to date" or "development build" included. -->
+    <button
+      class="version-mark"
+      class:newer={stampNewer !== null}
+      title={stampTitle}
+      onpointerenter={() => (stampNow = Date.now())}
+      onclick={() => void checkForUpdates(true)}
+    >
+      {#if health.version === "0.0.1"}daemon dev·{(health.build ?? "unknown").split(".")[0]}{:else}v{health.version}{/if}{#if stampNewer !== null}<span class="newer-tag"
+          >{` · ${stampNewer} available`}</span
+        >{/if}
+    </button>
+  {/if}
+    </footer>
   </div>
 
   {#if launchOpen && isHostPage}
@@ -1466,21 +1425,6 @@
 </div>
 
 <style>
-  .home-settings {
-    position: absolute;
-    right: 20px;
-    bottom: 18px;
-    border: 0;
-    background: transparent;
-    color: var(--muted);
-    font: inherit;
-    cursor: pointer;
-  }
-  .home-settings { display: flex; flex-direction: column; gap: 8px; align-items: flex-end; }
-  .home-settings button { color: var(--muted); border: 0; background: var(--bg); border-radius: 5px; padding: 4px 8px; font: inherit; cursor: pointer; }
-  .home-settings button:hover { color: var(--fg); }
-  .home-settings button:focus-visible { outline: 2px solid var(--focus-ring); }
-
   .via-pro {
     flex: none;
     font-size: var(--text-xs);
@@ -1488,37 +1432,14 @@
     white-space: nowrap;
   }
 
-  .home {
-    position: absolute;
-    inset: 0;
-    overflow-y: auto;
-    background: var(--bg);
-  }
-
-  .inner {
-    max-width: 640px;
-    margin: 0 auto;
-    padding: clamp(24px, 10vh, 96px) 24px 64px;
-    display: flex;
-    flex-direction: column;
-    gap: 36px;
-  }
-
-  .masthead {
-    display: flex;
-    align-items: baseline;
-    justify-content: space-between;
-    gap: 16px;
-    flex-wrap: wrap;
-  }
-
-  .masthead-leading {
-    display: flex;
-    align-items: center;
-    gap: 14px;
-    min-width: 0;
-  }
-
+  .home { position: absolute; inset: 0; display: flex; overflow: hidden; background: var(--bg); }
+  .inner { flex: 1; min-width: 0; overflow-y: auto; padding: 56px clamp(24px, 4vw, 64px) 24px; display: flex; flex-direction: column; gap: 36px; }
+  .inner > :global(*) { width: 100%; max-width: 860px; margin-left: auto; margin-right: auto; box-sizing: border-box; }
+  .masthead { display: flex; align-items: center; justify-content: space-between; gap: 20px; flex-wrap: wrap; margin-bottom: 8px; }
+  .masthead-leading { display: flex; flex-direction: column; align-items: flex-start; gap: 18px; min-width: 0; }
+  .welcome p { margin: 8px 0 0; color: var(--muted); font-size: var(--text-md); }
+  .open-folder { display: inline-flex; align-items: center; gap: 9px; white-space: nowrap; }
+  .open-folder kbd { margin-left: 8px; }
   .back-home {
     appearance: none;
     border: none;
@@ -1593,12 +1514,6 @@
     color: var(--muted);
   }
 
-  .brand {
-    display: flex;
-    align-items: center;
-    gap: 9px;
-  }
-
   /* Quiet running-version stamp, pinned to the home screen's corner — a
      button (a click checks for updates) reset to plain text. */
   .version-mark {
@@ -1607,9 +1522,7 @@
     background: none;
     padding: 0;
     cursor: pointer;
-    position: fixed;
-    bottom: 12px;
-    right: 16px;
+    text-align: left;
     font-family: var(--mono);
     font-size: var(--text-xs);
     color: var(--muted);
@@ -1634,9 +1547,9 @@
 
   h1 {
     margin: 0;
-    font-size: calc(var(--text-lg) + 4px);
-    font-weight: 600;
-    letter-spacing: 0.01em;
+    font-size: clamp(24px, 3vw, 30px);
+    font-weight: 550;
+    letter-spacing: -0.035em;
   }
 
   .where {
@@ -1680,9 +1593,7 @@
     color: var(--accent);
   }
 
-  .host-label {
-    color: var(--fg);
-  }
+
 
   .hostname {
     overflow: hidden;
@@ -1701,14 +1612,16 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 0 8px 4px;
+    gap: 16px;
+    padding: 0 0 10px;
   }
 
   .sec-title {
-    font-size: var(--text-xs);
-    color: var(--muted);
-    text-transform: lowercase;
-    letter-spacing: 0.04em;
+    margin: 0;
+    font-size: var(--text-md);
+    font-weight: 550;
+    color: var(--fg);
+    letter-spacing: -0.01em;
   }
 
   .ghost {
@@ -1738,9 +1651,9 @@
   }
 
   .blank {
-    border: 1px dashed var(--edge);
-    border-radius: 8px;
-    padding: 28px 24px;
+    border: 1px solid var(--edge);
+    border-radius: 10px;
+    padding: 44px 24px;
     text-align: center;
     color: var(--muted);
     font-size: var(--text-md);
@@ -1785,6 +1698,7 @@
   .rows {
     display: flex;
     flex-direction: column;
+    gap: 5px;
   }
 
   .rowwrap {
@@ -1818,9 +1732,7 @@
 
   /* A connected host wears its alias in the accent — the same "this is live"
      language the rail uses for a remote window's host label. */
-  .rowwrap.connected > .row > .name {
-    color: var(--accent);
-  }
+
 
   .row {
     flex: 1;
@@ -1905,9 +1817,8 @@
     padding: 1px 8px 1px 6px;
   }
 
-  .badge.attn {
+  .session-state.attention {
     color: var(--warn);
-    border-color: color-mix(in srgb, var(--warn) 40%, transparent);
   }
 
   /* Session/host state dot. This is the home screen's at-a-glance liveness
@@ -1960,13 +1871,6 @@
     animation-play-state: paused;
   }
 
-  /* Inside a count pill the halo would clip against the border — the pill's
-     own tint already carries the state, so the inner dot stays flat. */
-  .badge .dot {
-    width: 6px;
-    height: 6px;
-    box-shadow: none;
-  }
 
   .when {
     flex: none;
@@ -1979,7 +1883,7 @@
 
   .side {
     flex: none;
-    visibility: hidden;
+    visibility: visible;
     appearance: none;
     border: none;
     background: none;
@@ -2004,17 +1908,6 @@
 
   .rowwrap:hover .side {
     visibility: visible;
-  }
-
-  /* The stop control stays visible for a running workspace (not hover-gated
-     like the others) — ending live work should never be a hidden gesture. */
-  .side.shown {
-    visibility: visible;
-    color: var(--warn);
-  }
-
-  .side.shown:hover {
-    color: var(--err);
   }
 
   .remote-ws {
@@ -2295,5 +2188,68 @@
     font-size: var(--text-sm);
     color: var(--err);
     white-space: pre-wrap;
+  }
+
+  .home-footer { margin-top: auto; padding-top: 18px; }
+  .workspaces .rows { border: 1px solid var(--edge); border-radius: 10px; padding: 5px; }
+  .workspace-row, .host-row { padding-right: 8px; }
+  .workspace-row .row, .host-row .row { padding: 14px 12px; gap: 14px; }
+  .workspace-label { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 5px; }
+  .workspace-label .name { max-width: none; font-family: inherit; font-weight: 550; font-size: var(--text-md); }
+  .workspace-label .path, .workspace-label .phase { flex: none; font-size: var(--text-xs); }
+  .workspace-meta { display: flex; flex-direction: column; align-items: flex-end; gap: 5px; flex: none; }
+  .session-state.stale { color: var(--muted); }
+  .session-state { font-size: var(--text-xs); color: var(--accent); }
+  .workspace-meta .when { font-family: inherit; font-size: var(--text-xs); }
+  .host-card { border: 1px solid var(--edge); border-radius: 10px; padding: 5px; }
+  .remotes .rows { gap: 10px; }
+  .host-name { display: flex; align-items: center; gap: 9px; min-width: 0; }
+  .host-name > .name { flex: 1 1 auto; min-width: 0; }
+  .host-open { flex: none; font-size: var(--text-sm); color: var(--muted); }
+  .host-open span { margin-left: 4px; }
+  .host-row.connected, .workspace-row.live { background: transparent; }
+  .host-row.connected:hover, .workspace-row.live:hover { background: var(--row-hover); }
+  .remote-ws { margin: 0 9px 7px 26px; padding: 6px 0 0 12px; border-color: var(--edge); }
+  .remote-ws .name { font-family: inherit; font-size: var(--text-sm); }
+  .remote-ws .path, .remote-ws .when { font-size: var(--text-xs); }
+  .remote-ws .row.sub { gap: 12px; }
+  .remote-ws .row.browse { justify-content: space-between; }
+  .blank h3 { margin: 0; color: var(--fg); font-size: var(--text-lg); font-weight: 500; letter-spacing: -.02em; }
+  .blank p { line-height: 1.6; }
+  .remotes > .hint { padding: 16px 18px; border: 1px solid var(--edge); border-radius: 10px; }
+  .offline-note { margin: 0 0 8px; font-size: var(--text-sm); line-height: 1.5; color: var(--muted); }
+  .confirm { flex-wrap: wrap; min-height: 58px; }
+  .confirm-label { min-width: 120px; line-height: 1.5; }
+  .add { padding: 10px 0; flex-wrap: wrap; }
+  .add-input { min-width: 160px; min-height: 34px; }
+  .side { min-height: 30px; }
+  .side.x { font: inherit; font-size: var(--text-sm); }
+  button:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
+  @media (max-width: 900px) {
+    .inner { padding-left: 24px; padding-right: 24px; }
+    .workspace-row .row { flex-wrap: wrap; gap: 10px; }
+    .workspace-row .workspace-label { flex-basis: calc(100% - 24px); }
+    .workspace-meta { flex-direction: row; margin-left: 17px; align-items: center; flex-wrap: wrap; }
+    .workspace-meta .when { margin-left: 0; }
+  }
+  @media (max-width: 700px) {
+    .home { flex-direction: column; }
+    .inner { padding: 24px 20px 20px; gap: 30px; }
+    .masthead { align-items: flex-start; gap: 20px; }
+    .where .hostname { display: none; }
+    .open-folder { padding: 9px 12px; }
+    .open-folder kbd { display: none; }
+    .host-row .row { padding: 12px 9px; gap: 10px; }
+    .host-open { font-size: var(--text-xs); }
+    .remote-ws { margin-left: 13px; padding-left: 9px; }
+    .remote-ws .row.sub { flex-wrap: wrap; gap: 5px 10px; }
+    .remote-ws .row.sub .name { max-width: 100%; }
+    .remote-ws .path { flex-basis: 100%; order: 1; }
+    .row.comp { flex-wrap: wrap; }
+    .row.comp .name { max-width: 100%; }
+    .row.comp .node { flex-basis: calc(100% - 24px); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .dot, .row.comp-count.checking, .probe-line, .ghost.refresh.spinning svg { animation: none; }
   }
 </style>

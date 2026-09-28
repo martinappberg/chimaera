@@ -21,7 +21,15 @@ Cloud setup controls are implemented; automatic handoff and browser access are b
    **Start again** opens a fresh sign-in and **Cancel sign-in** closes the request.
    An expired or failed request offers **Try again**. The browser confirms success
    only after the account is active in the app; keeper provisioning can finish later.
-3. The page shows the signed-in email and current plan. Without a plan, choose
+3. The page explains the workflow in three steps: work on the Mac, continue
+   compatible agents in the cloud, and pick up the project on the Mac again.
+   Provider sign-in and the limits of process handoff are stated alongside that
+   explanation. Local projects, agents and ordinary SSH remain free.
+   Plan cards lead with what Pro includes and how Max adds capacity; pricing is
+   visible before checkout; **See plans** jumps directly to the comparison. Active subscribers see account controls and cloud
+   readiness first, with the introduction under **How Pro works**. Numeric usage
+   and limits appear only in the active account's **Usage and plan details**, using the service's current values.
+   The page shows the signed-in email and current plan. Without a plan, choose
    Pro or Max and monthly or yearly billing, then continue to checkout in the
    system browser. Existing subscribers can open **Manage billing**. The app
    refreshes account state on return; a browser return alone never activates a
@@ -43,7 +51,7 @@ for a local integration run.
 
 ## Subscriber branding
 
-An active Pro or Max account wears a small plan badge beside the Home wordmark and in the workspace header. The dedicated Pro page and navigation entry use the same badge. The styling follows the current theme, and an unknown, signed-out or inactive plan shows no paid badge.
+An active Pro or Max account wears a small plan badge beside the Home wordmark and in the workspace header. The dedicated Pro page uses the same badge. The quiet navigation entry uses the Chimaera mark, an Active label for Pro, or the Max badge. The styling follows the current theme, and an unknown, signed-out or inactive plan shows no paid badge.
 
 The shared `web-ui/src/lib/net/plan.ts` store reads native `pro_status` and refreshes on `pro-changed` and visibility return. Account-browser windows instead make a bounded, same-origin `HEAD` request to their existing `/app/{host}/` index. Its optional `X-Chimaera-Plan` response header is `none`, `pro` or `max`, derived from the authenticated account's active or trialing subscription; an absent header or failed request leaves branding neutral. Index responses remain `Cache-Control: no-store`. The browser refreshes once per minute while visible and when returning to the page, without requesting or waking a keeper or worker. Ordinary daemon browser windows make no account request. The badge is presentation only and grants no capabilities.
 

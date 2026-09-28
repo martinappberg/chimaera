@@ -55,11 +55,11 @@
   </section>
 {/if}
 <style>
-  .cloud-projects { margin: 30px 0; }
+  .cloud-projects { margin: 0; }
   .heading { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
-  h2 { margin: 0; color: var(--muted); font-size: var(--text-xs); text-transform: uppercase; letter-spacing: .08em; font-weight: 600; }
+  h2 { margin: 0; color: var(--fg); font-size: var(--text-md); letter-spacing: -.01em; font-weight: 550; }
   .hint { color: var(--muted); font-size: var(--text-sm); line-height: 1.6; }
-  .project { display: flex; align-items: center; justify-content: space-between; gap: 14px; border-bottom: 1px solid var(--edge); padding: 13px 0; }
+  .project { display: flex; align-items: center; justify-content: space-between; gap: 14px; border: 1px solid var(--edge); border-radius: 10px; padding: 14px 16px; margin-top: 8px; }
   .project > div { display: flex; flex-direction: column; gap: 3px; min-width: 0; overflow-wrap: anywhere; }
   .name { font-size: var(--text-md); }
   button { background: transparent; color: var(--fg); border: 1px solid var(--edge); border-radius: 6px; padding: 6px 10px; font: inherit; font-size: var(--text-sm); cursor: pointer; flex: none; }
@@ -67,4 +67,5 @@
   button:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 3px; }
   .refresh { border: 0; color: var(--muted); }
   .error { color: var(--warn); font-size: var(--text-sm); }
+  @media (max-width: 480px) { .project { align-items: flex-start; flex-direction: column; gap: 10px; } }
 </style>
