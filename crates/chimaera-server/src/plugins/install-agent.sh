@@ -8,6 +8,14 @@ marketplace=$4
 plugin_id=$5
 install_verb=$6
 completion_file=$7
+# The directory of the git chimaera resolved (the Git binary path setting, or
+# the login shell's), empty when it found none new enough. First on PATH so
+# the agent's marketplace clone uses it, not an old system git.
+git_dir=${8:-}
+if [ -n "$git_dir" ]; then
+    PATH="$git_dir:$PATH"
+    export PATH
+fi
 
 finish() {
     install_status=$?
@@ -42,7 +50,7 @@ explain_claude_git_failure() {
     [ "$agent_name" = claude ] || return 0
     if ! command -v git >/dev/null 2>&1; then
         printf '%s\n' 'Claude needs Git to fetch this marketplace, but git is not on PATH.'
-        printf '%s\n' 'Add your Git setup command in Settings > Environment, then retry.'
+        printf '%s\n' 'Set Settings > Git binary path (or add your Git setup command in Settings > Environment), then retry.'
         return 0
     fi
     git_help=$(LC_ALL=C git clone -h 2>&1)
@@ -50,7 +58,7 @@ explain_claude_git_failure() {
         *shallow-submodules*) ;;
         *)
             printf 'Claude needs a Git that supports --shallow-submodules.\nFound: %s (%s).\n' "$(git --version 2>&1)" "$(command -v git)"
-            printf '%s\n' 'Load a newer Git in Settings > Environment for this host or workspace, then retry.'
+            printf '%s\n' 'Set Settings > Git binary path to a newer git (or load one in Settings > Environment), then retry.'
             ;;
     esac
 }

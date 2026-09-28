@@ -127,8 +127,8 @@ export function whereThingsStand(k: Knowledge, limit = 3): { finding: Finding; t
     .slice(0, limit);
 }
 
-function has(hay: string | undefined, q: string): boolean {
-  return hay !== undefined && hay.toLowerCase().includes(q);
+function has(hay: unknown, q: string): boolean {
+  return typeof hay === "string" && hay.toLowerCase().includes(q);
 }
 
 function hasAny(list: readonly string[] | undefined, q: string): boolean {
@@ -237,18 +237,36 @@ export function recentStatusMove(
   entries: readonly TimelineEntry[],
   nowMs: number,
 ): { text: string; tone: Tone } | null {
+  return statusMoves(entries, nowMs).get(findingId) ?? null;
+}
+
+/**
+ * Every finding's recent status move in ONE pass over the Timeline (newest
+ * first): its newest knowledge entry decides — a badge when within 24 h,
+ * nothing when older. The view asks per row; a scan per row was findings ×
+ * entries on every snapshot, Timeline page and minute tick.
+ */
+export function statusMoves(
+  entries: readonly TimelineEntry[],
+  nowMs: number,
+): Map<string, { text: string; tone: Tone } | null> {
   const dayAgo = nowMs - 86_400_000;
+  const out = new Map<string, { text: string; tone: Tone } | null>();
   for (const e of entries) {
-    if (e.kind !== "knowledge" || e.knowledge === undefined || e.knowledge.id !== findingId) continue;
-    if (e.ts < dayAgo) break;
+    if (e.kind !== "knowledge" || e.knowledge === undefined || out.has(e.knowledge.id)) continue;
+    if (e.ts < dayAgo) {
+      out.set(e.knowledge.id, null);
+      continue;
+    }
     const to = e.knowledge.to;
-    if (e.knowledge.change === "new") return { text: "new today", tone: "accent" };
-    return {
-      text: to === "contradicted" ? "contradicted today" : `now ${to}`,
-      tone: to === "contradicted" ? "err" : "accent",
-    };
+    out.set(
+      e.knowledge.id,
+      e.knowledge.change === "new"
+        ? { text: "new today", tone: "accent" }
+        : { text: to === "contradicted" ? "contradicted today" : `now ${to}`, tone: to === "contradicted" ? "err" : "accent" },
+    );
   }
-  return null;
+  return out;
 }
 
 /** Newest first: ISO dates sort lexically. */

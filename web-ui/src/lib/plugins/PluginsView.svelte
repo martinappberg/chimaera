@@ -12,6 +12,7 @@
    * one is shown), and the views swap in place below it, each in its own
    * scroller, so a switch never moves the chrome or loses a scroll position.
    */
+  import { untrack } from "svelte";
   import Segmented from "../shared/Segmented.svelte";
   import { pageVisible } from "../shared/visibility";
   import { getHostLabel } from "../net/api";
@@ -101,9 +102,13 @@
     }
     if (key === lastShown) return;
     lastShown = key;
-    refreshWorkspacePlugins();
-    if (view === "plugins") void loadAgentPlugins();
-    if (view === "skills") void loadSkills();
+    // The loads read and write the fetch state (and read the install
+    // continuation): untracked, so their own writes can't re-run this.
+    untrack(() => {
+      refreshWorkspacePlugins();
+      if (view === "plugins") void loadAgentPlugins();
+      if (view === "skills") void loadSkills();
+    });
   });
 
   const host = $derived(agentPlugins.data?.host || skills.data?.host || getHostLabel());

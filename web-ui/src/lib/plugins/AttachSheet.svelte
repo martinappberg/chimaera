@@ -255,6 +255,14 @@
           hooks.map((h) => ({ key: h.key, hash: h.hash })),
         );
         skipped = res.skipped;
+        if (skipped.length > 0) {
+          // A hook changed after it was shown: nothing past this step
+          // runs on a trust the user didn't give. Re-read the hooks so
+          // the list (and the next click) carries their current hashes.
+          await check();
+          busy = null;
+          return;
+        }
       }
       if (!plugin.on) await putWorkspacePlugin(wsId, pluginId, true);
       refreshWorkspacePlugins();
@@ -266,14 +274,15 @@
         return;
       }
       refreshKnowledge();
-      if (skipped.length === 0) {
-        clearContinuation();
-        onClose();
-      } else busy = null;
+      clearContinuation();
+      onClose();
     } catch (e) {
       error = isMissingRoute(e) ? "this daemon can't finish that step yet — update chimaera" : message(e);
-      busy = null;
       refreshWorkspacePlugins();
+      // Steps before the failure may have landed (hooks trusted, switched
+      // on): show where things are now, so a retry doesn't redo them.
+      await check();
+      busy = null;
     }
   }
 

@@ -186,3 +186,44 @@ describe("recentStatusMove", () => {
     expect(recentStatusMove("F-009", entries as never, now)).toBeNull();
   });
 });
+
+describe("normalizeKnowledge", () => {
+  // A real .living/ files "### F-027 addendum:" under F-027 and numbers some
+  // decisions twice; a repeated list key threw in Svelte and wedged the window.
+  it("gives every row a unique key even when ids and fingerprints repeat", () => {
+    const k = normalizeKnowledge({
+      provider: "mycelium",
+      topics: [
+        { slug: "cohort", path: "a.md", findings: [{ id: "F-027" }, { id: "F-027" }, { id: "F-027~2" }, {}] },
+        { slug: "cohort", path: "b.md", findings: [{ id: "F-027" }] },
+      ],
+      decisions: [{ fp: "d1" }, { fp: "d1" }],
+      learnings: [{ fp: "l1" }, { fp: "l1" }, { fp: "l1" }],
+    });
+    const findings = k.topics.flatMap((t) => t.findings);
+    expect(findings.map((f) => f.id)).toEqual(["F-027", "F-027", "F-027~2", "", "F-027"]);
+    expect(new Set(findings.map((f) => f.key)).size).toBe(findings.length);
+    expect(findings[0].key).toBe("F-027");
+    expect(new Set(k.topics.map((t) => t.key)).size).toBe(2);
+    expect(k.decisions.map((d) => d.key)).toEqual(["d1", "d1~2"]);
+    expect(k.learnings.map((l) => l.key)).toEqual(["l1", "l1~2", "l1~3"]);
+  });
+
+  it("turns non-string fields and non-object rows into something renderable", () => {
+    const k = normalizeKnowledge({
+      provider: "mycelium",
+      topics: [{ slug: 7, findings: [{ id: 3, claim: null, tags: ["a", 1], status: 5 }, "junk"] }],
+      todos: [{ item: "x", status: null }, 4],
+      questions: [{ text: 9, finding: null }],
+      decisions: [null, { fp: "d", alternatives: [1, "b"] }],
+    });
+    const f = k.topics[0].findings;
+    expect(f).toHaveLength(1);
+    expect(f[0]).toMatchObject({ id: "", claim: "", status: "unknown", tags: ["a"] });
+    expect(k.todos).toEqual([expect.objectContaining({ item: "x", status: "" })]);
+    expect(k.questions).toEqual([{ text: "", finding: "" }]);
+    expect(k.decisions).toHaveLength(1);
+    expect(k.decisions[0].alternatives).toEqual(["b"]);
+    expect(searchKnowledge(k, "x").todos).toHaveLength(1);
+  });
+});

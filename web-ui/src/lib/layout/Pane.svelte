@@ -287,6 +287,11 @@
     requestAssetReload();
   }
 
+  function errorText(error: unknown): string {
+    const text = error instanceof Error ? error.message : String(error);
+    return text.length > 300 ? `${text.slice(0, 300)}…` : text;
+  }
+
   function viewKind(tab: Tab): PaneViewKind | null {
     if (tab.surface !== "terminal") return tab.surface;
     const session = sessions.get(tab.sessionId);
@@ -320,6 +325,18 @@
   <div class="hint load-failure">
     <span>could not load {label}</span>
     <button type="button" onclick={() => retryView(kind)}>retry</button>
+    <button type="button" onclick={reloadWindow}>reload window</button>
+  </div>
+{/snippet}
+
+<!-- A view that throws while rendering (a bug, or data it didn't expect —
+     plugin output is untrusted) fails alone: without a boundary the error
+     escapes Svelte's update and every view in the window stops updating. -->
+{#snippet viewCrash(error: unknown, reset: () => void)}
+  <div class="hint load-failure crash">
+    <span>this view hit an error</span>
+    <span class="crash-msg" title={errorText(error)}>{errorText(error)}</span>
+    <button type="button" onclick={reset}>try again</button>
     <button type="button" onclick={reloadWindow}>reload window</button>
   </div>
 {/snippet}
@@ -540,7 +557,12 @@
       <div class="layer" class:active class:dormant={dormant.has(tabKey(tab))} inert={!active}>
         <img class="sel-stop" src={STOP_SRC} alt="" aria-hidden="true" />
         {#if mountedTabs.includes(tab)}
-          {@render surface(tab, active)}
+          <svelte:boundary onerror={(e) => console.error("pane view failed", e)}>
+            {@render surface(tab, active)}
+            {#snippet failed(error, reset)}
+              {@render viewCrash(error, reset)}
+            {/snippet}
+          </svelte:boundary>
         {/if}
         <img class="sel-stop" src={STOP_SRC} alt="" aria-hidden="true" />
       </div>
@@ -781,6 +803,24 @@
 
   .load-failure button:hover {
     border-color: color-mix(in srgb, var(--accent) 60%, var(--edge));
+  }
+
+  .crash {
+    flex-wrap: wrap;
+    align-content: center;
+    row-gap: 0.6rem;
+    padding: 0 24px;
+  }
+
+  .crash-msg {
+    flex-basis: 100%;
+    order: 1;
+    text-align: center;
+    font-family: var(--mono);
+    font-size: var(--text-xs);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   /* Translucent drop-zone preview showing exactly where the drop lands, with

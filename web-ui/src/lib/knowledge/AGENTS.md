@@ -27,6 +27,14 @@ and on visibility return — never polled).
 - **Empty never shows chrome.** Sections and nav rows exist only with
   content; the no-provider state is one card with the single action that
   fills it (the attach sheet, `plugins/store.ts`'s `openAttachSheet`).
+- **Ids repeat; keys don't.** The snapshot is a plugin's reading of
+  hand-kept files, and real ones reuse ids (`### F-027 addendum:` under
+  F-027). A repeated `{#each}` key throws inside Svelte and used to freeze
+  the whole window, so every list, expand state and element id uses the
+  client-only `key` that `normalizeKnowledge` (`../workspace/knowledge.ts`)
+  assigns — never `id`/`fp`/`slug`. The same normalization turns non-string
+  fields into strings, so a provider's odd JSON renders instead of throwing.
+  An unchanged body keeps the held snapshot (no re-render per turn end).
 - **Paths on the wire are workspace-relative** (`.living/…`, `todo/…`) or
   absolute (claude's memory dir); join with `wsRoot` before opening. There is
   no open-at-line — the file just opens.

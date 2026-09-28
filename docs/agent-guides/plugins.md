@@ -313,12 +313,24 @@ explain a trap), one call at a time per (plugin, workspace) instance. A trap
 costs the instance, not the daemon; five traps in a minute mark the plugin
 faulted in that workspace until the user switches it off and on. What a
 plugin returns is capped too: a tool result at 256 KiB, the instruction
-paragraph at 8 KiB, a hook line at 1 KiB. A component whose `tools()` names
-differ from its manifest's `provides.mcp_tools` is refused.
+paragraph at 8 KiB, a hook line at 1 KiB, a tool description at 2 KiB. A
+component whose `tools()` names differ from its manifest's
+`provides.mcp_tools` is refused, and so is one whose tool input schema isn't a
+JSON object schema (`"type": "object"`, ≤ 16 KiB): agents' MCP clients
+validate the whole tool list, so one bad schema would cost them every
+chimaera tool. A call whose caller stops waiting (a hook the agent gave up on,
+a closed window) drops its instance; the next call starts a fresh one and
+nothing counts as a failure.
 
 Knowledge stamps and Timeline baselines are scoped to the provider id and
 component digest: an update, rollback or provider change gets a fresh snapshot
 even when its input files are unchanged.
+
+A snapshot's ids may repeat — real `.living/` repositories file
+`### F-027 addendum:` headings under their finding's id and reuse numbers.
+The UI keys its lists by a client-side `key` (never the id), and Timeline
+attribution takes the first entry with an id as the one meant, so a provider
+need not dedupe; it should still read an addendum as part of its finding.
 
 ## Build and test
 
