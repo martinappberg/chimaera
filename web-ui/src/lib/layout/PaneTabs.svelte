@@ -12,6 +12,7 @@
    */
   import { untrack } from "svelte";
   import { tabKey, type PaneNode, type Tab } from "./layout";
+  import { TAB_FADE_PX, revealTabScrollLeft, tabFadeWidths, tabInView, type TabBounds } from "./tabScroll";
   import type { Session } from "../workspace/sessions";
   import {
     dotState,
@@ -194,16 +195,18 @@
     right: boolean;
     over: boolean;
     hidden: number;
+    leftFade: number;
+    rightFade: number;
   }
-  let clip = $state.raw<Clip>({ left: false, right: false, over: false, hidden: 0 });
-  /** Whether the active tab was fully in view at the last measure: a strip
-   *  resize re-reveals it only then — a user who scrolled away to read
-   *  hidden tabs is not snapped back by an unrelated layout change. */
+  let clip = $state.raw<Clip>({
+    left: false, right: false, over: false, hidden: 0,
+    leftFade: TAB_FADE_PX, rightFade: TAB_FADE_PX,
+  });
+  /** Only scrolling in a settled layout can opt out of following the active
+   *  tab. A resize can emit a scroll before its observer runs (notably when
+   *  the dropdown appears); that is not the user scrolling away. */
   let activeVisible = true;
-
-  /** Fade width; the reveal keeps the active tab this far inside the edge so
-   *  the fade never sits on it. */
-  const FADE_PX = 24;
+  let measuredWidth = 0;
 
   /** Reads only (scroll metrics + tab offsets), then one state write — no
    *  interleaved layout so a scroll event never thrashes. */
@@ -217,18 +220,35 @@
     // strip narrower than a tab's floor — nothing to list there, no control.
     const over = sw > cw + 1 && node.tabs.length > 1;
     let hidden = 0;
-    activeVisible = true;
+    let active: TabBounds | null = null;
     for (const t of strip.querySelectorAll<HTMLElement>("[data-tab-index]")) {
-      const l = t.offsetLeft;
-      const clipped = l < sl - 2 || l + t.offsetWidth > sl + cw + 2;
+      const bounds = { left: t.offsetLeft, width: t.offsetWidth };
+      const clipped = !tabInView(sl, cw, bounds);
       if (clipped && over) hidden++;
-      if (clipped && Number(t.dataset.tabIndex) === node.active) activeVisible = false;
+      if (Number(t.dataset.tabIndex) === node.active) active = bounds;
     }
-    const next: Clip = { left: sl > 1, right: sl + cw < sw - 1, over, hidden };
+    const fades = tabFadeWidths(sl, cw, active);
+    const next: Clip = {
+      left: sl > 1, right: sl + cw < sw - 1, over, hidden,
+      leftFade: fades.left, rightFade: fades.right,
+    };
     const p = untrack(() => clip);
-    if (next.left !== p.left || next.right !== p.right || next.over !== p.over || next.hidden !== p.hidden) {
+    if (next.left !== p.left || next.right !== p.right || next.over !== p.over ||
+        next.hidden !== p.hidden || next.leftFade !== p.leftFade || next.rightFade !== p.rightFade) {
       clip = next;
     }
+  }
+
+  function onStripScroll(): void {
+    const strip = tabsEl;
+    if (strip === null) return;
+    const tab = strip.querySelector<HTMLElement>(`[data-tab-index="${node.active}"]`);
+    if (tab !== null && strip.clientWidth === measuredWidth) {
+      activeVisible = tabInView(strip.scrollLeft, strip.clientWidth, {
+        left: tab.offsetLeft, width: tab.offsetWidth,
+      });
+    }
+    measure();
   }
 
   /** Scroll tab `i` into the strip's view (own scrollLeft math — never
@@ -239,15 +259,10 @@
     const tab = strip.querySelector<HTMLElement>(`[data-tab-index="${i}"]`);
     if (tab === null) return;
     // offsetLeft is relative to .tabs (position: relative) and ignores scroll.
-    const left = tab.offsetLeft;
-    const right = left + tab.offsetWidth;
-    const view = strip.clientWidth;
-    if (strip.scrollWidth <= view) return;
-    if (left < strip.scrollLeft + FADE_PX) {
-      strip.scrollLeft = Math.max(0, left - FADE_PX);
-    } else if (right > strip.scrollLeft + view - FADE_PX) {
-      strip.scrollLeft = right - view + FADE_PX;
-    }
+    strip.scrollLeft = revealTabScrollLeft(strip.scrollLeft, strip.clientWidth, strip.scrollWidth, {
+      left: tab.offsetLeft,
+      width: tab.offsetWidth,
+    });
   }
 
   // Active tab changed (click, Mod+Alt+[/], open, restore, a preview slot
@@ -259,6 +274,8 @@
     void (t === undefined ? null : tabKey(t));
     if (tabsEl === null) return;
     revealTab(i);
+    activeVisible = true;
+    measuredWidth = tabsEl.clientWidth;
     measure();
   });
 
@@ -277,6 +294,7 @@
       raf = requestAnimationFrame(() => {
         raf = 0;
         if (activeVisible) revealTab(node.active);
+        measuredWidth = strip.clientWidth;
         measure();
       });
     });
@@ -340,7 +358,7 @@
     };
     const onMove = (e: PointerEvent) => {
       const r = strip.getBoundingClientRect();
-      dir = e.clientX < r.left + FADE_PX ? -1 : e.clientX > r.right - FADE_PX ? 1 : 0;
+      dir = e.clientX < r.left + TAB_FADE_PX ? -1 : e.clientX > r.right - TAB_FADE_PX ? 1 : 0;
       if (dir !== 0 && raf === 0) raf = requestAnimationFrame(step);
     };
     window.addEventListener("pointermove", onMove);
@@ -653,8 +671,9 @@
   {/if}
   <!-- .strip owns the edge fades + the "more" control; .tabs is the
        scroller (hidden scrollbar, wheel → sideways). -->
-  <div class="strip" class:clip-left={clip.left} class:clip-right={clip.right} class:over={clip.over}>
-    <div class="tabs" role="tablist" bind:this={tabsEl} onscroll={measure} onwheel={onStripWheel}>
+  <div class="strip" class:clip-left={clip.left} class:clip-right={clip.right} class:over={clip.over}
+    style:--left-fade="{clip.leftFade}px" style:--right-fade="{clip.rightFade}px">
+    <div class="tabs" role="tablist" bind:this={tabsEl} onscroll={onStripScroll} onwheel={onStripWheel}>
       {#each node.tabs as tab, i (tabKey(tab))}
         {@const sid = tab.surface === "terminal" ? tab.sessionId : null}
         {@const ts = sid !== null ? (sessions.get(sid) ?? null) : null}
@@ -1204,7 +1223,6 @@
     position: absolute;
     top: 0;
     bottom: 0;
-    width: 24px;
     z-index: 2;
     pointer-events: none;
     opacity: 0;
@@ -1215,11 +1233,13 @@
      hint, not as legible text (dark ground otherwise let it read through). */
   .strip::before {
     left: 0;
+    width: var(--left-fade);
     background: linear-gradient(to right, var(--term-bg) 30%, transparent);
   }
 
   .strip::after {
     right: 0;
+    width: var(--right-fade);
     background: linear-gradient(to left, var(--term-bg) 30%, transparent);
   }
 
