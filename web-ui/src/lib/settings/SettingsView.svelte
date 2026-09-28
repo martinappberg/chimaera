@@ -513,7 +513,8 @@
   }
 
   .pro-entry {
-    display: flex;
+    display: grid;
+    grid-template-columns: 30px minmax(0, 1fr) auto;
     align-items: center;
     gap: 12px;
     width: calc(100% - 28px);
@@ -534,8 +535,8 @@
   .pro-copy > span { color: var(--muted); line-height: 1.5; }
   .pro-open { flex: none; display: flex; align-items: center; gap: 8px; font-size: var(--text-sm); color: var(--muted); }
   @container settings (max-width: 460px) {
-    .pro-entry { flex-wrap: wrap; }
-    .pro-open { margin-left: 42px; }
+    .pro-entry { grid-template-columns: 30px minmax(0, 1fr); }
+    .pro-open { grid-column: 2; }
   }
 
   .empty {
