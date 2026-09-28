@@ -109,3 +109,23 @@ export function placePopover(
     maxHeight: Math.min(want.height, room),
   };
 }
+
+/**
+ * `placePopover` for a popover mounted in `layer` but kept inside `area`
+ * (all three in viewport coordinates): chat mounts it in its host, beside
+ * the scroller, and keeps it over the transcript. The same placement as
+ * `placePopover` when the two are one box.
+ */
+export function placeIn(link: Rect, area: Rect, layer: Rect, want: { width: number; height: number }): Placement {
+  const p = placePopover(
+    { left: link.left - area.left, top: link.top - area.top, right: link.right - area.left, bottom: link.bottom - area.top },
+    { width: area.right - area.left, height: area.bottom - area.top },
+    want,
+  );
+  return {
+    ...p,
+    left: p.left + area.left - layer.left,
+    top: p.top === null ? null : p.top + area.top - layer.top,
+    bottom: p.bottom === null ? null : p.bottom + layer.bottom - area.bottom,
+  };
+}

@@ -47,6 +47,27 @@ export function artifactShape(path: string): ArtifactShape | null {
   }
 }
 
+/**
+ * Whether a prose embed (`![alt](target)`) draws as a document chip rather
+ * than a card. A document is read whole or not at all — the opening of a
+ * plan is rarely the part that matters — so the prose names it on a chip
+ * (a hover previews it, a click opens it), as the turn's gallery shows its
+ * documents. Results keep their cards: figures, reports, PDF pages, table
+ * slices, notebook outputs, and a deck's slide (`#slide=N`).
+ */
+export function embedsAsChip(target: string): boolean {
+  const { path, fragment } = splitTarget(target);
+  switch (viewKindFor(path)) {
+    case "markdown":
+      return !/^slide=/i.test(fragment ?? "");
+    case "docx":
+    case "pptx":
+      return true;
+    default:
+      return false;
+  }
+}
+
 /** Whether a path is the kind of file a turn's gallery shows. */
 export function isArtifactPath(path: string): boolean {
   return artifactShape(path) !== null;

@@ -17,6 +17,11 @@
  * preview is due, and leaving first cancels it. The popover never takes
  * focus, its content is inert, and it goes on leave, Escape, a press
  * elsewhere, a scroll, or a mode switch.
+ *
+ * A host that is no document (chat) names its own targets (`targetOf`: its
+ * path links and file chips, kept off the DOM so agent HTML can't forge
+ * one), mounts the popover beside its scroller (`layer`), and asks for the
+ * reading typography it doesn't have around it (`standalone`).
  */
 import { flushSync, mount, unmount } from "svelte";
 import type { EditorView } from "@codemirror/view";
@@ -25,7 +30,7 @@ import type { SyntaxNode } from "@lezer/common";
 import { basename, fsFile, tableHeaderRow } from "../files";
 import { isMac } from "../../shared/keys";
 import { mountEmbed, type EmbedHandle } from "../../shared/embed/mount.svelte";
-import { embedKind, isMissing, type TargetInfo } from "../../shared/embed/embed";
+import { embedKind, isMissing, type TargetInfo, type TargetResult } from "../../shared/embed/embed";
 import { fragmentLabel, parseEmbedFragment } from "../../shared/embed/fragment";
 import { anchorIds, decodeAnchor } from "../mdDoc";
 import { destinationText, inlineOf } from "../mdTable";
@@ -34,25 +39,46 @@ import type { LinkContext } from "../docLinks";
 import { bodyText, documentContext, footnotesOf, htmlOfNode, htmlRuns, type DocContext } from "./model";
 import { escapeHref, hrefFor, renderBlocks, renderRun, topLevel, wikilinkHref } from "./render";
 import { Hydrator, markTasks } from "./reader";
-import type { DocEmbeds } from "./embeds";
-import { hoverTarget, isLineFragment, placePopover, sectionBounds, type HoverTarget, type Placement, type Rect } from "./hover";
+import type { EmbedRef } from "./render";
+import { hoverTarget, isLineFragment, placeIn, sectionBounds, type HoverTarget, type Placement } from "./hover";
 import HoverPreview from "./HoverPreview.svelte";
 
 export interface HoverHost {
-  /** The positioned content box every link lives in; the popover mounts here. */
+  /** The content box every link lives in: it hears the pointer, and the
+   *  popover stays inside it. */
   root: HTMLElement;
+  /** The positioned element the popover mounts in (default `root`): a
+   *  scroller can't hold it, so chat mounts beside its transcript. */
+  layer?: () => HTMLElement;
+  /** The document the links are in ("" for none). */
   docPath: () => string;
   mode: () => "reading" | "live" | "source";
   /** The document's current text (a same-document preview reads it). */
   text: () => string | null;
   links: () => LinkContext;
-  /** The document's embed answers: a target resolves once for both. */
-  embeds: () => DocEmbeds;
+  /** A target's answer (the document's embed answers: a target resolves
+   *  once for the view and the preview). */
+  ask: (ref: EmbedRef) => Promise<TargetResult | null>;
   theme: () => "light" | "dark";
   /** The body text size, px. */
   fontSize: () => number;
   /** Live mode's editor, when mounted. */
-  editor: () => EditorView | null;
+  editor?: () => EditorView | null;
+  /** What an element the host built previews, tried before its links. */
+  targetOf?: (el: Element) => HostTarget | null;
+  /** Whether plain links preview (default true). A host whose links are
+   *  already `targetOf`'s answers turns them off, so a link it could not
+   *  resolve shows nothing rather than a strict miss. */
+  anchors?: boolean;
+  /** No reading view around the popover: it brings its own typography. */
+  standalone?: boolean;
+}
+
+/** A target a host names itself. */
+export interface HostTarget {
+  target: HoverTarget;
+  /** A line the popover shows above the preview ("changed after this turn"). */
+  note?: string;
 }
 
 /** What the popover draws (reactive; the component reads it). */
@@ -60,6 +86,8 @@ export interface PreviewState {
   id: string;
   kind: "doc" | "card";
   visible: boolean;
+  standalone: boolean;
+  note: string;
   place: Placement;
   fontSize: number;
   path: string;
@@ -76,9 +104,11 @@ export interface PreviewState {
 interface Candidate {
   /** Identity: the element, or a source link's href and offset. */
   key: unknown;
-  href: string;
-  byName: boolean;
-  rect: DOMRect;
+  target: HoverTarget;
+  note?: string;
+  /** Where it is, measured when the preview opens (not per pointermove:
+   *  that would force a layout on every move over a streaming reply). */
+  rect: () => DOMRect;
   via: "pointer" | "key";
 }
 
@@ -121,6 +151,15 @@ function sourceLinkAt(view: EditorView, pos: number): { href: string; byName: bo
   return null;
 }
 
+/** An element's padding box, in viewport coordinates: what an absolutely
+ *  positioned child is placed against (its border box is `getBoundingClientRect`). */
+function paddingBox(el: HTMLElement): { left: number; top: number; right: number; bottom: number } {
+  const b = el.getBoundingClientRect();
+  const left = b.left + el.clientLeft;
+  const top = b.top + el.clientTop;
+  return { left, top, right: left + el.clientWidth, bottom: top + el.clientHeight };
+}
+
 /** The rect of `el` the point sits in (a wrapped link has several). */
 function rectNear(el: Element, x: number | null, y: number | null): DOMRect {
   const rects = Array.from(el.getClientRects());
@@ -155,9 +194,10 @@ export class HoverPreviews {
       if (this.shown?.c.via === "pointer") this.scheduleHide();
     });
     on(root, "keydown", (e) => this.key(e));
-    // Anything scrolling moves the link out from under the popover.
+    // Anything scrolling moves the link out from under the popover — and
+    // from under a preview still due (it would open where the link was).
     on(root, "scroll", (e) => {
-      if (this.shown !== null && !this.inPopover(e.target)) this.hide();
+      if (!this.inPopover(e.target)) this.hide();
     }, { capture: true, passive: true });
     on(root, "focusout", (e) => {
       if (this.shown?.c.via === "key" && e.target === this.shown.c.key) this.hide();
@@ -181,8 +221,15 @@ export class HoverPreviews {
     this.sources.clear();
   }
 
-  /** Close the popover (a mode switch, a new document). */
+  /** Close the popover and drop a preview still due (a mode switch, a new
+   *  document, a hidden view). */
   hide(): void {
+    this.cancelPending();
+    this.close();
+  }
+
+  /** Close the popover only: a pending preview for another link stays due. */
+  private close(): void {
     if (this.hideTimer !== null) clearTimeout(this.hideTimer);
     this.hideTimer = null;
     const s = this.shown;
@@ -226,20 +273,58 @@ export class HoverPreviews {
     const live = mode === "live";
     const shownKey = this.shown?.c.key;
     const a = target.closest<HTMLAnchorElement>("a[href]");
-    if (a !== null && this.host.root.contains(a) && a.closest(".embed-card, .md-props") === null && !a.classList.contains("anchor")) {
+    const own = this.hostCandidate(target, "pointer");
+    if (own !== null) return live && !mod && own.key !== shownKey ? null : own;
+    if (a !== null && this.host.anchors !== false && this.host.root.contains(a) && a.closest(".embed-card, .md-props") === null && !a.classList.contains("anchor")) {
       if (live && !mod && a !== shownKey) return null;
-      return { key: a, href: a.getAttribute("href") ?? "", byName: a.hasAttribute("data-wikilink"), rect: rectNear(a, x, y), via: "pointer" };
+      return this.linkCandidate(a, "pointer");
     }
     if (!live || (!mod && typeof shownKey !== "string")) return null;
-    const view = this.host.editor();
+    const view = this.host.editor?.() ?? null;
     if (view === null || !view.contentDOM.contains(target)) return null;
     const pos = view.posAtCoords({ x, y });
     const link = pos === null ? null : sourceLinkAt(view, pos);
     if (link === null) return null;
     const key = `src:${link.from}:${link.href}`;
     if (!mod && key !== shownKey) return null;
+    const t = hoverTarget(link.href, link.byName);
+    if (t === null) return null;
     const lineHeight = view.defaultLineHeight;
-    return { key, href: link.href, byName: link.byName, rect: new DOMRect(x - 4, y - lineHeight / 2, 8, lineHeight), via: "pointer" };
+    const rect = new DOMRect(x - 4, y - lineHeight / 2, 8, lineHeight);
+    return { key, target: t, rect: () => rect, via: "pointer" };
+  }
+
+  /** An element the host named (or one inside it), as a candidate. */
+  private hostCandidate(from: Element, via: Candidate["via"]): Candidate | null {
+    const of = this.host.targetOf;
+    if (of === undefined) return null;
+    const root = this.host.root;
+    if (!root.contains(from)) return null;
+    for (let n: Element | null = from; n !== null && n !== root; n = n.parentElement) {
+      const t = of(n);
+      if (t === null) continue;
+      const el = n;
+      return {
+        key: el,
+        target: t.target,
+        ...(t.note !== undefined ? { note: t.note } : {}),
+        rect: () => this.rectOf(el, via),
+        via,
+      };
+    }
+    return null;
+  }
+
+  /** A link element as a candidate, or null for what previews nothing. */
+  private linkCandidate(a: HTMLAnchorElement, via: Candidate["via"]): Candidate | null {
+    const t = hoverTarget(a.getAttribute("href") ?? "", a.hasAttribute("data-wikilink"));
+    if (t === null) return null;
+    return { key: a, target: t, rect: () => this.rectOf(a, via), via };
+  }
+
+  /** The rect of `el` to place against: the one under the pointer. */
+  private rectOf(el: Element, via: Candidate["via"]): DOMRect {
+    return via === "pointer" ? rectNear(el, this.pointer.x, this.pointer.y) : rectNear(el, null, null);
   }
 
   private consider(target: EventTarget | null, mod: boolean): void {
@@ -255,7 +340,7 @@ export class HoverPreviews {
     }
     if (same(this.pending?.c)) return;
     this.cancelPending();
-    if (c === null || hoverTarget(c.href, c.byName) === null) {
+    if (c === null) {
       if (this.shown?.c.via === "pointer") this.scheduleHide();
       return;
     }
@@ -278,7 +363,7 @@ export class HoverPreviews {
     if (this.hideTimer !== null) return;
     this.hideTimer = setTimeout(() => {
       this.hideTimer = null;
-      this.hide();
+      this.close();
     }, LEAVE_GRACE);
   }
 
@@ -308,16 +393,21 @@ export class HoverPreviews {
   private keyCandidate(): Candidate | null {
     const active = document.activeElement;
     if (this.host.mode() === "reading") {
-      if (!(active instanceof HTMLAnchorElement) || !this.host.root.contains(active) || !active.hasAttribute("href")) return null;
-      return { key: active, href: active.getAttribute("href") ?? "", byName: active.hasAttribute("data-wikilink"), rect: rectNear(active, null, null), via: "key" };
+      if (!(active instanceof Element) || !this.host.root.contains(active)) return null;
+      const own = this.hostCandidate(active, "key");
+      if (own !== null) return own;
+      if (!(active instanceof HTMLAnchorElement) || !active.hasAttribute("href") || this.host.anchors === false) return null;
+      return this.linkCandidate(active, "key");
     }
-    const view = this.host.editor();
+    const view = this.host.editor?.() ?? null;
     if (view === null || !view.hasFocus) return null;
     const head = view.state.selection.main.head;
     const link = sourceLinkAt(view, head) ?? (head > 0 ? sourceLinkAt(view, head - 1) : null);
     const at = view.coordsAtPos(head);
-    if (link === null || at === null) return null;
-    return { key: `src:${link.from}:${link.href}`, href: link.href, byName: link.byName, rect: new DOMRect(at.left, at.top, 1, at.bottom - at.top), via: "key" };
+    const t = link === null ? null : hoverTarget(link.href, link.byName);
+    if (link === null || t === null || at === null) return null;
+    const rect = new DOMRect(at.left, at.top, 1, at.bottom - at.top);
+    return { key: `src:${link.from}:${link.href}`, target: t, rect: () => rect, via: "key" };
   }
 
   private windowKey(e: KeyboardEvent): void {
@@ -344,20 +434,22 @@ export class HoverPreviews {
   // --- showing ----------------------------------------------------------------------
 
   private show(c: Candidate): void {
-    const target = hoverTarget(c.href, c.byName);
+    const target = c.target;
     // A place in a document drawn by the daemon (too large for the browser)
     // has no text here to draw from.
-    if (target === null || (target.kind === "self" && this.host.text() === null)) return;
-    this.hide();
-    const root = this.host.root;
-    const box = root.getBoundingClientRect();
-    const rel: Rect = { left: c.rect.left - box.left, top: c.rect.top - box.top, right: c.rect.right - box.left, bottom: c.rect.bottom - box.top };
+    if (target.kind === "self" && this.host.text() === null) return;
+    // A re-render replaced the link while the preview was due.
+    if (c.key instanceof Element && !c.key.isConnected) return;
+    this.close();
+    const layer = this.host.layer?.() ?? this.host.root;
     const content = document.createElement("div");
     const state: PreviewState = $state({
       id: `md-hover-${++seq}`,
       kind: "doc",
       visible: false,
-      place: placePopover(rel, { width: box.width, height: box.height }, WANT),
+      standalone: this.host.standalone === true,
+      note: c.note ?? "",
+      place: placeIn(c.rect(), this.host.root.getBoundingClientRect(), paddingBox(layer), WANT),
       fontSize: this.host.fontSize(),
       path: this.host.docPath(),
       name: "",
@@ -370,7 +462,7 @@ export class HoverPreviews {
         if (this.shown?.c.via === "pointer") this.scheduleHide();
       },
     });
-    const component = mount(HoverPreview, { target: root, props: { s: state } });
+    const component = mount(HoverPreview, { target: layer, props: { s: state } });
     // The content node is in the page before anything draws into it: the
     // reader's passes (equations, fences) only work on connected nodes.
     flushSync();
@@ -404,7 +496,7 @@ export class HoverPreviews {
       this.drawDoc(state, docPath, text, t.anchor, cleanups);
       return;
     }
-    const a = await this.host.embeds().ask({ target: t.target, byName: t.byName });
+    const a = await this.host.ask({ target: t.target, byName: t.byName });
     if (signal.aborted) return;
     if (a === null) throw new Error("couldn't reach the daemon");
     if (isMissing(a)) {
