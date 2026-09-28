@@ -64,3 +64,58 @@ All routes are behind the daemon bearer middleware, under `/api/v1/pro/cloud`:
   excluded setup workspace. Cancel kills only the job's own session. Install uses
   the runtime subsystem's curated official downloads and existing reservation;
   it never attaches to or cancels someone else's install.
+
+## Adding a provider
+
+Cloud connections currently support Claude Code and Codex, with GitHub as an
+optional repository connection. Grok is an example of a future provider, not a
+shipped adapter. Adding a JSON entry alone neither enables authentication nor
+makes an agent's sessions portable. Complete this checklist before advertising
+support:
+
+1. Add the stable ID, label, `agent` or `repository` category, and exact verified
+   HTTPS authentication origins to the [shared catalog](../../../../chimaera-core/src/cloud-providers.json).
+   Keep terminal-only providers' origins empty. Add the server adapter to
+   `PROVIDERS` in `mod.rs`; the HTTP catalog lists implemented adapters, not every
+   JSON entry. Keep catalog/adapter consistency tests passing.
+2. For an agent, extend [AgentKind](../../agent_state.rs),
+   [launcher detection](../../launcher.rs) and the
+   [curated runtime installer](../../runtimes.rs) as needed. Verify the official
+   binary/download and supported platforms. Install only after an explicit
+   connection request; never interpret a provider ID as an executable or reuse
+   another provider's install/login fallback. Repository adapters must define
+   their own binary discovery and honest missing-runtime behavior.
+3. Implement and live-verify the official auth-status protocol in `mod.rs` and
+   explicit login adapter in `connect.rs`/`process.rs`. Distinguish missing,
+   signed out, signed in, and unverifiable status using allowlisted fields;
+   never inspect credential files or expose raw output. Preserve probe deadlines,
+   output caps, one writer per provider, expiry, activity accounting, cancellation
+   and observed child cleanup. Login completion must trigger a fresh auth probe.
+4. Validate every published browser/device URL against that provider's catalog
+   origins in the daemon, and preserve the matching
+   [native opener](../../../../chimaera-app/src/shell/cloud.rs) and
+   [browser policy](../../../../../web-ui/src/lib/pro/providers.ts) checks.
+   Keep client-supplied URLs/commands out of opener requests. A new action shape
+   needs coordinated daemon, native and UI support; existing terminal/device-code
+   actions can reuse their current presentation.
+5. Treat handoff support as a separate gate. Implement the provider's native
+   conversation identity, history discovery, archive validation/export/import,
+   resume and native fork semantics in [bundle.rs](../../bundle.rs),
+   [ledger.rs](../../ledger.rs), [spawn.rs](../../spawn.rs) and the corresponding
+   agent integration. Preserve conversation bytes and public IDs, and verify
+   move, return, fork, restart and destination-root behavior against the real CLI.
+   `AgentKind::as_str()` must match the adapter ID because
+   [provider_gate.rs](../../pro/provider_gate.rs) derives required providers from
+   deferred sessions. Authentication alone must never grant unsupported resume.
+6. Keep [ProviderConnections](../../../../../web-ui/src/lib/pro/ProviderConnections.svelte)
+   driven by returned catalog rows, labels, categories and methods rather than a
+   new hard-coded provider card. General onboarding needs one connected agent;
+   handoff requires every provider used by that project's deferred agents.
+   Unsupported required IDs must remain visible and blocked, never silently
+   substituted with a connected provider.
+7. Cover unknown IDs, malformed status, missing runtime, denied/expired login,
+   cancellation/retry cleanup and fresh handoff checks with focused tests. Record
+   real CLI versions and bounded auth-flow observations in the
+   [protocol log](../../../../chimaera-agent/PROTOCOL.md); run the applicable live
+   agent verification before claiming session compatibility. Keep unknown
+   protocols and incomplete adapters fail-closed throughout rollout.

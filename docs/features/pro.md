@@ -22,6 +22,9 @@ Cloud setup controls are implemented; automatic handoff and browser access are b
    **Start again** opens a fresh sign-in and **Cancel sign-in** closes the request.
    An expired or failed request offers **Try again**. The browser confirms success
    only after the account is active in the app; keeper provisioning can finish later.
+   On restart, saved account access shows its current phase immediately. If the
+   system Keychain needs a response, the page says so while Home stays usable;
+   billing and account changes wait until initialization completes.
 3. The page explains the workflow in three steps: work on the Mac, continue
    compatible agents in the cloud, and pick up the project on the Mac again.
    Provider sign-in and the limits of process handoff are stated alongside that
