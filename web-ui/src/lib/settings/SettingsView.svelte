@@ -17,6 +17,7 @@
   import { isBrowserGateway } from "../net/base";
   import { isNativeShell } from "../net/native";
   import BrandMark from "../shared/BrandMark.svelte";
+  import { accountPlan } from "../net/plan";
   import NotificationStatus from "./NotificationStatus.svelte";
   import UpdatesStatus from "./UpdatesStatus.svelte";
   import { APP_MENU, PINNED } from "../shared/keys";
@@ -48,6 +49,8 @@
   let navEl = $state<HTMLElement | null>(null);
 
   const q = $derived(query.trim().toLowerCase());
+  const paid = $derived($accountPlan === "pro" || $accountPlan === "max");
+  const proAction = $derived($accountPlan === "free" ? "Get Pro" : "View account");
 
   // Focus the search box when the UI tab shows (VS Code behavior).
   $effect(() => {
@@ -78,7 +81,7 @@
   const DOC_KEYWORDS = ["documents", "markdown", "agents.md", "skill", "claude", "teach", "check"];
   const docsVisible = $derived(q === "" || DOC_KEYWORDS.some((k) => k.includes(q)));
 
-  const PRO_KEYWORDS = ["chimaera pro", "account", "sign in", "plan", "kept", "connected", "devices", "sign out", "cloud machine", "github", "repository", "ssh public key"];
+  const PRO_KEYWORDS = ["chimaera pro", "chimaera max", "sessions", "files", "account", "sign in", "plan", "kept", "connected", "devices", "sign out", "cloud machine", "github", "repository", "ssh public key"];
   const proVisible = $derived(q === "" || PRO_KEYWORDS.some((keyword) => keyword.includes(q)));
 
   /** Rows grouped by category, registry order, empty groups dropped. */
@@ -226,14 +229,22 @@
           {#if group.category === "Chimaera Pro"}
             <section data-section={group.category}>
               <h2 class="cat">Chimaera Pro</h2>
-              <button class="pro-entry" aria-label="Open Chimaera Pro"
+              <button class="pro-entry" class:offer={$accountPlan === "free"} aria-label={proAction === "Get Pro" ? "Get Chimaera Pro" : `View Chimaera ${$accountPlan === "max" ? "Max" : "Pro"} account`}
                 onclick={() => window.dispatchEvent(new Event("chimaera:open-pro"))}>
                 <BrandMark size={30} />
                 <span class="pro-copy">
-                  <strong>Your account and cloud work</strong>
-                  <span>Cloud agents, project mirrors and connected machines.</span>
+                  {#if $accountPlan === "free"}
+                    <strong>Your work, across devices.</strong>
+                    <span>Pick up your agent sessions and project files on another device.</span>
+                  {:else if paid}
+                    <strong>Your Chimaera {$accountPlan === "max" ? "Max" : "Pro"}</strong>
+                    <span>Your plan, cloud connections and project mirrors.</span>
+                  {:else}
+                    <strong>Your Chimaera account</strong>
+                    <span>{$accountPlan === "loading" ? "Checking your plan…" : "View your account to check your plan and cloud access."}</span>
+                  {/if}
                 </span>
-                <span class="pro-open" aria-hidden="true">Open Pro <span>→</span></span>
+                <span class="pro-open" aria-hidden="true">{proAction} <span>→</span></span>
               </button>
             </section>
           {:else if group.category === "Agents"}
@@ -528,7 +539,9 @@
     text-align: left;
     cursor: pointer;
   }
+  .pro-entry.offer { border-color: color-mix(in srgb, var(--accent) 28%, var(--edge)); background: color-mix(in srgb, var(--accent) 4%, transparent); }
   .pro-entry:hover { background: var(--row-hover); }
+  .offer .pro-open { color: var(--fg); font-weight: 600; }
   .pro-entry:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
   .pro-copy { display: grid; flex: 1; min-width: 0; gap: 4px; font-size: var(--text-sm); }
   .pro-copy strong { font-size: var(--text-md); font-weight: 550; }

@@ -1,23 +1,32 @@
-import { readable } from "svelte/store";
+import { derived, readable } from "svelte/store";
 import { asyncDisposer } from "../shared/asyncDisposer";
 import { isBrowserGateway, workbenchPath } from "./base";
-import { isNativeShell, onProChanged, proStatus } from "./native";
+import { isNativeShell, onProChanged, proStatus, type ProStatus } from "./native";
 
 export type PaidPlan = "pro" | "max" | null;
 
-function paid(value: unknown): PaidPlan {
-  return value === "pro" || value === "max" ? value : null;
+export type AccountPlan = "loading" | "unknown" | "free" | "pro" | "max";
+
+function knownPlan(value: unknown): AccountPlan {
+  if (value === "pro" || value === "max") return value;
+  return value === "none" ? "free" : "unknown";
+}
+
+function nativePlan(status: ProStatus & { initializing?: boolean }): AccountPlan {
+  if (status.initializing || status.sign_in) return "loading";
+  if (!status.available || status.error !== null) return "unknown";
+  return status.signed_in ? knownPlan(status.plan) : "free";
 }
 
 /** Account branding only; transport availability never implies entitlement.
  * Each window owns one subscription lifecycle and keeps no account data on disk.
  */
-export const paidPlan = readable<PaidPlan>(null, (set) => {
-  set(null);
+export const accountPlan = readable<AccountPlan>("loading", (set) => {
+  set("loading");
   if (typeof document === "undefined") return;
   const native = isNativeShell();
   const gateway = !native && isBrowserGateway();
-  if (!native && !gateway) return;
+  if (!native && !gateway) { set("unknown"); return; }
 
   let alive = true;
   let generation = 0;
@@ -30,7 +39,7 @@ export const paidPlan = readable<PaidPlan>(null, (set) => {
     request = null;
     if (timer !== null) clearTimeout(timer);
     timer = null;
-    if (clear) set(null);
+    if (clear) set("loading");
   }
 
   async function refresh(clear = true): Promise<void> {
@@ -48,18 +57,18 @@ export const paidPlan = readable<PaidPlan>(null, (set) => {
     const deadline = setTimeout(() => controller.abort(), 10_000);
     try {
       const lookup = native
-        ? proStatus().then((status) => status.signed_in ? paid(status.plan) : null)
+        ? proStatus().then(nativePlan)
         : fetch(workbenchPath(), {
           method: "HEAD",
           credentials: "same-origin",
           cache: "no-store",
           redirect: "error",
           signal: controller.signal,
-        }).then((response) => response.ok ? paid(response.headers.get("X-Chimaera-Plan")) : null);
+        }).then((response) => response.ok ? knownPlan(response.headers.get("X-Chimaera-Plan")) : "unknown" as const);
       const plan = await Promise.race([lookup, cancelled]);
       if (alive && revision === generation) set(plan);
     } catch {
-      if (alive && revision === generation) set(null);
+      if (alive && revision === generation) set("unknown");
     } finally {
       clearTimeout(deadline);
       controller.signal.removeEventListener("abort", cancel);
@@ -92,3 +101,8 @@ export const paidPlan = readable<PaidPlan>(null, (set) => {
     document.removeEventListener("visibilitychange", visibility);
   };
 });
+
+/** Existing badge consumers share the account read; unknown is never a paid badge. */
+export const paidPlan = derived(accountPlan, (plan): PaidPlan =>
+  plan === "pro" || plan === "max" ? plan : null,
+);

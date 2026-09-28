@@ -13,7 +13,7 @@ const gateway = vi.hoisted(() => ({
 vi.mock("./native", () => bridge);
 vi.mock("./base", () => gateway);
 
-import { paidPlan, type PaidPlan } from "./plan";
+import { accountPlan, paidPlan, type AccountPlan, type PaidPlan } from "./plan";
 
 function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
   let resolve!: (value: T) => void;
@@ -40,6 +40,11 @@ describe("shared paid plan", () => {
   function subscribe(): PaidPlan[] {
     const values: PaidPlan[] = [];
     subscriptions.push(paidPlan.subscribe((value) => values.push(value)));
+    return values;
+  }
+  function subscribeAccount(): AccountPlan[] {
+    const values: AccountPlan[] = [];
+    subscriptions.push(accountPlan.subscribe((value) => values.push(value)));
     return values;
   }
   function visibility(value: "visible" | "hidden"): void {
@@ -210,6 +215,76 @@ describe("shared paid plan", () => {
     expect(values.at(-1)).toBeNull();
     await flush();
     expect(values.at(-1)).toBeNull();
+  });
+
+
+  it("distinguishes free, paid and uncertain native account state without another read", async () => {
+    const firstRead = deferred<ProStatus>();
+    bridge.proStatus.mockReturnValueOnce(firstRead.promise);
+    const account = subscribeAccount();
+    const badge = subscribe();
+    await flush();
+    expect(account).toEqual(["loading"]);
+    expect(badge).toEqual([null]);
+    expect(bridge.proStatus).toHaveBeenCalledTimes(1);
+    firstRead.resolve(status(null, false));
+    await flush();
+    expect(account.at(-1)).toBe("free");
+
+    for (const plan of ["none", "pro", "max"] as const) {
+      bridge.proStatus.mockResolvedValue(status(plan));
+      changed();
+      expect(account.at(-1)).toBe("loading");
+      await flush();
+      expect(account.at(-1)).toBe(plan === "none" ? "free" : plan);
+      expect(badge.at(-1)).toBe(plan === "none" ? null : plan);
+    }
+    for (const uncertain of [
+      { ...status(null, false), initializing: true },
+      { ...status("pro"), initializing: true },
+      { ...status(null, false), sign_in: { phase: "waiting", expires_at: 1000 } },
+    ]) {
+      bridge.proStatus.mockResolvedValue(uncertain);
+      changed();
+      await flush();
+      expect(account.at(-1)).toBe("loading");
+      expect(badge.at(-1)).toBeNull();
+    }
+    for (const unknown of [
+      status(null),
+      { ...status(null, false), available: false },
+      { ...status("pro"), error: "Account could not be checked" },
+      { ...status("none"), error: "Account could not be checked" },
+    ]) {
+      bridge.proStatus.mockResolvedValue(unknown);
+      changed();
+      await flush();
+      expect(account.at(-1)).toBe("unknown");
+      expect(badge.at(-1)).toBeNull();
+    }
+    bridge.proStatus.mockRejectedValue(new Error("connection failed"));
+    changed();
+    await flush();
+    expect(account.at(-1)).toBe("unknown");
+    expect(bridge.onProChanged).toHaveBeenCalledTimes(1);
+  });
+
+  it("requires a confirmed gateway none header before offering a plan", async () => {
+    bridge.isNativeShell.mockReturnValue(false);
+    gateway.isBrowserGateway.mockReturnValue(true);
+    fetcher.mockResolvedValue(response("none"));
+    const account = subscribeAccount();
+    const badge = subscribe();
+    await flush();
+    expect(account.at(-1)).toBe("free");
+    expect(badge.at(-1)).toBeNull();
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    for (const [header, code] of [[null, 200], ["future-plan", 200], ["none", 401]] as const) {
+      fetcher.mockResolvedValue(response(header, code));
+      visibility("visible");
+      await flush();
+      expect(account.at(-1)).toBe("unknown");
+    }
   });
 
   it("does no account work in an ordinary browser", async () => {
