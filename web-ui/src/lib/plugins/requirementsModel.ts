@@ -40,6 +40,8 @@ export interface RequirementRow {
   /** The id's part before `@`. */
   name: string;
   status: RowStatus;
+  /** A short report cannot identify this marketplace; setup must not guess. */
+  identityAmbiguous?: boolean;
   /** What the agent reports for its installed copy. */
   version: string | null;
   scope: string | null;
@@ -62,6 +64,25 @@ export interface RequirementsModel {
    *  the requirement no agent on this host can meet. */
   notice: string | null;
   rows: RequirementRow[];
+}
+
+/** Installation presence is independent of enablement, and belongs to the
+ *  requested add-on: a different plugin for the same agent cannot complete it. */
+export function installationDetected(rows: RequirementRow[], agent: string, id: string): boolean {
+  return rows.some((r) => r.agent === agent && r.id === id && (r.status === "installed" || r.status === "disabled"));
+}
+
+/** Setup needs an enabled add-on and all mandatory add-ons for that agent.
+ *  Missing optional add-ons are fine; an unknown identity is never readiness. */
+export function agentsForSetup(model: RequirementsModel, available: string[]): string[] {
+  if (model.phase === "none") return available;
+  if (model.phase !== "ready") return [];
+  return available.filter((agent) => {
+    const rows = model.rows.filter((r) => r.agent === agent);
+    return rows.some((r) => r.status === "installed") && rows.every(
+      (r) => r.status !== "unknown" && (r.kind !== "requires" || r.status === "installed"),
+    );
+  });
 }
 
 export interface RequirementsInput {
@@ -146,9 +167,24 @@ export function requirementsModel(input: RequirementsInput): RequirementsModel {
     const entry = here(r.agent);
     if (entry === null) return null;
     const base = baseId(r.id);
-    const got = entry.plugins.find((p) => p.id === r.id || p.id === base) ?? null;
+    const candidateIds = new Set([
+      ...[...requires, ...recommends]
+        .filter((candidate) => candidate.agent === r.agent && baseId(candidate.id) === base)
+        .map((candidate) => candidate.id),
+      ...entry.plugins.filter((p) => p.id !== base && baseId(p.id) === base).map((p) => p.id),
+    ]);
+    const unambiguous = candidateIds.size === 1;
+    const baseReport = entry.plugins.find((p) => p.id === base);
+    const exact = r.id !== base ? entry.plugins.find((p) => p.id === r.id) : undefined;
+    const got = exact ?? (unambiguous ? baseReport : undefined);
     const out = blankRow(kind, r);
-    if (got === null) {
+    if (got === undefined && baseReport !== undefined) {
+      out.identityAmbiguous = true;
+      out.state = "marketplace unclear — check in the agent";
+      out.tone = "warn";
+      return out;
+    }
+    if (got === undefined) {
       out.status = "missing";
       out.offerInstall = true;
       out.state = "not installed";
@@ -160,7 +196,7 @@ export function requirementsModel(input: RequirementsInput): RequirementsModel {
     out.version = got.version ?? null;
     out.scope = got.scope ?? null;
     out.untrustedHooks = (entry.hooks ?? []).filter(
-      (h) => (h.plugin_id === r.id || h.plugin_id === base) && (h.trust === "untrusted" || h.trust === "modified"),
+      (h) => (h.plugin_id === r.id || (unambiguous && h.plugin_id === base)) && (h.trust === "untrusted" || h.trust === "modified"),
     );
     const n = out.untrustedHooks.length;
     if (!got.enabled) {
@@ -271,6 +307,7 @@ function fallbackSummary(kind: RowKind, p: BlockInput): string {
  *  recommendation as optional. */
 export function sheetText(row: RequirementRow, knowledge: string | null | undefined): string {
   const v = row.version !== null ? ` ${row.version}` : "";
+  if (row.identityAmbiguous) return `${row.agent}'s ${row.id}: ${row.state}`;
   if (row.status === "installed") return `${row.agent} has ${row.name}${v} ✓`;
   if (row.status === "disabled") return `${row.agent} has ${row.name}${v}, but it is disabled`;
   if (row.kind === "requires") {

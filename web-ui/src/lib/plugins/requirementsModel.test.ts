@@ -3,7 +3,9 @@ import type { AgentHook, AgentPlugin, AgentPlugins, PluginRequirement } from "./
 import {
   CHECKING,
   agentSideBlocks,
+  agentsForSetup,
   hooksAwaitingTrust,
+  installationDetected,
   marketplaceUrl,
   requirementsModel,
   sheetText,
@@ -22,6 +24,76 @@ function report(agents: { agent: string; available?: boolean; plugins?: AgentPlu
 }
 
 const mycelium = (enabled = true, id = "mycelium@mycelium"): AgentPlugin => ({ id, version: "0.7.2", scope: "user", enabled });
+
+describe("installation completion", () => {
+  it("does not attribute an ambiguous short name or hook to either marketplace", () => {
+    const required = { agent: "codex", id: "foo@market-a", marketplace: "owner/a" };
+    const recommended = { agent: "codex", id: "foo@market-b", marketplace: "owner/b" };
+    const short = mycelium(true, "foo");
+    const model = (plugins: AgentPlugin[]) => requirementsModel(input({
+      requires: [required], recommends: [recommended],
+      report: report([{ agent: "codex", plugins, hooks: [{key: "short", event: "Stop", plugin_id: "foo", trust: "untrusted", hash: "x"}] }]),
+    }));
+    const ambiguous = model([short]);
+    expect(ambiguous.rows.map((r) => r.status)).toEqual(["unknown", "unknown"]);
+    expect(agentsForSetup(ambiguous, ["codex"])).toEqual([]);
+    expect(sheetText(ambiguous.rows[1], null)).toContain("marketplace unclear");
+    expect(installationDetected(ambiguous.rows, "codex", recommended.id)).toBe(false);
+    // Qualified evidence wins even if an unqualified report appears first.
+    const exact = model([short, mycelium(false, recommended.id)]);
+    expect(exact.rows.map((r) => r.status)).toEqual(["unknown", "disabled"]);
+    expect(installationDetected(exact.rows, "codex", recommended.id)).toBe(true);
+    expect(hooksAwaitingTrust(exact)).toEqual([]);
+    const otherReportedMarketplace = requirementsModel(input({
+      recommends: [recommended],
+      report: report([{agent: "codex", plugins: [short, mycelium(true, required.id)]}]),
+    }));
+    expect(installationDetected(otherReportedMarketplace.rows, "codex", recommended.id)).toBe(false);
+    const unqualified = requirementsModel(input({
+      recommends: [{...recommended, id: "foo"}],
+      report: report([{agent: "codex", plugins: [short, mycelium(true, required.id)]}]),
+    }));
+    expect(unqualified.rows[0]).toMatchObject({ status: "unknown", identityAmbiguous: true });
+    expect(installationDetected(unqualified.rows, "codex", "foo")).toBe(false);
+  });
+
+  it.each([true, false])("matches the requested add-on independently of enablement (%s)", (enabled) => {
+    const needed = { agent: "codex", id: "need@market", marketplace: "owner/needed" };
+    const installed = mycelium(enabled, needed.id);
+    const before = requirementsModel(input({
+      requires: [needed], recommends: [myc("codex")],
+      report: report([{ agent: "codex", plugins: [installed] }]),
+    }));
+    expect(installationDetected(before.rows, "codex", needed.id)).toBe(true);
+    expect(installationDetected(before.rows, "codex", myc("codex").id)).toBe(false);
+    expect(installationDetected(before.rows, "claude", needed.id)).toBe(false);
+
+    const after = requirementsModel(input({
+      requires: [needed], recommends: [myc("codex")],
+      report: report([{ agent: "codex", plugins: [installed, mycelium(enabled)] }]),
+    }));
+    expect(installationDetected(after.rows, "codex", myc("codex").id)).toBe(true);
+  });
+});
+
+describe("setup readiness", () => {
+  it("requires known enabled add-ons and does not treat unknown or disabled as ready", () => {
+    for (const enabled of [true, false]) {
+      const m = requirementsModel(input({
+        recommends: [myc("codex")], report: report([{agent:"codex", plugins:[mycelium(enabled)]}]),
+      }));
+      expect(agentsForSetup(m, ["codex"])).toEqual(enabled ? ["codex"] : []);
+    }
+    const missingRequired = requirementsModel(input({
+      requires: [{...myc("codex"), id:"required@market"}], recommends:[myc("codex")],
+      report: report([{agent:"codex", plugins:[mycelium()]}]),
+    }));
+    expect(agentsForSetup(missingRequired, ["codex"])).toEqual([]);
+    const unavailable = requirementsModel(input({requires:[myc("codex")], state:"unavailable"}));
+    expect(agentsForSetup(unavailable, ["codex"])).toEqual([]);
+    expect(agentsForSetup(requirementsModel(input({})), ["codex"])).toEqual(["codex"]);
+  });
+});
 
 function input(over: Partial<RequirementsInput>): RequirementsInput {
   return { requires: [], recommends: [], knowledge: null, report: null, state: "ok", ...over };

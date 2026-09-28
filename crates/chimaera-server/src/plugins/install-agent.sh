@@ -36,8 +36,29 @@ finish() {
 trap finish EXIT
 
 printf 'Installing %s for %s with the agent plugin manager.\n\n' "$plugin_name" "$agent_name"
+explain_claude_git_failure() {
+    # Check only after a failed fetch: local or already-cached marketplaces
+    # can install successfully without modern Git. Codex has its own fetcher.
+    [ "$agent_name" = claude ] || return 0
+    if ! command -v git >/dev/null 2>&1; then
+        printf '%s\n' 'Claude needs Git to fetch this marketplace, but git is not on PATH.'
+        printf '%s\n' 'Add your Git setup command in Settings > Environment, then retry.'
+        return 0
+    fi
+    git_help=$(LC_ALL=C git clone -h 2>&1)
+    case "$git_help" in
+        *shallow-submodules*) ;;
+        *)
+            printf 'Claude needs a Git that supports --shallow-submodules.\nFound: %s (%s).\n' "$(git --version 2>&1)" "$(command -v git)"
+            printf '%s\n' 'Load a newer Git in Settings > Environment for this host or workspace, then retry.'
+            ;;
+    esac
+}
 printf '$ %s plugin marketplace add %s\n' "$agent_name" "$marketplace"
-"$agent_bin" plugin marketplace add "$marketplace" || printf '%s\n' '(marketplace already added or unavailable — trying the install)'
+if ! "$agent_bin" plugin marketplace add "$marketplace"; then
+    explain_claude_git_failure
+    printf '%s\n' 'Marketplace registration failed; trying the existing local marketplace, if any.'
+fi
 printf '\n$ %s plugin %s %s\n' "$agent_name" "$install_verb" "$plugin_id"
 "$agent_bin" plugin "$install_verb" "$plugin_id"
 exit $?

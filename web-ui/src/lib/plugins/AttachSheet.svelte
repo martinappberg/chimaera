@@ -17,7 +17,7 @@
   import { modalFocus } from "../shared/modalFocus";
   import { refreshKnowledge } from "../workspace/knowledge";
   import { installedOutcome, installTitle, pinnedVersion, type Outcome } from "./installCopy";
-  import { hooksAwaitingTrust, requirementsModel, sheetText, type AgentsState, type RequirementRow } from "./requirementsModel";
+  import { agentsForSetup, hooksAwaitingTrust, requirementsModel, sheetText, type AgentsState, type RequirementRow } from "./requirementsModel";
   import {
     agentInstallContinuation,
     fetchAgentPlugins,
@@ -83,8 +83,9 @@
       plugin = wp.plugins.find((p) => p.id === pluginId) ?? null;
       agents = ap;
       if (plugin === null) loadError = `no plugin “${pluginId}” on this daemon`;
-      // Default the setup agent to one that is installed and has the plugin.
-      const preferred = model?.rows.find((r) => r.status === "installed")?.agent;
+      // Use the same readiness decision as the chooser, including every
+      // required add-on and any ambiguous marketplace report.
+      const preferred = setupAgents[0];
       if (preferred !== undefined) setupAgent = preferred as AgentId;
     } catch (e) {
       loadError = message(e);
@@ -111,6 +112,7 @@
         }),
   );
   const rows = $derived(model?.rows ?? []);
+  const identityUncertain = $derived(rows.some((r) => r.identityAmbiguous));
 
   /** The plugin itself isn't on this host yet: installing it comes first. */
   const notInstalled = $derived(plugin !== null && plugin.source === "available");
@@ -123,7 +125,7 @@
       rows.every((r) => r.status === "installed"),
   );
   const agentsWarn = $derived(
-    (model?.phase === "ready" && model.notice !== null) ||
+    identityUncertain || (model?.phase === "ready" && model.notice !== null) ||
       rows.some((r) => r.kind === "requires" && (r.status === "missing" || r.status === "disabled")),
   );
 
@@ -138,12 +140,12 @@
    *  a plugin that asks nothing of the agents — any agent on this host. */
   const setupAgents = $derived.by((): AgentId[] => {
     if (model === null) return [];
-    const ids =
-      model.phase === "none"
-        ? (agents?.agents ?? []).filter((a) => a.available).map((a) => a.agent)
-        : rows.filter((r) => r.status !== "missing").map((r) => r.agent);
-    return [...new Set(ids)] as AgentId[];
+    const available = (agents?.agents ?? []).filter((a) => a.available).map((a) => a.agent);
+    return agentsForSetup(model, available) as AgentId[];
   });
+  const needsSetup = $derived(!detected && canSetup);
+  // An empty eligible list still means setup is blocked, not optional.
+  const setupBlocked = $derived(needsSetup && !setupAgents.includes(setupAgent));
 
   /** Step numbers: the plugin's own install (when shown) comes first. */
   const nAgents = $derived(showInstallStep ? 2 : 1);
@@ -159,7 +161,7 @@
 
   function rowClass(r: RequirementRow): string {
     if (r.status === "installed") return "good-text";
-    if (r.status === "disabled" || (r.kind === "requires" && r.status === "missing")) return "warn-text";
+    if (r.tone === "warn") return "warn-text";
     return "muted-text";
   }
 
@@ -198,7 +200,7 @@
     if (notInstalled) return "Turn on";
     const parts: string[] = [];
     if (needsTrust && trust) parts.push("Trust hooks");
-    if (!detected && canSetup && setupAgents.length > 0) parts.push("set up");
+    if (needsSetup) parts.push("set up");
     else if (!plugin.on) parts.push("turn on");
     if (parts.length === 0) return "Done";
     const s = parts.join(" & ");
@@ -222,11 +224,11 @@
     }
   }
 
-  async function install(agent: AgentId): Promise<void> {
+  async function install(agent: AgentId, agentPluginId: string): Promise<void> {
     busy = `install:${agent}`;
     error = null;
     try {
-      const res = await installPlugin(wsId, pluginId, agent);
+      const res = await installPlugin(wsId, pluginId, agent, agentPluginId);
       onOpenSession(res.session_id);
     } catch (e) {
       error = isMissingRoute(e) ? `this daemon can't run installs yet — run ${agent}'s own plugin manager instead` : message(e);
@@ -235,7 +237,11 @@
   }
 
   async function complete(): Promise<void> {
-    if (plugin === null || notInstalled) return;
+    if (plugin === null || notInstalled || identityUncertain) return;
+    if (setupBlocked) {
+      error = "Choose an agent with the required plugins enabled.";
+      return;
+    }
     busy = "complete";
     error = null;
     skipped = [];
@@ -252,7 +258,7 @@
       }
       if (!plugin.on) await putWorkspacePlugin(wsId, pluginId, true);
       refreshWorkspacePlugins();
-      if (!detected && canSetup && setupAgents.length > 0) {
+      if (needsSetup) {
         const res = await setupPlugin(wsId, pluginId, setupAgent);
         refreshKnowledge();
         clearContinuation();
@@ -359,7 +365,7 @@
                         <button
                           class="opt"
                           disabled={busy !== null}
-                          onclick={() => void install(r.agent as AgentId)}
+                          onclick={() => void install(r.agent as AgentId, r.id)}
                           title="runs {r.agent}'s own plugin manager in a visible terminal"
                         >
                           {busy === `install:${r.agent}` ? "starting…" : `Install for ${r.agent}`}
@@ -442,8 +448,10 @@
                 </select>
                 <span class="smuted">billed to your {setupAgent} account</span>
               </div>
-              {#if setupAgents.length === 0 && rows.length > 0}
-                <div class="smuted">Install the plugin for an agent first (step {nAgents}).</div>
+              {#if identityUncertain}
+                <div class="smuted warn-text">Resolve the marketplace identity in the agent before continuing.</div>
+              {:else if setupAgents.length === 0}
+                <div class="smuted">Setup needs an available agent with its required plugins installed and enabled (step {nAgents}).</div>
               {/if}
             {/if}
           </div>
@@ -457,7 +465,7 @@
       <button class="opt quiet" use:focusOnMount onclick={onClose}>Cancel</button>
       <button
         class="opt primary"
-        disabled={busy !== null || plugin === null || notInstalled}
+        disabled={busy !== null || plugin === null || notInstalled || identityUncertain || setupBlocked}
         title={notInstalled && plugin !== null ? `install ${plugin.name} first` : undefined}
         onclick={() => void complete()}
       >

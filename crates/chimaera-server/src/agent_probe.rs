@@ -18,6 +18,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -45,6 +46,8 @@ const HOOKS_JSON_MAX: u64 = 256 * 1024;
 #[derive(Default)]
 pub(crate) struct ProbeState {
     cache: Mutex<HashMap<String, (Instant, Value)>>,
+    generation: AtomicU64,
+    changed_epoch: AtomicU64,
 }
 
 /// Daemon-wide: at most one agent CLI probe in flight.
@@ -58,8 +61,13 @@ impl ProbeState {
             .map(|(_, v)| v.clone())
     }
 
-    fn put(&self, key: &str, value: Value) {
+    fn put(&self, key: &str, value: Value, generation: u64) {
         let mut cache = crate::lock(&self.cache);
+        // An install may finish while a CLI probe is still in flight. Its
+        // old result can answer that caller, but must not refill the cache.
+        if self.generation.load(Ordering::Relaxed) != generation {
+            return;
+        }
         if cache.len() > 64 {
             cache.retain(|_, (at, _)| at.elapsed() < CACHE_TTL);
         }
@@ -68,7 +76,20 @@ impl ProbeState {
 
     /// Forget everything (an install or trust write just changed the truth).
     pub(crate) fn invalidate(&self) {
-        crate::lock(&self.cache).clear();
+        let mut cache = crate::lock(&self.cache);
+        self.generation.fetch_add(1, Ordering::Relaxed);
+        cache.clear();
+    }
+
+    /// A write changed agent plugins/hooks. Explicit refreshes invalidate
+    /// only the cache: broadcasting those would cause a refetch loop.
+    pub(crate) fn changed(&self) {
+        self.invalidate();
+        self.changed_epoch.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn changed_epoch(&self) -> u64 {
+        self.changed_epoch.load(Ordering::Relaxed)
     }
 }
 
@@ -280,6 +301,7 @@ async fn claude_state(state: &AppState) -> Value {
     if let Some(hit) = state.probes.get("claude") {
         return hit;
     }
+    let generation = state.probes.generation.load(Ordering::Relaxed);
     let listed = run_bounded(&wrapped(&bin, &["plugin", "list", "--json"]), None).await;
     let plugins: Vec<Value> = match listed.and_then(|out| {
         serde_json::from_str::<Vec<Value>>(out.trim())
@@ -320,7 +342,7 @@ async fn claude_state(state: &AppState) -> Value {
         rows.push(row);
     }
     let value = json!({"agent": "claude", "available": true, "version": version, "plugins": rows});
-    state.probes.put("claude", value.clone());
+    state.probes.put("claude", value.clone(), generation);
     value
 }
 
@@ -340,6 +362,7 @@ async fn codex_raw(state: &AppState, root: &Path) -> Value {
     if let Some(hit) = state.probes.get(&key) {
         return hit;
     }
+    let generation = state.probes.generation.load(Ordering::Relaxed);
     let result = async {
         let mut rpc = CodexRpc::open(&bin, root).await?;
         let cwd = root.to_string_lossy().into_owned();
@@ -374,7 +397,7 @@ async fn codex_raw(state: &AppState, root: &Path) -> Value {
         }
         Err(err) => json!({"available": true, "version": version, "error": err}),
     };
-    state.probes.put(&key, value.clone());
+    state.probes.put(&key, value.clone(), generation);
     value
 }
 
@@ -676,7 +699,8 @@ pub(crate) async fn trust_hooks(
     }
     .await;
     drop(_permit);
-    state.probes.invalidate();
+    state.probes.changed();
+    state.changes.notify_waiters();
     match result {
         Ok((trusted, skipped)) => {
             tracing::info!(workspace = %id, plugin = %pid, trusted = trusted.len(),
@@ -964,6 +988,24 @@ pub(crate) async fn skills(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalidation_rejects_in_flight_results_without_broadcasting_refreshes() {
+        let probes = ProbeState::default();
+        probes.put("codex", json!("before"), 0);
+        probes.invalidate();
+        assert_eq!(probes.changed_epoch(), 0);
+        probes.put("codex", json!("stale"), 0);
+        assert!(probes.get("codex").is_none());
+
+        let generation = probes.generation.load(Ordering::Relaxed);
+        probes.put("codex", json!("fresh"), generation);
+        assert_eq!(probes.get("codex"), Some(json!("fresh")));
+        probes.changed();
+        assert_eq!(probes.changed_epoch(), 1);
+        probes.put("codex", json!("stale after install"), generation);
+        assert!(probes.get("codex").is_none());
+    }
 
     #[test]
     fn claude_details_totals_parse_or_stay_none() {

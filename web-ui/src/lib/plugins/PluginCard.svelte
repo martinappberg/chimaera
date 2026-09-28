@@ -43,7 +43,7 @@
     updatedOutcome,
     type Outcome,
   } from "./installCopy";
-  import { agentSideBlocks, requirementsModel, type AgentsState, type RequirementRow } from "./requirementsModel";
+  import { agentSideBlocks, installationDetected, requirementsModel, type AgentsState, type RequirementRow } from "./requirementsModel";
   import {
     agentInstallContinuation,
     changeWorkbenchPlugin,
@@ -159,6 +159,9 @@
       ? $agentInstallContinuation
       : null,
   );
+  const installDetected = $derived(
+    continuation !== null && installationDetected(model.rows, continuation.agent, continuation.agentPluginId),
+  );
   /** A plugin that can't run here: the switch can't turn it on (the daemon
    *  refuses) until the fault is gone. A fault while on is the plugin
    *  failing in this workspace, which switching off and on clears. */
@@ -226,7 +229,7 @@
     agentBusy = r.agent;
     error = null;
     try {
-      const res = await installPlugin(wsId, p.id, r.agent as AgentId);
+      const res = await installPlugin(wsId, p.id, r.agent as AgentId, r.id);
       onOpenSession(res.session_id);
     } catch (e) {
       error = isMissingRoute(e) ? "this daemon can't run installs yet — use the agent's own plugin manager" : message(e);
@@ -493,7 +496,11 @@
     <p class="status err" role="alert">{error}</p>
   {:else if continuation !== null}
     <p class="status" role="status">
-      Installation opened for {continuation.agent}. When it finishes,
+      {#if installDetected}
+        Installed for {continuation.agent} —
+      {:else}
+        Installation opened for {continuation.agent}. When it finishes,
+      {/if}
       <button class="link" onclick={() => onAttach(p.id)}>continue setup</button>.
     </p>
   {:else if note !== null}

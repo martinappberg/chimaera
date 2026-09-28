@@ -31,12 +31,14 @@ sheet, hosted once in `web-ui/src/App.svelte`. Wire (all under `/api/v1`, bearer
 `POST /plugins/install {github, version?}` or `{path}` · `POST /plugins/{pid}/install` ·
 `POST /plugins/{pid}/update` · `POST /plugins/{pid}/rollback` · `POST /plugins/{pid}/check` ·
 `DELETE /plugins/{pid}` · `GET /plugins/{pid}/details` · `POST /plugins/preview {github}` ·
-`POST /workspaces/{id}/plugins/{pid}/install {agent}` ·
+`POST /workspaces/{id}/plugins/{pid}/install {agent, agent_plugin_id?}` ·
 `POST …/{pid}/setup {agent}` · `POST …/{pid}/trust-hooks {hooks:[{key,hash}]}` ·
 `GET /workspaces/{id}/agent-plugins?refresh=` · `GET /workspaces/{id}/skills?refresh=` ·
 `POST /workspaces/{id}/timeline/{seq}/deliver`; plugin tools ride the per-session MCP endpoint
 ([linked-terminals.md](linked-terminals.md#the-mcp-server)); a plugin's `emit` reaches
 `/ws/events` as a `{"type":"plugin","plugin":…,"workspace":…}` frame (no UI reads one yet).
+The additive `{"type":"agent_plugins","epoch":…}` frame invalidates agent reports after
+installation or hook trust and on reconnect; it carries no plugin payload.
 
 ## Workbench plugins
 
@@ -147,11 +149,25 @@ sheet, hosted once in `web-ui/src/App.svelte`. Wire (all under `/api/v1`, bearer
   - **Agent-plugin installs are the agent's own CLI** in a visible `install <plugin> for
     <agent>` terminal (ids and marketplace sources charset-gated, never flag-shaped); 409 when
     the agent binary is missing. `plugins/install-agent.sh` receives metadata as arguments,
-    never shell source. Success and failure output stay visible until **Enter** closes the
+    never shell source. It inherits the host + workspace **Settings → Environment** commands
+    so module loads and PATH setup apply. A failed Claude marketplace fetch explains missing
+    Git or lack of `--shallow-submodules` support; an existing cached marketplace can still
+    install. Codex's fetcher is independent of this Git requirement.
+    Success and failure output stay visible until **Enter** closes the
     terminal; the original exit status is preserved. The probe cache is invalidated when the
-    command finishes, even while its result remains open. The card offers **continue setup**
+    command finishes, even while its result remains open, and visible Extensions tabs
+    automatically recheck via `/ws/events`. The card offers **continue setup**
     after an agent install is opened, including one launched from the attach sheet. Returning
-    to Extensions during this flow and opening the sheet request a fresh agent report. The
+    to Extensions during this flow and opening the sheet request a fresh agent report. Once
+    the specific requested add-on is detected (even disabled), the card says
+    **Installed for <agent> — continue setup**. Card and sheet select that add-on by
+    its manifest id, so a required and recommended plugin for one agent stay distinct.
+    Full marketplace ids take precedence over short names. If a short name could refer
+    to different marketplaces in the manifest or report, the row says the marketplace
+    is unclear and does not confirm installation or infer hook ownership.
+    The setup sheet repeats this warning and blocks completion until resolved;
+    setup runs only through an agent with known enabled add-ons and all its requirements.
+    Omitting the optional id preserves required-first selection for older clients. The
     sheet resumes the existing install → hook review → workspace setup steps; installation
     alone does not trust hooks or initialize a repository. Newly started agent sessions load
     the installed plugin. Setup is a fresh chat plus one Send (502 if the prompt didn't land —
@@ -454,7 +470,9 @@ sheet, hosted once in `web-ui/src/App.svelte`. Wire (all under `/api/v1`, bearer
 - **Key behaviors.** Every child is login-shell wrapped, time-boxed (20 s CLI, 15 s per RPC),
   output-capped, `kill_on_drop`; **one probe runs daemon-wide at a time** (a semaphore — three
   windows on the tab never spawn three app-servers); answers are cached 60 s; `?refresh=true`,
-  an install ending and a trust write invalidate. Claude has no skills-list API, so its side is
+  an install ending and a trust write invalidate. Only writes broadcast a changed epoch;
+  explicit refreshes do not. Probes started before invalidation cannot refill the cache with
+  stale results. Claude has no skills-list API, so its side is
   a bounded directory scan (200 skills per dir, 8 KiB of each `SKILL.md`) joined with the live
   catalog.
 

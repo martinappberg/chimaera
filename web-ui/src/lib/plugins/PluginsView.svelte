@@ -22,6 +22,7 @@
   import SkillsView from "./SkillsView.svelte";
   import {
     agentInstallContinuation,
+    agentPluginsRevision,
     fetchAgentPlugins,
     fetchSkills,
     openAttachSheet,
@@ -88,12 +89,12 @@
     }
   }
 
-  // Fetch what the shown view needs, on show and on return (the daemon
-  // caches its agent probes, so a return costs at most one cached read).
+  // Fetch on show, return, and the daemon's install/trust invalidation.
+  // Hidden tabs only catch up on return; no recurring CLI probes.
   let lastShown: string | null = null;
   $effect(() => {
     const on = visible && $pageVisible && wsId !== null;
-    const key = on ? `${wsId}:${view}` : null;
+    const key = on ? `${wsId}:${view}:${$agentPluginsRevision}` : null;
     if (key === null) {
       lastShown = null;
       return;

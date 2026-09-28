@@ -299,10 +299,16 @@ impl Manifest {
     /// first, else a recommendation (the install route and codex hook trust
     /// serve both).
     pub(crate) fn agent_plugin(&self, agent: &str) -> Option<&AgentPluginReq> {
+        self.agent_plugin_matching(agent, None)
+    }
+
+    fn agent_plugin_matching(&self, agent: &str, id: Option<&str>) -> Option<&AgentPluginReq> {
         self.requires
             .agent_plugins
             .get(agent)
-            .or_else(|| self.recommends.agent_plugins.get(agent))
+            .into_iter()
+            .chain(self.recommends.agent_plugins.get(agent))
+            .find(|req| id.is_none_or(|id| req.id == id))
     }
 }
 
@@ -1195,11 +1201,18 @@ pub(crate) struct AgentBody {
     agent: String,
 }
 
+#[derive(Deserialize)]
+pub(crate) struct InstallAgentBody {
+    agent: String,
+    /// Absent for older clients: preserve required-before-recommended selection.
+    agent_plugin_id: Option<String>,
+}
+
 pub(crate) fn bad_request(msg: impl Into<String>) -> Response {
     (StatusCode::BAD_REQUEST, Json(json!({"error": msg.into()}))).into_response()
 }
 
-/// POST /workspaces/{id}/plugins/{pid}/install {agent} — install the agent
+/// POST /workspaces/{id}/plugins/{pid}/install {agent, agent_plugin_id?} — install the agent
 /// plugin this workbench plugin requires or recommends, with the AGENT's own
 /// plugin manager, in a visible terminal the user watches (chimaera never
 /// reimplements `claude plugin` / `codex plugin`). The session is theirs to
@@ -1208,7 +1221,7 @@ pub(crate) fn bad_request(msg: impl Into<String>) -> Response {
 pub(crate) async fn install_requirement(
     State(state): State<Arc<AppState>>,
     AxPath((id, pid)): AxPath<(String, String)>,
-    Json(body): Json<AgentBody>,
+    Json(body): Json<InstallAgentBody>,
 ) -> Response {
     let Some(workspace) = crate::lock(&state.workspaces).get(&id) else {
         return not_found("unknown workspace");
@@ -1216,8 +1229,11 @@ pub(crate) async fn install_requirement(
     let Some(m) = manifest(&state, &pid) else {
         return not_found("unknown plugin");
     };
-    let Some(req) = m.agent_plugin(&body.agent) else {
-        return bad_request(format!("{} names no {} plugin", m.name, body.agent));
+    let Some(req) = m.agent_plugin_matching(&body.agent, body.agent_plugin_id.as_deref()) else {
+        return bad_request(format!(
+            "{} names no matching {} plugin",
+            m.name, body.agent
+        ));
     };
     let Some(kind) = crate::agents::AgentKind::parse(&body.agent) else {
         return bad_request("unknown agent");
@@ -1238,14 +1254,27 @@ pub(crate) async fn install_requirement(
         "install"
     };
     let agent = kind.as_str();
+    let session_id = crate::agents::fresh_session_id();
+    let prepare_state = state.clone();
+    let prepare_id = session_id.clone();
+    let prepare_workspace = workspace.id.clone();
     // Keep completion out of the untrusted PTY stream. The runtime directory
     // is private and the random, exclusively created marker is one byte at most.
-    let completion = match tokio::task::spawn_blocking(|| {
+    let (completion, prelude) = match tokio::task::spawn_blocking(move || {
         let path = chimaera_core::runtime_dir().join(format!(
             "plugin-install-{}",
             chimaera_core::generate_token()
         ));
-        std::fs::File::create_new(&path).map(|_| path)
+        std::fs::File::create_new(&path)?;
+        // Agent-plugin managers need the same modules/PATH as agents in this
+        // workspace. Runtime bootstrap installers have a separate contract.
+        let prelude = crate::environment::materialize_prelude(
+            &prepare_state,
+            &prepare_id,
+            &prepare_workspace,
+            None,
+        );
+        Ok::<_, std::io::Error>((path, prelude))
     })
     .await
     {
@@ -1259,8 +1288,7 @@ pub(crate) async fn install_requirement(
                 .into_response();
         }
     };
-    let session_id = crate::agents::fresh_session_id();
-    let env = crate::api::session_env(&state, &session_id, "dark", None);
+    let env = crate::api::session_env(&state, &session_id, "dark", prelude.as_deref());
     let env_remove = crate::api::spawn_env_remove(&env);
     let opts = chimaera_pty::SpawnOpts {
         cwd: workspace.root.clone(),
@@ -1310,7 +1338,10 @@ pub(crate) async fn install_requirement(
                     tokio::time::sleep(Duration::from_secs(2)).await;
                 }
                 let _ = tokio::fs::remove_file(&completion).await;
-                watch_state.probes.invalidate();
+                if let Some(prelude) = prelude {
+                    let _ = tokio::fs::remove_file(prelude).await;
+                }
+                watch_state.probes.changed();
                 watch_state.changes.notify_waiters();
             });
             tracing::info!(workspace = %id, plugin = %pid, agent, "plugin requirement install started");
@@ -1319,6 +1350,9 @@ pub(crate) async fn install_requirement(
         }
         Err(err) => {
             let _ = tokio::fs::remove_file(&completion).await;
+            if let Some(prelude) = prelude {
+                let _ = tokio::fs::remove_file(prelude).await;
+            }
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": err.to_string()})),
@@ -1560,6 +1594,16 @@ mod tests {
         );
         assert_eq!(m.agent_plugin("claude").unwrap().id, "nice@x");
         assert!(m.agent_plugin("agy").is_none());
+        assert_eq!(
+            m.agent_plugin_matching("codex", Some("also@x"))
+                .unwrap()
+                .marketplace,
+            "x/also"
+        );
+        assert!(m.agent_plugin_matching("codex", Some("nice@x")).is_none());
+        assert!(m
+            .agent_plugin_matching("codex", Some("undeclared@x"))
+            .is_none());
         assert!(
             demo("version = \"0.1.0\"\napi = \"0.1\"\n[recommends]\nchimaera = \">=1\"\n").is_err()
         );
