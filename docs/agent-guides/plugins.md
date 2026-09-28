@@ -517,18 +517,11 @@ host:
   API crate's version with it, and the host's `plugins::API`, adding the new
   version to `plugins::SERVED_APIS` beside those it still serves.
 
-## The LaTeX plugin
+## LaTeX and Typst are not plugins
 
-The LaTeX and Typst plugins are the first new plugins planned on this host.
-Their contribution point is `build` (files → a bounded, quiet child process
-on the host, diagnostics as editor marks, SyncTeX, a `compile_document` tool
-where on), designed in the
-[LaTeX and Typst plan](../latex-reports-plan.md#the-plugin-shape). Running an
-engine is the host's job, never something a plugin does itself. The plan's
-2026-09-28 revision proposes a WIT 0.2 **build world** in place of the `exec` and
-`watch` imports sketched above: the host runs what the plugin's `plan` export asks
-for (programs declared in `[build]`, checked by the host) and hands the outputs to
-its `digest` export, because a guest call's 5 s budget and one-call-at-a-time
-instance cannot hold a three-minute build
-([why](../latex-reports-plan.md#why-a-build-plugin-cannot-simply-call-exec)).
-That is an open decision until the maintainer confirms it.
+LaTeX and Typst were planned as the first new plugins on this host; on
+2026-09-28 the maintainer made them core document support instead, kept lean
+([LaTeX and Typst plan](../latex-reports-plan.md#decisions-maintainer-2026-09-28)).
+File formats are core; plugins are for someone else's framework on its own
+cadence, or for optional capabilities. Nothing is waiting on `exec` or `watch`
+any more: they arrive with the first plugin that needs them.

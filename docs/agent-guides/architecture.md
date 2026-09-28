@@ -852,8 +852,10 @@ setup into a new session. Distinctive, deferred.
 *Added 2026-09-26. Plan: [plugin-system-plan.md](../plugin-system-plan.md); what users see:
 [features/plugins.md](../features/plugins.md); authoring: [plugins.md](plugins.md).*
 
-Opt-in capabilities beyond the core (Mycelium's Knowledge reader, Agent notes, later LaTeX and
-Typst) are **workbench plugins**, and none of their behaviour is daemon code. A plugin is a
+Opt-in capabilities beyond the core (Mycelium's Knowledge reader, Agent notes) are **workbench
+plugins**, and none of their behaviour is daemon code. (File formats stay core: LaTeX and Typst,
+once planned as plugins, are planned as lean core document support,
+[latex-reports-plan.md](../latex-reports-plan.md).) A plugin is a
 Rust crate compiled to one portable WebAssembly component (`plugin.wasm`, `wasm32-wasip2`)
 beside a `plugin.toml` manifest; the same file runs on a laptop, an x86 login node and an ARM
 box, so the one-static-binary model survives: the binary carries no plugin bytes, only

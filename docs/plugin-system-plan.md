@@ -6,8 +6,9 @@ Mycelium) to run as WASM components before anything new is built on it. Read
 this first when touching `crates/chimaera-plugin-api`, `crates/chimaera-server/src/plugins/`
 or `plugins/`. The earlier plugin seam (manifests embedded as data, behaviour as
 named first-party code) is in [timeline-knowledge-plugins-plan.md §6](timeline-knowledge-plugins-plan.md);
-this plan replaces its "named built-in" column. The LaTeX and Typst plugins are
-the first new plugins on it ([latex-reports-plan.md](latex-reports-plan.md)).
+this plan replaces its "named built-in" column. LaTeX and Typst were to be the
+first new plugins on it; on 2026-09-28 they became core document support instead
+([latex-reports-plan.md](latex-reports-plan.md#decisions-maintainer-2026-09-28)).
 
 ## Status (2026-09-27)
 
@@ -162,8 +163,8 @@ describe what shipped; the phases below remain the design record.
   10.2 MB with a workspace and a session, 28.8 MB after the first plugin call
   (compile + instantiate, 70 ms end to end), 28.9 MB after 50 more calls. The
   debug daemon stayed at 29 to 64 MB through the P3 run.
-- **Later (P5):** the Browse view; `exec` and `watch` (WIT 0.2) and the LaTeX
-  plan's `build` point on them; the UI-facing `query` route; delivering
+- **Later (P5):** the Browse view; `exec` and `watch` (WIT 0.2), once a plugin
+  needs them; the UI-facing `query` route; delivering
   `switched-on` / `switched-off`; a UI that reads `emit` frames; and, only if
   cold compile or binary size hurts on a real login node (not yet measured on
   one), an on-disk `.cwasm` cache or the runtime-only host. (Adding a
@@ -387,14 +388,12 @@ Two WIT spellings to know: `%list` escapes a keyword (the function is
 hence `stat as file-stat` in `host`.
 
 What is deliberately not in 0.1: **`exec`** (a bounded child process on the
-host, the heart of the LaTeX plan's `build` point) and **`watch`** (ask the host
-to report file changes). Both are additive: a host may offer more imports than a
+host) and **`watch`** (ask the host to report file changes). Both are additive: a host may offer more imports than a
 component uses, so 0.2 adds them without breaking 0.1 plugins. They land with the
-first plugin that needs them. (2026-09-28: the LaTeX plan proposes a build world
-with `plan` and `digest` exports instead, the host running the process, because a
-build outlives a guest call's budget; see
-[latex-reports-plan.md](latex-reports-plan.md#why-a-build-plugin-cannot-simply-call-exec).
-Open until decided.) Removing or changing an export is the breaking
+first plugin that needs them. (LaTeX, which was to be that plugin, became core on
+2026-09-28. A process that outlives a guest call's 5 s budget would also need a
+different shape than an import called from inside the guest.) Removing or changing
+an export is the breaking
 direction; the exports above are the complete set a plugin must provide.
 
 ### The Rust side of it
@@ -820,8 +819,8 @@ their own repositories, `plugins/plugins.lock`, and embedded plugins updating
 from their repositories; then (2026-09-27, decisions 6 and 7) no embedded
 plugins at all, the three install kinds, `SHA256SUMS` kept and re-checked,
 `recommends`, and the Extensions tab. Still to come: the Browse view over plugin
-repositories; `exec` and `watch` in the WIT (0.2)
-and the LaTeX plan's `build` point on them; the UI-facing `query` route;
+repositories; `exec` and `watch` in the WIT (0.2), once a plugin needs them;
+the UI-facing `query` route;
 precompiled first-party components if cold compile is slow on a login node.
 
 ## Risks, and what the spike answered
