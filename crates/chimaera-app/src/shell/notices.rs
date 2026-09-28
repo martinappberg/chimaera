@@ -597,3 +597,61 @@ pub(crate) fn route_click(app: &AppHandle, route: Route) {
         }
     });
 }
+
+/// Open an explicitly requested daemon-owned session, preserving the same
+/// deferred focus handshake used by notifications. The caller holds its
+/// account generation guard; this does not detach work into another task.
+pub(super) async fn open_session(
+    app: &AppHandle,
+    alias: String,
+    workspace: String,
+    session: String,
+) -> Result<(), String> {
+    let shell = app.state::<Shell>();
+    let key = Some(alias.clone());
+    let label = lock(&shell.windows)
+        .iter()
+        .find(|(_, scope)| {
+            scope.alias == key && scope.ws.as_ref() == Some(&workspace) && !scope.detached
+        })
+        .map(|(label, _)| label.clone());
+    if let Some(label) = label {
+        if let Some(window) = app.get_webview_window(&label) {
+            if let Some(hub) = hub(app) {
+                lock(&hub.inner)
+                    .owed_focus
+                    .insert(label.clone(), session.clone());
+            }
+            let _ = window.unminimize();
+            let _ = window.show();
+            window
+                .set_focus()
+                .map_err(|_| "Couldn't focus the connection window.")?;
+            app.emit_to(&label, "focus-session", session)
+                .map_err(|_| "Couldn't focus the connection session.")?;
+            return Ok(());
+        }
+    }
+    let (port, token) = endpoint(app, &key)
+        .await
+        .ok_or("Cloud machine is disconnected.")?;
+    if let Some(hub) = hub(app) {
+        let mut inner = lock(&hub.inner);
+        inner.pending_focus.retain(|pending| {
+            pending.at.elapsed() < PENDING_FOCUS_TTL
+                && !(pending.alias == key && pending.ws == workspace)
+        });
+        if inner.pending_focus.len() >= 32 {
+            inner.pending_focus.remove(0);
+        }
+        inner.pending_focus.push(PendingFocus {
+            alias: key.clone(),
+            ws: workspace.clone(),
+            session,
+            at: Instant::now(),
+        });
+    }
+    let record = crate::windows::WindowRecord::new(key, Some(workspace));
+    super::open_ui_window(app, port, &token, &record)
+        .map_err(|_| "Couldn't open the connection window.".to_string())
+}

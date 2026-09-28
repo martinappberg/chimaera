@@ -11,6 +11,7 @@ revocable delegation over the authenticated local API.
 | `projects.rs` | Passive bounded cloud-project discovery and explicit per-device local adoption; native-picked folder validation, saved directory identity, retry and legacy-import fences. |
 | `projects/tests.rs` | Synthetic loopback HTTP plus real Git transfer, passive-read, conflict, retry, restart and two-device destination checks. |
 | `engine.rs` | Independent lease renewal, mirror coordinator, transactional hydration, profile execution and lazy return. |
+| `provider_gate.rs` / `provider_tests.rs` | Per-agent cloud readiness, bounded blocked-provider status, and staged retry/cancellation tests with a synthetic CLI and real PTY. |
 | `protocol.rs` | Additive account contract subset; intentionally no link/TLS dependency in the daemon. |
 | `transport.rs` | Bounded external curl/git children; credentials only in memory, never argv or Git config. |
 | `policy.rs` | Mirrored-path policy, credential filtering, size budgets and cloud-profile classification. |
@@ -80,3 +81,18 @@ keeps that fence and exposes an attention error; a hydrate retry runs the update
 setup against already installed files. Laptop-only deferred steps stay in the
 profile as instructions for the returning agent under its usual permissions;
 the daemon never replays those commands automatically.
+
+Cloud resume additionally checks the providers named by actual deferred ledger
+agents after setup, using fresh bounded worker-local readiness probes. Every
+required provider must be installed and signed in; another provider's login,
+unknown provider ids, timeouts and missing evidence cannot satisfy the gate.
+The workspace remains `SettingUp` until all checks succeed. The local status
+row exposes additive `blocked_providers: [{id,state,reason}]` and its mirror
+error is `cloud_provider_not_ready`; the same bounded rows feed cloud-provider
+onboarding and session-scoped MCP guidance without probes. Nonsecret blocked
+rows survive daemon restart only beside a persisted `SettingUp` fence; cached
+readiness never grants permission to resume. An explicit hydrate retry against the recorded epoch reuses staged
+files and repeats setup/readiness without fetching another snapshot. It never
+starts authentication or transfers provider credentials. Account replacement,
+ownership changes and cancellation retain the fence. Personal-device and
+ordinary SSH/free workspace behavior is unchanged.

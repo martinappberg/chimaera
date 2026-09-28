@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { cloudOnboarding } from "./lib/pro/onboarding.svelte";
   import { onMount, tick, untrack } from "svelte";
   import PlanBadge from "./lib/shared/PlanBadge.svelte";
   import ProNavigation from "./lib/pro/ProNavigation.svelte";
@@ -1752,10 +1753,33 @@
     const onCopy = () => rememberCopy();
     // Which-key discovery: holding the app modifier fades in the ⌘1–9 badges.
     const stopChordHints = initChordHints();
+    const connectProviders = (event: Event) => {
+      if (cloudOnboarding.set((event as CustomEvent).detail)) openProSurface();
+    };
+    const providerTerminal = (event: Event) => {
+      const detail = (event as CustomEvent).detail;
+      if (!detail || typeof detail.workspaceId !== "string" || typeof detail.sessionId !== "string"
+        || !/^[a-zA-Z0-9_-]{1,128}$/.test(detail.workspaceId)
+        || !/^[a-zA-Z0-9_-]{1,128}$/.test(detail.sessionId)) return;
+      // The daemon owns this session. Reuse workspace navigation and deferred
+      // focus rather than replacing the fragment that carries window identity.
+      void revealWorktreeSession(detail.sessionId, detail.workspaceId);
+    };
+    const providersReady = () => {
+      cloudOnboarding.clear();
+      if (activeWsId === null) homeSettingsOpen = false;
+      else openDashboardSurface();
+    };
+    window.addEventListener("chimaera:providers-ready", providersReady);
+    window.addEventListener("chimaera:connect-providers", connectProviders);
+    window.addEventListener("chimaera:provider-terminal", providerTerminal);
     window.addEventListener("keydown", onKeydown, true);
     window.addEventListener("pagehide", onPagehide);
     document.addEventListener("copy", onCopy);
     return () => {
+      window.removeEventListener("chimaera:providers-ready", providersReady);
+      window.removeEventListener("chimaera:connect-providers", connectProviders);
+      window.removeEventListener("chimaera:provider-terminal", providerTerminal);
       window.removeEventListener("keydown", onKeydown, true);
       window.removeEventListener("pagehide", onPagehide);
       unlistenMenu?.();
@@ -3218,8 +3242,7 @@
   }
 
   function openProSurface(): void {
-    if (isBrowserGateway()) { location.assign("/account"); return; }
-    if (!isNativeShell()) return;
+    if (!isNativeShell() && !isBrowserGateway()) return;
     if (activeWsId === null) {
       homeSurface = "pro";
       homeSettingsLoad = loadPaneView("pro");

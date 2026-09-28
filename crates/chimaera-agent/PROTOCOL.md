@@ -2590,3 +2590,35 @@ Native TUI gate: imported the same fixture histories with the terminal surface,
 observed the transfer context in each real CLI and its acknowledgment through
 the daemon PTY. Local CLI help pins positional `[PROMPT]` support for Claude and
 Codex resume/fork; the launcher bounds it and places it after `--`.
+
+
+## Pass 39 (2026-09-27 — Claude 2.1.283 and Codex 0.157.1): worker provider authentication. ADOPTED.
+
+This is daemon onboarding (`cloud/providers`), separate from the model drivers.
+No thread or turn is created by a readiness check. With fresh isolated home and
+provider config directories, real Claude `auth status --json` returned
+`loggedIn:false` and exit 1. Only the boolean and compatible exit code are used;
+account identity and credential fields are discarded. The installed CLI supports
+`auth login --claudeai` for the dedicated provider-owned terminal flow; setup-token
+is deliberately not used because it would print a credential.
+
+The installed Codex app-server's generated schema and a real isolated process
+confirm `account/read {refreshToken:false}` returns
+`{account:null,requiresOpenaiAuth:true}` when signed out. An explicit
+`account/login/start {type:"chatgptDeviceCode"}` returned a login ID,
+`verificationUrl` on `https://auth.openai.com`, and a one-time user code. The
+probe canceled it with `account/login/cancel {loginId}` and received
+`{status:"canceled"}`. Completion notifications use
+`account/login/completed {loginId,success,error?}`; the service matches its own
+login ID, ignores raw error text, and requires a fresh account/read before
+publishing Connected. No credential was entered and no existing account used
+in the probe; successful login completion has hermetic app-server coverage.
+
+The service retains only the catalog/status/action fields. Its cancel path
+terminates the owned process group and waits for cleanup before permitting a
+replacement writer. A previously issued vendor device code expires according
+to the provider; cancellation does not claim to revoke that code or sign out an
+already completed login. Official references: [Codex authentication](https://developers.openai.com/codex/auth),
+[app-server account API](https://developers.openai.com/codex/app-server),
+[Claude CLI reference](https://code.claude.com/docs/en/cli-reference), and
+[GitHub auth status](https://cli.github.com/manual/gh_auth_status).

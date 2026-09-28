@@ -11,6 +11,13 @@ use serde_json::json;
 use std::sync::{atomic::Ordering, Arc};
 
 pub(super) fn failure(error: anyhow::Error) -> Response {
+    if let Some(blocked) = error.downcast_ref::<super::provider_gate::Blocked>() {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error":"cloud_provider_not_ready","blocked_providers":blocked.0})),
+        )
+            .into_response();
+    }
     (
         StatusCode::BAD_REQUEST,
         Json(json!({"error":error.to_string().chars().take(256).collect::<String>()})),
@@ -114,7 +121,7 @@ pub(crate) async fn status(State(state): State<Arc<AppState>>) -> Json<serde_jso
     let ownership = lock(&state.pro.ownership).clone();
     let statuses = lock(&state.pro.status).clone();
     Json(
-        json!({"configured":state.pro.configured.load(Ordering::Acquire),"projects_root":super::projects_root(&state),"projects_root_confirmed":lock(&state.pro.projects_root).is_some(),"sessions":sessions,"workspaces":workspaces.into_iter().take(128).map(|workspace|json!({"workspace_id":workspace.id,"name":workspace.name,"root":workspace.root,"never_mirror":preferences.get(&workspace.id).is_some_and(|p|p.never_mirror),"privacy_pending":preferences.get(&workspace.id).is_some_and(|p|p.privacy_pending),"ownership":ownership.get(&workspace.id),"mirror":statuses.get(&workspace.id),"git_branches":preferences.get(&workspace.id).map(|p|&p.git_branches),"profile":preferences.get(&workspace.id).map(|p|&p.profile)})).collect::<Vec<_>>()}),
+        json!({"configured":state.pro.configured.load(Ordering::Acquire),"projects_root":super::projects_root(&state),"projects_root_confirmed":lock(&state.pro.projects_root).is_some(),"sessions":sessions,"workspaces":workspaces.into_iter().take(128).map(|workspace|json!({"workspace_id":workspace.id,"name":workspace.name,"root":workspace.root,"never_mirror":preferences.get(&workspace.id).is_some_and(|p|p.never_mirror),"privacy_pending":preferences.get(&workspace.id).is_some_and(|p|p.privacy_pending),"ownership":ownership.get(&workspace.id),"mirror":statuses.get(&workspace.id),"blocked_providers":statuses.get(&workspace.id).map(|status|status.blocked_providers.clone()).unwrap_or_default(),"git_branches":preferences.get(&workspace.id).map(|p|&p.git_branches),"profile":preferences.get(&workspace.id).map(|p|&p.profile)})).collect::<Vec<_>>()}),
     )
 }
 pub(crate) async fn privacy(
@@ -242,10 +249,31 @@ pub(crate) async fn hydrate(
     if !super::valid_id(&request.workspace_id) {
         return StatusCode::BAD_REQUEST.into_response();
     }
-    let Some(config) = lock(&state.pro.runtime).clone() else {
-        return StatusCode::PRECONDITION_FAILED.into_response();
-    };
     let _guard = state.pro.jobs.lock().await;
+    let (config, generation) = {
+        let _configuration = state.pro.configuration.lock().await;
+        let Some(config) = lock(&state.pro.runtime).clone() else {
+            return StatusCode::PRECONDITION_FAILED.into_response();
+        };
+        (config, state.pro.generation.load(Ordering::Acquire))
+    };
+    if lock(&state.workspaces).get(&request.workspace_id).is_some()
+        && matches!(lock(&state.pro.ownership).get(&request.workspace_id),Some(Ownership::SettingUp{epoch}) if *epoch==request.expected_epoch)
+    {
+        return match engine::hydrate(
+            &state,
+            &config,
+            &request.workspace_id,
+            request.expected_epoch,
+            false,
+            None,
+        )
+        .await
+        {
+            Ok(()) => StatusCode::NO_CONTENT.into_response(),
+            Err(error) => failure(error),
+        };
+    }
     if config.role == super::protocol::Role::Worker
         && lock(&state.workspaces).get(&request.workspace_id).is_some()
         && matches!(lock(&state.pro.ownership).get(&request.workspace_id),Some(Ownership::Local{epoch}|Ownership::AwaitingVerification{epoch}) if *epoch==request.expected_epoch)
@@ -298,6 +326,9 @@ pub(crate) async fn hydrate(
     .unwrap_or(false);
     if !ready {
         return (StatusCode::CONFLICT,Json(json!({"error":"root_setup_required","root":required_root,"workspace_id":request.workspace_id}))).into_response();
+    }
+    if generation != state.pro.generation.load(Ordering::Acquire) {
+        return failure(anyhow::anyhow!("Account changed during project transfer"));
     }
     match engine::hydrate(
         &state,

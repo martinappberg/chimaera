@@ -1,5 +1,7 @@
 //! Shared types and helpers for the chimaera daemon and CLI.
 
+pub mod cloud_providers;
+
 #[cfg(unix)]
 pub mod shellint;
 

@@ -28,8 +28,8 @@ owns the text; the confirm dialog shows it verbatim before anything is written.
 workbench tab and Home view, reached through the quiet Pro entry above Settings.
 It renders `ProSettings.svelte`, which invokes the native `pro_*` commands.
 The generic Settings form no longer embeds account/billing/onboarding controls.
-An account browser opens its own `/account` page; ordinary browser daemons have
-no Pro entry. Their Cloud machine category remains host-pinned and cookie-authenticated.
+An account browser on a cloud worker opens the same provider flow; other hosts
+link to `/account`. Ordinary browser daemons have no Pro entry. Their Cloud machine category remains host-pinned and cookie-authenticated.
 Credentials stay in the app's keychain, never in the schema or this UI.
 
 Account sign-in, entitlement, and cloud readiness are separate. No-plan accounts
@@ -48,8 +48,8 @@ Refresh and short-lived checkout polling stop while the view is hidden.
 | `AgentsSettings.svelte` | Per-agent binary/model settings (paths, managed installs). |
 | `EnvironmentSettings.svelte` | The Environment prelude panel (bespoke, `/api/v1/environment`-backed — see the exception above). |
 | `environment.ts` | Wire types + `getEnvironment`/`putEnvironment` for the prelude map. |
-| `CloudSetup.svelte` | Passive cloud readiness and explicit provider login terminals; repository/key details stay secondary. No create/wake onboarding button. |
-| `MirrorSettings.svelte` | Native laptop-daemon mirror status, privacy, setup profile and persistent session pins; visibility-gated 15-second status refresh. |
+| `CloudSetup.svelte` | Passive machine readiness and first-class catalog-driven provider connections; an explicit Connect to cloud wakes an unavailable/sleeping worker. Repository/key details stay secondary. See [provider map](../pro/AGENTS.md). |
+| `MirrorSettings.svelte` | Native laptop-daemon mirror status, privacy, setup profile and persistent session pins; visibility-gated 15-second status refresh; blocked-provider rows open the shared connection flow. |
 | `ProSettings.svelte` | Dedicated Pro overview content: account identity, plan choices, browser checkout/portal, usage, and progressive connection/privacy/security sections. |
 | `DocumentsSettings.svelte` | The Documents panel: the opt-in AGENTS.md / Claude skill installs (see the exception above). |
 | `agentDocs.ts` | Wire types + `getAgentDocs`/`installAgentDocs` for `/api/v1/agent-docs`. |

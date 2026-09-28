@@ -33,7 +33,7 @@ pub(super) struct Pro {
     daemon_stamp: Mutex<Option<(u16, String, bool)>>,
     worker_links: tokio::sync::Mutex<HashMap<String, chimaera_link::LinkTunnel>>,
     runtime: tokio::sync::Mutex<Option<Runtime>>,
-    operation: tokio::sync::Mutex<()>,
+    pub(super) operation: tokio::sync::Mutex<()>,
     refresh: tokio::sync::Mutex<()>,
     ready: tokio::sync::watch::Sender<bool>,
     credential_generation: Arc<AtomicU64>,

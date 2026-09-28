@@ -5,10 +5,12 @@ mod mirror;
 mod policy;
 mod projects;
 mod protocol;
+mod provider_gate;
 mod repository;
 mod routes;
 mod transport;
 pub(crate) use policy::CloudProfile;
+pub(crate) use provider_gate::{cloud_provider_blocks, workspace_provider_blocks};
 pub(crate) use routes::*;
 tokio::task_local! { static PROFILE_SETUP: (String, u64); }
 
@@ -76,9 +78,13 @@ struct WorkspaceStatus {
     last_mirrored_at: Option<u64>,
     storage_limit_bytes: u64,
     error: Option<String>,
+    #[serde(skip)]
+    blocked_providers: Vec<provider_gate::BlockedProvider>,
 }
 #[derive(Default, Serialize, Deserialize)]
 struct DiskState {
+    #[serde(default)]
+    provider_blocks: HashMap<String, Vec<provider_gate::BlockedProvider>>,
     #[serde(default)]
     projects_root: Option<PathBuf>,
     #[serde(default)]
@@ -114,7 +120,7 @@ impl ProState {
             .filter(|id| valid_id(id))
             .take(128)
             .collect();
-        let ownership = disk
+        let ownership: HashMap<_, _> = disk
             .ownership
             .into_iter()
             .take(128)
@@ -126,6 +132,24 @@ impl ProState {
                     owner => owner,
                 };
                 (id, owner)
+            })
+            .collect();
+        let status = disk
+            .provider_blocks
+            .into_iter()
+            .take(128)
+            .filter_map(|(id, blocks)| {
+                let blocked_providers = provider_gate::restored(blocks);
+                (matches!(ownership.get(&id), Some(Ownership::SettingUp { .. }))
+                    && !blocked_providers.is_empty())
+                .then_some((
+                    id,
+                    WorkspaceStatus {
+                        blocked_providers,
+                        error: Some("cloud_provider_not_ready".into()),
+                        ..Default::default()
+                    },
+                ))
             })
             .collect();
         Self {
@@ -141,7 +165,7 @@ impl ProState {
             project_cache: Mutex::new(projects::Cache::default()),
             discovery: AsyncMutex::new(()),
             keep_running: Mutex::new(disk.keep_running.into_iter().take(512).collect()),
-            status: Mutex::new(HashMap::new()),
+            status: Mutex::new(status),
             task: Mutex::new(None),
             mirror_task: Mutex::new(None),
             jobs: AsyncMutex::new(()),
@@ -212,7 +236,14 @@ async fn persist(state: &crate::AppState) -> anyhow::Result<()> {
     let projects_root = crate::lock(&state.pro.projects_root).clone();
     let adoptions = crate::lock(&state.pro.adoptions).clone();
     let legacy_pending = crate::lock(&state.pro.legacy_pending).clone();
+    let provider_blocks = crate::lock(&state.pro.status)
+        .iter()
+        .filter(|(_, status)| !status.blocked_providers.is_empty())
+        .take(128)
+        .map(|(id, status)| (id.clone(), status.blocked_providers.clone()))
+        .collect();
     let bytes = serde_json::to_vec(&DiskState {
+        provider_blocks,
         legacy_pending,
         import_roots: HashMap::new(),
         adoptions,

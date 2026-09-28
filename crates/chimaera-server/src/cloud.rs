@@ -1,5 +1,6 @@
 //! Worker-only setup through the same authenticated daemon routes on every
 //! client. Agent sign-in runs the vendor CLI itself in an ordinary terminal.
+pub(crate) mod providers;
 use crate::AppState;
 use axum::{
     extract::State,
@@ -13,7 +14,7 @@ use std::{path::PathBuf, process::Stdio, sync::Arc, time::Duration};
 use tokio::io::AsyncReadExt;
 static OPERATIONS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
 pub(crate) fn active_operations() -> usize {
-    1 - OPERATIONS.available_permits()
+    1 - OPERATIONS.available_permits() + providers::active_operations()
 }
 pub(crate) fn enabled() -> bool {
     std::env::var("CHIMAERA_WORKER").as_deref() == Ok("1")
@@ -104,7 +105,7 @@ pub(crate) async fn onboard(
             let arguments = if input.agent == "codex" {
                 " login --device-auth"
             } else {
-                ""
+                " auth login --claudeai"
             };
             (
                 format!("Sign in to {}", kind.product_name()),

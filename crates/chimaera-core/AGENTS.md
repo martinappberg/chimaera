@@ -22,6 +22,7 @@ versions). Run `cargo test` in the app workspace too when you touch core deps.
 | File | What it owns |
 |---|---|
 | `lib.rs` | `Manifest` + `Handoff` (the daemon's on-disk lifecycle records), `VERSION`/`REPOSITORY`/`BUILD_ID` + build-match helpers (`builds_match`, `build_ref`, `parse_version`, `release_is_newer`), `data_dir`/`config_dir`/`runtime_dir` (honoring `CHIMAERA_HOME`), `login_shell` (+ pure `resolve_login_shell`), `generate_token`. |
+| `cloud_providers.rs` + `cloud-providers.json` | Shared provider identities and exact browser authentication origins; adapters stay in the daemon. The UI imports the same JSON. |
 | `shellint.rs` + `shellint/` | The shell-integration subsystem: materialize OSC 133/633/7 scripts, compose per-shell launch argv/env, and the remote-install snippet. |
 
 ## Invariants / gotchas

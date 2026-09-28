@@ -995,16 +995,57 @@ export function onProChanged(handler: () => void): Promise<() => void> {
   return tauri()?.event.listen<null>("pro-changed", () => handler()) ?? Promise.resolve(() => {});
 }
 
+export type CloudProviderState = "missing" | "needs_sign_in" | "signed_in" | "unknown" | "unavailable";
+export interface CloudProviderStatus {
+  id: string;
+  label: string;
+  category: "agent" | "repository";
+  installed: boolean | null;
+  state: CloudProviderState;
+  reason: string | null;
+  checked_at: number | null;
+  methods: string[];
+}
+export interface CloudProviderConnection {
+  id: string;
+  provider_id: string;
+  phase: "preparing" | "waiting" | "verifying" | "connected" | "failed" | "canceled" | "expired";
+  expires_at: number;
+  action: { type: "device_code"; verification_url: string; user_code: string }
+    | { type: "browser"; url: string }
+    | { type: "terminal"; workspace_id: string; session_id: string } | null;
+  error_code: string | null;
+}
+export interface CloudBlockedProvider {
+  id: string;
+  state: CloudProviderState;
+  reason: string | null;
+}
+export interface CloudPendingHandoff {
+  workspace_id: string;
+  name: string;
+  expected_epoch: number;
+  blocked_providers: CloudBlockedProvider[];
+}
 export interface CloudSetupInfo {
   available?: boolean;
   host_alias?: string;
   ssh_public_key?: string | null;
+  /** Legacy worker fields; installation alone is never provider readiness. */
   claude_installed?: boolean;
   codex_installed?: boolean;
   workspace_id?: string;
   session_id?: string;
+  providers?: CloudProviderStatus[];
+  connection?: CloudProviderConnection;
+  handoffs?: CloudPendingHandoff[];
 }
-export type CloudSetupRequest = { operation: "info" | "start" } | { operation: "onboard"; agent: "claude" | "codex" | "github" } | { operation: "project"; url: string; name?: string };
+export type CloudSetupRequest = { operation: "info" | "start" | "providers" }
+  | { operation: "onboard"; agent: string }
+  | { operation: "provider_connect"; provider_id: string }
+  | { operation: "provider_connection" | "provider_cancel" | "open_provider_browser" | "open_provider_terminal"; connection_id: string }
+  | { operation: "resume_handoff"; workspace_id: string; expected_epoch: number }
+  | { operation: "project"; url: string; name?: string };
 export async function proCloudRequest(request: CloudSetupRequest): Promise<CloudSetupInfo> {
   const t = tauri();
   if (t === null) throw new Error("Cloud account setup requires the native app");
@@ -1019,10 +1060,11 @@ export interface MirrorProfile {
 }
 export interface MirrorWorkspace {
   workspace_id: string; name: string; root: string; never_mirror: boolean; privacy_pending?: boolean;
-  ownership: { state: "awaiting_verification" | "local" | "remote" | "transferring" | "hydrating" | "privacy_disabled"; epoch: number; holder?: string } | null;
+  ownership: { state: "awaiting_verification" | "local" | "remote" | "transferring" | "hydrating" | "setting_up" | "privacy_disabled"; epoch: number; holder?: string } | null;
   mirror: { files: number; bytes: number; excluded: number; too_large: number; last_mirrored_at: number | null; storage_limit_bytes: number; error: string | null } | null;
   profile: MirrorProfile | null;
   git_branches?: string[] | null;
+  blocked_providers?: CloudBlockedProvider[];
 }
 export interface MirrorStatus {
   configured: boolean; projects_root: string; projects_root_confirmed: boolean; workspaces: MirrorWorkspace[];

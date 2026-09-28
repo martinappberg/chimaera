@@ -189,6 +189,7 @@ pub(super) async fn reconcile(
     config: &Configure,
     workspace: &str,
 ) -> Result<()> {
+    let generation = state.pro.generation.load(Ordering::Acquire);
     ensure!(
         super::projects::account_matches(state, workspace),
         "This project belongs to another account"
@@ -272,11 +273,35 @@ pub(super) async fn reconcile(
     .await?
     .json()?;
     ensure!(
-        grant.holder_id.as_deref() == Some(holder),
+        grant.workspace_id == workspace && grant.holder_id.as_deref() == Some(holder),
         "baton grant names another owner"
     );
+    ensure!(
+        generation == state.pro.generation.load(Ordering::Acquire),
+        "Account changed while verifying project ownership"
+    );
     if transferring {
+        if let Some(Ownership::SettingUp { epoch }) = previous {
+            ensure!(
+                grant.epoch == epoch,
+                "Project ownership changed; retry the handoff"
+            );
+        }
         return Ok(());
+    }
+    if config.role == Role::Worker
+        && (!matches!(previous, Some(Ownership::Local { .. }))
+            || !super::provider_gate::required(state, workspace).is_empty())
+    {
+        ensure!(
+            generation == state.pro.generation.load(Ordering::Acquire),
+            "Account changed while verifying project ownership"
+        );
+        lock(&state.pro.ownership).insert(
+            workspace.into(),
+            Ownership::SettingUp { epoch: grant.epoch },
+        );
+        return finish_hydration(state, workspace, grant.epoch, generation, async { Ok(()) }).await;
     }
     if baton.mirror_disabled
         && !matches!(
@@ -408,7 +433,7 @@ pub(super) async fn snapshot(
         let policy = account(config, &format!("/v1/baton/{}/policy", workspace.id), "PUT", Some(&json!({"holder_id":config.delegation.device_id,"epoch":epoch,"handoff_enabled":!config.hours_exhausted,"offline_takeover":!config.hours_exhausted,"has_agents":has_agents}))).await?;
         ensure!((200..300).contains(&policy.status), "mirror policy update failed");
         lock(&state.pro.preferences).entry(workspace.id.clone()).or_default().profile = profile;
-        lock(&state.pro.status).insert(workspace.id.clone(), WorkspaceStatus {report,last_mirrored_at:Some(super::now()),storage_limit_bytes:budget,error:None});
+        lock(&state.pro.status).insert(workspace.id.clone(), WorkspaceStatus {report,last_mirrored_at:Some(super::now()),storage_limit_bytes:budget,error:None,blocked_providers:Vec::new()});
         super::persist(state).await?;
         if clean {
             let released = account(config, &format!("/v1/baton/{}/release",workspace.id), "POST", Some(&json!({"holder_id":config.delegation.device_id,"epoch":epoch}))).await?;
@@ -955,6 +980,25 @@ async fn finish_hydration(
     generation: u64,
     setup: impl std::future::Future<Output = Result<()>>,
 ) -> Result<()> {
+    finish_hydration_checked(
+        state,
+        workspace,
+        epoch,
+        generation,
+        setup,
+        super::provider_gate::check(state, workspace, true),
+    )
+    .await
+}
+
+async fn finish_hydration_checked(
+    state: &Arc<AppState>,
+    workspace: &str,
+    epoch: u64,
+    generation: u64,
+    setup: impl std::future::Future<Output = Result<()>>,
+    providers: impl std::future::Future<Output = Vec<super::provider_gate::BlockedProvider>>,
+) -> Result<()> {
     ensure!(
         generation == state.pro.generation.load(Ordering::Acquire),
         "Account changed during project setup"
@@ -973,12 +1017,27 @@ async fn finish_hydration(
         state.changes.notify_waiters();
         return Err(error);
     }
+    let blocked = providers.await;
+    // Account replacement cannot race a successful readiness check into a new
+    // writer grant. Checks are outside this lock; the local transition is not.
+    let _configuration = state.pro.configuration.lock().await;
     ensure!(
         generation == state.pro.generation.load(Ordering::Acquire)
             && matches!(lock(&state.pro.ownership).get(workspace),Some(Ownership::SettingUp {epoch:current}) if *current==epoch),
         "Project ownership changed during setup"
     );
-    lock(&state.pro.ownership).insert(workspace.into(), Ownership::Local { epoch });
+    if let Err(error) = super::provider_gate::record(state, workspace, blocked) {
+        super::persist(state).await?;
+        return Err(error);
+    }
+    {
+        let mut ownership = lock(&state.pro.ownership);
+        ensure!(
+            matches!(ownership.get(workspace), Some(Ownership::SettingUp { epoch: current }) if *current == epoch),
+            "Project ownership changed before resume"
+        );
+        ownership.insert(workspace.into(), Ownership::Local { epoch });
+    }
     super::persist(state).await?;
     if let Some(status) = lock(&state.pro.status).get_mut(workspace) {
         status.error = None;
@@ -1051,6 +1110,10 @@ async fn run_profile_steps(
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "provider_tests.rs"]
+mod provider_tests;
 
 pub(super) fn eligible(state: &AppState, workspace: &crate::workspaces::Workspace) -> bool {
     if crate::cloud::is_onboarding_workspace(workspace)

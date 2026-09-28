@@ -43,6 +43,19 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         .route("/pro/handoff", post(crate::pro::handoff))
         .route("/pro/hydrate", post(crate::pro::hydrate))
         .route("/pro/cloud", get(crate::cloud::info))
+        .route("/pro/cloud/providers", get(crate::cloud::providers::list))
+        .route(
+            "/pro/cloud/providers/{id}/connect",
+            post(crate::cloud::providers::start),
+        )
+        .route(
+            "/pro/cloud/connections/{id}",
+            get(crate::cloud::providers::get),
+        )
+        .route(
+            "/pro/cloud/connections/{id}/cancel",
+            post(crate::cloud::providers::cancel),
+        )
         .route("/pro/cloud/onboard", post(crate::cloud::onboard))
         .route("/pro/cloud/project", post(crate::cloud::project))
         .route("/pro/bundles/{id}", get(crate::bundle::snapshot_route))

@@ -89,6 +89,7 @@ pub(crate) struct AppState {
     pub(crate) session_workspaces: Mutex<HashMap<String, String>>,
     pub(crate) activity: Mutex<crate::activity::Activity>,
     pub(crate) pro: crate::pro::ProState,
+    pub(crate) cloud_providers: crate::cloud::providers::Providers,
     pub(crate) deferred_sessions: Mutex<HashMap<String, crate::ledger::LedgerEntry>>,
     pub(crate) session_proxy: crate::session_proxy::Store,
     /// session id -> agent wrapper state (kind "agent" sessions only).
@@ -272,6 +273,7 @@ impl AppState {
             session_workspaces: Mutex::new(HashMap::new()),
             activity: Mutex::new(crate::activity::Activity::default()),
             pro: crate::pro::ProState::new(data_dir.join("pro")),
+            cloud_providers: crate::cloud::providers::Providers::default(),
             deferred_sessions: Mutex::new(HashMap::new()),
             session_proxy: crate::session_proxy::Store::default(),
             agents: Mutex::new(HashMap::new()),

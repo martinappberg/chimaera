@@ -1,5 +1,6 @@
 <script lang="ts">
   import { untrack } from "svelte";
+  import { cloudOnboarding } from "../pro/onboarding.svelte";
   import { pageVisible } from "../shared/visibility";
   import { proMirrorStatus, proSetNeverMirror, proMirrorPreference, type MirrorStatus, type MirrorWorkspace, type MirrorProfile } from "../net/native";
   let { visible = true, recoveryOnly = false }: { visible?: boolean; recoveryOnly?: boolean } = $props();
@@ -44,6 +45,7 @@
       case "remote": return "Running on your cloud machine";
       case "transferring": return "Moving to your cloud machine…";
       case "privacy_disabled": return "Mirroring is disabled";
+      case "setting_up": return workspace.blocked_providers?.length ? "Waiting for cloud agent sign-in" : "Cloud project setup needs attention";
       case "hydrating": return "Restoring files and conversations…";
       case "awaiting_verification": return "Checking where this project is running…";
       default: return "Waiting for the first mirror";
@@ -64,10 +66,13 @@
         <label class="check"><input type="checkbox" checked={workspace.never_mirror} disabled={busy !== null || (recoveryOnly && workspace.never_mirror)} onchange={(event) => privacy(workspace,event.currentTarget)} />Never mirror this project</label>
         {#if workspace.privacy_pending}<p class="error" role="status">Copying from this laptop has stopped. Cloud privacy is still pending; retry to disable it everywhere.</p><button class="btn" disabled={busy !== null} onclick={() => void act(workspace.workspace_id, () => proSetNeverMirror(workspace.workspace_id, true))}>Retry cloud privacy</button>{/if}
         {#if workspace.git_branches?.length}<p class="hint">Cloud changes are saved in {workspace.git_branches.join(", ")} for you to merge.</p>{/if}
+        {#if !recoveryOnly && workspace.blocked_providers?.length}
+          <div class="connection-needed"><p class="hint">This project is paused until its agents are connected on your cloud machine.</p><button class="btn" onclick={() => cloudOnboarding.request({ providerIds: workspace.blocked_providers!.map(provider => provider.id), workspaceId: workspace.workspace_id, workspaceName: workspace.name })}>Connect agents to continue</button></div>
+        {/if}
         {#if workspace.mirror}
           <p class="hint">{workspace.mirror.files} files · {bytes(workspace.mirror.bytes)} working files · {bytes(workspace.mirror.storage_limit_bytes)} storage limit · {workspace.mirror.excluded} private files excluded{#if workspace.mirror.too_large} · {workspace.mirror.too_large} files exceed the size limit{/if}</p>
           {#if workspace.mirror.last_mirrored_at}<p class="hint">Last copied {new Date(workspace.mirror.last_mirrored_at * 1000).toLocaleString()}</p>{/if}
-          {#if workspace.mirror.error}<p class="error" role="status">{workspace.mirror.error}</p>{/if}
+          {#if workspace.mirror.error && workspace.mirror.error !== "cloud_provider_not_ready"}<p class="error" role="status">{workspace.mirror.error}</p>{/if}
         {/if}
         {#if !recoveryOnly}
         <label class="field">Cloud setup command<input value={drafts[workspace.workspace_id] ?? workspace.profile?.setup_command ?? ""} oninput={(event) => { drafts[workspace.workspace_id] = event.currentTarget.value; }} placeholder="For example, npm ci" /></label>

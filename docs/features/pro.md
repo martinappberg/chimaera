@@ -12,7 +12,8 @@ Cloud setup controls are implemented; automatic handoff and browser access are b
 
 1. Open **Pro** from Home or the entry above Settings in the workspace sidebar.
    It opens a dedicated account page; ordinary app settings stay separate.
-   An account browser entry opens the account surface; ordinary daemon browser
+   In an account browser, the cloud machine opens the same agent-connection
+   flow; other machines link to the account surface. Ordinary daemon browser
    windows have no Pro entry. A build with no configured endpoint shows only
    “Chimaera Pro isn't available in this build.”
 2. With an endpoint configured, choose **Sign in**. Complete the system-browser
@@ -64,20 +65,47 @@ page shows passive account-owned readiness: preparing, ready, sleeping, unavaila
 or a plan limit. A disabled service or uninvited preview account shows its actual
 availability. The page does not offer a manual machine-creation button.
 
-When the machine is ready, provider actions open the unmodified Claude, Codex and
-GitHub login flows in ordinary terminals on that worker. Credentials remain on that machine.
-The worker has its own SSH public key, which can be copied from the panel.
-An HTTPS Git URL clones into the worker's persistent projects folder and opens
-as a workspace. Duplicate names and embedded URL credentials are rejected.
-Only one clone runs at a time; incomplete clones are not registered.
+Machine readiness and provider sign-in are separate. Once the cloud machine is
+available, **Connect your first agent** appears directly in the Pro overview.
+Choose one agent to get started; connecting the other agents is optional. The
+provider list comes from a shared catalog, initially Claude Code and Codex, rather
+than hard-coded buttons. Installation alone never shows a provider as connected.
+An unavailable or timed-out authentication check remains unknown.
 
-Passive cloud information reads do not wake a sleeping worker. A provider login or repository-open
-action does. A running clone counts as active work until it finishes.
-The daemon exposes `/api/v1/pro/cloud`, `/api/v1/pro/cloud/onboard`, and
-`/api/v1/pro/cloud/project` only on a worker. The native `pro_cloud_request`
-command keeps both account and daemon credentials out of the UI. The account
-browser uses the same daemon routes through its host-pinned gateway; its account
-launcher displays the same passive account readiness.
+**Connect** prepares a missing agent and then guides its supported sign-in flow.
+Codex uses a one-time device code and the provider's secure browser page. Claude
+Code uses its dedicated sign-in terminal. A new attempt brings its guide into
+view; background status updates never scroll the page. Installation progress and
+sign-in are named separately. Users can cancel, retry an expired request or reopen
+the exact provider terminal. Sign-in is confirmed by the provider CLI on the cloud
+machine, not by a local checkbox or simply opening a browser. This confirms the
+configured account; it does not promise available provider quota or model access.
+Provider credentials remain on the cloud machine and are never copied from the Mac.
+
+A paused handoff names the specific providers its sessions need. **Connect agents
+to continue** opens the same flow with that project context. Every required agent
+must be connected before **Continue project** appears. Continuing asks the daemon
+to verify the current ownership epoch and provider state again; the UI cannot
+release the setup fence. A canceled connection leaves the project paused.
+
+Status reads never wake a sleeping worker. **Connect to cloud**, connecting a
+provider or opening a repository are explicit wake actions. Catalog checks are
+single-flight and visibility-gated. Active sign-in checks run sequentially every
+two seconds, stop while hidden, and end at the attempt's finite deadline. Pending
+connection operations keep the worker active only until they finish or expire.
+
+Repository-provider connections remain optional. An HTTPS Git URL clones into the
+worker's persistent projects folder and opens as a workspace. Duplicate names and
+embedded URL credentials are rejected. Only one clone runs at a time; incomplete
+clones are not registered. The cloud machine's SSH public key is under advanced
+connections.
+
+The worker exposes `/api/v1/pro/cloud`, `/api/v1/pro/cloud/providers`, provider
+connect routes, connection read/cancel routes, and `/api/v1/pro/cloud/project`.
+The native `pro_cloud_request` command keeps account and daemon credentials out
+of the UI and opens only a server-owned connection's validated browser URL or
+terminal. Browser clients use the same routes through the host-pinned gateway.
+A shared provider catalog bounds external authentication origins in both clients.
 
 ## Where it lives
 
@@ -86,7 +114,7 @@ launcher displays the same passive account readiness.
 | Pro account surface and native bridge | `web-ui/src/lib/pro/ProView.svelte`, `web-ui/src/lib/settings/ProSettings.svelte`, `web-ui/src/lib/net/native.ts` |
 | Billing and local project adoption | `crates/chimaera-app/src/shell/pro/billing.rs`, `projects.rs`, `web-ui/src/lib/pro/CloudProjects.svelte` |
 | Host and prompt labels | `web-ui/src/lib/workspace/HomeScreen.svelte`, `AskpassModal.svelte` |
-| Cloud setup | `web-ui/src/lib/settings/CloudSetup.svelte`, `crates/chimaera-app/src/shell/cloud.rs`, `crates/chimaera-server/src/cloud.rs` |
+| Cloud setup | `web-ui/src/lib/settings/CloudSetup.svelte`, `web-ui/src/lib/pro/ProviderConnections.svelte`, `crates/chimaera-app/src/shell/cloud.rs`, `crates/chimaera-server/src/cloud.rs` |
 | App account lifecycle | `crates/chimaera-app/src/shell/pro.rs` |
 | App connections and prompt routing | `crates/chimaera-app/src/shell/connect.rs`, `askpass.rs` |
 | Device transport and wire types | `crates/chimaera-link/src/`, [protocol](../../crates/chimaera-link/PROTOCOL.md) |

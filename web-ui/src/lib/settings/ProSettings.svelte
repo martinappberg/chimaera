@@ -13,7 +13,7 @@
     type ProStatus, type ProHost, type ProDevice,
   } from "../net/native";
 
-  let { visible = true }: { visible?: boolean } = $props();
+  let { visible = true, requiredProviders = [], contextLabel, workspaceId, onReady }: { visible?: boolean; requiredProviders?: string[]; contextLabel?: string; workspaceId?: string; onReady?: () => void } = $props();
   const intentKey = "chimaera.pro.purchase";
   const prices: Record<PaidPlan, Record<BillingInterval, number>> = {
     pro: { month: 8, year: 80 }, max: { month: 30, year: 300 },
@@ -38,7 +38,7 @@
   let securityOpen = $state(false);
   let mirrorsOpen = $state(false);
   let recoveryOpen = $state(false);
-  let plansElement: HTMLElement | undefined;
+  let plansElement = $state<HTMLElement>();
   let generation = 0;
   let alive = true;
   const subscribed = $derived(status?.signed_in === true && paid(status.plan));
@@ -210,6 +210,7 @@
         <p class="free-note"><strong>Your local workbench stays free.</strong> Local projects, agents and ordinary SSH work without a Pro account.</p>
       </section>
     {:else}
+      {#key status.email}<CloudSetup {visible} {requiredProviders} {contextLabel} {workspaceId} {onReady} />{/key}
       <section class="panel plan-current" aria-label="Current plan">
         <div class="section-heading"><div><span class="section-label">Your plan</span><h2>Chimaera {status.plan === "max" ? "Max" : "Pro"}</h2><p class="muted small">Project mirrors, cloud handoff and connected machines are included.</p></div><button class="secondary" disabled={busy !== null} onclick={() => void act("billing", proBillingPortal, "Billing couldn't open. Please try again in a moment.")}>{busy === "billing" ? "Opening billing…" : "Manage billing"}</button></div>
         <details class="usage-details"><summary>Usage and plan details</summary><div class="usage-grid">
@@ -217,7 +218,6 @@
           {#if status.usage && status.limits}<div><span class="usage-label">Mirrored projects</span><p class="usage-value"><strong>{(status.usage.storage_bytes / 1e9).toFixed(1)}</strong><span> / {(status.limits.storage_bytes / 1e9).toLocaleString(undefined, { maximumFractionDigits: 1 })} GB</span></p>{#if status.limits.storage_bytes > 0}<progress max={status.limits.storage_bytes} value={Math.max(0, Math.min(status.usage.storage_bytes, status.limits.storage_bytes))} aria-label="Mirrored storage used"></progress>{/if}</div>{/if}
         </div>{#if !status.usage || !status.limits}<p class="muted small">Usage isn't available yet. Refresh your account to check again.</p>{:else}<p class="muted small usage-note">These are your account's current allowances. Local work remains available when a cloud limit is reached.</p>{/if}</details>
       </section>
-      <CloudSetup {visible} />
       <details class="section" ontoggle={(event) => (connectionsOpen = event.currentTarget.open)}><summary>Connected machines</summary>{#if connectionsOpen}<div class="section-body"><p class="muted small">Add your remote hosts on Home. Keep a connection available through Pro here.</p>{#if hosts.length === 0}<p class="muted">No machines to show yet.</p>{/if}{#each hosts as host (host.alias)}<div class="row"><div><span>{host.alias}</span><span class="muted small">{host.status === "prompting" ? "Waiting for authentication" : host.status === "connecting" ? "Connecting…" : host.status === "connected" ? "Connected" : "Offline"}</span></div>{#if host.kind === "ssh"}<label class="keep"><input type="checkbox" checked={host.kept} disabled={busy !== null} onchange={(event) => setKept(host, event.currentTarget)} />Keep connected</label>{/if}</div>{/each}</div>{/if}</details>
       <details class="section" ontoggle={(event) => (mirrorsOpen = event.currentTarget.open)}><summary>Project mirrors and privacy</summary>{#if mirrorsOpen}<MirrorSettings visible={visible && mirrorsOpen} />{/if}</details>
       <details class="section how-it-works"><summary>How Pro works</summary><div class="section-body">{@render howItWorks()}</div></details>
