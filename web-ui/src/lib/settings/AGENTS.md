@@ -36,6 +36,10 @@ Account sign-in, entitlement, and cloud readiness are separate. No-plan accounts
 see plan selection, not paid operation controls. Existing privacy controls remain
 available in a recovery disclosure. Checkout runs in the browser through the
 native authenticated bridge; confirmed account state alone activates the plan.
+The signed-out page has one Sign in action: it retains a chosen plan, but an
+already active account restores its existing plan without opening checkout.
+The introduction describes device-neutral file/conversation continuity; browser
+access on another device does not imply arbitrary process migration.
 Refresh and short-lived checkout polling stop while the view is hidden.
 
 ## File map

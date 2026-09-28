@@ -19,7 +19,7 @@
     pro: { month: 8, year: 80 }, max: { month: 30, year: 300 },
   };
   const planChoices = [
-    { plan: "pro" as PaidPlan, name: "Pro", purpose: "For your everyday projects", detail: "Keep your projects connected, and continue agent work while you're away from your Mac.", capacity: "The complete Pro workflow." },
+    { plan: "pro" as PaidPlan, name: "Pro", purpose: "For your everyday projects", detail: "Keep your projects in sync, and let agent work continue in the cloud while you're away.", capacity: "The complete Pro workflow." },
     { plan: "max" as PaidPlan, name: "Max", purpose: "For more cloud work", detail: "The same Pro workflow, with more capacity for longer cloud runs and more mirrored projects.", capacity: "More capacity. All the same features." },
   ];
   function savedIntent(): PurchaseIntent | null { try { return readIntent(sessionStorage.getItem(intentKey)); } catch { return null; } }
@@ -117,6 +117,8 @@
   }
   async function checkout(): Promise<void> {
     if (busy !== null || status?.initializing) return;
+    // A returning subscriber uses the same sign-in action, never a new checkout.
+    if (subscribed) { remember(null); return; }
     if (!status?.signed_in) {
       remember({ plan: selected, interval, stage: "sign_in", created: Date.now() });
       await act("sign-in", proSignIn, "Sign-in couldn't start. Please try again.");
@@ -145,9 +147,9 @@
     <section class="workflow" aria-labelledby="workflow-title">
       <h2 id="workflow-title" class="section-label">How it fits your day</h2>
       <ol class="steps">
-        <li><span class="step-number" aria-hidden="true">01</span><h3>Work here</h3><p>Use your usual project folders and your own Claude or Codex subscription. Your Mac stays the first place you work.</p></li>
-        <li><span class="step-number" aria-hidden="true">02</span><h3>Continue in the cloud</h3><p>Pro mirrors your project and conversation history so your agent work can continue while your Mac is away.</p></li>
-        <li><span class="step-number" aria-hidden="true">03</span><h3>Pick up on your Mac</h3><p>Existing projects return to their original folders. For a project started in the cloud, choose where to save it the first time you open it here.</p></li>
+        <li><span class="step-number" aria-hidden="true">01</span><h3>Work where you are</h3><p>Use your usual project folders and your own Claude or Codex subscription. Your local workbench stays free.</p></li>
+        <li><span class="step-number" aria-hidden="true">02</span><h3>Keep work moving</h3><p>Pro keeps project files and conversation history in sync, so supported agents can continue in the cloud while your computer is away.</p></li>
+        <li><span class="step-number" aria-hidden="true">03</span><h3>Continue on another device</h3><p>Open your cloud work in a browser on any device. When you bring a cloud-created project onto a computer, choose a folder for its first local copy.</p></li>
       </ol>
       <p class="workflow-note">Sign in to Claude or Codex on the cloud machine before using it. Handoff resumes supported agent sessions; other running programs stay on their original machine.</p>
     </section>
@@ -157,7 +159,7 @@
   <header class="heading">
     <div class="brand"><BrandMark size={44} /><span>chimaera</span><span class="product">Pro</span></div>
     {#if status && !status.initializing && !subscribed}<h1>Your work, here and away.</h1>
-    <p class="lede">Start on your Mac. Let your agents continue in the cloud. Pick up your project when you return.</p>
+    <p class="lede">Start on one device. Let your agents continue in the cloud. Pick up your work from another.</p>
     {#if status.available}<button class="secondary intro-plans" onclick={showPlans}>See plans</button>{/if}{/if}
   </header>
 
@@ -215,8 +217,7 @@
           {/each}
         </div>
         <div class="included"><span class="section-label">Included with both</span><ul><li>Project mirrors and agent handoff</li><li>Persistent remote connections</li><li>Browser access to your work</li><li>Project-by-project privacy controls</li></ul></div>
-        <div class="purchase"><button disabled={busy !== null || signInPhase !== null} onclick={() => void checkout()}>{busy === "checkout" ? "Opening checkout…" : status.signed_in ? `Continue with ${selected === "max" ? "Max" : "Pro"}` : "Sign in to continue"}</button><p class="small muted">Billed ${prices[selected][interval]} {interval === "year" ? "yearly" : "monthly"}. Cloud work and mirrored storage have plan limits. Review billing details in secure checkout before subscribing.</p></div>
-        {#if !status.signed_in}<p class="small muted account-link">Already subscribed? <button class="text-button" disabled={busy !== null || signInPhase !== null} onclick={() => { remember(null); void act("sign-in", proSignIn, "Sign-in couldn't start. Please try again."); }}>Sign in to your account</button></p>{/if}
+        <div class="purchase"><button disabled={busy !== null || signInPhase !== null} onclick={() => void checkout()}>{busy === "checkout" ? "Opening checkout…" : status.signed_in ? `Continue with ${selected === "max" ? "Max" : "Pro"}` : "Sign in"}</button><p class="small muted">Billed ${prices[selected][interval]} {interval === "year" ? "yearly" : "monthly"}. Cloud work and mirrored storage have plan limits. Review billing details in secure checkout before subscribing.</p></div>
         <p class="free-note"><strong>Your local workbench stays free.</strong> Local projects, agents and ordinary SSH work without a Pro account.</p>
       </section>
     {:else}
@@ -303,7 +304,6 @@
   .purchase { display: flex; align-items: center; gap: 22px; margin-top: 23px; }
   .purchase > button { flex: none; }
   .purchase p { max-width: 44ch; margin: 0; font-size: var(--text-xs); }
-  .account-link { margin-top: 18px; }
   .free-note { margin-top: 30px; padding-top: 22px; border-top: 1px solid var(--edge); color: var(--muted); font-size: var(--text-sm); }
   .free-note strong { display: block; color: var(--fg); font-weight: 500; margin-bottom: 3px; }
   .notice { background: color-mix(in srgb, var(--accent) 5%, transparent); }

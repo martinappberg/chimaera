@@ -25,8 +25,10 @@ Cloud setup controls are implemented; automatic handoff and browser access are b
    On restart, saved account access shows its current phase immediately. If the
    system Keychain needs a response, the page says so while Home stays usable;
    billing and account changes wait until initialization completes.
-3. The page explains the workflow in three steps: work on the Mac, continue
-   compatible agents in the cloud, and pick up the project on the Mac again.
+3. The page explains the workflow in three steps: work where you are, keep
+   supported agents running in the cloud, and continue on another device through
+   the browser. Files and conversation history stay connected; when first bringing
+   a cloud-created project onto a computer, choose its local folder.
    Provider sign-in and the limits of process handoff are stated alongside that
    explanation. Local projects, agents and ordinary SSH remain free.
    Plan cards lead with what Pro includes and how Max adds capacity; pricing is
@@ -35,7 +37,9 @@ Cloud setup controls are implemented; automatic handoff and browser access are b
    and limits appear only in the active account's **Usage and plan details**, using the service's current values.
    The page shows the signed-in email and current plan. Without a plan, choose
    Pro or Max and monthly or yearly billing, then continue to checkout in the
-   system browser. Existing subscribers can open **Manage billing**. The app
+   system browser. The single signed-out **Sign in** action remembers that
+   selection; an existing active plan is restored without opening checkout.
+   Existing subscribers can open **Manage billing**. The app
    refreshes account state on return; a browser return alone never activates a
    plan. With an active plan, toggle **Keep connected** for a saved SSH host. A password or Duo challenge uses the usual
    host-scoped prompt, with “Asked by your Pro connection” underneath its title.
@@ -93,7 +97,7 @@ sign-in are named separately. Users can cancel, retry an expired request or reop
 the exact provider terminal. Sign-in is confirmed by the provider CLI on the cloud
 machine, not by a local checkbox or simply opening a browser. This confirms the
 configured account; it does not promise available provider quota or model access.
-Provider credentials remain on the cloud machine and are never copied from the Mac.
+Provider credentials remain on the cloud machine and are never copied from other devices.
 
 A paused handoff names the specific providers its sessions need. **Connect agents
 to continue** opens the same flow with that project context. Every required agent

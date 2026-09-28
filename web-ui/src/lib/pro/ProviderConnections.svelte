@@ -165,7 +165,7 @@
 <section class="providers" aria-label="Cloud agent connections">
   <div class="heading"><div><span class="eyebrow">Your cloud agents</span><h2>{required.length ? `Connect your agents${projectName ? ` for ${projectName}` : " to continue"}` : ready ? "Your agents are connected" : "Connect your first agent"}</h2></div><button class="text-button" disabled={catalogFlight || busy !== null} onclick={() => void load()}>Check connections</button></div>
   <p class="intro">{required.length ? "This project is paused until the agents it uses are signed in on your cloud machine." : ready ? "Your connected agents can work on your cloud machine. You can add another whenever you need it." : "Choose the agent you want to use. Connect one to get started; you can add others later."}</p>
-  <p class="privacy">Use your own provider account and subscription. Sign-in authorizes this cloud machine; credentials from your Mac aren't copied.</p>
+  <p class="privacy">Use your own provider account and subscription. Sign-in authorizes this cloud machine; credentials from your other devices aren't copied.</p>
   {#if !loaded}<p class="muted" role="status">Checking your cloud connections…</p>{/if}
   {#if loaded && agents.length === 0}<p class="muted">No agent connections are available from this cloud machine yet.</p>{/if}
   <div class="provider-cards">
