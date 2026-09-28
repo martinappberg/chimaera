@@ -13,6 +13,10 @@
 //! - **Instances** are created lazily, one call at a time each (an async
 //!   mutex), at most `MAX_INSTANCES` daemon-wide (least recently used idle slot goes),
 //!   and dropped after `IDLE` (swept on access — no polling task).
+//! - **A build the host can't run** (it doesn't compile, or its imports
+//!   don't link) is remembered per daemon so it isn't recompiled per call,
+//!   reported as the plugin's fault, and forgotten when the user switches
+//!   the plugin off and on or its `current` moves — the user's retry.
 //! - **A trap costs the instance, never the daemon**: the store is dropped
 //!   and re-created on the next call (~20 µs). `FAULT_LIMIT` traps within
 //!   `FAULT_WINDOW` mark the plugin faulted in that workspace until the user
@@ -90,21 +94,26 @@ const INSTRUCTIONS_MAX: usize = 8 * 1024;
 const TOOL_DESCRIPTION_MAX: usize = 2 * 1024;
 const TOOL_SCHEMA_MAX: usize = 16 * 1024;
 const HOOK_LINE_MAX: usize = 1024;
+/// A Knowledge snapshot's JSON (the view's whole data, cached per
+/// workspace) and its stamp: a real `.living/` of ~300 findings, ~160
+/// decisions and ~300 learnings is well under a MiB.
+pub(crate) const SNAPSHOT_MAX: usize = 4 << 20;
+const STAMP_MAX: usize = 1 << 20;
 /// `emit` frames kept for the `/ws/events` clients, and one frame's size.
 const EVENTS_KEPT: usize = 64;
 pub(crate) const EVENT_MAX: usize = 16 * 1024;
 
-type Compiled = Result<ChimaeraPluginPre<HostState>, String>;
-/// One plugin's compiled builds by SHA-256, most recently used first.
-type Builds = VecDeque<(Arc<str>, Compiled)>;
+/// One plugin's compiled builds by SHA-256, most recently used first. Only
+/// builds that compiled: why one can't is the daemon's (`refused`).
+type Builds = VecDeque<(Arc<str>, ChimaeraPluginPre<HostState>)>;
 
 /// The process-wide half: engine, linker, compiled components. A test
 /// process builds many `AppState`s; they share this, as one daemon would.
 struct Shared {
     engine: Engine,
     linker: Linker<HostState>,
-    /// plugin id → its pre-instantiated builds by SHA-256 (or why one can't
-    /// be), most recently used first, at most `COMPILED_PER_ID`.
+    /// plugin id → its pre-instantiated builds by SHA-256, most recently
+    /// used first, at most `COMPILED_PER_ID`.
     compiled: tokio::sync::Mutex<VecDeque<(String, Builds)>>,
 }
 
@@ -151,7 +160,8 @@ fn build_shared() -> wasmtime::Result<Shared> {
 
 /// The component for `m`'s build, compiled on first use (Cranelift: tens
 /// of ms of CPU, so on the blocking pool) and kept while it is one of the
-/// plugin's last `COMPILED_PER_ID` builds.
+/// plugin's last `COMPILED_PER_ID` builds. A failure isn't kept here: the
+/// caller remembers it (`PluginRuntime::refused`), where a retry clears it.
 async fn component(m: &Manifest) -> Result<ChimaeraPluginPre<HostState>, String> {
     let shared = shared()?;
     let mut compiled = shared.compiled.lock().await;
@@ -166,7 +176,7 @@ async fn component(m: &Manifest) -> Result<ChimaeraPluginPre<HostState>, String>
         let done = build.1.clone();
         builds.push_front(build);
         compiled.push_front((m.id.clone(), builds));
-        return done;
+        return Ok(done);
     }
     let bytes = m.wasm.bytes.clone();
     let engine = shared.engine.clone();
@@ -189,10 +199,14 @@ async fn component(m: &Manifest) -> Result<ChimaeraPluginPre<HostState>, String>
         ),
         Err(err) => tracing::error!(plugin = %m.id, %err, "plugin refused"),
     }
-    builds.push_front((m.wasm.sha256.clone(), result.clone()));
-    builds.truncate(COMPILED_PER_ID);
-    compiled.push_front((m.id.clone(), builds));
-    compiled.truncate(COMPILED_IDS);
+    if let Ok(pre) = &result {
+        builds.push_front((m.wasm.sha256.clone(), pre.clone()));
+        builds.truncate(COMPILED_PER_ID);
+    }
+    if !builds.is_empty() {
+        compiled.push_front((m.id.clone(), builds));
+        compiled.truncate(COMPILED_IDS);
+    }
     result
 }
 
@@ -534,6 +548,9 @@ pub(crate) struct PluginRuntime {
     /// (plugin id, build) → its offer, or why it is refused everywhere (a
     /// component whose tools don't match its manifest).
     offers: Mutex<HashMap<BuildKey, Result<Offer, String>>>,
+    /// (plugin id, build) → why the host can't run it (it didn't compile or
+    /// link). Not asked again until a reset or `forget_plugin`.
+    refused: Mutex<HashMap<BuildKey, String>>,
     events: Mutex<Events>,
     /// Tests only: a shorter call budget, in ms (0 = the real ones).
     budget_override_ms: AtomicU64,
@@ -612,6 +629,9 @@ impl PluginRuntime {
 
     /// Why `m` isn't answering in `ws`, if it isn't (for the card).
     pub(crate) fn fault(&self, m: &Manifest, ws: &str) -> Option<String> {
+        if let Some(refused) = crate::lock(&self.refused).get(&offer_key(m)) {
+            return Some(refused.clone());
+        }
         if let Some(Err(refused)) = crate::lock(&self.offers).get(&offer_key(m)) {
             return Some(refused.clone());
         }
@@ -621,11 +641,13 @@ impl PluginRuntime {
     }
 
     /// Start `plugin` over in `ws`: drop its instance and clear its fault
-    /// (the plugin's switch flipped).
+    /// (the plugin's switch flipped) — and a build the host couldn't run is
+    /// compiled again on next use, since the switch is the user's retry.
     pub(crate) fn reset(&self, plugin: &str, ws: &str) {
         let key = (plugin.to_string(), ws.to_string());
         crate::lock(&self.slots).remove(&key);
         crate::lock(&self.faults).remove(&key);
+        crate::lock(&self.refused).retain(|(p, _), _| p != plugin);
     }
 
     /// `plugin`'s `current` moved (installed, updated, rolled back,
@@ -636,6 +658,7 @@ impl PluginRuntime {
         crate::lock(&self.slots).retain(|(p, _), _| p != plugin);
         crate::lock(&self.faults).retain(|(p, _), _| p != plugin);
         crate::lock(&self.offers).retain(|(p, _), _| p != plugin);
+        crate::lock(&self.refused).retain(|(p, _), _| p != plugin);
     }
 
     /// Tests only: how many live instances `plugin` has.
@@ -732,7 +755,16 @@ impl PluginRuntime {
                 m.name
             ));
         }
-        let pre = component(m).await?;
+        if let Some(refused) = crate::lock(&self.refused).get(&offer_key(m)) {
+            return Err(refused.clone());
+        }
+        let pre = match component(m).await {
+            Ok(pre) => pre,
+            Err(refused) => {
+                crate::lock(&self.refused).insert(offer_key(m), refused.clone());
+                return Err(refused);
+            }
+        };
         let budget = self.budget(&call);
         let cx = wit::Context {
             workspace: ws.to_string(),
@@ -912,14 +944,33 @@ impl PluginRuntime {
         let Some(snapshot) = answer? else {
             return Ok(None);
         };
-        let parse = |what: &str, text: &str| {
-            serde_json::from_str::<Value>(text)
-                .map_err(|e| format!("{}: the snapshot's {what} is not JSON ({e})", m.name))
-        };
-        Ok(Some((
-            parse("stamp", &snapshot.stamp)?,
-            parse("data", &snapshot.data)?,
-        )))
+        for (what, text, max) in [
+            ("snapshot", &snapshot.data, SNAPSHOT_MAX),
+            ("stamp", &snapshot.stamp, STAMP_MAX),
+        ] {
+            if text.len() > max {
+                return Err(format!(
+                    "{}'s {what} is {:.1} MiB, over the {} MiB it may be",
+                    m.name,
+                    text.len() as f64 / f64::from(1 << 20),
+                    max >> 20
+                ));
+            }
+        }
+        // Megabytes of JSON: parsed on the blocking pool.
+        let name = m.name.clone();
+        tokio::task::spawn_blocking(move || {
+            let parse = |what: &str, text: &str| {
+                serde_json::from_str::<Value>(text)
+                    .map_err(|e| format!("{name}: the snapshot's {what} is not JSON ({e})"))
+            };
+            Ok(Some((
+                parse("stamp", &snapshot.stamp)?,
+                parse("data", &snapshot.data)?,
+            )))
+        })
+        .await
+        .map_err(|e| format!("{}: reading its snapshot failed ({e})", m.name))?
     }
 
     /// Tell `m` something happened; a hook event may get one line back for

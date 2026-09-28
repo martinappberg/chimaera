@@ -16,9 +16,17 @@
 //! provider is re-checked (a few stats; a re-parse only when its files
 //! changed) and what appeared is attributed to that turn ONLY when
 //! unambiguous: the entry's file changed after the turn started AND no other
-//! agent in the workspace was running. Anything else is recorded
-//! unattributed — never guessed. A finding's confidence move is its own
-//! Timeline entry; moves to or from `unknown` (a torn read) never are.
+//! agent in the workspace was running AND the turn's own session hadn't
+//! started another. Anything else is recorded unattributed — never guessed.
+//! A finding's confidence move is its own Timeline entry; moves to or from
+//! `unknown` (a torn read) never are. The Timeline's checks run on
+//! `episodes`' per-workspace queue, never on the task that saw the turn end.
+//!
+//! A provider that fails keeps the last snapshot it answered: the route
+//! serves it with an `error`, so a slow or faulted plugin reads as "couldn't
+//! refresh", not as "no provider". The cache holds one snapshot per
+//! workspace, of the build active there — dropped when the provider is
+//! switched off, updated, removed or changes build.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -54,6 +62,22 @@ impl KnowledgeState {
     pub(crate) fn forget_workspace(&mut self, ws: &str) {
         self.cache.remove(ws);
         self.baseline.remove(ws);
+    }
+
+    /// Tests: whether a snapshot is cached for `ws`.
+    #[cfg(test)]
+    pub(crate) fn holds(&self, ws: &str) -> bool {
+        self.cache.contains_key(ws)
+    }
+
+    /// Drop what plugin `id` answered — everywhere, or in `ws` only (its
+    /// switch flipped there). An install, update, rollback or remove
+    /// changes the build; switched off, it isn't the provider any more.
+    pub(crate) fn forget_provider(&mut self, id: &str, ws: Option<&str>) {
+        let gone =
+            |w: &String, build: &(String, Arc<str>)| build.0 == id && ws.is_none_or(|ws| ws == w);
+        self.cache.retain(|w, c| !gone(w, &c.build));
+        self.baseline.retain(|w, b| !gone(w, &b.build));
     }
 }
 
@@ -94,6 +118,31 @@ struct Current {
     files: Arc<Stamp>,
 }
 
+impl Current {
+    fn of(cached: &Cached, provider: &str) -> Self {
+        Current {
+            build: cached.build.clone(),
+            provider: provider.to_string(),
+            knowledge: cached.knowledge.clone(),
+            files: cached.files.clone(),
+        }
+    }
+}
+
+/// What asking a workspace's provider came to.
+enum Answer {
+    /// No provider is active there.
+    NoProvider,
+    Fresh(Current),
+    /// It failed (faulted, trapped, too slow, a snapshot that isn't a JSON
+    /// object): why, and the last snapshot this build answered here.
+    Failed {
+        provider: String,
+        last: Option<Current>,
+        error: String,
+    },
+}
+
 #[derive(Default)]
 struct Baseline {
     build: (String, Arc<str>),
@@ -109,23 +158,48 @@ async fn provider(state: &AppState, ws: &str) -> Option<Arc<Manifest>> {
         .find(|m| m.provides.knowledge.is_some())
 }
 
-/// The provider's current knowledge: asked every time with the stamp held
-/// here (it re-stats — cheap), re-read by it only when the stamp moved. A
-/// provider that fails (faulted, trapping, a snapshot that isn't a JSON
-/// object) answers nothing, and the route says there is no provider.
-async fn current(state: &Arc<AppState>, ws: &str) -> Option<Current> {
-    let m = provider(state, ws).await?;
-    let name = m.provides.knowledge.clone()?;
+/// Ask the provider, handing it the stamp held here (it re-stats — cheap)
+/// so it re-reads only when its files moved. With no provider the
+/// workspace's snapshot and baseline go; another build's go before asking.
+async fn ask(state: &Arc<AppState>, ws: &str) -> Answer {
+    let Some(m) = provider(state, ws).await else {
+        crate::lock(&state.knowledge).forget_workspace(ws);
+        return Answer::NoProvider;
+    };
+    let Some(name) = m.provides.knowledge.clone() else {
+        return Answer::NoProvider;
+    };
     // Stamps belong to one provider build; another build may interpret the
     // same files differently, even when none of their mtimes changed.
     let build = (m.id.clone(), m.wasm.sha256.clone());
+    {
+        let mut st = crate::lock(&state.knowledge);
+        if st.cache.get(ws).is_some_and(|c| c.build != build) {
+            st.cache.remove(ws);
+        }
+        if st.baseline.get(ws).is_some_and(|b| b.build != build) {
+            st.baseline.remove(ws);
+        }
+    }
+    let failed = |error: String| {
+        tracing::warn!(plugin = %m.id, workspace = ws, %error, "no fresh knowledge snapshot");
+        let last = crate::lock(&state.knowledge)
+            .cache
+            .get(ws)
+            .filter(|c| c.build == build)
+            .map(|c| Current::of(c, &name));
+        Answer::Failed {
+            provider: name.clone(),
+            last,
+            error,
+        }
+    };
     // Twice at most: "unchanged" for a stamp whose cache entry was dropped
     // meanwhile (the workspace forgotten) is asked again without one.
     for _ in 0..2 {
         let held = crate::lock(&state.knowledge)
             .cache
             .get(ws)
-            .filter(|c| c.build == build)
             .map(|c| c.stamp.clone());
         let answer = state
             .plugin_runtime
@@ -139,44 +213,33 @@ async fn current(state: &Arc<AppState>, ws: &str) -> Option<Current> {
                     .get(ws)
                     .filter(|c| c.build == build && Some(&c.stamp) == held.as_ref())
                 {
-                    return Some(Current {
-                        build,
-                        provider: name,
-                        knowledge: c.knowledge.clone(),
-                        files: c.files.clone(),
-                    });
+                    return Answer::Fresh(Current::of(c, &name));
                 }
             }
             Ok(Some((stamp, data))) => {
                 if !data.is_object() {
-                    tracing::warn!(plugin = %m.id, "knowledge snapshot is not a JSON object");
-                    return None;
+                    return failed(format!("{}'s snapshot is not a JSON object", m.name));
                 }
                 let files = Arc::new(Stamp::deserialize(&stamp).unwrap_or_default());
-                let knowledge = Arc::new(data);
-                crate::lock(&state.knowledge).cache.insert(
-                    ws.to_string(),
-                    Cached {
-                        build: build.clone(),
-                        stamp,
-                        files: files.clone(),
-                        knowledge: knowledge.clone(),
-                    },
-                );
-                return Some(Current {
-                    build,
-                    provider: name,
-                    knowledge,
+                let cached = Cached {
+                    build: build.clone(),
+                    stamp,
                     files,
-                });
+                    knowledge: Arc::new(data),
+                };
+                let now = Current::of(&cached, &name);
+                crate::lock(&state.knowledge)
+                    .cache
+                    .insert(ws.to_string(), cached);
+                return Answer::Fresh(now);
             }
-            Err(err) => {
-                tracing::warn!(plugin = %m.id, workspace = ws, %err, "no knowledge snapshot");
-                return None;
-            }
+            Err(err) => return failed(err),
         }
     }
-    None
+    failed(format!(
+        "{} answered \"unchanged\" for a snapshot it never gave",
+        m.name
+    ))
 }
 
 /// (entry id, kind, the workspace-relative file it lives in).
@@ -315,52 +378,72 @@ async fn recorded_by(state: &AppState, ws: &str) -> HashMap<String, (String, Str
     by
 }
 
-/// Take the diff baseline if none exists yet — called when a turn STARTS
-/// (and when the Knowledge view loads), so the first turn after a daemon
-/// start can still be credited with what it records. A few stats when the
-/// provider is active; nothing otherwise.
-pub(crate) async fn prime(state: &Arc<AppState>, sid: &str) {
-    let Some(ws) = crate::plugins::workspace_of_session(state, sid) else {
-        return;
-    };
-    prime_workspace(state, &ws).await;
-}
-
-async fn prime_workspace(state: &Arc<AppState>, ws: &str) {
+/// Take the diff baseline if none exists yet — when a turn STARTS (from
+/// `episodes`' queue) and when the Knowledge view loads — so the first turn
+/// after a daemon start can still be credited with what it records. A few
+/// stats when the provider is active; nothing otherwise.
+pub(crate) async fn prime_workspace(state: &Arc<AppState>, ws: &str) {
     if crate::lock(&state.knowledge).baseline.contains_key(ws) {
         return;
     }
-    let Some(now) = current(state, ws).await else {
-        return;
-    };
-    let (ids, statuses) = ids_of(&now.knowledge);
-    crate::lock(&state.knowledge)
-        .baseline
-        .entry(ws.to_string())
-        .or_insert(Baseline {
-            build: now.build,
-            ids: ids.into_iter().map(|(id, _, _)| id).collect(),
-            statuses,
-        });
+    if let Answer::Fresh(now) = ask(state, ws).await {
+        take_baseline(state, ws, &now);
+    }
 }
 
-/// Called at an episode end in `sid` (turn started at `start_ts`): diff the
-/// provider against the last check, attribute what is unambiguous to this
-/// turn (the returned `Recorded`), and put status moves (and unattributed
-/// new findings) on the Timeline. The first check in a workspace only sets
-/// the baseline — history is not news.
+/// `now` as the baseline, unless one was taken meanwhile.
+fn take_baseline(state: &AppState, ws: &str, now: &Current) {
+    let mut st = crate::lock(&state.knowledge);
+    if st.baseline.contains_key(ws) {
+        return;
+    }
+    let (ids, statuses) = ids_of(&now.knowledge);
+    st.baseline.insert(
+        ws.to_string(),
+        Baseline {
+            build: now.build.clone(),
+            ids: ids.into_iter().map(|(id, _, _)| id).collect(),
+            statuses,
+        },
+    );
+}
+
+pub(crate) fn has_baseline(state: &AppState, ws: &str) -> bool {
+    crate::lock(&state.knowledge).baseline.contains_key(ws)
+}
+
+/// Forget the diff baseline: the next check only takes one again, so what
+/// was recorded meanwhile is history, never credited to a later turn (the
+/// episode queue fell behind and skipped checks).
+pub(crate) fn forget_baseline(state: &AppState, ws: &str) {
+    crate::lock(&state.knowledge).baseline.remove(ws);
+}
+
+/// Called at an episode end in `sid` (`name` on the Timeline; turn started
+/// at `start_ts`): diff the provider against the last check, attribute what
+/// is unambiguous to this turn (the returned `Recorded`), and put status
+/// moves (and unattributed new findings) on the Timeline. `may_credit` is
+/// false when the session has moved on to another turn since this one
+/// ended — what the files hold now may be that turn's. The first check in a
+/// workspace only sets the baseline — history is not news. A provider that
+/// fails leaves the baseline as it was, for the next check to diff against.
 pub(crate) async fn recorded_since_last_check(
     state: &Arc<AppState>,
     ws: &str,
     sid: &str,
+    name: &str,
     start_ts: Option<u64>,
+    may_credit: bool,
 ) -> Option<Recorded> {
-    let Current {
+    let Answer::Fresh(Current {
         build,
         knowledge: k,
         files: stamp,
         ..
-    } = current(state, ws).await?;
+    }) = ask(state, ws).await
+    else {
+        return None;
+    };
     let (ids, statuses) = ids_of(&k);
     let previous = {
         let mut st = crate::lock(&state.knowledge);
@@ -374,7 +457,7 @@ pub(crate) async fn recorded_since_last_check(
         )
     };
     let previous = previous.filter(|p| p.build == build)?;
-    let sole = !another_agent_active_since(state, ws, sid, start_ts).await;
+    let sole = may_credit && !another_agent_active_since(state, ws, sid, start_ts).await;
     let fresh = |file: &str| {
         start_ts.is_some_and(|start| {
             stamp
@@ -382,7 +465,6 @@ pub(crate) async fn recorded_since_last_check(
                 .is_some_and(|m| m + ATTRIBUTION_SLACK_MS >= start)
         })
     };
-    let name = crate::session_view::display_name_now(state, sid).unwrap_or_else(|| sid.into());
 
     let mut recorded = Recorded::default();
     let mut unattributed_findings = Vec::new();
@@ -415,7 +497,7 @@ pub(crate) async fn recorded_since_last_check(
         let mut entry = Entry::new(Kind::Knowledge);
         if sole {
             entry.sid = Some(sid.to_string());
-            entry.name = Some(name.clone());
+            entry.name = Some(name.to_string());
         }
         entry.knowledge = Some(KnowledgeChange {
             change: "status".into(),
@@ -517,8 +599,28 @@ fn guidance(root: &Path) -> Vec<Value> {
     out
 }
 
+/// The body with no snapshot: guidance only, every list empty.
+fn empty_body(provider: Value, guidance: Vec<Value>) -> Value {
+    json!({
+        "schema": 1,
+        "provider": provider,
+        "left_off": Value::Null,
+        "topics": [],
+        "decisions": [],
+        "learnings": [],
+        "todos": [],
+        "questions": [],
+        "counts": {"findings": 0, "decisions": 0, "learnings": 0, "open": 0},
+        "guidance": guidance,
+        "warnings": [],
+    })
+}
+
 /// GET /workspaces/{id}/knowledge — the Knowledge view's data. With no
 /// structured provider active: `provider: null`, guidance only, empty lists.
+/// A provider that failed to answer adds `error` (additive, only then) to
+/// the last snapshot it gave here — or to empty lists, still naming itself:
+/// it is the provider, it just couldn't read.
 pub(crate) async fn get_knowledge(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
@@ -536,53 +638,78 @@ pub(crate) async fn get_knowledge(
             .await
             .unwrap_or_default()
     };
-    prime_workspace(&state, &id).await;
-    let Some(now) = current(&state, &id).await else {
-        return Json(json!({
-            "schema": 1,
-            "provider": Value::Null,
-            "left_off": Value::Null,
-            "topics": [],
-            "decisions": [],
-            "learnings": [],
-            "todos": [],
-            "questions": [],
-            "counts": {"findings": 0, "decisions": 0, "learnings": 0, "open": 0},
-            "guidance": guidance,
-            "warnings": [],
-        }))
-        .into_response();
+    let (now, error) = match ask(&state, &id).await {
+        Answer::NoProvider => return Json(empty_body(Value::Null, guidance)).into_response(),
+        // The one ask also primes the Timeline's baseline.
+        Answer::Fresh(now) => {
+            take_baseline(&state, &id, &now);
+            (now, None)
+        }
+        Answer::Failed {
+            last: Some(last),
+            error,
+            ..
+        } => (last, Some(error)),
+        Answer::Failed {
+            provider,
+            last: None,
+            error,
+        } => {
+            let mut body = empty_body(json!(provider), guidance);
+            body["error"] = json!(error);
+            return Json(body).into_response();
+        }
     };
-    // The provider's snapshot as it serialized it: the wire the view reads.
-    let mut body = (*now.knowledge).clone();
     // Who recorded what, where the Timeline knows it.
     let by = recorded_by(&state, &id).await;
-    let annotate = |v: &mut Value, key: &str| {
-        if let Some(id) = v.get(key).and_then(Value::as_str) {
-            if let Some((sid, name)) = by.get(id) {
-                v["recorded_by"] = json!({"sid": sid, "name": name});
+    // A snapshot is up to `runtime::SNAPSHOT_MAX` of JSON: copied,
+    // annotated and serialized on the blocking pool.
+    let body = tokio::task::spawn_blocking(move || {
+        // The provider's snapshot as it serialized it: the wire the view reads.
+        let mut body = (*now.knowledge).clone();
+        let annotate = |v: &mut Value, key: &str| {
+            if let Some(id) = v.get(key).and_then(Value::as_str) {
+                if let Some((sid, name)) = by.get(id) {
+                    v["recorded_by"] = json!({"sid": sid, "name": name});
+                }
+            }
+        };
+        if let Some(topics) = body.get_mut("topics").and_then(Value::as_array_mut) {
+            for t in topics {
+                if let Some(fs) = t.get_mut("findings").and_then(Value::as_array_mut) {
+                    fs.iter_mut().for_each(|f| annotate(f, "id"));
+                }
             }
         }
-    };
-    if let Some(topics) = body.get_mut("topics").and_then(Value::as_array_mut) {
-        for t in topics {
-            if let Some(fs) = t.get_mut("findings").and_then(Value::as_array_mut) {
-                fs.iter_mut().for_each(|f| annotate(f, "id"));
+        for list in ["decisions", "learnings"] {
+            if let Some(items) = body.get_mut(list).and_then(Value::as_array_mut) {
+                items.iter_mut().for_each(|e| annotate(e, "fp"));
             }
         }
-    }
-    for list in ["decisions", "learnings"] {
-        if let Some(items) = body.get_mut(list).and_then(Value::as_array_mut) {
-            items.iter_mut().for_each(|e| annotate(e, "fp"));
+        body["schema"] = json!(1);
+        body["provider"] = json!(now.provider);
+        body["guidance"] = json!(guidance);
+        if body.get("left_off").is_none() {
+            body["left_off"] = Value::Null;
         }
+        if let Some(error) = error {
+            body["error"] = json!(error);
+        }
+        serde_json::to_vec(&body)
+    })
+    .await;
+    match body {
+        Ok(Ok(bytes)) => (
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            bytes,
+        )
+            .into_response(),
+        _ => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "could not serialize the knowledge snapshot"})),
+        )
+            .into_response(),
     }
-    body["schema"] = json!(1);
-    body["provider"] = json!(now.provider);
-    body["guidance"] = json!(guidance);
-    if body.get("left_off").is_none() {
-        body["left_off"] = Value::Null;
-    }
-    Json(body).into_response()
 }
 
 #[cfg(test)]

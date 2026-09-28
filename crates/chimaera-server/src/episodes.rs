@@ -16,10 +16,17 @@
 //! Anatomy (plan §4): the headline is the user's own prompt; the result is
 //! the first meaningful sentence of the agent's final message; the evidence
 //! is files · duration · tools · end state. Nothing here calls a model.
+//!
+//! What a turn recorded in Knowledge is asked of the provider plugin (30 s
+//! budget; a tree on NFS). That never runs on the task that saw the turn —
+//! the chat signal task relays every chat's events, a hook handler has
+//! claude waiting on its answer — but on [`EpisodeQueue`]: one FIFO per
+//! workspace, so a turn's baseline is taken before its end is diffed and
+//! entries land in the order their turns ended.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use chimaera_agent::model::{AgentEvent, ToolKind, ToolStatus, UserMessageState};
 
@@ -303,10 +310,145 @@ impl TuiEpisodes {
     }
 }
 
-/// Attach session + workspace context to a draft and append it. The
+/// Jobs waiting per workspace before new ones are dropped (and logged): a
+/// provider stuck for that many turn ends is broken, and the Timeline
+/// appends themselves never block.
+const QUEUE_MAX: usize = 256;
+/// With this many jobs waiting behind one, the queue catches up: turn ends
+/// are appended unattributed without asking the provider, and its baseline
+/// is dropped so nothing recorded meanwhile is credited to a later turn.
+const BACKLOG_SKIP: usize = 16;
+
+enum Job {
+    /// A turn started: take the Knowledge baseline if none exists yet.
+    Prime,
+    /// A turn ended: what it recorded, then the entry.
+    Episode { sid: String, entry: Entry },
+    /// An entry that only needs its place in line (a crash after the
+    /// session's last turn).
+    Append(Entry),
+}
+
+/// The per-workspace FIFOs; a workspace's worker task runs while its queue
+/// is in the map (it removes it, under the same lock, when it runs dry).
+#[derive(Default)]
+pub(crate) struct EpisodeQueue {
+    queues: Mutex<HashMap<String, VecDeque<Job>>>,
+}
+
+impl EpisodeQueue {
+    fn push(&self, state: &Arc<AppState>, ws: &str, job: Job) {
+        let mut queues = crate::lock(&self.queues);
+        if let Some(queue) = queues.get_mut(ws) {
+            if queue.len() >= QUEUE_MAX {
+                if !matches!(job, Job::Prime) {
+                    tracing::warn!(
+                        workspace = ws,
+                        "episode queue full; a Timeline entry was dropped"
+                    );
+                }
+                return;
+            }
+            queue.push_back(job);
+            return;
+        }
+        queues.insert(ws.to_string(), VecDeque::from([job]));
+        drop(queues);
+        tokio::spawn(drain(state.clone(), ws.to_string()));
+    }
+
+    /// Tests: until `ws`'s queue has run dry.
+    #[cfg(test)]
+    pub(crate) async fn settled(&self, ws: &str) {
+        while crate::lock(&self.queues).contains_key(ws) {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+}
+
+/// One workspace's worker: its jobs in order, until none are left.
+async fn drain(state: Arc<AppState>, ws: String) {
+    loop {
+        // The job, how many wait behind it, and whether its session has
+        // another turn end queued (then the files may hold that turn's too).
+        let (job, behind, later_turn) = {
+            let mut queues = crate::lock(&state.episode_queue.queues);
+            let Some(queue) = queues.get_mut(&ws) else {
+                return;
+            };
+            let Some(job) = queue.pop_front() else {
+                queues.remove(&ws);
+                return;
+            };
+            let later_turn = match &job {
+                Job::Episode { sid, .. } => queue
+                    .iter()
+                    .any(|j| matches!(j, Job::Episode { sid: s, .. } if s == sid)),
+                _ => false,
+            };
+            (job, queue.len(), later_turn)
+        };
+        let catching_up = behind >= BACKLOG_SKIP;
+        match job {
+            Job::Prime if catching_up => {}
+            Job::Prime => crate::knowledge::prime_workspace(&state, &ws).await,
+            Job::Episode { sid, mut entry } => {
+                if catching_up {
+                    crate::knowledge::forget_baseline(&state, &ws);
+                } else if let Some(evidence) = entry.evidence.as_mut() {
+                    let name = entry.name.clone().unwrap_or_else(|| sid.clone());
+                    let may_credit = !later_turn && !mid_turn(&state, &sid);
+                    evidence.recorded = crate::knowledge::recorded_since_last_check(
+                        &state,
+                        &ws,
+                        &sid,
+                        &name,
+                        entry.start_ts,
+                        may_credit,
+                    )
+                    .await;
+                }
+                state.timeline.append(&ws, entry).await;
+                state.changes.notify_waiters();
+            }
+            Job::Append(entry) => {
+                state.timeline.append(&ws, entry).await;
+                state.changes.notify_waiters();
+            }
+        }
+    }
+}
+
+/// Whether `sid` is in a turn right now — a later one than the job's.
+fn mid_turn(state: &AppState, sid: &str) -> bool {
+    use crate::agent_state::AgentState;
+    crate::lock(&state.agents).get(sid).is_some_and(|r| {
+        matches!(
+            r.state,
+            AgentState::Running | AgentState::NeedsPermission | AgentState::RateLimited
+        )
+    })
+}
+
+/// A turn started in `sid`: the Knowledge baseline is taken (if none
+/// exists yet) in line on its workspace's queue.
+pub(crate) fn turn_started(state: &Arc<AppState>, sid: &str) {
+    let Some(ws) = crate::plugins::workspace_of_session(state, sid) else {
+        return;
+    };
+    // Most turns start with a baseline already taken: nothing to queue.
+    if !crate::knowledge::has_baseline(state, &ws) {
+        state.episode_queue.push(state, &ws, Job::Prime);
+    }
+}
+
+/// Attach session + workspace context to a draft and queue it; what the
+/// turn recorded in Knowledge is attributed on the queue, then it's
+/// appended. Everything read from the session happens now — by the time the
+/// job runs, a dead session's workspace mapping and name may be gone. The
 /// Mastermind's own turns are not project history (the observer, not the
-/// observed). Knowledge written during the turn is attributed here.
-pub(crate) async fn record(state: &Arc<AppState>, sid: &str, draft: Draft, tier: &'static str) {
+/// observed).
+pub(crate) fn record(state: &Arc<AppState>, sid: &str, draft: Draft, tier: &'static str) {
     if crate::mcp::mastermind_of(state, sid) {
         return;
     }
@@ -342,23 +484,23 @@ pub(crate) async fn record(state: &Arc<AppState>, sid: &str, draft: Draft, tier:
         .take(timeline::FILES_MAX)
         .map(|f| relative_to(root.as_deref(), f))
         .collect();
-    let mut evidence = Evidence {
+    entry.evidence = Some(Evidence {
         files,
         files_n,
         tools: draft.tools,
         recorded: None,
+    });
+    let job = Job::Episode {
+        sid: sid.to_string(),
+        entry,
     };
-    evidence.recorded =
-        crate::knowledge::recorded_since_last_check(state, &ws, sid, entry.start_ts).await;
-    entry.evidence = Some(evidence);
-    state.timeline.append(&ws, entry).await;
-    state.changes.notify_waiters();
+    state.episode_queue.push(state, &ws, job);
 }
 
 /// A chat session that died on its own with an error is history ("claude-2
 /// crashed"); a clean exit, a deliberate kill, or a handshake failure (which
 /// degrades to a terminal and says so there) is not.
-pub(crate) async fn record_exit(
+pub(crate) fn record_exit(
     state: &Arc<AppState>,
     sid: &str,
     exit: &chimaera_agent::driver::DriverExit,
@@ -385,8 +527,8 @@ pub(crate) async fn record_exit(
     entry.ui = Some(ui.to_string());
     entry.end = Some("errored".to_string());
     entry.title = Some(detail);
-    state.timeline.append(&ws, entry).await;
-    state.changes.notify_waiters();
+    // Behind the session's last turn, which may still be on the queue.
+    state.episode_queue.push(state, &ws, Job::Append(entry));
 }
 
 /// Commands worth remembering: a failure that ran ≥10 s, or anything that

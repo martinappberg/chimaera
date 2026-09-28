@@ -303,6 +303,34 @@ async fn blocking<T: Send + 'static>(
         .map_err(|e| Refusal::internal(format!("the plugin task failed: {e}")))?
 }
 
+/// A change runs to its end even when its caller goes away (a window
+/// closed mid-install, an interrupted `chimaera plugin add`): the files move
+/// on the blocking pool either way, and the catalog reload after them
+/// (`after_change`) must not be skipped — the old version would keep running
+/// and listing until the next change.
+async fn detached<T: Send + 'static>(
+    change: impl std::future::Future<Output = Result<T, Refusal>> + Send + 'static,
+) -> Result<T, Refusal> {
+    tokio::spawn(change)
+        .await
+        .unwrap_or_else(|e| Err(Refusal::internal(format!("the plugin change failed: {e}"))))
+}
+
+/// A plugin new to this daemon starts switched off everywhere: a switch
+/// kept under its id — from a removed plugin, perhaps another publisher's —
+/// must not switch it on. `first_party` (the lock's id from the lock's
+/// repository) keeps it: that switch holds across Remove → Install.
+async fn fresh_switches(state: &Arc<AppState>, id: &str, first_party: bool) -> Result<(), Refusal> {
+    if first_party || state.plugin_catalog.installed_copy(id).is_some() {
+        return Ok(());
+    }
+    super::clear_switches(state, id).await.map_err(|e| {
+        Refusal::internal(format!(
+            "could not clear the switch another {id} left behind: {e:#}"
+        ))
+    })
+}
+
 /// `<dir>` made, leftovers of an interrupted change cleared (the caller
 /// holds the change lock, so none is in flight), and a fresh temp dir in it.
 fn stage(dir: &Path) -> Result<PathBuf, Refusal> {
@@ -346,14 +374,27 @@ fn sha256_file(path: &Path) -> std::io::Result<String> {
 fn activate(dir: &Path, staged: &Path, version: &str) -> Result<Option<String>, Refusal> {
     let current = link(dir, CURRENT).map_err(Refusal::internal)?;
     let dest = dir.join(version);
-    if dest.exists() {
-        // A version kept from before (the previous one, reinstalled): the
-        // fresh, verified download replaces it.
-        let aside = dir.join(format!("{TEMP_PREFIX}old-{}", nonce()));
-        std::fs::rename(&dest, &aside).map_err(io("could not set the old copy aside"))?;
-        let _ = std::fs::remove_dir_all(&aside);
+    // A version kept from before (the current one reinstalled, or the
+    // previous one): the fresh, verified copy replaces it. The old copy is
+    // set aside, not deleted, until the new one is in place — `current`
+    // may name it, and a failed move puts it back.
+    let aside = dest
+        .exists()
+        .then(|| dir.join(format!("{TEMP_PREFIX}old-{}", nonce())));
+    if let Some(aside) = &aside {
+        std::fs::rename(&dest, aside).map_err(io("could not set the old copy aside"))?;
     }
-    std::fs::rename(staged, &dest).map_err(io("could not move the download into place"))?;
+    if let Err(err) = std::fs::rename(staged, &dest) {
+        if let Some(aside) = &aside {
+            if let Err(back) = std::fs::rename(aside, &dest) {
+                tracing::error!(dir = %dest.display(), %back, "the old plugin copy could not be put back");
+            }
+        }
+        return Err(io("could not move the download into place")(err));
+    }
+    if let Some(aside) = &aside {
+        let _ = std::fs::remove_dir_all(aside);
+    }
     let replaced = current.filter(|c| c != version);
     // `previous` first: an interruption between the two swaps leaves the
     // old version current.
@@ -388,13 +429,15 @@ fn prune(dir: &Path, current: &str, previous: Option<&str>) {
 
 /// After any change: the catalog re-read, the plugin's instances and
 /// compiled offers dropped (the next call runs the version now current),
-/// footprints re-detected, windows told.
+/// what it answered Knowledge with dropped, footprints re-detected, windows
+/// told.
 async fn after_change(state: &Arc<AppState>, id: &str) {
     let reloading = state.clone();
     if let Err(err) = tokio::task::spawn_blocking(move || reloading.plugin_catalog.reload()).await {
         tracing::error!(%err, "plugin catalog reload failed");
     }
     state.plugin_runtime.forget_plugin(id);
+    crate::lock(&state.knowledge).forget_provider(id, None);
     crate::lock(&state.plugin_detect).clear();
     state.changes.notify_waiters();
 }
@@ -554,6 +597,8 @@ async fn install(
             m.name, release.version
         )));
     }
+    let first_party = super::lock_entry(&id).is_some_and(|l| l.repo.eq_ignore_ascii_case(&source));
+    fresh_switches(state, &id, first_party).await?;
     let dir = state.plugin_catalog.root.join(&id);
     let staging = dir.clone();
     let tmp = blocking(move || stage(&staging)).await?;
@@ -636,7 +681,9 @@ async fn install_path(state: &Arc<AppState>, src: PathBuf) -> Result<Installed, 
     let _change = state.plugin_releases.changing.lock().await;
     let root = state.plugin_catalog.root.clone();
     let daemon = state.plugin_catalog.daemon_version();
-    let (done, from) = blocking(move || {
+    // Read and checked first: the switches of an id new to this daemon go
+    // before anything is in place under it.
+    let (m, files, src) = blocking(move || {
         let src = src
             .canonicalize()
             .map_err(|e| Refusal::bad_request(format!("{}: {e}", src.display())))?;
@@ -679,14 +726,29 @@ async fn install_path(state: &Arc<AppState>, src: PathBuf) -> Result<Installed, 
                 }
             }
         }
+        let files = LocalFiles {
+            toml,
+            wasm,
+            sums,
+            wasm_sha256,
+            toml_sha256,
+        };
+        Ok((m, files, src))
+    })
+    .await?;
+    // A local build is never first-party (`first_party` needs the release
+    // marker only a release install writes).
+    fresh_switches(state, &m.id, false).await?;
+    let from = src.clone();
+    let done = blocking(move || {
         let dir = root.join(&m.id);
         let tmp = stage(&dir)?;
         let written = (|| {
-            std::fs::write(tmp.join("plugin.toml"), &toml)
+            std::fs::write(tmp.join("plugin.toml"), &files.toml)
                 .map_err(io("could not write plugin.toml"))?;
-            std::fs::write(tmp.join("plugin.wasm"), &wasm)
+            std::fs::write(tmp.join("plugin.wasm"), &files.wasm)
                 .map_err(io("could not write plugin.wasm"))?;
-            if let Some(sums) = &sums {
+            if let Some(sums) = &files.sums {
                 std::fs::write(tmp.join(SUMS), sums).map_err(io("could not write SHA256SUMS"))?;
             }
             std::fs::write(tmp.join(LOCAL_PATH), src.to_string_lossy().as_bytes())
@@ -700,14 +762,13 @@ async fn install_path(state: &Arc<AppState>, src: PathBuf) -> Result<Installed, 
                 return Err(refusal);
             }
         };
-        let done = Installed {
+        Ok(Installed {
             id: m.id,
             version: m.version,
             replaced,
-            wasm_sha256,
-            toml_sha256,
-        };
-        Ok((done, src))
+            wasm_sha256: files.wasm_sha256,
+            toml_sha256: files.toml_sha256,
+        })
     })
     .await?;
     after_change(state, &done.id).await;
@@ -720,6 +781,15 @@ async fn install_path(state: &Arc<AppState>, src: PathBuf) -> Result<Installed, 
         "plugin installed from a local directory"
     );
     Ok(done)
+}
+
+/// A local build's files, read and checked.
+struct LocalFiles {
+    toml: Vec<u8>,
+    wasm: Vec<u8>,
+    sums: Option<Vec<u8>>,
+    wasm_sha256: String,
+    toml_sha256: String,
 }
 
 #[derive(Deserialize)]
@@ -755,23 +825,25 @@ pub(crate) async fn install_route(
     State(state): State<Arc<AppState>>,
     Json(body): Json<InstallBody>,
 ) -> Response {
-    let result = match (body.github.as_deref(), body.path) {
-        (None, Some(path)) => install_path(&state, path).await,
+    let changing = state.clone();
+    let result = match (body.github, body.path) {
+        (None, Some(path)) => detached(async move { install_path(&changing, path).await }).await,
         (Some(github), None) => {
-            let github = normalize_github(github);
-            let version = body
-                .version
-                .as_deref()
-                .map(|v| v.trim().trim_start_matches('v'));
-            let pinned = super::lock_entries()
-                .iter()
-                .find(|l| l.repo.eq_ignore_ascii_case(github))
-                .filter(|l| version.is_none_or(|v| v == l.version));
-            let from = match pinned {
-                Some(l) => Fetch::Pinned(l),
-                None => Fetch::Release { github, version },
-            };
-            install(&state, from, None).await
+            let version = body.version;
+            detached(async move {
+                let github = normalize_github(&github);
+                let version = version.as_deref().map(|v| v.trim().trim_start_matches('v'));
+                let pinned = super::lock_entries()
+                    .iter()
+                    .find(|l| l.repo.eq_ignore_ascii_case(github))
+                    .filter(|l| version.is_none_or(|v| v == l.version));
+                let from = match pinned {
+                    Some(l) => Fetch::Pinned(l),
+                    None => Fetch::Release { github, version },
+                };
+                install(&changing, from, None).await
+            })
+            .await
         }
         _ => Err(Refusal::bad_request(
             "name a repository (github) or a local directory (path)",
@@ -793,7 +865,9 @@ pub(crate) async fn pinned_install_route(
         ))
         .into_response();
     };
-    installed_reply(&state, install(&state, Fetch::Pinned(l), None).await)
+    let changing = state.clone();
+    let result = detached(async move { install(&changing, Fetch::Pinned(l), None).await }).await;
+    installed_reply(&state, result)
 }
 
 /// POST /plugins/{pid}/update — install the plugin's latest release, when
@@ -808,11 +882,16 @@ pub(crate) async fn update_route(
     let Some(github) = m.origin.release.clone() else {
         return releases::no_source(&m).into_response();
     };
-    let from = Fetch::Release {
-        github: &github,
-        version: None,
-    };
-    installed_reply(&state, install(&state, from, Some(&m)).await)
+    let changing = state.clone();
+    let result = detached(async move {
+        let from = Fetch::Release {
+            github: &github,
+            version: None,
+        };
+        install(&changing, from, Some(&m)).await
+    })
+    .await;
+    installed_reply(&state, result)
 }
 
 fn installed_reply(state: &AppState, result: Result<Installed, Refusal>) -> Response {
@@ -836,7 +915,8 @@ pub(crate) async fn rollback_route(
     State(state): State<Arc<AppState>>,
     AxPath(pid): AxPath<String>,
 ) -> Response {
-    match rollback(&state, &pid).await {
+    let (changing, id) = (state.clone(), pid.clone());
+    match detached(async move { rollback(&changing, &id).await }).await {
         Ok((version, previous)) => Json(json!({
             "id": pid,
             "version": version,
@@ -888,7 +968,8 @@ pub(crate) async fn remove_route(
     State(state): State<Arc<AppState>>,
     AxPath(pid): AxPath<String>,
 ) -> Response {
-    match remove(&state, &pid).await {
+    let (changing, id) = (state.clone(), pid.clone());
+    match detached(async move { remove(&changing, &id).await }).await {
         Ok(()) => Json(json!({
             "id": pid,
             "removed": true,
@@ -925,6 +1006,14 @@ async fn remove(state: &Arc<AppState>, pid: &str) -> Result<(), Refusal> {
     state.plugin_releases.forget(pid);
     after_change(state, pid).await;
     tracing::info!(plugin = %pid, "plugin removed");
+    // A third-party plugin's switches go with it: nothing is left to show
+    // them on, and they'd switch on whatever is installed under the id
+    // next (a first-party switch holds across Remove → Install).
+    if super::lock_entry(pid).is_none() {
+        if let Err(err) = super::clear_switches(state, pid).await {
+            tracing::warn!(plugin = %pid, %err, "removed plugin's switches not cleared");
+        }
+    }
     Ok(())
 }
 
@@ -1012,6 +1101,46 @@ mod tests {
             .filter(|n| n.starts_with(TEMP_PREFIX))
             .collect();
         assert!(left.is_empty(), "no staging left: {left:?}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Reinstalling the version `current` names replaces it in place: the
+    /// old copy is only set aside until the new one is there, and a move
+    /// that fails puts it back — `current` never names a missing directory.
+    #[test]
+    fn a_reinstall_in_place_keeps_the_old_copy_until_the_new_one_is_there() {
+        let root = dir("reinstall");
+        let d = root.join("demo");
+        let tmp = stage(&d).unwrap();
+        std::fs::write(tmp.join("plugin.toml"), manifest("demo", "0.1.0")).unwrap();
+        std::fs::write(tmp.join("plugin.wasm"), b"\0asm old").unwrap();
+        activate(&d, &tmp, "0.1.0").unwrap();
+
+        // The move into place fails (nothing staged there): the old copy is back.
+        let gone = d.join(format!("{TEMP_PREFIX}missing"));
+        assert!(activate(&d, &gone, "0.1.0").is_err());
+        assert_eq!(link(&d, CURRENT).unwrap().as_deref(), Some("0.1.0"));
+        assert_eq!(
+            std::fs::read(d.join("0.1.0/plugin.wasm")).unwrap(),
+            b"\0asm old"
+        );
+
+        // It succeeds: the fresh copy, and nothing set aside is left.
+        let tmp = stage(&d).unwrap();
+        std::fs::write(tmp.join("plugin.toml"), manifest("demo", "0.1.0")).unwrap();
+        std::fs::write(tmp.join("plugin.wasm"), b"\0asm new").unwrap();
+        assert_eq!(activate(&d, &tmp, "0.1.0").unwrap(), None);
+        assert_eq!(
+            std::fs::read(d.join("0.1.0/plugin.wasm")).unwrap(),
+            b"\0asm new"
+        );
+        let left: Vec<String> = std::fs::read_dir(&d)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(TEMP_PREFIX))
+            .collect();
+        assert!(left.is_empty(), "nothing set aside is left: {left:?}");
         let _ = std::fs::remove_dir_all(root);
     }
 

@@ -1640,3 +1640,84 @@ async fn overlapping_active_plugins_offer_each_tool_once() {
     assert!(!error && reply.contains("hello"), "{reply}");
     state.sessions.kill(&sid).ok();
 }
+
+/// A third-party plugin's switches go with it when it's removed — no card
+/// is left to switch it off from — and a plugin new to the daemon never
+/// inherits a switch kept under its id (another publisher's, or one an
+/// older daemon left): it starts off everywhere. One left behind for an id
+/// nothing is installed under can still be switched off.
+#[tokio::test]
+async fn a_third_party_plugin_never_inherits_or_leaves_a_switch() {
+    let fake = FakeReleases::start().await;
+    let state = state_for(&fake);
+    let id = "up-switch";
+    let repo = "acme/up-switch";
+    fake.publish(repo, "0.1.0", &manifest(false, id, "0.1.0", ""), &v1_wasm());
+    assert_eq!(install(&state, repo, None).await.0, StatusCode::OK);
+    let (ws, sid) = workspace_with(&state, "up-switch", "switch-key", &[id]).await;
+    let on = || lock(&state.workspaces).get(&ws).unwrap().plugins_on;
+    assert_eq!(on(), [id]);
+    let (status, body) = request(
+        &state,
+        Method::DELETE,
+        &format!("/api/v1/plugins/{id}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(on().is_empty(), "removed with the plugin: {:?}", on());
+
+    lock(&state.workspaces)
+        .set_plugin_on(&ws, id, true)
+        .unwrap();
+    assert_eq!(install(&state, repo, None).await.0, StatusCode::OK);
+    assert!(on().is_empty(), "a new install starts off: {:?}", on());
+
+    lock(&state.workspaces)
+        .set_plugin_on(&ws, "up-gone", true)
+        .unwrap();
+    let (status, body) = request(
+        &state,
+        Method::PUT,
+        &format!("/api/v1/workspaces/{ws}/plugins/up-gone"),
+        Some(json!({"on": false})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(on().is_empty(), "{:?}", on());
+    state.sessions.kill(&sid).ok();
+}
+
+/// A change runs to its end when its caller goes away (a window closed
+/// mid-request): its files have moved by then, so the catalog must follow —
+/// or the removed plugin keeps listing and running until the next change.
+#[tokio::test]
+async fn a_removal_whose_caller_went_away_still_reloads_the_catalog() {
+    let state = test_state();
+    let id = "up-detached";
+    let src = test_dir("up-detached-src");
+    local_build(&src, &unreleased(false, id, "0.1.0"), &v1_wasm(), None);
+    let (status, body) = request(
+        &state,
+        Method::POST,
+        "/api/v1/plugins/install",
+        Some(json!({"path": src})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(crate::plugins::manifest(&state, id).is_some());
+    let removing = crate::plugins::installed::remove_route(
+        axum::extract::State(state.clone()),
+        axum::extract::Path(id.to_string()),
+    );
+    // One poll starts it; then the caller is gone.
+    let _ = tokio::time::timeout(std::time::Duration::ZERO, removing).await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while crate::plugins::manifest(&state, id).is_some() {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the catalog never caught up with the removal");
+    assert!(!plugin_dir(&state, id).exists());
+}
