@@ -28,6 +28,7 @@ const MAX_HOSTS: usize = 32;
 const MAX_ROWS: usize = 512;
 const MAX_RESPONSE: usize = 2 * 1024 * 1024;
 const MAX_METADATA: usize = 1024 * 1024;
+const POLL_CONCURRENCY: usize = 4;
 static REQUESTS: Semaphore = Semaphore::const_new(32);
 
 #[derive(Default)]
@@ -238,27 +239,35 @@ impl Store {
         // slot. Captured requests/tickets fail current() once the route is gone.
         data.routes.retain(|_, route| !route.workspaces.is_empty());
     }
-    fn install(&self, route: &Route, rows: Vec<Value>) {
+    fn install_workspace(&self, route: &Route, workspace: &str, rows: Vec<Value>) -> bool {
         let mut data = crate::lock(&self.inner);
         if data
             .routes
             .get(&route.host_id)
             .is_none_or(|current| current.generation != route.generation)
         {
-            return;
+            return false;
         }
-        data.rows
-            .retain(|_, row| row["placement"]["remote"].as_str() != Some(&route.host_id));
+        let outside = data
+            .rows
+            .values()
+            .filter(|row| row["workspace_id"].as_str() != Some(workspace))
+            .count();
+        let capacity = MAX_ROWS.saturating_sub(outside);
+        let mut incoming = HashMap::new();
         for mut row in rows.into_iter().take(MAX_ROWS) {
-            if data.rows.len() >= MAX_ROWS {
+            if incoming.len() >= capacity {
                 break;
             }
-            let (Some(id), Some(workspace)) = (row["id"].as_str(), row["workspace_id"].as_str())
-            else {
+            let Some(id) = row["id"].as_str() else {
                 continue;
             };
             if !valid_id(id)
-                || !route.workspaces.contains_key(workspace)
+                || row["workspace_id"].as_str() != Some(workspace)
+                || data
+                    .rows
+                    .get(id)
+                    .is_some_and(|existing| existing["workspace_id"].as_str() != Some(workspace))
                 || !serde_json::to_vec(&row).is_ok_and(|bytes| bytes.len() <= 64 * 1024)
             {
                 continue;
@@ -269,8 +278,40 @@ impl Store {
             };
             map.insert("placement".into(), json!({"remote": route.host_id}));
             map.insert("placement_available".into(), json!(true));
-            data.rows.insert(id, row);
+            incoming.insert(id, row);
         }
+        let previous = data.rows.len() - outside;
+        if previous == incoming.len()
+            && incoming
+                .iter()
+                .all(|(id, row)| data.rows.get(id) == Some(row))
+        {
+            return false;
+        }
+        data.rows
+            .retain(|_, row| row["workspace_id"].as_str() != Some(workspace));
+        data.rows.extend(incoming);
+        true
+    }
+    fn unavailable_workspace(&self, route: &Route, workspace: &str) -> bool {
+        let mut data = crate::lock(&self.inner);
+        if data
+            .routes
+            .get(&route.host_id)
+            .is_none_or(|current| current.generation != route.generation)
+        {
+            return false;
+        }
+        let mut changed = false;
+        for row in data.rows.values_mut() {
+            if row["workspace_id"].as_str() == Some(workspace)
+                && row["placement_available"] != false
+            {
+                row["placement_available"] = json!(false);
+                changed = true;
+            }
+        }
+        changed
     }
 }
 /// Authenticated local inventory lets a restarted native shell retire stale
@@ -347,68 +388,67 @@ pub(crate) fn start(state: Arc<AppState>) {
             if state.stopping.load(Ordering::Acquire) {
                 return;
             }
-            let routes: Vec<_> = crate::lock(&state.session_proxy.inner)
-                .routes
-                .values()
-                .filter(|r| r.address.is_some())
-                .cloned()
-                .collect();
-            for route in routes {
-                let result = tokio::time::timeout(Duration::from_secs(10), async {
-                    let mut rows = Vec::new();
-                    for workspace in route.workspaces.keys() {
-                        let response = request(
-                            &route,
-                            workspace,
-                            Request::builder()
-                                .uri("/api/v1/sessions")
-                                .body(Body::empty())?,
-                        )
-                        .await?;
-                        if !response.status().is_success() {
-                            bail!("remote unavailable");
-                        }
-                        let bytes =
-                            axum::body::to_bytes(response.into_body(), MAX_RESPONSE).await?;
-                        let mut value: Value = serde_json::from_slice(&bytes)?;
-                        if let Some(alias) = route.alias(workspace) {
-                            alias.response("/sessions", &mut value);
-                        }
-                        let incoming: Vec<Value> = serde_json::from_value(value)?;
-                        rows.extend(
-                            incoming
-                                .into_iter()
-                                .take(MAX_ROWS.saturating_sub(rows.len())),
-                        );
-                    }
-                    Ok::<Vec<Value>, anyhow::Error>(rows)
-                })
-                .await;
-                match result {
-                    Ok(Ok(rows)) => state.session_proxy.install(&route, rows),
-                    _ => {
-                        let mut data = crate::lock(&state.session_proxy.inner);
-                        if data
-                            .routes
-                            .get(&route.host_id)
-                            .is_none_or(|current| current.generation != route.generation)
-                        {
-                            continue;
-                        }
-                        for row in data.rows.values_mut() {
-                            if row["placement"]["remote"].as_str() == Some(&route.host_id) {
-                                row["placement_available"] = json!(false);
-                            }
-                        }
-                    }
-                }
-            }
-            if !crate::lock(&state.session_proxy.inner).routes.is_empty() {
-                state.changes.notify_waiters();
-            }
+            poll_workspaces(&state.session_proxy, &state.changes).await;
         }
     });
 }
+async fn poll_workspaces(store: &Store, changes: &crate::state::ChangeBus) -> bool {
+    // Share one bounded route snapshot per host. A slow or failed project must
+    // neither suppress its siblings' results nor turn their cached rows offline.
+    let jobs: Vec<_> = crate::lock(&store.inner)
+        .routes
+        .values()
+        .filter(|route| route.address.is_some())
+        .flat_map(|route| {
+            let route = Arc::new(route.clone());
+            route
+                .workspaces
+                .keys()
+                .map(|workspace| (Arc::clone(&route), workspace.clone()))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let mut polls = futures::stream::iter(jobs)
+        .map(|(route, workspace)| async move {
+            let result = tokio::time::timeout(Duration::from_secs(10), async {
+                let response = request(
+                    &route,
+                    &workspace,
+                    Request::builder()
+                        .uri("/api/v1/sessions")
+                        .body(Body::empty())?,
+                )
+                .await?;
+                if !response.status().is_success() {
+                    bail!("remote unavailable");
+                }
+                let bytes = axum::body::to_bytes(response.into_body(), MAX_RESPONSE).await?;
+                let mut value: Value = serde_json::from_slice(&bytes)?;
+                if let Some(alias) = route.alias(&workspace) {
+                    alias.response("/sessions", &mut value);
+                }
+                Ok::<Vec<Value>, anyhow::Error>(serde_json::from_value(value)?)
+            })
+            .await;
+            (route, workspace, result)
+        })
+        .buffer_unordered(POLL_CONCURRENCY);
+    let mut any_changed = false;
+    while let Some((route, workspace, result)) = polls.next().await {
+        let changed = match result {
+            Ok(Ok(rows)) => store.install_workspace(&route, &workspace, rows),
+            _ => store.unavailable_workspace(&route, &workspace),
+        };
+        if changed {
+            // Notify as each project completes; waiting for a stalled sibling
+            // must not delay a healthy project's newly available session.
+            changes.notify_waiters();
+            any_changed = true;
+        }
+    }
+    any_changed
+}
+
 async fn request(route: &Route, workspace: &str, request: Request<Body>) -> Result<Response> {
     verify_scope(route, workspace).await?;
     target_request(route, workspace, request).await
@@ -982,6 +1022,160 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn shared_host_polls_keep_healthy_project_available_and_recover_independently() {
+        use axum::{http::HeaderMap, routing::get, Router};
+        use std::sync::atomic::AtomicUsize;
+        #[derive(Default)]
+        struct Target {
+            fail_a: AtomicBool,
+            b_reads: AtomicUsize,
+            b_revision: AtomicUsize,
+        }
+        let target = Arc::new(Target::default());
+        let remote = Router::new()
+            .route(
+                "/api/v1/health",
+                get(|State(target): State<Arc<Target>>, headers: HeaderMap| async move {
+                    assert_eq!(headers[header::AUTHORIZATION], "Bearer synthetic-poll");
+                    let workspace = &headers[crate::workspace_scope::WORKSPACE_HEADER];
+                    if workspace == "w-a" && target.fail_a.load(Ordering::Acquire) {
+                        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                    }
+                    let mut response = StatusCode::OK.into_response();
+                    response.headers_mut().insert("x-chimaera-scope-version", "1".parse().unwrap());
+                    response.headers_mut().insert(crate::workspace_scope::WORKSPACE_HEADER, workspace.clone());
+                    response.headers_mut().insert(crate::workspace_scope::EPOCH_HEADER, headers[crate::workspace_scope::EPOCH_HEADER].clone());
+                    response
+                }),
+            )
+            .route(
+                "/api/v1/sessions",
+                get(|State(target): State<Arc<Target>>, headers: HeaderMap| async move {
+                    assert_eq!(headers[header::AUTHORIZATION], "Bearer synthetic-poll");
+                    let workspace = headers[crate::workspace_scope::WORKSPACE_HEADER].to_str().unwrap();
+                    let revision = if workspace == "w-b" {
+                        target.b_reads.fetch_add(1, Ordering::AcqRel);
+                        target.b_revision.load(Ordering::Acquire)
+                    } else {
+                        0
+                    };
+                    Json(json!([{"id":format!("s-{workspace}"),"workspace_id":workspace,"revision":revision}]))
+                }),
+            )
+            .with_state(Arc::clone(&target));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, remote).await.unwrap() });
+        let store = Store::default();
+        for workspace in ["w-a", "w-b"] {
+            store
+                .register(
+                    Registration {
+                        host_id: "worker-shared".into(),
+                        endpoint: format!("http://{address}"),
+                        token: "synthetic-poll".into(),
+                        workspace_id: workspace.into(),
+                        epoch: 7,
+                    },
+                    "/project".into(),
+                )
+                .unwrap();
+        }
+        let changes = crate::state::ChangeBus::new();
+        let available = |workspace: &str| {
+            store
+                .rows()
+                .into_iter()
+                .find(|row| row["workspace_id"] == workspace)
+                .unwrap()["placement_available"]
+                .clone()
+        };
+        assert!(poll_workspaces(&store, &changes).await);
+        assert_eq!(available("w-a"), true);
+        assert_eq!(available("w-b"), true);
+        let stable_generation = changes.generation();
+        assert!(
+            !poll_workspaces(&store, &changes).await,
+            "unchanged rosters must not refresh the UI"
+        );
+        assert_eq!(changes.generation(), stable_generation);
+
+        target.fail_a.store(true, Ordering::Release);
+        target.b_revision.store(1, Ordering::Release);
+        assert!(poll_workspaces(&store, &changes).await);
+        assert_eq!(available("w-a"), false);
+        assert_eq!(available("w-b"), true);
+        let rows = store.rows();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows.iter()
+                .find(|row| row["workspace_id"] == "w-b")
+                .unwrap()["revision"],
+            1
+        );
+        assert_eq!(
+            target.b_reads.load(Ordering::Acquire),
+            3,
+            "healthy project still receives fresh HTTP polls"
+        );
+        assert!(
+            !poll_workspaces(&store, &changes).await,
+            "a stable failure must not cause recurring UI churn"
+        );
+
+        target.fail_a.store(false, Ordering::Release);
+        assert!(poll_workspaces(&store, &changes).await);
+        assert_eq!(available("w-a"), true);
+        assert_eq!(available("w-b"), true);
+        assert!(!poll_workspaces(&store, &changes).await);
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[test]
+    fn project_poll_results_cannot_replace_siblings_or_revive_retired_routes() {
+        let store = Store::default();
+        for workspace in ["w-a", "w-b"] {
+            store
+                .register(
+                    Registration {
+                        host_id: "worker-shared".into(),
+                        endpoint: "http://127.0.0.1:1234".into(),
+                        token: "fixture".into(),
+                        workspace_id: workspace.into(),
+                        epoch: 4,
+                    },
+                    "/project".into(),
+                )
+                .unwrap();
+        }
+        let route = store.for_workspace("w-a").unwrap();
+        assert!(store.install_workspace(
+            &route,
+            "w-b",
+            vec![json!({"id":"s-b","workspace_id":"w-b"})]
+        ));
+        assert!(!store.install_workspace(
+            &route,
+            "w-a",
+            vec![
+                json!({"id":"s-extra","workspace_id":"w-b"}),
+                json!({"id":"s-b","workspace_id":"w-a"}),
+            ]
+        ));
+        assert_eq!(store.rows().len(), 1);
+        assert_eq!(store.rows()[0]["workspace_id"], "w-b");
+        store.clear_workspace("w-a");
+        assert!(!store.install_workspace(
+            &route,
+            "w-a",
+            vec![json!({"id":"s-a","workspace_id":"w-a"})]
+        ));
+        assert!(!store.unavailable_workspace(&route, "w-b"));
+        assert_eq!(store.rows()[0]["placement_available"], true);
+    }
+
     #[test]
     fn retiring_last_project_releases_the_bounded_host_slot() {
         let store = Store::default();

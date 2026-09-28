@@ -36,6 +36,10 @@ missing, private, unowned, local-owned, disconnected or unsuccessfully verified
 projects are retired with `DELETE ...?workspace_id=…`. A shared transport stays
 open while any healthy project still needs it. Failed probes do not skip healthy
 siblings; failed retirements remain reported and retry on the next bounded refresh.
+The daemon also polls each project roster independently, with at most four requests
+in flight and a ten-second deadline per project. One failure only marks that
+project unavailable; healthy siblings keep updating. Changed results notify views
+immediately, while repeated identical success or failure emits no refresh.
 A hinted project without a route must have live local execution authority before
 its local files or Git state can be substituted. Unavailable ownership returns an
 error instead of silently viewing or saving a stale local copy.
