@@ -10,9 +10,13 @@
 # copy is exactly the release chimaera pins. scripts/build-plugins.sh
 # downloads the same releases into plugins/dist-test for the daemon's tests.
 #
-# A first-party bump is a reviewed change to this file: the new version and
-# the two sha256s from that release's SHA256SUMS (and `name` / `summary`
-# when the plugin's own changed). To run a local build of a plugin against
+# A first-party bump is automatic: .github/workflows/plugin-lock.yml checks
+# each repository's latest release hourly (SHA256SUMS against the downloaded
+# bytes; the manifest's id, version and [release] github against this file),
+# rewrites the entry — version, the two sha256s, and `name` / `summary` from
+# the release's plugin.toml — and opens a `fix:` PR with auto-merge, which
+# CI (these same releases, downloaded and installed) gates. Hand edits
+# follow the same rules; keep every value a one-line "string". To run a local build of a plugin against
 # the daemon: `chimaera plugin add --path <dir>` (see plugins/AGENTS.md).
 
 [[plugin]]

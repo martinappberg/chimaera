@@ -19,7 +19,7 @@ Writing one: [docs/agent-guides/plugins.md](../docs/agent-guides/plugins.md).
 
 | Path | What |
 |---|---|
-| `plugins.lock` | One `[[plugin]]` per first-party plugin: `id`, `name` and `summary` (what an available card shows before any install), `version` (the pinned release), `repo` (`owner/name`), `sha256_wasm`, `sha256_toml` (that release's `SHA256SUMS`). The daemon embeds it (`include_str!`, parsed with toml in `crates/chimaera-server/src/plugins/mod.rs`): each entry is listed as available until installed, and a first-party install fetches `https://github.com/<repo>/releases/download/v<version>/{SHA256SUMS,plugin.toml,plugin.wasm}` and refuses bytes that don't match both the release's `SHA256SUMS` and these sha256s. A bump is a reviewed change to this file. `plugins::tests::every_locked_release_is_what_the_lock_says` checks each locked release (downloaded into `dist-test/`) against it: both sha256s, id, version, name, `[release] github` equal to `repo`, the gates, and that it says what it adds. |
+| `plugins.lock` | One `[[plugin]]` per first-party plugin: `id`, `name` and `summary` (what an available card shows before any install), `version` (the pinned release), `repo` (`owner/name`), `sha256_wasm`, `sha256_toml` (that release's `SHA256SUMS`). The daemon embeds it (`include_str!`, parsed with toml in `crates/chimaera-server/src/plugins/mod.rs`): each entry is listed as available until installed, and a first-party install fetches `https://github.com/<repo>/releases/download/v<version>/{SHA256SUMS,plugin.toml,plugin.wasm}` and refuses bytes that don't match both the release's `SHA256SUMS` and these sha256s. A bump is automatic — `.github/workflows/plugin-lock.yml` (below) — and CI-gated. `plugins::tests::every_locked_release_is_what_the_lock_says` checks each locked release (downloaded into `dist-test/`) against it: both sha256s, id, version, name, `[release] github` equal to `repo`, the gates, and that it says what it adds. |
 | `Cargo.toml`, `Cargo.lock` | The workspace: `test-fixture` only, `chimaera-plugin-api` by path, a small release profile. |
 | `test-fixture/` | The host's test fixture (echo, loop, allocate, panic, read, state, append, recent): each tool pokes one host limit. Built here into `dist-test/`, which only the daemon's **test** builds embed — never shipped. Its `v2` feature (one more tool, `version`) with `plugin-v2.toml` (0.2.0) is its "next release" for the daemon's update tests: the script also lays that out as `dist-test/test-fixture-v2/`, which the tests serve from a fake releases server (`crates/chimaera-server/src/tests/plugin_updates.rs`). |
 | `dist-test/`, `target/` | Build output (gitignored). `dist-test/` holds the fixture (and its v2), embedded by test builds, and each locked release as `dist-test/<id>/{plugin.wasm,plugin.toml,SHA256SUMS}`, which tests install by path. |
@@ -64,10 +64,35 @@ version again replaces it in place).
 2. Daemons that have it installed offer it on the card (their checker asks
    every installed plugin whose manifest names `[release]`), and **Update**
    installs it; it stays first-party and verified past the pin.
-3. Here: set the entry's `version`, `sha256_wasm` and `sha256_toml` from that
-   release's `SHA256SUMS` (and `name` / `summary` if they changed), run the
-   script and the daemon's tests, and review the change like code — from the
-   next chimaera release, **Install** fetches that version.
+3. Here, automatically: within the hour, `.github/workflows/plugin-lock.yml`
+   (`.github/scripts/plugin-lock.mjs`, tested by `plugin-lock.test.mjs`)
+   sees the newer release, downloads it, checks `SHA256SUMS` against the
+   bytes and the manifest's id, version and `[release] github` against the
+   lock, rewrites the entry (`version`, both sha256s, `name` / `summary`) and
+   opens `fix: update <Name> to <version>` with squash auto-merge. CI installs
+   the release against the new lock; the merge cuts a patch release, and from
+   it **Install** fetches that version. Run it by hand with **Actions →
+   plugin-lock → Run workflow**, or locally without writing:
+   `node .github/scripts/plugin-lock.mjs`. One bump PR at a time: a newer
+   release waits for the open one, which the workflow keeps up to date with
+   `main`, and one that can no longer land (it conflicts with a lock edited
+   on `main`, or `main` already has its change) is closed as "Superseded:"
+   and redone from `main`'s lock. Closing a bump PR unmerged yourself turns
+   that version down for good; the workflow never reopens it. A release
+   still uploading its files is picked up by the next run. A release that fails a
+   check leaves the lock alone and fails the run (every hour, until a good
+   release supersedes it).
+
+   **One-time setup — the `PLUGIN_LOCK_TOKEN` secret.** A PR opened with the
+   workflow's own `GITHUB_TOKEN` triggers no workflows (no CI, no `cla`
+   status, so auto-merge never fires) and a merge made with it doesn't start
+   `release.yml`, so the workflow writes with a token of the maintainer's: a
+   fine-grained personal access token on the maintainer's account (so the PR
+   author passes the CLA allowlist), repository access *only*
+   `martinappberg/chimaera`, permissions **Contents: Read and write** and
+   **Pull requests: Read and write**, saved as the repository secret
+   `PLUGIN_LOCK_TOKEN`. Without it a run only reports the bump it would make
+   (a warning). Replace it before it expires.
 
 ## Rules
 
