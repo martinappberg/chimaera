@@ -485,14 +485,31 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   slide, a player, a document excerpt, a file card. Click a card's name (or ↗) to open the full
   viewer in a pane at the same spot.
 - **Images in agent prose.** `![alt](figs/plot.png)` renders the file (it used to be a broken
-  image). Agents are told so: every **chat** spawn (never a TUI one) carries a short host frame —
-  claude via `--append-system-prompt`, codex via `developer_instructions`, a forked branch at the
-  head of its portable context — saying that a markdown image link with a workspace-relative path
-  renders inline as a card and that written files are listed under the reply automatically, so
-  the agent shows a figure without being asked to. The frame: the target resolves against the session's live directory, then where it started, then
-  the workspace root — strictly, an embed names one file — and any fragment picks the piece
-  (`paper.pdf#page=3`, `run.py#L10-L30`, `data.csv#row=2-9`). A file the agent announces before
-  writing shows as "not found" and turns into its card when it appears.
+  image). Agents are told so: every **chat** spawn (never a TUI one) carries a short host frame
+  (`launcher::CHAT_HOST_PROMPT`) — claude via `--append-system-prompt`, codex via
+  `developer_instructions`, a forked branch at the head of its portable context — saying that a
+  markdown image link with a workspace-relative path renders inline as a card, to use one for a
+  **result** (a figure, an HTML report, a PDF page, a table slice), to link a **document** (a
+  markdown note, plan or report) with an ordinary link instead, to put a small table in the reply
+  when a few numbers carry the point, and that written files are listed under the reply
+  automatically. The target resolves against the session's live directory, then where it
+  started, then the workspace root — strictly, an embed names one file — and any fragment picks
+  the piece (`paper.pdf#page=3`, `run.py#L10-L30`, `data.csv#row=2-9`). A file the agent
+  announces before writing shows as "not found" and turns into its card when it appears.
+- **Documents are chips, not excerpts.** A document is read whole or not at all, so an embed of
+  one — `![the plan](analysis/PLAN.md)`, a `.docx`/`.pptx` — draws as a **chip** where it stands
+  (`embedsAsChip`; several in a row share one line), the same chip the turn-end block uses: click
+  opens it, a rest previews it. Results keep their cards, and so does a deck's slide
+  (`deck.md#slide=3`). Agents mostly write an ordinary link for a document now (the host frame);
+  the chip is for the ones that still embed it, and for transcripts from before.
+- **Hover previews.** Rest the pointer (400 ms) on a file the transcript names — a path link the
+  daemon resolved (`notes.md`, `src/a.rs:12`, `[plan](PLAN.md#Results)`), a document chip in the
+  prose, a chip on the turn-end line — and the document view's own hover preview opens over the
+  transcript: a markdown file's section (or its opening) drawn by the reading renderer, any other
+  file the compact body its card would show, at the link's fragment or line. Mod+K on a focused
+  link or chip shows it from the keyboard; Escape, a scroll, a press elsewhere or leaving closes
+  it. Directories, names with several matches, and links the chat could not resolve preview
+  nothing. A chip whose file changed after its turn says so at the top of the preview.
 - **Written this turn.** After a turn's closing prose, the files the turn wrote — created or
   changed, by its edit tools or by **shell commands** (a plot saved by a script, a rendered
   report); never source code (its diff is in the tool card). The block **adds, never repeats**:
@@ -504,11 +521,11 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   turn whose prose covers everything ends with no block. Two shapes by what a file is *for*: a
   **visual** (a figure, an HTML report, a PDF, a clip) is something to look at, so it shows as a
   compact tile; a **document** (markdown, docx/pptx, tables and spreadsheets, notebooks) is
-  something to open, so it shows as one chip on a quiet line — click to open in a pane, "+n
-  more" past six, "preview" unfolds the documents' tiles; with no tiles the heading sits on the
-  chip line, so a turn costs one line. Two files sharing a name show their folders (against
+  something to open, so it shows as one chip on a quiet line — click to open in a pane, rest on
+  it to preview that one file, "+n more" past six; with no tiles the heading sits on the chip
+  line, so a turn costs one line. Two files sharing a name show their folders (against
   everything the turn wrote, linked in the prose or not). A chip knows
-  its file: gone (struck, not clickable) or changed after this turn (its tooltip says so), kept
+  its file: gone (struck, not clickable) or changed after this turn (its preview says so), kept
   current by the disk monitor while on screen. A stopped or failed turn keeps its block. Tiles
   stay fresh when a file is overwritten, and say so when one is gone.
 - **How the gallery finds shell-written files.** No structured event names them, so the reducer
@@ -521,9 +538,13 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   seconds' slack). A file merely `cat`-ed, or rewritten by a later turn, stays out. One
   `resolve_targets` round trip per gallery, when it nears the viewport; replay rebuilds the same
   `turn_end` from the journal.
-- **Where.** `Markdown.svelte` (the sanitizer moves a local `<img>` src out of reach; cards mount
-  beside the placeholder on settled content and closed stream segments, and are destroyed with
-  it), `ArtifactGallery.svelte`, `artifacts.ts`, `embeds.ts` (`EmbedResolver`),
+- **Where.** `Markdown.svelte` (the sanitizer moves a local `<img>` src out of reach; cards and
+  document chips mount beside the placeholder on settled content and closed stream segments, and
+  are destroyed with it; resolved path links register their file for hover),
+  `ArtifactGallery.svelte`, `FileChip.svelte` / `ProseChip.svelte` (the chip, and the prose
+  chip's resolve), `hoverTargets.ts` (what a chat element previews, kept off the DOM),
+  `previews/doc/hoverController.svelte.ts` (the shared hover preview; `ChatView` hosts it over
+  the transcript), `artifacts.ts`, `embeds.ts` (`EmbedResolver`),
   `store.svelte.ts` (`turn_end.artifacts` / `mentioned` / `covered` / `startedAtMs` /
   `endedAtMs` / `aborted`), `shared/embed/`. Uses `POST /api/v1/fs/resolve_targets` and `GET /raw/{ticket}`.
 
@@ -628,8 +649,16 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
 _Captured 2026-09-26 from the maintainer's own words in the session that shipped it (PR #171); the settled/open questions are still pending._
 
 - **Why (maintainer, verbatim):** "'Made this turn · 3 files' — is this really even only when just files have been changed? Should this really be expanded? I know when agents want to show images figures etc. that is good, but just like this? I feel maybe collapsed by default or something, and in a better way." Later: "when the agent links to files here there is a lot of information on what was written that turn? like is that how we want it. Can we think about this so it becomes optimal experience for the user. And also think about the wording. If a file is only changed, is it really made that turn?" And: "can we make the tiles etc. prettier? so that it actually looks nice for the user? Still with our own touch but so that one actually wants to use this app."
-- **Decisions the maintainer took in that session:** no hover-peek on chips ("too cluttered"); one heading, not two; chips must know their file's state; same-named files must be told apart; billed CLI runs are fine for verifying this.
+- **Decisions the maintainer took in that session:** ~~no hover-peek on chips ("too cluttered")~~ — retracted 2026-09-28, see below; one heading, not two; chips must know their file's state; same-named files must be told apart; billed CLI runs are fine for verifying this.
 - **What this fixed in the design:** the block now adds what the prose did not already show (an embedded figure is not tiled again, a linked document is not chipped again), the heading is precise ("Written", never "made", for an edited document; "Also written" when the prose showed a share), figures are a strip of captioned tiles, documents one line of chips.
+- _Settled vs. free-to-change, and what must not be "fixed": pending — not yet asked._
+
+### Document chips and hover previews in chat — why they exist
+_Captured 2026-09-28 from the maintainer's own words in the session that built them; the settled/open questions are still pending._
+
+- **Why (maintainer, verbatim):** on an agent reply that embedded two plan documents in full: "This shows the full .md files in the preview. I am thinking that is too much and clutters ? maybe a hover is actually what we need ? similar to how the rest of the .md files are handled in the app." And: "That preview would also let you hover the other 'Written this turn' files and see them a tiny bit before going all in on them. But figures etc. is stil nice if the agent can include in a good way when talking about results ? as well as tables. So maybe this is more a system prompt issue."
+- **Decision:** the earlier "no hover-peek on chips" call is retracted — "I retract my earlier call because the fact that we do 'preview' and it shows all of them at the same time now is even worse UI / UX". The chips' "preview" fold is gone; a rest on a chip previews that one file.
+- **What it changed:** documents in prose are chips (results keep their cards), every resolved file the transcript names previews on a rest the way a document's links do, and the host frame tells agents to embed results and link documents.
 - _Settled vs. free-to-change, and what must not be "fixed": pending — not yet asked._
 
 ### Conversation branching — why it exists

@@ -13,9 +13,11 @@
    * One header, two shapes by what a file is for (artifactShape): a
    * *visual* — a figure, a rendered report, a PDF, a clip — is looked at,
    * so it gets an embed tile; a *document* — a markdown note, a table, a
-   * notebook, a deck — is opened, so it gets one chip on a quiet line, and
-   * its tile only when the line is unfolded. With no tiles the header sits
-   * on the chip line, so a turn that only touched documents costs one line.
+   * notebook, a deck — is opened, so it gets one chip on a quiet line
+   * (FileChip), and resting the pointer on a chip previews that one file
+   * (the chat's hover preview; `hoverTargets`). With no tiles the header
+   * sits on the chip line, so a turn that only touched documents costs one
+   * line.
    *
    * A chip knows its file: two files sharing a name show their folders; a
    * file rewritten after the turn says so in its tooltip; a gone file is
@@ -25,14 +27,14 @@
    * near the viewport, stay fresh when a file is overwritten, and say so
    * when one is gone.
    */
-  import Chevron from "../shared/Chevron.svelte";
-  import FileIcon from "../shared/FileIcon.svelte";
   import EmbedCard from "../shared/embed/EmbedCard.svelte";
+  import FileChip from "./FileChip.svelte";
   import { isMissing, resolveFile, type TargetInfo, type TargetResult } from "../shared/embed/embed";
   import type { OpenPathOptions, PathKind } from "../shared/openPath";
   import { lastDiskChange, releaseDiskFile, retainDiskFile } from "../workspace/diskWatch";
   import { artifactShape, chipLabels, fileStateAfter, writtenDuring, type FileState } from "./artifacts";
   import type { EmbedResolver } from "./embeds";
+  import type { HoverTargets } from "./hoverTargets";
 
   interface Props {
     /** Files the turn's tools reported writing (absolute). */
@@ -48,6 +50,8 @@
     /** Resolves mentioned paths against the session's directories. */
     resolver?: EmbedResolver;
     onOpenPath?: (path: string, kind: PathKind, opts?: OpenPathOptions) => void;
+    /** The chat's hover registry: each known chip previews its file. */
+    hoverTargets?: HoverTargets;
   }
 
   let {
@@ -58,6 +62,7 @@
     covered = [],
     resolver,
     onOpenPath,
+    hoverTargets,
   }: Props = $props();
 
   /** Precise about what the block is: everything the turn wrote, or what
@@ -76,8 +81,6 @@
   let confirmed = $state.raw<TargetInfo[]>([]);
   /** Each document's state now, by path; absent = not yet known. */
   let states = $state.raw<Record<string, FileState>>({});
-  /** The documents' tiles, unfolded by the reader. */
-  let peek = $state(false);
   let allChips = $state(false);
 
   $effect(() => {
@@ -144,8 +147,6 @@
   const visuals = $derived(all.filter((t) => artifactShape(t.path) === "visual").slice(0, MAX_TILES));
   const documents = $derived(all.filter((t) => artifactShape(t.path) === "document").slice(0, MAX_TILES * 3));
   const chips = $derived(allChips || documents.length <= MAX_CHIPS ? documents : documents.slice(0, MAX_CHIPS));
-  /** The fold previews the first tiles' worth; the chips still name them all. */
-  const previewed = $derived(documents.slice(0, MAX_TILES));
   /** Names widen against everything the turn wrote, shown here or not:
    *  `docs/notes.md` must not read "notes.md" beside the prose's link to
    *  the root one. */
@@ -214,69 +215,59 @@
     onOpenPath?.(path, kind, reveal !== undefined ? { reveal } : {});
   }
 
-  function chipTitle(path: string, state: FileState): string {
+  /** A chip's accessible name: what a sighted reader gets from the chip
+   *  and its preview. */
+  function chipName(path: string, state: FileState): string {
     if (state === "gone") return `${path} · gone`;
     const verb = onOpenPath !== undefined ? "open " : "";
     return state === "changed" ? `${verb}${path} · changed after this turn` : `${verb}${path}`;
   }
 </script>
 
-{#snippet tiles(items: Tile[], label: string)}
-  <div class="gallery" role="group" aria-label={label}>
-    {#each items as tile (tile.path)}
-      <div class="tile">
-        <EmbedCard
-          path={tile.path}
-          info={tile.info}
-          compact
-          onOpen={onOpenPath !== undefined ? open : undefined}
-        />
-      </div>
-    {/each}
-  </div>
-{/snippet}
-
 <div class="gallery-host" bind:this={host}>
   {#if visuals.length > 0}
     <div class="label">{heading}</div>
-    {@render tiles(visuals, heading.toLowerCase())}
+    <div class="gallery" role="group" aria-label={heading.toLowerCase()}>
+      {#each visuals as tile (tile.path)}
+        <div class="tile">
+          <EmbedCard
+            path={tile.path}
+            info={tile.info}
+            compact
+            onOpen={onOpenPath !== undefined ? open : undefined}
+          />
+        </div>
+      {/each}
+    </div>
   {/if}
   {#if documents.length > 0}
     <!-- Documents are opened, not stared at: one chip each, the same quiet
-         voice as a folded activity line, and their tiles behind a fold. -->
+         voice as a folded activity line; a rest on one previews it. -->
     <div class="files" role="group" aria-label="documents written this turn">
       {#if visuals.length === 0}
         <span class="files-label">{heading}</span>
       {/if}
       {#each chips as doc (doc.path)}
         {@const state = states[doc.path] ?? "present"}
-        <button
-          class="chip"
-          class:gone={state === "gone"}
-          title={chipTitle(doc.path, state)}
-          disabled={onOpenPath === undefined || state === "gone"}
-          onclick={() => open(doc.path, "file")}
-        >
-          <FileIcon path={doc.path} size={13} broken={state === "gone"} />
-          <span class="name">{labels.get(doc.path) ?? doc.path}</span>
-        </button>
+        <FileChip
+          path={doc.path}
+          label={labels.get(doc.path) ?? doc.path}
+          {state}
+          name={chipName(doc.path, state)}
+          title={state === "gone" ? chipName(doc.path, state) : undefined}
+          onOpen={onOpenPath !== undefined ? (e) => onOpenPath(doc.path, "file", { split: e.metaKey || e.ctrlKey }) : undefined}
+          hover={hoverTargets !== undefined && state !== "gone"
+            ? {
+                targets: hoverTargets,
+                target: { path: doc.path, fragment: null, ...(state === "changed" ? { note: "changed after this turn" } : {}) },
+              }
+            : null}
+        />
       {/each}
       {#if chips.length < documents.length}
         <button class="more" onclick={() => (allChips = true)}>+{documents.length - chips.length} more</button>
       {/if}
-      <button
-        class="peek"
-        aria-expanded={peek}
-        title={peek ? "hide the previews" : "preview these files here"}
-        onclick={() => (peek = !peek)}
-      >
-        preview
-        <Chevron open={peek} />
-      </button>
     </div>
-    {#if peek}
-      {@render tiles(previewed, "documents written this turn, previewed")}
-    {/if}
   {/if}
 </div>
 
@@ -349,11 +340,7 @@
   .tile > :global(.embed-card[data-embed-kind="pdf"]) {
     width: 220px;
   }
-  .tile > :global(.embed-card[data-embed-kind="markdown"]),
-  .tile > :global(.embed-card[data-embed-kind="table"]),
-  .tile > :global(.embed-card[data-embed-kind="xlsx"]),
-  .tile > :global(.embed-card[data-embed-kind="notebook"]),
-  .tile > :global(.embed-card[data-embed-kind="code"]),
+  /* Until it resolves, or when it can't draw: a card's worth. */
   .tile > :global(.embed-card[data-embed-kind="file"]),
   .tile > :global(.embed-card[data-embed-kind="pending"]) {
     width: 280px;
@@ -371,71 +358,26 @@
   .files-label {
     margin-right: 2px;
   }
-  .chip,
-  .more,
-  .peek {
+  /* "+n more": text-only, no chip edge. */
+  .more {
     display: inline-flex;
     align-items: center;
-    gap: 5px;
-    max-width: 100%;
-    padding: 1px 7px 1px 5px;
-    border: 1px solid var(--edge);
-    border-radius: 999px;
-    background: color-mix(in srgb, var(--fg) 3%, transparent);
-    color: var(--fg);
+    padding: 1px 4px;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    background: none;
+    color: var(--activity-fg, var(--muted));
     font: inherit;
     font-size: var(--text-xs);
     line-height: 1.5;
     cursor: pointer;
     transition:
-      border-color 0.12s ease,
       background-color 0.12s ease,
       color 0.12s ease;
   }
-  .chip:hover:not(:disabled),
-  .chip:focus-visible {
-    border-color: color-mix(in srgb, var(--accent) 55%, var(--edge));
-    background: color-mix(in srgb, var(--accent) 9%, transparent);
-  }
-  .chip:disabled {
-    cursor: default;
-  }
-  .chip .name {
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    font-family: var(--mono, monospace);
-  }
-  /* Gone: still named (the turn did write it), plainly not there any more. */
-  .chip.gone {
-    color: var(--muted);
-    border-style: dashed;
-    background: none;
-  }
-  .chip.gone .name {
-    text-decoration: line-through;
-  }
-  /* "+n more" and the preview fold: text-only, no card edge. */
-  .more,
-  .peek {
-    padding: 1px 4px;
-    border-color: transparent;
-    background: none;
-    color: var(--activity-fg, var(--muted));
-  }
   .more:hover,
-  .peek:hover,
-  .more:focus-visible,
-  .peek:focus-visible {
+  .more:focus-visible {
     color: var(--fg);
     background: color-mix(in srgb, var(--fg) 4%, transparent);
-    border-radius: 6px;
-  }
-  .peek :global(.chev) {
-    opacity: 0.55;
-  }
-  .peek:hover :global(.chev) {
-    opacity: 1;
   }
 </style>

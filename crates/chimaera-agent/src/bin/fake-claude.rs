@@ -742,7 +742,8 @@ fn run_showcase_turn() {
 /// a table and an HTML report — named only in the command line, its output
 /// and the closing prose, which also embeds the figure inline. Even turns do
 /// all of it; odd turns only rewrite the documents, the shape of a turn that
-/// edited docs and nothing else.
+/// edited docs and nothing else, and embed the plan the way agents do
+/// (`![the plan](plan.md)`: the chat draws it as a chip).
 fn run_artifacts_turn(n: u32) {
     let cwd = std::env::current_dir().expect("cwd");
     let abs = |rel: &str| cwd.join(rel).to_string_lossy().into_owned();
@@ -843,7 +844,7 @@ fn run_artifacts_turn(n: u32) {
         stream(json!({ "type": "message_start", "message": { "id": "ma-2" } }));
         stream_text(
             "ma-2",
-            "Updated the notes and the plan with this turn's findings.",
+            "Updated the plan with this turn's findings:\n\n![the plan](plan.md)",
         );
     }
     emit(json!({

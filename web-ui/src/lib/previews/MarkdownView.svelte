@@ -1408,7 +1408,7 @@
       mode: () => (render ? "reading" : mode),
       text: () => docText,
       links: linkContext,
-      embeds: () => docEmbeds,
+      ask: (ref) => docEmbeds.ask(ref),
       theme: () => themeMode,
       fontSize: () => bodyFont,
       editor: editorView,

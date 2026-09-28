@@ -488,7 +488,11 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   popover sits on the app's floating surface (`.overlay-surface`) inside the view's content
   box, below the link or above it when that has more room; its content is inert (links don't
   follow, nothing takes focus) but scrolls, and moving onto it keeps it. It goes on leave,
-  Escape, any other key, a press elsewhere, a scroll, or a mode switch.
+  Escape, any other key, a press elsewhere, a scroll, or a mode switch. The chat transcript
+  hosts the same controller ([chat mode](chat-mode.md#inline-artifacts)): there the host names
+  its own targets (`targetOf` — resolved path links and file chips, kept off the DOM), mounts
+  the popover beside its scroller (`layer`), and asks it to carry the reading typography it has
+  no reading view around it for (`standalone`).
 
   **Publishing** (the toolbar's **publish** menu, `previews/PublishButton.svelte`; the work,
   loaded on first use, is `previews/doc/publishRun.ts`, its pure pieces `doc/publish.ts` and
