@@ -50,6 +50,15 @@
             "timeout": 300
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/scripts/worktree-gc\" --hook session-start",
+            "timeout": 10
+          }
+        ]
       }
     ],
     "Stop": [
@@ -59,6 +68,17 @@
             "type": "command",
             "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/doc-drift.sh\"",
             "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/scripts/worktree-gc\" --hook session-end",
+            "timeout": 5
           }
         ]
       }

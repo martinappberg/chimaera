@@ -87,6 +87,30 @@ notify-rust = "4.18"
 winreg = "0.56"
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
+# The root workspace's dev profile (see the comment there): file:line debug
+# info for our code, none for dependencies. Here the chimaera crates are path
+# dependencies, not members, so "*" covers them and they are named back in.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.dev.package.chimaera-agent]
+debug = "line-tables-only"
+
+[profile.dev.package.chimaera-core]
+debug = "line-tables-only"
+
+[profile.dev.package.chimaera-pty]
+debug = "line-tables-only"
+
+[profile.dev.package.chimaera-remote]
+debug = "line-tables-only"
+
+[profile.dev.package.chimaera-server]
+debug = "line-tables-only"
+
 [profile.release]
 lto = true
 strip = true
