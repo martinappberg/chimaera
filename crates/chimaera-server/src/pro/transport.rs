@@ -207,6 +207,23 @@ async fn run_reserved(
 fn helper_diagnostic(stderr: &[u8]) -> &'static str {
     let text = String::from_utf8_lossy(stderr).to_ascii_lowercase();
     for (category, patterns) in [
+        ("http_bad_request", &["http 400", "error: 400"][..]),
+        ("http_unauthorized", &["http 401", "http 403"][..]),
+        ("http_too_large", &["http 413", "error: 413"][..]),
+        (
+            "http_service_failure",
+            &["http 500", "http 502", "http 503", "http 504"][..],
+        ),
+        ("http2_stream", &["curl 92", "http/2 stream"][..]),
+        (
+            "truncated_transfer",
+            &["curl 18", "transfer closed with"][..],
+        ),
+        ("receive_failure", &["curl 56"][..]),
+        ("tls_handshake", &["curl 35"][..]),
+        ("early_eof", &["early eof"][..]),
+        ("disconnect", &["unexpected disconnect"][..]),
+        ("pack_index", &["index-pack failed"][..]),
         (
             "authentication",
             &[
