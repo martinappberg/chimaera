@@ -2,6 +2,45 @@ use super::support::*;
 use crate::*;
 
 #[tokio::test]
+async fn ws_agent_plugins_invalidation_without_session_changes() {
+    use futures::SinkExt;
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+    let state = test_state();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = app(state.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws/events"))
+        .await
+        .unwrap();
+    socket
+        .send(WsMessage::text(
+            serde_json::json!({"type": "auth", "token": "test-token"}).to_string(),
+        ))
+        .await
+        .unwrap();
+
+    for expected in 0..=1 {
+        loop {
+            if let WsMessage::Text(text) = next_ws_frame(&mut socket).await {
+                let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if frame["type"] == "agent_plugins" {
+                    assert_eq!(frame["epoch"], expected);
+                    break;
+                }
+            }
+        }
+        if expected == 0 {
+            state.probes.changed();
+            state.changes.notify_waiters();
+        }
+    }
+    socket.close(None).await.unwrap();
+    server.abort();
+}
+
+#[tokio::test]
 async fn ws_bridge_auth_snapshot_and_echo() {
     use futures::SinkExt;
     use tokio_tungstenite::tungstenite::Message as WsMessage;

@@ -24,11 +24,34 @@ async fn agent_plugin_install_keeps_success_and_failure_until_acknowledged() {
         install_first_party(&state, "mycelium").await;
         let ws = make_workspace(&state, "plugin-install-result").await;
         let root = root_of(&state, &ws);
+        let git_dir = root.join("module-bin");
+        std::fs::create_dir(&git_dir).unwrap();
+        let git = git_dir.join("git");
+        std::fs::write(
+            &git,
+            "#!/bin/bash\nprintf '%s\\n' '--[no-]shallow-submodules'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let git_dir = git_dir.to_string_lossy().replace('\'', "'\"'\"'");
+        let (status, _) = request(
+            &state,
+            Method::PUT,
+            "/api/v1/environment",
+            Some(serde_json::json!({
+                "host": {"text": "export CHIMAERA_TEST_INSTALL_ENV=host"},
+                "workspaces": {(&ws): {"text": format!(
+                    "export CHIMAERA_TEST_INSTALL_ENV=\"$CHIMAERA_TEST_INSTALL_ENV:workspace\"\nexport PATH='{git_dir}':\"$PATH\""
+                )}},
+            })),
+        ).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
         let bin = root.join("agent's cli");
         std::fs::write(
             &bin,
             format!(
-                "#!/bin/bash\nprintf '%s\\n' \"$*\" >> calls\n\
+                "#!/bin/bash\n[ \"$CHIMAERA_TEST_INSTALL_ENV\" = host:workspace ] || exit 90\n\
+                 printf '%s\\n' \"$*\" >> calls\n\
                  if [ \"$2\" = marketplace ]; then exit 1; fi\n\
                  printf 'agent install output\\n'\nexit {code}\n"
             ),
@@ -130,6 +153,65 @@ fn agent_plugin_install_treats_names_as_data() {
     assert!(!root.join("injected-too").exists());
 }
 
+#[test]
+fn agent_plugin_install_explains_claude_git_without_blocking_cached_installs() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for (agent, git_help, expected, hint) in [
+        ("claude", Some("usage: git clone [--recursive]"), 1, true),
+        ("claude", None, 1, true),
+        ("claude", Some("usage: git clone [--recursive]"), 0, true),
+        ("codex", Some("usage: git clone [--recursive]"), 0, false),
+        ("claude", Some("--[no-]shallow-submodules"), 0, false),
+    ] {
+        let root = test_dir("plugin-install-git");
+        let bin = root.join("agent");
+        std::fs::write(&bin, format!("#!/bin/bash\nprintf '%s\\n' \"$*\" >> calls\nif [ \"$2\" = marketplace ]; then exit 1; fi\nexit {expected}\n")).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if let Some(help) = git_help {
+            let git = root.join("git");
+            std::fs::write(&git, format!(
+                "#!/bin/bash\nif [ \"$1\" = --version ]; then printf 'git version 1.8.3.1\\n'; else printf '%s\\n' '{help}'; exit 129; fi\n"
+            )).unwrap();
+            std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let completion = root.join("completion");
+        let output = std::process::Command::new("/bin/bash")
+            .args([
+                "-c",
+                include_str!("../plugins/install-agent.sh"),
+                "chimaera-plugin-install",
+                "Mycelium",
+                agent,
+                bin.to_str().unwrap(),
+                "arjunrajlaboratory/mycelium",
+                "mycelium@mycelium",
+                "install",
+                completion.to_str().unwrap(),
+            ])
+            .env("PATH", &root)
+            .current_dir(&root)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        let screen = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(output.status.code(), Some(expected), "{screen}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("calls"))
+                .unwrap()
+                .lines()
+                .count(),
+            2
+        );
+        assert_eq!(screen.contains("Settings > Environment"), hint, "{screen}");
+        if hint && git_help.is_some() {
+            assert!(screen.contains("1.8.3.1"), "{screen}");
+            assert!(screen.contains("--shallow-submodules"), "{screen}");
+        }
+        assert_eq!(std::fs::read(completion).unwrap(), b"1");
+    }
+}
+
 /// A CLI (or a manifest name echoed by the installer) can set any terminal
 /// title. It must not retire the completion watcher before the install ends.
 #[tokio::test]
@@ -193,6 +275,7 @@ esac
     tokio::time::sleep(Duration::from_secs(3)).await;
     request(&state, Method::GET, &report_url, None).await;
     assert_eq!(probe_calls(), "probe\n", "title must not invalidate probes");
+    assert_eq!(state.probes.changed_epoch(), 0);
 
     std::fs::write(root.join("release-install"), "").unwrap();
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -206,6 +289,7 @@ esac
     })
     .await
     .expect("completion did not invalidate probes before terminal dismissal");
+    assert_eq!(state.probes.changed_epoch(), 1);
     assert!(state.sessions.get(sid).is_some());
     state.sessions.kill(sid).unwrap();
 }

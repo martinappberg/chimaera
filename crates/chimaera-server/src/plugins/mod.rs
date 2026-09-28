@@ -1238,14 +1238,27 @@ pub(crate) async fn install_requirement(
         "install"
     };
     let agent = kind.as_str();
+    let session_id = crate::agents::fresh_session_id();
+    let prepare_state = state.clone();
+    let prepare_id = session_id.clone();
+    let prepare_workspace = workspace.id.clone();
     // Keep completion out of the untrusted PTY stream. The runtime directory
     // is private and the random, exclusively created marker is one byte at most.
-    let completion = match tokio::task::spawn_blocking(|| {
+    let (completion, prelude) = match tokio::task::spawn_blocking(move || {
         let path = chimaera_core::runtime_dir().join(format!(
             "plugin-install-{}",
             chimaera_core::generate_token()
         ));
-        std::fs::File::create_new(&path).map(|_| path)
+        std::fs::File::create_new(&path)?;
+        // Agent-plugin managers need the same modules/PATH as agents in this
+        // workspace. Runtime bootstrap installers have a separate contract.
+        let prelude = crate::environment::materialize_prelude(
+            &prepare_state,
+            &prepare_id,
+            &prepare_workspace,
+            None,
+        );
+        Ok::<_, std::io::Error>((path, prelude))
     })
     .await
     {
@@ -1259,8 +1272,7 @@ pub(crate) async fn install_requirement(
                 .into_response();
         }
     };
-    let session_id = crate::agents::fresh_session_id();
-    let env = crate::api::session_env(&state, &session_id, "dark", None);
+    let env = crate::api::session_env(&state, &session_id, "dark", prelude.as_deref());
     let env_remove = crate::api::spawn_env_remove(&env);
     let opts = chimaera_pty::SpawnOpts {
         cwd: workspace.root.clone(),
@@ -1310,7 +1322,10 @@ pub(crate) async fn install_requirement(
                     tokio::time::sleep(Duration::from_secs(2)).await;
                 }
                 let _ = tokio::fs::remove_file(&completion).await;
-                watch_state.probes.invalidate();
+                if let Some(prelude) = prelude {
+                    let _ = tokio::fs::remove_file(prelude).await;
+                }
+                watch_state.probes.changed();
                 watch_state.changes.notify_waiters();
             });
             tracing::info!(workspace = %id, plugin = %pid, agent, "plugin requirement install started");
@@ -1319,6 +1334,9 @@ pub(crate) async fn install_requirement(
         }
         Err(err) => {
             let _ = tokio::fs::remove_file(&completion).await;
+            if let Some(prelude) = prelude {
+                let _ = tokio::fs::remove_file(prelude).await;
+            }
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": err.to_string()})),

@@ -219,6 +219,7 @@
     attachRequest,
     closeAttachSheet,
     knowledgeProviderActive,
+    onAgentPluginsChanged,
   } from "./lib/plugins/store";
   import ExtensionsGlyph from "./lib/plugins/ExtensionsGlyph.svelte";
   import ComputeStrip from "./lib/workspace/ComputeStrip.svelte";
@@ -1582,6 +1583,7 @@
       onSettings: applyRemoteSettings,
       onGit: onGitNudge,
       onTimeline: onTimelineNudge,
+      onAgentPlugins: onAgentPluginsChanged,
       onUpdate: (status) => (updateState.daemon = status),
       onRecents: (epoch) => {
         // Invalidate-and-pull, like git: a conversation retired somewhere;

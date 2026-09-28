@@ -159,6 +159,9 @@
       ? $agentInstallContinuation
       : null,
   );
+  const installationDetected = $derived(
+    continuation !== null && model.rows.some((r) => r.agent === continuation.agent && r.status === "installed"),
+  );
   /** A plugin that can't run here: the switch can't turn it on (the daemon
    *  refuses) until the fault is gone. A fault while on is the plugin
    *  failing in this workspace, which switching off and on clears. */
@@ -493,7 +496,11 @@
     <p class="status err" role="alert">{error}</p>
   {:else if continuation !== null}
     <p class="status" role="status">
-      Installation opened for {continuation.agent}. When it finishes,
+      {#if installationDetected}
+        Installed for {continuation.agent} —
+      {:else}
+        Installation opened for {continuation.agent}. When it finishes,
+      {/if}
       <button class="link" onclick={() => onAttach(p.id)}>continue setup</button>.
     </p>
   {:else if note !== null}

@@ -221,9 +221,19 @@ the lifecycle, keep them consistent:
   a private runtime completion marker to invalidate agent probes, and waits
   for Enter before exiting with the install's status. Terminal titles are
   presentation only, never a trusted completion signal. The watcher removes
-  the marker on completion or session exit. This retention belongs to the
+  the marker and per-session prelude on completion or session exit. Installs
+  inherit the host + workspace Environment prelude (runtime bootstrap installers
+  remain separate). A failed Claude marketplace fetch explains missing/old Git
+  without blocking a cached install. This retention belongs to the
   installer, not ordinary terminal sessions. `tests/plugins.rs` drives the
   install route with fast success/failure commands and late PTY attachment.
+
+- **Agent-plugin changes invalidate and push.** Install completion and hook-trust
+  writes clear the probe cache and advance the `agent_plugins` epoch on
+  `/ws/events`; every connection receives the current epoch after auth. Visible
+  Extensions views refetch; hidden views catch up on return. Explicit refreshes
+  clear only the cache, never broadcast (no refetch loop). Cache generations
+  prevent a pre-change probe from repopulating it after invalidation.
 
 - **Auth every new route.** Chat WS uses first-frame token auth
   (`chat_authenticate`), same token as the rest. Don't add an unauthenticated

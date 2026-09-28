@@ -51,6 +51,11 @@ QuickOpen — not in `shared/icons.ts`, which `prebuild` regenerates from Tabler
 - **Agent state comes from the agents** (the daemon's probes of `claude
   plugin list` / codex `app-server`), never re-derived here. A 404 from a
   route the daemon doesn't have yet renders an honest line, not a spinner.
+  `agent_plugins` events (install completion, hook trust, reconnect) advance
+  `store.ts`'s local revision. The visible Plugins/Skills segment refetches;
+  hidden panes/documents catch up on return. Once the report confirms the
+  installed plugin, the card's continuation reads "Installed for <agent>";
+  hook trust and workspace setup still require the user's action.
 - **Never list an agent that isn't installed on this host.** A
   recommendation for it says nothing; a requirement none of the listed
   agents here can meet says so once. `requirementsModel.ts` owns this rule —

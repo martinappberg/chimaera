@@ -457,6 +457,14 @@ export async function previewPlugin(github: string): Promise<PluginDetails> {
 
 // ---- reactive store (active workspace only) ---------------------------------
 
+const agentPluginsRevisionStore = writable(0);
+/** Invalidates mounted reports, including after a socket reconnect. Only a
+ *  visible view fetches; a hidden one catches up when shown. */
+export const agentPluginsRevision: Readable<number> = agentPluginsRevisionStore;
+export function onAgentPluginsChanged(): void {
+  agentPluginsRevisionStore.update((revision) => revision + 1);
+}
+
 const pluginsStore = writable<WorkspacePlugins | null>(null);
 /** The active workspace's plugin status (`null` = not loaded / unavailable). */
 export const workspacePlugins: Readable<WorkspacePlugins | null> = pluginsStore;
