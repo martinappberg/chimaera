@@ -327,12 +327,21 @@ immutable, acknowledged checkpoint before releasing ownership, and hydration
 selects that receipt rather than a moving mirror head. Same-installation sign-in
 recovery publishes stopped local work before replacing its old device binding.
 
-This implementation still advertises that expired takeover is unsupported:
-process groups do not contain deliberately detached children or guarantee ordering
-on unannounced OS resume. Persisted unclean-launch evidence blocks unsafe
-same-boot restart. A stronger supervised execution boundary must be verified
-before abrupt battery-loss takeover can be enabled. Local non-Pro execution is
-unchanged; no machine chooser or new secret-sharing capability is introduced.
+Automatic recovery has a distinct canonical-checkpoint capability. After the
+server lease expires and a bounded reconnect grace passes, the cloud can continue
+from the acknowledged checkpoint with a forked native conversation and the same
+logical session. The agent receives uncertainty context to inspect prior effects
+before repeating them; known idle chats remain idle. This does not add a routine
+human review step or promise exactly-once external actions. The old strict managed
+mode remains supported and is never silently changed during a live grant.
+
+Returning home adopts canonical cloud files and sessions after stopping its
+registered managed work. Unsynchronized local conflicts are retained privately
+outside the mirrored project within explicit storage bounds. Persisted unclean
+launch evidence still blocks unsafe same-boot restart until supervisor cleanup;
+process groups alone cannot contain detached descendants or guarantee OS-resume
+ordering. Local non-Pro execution is unchanged; no machine chooser or new
+secret-sharing capability is introduced.
 
 ## Intent — human-authored ground truth
 

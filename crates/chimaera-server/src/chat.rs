@@ -3577,7 +3577,11 @@ pub(crate) async fn resurrect_chat_transfer(
             let pick_up = if mastermind_mode.is_some() {
                 None
             } else if let Some(origin) = origin {
-                if let Some(mut text) = handoff_message(origin, carry.as_ref()) {
+                if let Some(mut text) = handoff_message(
+                    origin,
+                    carry.as_ref(),
+                    crate::pro::checkpoint_recovery_context(state, &entry.workspace_id),
+                ) {
                     text.push_str(
                         &crate::mcp::cloud_context::arrival(state, &entry.workspace_id).await,
                     );
@@ -3785,23 +3789,38 @@ fn restart_message(carry: &chimaera_agent::Carryover) -> Option<String> {
 /// Only interrupted work needs a transfer pick-up turn. Idle conversations keep
 /// their history without asking the model to do more work; fresh MCP initialization
 /// supplies the current host context before a later user-requested turn.
-fn handoff_message(origin: &str, carry: Option<&chimaera_agent::Carryover>) -> Option<String> {
-    let carry = carry.filter(|c| c.interrupted_work())?;
-    Some(transfer_context(origin, Some(carry)))
+fn handoff_message(
+    origin: &str,
+    carry: Option<&chimaera_agent::Carryover>,
+    recovery: bool,
+) -> Option<String> {
+    if carry.is_some_and(|c| !c.interrupted_work()) || (carry.is_none() && !recovery) {
+        return None;
+    }
+    Some(transfer_context(origin, carry, recovery))
 }
 
 /// TUIs do not yet record reliable turn state for every provider. Keep their
 /// existing transfer prompt until that state can distinguish idle from interrupted
 /// work; a missing carryover must not silently suppress an active TUI's pickup.
-pub(crate) fn transfer_context(origin: &str, carry: Option<&chimaera_agent::Carryover>) -> String {
+pub(crate) fn transfer_context(
+    origin: &str,
+    carry: Option<&chimaera_agent::Carryover>,
+    recovery: bool,
+) -> String {
     let place = if origin == "home" {
         "back on the laptop"
     } else {
         "on another host"
     };
     let mut text = format!("This Chimaera session is now {place}. Your native conversation and project files were transferred. Re-check tools and paths before using host-specific resources.");
+    if recovery {
+        text.push_str(" This is an automatic continuation from the last acknowledged checkpoint after the previous host stopped responding. The previous host may still have performed work after that checkpoint. Treat unfinished tool calls and background work in the saved history as uncertain, not failed or safely repeatable. Inspect the current project and relevant external state before repeating effects; continue the user's unfinished task using the existing permissions. Do not require a routine user confirmation solely because this recovery occurred, and do not claim an external action happened exactly once. If the saved task is already complete, leave it complete.");
+    }
     if let Some(carry) = carry.filter(|c| c.interrupted_work()) {
-        text.push_str(" The previous agent process and its background work stopped during transfer. Continue the interrupted task; recreate needed background processes on this host.");
+        if !recovery {
+            text.push_str(" The previous agent process and its background work stopped during transfer. Continue the interrupted task; recreate needed background processes on this host.");
+        }
         for task in carry.background.iter().take(32) {
             text.push_str(&format!("\nBackground task: {}", task.description));
         }
@@ -4880,8 +4899,11 @@ mod tests {
         use chimaera_agent::Carryover;
 
         for origin in ["moved", "home"] {
-            assert_eq!(handoff_message(origin, None), None, "older ledger");
-            assert_eq!(handoff_message(origin, Some(&Carryover::default())), None);
+            assert_eq!(handoff_message(origin, None, false), None, "older ledger");
+            assert_eq!(
+                handoff_message(origin, Some(&Carryover::default()), false),
+                None
+            );
             let idle = Carryover {
                 remote_control: true,
                 ultracode: true,
@@ -4889,11 +4911,24 @@ mod tests {
                 ..Carryover::default()
             };
             assert_eq!(
-                handoff_message(origin, Some(&idle)),
+                handoff_message(origin, Some(&idle), false),
                 None,
                 "settings and an earlier pickup are not unfinished work"
             );
         }
+    }
+
+    #[test]
+    fn automatic_checkpoint_recovery_inspects_uncertainty_without_waking_known_idle_work() {
+        let text = handoff_message("moved", None, true)
+            .expect("unknown saved work is inspected automatically");
+        assert!(text.contains("Inspect the current project and relevant external state"));
+        assert!(!text.contains("background work stopped during transfer"));
+        assert!(text.contains("Do not require a routine user confirmation"));
+        assert_eq!(
+            handoff_message("moved", Some(&chimaera_agent::Carryover::default()), true),
+            None
+        );
     }
 
     #[test]
@@ -4920,7 +4955,7 @@ mod tests {
         };
         for (origin, place) in [("moved", "on another host"), ("home", "back on the laptop")] {
             for carry in [&turn, &background, &both] {
-                let text = handoff_message(origin, Some(carry)).expect("interrupted work");
+                let text = handoff_message(origin, Some(carry), false).expect("interrupted work");
                 assert!(text.contains(place), "{text}");
                 assert!(text.contains("Re-check tools and paths"), "{text}");
                 assert!(text.contains("Continue the interrupted task"), "{text}");

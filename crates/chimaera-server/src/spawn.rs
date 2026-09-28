@@ -265,6 +265,7 @@ pub(crate) async fn spawn_session(
                     let context = crate::chat::transfer_context(
                         handoff.origin.as_str(),
                         entry.agent.as_ref().and_then(|a| a.carryover.as_ref()),
+                        crate::pro::checkpoint_recovery_context(state, &workspace.id),
                     );
                     crate::launcher::append_transfer_prompt(&mut argv, &context);
                 }

@@ -146,3 +146,61 @@ async fn same_boot_crash_never_turns_empty_registry_into_stopped_evidence() {
 
 #[path = "runtime_tests.rs"]
 mod runtime;
+
+#[test]
+fn canonical_recovery_has_a_distinct_exact_capability_and_keeps_expired_input_closed() {
+    let (state, mut config, root) = fixture();
+    let mut grant = baton();
+    config.execution.as_mut().unwrap().capability = wire::ExecutionCapability::checkpoint_fork();
+    grant.execution_capability = Some(wire::ExecutionCapability::checkpoint_fork());
+    grant.continuity.as_mut().unwrap().mode = "checkpoint_fork_v1".into();
+    accept(&state, &config, &grant, 0, RequestStart::now()).unwrap();
+    lock(&state.pro.ownership).insert("w-a".into(), Ownership::Local { epoch: 2 });
+    assert!(crate::pro::may_execute(&state, "w-a"));
+    lock(&state.pro.execution.proofs)
+        .get_mut("w-a")
+        .unwrap()
+        .deadline = lease::Deadline::expired_fixture();
+    expire(&state, 0);
+    assert!(
+        resume_allowed(&state, "w-a"),
+        "recovery does not add a routine human review gate"
+    );
+    assert!(
+        !crate::pro::may_execute(&state, "w-a"),
+        "automatic recovery is not permission to use an expired grant"
+    );
+    assert!(recovery_context(&state, "w-a"));
+    grant.epoch = 3;
+    grant.execution_lease = Some(wire::ExecutionLease {
+        id: "lease-new".into(),
+        sequence: 1,
+    });
+    grant.requires_fork = true;
+    accept(&state, &config, &grant, 0, RequestStart::now()).unwrap();
+    assert!(
+        !crate::pro::may_execute(&state, "w-a"),
+        "old ownership cannot use a new proof"
+    );
+    lock(&state.pro.ownership).insert("w-a".into(), Ownership::Local { epoch: 3 });
+    assert!(crate::pro::may_execute(&state, "w-a"));
+    std::fs::remove_dir_all(root).unwrap();
+}
+#[test]
+fn new_default_capability_never_changes_an_existing_strict_policy_renewal() {
+    let (state, mut config, root) = fixture();
+    observe(&state, &config, &baton()).unwrap();
+    config.execution.as_mut().unwrap().capability = wire::ExecutionCapability::checkpoint_fork();
+    assert_eq!(
+        effective(&state, &config, "w-a")
+            .unwrap()
+            .execution
+            .unwrap()
+            .capability,
+        wire::ExecutionCapability::managed()
+    );
+    let mut mismatched = baton();
+    mismatched.execution_capability = Some(wire::ExecutionCapability::checkpoint_fork());
+    assert!(observe(&state, &config, &mismatched).is_err());
+    std::fs::remove_dir_all(root).unwrap();
+}

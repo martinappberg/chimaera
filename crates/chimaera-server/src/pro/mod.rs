@@ -1,5 +1,6 @@
 //! Optional daemon-owned mirrors and workspace handoff. No credential is durable.
 mod authority;
+mod canonical;
 mod config;
 mod engine;
 mod execution;
@@ -241,6 +242,7 @@ pub(crate) fn may_write(state: &crate::AppState, workspace: &str) -> bool {
 #[cfg(test)]
 pub(crate) use execution::install_fixture as install_execution_fixture;
 pub(crate) use execution::prepare_launch as prepare_managed_launch;
+pub(crate) use execution::recovery_context as checkpoint_recovery_context;
 pub(crate) fn managed_execution(state: &crate::AppState, workspace: &str) -> bool {
     execution::managed(state, workspace)
 }

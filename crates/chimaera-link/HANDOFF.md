@@ -301,14 +301,17 @@ it. Re-enabling does not restore the automatic handoff flags.
 
 The additive public types are in `continuity.rs`. This protocol is enabled only
 through exact capability negotiation; a legacy configure success never proves
-execution fencing. The current capability is
-`{version:1,boundary:"managed_processes",expired_takeover:false}`. It deliberately
-rejects expired takeover: an ordinary userspace process group cannot guarantee
-ordering after an unannounced OS resume or contain arbitrary detached children.
-The required home-first behavior above remains the acceptance target.
+execution fencing. Two exact capabilities are supported:
+`{version:1,boundary:"managed_processes",expired_takeover:false}` with policy
+`managed_v1`, and `{version:2,boundary:"canonical_checkpoint",expired_takeover:true}`
+with policy `checkpoint_fork_v1`. The latter is the automatic-recovery default:
+it guarantees a single canonical grant/checkpoint publication, not atomic
+physical process extinction on a disconnected computer or exactly-once external
+effects. Process groups do not contain deliberately detached descendants.
 
-`GET /v2/capabilities` returns execution_authority 2, that exact capability,
-installation_binding 1, workspace_placement 2 and checkpoint_receipts 1. Native
+`GET /v2/capabilities` returns execution_authority 2, the exact default capability,
+supported_execution_capabilities, failover_grace_seconds 30, installation_binding
+1, workspace_placement 2 and checkpoint_receipts 1. Native
 clients keep the stable installation proof in the account/origin-specific
 keychain; the daemon receives only its opaque installation ID.
 `POST /api/v1/pro/configure/execution` takes ordinary Configure plus
@@ -319,7 +322,7 @@ for a workspace-bound worker. Its 200 response must exactly match
 `GET /v2/baton/{workspace}` may observe legacy work with null continuity; it
 never grants execution. Existing live legacy grants remain legacy until a clean
 release. Acquire/renew/release add execution_capability and return continuity
-(version 2, mode managed_v1, policy_revision, preferred_installation_id), an
+(version 2, mode managed_v1 or checkpoint_fork_v1, policy_revision, preferred_installation_id), an
 execution_lease (opaque id and increasing sequence), and a checkpoint. Acquiring
 and renewing pin the selected checkpoint; GET reports the latest acknowledged
 publication. Once enrolled, legacy acquisition/renewal/write credentials and
@@ -331,7 +334,24 @@ replayed lease sequences, stale generations, clock discontinuity and restart
 cannot extend that deadline. Viewer location never selects the preferred home.
 Clean transfer selects exactly the receipt's working-tree/config/handoff Git
 object IDs. Unknown continuation evidence is uncertain, never a blind replay of
-external actions.
+external actions. In checkpoint_fork_v1, after the recorded lease expiry plus
+30 seconds, an acknowledged checkpoint permits a new canonical epoch and a
+forked native conversation. The logical session identity remains stable. The
+receipt may originate from an earlier epoch if an intervening executor never
+published; its own source epoch, not the incoming grant epoch, binds the manifest.
+A known idle conversation remains idle. Interrupted or unknown work gets bounded
+historical recovery context directing the agent to inspect files and external
+state before repeating effects, using existing permissions without a routine
+human-review gate. Timeout alone is never proof that the old OS process stopped.
+
+Returning home installs the canonical receipt only after its own registered
+managed processes are stopped. Unclean same-boot restart remains fenced until
+supervisor cleanup is proven. Unsynchronized local file conflicts are retained
+outside the mirrored project (100 MB per file, 1 GiB/4096 files total), while
+canonical file content occupies the original path. Exceeding preservation limits
+retains the original and fails the import; it never deletes old conflict copies.
+A globally advertised new capability does not change an existing strict-mode
+renewal; mode changes require an explicit clean unowned acquisition.
 
 A normal installation rebind first stops/publishes/releases with its old valid
 credentials. If those credentials expired, full new-device authentication plus

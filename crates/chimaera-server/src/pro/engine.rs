@@ -329,6 +329,23 @@ async fn reconcile_generation(
     } else {
         "acquire"
     };
+    if operation == "acquire" && execution::checkpoint_mode(state, workspace) {
+        ensure!(
+            baton.checkpoint.is_some(),
+            "a durable project checkpoint is not available yet"
+        );
+        // An expired/replaced executor must install the selected canonical
+        // checkpoint, even when it is the same physical worker or home device.
+        let Ok(_job) = state.pro.jobs.try_lock() else {
+            return Ok(());
+        };
+        lock(&state.pro.ownership).insert(
+            workspace.into(),
+            Ownership::AwaitingVerification { epoch: baton.epoch },
+        );
+        super::persist(state).await?;
+        return Box::pin(hydrate(state, config, workspace, baton.epoch, true, None)).await;
+    }
     let body = execution::body(&operation_config, baton.epoch, operation == "acquire");
     if operation_config.execution.is_some() && baton.continuity.is_none() {
         lock(&state.pro.ownership).insert(
@@ -357,6 +374,10 @@ async fn reconcile_generation(
     ensure!(
         generation == state.pro.generation.load(Ordering::Acquire),
         "Account changed while verifying project ownership"
+    );
+    ensure!(
+        grant.workspace_id == workspace,
+        "execution grant workspace mismatch"
     );
     execution::accept(state, &operation_config, &grant, generation, request_start)?;
     super::projects::bind_workspace_account(state, config, workspace)?;
@@ -722,9 +743,16 @@ pub(super) async fn hydrate(
     // snapshot after a restart. The normal grant path resumes its own ledger.
     if lock(&state.workspaces).get(workspace).is_some()
         && config.role == Role::Worker
+        && !execution::managed(state, workspace)
         && matches!(lock(&state.pro.ownership).get(workspace),Some(Ownership::Local{epoch}|Ownership::AwaitingVerification{epoch}) if *epoch==expected_epoch)
     {
         return reconcile(state, config, workspace).await;
+    }
+    if execution::managed(state, workspace) {
+        // No canonical files are installed while an old local managed executor
+        // can still write them. An unclean same-boot registry remains blocked.
+        execution::fence_workspace(state, workspace);
+        execution::stop(state, &[workspace.to_owned()]).await?;
     }
     let cache = state.pro.root.join(workspace).join("incoming.git");
     let manifest = fetch_snapshot(config, workspace, &cache).await?;
@@ -784,19 +812,23 @@ pub(super) async fn hydrate(
         .json()?
     };
     ensure!(
-        grant.holder_id.as_deref() == Some(&config.delegation.device_id),
+        grant.workspace_id == workspace
+            && grant.holder_id.as_deref() == Some(&config.delegation.device_id),
         "invalid handoff ownership grant"
     );
     current()?;
     execution::accept(state, config, &grant, generation, request_start)?;
     install_epoch.store(grant.epoch, Ordering::Release);
     let receipt = if config.execution.is_some() {
-        Some(
-            grant
-                .checkpoint
-                .as_ref()
-                .context("acquired grant has no durable checkpoint")?,
-        )
+        let receipt = grant
+            .checkpoint
+            .as_ref()
+            .context("acquired grant has no durable checkpoint")?;
+        ensure!(
+            receipt.source_epoch <= grant.epoch,
+            "checkpoint is newer than its execution grant"
+        );
+        Some(receipt)
     } else {
         None
     };
@@ -890,11 +922,15 @@ pub(super) async fn hydrate(
         authority::destination(state, config, workspace, Some(&destination_root)).await?;
         let tree = stage.join("tree");
         let destination = destination_root.clone();
+        let local_conflicts = (config.role == Role::Device
+            && execution::checkpoint_mode(state, workspace))
+        .then(|| state.pro.root.join(workspace).join("local-conflicts"));
         tokio::task::spawn_blocking(move || {
             install_tree(
                 &tree,
                 &destination,
                 has_baseline.then_some(baseline).as_deref(),
+                local_conflicts.as_deref(),
             )
         })
         .await??;
@@ -941,14 +977,13 @@ pub(super) async fn hydrate(
         let owner = state.clone();
         tokio::task::spawn_blocking(move || lock(&owner.workspaces).import_exact(new_workspace))
             .await??;
-        if receipt
-            .is_some_and(|receipt| receipt.continuation == execution::wire::Continuation::Uncertain)
-        {
-            lock(&state.pro.preferences)
-                .entry(workspace.into())
-                .or_default()
-                .execution_uncertain = true;
-        }
+        lock(&state.pro.preferences)
+            .entry(workspace.into())
+            .or_default()
+            .execution_uncertain = grant.requires_fork
+            || receipt.is_some_and(|receipt| {
+                receipt.continuation == execution::wire::Continuation::Uncertain
+            });
         for archive in manifest.sessions {
             current()?;
             crate::bundle::import(
@@ -989,7 +1024,15 @@ pub(super) async fn hydrate(
     let _ = tokio::fs::remove_dir_all(stage).await;
     result
 }
-fn install_tree(source: &Path, destination: &Path, baseline: Option<&Path>) -> Result<()> {
+fn install_tree(
+    source: &Path,
+    destination: &Path,
+    baseline: Option<&Path>,
+    local_conflicts: Option<&Path>,
+) -> Result<()> {
+    let mut conflicts = local_conflicts
+        .map(super::canonical::Conflicts::open)
+        .transpose()?;
     if let Some(baseline) = baseline {
         let mut pending = vec![(baseline.to_path_buf(), PathBuf::new())];
         let mut count = 0;
@@ -1024,8 +1067,13 @@ fn install_tree(source: &Path, destination: &Path, baseline: Option<&Path>) -> R
                 });
                 // A deletion is safe only when the local file still equals
                 // the shared baseline. Local edits and symlinks always win.
-                if safe && target.try_exists()? && same_file(&target, &entry.path())? {
-                    std::fs::remove_file(target)?;
+                if safe && target.try_exists()? {
+                    if same_file(&target, &entry.path())? {
+                        std::fs::remove_file(target)?;
+                    } else if let Some(conflicts) = conflicts.as_mut() {
+                        conflicts.preserve(&target, &relative)?;
+                        std::fs::remove_file(target)?;
+                    }
                 }
             }
         }
@@ -1062,12 +1110,17 @@ fn install_tree(source: &Path, destination: &Path, baseline: Option<&Path>) -> R
                         same_file(&target, &root.join(&relative)).unwrap_or(false)
                     })
                 {
-                    let preserved = target.with_file_name(format!(
-                        "{}.cloud-{}",
-                        entry.file_name().to_string_lossy(),
-                        super::now()
-                    ));
-                    std::fs::copy(entry.path(), preserved)?;
+                    if let Some(conflicts) = conflicts.as_mut() {
+                        conflicts.preserve(&target, &relative)?;
+                        std::fs::copy(entry.path(), target)?;
+                    } else {
+                        let preserved = target.with_file_name(format!(
+                            "{}.cloud-{}",
+                            entry.file_name().to_string_lossy(),
+                            super::now()
+                        ));
+                        std::fs::copy(entry.path(), preserved)?;
+                    }
                 } else {
                     std::fs::copy(entry.path(), target)?;
                 }
@@ -1561,7 +1614,7 @@ mod tests {
             )
             .unwrap();
         }
-        install_tree(&cloud, &local, Some(&base)).unwrap();
+        install_tree(&cloud, &local, Some(&base), None).unwrap();
         assert_eq!(
             std::fs::read_to_string(local.join("same.txt")).unwrap(),
             "cloud"
@@ -1580,6 +1633,44 @@ mod tests {
             .file_name()
             .to_string_lossy()
             .starts_with("conflict.txt.cloud-")));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn canonical_return_uses_cloud_files_and_preserves_unpublished_local_edits() {
+        let root = std::env::temp_dir().join(format!(
+            "chimaera-canonical-return-{}",
+            chimaera_core::generate_token()
+        ));
+        let local = root.join("local");
+        let cloud = root.join("cloud");
+        let base = root.join("base");
+        let conflicts = root.join("private-conflicts");
+        for dir in [&local, &cloud, &base] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        for name in ["changed", "deleted"] {
+            std::fs::write(base.join(name), "base").unwrap();
+            std::fs::write(local.join(name), "unpublished local").unwrap();
+        }
+        std::fs::write(cloud.join("changed"), "canonical cloud").unwrap();
+        install_tree(&cloud, &local, Some(&base), Some(&conflicts)).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(local.join("changed")).unwrap(),
+            "canonical cloud"
+        );
+        assert!(!local.join("deleted").exists());
+        let mut preserved = Vec::new();
+        for dir in std::fs::read_dir(&conflicts).unwrap() {
+            for file in std::fs::read_dir(dir.unwrap().path()).unwrap() {
+                preserved.push(std::fs::read_to_string(file.unwrap().path()).unwrap());
+            }
+        }
+        assert_eq!(preserved, vec!["unpublished local", "unpublished local"]);
+        assert_eq!(
+            std::fs::read_dir(local).unwrap().count(),
+            1,
+            "conflicts are outside the canonical mirror"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -94,6 +94,21 @@ pub(super) fn effective(
     let mut result = config.clone();
     if !managed {
         result.execution = None;
+    } else {
+        let policy = lock(&state.pro.preferences)
+            .get(workspace)
+            .and_then(|p| p.continuity.clone())
+            .context("continuity policy unavailable")?;
+        let capability = match policy.mode.as_str() {
+            "managed_v1" => wire::ExecutionCapability::managed(),
+            "checkpoint_fork_v1" => wire::ExecutionCapability::checkpoint_fork(),
+            _ => anyhow::bail!("unsupported continuity policy"),
+        };
+        result
+            .execution
+            .as_mut()
+            .context("continuity upgrade required")?
+            .capability = capability;
     }
     Ok(result)
 }
@@ -140,7 +155,11 @@ pub(super) fn observe(state: &AppState, config: &Configure, baton: &Baton) -> Re
     ensure!(
         config.execution.is_some()
             && policy.version == 2
-            && policy.mode == "managed_v1"
+            && baton
+                .execution_capability
+                .as_ref()
+                .and_then(|cap| cap.policy_mode())
+                == Some(policy.mode.as_str())
             && policy.policy_revision > 0
             && policy
                 .preferred_installation_id
@@ -216,6 +235,8 @@ pub(super) fn accept(
     }
     ensure!(
         baton.continuity.is_some()
+            && config.execution.as_ref().map(|e| &e.capability)
+                == baton.execution_capability.as_ref()
             && baton.holder_id.as_deref() == Some(&config.delegation.device_id)
             && !baton.mirror_disabled
             && generation == state.pro.generation.load(Ordering::Acquire),
@@ -333,10 +354,28 @@ pub(super) fn preferred_here(state: &AppState, config: &Configure, workspace: &s
             .is_some_and(|id| Some(id) == policy.preferred_installation_id.as_ref()),
     }
 }
-pub(super) fn resume_allowed(state: &AppState, workspace: &str) -> bool {
-    !lock(&state.pro.preferences)
+pub(super) fn checkpoint_mode(state: &AppState, workspace: &str) -> bool {
+    lock(&state.pro.preferences)
         .get(workspace)
-        .is_some_and(|p| p.execution_uncertain)
+        .and_then(|p| p.continuity.as_ref())
+        .is_some_and(|p| p.mode == "checkpoint_fork_v1")
+}
+pub(super) fn resume_allowed(state: &AppState, workspace: &str) -> bool {
+    checkpoint_mode(state, workspace)
+        || !lock(&state.pro.preferences)
+            .get(workspace)
+            .is_some_and(|p| p.execution_uncertain)
+}
+pub(crate) fn recovery_context(state: &AppState, workspace: &str) -> bool {
+    checkpoint_mode(state, workspace)
+        && lock(&state.pro.preferences)
+            .get(workspace)
+            .is_some_and(|p| p.execution_uncertain)
+}
+pub(super) fn fence_workspace(state: &AppState, workspace: &str) {
+    if let Some(proof) = lock(&state.pro.execution.proofs).get_mut(workspace) {
+        proof.stopped = true;
+    }
 }
 
 pub(super) fn quiescent(state: &AppState, workspace: &str) -> bool {

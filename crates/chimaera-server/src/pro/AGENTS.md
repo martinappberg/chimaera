@@ -21,6 +21,7 @@ revocable delegation over the authenticated local API.
 | `policy.rs` | Mirrored-path policy, credential filtering, size budgets and cloud-profile classification. |
 | `mirror.rs` | Separate shadow and repository Git directories, incremental transfer and conservative hand-back. |
 | `repository.rs` | Portable remote/tracking allowlist; bounded ref import, compare-and-swap adoption and index/ref-lock cancellation cleanup. |
+| `canonical.rs` | Bounded private preservation of unpublished local file conflicts before canonical checkpoint adoption; never overwrites previous conflict copies. |
 | `config.rs` | Portable agent configuration export/import, scoped environment-omission diagnostics and destination connection identity preservation. |
 
 One recorded holder and epoch controls shared writes. Legacy v1 retains its
@@ -35,9 +36,14 @@ old children stopped. A separate enrollment latch rejects lost ordinary state or
 protocol downgrade. macOS boot-session UUID and Linux boot ID can distinguish a
 cold reboot; neither authorizes takeover by another device.
 
-The capability remains `managed_processes` with `expired_takeover:false`.
-Detached descendants and unannounced OS-resume scheduling require a stronger
-supervisor boundary before abrupt cloud takeover is allowed. Native installation
+Strict `managed_processes` retains `expired_takeover:false`. The separately
+negotiated `canonical_checkpoint` capability supports automatic native-conversation
+fork after a server-authored reconnect grace, preserving the logical session and
+single canonical checkpoint authority. It does not claim physical stop of all
+old-host descendants or exactly-once external effects. Recovery context tells the
+agent to inspect uncertain effects under its existing permissions, without a new
+routine human-review gate. Returning local canonical files still waits for local
+managed quiescence and retains conflicting unpublished files outside the mirror. Native installation
 proofs never enter the daemon. Recovery accepts only a bounded same-installation
 mirror/release grant after execution stops, keeps it in memory, publishes the
 stopped source and consumes release; it cannot acquire/renew or resume execution.
