@@ -15,6 +15,8 @@
   import DocumentsSettings from "./DocumentsSettings.svelte";
   import CloudSetup from "./CloudSetup.svelte";
   import { isBrowserGateway } from "../net/base";
+  import { isNativeShell } from "../net/native";
+  import BrandMark from "../shared/BrandMark.svelte";
   import NotificationStatus from "./NotificationStatus.svelte";
   import UpdatesStatus from "./UpdatesStatus.svelte";
   import { APP_MENU, PINNED } from "../shared/keys";
@@ -31,6 +33,7 @@
    */
   const sections = (() => {
     const out = [...CATEGORIES];
+    if (isNativeShell() || isBrowserGateway()) out.unshift("Chimaera Pro");
     const at = out.indexOf("Agents");
     out.splice(at >= 0 ? at + 1 : out.length, 0, "Environment", "Documents");
     if (isBrowserGateway()) out.splice(out.indexOf("Keyboard"), 0, "Cloud machine");
@@ -90,7 +93,7 @@
         if (docsVisible) out.push({ category: cat, defs: [] });
         continue;
       }
-      if (cat === "Cloud machine") {
+      if (cat === "Cloud machine" || cat === "Chimaera Pro") {
         if (proVisible) out.push({ category: cat, defs: [] });
         continue;
       }
@@ -220,7 +223,20 @@
 
       <div class="list" bind:this={listEl} onscroll={onScroll}>
         {#each groups as group (group.category)}
-          {#if group.category === "Agents"}
+          {#if group.category === "Chimaera Pro"}
+            <section data-section={group.category}>
+              <h2 class="cat">Chimaera Pro</h2>
+              <button class="pro-entry" aria-label="Open Chimaera Pro"
+                onclick={() => window.dispatchEvent(new Event("chimaera:open-pro"))}>
+                <BrandMark size={30} />
+                <span class="pro-copy">
+                  <strong>Your account and cloud work</strong>
+                  <span>Cloud agents, project mirrors and connected machines.</span>
+                </span>
+                <span class="pro-open" aria-hidden="true">Open Pro <span>→</span></span>
+              </button>
+            </section>
+          {:else if group.category === "Agents"}
             <!-- Bespoke panel: fuses live daemon detection with the
                  agents.<id>.path settings and an uninstall action. It renders
                  its own <h2>, so the generic rows are skipped here. -->
@@ -494,6 +510,32 @@
     letter-spacing: 0.1em;
     text-transform: uppercase;
     color: var(--muted);
+  }
+
+  .pro-entry {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    width: calc(100% - 28px);
+    margin: 10px 14px 18px;
+    padding: 14px;
+    border: 1px solid var(--edge);
+    border-radius: 8px;
+    background: color-mix(in srgb, var(--fg) 2%, transparent);
+    color: var(--fg);
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+  }
+  .pro-entry:hover { background: var(--row-hover); }
+  .pro-entry:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
+  .pro-copy { display: grid; flex: 1; min-width: 0; gap: 4px; font-size: var(--text-sm); }
+  .pro-copy strong { font-size: var(--text-md); font-weight: 550; }
+  .pro-copy > span { color: var(--muted); line-height: 1.5; }
+  .pro-open { flex: none; display: flex; align-items: center; gap: 8px; font-size: var(--text-sm); color: var(--muted); }
+  @container settings (max-width: 460px) {
+    .pro-entry { flex-wrap: wrap; }
+    .pro-open { margin-left: 42px; }
   }
 
   .empty {

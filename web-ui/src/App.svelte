@@ -1,6 +1,5 @@
 <script lang="ts">
   import { onMount, tick, untrack } from "svelte";
-  import PlanBadge from "./lib/shared/PlanBadge.svelte";
   import ProNavigation from "./lib/pro/ProNavigation.svelte";
   import { paidPlan } from "./lib/net/plan";
   import { isBrowserGateway } from "./lib/net/base";
@@ -1754,10 +1753,12 @@
     const stopChordHints = initChordHints();
     window.addEventListener("keydown", onKeydown, true);
     window.addEventListener("pagehide", onPagehide);
+    window.addEventListener("chimaera:open-pro", openProSurface);
     document.addEventListener("copy", onCopy);
     return () => {
       window.removeEventListener("keydown", onKeydown, true);
       window.removeEventListener("pagehide", onPagehide);
+      window.removeEventListener("chimaera:open-pro", openProSurface);
       unlistenMenu?.();
       unlistenDaemonMoved?.();
       unlistenHostStatus?.();
@@ -4763,7 +4764,9 @@
             />
           </svg>
         </button>
-        <PlanBadge plan={$paidPlan} compact />
+        {#if isNativeShell() || isBrowserGateway()}
+          <ProNavigation plan={$paidPlan} onOpen={openProSurface} />
+        {/if}
         {#if needsYou > 0}
           <span
             class="needs"
@@ -5216,9 +5219,6 @@
              own truth, not the URL hash): countdown + resources, stacked
              ABOVE the daemon bar so neither crowds the other. -->
         <ComputeStrip self={$computeStatus.self} receivedAt={$computeStatus.received_at_ms} />
-      {/if}
-      {#if isNativeShell() || isBrowserGateway()}
-        <ProNavigation plan={$paidPlan} onOpen={openProSurface} />
       {/if}
       <div class="daemon" bind:this={daemonEl}>
         <!-- Two groups so the bar can WRAP: identity (dot, host, link RTT)
