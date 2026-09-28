@@ -234,12 +234,12 @@ async fn probe(state: &Arc<AppState>, id: &str) -> ProviderStatus {
     status
 }
 /// Prompt context must never turn a read into authentication or a CLI probe.
-/// Expired, absent, concurrently changed and disconnecting states are unknown.
+/// Expired and absent states are unknown; this is a cached observation, not an
+/// authorization decision. The normal readiness gate still performs fresh checks.
 pub(crate) fn cached_observations(state: &AppState) -> Vec<ProviderStatus> {
-    let epoch = state.cloud_providers.auth_epoch.load(Ordering::Acquire);
     let now = Instant::now();
     let cache = crate::lock(&state.cloud_providers.cache);
-    let mut result: Vec<_> = PROVIDERS
+    PROVIDERS
         .iter()
         .map(|definition| {
             let mut observation = ProviderStatus::new(definition.id);
@@ -258,16 +258,7 @@ pub(crate) fn cached_observations(state: &AppState) -> Vec<ProviderStatus> {
             }
             observation
         })
-        .collect();
-    drop(cache);
-    for observation in &mut result {
-        if state.cloud_providers.auth_epoch.load(Ordering::Acquire) != epoch
-            || connect::disconnecting(state, &observation.id)
-        {
-            *observation = ProviderStatus::new(&observation.id);
-        }
-    }
-    result
+        .collect()
 }
 
 /// Shared by onboarding and staged handoff. This NEVER installs or signs in.

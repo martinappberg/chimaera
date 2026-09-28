@@ -291,7 +291,6 @@ mod tests {
             reason: Some("secret raw diagnostic".into()),
             checked_at: None,
             methods: vec![],
-            disconnect_supported: true,
         };
         let text = render(
             true,
