@@ -609,7 +609,8 @@ auto_enabled() { [ "$(git -C "$HERE" config --get worktree-gc.auto 2>/dev/null)"
 hook_mode() {
   [ "${WORKTREE_GC:-on}" = off ] && exit 0
   local input="" free reason cwd
-  [ -t 0 ] || input=$(cat 2>/dev/null)
+  # The payload is one small JSON object; never wait on a stdin that stays open.
+  [ -t 0 ] || IFS= read -r -d '' -t 1 input || true
   case "$HOOK" in
     session-start)
       free=$(free_kb "$HERE")

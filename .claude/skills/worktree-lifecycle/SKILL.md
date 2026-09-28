@@ -82,9 +82,12 @@ and without `gh` nothing is removable by PR state.
   — prints one line into context when disk is low, and starts a detached
   `--apply` run at most once an hour. SessionEnd runs `--hook session-end` — a
   detached `--self --sweep --apply` (skipped on `/clear`).
-- **Codex** (`.codex/hooks.json`): the same two hooks. Codex loads project hooks only
-  for a trusted project and after you approve each hook once in `/hooks`; until then
-  they are skipped, and this skill is the whole mechanism.
+- **Codex** (`.codex/hooks.json`): the same two hooks, in Codex's documented format.
+  Codex runs project hooks only in a trusted project, after each is approved in
+  `/hooks` — and it records that approval per `hooks.json` path, so each Codex worktree
+  may ask again. `codex exec` 0.157.1 ran no project SessionStart hook at all in
+  testing. So for Codex, treat this skill and the AGENTS.md rule as the mechanism
+  and the hooks as a bonus.
 - Background runs log to `<main checkout>/.git/worktree-gc/log`.
 
 ## Why the build is smaller now
@@ -94,3 +97,9 @@ builds workspace crates with `debug = "line-tables-only"` and dependencies with
 `debug = false`: backtraces and debugger breakpoints keep file:line, but locals are
 not inspectable. When you need them, rebuild with full debug info:
 `CARGO_PROFILE_DEV_DEBUG=full cargo build`.
+
+On macOS, `export CARGO_PROFILE_DEV_SPLIT_DEBUGINFO=packed` in your own shell stops
+the stale-object pile-up at the source (dsymutil writes a `.dSYM` per binary and the
+objects are deleted). It is not the repo default: the profile key would change Linux
+builds too, and a macOS-only rustflag would silently disable any `build.rustflags`
+you set yourself.
