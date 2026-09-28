@@ -249,6 +249,8 @@ mod tests {
         assert!(cloud.contains("Chimaera Pro → Agent connections"));
         assert!(cloud.contains("For direct questions about Chimaera implementation"));
         assert!(cloud.contains("Be candid about observable platform facts and limitations"));
+        assert!(cloud.contains("Inspect disk, memory and CPU availability internally"));
+        assert!(!cloud.contains("this guidance does not guarantee secrecy"));
         assert!(cloud.contains("existing blocked handoff automatically after fresh verification"));
         assert!(
             cloud.contains("Keep completed work complete")
@@ -257,7 +259,9 @@ mod tests {
         for forbidden in [
             "cgroup",
             "proc_memory",
-            "CPU",
+            "cpu_quota",
+            "memory_limit_bytes",
+            "disk_available_bytes",
             "architecture=",
             "cloud worker",
             "holder_id",
