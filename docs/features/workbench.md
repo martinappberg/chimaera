@@ -79,9 +79,7 @@ Daemon side: `crates/chimaera-server/src/{workspaces.rs,view_state.rs,quickopen.
   a tab to a pane edge. Drag the divider to reratio (double-click snaps 50/50; Escape restores).
   Open a surface → it appends a tab to the focused pane (VS Code "no duplicates": if already
   open anywhere, that tab is focused). Middle-click or `×` closes a tab (**detaches the view —
-  never kills the session**). The `×` stays visible on the right of active and inactive
-  tabs; unread output has a separate dot beside the icon, so it never replaces the close
-  control or changes the tab's width. `Mod+Alt+[`/`]` cycle tabs. Drag a tab to reorder within a bar,
+  never kills the session**). `Mod+Alt+[`/`]` cycle tabs. Drag a tab to reorder within a bar,
   move to another pane, tear off into a split, or slam a **window edge** to split the whole window.
   A **pane grip** (a small window icon) fades in at the top-left of the tab strip on hover; drag
   it to move the **whole pane** (all its tabs) to another split — center merges, edges tear a

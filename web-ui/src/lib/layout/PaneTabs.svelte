@@ -822,9 +822,6 @@
               <FileIcon path={tab.path} size={13} plain={i === node.active} />
             </span>
           {/if}
-          {#if unread}
-            <span class="tab-unread-dot" role="img" aria-label="unread output" title="unread output"></span>
-          {/if}
           {#if renamingTab === tabKey(tab)}
             <!-- svelte-ignore a11y_autofocus -->
             <input
@@ -1481,6 +1478,8 @@
   }
 
   .tab-close {
+    /* Anchors the unread dot drawn in this slot (see .tab.unread below). */
+    position: relative;
     appearance: none;
     border: none;
     background: none;
@@ -1491,26 +1490,41 @@
     line-height: 1;
     color: var(--muted);
     cursor: pointer;
+    opacity: 0;
     flex: none;
-    transition: color 0.12s ease;
+    transition:
+      opacity 0.12s ease,
+      color 0.12s ease;
   }
 
-  .tab-close:hover,
-  .tab-close:focus-visible {
+  .tab:hover .tab-close,
+  .tab.active .tab-close {
+    opacity: 0.7;
+  }
+
+  .tab-close:hover {
+    opacity: 1;
     color: var(--fg);
   }
 
-  /* Unread sits beside the type glyph, leaving the right-hand close button
-     visible. Absolute positioning keeps tab widths stable as turns finish. */
-  .tab-unread-dot {
+  /* Unread's scannable half: an accent dot in the close button's slot that
+     turns back into × under the pointer (the editor "dirty dot" gesture,
+     here meaning "finished — not looked at yet"). No reflow either way. */
+  .tab.unread:not(:hover) .tab-close {
+    opacity: 1;
+    color: transparent;
+  }
+
+  .tab.unread:not(:hover) .tab-close::after {
+    content: "";
     position: absolute;
-    left: 3px;
-    top: 4px;
-    width: 5px;
-    height: 5px;
+    left: 50%;
+    top: 50%;
+    width: 6px;
+    height: 6px;
+    margin: -3px 0 0 -3px;
     border-radius: 50%;
     background: var(--accent);
-    pointer-events: none;
   }
 
   /* --- linked-terminal chips ------------------------------------------- */
