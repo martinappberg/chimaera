@@ -5,6 +5,39 @@ export function pendingConnection(connection: CloudProviderConnection | null): b
   return connection !== null && ["preparing", "waiting", "verifying"].includes(connection.phase);
 }
 
+export function disconnectConnection(connection: CloudProviderConnection | null): boolean {
+  return connection?.operation === "disconnect";
+}
+
+export function sameConnection(expected: CloudProviderConnection, received: CloudProviderConnection | null | undefined): boolean {
+  return received != null && received.id === expected.id && received.provider_id === expected.provider_id
+    && (received.operation ?? "connect") === (expected.operation ?? "connect");
+}
+
+export function canDisconnect(provider: CloudProviderStatus): boolean {
+  return provider.disconnect_supported === true && (provider.state === "signed_in" || provider.installed === true && provider.state === "unknown");
+}
+
+export function connectionSuccessCurrent(connection: CloudProviderConnection | null, providers: CloudProviderStatus[], fresh: boolean): boolean {
+  if (!fresh || !connection) return false;
+  const state = providers.find(provider => provider.id === connection.provider_id)?.state;
+  return connection.phase === "connected" ? state === "signed_in"
+    : connection.phase === "disconnected" && (state === "needs_sign_in" || state === "missing");
+}
+
+/** Catalog recovery must neither replace another pending job nor roll a known
+ * terminal outcome back to a delayed in-flight snapshot of the same job. */
+export function recoverDisconnect(current: CloudProviderConnection | null, observed: CloudProviderConnection | null | undefined): CloudProviderConnection | null {
+  if (!observed || !disconnectConnection(observed)) return current;
+  if (current && (current.id === observed.id ? !pendingConnection(current) : pendingConnection(current))) return current;
+  return observed;
+}
+
+/** An expired local polling deadline is not proof that the server job finished. */
+export function canStartConnection(connection: CloudProviderConnection | null, fresh: boolean): boolean {
+  return fresh && !pendingConnection(connection);
+}
+
 /** Initial setup needs one agent; continuing a handoff needs every actual
  * provider used by its sessions. Installation and unknown auth never qualify. */
 export function providersReady(providers: CloudProviderStatus[], required: string[] = []): boolean {
@@ -49,8 +82,20 @@ export function providerLoginUrl(providerId: string, value: string): string | nu
   } catch { return null; }
 }
 
-export function connectionError(code: string | null): string {
+export function connectionError(code: string | null, operation: "connect" | "disconnect" = "connect"): string {
+  if (operation === "disconnect") {
+    switch (code) {
+      case "provider_busy": return "This service has another connection request in progress. Check its status before trying again.";
+      case "external_auth_unverified": return "This connection uses access managed outside Chimaera. Chimaera couldn't confirm its removal.";
+      case "disconnect_not_confirmed": return "The service still reports a connection. Check its status before trying again.";
+      case "expired": case "connection_expired": return "This request timed out before disconnection could be confirmed. Check the connection before trying again.";
+      case "invalid_status": return "The service couldn't confirm its connection status. Check again before trying to disconnect.";
+      default: return "Disconnection couldn't be confirmed. Check the connection before trying again. Sign-in on your other devices hasn't changed.";
+    }
+  }
   switch (code) {
+    case "provider_busy": return "This service has another connection request in progress. Check its status before trying again.";
+    case "invalid_status": return "The service couldn't confirm its connection status. Check again before starting sign-in.";
     case "expired": case "connection_expired": return "This sign-in request expired. Start again for a fresh request.";
     case "canceled": case "connection_canceled": return "Sign-in was canceled. Your existing provider connections haven't changed.";
     case "device_login_unavailable": return "Device sign-in couldn't start. Check your connection and that your provider account allows device sign-in, then try again.";

@@ -36,6 +36,7 @@ pub(super) enum Phase {
     Waiting,
     Verifying,
     Connected,
+    Disconnected,
     Failed,
     Canceled,
     Expired,
@@ -61,10 +62,17 @@ pub(super) enum Action {
         session_id: String,
     },
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum Operation {
+    Connect,
+    Disconnect,
+}
 #[derive(Clone, Debug, Serialize)]
 pub(super) struct Connection {
     id: String,
     provider_id: String,
+    operation: Operation,
     phase: Phase,
     expires_at: u64,
     action: Option<Action>,
@@ -75,7 +83,7 @@ pub(super) struct Attempt {
     cancel: watch::Sender<bool>,
     finished: AtomicBool,
     session: Mutex<Option<String>>,
-    process: Mutex<Option<u32>>,
+    pub(super) process: Mutex<Option<u32>>,
     input: Mutex<Option<mpsc::Sender<String>>>,
 }
 impl Attempt {
@@ -126,13 +134,13 @@ impl Attempt {
     }
     pub fn cancel(&self) {
         let mut value = crate::lock(&self.value);
-        if value.phase.pending() {
+        if value.phase.pending() && value.operation == Operation::Connect {
             value.phase = Phase::Canceled;
             value.action = None;
             let _ = self.cancel.send(true);
         }
     }
-    fn update(&self, phase: Phase, action: Option<Action>, error: Option<&str>) {
+    pub(super) fn update(&self, phase: Phase, action: Option<Action>, error: Option<&str>) {
         let mut value = crate::lock(&self.value);
         // A late CLI completion must never resurrect a canceled attempt.
         if !value.phase.pending() {
@@ -143,14 +151,53 @@ impl Attempt {
         value.error_code = error.map(str::to_owned);
     }
 }
-pub(super) fn start(state: Arc<AppState>, def: &'static ProviderDefinition) -> Connection {
+pub(super) fn start(
+    state: Arc<AppState>,
+    def: &'static ProviderDefinition,
+) -> Result<Connection, &'static str> {
+    start_operation(state, def, Operation::Connect)
+}
+pub(super) fn start_disconnect(
+    state: Arc<AppState>,
+    def: &'static ProviderDefinition,
+) -> Result<Connection, &'static str> {
+    start_operation(state, def, Operation::Disconnect)
+}
+pub(super) fn disconnecting(state: &AppState, id: &str) -> bool {
+    crate::lock(&state.cloud_providers.connections)
+        .values()
+        .any(|attempt| {
+            let value = attempt.snapshot();
+            !attempt.finished()
+                && value.provider_id == id
+                && value.operation == Operation::Disconnect
+        })
+}
+pub(super) fn pending_disconnect(state: &AppState) -> Option<Connection> {
+    crate::lock(&state.cloud_providers.connections)
+        .values()
+        .filter(|attempt| !attempt.finished())
+        .map(|attempt| attempt.snapshot())
+        .filter(|value| value.operation == Operation::Disconnect)
+        .min_by(|a, b| (a.expires_at, &a.id).cmp(&(b.expires_at, &b.id)))
+}
+fn start_operation(
+    state: Arc<AppState>,
+    def: &'static ProviderDefinition,
+    operation: Operation,
+) -> Result<Connection, &'static str> {
     let mut connections = crate::lock(&state.cloud_providers.connections);
     connections.retain(|_, a| !a.finished() || a.snapshot().expires_at.saturating_add(300) > now());
     if let Some(a) = connections.values().find(|a| {
         let c = a.snapshot();
         c.provider_id == def.id && !a.finished()
     }) {
-        return a.snapshot();
+        let snapshot = a.snapshot();
+        return if snapshot.operation == operation {
+            Ok(snapshot)
+        } else {
+            Err("provider_busy")
+        };
     }
     while connections.len() >= 24 {
         let oldest = connections
@@ -167,8 +214,14 @@ pub(super) fn start(state: Arc<AppState>, def: &'static ProviderDefinition) -> C
     let value = Connection {
         id: crate::agents::fresh_session_id(),
         provider_id: def.id.into(),
+        operation,
         phase: Phase::Preparing,
-        expires_at: now() + 900,
+        expires_at: now()
+            + if operation == Operation::Connect {
+                900
+            } else {
+                60
+            },
         action: None,
         error_code: None,
     };
@@ -182,10 +235,20 @@ pub(super) fn start(state: Arc<AppState>, def: &'static ProviderDefinition) -> C
     });
     connections.insert(value.id.clone(), attempt.clone());
     drop(connections);
+    state
+        .cloud_providers
+        .auth_epoch
+        .fetch_add(1, Ordering::AcqRel);
+    crate::lock(&state.cloud_providers.cache).remove(def.id);
     ACTIVE.fetch_add(1, Ordering::AcqRel);
     tokio::spawn(async move {
         let _busy = Busy;
-        let work = run(&state, def, &attempt);
+        let work = async {
+            match operation {
+                Operation::Connect => run(&state, def, &attempt).await,
+                Operation::Disconnect => super::disconnect::run(&state, def, &attempt).await,
+            }
+        };
         let stopped = async {
             loop {
                 if state.stopping.load(Ordering::Acquire) {
@@ -197,7 +260,7 @@ pub(super) fn start(state: Arc<AppState>, def: &'static ProviderDefinition) -> C
         let result = tokio::select! {
             result=work=>result,
             _=canceled.changed()=>Err("canceled"),
-            _=tokio::time::sleep(Duration::from_secs(900))=>Err("expired"),
+            _=tokio::time::sleep(Duration::from_secs(if operation == Operation::Connect { 900 } else { 60 }))=>Err("expired"),
             _=stopped=>Err("unavailable"),
         };
         // The run future has been dropped here, so its RPC process group and
@@ -220,9 +283,21 @@ pub(super) fn start(state: Arc<AppState>, def: &'static ProviderDefinition) -> C
         .await
         .is_ok();
         crate::lock(&attempt.input).take();
+        state
+            .cloud_providers
+            .auth_epoch
+            .fetch_add(1, Ordering::AcqRel);
         crate::lock(&state.cloud_providers.cache).remove(def.id);
         match result {
-            Ok(()) => attempt.update(Phase::Connected, None, None),
+            Ok(()) => attempt.update(
+                if operation == Operation::Connect {
+                    Phase::Connected
+                } else {
+                    Phase::Disconnected
+                },
+                None,
+                None,
+            ),
             Err("canceled") => attempt.update(Phase::Canceled, None, None),
             Err("expired") => attempt.update(Phase::Expired, None, Some("expired")),
             Err(reason) => attempt.update(Phase::Failed, None, Some(reason)),
@@ -238,7 +313,7 @@ pub(super) fn start(state: Arc<AppState>, def: &'static ProviderDefinition) -> C
         }
         state.changes.notify_waiters();
     });
-    value
+    Ok(value)
 }
 struct SessionGuard {
     state: Arc<AppState>,

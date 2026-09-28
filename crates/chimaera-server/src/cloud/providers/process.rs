@@ -48,6 +48,13 @@ pub(super) fn command(bin: &Path, args: &[&str], cwd: &Path) -> tokio::process::
     let mut cmd = tokio::process::Command::new(&argv[0]);
     cmd.args(&argv[1..])
         .current_dir(cwd)
+        // The worker's explicit provider home owns auth. A different ambient
+        // desktop HOME/config override must never redirect an auth mutation.
+        .env("HOME", cwd)
+        .env("CODEX_HOME", cwd.join(".codex"))
+        .env("CLAUDE_CONFIG_DIR", cwd.join(".claude"))
+        .env("GH_CONFIG_DIR", cwd.join(".config/gh"))
+        .env("XDG_CONFIG_HOME", cwd.join(".config"))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -62,7 +69,16 @@ pub(super) struct Output {
     pub stdout: Vec<u8>,
 }
 pub(super) async fn output(cmd: &mut tokio::process::Command) -> Result<Output, &'static str> {
+    output_tracked(cmd, |_| {}).await
+}
+pub(super) async fn output_tracked(
+    cmd: &mut tokio::process::Command,
+    started: impl FnOnce(u32),
+) -> Result<Output, &'static str> {
     let mut child = Child::spawn(cmd)?;
+    if let Some(pid) = child.child.id() {
+        started(pid);
+    }
     let stdout = child.child.stdout.take().ok_or("start_failed")?;
     let stderr = child.child.stderr.take().ok_or("start_failed")?;
     let work = async {

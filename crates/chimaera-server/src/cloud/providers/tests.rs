@@ -79,7 +79,7 @@ fn status_reads_only_explicit_allowlisted_auth_fields() {
                 0
             )
         ),
-        Ok(false)
+        Err("invalid_status")
     );
     assert_eq!(
         auth_status(
@@ -99,7 +99,7 @@ fn status_reads_only_explicit_allowlisted_auth_fields() {
                 0
             )
         ),
-        Ok(false)
+        Err("invalid_status")
     );
 }
 
@@ -182,4 +182,44 @@ fn every_auth_adapter_uses_the_shared_provider_catalog() {
         assert_eq!(status.category, catalog.category);
         assert!(!status.methods.is_empty());
     }
+}
+
+#[test]
+fn provider_commands_bind_auth_storage_to_the_explicit_worker_home() {
+    let home = Path::new("/tmp/chimaera-synthetic-auth-home");
+    let command = process::command(Path::new("/fixture/cli"), &["auth", "logout"], home);
+    let env: std::collections::HashMap<_, _> = command
+        .as_std()
+        .get_envs()
+        .filter_map(|(key, value)| {
+            value.map(|value| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.to_string_lossy().into_owned(),
+                )
+            })
+        })
+        .collect();
+    assert_eq!(env["HOME"], home.to_string_lossy());
+    assert_eq!(
+        env["CODEX_HOME"],
+        "/tmp/chimaera-synthetic-auth-home/.codex"
+    );
+    assert_eq!(
+        env["CLAUDE_CONFIG_DIR"],
+        "/tmp/chimaera-synthetic-auth-home/.claude"
+    );
+    assert_eq!(
+        env["GH_CONFIG_DIR"],
+        "/tmp/chimaera-synthetic-auth-home/.config/gh"
+    );
+}
+
+#[test]
+fn new_catalog_entries_do_not_imply_a_disconnect_adapter() {
+    for id in ["claude", "codex", "github"] {
+        assert!(ProviderStatus::new(id).disconnect_supported);
+    }
+    assert!(!super::disconnect::supported("future-provider"));
+    assert!(!ProviderStatus::new("future-provider").disconnect_supported);
 }

@@ -1035,11 +1035,14 @@ export interface CloudProviderStatus {
   reason: string | null;
   checked_at: number | null;
   methods: string[];
+  /** Older daemons omit this capability; never infer it from sign-in support. */
+  disconnect_supported?: boolean;
 }
 export interface CloudProviderConnection {
   id: string;
   provider_id: string;
-  phase: "preparing" | "waiting" | "verifying" | "connected" | "failed" | "canceled" | "expired";
+  operation?: "connect" | "disconnect";
+  phase: "preparing" | "waiting" | "verifying" | "connected" | "disconnected" | "failed" | "canceled" | "expired";
   expires_at: number;
   action: { type: "device_code"; verification_url: string; user_code: string }
     | { type: "browser"; url: string; input?: "authorization_code" }
@@ -1067,12 +1070,13 @@ export interface CloudSetupInfo {
   workspace_id?: string;
   session_id?: string;
   providers?: CloudProviderStatus[];
-  connection?: CloudProviderConnection;
+  connection?: CloudProviderConnection | null;
   handoffs?: CloudPendingHandoff[];
 }
 export type CloudSetupRequest = { operation: "info" | "start" | "providers" }
   | { operation: "onboard"; agent: string }
   | { operation: "provider_connect"; provider_id: string }
+  | { operation: "provider_disconnect"; provider_id: string; acknowledge_cloud_work: true }
   | { operation: "provider_submit"; connection_id: string; code: string }
   | { operation: "provider_connection" | "provider_cancel" | "open_provider_browser" | "open_provider_terminal"; connection_id: string }
   | { operation: "resume_handoff"; workspace_id: string; expected_epoch: number }

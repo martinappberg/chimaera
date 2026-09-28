@@ -9,7 +9,8 @@ Worker-only readiness and explicitly requested provider authentication. Parent:
 | `mod.rs` | Catalog adapters, allowlisted status parsing, bounded single-flight cache, authenticated HTTP handlers and the handoff `readiness` helper. |
 | `process.rs` | Capped CLI output and Codex auth-only JSON-RPC; owned process-group cleanup. No raw output enters HTTP errors or logs. |
 | `claude.rs` | Official Claude CLI headless browser/code adapter; bounded URL extraction and one-time stdin reply, without a workspace or PTY. |
-| `connect.rs` | Short-lived connection jobs, curated runtime installation, exact login terminals, Codex device codes, cancellation and cleanup acknowledgement. |
+| `connect.rs` | Short-lived connection/disconnection jobs, one writer per provider, curated runtime installation, exact login terminals, Codex device codes, cancellation and cleanup acknowledgement. |
+| `disconnect.rs` | Official CLI logout adapters and fresh negative verification; personal-cloud scope, no credential-file reads or claims of vendor-wide revocation. |
 | `tests.rs`, `connect_tests.rs` | Status isolation, cache/freshness, real child/PTY cleanup, cancellation/retry races and device completion verification. |
 
 ## Contract
@@ -17,13 +18,22 @@ Worker-only readiness and explicitly requested provider authentication. Parent:
 All routes are behind the daemon bearer middleware, under `/api/v1/pro/cloud`:
 
 - `GET /providers` returns `{available,providers,handoffs}`. Provider rows contain
-  `id,label,category,installed,state,reason,checked_at,methods`. State is `missing`,
+  `id,label,category,installed,state,reason,checked_at,methods,disconnect_supported`. Older servers omit the additive capability, so clients hide disconnect unless it is true. State is `missing`,
   `needs_sign_in`, `signed_in`, `unknown` or `unavailable`; `installed` is nullable.
   `handoffs` comes from `pro::cloud_provider_blocks`, never inferred from UI state.
+  An optional `connection` recovers the earliest unfinished disconnect after a
+  lost mutation response or reopened UI; reading it starts no operation.
 - `POST /providers/{id}/connect`, `GET /connections/{id}`, and
   `POST /connections/{id}/cancel`, and `POST /connections/{id}/input` return `{available,connection}`. An attempt has
-  `id,provider_id,phase,expires_at,action,error_code`. Phase is `preparing`,
-  `waiting`, `verifying`, `connected`, `failed`, `canceled` or `expired`.
+  `id,provider_id,operation,phase,expires_at,action,error_code`. Additive `operation` is `connect` or `disconnect`; an absent operation means `connect` for older servers. Phase is `preparing`,
+  `waiting`, `verifying`, `connected`, `disconnected`, `failed`, `canceled` or `expired`.
+- `POST /providers/{id}/disconnect {acknowledge_cloud_work:true}` starts or joins
+  a bounded 60-second disconnect job. The UI first names the provider and warns
+  that cloud tasks may lose access. A concurrent login returns `409 provider_busy`;
+  login likewise cannot race a disconnect. This operation is personal-cloud-wide,
+  never project-only, and does not stop existing agent tasks. Once accepted it
+  completes independently of UI visibility; cancel does not undo logout. Success
+  requires a fresh official signed-out result, not a timeout or invalid-token row.
 - `POST /connections/{id}/input {code}` accepts a single-use, nonempty authorization
   code (maximum 4096 bytes, no whitespace/control characters) only while that
   exact attempt is waiting for `authorization_code`. Code bodies are never logged,
@@ -55,7 +65,7 @@ All routes are behind the daemon bearer middleware, under `/api/v1/pro/cloud`:
   same completed probe; a later fresh request bypasses cached auth state.
   Each subprocess stream/JSON-RPC frame is capped at 64 KiB; request RPCs have an
   eight-second deadline and bounded notification skips. Cache keys are catalog IDs.
-- Connection lifetime is at most 15 minutes plus bounded cleanup. The daemon
+- Login lifetime is at most 15 minutes; disconnect at most 60 seconds, plus bounded cleanup. The daemon
   health active-operation count includes pending auth/install jobs. Jobs continue
   across UI disconnect but cancel on daemon stop; they are not restart-restored.
 - A provider has at most one unfinished credential writer. Cancel clears the
@@ -67,6 +77,17 @@ All routes are behind the daemon bearer middleware, under `/api/v1/pro/cloud`:
   vendor code already issued (that code expires at the provider), or sign out an
   account whose login completed concurrently. No user credentials are copied from
   another host. Raw CLI errors, account email and token fields never leave a probe.
+- Disconnect uses Claude `auth logout`, Codex `account/logout`, and GitHub
+  `auth logout --hostname github.com --user <CLI-reported account>`. GitHub removes
+  at most eight stored accounts for that host, preserving enterprise hosts and
+  refusing environment-owned tokens. Names stay internal; no token values are read.
+  GitHub logout removes local stored auth, not vendor authorization. Neither a
+  successful logout nor Chimaera sign-out promises to erase tokens already cached
+  by running agents. Cloud-wide provider connections are reused until disconnected
+  or their official auth state requires sign-in again.
+- Auth changes invalidate cached readiness and fence in-flight results by an
+  auth generation. While disconnect is unfinished, readiness remains unknown;
+  a stale signed-in cache cannot authorize a handoff during removal.
 - Claude sign-in creates no workspace or PTY. It validates the current official
   `https://claude.com/cai/oauth/authorize` URL and prompt before exposing the
   browser action. Unrecognized CLI output fails closed. A code is passed once

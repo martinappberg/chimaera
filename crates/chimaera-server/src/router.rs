@@ -49,6 +49,10 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
             post(crate::cloud::providers::start),
         )
         .route(
+            "/pro/cloud/providers/{id}/disconnect",
+            post(crate::cloud::providers::disconnect),
+        )
+        .route(
             "/pro/cloud/connections/{id}",
             get(crate::cloud::providers::get),
         )

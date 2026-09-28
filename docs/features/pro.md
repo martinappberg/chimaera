@@ -136,6 +136,18 @@ machine, not by a local checkbox or simply opening a browser. This confirms the
 configured account; it does not promise available provider quota or model access.
 Provider credentials remain on the cloud machine and are never copied from other devices.
 
+Agent and GitHub connections authorize use throughout the user's personal cloud,
+within the access granted by that provider. The official **Connect** action is the
+authorization step; connecting again is not required for each project or handoff.
+Connected provider cards offer **Disconnect** when the worker supports it. The
+confirmation names that provider and explains that active cloud tasks may lose
+access. Disconnection signs the official CLI out in the cloud; computer sign-in is
+unchanged. It does not stop existing tasks or promise to erase their cached tokens.
+GitHub removes stored github.com logins only, not enterprise connections, and does
+not revoke tokens at GitHub. Revoking the GitHub CLI application at GitHub can
+also affect other devices. Failed or unknown verification stays recoverable and
+never reports a completed disconnection. Reconnecting is a separate user action.
+
 A paused handoff names the specific providers its sessions need. **Connect agents
 to continue** opens the same flow with that project context. Every required agent
 must be confirmed by a fresh catalog before that existing staged transfer continues
@@ -160,7 +172,7 @@ clones are not registered. The cloud machine's SSH public key is under advanced
 connections.
 
 The worker exposes `/api/v1/pro/cloud`, `/api/v1/pro/cloud/providers`, provider
-connect routes, connection read/cancel routes, and `/api/v1/pro/cloud/project`.
+connect/disconnect routes, connection read/cancel routes, and `/api/v1/pro/cloud/project`.
 The native `pro_cloud_request` command keeps account and daemon credentials out
 of the UI and opens only a server-owned connection's validated browser URL or
 terminal. Browser clients use the same routes through the host-pinned gateway.
@@ -290,15 +302,34 @@ Passive roster polls, reconnects and watchers carry no cloud wake intent.
   Signing out or quitting closes the offer. Device-host rows have no “Keep
   connected” toggle because their owning device controls availability.
 
----
-
-## Intent — human-authored ground truth
-
-_No intent captured yet — pending the maintainer's feature-intent review. The
-implemented behavior above is derived from code, not a replacement for intent._
-
 System sleep hooks give the daemon a bounded chance to flush: macOS uses IOKit,
 Linux uses a logind delay inhibitor, and Windows uses the suspend callback's short
 best-effort window. Wake restores heartbeats. Automatic hand-back waits for AC
 power. Platform compilation and actual physical sleep are separate verification
 gates; Linux and Windows physical sleep still need their own hosts.
+
+---
+
+## Intent — human-authored ground truth
+
+### Cloud connections — scope and experience
+_Captured 2026-09-28 from the maintainer's instructions in this conversation._
+
+- **Problem it solves:** The maintainer asked why credentials stay on a device
+  when the intended experience is to continue work automatically in the cloud.
+  They explicitly requested implementation of the credential proposal with a
+  subagent.
+- **Current direction, open to improvement:** Asked to choose between selected
+  projects and the whole personal cloud for custom secrets, the maintainer chose
+  selected projects: “1, I think? but GitHub for instance feels like something you
+  would allow for the full cloud box ?” This records the scope decision; it does
+  not claim custom-secret sharing is implemented by the connection controls above.
+- **Experience:** “I dont want this to meddle with the UI / UX and become unclear
+  so the user doesn't know what to do”. Named service connections and project
+  secret permissions must be understandable in the flow where they are needed.
+- **Extension:** The maintainer explicitly wants other providers to fit later,
+  giving Grok as an example. This addition is intended to evolve; no fixed
+  provider list or immutable interface was requested.
+
+_Broader Pro intent capture remains pending. The behavior above the divider is
+derived from code; the statements here record the maintainer's instructions._

@@ -16,6 +16,7 @@ export async function cloudRequest(request: CloudSetupRequest, signal?: AbortSig
     case "info": case "start": path = "/pro/cloud"; break;
     case "providers": path = "/pro/cloud/providers"; break;
     case "provider_connect": path = `/pro/cloud/providers/${encodeURIComponent(request.provider_id)}/connect`; method = "POST"; body = {}; break;
+    case "provider_disconnect": path = `/pro/cloud/providers/${encodeURIComponent(request.provider_id)}/disconnect`; method = "POST"; body = { acknowledge_cloud_work: request.acknowledge_cloud_work }; break;
     case "provider_connection": path = `/pro/cloud/connections/${encodeURIComponent(request.connection_id)}`; break;
     case "provider_submit": path = `/pro/cloud/connections/${encodeURIComponent(request.connection_id)}/input`; method = "POST"; body = { code: request.code }; break;
     case "provider_cancel": path = `/pro/cloud/connections/${encodeURIComponent(request.connection_id)}/cancel`; method = "POST"; body = {}; break;
@@ -36,6 +37,14 @@ export async function cloudRequest(request: CloudSetupRequest, signal?: AbortSig
   if (body !== undefined) headers["Content-Type"] = "application/json";
   const timeout = AbortSignal.timeout(request.operation === "project" ? 310_000 : request.operation === "resume_handoff" ? 1_200_000 : method === "GET" && request.operation !== "start" ? 40_000 : 95_000);
   const response = await api(path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body), signal: signal ? AbortSignal.any([signal, timeout]) : timeout });
-  if (!response.ok) throw new Error("This cloud operation couldn't finish. Please try again.");
+  if (!response.ok) {
+    // Only this bounded code is safe to carry through from the daemon. Vendor
+    // output and raw error details must never reach the connection panel.
+    if (request.operation === "provider_disconnect" && response.status === 409) {
+      const details = await response.json().catch(() => null);
+      if (details?.error === "provider_busy") throw new Error("provider_busy");
+    }
+    throw new Error("This cloud operation couldn't finish. Please try again.");
+  }
   return response.status === 204 ? {} : await response.json() as CloudSetupInfo;
 }

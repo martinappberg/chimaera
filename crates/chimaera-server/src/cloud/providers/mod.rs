@@ -1,6 +1,7 @@
 //! Worker provider readiness and explicit, short-lived authentication jobs.
 //! IDs are catalog keys, never executable names supplied by a client.
 mod connect;
+mod disconnect;
 mod process;
 #[cfg(test)]
 mod tests;
@@ -19,7 +20,10 @@ use serde_json::{json, Value};
 use std::{
     collections::HashMap,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -67,6 +71,7 @@ pub(crate) struct ProviderStatus {
     pub reason: Option<String>,
     pub checked_at: Option<u64>,
     pub methods: Vec<String>,
+    pub disconnect_supported: bool,
 }
 impl ProviderStatus {
     fn new(id: &str) -> Self {
@@ -80,6 +85,7 @@ impl ProviderStatus {
             state: ProviderState::Unknown,
             reason: None,
             checked_at: None,
+            disconnect_supported: def.is_some() && disconnect::supported(id),
             methods: def.map_or_else(Vec::new, |d| {
                 d.methods.iter().map(|m| (*m).into()).collect()
             }),
@@ -93,6 +99,7 @@ impl ProviderStatus {
 #[derive(Default)]
 pub(crate) struct Providers {
     cache: Mutex<HashMap<String, (Instant, ProviderStatus)>>,
+    auth_epoch: AtomicU64,
     probe: tokio::sync::Mutex<()>,
     connections: Mutex<HashMap<String, Arc<connect::Attempt>>>,
 }
@@ -155,6 +162,9 @@ fn auth_status(id: &str, output: &process::Output) -> Result<bool, &'static str>
             }
         }
         "github" => {
+            if !output.success {
+                return Err("invalid_status");
+            }
             let value: Value =
                 serde_json::from_slice(&output.stdout).map_err(|_| "invalid_status")?;
             let all = value["hosts"].as_object().ok_or("invalid_status")?;
@@ -162,9 +172,17 @@ fn auth_status(id: &str, output: &process::Output) -> Result<bool, &'static str>
                 return Ok(false);
             };
             let hosts = hosts.as_array().ok_or("invalid_status")?;
-            Ok(hosts.iter().any(|h| {
+            if hosts.is_empty() {
+                return Ok(false);
+            }
+            if hosts.iter().any(|h| {
                 h["active"].as_bool() == Some(true) && h["state"].as_str() == Some("success")
-            }))
+            }) {
+                Ok(true)
+            } else {
+                // Failed network/token verification does not establish logout.
+                Err("invalid_status")
+            }
         }
         _ => Err("unsupported_provider"),
     }
@@ -252,6 +270,11 @@ pub(crate) async fn readiness(
     let mut result = Vec::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(25);
     for id in ids {
+        if connect::disconnecting(state, &id) {
+            result.push(ProviderStatus::new(&id).failed("disconnecting"));
+            continue;
+        }
+        let epoch = state.cloud_providers.auth_epoch.load(Ordering::Acquire);
         let requested = Instant::now();
         let Ok(_single) =
             tokio::time::timeout_at(deadline, state.cloud_providers.probe.lock()).await
@@ -266,7 +289,13 @@ pub(crate) async fn readiness(
             })
             .map(|(_, v)| v.clone());
         if let Some(cached) = cached {
-            result.push(cached);
+            if state.cloud_providers.auth_epoch.load(Ordering::Acquire) == epoch
+                && !connect::disconnecting(state, &id)
+            {
+                result.push(cached);
+            } else {
+                result.push(ProviderStatus::new(&id).failed("connection_changed"));
+            }
             continue;
         }
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -274,6 +303,12 @@ pub(crate) async fn readiness(
             tokio::time::timeout(remaining.min(Duration::from_secs(12)), probe(state, &id))
                 .await
                 .unwrap_or_else(|_| ProviderStatus::new(&id).failed("probe_timeout"));
+        if state.cloud_providers.auth_epoch.load(Ordering::Acquire) != epoch
+            || connect::disconnecting(state, &id)
+        {
+            result.push(ProviderStatus::new(&id).failed("connection_changed"));
+            continue;
+        }
         // Only catalog keys are cached: unknown IDs cannot grow daemon state.
         if definition(&id).is_some() {
             crate::lock(&state.cloud_providers.cache).insert(id, (Instant::now(), status.clone()));
@@ -293,7 +328,13 @@ pub(crate) async fn list(State(state): State<Arc<AppState>>) -> Response {
         .iter()
         .map(|d| d.id.to_string())
         .collect::<Vec<_>>();
-    Json(json!({"available":true,"providers":readiness(&state,&ids,false).await,"handoffs":crate::pro::cloud_provider_blocks(&state)})).into_response()
+    let mut result = json!({"available":true,"providers":readiness(&state,&ids,false).await,"handoffs":crate::pro::cloud_provider_blocks(&state)});
+    // Reopening the UI or losing the mutation's HTTP response must not strand a
+    // running logout with no job ID. This is an observation, never a new action.
+    if let Some(connection) = connect::pending_disconnect(&state) {
+        result["connection"] = json!(connection);
+    }
+    Json(result).into_response()
 }
 pub(crate) async fn start(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
     if !super::enabled() {
@@ -306,8 +347,42 @@ pub(crate) async fn start(State(state): State<Arc<AppState>>, Path(id): Path<Str
         )
             .into_response();
     };
-    let connection = connect::start(state, def);
-    Json(json!({"available":true,"connection":connection})).into_response()
+    match connect::start(state, def) {
+        Ok(connection) => Json(json!({"available":true,"connection":connection})).into_response(),
+        Err(error) => (StatusCode::CONFLICT, Json(json!({"error":error}))).into_response(),
+    }
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Disconnect {
+    acknowledge_cloud_work: bool,
+}
+pub(crate) async fn disconnect(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(input): Json<Disconnect>,
+) -> Response {
+    if !super::enabled() {
+        return unavailable();
+    }
+    if !input.acknowledge_cloud_work {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":"disconnect_confirmation_required"})),
+        )
+            .into_response();
+    }
+    let Some(def) = definition(&id).filter(|def| disconnect::supported(def.id)) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error":"unsupported_provider"})),
+        )
+            .into_response();
+    };
+    match connect::start_disconnect(state, def) {
+        Ok(connection) => Json(json!({"available":true,"connection":connection})).into_response(),
+        Err(error) => (StatusCode::CONFLICT, Json(json!({"error":error}))).into_response(),
+    }
 }
 pub(crate) async fn get(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
     connection_response(&state, &id, false).await

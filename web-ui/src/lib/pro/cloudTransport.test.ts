@@ -26,6 +26,29 @@ describe("cloud provider request intent", () => {
     expect(path).toBe("/pro/hydrate");
     expect(JSON.parse(options.body)).toEqual({ workspace_id: "ws-1", expected_epoch: 7, requires_fork: false });
   });
+  it("disconnects only the named provider with explicit cloud-work acknowledgement", async () => {
+    await cloudRequest({ operation: "provider_disconnect", provider_id: "future/provider", acknowledge_cloud_work: true });
+    const [path, options] = mocks.api.mock.calls[0];
+    expect(path).toBe("/pro/cloud/providers/future%2Fprovider/disconnect");
+    expect(options.method).toBe("POST");
+    expect(options.headers["X-Chimaera-Wake"]).toBe("interaction");
+    expect(JSON.parse(options.body)).toEqual({ acknowledge_cloud_work: true });
+  });
+  it("passes the same named disconnection acknowledgement to the native bridge", async () => {
+    mocks.native.mockReturnValue(true);
+    mocks.invoke.mockResolvedValue({ available: true });
+    const request = { operation: "provider_disconnect", provider_id: "codex", acknowledge_cloud_work: true } as const;
+    await cloudRequest(request);
+    expect(mocks.invoke).toHaveBeenCalledWith(request);
+    expect(mocks.api).not.toHaveBeenCalled();
+  });
+  it("preserves only the bounded busy error for disconnection, never raw upstream output", async () => {
+    const request = { operation: "provider_disconnect", provider_id: "codex", acknowledge_cloud_work: true } as const;
+    mocks.api.mockResolvedValueOnce(Response.json({ error: "provider_busy" }, { status: 409 }));
+    await expect(cloudRequest(request)).rejects.toThrow("provider_busy");
+    mocks.api.mockResolvedValueOnce(Response.json({ error: "SECRET raw stderr" }, { status: 409 }));
+    await expect(cloudRequest(request)).rejects.toThrow("This cloud operation couldn't finish. Please try again.");
+  });
   it("accepts successful empty handoff responses", async () => {
     mocks.api.mockResolvedValue(new Response(null, { status: 204 }));
     await expect(cloudRequest({ operation: "resume_handoff", workspace_id: "ws-1", expected_epoch: 7 })).resolves.toEqual({});

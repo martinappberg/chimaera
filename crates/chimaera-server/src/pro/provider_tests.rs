@@ -55,6 +55,7 @@ fn entry(kind: AgentKind) -> crate::ledger::LedgerEntry {
 }
 fn status(id: &str, state: ProviderState) -> ProviderStatus {
     ProviderStatus {
+        disconnect_supported: true,
         id: id.into(),
         label: id.into(),
         category: "agent".into(),

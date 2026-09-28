@@ -33,6 +33,10 @@ pub enum Request {
     ProviderConnect {
         provider_id: String,
     },
+    ProviderDisconnect {
+        provider_id: String,
+        acknowledge_cloud_work: bool,
+    },
     ProviderConnection {
         connection_id: String,
     },
@@ -149,6 +153,15 @@ async fn live_worker(client: &Client, host: &Host) -> bool {
 
 #[tauri::command]
 pub async fn pro_cloud_request(app: AppHandle, request: Request) -> Result<Value, String> {
+    if let Request::ProviderDisconnect {
+        provider_id,
+        acknowledge_cloud_work,
+    } = &request
+    {
+        if !acknowledge_cloud_work || provider_definition(provider_id).is_none() {
+            return Err("Confirm which cloud connection to disconnect.".into());
+        }
+    }
     let state = app.state::<Shell>();
     let (client, generation) = state.pro.client_snapshot().await.ok_or("Sign in first")?;
     let wake = matches!(
@@ -157,10 +170,14 @@ pub async fn pro_cloud_request(app: AppHandle, request: Request) -> Result<Value
             | Request::Onboard { .. }
             | Request::Project { .. }
             | Request::ProviderConnect { .. }
+            | Request::ProviderDisconnect { .. }
             | Request::OpenProviderTerminal { .. }
             | Request::ResumeHandoff { .. }
     );
-    let submit_code = matches!(request, Request::ProviderSubmit { .. });
+    let account_mutation = matches!(
+        request,
+        Request::ProviderSubmit { .. } | Request::ProviderDisconnect { .. }
+    );
     let open_browser = matches!(request, Request::OpenProviderBrowser { .. });
     let open_terminal = matches!(request, Request::OpenProviderTerminal { .. });
     let timeout = match &request {
@@ -171,14 +188,14 @@ pub async fn pro_cloud_request(app: AppHandle, request: Request) -> Result<Value
     let Some(host) = worker(&app, &client, generation, wake).await? else {
         return Ok(json!({"available":false}));
     };
-    // A one-time reply must not outlive account replacement while the blocking
-    // HTTP client is sending it to its original worker-owned login attempt.
-    let _submit_operation = if submit_code {
+    // Credential submission and removal must stay bound to the same account
+    // while the blocking HTTP client sends the explicitly authorized operation.
+    let _account_operation = if account_mutation {
         Some(state.pro.operation.lock().await)
     } else {
         None
     };
-    if submit_code && state.pro.generation() != generation {
+    if account_mutation && state.pro.generation() != generation {
         return Err("Your account changed. Start sign-in again.".into());
     }
     let (route, body): (String, Option<Value>) = match request {
@@ -191,6 +208,16 @@ pub async fn pro_cloud_request(app: AppHandle, request: Request) -> Result<Value
             )
         }
         Request::ProviderConnect { .. } => return Err("This provider is not supported yet.".into()),
+        Request::ProviderDisconnect {
+            provider_id,
+            acknowledge_cloud_work: true,
+        } if provider_definition(&provider_id).is_some() => (
+            format!("cloud/providers/{provider_id}/disconnect"),
+            Some(json!({"acknowledge_cloud_work":true})),
+        ),
+        Request::ProviderDisconnect { .. } => {
+            return Err("Confirm which cloud connection to disconnect.".into())
+        }
         Request::ProviderConnection { connection_id }
         | Request::OpenProviderBrowser { connection_id }
         | Request::OpenProviderTerminal { connection_id }
@@ -281,6 +308,9 @@ pub async fn pro_cloud_request(app: AppHandle, request: Request) -> Result<Value
                     "Connect the agent required by this project before continuing."
                 }
                 Some("provider_unavailable") => "This provider cannot connect here yet.",
+                // This fixed code is mapped to copy by the typed UI. Never
+                // forward arbitrary provider errors or CLI output.
+                Some("provider_busy") => "provider_busy",
                 _ => "Couldn't complete cloud setup. Try again shortly.",
             }
             .into());
@@ -361,12 +391,14 @@ fn active_connection(value: &Value) -> Result<&Value, String> {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    if !matches!(
-        connection["phase"].as_str(),
-        Some("preparing" | "waiting" | "verifying")
-    ) || connection["expires_at"]
-        .as_u64()
-        .is_none_or(|expiry| expiry <= now)
+    if connection["operation"].as_str() == Some("disconnect")
+        || !matches!(
+            connection["phase"].as_str(),
+            Some("preparing" | "waiting" | "verifying")
+        )
+        || connection["expires_at"]
+            .as_u64()
+            .is_none_or(|expiry| expiry <= now)
         || connection["provider_id"]
             .as_str()
             .and_then(provider_definition)
@@ -434,7 +466,7 @@ mod tests {
 
     #[test]
     fn stale_and_finished_connections_cannot_open_actions() {
-        for phase in ["connected", "failed", "canceled", "expired"] {
+        for phase in ["connected", "disconnected", "failed", "canceled", "expired"] {
             assert!(active_connection(
                 &json!({"connection":{"provider_id":"codex","phase":phase,"expires_at":u64::MAX}})
             )
@@ -448,6 +480,9 @@ mod tests {
             &json!({"connection":{"provider_id":"codex","phase":"waiting","expires_at":u64::MAX}})
         )
         .is_ok());
+        assert!(active_connection(
+            &json!({"connection":{"provider_id":"codex","operation":"disconnect","phase":"verifying","expires_at":u64::MAX}})
+        ).is_err());
         for id in ["", "../sessions", "connection?token", "one/two"] {
             assert!(!valid_id(id));
         }
