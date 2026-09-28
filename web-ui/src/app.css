@@ -332,6 +332,19 @@
   }
 }
 
+/* The "working on it" breathe of a live text label — the chat's status line
+   and a still-streaming Thinking row. Each component keeps its own
+   prefers-reduced-motion and html.app-hidden overrides. */
+@keyframes label-pulse {
+  0%,
+  100% {
+    opacity: 0.9;
+  }
+  50% {
+    opacity: 0.55;
+  }
+}
+
 /* The slow "presence, not alarm" breathe shared by the work-tray header
    glyphs (subagents + background tasks) — one rhythm so the sibling trays
    read as one family. Reduced-motion overrides live in the components. */

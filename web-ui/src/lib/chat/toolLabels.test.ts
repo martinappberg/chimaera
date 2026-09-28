@@ -93,12 +93,21 @@ describe("toolRunHealth", () => {
   });
 
   it("recovers a failed command with any later completed command", () => {
-    const cmd = (over: Partial<HealthTool> = {}) => call({ tool: "execute", title: "cargo build", ...over });
-    expect(toolRunHealth([cmd({ status: "failed" }), cmd({ title: "cargo build 2>&1 | tail" })])).toBe(
-      "recovered",
-    );
-    expect(toolRunHealth([cmd({ status: "failed" }), cmd({ status: "in_progress" })])).toBe("failed");
-    expect(toolRunHealth([cmd({ status: "failed" }), call({ title: "cargo build" })])).toBe("failed");
+    const cmd = (command: string, over: Partial<HealthTool> = {}) =>
+      call({ tool: "execute", title: command, command, ...over });
+    const failed = cmd("cargo build", { status: "failed" });
+    expect(toolRunHealth([failed, cmd("cargo build 2>&1 | tail")])).toBe("recovered");
+    expect(toolRunHealth([failed, cmd("cargo build", { status: "in_progress" })])).toBe("failed");
+    expect(toolRunHealth([failed, call({ title: "cargo build" })])).toBe("failed");
+  });
+
+  it("doesn't let a call that ran no command recover one", () => {
+    const failed = call({ tool: "execute", title: "cargo test", command: "cargo test", status: "failed" });
+    const kill = call({ tool: "execute", title: "KillShell: bg-1", command: null });
+    expect(toolRunHealth([failed, kill])).toBe("failed");
+    // A pre-field journal row still recovers the old way: the same title.
+    const ls = (over: Partial<HealthTool> = {}) => call({ tool: "execute", title: "ls", ...over });
+    expect(toolRunHealth([ls({ status: "failed" }), ls()])).toBe("recovered");
   });
 
   it("looks past the run into the rest of its turn", () => {

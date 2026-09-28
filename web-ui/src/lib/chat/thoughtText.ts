@@ -10,30 +10,38 @@ const MAX = 160;
 /** A whole-line bold title — codex's reasoning-summary section header. */
 const SECTION = /^\s*\*\*(.+?)\*\*\s*$/;
 
-/** One line of markdown as plain text. A still-streaming title has no
+/** One line of markdown as plain text. Code spans are set aside first, so
+ *  `__init__.py` and `**kwargs` survive; a still-streaming title has no
  *  closing `**` yet, so a leading one goes on its own. */
 function plain(line: string): string {
+  const code: string[] = [];
   return line
+    .replace(/`([^`]+)`/g, (_, span: string) => `\u0000${code.push(span) - 1}\u0000`)
     .replace(/^\s*#{1,6}\s+/, "")
-    .replace(/(\*\*|__)(.+?)\1/g, "$2")
-    .replace(/`([^`]+)`/g, "$1")
+    .replace(/\*\*(.+?)\*\*/g, "$1")
     .replace(/^\s*\*\*/, "")
+    .replace(/\u0000(\d+)\u0000/g, (_, i: string) => code[Number(i)] ?? "")
     .trim();
 }
 
-/** The first line of the thought — or, while it is still being written,
- *  its newest section title (what the agent is on now, the way codex's own
- *  status line reads). */
-export function thoughtPreview(text: string, live = false): string {
-  let line: string | undefined;
-  if (live) {
-    const lines = text.split("\n");
-    for (let i = lines.length - 1; i >= 0 && line === undefined; i--) {
-      const title = SECTION.exec(lines[i]);
-      if (title) line = title[1];
-    }
+/** The newest whole-line section title, scanning back from the end (the
+ *  live row re-asks on every streamed chunk). */
+function newestSection(text: string): string | undefined {
+  let end = text.length;
+  while (end > 0) {
+    const start = text.lastIndexOf("\n", end - 1) + 1;
+    const title = SECTION.exec(text.slice(start, end));
+    if (title) return title[1];
+    end = start - 1;
   }
-  line ??= text.trimStart().split("\n", 1)[0] ?? "";
+  return undefined;
+}
+
+/** The thought's newest section title — what the agent is on now while it
+ *  streams, the way codex's own status line reads, and the same line once
+ *  it settles — else its first line. */
+export function thoughtPreview(text: string): string {
+  const line = newestSection(text) ?? text.trimStart().split("\n", 1)[0] ?? "";
   const out = plain(line);
   return out.length > MAX ? `${out.slice(0, MAX)}…` : out;
 }

@@ -171,9 +171,10 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   question cards, inline artifacts — and, between the prose, one family of quiet 12px **activity
   lines** that cluster tight so messages stay the page's voice:
   - **Thought** — a collapsed reasoning block: "Thought" + a faded first line read as plain text
-    (Codex titles each reasoning section in bold — `**Checking the screen**` — so the line is that
-    title, and while live the newest one, the way Codex's own status line reads); click for the
-    text, rendered as sanitized markdown and mounted only while open.
+    (Codex titles each reasoning section in bold — `**Checking the screen**` — so the line is the
+    newest title, the way Codex's own status line reads, and stays put when the row settles); click
+    for the text, rendered as sanitized markdown (paths, hover previews and embeds as in a reply)
+    and mounted only while open.
   - **Tool groups** — a run of tool calls as one line, titled by the agent's own past-tense batch
     label when it offers one (Claude `tool_use_summary`: "Listed files in the workspace"; on by
     default, `chat.toolSummaries`), else readable counts ("Ran 2 commands, read a file"); calls

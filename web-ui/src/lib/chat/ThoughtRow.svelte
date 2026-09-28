@@ -1,5 +1,7 @@
 <script lang="ts">
   import Chevron from "../shared/Chevron.svelte";
+  import type { EmbedResolver } from "./embeds";
+  import type { HoverTargets } from "./hoverTargets";
   import Markdown from "./Markdown.svelte";
   import type { OpenPathFn, PathResolver } from "./paths";
   import { thoughtPreview } from "./thoughtText";
@@ -13,21 +15,35 @@
    */
   interface Props {
     text: string;
-    /** The turn's streaming tail: "Thinking", and the newest section title. */
+    /** The turn's streaming tail: "Thinking", and a streaming body. */
     live: boolean;
     /** False while a retained chat tab is hidden. */
     visible?: boolean;
+    /** The chat's prose wiring, so paths, previews and embeds in reasoning
+     *  behave as they do in a reply. */
     onOpenPath?: OpenPathFn;
     resolvePaths?: PathResolver;
+    embeds?: EmbedResolver;
+    hoverTargets?: HoverTargets;
     /** Absolute transcript index + stable uid, for ChatView's scroll anchor. */
     sourceIndex: number;
     sourceUid: number;
   }
 
-  let { text, live, visible = true, onOpenPath, resolvePaths, sourceIndex, sourceUid }: Props = $props();
+  let {
+    text,
+    live,
+    visible = true,
+    onOpenPath,
+    resolvePaths,
+    embeds,
+    hoverTargets,
+    sourceIndex,
+    sourceUid,
+  }: Props = $props();
 
   let open = $state(false);
-  const preview = $derived(thoughtPreview(text, live));
+  const preview = $derived(thoughtPreview(text));
 </script>
 
 <details class="thought activity" bind:open data-block-index={sourceIndex} data-block-uid={sourceUid}>
@@ -38,7 +54,7 @@
   </summary>
   {#if open}
     <div class="thought-body">
-      <Markdown {text} streaming={live} {visible} {onOpenPath} {resolvePaths} />
+      <Markdown {text} streaming={live} {visible} {onOpenPath} {resolvePaths} {embeds} {hoverTargets} />
     </div>
   {/if}
 </details>
@@ -85,16 +101,6 @@
   }
   :global(html.app-hidden) .thought-title.live {
     animation-play-state: paused;
-  }
-  /* ChatView's status label breathes the same way. */
-  @keyframes label-pulse {
-    0%,
-    100% {
-      opacity: 0.9;
-    }
-    50% {
-      opacity: 0.55;
-    }
   }
   @media (prefers-reduced-motion: reduce) {
     .thought-title.live {

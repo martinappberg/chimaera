@@ -2199,6 +2199,8 @@
           {visible}
           onOpenPath={openProsePath}
           resolvePaths={prosePaths}
+          embeds={proseEmbeds}
+          {hoverTargets}
           sourceIndex={item.index}
           sourceUid={item.block.uid}
         />
@@ -3067,15 +3069,6 @@
     50% {
       opacity: 0.45;
       transform: scale(0.88);
-    }
-  }
-  @keyframes label-pulse {
-    0%,
-    100% {
-      opacity: 0.9;
-    }
-    50% {
-      opacity: 0.55;
     }
   }
   @media (prefers-reduced-motion: reduce) {

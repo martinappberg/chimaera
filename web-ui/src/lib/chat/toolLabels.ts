@@ -118,6 +118,9 @@ export interface HealthTool {
   status: string;
   locations: string[];
   denied: boolean;
+  /** The shell command the call ran; absent on execute-kind calls that run
+   *  none (claude's BashOutput / KillShell) and on pre-field journals. */
+  command?: string | null;
 }
 
 /** The rest of a run's turn: `tools[from..]` are the calls made after it.
@@ -130,11 +133,12 @@ export interface TurnTail {
 
 /** Whether `later` completing undoes `failed`. Commands have no target to
  *  match (the title is the command line, which a retry almost always
- *  rewrites), so any later successful command counts; everything else must
+ *  rewrites), so any later successful command counts — one that ran a
+ *  command, not a background-output read or a kill. Everything else must
  *  hit the same file, or failing that the same title. */
 function recovers(failed: HealthTool, later: HealthTool): boolean {
   if (later.status !== "completed" || later.denied || later.tool !== failed.tool) return false;
-  if (failed.tool === "execute") return true;
+  if (failed.tool === "execute" && typeof later.command === "string") return true;
   return failed.locations.length > 0
     ? later.locations.some((l) => failed.locations.includes(l))
     : later.title === failed.title;
