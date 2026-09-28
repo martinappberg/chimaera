@@ -3,6 +3,7 @@
 use super::{account, Baton, Configure};
 use anyhow::{ensure, Context, Result};
 use serde::Deserialize;
+#[cfg(test)]
 use serde_json::json;
 use std::time::Duration;
 

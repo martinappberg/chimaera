@@ -426,3 +426,31 @@ pub(crate) async fn prepare_launch(
     );
     Ok(())
 }
+
+/// Shared HTTP/scope fixtures install a normally validated synthetic grant;
+/// production validation has no test-only permissive branch.
+#[cfg(test)]
+pub(crate) fn install_fixture(state: &AppState, workspace: &str, epoch: u64) -> Result<()> {
+    let config: Configure = serde_json::from_value(json!({
+        "account_id":"a-fixture", "role":"device", "endpoint":"http://127.0.0.1:1",
+        "keeper_url":"", "hours_exhausted":false,
+        "execution":{"version":1,"installation_id":"i-home","capability":wire::ExecutionCapability::managed()},
+        "delegation":{"access_token":"synthetic","expires_at":"2099-01-01T00:00:00Z","scope":["baton","mirror"],"device_id":"d-home"}
+    }))?;
+    let grant: Baton = serde_json::from_value(json!({
+        "workspace_id":workspace,"holder_id":"d-home","epoch":epoch,"requires_fork":false,
+        "server_now":"2026-09-28T00:00:00Z","expires_at":"2026-09-28T00:01:30Z",
+        "continuity":{"version":2,"mode":"managed_v1","policy_revision":1,"preferred_installation_id":"i-home"},
+        "execution_capability":wire::ExecutionCapability::managed(),
+        "execution_lease":{"id":"lease-fixture","sequence":1}
+    }))?;
+    accept(
+        state,
+        &config,
+        &grant,
+        state.pro.generation.load(Ordering::Acquire),
+        RequestStart::now(),
+    )?;
+    lock(&state.pro.ownership).insert(workspace.into(), Ownership::Local { epoch });
+    Ok(())
+}

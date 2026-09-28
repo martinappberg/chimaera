@@ -238,6 +238,8 @@ pub(crate) fn may_write(state: &crate::AppState, workspace: &str) -> bool {
         )
 }
 /// Execution has a stricter lease boundary than local file editing.
+#[cfg(test)]
+pub(crate) use execution::install_fixture as install_execution_fixture;
 pub(crate) use execution::prepare_launch as prepare_managed_launch;
 pub(crate) fn managed_execution(state: &crate::AppState, workspace: &str) -> bool {
     execution::managed(state, workspace)

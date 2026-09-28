@@ -83,9 +83,8 @@ fn grant_replay_stale_generation_and_capability_downgrade_do_not_extend_deadline
 }
 #[test]
 fn expiry_closes_ingress_and_marks_uncertain_without_a_network_round_trip() {
-    let (state, config, root) = fixture();
-    accept(&state, &config, &baton(), 0, RequestStart::now()).unwrap();
-    lock(&state.pro.ownership).insert("w-a".into(), Ownership::Local { epoch: 2 });
+    let (state, _config, root) = fixture();
+    crate::pro::install_execution_fixture(&state, "w-a", 2).unwrap();
     {
         let mut proofs = lock(&state.pro.execution.proofs);
         proofs.get_mut("w-a").unwrap().deadline = lease::Deadline::expired_fixture();

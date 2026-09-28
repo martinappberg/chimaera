@@ -35,7 +35,7 @@ impl State {
         let mut latched = loaded.unwrap_or_default();
         invalid |= latched
             .iter()
-            .any(|id| !preferences.get(id).is_some_and(|p| p.continuity.is_some()));
+            .any(|id| preferences.get(id).is_none_or(|p| p.continuity.is_none()));
         latched.extend(
             preferences
                 .iter()
